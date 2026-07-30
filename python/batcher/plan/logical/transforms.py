@@ -37,9 +37,35 @@ __all__ = [
     "is_cartesian_key_pair",
     "is_partition_independent",
     "is_streamable",
+    "passthrough_renames",
     "project_columns",
     "remap_sources",
 ]
+
+
+def passthrough_renames(items: tuple) -> dict[str, str]:
+    """A projection's `output alias -> source column`, for its bare-reference items only.
+
+    The question "which of this projection's outputs *are* an input column, just possibly under
+    another name?" — asked by every rule that needs to translate a predicate written against a
+    projection's output into the names its input uses. Predicate pushdown asks it to move a
+    conjunct below a `Project`, and the outer-join type rewrite asks it to see past the
+    projection that a full outer join carries.
+
+    Only an item whose expression is a bare `Col` is included, and callers depend on that
+    exclusion rather than merely tolerating it: an item that *computes* something is not a
+    reference to any single input column, so a fact about the output says nothing about an input.
+    `coalesce(left_key, right_key)` is the case that makes it load-bearing — it is non-null
+    wherever *either* side is, so "this output is not null" implies nothing about either input.
+
+    Args:
+        items: The projection's items (`Projection` records).
+
+    Returns:
+        The alias-to-source mapping, with computed items absent.
+    """
+    return {item.alias: item.expr.name for item in items if isinstance(item.expr, Col)}
+
 
 # Sentinel distinguishing "the column is a known constant whose value is None" from
 # "the column is not a provable constant". `constant_column_value` returns this when

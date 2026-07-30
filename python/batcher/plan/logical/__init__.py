@@ -46,6 +46,7 @@ from batcher.plan.logical.transforms import (
     is_cartesian_key_pair,
     is_partition_independent,
     is_streamable,
+    passthrough_renames,
     project_columns,
     remap_sources,
 )
@@ -84,6 +85,7 @@ __all__ = [
     "is_cartesian_key_pair",
     "is_partition_independent",
     "is_streamable",
+    "passthrough_renames",
     "project_columns",
     "remap_sources",
 ]

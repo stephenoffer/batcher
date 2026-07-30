@@ -42,6 +42,7 @@ from batcher.plan.logical import (
     Sort,
     Window,
     is_cartesian_key_pair,
+    passthrough_renames,
 )
 from batcher.plan.visitor import transform_up
 
@@ -286,9 +287,7 @@ def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPla
     cur: LogicalPlan = node.left
     keys: list[str] = list(node.left_keys)
     while isinstance(cur, Project):
-        passthrough = {
-            item.alias: item.expr.name for item in cur.items if isinstance(item.expr, Col)
-        }
+        passthrough = passthrough_renames(cur.items)
         if any(k not in passthrough for k in keys):
             return None  # a key is a computed column here — cannot attribute it
         keys = [passthrough[k] for k in keys]

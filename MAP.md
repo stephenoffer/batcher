@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1012 Python modules across 157 packages and 186 Rust files across 13 crates.
+Covering 1038 Python modules across 163 packages and 188 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -163,12 +163,12 @@ The public, fluent, lazy, expression-first API surface.
 | module | lines | what it is |
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
-| `executors.py` | 361 | Execution strategies and their registry (the conductor's wiring). |
-| `functions.py` | 763 | Top-level expression constructors re-exported for the public API. |
+| `executors.py` | 404 | Execution strategies and their registry (the conductor's wiring). |
+| `functions.py` | 773 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
-| `source_stats.py` | 356 | Per-source statistics collection for the conductor. |
+| `source_stats.py` | 382 | Per-source statistics collection for the conductor. |
 | `stats.py` | 383 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 
 ### `batcher/api/adaptive/` — 5 · conductor
@@ -302,7 +302,7 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 33 | The one place a `Source` becomes a `Dataset`. |
-| `accelerators.py` | 242 | Accelerator reporting (`accelerators`, `show_accelerators`). |
+| `accelerators.py` | 374 | Accelerator reporting (`accelerators`, `show_accelerators`). |
 | `admin.py` | 223 | Session-level administration: table maintenance and streaming-query control. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
@@ -344,7 +344,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 432 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 438 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 446 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -414,6 +414,16 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `splitting.py` | 319 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 | `timeseries.py` | 323 | Time-series diagnostics — autocorrelation and the tests built on it. |
 
+### `batcher/ml/corpus/` — 6 · front-end
+
+Preparing a training corpus: mixing sources, filtering junk, removing eval leakage.
+
+| module | lines | what it is |
+|---|---|---|
+| `decontamination.py` | 180 | Removing evaluation data from a training corpus. |
+| `filtering.py` | 242 | Heuristic quality filtering for a web-scale text corpus. |
+| `mixing.py` | 238 | Sampling several corpora into one training mixture, at declared weights. |
+
 ### `batcher/ml/decode/` — 6 · front-end
 
 Decode media columns into tensors — native image decode, Python audio/video.
@@ -444,7 +454,7 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 | `columns.py` | 182 | Building the columns a generation appends, from what the engine reported. |
 | `generate.py` | 428 | LLM batch generation — the columnar half of offline text generation. |
 | `judge.py` | 368 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
-| `packing.py` | 184 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
+| `packing.py` | 183 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
 | `requests.py` | 290 | Turning a `RecordBatch` into the per-row requests an engine receives. |
 | `sizing.py` | 299 | Sizing an LLM engine from the workload instead of from the model's maximum. |
 | `structured.py` | 426 | Typed columns out of an LLM — the AI-powered-ETL primitives. |
@@ -459,7 +469,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 | `base.py` | 53 | LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends. |
 | `limits.py` | 232 | Client-side rate limiting for a hosted LLM endpoint. |
 | `openai.py` | 339 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
-| `parallelism.py` | 178 | How many GPUs one LLM engine replica needs, and what that choice costs. |
+| `parallelism.py` | 217 | How many GPUs one LLM engine replica needs, and what that choice costs. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
 | `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
 
@@ -543,6 +553,14 @@ Features derived from time — calendar parts, and history as columns.
 |---|---|---|
 | `calendar.py` | 257 | Turning a timestamp into features a model can use. |
 | `history.py` | 229 | Lag and rolling features — history as columns, without leaking the future. |
+
+### `batcher/ml/retrieval/` — 6 · front-end
+
+Reranking a retrieved candidate set before it reaches a model.
+
+| module | lines | what it is |
+|---|---|---|
+| `mmr.py` | 221 | Maximal marginal relevance — reranking a candidate set for diversity, not just relevance. |
 
 ### `batcher/ml/serving/` — 6 · front-end
 
@@ -666,8 +684,8 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 179 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1132 | The shared Arrow Flight shuffle worker actor. |
-| `shuffle_io.py` | 187 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
+| `flight_worker.py` | 1168 | The shared Arrow Flight shuffle worker actor. |
+| `shuffle_io.py` | 195 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 166 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
 | `window_stream.py` | 243 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window. |
@@ -691,7 +709,7 @@ Per-operator distributed executor implementations.
 | `join.py` | 866 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `map.py` | 1478 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 329 | Plan-shape analysis for the distributed dispatcher. |
-| `scan_read.py` | 522 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
+| `scan_read.py` | 544 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 216 | Distributed sort over a disk Arrow-IPC shuffle. |
 | `union.py` | 59 | Distributed UNION — distribute each branch, then concatenate (and dedup). |
 | `window.py` | 144 | Distributed window functions over a disk Arrow-IPC shuffle. |
@@ -723,8 +741,8 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 264 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `scaling.py` | 495 | What the live cluster is, and what of it a query may use. |
-| `scheduling.py` | 392 | The metadata-driven scheduling envelope and placement-group machinery. |
-| `trace.py` | 104 | Why this query got the fan-out it got. |
+| `scheduling.py` | 401 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `trace.py` | 127 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
 
@@ -764,12 +782,12 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 225 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `device_read.py` | 126 | Read a shard onto the device, instead of onto the host and then across the bus. |
-| `dispatch.py` | 157 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
-| `groupby.py` | 237 | The single-key group-by fan-out that predates the plan translator. |
+| `device_read.py` | 158 | Read a shard onto the device, instead of onto the host and then across the bus. |
+| `dispatch.py` | 163 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
+| `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 141 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `shards.py` | 236 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
-| `tasks.py` | 208 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 232 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
 
@@ -778,7 +796,7 @@ Out-of-core execution on one node: scratch plumbing, and the spilling aggregate.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 374 | Single-node out-of-core aggregation via partition-and-spill, plus the spill dispatcher. |
-| `scratch.py` | 167 | Spill scratch: where an out-of-core query's bytes go, and how its input is fed in. |
+| `scratch.py` | 176 | Spill scratch: where an out-of-core query's bytes go, and how its input is fed in. |
 
 ### `batcher/dist/spill_breakers/` — 4 · backend
 
@@ -831,7 +849,8 @@ Cost model — what will this plan *cost* to run?
 
 | module | lines | what it is |
 |---|---|---|
-| `model.py` | 437 | The four-axis cost model and its per-operator closed forms. |
+| `fabric.py` | 158 | What a shuffled byte is worth on *this* cluster's fabric. |
+| `model.py` | 443 | The four-axis cost model and its per-operator closed forms. |
 | `shuffle.py` | 279 | The `net` axis — what a plan costs to move across a cluster. |
 | `terms.py` | 184 | The machine-shaped multipliers the per-operator cost forms fold in. |
 
@@ -852,9 +871,10 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 | module | lines | what it is |
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
-| `energy.py` | 402 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
-| `policy.py` | 475 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
-| `sizing.py` | 108 | SELECTION-phase rule — size a GPU inference stage's resources. |
+| `energy.py` | 421 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
+| `policy.py` | 430 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `shape.py` | 95 | What Kyber can tell the GPU backend about a plan's *shape*, as opposed to its cost. |
+| `sizing.py` | 112 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
 ### `batcher/kyber/learned_tuning/` — 3 · subsystem
 
@@ -872,7 +892,7 @@ EXACT-gated *filtered-count* metadata shortcuts (façade).
 
 | module | lines | what it is |
 |---|---|---|
-| `answers.py` | 332 | Answer *filtered* counts from metadata — Kyber's EXACT-gated filter-count layer. |
+| `answers.py` | 339 | Answer *filtered* counts from metadata — Kyber's EXACT-gated filter-count layer. |
 
 ### `batcher/kyber/metadata_summary/` — 3 · subsystem
 
@@ -904,9 +924,9 @@ Kyber rule modules.
 | `leaf_rewrite.py` | 139 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 58 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 724 | Projection rewrites — collapse stacked projections and prune unread columns. |
-| `pushdown.py` | 487 | Predicate pushdown — evaluate filters as early as possible. |
+| `pushdown.py` | 486 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 452 | SELECTION-phase rules — cost-based physical algorithm choice. |
-| `zonemap_pruning.py` | 373 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
+| `zonemap_pruning.py` | 384 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
 
@@ -994,7 +1014,7 @@ Extended Kyber rule families.
 | `metadata_adaptive.py` | 291 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
 | `null_shapes.py` | 190 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
 | `nullability.py` | 364 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
-| `predicate_impossible.py` | 341 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
+| `predicate_impossible.py` | 391 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
 | `predicate_infer.py` | 490 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
 | `projection_scan.py` | 350 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 458 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
@@ -1003,7 +1023,7 @@ Extended Kyber rule families.
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 487 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
-| `temporal_date_cast.py` | 169 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
+| `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
 | `temporal_extra.py` | 455 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
 | `temporal_folds.py` | 142 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
 | `temporal_sargable.py` | 280 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
@@ -1059,7 +1079,7 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `order.py` | 578 | Cost-based join reordering — the JOIN_REORDER phase. |
 | `projection.py` | 193 | Push a derived projection through a join onto the side it reads, so the join |
 | `range_join.py` | 366 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
-| `rewrites.py` | 469 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
+| `rewrites.py` | 492 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
 
 ### `batcher/kyber/rules/math_algebra/` — 3 · subsystem
 
@@ -1206,12 +1226,13 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 
 | module | lines | what it is |
 |---|---|---|
-| `allocator.py` | 325 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
-| `health.py` | 241 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
+| `affinity.py` | 189 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
+| `allocator.py` | 335 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
+| `health.py` | 432 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 102 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
 | `power.py` | 101 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
-| `vram.py` | 208 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
+| `vram.py` | 216 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1283,9 +1304,9 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 83 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
-| `energy.py` | 237 | Measuring what a stage drew — Core's half of the energy loop. |
+| `energy.py` | 241 | Measuring what a stage drew — Core's half of the energy loop. |
 | `executor.py` | 245 | The Core local executor. |
-| `gpu_transform.py` | 243 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
+| `gpu_transform.py` | 244 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
@@ -1301,7 +1322,7 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `aggs.py` | 261 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
 | `backend.py` | 161 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
-| `execute.py` | 229 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
+| `execute.py` | 312 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 346 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 198 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `scalar_fns.py` | 320 | The named scalar-function families: math, two-argument math, strings, and dates. |
@@ -1381,7 +1402,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `catalog.py` | 125 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 177 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 270 | Format auto-detection for the generic `read(path, format=None)` entry point. |
-| `filesystem.py` | 370 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
+| `filesystem.py` | 394 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 342 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `predicate.py` | 374 | Predicate translation for source-side pushdown. |
@@ -1653,7 +1674,7 @@ Source connectors — the façade over the source implementation modules.
 |---|---|---|
 | `base.py` | 184 | The `Source` protocol — the contract every connector satisfies. |
 | `inmemory.py` | 540 | `InMemorySource` — a relation already materialized as Arrow record batches. |
-| `inmemory_aggregates.py` | 170 | Exact aggregate answers over an immutable in-memory Arrow relation. |
+| `inmemory_aggregates.py` | 198 | Exact aggregate answers over an immutable in-memory Arrow relation. |
 | `inmemory_stats.py` | 362 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 186 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
 | `materialized.py` | 70 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
@@ -1668,6 +1689,7 @@ Splits — independently-readable, picklable slices of a source.
 | `base.py` | 244 | The `Split` protocol and the whole-source fallback. |
 | `device.py` | 114 | Which splits a GPU can read for itself, and the locators it needs to do it. |
 | `file.py` | 390 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
+| `gds.py` | 209 | Whether a file's bytes can reach a device without a detour through host memory. |
 | `parquet.py` | 418 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
 
 ### `batcher/io/stats/` — 2 · neutral IO
@@ -1696,7 +1718,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 |---|---|---|
 | `console.py` | 447 | The terminal face of the engine — a live progress bar plus structured status lines. |
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
-| `energy.py` | 211 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
+| `energy.py` | 251 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `metrics.py` | 389 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
 | `system.py` | 185 | The host and engine the queries are running on — the dashboard's hardware panel. |
@@ -1781,7 +1803,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `resource.py` | 251 | Resource contracts between Kyber (optimizer) and Carbonite (resource manager). |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 232 | `plan.source_stats` — what a connector declares about a source, cheaply. |
-| `stats.py` | 257 | `plan.stats` — the neutral statistics algebra shared across every layer. |
+| `stats.py` | 300 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract
@@ -1798,7 +1820,7 @@ Energy as a first-class plan quantity: power draw, grid conversion, and per-stag
 
 | module | lines | what it is |
 |---|---|---|
-| `accounting.py` | 247 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
+| `accounting.py` | 299 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
 | `carbon.py` | 175 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
 | `power.py` | 286 | Device power draw — the neutral model every power-aware decision reads. |
 
@@ -1808,12 +1830,12 @@ The scalar expression algebra.
 
 | module | lines | what it is |
 |---|---|---|
-| `audio.py` | 221 | The `.audio` expression namespace — lazy, batch-level audio decode. |
+| `audio.py` | 312 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 322 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 5171 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 182 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 366 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
-| `image.py` | 431 | The `.image` expression namespace — lazy, batch-level image decode. |
+| `image.py` | 497 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 265 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 492 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 257 | A readable ``repr`` for the scalar `Expr` tree. |
@@ -1911,7 +1933,7 @@ Metrics that score a model's predictions against known labels.
 | `agreement.py` | 134 | Agreement and efficiency scores — how well two series match, beyond a plain correlation. |
 | `classification.py` | 500 | Classification metrics as mergeable aggregate expressions. |
 | `diagnostic.py` | 399 | Diagnostic-test metrics — the epidemiology and medical-ML vocabulary of the confusion matrix. |
-| `embedding.py` | 295 | Embedding-quality metrics — scoring vector columns for retrieval, similarity, and drift. |
+| `embedding.py` | 340 | Embedding-quality metrics — scoring vector columns for retrieval, similarity, and drift. |
 | `errors.py` | 500 | Regression error metrics as mergeable aggregate expressions. |
 | `losses.py` | 282 | Loss functions and proper scoring rules — the numbers a model is trained to minimize. |
 
@@ -1951,6 +1973,7 @@ Prompt construction and context budgeting, as row-wise expressions.
 |---|---|---|
 | `assembly.py` | 262 | Assembling a prompt from row columns — templates, tags, chat formats, retrieved context. |
 | `budget.py` | 218 | Fitting an assembled prompt into a context window, without a tokenizer. |
+| `chat.py` | 256 | Reading a conversation column — the shape a chat log and an SFT dataset both arrive in. |
 
 ### `batcher/plan/logical/` — 1 · contract
 
@@ -1963,7 +1986,7 @@ Prompt construction and context budgeting, as row-wise expressions.
 | `join.py` | 335 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 431 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
-| `transforms.py` | 294 | Plan transforms and predicates over `LogicalPlan` trees. |
+| `transforms.py` | 320 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 253 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract
@@ -2031,8 +2054,8 @@ Configuration: one frozen, typed `Config` object.
 
 | module | lines | what it is |
 |---|---|---|
-| `accelerator.py` | 255 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 2401 | The single frozen `Config` and its typed sections. |
+| `accelerator.py` | 275 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
+| `config.py` | 2416 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 200 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
@@ -2055,7 +2078,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | module | lines | what it is |
 |---|---|---|
 | `accelerators.py` | 377 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
-| `events.py` | 286 | The engine's one observability event bus — every subsystem publishes here. |
+| `events.py` | 292 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 274 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
 | `mathx.py` | 101 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
 | `native.py` | 82 | The single accessor for the compiled Rust data plane (``batcher._native``). |
@@ -2071,7 +2094,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 
 | module | lines | what it is |
 |---|---|---|
-| `accessors.py` | 350 | Reading the device table: one accessor per fact, and the name resolver in front of them. |
+| `accessors.py` | 363 | Reading the device table: one accessor per fact, and the name resolver in front of them. |
 | `table.py` | 183 | The device table itself: one row per accelerator model, and the host link per part. |
 
 ### `batcher/_internal/errors/` — 0 · utility
@@ -2096,11 +2119,50 @@ Effective hardware detection — what this process's machine really is and reall
 | `isa.py` | 137 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 67 | The memory ceiling and page geometry this process runs under. |
 | `mig.py` | 158 | Multi-Instance GPU profiles — which partitionings a device model actually offers. |
-| `nvml.py` | 254 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
-| `probes.py` | 57 | The one hook that clears every memoized hardware reading. |
+| `nvml.py` | 307 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
+| `probes.py` | 70 | The one hook that clears every memoized hardware reading. |
 | `profile.py` | 321 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 107 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
+
+### `batcher/_internal/hardware/engine/` — 0 · utility
+
+Hardware facts read back from the compiled data plane, rather than probed from Python.
+
+| module | lines | what it is |
+|---|---|---|
+| `allocator.py` | 58 | What the engine's allocator is holding, and how to make it give some back. |
+| `detected.py` | 115 | What the *engine process* detected about its CPU, as opposed to what this interpreter sees. |
+
+### `batcher/_internal/hardware/fabric/` — 0 · utility
+
+The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
+
+| module | lines | what it is |
+|---|---|---|
+| `device_links.py` | 216 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
+| `nvlink.py` | 259 | NVLink, per link and per device — whether the fast path between devices is actually up. |
+| `pcie.py` | 296 | A device's PCIe link, its NUMA home, and how far two devices sit apart on the bus. |
+| `rdma.py` | 370 | InfiniBand and RoCE NICs — the wire a cross-node shuffle actually runs on. |
+
+### `batcher/_internal/hardware/faults/` — 0 · utility
+
+How a GPU is failing, as distinct from how busy it is.
+
+| module | lines | what it is |
+|---|---|---|
+| `counters.py` | 213 | The per-device fault counters NVML publishes — memory rows, retired pages, PCIe replays. |
+| `xid.py` | 253 | Xid errors — the driver's own account of what went wrong with a device. |
+
+### `batcher/_internal/site/` — 0 · utility
+
+Where this process is running — the provider, the scheduler, and the local scratch.
+
+| module | lines | what it is |
+|---|---|---|
+| `provider.py` | 277 | Which GPU cloud this is — read from the environment, never from a metadata service. |
+| `scheduler.py` | 253 | What launched this process — Slurm, Kubernetes, Ray, or nothing. |
+| `scratch.py` | 198 | The node-local fast filesystem — where a spill should actually go. |
 
 ## Rust data plane — `crates/`
 
@@ -2153,7 +2215,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/repartition.rs` | 256 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
-| `ops/str_sort.rs` | 71 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
+| `ops/str_sort.rs` | 168 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 2864 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
@@ -2177,7 +2239,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `agg/accum.rs` | 625 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
 | `agg/argextreme.rs` | 97 | ARG_MIN / ARG_MAX — the value at the row with the extreme (min/max) ordering key. |
-| `agg/distinct.rs` | 401 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
+| `agg/distinct.rs` | 408 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/fused.rs` | 418 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1079 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
 | `agg/group/combine.rs` | 649 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
@@ -2191,7 +2253,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 399 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 271 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `error.rs` | 88 | The crate's error type: how the stateful runtime structures report failure. |
-| `gather.rs` | 253 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
+| `gather.rs` | 431 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 137 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
@@ -2206,7 +2268,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/stream.rs` | 243 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 264 | The one canonical form for grouping/partitioning keys. |
 | `lib.rs` | 36 | `bc-runtime` — the engine's runtime library. |
-| `shuffle.rs` | 997 | Hash repartitioning — the shuffle primitive. |
+| `shuffle.rs` | 1003 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
 | `window.rs` | 1097 | Window functions — partition, order, and append one column per function. |
 | `window_agg.rs` | 578 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
@@ -2256,7 +2318,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `error.rs` | 99 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 746 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 446 | `cast` evaluation with DuckDB float→int rounding semantics. |
-| `eval/dispatch.rs` | 389 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 399 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
 | `eval/in_list.rs` | 249 | `x IN (lit, lit, …)` — hash-set membership. |
@@ -2274,11 +2336,13 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 194 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 475 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
-| `eval/media/audio.rs` | 395 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
-| `eval/media/image/mod.rs` | 617 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
+| `eval/media/audio.rs` | 400 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
+| `eval/media/image/mod.rs` | 621 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
+| `eval/media/image/quality.rs` | 121 | Image-curation measures: how bright an image is, and how sharp. |
 | `eval/media/image/reencode.rs` | 250 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
-| `eval/media/mod.rs` | 40 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
+| `eval/media/mod.rs` | 42 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
+| `eval/media/speech.rs` | 126 | Waveform conditioning for speech pipelines: silence trimming, peak normalization, and the zero-crossing rate. |
 | `eval/media/video.rs` | 159 | Video-decode evaluation for `Expr::Video` (the `.video` namespace). |
 | `eval/mod.rs` | 21 | Evaluation bodies for the scalar `Expr` variants. |
 | `eval/security/crypto.rs` | 101 | Keyed cryptographic primitives: HMAC-SHA-256 pseudonymization and AES-256-GCM-SIV column encryption. |
@@ -2290,7 +2354,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/str/compress.rs` | 144 | Byte-stream compression for `StrFunc::Compress`/`Decompress` — six codecs, one shape. |
 | `eval/str/html.rs` | 172 | `strip_html`: recover the readable text of an HTML document. |
 | `eval/str/jaro.rs` | 80 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
-| `eval/str/json.rs` | 618 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
+| `eval/str/json.rs` | 653 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 165 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 146 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
 | `eval/str/mod.rs` | 1696 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
@@ -2301,7 +2365,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1255 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1286 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 410 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
