@@ -247,3 +247,58 @@ def test_excluding_every_device_still_returns_a_placement():
 
     pool = VramPool(capacity_bytes=1 << 30, device_count=2, headroom=0.0)
     assert pool.best_device(exclude=[0, 1]) == 0
+
+
+# --- Attributing device memory to the process that holds it --------------------------------
+
+
+class _ProcNvml:
+    """NVML with a per-process memory listing, which a shared device needs and a total hides."""
+
+    def __init__(self, procs, refuse=False):
+        self._procs, self._refuse = procs, refuse
+
+    def nvmlDeviceGetHandleByIndex(self, index):
+        return index
+
+    def nvmlDeviceGetComputeRunningProcesses(self, handle):
+        if self._refuse:
+            raise RuntimeError("not permitted in this namespace")
+        return [type("P", (), {"pid": p, "usedGpuMemory": m})() for p, m in self._procs]
+
+
+def test_this_process_share_is_measured_not_accounted(monkeypatch):
+    import os
+
+    from batcher._internal.hardware import nvml
+
+    mine = os.getpid()
+    monkeypatch.setattr(nvml, "_nvml", lambda: _ProcNvml([(mine, 10 << 30), (999, 30 << 30)]))
+    assert nvml.device_processes(0) == ((mine, 10 << 30), (999, 30 << 30))
+    assert nvml.own_device_memory(0) == 10 << 30
+
+
+def test_an_unattributable_device_reports_none_not_zero(monkeypatch):
+    # `0` would mean "this process holds nothing", which is a claim; `None` means "the driver
+    # would not say", which is the truth inside a container that hides other namespaces.
+    from batcher._internal.hardware import nvml
+
+    monkeypatch.setattr(nvml, "_nvml", lambda: _ProcNvml([], refuse=True))
+    assert nvml.own_device_memory(0) is None
+    monkeypatch.setattr(nvml, "_nvml", lambda: None)
+    assert nvml.own_device_memory(0) is None
+    assert nvml.device_processes(0) == ()
+
+
+def test_the_pool_reserves_against_the_neighbour_not_against_itself():
+    # The pool admits; the framework allocates. Subtracting what was admitted leaves the
+    # difference — the allocator's own pool, the CUDA context — charged to the co-tenant.
+    from batcher.carbonite.accel import VramPool
+
+    gib = 1 << 30
+    pool = VramPool(capacity_bytes=80 * gib, headroom=0.0)
+    pool.reserve(10 * gib)
+    pool.observe_external(0, 50 * gib)
+    assert pool.external_bytes[0] == 40 * gib  # accounting: total minus what we admitted
+    pool.observe_external(0, 50 * gib, own_bytes=20 * gib)
+    assert pool.external_bytes[0] == 30 * gib  # measured: total minus what we actually hold

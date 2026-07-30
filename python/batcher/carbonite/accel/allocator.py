@@ -299,7 +299,7 @@ def _visible_device_usable_bytes(headroom: float) -> int:
     out of a device it does not have to itself.
     """
     from batcher._internal.accelerators import gpu_inventory
-    from batcher._internal.hardware.nvml import device_telemetry
+    from batcher._internal.hardware.nvml import device_telemetry, own_device_memory
     from batcher.carbonite.accel.vram import VramPool
 
     devices = gpu_inventory()
@@ -319,7 +319,14 @@ def _visible_device_usable_bytes(headroom: float) -> int:
     if not pool.capacity_bytes:
         return 0
     for telemetry in device_telemetry()[:1]:
-        pool.observe_external(0, int(telemetry.memory_used_bytes))
+        # Measured rather than accounted where the driver will attribute it: what this
+        # process holds is not what this pool admitted, and on a shared device the
+        # difference is charged to the co-tenant.
+        pool.observe_external(
+            0,
+            int(telemetry.memory_used_bytes),
+            own_bytes=own_device_memory(telemetry.index),
+        )
     return pool.usable_bytes(0)
 
 

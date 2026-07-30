@@ -42,8 +42,10 @@ from dataclasses import dataclass
 
 __all__ = [
     "DeviceTelemetry",
+    "device_processes",
     "device_telemetry",
     "nvml_available",
+    "own_device_memory",
     "reset_nvml_probe",
     "throttled_devices",
     "total_power_watts",
@@ -305,3 +307,67 @@ def throttled_devices() -> tuple[DeviceTelemetry, ...]:
         The throttled subset of `device_telemetry`, empty when none or when unreadable.
     """
     return tuple(d for d in device_telemetry() if d.throttled)
+
+
+def device_processes(index: int) -> tuple[tuple[int, int], ...]:
+    """`(pid, bytes)` for every process holding memory on one device.
+
+    The question `memory_used_bytes` cannot answer: that figure is the device's total, so a
+    process reading it to decide what it may allocate is counting its own allocations against
+    itself and everyone else's as though they were interchangeable. On a shared device — the
+    normal case on a rented GPU, and the whole point of MPS and fractional scheduling — those
+    are different numbers with different meanings.
+
+    Args:
+        index: NVML device index.
+
+    Returns:
+        One pair per compute process, in the order NVML lists them. Empty when NVML is
+        unavailable, when the query is refused (common inside a container, which often cannot
+        see processes in other PID namespaces), and genuinely when the device is idle. A caller
+        that needs to tell those apart should compare against `DeviceTelemetry.memory_used_bytes`
+        — memory resident with no process visible is exactly the containerized case.
+    """
+    nv = _nvml()
+    if nv is None:
+        return ()
+    handle = _read(lambda: nv.nvmlDeviceGetHandleByIndex(index), None)
+    if handle is None:
+        return ()
+    procs = _read(lambda: nv.nvmlDeviceGetComputeRunningProcesses(handle), None)
+    if not procs:
+        return ()
+    out: list[tuple[int, int]] = []
+    for proc in procs:
+        used = getattr(proc, "usedGpuMemory", None)
+        # NVML reports `None` for a process whose memory it cannot attribute — a MIG instance,
+        # or a process in another namespace. Counting it as zero would under-report the device.
+        out.append((int(getattr(proc, "pid", 0) or 0), int(used) if used else 0))
+    return tuple(out)
+
+
+def own_device_memory(index: int) -> int | None:
+    """Device memory this process itself holds, in bytes, or `None` when unattributable.
+
+    The correction a shared device needs. A pool sizing itself against the device's *total*
+    resident memory is counting its own allocations as a competitor's, and the usual fix —
+    subtracting what the pool believes it reserved — is accounting rather than measurement:
+    the framework allocates, the pool only admits, and the two diverge by the allocator's own
+    pool, the CUDA context, and every buffer nobody reserved.
+
+    Args:
+        index: NVML device index.
+
+    Returns:
+        Bytes attributed to this process, or `None` when NVML cannot attribute per process —
+        inside a container that cannot see other PID namespaces, and on a MIG instance. `None`
+        is distinct from `0`: a caller keeps its previous accounting rather than concluding it
+        holds nothing.
+    """
+    import os
+
+    procs = device_processes(index)
+    if not procs:
+        return None
+    mine = os.getpid()
+    return sum(used for pid, used in procs if pid == mine)

@@ -213,6 +213,7 @@ def _free_device_bytes() -> int:
     batch. The pool takes the measured resident figure and reserves against the remainder.
     """
     from batcher._internal.hardware import device_telemetry, gpu_inventory
+    from batcher._internal.hardware.nvml import own_device_memory
     from batcher.carbonite.accel import VramPool
 
     capacity = min((int(g.get("memory_bytes") or 0) for g in gpu_inventory()), default=0)
@@ -220,7 +221,11 @@ def _free_device_bytes() -> int:
         return 0
     pool = VramPool(capacity_bytes=capacity, headroom=0.0)
     for reading in device_telemetry():
-        pool.observe_external(reading.index, reading.memory_used_bytes)
+        pool.observe_external(
+            reading.index,
+            reading.memory_used_bytes,
+            own_bytes=own_device_memory(reading.index),
+        )
     return min(
         (pool.available_bytes(r.index) for r in device_telemetry()),
         default=pool.available_bytes(0),

@@ -195,16 +195,24 @@ class VramPool:
             held = self._held.get(reservation.device, 0)
             self._held[reservation.device] = max(0, held - reservation.bytes_)
 
-    def observe_external(self, device: int, used_bytes: int) -> None:
+    def observe_external(
+        self, device: int, used_bytes: int, *, own_bytes: int | None = None
+    ) -> None:
         """Record memory resident to processes outside this pool, from live telemetry.
 
         Args:
             device: Device index.
             used_bytes: Total resident bytes on the device as the driver reports them; this
-                pool's own holdings are subtracted, so passing a raw NVML figure is correct.
+                pool's own share is subtracted, so passing a raw NVML figure is correct.
+            own_bytes: This process's *measured* share of that total, when the driver could
+                attribute it per process. Preferred over the pool's own accounting, which
+                tracks what was admitted rather than what was allocated: the framework
+                allocates, and the two diverge by the allocator's pool, the CUDA context, and
+                every buffer nobody reserved. `None` keeps the accounting-based subtraction.
         """
         with self._lock:
-            self.external_bytes[device] = max(0, used_bytes - self._held.get(device, 0))
+            mine = self._held.get(device, 0) if own_bytes is None else own_bytes
+            self.external_bytes[device] = max(0, used_bytes - mine)
 
     def pressure(self, device: int = 0) -> float:
         """Fraction of the usable budget currently reserved on one device, in [0, 1].
