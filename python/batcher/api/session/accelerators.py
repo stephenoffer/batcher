@@ -110,9 +110,15 @@ def _add_modes(row: dict, modes) -> None:
     Only the findings. A well-configured device contributes nothing here, which is what keeps
     the row readable and makes the day it says `ecc_disabled` worth noticing.
     """
-    if modes is None or not modes.findings:
+    if modes is None:
         return
-    row["config"] = list(modes.findings)
+    if modes.mig_enabled:
+        # Not a finding: partitioning is usually deliberate. It is reported unconditionally
+        # because it changes what every other number on the row means — a process handed one
+        # instance has a fraction of the memory and a fraction of the SMs.
+        row["mig_instances"] = modes.mig_instances
+    if modes.findings:
+        row["config"] = list(modes.findings)
 
 
 def accelerators() -> dict:

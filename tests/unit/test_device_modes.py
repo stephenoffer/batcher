@@ -231,3 +231,57 @@ def test_every_finding_has_advice_written_for_it():
         produced.update(record.findings)
     produced.add("power_at_floor")
     assert produced <= set(report_mod._CONFIG_ADVICE)
+
+
+# --- Partitioning, which changes what every other number means -----------------------------
+
+
+class _MigNvml(_FakeNvml):
+    """A device reporting MIG mode and a fixed number of instances."""
+
+    def __init__(self, *, mig=(1, 1), instances=4, **kw):
+        super().__init__(**kw)
+        self._mig, self._instances = mig, instances
+
+    def nvmlDeviceGetMigMode(self, handle):
+        if self._mig is None:
+            raise RuntimeError("not a MIG-capable part")
+        return self._mig
+
+    def nvmlDeviceGetMigDeviceHandleByIndex(self, handle, index):
+        if index >= self._instances:
+            raise RuntimeError("no such instance")
+        return (handle, index)
+
+
+def test_a_partitioned_device_reports_its_instances(monkeypatch):
+    _use(monkeypatch, _MigNvml(mig=(1, 1), instances=4))
+    (record,) = modes_mod.device_modes()
+    assert record.mig_enabled is True
+    assert record.mig_instances == 4
+
+
+def test_an_unpartitioned_device_counts_no_instances(monkeypatch):
+    # The walk must not run at all when MIG is off: on a card that cannot partition, every
+    # index would be a refused query.
+    _use(monkeypatch, _MigNvml(mig=(0, 0), instances=7))
+    (record,) = modes_mod.device_modes()
+    assert record.mig_enabled is False
+    assert record.mig_instances == 0
+
+
+def test_a_part_that_cannot_partition_says_nothing(monkeypatch):
+    _use(monkeypatch, _MigNvml(mig=None))
+    (record,) = modes_mod.device_modes()
+    assert record.mig_enabled is None
+    assert record.mig_instances == 0
+
+
+def test_partitioning_reaches_the_device_row_but_is_not_a_finding():
+    report_mod = importlib.import_module("batcher.api.session.accelerators")
+    row: dict = {"index": 0}
+    report_mod._add_modes(
+        row, DeviceModes(index=0, mig_enabled=True, mig_instances=7, readable=True)
+    )
+    assert row["mig_instances"] == 7
+    assert "config" not in row  # deliberate partitioning is not a misconfiguration

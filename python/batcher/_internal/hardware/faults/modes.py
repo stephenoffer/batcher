@@ -68,6 +68,12 @@ class DeviceModes:
             `exclusive_process`, or `""` when unreported.
         power_limit_watts: The enforced limit, `0.0` when unreported.
         power_limit_floor_watts: The lowest limit this part accepts, `0.0` when unreported.
+        mig_enabled: Whether the device is partitioned into MIG instances, `None` when the
+            query was refused or the part cannot partition. A partitioned device is not the
+            card its model name implies: a process handed one instance has a fraction of the
+            memory and a fraction of the SMs, and every sizing decision downstream is about
+            the slice rather than the board.
+        mig_instances: Instances currently configured on it, `0` when none or unreported.
         readable: Whether NVML answered any of it. False means every field above is a default
             rather than a measurement.
     """
@@ -79,6 +85,8 @@ class DeviceModes:
     compute_mode: str = ""
     power_limit_watts: float = 0.0
     power_limit_floor_watts: float = 0.0
+    mig_enabled: bool | None = None
+    mig_instances: int = 0
     readable: bool = False
 
     @property
@@ -157,6 +165,8 @@ def device_modes() -> tuple[DeviceModes, ...]:
         mode = _read(lambda h=handle: nv.nvmlDeviceGetComputeMode(h), sentinel)
         limit = _read(lambda h=handle: nv.nvmlDeviceGetEnforcedPowerLimit(h), sentinel)
         floor = _read(lambda h=handle: nv.nvmlDeviceGetPowerManagementLimitConstraints(h), sentinel)
+        mig = _read(lambda h=handle: nv.nvmlDeviceGetMigMode(h), sentinel)
+        mig_on = None if mig is sentinel else bool(int(_first_of(mig, sentinel) or 0))
         readable = any(v is not sentinel for v in (ecc, persistence, mode, limit))
         out.append(
             DeviceModes(
@@ -167,6 +177,8 @@ def device_modes() -> tuple[DeviceModes, ...]:
                 compute_mode=("" if mode is sentinel else _COMPUTE_MODES.get(int(mode or 0), "")),
                 power_limit_watts=0.0 if limit is sentinel else int(limit or 0) / 1000.0,
                 power_limit_floor_watts=_floor_watts(floor, sentinel),
+                mig_enabled=mig_on,
+                mig_instances=_mig_instances(nv, handle) if mig_on else 0,
                 readable=readable,
             )
         )
@@ -201,3 +213,23 @@ def misconfigured_devices(modes: tuple[DeviceModes, ...] | None = None) -> tuple
     """
     records = device_modes() if modes is None else modes
     return tuple(m for m in records if m.findings)
+
+
+#: Instances to probe before concluding a device has no more. NVML has no portable count, so
+#: the walk stops at the first index the driver rejects; seven is the widest partitioning any
+#: shipping part offers.
+_MAX_MIG_INSTANCES = 7
+
+
+def _mig_instances(nv, handle) -> int:
+    """How many MIG instances are configured on a device, `0` when none or unreadable."""
+    fn = getattr(nv, "nvmlDeviceGetMigDeviceHandleByIndex", None)
+    if fn is None:
+        return 0
+    count = 0
+    for index in range(_MAX_MIG_INSTANCES):
+        sentinel = object()
+        if _read(lambda i=index: fn(handle, i), sentinel) is sentinel:
+            break
+        count += 1
+    return count
