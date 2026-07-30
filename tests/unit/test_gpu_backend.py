@@ -76,20 +76,20 @@ def test_oversubscribed_shards_combine_to_the_same_aggregate():
     import pandas as pd
     import pyarrow as pa
 
-    from batcher.api.terminal.gpu_backend import _combine_partials, _partial_aggs
+    from batcher.dist.gpu.groupby import _combine_partials, partial_aggs
 
     rng = np.random.default_rng(0)
     n = 5000
     full = pd.DataFrame({"k": rng.integers(0, 7, n), "v": rng.random(n)})
     aggs = {"s": ("v", "sum"), "c": ("v", "count"), "m": ("v", "mean"), "mx": ("v", "max")}
-    partial_aggs = _partial_aggs(aggs)
+    reductions = partial_aggs(aggs)
 
     def shard_partial(df: pd.DataFrame) -> pa.Table:
         cols: dict[str, list] = {"k": []}
-        agg_map: dict[str, list] = {a: [] for a in partial_aggs}
+        agg_map: dict[str, list] = {a: [] for a in reductions}
         for kval, grp in df.groupby("k"):
             cols["k"].append(kval)
-            for alias, (colname, func) in partial_aggs.items():
+            for alias, (colname, func) in reductions.items():
                 agg_map[alias].append(getattr(grp[colname], func)())
         return pa.table({**cols, **agg_map})
 

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 982 Python modules across 152 packages and 179 Rust files across 13 crates.
+Covering 986 Python modules across 152 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -344,7 +344,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 484 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 356 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 434 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -713,15 +713,16 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | module | lines | what it is |
 |---|---|---|
 | `accelerators.py` | 133 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
-| `autoscale_request.py` | 98 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
+| `autoscale_request.py` | 163 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 55 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `hardware_probe.py` | 209 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
-| `lifecycle.py` | 466 | Ray lifecycle + single-node fallback for the distributed executor. |
+| `lifecycle.py` | 468 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `policies.py` | 462 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
+| `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 241 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
-| `scaling.py` | 500 | Live cluster topology and the autoscaler request lifecycle. |
-| `scheduling.py` | 334 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scaling.py` | 446 | What the live cluster is, and what of it a query may use. |
+| `scheduling.py` | 343 | The metadata-driven scheduling envelope and placement-group machinery. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
 
@@ -750,8 +751,10 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 153 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `aggregate.py` | 172 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `dispatch.py` | 129 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
+| `groupby.py` | 173 | The single-key group-by fan-out that predates the plan translator. |
+| `shards.py` | 145 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
 | `tasks.py` | 162 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
@@ -835,8 +838,8 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 | module | lines | what it is |
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
-| `energy.py` | 239 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
-| `policy.py` | 333 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `energy.py` | 235 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
+| `policy.py` | 350 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `sizing.py` | 104 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
 ### `batcher/kyber/learned_tuning/` — 3 · subsystem
@@ -1181,8 +1184,8 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | `health.py` | 241 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 229 | Multi-Instance GPU: cutting one device into several, so a small model stops holding a big one. |
-| `power.py` | 116 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
-| `vram.py` | 208 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
+| `power.py` | 93 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
+| `vram.py` | 237 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
 
@@ -1273,9 +1276,10 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `backend.py` | 161 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 173 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
-| `exprs.py` | 482 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
+| `exprs.py` | 334 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 124 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
-| `windows.py` | 310 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
+| `scalar_fns.py` | 266 | The named scalar-function families: math, two-argument math, strings, and dates. |
+| `windows.py` | 385 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 
 ### `batcher/core/streaming/` — 3 · subsystem
 
@@ -1665,7 +1669,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 |---|---|---|
 | `console.py` | 447 | The terminal face of the engine — a live progress bar plus structured status lines. |
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
-| `energy.py` | 154 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
+| `energy.py` | 201 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `metrics.py` | 389 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
 | `system.py` | 185 | The host and engine the queries are running on — the dashboard's hardware panel. |
@@ -1769,7 +1773,7 @@ Energy as a first-class plan quantity: power draw, grid conversion, and per-stag
 |---|---|---|
 | `accounting.py` | 247 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
 | `carbon.py` | 153 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
-| `power.py` | 221 | Device power draw — the neutral model every power-aware decision reads. |
+| `power.py` | 286 | Device power draw — the neutral model every power-aware decision reads. |
 
 ### `batcher/plan/expr_ir/` — 1 · contract
 
@@ -1981,8 +1985,8 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 191 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 2369 | The single frozen `Config` and its typed sections. |
-| `deadline.py` | 151 | The wall-clock deadline this process will be killed at, so it drains before that. |
+| `config.py` | 2401 | The single frozen `Config` and its typed sections. |
+| `deadline.py` | 200 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
 | `profiles.py` | 296 | Named fault-tolerance profiles for the distributed engine. |
@@ -1995,7 +1999,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | module | lines | what it is |
 |---|---|---|
 | `gate.py` | 58 | The validation gate: run every section check once per distinct `Config` object. |
-| `sections.py` | 485 | The range and consistency checks themselves, one function per `Config` section. |
+| `sections.py` | 489 | The range and consistency checks themselves, one function per `Config` section. |
 
 ### `batcher/_internal/` — 0 · utility
 

@@ -1101,6 +1101,24 @@ class DistributedConfig:
     # near-free default; "zstd" trades CPU for a higher ratio; "none" disables it.
     flight_compression: str = "lz4"
     placement_timeout_s: float = 60.0
+    # Bounded retry window for *attaching* to a Ray cluster whose head is not answering yet.
+    #
+    # The driver and the head come up concurrently in every orchestrated environment: a
+    # KubeRay driver pod is admitted before the head pod passes its readiness probe, and a
+    # Slurm job's `ray start --head` on the first node races the step that runs the query.
+    # A single failed attach there is not "there is no cluster", it is "not yet" — and
+    # treating the two alike is expensive, because the fallback is to start a *local*
+    # single-node Ray and run what the user asked to distribute on one machine, silently.
+    #
+    # Retried with exponential backoff for this many seconds before giving up. Set to 0 to
+    # restore the old single-attempt behavior (a local dev run inside a workspace whose
+    # cluster is deliberately down falls back immediately rather than pausing here).
+    #
+    # Exhausting the window is only a *fallback* when the address was merely detected. An
+    # address the user configured explicitly (`ray_address`, or `RAY_ADDRESS`) raises
+    # instead: they named a cluster, and running single-node in its place is a wrong answer
+    # to a question they asked precisely.
+    cluster_connect_timeout_s: float = 30.0
     # Bounded wait for the Ray autoscaler to grow the cluster before clamping a query's
     # worker fan-out. When a query wants more workers than the cluster can schedule now,
     # `clamp_workers` asks the autoscaler to scale up (`request_resources`) and then
@@ -1302,11 +1320,25 @@ class DistributedConfig:
     # cluster and makes a spot-preempted shard's retry cheap (1/N the work). The mergeable
     # combine is correct for any shard count. 1 = one shard per GPU (the old behavior).
     gpu_shard_oversubscribe: int = 4
-    # A GPU shard that fails after its Ray retries is recomputed by the native CPU engine on a
-    # CPU worker, instead of the whole query abandoning the accelerated path. Both compute the
-    # same mergeable partial, so the combined answer is identical either way — only that shard
-    # is slower. Off → a lost shard fails the GPU attempt and the caller re-runs everything on
-    # the host, which is the older, coarser behavior.
+    # A shard that did not FIT the device is divided into this many pieces and rerun on the
+    # device, for up to `rounds` further halvings. The shard count is fixed before the query
+    # runs, from an estimate, and estimates are wrong exactly where it matters — a skewed key, a
+    # wider row than the footer suggested, a neighbouring tenant on the device — so one shard
+    # can miss while every other one fits. Subdividing is exact, because the stage is mergeable:
+    # a shard's partial and the concatenation of its pieces' partials are the same value. `1`
+    # disables it, sending an over-large shard straight to the host.
+    # The most devices a single query may ask the autoscaler to grow to. The request is sized
+    # from the working set (how many devices would hold it in one wave), so a badly-estimated
+    # query would otherwise be able to ask a cluster to grow without bound. Reaching the cap is
+    # not a failure: the query simply runs in more waves on fewer devices.
+    gpu_max_autoscale_devices: int = 64
+    gpu_shard_subdivide: int = 4
+    gpu_shard_subdivide_rounds: int = 3
+    # A GPU shard that fails for any other reason — a lost worker, an untranslatable expression —
+    # is recomputed by the native CPU engine on a CPU worker, instead of the whole query
+    # abandoning the accelerated path. Both compute the same mergeable partial, so the combined
+    # answer is identical either way; only that shard is slower. Off → a lost shard fails the GPU
+    # attempt and the caller re-runs everything on the host, which is the older, coarser behavior.
     gpu_shard_cpu_fallback: bool = True
     # Kyber's cost-based GPU-backend policy (`backend="auto"`, and the memory routing under an
     # explicit `backend="gpu"`). Below `gpu_min_rows` estimated rows the fixed GPU overhead —

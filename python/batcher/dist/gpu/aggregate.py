@@ -102,30 +102,49 @@ def _shard_descriptors(source: Source, gpu_count: int, *, sharded: bool):
 
 
 def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
-    """Reduce every shard on a device, substituting the CPU engine for any that fails.
+    """Reduce every shard on a device, recovering from a failed one rather than the query.
 
     Uses the same straggler-backup barrier the CPU shuffle does: a shard is a pure function of
     its descriptor, so a duplicate of a slow one is safe and the barrier keeps whichever copy
-    lands first. `on_failure` is what makes a *lost* device local — it recomputes that shard's
-    identical partial through the engine rather than failing the gather.
+    lands first. `on_failure` is what makes a bad shard local, on a two-rung ladder:
+
+    * a shard that did not **fit** is subdivided and run on the device in pieces. The shard
+      count was chosen from an estimate, and an estimate is wrong exactly where it matters — a
+      skewed key, a wider row than the footer suggested, a neighbouring tenant on the device.
+      Handing that shard, the largest piece of the work, to the slowest executor is the worst
+      available answer, and subdividing is exact because the stage is mergeable.
+    * anything else — a lost worker, an untranslatable expression — is recomputed by the native
+      **CPU engine**, which produces the identical partial. A deterministic error fails the same
+      way on a smaller shard, so it does not take the first rung.
     """
     import ray
 
     from batcher.carbonite.resilience import gather_with_backups
     from batcher.dist.executors.ray_runtime import engine_config_json, speculation_policy
+    from batcher.dist.gpu.shards import is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import cpu_shard_partial, gpu_shard_partial, gpu_task_options
 
+    dc = active_config().distributed
     cfg_json = engine_config_json()
     gpu_task = ray.remote(**gpu_task_options())(gpu_shard_partial)
-    cpu_task = ray.remote(max_retries=int(active_config().distributed.task_max_retries))(
-        cpu_shard_partial
-    )
+    cpu_task = ray.remote(max_retries=int(dc.task_max_retries))(cpu_shard_partial)
 
     def _launch(i: int):
         return gpu_task.remote(descriptors[i], shard_ops)
 
     def _on_failure(i: int, _ref, exc):
-        if not active_config().distributed.gpu_shard_cpu_fallback:
+        if is_memory_failure(exc) and dc.gpu_shard_subdivide > 1:
+            try:
+                note_suppressed("dist", f"gpu shard {i} did not fit; subdividing", exc)
+                return run_subdivided(
+                    descriptors[i],
+                    lambda d: ray.get(gpu_task.remote(d, shard_ops)),
+                    parts=int(dc.gpu_shard_subdivide),
+                    rounds=int(dc.gpu_shard_subdivide_rounds),
+                )
+            except Exception as sub_exc:
+                exc = sub_exc
+        if not dc.gpu_shard_cpu_fallback:
             raise exc
         note_suppressed("dist", f"gpu shard {i}; recomputing on the CPU engine", exc)
         return ray.get(cpu_task.remote(descriptors[i], shard_ops, cfg_json))

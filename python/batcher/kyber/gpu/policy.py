@@ -44,12 +44,19 @@ class GpuDecision:
     one GPU's memory so the run must fan out across GPUs (the mergeable distributed aggregate);
     False means a single-device dispatch fits. `est_rows` is the estimated input cardinality the
     decision used (`-1` when unknown) — the x-coordinate the adaptive crossover records against.
-    `reason` is a short human string for the decision log / `explain()`."""
+    `reason` is a short human string for the decision log / `explain()`.
+
+    `desired_gpus` is how many devices would let the working set run in ONE wave — the number
+    the autoscaler should be asked for, which is not the number the cluster currently has. A
+    fan-out that asks for its current device count pins the floor against scale-down and can
+    never scale *up*, so a query that could use thirty-two devices runs on the four it happened
+    to find. `0` means the plan does not want devices at all."""
 
     use_gpu: bool
     distributed: bool
     reason: str
     est_rows: int = -1
+    desired_gpus: int = 0
 
 
 def _estimate(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None):
@@ -165,11 +172,20 @@ def decide_gpu_backend(
         1e-9,
     )
     if ws_gb <= one_gpu_gb:
-        return GpuDecision(True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows)
+        return GpuDecision(
+            True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows, 1
+        )
     shardable = _is_shardable(plan)
+    # How many devices would hold the working set in one wave, which is what the autoscaler is
+    # asked for. Capped so a badly-estimated query cannot ask a cluster to grow without bound.
+    wanted = min(math.ceil(ws_gb / one_gpu_gb), max(1, int(dc.gpu_max_autoscale_devices)))
     if ws_gb <= one_gpu_gb * gpu_count and shardable:
         return GpuDecision(
-            True, True, f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs", rows
+            True,
+            True,
+            f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs",
+            rows,
+            wanted,
         )
     # Beyond the cluster's *aggregate* VRAM the question is no longer how much memory the
     # cluster has at once, but how small a shard can be made. A plan with a mergeable reducer
@@ -189,13 +205,14 @@ def decide_gpu_backend(
             f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs, but shards to "
             f"~{ws_gb / shards:.2f}GB across {shards}",
             rows,
+            wanted,
         )
     # Not shardable, and larger than one device. A single dispatch is the only accelerated form
     # available and it does not fit, so it would OOM and fall back anyway; the CPU engine spills
     # and is the honest destination. Reported as such rather than attempted and abandoned.
-    why = "exceeds all" if ws_gb > one_gpu_gb * gpu_count else "exceeds one"
-    reason = "no mergeable reducer to shard on" if not shardable else "CPU engine (spillable)"
-    return GpuDecision(False, False, f"~{ws_gb:.1f}GB {why} GPU: {reason}", rows)
+    scope = f"exceeds all {gpu_count} GPUs" if ws_gb > one_gpu_gb * gpu_count else "exceeds one GPU"
+    why = "no mergeable reducer to shard on" if not shardable else "CPU engine (spillable)"
+    return GpuDecision(False, False, f"~{ws_gb:.1f}GB {scope}: {why}", rows)
 
 
 def _is_shardable(plan: LogicalPlan) -> bool:
