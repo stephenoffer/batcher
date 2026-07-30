@@ -22,9 +22,24 @@ to `2023-12-31` — the day boundary is a local midnight, which is not a fixed i
 across a DST transition, so no single pair of naive bounds names it. `_kind_from_schema` answers
 `True` only for a naive timestamp, and the rule declines otherwise.
 
-One rule per comparison, six in all, following the `temporal_sargable` family: they are schema
-*leaves*, so the driver offers every expression to all six in the one traversal it already makes
-and resolves the node's schema once, which is what makes the per-operator split free here.
+**One rule, and a node rule rather than a fused leaf** — against the grain of the sibling
+`temporal_sargable` family, and for a measured reason.
+
+A fused leaf must declare every `Expr` type it *rewrites*, because that declaration is the chain's
+dispatch key. This rewrite produces a `Binary`, so as a leaf it would have to declare `Binary` —
+which nearly every plan contains, so the plan-level filter could never drop it and every `Filter`
+node in every fixpoint iteration would be offered it. As a *node* rule the declaration is used only
+for the plan-level filter, which frees it to name what the rewrite genuinely **needs**: a `Cast`.
+That is the sharper filter `kyber.rule` recommends, and it drops the rule outright on any plan
+without one; within a matching plan `guards.schema_rule` declines on a node carrying no `Cast`
+before resolving a schema, using the memoized `contained_types`. Measured cost on a plan the rule
+cannot fire on: **+1%**.
+
+On a plan where it *does* fire, planning costs about 0.6 ms more (0.9 -> 1.5 ms on a
+filter-and-project). Almost none of that is this rule: it is predicate pushdown, bound tightening,
+and zone-map pruning finally having a raw-column range to work on, which is the entire point. The
+profile shows this rule's own functions nowhere near the top; what grew is the driver's fixpoint,
+because the rewrite cascades.
 """
 
 from __future__ import annotations
@@ -32,15 +47,15 @@ from __future__ import annotations
 import datetime as _dt
 
 from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
+from batcher.kyber.registry import rule
+from batcher.kyber.rule import Phase
+from batcher.kyber.rules.exprs.guards import schema_rule
 
 # `_MIRROR`/`_OPS` (the operator vocabulary), `_kind_from_schema`/`_column_kind` (the naive
 # date-vs-timestamp guard) and `_range_expr` (the per-operator band predicate) are the sibling
 # family's helpers, imported rather than re-implemented.
 from batcher.kyber.rules.extra.temporal_sargable import (
     _MIRROR,
-    _OPS,
     _column_kind,
     _kind_from_schema,
     _range_expr,
@@ -49,7 +64,7 @@ from batcher.plan.expr_ir import Binary, Cast, Col, Expr, Lit
 from batcher.plan.expr_rewrite import transform_expr_up
 from batcher.plan.logical import Filter, LogicalPlan
 
-__all__ = ["DATE_CAST_RANGE_RULES", "rewrite_date_cast_range"]
+__all__ = ["cast_date_to_range", "rewrite_date_cast_range"]
 
 #: The `Cast` dtype spellings that narrow a timestamp to a date. Both name the same Arrow
 #: type; `plan.types.CAST_DTYPES` accepts either, so a rule matching only one would fire on
@@ -113,8 +128,8 @@ def _rewrite(expr: Expr, op: str, kind) -> Expr:
 def rewrite_date_cast_range(node: Filter, op: str) -> Filter | None:
     """Rewrite `cast(ts, date) <op> DATE 'd'` conjuncts in `node`'s predicate to a band on `ts`.
 
-    The standalone whole-node form, equivalent to the fused leaf below and the entry point the
-    unit tests drive.
+    The single-operator form the unit tests drive, so each comparison's boundary can be pinned
+    on its own; the registered rule applies all six in one pass.
 
     Args:
         node: The `Filter` whose predicate is scanned.
@@ -136,34 +151,36 @@ def rewrite_date_cast_range(node: Filter, op: str) -> Filter | None:
     return Filter(node.input, new_pred) if changed else None
 
 
-def _make_rule(op: str):
-    def apply(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_date_cast_range(node, op)
+def _leaf(expr: Expr, schema) -> Expr:
+    """Apply whichever of the six comparisons `expr` is, or return it unchanged.
 
-    return apply
+    Dispatches on the comparison the decomposition resolves rather than being built per
+    operator, so all six rewrites cost one pass over the node's expressions.
+    """
+    if not isinstance(expr, Binary):
+        return expr
+    matched = _match_date_cast(expr)
+    if matched is None:
+        return expr
+    return _rewrite(expr, matched[2], lambda name: _kind_from_schema(schema, name))
 
 
-def _make_leaf(op: str):
-    def leaf(expr: Expr, schema) -> Expr:
-        return _rewrite(expr, op, lambda name: _kind_from_schema(schema, name))
+@rule(
+    name="cast_date_to_range",
+    phase=Phase.NORMALIZE,
+    matches=(Filter,),
+    # A `Cast` is what the rewrite *needs*, and naming it is what lets the driver drop this rule
+    # for a plan that has none — a far sharper filter than the `Binary` it rewrites, which nearly
+    # every plan carries. Sound because this is a node rule: the declaration is used only for the
+    # plan-level filter, never as a fused chain's dispatch key.
+    expr_matches=(Cast,),
+)
+def cast_date_to_range(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`cast(ts, date) <op> DATE 'd'` → the instant band on `ts`, for all six comparisons.
 
-    return leaf
-
-
-#: `cast(ts, date) <op> DATE 'd'` -> the instant band on `ts`, one rule per comparison:
-#: `=` becomes `ts >= d AND ts < d+1`, `<>` its complement as a disjunction, and each ordered
-#: comparison the single bound at whichever end of the band it names.
-DATE_CAST_RANGE_RULES = [
-    DEFAULT_REGISTRY.add(
-        node_rule(
-            f"cast_date_{op}_to_range",
-            Phase.NORMALIZE,
-            _make_rule(op),
-            matches=(Filter,),
-            expr_schema_fn=_make_leaf(op),
-            expr_matches=(Binary,),
-            expr_ops=(op, _MIRROR[op]),
-        )
-    )
-    for op in _OPS
-]
+    `=` becomes `ts >= d AND ts < d+1`, `<>` its complement as a disjunction, and each ordered
+    comparison the single bound at whichever end of the band it names. Declines when the column
+    is not a naive timestamp: a date column's cast is a no-op, and a timezone-aware column's day
+    boundary is a local midnight that no naive band describes.
+    """
+    return schema_rule(node, _leaf, carries=(Cast,))

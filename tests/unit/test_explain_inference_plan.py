@@ -101,12 +101,19 @@ def _slow(time_module):
 def test_relational_explain_is_byte_identical() -> None:
     """A pure-relational plan's `explain()` output is unchanged by the UDF fallback.
 
-    The fix adds a branch that only triggers on a `map_batches` plan; a lowerable plan must
-    render exactly as before. The expected string is the captured pre-change output.
+    The fallback branch only triggers on a `map_batches` plan; a lowerable plan must render
+    exactly as this string.
+
+    The filter's estimate reads 4 rather than the 1 this test originally captured, and the change
+    is deliberate: `explain()` used to plan *without* per-source statistics, so it showed a
+    different plan than `collect()` runs and every bound-reading estimate fell back to a default
+    guess. It now collects them the way the execution path does. The filter keeps 3 of 4 rows, so
+    4 (interpolated from the column's `[1, 4]` bounds) is closer to the truth than 1 was — both
+    still labelled `default`, since neither is exact.
     """
     expected = (
         "aggregate                       est≈1 (default)\n"
-        "  filter                        est≈1 (default)\n"
+        "  filter                        est≈4 (default)\n"
         "    scan                        est≈4 (exact)"
     )
     assert _relational_plan().explain() == expected

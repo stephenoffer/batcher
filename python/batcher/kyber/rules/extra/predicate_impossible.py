@@ -31,6 +31,11 @@ The type guard is load-bearing and is why this reads the node's schema: `%` on a
 same magnitude property but `*` has no parity one, and a bit operation over a non-integer is
 not this shape at all. Anything not provably integer is left alone.
 
+`filter_arithmetic_contradiction` also refutes a **widening cast against a literal no integer
+can equal**: `cast(i AS DOUBLE) = 5.5`. That one is left alone by `exprs/cast_unwrap`, correctly
+and for a stated reason -- the fold is to a constant, which differs from the original on a null
+row, so it "is only correct at the top of a filter". This is the top of a filter.
+
 A second rule, `filter_function_range_contradiction`, refutes from the **image of a function**
 rather than the range of an operator: `month(ts) = 13`, `hour(ts) >= 24`, `length(s) < 0`,
 `abs(x) = -5`, `sign(x) = 5`, and `upper(name) = 'john'` are unsatisfiable in every table there
@@ -48,6 +53,10 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+
+# `_oriented` resolves `cast(<int> AS float) <op> <float literal>` in either operand order --
+# the sibling family's helper, imported rather than re-implemented.
+from batcher.kyber.rules.exprs.cast_unwrap import _oriented
 from batcher.kyber.rules.exprs.guards import is_integer, node_schema
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_rewrite import split_conjuncts
@@ -118,6 +127,11 @@ def _two_adic(value: int) -> int:
     return count
 
 
+def _is_equality(expr: Expr) -> bool:
+    """Whether `expr` is an equality — the cheap shape gate for the cast refutation."""
+    return isinstance(expr, Binary) and expr.op == "eq"
+
+
 def _range_refutes(op: str, low: float | None, high: float | None, lit: float) -> bool:
     """Whether `v <op> lit` is unsatisfiable for every `v` in `[low, high]`.
 
@@ -173,8 +187,34 @@ def _bitwise_impossible(arith: str, op: str, k: int, lit: int) -> bool:
     return bool(mask & ~value & _U64)  # `|` forces every mask bit, so a missing one is unreachable
 
 
+def _cast_refutes(conjunct: Expr, schema: SchemaRef | None) -> bool:
+    """Whether `cast(<integer col> AS double) = <fractional literal>` — never TRUE.
+
+    `exprs/cast_unwrap` unwraps the *ordered* comparisons against a fractional literal
+    (`i > 3.5` is `i > 3`) and deliberately leaves equality alone, for a reason its docstring
+    states precisely: the fold would be to a constant, and the original yields NULL on a null
+    row where a constant does not — so it "is only correct at the top of a filter". This is the
+    top of a filter. No integer equals 3.5, so the conjunct is TRUE on no row, and NULL and
+    FALSE both drop a row here, which is exactly the context that makes the refutation sound.
+
+    `<>` is not refuted, and not by omission: `i <> 3.5` is TRUE on every non-null row, so
+    rewriting it to a constant TRUE would *keep* the null rows a filter must drop.
+    """
+    if not isinstance(conjunct, Binary) or conjunct.op != "eq":
+        return False
+    resolved = _oriented(conjunct, schema)
+    if resolved is None:
+        return False
+    _inner, op, value = resolved
+    # A float64 above 2**53 has no fractional part, so `is_integer()` already confines this to
+    # the window where the literal names a value strictly between two integers.
+    return op == "eq" and not value.is_integer()
+
+
 def _never_true(conjunct: Expr, schema: SchemaRef | None) -> bool:
     """Whether `conjunct` is TRUE on no row at all, by one of the arithmetic invariants."""
+    if _cast_refutes(conjunct, schema):
+        return True
     found = _decompose(conjunct)
     if found is None:
         return False
@@ -207,11 +247,19 @@ def _never_true(conjunct: Expr, schema: SchemaRef | None) -> bool:
 #: therefore lower-bounded only — a direction NaN cannot violate, since a NaN is never *below*
 #: anything. The integer-valued entries (the calendar parts, the lengths) have no NaN to worry
 #: about, which is what lets them bound both ends.
-_IMAGE: dict[tuple[type, str], tuple[float | None, float | None]] = {}
+#: Keyed by `Expr` type first, then function name, and the nesting is deliberate rather than
+#: incidental. Probing for a function name with `getattr(expr, "fn", None)` looks harmless and is
+#: not: `Expr.__getattr__` builds a "did you mean ..." suggestion with `difflib` before raising
+#: the `AttributeError` that a default then swallows, so every miss pays a fuzzy match over the
+#: whole expression vocabulary. Measured at **+95% planning time** for this one rule before the
+#: index was reshaped. Looking the *type* up first means `.fn` is only ever read on a type that
+#: has one. (`optimizer.expr_dispatch.discriminator` avoids the same trap by caching the answer
+#: per type.)
+_IMAGE: dict[type, dict[str, tuple[float | None, float | None]]] = {}
 
 
 def _register_images() -> None:
-    """Populate `_IMAGE`, keyed by `(Expr type, function name)`."""
+    """Populate `_IMAGE`, keyed by `Expr` type and then by function name."""
     from batcher.plan.expr_ir.core import MathExpr
     from batcher.plan.expr_ir.func_nodes import DateFunc, ListFunc, StrFunc
 
@@ -228,28 +276,26 @@ def _register_images() -> None:
         "isodow": (1, 7),  # Monday = 1
         "day_of_year": (1, 366),  # a leap year has 366
     }
-    for name, bounds in calendar.items():
-        _IMAGE[(DateFunc, name)] = bounds
+    _IMAGE[DateFunc] = dict(calendar)
     # Every counting function: a length or an occurrence count is never negative and has no
     # upper bound. `len` is the character length, `octet_length` the byte length, and
     # `regexp_count` the number of matches; a `ListFunc` `len` counts elements.
-    for name in ("len", "octet_length", "regexp_count"):
-        _IMAGE[(StrFunc, name)] = (0, None)
-    _IMAGE[(ListFunc, "len")] = (0, None)
+    _IMAGE[StrFunc] = dict.fromkeys(("len", "octet_length", "regexp_count"), (0, None))
+    _IMAGE[ListFunc] = {"len": (0, None)}
     # `abs` is non-negative for every input the engine has: integer `abs` *saturates* rather
     # than wrapping (`abs(INT64_MIN)` answers `INT64_MAX`), and `abs(NaN)` is NaN, which the
     # engine's total order places above every finite value — so above zero either way.
-    _IMAGE[(MathExpr, "abs")] = (0, None)
+    _IMAGE[MathExpr] = {"abs": (0, None)}
     # `sign` answers -1, 0, or 1 — including 0 for a **NaN**, so it never returns one and the
     # upper bound is safe here in a way it would not be for a trig function.
-    _IMAGE[(MathExpr, "sign")] = (-1, 1)
+    _IMAGE[MathExpr]["sign"] = (-1, 1)
     # `sqrt` answers NaN for a negative input (again, above every finite value) and `-0.0` for
     # `-0.0`, which equals `0.0` — so nothing it returns is below zero. Measured, because the
     # signed zero is exactly where a guess would go wrong.
-    _IMAGE[(MathExpr, "sqrt")] = (0, None)
+    _IMAGE[MathExpr]["sqrt"] = (0, None)
     # `exp` is mathematically positive and *reaches* zero by underflow (`exp(-1e300)` is `0.0`),
     # so the bound is the inclusive zero rather than an exclusive one.
-    _IMAGE[(MathExpr, "exp")] = (0, None)
+    _IMAGE[MathExpr]["exp"] = (0, None)
 
 
 _register_images()
@@ -271,10 +317,12 @@ def _image_refutes(conjunct: Expr) -> bool:
         (conjunct.left, conjunct.right, conjunct.op),
         (conjunct.right, conjunct.left, _FLIP[conjunct.op]),
     ):
-        fn = getattr(call, "fn", None)
-        if not isinstance(fn, str) or not isinstance(other, Lit):
+        # Type first, so `.fn` is read only on a type that has one -- see `_IMAGE`.
+        by_fn = _IMAGE.get(type(call))
+        if by_fn is None or not isinstance(other, Lit):
             continue
-        bounds = _IMAGE.get((type(call), fn))
+        fn = call.fn
+        bounds = by_fn.get(fn)
         numeric = isinstance(other.value, (int, float)) and not isinstance(other.value, bool)
         if bounds is not None and numeric and _range_refutes(op, *bounds, other.value):
             return True
@@ -330,7 +378,9 @@ def filter_arithmetic_contradiction(node: Filter, _ctx: OptimizerContext) -> Log
     conjuncts = split_conjuncts(node.predicate)
     # The schema is resolved only once a conjunct has the right *shape*, since `node_schema`
     # rebuilds a pyarrow schema up the plan and almost no filter carries this shape.
-    shaped = [c for c in conjuncts if _decompose(c) is not None]
+    # The cast shape is admitted here as well as the arithmetic one; both need the schema, and
+    # resolving it once for either is what keeps this rule to a single pass.
+    shaped = [c for c in conjuncts if _decompose(c) is not None or _is_equality(c)]
     if not shaped:
         return None
     schema = node_schema(node)

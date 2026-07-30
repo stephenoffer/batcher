@@ -157,6 +157,49 @@ def test_satisfiable_bit_mask_is_left_alone(pred):
     assert filter_arithmetic_contradiction(_plan(pred), None) is None
 
 
+# --- a widening cast against a literal no integer can equal ------------------
+#
+# `exprs/cast_unwrap` unwraps the *ordered* comparisons against a fractional literal and leaves
+# equality alone on purpose: the fold is to a constant, which differs from the original on a null
+# row, so it "is only correct at the top of a filter". This is the top of a filter, which is why
+# the case lives here and not there.
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        col("i").cast("float64") == 5.5,
+        col("i").cast("double") == -0.5,
+        col("i").cast("float") == 0.25,
+        # Written the other way round.
+        Binary("eq", Lit(5.5), col("i").cast("float64")),
+    ],
+)
+def test_integer_cast_against_a_fractional_literal_empties_the_filter(pred):
+    assert _empties(pred)
+
+
+@pytest.mark.parametrize(
+    "pred",
+    [
+        # An integral literal is reachable, and `cast_unwrap` turns it into `i = 5`.
+        col("i").cast("float64") == 5.0,
+        # `<>` is TRUE on every non-null row, so folding it to a constant TRUE would *keep* the
+        # null rows a filter must drop. Never refuted, and not by omission.
+        col("i").cast("float64") != 5.5,
+        # The ordered comparisons are `cast_unwrap`'s job and are satisfiable.
+        col("i").cast("float64") > 5.5,
+        col("i").cast("float64") <= 5.5,
+        # A float column's cast is a self-cast: 5.5 is perfectly reachable.
+        col("f").cast("float64") == 5.5,
+        # Not a widening float cast at all.
+        col("i").cast("int64") == 5,
+    ],
+)
+def test_reachable_or_out_of_scope_cast_comparison_is_left_alone(pred):
+    assert filter_arithmetic_contradiction(_plan(pred), None) is None
+
+
 # --- the guards --------------------------------------------------------------
 
 
@@ -367,11 +410,7 @@ def test_no_float_function_carries_an_upper_image_bound():
     from batcher.kyber.rules.extra.predicate_impossible import _IMAGE
     from batcher.plan.expr_ir.core import MathExpr
 
-    bounded_above = {
-        fn
-        for (node_type, fn), (_lo, hi) in _IMAGE.items()
-        if node_type is MathExpr and hi is not None
-    }
+    bounded_above = {fn for fn, (_lo, hi) in _IMAGE[MathExpr].items() if hi is not None}
     # `sign` is the one exception, and it is one because it never returns a NaN at all: the
     # engine answers 0.0 for a NaN input, which the family's tests pin directly.
     assert bounded_above == {"sign"}

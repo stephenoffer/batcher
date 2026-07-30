@@ -18,10 +18,10 @@ import batcher as bt
 from batcher import col, lit
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rules.extra.temporal_date_cast import (
-    DATE_CAST_RANGE_RULES,
+    cast_date_to_range,
     rewrite_date_cast_range,
 )
-from batcher.plan.expr_ir import Binary, Col, Lit
+from batcher.plan.expr_ir import Binary, Cast, Col, Lit
 
 _DAY = dt.date(2024, 1, 1)
 _LO = dt.datetime(2024, 1, 1)
@@ -58,19 +58,24 @@ def _lt(value):
 # --- registration -----------------------------------------------------------
 
 
-def test_one_rule_per_comparison_is_registered():
-    names = {r.name for r in DEFAULT_REGISTRY.rules()}
-    assert {f"cast_date_{op}_to_range" for op in ("eq", "ne", "lt", "le", "gt", "ge")} <= names
-    assert len(DATE_CAST_RANGE_RULES) == 6
+def test_the_rule_is_registered():
+    assert "cast_date_to_range" in {r.name for r in DEFAULT_REGISTRY.rules()}
 
 
-def test_each_rule_declares_both_spellings_of_its_comparison():
-    # A predicate written `DATE 'd' < ts::date` arrives mirrored, and `_match_date_cast`
-    # normalizes it — so a rule naming only its own operator would miss half of them.
-    mirror = {"eq": "eq", "ne": "ne", "lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}
-    for rule_obj in DATE_CAST_RANGE_RULES:
-        op = rule_obj.name.split("_")[2]
-        assert rule_obj.expr_ops == frozenset({op, mirror[op]}), rule_obj.name
+def test_the_rule_declares_the_cast_it_needs_not_the_binary_it_writes():
+    """The declaration is the plan-level filter, and naming `Cast` is what makes it sharp.
+
+    `Binary` — the type the rewrite *produces* — is in nearly every plan, so declaring it would
+    make the rule applicable everywhere. `Cast` is what the rewrite cannot proceed without, which
+    is the "name a type whose presence is necessary" case `kyber.rule` documents. Sound only
+    because this is a node rule and not a fused leaf: a leaf's declaration doubles as its dispatch
+    key, so a leaf declaring only `Cast` would never be offered the `Binary` and would silently
+    stop firing.
+    """
+    registered = next(r for r in DEFAULT_REGISTRY.rules() if r.name == "cast_date_to_range")
+    assert registered.expr_matches == frozenset({Cast})
+    assert registered.expr_fn is None, "a fused leaf could not use the Cast declaration"
+    assert registered.expr_schema_fn is None
 
 
 # --- the band each comparison lands on --------------------------------------
@@ -166,9 +171,31 @@ def test_a_cast_of_an_expression_is_refused():
     assert _fire("eq", (col("ts").cast("date")).cast("date") == lit(_DAY)) is None
 
 
-def test_each_rule_ignores_the_other_operators():
+def test_each_single_operator_form_ignores_the_other_operators():
+    # `rewrite_date_cast_range` is per-operator so each boundary can be pinned alone; the
+    # registered rule dispatches on whichever comparison it finds.
     assert _fire("eq", col("ts").cast("date") >= lit(_DAY)) is None
     assert _fire("ge", col("ts").cast("date") == lit(_DAY)) is None
+
+
+def test_the_registered_rule_handles_every_comparison_in_one_pass():
+    from batcher.plan.expr_ir import Binary as _B
+
+    for pred, want_op in (
+        (col("ts").cast("date") == lit(_DAY), "and"),
+        (col("ts").cast("date") != lit(_DAY), "or"),
+        (col("ts").cast("date") < lit(_DAY), "lt"),
+        (col("ts").cast("date") <= lit(_DAY), "lt"),
+        (col("ts").cast("date") > lit(_DAY), "ge"),
+        (col("ts").cast("date") >= lit(_DAY), "ge"),
+    ):
+        out = cast_date_to_range(_plan(pred), None)
+        assert out is not None, f"declined {pred!r}"
+        assert isinstance(out.predicate, _B) and out.predicate.op == want_op
+
+
+def test_the_registered_rule_declines_a_timezone_aware_column():
+    assert cast_date_to_range(_plan(col("tz").cast("date") == lit(_DAY)), None) is None
 
 
 def test_unrelated_predicate_is_left_alone():

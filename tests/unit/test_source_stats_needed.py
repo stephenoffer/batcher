@@ -65,8 +65,25 @@ def test_aggregate_input_columns_are_named_as_needed():
 
 
 def test_group_keys_are_named_as_needed():
-    # `drop_constant_group_key` proves a key constant from min == max.
+    # `drop_constant_group_key` proves a key constant from min == max; `x` comes along because
+    # `count_of_non_null_column` reads its null count to rewrite `count(x)` as `count(*)`.
     assert column_bounds_needed(_ds().group_by("g").agg(n=col("x").count())._plan) == {"g", "x"}
+
+
+def test_only_the_aggregates_that_read_column_statistics_name_their_input():
+    """An aggregate whose input no rule reads must not pull that column's statistics in.
+
+    Fetching a column materializes its whole `ColumnStat`, quantile grid included, and the
+    `approx_*` terminals answer from a sketch *when one exists* — so requesting a column for an
+    unrelated reason changes what `ds.approx_percentile` on that column returns. Asking only for
+    the inputs a rule actually reads is what keeps that from happening.
+    """
+    assert column_bounds_needed(_ds().agg(m=col("x").min())._plan) == {"x"}
+    assert column_bounds_needed(_ds().agg(s=col("x").sum())._plan) == {"x"}
+    assert column_bounds_needed(_ds().agg(n=col("x").count())._plan) == {"x"}
+    # No rule reads the input column's statistics for these, so neither does the collector.
+    assert column_bounds_needed(_ds().agg(q=col("x").quantile(0.5))._plan) == set()
+    assert column_bounds_needed(_ds().agg(d=col("x").n_unique())._plan) == set()
 
 
 def test_sort_keys_are_named_as_needed():

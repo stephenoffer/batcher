@@ -172,6 +172,9 @@ _IMAGE_REFUTED = [
     (lambda: col("s").str.count_matches("a") == -1, "length(regexp_extract_all(s, 'a')) = -1"),
     (lambda: col("i").abs().sqrt() < 0, "sqrt(abs(i)) < 0"),
     (lambda: col("i").exp() < 0, "exp(i) < 0"),
+    # A widening cast against a literal no integer can equal.
+    (lambda: col("i").cast("float64") == 5.5, "CAST(i AS DOUBLE) = 5.5"),
+    (lambda: col("i").cast("float64") == -0.5, "CAST(i AS DOUBLE) = -0.5"),
 ]
 
 #: The boundary values themselves, which the engine really does return — so these must keep
@@ -199,6 +202,11 @@ _IMAGE_SATISFIABLE = [
     # `sqrt(0)` is `0`, and `exp` reaches zero by underflow — both inclusive bounds are
     # reachable, so neither of these may be refuted.
     (lambda: col("i").abs().sqrt() == 0, "sqrt(abs(i)) = 0"),
+    # An integral literal is reachable; `<>` against a fractional one is true everywhere the
+    # row is non-null, which is the case a constant TRUE would get wrong.
+    (lambda: col("i").cast("float64") == 5.0, "CAST(i AS DOUBLE) = 5.0"),
+    (lambda: col("i").cast("float64") != 5.5, "CAST(i AS DOUBLE) <> 5.5"),
+    (lambda: col("i").cast("float64") > 5.5, "CAST(i AS DOUBLE) > 5.5"),
 ]
 
 
