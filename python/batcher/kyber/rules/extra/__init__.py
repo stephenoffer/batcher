@@ -70,6 +70,9 @@ from batcher.kyber.rules.extra import strings as _strings  # noqa: F401
 from batcher.kyber.rules.extra import string_folds as _string_folds  # noqa: F401
 
 # isort: on
+# Registered directly after `temporal_sargable`: the same extraction-to-range family, for the
+# timestamp-to-date cast rather than a field extraction, and built on that module's helpers.
+from batcher.kyber.rules.extra import temporal_date_cast as _temporal_date_cast  # noqa: F401
 from batcher.kyber.rules.extra import temporal_extra as _temporal_extra  # noqa: F401
 
 # Imported immediately after `temporal_extra`: the folding rules were split out of it and
