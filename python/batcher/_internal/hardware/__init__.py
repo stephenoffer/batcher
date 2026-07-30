@@ -15,6 +15,8 @@ Organized by the question each module answers:
 * `memory` — the memory ceiling, page geometry, and whether swap exists.
 * `topology` — NUMA nodes and SMT siblings: which cores are actually independent.
 * `isa` — CPU identity and vector width.
+* `engine` — the same questions answered by the *data plane's own* process, plus its
+  allocator's accounting; they diverge once a cgroup lands after `import batcher`.
 * `storage` — the block device behind a directory, and what spilling to it will cost.
 * `profile` — one assembled record of all of it, plus the fingerprint that names this
   machine class so learned parameters do not blend across unlike hardware.
@@ -49,6 +51,13 @@ from batcher._internal.hardware.cpu import (
     cpu_oversubscription,
     process_start_method_context,
 )
+from batcher._internal.hardware.engine import (
+    allocator_stats,
+    engine_hardware,
+    engine_numa_map,
+    engine_pinning_order,
+    release_retained_memory,
+)
 from batcher._internal.hardware.isa import cpu_features, cpu_model_name, cpu_vendor, simd_width_bits
 from batcher._internal.hardware.memory import (
     machine_memory_bytes,
@@ -76,6 +85,7 @@ __all__ = [
     "DeviceTelemetry",
     "HardwareProfile",
     "accelerator_backend",
+    "allocator_stats",
     "available_cpu_count",
     "cache_hierarchy",
     "cgroup_pressure",
@@ -88,6 +98,9 @@ __all__ = [
     "cpus_per_numa_node",
     "device_class",
     "device_telemetry",
+    "engine_hardware",
+    "engine_numa_map",
+    "engine_pinning_order",
     "fingerprint",
     "gpu_devices_absent",
     "gpu_inventory",
@@ -100,6 +113,7 @@ __all__ = [
     "physical_core_count",
     "process_start_method_context",
     "read_cgroup_bytes",
+    "release_retained_memory",
     "reset_hardware_probes",
     "simd_width_bits",
     "total_power_watts",
