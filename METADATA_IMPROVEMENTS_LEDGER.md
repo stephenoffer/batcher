@@ -259,6 +259,23 @@ decision; neither is a result.
 **M63.** `merge` stays, and stays the right tool for what it is for: combining sketches built on
 different *partitions*, which is the distributed path and which this does not replace.
 
+**Measured.** 800,000 rows, 49 morsels, one column, `core.column_ndv`. Ratios between paths in
+one build are the meaningful figure here — the absolute times are from a debug engine and are
+inflated several-fold, so they are not quoted.
+
+| column type | path | relative per-value cost |
+|---|---|---|
+| `int64` | fast (always was) | 1.00x |
+| `timestamp[us]` | fast (new) | 1.19x |
+| `decimal128(30,3)` | fast (new) | 0.85x |
+| `list<int64>` | `RowConverter` (still) | **25.7x** |
+
+So the two column types that essentially every event table and every financial table is built
+from moved from the 25.7x column to parity with a plain integer. And a decimal column now
+returns a quantile grid — `column_statistics` on the same data yields boundaries where it
+previously yielded nothing, which is the difference between interpolated range selectivity
+and the Selinger constant.
+
 ## Identified, argued, and deliberately not shipped
 
 Each of these is a real gap between what the engine measures and what it spends. None was
