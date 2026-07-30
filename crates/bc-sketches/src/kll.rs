@@ -156,11 +156,35 @@ impl KllSketch {
                 | DataType::Date32
                 | DataType::Date64
                 | DataType::Timestamp(_, _)
+                // A decimal is an ordered numeric domain like any other, and leaving it out
+                // did not degrade its range selectivity — it removed it. A column with no
+                // quantile grid has no interpolated `fraction <= literal`, so every
+                // `WHERE amount BETWEEN ...` on a decimal fell back to the Selinger constant,
+                // and a decimal is what a monetary column *is*. The cast to `f64` loses
+                // precision past 15 significant digits, which is far below anything a
+                // selectivity estimate resolves; nothing exact is ever answered from a KLL.
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                // The remaining ordered temporal domains, for the same reason `Timestamp` is
+                // here: a duration or a time-of-day column is range-filtered like a number.
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Duration(_)
         ) {
             return;
         }
-        let Ok(f) = cast(array, &DataType::Float64) else {
-            return;
+        // Arrow declines a direct `Time*`/`Duration` → `Float64` cast, so route those through
+        // their `Int64` storage first. Both are already ordered integer domains, so the two-step
+        // conversion is exact for every value a `Time64`/`Duration` can hold, and skipping them
+        // would leave the column with no quantile grid at all rather than a slightly coarse one.
+        let f = match cast(array, &DataType::Float64) {
+            Ok(f) => f,
+            Err(_) => {
+                match cast(array, &DataType::Int64).and_then(|i| cast(&i, &DataType::Float64)) {
+                    Ok(f) => f,
+                    Err(_) => return,
+                }
+            }
         };
         let f = f
             .as_any()
@@ -901,5 +925,73 @@ mod tests {
         for (q, got) in qs.iter().zip(batch) {
             assert_eq!(got, s.quantile(*q), "disagreement at q = {q}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ordered_domain_tests {
+    use super::*;
+    use arrow::array::{
+        ArrayRef, Decimal128Array, DurationMicrosecondArray, Time64NanosecondArray,
+    };
+    use std::sync::Arc;
+
+    /// A column with no quantile grid has no interpolated range selectivity at all, so every
+    /// `BETWEEN` over it falls back to a constant. These pin that the ordered domains a real
+    /// schema is made of actually produce one.
+    fn quantiles_of(array: ArrayRef) -> KllSketch {
+        let mut kll = KllSketch::default();
+        kll.add_array(&array);
+        kll
+    }
+
+    #[test]
+    fn a_decimal_column_gets_a_quantile_grid() {
+        let values: Vec<i128> = (0..10_000).map(|i| i * 100).collect();
+        let array = Decimal128Array::from(values)
+            .with_precision_and_scale(38, 2)
+            .unwrap();
+        let kll = quantiles_of(Arc::new(array) as ArrayRef);
+
+        assert!(!kll.is_empty());
+        // Scale 2 over unscaled 0..999_900 → 0.00 .. 9999.00.
+        let median = kll.quantile(0.5).expect("a numeric column has quantiles");
+        assert!(
+            (median - 4999.5).abs() < 250.0,
+            "median {median} far from the true 4999.5"
+        );
+    }
+
+    #[test]
+    fn a_decimal_column_answers_range_selectivity() {
+        let values: Vec<i128> = (0..10_000).collect();
+        let array = Decimal128Array::from(values)
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let kll = quantiles_of(Arc::new(array) as ArrayRef);
+
+        let below = kll.rank(2_500.0);
+        assert!(
+            (below - 0.25).abs() < 0.05,
+            "selectivity {below} far from the true 0.25"
+        );
+    }
+
+    #[test]
+    fn time_and_duration_columns_get_a_quantile_grid() {
+        let times: Vec<i64> = (0..5_000).collect();
+        assert!(!quantiles_of(Arc::new(Time64NanosecondArray::from(times)) as ArrayRef).is_empty());
+        let durations: Vec<i64> = (0..5_000).map(|i| i * 7).collect();
+        assert!(
+            !quantiles_of(Arc::new(DurationMicrosecondArray::from(durations)) as ArrayRef)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unordered_type_still_has_no_grid() {
+        use arrow::array::StringArray;
+        let array: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        assert!(quantiles_of(array).is_empty());
     }
 }

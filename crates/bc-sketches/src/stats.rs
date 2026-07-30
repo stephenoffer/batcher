@@ -44,22 +44,56 @@ pub struct ColumnStats {
 }
 
 impl ColumnStats {
+    /// An empty accumulator, for folding several arrays of one column into one sketch.
+    pub fn empty() -> Self {
+        Self {
+            count: 0,
+            null_count: 0,
+            total_bytes: 0,
+            distinct: HyperLogLog::default_precision(),
+            quantiles: None,
+        }
+    }
+
     /// Compute stats for an Arrow array. A quantile sketch is built only when the
     /// column is numeric/temporal; otherwise `quantiles` stays `None`.
     pub fn from_array(array: &ArrayRef) -> Self {
-        let mut distinct = HyperLogLog::default_precision();
-        distinct.add_array(array);
+        let mut stats = Self::empty();
+        stats.update(array);
+        stats
+    }
 
-        let mut kll = KllSketch::default();
+    /// Fold one more array of the *same column* into this sketch, in place.
+    ///
+    /// The accumulating counterpart of `from_array` + [`Mergeable::merge`], and the
+    /// difference is not cosmetic: a column is measured across every morsel of a relation,
+    /// and building a fresh `ColumnStats` per morsel allocates and zeroes a **16 KB** HLL
+    /// register array each time, then walks all 16 KB again to merge it. Over a modest
+    /// 49-morsel, 16-column relation that is ~12 MB of allocation and ~12 MB of register
+    /// maxing, on the query path, to summarize data the caller already holds.
+    ///
+    /// The distinct estimate is bit-identical either way — an HLL register is a maximum, so
+    /// adding values sequentially and taking the max of separately-built registers give the
+    /// same array. The quantile sketch is *not* bit-identical, because KLL compaction depends
+    /// on the order values arrive in; accumulating is, if anything, the more accurate of the
+    /// two, since it compacts fewer times. Both are approximate summaries whose consumers
+    /// (range selectivity, range-partition boundaries) are estimates and scheduling
+    /// decisions, never results.
+    ///
+    /// Merging stays available and stays the right tool for the job it is for: combining
+    /// sketches built on *different partitions*, which is what the distributed path does and
+    /// what this cannot replace.
+    pub fn update(&mut self, array: &ArrayRef) {
+        self.count += array.len();
+        self.null_count += array.null_count();
+        self.total_bytes += slice_bytes(array);
+        self.distinct.add_array(array);
+        // A KLL is allocated only once the column proves to be numeric/temporal, so a string
+        // column never pays for one — the same rule `from_array` applied per array.
+        let kll = self.quantiles.get_or_insert_with(KllSketch::default);
         kll.add_array(array); // no-op for non-numeric types
-        let quantiles = (!kll.is_empty()).then_some(kll);
-
-        Self {
-            count: array.len(),
-            null_count: array.null_count(),
-            total_bytes: slice_bytes(array),
-            distinct,
-            quantiles,
+        if kll.is_empty() {
+            self.quantiles = None;
         }
     }
 
