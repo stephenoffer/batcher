@@ -1,11 +1,13 @@
 """Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics.
 
 Aggregation is where a translated GPU plan is easiest to get subtly wrong, because the
-dataframe libraries' defaults disagree with Arrow/SQL on three points that never show up in
+dataframe libraries' defaults disagree with Arrow/SQL on five points that never show up in
 a smoke test and each produce a *wrong answer* rather than an error:
 
 * a **null group key** is a group. `groupby` drops it by default, so a query whose key column
   had nulls silently lost rows from its result;
+* a **float group key of `-0.0` and `0.0` is one group**. The libraries group on a hash of the
+  bits and make it two, splitting a sum between them;
 * the **sum of an all-null group is null**, not `0.0`. `groupby.sum()` returns `0.0`, which
   reads as a real measurement;
 * **`all` and `any` over an all-null group are null**, not `True` and `False`. The libraries
@@ -14,8 +16,13 @@ a smoke test and each produce a *wrong answer* rather than an error:
 * **variance and standard deviation are the sample** forms (`ddof=1`), which is the libraries'
   default but not the one a "population" reading would pick.
 
+A sixth disagreement is *declined* rather than corrected: over a `NaN` the four order
+statistics cannot be reconciled, and `_NAN_SAFE` records which reductions can. Everything else
+runs on the device with a `NaN` present.
+
 Each aggregate is computed off one shared `GroupBy`, so the grouping is built once on the
-device and every reduction reuses it.
+device and every reduction reuses it. The columns those reductions read are materialized
+*before* the grouping is taken, which is what lets a per-column check see them.
 """
 
 from __future__ import annotations
