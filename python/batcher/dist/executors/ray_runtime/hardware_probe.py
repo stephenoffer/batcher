@@ -229,12 +229,20 @@ def _device_health_on_this_worker() -> dict:
     on a fleet the difference between "no device is sick" and "no device that the driver can
     see is sick" is the difference between a report and a guess.
     """
-    from batcher._internal.hardware.fabric import degraded_device_links, nvlink_summary
+    from batcher._internal.hardware.fabric import (
+        degraded_device_links,
+        fabric_error_total,
+        nvlink_summary,
+    )
     from batcher._internal.hardware.faults import xid_readable
     from batcher.carbonite.accel import assess_fleet, device_reset_candidates
 
     verdicts = assess_fleet()
     return {
+        # The fabric's own error history, which is how a failing cable announces itself: the
+        # port stays `ACTIVE` and the errors climb, so a node whose counters stand out against
+        # its neighbours has hardware to check before it drops a stage.
+        "fabric_errors": fabric_error_total(),
         "devices": len(verdicts),
         "quarantined": [v.uuid or v.device_index for v in verdicts if not v.schedulable],
         "degraded": [v.uuid or v.device_index for v in verdicts if v.state == "degraded"],
@@ -346,9 +354,9 @@ def unhealthy_nodes(records: tuple[dict, ...] | None = None) -> tuple[dict, ...]
 
     Returns:
         The subset with a quarantined device, a degraded device, a pending reset, a degraded
-        host link, or a partially-down NVLink fabric. Empty on a healthy fleet *and* on one
-        that could not be probed; `cluster_device_health()` returning nothing is what
-        distinguishes them.
+        host link, a partially-down NVLink fabric, or an RDMA port that has dropped. Empty on
+        a healthy fleet *and* on one that could not be probed; `cluster_device_health()`
+        returning nothing is what distinguishes them.
     """
     probed = cluster_device_health() if records is None else records
     return tuple(
@@ -359,4 +367,7 @@ def unhealthy_nodes(records: tuple[dict, ...] | None = None) -> tuple[dict, ...]
         or r.get("reset_pending")
         or r.get("degraded_links")
         or (r.get("nvlink") or {}).get("degraded_devices")
+        # A link that has actually dropped, as opposed to one merely accumulating symbol
+        # errors: the first cost a stage its in-flight transfers, the second is a warning.
+        or (r.get("fabric_errors") or {}).get("link_downed")
     )

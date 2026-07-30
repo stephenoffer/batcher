@@ -13,6 +13,8 @@ Organized by the wire each module reads:
 * `rdma` — InfiniBand and RoCE NICs from `/sys/class/infiniband`: rate, state, partition.
 * `pcie` — a device's PCIe link, its NUMA home, and how far apart two devices are on the bus.
 * `device_links` — the join of the two: which host link each accelerator is *actually* on.
+* `counters` — what an RDMA port has carried and what it got wrong doing it: the signal
+  that predicts a cable failure before the port ever leaves `ACTIVE`.
 * `nvlink` — per-device NVLink state and error counters through NVML.
 
 Every entry point degrades to an empty or neutral answer off Linux, without the driver, or
@@ -24,6 +26,13 @@ A neutral utility: any layer may import `_internal`.
 
 from __future__ import annotations
 
+from batcher._internal.hardware.fabric.counters import (
+    ERROR_COUNTERS,
+    PortCounters,
+    fabric_error_total,
+    port_counters,
+    throughput_delta,
+)
 from batcher._internal.hardware.fabric.device_links import (
     degraded_device_links,
     device_link_efficiency,
@@ -61,9 +70,11 @@ from batcher._internal.hardware.fabric.rdma import (
 )
 
 __all__ = [
+    "ERROR_COUNTERS",
     "PCIE_CLASSES",
     "NvLinkStatus",
     "PcieLink",
+    "PortCounters",
     "RdmaDevice",
     "active_rdma_devices",
     "degraded_device_links",
@@ -72,6 +83,7 @@ __all__ = [
     "device_numa_node",
     "device_pcie_links",
     "fabric_bandwidth_gbps",
+    "fabric_error_total",
     "fabric_interface_address",
     "fabric_partition",
     "gpu_pci_addresses",
@@ -82,10 +94,12 @@ __all__ = [
     "pcie_bandwidth_gbps",
     "pcie_class",
     "pcie_link",
+    "port_counters",
     "rdma_available",
     "rdma_devices",
     "rdma_link_layers",
     "rdma_net_interfaces",
     "rdma_summary",
     "reset_fabric_probes",
+    "throughput_delta",
 ]
