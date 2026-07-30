@@ -303,3 +303,40 @@ def test_distinct_over_columns_with_no_floats_is_unchanged(be):
     table = pa.table({"a": [1, 1, 2, None, None], "b": ["x", "x", "y", None, None]})
     got, expected = _run(lambda ds: ds.distinct(), table, be)
     assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+ZERO_LEFT = pa.table({"k": [0.0, -0.0, float("nan"), 1.0], "l": [1, 2, 3, 4]})
+ZERO_RIGHT = pa.table({"k": [-0.0, float("nan"), 1.0], "r": [10, 20, 30]})
+
+
+@pytest.mark.parametrize("how", ["semi", "anti"])
+def test_a_semi_or_anti_join_folds_negative_zero(be, how):
+    """`isin` compares by hash, so a left `0.0` did not find a right `-0.0`.
+
+    The third door the two-zeros problem arrives through, after the group key and DISTINCT.
+    """
+    got, expected = _run_join(how, ZERO_LEFT, ZERO_RIGHT, be)
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+def test_an_equi_join_agrees_on_negative_zero_too(be, how):
+    got, expected = _run_join(how, ZERO_LEFT, ZERO_RIGHT, be)
+    assert sorted(map(repr, got.to_pylist())) == sorted(map(repr, expected.to_pylist()))
+
+
+def test_union_distinct_folds_negative_zero(be):
+    """A UNION deduplicates rows, so it decides identity and needs the same fold."""
+    from batcher.core.gpu_plan import gpu_union_spec
+    from batcher.core.gpu_plan.execute import run_union
+
+    a = pa.table({"x": [1, 2], "y": [1.0, -0.0]})
+    b = pa.table({"x": [2, 3], "y": [0.0, 3.0]})
+    ds = bt.from_arrow(a).union(bt.from_arrow(b), distinct=True)
+    inputs, distinct, ops = gpu_union_spec(ds._plan)
+    got = be.to_arrow(run_union([a, b], [o for _, o in inputs], distinct, ops, be))
+    expected = ds.collect()
+    assert got.num_rows == expected.num_rows == 3
+    assert sorted(map(repr, got.select(expected.column_names).to_pylist())) == sorted(
+        map(repr, expected.to_pylist())
+    )
