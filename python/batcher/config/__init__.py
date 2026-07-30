@@ -10,6 +10,7 @@ from __future__ import annotations
 from batcher.config.accelerator import (
     AcceleratorConfig,
     DeviceHealthConfig,
+    DeviceMemoryConfig,
     EnergyConfig,
 )
 from batcher.config.config import (
@@ -58,6 +59,7 @@ __all__ = [
     "CostCoefficients",
     "CostWeights",
     "DeviceHealthConfig",
+    "DeviceMemoryConfig",
     "DistributedConfig",
     "EnergyConfig",
     "ExecutionConfig",

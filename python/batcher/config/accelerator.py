@@ -23,7 +23,13 @@ from dataclasses import dataclass
 
 from batcher._internal.errors import ConfigError
 
-__all__ = ["AcceleratorConfig", "DeviceHealthConfig", "EnergyConfig", "validate_accelerator"]
+__all__ = [
+    "AcceleratorConfig",
+    "DeviceHealthConfig",
+    "DeviceMemoryConfig",
+    "EnergyConfig",
+    "validate_accelerator",
+]
 
 #: Cache element types an inference stage may be sized for. Mirrors what the KV-cache math in
 #: `carbonite.accel.kv_cache` knows an element width for, so a config that validates is a
@@ -106,6 +112,46 @@ class DeviceHealthConfig:
     enabled: bool = False
 
 
+#: Device allocator strategies. `default` is one driver allocation per request (CUDA's own,
+#: and what RAPIDS uses unconfigured); `pool` suballocates from one large reservation; `async`
+#: uses the driver's stream-ordered pool; `managed` backs the pool with unified memory so a
+#: working set larger than the device migrates over the bus instead of failing.
+_ALLOCATORS = frozenset({"default", "pool", "async", "managed"})
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceMemoryConfig:
+    """How a GPU worker's device memory is allocated and what it does when it runs out.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import DeviceMemoryConfig
+            >>> DeviceMemoryConfig().allocator
+            'default'
+    """
+
+    #: Allocator strategy: `default`, `pool`, `async`, or `managed`. `default` is the
+    #: unconfigured driver allocator, where every intermediate column costs a `cudaMalloc`
+    #: that synchronizes the device. A pool pays that once and suballocates, which is the
+    #: single largest constant-factor lever on a chain of many small operators.
+    allocator: str = "default"
+    #: Fraction of a device's *reservable* memory the pool takes at startup. Reserved up
+    #: front, so a large value trades a longer first allocation for no growth pauses later.
+    pool_initial_fraction: float = 0.5
+    #: Fraction of a device's reservable memory the pool may grow to. `1.0` means all of
+    #: what the VRAM headroom leaves; the remainder stays available to a co-tenant.
+    pool_max_fraction: float = 1.0
+    #: Let cuDF move columns to host memory rather than fail when the device fills. Turns a
+    #: class of hard OOM into a slowdown, which is what makes a shard that misjudged its size
+    #: survivable. Off by default because it makes an over-large query slow rather than loud.
+    spill_to_host: bool = False
+    #: Track allocation counts and the device high-water mark, so a stage reports the device
+    #: memory it actually peaked at rather than the footprint it declared. Costs an atomic
+    #: per allocation.
+    statistics: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class AcceleratorConfig:
     """How accelerator work is placed, partitioned, and budgeted.
@@ -120,6 +166,7 @@ class AcceleratorConfig:
 
     energy: EnergyConfig = EnergyConfig()
     health: DeviceHealthConfig = DeviceHealthConfig()
+    memory: DeviceMemoryConfig = DeviceMemoryConfig()
     #: Fraction of each device's memory held back from reservation: CUDA context, allocator
     #: fragmentation, and activation peaks no declared model footprint includes.
     vram_headroom: float = 0.15
@@ -154,8 +201,25 @@ def validate_accelerator(cfg: AcceleratorConfig) -> None:
     Raises:
         ConfigError: On the first out-of-range value, naming the field and its bound.
     """
-    energy, health = cfg.energy, cfg.health
+    energy, health, memory = cfg.energy, cfg.health, cfg.memory
     checks: tuple[tuple[bool, str], ...] = (
+        (
+            memory.allocator in _ALLOCATORS,
+            f"accelerator.memory.allocator {memory.allocator!r} must be one of "
+            f"{sorted(_ALLOCATORS)}",
+        ),
+        (
+            0.0 < memory.pool_initial_fraction <= 1.0,
+            "accelerator.memory.pool_initial_fraction must be in (0, 1]",
+        ),
+        (
+            0.0 < memory.pool_max_fraction <= 1.0,
+            "accelerator.memory.pool_max_fraction must be in (0, 1]",
+        ),
+        (
+            memory.pool_initial_fraction <= memory.pool_max_fraction,
+            "accelerator.memory.pool_initial_fraction must not exceed pool_max_fraction",
+        ),
         (energy.power_budget_watts >= 0, "accelerator.energy.power_budget_watts must be >= 0"),
         (0.0 <= energy.power_headroom < 1.0, "accelerator.energy.power_headroom must be in [0, 1)"),
         (energy.carbon_intensity >= 0, "accelerator.energy.carbon_intensity must be >= 0"),

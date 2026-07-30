@@ -3,9 +3,10 @@
 `decide_gpu_backend` is a pure decision over the plan's estimated size and the cluster's GPU
 count — head-runnable, no GPU. It must: never use a GPU when there is none; keep tiny inputs on
 the CPU (the fixed GPU overhead isn't amortized); run single-device when the working set fits one
-GPU; shard across GPUs when it exceeds one but fits the cluster; and fall back to the CPU engine
-when it exceeds every GPU. `force=True` (explicit `backend="gpu"`) bypasses only the small-input
-threshold, never the memory routing.
+GPU; shard across GPUs when it exceeds one but fits the cluster; keep sharding past the cluster's
+aggregate VRAM as long as one *shard* fits a device; and fall back to the CPU engine when the plan
+exceeds every GPU with no mergeable reducer to divide it by. `force=True` (explicit
+`backend="gpu"`) bypasses only the small-input threshold, never the memory routing.
 """
 
 from __future__ import annotations
@@ -36,6 +37,14 @@ def _set_gpu(**overrides):
 def _plan(n_rows: int):
     ds = bt.from_pydict({"k": list(range(n_rows)), "v": [float(i) for i in range(n_rows)]})
     q = ds.group_by("k").agg(s=bt.col("v").sum())
+    return q._plan, q._sources
+
+
+def _unshardable_plan(n_rows: int):
+    """A plan with no mergeable reducer: a Python `map_batches` does not lower to the engine IR,
+    so there is no algebra to divide it by and every row has to be resident at once."""
+    ds = bt.from_pydict({"k": list(range(n_rows)), "v": [float(i) for i in range(n_rows)]})
+    q = ds.map_batches(lambda batch: batch)
     return q._plan, q._sources
 
 
@@ -80,13 +89,34 @@ def test_exceeds_one_gpu_but_fits_cluster_shards(restore_config):
     assert d.use_gpu is True and d.distributed is True
 
 
-def test_exceeds_all_gpus_falls_back_to_cpu(restore_config):
-    # Working set larger than every GPU combined -> the spillable CPU engine, even when forced.
+def test_exceeds_all_gpus_but_shards_small_enough_still_uses_them(restore_config):
+    """Past the cluster's aggregate VRAM the question becomes how small a shard can be made.
+
+    A mergeable plan oversubscribes shards and pipelines them, so what must fit a device is one
+    shard rather than the working set. Refusing it outright would make the fan-out built for
+    exactly this case unreachable.
+    """
     plan, sources = _plan(5000)
     ws = _working_set_gb(plan, sources)
     _set_gpu(gpu_min_rows=10, gpu_memory_gb=ws / 8)  # 2 GPUs hold only a quarter of the set
     d = decide_gpu_backend(plan, sources, gpu_count=2, force=True)
+    assert d.use_gpu is True and d.distributed is True
+
+
+def test_exceeds_all_gpus_with_nothing_to_shard_on_falls_back_to_cpu(restore_config):
+    """A plan with no mergeable reducer needs the whole set resident, so it goes to the CPU.
+
+    The counter-case to the test above, and the reason the routing turns on shardability rather
+    than on size alone: a single dispatch is the only accelerated form available for this shape,
+    it would not fit, and the spillable CPU engine is the honest destination. `force=True` does
+    not override it — an explicit `backend="gpu"` bypasses the small-input threshold only.
+    """
+    plan, sources = _unshardable_plan(5000)
+    ws = _working_set_gb(plan, sources)
+    _set_gpu(gpu_min_rows=10, gpu_memory_gb=ws / 8)
+    d = decide_gpu_backend(plan, sources, gpu_count=2, force=True)
     assert d.use_gpu is False
+    assert "nothing to shard on" in d.reason
 
 
 def test_gpu_memory_budget_is_detected_not_assumed(monkeypatch):
