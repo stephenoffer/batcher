@@ -13,12 +13,13 @@ performs at provisioning time, so nothing here reconfigures a device — the pla
 scheduler requests and what an operator provisions against.
 
 **The profile family is derived, not tabulated.** NVIDIA's naming (`1g.10gb`, `2g.20gb`,
-`3g.40gb`, `7g.80gb`) follows one rule on every MIG-capable part: a device has seven compute
-slices and eight memory slices, a profile takes `k` compute slices, and its memory is the next
-power of two at or above `k`, in eighths of the device. That reproduces the published A100-40,
-A100-80, and H100-80 tables exactly, and it extends to a future part without waiting for a
-table update — which is the failure mode a hardcoded list has, and it fails by silently
-refusing to partition new hardware.
+`3g.40gb`, `7g.80gb`) follows one rule on every MIG-capable part: the device has `S` compute
+slices (seven on the A100/H100 class, four on the A30) and its memory divides into the next
+power of two at or above `S`; a profile takes `k` compute slices and gets the next power of two
+at or above `k` of those memory units. That reproduces the published A100-40, A100-80, H100-80,
+and A30 tables exactly, and it extends to a future part without waiting for a table update —
+which is the failure mode a hardcoded list has, and it fails by silently refusing to partition
+new hardware.
 """
 
 from __future__ import annotations
@@ -34,10 +35,14 @@ __all__ = [
     "smallest_profile_for",
 ]
 
-#: Compute slices in a MIG-capable device, and memory slices. Both are architectural constants
-#: on every part that supports MIG, and the profile names derive from them.
-_COMPUTE_SLICES = 7
-_MEMORY_SLICES = 8
+#: Compute-slice counts a profile may take, per device slice count. These are the published
+#: families, and they are listed rather than derived because the seven-slice parts offer a `3g`
+#: (7 packs as 3+4) and a `4g` while the four-slice A30 offers neither — a rule that produces
+#: both from arithmetic alone would be a rule invented to fit two data points.
+_PROFILE_SLICES: dict[int, tuple[int, ...]] = {
+    7: (1, 2, 3, 4, 7),  # A100, H100, H200, B200, GB200
+    4: (1, 2, 4),  # A30
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +63,13 @@ class MigProfile:
     instances: int
     device: str
 
+    #: Compute slices the whole device has, so the instance's share is `compute_slices/total`.
+    device_slices: int = 7
+
     @property
     def gpu_fraction(self) -> float:
         """The instance's share of the device, as the fractional `num_gpus` a scheduler asks for."""
-        return self.compute_slices / _COMPUTE_SLICES
+        return self.compute_slices / max(1, self.device_slices)
 
 
 def mig_supported(accelerator_type: str | None) -> bool:
@@ -93,13 +101,20 @@ def mig_profiles(accelerator_type: str | None) -> tuple[MigProfile, ...]:
     spec = device_spec(accelerator_type)
     if spec is None or spec.mig_slices <= 0:
         return ()
+    slices = spec.mig_slices
+    memory_slices = 1 << (slices - 1).bit_length()  # next power of two >= slices
+    # A slice count this build has not seen a published family for falls back to the powers of
+    # two plus the whole device, which is the shape every published family shares. Fewer
+    # profiles than the hardware really offers is the safe direction: each one it does offer is
+    # real, and a caller only ever loses a packing option.
+    candidates = _PROFILE_SLICES.get(slices) or tuple(
+        sorted({1, 2, 4, slices} & set(range(1, slices + 1)))
+    )
     out: list[MigProfile] = []
-    for k in (1, 2, 3, 4, 7):
-        mem_slices = 1 << (k - 1).bit_length()  # next power of two >= k
-        if mem_slices > _MEMORY_SLICES:
-            continue
-        memory_gib = spec.memory_gib * mem_slices // _MEMORY_SLICES
-        instances = _COMPUTE_SLICES // k
+    for k in candidates:
+        instances = slices // k
+        mem_units = 1 << (k - 1).bit_length()
+        memory_gib = spec.memory_gib * mem_units // memory_slices
         out.append(
             MigProfile(
                 name=f"{k}g.{memory_gib}gb",
@@ -107,6 +122,7 @@ def mig_profiles(accelerator_type: str | None) -> tuple[MigProfile, ...]:
                 memory_gib=memory_gib,
                 instances=instances,
                 device=spec.name,
+                device_slices=slices,
             )
         )
     return tuple(out)

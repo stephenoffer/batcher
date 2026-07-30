@@ -20,6 +20,7 @@ __all__ = [
     "default_batch_size",
     "default_dtype",
     "describe_accelerators",
+    "device_feed_advice",
     "get_device",
     "gpu_available",
     "resolve_device",
@@ -357,3 +358,49 @@ def validate_num_gpus(num_gpus: float) -> None:
     """
     if isinstance(num_gpus, bool) or not isinstance(num_gpus, (int, float)) or num_gpus < 0:
         raise PlanError(f"num_gpus must be a non-negative number, got {num_gpus!r}")
+
+
+def device_feed_advice() -> str:
+    """Whether the pipeline is keeping this host's devices busy, in one sentence.
+
+    The most common GPU pipeline problem is not a slow kernel; it is a device waiting on the
+    stage in front of it. Utilization says which one you have, and the two cases take opposite
+    fixes: a starved device wants deeper prefetch or a larger batch, while a saturated one
+    wants more devices or a cheaper model. Reported rather than acted on, because the fix
+    depends on the pipeline rather than on the device.
+
+    Returns:
+        A sentence naming the mean utilization and what it implies, or a note that telemetry
+        is unavailable.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml.devices import device_feed_advice
+            >>> isinstance(device_feed_advice(), str)
+            True
+    """
+    from batcher._internal.hardware.nvml import device_telemetry
+
+    readings = device_telemetry()
+    if not readings:
+        return "no device telemetry on this host (install pynvml to see utilization)"
+    mean = sum(r.sm_utilization for r in readings) / len(readings)
+    clamped = [r for r in readings if r.throttled]
+    if clamped:
+        reasons = ", ".join(sorted({reason for r in clamped for reason in r.throttle_reasons}))
+        return (
+            f"{len(clamped)} of {len(readings)} device(s) are clamped ({reasons}) at "
+            f"{mean:.0%} mean utilization: the ceiling is the device, not the pipeline"
+        )
+    if mean < 0.4:
+        return (
+            f"devices at {mean:.0%} mean utilization: the pipeline is starving them, so the "
+            "lever is upstream (deeper prefetch, larger batches, fewer devices)"
+        )
+    if mean > 0.85:
+        return (
+            f"devices at {mean:.0%} mean utilization: they are saturated, so the lever is more "
+            "devices or a cheaper model rather than a faster feed"
+        )
+    return f"devices at {mean:.0%} mean utilization: fed, with headroom in both directions"

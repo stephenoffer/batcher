@@ -38,6 +38,8 @@ __all__ = [
     "HealthVerdict",
     "assess_device",
     "assess_fleet",
+    "configured_thresholds",
+    "schedulable_device_count",
     "schedulable_devices",
 ]
 
@@ -193,3 +195,47 @@ def schedulable_devices(
         apart should call `assess_fleet` instead, because the correct response differs.
     """
     return tuple(v.device_index for v in assess_fleet(readings, thresholds) if v.schedulable)
+
+
+def configured_thresholds() -> HealthThresholds:
+    """The threshold set the active configuration asks for.
+
+    Keeps the mapping from `accelerator.health` to thresholds in one place, so a caller does
+    not restate it and the two cannot drift. `quarantine_on_ecc=False` is expressed as an
+    effectively unreachable ECC ceiling rather than as a second code path.
+
+    Returns:
+        The thresholds to apply on this deployment.
+    """
+    from batcher.config import active_config
+
+    health = active_config().accelerator.health
+    return HealthThresholds(
+        max_temperature_c=health.max_temperature_c,
+        quarantine_below_derate=health.quarantine_below_derate,
+        max_ecc_uncorrected=0 if health.quarantine_on_ecc else 1 << 62,
+        max_memory_fraction=health.max_memory_fraction,
+    )
+
+
+def schedulable_device_count() -> int | None:
+    """Devices on this host that are safe to schedule on, or `None` when it cannot be told.
+
+    A device rarely fails by disappearing. It stays present and reports uncorrectable ECC
+    errors, or the driver clamps it to a fraction of its clock, and a pool sized to the device
+    *count* keeps feeding it either way. This is the count after those verdicts.
+
+    `None` rather than a number when telemetry is unavailable, which a caller must treat as
+    "keep the device count you already had": an absent probe is not evidence that a fleet is
+    unhealthy, and turning it into one would take a cluster offline the day `pynvml` stopped
+    being installed.
+
+    Returns:
+        The schedulable device count, or `None` when no telemetry could be read.
+    """
+    from batcher._internal.hardware.nvml import device_telemetry
+
+    readings = device_telemetry()
+    if not readings:
+        return None
+    return len(schedulable_devices(readings, configured_thresholds()))

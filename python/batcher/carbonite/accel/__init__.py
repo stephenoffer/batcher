@@ -12,6 +12,8 @@ Four modules, one question each:
   large device.
 * `kv_cache` — the LLM cache budget that actually sets an inference stage's concurrency.
 * `health` — turning live telemetry into a schedule/derate/quarantine verdict.
+* `power` — the deployment's power envelope as an admission decision, with a device-count
+  counter-offer rather than a refusal.
 
 Nothing here allocates device memory or touches a tensor: these are the control-plane
 decisions, and the framework doing the allocating carries them out.
@@ -24,6 +26,8 @@ from batcher.carbonite.accel.health import (
     HealthVerdict,
     assess_device,
     assess_fleet,
+    configured_thresholds,
+    schedulable_device_count,
     schedulable_devices,
 )
 from batcher.carbonite.accel.kv_cache import (
@@ -40,6 +44,11 @@ from batcher.carbonite.accel.mig import (
     mig_supported,
     smallest_profile_for,
 )
+from batcher.carbonite.accel.power import (
+    configured_envelope,
+    devices_within_budget,
+    validate_fleet_power,
+)
 from batcher.carbonite.accel.vram import DEFAULT_HEADROOM, VramPool, VramReservation
 
 __all__ = [
@@ -53,12 +62,17 @@ __all__ = [
     "VramReservation",
     "assess_device",
     "assess_fleet",
+    "configured_envelope",
+    "configured_thresholds",
+    "devices_within_budget",
     "kv_bytes_per_token",
     "kv_cache_bytes",
     "max_concurrent_sequences",
     "mig_plan",
     "mig_profiles",
     "mig_supported",
+    "schedulable_device_count",
     "schedulable_devices",
     "smallest_profile_for",
+    "validate_fleet_power",
 ]

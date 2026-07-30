@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 980 Python modules across 151 packages and 179 Rust files across 13 crates.
+Covering 982 Python modules across 152 packages and 179 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -752,7 +752,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 |---|---|---|
 | `aggregate.py` | 153 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `dispatch.py` | 129 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
-| `tasks.py` | 182 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 162 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
 ### `batcher/dist/spill/` — 4 · backend
 
@@ -836,7 +836,7 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
 | `energy.py` | 239 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
-| `policy.py` | 281 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `policy.py` | 333 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `sizing.py` | 104 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
 ### `batcher/kyber/learned_tuning/` — 3 · subsystem
@@ -1180,7 +1180,8 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 |---|---|---|
 | `health.py` | 241 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
-| `mig.py` | 213 | Multi-Instance GPU: cutting one device into several, so a small model stops holding a big one. |
+| `mig.py` | 229 | Multi-Instance GPU: cutting one device into several, so a small model stops holding a big one. |
+| `power.py` | 116 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
 | `vram.py` | 208 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1206,7 +1207,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `cpu_budget.py` | 94 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 485 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 232 | How big a morsel should be, given memory pressure and the rows' measured width. |
-| `scheduling.py` | 258 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
+| `scheduling.py` | 240 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
 | `spill_advice.py` | 263 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 151 | How wide and how compressed a spilled state should be. |
 
@@ -1273,7 +1274,6 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 173 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 482 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
-| `mergeable.py` | 189 | Split a translated chain into a per-shard stage and a merge stage, in the plan IR. |
 | `ops.py` | 124 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `windows.py` | 310 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 
@@ -1753,13 +1753,21 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `stats.py` | 257 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
+### `batcher/plan/distribution/` — 1 · contract
+
+How a plan splits across workers — the neutral algebra both the optimizer and the backends read.
+
+| module | lines | what it is |
+|---|---|---|
+| `mergeable.py` | 242 | Split a chain of operators into a per-shard stage and a merge stage, in the plan IR. |
+
 ### `batcher/plan/energy/` — 1 · contract
 
 Energy as a first-class plan quantity: power draw, grid conversion, and per-stage accounting.
 
 | module | lines | what it is |
 |---|---|---|
-| `accounting.py` | 210 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
+| `accounting.py` | 247 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
 | `carbon.py` | 153 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
 | `power.py` | 221 | Device power draw — the neutral model every power-aware decision reads. |
 
@@ -1996,7 +2004,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | module | lines | what it is |
 |---|---|---|
 | `accelerators.py` | 377 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
-| `device_specs.py` | 330 | Datacenter accelerator specifications — the hardware facts a cluster cannot report. |
+| `device_specs.py` | 396 | Datacenter accelerator specifications — the hardware facts a cluster cannot report. |
 | `events.py` | 280 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 274 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
 | `mathx.py` | 101 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |

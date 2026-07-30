@@ -112,6 +112,15 @@ def test_derived_profiles_match_the_published_families() -> None:
     assert h100 == ["1g.10gb", "2g.20gb", "3g.40gb", "4g.40gb", "7g.80gb"]
 
 
+def test_a_four_slice_part_gets_its_own_published_family() -> None:
+    # The A30 has four slices, not seven, and offers no 3g profile. A rule that derived one
+    # from arithmetic would invent a partitioning the hardware does not have.
+    assert [p.name for p in mig_profiles("NVIDIA_A30")] == ["1g.6gb", "2g.12gb", "4g.24gb"]
+    by_name = {p.name: p for p in mig_profiles("NVIDIA_A30")}
+    assert by_name["1g.6gb"].instances == 4
+    assert by_name["1g.6gb"].gpu_fraction == pytest.approx(0.25), "a quarter, not a seventh"
+
+
 def test_instances_per_device_follow_the_compute_slices() -> None:
     by_name = {p.name: p for p in mig_profiles("NVIDIA_H100")}
     assert by_name["1g.10gb"].instances == 7

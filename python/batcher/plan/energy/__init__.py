@@ -13,12 +13,13 @@ Three modules, one responsibility each:
 * `carbon` — joules to money and grams CO2e via a `GridProfile`. There is deliberately no
   built-in table of regional carbon intensities; an unconfigured profile reports zero.
 * `accounting` — `StageEnergy` records and the `EnergyLedger` that rolls them up into
-  tokens-per-joule, rows-per-joule, and the idle fraction.
+  tokens-per-joule, rows-per-joule, and the idle fraction. Ledgers are mergeable, so a
+  distributed run's energy is the fold of its workers' and equals the single-node figure.
 """
 
 from __future__ import annotations
 
-from batcher.plan.energy.accounting import EnergyLedger, StageEnergy
+from batcher.plan.energy.accounting import EnergyLedger, StageEnergy, merge_ledgers
 from batcher.plan.energy.carbon import (
     GridProfile,
     carbon_grams,
@@ -49,4 +50,5 @@ __all__ = [
     "joules_to_kwh",
     "kwh_to_joules",
     "max_concurrent_devices",
+    "merge_ledgers",
 ]

@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import available_cpu_count
 from batcher.carbonite.memory.estimator import learned_plan_peak
-from batcher.config import active_config
 from batcher.plan.resource import SchedulingEnvelope
 
 if TYPE_CHECKING:
@@ -43,25 +42,6 @@ __all__ = ["DefaultSchedulingPolicy"]
 # what the ceiling should be on a real fleet is a measurement, and `dist.clamp_workers`
 # reduces the figure to live cluster capacity downstream in any case.
 _MAX_TASK_FANOUT = 100_000
-
-
-def _devices_within_power_budget(accelerator_type: str | None, gpu_count: int) -> int:
-    """Devices the configured power budget can run, or `gpu_count` when it has no opinion.
-
-    Returns the inventory figure unchanged in the two cases where a clamp would be an
-    invention: no budget configured (the default), and a device model whose draw this build
-    does not recognize.
-    """
-    from batcher.plan.energy.power import max_concurrent_devices
-
-    energy = active_config().accelerator.energy
-    if energy.power_budget_watts <= 0:
-        return gpu_count
-    usable = energy.power_budget_watts * (1.0 - min(0.9, max(0.0, energy.power_headroom)))
-    allowed = max_concurrent_devices(usable, accelerator_type)
-    if allowed < 0:
-        return gpu_count  # unknown device: no opinion
-    return max(1, allowed)
 
 
 class DefaultSchedulingPolicy:
@@ -124,7 +104,9 @@ class DefaultSchedulingPolicy:
             # No GPU visible (or none asked for): grant none. Asking for a GPU the
             # cluster does not have makes the task permanently unschedulable.
             return SchedulingEnvelope(num_gpus=0.0, n_tasks=max(1, n_tasks))
-        devices = min(gpu_count, _devices_within_power_budget(accelerator_type, gpu_count))
+        from batcher.carbonite.accel.power import devices_within_budget
+
+        devices = min(gpu_count, devices_within_budget(accelerator_type, gpu_count))
         concurrent = max(1, int(devices / num_gpus))
         return SchedulingEnvelope(
             num_gpus=num_gpus,

@@ -236,6 +236,29 @@ scheduling, because the alternative is a cluster that goes offline the day a dep
 being installed.
 ```
 
+## Diagnose a slow GPU stage
+
+Before tuning a kernel, check whether the devices were ever busy. The most common GPU pipeline
+problem is a device waiting on the stage in front of it, and the fix for that is the opposite
+of the fix for a saturated one.
+
+```python
+from batcher.ml.devices import device_feed_advice
+
+print(isinstance(device_feed_advice(), str))
+# True
+```
+
+On a GPU host the sentence names the mean utilization and what it implies: below roughly 40
+percent the pipeline is starving the devices and the lever is upstream, above 85 percent they
+are saturated and the lever is more devices or a cheaper model. A clamped device is called out
+separately, because that ceiling is the hardware rather than the feed.
+
+`batcher.carbonite.accel.schedulable_device_count()` gives the matching count for pool sizing:
+devices that passed the health verdicts, or `None` when there is no telemetry to judge from.
+Size to `None` by keeping whatever count you had, since an absent probe is not evidence that a
+fleet is unhealthy.
+
 ## Constrain where regulated data is computed
 
 Storage residency is the half most systems cover: the bytes live in a bucket in a named region.
@@ -277,6 +300,13 @@ in any single region, so the job has to be split.
 
 An unregistered dataset is unrestricted. Batcher never infers a region from a bucket name or an
 endpoint, because guessing a legal fact is wrong in whichever direction it errs.
+
+On a cluster, the catalog reaches the scheduler through
+`batcher.dist.executors.ray_runtime.fabric.permitted_nodes`, which keeps only the accelerator
+nodes whose region every input permits. A node with no region label is never filtered out, so
+labelling your fleet is part of enabling the control. `residency_report` gives the before and
+after device counts, which is what distinguishes a fleet narrowed by a compliance rule from one
+that is merely busy.
 
 ## Requirements and limitations
 

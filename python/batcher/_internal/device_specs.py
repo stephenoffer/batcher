@@ -40,6 +40,8 @@ from dataclasses import dataclass
 __all__ = [
     "DeviceSpec",
     "device_arithmetic_intensity",
+    "device_fp8_tflops",
+    "device_generation",
     "device_half_tflops",
     "device_idle_watts",
     "device_memory_bandwidth_gbps",
@@ -49,6 +51,8 @@ __all__ = [
     "device_spec",
     "device_tdp_watts",
     "device_tflops_per_watt",
+    "device_vendor",
+    "devices_by_generation",
     "known_device_names",
     "rank_devices_by_efficiency",
 ]
@@ -105,6 +109,8 @@ _ROWS: tuple[tuple, ...] = (
     ("NVIDIA_A100_80G", "nvidia", "ampere", 80, 2039, 400, 80, 312, 0, 8, 600, 7),
     ("NVIDIA_A100_40G", "nvidia", "ampere", 40, 1555, 400, 80, 312, 0, 8, 600, 7),
     ("NVIDIA_A100", "nvidia", "ampere", 40, 1555, 400, 80, 312, 0, 8, 600, 7),
+    ("NVIDIA_A40", "nvidia", "ampere", 48, 696, 300, 35, 75, 0, 1, 0, 0),
+    ("NVIDIA_A30", "nvidia", "ampere", 24, 933, 165, 30, 165, 0, 2, 200, 4),
     ("NVIDIA_A10G", "nvidia", "ampere", 24, 600, 300, 30, 70, 0, 1, 0, 0),
     ("NVIDIA_A10", "nvidia", "ampere", 24, 600, 150, 25, 62.5, 0, 1, 0, 0),
     ("NVIDIA_TESLA_T4", "nvidia", "turing", 16, 320, 70, 12, 65, 0, 1, 0, 0),
@@ -113,6 +119,7 @@ _ROWS: tuple[tuple, ...] = (
     ("NVIDIA_TESLA_P4", "nvidia", "pascal", 8, 192, 75, 10, 0, 0, 1, 0, 0),
     ("NVIDIA_TESLA_K80", "nvidia", "kepler", 12, 240, 300, 45, 0, 0, 1, 0, 0),
     # AMD Instinct.
+    ("AMD_INSTINCT_MI325X", "amd", "cdna3", 256, 6000, 1000, 180, 1307, 2615, 8, 896, 0),
     ("AMD_INSTINCT_MI300X", "amd", "cdna3", 192, 5300, 750, 150, 1307, 2615, 8, 896, 0),
     ("AMD_INSTINCT_MI250X", "amd", "cdna2", 128, 3200, 560, 100, 383, 0, 8, 800, 0),
     ("AMD_INSTINCT_MI210", "amd", "cdna2", 64, 1600, 300, 60, 181, 0, 2, 300, 0),
@@ -328,3 +335,62 @@ def rank_devices_by_efficiency(names: list[str] | tuple[str, ...]) -> list[str]:
     """
     rankable = [(n, device_tflops_per_watt(n)) for n in names]
     return [n for n, eff in sorted(rankable, key=lambda p: (-p[1], p[0])) if eff > 0]
+
+
+def device_fp8_tflops(accelerator_type: str | None) -> float:
+    """Peak dense FP8 tensor throughput in TFLOP/s, `0.0` on a generation with no FP8 unit.
+
+    The figure that decides whether quantizing a model buys throughput or only memory: on a
+    part with an FP8 unit it roughly doubles the compute rate as well as halving the weights,
+    and on one without it buys the memory alone.
+
+    Args:
+        accelerator_type: A Ray accelerator-type name.
+
+    Returns:
+        Dense FP8 TFLOP/s, `0.0` when unsupported or unknown.
+    """
+    return _field(accelerator_type, "fp8_tflops")
+
+
+def device_vendor(accelerator_type: str | None) -> str:
+    """The device's vendor (`nvidia`, `amd`, `intel`, `google`), or `""` when unrecognized.
+
+    Args:
+        accelerator_type: A Ray accelerator-type name.
+
+    Returns:
+        The vendor name, lowercase.
+    """
+    spec = device_spec(accelerator_type)
+    return spec.vendor if spec is not None else ""
+
+
+def device_generation(accelerator_type: str | None) -> str:
+    """The device's architecture family, or `""` when unrecognized.
+
+    The right key for anything learned *per capability set* rather than per model: an H100 and
+    an H200 differ in memory and bandwidth but share a instruction set and an FP8 unit, so a
+    measurement from one transfers to the other in a way an Ampere measurement does not.
+
+    Args:
+        accelerator_type: A Ray accelerator-type name.
+
+    Returns:
+        The generation name (`"hopper"`, `"blackwell"`, `"ampere"`, ...), lowercase.
+    """
+    spec = device_spec(accelerator_type)
+    return spec.generation if spec is not None else ""
+
+
+def devices_by_generation(generation: str) -> tuple[str, ...]:
+    """Every recognized device model in one architecture family, in table order.
+
+    Args:
+        generation: A generation name, matched case-insensitively.
+
+    Returns:
+        The model names, empty when the generation is not recognized.
+    """
+    want = generation.lower()
+    return tuple(name for name, spec in _SPECS.items() if spec.generation == want)

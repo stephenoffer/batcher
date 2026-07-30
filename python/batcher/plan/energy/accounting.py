@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-__all__ = ["EnergyLedger", "StageEnergy"]
+__all__ = ["EnergyLedger", "StageEnergy", "merge_ledgers"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +141,24 @@ class EnergyLedger:
         """Energy that came from a device reading rather than the datasheet model."""
         return sum(s.joules for s in self.stages if s.measured)
 
+    def merge(self, other: EnergyLedger) -> EnergyLedger:
+        """Fold another ledger's records into this one, returning self.
+
+        Energy is mergeable in exactly the way the engine's stateful operators are: a run's
+        total is the sum over its workers, and every roll-up here is a sum or a ratio of sums,
+        so combining is associative and commutative and the merged figures equal what a
+        single-node run would have reported. That is what lets a distributed run report one
+        honest energy number instead of the driver's own share of it.
+
+        Args:
+            other: A ledger from another worker or another stage of the same run.
+
+        Returns:
+            This ledger, so merges chain over a list of per-worker ledgers.
+        """
+        self.stages.extend(other.stages)
+        return self
+
     def by_device(self) -> dict[str, float]:
         """Energy grouped by accelerator model.
 
@@ -208,3 +226,22 @@ class EnergyLedger:
         if rpj is not None:
             out["rows_per_joule"] = rpj
         return out
+
+
+def merge_ledgers(ledgers: list[EnergyLedger] | tuple[EnergyLedger, ...]) -> EnergyLedger:
+    """Combine per-worker ledgers into the one a distributed run reports.
+
+    The `combine` half of the same mergeable shape the stateful operators use: partial ledgers
+    from any number of workers fold into a single result that equals the single-node one, in
+    any order.
+
+    Args:
+        ledgers: Per-worker ledgers; an empty sequence yields an empty ledger.
+
+    Returns:
+        A new ledger holding every record, leaving the inputs unmodified.
+    """
+    out = EnergyLedger()
+    for ledger in ledgers:
+        out.stages.extend(ledger.stages)
+    return out
