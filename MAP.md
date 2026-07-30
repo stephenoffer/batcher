@@ -660,7 +660,7 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 1442 | The distributed executor — the dispatcher. |
+| `executor.py` | 1443 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 642 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
@@ -851,7 +851,7 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 | module | lines | what it is |
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
-| `energy.py` | 371 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
+| `energy.py` | 402 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
 | `policy.py` | 475 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `sizing.py` | 108 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
@@ -2068,7 +2068,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 
 | module | lines | what it is |
 |---|---|---|
-| `accessors.py` | 399 | Reading the device table: one accessor per fact, and the name resolver in front of them. |
+| `accessors.py` | 350 | Reading the device table: one accessor per fact, and the name resolver in front of them. |
 | `table.py` | 183 | The device table itself: one row per accelerator model, and the host link per part. |
 
 ### `batcher/_internal/errors/` — 0 · utility

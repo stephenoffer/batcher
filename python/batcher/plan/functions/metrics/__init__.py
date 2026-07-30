@@ -142,6 +142,7 @@ from batcher.plan.functions.metrics.text.length import (
     min_char_length,
     token_budget_exceed_rate,
     token_estimate_quantile,
+    token_spend,
     total_token_estimate,
     word_count_quantile,
 )
@@ -368,6 +369,7 @@ __all__ = [
     "token_set_jaccard",
     "token_set_precision",
     "token_set_recall",
+    "token_spend",
     "total_token_estimate",
     "trailing_whitespace_rate",
     "true_negatives",

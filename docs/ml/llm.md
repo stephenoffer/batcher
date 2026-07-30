@@ -281,6 +281,41 @@ request, which is what `usage=True` reads to append the token-count columns.
 | `http_engine(base_url, model, *, api_key, system, chat=True, max_tokens=512, temperature=0.0, on_error="raise", timeout=60.0)` | An OpenAI-compatible HTTP endpoint (vLLM server, llama.cpp, a hosted API). Applies the chat template server-side; retries on rate limits. `on_error="null"` skips a failed row instead of failing the batch. |
 | `anthropic_engine(model, *, api_key, system, max_tokens=1024, temperature=None, on_error="raise", concurrency=8)` | A hosted Claude model over the Anthropic Messages API. Same interchangeable engine contract; `temperature` is omitted unless set (some models reject it). Reads `$ANTHROPIC_API_KEY` when `api_key` is unset. |
 
+Both hosted engines also take `requests_per_minute` and `tokens_per_minute`, covered below.
+
+### Staying inside a provider's quota
+
+Retrying a 429 is recovery, not control. A fleet that only retries still sends the burst that
+caused the rejection, then sends it again, so throughput settles below the quota while every
+worker spends its time asleep. Some providers also count rejected requests against the quota,
+which makes the retries fund their own starvation.
+
+`http_engine` and `anthropic_engine` take `requests_per_minute` and `tokens_per_minute`. Each
+worker holds a token bucket refilled at that rate, and a request waits for capacity *before*
+going out. The send rate is then smooth at the quota rather than a sawtooth under it. The token
+dimension counts the prompt plus the reply the request reserved with `max_tokens`, because that
+is what a provider counts.
+
+```python
+# docs: skip
+from batcher.ml import http_engine
+
+engine = http_engine(
+    "https://api.example.com/v1",
+    "some-model",
+    api_key="...",
+    concurrency=16,
+    requests_per_minute=500,     # per worker, not per fleet
+    tokens_per_minute=400_000,
+)
+```
+
+The limit is **per worker**, deliberately: coordinating a fleet-wide limiter would put a
+synchronous round trip in front of every request. Divide the account quota by the number of
+workers and leave headroom, because a provider measures arrival at its edge, where two workers'
+bursts can coincide. Keep `retries` on as well — a limiter smooths your own send rate, it
+cannot see the other traffic on the account.
+
 `vllm_engine` is the high-throughput path. The GPU stays saturated because vLLM
 batches continuously across in-flight requests. It enables **prefix caching** and
 **chunked prefill** by default, both of which help offline batch throughput and

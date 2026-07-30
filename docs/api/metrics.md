@@ -216,6 +216,7 @@ fraction of rows that overflow a context window, and the token-length tail that 
    total_token_estimate
    token_budget_exceed_rate
    token_estimate_quantile
+   token_spend
 ```
 
 The structured-output compliance metrics measure whether a model returned the shape it was asked

@@ -29,6 +29,7 @@ __all__ = [
     "min_char_length",
     "token_budget_exceed_rate",
     "token_estimate_quantile",
+    "token_spend",
     "total_token_estimate",
     "word_count_quantile",
 ]
@@ -376,3 +377,54 @@ def token_estimate_quantile(text: IntoExpr, q: float, chars_per_token: float = 4
             2
     """
     return approx_quantile(_as_column(text).str.estimate_tokens(chars_per_token), q)
+
+
+def token_spend(
+    input_tokens: IntoExpr,
+    output_tokens: IntoExpr,
+    *,
+    input_price: float,
+    output_price: float,
+) -> Expr:
+    """The total spend implied by two token-count columns, at the given per-million prices.
+
+    Prices are **per million tokens**, the unit every current provider quotes, and input and
+    output are separate because they are priced separately — output is typically several times
+    input, so a run's bill is driven by generation length far more than by prompt length.
+
+    Feed it the *measured* usage columns `ds.ml.generate(usage=True)` appends, not an estimate,
+    and it reconciles against an invoice. Inside `group_by` it attributes spend per model, per
+    tenant, or per prompt template in one scan, which is the breakdown a provider's own billing
+    page does not give you.
+
+    Args:
+        input_tokens: The prompt-token count column.
+        output_tokens: The completion-token count column.
+        input_price: Price per million input tokens.
+        output_price: Price per million output tokens.
+
+    Returns:
+        The total spend over the corpus, in the currency the prices were given in.
+
+    Raises:
+        PlanError: If either price is negative.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> usage = bt.from_pydict({"pt": [1_000_000], "ct": [500_000]})
+            >>> usage.agg(
+            ...     cost=bt.token_spend("pt", "ct", input_price=3.0, output_price=15.0)
+            ... ).to_pydict()["cost"][0]
+            10.5
+    """
+    from batcher._internal.errors import PlanError
+
+    for name, price in (("input_price", input_price), ("output_price", output_price)):
+        if price < 0:
+            raise PlanError(f"token_spend: {name} must not be negative, got {price}")
+    per_row = _as_column(input_tokens) * lit(input_price / 1_000_000.0) + _as_column(
+        output_tokens
+    ) * lit(output_price / 1_000_000.0)
+    return per_row.sum()

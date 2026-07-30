@@ -172,6 +172,29 @@ print(
 # {'total': [12], 'over': [0.5]}
 ```
 
+After a run, `bt.token_spend` prices the *measured* usage columns `ds.ml.generate(usage=True)`
+appends, rather than an estimate, so it reconciles against an invoice. Prices are per million
+tokens, and input and output are separate because they are priced separately: output usually
+costs several times input, which is why a bill tracks generation length far more closely than
+prompt length. Inside `group_by` it gives the per-model or per-tenant breakdown a provider's
+billing page does not.
+
+```python
+usage = bt.from_pydict(
+    {
+        "model": ["small", "small", "large"],
+        "prompt_tokens": [1000, 2000, 1500],
+        "completion_tokens": [500, 400, 900],
+    }
+)
+print(
+    usage.group_by("model")
+    .agg(spend=bt.token_spend("prompt_tokens", "completion_tokens", input_price=3.0, output_price=15.0))
+    .sort("model")
+    .to_pydict()
+)
+```
+
 A second set of monitors watches for output a model *should not* produce at scale. `bt.all_caps_rate`
 and `bt.repeated_punctuation_rate` catch shouting and degenerate punctuation, `bt.non_ascii_rate`
 flags encoding or language drift, `bt.url_rate` surfaces hallucinated links or prompt injection, and
