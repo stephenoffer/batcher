@@ -32,11 +32,9 @@ use crate::ExprError;
 /// expressions that divide by it never have to cast.
 pub(crate) fn eval_multiset_overlap(la: &ListArray, ra: &ListArray) -> Result<ArrayRef, ExprError> {
     // Strings are the overwhelmingly common element here — every generation metric feeds this
-    // n-gram text — and the general path below is expensive for them: it concatenates both
-    // children (copying every string) and row-encodes the result before a single comparison.
-    // Hashing `&str` directly skips both, and the borrow is safe because the arrays outlive
-    // the call. Measured on 20k pairs of 40-token text, this is the difference between a
-    // metric that scans a corpus and one that is only usable on a sample.
+    // n-gram text — and the general path below does two things for them that hashing `&str`
+    // does not need: it concatenates both children, copying every string, and row-encodes the
+    // result before a single comparison is made. This path skips both allocations.
     if let (Some(left), Some(right)) = (utf8_child(la), utf8_child(ra)) {
         return Ok(utf8_overlap(la, left, ra, right));
     }
