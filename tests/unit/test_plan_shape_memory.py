@@ -160,8 +160,7 @@ def test_a_guess_in_any_contributor_keeps_the_verdict_advisory():
     if len(sized) < 2:  # pragma: no cover - plan shape without two sized operators
         pytest.skip("plan has fewer than two sized operators")
     exact = tuple(
-        dc_replace(o, properties=dc_replace(o.properties, provenance=Provenance.EXACT))
-        for o in ops
+        dc_replace(o, properties=dc_replace(o.properties, provenance=Provenance.EXACT)) for o in ops
     )
     all_exact = PP(ir={}, output_schema=None, ops=exact)
     binding = max(exact, key=lambda o: o.bounds.m_max_bytes)

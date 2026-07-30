@@ -50,9 +50,7 @@ def test_contains_phrase_rate_is_case_sensitive() -> None:
 
 
 def test_group_by() -> None:
-    ds = bt.from_pydict(
-        {"g": ["a", "a", "b", "b"], "o": ["Why?", "ok.", "Sure!", "How?"]}
-    )
+    ds = bt.from_pydict({"g": ["a", "a", "b", "b"], "o": ["Why?", "ok.", "Sure!", "How?"]})
     out = ds.group_by("g").agg(m=tone.question_rate("o")).sort("g").to_pydict()
     assert out["g"] == ["a", "b"]
     assert out["m"] == pytest.approx([0.5, 0.5])

@@ -1040,7 +1040,7 @@ statistics*. The Python path it replaced deliberately does not:
 
 ```python
 if stats is None or not getattr(stats, "has_min_max", False):
-    known = False   # a partial min/max is a bound over PART of the file
+    known = False  # a partial min/max is a bound over PART of the file
     break
 ```
 
@@ -1068,7 +1068,7 @@ asserting the two paths agree.
 ```python
 pa_filter = self._pa_filter(predicate)
 if pa_filter is None:
-    batched = self._native_read_many(projection)   # native, but only unfiltered
+    batched = self._native_read_many(projection)  # native, but only unfiltered
 ```
 
 So the *selective* scan — the case pushdown exists for — fell to PyArrow, while

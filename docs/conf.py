@@ -177,6 +177,11 @@ exclude_patterns = [
     # which it still inherits, read against a field-engineering corpus. A contributor
     # working record like the parity scorecards above, not a site page.
     "internals/ray_pitfall_parity.md",
+    # The running record of the spill / OOM / larger-than-memory work: each entry names what
+    # was wrong, why it passed the gate anyway, and the test that now fails without the fix.
+    # A contributor working record like the ledgers above, and it says so in its own opening
+    # line, so it is excluded rather than wired into a toctree.
+    "internals/spill_oom_improvements_ledger.md",
     # The authoring guide for the diagram sources that live beside it (palette, the
     # rsvg-convert render step). A contributor note in an asset directory, not a page.
     "_static/diagrams/README.md",

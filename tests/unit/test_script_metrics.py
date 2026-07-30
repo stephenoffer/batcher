@@ -43,9 +43,7 @@ def test_latin_only_rate() -> None:
 
 
 def test_group_by() -> None:
-    ds = bt.from_pydict(
-        {"lang": ["a", "a", "b"], "o": ["世界", "ok", "привет"]}
-    )
+    ds = bt.from_pydict({"lang": ["a", "a", "b"], "o": ["世界", "ok", "привет"]})
     got = ds.group_by("lang").agg(m=s.cjk_rate("o")).sort("lang").to_pydict()
     assert got["lang"] == ["a", "b"]
     assert got["m"] == pytest.approx([0.5, 0.0])

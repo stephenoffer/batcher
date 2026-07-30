@@ -327,6 +327,16 @@ class InMemorySource:
         `inmemory_stats.column_cheap_stat`: the narrowing exists to skip an O(rows) pass, and
         the width is a buffer-field read that was being skipped with it.
 
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> src = InMemorySource([pa.record_batch({"x": [1, 2, None]})])
+                >>> stat = src.column_cheap_stat("x")
+                >>> stat.null_count, stat.min
+                (1.0, None)
+
         Args:
             name: The column to describe.
 

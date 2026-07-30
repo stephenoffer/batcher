@@ -38,8 +38,6 @@ def test_char_length_range() -> None:
 
 
 def test_max_char_length_group_by() -> None:
-    ds = bt.from_pydict(
-        {"g": ["a", "a", "b"], "o": ["ab", "abcd", "abcdef"]}
-    )
+    ds = bt.from_pydict({"g": ["a", "a", "b"], "o": ["ab", "abcd", "abcdef"]})
     out = ds.group_by("g").agg(m=ld.max_char_length("o")).sort("g").to_pydict()
     assert out == {"g": ["a", "b"], "m": [4, 6]}

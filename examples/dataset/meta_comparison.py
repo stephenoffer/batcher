@@ -48,19 +48,24 @@ def main() -> None:
 
     # Approximate statistics, backed by sketches rather than exact passes. They are
     # available only where the source carries them, so every accessor returns `None`
-    # rather than guessing -- check `is_measured` before relying on one.
+    # rather than guessing -- test the value you are about to use.
     big = bt.from_pydict({"user": [f"u{i % 50}" for i in range(1000)]})
     approx = big.meta.approx
     print("rows:", approx.rows(), "measured:", approx.is_measured("user"))
     assert approx.rows() == 1000.0
 
+    # `is_measured` asks the coarser question -- is *anything* recorded for this column, a
+    # distinct count or a quantile grid or a top-values map or just a width. An in-memory
+    # source already knows the column's average width, so it reads True while the
+    # distinct-count sketch is still absent. Gate on the accessor, not on the column.
     est = approx.n_unique("user")
     print("approx distinct users:", est)
-    if approx.is_measured("user"):
-        assert est is not None and 40 <= est <= 60
+    if est is None:
+        # No run has recorded a distinct-count sketch for this column yet, so the estimate is
+        # `None` by design and the exact pass below is the only answer available.
+        print("no distinct-count sketch recorded yet")
     else:
-        # An in-memory dataset carries no column sketch, so this is `None` by design.
-        assert est is None
+        assert 40 <= est <= 60
 
     # The exact answer is always available, it just costs a pass.
     exact = big.meta.col("user").n_unique()

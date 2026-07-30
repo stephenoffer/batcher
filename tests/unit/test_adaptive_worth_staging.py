@@ -90,11 +90,7 @@ def test_the_boundary_is_exact_and_not_default(monkeypatch, plan_node):
     assert Provenance.EXACT < Provenance.LEARNED < Provenance.DEFAULT, (
         "Provenance must stay ordered strongest-trust first, or this predicate inverts"
     )
-    staged = {
-        p
-        for p in Provenance
-        if _accepts(monkeypatch, p, plan_node)
-    }
+    staged = {p for p in Provenance if _accepts(monkeypatch, p, plan_node)}
     assert staged == set(Provenance) - {Provenance.EXACT}, (
         f"staged provenances {sorted(p.name for p in staged)}; expected everything except EXACT"
     )

@@ -689,12 +689,27 @@ class Writer:
                 >>> bt.read_memory("scratch").count()
                 3
         """
+        from batcher._internal.errors import PlanError
         from batcher.io.formats.streaming.sinks import MemoryStreamSink
 
         # The plan's output schema goes to the sink, so a stream that matches nothing still
         # reads back as this query's relation rather than as a table with no columns.
+        #
+        # But deriving that schema can require *executing* a `limit(0)` — a `map_batches`
+        # output schema is not knowable statically — and materializing is exactly what an
+        # unbounded source refuses. That refusal made `write.memory()` raise on every
+        # streaming query whose schema was not statically derivable, which is the case this
+        # sink exists for. `MemoryStreamSink` treats the schema as optional and learns it from
+        # the first batch it writes, so hand it `None` rather than failing the query. Nothing
+        # is swallowed by this: a plan that is invalid for any other reason still raises when
+        # the query runs it.
+        try:
+            schema = self._ds.schema
+        except PlanError:
+            schema = None
+
         return self._start_stream(
-            MemoryStreamSink(name, output_mode=output_mode, schema=self._ds.schema),
+            MemoryStreamSink(name, output_mode=output_mode, schema=schema),
             trigger,
             output_mode,
             query_name,

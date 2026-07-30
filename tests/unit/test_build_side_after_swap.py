@@ -27,9 +27,7 @@ _SMALL, _WIDE_COLS = 5_000, 2
 def _sides(big_rows: int):
     """A small single-column left and a large two-column right, joined left-to-right."""
     rng = np.random.default_rng(0)
-    left = bt.from_arrow(
-        pa.table({"k": pa.array(rng.integers(0, 1000, _SMALL).astype("int64"))})
-    )
+    left = bt.from_arrow(pa.table({"k": pa.array(rng.integers(0, 1000, _SMALL).astype("int64"))}))
     right = bt.from_arrow(
         pa.table(
             {

@@ -92,6 +92,6 @@ def test_extract_choice_reads_a_standalone_letter() -> None:
 
 def test_parsers_accept_an_expression_not_just_a_name() -> None:
     # `str | Expr`: passing an expression (an upcased column) must work like a name.
-    ds = bt.from_pydict({"o": ["answer: {\"a\": 1}"]})
+    ds = bt.from_pydict({"o": ['answer: {"a": 1}']})
     got = ds.select(j=bt.extract_json(bt.col("o"))).to_pydict()["j"]
     assert got == ['{"a": 1}']
