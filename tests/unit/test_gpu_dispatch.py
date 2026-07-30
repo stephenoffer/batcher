@@ -139,3 +139,30 @@ def test_nested_ops_bottoms_out_at_the_scan():
         depth += 1
     assert depth == 2  # filter, aggregate
     assert node == {"op": "scan", "source_id": 0}
+
+
+def test_union_task_body_matches_the_cpu_engine(be):
+    from batcher.core.gpu_plan import gpu_union_spec
+    from batcher.dist.gpu.tasks import run_shard_union
+
+    a = pa.table({"x": np.array([1, 2, 3], "int64"), "y": np.array([1.0, 2, 3])})
+    b = pa.table({"x": np.array([3, 4], "int64"), "y": np.array([3.0, 4])})
+    ds = bt.from_arrow(a).union(bt.from_arrow(b)).group_by("x").agg(s=col("y").sum())
+    inputs, distinct, ops = gpu_union_spec(ds._plan)
+    tables = [a if s.source_id == 0 else b for s, _ in inputs]
+    got = run_shard_union(
+        [_descriptor(t) for t in tables], [o for _, o in inputs], distinct, ops, be
+    )
+    expected = ds.collect()
+    assert _rows(got.select(expected.column_names)) == _rows(expected)
+
+
+def test_union_task_reports_all_empty_inputs_as_none(be):
+    from batcher.core.gpu_plan import gpu_union_spec
+    from batcher.dist.gpu.tasks import run_shard_union
+
+    a = pa.table({"x": np.array([1], "int64")})
+    ds = bt.from_arrow(a).union(bt.from_arrow(a))
+    inputs, distinct, ops = gpu_union_spec(ds._plan)
+    empty = [{"batches": []} for _ in inputs]
+    assert run_shard_union(empty, [o for _, o in inputs], distinct, ops, be) is None

@@ -30,8 +30,10 @@ __all__ = [
     "gpu_shard_partial",
     "gpu_task_options",
     "gpu_task_runtime_env",
+    "gpu_union_task",
     "run_shard_chain",
     "run_shard_join",
+    "run_shard_union",
 ]
 
 
@@ -95,6 +97,32 @@ def run_shard_join(
     if left is None or right is None:
         return None
     return be.to_arrow(run_join(left, right, left_ops, right_ops, join_ir, ops, be))
+
+
+def run_shard_union(
+    descriptors: list[dict], input_ops: list[list[dict]], distinct: bool, ops: list[dict], be
+):
+    """Read every union input and run the union on `be` — the body of the GPU union task.
+
+    Returns `None` when every input was empty, which the caller handles rather than
+    concatenating tables of unknown schema.
+    """
+    from batcher.core.gpu_plan.execute import run_union
+
+    read = [(_read(d), o) for d, o in zip(descriptors, input_ops, strict=True)]
+    present = [(t, o) for t, o in read if t is not None]
+    if not present:
+        return None
+    tables = [t for t, _ in present]
+    chains = [o for _, o in present]
+    return be.to_arrow(run_union(tables, chains, distinct, ops, be))
+
+
+def gpu_union_task(
+    descriptors: list[dict], input_ops: list[list[dict]], distinct: bool, ops: list[dict]
+):
+    """On a GPU worker: read every union input from storage and run the union on the device."""
+    return run_shard_union(descriptors, input_ops, distinct, ops, _device())
 
 
 def gpu_join_task(

@@ -8,10 +8,45 @@ Both GPU paths are Python. The `bc-*` crates contain no GPU code at all, which f
 
 | Path | What runs on the device | Where |
 |---|---|---|
-| GPU relational backend (`collect(backend="gpu")`) | cuDF dataframe ops, with a torch scatter-reduce fallback | `api/terminal/gpu_backend.py`, in a Ray task with `num_gpus=1` |
+| GPU relational backend (`collect(backend="gpu")`) | cuDF dataframe ops, with a torch scatter-reduce fallback | `core/gpu_plan/` translates, `dist/gpu/` schedules, in Ray tasks with `num_gpus=1` |
 | GPU inference stage (`map_batches(..., num_gpus=...)`) | the user's torch model | a Python Ray actor |
 
-The second is the one that matters. The first is an opt-in accelerator for a bounded set of relational shapes, covering a single-key group-by aggregate over a scan and a linear chain of filter, project, multi-key group-by, sort, distinct, limit, and window. An unsupported shape, an OOM, or a GPU-less cluster falls back to the CPU engine, so `backend="gpu"` is always safe to request. The second path is the entire ML batch-inference workload.
+The second is the larger workload. The first is an opt-in accelerator for relational shapes, described in the next section. An unsupported shape, an OOM, or a GPU-less cluster falls back to the CPU engine, so `backend="gpu"` is always safe to request.
+
+## The relational backend
+
+`collect(backend="gpu")` walks a plan's operator IR and replays it on a cuDF DataFrame, one case per operator and one per expression. A plan reaches the device only when *every* node in it translates, so coverage is what decides how much of a real query is accelerated rather than a list of features.
+
+| Layer | What translates |
+|---|---|
+| Operators | filter, project, group-by aggregate, sort, distinct, limit, window, equi/semi/anti join, union |
+| Aggregates | sum, count, count(\*), mean, min, max, var, stddev, median, quantile, count-distinct, product, bool-and, bool-or |
+| Window functions | row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, forward and backward fill, and the aggregates over a whole partition, a running frame, or a moving frame |
+| Expressions | arithmetic, comparison, boolean, cast, `CASE`, coalesce, nullif, greatest, least, `IN`, null and NaN tests, twenty unary math functions, and the string and date vocabularies |
+
+Anything outside that set is *declined* rather than approximated, and the stage runs on the CPU engine instead. That distinction is the whole safety argument for the backend: a fallback costs time, and an approximation costs a wrong answer.
+
+The translator is parameterized by dataframe library. It runs on cuDF on a GPU worker and on pandas in the test suite, against the CPU engine as the oracle, so the same code a device executes is checked on every commit without a device. That check is what surfaced the cases where a dataframe library's default quietly disagrees with the engine: a null group key is a group rather than a dropped row, the sum of an all-null group is null rather than `0.0`, a null predicate drops its row, `NaN` orders above every number rather than comparing false, `substr` is 1-based, `%` takes the sign of the dividend, and `round` breaks halves away from zero.
+
+### Using more than one device
+
+A single device's memory is the wrong ceiling for the queries a GPU is worth using for. A chain with a **mergeable reducer** is split instead: each device reads its own shard straight from storage and reduces it, and the small per-group results are folded once.
+
+Three reducers have a mergeable form. An `aggregate`, for the reductions whose partials fold — a mean is not itself mergeable, but the sum and count it is a ratio of are. A `distinct`, because deduplicating twice is deduplicating once. And a sort carrying a limit, because a global top-N is the top-N of the shards' top-Ns. Only the row-local operators — filter and project — may run *below* the reducer; everything else reads rows its shard does not have. Anything *above* it runs once on the folded result, which is what lets the ordinary analytical shape (group by, then sort, then limit) fan out at all.
+
+`median`, `quantile`, `var`, `stddev` and `count-distinct` each need a group's whole value set, so a chain reducing with one of those stays on a single device. An aggregate that cannot shard is a scale ceiling; one that shards wrongly is a wrong number.
+
+The decomposition is expressed as more plan IR (`plan/distribution/`) rather than as a second set of kernels, so partial and combine run through the same translator every other operator does, and the multi-device answer equals the single-device one by construction. The same module answers the optimizer's question — a plan that shards is bounded by its shard size rather than by one device's memory, which changes where Kyber routes it.
+
+### When a device is lost, or too small
+
+A fan-out that abandons the accelerated path because one shard failed is not much of a fan-out. Failures are handled where they happen:
+
+- a shard that **did not fit** is subdivided and rerun on the device, halving further while it still does not fit. The shard count is fixed before the query runs, from an estimate, and estimates are wrong exactly where it matters — a skewed key, a wider row than the footer promised, a neighbouring tenant on the device. Subdividing is exact because the stage is mergeable;
+- a shard that failed for **any other reason** — a reclaimed spot node, a device that fell off the bus — is recomputed by the native CPU engine, which produces the identical mergeable partial. One dead device costs that shard's time rather than the query;
+- a **straggler** gets a duplicate through the same backup barrier the CPU shuffle uses, and whichever copy lands first is kept.
+
+No worker's input passes through the driver. Each task receives a partition descriptor — a manifest of splits with the projection and predicate already pushed into it — and reads from storage itself. The second path is the entire ML batch-inference workload.
 
 ## Keeping the device fed
 
@@ -163,7 +198,9 @@ The ceiling is arithmetic. A *single, maximally large, compute-bound* job runs a
 
 A GPU `fn` never runs in a process pool, because it has to keep a single process and CUDA context. The GIL is therefore a real constraint on a GPU stage whose Python glue is heavy.
 
-Multi-GPU collective placement doesn't work. `SchedulingEnvelope.gpu_collective` and `placement_strategy` exist in `plan/resource.py` and are read by `dist/executors/ray_runtime/scheduling.py`, but the actor pool sets only `num_gpus` and `accelerator_type` and there's no placement group behind them.
+Multi-GPU collective placement doesn't work. `SchedulingEnvelope.gpu_collective` and `placement_strategy` exist in `plan/resource.py` and are read by `dist/executors/ray_runtime/scheduling.py`, but the actor pool sets only `num_gpus` and `accelerator_type` and there's no placement group behind them. This is about *inference* stages. The relational fan-out described above uses many devices, but as independent single-device tasks that share nothing, which is a weaker requirement than a collective.
+
+The relational backend has no device-to-device shuffle, so it distributes only what the mergeable algebra covers. A chain that reduces with `median`, `quantile`, `var`, `stddev` or `count-distinct` runs on one device; a chain with no reducer at all produces every input row and is left to the spillable CPU engine when it exceeds one device. Both are scale ceilings rather than wrong answers, and both would lift with a key-partitioning exchange between devices.
 
 GPU tensors move between stages as Arrow through host memory. There's no device-to-device transport. That's a deliberate consequence of the Arrow-only invariant, and `docs/internals/rfc-gpu-transport.md` proposes changing it. That document is an in-tree proposal, not a description of shipped behavior.
 
@@ -183,20 +220,21 @@ rules on this page can be read directly:
 | Throughput hill-climb | `python/batcher/ml/autobatch.py` |
 | Device detection, utilization, VRAM | `python/batcher/ml/gpu.py` |
 | GPU-vs-CPU backend policy | `python/batcher/kyber/gpu/policy.py` |
-| GPU relational backend dispatch | `python/batcher/api/terminal/gpu_backend.py` |
+| GPU relational backend routing | `python/batcher/api/terminal/gpu_backend.py` |
+| Plan and expression translation to cuDF | `python/batcher/core/gpu_plan/` |
+| Mergeable split, shared by the optimizer and the backend | `python/batcher/plan/distribution/` |
+| Multi-device fan-out, shard recovery, worker-side reads | `python/batcher/dist/gpu/` |
 | cuDF and torch scatter-reduce kernels | `python/batcher/core/gpu_transform.py` |
 
 ## See also
 
-:::{seealso}
-- {doc}`Architecture <../architecture/index>`: why the GPU paths live in Python and not in the crates
-- {doc}`Execution engine <../internals/execution>`: the UDF stage this pipelines
-- `docs/internals/rfc-gpu-transport.md` (an in-tree RFC, not a site page): the device-to-device transport this page does not have
-- {doc}`GPU guide <../ml/gpu>`: the knobs, from a user's side
-- {doc}`ML guide <../ml/index>`: how to write these pipelines
-- {doc}`Batch inference tutorial <../tutorials/batch-inference>`: the pipeline this page is underneath
-- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the numbers on this page, in context
-- {doc}`Multimodal ingest benchmarks <../benchmarks/multimodal-ingest>`: the decode side of the same pipeline
-- {doc}`Tensor columns <tensor-columns>`: what crosses into the model
-- {doc}`Distributed scheduling <distributed-scheduling>`: how the actors get placed
-:::
+- {doc}`Architecture <../architecture/index>`: why the GPU paths live in Python and not in the crates.
+- {doc}`Execution engine <../internals/execution>`: the UDF stage this pipelines.
+- `docs/internals/rfc-gpu-transport.md` (an in-tree RFC, not a site page): the device-to-device transport this page does not have.
+- {doc}`GPU guide <../ml/gpu>`: the knobs, from a user's side.
+- {doc}`ML guide <../ml/index>`: how to write these pipelines.
+- {doc}`Batch inference tutorial <../tutorials/batch-inference>`: the pipeline this page is underneath.
+- {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the numbers on this page, in context.
+- {doc}`Multimodal ingest benchmarks <../benchmarks/multimodal-ingest>`: the decode side of the same pipeline.
+- {doc}`Tensor columns <tensor-columns>`: what crosses into the model.
+- {doc}`Distributed scheduling <distributed-scheduling>`: how the actors get placed.

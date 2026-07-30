@@ -9,7 +9,11 @@ semantics, and the mergeable algebra is what guarantees the two agree.
 from __future__ import annotations
 
 from batcher.dist.gpu.aggregate import sharded_gpu_aggregate
-from batcher.dist.gpu.dispatch import gpu_chain_on_worker, gpu_join_on_worker
+from batcher.dist.gpu.dispatch import (
+    gpu_chain_on_worker,
+    gpu_join_on_worker,
+    gpu_union_on_worker,
+)
 from batcher.dist.gpu.groupby import dispatch_gpu_aggregate, distributed_gpu_aggregate
 from batcher.dist.gpu.tasks import gpu_task_options, gpu_task_runtime_env
 
@@ -20,5 +24,6 @@ __all__ = [
     "gpu_join_on_worker",
     "gpu_task_options",
     "gpu_task_runtime_env",
+    "gpu_union_on_worker",
     "sharded_gpu_aggregate",
 ]

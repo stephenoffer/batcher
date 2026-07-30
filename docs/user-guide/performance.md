@@ -252,11 +252,35 @@ q.collect(backend="auto")  # let Kyber decide GPU vs CPU by estimated size
 
 `backend="auto"` is the adaptive choice. Kyber sends a query to the GPU only when the
 estimated input is large enough to amortize the device overhead of host-to-device
-transfer, cuDF import, and task dispatch, and only when it fits the cluster's GPU
-memory. A working set that exceeds one GPU is sharded across many. One that exceeds
-them all stays on the spillable CPU engine. Below the crossover a small query stays on
+transfer, cuDF import, and task dispatch. Below that crossover a small query stays on
 the CPU engine, and anything unsupported or a GPU-less cluster falls back
 transparently.
+
+Above it, how far the query scales depends on the plan rather than on the cluster. A
+chain that reduces — a group-by aggregate, a distinct, or a sort with a limit — splits
+across every device, each reading its own shard from storage and reducing it, so the
+memory that has to fit a device is one shard's rather than the whole working set's. A
+chain with nothing to reduce produces every input row, cannot be split that way, and
+runs on the spillable CPU engine once it exceeds one device.
+
+That is why the shape of the query, not just its size, decides whether the GPU helps:
+
+```python
+# docs: skip
+# reduces: shards across every device, whatever the input size
+ds.group_by("country").agg(revenue=bt.col("amount").sum()).collect(backend="auto")
+
+# reduces, and the sort and limit run once on the folded result
+(ds.group_by("country").agg(r=bt.col("amount").sum())
+   .sort("r", descending=True).limit(10).collect(backend="auto"))
+
+# does not reduce: one device, or the CPU engine if it does not fit one
+ds.filter(bt.col("amount") > 100).collect(backend="auto")
+```
+
+A shard that a device cannot hold is subdivided and rerun on the device rather than
+abandoned, and a shard whose device is lost is recomputed by the CPU engine, which
+produces the identical partial. Losing a device costs that shard, not the query.
 
 The crossover itself is learned rather than fixed. Each GPU or CPU group-by run
 records its estimated rows and wall time to the metadata hub, Kyber fits a cost line
@@ -360,3 +384,4 @@ Every field, with its default and meaning, is in
 - {doc}`Aggregations <aggregations>`: the breakers that spill and re-optimize.
 - {doc}`Agent skills <../agents/index>`: `optimize-a-slow-query` covers the measure-first
   methodology and the ordered fix checklist.
+- {doc}`../cookbook/operations/memory_and_caching`: caching and spilling under a tight budget, as a script.

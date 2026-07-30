@@ -27,7 +27,12 @@ if TYPE_CHECKING:
 
     from batcher.io.source import Source
 
-__all__ = ["gpu_chain_on_worker", "gpu_join_on_worker", "whole_source_descriptor"]
+__all__ = [
+    "gpu_chain_on_worker",
+    "gpu_join_on_worker",
+    "gpu_union_on_worker",
+    "whole_source_descriptor",
+]
 
 
 def whole_source_descriptor(source: Source) -> dict | None:
@@ -107,6 +112,29 @@ def gpu_join_on_worker(
     from batcher.dist.gpu.tasks import gpu_join_task
 
     return _remote(gpu_join_task, ldesc, rdesc, left_ops, right_ops, join_ir, ops)
+
+
+def gpu_union_on_worker(
+    sources: list[Source], input_ops: list[list[dict]], distinct: bool, ops: list[dict]
+) -> pa.Table | None:
+    """Run a translated union on one GPU worker that reads every input itself.
+
+    Args:
+        sources: Each union input's source.
+        input_ops: Each input chain's operator IR, positionally matching `sources`.
+        distinct: Whether the union deduplicates.
+        ops: The operator chain above the union.
+
+    Returns:
+        The union's result, or `None` when any input cannot be described to a worker or the
+        dispatch failed.
+    """
+    descriptors = [whole_source_descriptor(s) for s in sources]
+    if any(d is None for d in descriptors):
+        return None
+    from batcher.dist.gpu.tasks import gpu_union_task
+
+    return _remote(gpu_union_task, descriptors, input_ops, distinct, ops)
 
 
 def _remote(task, *args) -> pa.Table | None:

@@ -111,7 +111,11 @@ def try_gpu_collect(
     # the source itself: staging a large relation on the driver to send it to a GPU is the wrong
     # end of the machine, and the driver is routinely the smallest node in the cluster.
     from batcher.core.gpu_plan import gpu_join_spec, gpu_plan_ops, gpu_union_spec
-    from batcher.dist.gpu import gpu_chain_on_worker, gpu_join_on_worker
+    from batcher.dist.gpu import (
+        gpu_chain_on_worker,
+        gpu_join_on_worker,
+        gpu_union_on_worker,
+    )
 
     plan_spec = gpu_plan_ops(plan)
     if plan_spec is not None:
@@ -146,10 +150,16 @@ def try_gpu_collect(
             pa.Table.from_batches(lb), pa.Table.from_batches(rb), lops, rops, join_ir, ops
         )
 
-    # A `[ops] over Union(chains)` — concat (+ optional dedup) + a chain — on one GPU.
+    # A `[ops] over Union(chains)` — concat (+ optional dedup) + a chain — on one GPU, which
+    # reads every input itself.
     union_spec = gpu_union_spec(plan)
     if union_spec is not None:
         inputs, distinct, ops = union_spec
+        on_worker = gpu_union_on_worker(
+            [sources[sc.source_id] for sc, _ in inputs], [o for _, o in inputs], distinct, ops
+        )
+        if on_worker is not None:
+            return on_worker
         read = [(list(sources[sc.source_id].read()), iops) for sc, iops in inputs]
         tables = [(pa.Table.from_batches(b), iops) for b, iops in read if b]
         if not tables:
