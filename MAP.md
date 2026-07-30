@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1006 Python modules across 157 packages and 185 Rust files across 13 crates.
+Covering 1008 Python modules across 157 packages and 185 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -164,7 +164,7 @@ The public, fluent, lazy, expression-first API surface.
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `executors.py` | 361 | Execution strategies and their registry (the conductor's wiring). |
-| `functions.py` | 749 | Top-level expression constructors re-exported for the public API. |
+| `functions.py` | 751 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
@@ -454,9 +454,10 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 
 | module | lines | what it is |
 |---|---|---|
-| `anthropic.py` | 229 | The Anthropic Messages API backend — batch generation against a hosted Claude model. |
+| `anthropic.py` | 243 | The Anthropic Messages API backend — batch generation against a hosted Claude model. |
 | `base.py` | 53 | LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends. |
-| `openai.py` | 325 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
+| `limits.py` | 232 | Client-side rate limiting for a hosted LLM endpoint. |
+| `openai.py` | 339 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
 | `parallelism.py` | 178 | How many GPUs one LLM engine replica needs, and what that choice costs. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
 | `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
@@ -659,7 +660,7 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 1417 | The distributed executor — the dispatcher. |
+| `executor.py` | 1423 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 642 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
@@ -676,7 +677,7 @@ Learned execution-time sizing for the distributed executor (façade).
 
 | module | lines | what it is |
 |---|---|---|
-| `sizing.py` | 315 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
+| `sizing.py` | 342 | Learned execution-time sizing for the distributed executor — measure once, tune next run. |
 
 ### `batcher/dist/executors/` — 4 · backend
 
@@ -764,7 +765,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | `device_read.py` | 127 | Read a shard onto the device, instead of onto the host and then across the bus. |
 | `dispatch.py` | 157 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 237 | The single-key group-by fan-out that predates the plan translator. |
-| `join.py` | 139 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
+| `join.py` | 141 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `shards.py` | 236 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
 | `tasks.py` | 208 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 
@@ -850,7 +851,7 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 |---|---|---|
 | `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
 | `energy.py` | 371 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
-| `policy.py` | 417 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `policy.py` | 475 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `sizing.py` | 108 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
 ### `batcher/kyber/learned_tuning/` — 3 · subsystem
@@ -991,6 +992,7 @@ Extended Kyber rule families.
 | `metadata_adaptive.py` | 291 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
 | `null_shapes.py` | 190 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
 | `nullability.py` | 364 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
+| `predicate_impossible.py` | 197 | Arithmetic contradiction — empty out a filter whose conjunct no integer can satisfy. |
 | `predicate_infer.py` | 490 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
 | `projection_scan.py` | 350 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 458 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
@@ -1928,7 +1930,7 @@ Metrics that score generated or collected text, with no model in the loop.
 | `_text.py` | 79 | The tokenization and ratio-shape helpers every text metric in this package builds on. |
 | `diversity.py` | 276 | Degeneration and diversity metrics — catching a model that has started repeating itself. |
 | `formatting.py` | 337 | Output-shape metrics — did the generation take the form it was asked to take. |
-| `length.py` | 378 | Length, size, and reading-level metrics — how much text there is and how hard it is. |
+| `length.py` | 430 | Length, size, and reading-level metrics — how much text there is and how hard it is. |
 | `ngram.py` | 332 | Word n-gram overlap — the clipped-count metrics BLEU and ROUGE-N are defined on. |
 | `overlap.py` | 382 | Lexical-overlap metrics — scoring generated text against a reference, in one pass. |
 | `pii_safety.py` | 175 | PII and safety monitors — did the model leak contact details or emit a banned pattern. |

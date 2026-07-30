@@ -20,6 +20,7 @@ from batcher.kyber.rules.extra.conditional.shared import (
     _lit_class,
     _Node,
     _pure,
+    _rewrite_typed,
 )
 from batcher.plan.expr_ir import (
     Case,
@@ -31,14 +32,15 @@ from batcher.plan.expr_ir import (
     NullIf,
 )
 from batcher.plan.logical import Filter, LogicalPlan, Project
+from batcher.plan.schema import SchemaRef
 
 
-def _drop_unreachable(expr: Expr) -> Expr:
+def _drop_unreachable(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     if not isinstance(expr, Case):
         return expr
     kept = [b for b in expr.branches if not _is_false_lit(b[0])]
     dropped = [t for c, t in expr.branches if _is_false_lit(c)]
-    if not dropped or not _droppable(dropped, [t for _, t in kept] + [expr.otherwise]):
+    if not dropped or not _droppable(dropped, [t for _, t in kept] + [expr.otherwise], schema):
         return expr
     return Case(kept, expr.otherwise)
 
@@ -48,6 +50,7 @@ def _drop_unreachable(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_drop_unreachable,
+    expr_schema=_drop_unreachable,
     expr_matches=(Case,),
 )
 def case_drop_unreachable_branches(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
@@ -55,11 +58,15 @@ def case_drop_unreachable_branches(node: _Node, _ctx: OptimizerContext) -> Logic
     is TRUE, so it fires on no row and contributes nothing but its type. (A constant-NULL condition
     is just as dead — NULL selects no rows either — but no NULL *literal* exists here.) The branch
     goes only when its `then` is pure and its type is already carried by a surviving arm, so neither
-    the error behavior nor the CASE's result type moves."""
-    return _rewrite_node(node, _drop_unreachable)
+    the error behavior nor the CASE's result type moves.
+
+    "Already carried by a surviving arm" is answered schema-free *and*, where the node's schema
+    resolves, against the arms' exact Arrow types — without which two `int` columns look like two
+    unknowns and the branch is never dropped."""
+    return _rewrite_typed(node, _drop_unreachable, carries=(Case,))
 
 
-def _first_true(expr: Expr) -> Expr:
+def _first_true(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     if not isinstance(expr, Case):
         return expr
     i = next((i for i, (c, _) in enumerate(expr.branches) if _is_true_lit(c)), None)
@@ -68,7 +75,7 @@ def _first_true(expr: Expr) -> Expr:
     head, winner, tail = expr.branches[:i], expr.branches[i][1], expr.branches[i + 1 :]
     dropped = [t for _, t in tail] + [expr.otherwise]
     kept = [t for _, t in head] + [winner]
-    if not all(_pure(c) for c, _ in tail) or not _droppable(dropped, kept):
+    if not all(_pure(c) for c, _ in tail) or not _droppable(dropped, kept, schema):
         return expr
     return Case(head, winner)
 
@@ -78,6 +85,7 @@ def _first_true(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_first_true,
+    expr_schema=_first_true,
     expr_matches=(Case,),
 )
 def case_first_true_branch_wins(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
@@ -86,7 +94,7 @@ def case_first_true_branch_wins(node: _Node, _ctx: OptimizerContext) -> LogicalP
     its result *is* the default and nothing below it is reachable. Only a literal TRUE qualifies —
     FALSE or NULL says nothing about the branches beneath. Dropped conditions and results must be
     pure, and the result type must survive."""
-    return _rewrite_node(node, _first_true)
+    return _rewrite_typed(node, _first_true, carries=(Case,))
 
 
 def _all_same_result(expr: Expr) -> Expr:
@@ -133,7 +141,7 @@ def case_no_branches_to_else(node: _Node, _ctx: OptimizerContext) -> LogicalPlan
     return _rewrite_node(node, _no_branches)
 
 
-def _dedup_conditions(expr: Expr) -> Expr:
+def _dedup_conditions(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     if not isinstance(expr, Case) or len(expr.branches) < 2:
         return expr
     kept: list[tuple[Expr, Expr]] = []
@@ -145,7 +153,7 @@ def _dedup_conditions(expr: Expr) -> Expr:
             continue
         seen.add(_key(cond))
         kept.append((cond, then))
-    if not dropped or not _droppable(dropped, [t for _, t in kept] + [expr.otherwise]):
+    if not dropped or not _droppable(dropped, [t for _, t in kept] + [expr.otherwise], schema):
         return expr
     return Case(kept, expr.otherwise)
 
@@ -155,6 +163,7 @@ def _dedup_conditions(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_dedup_conditions,
+    expr_schema=_dedup_conditions,
     expr_matches=(Case,),
 )
 def case_drop_duplicate_conditions(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
@@ -162,7 +171,7 @@ def case_drop_duplicate_conditions(node: _Node, _ctx: OptimizerContext) -> Logic
     TRUE the earlier (structurally identical, and required to be pure, hence equal-valued) one was
     TRUE too — and first-true-wins already fired it — so the repeat is unreachable. Its result is
     removed under the usual purity + type guard."""
-    return _rewrite_node(node, _dedup_conditions)
+    return _rewrite_typed(node, _dedup_conditions, carries=(Case,))
 
 
 def _case_to_coalesce(expr: Expr) -> Expr:
@@ -247,7 +256,7 @@ def coalesce_flatten_nested(node: _Node, _ctx: OptimizerContext) -> LogicalPlan 
     return _rewrite_node(node, _coalesce_flatten)
 
 
-def _coalesce_drop_unreachable(expr: Expr) -> Expr:
+def _coalesce_drop_unreachable(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     if not isinstance(expr, Coalesce):
         return expr
     kept = [a for a in expr.inputs if not _is_null_lit(a)]
@@ -259,7 +268,7 @@ def _coalesce_drop_unreachable(expr: Expr) -> Expr:
     if len(kept) == len(expr.inputs) or not kept:
         return expr
     kept_keys = {_key(a) for a in kept}
-    if not _droppable([a for a in expr.inputs if _key(a) not in kept_keys], kept):
+    if not _droppable([a for a in expr.inputs if _key(a) not in kept_keys], kept, schema):
         return expr
     return Coalesce(kept)
 
@@ -269,6 +278,7 @@ def _coalesce_drop_unreachable(expr: Expr) -> Expr:
     phase=Phase.NORMALIZE,
     matches=(Filter, Project),
     expr=_coalesce_drop_unreachable,
+    expr_schema=_coalesce_drop_unreachable,
     expr_matches=(Coalesce, Lit),
 )
 def coalesce_drop_nulls_after_first_non_null(
@@ -279,7 +289,7 @@ def coalesce_drop_nulls_after_first_non_null(
     a `Lit` is never null, so it is *always* the answer once reached and all behind it is dead code.
     Dropped arguments must be pure and must not be the sole carrier of the result type: dropping the
     `NULL::double` from `coalesce(int_col, NULL::double)` would narrow DOUBLE to INT."""
-    return _rewrite_node(node, _coalesce_drop_unreachable)
+    return _rewrite_typed(node, _coalesce_drop_unreachable, carries=(Coalesce, Lit))
 
 
 def _coalesce_single(expr: Expr) -> Expr:
