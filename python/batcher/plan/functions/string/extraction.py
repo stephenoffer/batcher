@@ -1,139 +1,39 @@
-"""String-building free functions (`concat`, `concat_ws`, `format_string`).
+"""Pulling structure back out of a model's prose-wrapped output.
 
-All three lower to existing IR — the `concat` binary op (SQL ``||``), `array` +
-`list.join`, and casts — so they add public surface without touching the engine.
-Null handling matches DuckDB: `concat`/`concat_ws` treat NULL as absent (the
-differential oracle), not null-propagating like the raw ``||`` operator.
+A generation is a string, and a string is not a column anyone can filter, join, or grade. Each
+function here recovers one fragment a model wraps its answer in — a JSON object, a fenced code
+block, an ``<answer>`` tag, a multiple-choice letter, a LaTeX box, a citation marker — and each
+degrades to an empty value rather than an error when the fragment is absent, so one malformed
+generation cannot abort a scan over millions of rows.
+
+They are thin wrappers over the `.str` regex primitives, which means the contract worth knowing
+is the *pattern*: what it matches, and what it quietly does not. Each says so in its own
+documentation. The engine's regex engine has no lookahead or backreferences, so a pattern that
+would need one is composed from list operations instead.
 """
 
 from __future__ import annotations
 
 import re
 
-from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir.core import Binary, Coalesce, Expr, IntoExpr, Lit, _wrap
-from batcher.plan.expr_ir.nodes import Array, ListJoin
+from batcher.plan.expr_ir.core import Expr
 
 __all__ = [
-    "concat",
-    "concat_ws",
     "extract_after",
     "extract_between",
+    "extract_boxed",
     "extract_choice",
+    "extract_citations",
     "extract_code_block",
     "extract_first_number",
     "extract_json",
     "extract_json_array",
+    "extract_last_number",
     "extract_reasoning",
     "extract_tag",
-    "format_string",
     "is_refusal",
     "strip_reasoning",
 ]
-
-
-def concat(*exprs: IntoExpr) -> Expr:
-    """Concatenate values into one string (DuckDB/Spark ``concat``).
-
-    Each argument is cast to text; NULLs are treated as the empty string (DuckDB
-    semantics), so ``concat("a", lit(None), "b")`` is ``"ab"`` — unlike the raw
-    ``a || b`` operator, which propagates NULL. Requires at least one argument.
-
-    Args:
-        exprs: The values to concatenate, cast to text (nulls treated as empty).
-
-    Returns:
-        A string expression joining every argument.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": ["x", "y"], "b": ["1", "2"]})
-            >>> ds.select(c=bt.concat(bt.col("a"), bt.col("b"))).to_pydict()
-            {'c': ['x1', 'y2']}
-    """
-    if not exprs:
-        raise PlanError("concat() requires at least one argument")
-    # NULL → '' so a null contributes nothing (DuckDB concat, not `||`).
-    parts = [Coalesce([_wrap(e).cast("string"), Lit("")]) for e in exprs]
-    result = parts[0]
-    for part in parts[1:]:
-        result = Binary("concat", result, part)
-    return result
-
-
-def concat_ws(separator: str, *exprs: IntoExpr) -> Expr:
-    """Concatenate values with `separator` between them (DuckDB/Spark ``concat_ws``).
-
-    NULL arguments are skipped entirely — no doubled separator — matching DuckDB:
-    ``concat_ws(",", "a", lit(None), "b")`` is ``"a,b"``. Each argument is cast to
-    text. Requires at least one value argument.
-
-    Args:
-        separator: The text inserted between adjacent non-null values.
-        exprs: The values to concatenate, cast to text (nulls skipped).
-
-    Returns:
-        A string expression joining the arguments with ``separator``.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": ["x", "y"], "b": ["1", "2"]})
-            >>> ds.select(c=bt.concat_ws("-", bt.col("a"), bt.col("b"))).to_pydict()
-            {'c': ['x-1', 'y-2']}
-    """
-    if not exprs:
-        raise PlanError("concat_ws() requires at least one value argument")
-    # array(...).list.join skips nulls, which is exactly concat_ws's contract.
-    # `list.join` of an all-null (non-empty) list is NULL, but DuckDB `concat_ws`
-    # returns the empty string when every value argument is NULL — coalesce to "".
-    elements = [_wrap(e).cast("string") for e in exprs]
-    return Coalesce([ListJoin(Array(elements), separator), Lit("")])
-
-
-def format_string(format: str, *exprs: IntoExpr) -> Expr:
-    """Interpolate values into a template with ``{}`` placeholders (Polars ``format``).
-
-    ``format_string("{} = {}", col("k"), col("v"))`` yields ``"k = v"`` per row. The
-    number of ``{}`` placeholders must equal the number of arguments. Values are cast
-    to text with the same NULL-as-empty rule as :func:`concat`. The placeholder is the
-    literal two-character ``{}`` (no printf width/precision — keep formatting in SQL).
-
-    Args:
-        format: The template string with one ``{}`` per value argument.
-        exprs: The values to interpolate, cast to text (nulls treated as empty).
-
-    Returns:
-        A string expression with each ``{}`` replaced by its argument.
-
-    Raises:
-        PlanError: If the number of ``{}`` placeholders differs from the argument count.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> ds = bt.from_pydict({"a": ["x", "y"], "b": ["1", "2"]})
-            >>> ds.select(c=bt.format_string("{}={}", bt.col("a"), bt.col("b"))).to_pydict()
-            {'c': ['x=1', 'y=2']}
-    """
-    chunks = format.split("{}")
-    if len(chunks) - 1 != len(exprs):
-        raise PlanError(
-            f"format_string: {len(exprs)} argument(s) but {len(chunks) - 1} '{{}}' placeholder(s)"
-        )
-    parts: list[IntoExpr] = []
-    for i, chunk in enumerate(chunks):
-        if chunk:
-            parts.append(Lit(chunk))
-        if i < len(exprs):
-            parts.append(exprs[i])
-    if not parts:
-        return Lit("")
-    return concat(*parts)
 
 
 def _text(value: str | Expr) -> Expr:
@@ -424,3 +324,90 @@ def extract_choice(text: str | Expr) -> Expr:
             ['B', 'C']
     """
     return _text(text).str.regexp_extract(r"\b([A-H])\b", 1)
+
+
+def extract_boxed(text: str | Expr) -> Expr:
+    r"""The contents of the first LaTeX ``\boxed{...}`` in a text column.
+
+    Math benchmarks such as MATH ask the model to put its final answer in a ``\boxed{}`` and the
+    grader reads only that. `boxed_answer_rate` reports how often the model complied; this is
+    the answer itself, as a column to compare against the gold one.
+
+    Extraction stops at the first closing brace, so a box containing nested braces (a fraction,
+    a matrix) comes back truncated. That is a real limit of a non-recursive match rather than a
+    choice — check for a trailing unbalanced brace before trusting a structured answer.
+
+    Args:
+        text: The generated-text column.
+
+    Returns:
+        A string expression of the boxed answer, or an empty string where there is none.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"o": ["so the answer is \\boxed{42}.", "no box here"]})
+            >>> ds.select(a=bt.extract_boxed("o")).to_pydict()["a"]
+            ['42', '']
+    """
+    return extract_between(text, "\\boxed{", "}")
+
+
+def extract_last_number(text: str | Expr) -> Expr:
+    """The last number in a text column, parsed to a float — the reasoning-chain answer.
+
+    The companion to `extract_first_number`, and usually the one a math or arithmetic
+    evaluation wants. A model that reasons before answering emits its intermediate quantities
+    first, so the first number is a step and the last is the conclusion: "12 apples, minus 4,
+    leaves 8" grades on the 8, and `extract_first_number` would grade it on the 12.
+
+    Thousands separators are not understood — ``1,234`` reads as ``234`` — so strip them first
+    on a corpus that has them. A row with no number becomes null rather than erroring.
+
+    Args:
+        text: The generated-text column.
+
+    Returns:
+        A Float64 expression of the last number, or null where none is present.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"o": ["12 apples minus 4 leaves 8", "no digits"]})
+            >>> ds.select(n=bt.extract_last_number("o")).to_pydict()["n"]
+            [8.0, None]
+    """
+    # Every match, then the last one: the engine's regex has no lookahead, and a "last
+    # occurrence" pattern needs one. `regexp_extract_all` walks the string once either way.
+    numbers = _text(text).str.regexp_extract_all(r"-?\d+\.?\d*", 0)
+    return numbers.list.last().try_cast("float64")
+
+
+def extract_citations(text: str | Expr) -> Expr:
+    """Every bracketed citation marker in a text column, as a list of numbers.
+
+    A grounded answer cites its sources as ``[1]``, ``[2]``. `citation_rate` reports how often
+    the model cited anything; this is *which* sources it cited, which is what you need to check
+    them: join the list against the retrieved passages to find a citation pointing at a passage
+    that was never retrieved, the most common form of a fabricated reference.
+
+    Markers repeat naturally when a source is cited more than once, and they are returned as
+    they appear — deduplicate with `list.unique` when counting distinct sources.
+
+    Args:
+        text: The generated-text column.
+
+    Returns:
+        A List<Utf8> expression of the citation numbers, empty where there are none.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"o": ["Paris [1] is the capital [2][1]."]})
+            >>> ds.select(c=bt.extract_citations("o")).to_pydict()["c"]
+            [['1', '2', '1']]
+    """
+    return _text(text).str.regexp_extract_all(r"\[(\d+)\]", 1)
