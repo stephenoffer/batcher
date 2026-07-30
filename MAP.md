@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 992 Python modules across 153 packages and 183 Rust files across 13 crates.
+Covering 992 Python modules across 153 packages and 184 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -751,7 +751,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 183 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `aggregate.py` | 218 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `dispatch.py` | 157 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 237 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 135 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
@@ -1287,9 +1287,9 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 | `backend.py` | 161 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 135 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 173 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
-| `exprs.py` | 334 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
+| `exprs.py` | 338 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 124 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
-| `scalar_fns.py` | 266 | The named scalar-function families: math, two-argument math, strings, and dates. |
+| `scalar_fns.py` | 304 | The named scalar-function families: math, two-argument math, strings, and dates. |
 | `windows.py` | 385 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 
 ### `batcher/core/streaming/` — 3 · subsystem
@@ -2073,7 +2073,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
 | `flight.rs` | 590 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `lib.rs` | 721 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `hardware.rs` | 193 | What the engine's own process knows about its hardware and its allocator. |
+| `lib.rs` | 725 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 90 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 85 | Process-wide singletons the FFI layer shares across calls. |
@@ -2224,7 +2225,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/list_ops/list_set.rs` | 175 | Set operations between two `List` columns for `Expr::ListSet` (`array_intersect`/`array_except`/`array_union`). |
 | `eval/list_ops/list_zip.rs` | 75 | Element-wise arithmetic between two numeric `List` columns for `Expr::ListZip` (`list_add`/`list_subtract`/`list_multiply`) — the embedding-math primitive. |
 | `eval/list_ops/mod.rs` | 24 | Extended `List`-column operations beyond the per-row reductions in `eval/list.rs`: set operations between two lists (`intersect`/`except`/`union`) and the higher-order `transform`/`filter` over an element sub-expression, and the SimHash LSH signature of an embedding, and the input coercion plus numeric inner loop the vector-distance kernels share. |
-| `eval/list_ops/multiset.rs` | 83 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
+| `eval/list_ops/multiset.rs` | 80 | `list.multiset_overlap` — the clipped multiset intersection size of two lists. |
 | `eval/list_ops/simhash.rs` | 143 | `simhash`: a random-hyperplane LSH signature of an embedding → `List<Int64>` of bits. |
 | `eval/map.rs` | 194 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 475 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
@@ -2271,7 +2272,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `hash.rs` | 307 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 240 | The host's instruction-set capabilities, in full. |
 | `lib.rs` | 232 | `bc-arrow` — Arrow building blocks shared across the engine. |
-| `placement.rs` | 153 | Which CPU a worker thread should run on. |
+| `placement.rs` | 152 | Which CPU a worker thread should run on. |
 | `row_sort.rs` | 118 | A stable multi-column sort permutation over the Arrow row format. |
 | `topology.rs` | 561 | The machine's memory and core topology, as the data plane needs to see it. |
 

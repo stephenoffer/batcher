@@ -44,7 +44,7 @@ and everything else a datacenter schedules on was unavailable to the control pla
 
 ## What landed
 
-Nineteen new modules, 4,167 lines, 158 public functions, classes, and properties:
+Nineteen new modules, 4,521 lines, 165 public functions, classes, and properties:
 
 | Layer | Module | What it answers |
 |---|---|---|
@@ -67,8 +67,27 @@ Integration points, where the new facts change an existing decision:
 - `ml/llm/sizing.py::kv_cache_concurrency` sizes inference by cache rather than weights.
 - `ml/devices.py::device_feed_advice` separates a starved pipeline from a saturated device.
 - `_internal/accelerators.py` now reads device memory from the one table rather than a second.
+- `core/gpu_transform.py::gpu_groupby_agg` is bracketed by the stage meter, which is what
+  makes the measurement path load-bearing rather than documentation: it is the one point
+  every GPU relational stage passes through, local dispatch and Ray worker alike.
+- `api/session/accelerators.py::measure_energy` folds each *measured* stage into the hub on
+  the way out, which is the conductor's half of the learning loop.
 
-Coverage: 13 test modules, 190 tests, none requiring a GPU or the compiled engine. The
+The learning loop, closed the way the architecture describes it: Core measures the stage, the
+conductor folds it into the `MetadataHub`, and Kyber's `select_device_class` prefers the device
+this fleet measured best over the one the datasheet rates highest. Three refusals keep it from
+being worse than no loop — a modelled figure is never learned from (it is the datasheet
+restated), an under-sampled bucket reads as unmeasured rather than as slow, and a partially
+measured fleet falls back to the datasheet ordering entirely rather than ranking a measured
+device against an unmeasured one.
+
+Device names are resolved rather than matched: NVML reports `"NVIDIA H100 80GB HBM3"`, the
+driver reports `"NVIDIA A100-SXM4-80GB"`, Ray reports a label, and none of them is a table key.
+`resolve_device_name` anchors on the part token, which is what stops an H100 resolving to an
+A100 through their shared `80G` — a 2x error in bandwidth, power, and tensor rate that nothing
+downstream could have caught.
+
+Coverage: 14 test modules, 220 tests, none requiring a GPU or the compiled engine. The
 properties they pin are the conservative directions — unknown devices, absent telemetry,
 unlabelled fleets, unregistered datasets — because those are the paths that fail silently.
 `tests/integration/test_gpu_datacenter_loop.py` covers what the unit tests cannot: that the
@@ -92,9 +111,10 @@ Named explicitly, because the absence of each is a real limit and not an oversig
   tokens-per-joule, or power claim appears anywhere in the tree. The benchmark script
   (`benchmarks/gpu_backend/energy_efficiency.py`) exists to produce those numbers on a real
   fleet; its results belong in `benchmarks/BENCHMARK_RESULTS.md` with the hardware named.
-- **No learned energy statistics.** Kyber consumes device figures but does not yet record
-  measured tokens-per-joule across runs the way it records cardinalities. The `EnergyLedger` is
-  the shape that would feed it.
+- **The learned loop is per device model, not per workload shape.** Efficiency is bucketed by
+  device and by work kind; two very different pipelines on the same device share a bucket and
+  average toward each other. Keying by plan signature as the cardinality learner does is the
+  obvious next step.
 - **No admission-path integration for power.** `validate_fleet_power` returns a verdict, but
   `CarboniteManager.validate` still budgets memory only: the physical plan does not carry the
   device model and count a power check needs, and adding that is a contract change.

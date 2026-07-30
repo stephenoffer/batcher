@@ -193,6 +193,25 @@ re-optimization), `execution.fuse_linear=False` (pins the operator-at-a-time pat
 escape hatch, not a tuning knob), `optimizer.plan_cache_entries=0` (disables plan
 memoization, use when a query is right on first run and wrong after).
 
+## F. A GPU stage is slow, and the plan looks right
+
+On an accelerator fleet the usual suspects are not in the plan at all. Four of them produce
+*no error* — the query returns the right rows, slower — so they are invisible unless you look:
+
+| Symptom | Check | Cause |
+|---|---|---|
+| One stage far slower than an identical earlier run | `bt.accelerators()` -> `devices[].throttled` | The driver is clamping a device: thermal (cooling has failed) or power (your own cap doing its job). A clamped device is derated, not removed. |
+| Wrong numbers from an otherwise deterministic stage | `devices[].ecc_uncorrected` | Uncorrectable ECC: a tensor read back is not the tensor written. Enable `accelerator.health` and the device is quarantined. |
+| Devices idle, stage wall-clock long | `batcher.ml.devices.device_feed_advice()` | The pipeline is starving them. The lever is upstream (prefetch, batch size, fewer devices), not a faster kernel. |
+| Fan-out smaller than the cluster's GPU count | `accelerator.energy.power_budget_watts` | Carbonite clamped the grant to what the budget can power. `carbonite.accel.validate_fleet_power` reports the counter-offer. |
+| A multi-device collective slower than expected | the `dist` log line naming `world_size` and `widest_domain` | The collective is wider than any NVLink domain the fleet has, so its all-reduce left the fast path. |
+| A stage queueing on an apparently idle fleet | `fabric.residency_report(...)` | A residency rule narrowed the fleet to one region's nodes. The report gives the before/after device counts. |
+
+`bt.measure_energy()` around the pipeline plus `observe.format_energy_report` turns most of
+this into one table: per-stage joules, utilization, the idle share, and whether each figure was
+measured or modelled. An idle share above roughly a third means the fleet is under-fed, which
+is a pipeline problem wearing a hardware costume.
+
 ## If the bug is in the engine
 
 Land the **regression test first, and watch it fail** — the differential/matrix case or
@@ -210,3 +229,5 @@ layer: `add-relational-operator`, `add-expression-or-function`,
 - `docs/user-guide/troubleshooting.md`, `docs/user-guide/explain-plans.md`
 - `docs/internals/carbonite.md` — spill, credits, admission
 - `optimize-a-slow-query` — when the query is correct but slow
+- `docs/user-guide/gpu-fleets.md` — the power, fabric, health, and residency controls behind
+  section F, and how to turn each on
