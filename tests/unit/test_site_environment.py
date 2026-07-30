@@ -406,3 +406,48 @@ def test_an_unscheduled_process_says_nothing(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         readiness.warn_once_if_allocation_is_wider_than_ray()
     assert caplog.text == ""
+
+
+def test_the_file_cache_can_be_enabled_once_for_a_fleet(monkeypatch, tmp_path):
+    # The right cache directory is a per-node fact — `/ephemeral` on one provider,
+    # `/mnt/local_disk` on the next — so a literal path in a shared config is the wrong one
+    # everywhere but the machine it was written for.
+    from batcher.io._file_cache import FILE_CACHE_AUTO, resolve_cache_dir
+
+    volume = tmp_path / "ephemeral"
+    volume.mkdir()
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: str(volume))
+    resolved = resolve_cache_dir(FILE_CACHE_AUTO)
+    assert resolved == str(volume / "batcher_file_cache")
+    # An explicit path is used as written, and nothing configured stays off.
+    assert resolve_cache_dir("/named/dir") == "/named/dir"
+    assert resolve_cache_dir(None) is None
+    assert resolve_cache_dir("") is None
+
+
+def test_a_node_with_no_fast_disk_resolves_auto_to_no_cache(monkeypatch):
+    # Caching onto the container overlay would compete for the disk the read it is caching
+    # would otherwise never touch.
+    from batcher.io._file_cache import FILE_CACHE_AUTO, resolve_cache_dir
+
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    assert resolve_cache_dir(FILE_CACHE_AUTO) is None
+
+
+def test_auto_and_its_resolved_path_are_one_cache(monkeypatch, tmp_path):
+    # Keyed on the resolved path, so the two spellings do not produce two caches over the
+    # same files — which would double the disk and halve the hit rate.
+    from batcher.config import Config, config_context
+    from batcher.io import _file_cache
+
+    volume = tmp_path / "nvme"
+    volume.mkdir()
+    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: str(volume))
+    monkeypatch.setattr(_file_cache, "_CACHES", {})
+    with config_context(Config.from_dict({"memory": {"file_cache_dir": "auto"}})):
+        first = _file_cache.get_file_cache()
+    resolved = str(volume / "batcher_file_cache")
+    with config_context(Config.from_dict({"memory": {"file_cache_dir": resolved}})):
+        second = _file_cache.get_file_cache()
+    assert first is not None
+    assert first is second

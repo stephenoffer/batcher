@@ -342,6 +342,13 @@ class MemoryConfig:
     # remote files there, byte-bounded to `file_cache_max_bytes` with LRU eviction. It
     # only accelerates re-reads of the same remote file — transparent, ephemeral, and
     # result-invariant (a cache miss just re-fetches). Local paths are never cached.
+    #
+    # `"auto"` puts it on whatever fast local disk each node has, which is the only way to
+    # enable it once for a fleet: the right directory is a per-node fact (`/ephemeral` on one
+    # provider, `/mnt/local_disk` on the next), so a literal path in a shared config is the
+    # wrong one everywhere but the machine it was written for. A node with no fast local disk
+    # resolves `"auto"` to no cache at all rather than competing for the container overlay
+    # that the read it is caching would otherwise never touch.
     file_cache_dir: str | None = None
     file_cache_max_bytes: int = 8 << 30  # 8 GiB budget (used only when enabled)
     # Cap on one streaming operator's in-memory state (windowed-aggregate partials,
