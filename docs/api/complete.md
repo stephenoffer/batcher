@@ -431,6 +431,9 @@ for what each one does and when to change it.
 .. autoclass:: batcher.config.DeviceHealthConfig
    :members:
 
+.. autoclass:: batcher.config.DeviceMemoryConfig
+   :members:
+
 .. autoclass:: batcher.GovernanceConfig
    :members:
 

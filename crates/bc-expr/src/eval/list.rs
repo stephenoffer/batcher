@@ -410,6 +410,14 @@ pub(crate) fn eval_list_binary(
         return crate::eval::list_ops::jaccard_str::jaccard_utf8(la, ra);
     }
 
+    // `MultisetOverlap` compares elements for *equality* over a bag, not position by
+    // position, and its natural element type is a string n-gram. It takes the same exit
+    // as the string `jaccard` above, before the Float64 cast that would null out every
+    // non-numeric element.
+    if matches!(func, ListBinaryFunc::MultisetOverlap) {
+        return crate::eval::list_ops::eval_multiset_overlap(la, ra);
+    }
+
     // Embeddings are overwhelmingly `f32`; keeping them at native width halves the bytes
     // the inner loop streams. Accumulation is `f64` either way, so the two paths agree
     // bit-for-bit (`accumulate_pair`'s tests pin this).
@@ -491,6 +499,8 @@ pub(crate) fn eval_list_binary(
                     b.append_value(s.dot / denom);
                 }
             }
+            // Returned above, before the numeric cast.
+            ListBinaryFunc::MultisetOverlap => unreachable!("routed to eval_multiset_overlap"),
         }
     }
     Ok(Arc::new(b.finish()))

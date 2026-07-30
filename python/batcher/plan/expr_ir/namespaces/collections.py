@@ -1413,6 +1413,35 @@ class _ListNamespace:
         """
         return ListBinary("jaccard", self._e, _wrap(other))
 
+    def multiset_overlap(self, other: Any) -> ListBinary:
+        """How many of this list's elements `other` accounts for, counting repeats (→ Float64).
+
+        The clipped multiset intersection size ``Σ min(count_here(v), count_there(v))``. It
+        differs from ``set_intersection(other).len()`` in exactly one way, and that way is the
+        point: a value repeated four times here against one occurrence there contributes 1,
+        not 4. That clip is how BLEU's modified n-gram precision refuses to reward a
+        degenerate ``the the the the``, and it is ROUGE-N's numerator read from the other
+        side. Pair it with :meth:`~batcher.Expr.str.token_ngrams` to score generated text.
+
+        Order does not matter and the lists need not be the same length. Null if either list
+        is null; a null element matches nothing.
+
+        Args:
+            other: The other list column to account for this one's elements.
+
+        Returns:
+            A new Float64 expression: the clipped overlap count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [["the", "the", "cat"]], "b": [["the", "cat"]]})
+                >>> ds.select(o=bt.col("a").list.multiset_overlap(bt.col("b"))).to_pydict()
+                {'o': [2.0]}
+        """
+        return ListBinary("multiset_overlap", self._e, _wrap(other))
+
     def cosine_similarity(self, other: Any) -> ListBinary:
         """Cosine similarity with another vector column, in ``[-1, 1]`` (→ Float64).
 

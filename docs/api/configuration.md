@@ -50,6 +50,7 @@ The section dataclasses are exported so you can construct one and slot it into
 | `AcceleratorConfig` | GPU placement, VRAM headroom, MIG preference, and KV-cache sizing |
 | `EnergyConfig` | the site's power budget, energy price, grid carbon intensity, and PUE |
 | `DeviceHealthConfig` | when a device is derated or taken out of rotation |
+| `DeviceMemoryConfig` | the device allocator, its pool sizing, and host spilling |
 
 ### Config.replace
 

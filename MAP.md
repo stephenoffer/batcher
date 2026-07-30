@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 992 Python modules across 153 packages and 184 Rust files across 13 crates.
+Covering 992 Python modules across 153 packages and 185 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -344,7 +344,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 400 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 429 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 432 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 434 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -2271,7 +2271,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `hardware.rs` | 190 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 307 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 240 | The host's instruction-set capabilities, in full. |
-| `lib.rs` | 232 | `bc-arrow` — Arrow building blocks shared across the engine. |
+| `lib.rs` | 234 | `bc-arrow` — Arrow building blocks shared across the engine. |
+| `page_cache.rs` | 126 | Telling the kernel how a spill file is about to be used. |
 | `placement.rs` | 152 | Which CPU a worker thread should run on. |
 | `row_sort.rs` | 118 | A stable multi-column sort permutation over the Arrow row format. |
 | `topology.rs` | 561 | The machine's memory and core topology, as the data plane needs to see it. |

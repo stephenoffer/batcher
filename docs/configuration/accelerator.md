@@ -54,6 +54,36 @@ print(cfg.accelerator.energy.power_budget_watts)
 # 10000.0
 ```
 
+## Device memory
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `allocator` | `"default"` | Allocator strategy: `default`, `pool`, `async`, or `managed`. |
+| `pool_initial_fraction` | `0.5` | Fraction of reservable device memory the pool takes at startup. |
+| `pool_max_fraction` | `1.0` | Fraction of reservable device memory the pool may grow to. |
+| `spill_to_host` | `False` | Move columns to host memory instead of failing when the device fills. |
+| `statistics` | `False` | Track allocation counts and the device high-water mark. |
+
+These fields are the {py:class}`DeviceMemoryConfig <batcher.config.DeviceMemoryConfig>`
+dataclass. The default allocator pays a synchronizing device allocation for every intermediate
+column, so a chain of many small operators spends most of its time in the driver. A pool pays
+that cost once and suballocates, which is the largest constant-factor lever on this page.
+Reserving more up front trades a longer first allocation for no growth pauses later.
+
+`spill_to_host` turns a class of hard out-of-memory failure into a slowdown, which is what
+makes a shard that misjudged its size survivable. It is off by default so an over-large query
+is loud rather than quietly slow.
+
+```python
+from batcher import Config
+from batcher.config import AcceleratorConfig, DeviceMemoryConfig
+
+memory = DeviceMemoryConfig(allocator="pool", pool_initial_fraction=0.7, spill_to_host=True)
+cfg = Config().replace(accelerator=AcceleratorConfig(memory=memory))
+print(cfg.accelerator.memory.allocator)
+# pool
+```
+
 ## Device health
 
 | Field | Default | Meaning |

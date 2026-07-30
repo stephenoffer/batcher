@@ -15,7 +15,7 @@ from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.functions.collection import element
 
-__all__ = ["char_ngrams", "mean_ratio", "normalize", "tokens"]
+__all__ = ["char_ngrams", "mean_ratio", "normalize", "token_ngrams", "tokens"]
 
 
 def normalize(text: Expr) -> Expr:
@@ -37,6 +37,21 @@ def tokens(text: Expr) -> Expr:
     genuinely empty so `mean_ratio`'s zero-denominator guard fires.
     """
     return normalize(text).str.split(" ").list.filter(element() != lit(""))
+
+
+def token_ngrams(text: Expr, n: int) -> Expr:
+    """The word n-grams of a SQuAD-normalized text column, as a list of joined strings.
+
+    The word-level sibling of `char_ngrams`, and it normalizes the same way `tokens` does —
+    lowercased, articles and punctuation dropped — so every word-level metric in this package
+    agrees on what a token is. That is a deliberate departure from the reference BLEU
+    implementations, which n-gram the text exactly as tokenized; the functions built on this
+    say so in their own documentation.
+
+    A row with fewer than `n` tokens still yields one n-gram of everything it has, so a short
+    reference is scored rather than silently skipped.
+    """
+    return normalize(text).str.token_ngrams(n)
 
 
 def char_ngrams(text: Expr, n: int) -> Expr:

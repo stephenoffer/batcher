@@ -432,6 +432,15 @@ pub enum ListBinaryFunc {
     /// `minhash` signatures this is the standard unbiased estimator of the documents'
     /// Jaccard similarity; over arbitrary lists it is simply the agreement rate.
     Jaccard,
+    /// The clipped multiset intersection size `Σ_v min(count_left(v), count_right(v))` —
+    /// how many of the left list's elements the right can account for, **counting
+    /// repeats**. Unlike `array_intersect(...).len()` a value repeated four times on the
+    /// left and once on the right contributes 1, not 4. That clip is the definition of
+    /// BLEU's modified n-gram precision and of ROUGE-N's numerator, and it is what stops a
+    /// degenerate `the the the the` from scoring a perfect unigram precision. Order-free
+    /// and type-general (n-gram strings, token ids); a null row on either side → null, a
+    /// null element matches nothing.
+    MultisetOverlap,
 }
 
 /// Two-argument math functions (→ Float64).

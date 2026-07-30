@@ -3389,6 +3389,49 @@ class _StrNamespace:
         # `pattern` carries the boundary mode, which is otherwise unused by `chunk`.
         return StrFunc("chunk", self._e, pattern=boundary, start=overlap, length=size)
 
+    def token_ngrams(self, n: int) -> StrFunc:
+        """Every window of `n` adjacent whitespace tokens, joined by a space → List<Utf8>.
+
+        The token-level counterpart of :meth:`chunk`'s character windows, and the unit the
+        generation metrics are defined on: BLEU compares n-gram bags, ROUGE-N counts how
+        many reference n-grams the output reproduced, and distinct-n measures how many of
+        an output's n-grams are unique. Pair it with
+        :meth:`~batcher.Expr.list.multiset_overlap` to score two texts against each other,
+        or with :meth:`~batcher.Expr.list.n_unique` to score one against itself.
+
+        Tokens are split on whitespace with no normalization, so casing and punctuation
+        survive — normalize first (`str.lower`, `str.remove_punctuation`) when the metric
+        should ignore them. A text with fewer than `n` tokens yields the single n-gram of
+        all of them rather than an empty list, so a short document still contributes.
+        An empty or whitespace-only string yields an empty list; null yields null.
+
+        Args:
+            n: Tokens per n-gram. Must be at least 1.
+
+        Returns:
+            A List<Utf8> expression, one element per n-gram window.
+
+        Raises:
+            PlanError: If `n` is less than 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["the cat sat down"]})
+                >>> ds.select(g=bt.col("t").str.token_ngrams(2)).to_pydict()
+                {'g': [['the cat', 'cat sat', 'sat down']]}
+
+                >>> # Fewer tokens than `n` still yields one gram.
+                >>> bt.from_pydict({"t": ["hi"]}).select(
+                ...     g=bt.col("t").str.token_ngrams(3)
+                ... ).to_pydict()
+                {'g': [['hi']]}
+        """
+        n = require_int(n, func="str.token_ngrams", arg="n", minimum=1)
+        # `length` carries `n`, the same reuse of the scalar slot `chunk`/`repeat` make.
+        return StrFunc("token_ngrams", self._e, length=n)
+
     def compress(self, codec: str) -> StrFunc:
         """Compress each value's raw bytes with `codec` (→ Binary).
 

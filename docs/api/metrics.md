@@ -123,6 +123,24 @@ they score languages without spaces such as Chinese or Japanese:
    char_ngram_jaccard
 ```
 
+The clipped word n-gram metrics count repeats rather than sets, which is what BLEU and ROUGE-N
+are defined on. Each caps an n-gram at the number of times the reference contains it, so a
+generation that loops on one correct phrase cannot score a perfect precision:
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   ngram_precision
+   ngram_recall
+   ngram_f1
+   brevity_penalty
+   bleu
+   distinct_ngram_ratio
+   ngram_novelty
+```
+
 The embedding metrics score fixed-width vector columns for retrieval quality and drift:
 
 ```{eval-rst}
@@ -363,8 +381,7 @@ Descriptive and inferential statistics as aggregates. See the
 
 ## See also
 
-:::{seealso}
 - {doc}`../ml/evaluation`: the guide to scoring a model with these.
 - {doc}`ml-models`: the table-returning metrics and the in-engine estimators.
 - {doc}`ml-statistics`: drift comparisons and cross-validated scoring.
-:::
+- {doc}`../cookbook/metrics/index`: 14 runnable recipes computing these metrics as aggregates.

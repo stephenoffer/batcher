@@ -69,6 +69,7 @@ class ListBinaryFn(StrEnum):
     L1_DISTANCE = "l1_distance"
     HAMMING = "hamming"
     JACCARD = "jaccard"
+    MULTISET_OVERLAP = "multiset_overlap"
 
 
 class ListSetFn(StrEnum):
@@ -121,7 +122,8 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "regexp_replace", "regexp_replace_all", "regexp_split", "repeat", "replace",
         "reverse",
         "right", "rpad", "sha1", "sha256", "soundex", "split", "split_part",
-        "starts_with", "strip_html", "substr", "substring_index", "to_case", "translate",
+        "starts_with", "strip_html", "substr", "substring_index", "to_case",
+        "token_ngrams", "translate",
         "trim", "unhex", "upper", "xxhash64",
         "from_binary", "hamming", "jaccard_similarity", "parse_dirname", "parse_dirpath",
         "parse_filename", "parse_path", "regexp_escape", "to_binary", "url_decode",

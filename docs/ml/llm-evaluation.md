@@ -53,6 +53,72 @@ print(cjk.agg(chrf=bt.char_ngram_f1("pred", "gold", n=2)).to_pydict())
 # {'chrf': [0.5]}
 ```
 
+### Counting repeats: the BLEU and ROUGE-N scores
+
+The set metrics above ask which words two texts share. They cannot see repetition, and that
+blind spot has a cost: a model stuck emitting `cat cat cat cat` shares the word `cat` with
+its reference, so a set precision reads a perfect 1.0.
+
+The clipped metrics count occurrences instead, capping each n-gram at the number of times the
+reference actually contains it. `bt.ngram_precision` is BLEU's per-order term,
+`bt.ngram_recall` is ROUGE-N, and `bt.ngram_f1` balances the two. Pass `n` to choose the
+order: unigrams measure content coverage, and higher orders measure whether the wording
+survived.
+
+```python
+degenerate = bt.from_pydict({"answer": ["cat cat cat cat"], "gold": ["cat sat down"]})
+print(degenerate.agg(clipped=bt.ngram_precision("answer", "gold")).to_pydict())
+# {'clipped': [0.25]}
+```
+
+`bt.bleu` combines the orders: the geometric mean of the clipped precisions for `1..max_n`,
+multiplied by `bt.brevity_penalty`, which is what stops a one-word answer from scoring
+perfectly on precision alone. It is unsmoothed, so an example sharing no 4-gram scores zero.
+Lower `max_n` for short-answer tasks rather than reading a column of zeros.
+
+```python
+summaries = bt.from_pydict(
+    {"answer": ["the quick brown fox jumps"], "gold": ["the quick brown fox jumps"]}
+)
+print(summaries.agg(bleu=bt.bleu("answer", "gold")).to_pydict())
+# {'bleu': [1.0]}
+```
+
+Two more read the generation against itself or its source. `bt.distinct_ngram_ratio` is the
+phrase-level diversity score, which catches a model looping on a sentence long before
+`bt.distinct_token_ratio` moves. `bt.ngram_novelty` is the copying check: at `n=4` or higher,
+a value near zero means the output is reproducing its retrieved context verbatim rather than
+writing from it.
+
+```python
+rag = bt.from_pydict(
+    {
+        "answer": ["the quick brown fox jumps"],
+        "context": ["the quick brown fox jumps over the lazy dog"],
+    }
+)
+print(rag.agg(novel=bt.ngram_novelty("answer", "context")).to_pydict())
+# {'novel': [0.0]}
+```
+
+All of these tokenize with the same SQuAD normalization the token-set metrics use, so the
+numbers are comparable across this page. That is not what a reference BLEU implementation
+does, so use them to rank runs against each other rather than to publish against a paper.
+
+The two primitives underneath are on the expression accessors, for a score this page does not
+already spell. `str.token_ngrams(n)` turns a text column into its list of n-grams, and
+`list.multiset_overlap` counts how many of one list's elements another can account for,
+capping each at the number of times it appears. Divide the second by a length to build any
+clipped-overlap score you need:
+
+```python
+grams = bt.from_pydict({"answer": ["cat sat on the mat"], "gold": ["cat sat on a mat"]})
+pred = bt.col("answer").str.token_ngrams(2)
+gold = bt.col("gold").str.token_ngrams(2)
+print(grams.select(shared=pred.list.multiset_overlap(gold), total=pred.list.len()).to_pydict())
+# {'shared': [2.0], 'total': [4]}
+```
+
 ## Scoring generations without a reference
 
 Most generations arrive with no gold answer to compare against, and the questions you still want
@@ -164,8 +230,6 @@ For language, `bt.cjk_rate`, `bt.cyrillic_rate`, and `bt.arabic_rate` flag unexp
 
 ## See also
 
-:::{seealso}
 - {doc}`llm`: running the generation being scored.
 - {doc}`llm-outputs`: turning generations into the typed columns these metrics read.
 - {doc}`evaluation`: the model-evaluation metrics for classification and regression.
-:::

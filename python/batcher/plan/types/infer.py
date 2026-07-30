@@ -439,6 +439,8 @@ def _strfunc_type(fn: str) -> pa.DataType | None:
         return pa.list_(pa.int64())  # the signature: one value per permutation
     if fn == "chunk":
         return pa.list_(pa.string())
+    if fn == "token_ngrams":
+        return pa.list_(pa.string())  # one joined n-gram per window
     if fn == "split":
         return pa.list_(pa.string())
     if fn == "regexp_extract_all":
