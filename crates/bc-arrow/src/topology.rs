@@ -17,7 +17,7 @@
 //! Linux-only in substance (`/sys/devices/system/cpu`, `/sys/devices/system/node`). Every
 //! probe has a defined answer elsewhere — the conservative one that reproduces the behavior
 //! the engine had before this module existed: one NUMA node, no SMT, and the
-//! [`DEFAULT_*`](DEFAULT_CACHE_LINE) cache estimates.
+//! `DEFAULT_*` cache estimates.
 
 use std::sync::OnceLock;
 
@@ -141,15 +141,6 @@ impl CpuTopology {
         self.numa_nodes > 1
     }
 
-    /// Last-level cache bytes each running thread can expect to keep, given the fan-out.
-    ///
-    /// The LLC is shared, so `threads` concurrent operators each get roughly their share of
-    /// it. A blocking decision made against the *whole* L3 is wrong by the thread count on
-    /// exactly the machines where blocking matters most. Never returns 0.
-    pub fn llc_share_bytes(&self, threads: usize) -> usize {
-        (self.l3_bytes / threads.clamp(1, self.logical_cores.max(1))).max(1 << 10)
-    }
-
     /// How many rows of `row_bytes` fit in the working half of a cache level.
     ///
     /// The single place the engine turns "this cache is N bytes" into "so process M rows at a
@@ -169,35 +160,6 @@ impl CpuTopology {
         self.rows_in(self.l2_bytes, row_bytes)
     }
 
-    /// Radix bits (fan-out `1 << bits`) that keep one partition of `total_rows` × `row_bytes`
-    /// resident in L2.
-    ///
-    /// Radix partitioning trades passes for residency: too few bits and each partition still
-    /// misses cache; too many and the *output* buffers (one cache line per partition, live
-    /// simultaneously) blow out the TLB and L1. The result is therefore clamped to
-    /// `[MIN_RADIX_BITS, MAX_RADIX_BITS]`, whose upper end is where the write-buffer working
-    /// set (`fanout × cache_line`) reaches L1.
-    pub fn radix_bits(&self, total_rows: usize, row_bytes: usize) -> u32 {
-        let target = self.l2_resident_rows(row_bytes).max(1);
-        let mut bits = MIN_RADIX_BITS;
-        while bits < self.max_radix_bits() && (total_rows >> bits) > target {
-            bits += 1;
-        }
-        bits
-    }
-
-    /// The largest radix fan-out whose per-partition write buffers still fit in L1d.
-    ///
-    /// One open output buffer per partition costs a cache line; once `fanout × line` exceeds
-    /// L1d, every scattered write is a miss and adding bits makes partitioning slower, not
-    /// faster. This is the hardware fact behind the "don't exceed ~8 radix bits" rule of
-    /// thumb, computed instead of assumed.
-    pub fn max_radix_bits(&self) -> u32 {
-        let buffers = (self.l1d_bytes / self.cache_line.max(1)).max(2);
-        let bits = buffers.ilog2();
-        bits.clamp(MIN_RADIX_BITS, MAX_RADIX_BITS)
-    }
-
     /// Threads to run for work that saturates execution units rather than stalling on memory.
     ///
     /// Compute-bound kernels get the physical core count; the SMT sibling of a saturated core
@@ -207,14 +169,6 @@ impl CpuTopology {
         self.physical_cores.max(1)
     }
 }
-
-/// Radix fan-out floor: below 4 bits (16 partitions) the partitioning pass costs more than
-/// the locality it buys back.
-pub const MIN_RADIX_BITS: u32 = 4;
-
-/// Radix fan-out ceiling. 12 bits is 4096 partitions; beyond that the partition *metadata*
-/// alone leaves L2 regardless of the buffer arithmetic, and TLB pressure dominates.
-pub const MAX_RADIX_BITS: u32 = 12;
 
 /// Parse a Linux CPU list (`"0-3,8,10-11"`) into an ascending, deduplicated id vector.
 ///
@@ -483,50 +437,6 @@ fn detect_raw() -> CpuTopology {
 }
 
 // ---------------------------------------------------------------------------
-// Cache-line padding
-// ---------------------------------------------------------------------------
-
-/// A value pushed onto its own cache line so neighbouring elements cannot false-share it.
-///
-/// The canonical use is a per-thread accumulator array: `Vec<u64>` of partial sums has eight
-/// counters per 64 B line, so eight threads incrementing "their own" counter serialize on one
-/// line's coherency traffic. Wrapping the element in `CachePadded` removes that entirely, at
-/// the cost of one line per element.
-///
-/// The alignment is a fixed 128 B rather than the detected line size — `repr(align)` needs a
-/// compile-time constant, and 128 also covers the adjacent-line prefetcher on x86_64 (which
-/// pulls line pairs) and Apple silicon's 128 B lines. Over-padding wastes bytes; under-padding
-/// silently reintroduces the contention this exists to remove.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[repr(align(128))]
-pub struct CachePadded<T>(pub T);
-
-impl<T> std::ops::Deref for CachePadded<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-impl<T> std::ops::DerefMut for CachePadded<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
-}
-
-impl<T> CachePadded<T> {
-    /// Wrap a value on its own cache line.
-    pub fn new(v: T) -> Self {
-        Self(v)
-    }
-
-    /// Unwrap, dropping the padding.
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Prefetch
 // ---------------------------------------------------------------------------
 
@@ -553,37 +463,6 @@ pub fn prefetch_read<T>(addr: *const T) {
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = addr;
-    }
-}
-
-/// Prefetch into L2 rather than L1 — for data needed soon but not next.
-///
-/// Used when the prefetch distance is long enough that an L1 fill would be evicted before the
-/// use: pulling to L2 still removes the memory round trip without thrashing L1.
-#[inline(always)]
-pub fn prefetch_read_l2<T>(addr: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SAFETY: as `prefetch_read` — a non-faulting hint instruction.
-        unsafe {
-            core::arch::x86_64::_mm_prefetch(addr as *const i8, core::arch::x86_64::_MM_HINT_T1);
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = addr;
-    }
-}
-
-/// Prefetch the element `distance` slots ahead of `i`, if it exists.
-///
-/// The loop-shaped wrapper over [`prefetch_read`], so a hot loop reads as one call rather than
-/// a bounds check and a pointer cast at every site. Out-of-range indices are skipped, which is
-/// what makes it safe to call unconditionally at the end of every iteration.
-#[inline(always)]
-pub fn prefetch_slice_ahead<T>(slice: &[T], i: usize, distance: usize) {
-    if let Some(v) = slice.get(i + distance) {
-        prefetch_read(v as *const T);
     }
 }
 
@@ -655,64 +534,6 @@ mod tests {
         );
         // Half of a 512 KiB L2 at 8 B/row is 32768 rows.
         assert_eq!(narrow, (DEFAULT_L2_BYTES / 2) / 8);
-    }
-
-    #[test]
-    fn radix_bits_grow_with_input_and_stay_in_range() {
-        let t = CpuTopology::default();
-        let small = t.radix_bits(1 << 10, 8);
-        let big = t.radix_bits(1 << 30, 8);
-        assert_eq!(small, MIN_RADIX_BITS, "a tiny input needs no extra passes");
-        assert!(big > small, "a larger input must partition more finely");
-        assert!(big <= t.max_radix_bits());
-        assert!((MIN_RADIX_BITS..=MAX_RADIX_BITS).contains(&t.max_radix_bits()));
-    }
-
-    #[test]
-    fn radix_bits_are_monotone_in_input_size() {
-        // Monotonicity is the property the caller relies on: doubling the input may add a bit
-        // but must never take one away, or a `combine` would re-partition more coarsely as it
-        // accumulated more data.
-        let t = CpuTopology::default();
-        let mut prev = 0;
-        for shift in 10..34 {
-            let bits = t.radix_bits(1usize << shift, 16);
-            assert!(bits >= prev, "bits went backwards at 2^{shift}");
-            prev = bits;
-        }
-    }
-
-    #[test]
-    fn max_radix_bits_tracks_l1_and_line_size() {
-        // 32 KiB L1d / 64 B lines = 512 buffers = 9 bits.
-        let t = CpuTopology {
-            l1d_bytes: 32 << 10,
-            cache_line: 64,
-            ..CpuTopology::default()
-        };
-        assert_eq!(t.max_radix_bits(), 9);
-        // A tiny L1 must still clamp up to the floor rather than producing a 1-bit fan-out.
-        let tiny = CpuTopology {
-            l1d_bytes: 128,
-            cache_line: 64,
-            ..CpuTopology::default()
-        };
-        assert_eq!(tiny.max_radix_bits(), MIN_RADIX_BITS);
-    }
-
-    #[test]
-    fn llc_share_divides_by_the_thread_count() {
-        let t = CpuTopology {
-            l3_bytes: 32 << 20,
-            logical_cores: 16,
-            physical_cores: 8,
-            ..CpuTopology::default()
-        };
-        assert_eq!(t.llc_share_bytes(1), 32 << 20);
-        assert_eq!(t.llc_share_bytes(8), 4 << 20);
-        // Asking for more threads than cores clamps rather than shrinking without bound.
-        assert_eq!(t.llc_share_bytes(1024), t.llc_share_bytes(16));
-        assert_eq!(t.llc_share_bytes(0), t.llc_share_bytes(1));
     }
 
     #[test]
@@ -804,32 +625,11 @@ mod tests {
     }
 
     #[test]
-    fn cache_padding_puts_each_element_on_its_own_line() {
-        assert_eq!(std::mem::align_of::<CachePadded<u64>>(), 128);
-        assert_eq!(std::mem::size_of::<CachePadded<u64>>(), 128);
-        let v = vec![CachePadded::new(0u64); 4];
-        let a = &v[0] as *const _ as usize;
-        let b = &v[1] as *const _ as usize;
-        assert_eq!(b - a, 128, "adjacent counters must not share a line");
-    }
-
-    #[test]
-    fn cache_padded_derefs_to_the_value() {
-        let mut c = CachePadded::new(7u64);
-        assert_eq!(*c, 7);
-        *c += 1;
-        assert_eq!(c.into_inner(), 8);
-    }
-
-    #[test]
     fn prefetch_is_a_no_op_on_any_address() {
         // The contract is that a prefetch never faults and never changes state. Exercising it
         // on a live slice, past its end, and on a null pointer is what pins that.
         let v = [1u64, 2, 3, 4];
         prefetch_read(v.as_ptr());
-        prefetch_read_l2(v.as_ptr());
-        prefetch_slice_ahead(&v, 0, 2);
-        prefetch_slice_ahead(&v, 3, 8); // out of range: skipped
         prefetch_read(std::ptr::null::<u64>());
         assert_eq!(v[0], 1, "a prefetch must not modify the data");
     }

@@ -112,11 +112,6 @@ impl IsaFeatures {
         }
     }
 
-    /// f64 lanes in the widest usable vector.
-    pub fn f64_lanes(&self) -> usize {
-        (self.vector_bytes() / 8).max(1)
-    }
-
     /// Whether 512-bit code is likely to be a win rather than a clock-frequency loss.
     ///
     /// A **heuristic**, not a capability bit — see the module docs. `avx512vpopcntdq` is used
@@ -126,15 +121,6 @@ impl IsaFeatures {
     /// host", never as "the engine should widen automatically".
     pub fn avx512_is_cheap(&self) -> bool {
         self.avx512f && self.avx512vpopcntdq
-    }
-
-    /// Whether AVX-512's mask registers are usable at 128/256-bit width.
-    ///
-    /// This is the combination worth having on a Skylake-derived part: `avx512vl` gives
-    /// predicated 256-bit code — masked loads, compress-store — without entering the 512-bit
-    /// license domain that costs the clock.
-    pub fn masked_256(&self) -> bool {
-        self.avx512f && self.avx512vl
     }
 
     /// A short, stable label for the widest ISA family available, for logs and telemetry.
@@ -281,7 +267,6 @@ mod tests {
         let f = IsaFeatures::detect();
         let bytes = f.vector_bytes();
         assert!(bytes.is_power_of_two() && (8..=64).contains(&bytes));
-        assert_eq!(f.f64_lanes(), bytes / 8);
         if f.avx512f {
             assert_eq!(bytes, 64);
         } else if f.avx2 {
@@ -298,7 +283,6 @@ mod tests {
             ..IsaFeatures::default()
         };
         assert_eq!(avx512.vector_bytes(), 64);
-        assert_eq!(avx512.f64_lanes(), 8);
         assert_eq!(avx512.tier(), "avx512");
 
         let avx2 = IsaFeatures {
@@ -307,29 +291,13 @@ mod tests {
             ..IsaFeatures::default()
         };
         assert_eq!(avx2.vector_bytes(), 32);
-        assert_eq!(avx2.f64_lanes(), 4);
         assert_eq!(avx2.tier(), "avx2");
 
         let neon = IsaFeatures {
             neon: true,
             ..IsaFeatures::default()
         };
-        assert_eq!(neon.f64_lanes(), 2);
-    }
-
-    #[test]
-    fn masked_256_needs_both_foundation_and_vl() {
-        let vl = IsaFeatures {
-            avx512f: true,
-            avx512vl: true,
-            ..IsaFeatures::default()
-        };
-        assert!(vl.masked_256());
-        let no_vl = IsaFeatures {
-            avx512f: true,
-            ..IsaFeatures::default()
-        };
-        assert!(!no_vl.masked_256());
+        assert_eq!(neon.vector_bytes(), 16);
     }
 
     #[test]

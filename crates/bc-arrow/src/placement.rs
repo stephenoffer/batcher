@@ -86,15 +86,6 @@ pub fn pinning_order() -> Vec<usize> {
     order
 }
 
-/// The CPU id for worker `idx`, or `None` when the topology is unreadable.
-///
-/// The one-call form of [`pinning_order`] for a caller that pins a single thread. Prefer
-/// hoisting the order out of a loop when pinning a whole pool — this recomputes it.
-pub fn cpu_for_worker(idx: usize) -> Option<usize> {
-    let order = pinning_order();
-    (!order.is_empty()).then(|| order[idx % order.len()])
-}
-
 /// Physical cores as groups of usable sibling CPU ids, each group ascending, groups ordered by
 /// their lowest CPU id.
 ///
@@ -230,21 +221,6 @@ mod tests {
             node_of(order[1]),
             "on a multi-node host, two workers must not both land on node {}",
             node_of(order[0])
-        );
-    }
-
-    #[test]
-    fn worker_lookup_wraps_and_matches_the_order() {
-        let order = pinning_order();
-        if order.is_empty() {
-            assert_eq!(cpu_for_worker(0), None);
-            return;
-        }
-        assert_eq!(cpu_for_worker(0), Some(order[0]));
-        assert_eq!(cpu_for_worker(order.len()), Some(order[0]));
-        assert_eq!(
-            cpu_for_worker(order.len() * 3 + 1),
-            Some(order[1 % order.len()])
         );
     }
 

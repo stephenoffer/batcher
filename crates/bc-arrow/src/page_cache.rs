@@ -14,6 +14,11 @@
 //! those pages instead of leaving a spilled multi-gigabyte file resident in page cache — which
 //! matters precisely when it is worst, since the engine only spilled because memory was tight.
 //!
+//! Those two are what the spill paths actually call, and they are all this module offers.
+//! `posix_fadvise` has other hints (`RANDOM`, `WILLNEED`) and `posix_fallocate` would suit a
+//! spill writer that knew its run size, but nothing here needs them yet and an unused wrapper
+//! is a wrapper nobody has measured.
+//!
 //! Every function here is **advisory and best-effort**: a failure means the hint was not taken,
 //! never that the read or write is wrong. They are no-ops on non-Linux targets, where the
 //! equivalents are either absent or spelled differently enough not to be worth a shim.
@@ -38,40 +43,6 @@ pub fn advise_sequential(file: &std::fs::File) {
     }
 }
 
-/// Tell the kernel this file will be read in a scattered order, so readahead is wasted work.
-///
-/// The counterpart to [`advise_sequential`], for a spill file probed by row index rather than
-/// scanned. Readahead on a random pattern is not neutral: it fetches pages that are then
-/// evicted unread, spending both bandwidth and cache the actual reads wanted.
-#[cfg(target_os = "linux")]
-pub fn advise_random(file: &std::fs::File) {
-    // SAFETY: as `advise_sequential` — an advisory call over a live descriptor.
-    unsafe {
-        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
-    }
-}
-
-/// Start pulling `len` bytes from `offset` into page cache now, without waiting.
-///
-/// Use it when the next read is known well before it happens — a merge that has just decided
-/// which run it will draw from next, or a partition list where the following partition's file
-/// is already identified. `len == 0` means "to the end of the file".
-///
-/// Asynchronous: it queues the I/O and returns, so it hides latency rather than adding it.
-#[cfg(target_os = "linux")]
-pub fn advise_willneed(file: &std::fs::File, offset: u64, len: u64) {
-    // SAFETY: as `advise_sequential`. An offset or length past the end of the file is
-    // defined behavior for `posix_fadvise` — the kernel clamps to the file size.
-    unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            offset as libc::off_t,
-            len as libc::off_t,
-            libc::POSIX_FADV_WILLNEED,
-        );
-    }
-}
-
 /// Drop this file's pages from page cache.
 ///
 /// Call it when a spill file has been fully consumed. The engine spilled because memory was
@@ -91,38 +62,10 @@ pub fn advise_dontneed(file: &std::fs::File) {
     }
 }
 
-/// Reserve `len` bytes of disk for this file up front.
-///
-/// A spill writer that grows a file by appending makes the filesystem allocate extents
-/// incrementally, which fragments the run and turns the later sequential read into a seek per
-/// extent. Reserving the whole run in one call gives the allocator a chance to place it
-/// contiguously, and surfaces an out-of-space condition at reserve time rather than halfway
-/// through writing a hash table.
-///
-/// Best-effort: on a filesystem without `fallocate` support this simply does nothing, and the
-/// write proceeds exactly as it did before.
-#[cfg(target_os = "linux")]
-pub fn preallocate(file: &std::fs::File, len: u64) {
-    if len == 0 {
-        return;
-    }
-    // SAFETY: `posix_fallocate` takes a live descriptor and a byte range. It only reserves
-    // blocks; it does not move the file offset or change any bytes the engine reads back.
-    unsafe {
-        libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t);
-    }
-}
-
 #[cfg(not(target_os = "linux"))]
 pub fn advise_sequential(_file: &std::fs::File) {}
 #[cfg(not(target_os = "linux"))]
-pub fn advise_random(_file: &std::fs::File) {}
-#[cfg(not(target_os = "linux"))]
-pub fn advise_willneed(_file: &std::fs::File, _offset: u64, _len: u64) {}
-#[cfg(not(target_os = "linux"))]
 pub fn advise_dontneed(_file: &std::fs::File) {}
-#[cfg(not(target_os = "linux"))]
-pub fn preallocate(_file: &std::fs::File, _len: u64) {}
 
 #[cfg(test)]
 mod tests {
@@ -177,7 +120,6 @@ mod tests {
         let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
         let (_dir, mut f) = temp_file_with(&payload);
         advise_sequential(&f);
-        advise_willneed(&f, 0, 0);
         let mut got = Vec::new();
         f.read_to_end(&mut got).unwrap();
         assert_eq!(got, payload);
@@ -188,12 +130,6 @@ mod tests {
         let mut again = Vec::new();
         f.read_to_end(&mut again).unwrap();
         assert_eq!(again, payload);
-
-        advise_random(&f);
-        f.rewind().unwrap();
-        let mut third = Vec::new();
-        f.read_to_end(&mut third).unwrap();
-        assert_eq!(third, payload);
     }
 
     #[test]
@@ -202,41 +138,7 @@ mod tests {
         // then finished empty. Every hint must tolerate it.
         let (_dir, f) = temp_file_with(&[]);
         advise_sequential(&f);
-        advise_random(&f);
         advise_dontneed(&f);
-        advise_willneed(&f, 0, 0);
-        // Past the end of an empty file: the kernel clamps rather than erroring.
-        advise_willneed(&f, 4096, 4096);
         assert_eq!(f.metadata().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn preallocate_reserves_without_changing_the_visible_length() {
-        // `posix_fallocate` reserves blocks *and* extends the file length — which is why a
-        // spill writer must preallocate before writing, never after. This pins that the
-        // reserved region reads back as zeros rather than as garbage.
-        let dir = tempdir::Dir::new();
-        let path = dir.path().join("run.arrow");
-        let f = std::fs::File::create(&path).unwrap();
-        preallocate(&f, 1 << 16);
-        let len = f.metadata().unwrap().len();
-        // On a filesystem without fallocate support the call is a no-op and the file stays
-        // empty; either outcome is correct, but nothing in between is.
-        assert!(len == 0 || len == 1 << 16, "unexpected length {len}");
-        if len > 0 {
-            let mut buf = Vec::new();
-            std::fs::File::open(&path)
-                .unwrap()
-                .read_to_end(&mut buf)
-                .unwrap();
-            assert!(
-                buf.iter().all(|b| *b == 0),
-                "reserved space must read as zeros"
-            );
-        }
-        // A zero-length reservation is the "unknown size" case and must do nothing at all.
-        let f2 = std::fs::File::create(dir.path().join("empty.arrow")).unwrap();
-        preallocate(&f2, 0);
-        assert_eq!(f2.metadata().unwrap().len(), 0);
     }
 }
