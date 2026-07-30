@@ -167,6 +167,11 @@ _IMAGE_REFUTED = [
     (lambda: col("i").sign() == 5, "sign(i) = 5"),
     (lambda: col("s").str.to_uppercase() == "ab", "upper(s) = 'ab'"),
     (lambda: col("s").str.to_lowercase() == "AB", "lower(s) = 'AB'"),
+    # The counting functions and the two lower-bounded float ones.
+    (lambda: col("s").str.len_bytes() < 0, "strlen(s) < 0"),
+    (lambda: col("s").str.count_matches("a") == -1, "length(regexp_extract_all(s, 'a')) = -1"),
+    (lambda: col("i").abs().sqrt() < 0, "sqrt(abs(i)) < 0"),
+    (lambda: col("i").exp() < 0, "exp(i) < 0"),
 ]
 
 #: The boundary values themselves, which the engine really does return — so these must keep
@@ -189,6 +194,11 @@ _IMAGE_SATISFIABLE = [
     (lambda: col("s").str.to_uppercase() == "AB", "upper(s) = 'AB'"),
     (lambda: col("s").str.to_lowercase() == "ab", "lower(s) = 'ab'"),
     (lambda: col("ts").dt.month() != 13, "extract(month FROM ts) <> 13"),
+    (lambda: col("s").str.len_bytes() == 0, "strlen(s) = 0"),
+    (lambda: col("s").str.count_matches("a") == 0, "length(regexp_extract_all(s, 'a')) = 0"),
+    # `sqrt(0)` is `0`, and `exp` reaches zero by underflow — both inclusive bounds are
+    # reachable, so neither of these may be refuted.
+    (lambda: col("i").abs().sqrt() == 0, "sqrt(abs(i)) = 0"),
 ]
 
 

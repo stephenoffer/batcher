@@ -199,13 +199,21 @@ def _never_true(conjunct: Expr, schema: SchemaRef | None) -> bool:
 #: been. Ranges verified against the engine rather than assumed, which is why `day_of_week`
 #: reads 0-6 (Sunday = 0) while `isodow` reads 1-7 (Monday = 1) — the two conventions live
 #: side by side here, and guessing either would have made the rule wrong at one end.
+#:
+#: **No float function carries an upper bound here, and that is deliberate.** `sin`/`cos` look
+#: like obvious entries at `[-1, 1]`, and the upper half would be wrong: `sin(NaN)` is NaN, and
+#: the engine's total order places a NaN *above* every finite value, so `sin(x) > 1` is TRUE on a
+#: NaN row rather than impossible. Refuting it would drop that row. Every float entry below is
+#: therefore lower-bounded only — a direction NaN cannot violate, since a NaN is never *below*
+#: anything. The integer-valued entries (the calendar parts, the lengths) have no NaN to worry
+#: about, which is what lets them bound both ends.
 _IMAGE: dict[tuple[type, str], tuple[float | None, float | None]] = {}
 
 
 def _register_images() -> None:
     """Populate `_IMAGE`, keyed by `(Expr type, function name)`."""
     from batcher.plan.expr_ir.core import MathExpr
-    from batcher.plan.expr_ir.func_nodes import DateFunc, StrFunc
+    from batcher.plan.expr_ir.func_nodes import DateFunc, ListFunc, StrFunc
 
     calendar = {
         "month": (1, 12),
@@ -222,14 +230,26 @@ def _register_images() -> None:
     }
     for name, bounds in calendar.items():
         _IMAGE[(DateFunc, name)] = bounds
-    # A length is a count of characters, so it is never negative and has no upper bound.
-    _IMAGE[(StrFunc, "len")] = (0, None)
+    # Every counting function: a length or an occurrence count is never negative and has no
+    # upper bound. `len` is the character length, `octet_length` the byte length, and
+    # `regexp_count` the number of matches; a `ListFunc` `len` counts elements.
+    for name in ("len", "octet_length", "regexp_count"):
+        _IMAGE[(StrFunc, name)] = (0, None)
+    _IMAGE[(ListFunc, "len")] = (0, None)
     # `abs` is non-negative for every input the engine has: integer `abs` *saturates* rather
     # than wrapping (`abs(INT64_MIN)` answers `INT64_MAX`), and `abs(NaN)` is NaN, which the
     # engine's total order places above every finite value — so above zero either way.
     _IMAGE[(MathExpr, "abs")] = (0, None)
-    # `sign` answers -1, 0, or 1 — including 0 for a NaN, which is why the interval holds.
+    # `sign` answers -1, 0, or 1 — including 0 for a **NaN**, so it never returns one and the
+    # upper bound is safe here in a way it would not be for a trig function.
     _IMAGE[(MathExpr, "sign")] = (-1, 1)
+    # `sqrt` answers NaN for a negative input (again, above every finite value) and `-0.0` for
+    # `-0.0`, which equals `0.0` — so nothing it returns is below zero. Measured, because the
+    # signed zero is exactly where a guess would go wrong.
+    _IMAGE[(MathExpr, "sqrt")] = (0, None)
+    # `exp` is mathematically positive and *reaches* zero by underflow (`exp(-1e300)` is `0.0`),
+    # so the bound is the inclusive zero rather than an exclusive one.
+    _IMAGE[(MathExpr, "exp")] = (0, None)
 
 
 _register_images()

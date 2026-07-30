@@ -31,6 +31,7 @@ def _plan(pred):
             "j": [7, 8, 9],
             "f": [1.0, 2.0, 3.0],
             "s": ["ab", "cd", "ef"],
+            "lst": [[1, 2], [3], []],
             "ts": [dt.datetime(2024, 1, 1), dt.datetime(2024, 6, 15), dt.datetime(2024, 12, 31)],
         }
     )
@@ -268,6 +269,14 @@ def _image_empties(pred) -> bool:
         col("s").str.to_uppercase() == "ab",  # an uppercased string has no ASCII lowercase
         col("s").str.to_uppercase() == "Ab",  # one offending character is enough
         col("s").str.to_lowercase() == "AB",
+        # Every counting function: a length or a match count is never negative.
+        col("s").str.len_bytes() < 0,
+        col("s").str.count_matches("a") == -1,
+        col("lst").list.len() < 0,
+        col("lst").list.len() == -1,
+        # The two float functions whose *lower* bound is safe against NaN.
+        col("f").sqrt() < 0,
+        col("f").exp() < 0,
     ],
 )
 def test_value_outside_the_image_empties_the_filter(pred):
@@ -297,6 +306,17 @@ def test_value_outside_the_image_empties_the_filter(pred):
         col("s").str.to_uppercase() == "A1_",  # no letters to offend
         col("s").str.to_lowercase() == "ab",
         col("ts").dt.month() != 13,  # `<>` is true on every row, not refuted
+        col("lst").list.len() == 0,
+        col("lst").list.len() >= 0,
+        col("s").str.len_bytes() == 0,
+        col("s").str.count_matches("a") == 0,
+        # `sqrt(-0.0)` is `-0.0`, which equals `0.0`, so the inclusive bound is reachable.
+        col("f").sqrt() == 0,
+        # `exp` reaches zero by underflow, so the bound is inclusive rather than exclusive.
+        col("f").exp() == 0,
+        # No float function carries an *upper* bound, because `sin(NaN)` would break one.
+        col("f").sqrt() > 1e300,
+        col("f").exp() > 1e300,
     ],
 )
 def test_value_inside_the_image_is_left_alone(pred):
@@ -333,3 +353,25 @@ def test_image_refutation_empties_a_larger_conjunction():
 def test_image_refutation_does_not_fire_inside_a_disjunction():
     pred = (col("i") > 0) | (col("ts").dt.month() == 13)
     assert filter_function_range_contradiction(_plan(pred), None) is None
+
+
+def test_no_float_function_carries_an_upper_image_bound():
+    """A float upper bound would be unsound, and this states why mechanically.
+
+    `sin(x) <= 1` is true mathematically and false in the engine: `sin(NaN)` is NaN, which the
+    total order places *above* every finite value, so `sin(x) > 1` is TRUE on a NaN row rather
+    than impossible. Refuting it would drop that row. A *lower* bound has no such hazard, since
+    a NaN is never below anything — so every float entry must be lower-only, and this fails if
+    one ever grows an upper bound without that argument being revisited.
+    """
+    from batcher.kyber.rules.extra.predicate_impossible import _IMAGE
+    from batcher.plan.expr_ir.core import MathExpr
+
+    bounded_above = {
+        fn
+        for (node_type, fn), (_lo, hi) in _IMAGE.items()
+        if node_type is MathExpr and hi is not None
+    }
+    # `sign` is the one exception, and it is one because it never returns a NaN at all: the
+    # engine answers 0.0 for a NaN input, which the family's tests pin directly.
+    assert bounded_above == {"sign"}
