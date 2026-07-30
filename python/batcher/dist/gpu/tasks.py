@@ -72,11 +72,20 @@ def run_shard_chain(descriptor: dict, ops: list[dict], be: DfBackend):
     exactly as the translator it calls is. A task that can only be exercised on a GPU is a task
     nothing checks.
 
+    The device reads its own shard where it can (`device_read`), which skips a CPU Parquet
+    decode and a transfer across the bus; where it cannot, the host reader runs and the same
+    operator chain replays on the result. The two produce the same rows by construction — the
+    device path declines rather than approximating — so which one ran is a question of speed.
+
     Returns `None` for an empty shard, which the driver drops rather than concatenating an
     empty table of possibly-different schema into the partials.
     """
-    from batcher.core.gpu_plan.execute import run_chain
+    from batcher.core.gpu_plan.execute import run_chain, run_ops
+    from batcher.dist.gpu.device_read import read_descriptor_on_device
 
+    frame = read_descriptor_on_device(descriptor, be)
+    if frame is not None:
+        return be.to_arrow(run_ops(frame, ops, be)) if len(frame) else None
     table = _read(descriptor)
     return None if table is None else be.to_arrow(run_chain(table, ops, be))
 
