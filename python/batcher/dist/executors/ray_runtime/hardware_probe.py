@@ -239,7 +239,11 @@ def _device_health_on_this_worker() -> dict:
         misconfigured_devices,
         xid_readable,
     )
-    from batcher.carbonite.accel import assess_fleet, device_reset_candidates
+    from batcher.carbonite.accel import (
+        assess_fleet,
+        device_affinity_summary,
+        device_reset_candidates,
+    )
 
     verdicts = assess_fleet()
     return {
@@ -258,6 +262,10 @@ def _device_health_on_this_worker() -> dict:
         # operator reconciles a slow node against.
         "faulted": [f.uuid or f.index for f in faulted_devices()],
         "config_findings": sorted({f for m in misconfigured_devices() for f in m.findings}),
+        # How this worker's host half is placed against the device it feeds, and whether the
+        # device is its own. Both are per-worker facts the driver cannot see, and both explain
+        # a node that is slower than its identical neighbours without being faulty.
+        "affinity": device_affinity_summary(),
         "degraded_links": [link.address for link in degraded_device_links()],
         "nvlink": nvlink_summary(),
         "xid_readable": xid_readable(),

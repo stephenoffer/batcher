@@ -222,3 +222,30 @@ def test_an_unreadable_fleet_is_not_cached(monkeypatch):
     for _ in range(3):
         assert hardware_probe.cluster_device_health() == ()
     assert len(calls) == 3
+
+
+def test_the_worker_record_says_how_its_host_half_is_placed(monkeypatch):
+    # Per-worker facts the driver cannot see, and both explain a node slower than its
+    # identical neighbours without being faulty: which cores feed the device, and whether
+    # the device is this process's alone.
+    from batcher.carbonite.accel import HealthVerdict
+
+    monkeypatch.setattr(
+        "batcher.carbonite.accel.assess_fleet", lambda: (HealthVerdict(device_index=0),)
+    )
+    monkeypatch.setattr("batcher.carbonite.accel.device_reset_candidates", lambda: ())
+    monkeypatch.setattr("batcher._internal.hardware.fabric.degraded_device_links", lambda: ())
+    monkeypatch.setattr(
+        "batcher.carbonite.accel.device_affinity_summary",
+        lambda: {
+            "device_index": 3,
+            "numa_node": 1,
+            "local_cpus": 48,
+            "usable_cpus": 48,
+            "mps": True,
+            "device_share": 0.25,
+        },
+    )
+    record = hardware_probe._device_health_on_this_worker()
+    assert record["affinity"]["numa_node"] == 1
+    assert record["affinity"]["device_share"] == 0.25
