@@ -19,6 +19,7 @@ Gated behind the optional ``batcher-engine[serve]`` extra; importing this module
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -92,6 +93,15 @@ def serve_deployment(
             pool = getattr(self, "_pool", None)
             if pool is not None:
                 pool.shutdown(wait=False)
+            # The replica's model is the expensive thing it holds — a CUDA context, an HTTP
+            # session, a database handle — and a downscale or a reconfigure releases the
+            # replica without releasing them. Same optional `close()` contract the batch path
+            # honors in `teardown_udf` and `_close_workers`, and the same best-effort rule:
+            # a replica going away must not raise on the way out.
+            close = getattr(getattr(self, "_predict", None), "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
 
         async def __call__(self, request: Any) -> Any:
             return await self._batched(request)
