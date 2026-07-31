@@ -20,7 +20,49 @@ import dataclasses
 import os
 from typing import Any
 
-__all__ = ["init_batcher_ray", "init_ray", "strip_broken_runtime_env_hook", "with_timeout"]
+__all__ = [
+    "init_batcher_ray",
+    "init_ray",
+    "strip_broken_runtime_env_hook",
+    "with_timeout",
+    "worker_pip",
+]
+
+
+def _req_name(requirement: str) -> str:
+    """The distribution name a pip requirement string names, lowercased."""
+    for sep in ("=", "<", ">", "[", "!", "~", " "):
+        requirement = requirement.split(sep)[0]
+    return requirement.strip().lower()
+
+
+def worker_pip(extra: list[str] | None = None) -> list[str]:
+    """The pip set worker actors need: `extra`, plus the driver's own numpy.
+
+    Ray pickles a numpy array (and every dtype inside a `RecordBatch` handed to a UDF) by
+    module path, and numpy 2 moved `numpy.core` to `numpy._core`. A driver on numpy 2
+    against a cluster image on numpy 1 therefore kills **every** actor it starts with
+    `ModuleNotFoundError: No module named 'numpy._core.numeric'` — before any user code
+    runs, and identically for Batcher and for Ray Data, so a benchmark reports a timeout
+    and an `ActorDiedError` rather than a number. Pinning the workers to the driver's
+    version is the side that can be changed from here.
+
+    A caller pinning numpy itself (a cuDF build, say, whose wheel needs numpy 1) keeps its
+    own pin: that constraint is tighter than this one and the driver must match *it*.
+
+    Args:
+        extra: Requirements the caller needs on the workers.
+
+    Returns:
+        The pip requirement list to hand `runtime_env`.
+    """
+    import numpy
+
+    reqs = list(extra or [])
+    named = {_req_name(r) for r in reqs}
+    if "numpy" in named:
+        return reqs
+    return [f"numpy=={numpy.__version__}", *reqs]
 
 
 def strip_broken_runtime_env_hook() -> None:
@@ -42,24 +84,25 @@ def strip_broken_runtime_env_hook() -> None:
             os.environ.pop(var, None)
 
 
-def init_ray(*, env_vars: dict[str, str] | None = None) -> None:
+def init_ray(*, env_vars: dict[str, str] | None = None, pip: list[str] | None = None) -> None:
     """Attach to the running cluster *without* shipping the working-tree Batcher.
 
     For the scripts here that only drive Ray directly (no Batcher distributed path), so
-    they need no ``py_modules``. ``pip=None`` *neutralizes* the inherited workspace pip
-    set rather than requesting no packages — the cluster image already carries what
-    these need.
+    they need no ``py_modules``. The pip set replaces the inherited workspace one rather
+    than adding to it — the cluster image already carries torch and Ray — and always
+    carries the driver's numpy (see :func:`worker_pip`).
 
     Args:
         env_vars: Environment variables to propagate to worker actors. A driver-process
             ``os.environ`` does not otherwise reach a remote actor.
+        pip: Extra requirements the workers need (a cuDF build, say).
     """
     strip_broken_runtime_env_hook()
     import ray
 
     if ray.is_initialized():
         return
-    runtime_env: dict[str, Any] = {"pip": None}
+    runtime_env: dict[str, Any] = {"pip": worker_pip(pip)}
     if env_vars:
         runtime_env["env_vars"] = env_vars
     ray.init(
@@ -102,7 +145,7 @@ def init_batcher_ray(
         env_vars.setdefault("HF_HOME", os.environ.get("HF_HOME", hf_cache))
 
     pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    runtime_env = {"py_modules": [pkg], "pip": None, "env_vars": env_vars}
+    runtime_env = {"py_modules": [pkg], "pip": worker_pip(), "env_vars": env_vars}
 
     base = active_config()
     set_config(

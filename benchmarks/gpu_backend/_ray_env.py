@@ -17,7 +17,46 @@ from __future__ import annotations
 import os
 from typing import Any
 
-__all__ = ["init_ray", "strip_broken_runtime_env_hook"]
+__all__ = ["init_ray", "strip_broken_runtime_env_hook", "worker_pip"]
+
+
+def _req_name(requirement: str) -> str:
+    """The distribution name a pip requirement string names, lowercased."""
+    for sep in ("=", "<", ">", "[", "!", "~", " "):
+        requirement = requirement.split(sep)[0]
+    return requirement.strip().lower()
+
+
+def worker_pip(extra: Any = None) -> list[str]:
+    """The pip set worker actors need: `extra`, plus the driver's own numpy.
+
+    Ray pickles a numpy array (and every dtype inside a batch handed to a UDF) by module
+    path, and numpy 2 moved `numpy.core` to `numpy._core`. A driver on numpy 2 against a
+    cluster image on numpy 1 therefore kills **every** actor it starts with
+    `ModuleNotFoundError: No module named 'numpy._core.numeric'`, before any user code
+    runs — so a benchmark reports a timeout rather than a number. Pinning the workers to
+    the driver's version is the side that can be changed from here.
+
+    A caller pinning numpy itself (a cuDF wheel needing numpy 1) keeps its own pin: that
+    constraint is tighter, and the driver must then match *it*.
+
+    The twin of `cluster._ray_env.worker_pip`. These two bootstraps are deliberately
+    separate because each directory's scripts are run directly, putting only their own
+    directory on `sys.path`.
+
+    Args:
+        extra: Requirements the caller needs on the workers.
+
+    Returns:
+        The pip requirement list to hand `runtime_env`.
+    """
+    import numpy
+
+    reqs = list(extra or [])
+    named = {_req_name(r) for r in reqs}
+    if "numpy" in named:
+        return reqs
+    return [f"numpy=={numpy.__version__}", *reqs]
 
 
 def strip_broken_runtime_env_hook(*, unconditional: bool = False) -> None:
@@ -58,10 +97,8 @@ def init_ray(
     """Strip the broken hook, then attach to the running cluster if not already attached.
 
     Args:
-        pip: The runtime-env ``pip`` block. Defaults to ``None``, which *neutralizes*
-            the inherited workspace pip set rather than requesting no packages — the
-            cluster image already carries what these benchmarks need. Pass an explicit
-            list only when a script must install something job-wide.
+        pip: Extra requirements the workers need, job-wide. The driver's own numpy is
+            always added (see `worker_pip`); the cluster image carries the rest.
         env_vars: Environment variables to propagate to worker actors. A driver-process
             ``os.environ`` does not otherwise reach a remote actor.
         unconditional_hook_strip: Forwarded to `strip_broken_runtime_env_hook`.
@@ -71,7 +108,7 @@ def init_ray(
 
     if ray.is_initialized():
         return
-    runtime_env: dict[str, Any] = {"pip": pip}
+    runtime_env: dict[str, Any] = {"pip": worker_pip(pip)}
     if env_vars:
         runtime_env["env_vars"] = env_vars
     ray.init(
