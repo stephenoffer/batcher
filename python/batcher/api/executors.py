@@ -282,6 +282,7 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         actors_per_gpu_from_learned_vram,
         gpu_feedback_key,
         gpu_vram_gb,
+        load_gpu_actors_per_device,
         load_gpu_peak_vram,
         load_gpu_utilization,
         recommend_gpu_fraction,
@@ -327,7 +328,13 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         base_gpus = recommend_gpu_fraction(model_gb, vram)
     key = gpu_feedback_key(plan)
     util = load_gpu_utilization(hub, key)
-    num_gpus = recommend_num_gpus(util, base_gpus)
+    # The density that produced `util`, and the density VRAM allows: with both, the request
+    # is sized to land the device at the packing target instead of merely "not wasted". A
+    # stage measured at 78% on one actor per device is leaving a fifth of the GPU to its own
+    # UDF's CPU work, which only a second actor can fill.
+    density = load_gpu_actors_per_device(hub, key)
+    vram_cap = actors_per_gpu_from_learned_vram(load_gpu_peak_vram(hub, key))
+    num_gpus = recommend_num_gpus(util, base_gpus, density, vram_cap)
     # Refine packing from the MEASURED peak VRAM a prior run of this pipeline actually used,
     # not just the declared model size: if the model really consumed more VRAM than declared,
     # pack fewer actors per GPU (a larger num_gpus fraction) so it doesn't OOM. `max` means

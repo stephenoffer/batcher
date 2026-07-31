@@ -178,6 +178,36 @@ def _new_map_actor(plan0: LogicalPlan, opts: dict):
     return cls.remote(plan0)
 
 
+def _pool_key(plan0: LogicalPlan, opts: dict) -> tuple:
+    """The registry key for a resident pool: its pipeline **and its resource request**.
+
+    Keying on the pipeline alone makes two actors interchangeable when they are not. The
+    adaptive loop re-sizes `num_gpus` between runs, and a pool keyed only by UDF identity
+    then *grows* to the new replica count instead of being replaced — so four whole-GPU
+    actors from the previous run stay alive holding every device while the eight half-GPU
+    actors that replaced them wait for a GPU that will never come free. The query does not
+    fail; it hangs, with the cluster fully reserved and nothing running.
+    """
+    resources = tuple(sorted((k, repr(v)) for k, v in (opts or {}).items()))
+    return (_pipeline_signature(plan0), resources)
+
+
+def _evict_stale_configurations(key: tuple, registry: dict) -> None:
+    """Kill any pool for the same pipeline built against a *different* resource request.
+
+    Its actors cannot serve this run — they were placed against the old fraction — and they
+    hold exactly the devices the new pool needs, so leaving them warm is a deadlock rather
+    than a wasted reservation.
+    """
+    import ray
+
+    stale = [k for k in registry if k[0] == key[0] and k != key]
+    for k in stale:
+        for actor in registry.pop(k, []):
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+
+
 def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict) -> list:
     """The resident actor pool for `plan0` in `registry` (built once, reused after).
 
@@ -185,7 +215,8 @@ def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict
     registry lifetime (a query scope, or the whole session for the warm registry). A pool
     whose actors have died (preemption between reuses) is healed — dead actors are dropped
     and respawned to the requested size — so a session-warm pool survives node churn."""
-    sig = _pipeline_signature(plan0)
+    sig = _pool_key(plan0, opts)
+    _evict_stale_configurations(sig, registry)
     pool = registry.get(sig)
     pool = _healthy_actors(pool) if pool else []
     if len(pool) < max(1, size):
@@ -352,13 +383,7 @@ def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope):
 
 def _evict_scoped_pool(plan0, scope) -> None:
     """Drop (and kill) the resident pool for `plan0` from a `resident_inference_pools` scope."""
-    import ray
-
-    sig = _pipeline_signature(plan0)
-    for actor in scope.pop(sig, []):
-        with contextlib.suppress(Exception):
-            ray.kill(actor)
-    _unpin_pool_keys([sig])
+    _evict_pipeline_pools(plan0, scope)
 
 
 def _run_warm_pool(plan0, partitions, opts, lo, hi):
@@ -381,13 +406,25 @@ def _run_warm_pool(plan0, partitions, opts, lo, hi):
 
 def _evict_session_pool(plan0) -> None:
     """Drop (and kill) the session-warm pool for `plan0` — after a preemption or on demand."""
+    _evict_pipeline_pools(plan0, _SESSION_POOLS)
+
+
+def _evict_pipeline_pools(plan0, registry: dict) -> None:
+    """Kill every pool `registry` holds for `plan0`, whatever resource request built it.
+
+    A pipeline can have more than one entry, because the key carries the resource request
+    (`_pool_key`) — so an eviction that matched only one exact key would leave the other
+    configuration's actors alive holding their devices.
+    """
     import ray
 
     sig = _pipeline_signature(plan0)
-    for actor in _SESSION_POOLS.pop(sig, []):
-        with contextlib.suppress(Exception):
-            ray.kill(actor)
-    _unpin_pool_keys([sig])
+    keys = [k for k in list(registry) if k[0] == sig]
+    for key in keys:
+        for actor in registry.pop(key, []):
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+    _unpin_pool_keys(keys)
 
 
 def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
@@ -545,7 +582,7 @@ def _distributed_map(
             results, gpu_util, gpu_vram = _drive_actor_pool(
                 plan0, partitions, opts, lo, hi, recovery_policy()
             )
-        _record_gpu_feedback(hub, plan, gpu_util, gpu_vram)
+        _record_gpu_feedback(hub, plan, gpu_util, gpu_vram, _actors_per_device(hi, num_gpus))
     else:
         # Skew-aware adaptive CPU: each stateless task requests a CPU share sized to its
         # own partition's data (x the plan's compute weight) — fractional for a tiny
@@ -947,20 +984,45 @@ def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: in
 
 
 def _record_gpu_feedback(
-    hub, plan: LogicalPlan, gpu_util: float | None, gpu_vram: float | None = None
+    hub,
+    plan: LogicalPlan,
+    gpu_util: float | None,
+    gpu_vram: float | None = None,
+    actors_per_device: float | None = None,
 ) -> None:
-    """Persist the pipeline's observed GPU utilization *and* peak VRAM for next-run adaptation.
+    """Persist the pipeline's observed GPU utilization, peak VRAM, and packing density.
 
     Utilization adapts `num_gpus`; the peak VRAM fraction adapts how many inference actors
-    pack onto one device (`actors_per_gpu_from_learned_vram`). Both keyed by the pipeline's
+    pack onto one device (`actors_per_gpu_from_learned_vram`). `actors_per_device` is the
+    density that *produced* this utilization, without which the reading cannot be acted on:
+    78% means "add an actor" at one per device and "leave it alone" at two, and a loop that
+    cannot tell those apart alternates between them forever. All keyed by the pipeline's
     stable identity; best-effort (each recorder no-ops on `None`)."""
     if hub is None:
         return
-    from batcher.ml.gpu import gpu_feedback_key, record_gpu_peak_vram, record_gpu_utilization
+    from batcher.ml.gpu import (
+        gpu_feedback_key,
+        record_gpu_actors_per_device,
+        record_gpu_peak_vram,
+        record_gpu_utilization,
+    )
 
     key = gpu_feedback_key(plan)
     record_gpu_utilization(hub, key, gpu_util)
     record_gpu_peak_vram(hub, key, gpu_vram)
+    record_gpu_actors_per_device(hub, key, actors_per_device)
+
+
+def _actors_per_device(pool_size: int, num_gpus: float) -> float | None:
+    """How many actors of this pool shared one device, or `None` when it is not a GPU stage.
+
+    Derived from the *request*, not from a placement probe: an actor asking for `num_gpus`
+    of a device is one of `1 / num_gpus` that fit on it, and Ray honors that by construction.
+    A whole-GPU request is one actor per device.
+    """
+    if num_gpus <= 0 or pool_size <= 0:
+        return None
+    return max(1.0, 1.0 / num_gpus)
 
 
 def _gpu_options(

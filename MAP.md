@@ -163,7 +163,7 @@ The public, fluent, lazy, expression-first API surface.
 | module | lines | what it is |
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
-| `executors.py` | 404 | Execution strategies and their registry (the conductor's wiring). |
+| `executors.py` | 411 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 785 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
@@ -421,7 +421,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `feature_scores.py` | 268 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 331 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
 | `glm.py` | 344 | Generalized linear models fitted by iteratively reweighted least squares. |
-| `gpu.py` | 1357 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
+| `gpu.py` | 1438 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 500 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 374 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
@@ -732,7 +732,7 @@ Per-operator distributed executor implementations.
 | `aggregate.py` | 245 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 48 | Distributed DISTINCT — deduplicate across workers via the aggregate shuffle. |
 | `join.py` | 866 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
-| `map.py` | 1535 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 1597 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 329 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 544 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 216 | Distributed sort over a disk Arrow-IPC shuffle. |

@@ -20,6 +20,7 @@ pure.
 from __future__ import annotations
 
 import functools
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -46,6 +47,7 @@ __all__ = [
     "gpu_vram_gb",
     "inference_mode_call",
     "inference_vram_multiplier",
+    "load_gpu_actors_per_device",
     "load_gpu_peak_vram",
     "load_gpu_utilization",
     "max_actors_per_gpu",
@@ -54,6 +56,7 @@ __all__ = [
     "recommend_inflight_depth",
     "recommend_num_gpus",
     "recommend_quantization",
+    "record_gpu_actors_per_device",
     "record_gpu_peak_vram",
     "record_gpu_utilization",
     "resolve_num_workers",
@@ -223,6 +226,26 @@ _NAMESPACE = "ml.gpu"
 # more tasks onto a fraction of it; above the saturation mark, give it a whole GPU.
 _PACK_BELOW = 0.5
 _SATURATED_ABOVE = 0.9
+# The utilization an inference stage is packed *toward* once its actors-per-device is known.
+#
+# `_PACK_BELOW` is the older, cruder gate: it asks "is this device being wasted?" and 50% is
+# a defensible answer to that. But a stage that measures 78% is not being wasted and is still
+# leaving a fifth of the device idle, and no amount of re-measuring moves it — 78% is above
+# every threshold, so the loop declares success and stops. Measured on four T4s: one actor
+# per device held ResNet-50 at 78% and 2,576 img/s; a second actor per device, whose CPU
+# preprocessing interleaves with its neighbour's forward pass, reached **92% and 2,903
+# img/s**. The idle fifth was the UDF's own CPU work, which only another actor can fill.
+#
+# Deliberately below 1.0. Packing toward saturation would keep adding actors for the last
+# few percent, and each one costs VRAM, a CUDA context and SM time-slicing; the returns go
+# negative well before 100%. 0.9 is the point where one more actor stops paying, and it is
+# also what makes the loop a fixed point: a stage at 92% with two actors per device computes
+# `ceil(2 * 0.9 / 0.92) == 2` and stays there.
+_PACK_TOWARD = 0.9
+# Ceiling on utilization-driven packing. VRAM (`actors_per_gpu_from_learned_vram`) is the
+# other bound and the binding one for a large model; this one keeps a *cheap* model from
+# packing to a density where per-actor CUDA contexts cost more than the SMs they win.
+_MAX_ACTORS_PER_DEVICE = 8
 # Don't fragment a GPU finer than this (avoids requesting unschedulable slivers).
 # Raised back from 0.25: the old value silently CAPPED packing at 4 actors/GPU, so a
 # 0.1 GB embedding model that VRAM-fits 36 actors on an 80 GB card still got 4 and
@@ -871,17 +894,50 @@ def recommend_inference_dtype(backend: str | None = None) -> str | None:
     return None
 
 
-def recommend_num_gpus(util_fraction: float | None, requested: float) -> float:
+def recommend_num_gpus(
+    util_fraction: float | None,
+    requested: float,
+    actors_per_device: float | None = None,
+    max_actors: int | None = None,
+) -> float:
     """Adapt a per-task `num_gpus` request from measured utilization.
+
+    With `actors_per_device` — how many actors shared one device when `util_fraction` was
+    measured — the request is sized to land the device at `_PACK_TOWARD`:
+    ``ceil(actors x _PACK_TOWARD / util)`` actors per device, bounded by `max_actors` (what
+    VRAM allows) and `_MAX_ACTORS_PER_DEVICE`. Knowing the *configuration* that produced the
+    measurement is what makes this stable: the same 78% means "add an actor" at one per
+    device and "leave it alone" at two, and a loop that cannot tell those apart oscillates
+    between them forever.
+
+    Without it, the older utilization-only rule stands:
 
     * `None` utilization (no measurement) or no GPU requested → keep `requested`.
     * Under-utilized whole GPU → request a fraction (≈ the measured load, floored at
-      `_MIN_FRACTION`) so several tasks share one device.
+      `_UTIL_MIN_FRACTION`) so several tasks share one device.
     * Saturated fractional request → grow toward a whole GPU.
     * Otherwise keep the current request.
+
+    Args:
+        util_fraction: Sustained utilization measured on the device, in [0, 1].
+        requested: The `num_gpus` the stage declared.
+        actors_per_device: Actors that shared one device during that measurement.
+        max_actors: Upper bound from measured VRAM, if known.
+
+    Returns:
+        The per-actor `num_gpus` to request.
     """
     if util_fraction is None or requested <= 0.0:
         return requested
+    if actors_per_device and actors_per_device > 0 and util_fraction > 0.0:
+        ceiling = (
+            _MAX_ACTORS_PER_DEVICE
+            if max_actors is None
+            else min(max_actors, _MAX_ACTORS_PER_DEVICE)
+        )
+        want = math.ceil(actors_per_device * _PACK_TOWARD / util_fraction)
+        want = max(1, min(int(ceiling), want))
+        return min(requested, max(_UTIL_MIN_FRACTION, round(1.0 / want, 2)))
     if requested >= 1.0 and util_fraction < _PACK_BELOW:
         frac = max(_UTIL_MIN_FRACTION, round(util_fraction, 2))
         return min(1.0, frac)
@@ -974,6 +1030,31 @@ def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: flo
     if util_fraction is None:
         return
     record_smoothed_scalar(hub, scoped(_NAMESPACE), key, float(util_fraction))
+
+
+_PACKING_NAMESPACE = "ml.gpu.actors_per_device"
+
+
+def load_gpu_actors_per_device(hub: MetadataHub | None, key: str) -> float | None:
+    """How many inference actors shared one device when `key`'s utilization was measured.
+
+    Utilization alone cannot be acted on twice. A stage measured at 78% on one actor per
+    device wants a second actor; the same 78% measured *with* two actors already means the
+    packing worked and must be left alone. Without this the loop reads the two cases
+    identically and alternates between them forever — pack, measure saturation, unpack,
+    measure starvation — which is worse than never packing at all, because half the runs are
+    the bad configuration.
+    """
+    return load_scalar(hub, scoped(_PACKING_NAMESPACE), key)
+
+
+def record_gpu_actors_per_device(
+    hub: MetadataHub | None, key: str, actors_per_device: float | None
+) -> None:
+    """Record the actors-per-device that produced `key`'s utilization. Best-effort."""
+    if actors_per_device is None or actors_per_device <= 0:
+        return
+    record_smoothed_scalar(hub, scoped(_PACKING_NAMESPACE), key, float(actors_per_device))
 
 
 _VRAM_NAMESPACE = "ml.gpu.peak_vram"
