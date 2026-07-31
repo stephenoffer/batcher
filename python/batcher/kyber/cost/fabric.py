@@ -13,6 +13,11 @@ sixteen times a local one, and the optimizer should contort to avoid it. One con
 be right on both, and the failure is silent: the plan is correct, it is simply not the plan the
 cluster wanted.
 
+RDMA is read first and Ethernet second, because a node that has RDMA shuffles over it and the
+management NIC beside it is not what a batch will take. Reading Ethernet at all is what makes
+this useful on the commodity tier of rented GPU capacity, which has no RDMA and where the
+measurement previously returned zero.
+
 **The default is preserved wherever the fabric is unreadable, and wherever the operator set the
 weight.** Precedence is explicit override, then measurement, then the library default — the
 same order the resilience profiles use. A node with no RDMA NIC, a container without
@@ -37,6 +42,7 @@ __all__ = [
     "REFERENCE_LOCAL_GBPS",
     "fabric_adjusted_weights",
     "fabric_net_weight",
+    "measured_fabric_gbps",
     "net_weight_summary",
     "reset_fabric_weight",
 ]
@@ -61,6 +67,29 @@ _MIN_NET_WEIGHT = 1.0
 _MAX_NET_WEIGHT = 32.0
 
 
+def measured_fabric_gbps() -> float:
+    """This node's off-node bandwidth in Gb/s, from RDMA where it exists and Ethernet where it
+    does not.
+
+    RDMA first because a node that has it uses it: the shuffle runs over Arrow Flight on the
+    fast fabric, and the Ethernet management interface beside it is not what a batch will
+    take. Ethernet is the answer for the far larger share of rented GPU capacity that has no
+    RDMA at all, where the alternative was reporting zero and falling back to a constant.
+
+    One caveat the caller should know and this function will not paper over: an Ethernet line
+    rate is further from achievable bulk throughput than an RDMA port rate is, because TCP
+    pays a stack the fabric does not. No discount is applied for it. Inventing an efficiency
+    factor here would be a fabricated figure, and it would be invisible to a caller that had
+    already applied one of its own.
+
+    Returns:
+        Summed active rate in gigabits per second, `0.0` when neither is readable.
+    """
+    from batcher._internal.hardware.fabric import ethernet_bandwidth_gbps, fabric_bandwidth_gbps
+
+    return fabric_bandwidth_gbps() or ethernet_bandwidth_gbps()
+
+
 def fabric_net_weight(
     fabric_gbps: float | None = None,
     local_gbps: float = REFERENCE_LOCAL_GBPS,
@@ -81,14 +110,13 @@ def fabric_net_weight(
     """
     measured = fabric_gbps
     if measured is None:
-        from batcher._internal.hardware.fabric import fabric_bandwidth_gbps
         from batcher.config import active_config
 
         # A declared rate outranks the probe, because the deployment that needs to declare one
         # is exactly the deployment the probe cannot serve: a pod without the host's `/sys`
         # has a real fabric it simply cannot see, and measuring there returns zero.
         declared = active_config().accelerator.fabric_gbps
-        measured = declared if declared > 0.0 else fabric_bandwidth_gbps()
+        measured = declared if declared > 0.0 else measured_fabric_gbps()
     if measured is None or measured <= 0.0 or local_gbps <= 0.0:
         return None
     fabric_bytes_per_s = measured / 8.0  # Gb/s on the wire, GB/s in the cost model
@@ -136,12 +164,11 @@ def net_weight_summary() -> dict:
         reader can tell from this whether a plan was ranked against a measured fabric or
         against the default, which is otherwise invisible in the chosen plan.
     """
-    from batcher._internal.hardware.fabric import fabric_bandwidth_gbps
     from batcher.config import active_config
 
     configured = active_config().optimizer.cost_weights
     return {
-        "fabric_gbps": fabric_bandwidth_gbps(),
+        "fabric_gbps": measured_fabric_gbps(),
         "derived_net_weight": _measured_weight(),
         "net_weight": fabric_adjusted_weights(configured).net,
     }

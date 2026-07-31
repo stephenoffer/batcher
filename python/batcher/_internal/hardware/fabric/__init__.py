@@ -39,6 +39,12 @@ from batcher._internal.hardware.fabric.device_links import (
     device_pcie_links,
     gpu_pci_addresses,
 )
+from batcher._internal.hardware.fabric.ethernet import (
+    EthernetLink,
+    ethernet_bandwidth_gbps,
+    ethernet_links,
+    ethernet_summary,
+)
 from batcher._internal.hardware.fabric.nvlink import (
     NvLinkStatus,
     nvlink_degraded_devices,
@@ -72,6 +78,7 @@ from batcher._internal.hardware.fabric.rdma import (
 __all__ = [
     "ERROR_COUNTERS",
     "PCIE_CLASSES",
+    "EthernetLink",
     "NvLinkStatus",
     "PcieLink",
     "PortCounters",
@@ -82,6 +89,9 @@ __all__ = [
     "device_link_efficiency",
     "device_numa_node",
     "device_pcie_links",
+    "ethernet_bandwidth_gbps",
+    "ethernet_links",
+    "ethernet_summary",
     "fabric_bandwidth_gbps",
     "fabric_error_total",
     "fabric_interface_address",

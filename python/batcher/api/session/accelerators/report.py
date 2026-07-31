@@ -243,11 +243,17 @@ def _add_site(report: dict) -> None:
 def _add_fabric(report: dict) -> None:
     """Add the node's interconnect, when there is one to report.
 
-    Two facts a cross-node stage is bounded by and nothing else in this report carries: what
-    the NICs actually sustain, and whether the device fabric is up. Both are omitted on a node
-    with neither, which is every machine without RDMA hardware.
+    Three facts a cross-node stage is bounded by and nothing else in this report carries: what
+    the RDMA ports sustain, what the Ethernet sustains where there is no RDMA, and whether the
+    device fabric is up. Ethernet is reported only when there is no RDMA and only when an
+    interface publishes a rate, because on a node with a fast fabric the management NIC beside
+    it is not what a shuffle takes and printing it invites the wrong conclusion.
     """
-    from batcher._internal.hardware.fabric import nvlink_summary, rdma_summary
+    from batcher._internal.hardware.fabric import (
+        ethernet_summary,
+        nvlink_summary,
+        rdma_summary,
+    )
 
     fabric: dict = {}
     rdma = rdma_summary()
@@ -260,6 +266,10 @@ def _add_fabric(report: dict) -> None:
         if any(errors.values()):
             rdma["errors"] = {k: v for k, v in errors.items() if v}
         fabric["rdma"] = rdma
+    else:
+        ethernet = ethernet_summary()
+        if ethernet["total_gbps"]:
+            fabric["ethernet"] = ethernet
     nvlink = nvlink_summary()
     if nvlink["links"]:
         fabric["nvlink"] = nvlink
@@ -324,6 +334,12 @@ def show_accelerators() -> None:
             print(
                 f"fabric: {rdma['active_ports']}/{rdma['ports']} RDMA port(s) up "
                 f"({rdma['bandwidth_gbps']:.0f} Gb/s, {layers or 'unreported'})"
+            )
+        ethernet = fabric.get("ethernet")
+        if ethernet:
+            print(
+                f"fabric: no RDMA; {ethernet['up']}/{ethernet['interfaces']} Ethernet link(s) "
+                f"up ({ethernet['total_gbps']:.0f} Gb/s via {ethernet['fastest']})"
             )
         nvlink = fabric.get("nvlink")
         if nvlink:
