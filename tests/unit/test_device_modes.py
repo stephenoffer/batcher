@@ -325,11 +325,26 @@ def test_the_highest_cap_on_the_node_is_the_one_that_binds(monkeypatch):
     monkeypatch.setattr(
         "batcher._internal.hardware.nvml.device_telemetry",
         lambda: (
-            DeviceTelemetry(index=0, power_limit_watts=400.0),
-            DeviceTelemetry(index=1, power_limit_watts=700.0),
+            DeviceTelemetry(index=0, name="NVIDIA H100 80GB HBM3", power_limit_watts=400.0),
+            DeviceTelemetry(index=1, name="NVIDIA H100 80GB HBM3", power_limit_watts=700.0),
         ),
     )
     assert enforced_limit_watts() == pytest.approx(700.0)
+    assert enforced_limit_watts("NVIDIA_H100") == pytest.approx(700.0)
+
+
+def test_a_cap_is_not_borrowed_from_a_device_of_another_model(monkeypatch):
+    # This runs where the plan is built, and on the usual topology that is a head node whose
+    # hardware is not the fleet's. Lending its cap to a fleet-wide budget would under-state
+    # what the fleet draws — the one error here with a physical consequence.
+    from batcher.carbonite.accel.power import enforced_limit_watts
+
+    monkeypatch.setattr(
+        "batcher._internal.hardware.nvml.device_telemetry",
+        lambda: (DeviceTelemetry(index=0, name="NVIDIA L4", power_limit_watts=72.0),),
+    )
+    assert enforced_limit_watts("NVIDIA_H100") == 0.0
+    assert enforced_limit_watts("NVIDIA_L4") == pytest.approx(72.0)
 
 
 def test_an_unreadable_limit_leaves_the_datasheet_in_charge(monkeypatch):

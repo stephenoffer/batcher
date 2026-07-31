@@ -86,7 +86,7 @@ def validate_fleet_power(
         accelerator_type,
         utilization,
         include_host=True,
-        enforced_limit_watts=enforced_limit_watts(),
+        enforced_limit_watts=enforced_limit_watts(accelerator_type),
     )
     if per_device <= 0:
         return FeasibilityVerdict(feasible=True)  # unknown device: no opinion
@@ -107,24 +107,39 @@ def validate_fleet_power(
     )
 
 
-def enforced_limit_watts() -> float:
-    """The power cap this node's devices are actually running under, or `0.0`.
+def enforced_limit_watts(accelerator_type: str | None = None) -> float:
+    """The power cap *this* node's devices run under, when they are the ones being priced.
 
     A power-constrained hall runs its parts below nameplate — a 700 W device capped at 500 is
-    ordinary — and an admission check still using the datasheet over-states the draw by the
-    difference, refusing fan-outs the rack can power. The driver knows the enforced limit; the
-    datasheet does not.
+    ordinary on rented capacity — and an admission check using the datasheet over-states the
+    draw by the difference, refusing fan-outs the rack can power. The driver knows the enforced
+    limit; the datasheet does not.
+
+    **Only when the local devices are the model being asked about.** This runs where the plan
+    is built, and on the usual topology that is a head node whose hardware is not the fleet's.
+    Applying its cap to a fleet-wide budget would under-state what the fleet draws, and
+    under-stating a breaker's load is the one error here with a physical consequence — so a
+    model mismatch reports nothing and the datasheet stands.
+
+    Args:
+        accelerator_type: The model being priced. `None` accepts any local device, which is
+            correct only for a caller asking about *this* node.
 
     Returns:
-        The *highest* limit across the node's devices, `0.0` when nothing could be read. The
-        maximum rather than the mean, because this figure bounds what a fleet may draw and a
-        mean would under-state a node whose devices are capped unevenly — and under-stating a
-        breaker's load is the one direction with a physical consequence.
+        The highest limit across the matching local devices — the maximum rather than the
+        mean, since a mean under-states a node whose devices are capped unevenly — or `0.0`
+        when nothing matched or nothing could be read.
     """
+    from batcher._internal.device_specs import resolve_device_name
     from batcher._internal.hardware.nvml import device_telemetry
 
     try:
-        limits = [d.power_limit_watts for d in device_telemetry() if d.power_limit_watts > 0]
+        wanted = resolve_device_name(accelerator_type) if accelerator_type else ""
+        limits = [
+            d.power_limit_watts
+            for d in device_telemetry()
+            if d.power_limit_watts > 0 and (not wanted or resolve_device_name(d.name) == wanted)
+        ]
     except Exception as exc:  # pragma: no cover - a probe must never break admission
         note_suppressed("carbonite", "read the enforced device power limit", exc)
         return 0.0
