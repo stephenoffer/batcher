@@ -40,16 +40,20 @@ from batcher._internal.hardware.faults.modes import (
     misconfigured_devices,
 )
 from batcher._internal.hardware.faults.xid import (
+    XID_APPLICATION,
     XID_DESCRIPTIONS,
     XID_FATAL,
     XidEvent,
     describe_xid,
     recent_xid_events,
+    xid_application_faults,
     xid_fatal,
     xid_readable,
+    xid_severity,
 )
 
 __all__ = [
+    "XID_APPLICATION",
     "XID_DESCRIPTIONS",
     "XID_FATAL",
     "DeviceFaults",
@@ -61,6 +65,8 @@ __all__ = [
     "faulted_devices",
     "misconfigured_devices",
     "recent_xid_events",
+    "xid_application_faults",
     "xid_fatal",
     "xid_readable",
+    "xid_severity",
 ]

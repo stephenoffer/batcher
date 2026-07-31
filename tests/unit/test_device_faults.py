@@ -319,3 +319,55 @@ def test_several_fatal_codes_on_one_device_are_all_recorded():
     faults = (DeviceFaults(index=0, pci_address="0000:0c:00.0", readable=True),)
     out = health.xid_verdicts(verdicts, faults, {"0000:0c:00.0": (48, 95)})
     assert set(out[0].reasons) == {"xid_48", "xid_95"}
+
+
+# --- Who an Xid is addressed to --------------------------------------------------------
+
+
+def test_a_workload_fault_is_not_a_hardware_fault(tmp_path):
+    # The expensive mistake this prevents: quarantining a healthy board over a bug in the job
+    # that landed on it, then quarantining the next board the retry lands on.
+    path = _kmsg(
+        tmp_path,
+        [
+            "6,1,1;NVRM: Xid (PCI:0000:0c:00): 13, Graphics Exception",
+            "6,2,2;NVRM: Xid (PCI:0000:0c:00): 31, MMU fault",
+            "6,3,3;NVRM: Xid (PCI:0000:1a:00): 79, fell off the bus",
+        ],
+    )
+    events = xid.recent_xid_events(path)
+    assert [e.severity for e in events] == ["application", "application", "hardware"]
+    assert xid.xid_fatal(events) == {"0000:1a:00.0": (79,)}
+    assert xid.xid_application_faults(events) == {"0000:0c:00.0": (13, 31)}
+
+
+def test_an_unknown_code_is_classified_as_unknown_not_guessed():
+    # A future driver release must not be able to quarantine a fleet through a code this
+    # build has never seen.
+    assert xid.xid_severity(4242) == "unknown"
+    assert xid.xid_severity(79) == "hardware"
+    assert xid.xid_severity(13) == "application"
+
+
+def test_an_application_code_still_carries_an_explanation():
+    # An operator staring at "Xid 13" on a node that keeps failing needs to know the answer
+    # is in their code and not in the rack.
+    assert "illegal memory access" in xid.describe_xid(13)
+    assert set(xid.XID_APPLICATION) & set(xid.XID_FATAL) == set()
+
+
+def test_the_two_lists_stay_separate_in_the_fleet_record(monkeypatch):
+    from batcher.dist.executors.ray_runtime import hardware_probe
+
+    monkeypatch.setattr("batcher.carbonite.accel.assess_fleet", lambda: ())
+    monkeypatch.setattr("batcher.carbonite.accel.device_reset_candidates", lambda: ())
+    monkeypatch.setattr("batcher.carbonite.accel.device_affinity_summary", lambda: {})
+    monkeypatch.setattr("batcher._internal.hardware.fabric.degraded_device_links", lambda: ())
+    monkeypatch.setattr(
+        "batcher._internal.hardware.faults.xid_application_faults",
+        lambda: {"0000:0c:00.0": (13,)},
+    )
+    record = hardware_probe._device_health_on_this_worker()
+    assert record["xid_application"] == [13]
+    # And it is not a drain reason: the device is fine.
+    assert hardware_probe.unhealthy_nodes(({"node_id": "a", **record},)) == ()

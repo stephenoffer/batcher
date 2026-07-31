@@ -237,6 +237,7 @@ def _device_health_on_this_worker() -> dict:
     from batcher._internal.hardware.faults import (
         faulted_devices,
         misconfigured_devices,
+        xid_application_faults,
         xid_readable,
     )
     from batcher.carbonite.accel import (
@@ -269,6 +270,13 @@ def _device_health_on_this_worker() -> dict:
         "degraded_links": [link.address for link in degraded_device_links()],
         "nvlink": nvlink_summary(),
         "xid_readable": xid_readable(),
+        # Workload-caused Xids, kept apart from the hardware ones the verdicts act on. A
+        # device here needs no operator action — the job that faulted on it does — and a
+        # drain list that mixed the two would take healthy boards out over someone's
+        # out-of-bounds write, one retry at a time.
+        "xid_application": sorted(
+            {code for codes in xid_application_faults().values() for code in codes}
+        ),
     }
 
 

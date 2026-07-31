@@ -30,13 +30,16 @@ from dataclasses import dataclass
 
 __all__ = [
     "KMSG_PATH",
+    "XID_APPLICATION",
     "XID_DESCRIPTIONS",
     "XID_FATAL",
     "XidEvent",
     "describe_xid",
     "recent_xid_events",
+    "xid_application_faults",
     "xid_fatal",
     "xid_readable",
+    "xid_severity",
 ]
 
 #: The kernel ring buffer. A constant so a test can point it at a fixture and so a deployment
@@ -64,9 +67,27 @@ XID_FATAL = frozenset(
     }
 )
 
+#: Xid codes caused by the *workload* rather than the hardware, with what each one means.
+#:
+#: The distinction is the whole point of having it. These fire because a kernel did something
+#: illegal — an out-of-bounds access, an MMU fault, a kernel that ran past its watchdog — and
+#: the device is fine afterwards. Quarantining on one would take a healthy board out of a
+#: fleet over a bug in the job that happened to land on it, and then take out the next board
+#: the retry lands on, and so on: an application fault that walks the fleet is strictly worse
+#: than the crash it came from.
+#:
+#: They are worth *naming* rather than ignoring, because an operator staring at "Xid 13" on a
+#: node that keeps failing needs to know the answer is in their code and not in the rack.
+XID_APPLICATION: dict[int, str] = {
+    13: "graphics engine exception, usually an illegal memory access in a kernel",
+    31: "GPU memory page fault, usually an out-of-bounds access in a kernel",
+    43: "a kernel was stopped by the driver after a fault elsewhere in the process",
+    45: "preemptive cleanup, usually a process killed while its kernels were running",
+}
+
 #: What each fatal code means, in the words an operator needs to act. Only the fatal set is
-#: described: a table of every Xid would be a copy of the vendor's documentation that goes
-#: stale, while these are the ones a scheduler makes a decision about.
+#: described here: a table of every Xid would be a copy of the vendor's documentation that
+#: goes stale, while these are the ones a scheduler makes a decision about.
 XID_DESCRIPTIONS: dict[int, str] = {
     48: "double-bit ECC error",
     62: "internal micro-controller halt",
@@ -118,9 +139,14 @@ class XidEvent:
         return self.code in XID_FATAL
 
     @property
+    def severity(self) -> str:
+        """`"hardware"`, `"application"`, or `"unknown"` — who to send this to."""
+        return xid_severity(self.code)
+
+    @property
     def description(self) -> str:
         """A short description of the code, or `""` for one outside the documented set."""
-        return XID_DESCRIPTIONS.get(self.code, "")
+        return XID_DESCRIPTIONS.get(self.code) or XID_APPLICATION.get(self.code, "")
 
 
 def _normalize_pci(raw: str) -> str:
@@ -246,8 +272,58 @@ def describe_xid(code: int) -> str:
         code: The Xid number.
 
     Returns:
-        The documented meaning for a code in the fatal set, or `"unknown Xid <code>"` for one
-        outside it. Never a guess: a code this table has not seen is reported as unrecognized
-        so a reader goes to the vendor's documentation instead of trusting an invented gloss.
+        The documented meaning for a code this module classifies, or `"unknown Xid <code>"`
+        for one it does not. Never a guess: a code these tables have not seen is reported as
+        unrecognized so a reader goes to the vendor's documentation instead of trusting an
+        invented gloss.
     """
-    return XID_DESCRIPTIONS.get(code) or f"unknown Xid {code}"
+    return XID_DESCRIPTIONS.get(code) or XID_APPLICATION.get(code) or f"unknown Xid {code}"
+
+
+def xid_severity(code: int) -> str:
+    """Whether an Xid blames the hardware, the workload, or neither.
+
+    The classification a scheduler needs before it reacts. A hardware Xid means the device is
+    unusable until it is reset; an application Xid means a kernel did something illegal and
+    the device is fine. Treating the second as the first is the expensive mistake: it takes a
+    healthy board out of the fleet over a bug in the job, then takes out the next board the
+    retry lands on.
+
+    Args:
+        code: The Xid number.
+
+    Returns:
+        `"hardware"`, `"application"`, or `"unknown"`. An unrecognized code is never guessed
+        into a class — a future driver release must not be able to quarantine a fleet through
+        a code this build has never seen.
+    """
+    if code in XID_FATAL:
+        return "hardware"
+    if code in XID_APPLICATION:
+        return "application"
+    return "unknown"
+
+
+def xid_application_faults(
+    events: tuple[XidEvent, ...] | None = None,
+) -> dict[str, tuple[int, ...]]:
+    """Workload-caused Xid codes seen per device, keyed by PCI address.
+
+    The counterpart of `xid_fatal`, and deliberately a separate call rather than a flag on it:
+    the two have opposite remedies. A device here needs no operator action at all — the job
+    that produced the fault does — and mixing the two lists is how a healthy board ends up
+    drained over someone's out-of-bounds write.
+
+    Args:
+        events: Events to inspect, or `None` to read them live.
+
+    Returns:
+        PCI address to the application codes seen for it, ascending and deduplicated. Empty
+        when none were seen or the log is unreadable.
+    """
+    records = recent_xid_events() if events is None else events
+    out: dict[str, set[int]] = {}
+    for event in records:
+        if event.pci_address and xid_severity(event.code) == "application":
+            out.setdefault(event.pci_address, set()).add(event.code)
+    return {address: tuple(sorted(codes)) for address, codes in sorted(out.items())}
