@@ -152,7 +152,8 @@ def format_device_table(readings: Sequence[DeviceTelemetry] | None = None) -> st
 
         readings = device_telemetry()
     if not readings:
-        return "devices: no telemetry (NVML unavailable on this host)"
+        amd = _amd_device_table()
+        return amd or "devices: no telemetry (NVML unavailable on this host)"
     faults, links = _device_conditions()
     rows = ["gpu  name                        power      sm    memory        temp  state"]
     for d in readings:
@@ -164,6 +165,43 @@ def format_device_table(readings: Sequence[DeviceTelemetry] | None = None) -> st
         rows.append(
             f"{d.index:<3}  {d.name[:26]:<26}  {power:>10}  {d.sm_utilization:>4.0%}  "
             f"{memory:>12}  {d.temperature_c:>4.0f}C  {_device_state(d, faults, links)}"
+        )
+    return "\n".join(rows)
+
+
+def _amd_device_table() -> str:
+    """The same table for AMD boards, or `""` when there are none.
+
+    Only reached when NVML reported nothing, so a mixed host keeps NVML's richer reading.
+    The columns are the same ones, from the driver's sysfs: an operator comparing two nodes of
+    different vendors should not have to compare two table shapes.
+    """
+    from batcher._internal.hardware.amd import amd_devices
+
+    devices = amd_devices()
+    if not devices:
+        return ""
+    rows = ["gpu  name                        power      sm    memory        temp  state"]
+    for d in devices:
+        power = f"{d.power_watts:.0f}/{d.power_cap_watts:.0f} W" if d.power_watts else "-"
+        if d.memory_total_bytes:
+            memory = f"{d.memory_used_bytes >> 30}/{d.memory_total_bytes >> 30} GiB"
+        else:
+            memory = "-"
+        if d.memory_uncorrectable_errors:
+            state = f"rma:hbm-{d.memory_uncorrectable_errors}"
+        elif d.uncorrectable_errors:
+            state = f"ue:{d.uncorrectable_errors}"
+        elif 0.0 < d.thermal_headroom_c <= 3.0:
+            state = "thermal"
+        elif d.power_cap_watts > 0.0 and d.power_headroom <= 0.02:
+            state = "power"
+        else:
+            state = "ok"
+        name = d.name or d.card
+        rows.append(
+            f"{d.index:<3}  {name[:26]:<26}  {power:>10}  {d.busy_percent / 100:>4.0%}  "
+            f"{memory:>12}  {d.temperature_c:>4.0f}C  {state}"
         )
     return "\n".join(rows)
 

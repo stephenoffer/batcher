@@ -140,6 +140,16 @@ def enforced_limit_watts(accelerator_type: str | None = None) -> float:
             for d in device_telemetry()
             if d.power_limit_watts > 0 and (not wanted or resolve_device_name(d.name) == wanted)
         ]
+        # An AMD board publishes its cap the same way and for the same reason, and a
+        # power-constrained hall caps both vendors. Without this an Instinct node priced every
+        # admission against the datasheet and refused fan-outs the rack could power.
+        from batcher._internal.hardware.amd import amd_devices
+
+        limits += [
+            d.power_cap_watts
+            for d in amd_devices()
+            if d.power_cap_watts > 0 and (not wanted or resolve_device_name(d.name) == wanted)
+        ]
     except Exception as exc:  # pragma: no cover - a probe must never break admission
         note_suppressed("carbonite", "read the enforced device power limit", exc)
         return 0.0

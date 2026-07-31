@@ -65,8 +65,15 @@ def accelerators() -> dict:
     power: dict = {}
     if energy.power_budget_watts > 0:
         power["budget_watts"] = energy.power_budget_watts
-    if nvml_available():
-        power["draw_watts"] = round(total_power_watts(), 1)
+    # Both vendors, and the gate has to admit both too: it was `nvml_available()`, so an
+    # Instinct node reported no draw at all rather than the draw it was pulling. A power
+    # envelope that under-states a real breaker is the one error in this area with a physical
+    # consequence. Still gated, because "unknown" and "zero watts" must not look the same.
+    from batcher._internal.hardware.amd import amd_power_watts
+    from batcher._internal.hardware.amd import readable as amd_readable
+
+    if nvml_available() or amd_readable():
+        power["draw_watts"] = round(total_power_watts() + amd_power_watts(), 1)
     if fleet.get("power_zones"):
         # Per zone, because the breaker a rack trips is a zone's, not the fleet's: a hall
         # inside its total budget can still have one busway over its own.

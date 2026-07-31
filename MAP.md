@@ -319,7 +319,7 @@ Accelerator reporting (`accelerators`, `show_accelerators`, `measure_energy`).
 | module | lines | what it is |
 |---|---|---|
 | `energy.py` | 93 | Collecting what a pipeline drew, and folding the measurement back into what is learned. |
-| `report.py` | 412 | Assembling the accelerator report, and saying the part a reader would otherwise miss. |
+| `report.py` | 419 | Assembling the accelerator report, and saying the part a reader would otherwise miss. |
 | `rows.py` | 175 | One row per local device: nameplate figures, live readings, and what is wrong with it. |
 
 ### `batcher/api/sql_session/` — 5 · conductor
@@ -1243,7 +1243,7 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 | `health.py` | 459 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 102 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
-| `power.py` | 146 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
+| `power.py` | 156 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
 | `vram.py` | 241 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1731,7 +1731,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 |---|---|---|
 | `console.py` | 447 | The terminal face of the engine — a live progress bar plus structured status lines. |
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
-| `energy.py` | 251 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
+| `energy.py` | 289 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
 | `metrics.py` | 492 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
 | `system.py` | 228 | The host and engine the queries are running on — the dashboard's hardware panel. |
@@ -2152,7 +2152,7 @@ AMD accelerators, read from the driver rather than from ROCm.
 
 | module | lines | what it is |
 |---|---|---|
-| `devices.py` | 430 | What an AMD Instinct node can be asked about itself, without ROCm installed. |
+| `devices.py` | 448 | What an AMD Instinct node can be asked about itself, without ROCm installed. |
 
 ### `batcher/_internal/hardware/engine/` — 0 · utility
 

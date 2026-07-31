@@ -485,3 +485,106 @@ def test_the_partition_reaches_the_report_row(drm, monkeypatch):
     finally:
         accelerators._gpu_inventory_probe.cache_clear()
     assert row["partition"] == "CPX/NPS4"
+
+
+# --- Power, which has a physical consequence when it is wrong ------------------------------
+
+
+def test_the_node_s_draw_counts_the_amd_boards(drm):
+    _card(drm, 0, hwmon={"power1_average": "540000000", "power1_cap": "750000000"})
+    _card(drm, 1, hwmon={"power1_average": "610000000", "power1_cap": "750000000"})
+    assert amdgpu.amd_power_watts() == pytest.approx(1150.0)
+
+
+def test_a_board_that_publishes_no_draw_contributes_nothing(drm):
+    _card(drm, 0, product_name="mi210")
+    assert amdgpu.amd_power_watts() == 0.0
+
+
+def test_the_report_s_power_envelope_sums_both_vendors(drm, monkeypatch):
+    # A power envelope that summed only the NVIDIA devices reported a zero draw on an Instinct
+    # node. Under-stating a real breaker's load is the one error in this area with a physical
+    # consequence.
+    from batcher._internal import accelerators
+    from batcher.api.session.accelerators.report import accelerators as report
+
+    _card(
+        drm,
+        0,
+        product_name="AMD Instinct MI300X",
+        mem_info_vram_total=str(192 * (1 << 30)),
+        hwmon={"power1_average": "540000000", "power1_cap": "750000000"},
+    )
+    monkeypatch.setattr(accelerators, "_nvml_inventory", lambda: [])
+    accelerators._gpu_inventory_probe.cache_clear()
+    try:
+        power = report().get("power") or {}
+    finally:
+        accelerators._gpu_inventory_probe.cache_clear()
+    assert power.get("draw_watts") == pytest.approx(540.0)
+
+
+def test_the_enforced_cap_reads_an_amd_board_s_own_limit(drm):
+    # A power-constrained hall caps both vendors. Pricing an Instinct admission against the
+    # datasheet instead of the enforced cap refuses fan-outs the rack could actually power.
+    from batcher.carbonite.accel.power import enforced_limit_watts
+
+    _card(
+        drm,
+        0,
+        product_name="AMD Instinct MI300X",
+        hwmon={"power1_average": "400000000", "power1_cap": "500000000"},
+    )
+    assert enforced_limit_watts() == pytest.approx(500.0)
+    assert enforced_limit_watts("AMD_INSTINCT_MI300X") == pytest.approx(500.0)
+    assert enforced_limit_watts("NVIDIA_H100") == 0.0, "a cap is never lent across hardware"
+
+
+def test_the_live_device_table_falls_through_to_the_amd_boards(drm):
+    from batcher.observe.energy import format_device_table
+
+    _card(
+        drm,
+        0,
+        product_name="AMD Instinct MI300X",
+        mem_info_vram_total=str(192 * (1 << 30)),
+        mem_info_vram_used=str(40 * (1 << 30)),
+        gpu_busy_percent="87",
+        hwmon={
+            "temp1_input": "71000",
+            "temp1_crit": "100000",
+            "power1_average": "540000000",
+            "power1_cap": "750000000",
+        },
+        ras={"umc": (0, 0)},
+    )
+    table = format_device_table(readings=())
+    assert "AMD Instinct MI300X" in table
+    assert "540/750 W" in table
+    assert "87%" in table
+    assert "40/192 GiB" in table
+    assert table.rstrip().endswith("ok")
+    # Same columns as the NVIDIA table: an operator comparing two nodes of different vendors
+    # should not have to compare two table shapes.
+    assert table.splitlines()[0].split() == [
+        "gpu",
+        "name",
+        "power",
+        "sm",
+        "memory",
+        "temp",
+        "state",
+    ]
+
+
+def test_a_failed_board_says_so_in_the_table(drm):
+    from batcher.observe.energy import format_device_table
+
+    _card(drm, 0, product_name="mi300x", ras={"umc": (0, 3)})
+    assert "rma:hbm-3" in format_device_table(readings=())
+
+
+def test_no_devices_of_either_vendor_still_says_so(drm):
+    from batcher.observe.energy import format_device_table
+
+    assert "no telemetry" in format_device_table(readings=())

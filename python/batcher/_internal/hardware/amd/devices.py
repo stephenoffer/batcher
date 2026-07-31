@@ -57,6 +57,7 @@ __all__ = [
     "AmdDevice",
     "RasCounts",
     "amd_devices",
+    "amd_power_watts",
     "amd_present",
     "ecc_faulted_amd_devices",
     "readable",
@@ -371,6 +372,23 @@ def amd_devices() -> tuple[AmdDevice, ...]:
         One entry per device, empty when there are none or sysfs is unreadable.
     """
     return _probe() if amd_present() else ()
+
+
+def amd_power_watts(devices: tuple[AmdDevice, ...] | None = None) -> float:
+    """Instantaneous draw across this host's AMD accelerators, in watts.
+
+    The counterpart of `nvml.total_power_watts`. A power envelope that summed only the NVIDIA
+    devices reported zero on an Instinct node, and an admission check reading zero draw against
+    a real breaker is the one error here with a physical consequence.
+
+    Args:
+        devices: Readings to sum. Probed when omitted.
+
+    Returns:
+        Summed board power, `0.0` when no board publishes one.
+    """
+    probed = amd_devices() if devices is None else devices
+    return sum(device.power_watts for device in probed)
 
 
 def ecc_faulted_amd_devices(
