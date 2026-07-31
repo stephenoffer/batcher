@@ -243,7 +243,16 @@ def accelerator_backend() -> str:
         return "tpu"
     if has_neuron_device():
         return "neuron"
-    return "hpu" if has_gaudi_device() else "cpu"
+    if has_gaudi_device():
+        return "hpu"
+    # AMD last among the device-node checks, and only once torch has declined: a ROCm torch
+    # answers `torch.cuda.is_available()` above and is the better source. Without one, an
+    # Instinct node with the driver loaded reported `cpu` — the same "nobody looked" that the
+    # rest of the AMD path exists to remove, and here it named the wrong hardware rather than
+    # naming none. Device nodes are already the accepted evidence for `neuron` and `hpu`.
+    from batcher._internal.hardware.amd import amd_present
+
+    return "rocm" if amd_present() else "cpu"
 
 
 def _tpu_available() -> bool:

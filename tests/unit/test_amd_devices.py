@@ -588,3 +588,29 @@ def test_no_devices_of_either_vendor_still_says_so(drm):
     from batcher.observe.energy import format_device_table
 
     assert "no telemetry" in format_device_table(readings=())
+
+
+def test_an_instinct_node_with_no_rocm_torch_still_names_its_backend(drm, monkeypatch):
+    # It reported `cpu`. That is the same "nobody looked" the rest of this path removes, except
+    # here it named the wrong hardware rather than naming none — and `torch_device` and every
+    # diagnostic read it.
+    from batcher._internal import accelerators
+
+    _card(drm, 0, product_name="AMD Instinct MI300X")
+    monkeypatch.setattr(accelerators, "gpu_devices_absent", lambda: False)
+    monkeypatch.setattr(accelerators, "_tpu_available", lambda: False)
+    monkeypatch.setattr(accelerators, "has_neuron_device", lambda: False)
+    monkeypatch.setattr(accelerators, "has_gaudi_device", lambda: False)
+    monkeypatch.setitem(__import__("sys").modules, "torch", None)
+    assert accelerators.accelerator_backend() == "rocm"
+
+
+def test_a_host_with_no_accelerator_of_any_kind_still_says_cpu(drm, monkeypatch):
+    from batcher._internal import accelerators
+
+    monkeypatch.setattr(accelerators, "gpu_devices_absent", lambda: False)
+    monkeypatch.setattr(accelerators, "_tpu_available", lambda: False)
+    monkeypatch.setattr(accelerators, "has_neuron_device", lambda: False)
+    monkeypatch.setattr(accelerators, "has_gaudi_device", lambda: False)
+    monkeypatch.setitem(__import__("sys").modules, "torch", None)
+    assert accelerators.accelerator_backend() == "cpu"
