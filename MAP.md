@@ -1238,7 +1238,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 234 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 429 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 1577 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 1580 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 208 | Join column-statistics propagation. |
 | `skew.py` | 149 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -1251,7 +1251,7 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 | `combine.py` | 423 | Composing leaf selectivities into a whole-predicate estimate. |
 | `leaves.py` | 480 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 188 | What a text pattern says about how many rows it matches. |
-| `scalars.py` | 319 | Scalar and column-statistic primitives shared by every selectivity estimator. |
+| `scalars.py` | 331 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
 ### `batcher/carbonite/` — 3 · subsystem
 
@@ -1375,7 +1375,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
-| `stats.py` | 160 | Column-statistics measurement — Core's lane. |
+| `stats.py` | 189 | Column-statistics measurement — Core's lane. |
 | `streaming_runner.py` | 215 | How one micro-batch gets run — the seam between the loop and where the work happens. |
 
 ### `batcher/core/gpu_plan/` — 3 · subsystem
@@ -1885,7 +1885,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 232 | `plan.source_stats` — what a connector declares about a source, cheaply. |
-| `stats.py` | 300 | `plan.stats` — the neutral statistics algebra shared across every layer. |
+| `stats.py` | 396 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract

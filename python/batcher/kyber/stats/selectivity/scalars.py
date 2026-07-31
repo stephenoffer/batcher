@@ -13,11 +13,11 @@ from __future__ import annotations
 import datetime
 import math
 from collections.abc import Iterator
-from decimal import Decimal
 from typing import Any
 
 from batcher.kyber.stats.distribution import residual_eq_frequency
 from batcher.plan.expr_ir import Binary, Col, Lit
+from batcher.plan.stats import AXIS_NUMERIC, ordinal_with_axis
 
 _COMPARISONS = {"lt", "le", "gt", "ge"}
 # Comparison operators flip when the column is on the right (`literal < col` ≡ `col > literal`).
@@ -88,20 +88,13 @@ def _mcv_keys(value: Any) -> Iterator[str]:
 def _ordinal(value: Any) -> float | None:
     """Map a comparable scalar to a float ordinal, or `None` if it has no linear order.
 
-    Numbers (and `Decimal`) map to themselves; `date`/`datetime` map to their epoch
-    offset. Two values only ever get compared against each other after both pass through
-    here, so the unit (days vs seconds) is irrelevant — only that it is consistent and
-    monotonic. `bool` is excluded: `True` would otherwise interpolate as `1.0`.
+    The position half of `plan.stats.ordinal_with_axis`, for the comparisons whose two
+    operands are *both* literals or bounds and so are already on one axis by construction
+    (`_outside_bounds`, `_fraction_below_bounds`). Anything read against a **measured**
+    statistic must check the axis instead — see `_fraction_below_quantiles`.
     """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float, Decimal)):
-        return float(value)
-    if isinstance(value, datetime.datetime):
-        return value.timestamp()
-    if isinstance(value, datetime.date):
-        return float(value.toordinal())
-    return None
+    placed = ordinal_with_axis(value)
+    return None if placed is None else placed[1]
 
 
 def _point_mass(
@@ -144,9 +137,28 @@ def _outside_bounds(value: Any, bound: tuple[Any, Any] | None) -> bool:
     return x < lo or x > hi
 
 
-def _fraction_below_quantiles(x: float, q: dict[str, Any] | None) -> float | None:
-    """The fraction of rows ≤ `x` interpolated from learned quantile boundaries."""
-    if not q:
+def _fraction_below_quantiles(value: Any, q: dict[str, Any] | None) -> float | None:
+    """The fraction of rows ≤ `value` interpolated from learned quantile boundaries.
+
+    Declines (None, so the caller falls back to the column's bounds) unless the grid was
+    measured on the same axis the literal sits on. A grid and a literal on different number
+    lines do not merely estimate badly — they put every literal far outside the grid, which
+    reads as "no rows match" and collapses the plan built on it.
+    """
+    placed = ordinal_with_axis(value)
+    if placed is None:
+        return None
+    return _fraction_below_on_axis(placed[1], placed[0], q)
+
+
+def _fraction_below_on_axis(x: float, axis: str, q: dict[str, Any] | None) -> float | None:
+    """`_fraction_below_quantiles` for a position already placed on `axis`.
+
+    For the callers holding an ordinal rather than the literal it came from — a column's own
+    `min`/`max` read off its `ColumnStat`. They still must name the axis, because the grid is
+    only theirs to read if it was measured on the same one.
+    """
+    if not q or q.get("axis", AXIS_NUMERIC) != axis:
         return None
     return _fraction_below(x, q.get("probs", []), q.get("values", []))
 
