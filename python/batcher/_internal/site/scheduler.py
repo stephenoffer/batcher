@@ -1,9 +1,10 @@
-"""What launched this process — Slurm, Kubernetes, Ray, or nothing.
+"""What launched this process — Slurm, PBS, LSF, Kubernetes, Ray, or nothing.
 
-A GPU cluster is scheduled by one of two things, and neither is Ray. Slurm runs most of the
-research and HPC-adjacent capacity; Kubernetes runs most of the rest. Ray sits *inside* an
-allocation one of them made. That matters because the outer scheduler already knows the shape
-of the job, and the shape is otherwise expensive or impossible to discover:
+A GPU cluster is scheduled by one of two families, and neither is Ray. Batch schedulers run
+most of the research and HPC-adjacent capacity — Slurm most visibly, with PBS/OpenPBS and LSF
+behind it on older and vendor-supplied clusters; Kubernetes runs most of the rest. Ray sits
+*inside* an allocation one of them made. That matters because the outer scheduler already
+knows the shape of the job, and the shape is otherwise expensive or impossible to discover:
 
 * **The node list.** Slurm hands the job its allocated nodes in `SLURM_JOB_NODELIST`. That is
   the multi-node topology, available before Ray has started, in an environment variable.
@@ -14,6 +15,9 @@ of the job, and the shape is otherwise expensive or impossible to discover:
   many share its node, which is what decides whether a collective stays on NVLink.
 * **The pod's node.** Under Kubernetes the useful identity is the *node* the pod landed on,
   because that is what carries the topology labels and what a co-location decision is about.
+* **A host file rather than a variable.** PBS and LSF write their node lists to a file, one
+  line per task *slot* rather than per node, so the distinct names in order are the allocation
+  and the repetition is the task layout.
 
 Read from environment variables, which every one of these schedulers exports into the process.
 Nothing here shells out to `scontrol` or calls an API server: both are slow, both can fail
@@ -55,7 +59,7 @@ class SchedulerJob:
     """The job this process belongs to, as its scheduler describes it.
 
     Attributes:
-        kind: `"slurm"`, `"kubernetes"`, `"ray"`, or `"none"`.
+        kind: `"slurm"`, `"pbs"`, `"lsf"`, `"kubernetes"`, `"ray"`, or `"none"`.
         job_id: The scheduler's job identifier, `""` when there is none.
         nodes: Node names in the allocation, in the scheduler's own order. Empty under a
             scheduler that does not publish the list.
@@ -67,7 +71,8 @@ class SchedulerJob:
         rank: This process's global task index, `0` when unpublished or single-task.
         local_rank: This process's index among the tasks on its own node.
         node_name: The node this process is on, `""` when unpublished.
-        partition: Slurm partition or Kubernetes namespace, `""` when unpublished.
+        partition: The scheduler's queue or partition — a Slurm partition, a PBS or LSF
+            queue, a Kubernetes namespace — `""` when unpublished.
     """
 
     kind: str = "none"
@@ -164,10 +169,14 @@ def scheduler_kind() -> str:
     wants to know whether Ray is up asks Ray.
 
     Returns:
-        `"slurm"`, `"kubernetes"`, `"ray"`, or `"none"`.
+        `"slurm"`, `"pbs"`, `"lsf"`, `"kubernetes"`, `"ray"`, or `"none"`.
     """
     if os.environ.get("SLURM_JOB_ID", "").strip():
         return "slurm"
+    if os.environ.get("PBS_JOBID", "").strip():
+        return "pbs"
+    if os.environ.get("LSB_JOBID", "").strip():
+        return "lsf"
     if os.environ.get(_K8S_MARKER, "").strip():
         return "kubernetes"
     if os.environ.get("RAY_ADDRESS", "").strip() or os.environ.get("RAY_NODE_IP_ADDRESS", ""):
@@ -246,8 +255,70 @@ def scheduler_job() -> SchedulerJob:
     kind = scheduler_kind()
     if kind == "slurm":
         return _slurm_job()
+    if kind == "pbs":
+        return _pbs_job()
+    if kind == "lsf":
+        return _lsf_job()
     if kind == "kubernetes":
         return _kubernetes_job()
     if kind == "ray":
         return SchedulerJob(kind="ray", node_name=os.environ.get("NODE_NAME", "").strip())
     return SchedulerJob()
+
+
+def _nodes_from_file(path: str) -> tuple[str, ...]:
+    """Node names from a scheduler's host file, deduplicated in first-seen order.
+
+    PBS writes one line per *task slot*, so a four-node job with eight tasks each lists every
+    node eight times. The distinct names in order are the allocation; the repetition is the
+    task layout, which `tasks` already carries.
+    """
+    try:
+        with open(path) as f:
+            names = [line.strip() for line in f if line.strip()]
+    except OSError:
+        return ()
+    return tuple(dict.fromkeys(names))
+
+
+def _pbs_job() -> SchedulerJob:
+    """The allocation this process belongs to, from PBS/OpenPBS.
+
+    PBS puts its node list in a *file* rather than an environment variable, which is the one
+    structural difference from Slurm worth handling: `PBS_NODEFILE` names it, and the file is
+    one line per task slot rather than one per node.
+    """
+    nodefile = os.environ.get("PBS_NODEFILE", "").strip()
+    nodes = _nodes_from_file(nodefile) if nodefile else ()
+    return SchedulerJob(
+        kind="pbs",
+        job_id=os.environ.get("PBS_JOBID", "").strip(),
+        nodes=nodes,
+        gpus_per_node=_int_env("PBS_NGPUS"),
+        cpus_per_node=_int_env("PBS_NCPUS"),
+        tasks=_int_env("PBS_NP"),
+        node_name=os.environ.get("PBS_NODENUM", "").strip() or (nodes[0] if nodes else ""),
+        partition=os.environ.get("PBS_QUEUE", "").strip(),
+    )
+
+
+def _lsf_job() -> SchedulerJob:
+    """The allocation this process belongs to, from LSF.
+
+    LSF lists its hosts inline in `LSB_HOSTS`, space-separated and repeated per slot, or in a
+    file named by `LSB_DJOB_HOSTFILE` on a large job where the variable would overflow. Both
+    are read, the file first, because that is the one that stays correct at scale.
+    """
+    hostfile = os.environ.get("LSB_DJOB_HOSTFILE", "").strip()
+    nodes = _nodes_from_file(hostfile) if hostfile else ()
+    if not nodes:
+        nodes = tuple(dict.fromkeys(os.environ.get("LSB_HOSTS", "").split()))
+    return SchedulerJob(
+        kind="lsf",
+        job_id=os.environ.get("LSB_JOBID", "").strip(),
+        nodes=nodes,
+        gpus_per_node=len(_visible_devices()),
+        tasks=_int_env("LSB_DJOB_NUMPROC"),
+        node_name=os.environ.get("HOSTNAME", "").strip() or (nodes[0] if nodes else ""),
+        partition=os.environ.get("LSB_QUEUE", "").strip(),
+    )

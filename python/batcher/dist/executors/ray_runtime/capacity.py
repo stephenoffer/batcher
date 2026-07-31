@@ -101,13 +101,13 @@ _ALLOCATION_WARNED = False
 def warn_once_if_allocation_is_wider_than_ray() -> None:
     """Say so, once, when a batch allocation spans more nodes than Ray is using.
 
-    The silent failure this exists for: `srun -N 4 python job.py` gives the job four nodes,
-    and a bare `ray.init()` starts a *local* single-node Ray on whichever one the script
-    happens to be on. The job runs, returns the right answer, and uses a quarter of the
+    The silent failure this exists for: `srun -N 4 python job.py` — or the PBS and LSF
+    equivalents — gives the job four nodes, and a bare `ray.init()` starts a *local*
+    single-node Ray on whichever one the script happens to be on. The job runs, returns the right answer, and uses a quarter of the
     hardware it was billed for — with nothing anywhere to say so, because from Batcher's side
     a one-node cluster is a perfectly ordinary cluster.
 
-    Batcher cannot fix it from here: bringing up Ray across a Slurm allocation is the
+    Batcher cannot fix it from here: bringing up Ray across a batch allocation is the
     launcher's job (`ray start` on each node, then `RAY_ADDRESS`). So this reports rather
     than acts, and reports only where the two figures actually disagree — a single-node
     allocation, an unscheduled process, and a Ray cluster that already spans the allocation

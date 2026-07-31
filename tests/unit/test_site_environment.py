@@ -27,7 +27,9 @@ _REAL_DMI = provider.dmi_identity.__wrapped__
 def _clean_env(monkeypatch):
     """Strip every signal these probes read, so the host's own environment cannot leak in."""
     for name in list(os.environ):
-        if name.startswith(("SLURM", "RUNPOD", "COREWEAVE", "LAMBDA", "CRUSOE", "NEBIUS")):
+        if name.startswith(
+            ("SLURM", "PBS_", "LSB_", "RUNPOD", "COREWEAVE", "LAMBDA", "CRUSOE", "NEBIUS")
+        ):
             monkeypatch.delenv(name, raising=False)
     for name in (
         "BATCHER_PROVIDER",
@@ -595,3 +597,65 @@ def test_an_unrecognized_firmware_vendor_is_not_a_platform(monkeypatch, tmp_path
     assert provider.detect_provider() == "unknown"
     assert provider.dmi_identity()[1] == "AS-4125GS"
     assert provider.dmi_identity()[2] is False
+
+
+# --- The other batch schedulers a GPU cluster runs under --------------------------------------
+
+
+def test_pbs_reads_its_node_list_from_a_file(monkeypatch, tmp_path):
+    # The one structural difference from Slurm: PBS writes hosts to a file, one line per task
+    # *slot*, so a four-node job with eight tasks each lists every node eight times.
+    nodefile = tmp_path / "nodes"
+    nodefile.write_text("gpu01\n" * 8 + "gpu02\n" * 8)
+    monkeypatch.setenv("PBS_JOBID", "912.head")
+    monkeypatch.setenv("PBS_NODEFILE", str(nodefile))
+    monkeypatch.setenv("PBS_NGPUS", "8")
+    monkeypatch.setenv("PBS_NCPUS", "96")
+    monkeypatch.setenv("PBS_NP", "16")
+    monkeypatch.setenv("PBS_QUEUE", "gpu")
+    job = scheduler.scheduler_job()
+    assert job.kind == "pbs"
+    assert job.nodes == ("gpu01", "gpu02"), "distinct names, not one per slot"
+    assert job.multi_node is True
+    assert job.total_gpus == 16
+    assert (job.cpus_per_node, job.tasks, job.partition) == (96, 16, "gpu")
+
+
+def test_lsf_prefers_its_host_file_over_the_inline_list(monkeypatch, tmp_path):
+    # `LSB_HOSTS` overflows on a large job; the file is the one that stays correct at scale.
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("gpu07\ngpu07\ngpu08\n")
+    monkeypatch.setenv("LSB_JOBID", "5150")
+    monkeypatch.setenv("LSB_HOSTS", "wrong wrong")
+    monkeypatch.setenv("LSB_DJOB_HOSTFILE", str(hostfile))
+    monkeypatch.setenv("LSB_QUEUE", "gpuq")
+    job = scheduler.scheduler_job()
+    assert job.kind == "lsf"
+    assert job.nodes == ("gpu07", "gpu08")
+    assert job.partition == "gpuq"
+
+
+def test_lsf_falls_back_to_the_inline_host_list(monkeypatch):
+    monkeypatch.setenv("LSB_JOBID", "5150")
+    monkeypatch.setenv("LSB_HOSTS", "gpu01 gpu01 gpu02")
+    job = scheduler.scheduler_job()
+    assert job.nodes == ("gpu01", "gpu02")
+
+
+def test_an_unreadable_host_file_is_an_empty_allocation_not_a_crash(monkeypatch, tmp_path):
+    monkeypatch.setenv("PBS_JOBID", "1")
+    monkeypatch.setenv("PBS_NODEFILE", str(tmp_path / "absent"))
+    job = scheduler.scheduler_job()
+    assert job.kind == "pbs"
+    assert job.nodes == ()
+    assert job.multi_node is False
+
+
+def test_slurm_still_wins_when_more_than_one_scheduler_is_in_the_environment(monkeypatch):
+    # A Slurm job that submits through a PBS-compatible wrapper carries both; the outermost
+    # allocation is the one that bounds the job and will end it.
+    monkeypatch.setenv("PBS_JOBID", "1")
+    monkeypatch.setenv("LSB_JOBID", "2")
+    assert scheduler.scheduler_kind() == "pbs"
+    monkeypatch.setenv("SLURM_JOB_ID", "3")
+    assert scheduler.scheduler_kind() == "slurm"
