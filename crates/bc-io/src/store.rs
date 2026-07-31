@@ -136,7 +136,23 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
             );
             allow_http = std::env::var("AWS_ALLOW_HTTP")
                 .map(|v| is_truthy(&v))
-                .unwrap_or(false);
+                .unwrap_or_else(|_| {
+                    // An `http://` endpoint from the environment implies plain HTTP, the same
+                    // way one written into the query string already does. Without this the
+                    // asymmetry bites exactly the deployment the endpoint variable exists for:
+                    // a MinIO or Ceph gateway on an internal network, reached over HTTP
+                    // because there is no certificate for `minio.internal`. `object_store`
+                    // refuses the connection, the reader is unusable, and the scan degrades
+                    // to the slower PyArrow path with correct results and no diagnostic.
+                    //
+                    // Only when the operator has not said otherwise: an explicit
+                    // `AWS_ALLOW_HTTP=false` against an `http://` endpoint is a contradiction,
+                    // and the explicit half wins.
+                    std::env::var("AWS_ENDPOINT_URL")
+                        .or_else(|_| std::env::var("AWS_ENDPOINT"))
+                        .map(|e| e.trim_start().to_ascii_lowercase().starts_with("http://"))
+                        .unwrap_or(false)
+                });
         }
         "gs" | "gcs" => {
             env_opt(
@@ -251,6 +267,25 @@ mod tests {
             .collect()
     }
 
+    /// Serializes the tests that write process-global environment variables.
+    ///
+    /// The environment is shared by every thread cargo runs a test on, so two of these
+    /// interleave: one sets `AWS_ENDPOINT_URL` and the other removes it in its cleanup, and
+    /// the first then reads an option that is not there. That is a *flake*, which is worse
+    /// than a failure — it passes on a rerun, so it teaches whoever hits it to rerun.
+    ///
+    /// A plain `Mutex` rather than a crate: this is the only place in the crate that needs
+    /// one. A poisoned lock is recovered from rather than propagated, since a panic in one
+    /// env test has already been reported and must not turn every later one into a second
+    /// failure pointing at the wrong test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Static credentials in the environment must reach the builder for every cloud, not
     /// just AWS. Without this the on-prem case (MinIO/Ceph with `AWS_ACCESS_KEY_ID`, where
     /// there is no metadata service to fall back on) fails to authenticate and the scan
@@ -260,6 +295,7 @@ mod tests {
     /// across functions would race under cargo's parallel test threads.
     #[test]
     fn env_credentials_reach_every_scheme() {
+        let _guard = env_guard();
         std::env::set_var("AWS_ACCESS_KEY_ID", "AK");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "SK");
         std::env::set_var("AWS_ENDPOINT_URL", "http://minio.internal:9000");
@@ -300,10 +336,28 @@ mod tests {
             Some("eu-west-1")
         );
 
+        // An `http://` endpoint from the environment implies plain HTTP, the same way one in
+        // the query string does. Without it `object_store` refuses the connection to an
+        // internal MinIO or Ceph gateway, the reader is unusable, and the scan degrades to
+        // PyArrow with correct results and nothing to say why.
+        assert_eq!(s3.get("aws_allow_http").map(String::as_str), Some("true"));
+
+        // An https endpoint implies nothing, because it does not need to.
+        std::env::set_var("AWS_ENDPOINT_URL", "https://object.example.net");
+        assert!(!opts_for("s3://bucket/key.parquet").contains_key("aws_allow_http"));
+
+        // And an operator who said no outranks the inference: an explicit `false` against an
+        // `http://` endpoint is a contradiction, and the explicit half wins.
+        std::env::set_var("AWS_ENDPOINT_URL", "http://minio.internal:9000");
+        std::env::set_var("AWS_ALLOW_HTTP", "false");
+        assert!(!opts_for("s3://bucket/key.parquet").contains_key("aws_allow_http"));
+        std::env::remove_var("AWS_ALLOW_HTTP");
+
         for v in [
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_ENDPOINT_URL",
+            "AWS_ALLOW_HTTP",
             "AZURE_STORAGE_ACCOUNT_KEY",
             "GOOGLE_SERVICE_ACCOUNT",
         ] {
@@ -386,6 +440,7 @@ mod tests {
     /// re-reads once it is set.
     #[test]
     fn allow_http_is_read_by_value_not_by_presence() {
+        let _guard = env_guard();
         std::env::set_var("AWS_ALLOW_HTTP", "false");
         assert!(!opts_for("s3://bucket/key.parquet").contains_key("aws_allow_http"));
         std::env::set_var("AWS_ALLOW_HTTP", "1");

@@ -319,8 +319,8 @@ Accelerator reporting (`accelerators`, `show_accelerators`, `measure_energy`).
 | module | lines | what it is |
 |---|---|---|
 | `energy.py` | 93 | Collecting what a pipeline drew, and folding the measurement back into what is learned. |
-| `report.py` | 407 | Assembling the accelerator report, and saying the part a reader would otherwise miss. |
-| `rows.py` | 169 | One row per local device: nameplate figures, live readings, and what is wrong with it. |
+| `report.py` | 412 | Assembling the accelerator report, and saying the part a reader would otherwise miss. |
+| `rows.py` | 175 | One row per local device: nameplate figures, live readings, and what is wrong with it. |
 
 ### `batcher/api/sql_session/` — 5 · conductor
 
@@ -2152,7 +2152,7 @@ AMD accelerators, read from the driver rather than from ROCm.
 
 | module | lines | what it is |
 |---|---|---|
-| `devices.py` | 405 | What an AMD Instinct node can be asked about itself, without ROCm installed. |
+| `devices.py` | 430 | What an AMD Instinct node can be asked about itself, without ROCm installed. |
 
 ### `batcher/_internal/hardware/engine/` — 0 · utility
 
@@ -2170,7 +2170,7 @@ The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
 | module | lines | what it is |
 |---|---|---|
 | `counters.py` | 228 | What an RDMA port has actually carried, and what it got wrong doing it. |
-| `device_links.py` | 264 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
+| `device_links.py` | 272 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
 | `ethernet.py` | 183 | The node's Ethernet links, for the large share of GPU capacity that has no RDMA. |
 | `nvlink.py` | 264 | NVLink, per link and per device — whether the fast path between devices is actually up. |
 | `pcie.py` | 296 | A device's PCIe link, its NUMA home, and how far two devices sit apart on the bus. |
@@ -2482,7 +2482,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `page_index.rs` | 271 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 318 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `row_filter.rs` | 349 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
-| `store.rs` | 243 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
+| `store.rs` | 259 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-udf`
 
