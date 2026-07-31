@@ -59,7 +59,8 @@ _SCRATCH_OVERRIDE = "BATCHER_SCRATCH_DIR"
 #: Device classes ranked by what a spill costs on them, best first, using the vocabulary
 #: `hardware.storage.device_class` reports. `unknown` sits mid-table rather than last because
 #: an unclassified device is far more likely to be a local disk the `/sys` probe could not
-#: resolve than a network volume.
+#: resolve than anything worse; the classes that are genuinely worse are excluded outright
+#: below rather than ranked.
 _CLASS_RANK = {
     "nvme": 0,
     "ssd": 1,
@@ -67,15 +68,21 @@ _CLASS_RANK = {
     "mapped": 3,
     "unknown": 4,
     "rotational": 5,
-    "network": 6,
 }
 
-#: Classes that are never scratch, whatever their size or speed. A tmpfs is the trap worth
-#: naming: it is fast, it is often large, and spilling to it relieves no memory pressure at all
-#: because the bytes stay in RAM — an out-of-core query that "spills" to `/dev/shm` OOMs at
-#: exactly the point it was spilling to avoid. A loopback file inherits the properties of
-#: whatever it sits on, which this probe cannot see through.
-_EXCLUDED_CLASSES = frozenset({"memory", "loopback"})
+#: Classes that are never node-local scratch, whatever their size or speed.
+#:
+#: * `memory` — a tmpfs. The trap worth naming: fast, often large, and spilling to it relieves
+#:   no memory pressure at all because the bytes stay in RAM, so an out-of-core query that
+#:   "spills" to `/dev/shm` runs out of memory at exactly the point it spilled to avoid that.
+#: * `loopback` — a file pretending to be a disk. It inherits the properties of whatever it
+#:   sits on, which this probe cannot see through.
+#: * `network` — an NFS, Lustre or Ceph mount. This module's whole contract is *node-local
+#:   fast* storage, and a network volume is neither: it is slower than the tempdir it would be
+#:   chosen over for the random access an external merge produces, and it is shared, so two
+#:   workers spilling to it contend for the same bandwidth. A deployment that genuinely wants
+#:   to spill over the network says so with `memory.spill_dir`, where the choice is visible.
+_EXCLUDED_CLASSES = frozenset({"memory", "loopback", "network"})
 
 #: A volume smaller than this is not worth preferring over a tempdir: it is a config mount or
 #: a small ephemeral partition, and a spill that fills it fails the same way `/tmp` would.
@@ -89,7 +96,7 @@ class ScratchVolume:
     Attributes:
         path: The directory.
         device_class: What `hardware.storage` made of the block device behind it
-            (`"nvme"`, `"ssd"`, `"raid"`, `"rotational"`, `"network"`, `"unknown"`).
+            (`"nvme"`, `"ssd"`, `"raid"`, `"rotational"`, `"unknown"`).
         free_bytes: Space available at probe time.
         total_bytes: Size of the filesystem.
     """
@@ -103,9 +110,9 @@ class ScratchVolume:
     def rank(self) -> tuple[int, int]:
         """Sort key: device class first, then free space descending.
 
-        Class before capacity is deliberate. A 2 TB NVMe beats a 30 TB network volume for
+        Class before capacity is deliberate. A 2 TB NVMe beats a 30 TB spinning disk for
         spill by a margin no capacity difference makes up, because an external merge is
-        random-access and that is exactly what a network volume is worst at.
+        random-access and that is exactly what a slow device is worst at.
         """
         return (_CLASS_RANK.get(self.device_class, 4), -self.free_bytes)
 

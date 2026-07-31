@@ -229,14 +229,29 @@ def test_a_measured_volume_is_preferred_and_ranked_by_device_class(monkeypatch, 
     slow.mkdir()
     monkeypatch.setattr(scratch, "SCRATCH_CANDIDATES", (str(slow), str(fast)))
     monkeypatch.setattr(scratch, "_MIN_USEFUL_BYTES", 0)
-    classes = {str(fast): "nvme", str(slow): "network"}
+    classes = {str(fast): "nvme", str(slow): "rotational"}
     monkeypatch.setattr(
         "batcher._internal.hardware.storage.device_class", lambda p: classes.get(p, "unknown")
     )
     scratch.reset_scratch_probe()
     volumes = scratch.scratch_volumes()
-    assert [v.device_class for v in volumes] == ["nvme", "network"]
+    assert [v.device_class for v in volumes] == ["nvme", "rotational"]
     assert scratch.local_scratch_root() == str(fast)
+
+
+def test_a_network_volume_is_not_node_local_scratch(monkeypatch, tmp_path):
+    # This module's contract is node-local *fast* storage, and a network mount is neither:
+    # slower than the tempdir it would be chosen over for the random access an external merge
+    # produces, and shared, so two workers spilling to it contend for one pipe. A deployment
+    # that wants to spill over the network says so where the choice is visible.
+    volume = tmp_path / "nfs"
+    volume.mkdir()
+    monkeypatch.setattr(scratch, "SCRATCH_CANDIDATES", (str(volume),))
+    monkeypatch.setattr(scratch, "_MIN_USEFUL_BYTES", 0)
+    monkeypatch.setattr("batcher._internal.hardware.storage.device_class", lambda p: "network")
+    scratch.reset_scratch_probe()
+    assert scratch.scratch_volumes() == ()
+    assert scratch.local_scratch_root() is None
 
 
 def test_a_tmpfs_is_never_chosen_as_scratch(monkeypatch, tmp_path):
