@@ -458,6 +458,36 @@ fn arithmetic_shift_right(values: &Int64Array, amounts: &Int64Array) -> Int64Arr
         .collect()
 }
 
+/// Whether any **non-null** element of `values` is zero, given `nulls`.
+///
+/// The gate in front of every integer and decimal division, so it runs on the common path
+/// where nothing is zero and the answer is "no". `PrimitiveArray::iter()` yields `Option<T>`
+/// and checks the validity bitmap per element, which defeats vectorization for a scan whose
+/// whole job is to look at a slice of integers. Reading the values slice directly lets the
+/// compiler vectorize it, and a null-free column — much the commonest shape — needs no
+/// validity check at all.
+///
+/// Both branches short-circuit on the first zero, so the rare zero-bearing column is no
+/// slower than it was.
+#[inline]
+fn any_zero<T: PartialEq + Copy + Default>(
+    values: &[T],
+    nulls: Option<&arrow::buffer::NullBuffer>,
+) -> bool {
+    let zero = T::default();
+    match nulls {
+        // Null-free: `slice::contains`, which has a specialized implementation rather than
+        // the generic closure an `iter().any()` would compile to.
+        None => values.contains(&zero),
+        // A null slot's value is undefined (parquet leaves whatever was in the buffer), so a
+        // null row must not count as a zero divisor — it is already null in the output.
+        Some(n) => values
+            .iter()
+            .enumerate()
+            .any(|(i, v)| *v == zero && n.is_valid(i)),
+    }
+}
+
 /// Integer/decimal division (`is_div`) or modulo, with DuckDB zero-divisor semantics:
 /// a zero divisor yields NULL for that row (not an error and not a CPU trap). The naked
 /// kernel would trap the process on an integer zero divisor, so zero divisors are
@@ -475,7 +505,7 @@ fn int_div_or_mod(is_div: bool, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, 
     let (safe_r, is_zero) = match r.data_type() {
         DataType::Int64 => {
             let a = r.as_any().downcast_ref::<Int64Array>().expect("int64");
-            if !a.iter().flatten().any(|v| v == 0) {
+            if !any_zero(a.values(), a.nulls()) {
                 return kernel(l, r);
             }
             let safe: Int64Array = a
@@ -491,7 +521,7 @@ fn int_div_or_mod(is_div: bool, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, 
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .expect("decimal128");
-            if !a.iter().flatten().any(|v| v == 0) {
+            if !any_zero(a.values(), a.nulls()) {
                 return kernel(l, r);
             }
             // Rebuild with the same precision/scale, swapping 0 → 1.
@@ -789,6 +819,45 @@ mod arith_semantics_tests {
     }
 
     /// Integer `%` / `/` by zero yields NULL for that row (DuckDB), not an error or a CPU
+    /// The zero-divisor gate must never miss a real zero, whatever surrounds it.
+    ///
+    /// `any_zero` decides whether the naked kernel runs, and the naked kernel **traps the
+    /// process** on an integer zero divisor — so a false negative there is not a wrong answer,
+    /// it is a SIGFPE. The reason to test it separately from the arithmetic is that the gate
+    /// reads the *values slice*, where a null slot holds whatever was left in the buffer:
+    /// nulls interleaved with a real zero are exactly the shape that could make a scan look
+    /// past it, and a null slot that happens to hold 0 is the shape that could make it claim
+    /// one where there is none.
+    #[test]
+    fn the_zero_divisor_gate_sees_a_zero_among_nulls() {
+        // A real zero after a null. Missing it would trap rather than return null.
+        let l = i64arr(vec![Some(1), Some(2), Some(3)]);
+        let r = i64arr(vec![None, Some(0), Some(4)]);
+        assert_eq!(
+            as_i64(&eval_binary(BinaryOp::Div, &l, &r).unwrap()),
+            vec![None, None, Some(0)]
+        );
+        assert_eq!(
+            as_i64(&eval_binary(BinaryOp::Mod, &l, &r).unwrap()),
+            vec![None, None, Some(3)]
+        );
+        // Nulls but no real zero: the fast path is taken and the answer is still right.
+        // (A null slot's backing value is commonly 0, which is what the validity check in
+        // `any_zero` exists to discount — getting it wrong here costs speed, not answers.)
+        let r2 = i64arr(vec![None, Some(2), None]);
+        assert_eq!(
+            as_i64(&eval_binary(BinaryOp::Div, &l, &r2).unwrap()),
+            vec![None, Some(1), None]
+        );
+        // A zero in the very last slot, past every valid element — the position a
+        // short-circuiting scan reaches last.
+        let r3 = i64arr(vec![Some(1), Some(1), Some(0)]);
+        assert_eq!(
+            as_i64(&eval_binary(BinaryOp::Div, &l, &r3).unwrap()),
+            vec![Some(1), Some(2), None]
+        );
+    }
+
     /// trap; a non-zero divisor is unaffected and a null divisor stays null.
     #[test]
     fn integer_mod_div_by_zero_is_null() {
