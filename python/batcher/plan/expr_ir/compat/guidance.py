@@ -209,8 +209,12 @@ LIST_UNSUPPORTED: dict[str, str] = {
     "to_struct": "There is no list-to-struct; index elements with .list.get(i) into named columns.",
     "to_array": "List columns are already array-typed; there is no separate array conversion.",
     "explode": "Explode a list into rows at the Dataset level: ds.explode('x').",
-    "gather": "Index elements with .list.get(i) or .list.element_at(i).",
-    "take": "Index elements with .list.get(i) or .list.element_at(i).",
+    # No `gather` entry: `.list.gather(indices)` is a real method now, and an entry here would
+    # shadow it — the redirect fires on a missing attribute, so listing a method that exists
+    # is dead weight that reads as "we do not carry this". `take` is Polars' older spelling of
+    # the same operation, so it redirects to `gather` rather than to the scalar accessors,
+    # which index one position instead of taking a column of them.
+    "take": "Positional take is .list.gather(indices), taking a column of positions per row.",
     "count_matches": (
         "Count occurrences by filtering and .list.len(), or test with .list.contains(x)."
     ),
