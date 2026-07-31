@@ -221,10 +221,12 @@ def shard_directory() -> str:
     Returns:
         Path to a directory that exists and is private to this user.
     """
-    import tempfile
+    from batcher._internal.site.container import shm_root
 
-    root = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-    path = os.path.join(root, f"bcudf_{os.getpid()}")
+    # `shm_root` rather than `isdir`, because a container's default 64 MiB `/dev/shm` is a
+    # directory that exists and then fails the write with ENOSPC partway through a batch
+    # group. A slower temp directory that works beats a fast one that does not.
+    path = os.path.join(shm_root(), f"bcudf_{os.getpid()}")
     os.makedirs(path, mode=0o700, exist_ok=True)
     if sys.platform != "win32":
         # `makedirs` honours the umask, so an existing or umask-widened directory is

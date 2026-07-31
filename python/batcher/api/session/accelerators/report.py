@@ -51,6 +51,7 @@ def accelerators() -> dict:
 
     report: dict = {"backend": accelerator_backend(), "devices": device_rows()}
     _add_site(report)
+    _add_container(report)
     _add_fabric(report)
 
     from batcher.dist.executors.ray_runtime.fabric import topology_summary
@@ -180,6 +181,7 @@ def accelerator_problems() -> list[str]:
             )
         if row.get("throttled"):
             out.append(f"gpu {index}: clocks clamped ({', '.join(row['throttled'])})")
+    out.extend(f"container: {finding}" for finding in report.get("container", []))
     fabric = (report.get("fabric") or {}).get("rdma") or {}
     if fabric.get("ports", 0) > fabric.get("active_ports", 0):
         down = fabric["ports"] - fabric["active_ports"]
@@ -238,6 +240,20 @@ def _add_site(report: dict) -> None:
     if scratch:
         site["scratch_dir"] = scratch
     report["site"] = site
+
+
+def _add_container(report: dict) -> None:
+    """Add the container limits that will cost this job something, when there are any.
+
+    Its own section rather than part of `site`, because a container is a container whether or
+    not the platform identified itself, and this is the section an operator acts on: each
+    finding names the flag that fixes it.
+    """
+    from batcher._internal.site import container_findings
+
+    findings = container_findings()
+    if findings:
+        report["container"] = list(findings)
 
 
 def _add_fabric(report: dict) -> None:
@@ -326,6 +342,8 @@ def show_accelerators() -> None:
         print(f"{line}, scheduled by {site['scheduler']}")
         if site.get("scratch_dir"):
             print(f"      local scratch {site['scratch_dir']}")
+    for finding in report.get("container", []):
+        print(f"container: {finding}")
     fabric = report.get("fabric")
     if fabric:
         rdma = fabric.get("rdma")

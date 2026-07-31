@@ -25,6 +25,15 @@ A neutral utility: any layer may import `_internal`.
 
 from __future__ import annotations
 
+from batcher._internal.site.container import (
+    container_findings,
+    in_container,
+    memlock_limit_bytes,
+    open_files_limit,
+    shm_bytes,
+    shm_root,
+    usable_shm,
+)
 from batcher._internal.site.provider import (
     PROVIDERS,
     SiteProfile,
@@ -53,14 +62,21 @@ __all__ = [
     "SchedulerJob",
     "ScratchVolume",
     "SiteProfile",
+    "container_findings",
     "detect_provider",
     "expand_nodelist",
+    "in_container",
     "local_scratch_root",
+    "memlock_limit_bytes",
+    "open_files_limit",
     "reset_provider_probe",
     "reset_scratch_probe",
     "scheduler_job",
     "scheduler_kind",
     "scratch_volumes",
+    "shm_bytes",
+    "shm_root",
     "site_profile",
     "site_summary",
+    "usable_shm",
 ]
