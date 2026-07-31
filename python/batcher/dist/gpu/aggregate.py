@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.dist.gpu.fabric import adaptive_shard_factor
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -65,6 +66,28 @@ def sharded_gpu_aggregate(
     return merge_shards(partials, [*split.merge_ops, *split.tail_ops])
 
 
+def _fleet_throughputs() -> tuple[float, ...]:
+    """Rows per second per distinct device model in the fleet, from the learned statistics.
+
+    Per *model* rather than per device: that is the granularity the learner keys on, and it is
+    the one that matters — a fleet is uneven because it mixes an H100 with an L4, not because
+    two H100s differ. Empty on a fleet whose models are unknown or unmeasured, which every
+    consumer reads as "keep the configured shape".
+    """
+    try:
+        from batcher.core.runtime import default_hub
+        from batcher.dist.executors.ray_runtime.fabric import gpu_node_topology
+        from batcher.kyber.gpu.adaptive import learned_device_throughput
+
+        hub = default_hub()
+        models = {node.accelerator_type for node in gpu_node_topology() if node.accelerator_type}
+        rates = tuple(learned_device_throughput(hub, model) for model in sorted(models))
+    except Exception as exc:  # a sizing hint must never fail a fan-out
+        note_suppressed("dist", "read the fleet's measured device throughput", exc)
+        return ()
+    return tuple(r for r in rates if r > 0.0)
+
+
 def shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve_order: bool):
     """One partition descriptor per shard, or `None` when the source cannot be fanned out.
 
@@ -101,7 +124,13 @@ def shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve
         # OOM on a large source), work load-balances finely across a heterogeneous fleet, and
         # a preempted shard's retry is 1/N of the work. Ray runs at most `gpu_count`
         # single-device tasks at once, so the surplus pipelines behind them.
-        factor = max(1, int(active_config().distributed.gpu_shard_oversubscribe))
+        # Divided more finely when the fleet's own measurements say its devices differ. Ray
+        # runs one task per device at a time, so an equal number of shards each means the
+        # stage ends when the slowest device ends and the fast ones idle from then on. A
+        # uniform (or unmeasured) fleet keeps exactly the configured factor.
+        factor = adaptive_shard_factor(
+            int(active_config().distributed.gpu_shard_oversubscribe), _fleet_throughputs()
+        )
         n_shards = gpu_count * factor
     else:
         n_shards = 1

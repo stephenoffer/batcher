@@ -23,8 +23,12 @@ from concurrent import futures
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import ConfigError
+from batcher._internal.hardware.cpu import available_cpu_count
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.carbonite.transfer import ShuffleTicket
+from batcher.carbonite.transfer.codec import resolve_codec
+from batcher.kyber.cost.fabric import measured_fabric_gbps
 
 if TYPE_CHECKING:
     from batcher.config.config import ShuffleTlsConfig
@@ -1040,6 +1044,26 @@ except ImportError:  # pragma: no cover - ray optional
     _FlightWorker = None  # type: ignore
 
 
+def _connections_per_peer(dc) -> int:
+    """How many TCP flows a consumer opens to one peer, floored at the node's rail count.
+
+    A striped fetch can only use as many paths as it has flows: four connections on an
+    eight-rail node leave half the fabric unused however the routing hashes them, because
+    there are not enough flows to hash. The configured value is a floor rather than a
+    ceiling here — it was chosen against a NIC count, not against this node's rails — and a
+    node with no readable rail map keeps exactly the configured number.
+    """
+    from batcher._internal.hardware.fabric.rails import rail_summary
+
+    configured = int(dc.flight_connections_per_peer or 0)
+    try:
+        rails = int(rail_summary().get("loaded_rails", 0))
+    except Exception as exc:  # a transport hint must never fail a worker's startup
+        note_suppressed("dist", "read the node's rail count", exc)
+        return configured
+    return max(configured, rails)
+
+
 def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int | None = None):
     """Gang-schedule `workers` `_FlightWorker` actors in one SPREAD placement group.
 
@@ -1089,8 +1113,14 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
     # setter. 0 keepalive = off.
     idle_ms = int(dc.flight_idle_timeout_s * 1000)
     keepalive_ms = int((dc.flight_keepalive_s or 0) * 1000)
-    connections_per_peer = int(dc.flight_connections_per_peer or 0)
-    compression = {"none": 0, "lz4": 1, "zstd": 2}.get(dc.flight_compression, 1)
+    connections_per_peer = _connections_per_peer(dc)
+    # `auto` decides the codec against the fabric this node actually has. A compressor that
+    # cannot keep up with the wire is a ceiling below it, so the right answer on a 400 Gb/s
+    # port is usually no compression at all and on a 10 Gb/s VM is the highest ratio available.
+    # An explicitly named codec is never overruled by a measurement.
+    compression = resolve_codec(
+        dc.flight_compression, measured_fabric_gbps(), available_cpu_count()
+    )
     # Same-node shared-memory transfer, decided on the driver and shipped to every
     # worker (which can't see the driver's config_context). Gated on the native probe so
     # it is never enabled where no shared directory exists (it would just churn fallbacks).

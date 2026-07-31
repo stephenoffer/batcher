@@ -136,9 +136,14 @@ def decide_gpu_backend(
     # The row threshold below which the GPU overhead isn't amortized: the measured crossover
     # learned from this hub's own GPU/CPU runs when available (Core measures, Kyber consumes),
     # else the config default. This is what makes the backend choice adaptive to the hardware.
-    from batcher.kyber.gpu.adaptive import learned_gpu_min_rows
+    from batcher.kyber.gpu.adaptive import learned_gpu_min_rows, shape_key
 
-    learned_min = learned_gpu_min_rows(hub, accelerator_type)
+    # Keyed by the query's own shape where this hub has seen it enough times, because two
+    # pipelines on one device have different crossovers: a wide projection is transfer-bound
+    # and a narrow group-by is not. The signature is memoized on the node, and the reader falls
+    # back to this device's pooled fit and then to the fleet's, so a shape seen for the first
+    # time keeps exactly the threshold it had.
+    learned_min = learned_gpu_min_rows(hub, accelerator_type, shape_key(plan))
     # `is None`, not truthiness: `learned_gpu_min_rows` clamps to `[default/8, default*8]`, so a
     # legitimately-configured small `gpu_min_rows` (the config invites retuning) can learn a 0 —
     # which `or` discarded, silently reverting to the default *and* dropping the "learned "

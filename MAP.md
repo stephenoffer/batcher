@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1054 Python modules across 166 packages and 189 Rust files across 13 crates.
+Covering 1066 Python modules across 167 packages and 190 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -319,8 +319,9 @@ Accelerator reporting (`accelerators`, `show_accelerators`, `measure_energy`).
 | module | lines | what it is |
 |---|---|---|
 | `energy.py` | 93 | Collecting what a pipeline drew, and folding the measurement back into what is learned. |
-| `report.py` | 419 | Assembling the accelerator report, and saying the part a reader would otherwise miss. |
+| `report.py` | 427 | Assembling the accelerator report, and saying the part a reader would otherwise miss. |
 | `rows.py` | 175 | One row per local device: nameplate figures, live readings, and what is wrong with it. |
+| `wires.py` | 139 | The wires between the devices, in the report the operator already reads. |
 
 ### `batcher/api/sql_session/` — 5 · conductor
 
@@ -353,7 +354,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 412 | Per-query event log — one JSON document per query (Spark's event-log analog). |
-| `gpu_backend.py` | 472 | The opt-in GPU execution backend for supported relational shapes. |
+| `gpu_backend.py` | 484 | The opt-in GPU execution backend for supported relational shapes. |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
 | `profile.py` | 446 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
@@ -694,7 +695,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 179 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1168 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1198 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 166 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -751,7 +752,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 264 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `scaling.py` | 495 | What the live cluster is, and what of it a query may use. |
-| `scheduling.py` | 401 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scheduling.py` | 454 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 127 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
@@ -791,14 +792,23 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 225 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `aggregate.py` | 254 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `device_read.py` | 178 | Read a shard onto the device, instead of onto the host and then across the bus. |
 | `dispatch.py` | 163 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 141 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `shards.py` | 236 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
-| `tasks.py` | 234 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 244 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 | `union.py` | 173 | Run a translated union across every GPU, by sharding each of its inputs. |
+
+### `batcher/dist/gpu/fabric/` — 4 · backend
+
+Scheduling a GPU stage against the wires, not just the device count.
+
+| module | lines | what it is |
+|---|---|---|
+| `collective_env.py` | 251 | Telling the collective library which wires this node has, instead of letting it guess. |
+| `placement.py` | 218 | Which devices a multi-device stage gets, and how its shards are dealt across them. |
 
 ### `batcher/dist/spill/` — 4 · backend
 
@@ -881,9 +891,10 @@ GPU decisions — Kyber's cost-based accelerator choices, grouped as one family.
 
 | module | lines | what it is |
 |---|---|---|
-| `adaptive.py` | 118 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
+| `adaptive.py` | 252 | Adaptive GPU crossover — learn where the GPU backend starts beating the CPU engine. |
 | `energy.py` | 421 | Energy-aware accelerator choices — which device, how many, and is it worth the watts. |
-| `policy.py` | 430 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
+| `exchange.py` | 229 | What a byte costs when the data is on a device, and how wide a stage may fan out before it. |
+| `policy.py` | 435 | GPU-vs-CPU backend policy — Kyber's cost-based decision of *where* a plan runs. |
 | `shape.py` | 95 | What Kyber can tell the GPU backend about a plan's *shape*, as opposed to its cost. |
 | `sizing.py` | 112 | SELECTION-phase rule — size a GPU inference stage's resources. |
 
@@ -1302,12 +1313,16 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 
 | module | lines | what it is |
 |---|---|---|
-| `fabric_usage.py` | 79 | What the node's RDMA fabric carried while a shuffle was running. |
+| `codec.py` | 110 | Which wire codec a shuffle should use, decided against the link it will actually cross. |
+| `device_exchange.py` | 390 | Redistributing between the devices of one node without serializing them behind each other. |
+| `fabric_usage.py` | 129 | What the node's RDMA fabric carried while a shuffle was running. |
 | `lifecycle.py` | 125 | Process-level shuffle lifecycle — the shared consumer, and the exit-time drain. |
-| `locality.py` | 117 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
+| `locality.py` | 178 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
+| `peers.py` | 133 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 106 | Locality-aware reducer placement — put a reducer where its data already is. |
 | `server.py` | 448 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
-| `session.py` | 452 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `session.py` | 467 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `staging.py` | 271 | How a transfer crosses the host link: chunk size, how many are in flight, and pinned or not. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
 
 ### `batcher/core/` — 3 · subsystem
@@ -1732,6 +1747,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 | `console.py` | 447 | The terminal face of the engine — a live progress bar plus structured status lines. |
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `energy.py` | 289 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
+| `fabric.py` | 49 | The node's wires as flat metric rows, for a dashboard that watches a fleet rather than a run. |
 | `metrics.py` | 438 | Process-wide counters and timings, as a plain dict. |
 | `node_metrics.py` | 161 | What the *hardware* is doing, as gauges a fleet alerts on. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
@@ -2077,7 +2093,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 275 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 2423 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2426 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 200 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
@@ -2174,7 +2190,9 @@ The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
 | `device_links.py` | 368 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
 | `ethernet.py` | 183 | The node's Ethernet links, for the large share of GPU capacity that has no RDMA. |
 | `nvlink.py` | 264 | NVLink, per link and per device — whether the fast path between devices is actually up. |
+| `p2p.py` | 431 | Device-to-device reach: which pairs exchange on the fabric, and at what rate. |
 | `pcie.py` | 296 | A device's PCIe link, its NUMA home, and how far two devices sit apart on the bus. |
+| `rails.py` | 286 | Which NIC each accelerator leaves the node through, and whether the rails are balanced. |
 | `rdma.py` | 370 | InfiniBand and RoCE NICs — the wire a cross-node shuffle actually runs on. |
 
 ### `batcher/_internal/hardware/faults/` — 0 · utility
@@ -2212,9 +2230,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
-| `flight.rs` | 590 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 619 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 193 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 725 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 727 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 389 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 90 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 85 | Process-wide singletons the FFI layer shares across calls. |
@@ -2448,9 +2466,10 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 
 | file | lines | what it is |
 |---|---|---|
-| `exchange.rs` | 715 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
+| `exchange.rs` | 735 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 387 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
-| `lib.rs` | 105 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
+| `lib.rs` | 106 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
+| `peers.rs` | 170 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 429 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
 | `store.rs` | 407 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 91 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |

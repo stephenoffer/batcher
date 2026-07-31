@@ -324,9 +324,17 @@ def _record_gpu_timing(hub, plan, sources, est_rows: int, wall_ms: float) -> Non
         return
     from batcher.dist.executors.ray_runtime.accelerators import cluster_accelerator_type
     from batcher.kyber.gpu import record_backend_timing
+    from batcher.kyber.gpu.adaptive import record_device_throughput, shape_key
 
-    # Tagged with the device that produced it, so an H100 fleet's timings never join a T4's line.
-    record_backend_timing(hub, "gpu", rows, wall_ms, cluster_accelerator_type())
+    # Tagged with the device that produced it, so an H100 fleet's timings never join a T4's line,
+    # and with the query's shape, so a wide transfer-bound projection does not average against a
+    # narrow group-by on the same board.
+    device = cluster_accelerator_type()
+    record_backend_timing(hub, "gpu", rows, wall_ms, device, shape_key(plan))
+    # The same run as a throughput rather than a point on a line. It is what a fan-out divides
+    # its shards by, and it is learnable from GPU runs alone — the crossover fit needs CPU
+    # samples this fleet may never produce.
+    record_device_throughput(hub, device, rows, wall_ms / 1000.0)
 
 
 def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
@@ -339,11 +347,15 @@ def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
         if hub is None or _gpu_agg_spec(plan) is None or _cluster_gpu_count() < 1:
             return
         from batcher.kyber.gpu import record_backend_timing
+        from batcher.kyber.gpu.adaptive import shape_key
         from batcher.kyber.gpu.policy import _estimate
 
         rows = _agg_input_rows(plan, sources, fallback=int(_estimate(plan, sources, hub)[0] or 0))
         if rows:
-            record_backend_timing(hub, "cpu", rows, wall_ms)
+            # The same shape key as the GPU half. Both lines of a crossover have to come from
+            # the same rung of the ladder, so recording one shaped and the other pooled would
+            # leave the shaped bucket permanently unusable.
+            record_backend_timing(hub, "cpu", rows, wall_ms, None, shape_key(plan))
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("api", "record the GPU/CPU crossover point", exc)
         return

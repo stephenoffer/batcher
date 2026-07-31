@@ -3,22 +3,22 @@
 `hardware.topology` describes the CPUs and `accelerators` the devices. Neither describes the
 wires between them, and on a GPU datacenter the wires are what a run waits on: a shuffle is
 bounded by the NIC, a staging buffer by the PCIe link it crosses, a collective by whether
-NVLink is up. All three are readable, none is reported by a cluster manager, and each fails
-*quietly* — a link that renegotiated to half width still works, it just halves the stage.
+NVLink is up. Each fails *quietly* — a link that renegotiated to half width still works.
 
 Organized by the wire each module reads:
 * `rdma` — InfiniBand and RoCE NICs from `/sys/class/infiniband`: rate, state, partition.
 * `ethernet` — the ordinary NICs, which are the whole fabric on most rented capacity.
 * `pcie` — a device's PCIe link, its NUMA home, and how far apart two devices are on the bus.
-* `device_links` — the join: which host link each accelerator is on, and the device-to-device
-  topology a collective is placed against.
-* `counters` — what an RDMA port carried and what it got wrong doing it, which predicts a
-  cable failure before the port leaves `ACTIVE`.
+* `device_links` — the join: which host link each accelerator is on, and the bus topology.
+* `counters` — what an RDMA port carried and got wrong, which predicts a cable failure.
 * `nvlink` — per-device NVLink state and error counters through NVML.
+* `p2p` — the fabric overlaid on the bus: which device pairs exchange directly and how fast.
+* `rails` — which NIC each device leaves the node through, and whether the rails are balanced.
 
 Every entry point degrades to an empty or neutral answer off Linux, without the driver, and
 inside a container that did not mount the relevant `/sys` tree. A caller that gets nothing
-keeps the default it had, which is the behavior the engine had before any of this existed.
+keeps the default it had. `p2p` and `rails` are imported from their own modules, not
+re-exported here: this façade is capped at the size of its re-export list.
 
 A neutral utility: any layer may import `_internal`.
 """

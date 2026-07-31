@@ -151,6 +151,10 @@ exclude_patterns = [
     # on real GPU hardware). A working document for contributors, and the "what we did not do"
     # register is exactly what a published page must not carry.
     "internals/gpu_datacenter_program.md",
+    # The record of the inter-GPU fabric program that continues it: rails, peer islands, the
+    # exchange schedule, and the first Rust data-plane work in this area. Same reason again —
+    # it carries an explicit "decided against reported" register and a "not done" list.
+    "internals/gpu_fabric_program.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",

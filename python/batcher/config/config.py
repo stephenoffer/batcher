@@ -1120,7 +1120,10 @@ class DistributedConfig:
     # only way past line rate — and real shuffle data (sorted runs, repeated group keys,
     # dictionary strings, nulls) compresses several-fold, unlike the object store's
     # uncompressed blocks. "lz4" (~GB/s/core, gives up fast on incompressible data) is a
-    # near-free default; "zstd" trades CPU for a higher ratio; "none" disables it.
+    # near-free default; "zstd" trades CPU for a higher ratio; "none" disables it. "auto"
+    # decides against the node's measured fabric: past roughly 25 Gb/s a compressor becomes
+    # the ceiling rather than the wire, and on a 400 Gb/s port compressing costs throughput
+    # rather than buying it (`carbonite.transfer.codec`).
     flight_compression: str = "lz4"
     placement_timeout_s: float = 60.0
     # Bounded retry window for *attaching* to a Ray cluster whose head is not answering yet.

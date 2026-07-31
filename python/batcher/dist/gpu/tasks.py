@@ -203,17 +203,27 @@ def cpu_shard_partial(descriptor: dict, ops: list[dict], engine_config: str):
 
 
 def gpu_task_runtime_env() -> dict | None:
-    """The runtime_env for a GPU task: batcher, plus cuDF when the config asks for it.
+    """The runtime_env for a GPU task: batcher, cuDF when configured, and the node's fabric.
 
     numpy is pinned to the cluster version so arrays returned from the task unpickle on the
     driver — cuDF's install otherwise drags numpy to 2.x underneath the caller.
+
+    The fabric block (`collective_env`) tells a collective library which NIC each device is
+    rail-aligned with, which interfaces carry the fabric, and whether peer-to-peer can help
+    here, instead of leaving it to re-derive all three by probing. It is empty on a node whose
+    wires cannot be read, and it never overwrites a variable the deployment set itself, so the
+    worst case is exactly the environment the task had before.
     """
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
+    from batcher.dist.gpu.fabric import merge_env, node_collective_env
 
     rt = dict(worker_runtime_env() or {})
     if active_config().distributed.gpu_backend_cudf:
         rt["pip"] = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
+    fabric = node_collective_env()
+    if fabric:
+        rt["env_vars"] = merge_env(rt.get("env_vars"), fabric)
     return rt or None
 
 

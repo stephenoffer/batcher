@@ -9,6 +9,7 @@ correctness, which are the ones a job's own timings never reveal.
 from __future__ import annotations
 
 from batcher.api.session.accelerators.rows import device_rows
+from batcher.api.session.accelerators.wires import wire_problems
 
 __all__ = ["accelerator_problems", "accelerators", "show_accelerators"]
 
@@ -189,10 +190,12 @@ def accelerator_problems() -> list[str]:
         if row.get("throttled"):
             out.append(f"gpu {index}: clocks clamped ({', '.join(row['throttled'])})")
     out.extend(f"container: {finding}" for finding in report.get("container", []))
-    fabric = (report.get("fabric") or {}).get("rdma") or {}
+    wires = report.get("fabric") or {}
+    fabric = wires.get("rdma") or {}
     if fabric.get("ports", 0) > fabric.get("active_ports", 0):
         down = fabric["ports"] - fabric["active_ports"]
         out.append(f"fabric: {down} of {fabric['ports']} RDMA port(s) are not carrying traffic")
+    out.extend(wire_problems(wires))
     for node in ((report.get("fleet") or {}).get("health") or {}).get("unhealthy", []):
         reasons = ", ".join(node.get("reasons", ())) or "a degraded device"
         out.append(f"node {node['node_id'][:12]}: {reasons}")
@@ -301,6 +304,11 @@ def _add_fabric(report: dict) -> None:
     nvlink = nvlink_summary()
     if nvlink["links"]:
         fabric["nvlink"] = nvlink
+    from batcher.api.session.accelerators.wires import add_wires
+
+    # Which NIC each device leaves through, and which pairs copy without host memory: the two
+    # facts a multi-GPU stage is bounded by that the capability figures above cannot express.
+    add_wires(fabric)
     if fabric:
         from batcher.kyber.cost.fabric import net_weight_summary
 

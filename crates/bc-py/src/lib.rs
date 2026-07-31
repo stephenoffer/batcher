@@ -712,6 +712,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(flight::set_flight_transport_config, m)?)?;
     m.add_function(wrap_pyfunction!(flight::set_flight_client_tls, m)?)?;
     m.add_function(wrap_pyfunction!(flight::shm_available, m)?)?;
+    m.add_function(wrap_pyfunction!(flight::shuffle_peer_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(flight::reset_shuffle_peer_stats, m)?)?;
     m.add_function(wrap_pyfunction!(supported_cast_dtypes, m)?)?;
     m.add_class::<flight::ShuffleClient>()?;
     m.add_class::<pool::MemoryPool>()?;

@@ -600,9 +600,17 @@ impl ClientPool {
         credits: u32,
         token: Option<&str>,
     ) -> TransportResult<Vec<RecordBatch>> {
+        // Timed here rather than inside the retry, so a redial's dead-connection timeout is
+        // never charged to the peer's bandwidth: a stale channel would otherwise make a
+        // healthy node read as the slowest wire in the fleet.
+        let started = std::time::Instant::now();
         let out = self
             .fetch_once_with_retry(addr, ticket, credits, token)
             .await;
+        if let Ok(batches) = out.as_ref() {
+            let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            crate::record_fetch(addr, bytes as u64, started.elapsed());
+        }
         if out.is_err() {
             // Every failure path lands here, including a first `acquire` that could not
             // connect at all — which is the common shape for a peer that has gone away, and
@@ -625,6 +633,7 @@ impl ClientPool {
         match credit_exchange(&mut client, ticket, credits, token).await {
             Err(e) if is_connection_error(&e) => {
                 // Drop the dead connections and redial once.
+                crate::record_retry(addr);
                 self.peer(addr).reset().await;
                 let channel = self.channel(addr).await?;
                 let mut client = FlightClient::from_channel(channel);
@@ -700,7 +709,18 @@ impl ClientPool {
         let fetches = (0..stripe).map(|shard| async move {
             let channel = self.channel(addr).await?;
             let mut client = FlightClient::from_channel(channel);
-            credit_exchange_shard(&mut client, ticket, per_shard, token, shard, stripe).await
+            // Per shard, not per bucket. Each shard is its own TCP flow, so its bytes over
+            // its own duration is the per-stream rate the striping exists to multiply; timing
+            // the whole `try_join_all` instead would divide the bucket by the slowest flow's
+            // wall time and report a rate no flow achieved.
+            let started = std::time::Instant::now();
+            let out =
+                credit_exchange_shard(&mut client, ticket, per_shard, token, shard, stripe).await;
+            if let Ok(batches) = out.as_ref() {
+                let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+                crate::record_fetch(addr, bytes as u64, started.elapsed());
+            }
+            out
         });
         let shards = futures::future::try_join_all(fetches).await?;
         Ok(shards.into_iter().flatten().collect())
