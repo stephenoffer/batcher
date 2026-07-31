@@ -26,6 +26,8 @@ def torchserve_client(
     output_columns: Sequence[str],
     timeout: float = 30.0,
     tensor_encoding: str = "json",
+    max_batch_size: int | None = None,
+    pipeline_depth: int = 1,
 ) -> type:
     """A `map_batches` class UDF posting each batch to a TorchServe model.
 
@@ -50,6 +52,11 @@ def torchserve_client(
         tensor_encoding: how tensor inputs are encoded. Defaults to ``"json"``, the
             nested-list shape a stock TorchServe handler expects. Pass ``"auto"`` for
             the compact binary envelope when your handler decodes it.
+        max_batch_size: rows per request. Set it to the model's registered
+            ``batch_size``: TorchServe answers a request above that window with an error
+            rather than with predictions, and an engine batch is thousands of rows.
+        pipeline_depth: how many requests to keep in flight, so the server keeps working
+            while this worker encodes and decodes. Results stay in input order.
 
     Returns:
         A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
@@ -61,4 +68,6 @@ def torchserve_client(
         output_columns=output_columns,
         timeout=timeout,
         tensor_encoding=tensor_encoding,
+        max_batch_size=max_batch_size,
+        pipeline_depth=pipeline_depth,
     )

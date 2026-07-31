@@ -58,7 +58,10 @@ def triton_client(
         protocol: ``"http"`` or ``"grpc"``.
         model_version: optional model version (default: server-chosen).
         max_batch_size: the model's configured Triton batch window. A larger Arrow batch
-            is split into requests of at most this many rows.
+            is split into requests of at most this many rows. Left unset, the window is
+            read from the model's own configuration on the server, which is where it is
+            declared and where it can be right — an engine batch is far larger than a
+            typical `max_batch_size`, and Triton rejects an oversized request whole.
         pipeline_depth: how many requests to keep in flight, so Triton is not idle while
             the client encodes and decodes. Results stay in input order.
         retries: retry attempts, with jittered backoff, for a transient Triton failure
@@ -130,6 +133,38 @@ class _TritonServingClient:
             return
         if not ready(self._model, model_version=self._version):
             raise BackendError(f"triton model {self._model!r} is not ready")
+
+    def batch_window(self) -> int | None:
+        """The `max_batch_size` this model declares, or `None` when it declares none.
+
+        Read from the model configuration the server publishes, once per worker. A Triton
+        model config almost always names a window, and it is almost always far below an
+        engine batch — `max_batch_size: 8` against sixteen thousand rows — so sending the
+        batch whole is rejected outright by the server. Reading it here is what lets the
+        connector work against a real model without the caller restating a number the
+        server already knows.
+
+        A model with `max_batch_size: 0` does not batch at all in Triton's sense: its
+        inputs carry their own leading dimension. That is `None` here, not zero, because
+        zero would read as "split into empty requests".
+
+        Returns:
+            The declared window, or `None` when the model declares none, the field is
+            absent, or the config cannot be read.
+        """
+        get_config = getattr(self._client, "get_model_config", None)
+        if get_config is None:  # pragma: no cover - an older tritonclient
+            return None
+        config = get_config(self._model, model_version=self._version)
+        # The HTTP client returns the config dict itself; the gRPC client wraps it in a
+        # response message whose `config` field holds it.
+        config = getattr(config, "config", config)
+        declared = (
+            config.get("max_batch_size")
+            if isinstance(config, dict)
+            else getattr(config, "max_batch_size", None)
+        )
+        return int(declared) if isinstance(declared, int) and declared > 0 else None
 
     def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         infer_inputs = []

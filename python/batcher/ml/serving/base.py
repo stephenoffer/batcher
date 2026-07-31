@@ -278,6 +278,28 @@ def _check_response(result: Any, rows: int, outputs: list[str] | None) -> None:
             )
 
 
+def _declared_batch_window(client: object) -> int | None:
+    """The batch window a client's server declares, or `None` when it declares none.
+
+    Optional: a client that cannot ask its server simply does not define `batch_window`, and
+    the batch is sent whole exactly as before. A failure to ask is not a failure to serve
+    either — the window is an optimization over what the caller could have passed by hand, so
+    an unreachable config endpoint degrades to the old behavior rather than failing the worker
+    before it has run a row.
+    """
+    ask = getattr(client, "batch_window", None)
+    if not callable(ask):
+        return None
+    try:
+        window = ask()
+    except Exception as exc:
+        from batcher._internal.logging import note_suppressed
+
+        note_suppressed("ml", "read the serving model's declared batch window", exc)
+        return None
+    return window if isinstance(window, int) and window > 0 else None
+
+
 def serving_udf(
     connect: Callable[[], ServingClient],
     *,
@@ -304,7 +326,9 @@ def serving_udf(
         input_columns: the columns sent to the server, in order.
         output_columns: the appended result columns (defaults to the server's keys).
         max_batch_size: the server's own batch window. A larger Arrow batch is split
-            into requests of at most this many rows; ``None`` sends the batch whole.
+            into requests of at most this many rows. ``None`` asks the client for the
+            window the server declares (an optional ``batch_window()``), and sends the
+            batch whole only when there is nothing to ask or nothing declared.
         pipeline_depth: how many sub-batch requests to keep in flight at once. Above 1
             the server keeps working while the client encodes and decodes; results are
             still emitted in input order.
@@ -327,6 +351,11 @@ def serving_udf(
                 # Under retry: a worker that starts while the server is still rolling
                 # should wait for it, not fail the whole job on a cold endpoint.
                 _call_with_retry(warmup, retries, retry_backoff, "warmup")
+            # A server's batch window is a property of the deployed model, and the server
+            # knows it. An engine batch is orders of magnitude larger than the window a
+            # serving config typically declares, so leaving it unasked meant the first real
+            # batch was rejected whole — a configuration error surfacing as a failed job.
+            self._window = max_batch_size or _declared_batch_window(self._client)
 
         def _predict(self, feed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             return _call_with_retry(
@@ -339,7 +368,7 @@ def serving_udf(
             _require_input_columns(batch, inputs)
             feed = {name: _column_to_numpy(batch.column(name)) for name in inputs}
             _reject_non_numeric_inputs(feed, batch)
-            chunks = _split_feed(feed, batch.num_rows, max_batch_size)
+            chunks = _split_feed(feed, batch.num_rows, self._window)
             result = _merge_results(list(_pipelined(self._predict, chunks, depth)))
             _check_response(result, batch.num_rows, outputs)
             keep = [batch.column(i) for i in range(batch.num_columns)]
