@@ -252,6 +252,55 @@ than Batcher's own subdirectory of it; and the device-class cost table pasted in
 subsystem, which the layer rules forbid — it now sits at layer 0 where Kyber and Carbonite
 both read the one object.
 
+## The second vendor, the other fabric, and the container: a third pass
+
+The pass above still described one kind of node: an NVIDIA board, on an RDMA fabric, reached
+without a container runtime in the way. Most rented GPU capacity is at least one of those
+things away from that picture, and in every case the gap read as *healthy* rather than as
+*unlooked-at* — which is the failure mode this whole area exists to remove.
+
+| Question | Before | Now |
+|---|---|---|
+| Is there an AMD accelerator here at all? | reported none | `hardware.amd`, from the driver's sysfs |
+| Has an Instinct board's HBM failed? | unavailable | `ras/umc_err_count`, quarantined like a fatal Xid |
+| What is an AMD board drawing, and against what cap? | reported zero | hwmon, in the report and in admission |
+| Has it been carved into slices? | unavailable | `current_compute_partition` |
+| What fabric does a node with no RDMA have? | reported none | `hardware.fabric.ethernet` |
+| Which devices should a collective sit on? | unasked | `device_topology`, `tightest_device_group` |
+| What did the container runtime take away? | unavailable | `site.container` |
+| Is this a PBS or LSF allocation? | reported none | `site.scheduler` |
+
+The decisions those facts changed:
+
+- An AMD board is quarantined, drained, counted in the node-condition gauges, and listed by
+  the fleet probe on the same thresholds and through the same code paths as an NVIDIA one. A
+  fleet does not need a second health policy for a second vendor, and a dashboard written
+  against one works on the other.
+- The node's power draw and its enforced cap count both vendors. Under-stating a breaker's
+  load is the one error in this area with a physical consequence, and an Instinct node was
+  reporting zero.
+- Kyber prices a shuffled byte against Ethernet where there is no RDMA. It turns out to matter
+  in the unexpected direction: 100 Gb/s is 12.5 GB/s against the 20 GB/s local reference, so a
+  shuffle on an ordinary Ethernet node costs 1.6 local bytes — *cheaper* than the 2.0 default
+  that had been pushing the enumerator away from it.
+- The tensor-parallelism advice can say that a group cannot fit under one root complex, which
+  on a PCIe-only node means every all-reduce crosses the inter-socket link.
+- A backend that reported `cpu` on an Instinct node with no ROCm torch now reports `rocm`.
+  Naming the wrong hardware is worse than naming none.
+
+Three defects came out of this pass. Three staging paths chose `/dev/shm` with
+`os.path.isdir`, which is true inside a container with the runtime's default 64 MiB — so the
+write started and died with `ENOSPC` partway through a batch group. `bc-io` inferred plain HTTP
+from an `http://` endpoint written into a URI but not from the same endpoint in
+`AWS_ENDPOINT_URL`, so two spellings of one MinIO deployment behaved differently and one of
+them silently fell back to PyArrow. And the store tests raced each other over process-global
+environment variables, which is a flake rather than a failure and so teaches whoever hits it
+to rerun.
+
+Deliberately not read: AMD's XGMI fabric. The sysfs names have moved between kernel releases,
+and a fabric figure that is wrong is worse than one that is absent, so an AMD node reports an
+unknown fabric and the cost model keeps its default weight.
+
 ## What this program did **not** do
 
 Named explicitly, because the absence of each is a real limit and not an oversight:
