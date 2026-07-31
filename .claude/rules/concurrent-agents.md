@@ -68,6 +68,33 @@ What to do about it:
 - **Re-run before reporting.** A crashed run has no result, not a bad one.
 - If you must run the whole suite, do it right after your own build, and expect to repeat.
 
+### The long-lived Ray cluster holds a stale copy too
+
+The same rebuild breaks the **shared Ray cluster**, and it looks nothing like the local case.
+Ray's workers imported the engine when the cluster started, so after any `just build` they hold
+the old `.so` memory-mapped for the rest of their lives. Every distributed test then dies —
+`SystemExit: 1` from a worker, a raylet stack dump, or a nine-minute hang — while the identical
+test passes single-node.
+
+The tell is that it is not your test. Check with the smallest possible query before reading a
+line of your own code:
+
+```
+python -c "import batcher as bt; \
+  print(bt.from_pydict({'a':[1,2]}).agg(s=bt.col('a').sum()).collect(distributed=True).to_pydict())"
+```
+
+If a two-row sum crashes, nothing about your operator is under test. Confirm by running the same
+file against a fresh cluster, which needs no coordination with anyone and takes one env var:
+
+```
+RAY_ADDRESS=local python -m pytest tests/integration/test_your_thing.py -q
+```
+
+A file that goes from a nine-minute hang to `9 passed in 15s` under that variable was never
+failing on its own account. Prefer this over `ray stop`: the cluster is shared, another session
+may have work on it, and a fresh instance answers the question without touching theirs.
+
 ### You do not have to wait: build into a sandbox instead
 
 `just build` is what clobbers the shared `.so`. Building the crate does not. So an FFI or

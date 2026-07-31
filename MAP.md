@@ -391,7 +391,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `batch_format.py` | 181 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 | `cluster.py` | 346 | Unsupervised clustering — grouping rows by similarity, with no labels. |
 | `converters.py` | 399 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
-| `devices.py` | 406 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
+| `devices.py` | 441 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
 | `discriminant.py` | 324 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 208 | Baseline predictors — the "does my model beat doing nothing" reference. |
 | `embed.py` | 500 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
@@ -736,7 +736,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 146 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 196 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 144 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 383 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `hardware_probe.py` | 391 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 471 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
@@ -788,7 +788,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 141 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `shards.py` | 236 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
-| `tasks.py` | 232 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 234 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 | `union.py` | 173 | Run a translated union across every GPU, by sharding each of its inputs. |
 
 ### `batcher/dist/spill/` — 4 · backend
@@ -1228,12 +1228,12 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 
 | module | lines | what it is |
 |---|---|---|
-| `affinity.py` | 189 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
+| `affinity.py` | 202 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
 | `allocator.py` | 342 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
 | `health.py` | 448 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 102 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
-| `power.py` | 101 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
+| `power.py` | 146 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
 | `vram.py` | 241 | Device memory as a managed pool — the VRAM counterpart of the host buffer pool. |
 
 ### `batcher/carbonite/memory/` — 3 · subsystem
@@ -1722,7 +1722,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 | `console.py` | 447 | The terminal face of the engine — a live progress bar plus structured status lines. |
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `energy.py` | 251 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
-| `metrics.py` | 389 | Process-wide counters and timings, as a plain dict. |
+| `metrics.py` | 489 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
 | `system.py` | 228 | The host and engine the queries are running on — the dashboard's hardware panel. |
 | `theme.py` | 144 | Terminal capability detection, the color ramp, and the glyph set — the console's look. |
@@ -1825,7 +1825,7 @@ Energy as a first-class plan quantity: power draw, grid conversion, and per-stag
 |---|---|---|
 | `accounting.py` | 299 | Per-stage energy accounting — the ledger a run fills in and a report reads out. |
 | `carbon.py` | 175 | Turning joules into the two figures a datacenter is actually judged on: cost and carbon. |
-| `power.py` | 286 | Device power draw — the neutral model every power-aware decision reads. |
+| `power.py` | 295 | Device power draw — the neutral model every power-aware decision reads. |
 
 ### `batcher/plan/expr_ir/` — 1 · contract
 
@@ -2106,7 +2106,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 | module | lines | what it is |
 |---|---|---|
 | `accessors.py` | 363 | Reading the device table: one accessor per fact, and the name resolver in front of them. |
-| `table.py` | 183 | The device table itself: one row per accelerator model, and the host link per part. |
+| `table.py` | 208 | The device table itself: one row per accelerator model, and the host link per part. |
 
 ### `batcher/_internal/errors/` — 0 · utility
 
@@ -2132,7 +2132,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `mig.py` | 158 | Multi-Instance GPU profiles — which partitionings a device model actually offers. |
 | `nvml.py` | 385 | Live device telemetry through NVML — what a GPU is *doing*, not what it is. |
 | `probes.py` | 70 | The one hook that clears every memoized hardware reading. |
-| `profile.py` | 375 | The machine's identity — one record of what this hardware is, and a key that names it. |
+| `profile.py` | 388 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 155 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
@@ -2173,9 +2173,9 @@ Where this process is running — the provider, the scheduler, and the local scr
 
 | module | lines | what it is |
 |---|---|---|
-| `provider.py` | 277 | Which GPU cloud this is — read from the environment, never from a metadata service. |
+| `provider.py` | 377 | Which GPU cloud this is — read from the environment, never from a metadata service. |
 | `scheduler.py` | 253 | What launched this process — Slurm, Kubernetes, Ray, or nothing. |
-| `scratch.py` | 198 | The node-local fast filesystem — where a spill should actually go. |
+| `scratch.py` | 205 | The node-local fast filesystem — where a spill should actually go. |
 
 ## Rust data plane — `crates/`
 
@@ -2258,7 +2258,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/group/combine.rs` | 649 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/mod.rs` | 24 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/hll.rs` | 104 | APPROX_COUNT_DISTINCT — bounded-memory distinct count via per-group HyperLogLog. |
-| `agg/median.rs` | 495 | MEDIAN / continuous-quantile — exact, mergeable via a per-group value list (no dedup, unlike COUNT(DISTINCT)). |
+| `agg/median.rs` | 503 | MEDIAN / continuous-quantile — exact, mergeable via a per-group value list (no dedup, unlike COUNT(DISTINCT)). |
 | `agg/mod.rs` | 796 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/qsketch.rs` | 87 | APPROX_QUANTILE / APPROX_MEDIAN — bounded-memory quantiles via per-group DDSketch. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
@@ -2462,7 +2462,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `page_index.rs` | 271 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 318 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `row_filter.rs` | 349 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
-| `store.rs` | 231 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
+| `store.rs` | 243 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-udf`
 
