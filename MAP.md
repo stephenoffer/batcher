@@ -479,7 +479,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 | `base.py` | 53 | LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends. |
 | `limits.py` | 233 | Client-side rate limiting for a hosted LLM endpoint. |
 | `openai.py` | 339 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
-| `parallelism.py` | 217 | How many GPUs one LLM engine replica needs, and what that choice costs. |
+| `parallelism.py` | 250 | How many GPUs one LLM engine replica needs, and what that choice costs. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
 | `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
 
@@ -2170,7 +2170,7 @@ The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
 | module | lines | what it is |
 |---|---|---|
 | `counters.py` | 228 | What an RDMA port has actually carried, and what it got wrong doing it. |
-| `device_links.py` | 272 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
+| `device_links.py` | 368 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
 | `ethernet.py` | 183 | The node's Ethernet links, for the large share of GPU capacity that has no RDMA. |
 | `nvlink.py` | 264 | NVLink, per link and per device — whether the fast path between devices is actually up. |
 | `pcie.py` | 296 | A device's PCIe link, its NUMA home, and how far two devices sit apart on the bus. |

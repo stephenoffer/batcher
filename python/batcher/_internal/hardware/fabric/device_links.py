@@ -23,6 +23,7 @@ import contextlib
 import os
 
 from batcher._internal.hardware.fabric.pcie import (
+    PCIE_CLASSES,
     PcieLink,
     degraded_pcie_links,
     pcie_class,
@@ -36,8 +37,11 @@ __all__ = [
     "device_link_efficiency",
     "device_numa_nodes",
     "device_pcie_links",
+    "device_topology",
     "gpu_pci_addresses",
+    "group_topology_class",
     "nearest_rdma_device",
+    "tightest_device_group",
     "visible_device_indices",
 ]
 
@@ -270,3 +274,95 @@ def nearest_rdma_device(ordinal: int = 0) -> str:
         key=lambda nic: (PCIE_CLASSES.index(pcie_class(device_address, nic.pci_address)), nic.name),
     )
     return ranked.name
+
+
+def device_topology() -> tuple[tuple[str, ...], ...]:
+    """How far every pair of local devices sits apart on the bus, as a square matrix.
+
+    The `nvidia-smi topo -m` view, from `/sys` and without the tool. `m[i][j]` is the
+    `pcie_class` between devices `i` and `j`, and the diagonal is `"pix"` because a device is
+    as close to itself as anything can be.
+
+    Why it matters at all: two devices under one PCIe switch exchange peer-to-peer without the
+    transfer ever reaching the CPU, and two under different root complexes cross the
+    inter-socket link, which is slower and contended with every other socket-crossing access
+    on the machine. On an NVLink node the difference is hidden by the fabric. On the PCIe-only
+    nodes that make up most rented capacity it is the difference, and nothing else here
+    measures it.
+
+    Returns:
+        An n-by-n matrix in device-index order, empty when no device address could be read. A
+        device whose address is unknown reports `"sys"` — the coarsest class — against every
+        other, since an unknown distance must never be assumed to be a short one.
+    """
+    addresses = gpu_pci_addresses()
+    if not any(addresses):
+        return ()
+    return tuple(
+        tuple(
+            "pix" if i == j else (pcie_class(a, b) if a and b else "sys")
+            for j, b in enumerate(addresses)
+        )
+        for i, a in enumerate(addresses)
+    )
+
+
+def tightest_device_group(size: int) -> tuple[int, ...]:
+    """The `size` local devices that are closest together on the bus.
+
+    What a collective wants. A tensor-parallel group, an all-reduce, or any stage that has
+    every device talking to every other should sit inside one PCIe switch if it can, and
+    inside one root complex if it cannot — the alternative is every exchange crossing the
+    inter-socket link.
+
+    Greedy from the best possible seed rather than exhaustive: the group is chosen by taking
+    each device in turn as a seed and adding its nearest neighbours until the group is the
+    requested size, then keeping whichever group has the best worst-case pair. On the
+    device counts a single node has, that is exact for the shapes that occur — a node's
+    devices are partitioned into switch groups of equal size — and it is linear rather than
+    combinatorial.
+
+    Args:
+        size: How many devices the group needs.
+
+    Returns:
+        Device indices in ascending order, empty when the topology is unreadable or there are
+        fewer than `size` devices. Empty means "no opinion": a caller must fall back to its
+        existing choice rather than treat it as a refusal.
+    """
+    matrix = device_topology()
+    if size <= 0 or len(matrix) < size:
+        return ()
+    rank = {name: i for i, name in enumerate(PCIE_CLASSES)}
+    best: tuple[int, tuple[int, ...]] | None = None
+    for seed in range(len(matrix)):
+        # Nearest first, and by index within a tie so the choice is deterministic across runs
+        # — a group that changes between two identical processes is not a placement, it is a
+        # coin toss, and it would make a run's performance unreproducible.
+        order = sorted(range(len(matrix)), key=lambda j: (rank[matrix[seed][j]], j))
+        group = tuple(sorted(order[:size]))
+        worst = max(rank[matrix[a][b]] for a in group for b in group)
+        if best is None or worst < best[0]:
+            best = (worst, group)
+    return best[1] if best is not None else ()
+
+
+def group_topology_class(group: tuple[int, ...]) -> str:
+    """The worst pair distance inside a group, which is what bounds a collective.
+
+    A collective runs at the rate of its slowest edge, so the group's class is its *worst*
+    pair rather than its average — a seven-device group under one switch plus one device
+    across the socket is a socket-crossing group.
+
+    Args:
+        group: Device indices.
+
+    Returns:
+        A name from `PCIE_CLASSES`, or `""` when the topology is unreadable or the group has
+        fewer than two devices to compare.
+    """
+    matrix = device_topology()
+    if len(group) < 2 or any(i >= len(matrix) for i in group):
+        return ""
+    rank = {name: i for i, name in enumerate(PCIE_CLASSES)}
+    return max((matrix[a][b] for a in group for b in group), key=lambda c: rank[c])

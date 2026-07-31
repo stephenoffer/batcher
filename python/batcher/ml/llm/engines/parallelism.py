@@ -23,6 +23,7 @@ would never think to look. Advice, not a decision.
 from __future__ import annotations
 
 __all__ = [
+    "group_spread",
     "local_device_name",
     "measured_link_class",
     "minimum_tensor_parallel_size",
@@ -123,6 +124,10 @@ def warn_about_tensor_parallelism(
       a PCIe card that every nameplate check calls an NVLink one. It is the same throughput
       loss with none of the visibility, and unlike the two above it is a node fault rather
       than a setting, so the fix is to drain the node instead of changing the degree.
+    * **The group cannot fit under one root complex** — on a PCIe-only node, a group whose
+      devices span two sockets all-reduces across the inter-socket link, which is both slower
+      than the bus and contended with every other socket-crossing access on the machine. A
+      smaller degree that fits on one side is often faster than a larger one that does not.
 
     Nothing is changed: the degree stays exactly what the caller asked for. The penalty is
     hardware-specific and unmeasurable from here, so this is advice, not a decision.
@@ -162,6 +167,12 @@ def warn_about_tensor_parallelism(
             f"lower throughput. Unavoidable if the model does not otherwise fit; if it does, "
             f"tensor_parallel_size=1 will be faster."
         )
+        spread = group_spread(declared)
+        if spread:
+            message += (
+                f" This node cannot place {declared} devices closer than `{spread}`, so the "
+                f"all-reduce also crosses that boundary on every step."
+            )
     if not message:
         return
     _TP_WARNED = True
@@ -170,6 +181,28 @@ def warn_about_tensor_parallelism(
     from batcher._internal.errors import PerformanceWarning
 
     warnings.warn(message, PerformanceWarning, stacklevel=3)
+
+
+def group_spread(size: int) -> str:
+    """How far apart the tightest `size` local devices are, when that is worth saying.
+
+    Only the boundaries that cost something. Two devices under one switch (`pix`) or below one
+    host bridge (`pxb`) exchange peer-to-peer and need no warning; a group that reaches the
+    root complex (`phb`) turns every exchange around through the CPU, and one that spans NUMA
+    nodes (`sys`) crosses the inter-socket link as well.
+
+    Args:
+        size: The group size being placed.
+
+    Returns:
+        The class name when the tightest group of that size is `phb` or worse, `""` when it is
+        tighter than that, when the topology is unreadable, or when the node has too few
+        devices — all of which mean there is nothing useful to add.
+    """
+    from batcher._internal.hardware.fabric import group_topology_class, tightest_device_group
+
+    spread = group_topology_class(tightest_device_group(size))
+    return spread if spread in {"phb", "node", "sys"} else ""
 
 
 def local_device_name() -> str | None:

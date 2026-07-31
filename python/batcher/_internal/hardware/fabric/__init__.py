@@ -1,25 +1,24 @@
 """The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
 
-`hardware.topology` describes the CPUs and `accelerators` describes the devices. Neither
-describes the wires between them, and on a GPU datacenter the wires are what the run is
-usually waiting on: a shuffle moving a terabyte between nodes is bounded by the NIC, a host
-staging buffer feeding a device is bounded by the PCIe link it crosses, and a collective
-inside a node is bounded by whether NVLink is actually up. All three are readable, none is
-reported by a cluster manager, and each of them fails *quietly* — a link that renegotiated
-to half width still works, it just halves the stage.
+`hardware.topology` describes the CPUs and `accelerators` the devices. Neither describes the
+wires between them, and on a GPU datacenter the wires are what a run waits on: a shuffle is
+bounded by the NIC, a staging buffer by the PCIe link it crosses, a collective by whether
+NVLink is up. All three are readable, none is reported by a cluster manager, and each fails
+*quietly* — a link that renegotiated to half width still works, it just halves the stage.
 
 Organized by the wire each module reads:
-
 * `rdma` — InfiniBand and RoCE NICs from `/sys/class/infiniband`: rate, state, partition.
+* `ethernet` — the ordinary NICs, which are the whole fabric on most rented capacity.
 * `pcie` — a device's PCIe link, its NUMA home, and how far apart two devices are on the bus.
-* `device_links` — the join of the two: which host link each accelerator is *actually* on.
-* `counters` — what an RDMA port has carried and what it got wrong doing it: the signal
-  that predicts a cable failure before the port ever leaves `ACTIVE`.
+* `device_links` — the join: which host link each accelerator is on, and the device-to-device
+  topology a collective is placed against.
+* `counters` — what an RDMA port carried and what it got wrong doing it, which predicts a
+  cable failure before the port leaves `ACTIVE`.
 * `nvlink` — per-device NVLink state and error counters through NVML.
 
-Every entry point degrades to an empty or neutral answer off Linux, without the driver, or
+Every entry point degrades to an empty or neutral answer off Linux, without the driver, and
 inside a container that did not mount the relevant `/sys` tree. A caller that gets nothing
-keeps whatever default it had, which is the behavior the engine had before this existed.
+keeps the default it had, which is the behavior the engine had before any of this existed.
 
 A neutral utility: any layer may import `_internal`.
 """
@@ -37,7 +36,10 @@ from batcher._internal.hardware.fabric.device_links import (
     degraded_device_links,
     device_link_efficiency,
     device_pcie_links,
+    device_topology,
     gpu_pci_addresses,
+    group_topology_class,
+    tightest_device_group,
 )
 from batcher._internal.hardware.fabric.ethernet import (
     EthernetLink,
@@ -89,6 +91,7 @@ __all__ = [
     "device_link_efficiency",
     "device_numa_node",
     "device_pcie_links",
+    "device_topology",
     "ethernet_bandwidth_gbps",
     "ethernet_links",
     "ethernet_summary",
@@ -97,6 +100,7 @@ __all__ = [
     "fabric_interface_address",
     "fabric_partition",
     "gpu_pci_addresses",
+    "group_topology_class",
     "nvlink_degraded_devices",
     "nvlink_status",
     "nvlink_summary",
@@ -112,4 +116,5 @@ __all__ = [
     "rdma_summary",
     "reset_fabric_probes",
     "throughput_delta",
+    "tightest_device_group",
 ]
