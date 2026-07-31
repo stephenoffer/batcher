@@ -122,7 +122,10 @@ def test_a_name_without_a_memory_size_takes_the_conservative_entry() -> None:
 
 
 def test_an_unrecognized_part_resolves_to_unknown_not_a_neighbour() -> None:
-    assert resolve_device_name("NVIDIA GeForce RTX 4090") is None
+    # The RTX 4090 used to be the example here and is now in the table, which is the point of
+    # having added it: the rental market runs on consumer parts. An older consumer card still
+    # makes the case, and so does a part that does not exist.
+    assert resolve_device_name("NVIDIA GeForce GTX 1080 Ti") is None
     assert resolve_device_name("Some Future GPU") is None
     assert resolve_device_name("NVIDIA") is None, "a vendor alone identifies no part"
     assert resolve_device_name("") is None
@@ -174,3 +177,39 @@ def test_the_fabric_is_always_faster_than_the_host_link() -> None:
         spec = device_spec(name)
         if spec.nvlink_gbps and spec.host_link_gbps:
             assert spec.nvlink_gbps > spec.host_link_gbps, name
+
+
+def test_the_rental_market_parts_are_in_the_table() -> None:
+    # A GPU-rental fleet is not only datacenter SXM boards: RunPod, Vast and Lambda rent
+    # workstation and consumer cards in volume, and an unrecognized device falls back to a
+    # 12 GB default that sizes every working set for hardware nobody is running.
+    for name in (
+        "NVIDIA_RTX_5090",
+        "NVIDIA_RTX_4090",
+        "NVIDIA_RTX_3090",
+        "NVIDIA_RTX_6000_ADA",
+        "NVIDIA_RTX_A6000",
+        "NVIDIA_L40",
+        "NVIDIA_H20",
+        "AMD_INSTINCT_MI300A",
+    ):
+        spec = device_spec(name)
+        assert spec is not None, name
+        assert spec.memory_gib > 0 and spec.memory_bandwidth_gbps > 0, name
+
+
+def test_a_consumer_card_is_not_partitionable_and_has_no_wide_fabric() -> None:
+    # The two answers a placement decision asks of these parts, and the two it would get
+    # wrong by borrowing a datacenter row: none of them offers MIG, and the widest fabric
+    # any of them has is a two-way bridge.
+    for name in ("NVIDIA_RTX_5090", "NVIDIA_RTX_4090", "NVIDIA_RTX_3090", "NVIDIA_RTX_6000_ADA"):
+        assert device_mig_slices(name) == 0, name
+        assert device_nvlink_domain(name) <= 2, name
+
+
+def test_an_apu_reports_no_host_link_to_cross() -> None:
+    # The GPU and the CPU share one package and one memory pool, so a copy that does not
+    # happen is a different thing from a quick one.
+    spec = device_spec("AMD_INSTINCT_MI300A")
+    assert spec.host_link == "coherent"
+    assert spec.host_link_gbps == 0.0

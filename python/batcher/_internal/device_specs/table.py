@@ -95,7 +95,10 @@ _ROWS: tuple[tuple, ...] = (
     ("NVIDIA_B200", "nvidia", "blackwell", 180, 8000, 1000, 250, 2250, 4500, 8, 1800, 7),
     ("NVIDIA_H200", "nvidia", "hopper", 141, 4800, 700, 150, 989, 1979, 8, 900, 7),
     ("NVIDIA_H100", "nvidia", "hopper", 80, 3350, 700, 150, 989, 1979, 8, 900, 7),
+    ("NVIDIA_H20", "nvidia", "hopper", 96, 4000, 400, 0, 0, 0, 8, 900, 7),
     ("NVIDIA_L40S", "nvidia", "ada", 48, 864, 350, 40, 181, 362, 1, 0, 0),
+    ("NVIDIA_L40", "nvidia", "ada", 48, 864, 300, 0, 0, 0, 1, 0, 0),
+    ("NVIDIA_RTX_6000_ADA", "nvidia", "ada", 48, 960, 300, 0, 0, 0, 1, 0, 0),
     ("NVIDIA_L4", "nvidia", "ada", 24, 300, 72, 15, 121, 242, 1, 0, 0),
     ("NVIDIA_A100_80G", "nvidia", "ampere", 80, 2039, 400, 80, 312, 0, 8, 600, 7),
     ("NVIDIA_A100_40G", "nvidia", "ampere", 40, 1555, 400, 80, 312, 0, 8, 600, 7),
@@ -104,14 +107,25 @@ _ROWS: tuple[tuple, ...] = (
     ("NVIDIA_A30", "nvidia", "ampere", 24, 933, 165, 30, 165, 0, 2, 200, 4),
     ("NVIDIA_A10G", "nvidia", "ampere", 24, 600, 300, 30, 70, 0, 1, 0, 0),
     ("NVIDIA_A10", "nvidia", "ampere", 24, 600, 150, 25, 62.5, 0, 1, 0, 0),
+    ("NVIDIA_RTX_A6000", "nvidia", "ampere", 48, 768, 300, 0, 0, 0, 2, 112, 0),
     ("NVIDIA_TESLA_T4", "nvidia", "turing", 16, 320, 70, 12, 65, 0, 1, 0, 0),
     ("NVIDIA_TESLA_V100", "nvidia", "volta", 16, 900, 300, 50, 125, 0, 8, 300, 0),
     ("NVIDIA_TESLA_P100", "nvidia", "pascal", 16, 732, 300, 40, 19, 0, 4, 160, 0),
     ("NVIDIA_TESLA_P4", "nvidia", "pascal", 8, 192, 75, 10, 0, 0, 1, 0, 0),
     ("NVIDIA_TESLA_K80", "nvidia", "kepler", 12, 240, 300, 45, 0, 0, 1, 0, 0),
+    # NVIDIA workstation and consumer parts, which the GPU-rental market runs on a great deal
+    # of. Memory, bandwidth and board power are the columns these are consulted for — VRAM
+    # sizing, the MIG answer (none of them partition), and the fabric width (none has more
+    # than a two-way bridge). Their tensor throughput and idle draw are left unknown rather
+    # than filled from a marketing figure whose basis (sparsity, boost, TF32 vs FP16) differs
+    # by source, which is the one thing a table like this must not do.
+    ("NVIDIA_RTX_5090", "nvidia", "blackwell", 32, 1792, 575, 0, 0, 0, 1, 0, 0),
+    ("NVIDIA_RTX_4090", "nvidia", "ada", 24, 1008, 450, 0, 0, 0, 1, 0, 0),
+    ("NVIDIA_RTX_3090", "nvidia", "ampere", 24, 936, 350, 0, 0, 0, 2, 112, 0),
     # AMD Instinct.
     ("AMD_INSTINCT_MI325X", "amd", "cdna3", 256, 6000, 1000, 180, 1307, 2615, 8, 896, 0),
     ("AMD_INSTINCT_MI300X", "amd", "cdna3", 192, 5300, 750, 150, 1307, 2615, 8, 896, 0),
+    ("AMD_INSTINCT_MI300A", "amd", "cdna3", 128, 5300, 550, 0, 0, 0, 4, 896, 0),
     ("AMD_INSTINCT_MI250X", "amd", "cdna2", 128, 3200, 560, 100, 383, 0, 8, 800, 0),
     ("AMD_INSTINCT_MI210", "amd", "cdna2", 64, 1600, 300, 60, 181, 0, 2, 300, 0),
     # Intel Data Center GPU Max.
@@ -140,7 +154,14 @@ _HOST_LINK: dict[str, tuple[str, float]] = {
     "NVIDIA_B200": ("pcie5", 50.0),
     "NVIDIA_H200": ("pcie5", 50.0),
     "NVIDIA_H100": ("pcie5", 50.0),
+    "NVIDIA_H20": ("pcie5", 50.0),
     "NVIDIA_L40S": ("pcie4", 25.0),
+    "NVIDIA_L40": ("pcie4", 25.0),
+    "NVIDIA_RTX_6000_ADA": ("pcie4", 25.0),
+    "NVIDIA_RTX_5090": ("pcie5", 50.0),
+    "NVIDIA_RTX_4090": ("pcie4", 25.0),
+    "NVIDIA_RTX_3090": ("pcie4", 25.0),
+    "NVIDIA_RTX_A6000": ("pcie4", 25.0),
     "NVIDIA_L4": ("pcie4", 25.0),
     "NVIDIA_A100_80G": ("pcie4", 25.0),
     "NVIDIA_A100_40G": ("pcie4", 25.0),
@@ -156,6 +177,10 @@ _HOST_LINK: dict[str, tuple[str, float]] = {
     "NVIDIA_TESLA_K80": ("pcie3", 12.0),
     "AMD_INSTINCT_MI325X": ("pcie5", 50.0),
     "AMD_INSTINCT_MI300X": ("pcie5", 50.0),
+    # An APU: the GPU and the CPU share one package and one memory pool, so there is no host
+    # link to cross at all. Recorded as the coherent-fabric case rather than as a fast PCIe
+    # one, because a copy that does not happen is a different thing from a quick copy.
+    "AMD_INSTINCT_MI300A": ("coherent", 0.0),
     "AMD_INSTINCT_MI250X": ("pcie4", 25.0),
     "AMD_INSTINCT_MI210": ("pcie4", 25.0),
     "INTEL_MAX_1550": ("pcie5", 50.0),
