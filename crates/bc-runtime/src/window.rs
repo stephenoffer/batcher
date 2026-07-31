@@ -717,13 +717,20 @@ fn rank(
     let mut out = vec![0i64; num_rows];
     for part in ordered {
         let mut current = 0i64; // last assigned rank
+                                // Carry the previous position's encoded row. Comparing `part[pos - 1]` against `row`
+                                // is two random reads of the encoded buffer per position, and the first was already
+                                // read on the previous iteration — `part` is a sort permutation, so neither index is
+                                // sequential in `rows`.
+        let mut prev = None;
         for (pos, &row) in part.iter().enumerate() {
-            let tie = pos > 0 && rows_equal(rows, part[pos - 1], row);
+            let cur = rows.row(row);
+            let tie = prev == Some(cur);
             if pos == 0 {
                 current = 1;
             } else if !tie {
                 current = if dense { current + 1 } else { pos as i64 + 1 };
             }
+            prev = Some(cur);
             out[row] = current;
         }
     }
@@ -747,8 +754,12 @@ fn percent_rank(
     for part in ordered {
         let n = part.len();
         let mut current = 0i64; // last assigned RANK (1-based, gaps after ties)
+                                // As in `rank`: one encoded-row read per position instead of two.
+        let mut prev = None;
         for (pos, &row) in part.iter().enumerate() {
-            let tie = pos > 0 && rows_equal(rows, part[pos - 1], row);
+            let cur = rows.row(row);
+            let tie = prev == Some(cur);
+            prev = Some(cur);
             if pos == 0 {
                 current = 1;
             } else if !tie {
