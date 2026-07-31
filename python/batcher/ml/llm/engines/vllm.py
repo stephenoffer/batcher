@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
 from batcher.ml.llm.engines.base import Engine, EngineFactory
-from batcher.ml.llm.engines.parallelism import local_device_name, warn_about_tensor_parallelism
+from batcher.ml.llm.engines.footprint import declared_context
+from batcher.ml.llm.engines.parallelism import advise_tensor_parallelism
 from batcher.ml.llm.engines.templates import warn_if_chat_template_unused
 from batcher.ml.llm.sizing import fit_to_window, prompt_window, sized_window
 
@@ -145,20 +146,19 @@ def vllm_engine(
 
         def _build(prompts: list) -> None:
             kw = dict(kwargs)
-            # On the GPU worker, where the device is real; no footprint here, so only the
-            # interconnect half of the advice can fire.
-            warn_about_tensor_parallelism(
-                int(kw.get("tensor_parallel_size", 1) or 1), 0.0, None, local_device_name()
-            )
+            # On the GPU worker, with the model's real footprint read from repository metadata
+            # rather than by downloading it. Without those numbers the branch that matters —
+            # "this degree cannot hold this model" — could only fire as an allocation error.
+            advise_tensor_parallelism(model, int(kw.get("tensor_parallel_size", 1) or 1))
             if auto_window:
-                sized = sized_window(prompts, sampling_kwargs)
+                sized = sized_window(prompts, sampling_kwargs, declared_context(model))
                 if sized is not None:
                     kw["max_model_len"] = sized
             built["llm"] = _construct(LLM, model, enable_lora, kw)
             built["tokenizer"] = _worker_tokenizer(built["llm"])
             if chat is None:
                 warn_if_chat_template_unused(built["tokenizer"], model)
-            built["window"] = prompt_window(built["llm"], kw)
+            built["window"] = prompt_window(built["llm"], kw, sampling_kwargs.get("max_tokens"))
 
         if not auto_window:
             _build([])

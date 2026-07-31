@@ -23,7 +23,9 @@ would never think to look. Advice, not a decision.
 from __future__ import annotations
 
 __all__ = [
+    "advise_tensor_parallelism",
     "group_spread",
+    "local_device_count",
     "local_device_name",
     "measured_link_class",
     "minimum_tensor_parallel_size",
@@ -88,7 +90,7 @@ def minimum_tensor_parallel_size(model_gb: float, vram_gb: float | None) -> int:
         .. doctest::
 
             >>> from batcher.ml.llm.engines.parallelism import minimum_tensor_parallel_size
-            >>> minimum_tensor_parallel_size(14.0, 24.0)
+            >>> minimum_tensor_parallel_size(7.0, 24.0)
             1
             >>> minimum_tensor_parallel_size(140.0, 80.0)
             4
@@ -109,12 +111,20 @@ _TP_WARNED = False
 
 
 def warn_about_tensor_parallelism(
-    declared: int, model_gb: float, vram_gb: float | None, device_name: str | None
+    declared: int,
+    model_gb: float,
+    vram_gb: float | None,
+    device_name: str | None,
+    needed: int | None = None,
 ) -> None:
     """Say once when the declared TP degree looks wrong for this model and this hardware.
 
-    Three distinct mistakes, with different fixes:
+    Four distinct mistakes, with different fixes:
 
+    * **Wider than the devices this worker holds** — the most certain of them, and the one
+      that costs the most to discover: a worker scheduled with one GPU and told to build a
+      four-way group does not warn, it hangs while the engine waits for peers that will never
+      arrive, holding its slot until the job is killed. Checked first for that reason.
     * **Too low** — the weights cannot fit the group at all, so the engine will OOM on
       load. Better said before the model download than after it.
     * **Too high for the interconnect** — TP>=2 on a PCIe-only card costs a measured
@@ -128,6 +138,12 @@ def warn_about_tensor_parallelism(
       devices span two sockets all-reduces across the inter-socket link, which is both slower
       than the bus and contended with every other socket-crossing access on the machine. A
       smaller degree that fits on one side is often faster than a larger one that does not.
+    * **Wider than the model needs** — the quiet one, because nothing fails: the group loads,
+      serves, and pays an all-reduce on every layer for memory nobody uses, while the devices
+      it consumed would each have served their own sequences at full rate. Said only when
+      `needed` was measured from the model's shape and cache, never from the footprint bound,
+      which ignores the cache and so would advise a group that holds the weights and serves
+      nothing.
 
     Nothing is changed: the degree stays exactly what the caller asked for. The penalty is
     hardware-specific and unmeasurable from here, so this is advice, not a decision.
@@ -137,14 +153,34 @@ def warn_about_tensor_parallelism(
         model_gb: The model's weight footprint, or 0 when unknown.
         vram_gb: One card's VRAM, or `None` when unmeasurable.
         device_name: The card's reported name, for the interconnect class.
+        needed: The smallest workable degree, when the caller could work it out from more
+            than a footprint and a card size — the model's head counts constrain which
+            degrees exist at all, and its cache decides whether a group that holds the
+            weights can actually serve. `None` falls back to the footprint arithmetic here,
+            which is a bound rather than a configuration: it can name a degree the model's
+            head counts do not admit.
     """
     global _TP_WARNED
     if _TP_WARNED:
         return
-    needed = minimum_tensor_parallel_size(model_gb, vram_gb)
+    # Whether `needed` came from the model's own shape and cache or from the footprint bound
+    # below. Only the first is safe to advise *shrinking* against: the bound ignores the cache,
+    # so it under-estimates, and a group trimmed to it would hold the weights and serve nothing.
+    measured = needed is not None
+    if needed is None:
+        needed = minimum_tensor_parallel_size(model_gb, vram_gb)
     link = nvlink_class(device_name)
+    visible = local_device_count()
     message = ""
-    if needed > max(1, declared):
+    if declared >= 2 and 0 < visible < declared:
+        message = (
+            f"tensor_parallel_size={declared} but this worker can see {visible} "
+            f"{'device' if visible == 1 else 'devices'}. A tensor-parallel group is built from "
+            f"the devices the process holds, so the engine will wait for peers that were never "
+            f"scheduled rather than fail. Give the stage {declared} GPUs (`num_gpus`), or set "
+            f"tensor_parallel_size={visible}."
+        )
+    elif needed > max(1, declared):
         message = (
             f"this model needs about {model_gb:.0f} GB of weights but "
             f"tensor_parallel_size={declared} gives it "
@@ -173,6 +209,17 @@ def warn_about_tensor_parallelism(
                 f" This node cannot place {declared} devices closer than `{spread}`, so the "
                 f"all-reduce also crosses that boundary on every step."
             )
+    elif measured and declared > needed >= 1:
+        from batcher.carbonite.accel.parallelism import replicas_for_devices
+
+        replicas = replicas_for_devices(declared, needed)
+        message = (
+            f"tensor_parallel_size={declared}, but this model's head counts and cache fit a "
+            f"group of {needed}. The same {declared} devices would run {replicas} replicas, "
+            f"each serving its own sequences at full rate, instead of one group paying an "
+            f"all-reduce on every layer of every token for memory nobody uses. Set "
+            f"tensor_parallel_size={needed} and raise the stage's worker count instead."
+        )
     if not message:
         return
     _TP_WARNED = True
@@ -224,6 +271,28 @@ def local_device_name() -> str | None:
         return None
 
 
+def local_device_count() -> int:
+    """How many GPUs this worker can actually see, or `0` when that is unreadable.
+
+    The figure a tensor-parallel group is built from, and it is a *per-worker* one: a Ray task
+    given one GPU has `CUDA_VISIBLE_DEVICES` masked to that device, so a node with eight cards
+    still reports one here. That is the number the engine will find, which is what makes it the
+    right thing to check a declared degree against rather than the node's card count.
+
+    Returns:
+        Visible device count, `0` when torch is absent or reports no CUDA — where a warning
+        about the count would be a warning about a device that is not there.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        return int(torch.cuda.device_count())
+    except Exception:  # pragma: no cover - no driver, no device, or an older torch
+        return 0
+
+
 def measured_link_class() -> str:
     """What this node's device fabric is *doing*, as opposed to what its cards support.
 
@@ -248,3 +317,71 @@ def measured_link_class() -> str:
     # Partially down counts as `"pcie"`, not as a third state: a collective is bounded by the
     # slowest pair in its group, so one device off the fabric costs the group the fabric.
     return "pcie"
+
+
+def advise_tensor_parallelism(model: str, tensor_parallel: int) -> None:
+    """Warn about a tensor-parallel degree that will not hold `model` on this worker's devices.
+
+    The join between the two halves: `parallelism` knows what a degree costs and what it can
+    hold, and this supplies the two numbers it needs. Called once per worker on the first
+    engine build. Neither lookup touches a weight — a repository metadata call or a directory
+    listing for the footprint, and a driver query for the device size — and both degrade to
+    `None`, where the advice falls back to what it could say before: the interconnect half.
+
+    Args:
+        model: The model id or path the engine is about to build.
+        tensor_parallel: The degree the caller declared.
+    """
+    from batcher.ml.llm.engines.footprint import (
+        device_total_bytes,
+        model_weight_bytes,
+    )
+
+    weights = model_weight_bytes(model)
+    device = device_total_bytes()
+    warn_about_tensor_parallelism(
+        tensor_parallel,
+        (weights or 0) / (1 << 30),
+        device / (1 << 30) if device else None,
+        local_device_name(),
+        needed=_smallest_workable_degree(model, weights, device),
+    )
+
+
+def _smallest_workable_degree(model: str, weights: int | None, device: int | None) -> int | None:
+    """The smallest tensor-parallel degree that holds `model`, or `None` when unknowable.
+
+    Better than the footprint bound it replaces on both counts that matter. It only proposes
+    degrees the model's head counts admit, so it cannot name a group vLLM refuses to build —
+    a model with 6 key/value heads has no four-way group, whatever its size suggests. And it
+    sizes against the weights *plus* one full-context sequence, because a group where the
+    weights just fit leaves no cache, and an engine with no cache does not fail: it admits one
+    sequence, preempts it, recomputes it, and serves a fraction of the throughput.
+
+    Returns `None` whenever the shape, the footprint, or the device size is unreadable, which
+    hands the caller back to its own arithmetic rather than to a guess.
+    """
+    from batcher.carbonite.accel.kv_cache import kv_bytes_per_token
+    from batcher.carbonite.accel.parallelism import minimum_tensor_degree
+    from batcher.ml.llm.engines.footprint import model_shape
+
+    shape = model_shape(model)
+    if shape is None or not weights or not device:
+        return None
+    from batcher.config import active_config
+
+    accel = active_config().accelerator
+    context = accel.max_context_tokens or shape.max_context
+    degree = minimum_tensor_degree(
+        weights,
+        int(device * (1.0 - accel.vram_headroom)),
+        bytes_per_token=kv_bytes_per_token(
+            shape.layers, shape.kv_heads, shape.head_dim, accel.kv_cache_dtype
+        ),
+        context_tokens=context,
+        attention_heads=shape.attention_heads,
+        kv_heads=shape.kv_heads,
+    )
+    # `0` means no admissible degree holds it, which is a real answer but not one the
+    # "raise the degree to N" message can carry. Fall back rather than advise a zero.
+    return degree or None
