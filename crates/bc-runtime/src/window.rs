@@ -562,12 +562,19 @@ fn ordered_partitions_by_global_sort(
     // leaves behind — see the matching note in `try_ordered_partitions_packed`.
     let mut out: Vec<Vec<usize>> = Vec::new();
     let mut start = 0usize;
+    // The run's first row is compared against on every step of the run but only changes when
+    // the run ends, so hold it. `sorted` is a permutation, so re-reading it was a random
+    // access into the encoded partition-key buffer once per row — on a single-partition
+    // window, the entire scan reading one row over and over.
+    let mut start_row = (!sorted.is_empty()).then(|| prows.row(sorted[0] as usize));
     for pos in 1..=sorted.len() {
-        let boundary = pos == sorted.len()
-            || prows.row(sorted[pos] as usize) != prows.row(sorted[start] as usize);
+        let boundary = pos == sorted.len() || start_row != Some(prows.row(sorted[pos] as usize));
         if boundary {
             out.push(sorted[start..pos].iter().map(|&r| r as usize).collect());
             start = pos;
+            if pos < sorted.len() {
+                start_row = Some(prows.row(sorted[pos] as usize));
+            }
         }
     }
     Ok(out)
