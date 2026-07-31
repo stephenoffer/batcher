@@ -164,10 +164,24 @@ pub(crate) fn distinct_state(
     // repeatedly reallocate (each growth copies the whole buffer and transiently holds ~1.5×).
     let mut keep: Vec<u32> = Vec::with_capacity(group_ids.len());
     let mut kept_groups: Vec<i64> = Vec::with_capacity(group_ids.len());
-    for (i, &g) in group_ids.iter().enumerate() {
-        if values.is_valid(i) {
-            keep.push(i as u32);
-            kept_groups.push(g as i64);
+    // `values` is an `Arc<dyn Array>`, so `values.is_valid(i)` is a **virtual call per row** —
+    // and one the optimizer cannot see through, so it also blocks inlining the loop body.
+    // Resolving the null buffer once turns the per-row check into an inlinable bit test, and
+    // the null-free case (much the commonest) into no check at all.
+    match values.nulls() {
+        None => {
+            for (i, &g) in group_ids.iter().enumerate() {
+                keep.push(i as u32);
+                kept_groups.push(g as i64);
+            }
+        }
+        Some(nulls) => {
+            for (i, &g) in group_ids.iter().enumerate() {
+                if nulls.is_valid(i) {
+                    keep.push(i as u32);
+                    kept_groups.push(g as i64);
+                }
+            }
         }
     }
     let kept_values = take(values.as_ref(), &UInt32Array::from(keep), None)?;
