@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1045 Python modules across 164 packages and 189 Rust files across 13 crates.
+Covering 1053 Python modules across 166 packages and 189 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -302,7 +302,6 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 33 | The one place a `Source` becomes a `Dataset`. |
-| `accelerators.py` | 482 | Accelerator reporting (`accelerators`, `show_accelerators`). |
 | `admin.py` | 223 | Session-level administration: table maintenance and streaming-query control. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
@@ -312,6 +311,16 @@ Session entry points that create `Dataset`s.
 | `read.py` | 388 | The generic read dispatch plus the top-level ``read_*`` shorthands. |
 | `sql.py` | 136 | The default SQL catalog: `bt.sql` and `bt.register_function`. |
 | `versions.py` | 125 | Version and environment reporting (`engine_version`, `show_versions`). |
+
+### `batcher/api/session/accelerators/` — 5 · conductor
+
+Accelerator reporting (`accelerators`, `show_accelerators`, `measure_energy`).
+
+| module | lines | what it is |
+|---|---|---|
+| `energy.py` | 93 | Collecting what a pipeline drew, and folding the measurement back into what is learned. |
+| `report.py` | 407 | Assembling the accelerator report, and saying the part a reader would otherwise miss. |
+| `rows.py` | 169 | One row per local device: nameplate figures, live readings, and what is wrong with it. |
 
 ### `batcher/api/sql_session/` — 5 · conductor
 
@@ -736,7 +745,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 146 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 196 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 144 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 391 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `hardware_probe.py` | 401 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 471 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
@@ -851,7 +860,7 @@ Cost model — what will this plan *cost* to run?
 
 | module | lines | what it is |
 |---|---|---|
-| `fabric.py` | 158 | What a shuffled byte is worth on *this* cluster's fabric. |
+| `fabric.py` | 185 | What a shuffled byte is worth on *this* cluster's fabric. |
 | `model.py` | 443 | The four-axis cost model and its per-operator closed forms. |
 | `shuffle.py` | 279 | The `net` axis — what a plan costs to move across a cluster. |
 | `terms.py` | 184 | The machine-shaped multipliers the per-operator cost forms fold in. |
@@ -1208,9 +1217,9 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 | module | lines | what it is |
 |---|---|---|
 | `combine.py` | 423 | Composing leaf selectivities into a whole-predicate estimate. |
-| `leaves.py` | 450 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `leaves.py` | 480 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 188 | What a text pattern says about how many rows it matches. |
-| `scalars.py` | 249 | Scalar and column-statistic primitives shared by every selectivity estimator. |
+| `scalars.py` | 319 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
 ### `batcher/carbonite/` — 3 · subsystem
 
@@ -1230,7 +1239,8 @@ Accelerator resource management: device memory, partitioning, KV cache, and heal
 |---|---|---|
 | `affinity.py` | 202 | Putting a device's host-side work on the cores next to it, and knowing when it is shared. |
 | `allocator.py` | 342 | The device allocator a GPU worker computes on — the pool in front of `cudaMalloc`. |
-| `health.py` | 448 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
+| `amd_health.py` | 79 | The same admission decision, for a vendor NVML cannot see. |
+| `health.py` | 459 | Device health as an admission decision — Carbonite protecting a run from a sick GPU. |
 | `kv_cache.py` | 193 | KV-cache budgeting — the memory that decides an LLM stage's real throughput. |
 | `mig.py` | 102 | Choosing a MIG partitioning — Carbonite turning device profiles into a resource plan. |
 | `power.py` | 146 | The power envelope as an admission decision — Carbonite protecting a rack's breaker. |
@@ -1359,7 +1369,7 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 | `async_udf.py` | 192 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
 | `call.py` | 370 | The per-batch `map_batches` call boundary (Core, layer 3). |
 | `execute.py` | 330 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
-| `isolation.py` | 234 | What a UDF child process is allowed to see and consume. |
+| `isolation.py` | 236 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 78 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 302 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 157 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
@@ -1536,7 +1546,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `json.py` | 449 | JSON format — newline-delimited (line) JSON read + write. |
+| `json.py` | 452 | JSON format — newline-delimited (line) JSON read + write. |
 | `json_encoding.py` | 210 | Process-pool machinery for the JSON **write** path. |
 | `logs.py` | 133 | Log format — line-delimited text logs read as raw lines (core, no extra). |
 | `msgpack.py` | 100 | MessagePack format — row-oriented read + write via `ormsgpack`, to Arrow. |
@@ -1722,7 +1732,7 @@ Observability sinks — the terminal reporter, the activity store, and the web d
 | `console.py` | 447 | The terminal face of the engine — a live progress bar plus structured status lines. |
 | `control.py` | 217 | Turning the sinks on and off — the one place that owns observability's global state. |
 | `energy.py` | 251 | Reporting what a run cost in watts — the terminal view and the metrics rows. |
-| `metrics.py` | 489 | Process-wide counters and timings, as a plain dict. |
+| `metrics.py` | 492 | Process-wide counters and timings, as a plain dict. |
 | `store.py` | 469 | The bounded in-memory record of recent engine activity — the UI's data model. |
 | `system.py` | 228 | The host and engine the queries are running on — the dashboard's hardware panel. |
 | `theme.py` | 144 | Terminal capability detection, the color ramp, and the glyph set — the console's look. |
@@ -2088,7 +2098,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 
 | module | lines | what it is |
 |---|---|---|
-| `accelerators.py` | 377 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
+| `accelerators.py` | 403 | Accelerator model to device memory — the one hardware fact a cluster cannot report. |
 | `events.py` | 292 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 274 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
 | `mathx.py` | 101 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
@@ -2136,6 +2146,14 @@ Effective hardware detection — what this process's machine really is and reall
 | `storage.py` | 155 | The block device behind a directory — what spilling to it will actually cost. |
 | `topology.py` | 147 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
+### `batcher/_internal/hardware/amd/` — 0 · utility
+
+AMD accelerators, read from the driver rather than from ROCm.
+
+| module | lines | what it is |
+|---|---|---|
+| `devices.py` | 405 | What an AMD Instinct node can be asked about itself, without ROCm installed. |
+
 ### `batcher/_internal/hardware/engine/` — 0 · utility
 
 Hardware facts read back from the compiled data plane, rather than probed from Python.
@@ -2153,6 +2171,7 @@ The interconnect a node sits on — RDMA NICs, PCIe links, and NVLink.
 |---|---|---|
 | `counters.py` | 228 | What an RDMA port has actually carried, and what it got wrong doing it. |
 | `device_links.py` | 264 | The host link each accelerator is actually on, as opposed to the one its datasheet has. |
+| `ethernet.py` | 183 | The node's Ethernet links, for the large share of GPU capacity that has no RDMA. |
 | `nvlink.py` | 264 | NVLink, per link and per device — whether the fast path between devices is actually up. |
 | `pcie.py` | 296 | A device's PCIe link, its NUMA home, and how far two devices sit apart on the bus. |
 | `rdma.py` | 370 | InfiniBand and RoCE NICs — the wire a cross-node shuffle actually runs on. |
@@ -2165,7 +2184,7 @@ How a GPU is failing, as distinct from how busy it is.
 |---|---|---|
 | `counters.py` | 213 | The per-device fault counters NVML publishes — memory rows, retired pages, PCIe replays. |
 | `modes.py` | 235 | Device settings that cost throughput or correctness without ever raising anything. |
-| `xid.py` | 253 | Xid errors — the driver's own account of what went wrong with a device. |
+| `xid.py` | 329 | Xid errors — the driver's own account of what went wrong with a device. |
 
 ### `batcher/_internal/site/` — 0 · utility
 
@@ -2173,8 +2192,9 @@ Where this process is running — the provider, the scheduler, and the local scr
 
 | module | lines | what it is |
 |---|---|---|
+| `container.py` | 225 | What the container runtime took away, and the three limits that cost a GPU job silently. |
 | `provider.py` | 377 | Which GPU cloud this is — read from the environment, never from a metadata service. |
-| `scheduler.py` | 253 | What launched this process — Slurm, Kubernetes, Ray, or nothing. |
+| `scheduler.py` | 324 | What launched this process — Slurm, PBS, LSF, Kubernetes, Ray, or nothing. |
 | `scratch.py` | 205 | The node-local fast filesystem — where a spill should actually go. |
 
 ## Rust data plane — `crates/`
@@ -2283,10 +2303,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `lib.rs` | 36 | `bc-runtime` — the engine's runtime library. |
 | `shuffle.rs` | 1003 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
-| `window.rs` | 1091 | Window functions — partition, order, and append one column per function. |
+| `window.rs` | 1102 | Window functions — partition, order, and append one column per function. |
 | `window_agg.rs` | 578 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
 | `window_fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
-| `window_frame.rs` | 713 | Explicit `ROWS` window frames — sliding-window aggregates. |
+| `window_frame.rs` | 720 | Explicit `ROWS` window frames — sliding-window aggregates. |
 | `window_parallel.rs` | 287 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
 | `window_partition_agg.rs` | 306 | Whole-partition window aggregates (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT` with no ORDER BY and no frame): one value per partition, broadcast to every row of that… |
 
@@ -2329,7 +2349,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `analyze.rs` | 390 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 99 | The crate's error type: every way scalar expression evaluation can fail. |
-| `eval/binary.rs` | 746 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
+| `eval/binary.rs` | 776 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 446 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/dispatch.rs` | 399 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |

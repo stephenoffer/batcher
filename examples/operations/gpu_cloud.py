@@ -14,14 +14,21 @@ Run it once on each node shape you rent, before the first real job.
 from __future__ import annotations
 
 import batcher as bt
+from batcher._internal.hardware.amd import amd_devices, ecc_faulted_amd_devices
 from batcher._internal.hardware.fabric import (
     degraded_device_links,
+    ethernet_summary,
     fabric_bandwidth_gbps,
     nvlink_summary,
     rdma_summary,
 )
 from batcher._internal.hardware.faults import device_faults, faulted_devices, xid_readable
-from batcher._internal.site import local_scratch_root, scheduler_job, site_summary
+from batcher._internal.site import (
+    container_findings,
+    local_scratch_root,
+    scheduler_job,
+    site_summary,
+)
 
 
 def main() -> None:
@@ -51,7 +58,10 @@ def main() -> None:
     print("rdma:", rdma_summary())
     print("nvlink:", nvlink_summary())
     if fabric_bandwidth_gbps() == 0.0:
-        print("no readable RDMA fabric: the cost model keeps its default network weight")
+        # No RDMA is the common case below the top tier, and it is not the same as no
+        # network. The Ethernet line rate is a real measurement and prices a shuffle better
+        # than the built-in constant does.
+        print("no RDMA; ethernet:", ethernet_summary())
 
     # Everything wrong with this node in one list, which is the form a deployment check
     # wants: run it before the fleet takes work rather than reading a report after a job
@@ -64,6 +74,18 @@ def main() -> None:
     for problem in problems:
         print(f"  - {problem}")
     assert isinstance(problems, list)
+
+    # What the container runtime took away. Every one of these is a default nobody chose,
+    # each halves or breaks something, and none of them names itself in a job's own error.
+    for finding in container_findings():
+        print(f"CONTAINER {finding}")
+
+    # AMD is read from the driver's sysfs rather than from ROCm, so an Instinct node answers
+    # here with no ROCm installed. Empty on an NVIDIA host, which is not the same as healthy.
+    if amd_devices():
+        print(f"amd devices: {len(amd_devices())}")
+        for device in ecc_faulted_amd_devices():
+            print(f"FAULTED AMD DEVICE {device.card}: unrepairable HBM error")
 
     # Silent hardware faults, by device. An empty list here is the answer you want.
     degraded = degraded_device_links()

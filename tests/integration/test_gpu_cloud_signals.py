@@ -182,3 +182,59 @@ def test_nothing_readable_leaves_every_decision_exactly_where_it_was(monkeypatch
 
     gib = 1 << 30
     assert VramPool(capacity_bytes=80 * gib, headroom=0.0).usable_bytes() == 80 * gib
+
+
+# --- The vendors and the runtime the earlier signals did not cover ---------------------------
+
+
+def test_an_amd_node_is_not_silently_invisible() -> None:
+    # Every device probe in this suite reads NVML, which is NVIDIA-only. The AMD path answers
+    # from the driver's own sysfs, so an Instinct node reports rather than reading as an idle
+    # healthy host — and on this NVIDIA-free machine it correctly reports nothing at all.
+    from batcher._internal.hardware.amd import amd_devices, amd_present, readable
+
+    assert isinstance(amd_present(), bool)
+    assert isinstance(readable(), bool)
+    for device in amd_devices():
+        assert device.card.startswith("card")
+        assert device.index >= 0
+        # The invariant that makes a fault actionable: an unrepairable memory error is a
+        # subset of the uncorrectable ones, never larger than them.
+        assert device.memory_uncorrectable_errors <= device.uncorrectable_errors
+
+
+def test_the_fabric_estimate_prefers_rdma_and_falls_back_to_ethernet() -> None:
+    # Below the top tier there is no RDMA and there is still a network. Reporting zero there
+    # sent the cost model back to a constant on the majority of rented GPU capacity.
+    from batcher._internal.hardware.fabric import ethernet_bandwidth_gbps, fabric_bandwidth_gbps
+    from batcher.kyber.cost.fabric import measured_fabric_gbps
+
+    rdma = fabric_bandwidth_gbps()
+    combined = measured_fabric_gbps()
+    assert combined == (rdma or ethernet_bandwidth_gbps())
+    assert combined >= 0.0
+
+
+def test_the_container_limits_are_read_and_are_facts_not_guesses() -> None:
+    from batcher._internal.site import container_findings, memlock_limit_bytes, shm_bytes
+
+    assert shm_bytes() >= 0
+    assert memlock_limit_bytes() >= 0
+    for finding in container_findings():
+        # Every finding names its fix. A finding without one is a complaint, and an operator
+        # inside the container is exactly the person who cannot look the flag up.
+        assert any(flag in finding for flag in ("--shm-size", "--ulimit", "emptyDir")), finding
+
+
+def test_staging_never_picks_a_directory_that_cannot_take_the_write() -> None:
+    # The bug this closes: `isdir("/dev/shm")` is true inside a container with the runtime's
+    # default 64 MiB, so a shard write starts and dies with ENOSPC partway through.
+    import os
+
+    from batcher._internal.site import shm_root, usable_shm
+
+    root = shm_root()
+    assert os.path.isdir(root)
+    assert (root == "/dev/shm") == usable_shm()
+    # An absurd request must never be answered with a directory that cannot hold it.
+    assert shm_root(1 << 50) != "/dev/shm"
