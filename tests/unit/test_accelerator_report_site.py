@@ -27,8 +27,14 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _quiet_environment(monkeypatch):
-    """A machine with no site, no fabric, and no devices — the CI shape."""
+    """A machine with no site, no fabric, and no devices — the CI shape.
+
+    The firmware probe is silenced too. It is a real identity source and it answers on most
+    hosts, so a test asserting "this machine has nothing to say" would otherwise be answered
+    by whichever cloud the suite is running on.
+    """
     monkeypatch.setattr(report_mod, "_device_rows", lambda: [])
+    monkeypatch.setattr("batcher._internal.site.provider.dmi_identity", lambda: ("", "", None))
     for name in ("BATCHER_PROVIDER", "SLURM_JOB_ID", "KUBERNETES_SERVICE_HOST", "RAY_ADDRESS"):
         monkeypatch.delenv(name, raising=False)
     from batcher._internal.site import provider

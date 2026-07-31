@@ -17,6 +17,11 @@ from batcher._internal.site import provider, scheduler, scratch
 
 pytestmark = pytest.mark.unit
 
+#: The real firmware probe, captured before the autouse fixture silences it. The DMI tests
+#: below put it back deliberately; everything else in this file is about the environment and
+#: must not be answered by whatever machine the suite happens to run on.
+_REAL_DMI = provider.dmi_identity.__wrapped__
+
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
@@ -39,6 +44,10 @@ def _clean_env(monkeypatch):
         "NVIDIA_VISIBLE_DEVICES",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The firmware is a *fallback* identity, and this suite is about the environment. Silence
+    # it by default so a test asserting "no marker means unknown" is not answered by the host
+    # the suite happens to run on; the DMI tests below re-enable it deliberately.
+    monkeypatch.setattr(provider, "dmi_identity", lambda: ("", "", None))
     provider.reset_provider_probe()
     scratch.reset_scratch_probe()
     yield
@@ -523,3 +532,66 @@ def test_a_fabric_alone_is_enough_to_report_a_site(monkeypatch):
     site = system_snapshot()["site"]
     assert site["fabric_ports"] == 6
     assert site["fabric_gbps"] == 2400.0
+
+
+# --- The firmware, when the environment says nothing ----------------------------------------
+
+
+def _dmi(tmp_path, **fields) -> str:
+    root = tmp_path / "dmi"
+    root.mkdir(exist_ok=True)
+    for name, value in fields.items():
+        (root / name).write_text(f"{value}\n")
+    return str(root)
+
+
+def test_the_firmware_names_a_platform_the_environment_did_not(monkeypatch, tmp_path):
+    # A bare-metal node rented from a provider that exports no marker still knows what it is.
+    monkeypatch.setattr(provider, "dmi_identity", _REAL_DMI)
+    monkeypatch.setattr(
+        provider, "DMI_ROOT", _dmi(tmp_path, sys_vendor="Amazon EC2", product_name="p5.48xlarge")
+    )
+    assert provider.detect_provider() == "aws"
+    profile = provider.site_profile()
+    assert profile.machine == "p5.48xlarge"
+    assert profile.instance_type == "p5.48xlarge"
+    assert profile.virtualized is False
+
+
+def test_an_environment_marker_still_wins_over_the_firmware(monkeypatch, tmp_path):
+    # DMI names the machine a node was *built* as, not the service renting it out: a GPU
+    # cloud reselling EC2 capacity would read as `aws` while its own marker says who it is.
+    monkeypatch.setattr(provider, "dmi_identity", _REAL_DMI)
+    monkeypatch.setattr(provider, "DMI_ROOT", _dmi(tmp_path, sys_vendor="Amazon EC2"))
+    monkeypatch.setenv("CRUSOE_VM_ID", "vm-1")
+    assert provider.detect_provider() == "crusoe"
+
+
+def test_a_hypervisor_vendor_reports_a_virtual_machine(monkeypatch, tmp_path):
+    # An empty fabric probe is conclusive on bare metal and is not in a VM, where `/sys`
+    # shows the hypervisor's view of the PCI tree.
+    monkeypatch.setattr(provider, "dmi_identity", _REAL_DMI)
+    monkeypatch.setattr(provider, "DMI_ROOT", _dmi(tmp_path, sys_vendor="QEMU"))
+    assert provider.dmi_identity()[2] is True
+    assert provider.site_profile().virtualized is True
+
+
+def test_unreadable_firmware_says_nothing_rather_than_not_a_vm(monkeypatch, tmp_path):
+    monkeypatch.setattr(provider, "dmi_identity", _REAL_DMI)
+    monkeypatch.setattr(provider, "DMI_ROOT", str(tmp_path / "absent"))
+    assert provider.dmi_identity() == ("", "", None)
+    assert provider.detect_provider() == "unknown"
+    assert provider.site_profile().virtualized is None
+    assert "virtualized" not in provider.site_summary()
+
+
+def test_an_unrecognized_firmware_vendor_is_not_a_platform(monkeypatch, tmp_path):
+    monkeypatch.setattr(provider, "dmi_identity", _REAL_DMI)
+    monkeypatch.setattr(
+        provider, "DMI_ROOT", _dmi(tmp_path, sys_vendor="Supermicro", product_name="AS-4125GS")
+    )
+    # Bare metal from a builder nobody resells under that name: the machine is known, the
+    # platform is not, and neither is invented from the other.
+    assert provider.detect_provider() == "unknown"
+    assert provider.dmi_identity()[1] == "AS-4125GS"
+    assert provider.dmi_identity()[2] is False

@@ -32,7 +32,13 @@ from typing import Any
 from batcher._internal import events
 from batcher._internal.logging import note_suppressed
 
-__all__ = ["metrics_snapshot", "prometheus_text", "reset_metrics", "start_metrics"]
+__all__ = [
+    "metrics_snapshot",
+    "prometheus_text",
+    "reset_metrics",
+    "start_metrics",
+    "stop_metrics",
+]
 
 # Duration buckets in milliseconds, Prometheus-style cumulative histogram boundaries.
 # Chosen to straddle Batcher's stated range: sub-millisecond planning through multi-minute
@@ -245,6 +251,27 @@ def start_metrics() -> None:
     with _attach_lock:
         if _detach is None:
             _detach = events.subscribe(_collector.handle)
+
+
+def stop_metrics() -> None:
+    """Stop collecting, and leave the module able to start again.
+
+    The counterpart `start_metrics` needs and did not have. Detaching by calling the stored
+    unsubscribe function is not enough on its own: the handle stays set, and `start_metrics`
+    treats a non-`None` handle as "already attached", so collection can never be resumed in
+    that process. A test that detached to avoid leaking a subscriber therefore silenced every
+    later one instead, which is a worse leak in the other direction.
+
+    Idempotent: stopping a collector that is not running does nothing.
+
+    Returns:
+        None.
+    """
+    global _detach
+    with _attach_lock:
+        detach, _detach = _detach, None
+    if detach is not None:
+        detach()
 
 
 def metrics_snapshot() -> dict[str, Any]:

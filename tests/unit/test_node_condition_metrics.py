@@ -22,6 +22,26 @@ from batcher.observe import metrics
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _detached_collector():
+    """Detach the metrics collector afterwards, since it is a process-wide bus subscriber.
+
+    A subscriber left attached tells the engine that per-query profiles are being consumed,
+    which silently changes behavior for every later test — the same reason the metrics suite
+    next door details its own collector.
+    """
+    import batcher.observe.metrics as m
+
+    attached_before = m._detach is not None
+    yield
+    # Only undo an attachment *this* test caused, and undo it through `stop_metrics` so the
+    # module can attach again. Calling the raw detach handle leaves it set, and
+    # `start_metrics` then treats the collector as still attached — silencing every later
+    # test, which is a worse leak than the one being avoided.
+    if not attached_before:
+        m.stop_metrics()
+
+
 @pytest.fixture
 def clean_node(monkeypatch):
     """A host with nothing wrong and everything readable."""

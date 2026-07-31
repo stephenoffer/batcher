@@ -9,12 +9,15 @@ come from a different vocabulary. A default tuned for EC2 is not wrong on those 
 way that fails loudly; it is wrong in a way that spills to a 20 GB container overlay while a
 7 TB NVMe sits unused.
 
-Detection is **environment variables only**. That is a deliberate constraint, not a limitation:
+Detection is **local reads only** — environment variables first, then the firmware's own
+description of the machine in `/sys/class/dmi/id`. That is a deliberate constraint, not a
+limitation:
 
 * A metadata-service probe is a network round trip on a control-plane path, and the failure
   mode when a firewall blackholes it is a multi-second hang on every query rather than an error.
 * Every platform below exports something identifying into the container. Where one does not,
-  `BATCHER_PROVIDER` names it, which is also the escape hatch for a platform not listed.
+  the firmware still names the machine, and `BATCHER_PROVIDER` overrides both — which is also
+  the escape hatch for a platform not listed.
 
 **An unrecognized environment is `"unknown"`, and `"unknown"` behaves exactly as the engine did
 before this module existed.** No default is changed by a guess; a caller asks for a specific
@@ -28,9 +31,12 @@ import os
 from dataclasses import dataclass, field
 
 __all__ = [
+    "DMI_ROOT",
+    "DMI_VENDORS",
     "PROVIDERS",
     "SiteProfile",
     "detect_provider",
+    "dmi_identity",
     "reset_provider_probe",
     "site_profile",
     "site_summary",
@@ -141,6 +147,36 @@ PROVIDERS: tuple[_Provider, ...] = (
 #: here, and it is also how a test pins the answer.
 _PROVIDER_OVERRIDE = "BATCHER_PROVIDER"
 
+#: Where the kernel publishes the firmware's own description of the machine. A constant so a
+#: test can point it at a fake tree.
+DMI_ROOT = "/sys/class/dmi/id"
+
+#: What the firmware calls the platform, to what this module calls it. Read *after* every
+#: environment marker and only as a fallback, because DMI answers a coarser question: it names
+#: the machine a node was built as, not the service renting it out. A GPU cloud reselling EC2
+#: capacity reports `Amazon EC2` here while its own environment marker says who it is, and the
+#: marker is the more useful answer — so DMI only speaks when nothing else did.
+#:
+#: The strings are exact vendor values the firmware writes, not guesses at names.
+DMI_VENDORS: tuple[tuple[str, str], ...] = (
+    ("amazon ec2", "aws"),
+    ("google", "gcp"),
+    ("microsoft corporation", "azure"),
+    ("oracle corporation", "oci"),
+    ("openstack foundation", "openstack"),
+    ("alibaba cloud", "alibaba"),
+    ("tencent cloud", "tencent"),
+    ("digitalocean", "digitalocean"),
+    ("hetzner", "hetzner"),
+    ("scaleway", "scaleway"),
+)
+
+#: Firmware vendors that identify a *hypervisor* rather than a platform. Their presence says
+#: the node is virtualized, which is worth knowing on its own: a VM's `/sys` shows the
+#: hypervisor's view of the PCI tree, so a probe that finds no fabric there has not proved the
+#: host has none.
+_DMI_HYPERVISORS = ("qemu", "vmware", "xen", "bochs", "parallels", "innotek", "bhyve")
+
 #: Node-name variables shared across platforms. Kubernetes' downward API convention comes
 #: first because on a GPU fleet the pod is usually where the process actually runs.
 _NODE_VARS = ("BATCHER_NODE_NAME", "NODE_NAME", "KUBERNETES_NODE_NAME", "HOSTNAME")
@@ -166,6 +202,12 @@ class SiteProfile:
         node_name: This node's name, `""` when unpublished.
         scratch_hints: Mount points this platform documents for fast local storage, best
             first. Hints only: nothing is used before it is verified to exist and be writable.
+        machine: What the firmware calls this machine (`"c5d.24xlarge"`, a server model on
+            bare metal), `""` when DMI is not readable.
+        virtualized: Whether the firmware names a hypervisor, `None` when DMI says nothing.
+            Worth carrying rather than inferring: a VM's `/sys` shows the hypervisor's view of
+            the PCI tree, so a fabric probe finding nothing there has not proved the host has
+            none — while on bare metal the same empty answer is conclusive.
     """
 
     provider: str = "unknown"
@@ -173,6 +215,8 @@ class SiteProfile:
     region: str = ""
     node_name: str = ""
     scratch_hints: tuple[str, ...] = field(default_factory=tuple)
+    machine: str = ""
+    virtualized: bool | None = None
 
     @property
     def known(self) -> bool:
@@ -200,6 +244,44 @@ class SiteProfile:
 _NEOCLOUDS = frozenset({"coreweave", "lambda", "crusoe", "nebius", "runpod", "together", "vast"})
 
 
+@functools.lru_cache(maxsize=1)
+def dmi_identity() -> tuple[str, str, bool | None]:
+    """`(provider, machine, virtualized)` from the firmware's own description of this host.
+
+    The answer when the environment says nothing. A bare-metal GPU node rented from a
+    provider that exports no marker still knows what board it is, and the firmware is where a
+    virtual machine admits to being one.
+
+    Read from `/sys/class/dmi/id`, memoized because firmware does not change under a running
+    process. Every field degrades to `""`/`None`: DMI is absent inside many containers, off
+    Linux, and on ARM boards that publish device-tree information instead.
+
+    Returns:
+        The platform this maps to (`""` when the vendor string is not one this recognizes),
+        the machine name the firmware reports, and whether that vendor is a hypervisor —
+        `None` rather than `False` when DMI said nothing at all, since "not a VM" and "could
+        not tell" are different answers and only one of them makes an empty fabric probe
+        conclusive.
+    """
+    vendor = _dmi_field("sys_vendor") or _dmi_field("board_vendor")
+    machine = _dmi_field("product_name")
+    if not vendor:
+        return ("", machine, None)
+    lowered = vendor.lower()
+    provider = next((name for token, name in DMI_VENDORS if token in lowered), "")
+    virtualized = any(token in lowered for token in _DMI_HYPERVISORS)
+    return (provider, machine, virtualized)
+
+
+def _dmi_field(name: str) -> str:
+    """One `/sys/class/dmi/id` field, stripped, or `""` when it cannot be read."""
+    try:
+        with open(os.path.join(DMI_ROOT, name)) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def detect_provider() -> str:
     """The platform this process is running on.
 
@@ -207,8 +289,9 @@ def detect_provider() -> str:
         None.
 
     Returns:
-        A name from `PROVIDERS`, the value of `BATCHER_PROVIDER` when set, or `"unknown"`.
-        Never a guess: an environment with no marker reports unknown, and every caller treats
+        A name from `PROVIDERS`, the value of `BATCHER_PROVIDER` when set, the platform the
+        firmware names when the environment is silent, or `"unknown"`. Never a guess: a host
+        whose firmware this module does not recognize reports unknown, and every caller treats
         that as "keep the default you had".
     """
     override = os.environ.get(_PROVIDER_OVERRIDE, "").strip().lower()
@@ -217,7 +300,12 @@ def detect_provider() -> str:
     for provider in PROVIDERS:
         if any(os.environ.get(m, "").strip() for m in provider.markers):
             return provider.name
-    return "unknown"
+    # The firmware last, and only last. It names the machine a node was *built* as rather than
+    # the service renting it out, so a GPU cloud reselling EC2 capacity would read as `aws`
+    # here while its own marker says who it is — and the marker is the more useful answer.
+    # As a fallback it still beats `unknown`: a bare-metal node whose provider exports nothing
+    # at least stops being an unidentified machine.
+    return dmi_identity()[0] or "unknown"
 
 
 @functools.lru_cache(maxsize=1)
@@ -234,14 +322,20 @@ def site_profile() -> SiteProfile:
     name = detect_provider()
     spec = next((p for p in PROVIDERS if p.name == name), None)
     node = _first(_NODE_VARS)
+    _, machine, virtualized = dmi_identity()
     if spec is None:
-        return SiteProfile(provider=name, node_name=node)
+        return SiteProfile(provider=name, node_name=node, machine=machine, virtualized=virtualized)
     return SiteProfile(
         provider=name,
-        instance_type=_first(spec.instance_vars),
+        # The firmware's product name is the fallback: it is what an EC2 instance type or a
+        # bare-metal server model is written in, and a platform that exports neither reads as
+        # the board it is rather than as nothing.
+        instance_type=_first(spec.instance_vars) or machine,
         region=_first(spec.region_vars),
         node_name=node,
         scratch_hints=spec.scratch_hints,
+        machine=machine,
+        virtualized=virtualized,
     )
 
 
@@ -252,9 +346,10 @@ def reset_provider_probe() -> None:
     patching the probe out and resetting in either order is safe — the same contract
     `reset_hardware_probes` holds to.
     """
-    clear = getattr(site_profile, "cache_clear", None)
-    if clear is not None:
-        clear()
+    for probe in (site_profile, dmi_identity):
+        clear = getattr(probe, "cache_clear", None)
+        if clear is not None:
+            clear()
 
 
 def site_summary() -> dict:
@@ -267,7 +362,7 @@ def site_summary() -> dict:
     from batcher._internal.site.scheduler import scheduler_kind
 
     profile = site_profile()
-    return {
+    out = {
         "provider": profile.provider,
         "instance_type": profile.instance_type,
         "region": profile.region,
@@ -275,3 +370,8 @@ def site_summary() -> dict:
         "neocloud": profile.neocloud,
         "scheduler": scheduler_kind(),
     }
+    if profile.virtualized is not None:
+        # Reported only when the firmware answered. On bare metal an empty fabric probe is
+        # conclusive; in a VM it is not, and a reader needs to know which one they have.
+        out["virtualized"] = profile.virtualized
+    return out
