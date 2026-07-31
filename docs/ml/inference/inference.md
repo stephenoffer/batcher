@@ -38,7 +38,7 @@ class Classifier:
 
 
 ds = bt.read.parquet("data/features.parquet")
-scored = ds.ml.infer(Classifier(), batch_size=512, num_gpus=1, concurrency=4)
+scored = ds.ml.infer(Classifier, batch_size=512, num_gpus=1, concurrency=4)
 scored.write.parquet("output/scored.parquet")
 ```
 
@@ -166,7 +166,7 @@ class Embedder:
 
 
 docs = bt.read.parquet("data/docs.parquet")
-embedded = docs.ml.embed(Embedder(), batch_size=256, num_gpus=1, concurrency=2)
+embedded = docs.ml.embed(Embedder, batch_size=256, num_gpus=1, concurrency=2)
 ```
 
 ## Driving the pool yourself

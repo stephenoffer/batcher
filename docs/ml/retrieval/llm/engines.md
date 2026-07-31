@@ -145,6 +145,59 @@ answers = llm_generate(
 )
 ```
 
+## Sizing a model across several GPUs
+
+`tensor_parallel_size` shards one model's weights over a group of GPUs so a model too large
+for one card runs at all. It is the setting that most often costs a job hours, in three
+distinct ways, and Batcher checks all three on the worker before the engine builds rather than
+after it has downloaded the weights.
+
+The first is a group wider than the devices the worker holds. A stage scheduled with one GPU
+and told to build a four-way group does not raise. The engine waits for peers that were never
+scheduled, holding its slot, and the job reads as hung rather than misconfigured. It is the
+easiest mistake to make on a multi-GPU node, because the node has the cards the degree implies
+and the task does not. Give the stage the GPUs the degree needs, through the `num_gpus` of the
+map stage that runs it.
+
+The second is a group too small to hold the model. Batcher reads the model's weight footprint
+from the repository's metadata, which costs one request and no download, and says so before
+the tens of gigabytes move. Sizing on weights alone is not enough on its own: a group where
+the weights just fit leaves no room for the key/value cache, and an engine with no cache does
+not fail, it admits one sequence, preempts it, recomputes it, and reports a third of the
+throughput the hardware can do.
+
+The third is the interconnect. The same `tensor_parallel_size=2` is nearly free on an NVLink
+card and a measured 30-50% throughput loss on a PCIe-only one such as an L4 or an L40S,
+because every forward all-reduces across the group. Batcher warns when the degree is above one
+on a PCIe-only card, and separately when a card that *supports* NVLink has its links reported
+down, which is a node fault rather than a setting: the group looks free on paper while every
+collective runs over PCIe. Check `bt.accelerators()` and drain the node if the links do not
+come back.
+
+None of these change the degree. The penalty is hardware-specific and the fix differs per
+case, so Batcher reports and you decide.
+
+```{tip}
+Tensor parallelism divides the key/value cache as well as the weights, so the concurrency a
+group reaches is more than proportional to its size. Prefer the smallest group that holds the
+model, and spend the remaining GPUs on more replicas: a replica serves its own sequences at
+full rate, while a wider group than the model needs pays an all-reduce on every layer of every
+token for memory nobody uses.
+```
+
+## Where model weights are cached
+
+The default HuggingFace cache lives under `$HOME`, which on a GPU node is usually a small
+container overlay shared with the image. A node running eight GPU workers is eight processes
+each wanting the same tens of gigabytes there, and the failure is an out-of-space error partway
+through a download rather than anything that names the cause. When no cache location is
+configured, Batcher points the cache at the node's measured local disk before the first model
+loads, so the workers on a node share one copy on the filesystem that has room for it.
+
+Set any of `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, or `TRANSFORMERS_CACHE` and
+that choice is used untouched. An image that has already baked models into the default cache is
+also left alone, because moving the cache there would force the download it was meant to avoid.
+
 ## Vision-language models
 
 Pass an `image_column` holding raw bytes or a decoded `(H, W, 3)` tensor for a multimodal

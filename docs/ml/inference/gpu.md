@@ -146,10 +146,10 @@ class Model:
 ds = bt.read.parquet("data/features.parquet")
 
 # One whole GPU per actor, four actors.
-ds.ml.infer(Model(), batch_size=512, num_gpus=1, concurrency=4)
+ds.ml.infer(Model, batch_size=512, num_gpus=1, concurrency=4)
 
 # Two actors share each GPU; good for a small model.
-ds.ml.map_batches(Model(), batch_size=256, num_gpus=0.5, concurrency=4)
+ds.ml.map_batches(Model, batch_size=256, num_gpus=0.5, concurrency=4)
 ```
 
 ## Accelerators that are not GPUs
@@ -161,13 +161,13 @@ request it with `resources=`:
 ```python
 # docs: skip
 # Google TPU
-ds.ml.map_batches(Model(), resources={"TPU": 4}, concurrency=2)
+ds.ml.map_batches(Model, resources={"TPU": 4}, concurrency=2)
 
 # AWS Trainium / Inferentia
-ds.ml.map_batches(Model(), resources={"neuron_cores": 2}, concurrency=4)
+ds.ml.map_batches(Model, resources={"neuron_cores": 2}, concurrency=4)
 
 # Intel Gaudi
-ds.ml.map_batches(Model(), resources={"HPU": 8})
+ds.ml.map_batches(Model, resources={"HPU": 8})
 ```
 
 `resources` is a passthrough to Ray, not a fixed vendor list, so it equally requests a

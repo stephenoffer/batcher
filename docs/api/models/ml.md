@@ -90,7 +90,7 @@ class Classifier:
         return batch.append_column("prediction", pa.array(preds))
 
 
-labelled = ds.ml.map_batches(Classifier(), num_gpus=1, concurrency=4)
+labelled = ds.ml.map_batches(Classifier, num_gpus=1, concurrency=4)
 ```
 
 ## Common arguments
@@ -125,8 +125,8 @@ For full control over a custom model, a non-text modality, or your own batching,
 
 ```python
 # docs: skip
-scored = ds.ml.infer(Classifier(), output_columns=[...], batch_size=512, num_gpus=1, concurrency=4)
-vectors = ds.ml.embed(Embedder(), output_columns=[...], batch_size=256, num_gpus=1, concurrency=2)
+scored = ds.ml.infer(Classifier, output_columns=[...], batch_size=512, num_gpus=1, concurrency=4)
+vectors = ds.ml.embed(Embedder, output_columns=[...], batch_size=256, num_gpus=1, concurrency=2)
 ```
 
 See {doc}`Inference </ml/inference/inference>` for the inference workflow and
