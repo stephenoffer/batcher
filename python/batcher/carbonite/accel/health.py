@@ -206,10 +206,21 @@ def assess_fleet(
         One verdict per device, empty when telemetry is unavailable. Fault counters are joined
         by device index, and a device the counters do not cover keeps its telemetry verdict.
     """
+    live = readings is None
     if readings is None:
         from batcher._internal.hardware.nvml import device_telemetry
 
         readings = device_telemetry()
+    if live and not readings:
+        # NVML answers for NVIDIA and nothing else, so on an Instinct node every device was
+        # judged by not being judged: no readings, no verdicts, and a caller reading the empty
+        # tuple as "nothing to worry about". Only on the live path, and only when NVML found
+        # nothing — a caller that passed `()` deliberately asked for no verdicts.
+        from batcher.carbonite.accel.amd_health import amd_verdicts
+
+        amd = amd_verdicts(thresholds)
+        if amd:
+            return amd
     if faults is None:
         from batcher._internal.hardware.faults import device_faults
 

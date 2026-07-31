@@ -305,3 +305,94 @@ def test_an_amd_fault_reaches_the_problem_list_through_the_shared_row_keys(drm, 
         accelerators._gpu_inventory_probe.cache_clear()
     assert any("unrepairable HBM error" in p for p in problems), problems
     assert any("critical limit" in p for p in problems), problems
+
+
+# --- Reaching the admission decision --------------------------------------------------------
+
+
+def test_a_failed_hbm_takes_the_device_out_of_the_fleet(drm):
+    from batcher.carbonite.accel import amd_verdicts
+
+    _card(drm, 0, product_name="mi300x", unique_id="dead01", ras={"umc": (0, 1)})
+    (verdict,) = amd_verdicts()
+    assert verdict.state == "quarantine"
+    assert verdict.schedulable is False
+    assert verdict.reasons == ("hbm_uncorrectable",)
+    assert verdict.uuid == "dead01", "health history is keyed on the device's own id"
+
+
+def test_a_recovered_engine_fault_derates_rather_than_quarantines(drm):
+    from batcher.carbonite.accel import amd_verdicts
+
+    _card(drm, 0, ras={"gfx": (0, 2)})
+    (verdict,) = amd_verdicts()
+    assert verdict.state == "degraded"
+    assert verdict.schedulable is True
+    assert verdict.reasons == ("engine_uncorrectable",)
+
+
+def test_a_hot_board_is_judged_against_its_own_critical_point(drm):
+    # The same rule the NVIDIA path applies to a published slowdown point: the lower of the
+    # board's limit and the configured ceiling. A board that clamps at 90 must not be judged
+    # by a fleet-wide 87 it would trip long before its own hardware cares.
+    from batcher.carbonite.accel import HealthThresholds, amd_verdicts
+
+    _card(drm, 0, hwmon={"temp1_input": "84000", "temp1_crit": "88000"})
+    (verdict,) = amd_verdicts(HealthThresholds(max_temperature_c=95.0))
+    assert "hot" in verdict.reasons, "88 C limit less the 5 C margin is 83, and it is at 84"
+
+
+def test_a_healthy_board_produces_a_healthy_verdict(drm):
+    from batcher.carbonite.accel import amd_verdicts
+
+    _card(
+        drm,
+        0,
+        product_name="mi300x",
+        mem_info_vram_total=str(192 * (1 << 30)),
+        mem_info_vram_used=str(20 * (1 << 30)),
+        hwmon={"temp1_input": "62000", "temp1_crit": "100000"},
+        ras={"umc": (0, 0)},
+    )
+    (verdict,) = amd_verdicts()
+    assert (verdict.state, verdict.reasons, verdict.derate) == ("healthy", (), 1.0)
+
+
+def test_a_full_board_is_not_admitted_onto(drm):
+    from batcher.carbonite.accel import amd_verdicts
+
+    _card(drm, 0, mem_info_vram_total="100", mem_info_vram_used="99")
+    (verdict,) = amd_verdicts()
+    assert "memory_full" in verdict.reasons
+
+
+def test_the_live_fleet_assessment_falls_through_to_amd_when_nvml_is_silent(drm, monkeypatch):
+    # The wiring: `assess_fleet()` is what the scheduler and the fleet probe call, and on an
+    # Instinct node it returned an empty tuple that every caller read as "nothing to worry
+    # about" rather than "nothing was looked at".
+    from batcher.carbonite.accel import health
+
+    _card(drm, 0, product_name="mi300x", ras={"umc": (0, 5)})
+    monkeypatch.setattr(
+        "batcher._internal.hardware.nvml.device_telemetry", lambda: (), raising=True
+    )
+    verdicts = health.assess_fleet()
+    assert [v.state for v in verdicts] == ["quarantine"]
+
+
+def test_passing_no_readings_deliberately_still_means_no_verdicts(drm, monkeypatch):
+    # `assess_fleet(())` is how a caller asks to judge nothing. The AMD fall-through must not
+    # turn that into a fleet-wide probe on a path that explicitly opted out.
+    from batcher.carbonite.accel import health
+
+    _card(drm, 0, ras={"umc": (0, 5)})
+    assert health.assess_fleet((), None, ()) == ()
+
+
+def test_an_amd_fault_reaches_the_node_condition_gauge(drm):
+    # One gauge for both vendors: a fleet does not want two alerts for "a device's memory has
+    # failed", and NVML reports nothing at all on the AMD half of a mixed fleet.
+    from batcher.observe.metrics import _node_conditions
+
+    _card(drm, 0, ras={"umc": (0, 2)})
+    assert _node_conditions()["faulted_devices"] >= 1

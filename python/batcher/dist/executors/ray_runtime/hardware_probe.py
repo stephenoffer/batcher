@@ -229,6 +229,7 @@ def _device_health_on_this_worker() -> dict:
     on a fleet the difference between "no device is sick" and "no device that the driver can
     see is sick" is the difference between a report and a guess.
     """
+    from batcher._internal.hardware.amd import ecc_faulted_amd_devices
     from batcher._internal.hardware.fabric import (
         degraded_device_links,
         fabric_error_total,
@@ -261,7 +262,8 @@ def _device_health_on_this_worker() -> dict:
         # something without failing anything. Neither is a drain reason on its own — a
         # device with ECC off is working, it is simply not reporting — but both are what an
         # operator reconciles a slow node against.
-        "faulted": [f.uuid or f.index for f in faulted_devices()],
+        "faulted": [f.uuid or f.index for f in faulted_devices()]
+        + [d.unique_id or d.index for d in ecc_faulted_amd_devices()],
         "config_findings": sorted({f for m in misconfigured_devices() for f in m.findings}),
         # How this worker's host half is placed against the device it feeds, and whether the
         # device is its own. Both are per-worker facts the driver cannot see, and both explain

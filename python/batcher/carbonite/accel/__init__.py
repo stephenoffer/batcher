@@ -4,19 +4,18 @@ Carbonite protects a run from the resources it does not have. On a GPU fleet the
 those is device memory — 80 GiB with no swap behind it and a failure mode that kills a worker
 rather than degrading it — and the second scarcest is a healthy device.
 
-Seven modules, one question each:
+Eight modules, one question each:
 
 * `vram` — device memory as a pool: reserve, release, headroom, and what another tenant is
-  already holding, which is the binding figure when sizing an inference stage on a shared
-  device.
+  already holding, the binding figure when sizing a stage on a shared device.
 * `allocator` — how the allocations `vram` admitted are actually served: a suballocated pool
   in front of the driver, host spilling, and the measured high-water mark.
 * `mig` — partitioning one device into isolated instances, so a small model stops holding a
   large device.
 * `kv_cache` — the LLM cache budget that actually sets an inference stage's concurrency.
-* `health` — turning live telemetry into a schedule/derate/quarantine verdict.
-* `power` — the deployment's power envelope as an admission decision, with a device-count
-  counter-offer rather than a refusal.
+* `health` — turning live telemetry into a schedule/derate/quarantine verdict, and
+  `amd_health` — the same verdict for a vendor NVML cannot see.
+* `power` — the deployment's power envelope as an admission decision, with a counter-offer.
 * `affinity` — putting a device's host-side work on the cores next to it, and noticing when
   the device is shared with another process rather than this one's alone.
 
@@ -43,6 +42,7 @@ from batcher.carbonite.accel.allocator import (
     prepare_device_memory,
     reset_device_allocator,
 )
+from batcher.carbonite.accel.amd_health import amd_verdicts
 from batcher.carbonite.accel.health import (
     HealthThresholds,
     HealthVerdict,
@@ -88,6 +88,7 @@ __all__ = [
     "MigProfile",
     "VramPool",
     "VramReservation",
+    "amd_verdicts",
     "assess_device",
     "assess_faults",
     "assess_fleet",

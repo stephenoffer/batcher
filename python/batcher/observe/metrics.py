@@ -449,6 +449,7 @@ def _node_conditions() -> dict[str, int]:
     """
     out = dict.fromkeys(_NODE_CONDITION_HELP, 0)
     try:
+        from batcher._internal.hardware.amd import ecc_faulted_amd_devices
         from batcher._internal.hardware.fabric import (
             degraded_device_links,
             fabric_error_total,
@@ -458,7 +459,9 @@ def _node_conditions() -> dict[str, int]:
         from batcher._internal.hardware.faults import faulted_devices
 
         out["degraded_links"] = len(degraded_device_links())
-        out["faulted_devices"] = len(faulted_devices())
+        # Both vendors in one gauge. A fleet does not want two alerts for "a device's memory
+        # has failed", and NVML reports nothing at all on the AMD half of a mixed fleet.
+        out["faulted_devices"] = len(faulted_devices()) + len(ecc_faulted_amd_devices())
         out["nvlink_down_devices"] = int(nvlink_summary()["degraded_devices"])
         out["fabric_errors"] = sum(fabric_error_total().values())
         rdma = rdma_summary()
