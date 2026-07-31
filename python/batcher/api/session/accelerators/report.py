@@ -1,133 +1,16 @@
-"""Accelerator reporting (`accelerators`, `show_accelerators`).
+"""Assembling the accelerator report, and saying the part a reader would otherwise miss.
 
-The second question on a GPU bug report, after "which build", is "what hardware, and what was
-it doing". `versions` answers the first. This answers the second in one call: which devices
-this process can see, what the cluster's fleet looks like, what it is drawing, and whether the
-driver is clamping anything. `measure_energy` answers the third — what a pipeline cost to run.
-
-It reports rather than decides. Every figure comes from a source that already exists — the
-device table, live telemetry, the cluster topology, the configured power envelope — and each
-one is omitted when its source cannot answer, so a CPU-only host produces a small honest
-report rather than a large one full of zeros.
+`rows` says what is true of each device. This decides what a reader is shown: the site the
+process is on, the fabric it is wired to, the fleet's sick nodes, and — called out by name
+rather than left in a table — the conditions that cost throughput without costing
+correctness, which are the ones a job's own timings never reveal.
 """
 
 from __future__ import annotations
 
-import contextlib
-from typing import TYPE_CHECKING
+from batcher.api.session.accelerators.rows import device_rows
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-    from batcher.plan.energy import EnergyLedger
-
-__all__ = ["accelerators", "measure_energy", "show_accelerators"]
-
-
-def _device_rows() -> list[dict]:
-    """Per-device rows: nameplate figures for what is attached, live readings where available."""
-    from batcher._internal.device_specs import device_spec, resolve_device_name
-    from batcher._internal.hardware import device_telemetry, gpu_inventory
-    from batcher._internal.hardware.faults import device_faults, device_modes
-
-    live = {d.index: d for d in device_telemetry()}
-    faults = {f.index: f for f in device_faults()}
-    modes = {m.index: m for m in device_modes()}
-    rows: list[dict] = []
-    for index, device in enumerate(gpu_inventory()):
-        name = str(device.get("name") or "")
-        row: dict = {"index": index, "name": name}
-        memory = int(device.get("memory_bytes") or 0)
-        if memory:
-            row["memory_gib"] = round(memory / (1 << 30), 1)
-        spec = device_spec(resolve_device_name(device.get("accelerator_type") or name))
-        if spec is not None:
-            row["tdp_watts"] = spec.tdp_watts
-            row["nvlink_domain"] = spec.nvlink_domain
-            # The two links, because "why is this stage slow" is usually one of them: the host
-            # link decides whether the data can arrive fast enough to be worth a device, and
-            # the fabric decides how wide a collective can go before it leaves the fast path.
-            if spec.host_link:
-                row["host_link"] = spec.host_link
-                row["host_link_gbps"] = spec.host_link_gbps
-            if spec.nvlink_gbps:
-                row["nvlink_gbps"] = spec.nvlink_gbps
-        reading = live.get(index)
-        if reading is not None:
-            row["power_watts"] = round(reading.power_watts, 1)
-            row["sm_utilization"] = round(reading.sm_utilization, 3)
-            row["temperature_c"] = round(reading.temperature_c, 1)
-            if reading.throttle_reasons:
-                row["throttled"] = list(reading.throttle_reasons)
-            if reading.ecc_uncorrected:
-                row["ecc_uncorrected"] = reading.ecc_uncorrected
-        _add_measured_link(row, index)
-        _add_faults(row, faults.get(index))
-        _add_modes(row, modes.get(index))
-        rows.append(row)
-    return rows
-
-
-def _add_measured_link(row: dict, index: int) -> None:
-    """Add what the device's host link *negotiated*, where it differs from the nameplate.
-
-    The nameplate `host_link` above says what the model ships with. This says what this board
-    came up at, and only when the two disagree — a link at full capability adds nothing a
-    reader needs, while one at half width is the whole explanation for a transfer-bound stage
-    that used to be fast.
-    """
-    from batcher._internal.hardware.fabric.device_links import (
-        device_pcie_links,
-        nearest_rdma_device,
-    )
-
-    links = device_pcie_links()
-    if index >= len(links):
-        return
-    link = links[index]
-    nic = nearest_rdma_device(index)
-    if nic:
-        # Which NIC this device should reach the fabric through. A transfer routed via a NIC
-        # on the other root complex crosses the inter-socket link twice on its way off the
-        # node, and nothing else in the report pairs the two halves.
-        row["nearest_nic"] = nic
-    if link.numa_node >= 0:
-        # Which socket the device hangs off: the host half of its pipeline belongs there too.
-        row["numa_node"] = link.numa_node
-    if link.degraded:
-        row["link_degraded"] = f"gen{link.gen} x{link.width} of gen{link.max_gen} x{link.max_width}"
-        row["link_efficiency"] = round(link.degradation_ratio, 3)
-
-
-def _add_faults(row: dict, faults) -> None:
-    """Add the memory-fault counters that predict a device failing, where any are non-zero."""
-    if faults is None or not faults.readable:
-        return
-    if faults.remap_failure:
-        row["remap_failure"] = True
-    if faults.needs_reset:
-        row["reset_pending"] = True
-    if faults.remapped_uncorrectable:
-        row["remapped_uncorrectable"] = faults.remapped_uncorrectable
-    if faults.pcie_replay:
-        row["pcie_replay"] = faults.pcie_replay
-
-
-def _add_modes(row: dict, modes) -> None:
-    """Add the device's configuration, where it is costing something.
-
-    Only the findings. A well-configured device contributes nothing here, which is what keeps
-    the row readable and makes the day it says `ecc_disabled` worth noticing.
-    """
-    if modes is None:
-        return
-    if modes.mig_enabled:
-        # Not a finding: partitioning is usually deliberate. It is reported unconditionally
-        # because it changes what every other number on the row means — a process handed one
-        # instance has a fraction of the memory and a fraction of the SMs.
-        row["mig_instances"] = modes.mig_instances
-    if modes.findings:
-        row["config"] = list(modes.findings)
+__all__ = ["accelerator_problems", "accelerators", "show_accelerators"]
 
 
 def accelerators() -> dict:
@@ -166,7 +49,7 @@ def accelerators() -> dict:
     from batcher._internal.hardware import accelerator_backend, nvml_available, total_power_watts
     from batcher.config import active_config
 
-    report: dict = {"backend": accelerator_backend(), "devices": _device_rows()}
+    report: dict = {"backend": accelerator_backend(), "devices": device_rows()}
     _add_site(report)
     _add_fabric(report)
 
@@ -250,6 +133,56 @@ _CONFIG_ADVICE = {
 }
 
 
+def accelerator_problems() -> list[str]:
+    """Everything wrong with this node's accelerators, as one list of sentences.
+
+    The machine-readable form of what `show_accelerators` calls out, for the deployment check
+    that runs before a fleet takes work rather than the operator reading a report after it
+    went slow. Each entry is a complete sentence naming the device and the condition, so a
+    failing check can be pasted into an alert without a lookup table.
+
+    Returns:
+        The problems, most serious first, empty on a node with nothing wrong *and* on one that
+        could read nothing — `bt.accelerators()` is where those are told apart, and a check
+        that treats an unreadable node as broken would fail a fleet the day a base image
+        stopped shipping `pynvml`.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.accelerator_problems()
+            []
+    """
+    report = accelerators()
+    out: list[str] = []
+    for row in report.get("devices", []):
+        index = row.get("index")
+        if row.get("remap_failure"):
+            out.append(f"gpu {index}: memory row remapping has failed, the device needs replacing")
+        if row.get("ecc_uncorrected"):
+            out.append(f"gpu {index}: {row['ecc_uncorrected']} uncorrectable ECC error(s)")
+        for finding in row.get("config", ()):
+            out.append(f"gpu {index}: {_CONFIG_ADVICE.get(finding, finding)}")
+        if row.get("reset_pending"):
+            out.append(f"gpu {index}: a memory repair is waiting for a device reset")
+        if row.get("link_degraded"):
+            out.append(
+                f"gpu {index}: host link at {row['link_degraded']}, "
+                f"{row['link_efficiency']:.0%} of nameplate bandwidth"
+            )
+        if row.get("throttled"):
+            out.append(f"gpu {index}: clocks clamped ({', '.join(row['throttled'])})")
+    fabric = (report.get("fabric") or {}).get("rdma") or {}
+    if fabric.get("ports", 0) > fabric.get("active_ports", 0):
+        down = fabric["ports"] - fabric["active_ports"]
+        out.append(f"fabric: {down} of {fabric['ports']} RDMA port(s) are not carrying traffic")
+    for node in ((report.get("fleet") or {}).get("health") or {}).get("unhealthy", []):
+        reasons = ", ".join(node.get("reasons", ())) or "a degraded device"
+        out.append(f"node {node['node_id'][:12]}: {reasons}")
+    return out
+
+
 def _show_silent_faults(devices: list[dict]) -> None:
     """Call out, by device, the conditions that cost throughput without costing correctness.
 
@@ -270,6 +203,11 @@ def _show_silent_faults(devices: list[dict]) -> None:
             print(f"gpu {row['index']}  memory repair pending: schedule a device reset")
         for finding in row.get("config", ()):
             print(f"gpu {row['index']}  {_CONFIG_ADVICE.get(finding, finding)}")
+        if row.get("mig_instances"):
+            print(
+                f"gpu {row['index']}  partitioned into {row['mig_instances']} MIG instance(s):"
+                " every figure above is a slice, not the board"
+            )
 
 
 def _add_site(report: dict) -> None:
@@ -362,6 +300,10 @@ def show_accelerators() -> None:
             line += f" {site['instance_type']}"
         if site.get("region"):
             line += f" in {site['region']}"
+        if site.get("virtualized"):
+            # Worth saying: in a VM an empty fabric or device probe has not proved the host
+            # has none, it has proved the hypervisor did not pass one through.
+            line += " (virtual machine)"
         print(f"{line}, scheduled by {site['scheduler']}")
         if site.get("scratch_dir"):
             print(f"      local scratch {site['scratch_dir']}")
@@ -380,6 +322,14 @@ def show_accelerators() -> None:
                 f"        NVLink {nvlink['active_links']}/{nvlink['links']} link(s) up "
                 f"across {nvlink['devices']} device(s)"
             )
+        cost = fabric.get("cost") or {}
+        if cost.get("derived_net_weight") is not None:
+            # What the measurement did to the plan ranking. Two clusters producing different
+            # plans for the same query is otherwise unexplained by anything printed here.
+            print(
+                f"        a shuffled byte is priced at {cost['net_weight']:.1f}x a local one "
+                f"(measured, against the default 2.0)"
+            )
     fleet = report.get("fleet")
     if fleet:
         models = ", ".join(fleet["device_models"]) or "unlabelled"
@@ -396,6 +346,13 @@ def show_accelerators() -> None:
             for node in unhealthy:
                 reasons = ", ".join(node["reasons"]) or "degraded link"
                 print(f"       node {node['node_id'][:12]}: {reasons}")
+    problems = accelerator_problems()
+    if problems:
+        # The closing summary, because a reader who scrolled past a device table wants the
+        # count and the list, not to have reconstructed it from the lines above.
+        print(f"problems: {len(problems)}")
+        for problem in problems:
+            print(f"  - {problem}")
     power = report["power"]
     if power:
         parts = [
@@ -405,78 +362,3 @@ def show_accelerators() -> None:
             print("power: " + ", ".join(parts))
         for zone, watts in sorted(power.get("by_zone_watts", {}).items()):
             print(f"       zone {zone}: {watts} W at full load")
-
-
-@contextlib.contextmanager
-def measure_energy() -> Iterator[EnergyLedger]:
-    """Collect the energy every accelerator stage inside the block drew.
-
-    A GPU-hour is what a fleet is billed; joules are what it buys. This is how a pipeline
-    reports the second: each accelerator stage that runs inside the block records what it
-    drew, measured from device readings where NVML is available and modelled from the device
-    table where it is not, and the ledger tells the two apart.
-
-    The ledger is filled as the block runs, so read it after the block. Render it with
-    :func:`batcher.observe.format_energy_report`, or take the ratios off it directly.
-    Recording is skipped entirely when `accelerator.energy.accounting` is off.
-
-    On the way out, every *measured* stage is folded into the learned statistics, so the next
-    run's device choice is made against what this fleet delivers rather than against a
-    datasheet ratio. Modelled stages are not: learning from them would teach the optimizer its
-    own assumptions back.
-
-    Returns:
-        A context manager yielding the `EnergyLedger` the block's stages record into.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt
-            >>> with bt.measure_energy() as energy:
-            ...     _ = bt.from_pydict({"x": [1, 2, 3]}).to_pydict()
-            >>> energy.total_joules >= 0.0
-            True
-    """
-    from batcher.core.energy import energy_scope
-
-    with energy_scope() as ledger:
-        try:
-            yield ledger
-        finally:
-            _learn_from(ledger)
-
-
-def _learn_from(ledger: EnergyLedger) -> None:
-    """Fold a completed run's measured efficiency into the learned statistics.
-
-    The conductor's half of the loop the architecture describes: Core measured what each stage
-    drew, and this is where that measurement reaches Kyber, so the next run's device choice is
-    made against what this fleet actually delivers rather than against a datasheet ratio.
-    Only *measured* records are folded — a modelled figure is the datasheet restated, and
-    learning from it would teach the optimizer its own assumptions.
-
-    Best-effort: a missing hub, an unreadable backend, or a failed write is skipped rather
-    than raised, because a learning path must never fail a query.
-    """
-    if not ledger.stages:
-        return
-    try:
-        from batcher.core.runtime import default_hub
-        from batcher.kyber.gpu import record_measured_efficiency
-
-        hub = default_hub()
-        for stage in ledger.stages:
-            if not stage.measured or not stage.accelerator_type:
-                continue
-            if stage.tokens > 0:
-                record_measured_efficiency(
-                    hub, stage.accelerator_type, stage.joules, stage.tokens, kind="tokens"
-                )
-            elif stage.rows > 0:
-                record_measured_efficiency(
-                    hub, stage.accelerator_type, stage.joules, stage.rows, kind="rows"
-                )
-    except Exception as exc:  # pragma: no cover - learning must never break a query
-        from batcher._internal.logging import note_suppressed
-
-        note_suppressed("api", "record measured efficiency", exc)

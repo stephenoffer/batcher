@@ -25,6 +25,7 @@ from batcher.observe.metrics import (
     prometheus_text,
     reset_metrics,
     start_metrics,
+    stop_metrics,
 )
 from batcher.observe.store import ActivityStore
 
@@ -42,6 +43,7 @@ __all__ = [
     "reset_metrics",
     "start_metrics",
     "start_ui",
+    "stop_metrics",
     "stop_ui",
     "ui_url",
 ]

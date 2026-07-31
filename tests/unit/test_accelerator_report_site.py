@@ -17,10 +17,11 @@ import pytest
 from batcher._internal.hardware.fabric.pcie import PcieLink
 from batcher._internal.hardware.faults.counters import DeviceFaults
 
-# The module, not the function of the same name the package re-exports. `import a.b.c as m`
-# binds the *attribute*, which the package's own re-export has already replaced with the
-# function — so patching on it silently does nothing.
-report_mod = importlib.import_module("batcher.api.session.accelerators")
+# The modules, not the functions the package re-exports. `import a.b.c as m` binds the
+# *attribute*, which the package's own re-export has already replaced with the function — so
+# patching on it silently does nothing.
+report_mod = importlib.import_module("batcher.api.session.accelerators.report")
+rows_mod = importlib.import_module("batcher.api.session.accelerators.rows")
 
 pytestmark = pytest.mark.unit
 
@@ -33,7 +34,7 @@ def _quiet_environment(monkeypatch):
     hosts, so a test asserting "this machine has nothing to say" would otherwise be answered
     by whichever cloud the suite is running on.
     """
-    monkeypatch.setattr(report_mod, "_device_rows", lambda: [])
+    monkeypatch.setattr(report_mod, "device_rows", lambda: [])
     monkeypatch.setattr("batcher._internal.site.provider.dmi_identity", lambda: ("", "", None))
     for name in ("BATCHER_PROVIDER", "SLURM_JOB_ID", "KUBERNETES_SERVICE_HOST", "RAY_ADDRESS"):
         monkeypatch.delenv(name, raising=False)
@@ -109,7 +110,7 @@ def test_a_degraded_host_link_is_added_to_the_device_row(monkeypatch):
         "batcher._internal.hardware.fabric.device_links.device_pcie_links", lambda: (link,)
     )
     row: dict = {"index": 0}
-    report_mod._add_measured_link(row, 0)
+    rows_mod._add_measured_link(row, 0)
     assert row["numa_node"] == 1
     assert row["link_degraded"] == "gen3 x8 of gen5 x16"
     assert row["link_efficiency"] == pytest.approx(0.125, rel=1e-2)
@@ -121,15 +122,15 @@ def test_a_healthy_link_adds_no_noise(monkeypatch):
         "batcher._internal.hardware.fabric.device_links.device_pcie_links", lambda: (link,)
     )
     row: dict = {"index": 0}
-    report_mod._add_measured_link(row, 0)
+    rows_mod._add_measured_link(row, 0)
     assert row == {"index": 0, "numa_node": 0}
 
 
 def test_memory_faults_reach_the_device_row_only_when_readable():
     row: dict = {"index": 0}
-    report_mod._add_faults(row, DeviceFaults(index=0, remap_failure=True, readable=False))
+    rows_mod._add_faults(row, DeviceFaults(index=0, remap_failure=True, readable=False))
     assert row == {"index": 0}
-    report_mod._add_faults(
+    rows_mod._add_faults(
         row, DeviceFaults(index=0, remap_pending=True, pcie_replay=9, readable=True)
     )
     assert row["reset_pending"] is True
@@ -233,3 +234,66 @@ def test_the_table_never_fails_when_the_probes_do(monkeypatch):
     monkeypatch.setattr("batcher._internal.hardware.faults.device_faults", _boom)
     assert energy._device_conditions() == ({}, {})
     assert "NVIDIA H100" in energy.format_device_table([_reading()])
+
+
+# --- The list a deployment check reads ------------------------------------------------------
+
+
+def test_a_healthy_node_has_no_problems(monkeypatch):
+    monkeypatch.setattr(report_mod, "device_rows", lambda: [{"index": 0, "name": "H100"}])
+    assert report_mod.accelerator_problems() == []
+
+
+def test_every_silent_condition_becomes_a_sentence_naming_its_device(monkeypatch):
+    # A failing check should be pasteable into an alert without a lookup table.
+    monkeypatch.setattr(
+        report_mod,
+        "device_rows",
+        lambda: [
+            {"index": 0, "name": "H100", "remap_failure": True},
+            {"index": 1, "name": "H100", "ecc_uncorrected": 2},
+            {"index": 2, "name": "H100", "config": ["ecc_disabled"]},
+            {"index": 3, "name": "H100", "reset_pending": True},
+            {
+                "index": 4,
+                "name": "H100",
+                "link_degraded": "gen3 x8 of gen5 x16",
+                "link_efficiency": 0.125,
+            },
+            {"index": 5, "name": "H100", "throttled": ["thermal"]},
+        ],
+    )
+    problems = report_mod.accelerator_problems()
+    assert len(problems) == 6
+    assert problems[0].startswith("gpu 0: memory row remapping has failed")
+    assert "2 uncorrectable ECC" in problems[1]
+    assert "ECC is OFF" in problems[2]
+    assert "waiting for a device reset" in problems[3]
+    assert "12% of nameplate" in problems[4]
+    assert "clocks clamped (thermal)" in problems[5]
+
+
+def test_a_port_that_is_down_is_a_problem_too(monkeypatch):
+    monkeypatch.setattr(report_mod, "device_rows", lambda: [])
+    monkeypatch.setattr(
+        "batcher._internal.hardware.fabric.rdma_summary",
+        lambda: {
+            "ports": 8,
+            "active_ports": 6,
+            "bandwidth_gbps": 2400.0,
+            "link_layers": {"InfiniBand": 6},
+            "rdma_available": True,
+            "partition": "",
+            "devices": [],
+            "numa_nodes": [],
+        },
+    )
+    problems = report_mod.accelerator_problems()
+    assert any("2 of 8 RDMA port(s) are not carrying traffic" in p for p in problems)
+
+
+def test_an_unreadable_node_reports_no_problems_rather_than_failing_a_check(monkeypatch):
+    # A check that treats an unreadable node as broken fails a fleet the day a base image
+    # stops shipping pynvml.
+    monkeypatch.setattr(report_mod, "device_rows", lambda: [])
+    assert report_mod.accelerator_problems() == []

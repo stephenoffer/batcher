@@ -90,7 +90,7 @@ def test_the_worker_side_probe_reports_what_only_that_host_can_see(monkeypatch):
 def test_the_report_carries_the_drain_list(monkeypatch):
     import importlib
 
-    report_mod = importlib.import_module("batcher.api.session.accelerators")
+    report_mod = importlib.import_module("batcher.api.session.accelerators.report")
     monkeypatch.setattr(
         hardware_probe,
         "cluster_device_health",
@@ -106,7 +106,7 @@ def test_the_report_carries_the_drain_list(monkeypatch):
 def test_the_report_omits_health_entirely_off_a_cluster(monkeypatch):
     import importlib
 
-    report_mod = importlib.import_module("batcher.api.session.accelerators")
+    report_mod = importlib.import_module("batcher.api.session.accelerators.report")
     monkeypatch.setattr(hardware_probe, "cluster_device_health", lambda: ())
     fleet: dict = {}
     report_mod._add_fleet_health(fleet)

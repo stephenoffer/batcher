@@ -53,6 +53,18 @@ def main() -> None:
     if fabric_bandwidth_gbps() == 0.0:
         print("no readable RDMA fabric: the cost model keeps its default network weight")
 
+    # Everything wrong with this node in one list, which is the form a deployment check
+    # wants: run it before the fleet takes work rather than reading a report after a job
+    # came back slow. Empty on a healthy node *and* on one that could read nothing, so a
+    # check that treats an empty list as proof of health is checking the wrong thing.
+    from batcher.api.session.accelerators import accelerator_problems
+
+    problems = accelerator_problems()
+    print(f"problems: {len(problems)}")
+    for problem in problems:
+        print(f"  - {problem}")
+    assert isinstance(problems, list)
+
     # Silent hardware faults, by device. An empty list here is the answer you want.
     degraded = degraded_device_links()
     for link in degraded:

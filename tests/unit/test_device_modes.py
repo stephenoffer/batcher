@@ -189,9 +189,11 @@ def test_the_part_threshold_is_a_floor_on_strictness_not_a_licence_to_run_hotter
 
 
 def test_the_report_carries_the_findings_and_explains_them(capsys):
-    report_mod = importlib.import_module("batcher.api.session.accelerators")
+    report_mod = importlib.import_module("batcher.api.session.accelerators.report")
     row: dict = {"index": 2}
-    report_mod._add_modes(row, DeviceModes(index=2, ecc_enabled=False, readable=True))
+    importlib.import_module("batcher.api.session.accelerators.rows")._add_modes(
+        row, DeviceModes(index=2, ecc_enabled=False, readable=True)
+    )
     assert row["config"] == ["ecc_disabled"]
     report_mod._show_silent_faults([row])
     out = capsys.readouterr().out
@@ -200,17 +202,18 @@ def test_the_report_carries_the_findings_and_explains_them(capsys):
 
 
 def test_a_clean_device_adds_nothing_to_its_row():
-    report_mod = importlib.import_module("batcher.api.session.accelerators")
     row: dict = {"index": 0}
-    report_mod._add_modes(row, DeviceModes(index=0, ecc_enabled=True, readable=True))
-    report_mod._add_modes(row, None)
+    importlib.import_module("batcher.api.session.accelerators.rows")._add_modes(
+        row, DeviceModes(index=0, ecc_enabled=True, readable=True)
+    )
+    importlib.import_module("batcher.api.session.accelerators.rows")._add_modes(row, None)
     assert row == {"index": 0}
 
 
 def test_every_finding_has_advice_written_for_it():
     # A reason code with no explanation makes the reader look it up, which on a report they
     # are reading because something is slow is exactly the wrong moment.
-    report_mod = importlib.import_module("batcher.api.session.accelerators")
+    report_mod = importlib.import_module("batcher.api.session.accelerators.report")
     produced = set()
     for ecc, compute, limit, persistence in [
         (False, 0, 300_000, True),
@@ -278,9 +281,8 @@ def test_a_part_that_cannot_partition_says_nothing(monkeypatch):
 
 
 def test_partitioning_reaches_the_device_row_but_is_not_a_finding():
-    report_mod = importlib.import_module("batcher.api.session.accelerators")
     row: dict = {"index": 0}
-    report_mod._add_modes(
+    importlib.import_module("batcher.api.session.accelerators.rows")._add_modes(
         row, DeviceModes(index=0, mig_enabled=True, mig_instances=7, readable=True)
     )
     assert row["mig_instances"] == 7

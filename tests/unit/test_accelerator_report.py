@@ -18,9 +18,14 @@ from batcher.config import AcceleratorConfig, Config, EnergyConfig, config_conte
 
 pytestmark = pytest.mark.unit
 
-# The module, not the function of the same name that the package re-exports over it (the
-# same shadowing `versions` has). An `import a.b.c as m` would bind the function here.
-accel_mod = sys.modules["batcher.api.session.accelerators"]
+# The modules, not the functions the package re-exports over them (the same shadowing
+# `versions` has). An `import a.b.c as m` would bind the function here.
+#
+# `accelerators` became a package when the report outgrew one file: `rows` builds each
+# device's row and `report` decides what a reader is shown, so a patch belongs on whichever
+# of the two owns the name.
+accel_mod = sys.modules["batcher.api.session.accelerators.report"]
+rows_mod = sys.modules["batcher.api.session.accelerators.rows"]
 
 
 def test_a_cpu_only_host_reports_a_backend_and_no_devices() -> None:
@@ -48,7 +53,7 @@ def test_a_configured_budget_is_reported() -> None:
 def test_device_rows_carry_nameplate_and_live_figures(monkeypatch) -> None:
     monkeypatch.setattr(
         accel_mod,
-        "_device_rows",
+        "device_rows",
         lambda: [
             {
                 "index": 0,
@@ -87,7 +92,7 @@ def test_rows_are_built_from_inventory_and_telemetry(monkeypatch) -> None:
             ),
         ),
     )
-    row = accel_mod._device_rows()[0]
+    row = rows_mod.device_rows()[0]
     assert row["memory_gib"] == 80.0
     assert row["tdp_watts"] == 700.0, "nameplate figures come from the device table"
     assert row["host_link"] == "pcie5", "why a stage is transfer-bound, from the report alone"
@@ -104,7 +109,7 @@ def test_an_unrecognized_device_reports_only_what_is_known(monkeypatch) -> None:
         lambda: [{"name": "Some Future GPU", "memory_bytes": 0}],
     )
     monkeypatch.setattr("batcher._internal.hardware.device_telemetry", tuple)
-    row = accel_mod._device_rows()[0]
+    row = rows_mod.device_rows()[0]
     assert row == {"index": 0, "name": "Some Future GPU"}, "no invented memory, power, or domain"
 
 
