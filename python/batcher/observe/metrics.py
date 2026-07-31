@@ -30,7 +30,11 @@ from collections.abc import Callable
 from typing import Any
 
 from batcher._internal import events
-from batcher._internal.logging import note_suppressed
+from batcher.observe.node_metrics import (
+    NODE_CONDITION_HELP,
+    device_gauges,
+    node_conditions,
+)
 
 __all__ = [
     "metrics_snapshot",
@@ -213,7 +217,7 @@ class _Collector:
                     "util_pct_max": self.gpu_util_pct_max,
                     "devices": {device: dict(stats) for device, stats in sorted(self._gpu.items())},
                 },
-                "node": _node_conditions(),
+                "node": node_conditions(),
             }
 
 
@@ -403,72 +407,14 @@ def prometheus_text() -> str:
             out.append(
                 f'batcher_gpu_memory_used_bytes{{device="{device}"}} {stats["mem_used_bytes"]}'
             )
+    out.extend(device_gauges())
     node = snap.get("node") or {}
-    for name, help_text in _NODE_CONDITION_HELP.items():
+    for name, help_text in NODE_CONDITION_HELP.items():
         if name in node:
             out.append(f"# HELP batcher_node_{name} {help_text}")
             out.append(f"# TYPE batcher_node_{name} gauge")
             out.append(f"batcher_node_{name} {node[name]}")
     return "\n".join(out) + "\n"
-
-
-#: The node conditions exported as gauges, with the one-line help each carries into a
-#: dashboard. Gauges rather than counters because every one of them is a *state* an operator
-#: acts on now — "three devices are on a degraded link" is actionable; the number of times
-#: that has been true is not.
-_NODE_CONDITION_HELP = {
-    "degraded_links": "Devices whose host PCIe link negotiated below its capability",
-    "faulted_devices": "Devices with a memory fault: a pending repair or exhausted spares",
-    "nvlink_down_devices": "Devices with one or more NVLink links not up",
-    "fabric_errors": "Summed RDMA port error counters on this node",
-    "fabric_ports_down": "Cabled RDMA ports that are not carrying traffic",
-}
-
-
-def _node_conditions() -> dict[str, int]:
-    """The hardware conditions on this node, as gauges an alert can be written against.
-
-    These are the failures that never reach a counter: a host link at quarter width, memory
-    repairing itself, an NVLink fabric that dropped, a port accumulating symbol errors. Each
-    leaves every query correct and a fraction as fast, so a fleet finds them by scraping for
-    them or does not find them at all.
-
-    Facts only, never verdicts. `observe` is a neutral layer and may not ask a subsystem what
-    it *decided* — whether a device is schedulable is Carbonite's answer, and exporting it
-    here would put a scrape endpoint on the wrong side of the independence contract. The
-    conditions below are what the hardware reports; what to do about them is read from
-    `bt.accelerators()`, which is the conductor's to assemble.
-
-    Read live on each scrape rather than accumulated, because they are states rather than
-    events. Costs a handful of `/sys` reads and NVML calls, which is the right budget for a
-    path a monitoring system hits every fifteen seconds and nothing else hits at all.
-
-    Returns:
-        Condition name to count, all zero on a host where none of it is readable — a scrape
-        config should not have to be conditional on the hardware it is pointed at.
-    """
-    out = dict.fromkeys(_NODE_CONDITION_HELP, 0)
-    try:
-        from batcher._internal.hardware.amd import ecc_faulted_amd_devices
-        from batcher._internal.hardware.fabric import (
-            degraded_device_links,
-            fabric_error_total,
-            nvlink_summary,
-            rdma_summary,
-        )
-        from batcher._internal.hardware.faults import faulted_devices
-
-        out["degraded_links"] = len(degraded_device_links())
-        # Both vendors in one gauge. A fleet does not want two alerts for "a device's memory
-        # has failed", and NVML reports nothing at all on the AMD half of a mixed fleet.
-        out["faulted_devices"] = len(faulted_devices()) + len(ecc_faulted_amd_devices())
-        out["nvlink_down_devices"] = int(nvlink_summary()["degraded_devices"])
-        out["fabric_errors"] = sum(fabric_error_total().values())
-        rdma = rdma_summary()
-        out["fabric_ports_down"] = max(0, int(rdma["ports"]) - int(rdma["active_ports"]))
-    except Exception as exc:  # pragma: no cover - a scrape must never fail a process
-        note_suppressed("observe", "read the node's hardware conditions", exc)
-    return out
 
 
 def reset_metrics() -> None:
