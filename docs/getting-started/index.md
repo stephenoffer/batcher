@@ -32,17 +32,15 @@ control plane hands off to the Rust data plane.
 Once a query runs, the docs split by what you are trying to do. Reach for
 {doc}`../tutorials/index` if you want to be walked through a complete pipeline,
 {doc}`../user-guide/index` if you want one capability at a time, and
-{doc}`../examples/index` if you would rather start from working code and change it.
+{doc}`../cookbook/index` if you would rather start from working code and change it.
 
 ## See also
 
-:::{seealso}
 - {doc}`../learning-paths/index`: an ordered reading list for your role.
 - {doc}`../migration/index`: the verb-by-verb mapping if you are coming from Spark,
   pandas, Polars, DuckDB, or Daft.
 - {doc}`../api/reference`: the one-page cheat sheet to keep open while you work.
-- {doc}`../user-guide/troubleshooting`: what to read when the first query misbehaves.
-:::
+- {doc}`/user-guide/operate/troubleshooting`: what to read when the first query misbehaves.
 
 ```{toctree}
 :hidden:

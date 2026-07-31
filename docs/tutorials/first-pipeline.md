@@ -213,9 +213,9 @@ Run a model over Arrow batches with the `.ml` accessor.
 
 ## See also
 
-- {doc}`Expressions <../user-guide/expressions>`: the column language, in full.
-- {doc}`Aggregations <../user-guide/aggregations>`: every aggregate, and `GroupBy`.
-- {doc}`Reading data <../user-guide/reading-data>`: the sources the last block reached for.
+- {doc}`Expressions </user-guide/transform/expressions>`: the column language, in full.
+- {doc}`Aggregations </user-guide/analyze/aggregations>`: every aggregate, and `GroupBy`.
+- {doc}`Reading data </user-guide/moving-data/reading-data>`: the sources the last block reached for.
 - {doc}`Lazy evaluation <../getting-started/concepts/lazy>`: why nothing ran until the terminal
   op.
-- {doc}`Dataset API <../api/dataset>`: the reference for every method on this page.
+- {doc}`Dataset API </api/relational/dataset>`: the reference for every method on this page.

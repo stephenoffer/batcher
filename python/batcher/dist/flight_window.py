@@ -68,7 +68,7 @@ def execute_window_flight(
 
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
-    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
     try:
         # Read only the columns/rows the window's map prefix needs (see flight_aggregate).
@@ -77,7 +77,11 @@ def execute_window_flight(
         # 0) missed the lookup and silently read every column.
         projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
-            sources[sid], workers, projection=projection, predicate=predicate
+            sources[sid],
+            workers,
+            projection=projection,
+            predicate=predicate,
+            worker_addrs=fleet_addrs,
         )
 
         if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes

@@ -121,7 +121,7 @@ so this gap is Spark's, not Databricks'. Compare against Databricks-on.
 
 | Capability | Databricks | Batcher | Verdict |
 |---|---|---|---|
-| Rule-based rewrites | Catalyst, hundreds of rules | **302 rules / 7 phases**, live-verified registry; hybrid fixpoint with depth-scaled bound (`optimizer/driver.py:31,49`) | **Parity** |
+| Rule-based rewrites | Catalyst, hundreds of rules | **375 rules / 7 phases**, live-verified registry; hybrid fixpoint with depth-scaled bound (`optimizer/driver.py:31,49`) | **Parity** |
 | Join reordering | Selinger DP, 3–12 joins, **biased left-deep**; `JoinReorderDPFilters` states bushy suppression "not implemented" | **Bushy** DP: exhaustive ≤12 leaves, DPccp-style ≤20 / 200k pairs, greedy fallback (`kyber/rules/joins/order.py`, `_rebuild_dp` / `_rebuild_dphyp` / `_rebuild_greedy`) | **Batcher ahead** (bushy) |
 | Cardinality estimation | histograms off by default even on Spark; Databricks auto-stats during writes | HLL/KLL sketches → `Provenance.SKETCH`; Selinger containment w/ PK-FK detection, MCV skew floors, range pruning (`estimator.py:726`) | **Parity**, different mechanism |
 | Multi-column / joint histograms | Spark: off. Databricks: ⚠️ unverified whether they flip `histogram.enabled` | **Absent** | **Gap** (small — both weak) |
@@ -251,7 +251,7 @@ Three gaps, one of which is serious:
    Flight was made and reverted on 2026-07-18 — see the P0 entry in §7 for why, including a
    test-ordering dependence that must be fixed before any such change can be trusted.
 3. **Defaults ship the capability off.** `skew_join_salt=0` (correctly — see the P0 hazard
-   below; it now has a `salting_is_safe` guard), `locality_aware_scheduling=False`,
+   below; it now has a `salting_is_safe` guard), `persistent_fleet=False`,
    TLS off, adaptive off below 20M rows
    (`_ADAPTIVE_MIN_INPUT_ROWS`, `api/adaptive/gating.py` — a module constant, **not** a config field).
 
@@ -825,7 +825,7 @@ Both directions. Cite none of these without new primary evidence.
 ## Bottom line
 
 **Optimizer: at or above parity**, with one large hole (dynamic filter pushdown into scans).
-Bushy DP join reordering, 302 rules, a calibrated cost model and a cross-query bandit are
+Bushy DP join reordering, 375 rules, a calibrated cost model and a cross-query bandit are
 genuinely competitive, and bushy reordering beats Catalyst's left-deep bias.
 
 **Vectorized execution: below parity**, and the gap is coverage, not architecture. 8 of 46 `Expr`

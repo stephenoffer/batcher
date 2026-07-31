@@ -269,7 +269,7 @@ destroys time travel past the window — irreversibly.
 
 ## See also
 
-- Docs: `docs/user-guide/lakehouse.md`; `docs/tutorials/building-a-lakehouse.md`;
+- Docs: `docs/user-guide/moving-data/lakehouse.md`; `docs/tutorials/building-a-lakehouse.md`;
   `docs/integrations/{delta-lake,iceberg,hudi,databricks,snowflake}.md`;
   `docs/examples/data-engineering/{cdc-pipeline,slowly-changing-dimensions,
   partition-backfill,late-arriving-data,file-compaction,deduplication}.md`.

@@ -12,7 +12,7 @@ Five checks over the surface that ``tools/public_surface.py`` defines:
    guide, tutorial, getting-started page, ML guide, configuration page, or a runnable
    script under ``examples/`` — not only in the generated reference. A name that only
    an `autosummary` table knows about is a name nobody discovers.
-4. **Expression-complete.** The expression reference page (``docs/api/expressions.md``)
+4. **Expression-complete.** The expression reference page (``docs/api/relational/expressions.md``)
    enumerates *every* method callable on an ``Expr`` — the fluent builder and every
    accessor namespace — so the curated reference can't silently fall behind the
    surface (which is exactly how the ``.map``/``.audio``/``.video`` accessors and a
@@ -48,7 +48,7 @@ from public_surface import expression_names, public_names  # noqa: E402
 # The expression reference: the pages whose job is to enumerate every method a user can
 # call on an `Expr` — the fluent builder on one, every accessor namespace on the other.
 # Together they must be exhaustive; neither alone is.
-_EXPR_REFERENCE = ("api/expressions.md", "api/expression-accessors.md")
+_EXPR_REFERENCE = ("api/relational/expressions.md", "api/relational/expression-accessors.md")
 
 # Public names not yet documented (drain toward empty). Keep each with a reason.
 KNOWN_UNDOCUMENTED: dict[str, str] = {

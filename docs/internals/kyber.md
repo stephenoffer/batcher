@@ -236,5 +236,5 @@ read from.
 - {doc}`carbonite`: checks the feasibility of the plan Kyber produces.
 - {doc}`execution`: runs the plan and measures what Kyber re-plans on.
 - {doc}`../configuration/options`: the cost-model and cardinality knobs.
-- {doc}`../deep-dives/cardinality-estimation`: how the estimates themselves are built.
-- {doc}`../deep-dives/adaptive-reoptimization`: the re-planning loop in full detail.
+- {doc}`/deep-dives/adaptive/cardinality-estimation`: how the estimates themselves are built.
+- {doc}`/deep-dives/adaptive/adaptive-reoptimization`: the re-planning loop in full detail.

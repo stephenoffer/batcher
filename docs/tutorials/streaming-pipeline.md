@@ -244,7 +244,7 @@ Manage it with the handle: `q.status`, `q.recent_progress()`, `q.stop()`, and
 :gutter: 3
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Streaming guide
-:link: ../user-guide/streaming
+:link: /user-guide/moving-data/streaming
 :link-type: doc
 Every source, sink, trigger, and output mode.
 :::
@@ -256,7 +256,7 @@ The medallion layers this pipeline feeds.
 :::
 
 :::{grid-item-card} {octicon}`versions;1.1em` Window functions
-:link: ../user-guide/window-functions
+:link: /user-guide/analyze/window-functions
 :link-type: doc
 The SQL `OVER` family, on bounded and unbounded data alike.
 :::
@@ -264,13 +264,13 @@ The SQL `OVER` family, on bounded and unbounded data alike.
 
 ## See also
 
-- {doc}`Kafka integration <../integrations/kafka>`: the source the generator stands in for.
-- {doc}`Windowed aggregation <../examples/streaming/windowed-aggregation>` and
-  {doc}`exactly-once sink <../examples/streaming/exactly-once-sink>`: the recipes for steps 4
+- {doc}`Kafka integration </integrations/streams/kafka>`: the source the generator stands in for.
+- {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>` and
+  {doc}`exactly-once sink </cookbook/streaming/exactly-once-sink>`: the recipes for steps 4
   through 6.
-- {doc}`Late data and watermarks <../examples/streaming/late-data-watermarks>`: what happens to
+- {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>`: what happens to
   a row that arrives after its window closed.
-- {doc}`Deduplication <../examples/data-engineering/deduplication>`: the bounded-memory dedup,
+- {doc}`Deduplication </cookbook/data-engineering/deduplication>`: the bounded-memory dedup,
   in the batch case.
 - {doc}`Fault tolerance <../architecture/fault-tolerance>`: what a checkpoint actually
   guarantees.

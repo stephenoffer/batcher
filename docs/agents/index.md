@@ -138,5 +138,5 @@ documentation is.
 - {doc}`../migration/index`: the mapping tables the migration skills build on.
 - {doc}`../internals/extending`: the contributor cookbook behind the `add-*` skills.
 - {doc}`../user-guide/index`: the task-oriented guides the usage skills point into.
-- {doc}`../user-guide/troubleshooting`: the human-facing companion to
+- {doc}`/user-guide/operate/troubleshooting`: the human-facing companion to
   `debug-a-batcher-query`.

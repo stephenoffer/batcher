@@ -2,6 +2,8 @@
 
 This page describes how to build a Batcher `Config`, make it active, and load one from the environment or a file.
 
+The pages beneath it are the reference: {doc}`options` is the field-by-field listing, {doc}`accelerator` covers the GPU and device settings, {doc}`environment` covers the `BATCHER_*` variables and the JSON file format, and {doc}`profiles` shows worked configurations for common deployments.
+
 Most of the time you don't configure Batcher at all. The defaults are tuned to saturate your cores and stay within memory on their own. When you do need to tune a memory limit, the thread count, or how aggressively the engine spills, every knob lives on one `Config` object. It's a typed, immutable dataclass grouped by concern: `execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`, `distributed`, `observability`, and `accelerator`. There's no global mutable state and no dict of loose keys. You build a `Config`, then make it active.
 
 ```python
@@ -167,19 +169,15 @@ When the engine resolves the active config, the layers apply highest first:
 The environment and file layers are read once when `batcher` is imported.
 `set_config` and `config_context` override them at runtime.
 
-## In this section
-
-{doc}`options` is the field-by-field reference, {doc}`environment` covers the `BATCHER_*` variables and the JSON file format, and {doc}`profiles` shows worked configurations for common deployments.
-
 ## See also
 
-- {doc}`../user-guide/performance`: which of these options matter when a query is slow.
-- {doc}`../user-guide/caching`: the result cache and the options that bound it.
-- {doc}`../deep-dives/buffer-pool`: what the memory options actually govern.
-- {doc}`../api/configuration`: the configuration objects as an API surface.
+- {doc}`/user-guide/operate/performance`: which of these options matter when a query is slow.
+- {doc}`/user-guide/operate/caching`: the result cache and the options that bound it.
+- {doc}`/deep-dives/memory/buffer-pool`: what the memory options actually govern.
+- {doc}`/api/operations/configuration`: the configuration objects as an API surface.
 
 ```{toctree}
-:maxdepth: 1
+:hidden:
 
 options
 accelerator

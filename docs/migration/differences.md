@@ -99,8 +99,6 @@ print(ported.equals(expected))
 
 ## See also
 
-:::{seealso}
 - {doc}`transforming`: the replacements for most of the absent APIs above.
 - {doc}`../agents/index`: the migration skills, each ending in this verification step.
-- {doc}`../user-guide/troubleshooting`: diagnosing a ported query that runs but misbehaves.
-:::
+- {doc}`/user-guide/operate/troubleshooting`: diagnosing a ported query that runs but misbehaves.

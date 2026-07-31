@@ -202,7 +202,7 @@ rather than returning a wrong answer.
 
 ## See also
 
-- `docs/user-guide/sql.md` — the SQL surface; `docs/api/sql.md` — the feature table.
+- `docs/user-guide/analyze/sql.md` — the SQL surface; `docs/api/relational/sql.md` — the feature table.
 - `docs/tutorials/sql-to-dataframe.md`, `docs/benchmarks/vs-duckdb.md`.
 - `docs/user-guide/{joins,aggregations,window-functions,udfs,explain-plans}.md`.
 - Skills: `write-a-batcher-pipeline` (the DataFrame API you rewrite gaps into),

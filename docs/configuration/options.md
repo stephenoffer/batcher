@@ -31,7 +31,7 @@ How work is sized and parallelized.
 | `cpu_share_min` | `0.25` | Floor for the adaptive per-task CPU share, so an IO-bound stage never asks for an unschedulable sliver of a core. |
 | `adaptive_morsel_sizing` | `True` | Shrink the per-morsel (rows, bytes) target under memory pressure so the streaming working set stays bounded. Result-invariant; the static target is used unchanged until the pressure monitor reports elevated. Set `False` to pin the static target. |
 | `fuse_linear` | `True` | Fuse chains of linear streaming operators (filter/project) into one pass over the input morsels instead of a dispatch and buffer per operator. Result-invariant; engages only on a chain of two or more fusable ops. |
-| `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`../user-guide/hardening`. |
+| `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`/user-guide/trust/hardening`. |
 | `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
 | `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
 | `shrink_output_dtypes` | `False` | Re-narrow a pass-through output column back to its source numeric width, such as `Int32` ids widened on input, halving its footprint. It's lossless but data-dependent, so it's off by default. With it off, output types match `Dataset.schema` exactly. |
@@ -67,7 +67,7 @@ Setting `max_memory_bytes` is what opts the in-memory engine into spilling. The 
 | `spill_compression` | `"auto"` | Arrow-IPC codec for spilled batches. `"auto"` lets the engine choose. `"lz4"`, `"zstd"`, or `None` force it. |
 | `spill_bucket_max_bytes` | `134217728` (128 MiB) | A spilled aggregate bucket larger than this is re-partitioned (grace recursion) so a skewed key set degrades gracefully instead of OOMing the reduce. |
 | `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path, with no out-of-core spilling. Set it when you'd rather a query fail fast than spill to disk. |
-| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing `Dataset.cache()`, described in {doc}`../user-guide/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
+| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing `Dataset.cache()`, described in {doc}`/user-guide/operate/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
 | `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear `ResourceError` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
 
 ## flow_control
@@ -234,7 +234,7 @@ Whether the row filters and column masks in a `SecurityCatalog` are advisory or 
 
 These fields are the {py:class}`GovernanceConfig <batcher.GovernanceConfig>` dataclass.
 Reach for `"advisory"` before `"strict"`: it warns instead of refusing, which is how you
-find the ungoverned reads in a live workload. {doc}`../user-guide/hardening` walks through
+find the ungoverned reads in a live workload. {doc}`/user-guide/trust/hardening` walks through
 the migration.
 
 ## tenant
@@ -260,7 +260,7 @@ with bt.tenant("analytics", max_concurrent_queries=4):
 ```
 
 A tenant is a cooperating workload, not an adversary: two in one process share an address
-space. See {doc}`../user-guide/hardening`.
+space. See {doc}`/user-guide/trust/hardening`.
 
 ## distributed
 
@@ -281,7 +281,7 @@ cluster recipe in {doc}`profiles`.
 | `adaptive_credits` | `True` | AIMD shuffle credits: the window grows and shrinks per remote fetch from observed memory backpressure instead of holding the static grant. Flow control only, so the merged output is unchanged. `False` pins the static `default_credits` window. |
 | `runtime_bloom_join` | `"auto"` | Build a bloom from the join build side and push it to the probe side to drop non-matching rows before they shuffle, cutting network volume for a selective fact-to-dimension join. `"auto"` engages only when Kyber estimates the probe is much larger than the build. `True` always engages it and `False` never does. Inner and semi joins only. |
 | `shared_memory_transfer` | `True` | Same-node shared-memory shuffle: a mapper mirrors each bucket to a memory-mapped Arrow-IPC file, using Linux `/dev/shm` when available, that a same-node reducer reads via mmap with no gRPC. It's pressure-gated, so it's skipped when the node is tight on memory, and best-effort. A miss falls back to Flight, which is bit-identical. |
-| `locality_aware_scheduling` | `False` | Host a reducer whose bucket concentrates on one node on that node, turning the bulk of its fetches into same-node hits. Result-preserving; pays off on a multi-node cluster with a skewed / co-partitioned shuffle. |
+| `locality_aware_scheduling` | `True` | Host a reducer whose bucket concentrates on one node on that node, turning the bulk of its fetches into same-node hits. Result-preserving; pays off on a multi-node cluster with a skewed / co-partitioned shuffle. A single-node fleet resolves to "nothing to place" from the worker addresses alone, with no remote call. |
 | `persistent_fleet` | `False` | Reserve one placement group and worker fleet for a whole adaptive multi-stage query, keeping each stage's intermediate partitioned on the workers instead of collecting to the driver. Removes per-stage placement churn and the driver funnel. |
 | `resilience` | `"default"` | Named fault-tolerance profile. `"default"` keeps the conservative budgets below; `"spot"` hardens them as a bundle (more restarts / recompute, keepalive on, one speculative backup) for a churning spot-node cluster. Explicit knobs override the profile. See {doc}`../architecture/fault-tolerance`. |
 
@@ -418,7 +418,7 @@ What the engine tells you about what it did: the `batcher.*` logger hierarchy an
 | `otel_traces` | `False` | Emit an OpenTelemetry span per query, with a child span per operator, into the tracer your app already configured. It needs `opentelemetry` installed and a provider, because Batcher owns no exporter. It reuses the profile the event log already measures, so turning it on adds the emit, not the measurement. |
 | `event_log_dir` | `""` | Directory for event-log documents. Empty resolves to `$BATCHER_HOME/logs` (or `~/.batcher/logs`) at write time. |
 | `event_log_max_files` | `200` | Keep at most this many event-log files; the oldest are pruned on write. `0` is unbounded. |
-| `progress` | `None` | Explicit progress-bar mode: `"auto"` renders only into a real TTY that has not set `NO_COLOR`/`TERM=dumb`, `"on"` forces it, `"off"` disables it. `None` derives it from `verbosity`. Read the effective value from `resolved_progress`. See {doc}`../user-guide/observability`. |
+| `progress` | `None` | Explicit progress-bar mode: `"auto"` renders only into a real TTY that has not set `NO_COLOR`/`TERM=dumb`, `"on"` forces it, `"off"` disables it. `None` derives it from `verbosity`. Read the effective value from `resolved_progress`. See {doc}`/user-guide/operate/observability`. |
 | `ui` | `False` | Start the web dashboard automatically on the first query. It's off by default, because binding a port should be asked for. `bt.start_ui()` is the explicit spelling. Use this field for a long-running service that always wants the dashboard. |
 | `ui_host` | `"127.0.0.1"` | Interface the dashboard binds. Loopback by default: it exposes query text, plans, and logs, and Batcher ships no authentication. Set it to a routable address only deliberately. |
 | `ui_port` | `4040` | Dashboard port. `0` asks the OS for any free port. |

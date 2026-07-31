@@ -91,7 +91,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::{FlightData, Ticket};
-use futures::stream::TryStreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
 use tonic::transport::{Channel, Server};
 
 use crate::handler::FlightHandler;
@@ -423,7 +423,25 @@ impl FlightServer {
 
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| TransportError::Io(format!("from_std: {e}")))?;
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        // `TCP_NODELAY` on every accepted connection. [`tuned_server`] asks tonic for it,
+        // but that setting only reaches sockets tonic accepts through its *own* listener;
+        // with a caller-supplied `incoming` (which is how the port is learned before tonic
+        // takes the socket) the accepted streams keep the kernel default, Nagle on.
+        //
+        // Nagle on the producer's side against the consumer's delayed-ACK timer is a
+        // textbook 40 ms stall, and it lands on precisely the fetches that cannot hide it:
+        // a *serial* one — a next-stage worker reading one intermediate bucket, a GPU
+        // consumer pulling one morsel — pays the full stall per fetch, measured here at
+        // 41.75 ms to move a single one-row batch over loopback. A concurrent gather
+        // pipelines it away, which is why the wide shuffle never showed it and the
+        // one-at-a-time paths quietly did.
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(|conn| {
+            if let Ok(stream) = &conn {
+                // Best-effort: a socket that refuses the option still works, just slower.
+                let _ = stream.set_nodelay(true);
+            }
+            conn
+        });
 
         let mut builder = self.tls_builder()?;
         let svc = FlightServiceServer::new(FlightHandler {
@@ -706,6 +724,43 @@ mod tests {
         server.register("p1/s0/0/1", vec![batch_b()]).await;
         server.register("empty", vec![]).await;
         server.serve_ephemeral().await.unwrap()
+    }
+
+    /// A *serial* fetch must not sit in a Nagle/delayed-ACK stall.
+    ///
+    /// The server's accepted sockets need `TCP_NODELAY` set explicitly: tonic's builder
+    /// option does not reach a caller-supplied `incoming`, and without it the producer's
+    /// small writes wait on the consumer's delayed-ACK timer. Measured at 41.75 ms per
+    /// one-row fetch before the fix and 1.02 ms after, so the bound below sits an order of
+    /// magnitude clear of both — it cannot fire on a slow machine without the stall, and
+    /// cannot pass with it. A *concurrent* gather pipelines the stall away, which is why
+    /// only the one-at-a-time paths (a cross-stage bucket read, a streaming morsel) ever
+    /// paid it, and why no throughput test caught it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serial_fetches_do_not_stall_on_nagle() {
+        let server = FlightServer::new();
+        // A canonical 5-field ticket, so the credit-gated `fetch_secured` path is the one
+        // measured (the plain-string keys `start_server` registers are `DoGet` only).
+        server.register("7/0/0/0/0", vec![batch_b()]).await;
+        let (addr, _handle) = server.serve_ephemeral().await.unwrap();
+        let pool = ClientPool::new();
+        let addr = addr.to_string();
+        let ticket = ShuffleTicket::from_string("7/0/0/0/0").unwrap();
+
+        pool.fetch_secured(&addr, &ticket, 4, None).await.unwrap(); // warm the channel
+
+        const N: u32 = 10;
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let got = pool.fetch_secured(&addr, &ticket, 4, None).await.unwrap();
+            assert_eq!(got.len(), 1, "the fetch must still return the partition");
+        }
+        let per_fetch_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(N);
+        assert!(
+            per_fetch_ms < 15.0,
+            "serial fetch took {per_fetch_ms:.1} ms; a ~40 ms figure is the delayed-ACK \
+             stall returning (TCP_NODELAY lost on the server's accepted sockets)"
+        );
     }
 
     #[tokio::test]

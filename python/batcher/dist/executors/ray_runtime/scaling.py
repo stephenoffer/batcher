@@ -1,9 +1,12 @@
-"""Live cluster topology and the autoscaler request lifecycle.
+"""What the live cluster is, and what of it a query may use.
 
-Reads the cluster shape on demand (so it tracks autoscaler growth/shrink), clamps a
-requested worker fan-out to schedulable capacity, and manages a process-wide
-high-water autoscaler floor across in-flight query scopes (scale up for a query,
-reclaim the idle nodes after the last scope ends).
+Reads the cluster shape on demand (so it tracks autoscaler growth/shrink), narrows it to
+the nodes a worker can actually be placed on *and kept* on — the head is excluded, and so
+is anything Ray has marked for drain — and clamps a requested worker fan-out to that
+schedulable capacity.
+
+This is the *measuring* side. Asking the autoscaler for capacity lives in
+`autoscale_request`, and waiting for what was asked to arrive lives in `readiness`.
 """
 
 from __future__ import annotations
@@ -11,7 +14,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import math
-import threading
 
 from batcher._internal.accelerators import (
     accelerator_units,
@@ -24,13 +26,22 @@ from batcher.plan.resource import HardwareProfile
 
 
 class _Topology:
-    """A one-shot snapshot of the live cluster shape (alive node records + resources)."""
+    """A one-shot snapshot of the live cluster shape (alive node records + resources).
 
-    __slots__ = ("alive_nodes", "resources")
+    Carries the drain list too, because it is part of "what is schedulable" and is read on
+    the same paths: without it here, every `_worker_eligible` call inside a scope would make
+    its own GCS round trip, which is the O(workers x nodes) cost this snapshot exists to
+    remove.
+    """
 
-    def __init__(self, alive_nodes: list[dict], resources: dict) -> None:
+    __slots__ = ("alive_nodes", "draining", "resources")
+
+    def __init__(
+        self, alive_nodes: list[dict], resources: dict, draining: frozenset[str] = frozenset()
+    ) -> None:
         self.alive_nodes = alive_nodes
         self.resources = resources
+        self.draining = draining
 
 
 # The topology snapshot in force for the current scheduling phase, if any. A distributed
@@ -44,10 +55,99 @@ _TOPOLOGY: contextvars.ContextVar[_Topology | None] = contextvars.ContextVar(
 )
 
 
+# How long a live drain read is reused. The list is polled from two places that run at very
+# different rates: fan-out sizing reads it once per query, but the shuffle barrier polls it
+# every `poll_seconds` (0.5 s) for the whole barrier, and an uncached read there is a GCS
+# round trip twice a second for the length of a shuffle. A couple of seconds of staleness
+# costs nothing — a drain notice precedes reclamation by tens of seconds at minimum — while
+# an uncached read scales GCS load with barrier duration.
+_DRAIN_TTL_S = 2.0
+#: `(monotonic_deadline, node_ids)` for the last live read, or `None` before the first.
+_drain_cache: tuple[float, frozenset[str]] | None = None
+
+
+def _read_draining() -> frozenset[str]:
+    """A TTL-cached read of Ray's drain list; empty on any failure.
+
+    Deliberately unlocked: the worst a race does is two threads making the same GCS call and
+    one overwriting the other's identical answer. A lock here would serialize every barrier
+    poll in the process to protect against a benign duplicate read.
+    """
+    global _drain_cache
+    import time
+
+    cached = _drain_cache
+    now = time.monotonic()
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    try:
+        import ray._private.state as ray_state
+
+        draining = frozenset(ray_state.state.get_draining_nodes() or ())
+    except Exception as exc:
+        note_suppressed("dist", "read draining nodes", exc)
+        draining = frozenset()
+    _drain_cache = (now + _DRAIN_TTL_S, draining)
+    return draining
+
+
+def _reset_drain_cache() -> None:
+    """Drop the cached drain read (tests, and any caller wanting a fresh probe)."""
+    global _drain_cache
+    _drain_cache = None
+
+
+def draining_node_ids() -> frozenset[str]:
+    """Hex ids of nodes Ray has marked for drain, or empty when that cannot be read.
+
+    A draining node is alive, advertises its full resources, and is going away — the
+    autoscaler is scaling it in, KubeRay is evicting its pod, or a spot reclamation notice
+    reached the node provider. Ray keeps reporting it as schedulable because tasks already
+    on it must finish, but placing *new* work there loses that work minutes later.
+
+    Every fan-out sizing in this module counted those nodes. On an autoscaling cluster mid
+    scale-in, or a spot fleet mid churn, that means the fleet is sized to capacity already
+    committed to disappearing: the placement group reserves bundles on a node being removed,
+    the actors land, and the shuffle pays a recompute for output that was never going to
+    survive. The drain list is the one signal separating "alive" from "alive and staying",
+    and it arrives *before* the loss rather than after.
+
+    Snapshot-aware: inside a `topology_scope()` this is the set read once for the whole
+    scheduling phase, so a W-worker fleet costs one GCS round trip rather than W.
+
+    Best-effort: `get_draining_nodes` is a private accessor, so a Ray version without it —
+    or a GCS that will not answer — degrades to today's behavior (count every alive node)
+    rather than failing a query over a scheduling refinement.
+    """
+    snap = _TOPOLOGY.get()
+    if snap is not None:
+        return snap.draining
+    return _read_draining()
+
+
+def _schedulable(nodes: list[dict]) -> list[dict]:
+    """`nodes` minus those Ray is draining — unless that would leave nothing.
+
+    A fleet must still be placeable on a cluster where *every* remaining node is draining:
+    running on capacity that is going away beats not running at all, and the recovery path
+    (recompute, replication, proactive migration) exists for exactly that case. So this only
+    ever removes nodes when survivors remain.
+    """
+    draining = draining_node_ids()
+    if not draining:
+        return nodes
+    staying = [n for n in nodes if n.get("NodeID") not in draining]
+    return staying or nodes
+
+
 def _read_topology() -> _Topology:
     import ray
 
-    return _Topology([n for n in ray.nodes() if n.get("Alive", True)], ray.cluster_resources())
+    return _Topology(
+        [n for n in ray.nodes() if n.get("Alive", True)],
+        ray.cluster_resources(),
+        _read_draining(),
+    )
 
 
 @contextlib.contextmanager
@@ -84,13 +184,15 @@ _HEAD_MARKER = "node:__internal_head__"
 
 
 def _worker_eligible(nodes: list[dict]) -> list[dict]:
-    """`nodes` minus the Ray head, matching worker placement — unless the head is the whole
-    cluster (a single-node run must keep it). Sizing the fan-out from these keeps the worker
-    count at what can actually be PLACED: counting the head made a data-heavy shuffle request
-    one worker more than the schedulable node count, and the un-placeable actor hung the spawn
-    (`ray.get` on its address never returned)."""
+    """`nodes` minus the Ray head and minus anything Ray is draining, matching worker
+    placement — unless that would leave nothing (a single-node run must keep the head; a
+    fully-draining cluster must still run somewhere). Sizing the fan-out from these keeps the
+    worker count at what can actually be PLACED *and kept*: counting the head made a
+    data-heavy shuffle request one worker more than the schedulable node count, and the
+    un-placeable actor hung the spawn (`ray.get` on its address never returned); counting a
+    draining node places work that is lost when the node goes (see `_schedulable`)."""
     non_head = [n for n in nodes if _HEAD_MARKER not in n.get("Resources", {})]
-    return non_head or nodes
+    return _schedulable(non_head or nodes)
 
 
 def _alive_nodes() -> list[dict]:
@@ -197,7 +299,8 @@ def worker_node_memory_bytes() -> int:
 
 
 def node_classes() -> list[dict]:
-    """Per-alive-node resource class: ``{"cpus", "gpus", "accelerators", "accelerator_type"}``.
+    """Per-alive-node resource class:
+    ``{"cpus", "gpus", "memory", "accelerators", "accelerator_type"}``.
 
     The explicit cluster-heterogeneity model the scheduler lacked: a node is a "GPU
     node" when it exposes a `GPU` resource, a "CPU-only node" otherwise. The accelerator
@@ -219,6 +322,11 @@ def node_classes() -> list[dict]:
                 {
                     "cpus": cpus,
                     "gpus": float(res.get("GPU", 0.0)),
+                    # Per-node RAM, so a placement check can bound by the resource a
+                    # bundle reserves alongside cores. `0.0` when the node advertises no
+                    # `memory` resource, which callers read as "do not bound by memory"
+                    # rather than "this node has none".
+                    "memory": float(res.get("memory", 0.0)),
                     # Non-GPU accelerators (TPU / Trainium / Gaudi / NPU) Ray doesn't count as
                     # `GPU`; lets the CPU-fleet isolation treat a TPU node as an accelerator node.
                     "accelerators": accelerator_units(res),
@@ -326,7 +434,14 @@ def node_class_selector(prefer_cpu_only: bool, workers: int, num_cpus: float) ->
     return {"resources": {dc.cpu_node_resource: _CPU_NODE_EPS}}
 
 
-def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) -> int:
+def clamp_workers(
+    workers: int,
+    num_cpus: float = 1.0,
+    num_gpus: float = 0.0,
+    *,
+    memory_bytes: int = 0,
+    cpu_only: bool = False,
+) -> int:
     """Clamp the requested worker fan-out to what the cluster can actually schedule.
 
     Each worker asks for `num_cpus` cores (and, for a GPU stage, `num_gpus` GPUs), so the
@@ -339,6 +454,11 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
     (`distributed.autoscale_wait_s > 0`) we then *wait* — bounded — for the new nodes
     (CPU *and* GPU) to arrive, so the job runs on the scaled-up cluster instead of
     under-provisioned. With the wait off (the default) it clamps to current capacity.
+    `memory_bytes` and `cpu_only` describe the rest of what the fleet's bundle reserves —
+    the per-worker RAM grant, and whether the fleet is held to non-accelerator nodes. Both
+    narrow what can host a worker, and omitting them overstates capacity in the one
+    direction that hangs the job (see `capacity.placeable_workers`).
+
     Always leaves at least one worker; a no-op when Ray reports no CPUs (test stubs).
     """
     import ray
@@ -353,8 +473,9 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
         capacity = min(capacity, int(topo["gpus"] / num_gpus))
     # ...and by what a single node can *host* (see `capacity.placeable_workers`).
     from batcher.dist.executors.ray_runtime.capacity import placeable_workers
+    from batcher.dist.executors.ray_runtime.readiness import _await_autoscale
 
-    fits = placeable_workers(num_cpus, num_gpus)
+    fits = placeable_workers(num_cpus, num_gpus, memory_bytes=memory_bytes, cpu_only=cpu_only)
     capacity = capacity if fits is None else min(capacity, fits)
     if avail_cpus <= 0 or workers <= capacity:
         return workers
@@ -369,132 +490,6 @@ def clamp_workers(workers: int, num_cpus: float = 1.0, num_gpus: float = 0.0) ->
     if num_gpus > 0:
         fit = min(fit, int(float(cluster_topology()["gpus"]) / num_gpus))
     # Re-read after the wait: the grown cluster's shape decides what fits, not its totals.
-    fits_now = placeable_workers(num_cpus, num_gpus)
+    fits_now = placeable_workers(num_cpus, num_gpus, memory_bytes=memory_bytes, cpu_only=cpu_only)
     fit = fit if fits_now is None else min(fit, fits_now)
     return max(1, min(workers, fit))
-
-
-# The capacity a wait *confirmed* the autoscaler won't exceed (set when a wait stalls below
-# target): a later query asking for more skips the wait instead of re-discovering the same
-# ceiling, so a fixed-at-max cluster pays the startup grace ONCE, not per cold query. A wait
-# that grows the cluster lifts it (`_note_reached`), so real scale-up is never pinned stale.
-_reachable_ceiling: float = float("inf")
-_ceiling_lock = threading.Lock()
-
-
-def _note_ceiling(best_cpus: int) -> None:
-    """Record that the autoscaler stalled at `best_cpus` — the cluster will not exceed it."""
-    global _reachable_ceiling
-    with _ceiling_lock:
-        _reachable_ceiling = min(_reachable_ceiling, float(best_cpus))
-
-
-def _note_reached(cpus: int) -> None:
-    """Lift a stale ceiling once capacity has climbed past it (the cluster grew/recovered)."""
-    global _reachable_ceiling
-    with _ceiling_lock:
-        if cpus > _reachable_ceiling:
-            _reachable_ceiling = float("inf")
-
-
-def _reset_capacity_ceiling() -> None:
-    """Forget the learned ceiling (tests; and any caller that wants a fresh probe)."""
-    global _reachable_ceiling
-    with _ceiling_lock:
-        _reachable_ceiling = float("inf")
-
-
-def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
-    """Block (bounded, growth-detected) until the autoscaler grows the cluster toward
-    `target_cpus` cores (and `target_gpus` GPUs).
-
-    Called *before* the fan-out is sized to the cluster, so a query that triggered a scale-up
-    (`request_autoscale`) fills the SCALED-UP cluster rather than the pre-scale one — without
-    it the worker-per-node fill reads the current (small) topology and the query never uses
-    the nodes it asked for. A no-op when the wait is disabled, Ray is down, the cluster already
-    covers the target, or a previous wait learned it will not reach the target
-    (`_reachable_ceiling`) — so a fixed cluster pays the startup grace once, not per query.
-    Pure scheduling — the result is identical whether it waits or not.
-    """
-    if active_config().distributed.autoscale_wait_s <= 0 or target_cpus <= 0:
-        return
-    import ray
-
-    if not ray.is_initialized():
-        return
-    topo = cluster_topology()
-    avail = int(topo["cpus"])
-    # Read current capacity BEFORE the ceiling short-circuit, so a cluster grown since the
-    # ceiling was learned re-probes: covering the target returns satisfied (lifting the stale
-    # ceiling); merely exceeding it drops the bound and waits for the rest.
-    if avail >= target_cpus and float(topo["gpus"]) >= target_gpus:
-        if target_gpus <= 0:
-            _note_reached(avail)
-        return
-    with _ceiling_lock:
-        ceiling = _reachable_ceiling
-    if avail > ceiling:
-        _note_reached(avail)  # capacity climbed past the old ceiling — it is stale
-    elif target_cpus > ceiling and target_gpus <= 0:
-        return  # a prior wait proved this is unreachable — don't re-discover it
-    _await_autoscale(target_cpus, avail, target_gpus, float(topo["gpus"]))
-
-
-def _await_autoscale(
-    target_cpus: int, avail: int, target_gpus: float = 0.0, avail_gpus: float = 0.0
-) -> int:
-    """Wait (bounded) for the cluster to grow to `target_cpus` (and `target_gpus`), returning
-    observed CPUs.
-
-    Polls the live CPU/GPU counts every `autoscale_poll_s` until both cover their targets or
-    `autoscale_wait_s` elapses, then returns the CPU count. A GPU stage waits for the GPUs
-    too, not just the cores (else it clamps to the 0 GPUs visible before the GPU node boots).
-    A no-op (returns `avail`) when the wait is disabled or the cluster already fits; stops
-    early via the grace windows below when capacity goes flat.
-    """
-    dc = active_config().distributed
-    if dc.autoscale_wait_s <= 0 or (avail >= target_cpus and avail_gpus >= target_gpus):
-        return avail
-    import time
-
-    deadline = time.monotonic() + dc.autoscale_wait_s
-    poll = max(0.1, dc.autoscale_poll_s)
-    # Give up early once capacity has been flat for the grace window — the autoscaler is done
-    # (fixed cluster) or cannot satisfy the request (spot unavailable), so the rest of the
-    # budget would block on nodes that will not arrive; any gain resets the window. Two
-    # regimes: until the FIRST growth a short `startup_grace` applies — an infeasible request
-    # (a fixed cluster already at max, the common case where a large aggregate's fan-out
-    # exceeds the node count) grows zero from the start, and the query already runs on current
-    # capacity, so it must not eat the full 90 s stall for nodes that never come. Once any
-    # growth appears the cluster is genuinely scaling and the longer `autoscale_stall_s`
-    # governs. `startup_grace` sits above a couple of polls so nodes registering within a few
-    # seconds still cross into the growing regime.
-    stall_grace = max(dc.autoscale_stall_s, poll * 2)
-    startup_grace = max(dc.autoscale_startup_grace_s, poll * 2)
-    best = (avail, avail_gpus)
-    saw_growth = False
-    reached = False
-    last_growth = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
-        topo = cluster_topology()
-        avail = int(topo["cpus"])
-        avail_gpus = float(topo["gpus"])
-        if avail >= target_cpus and avail_gpus >= target_gpus:
-            reached = True
-            break
-        if (avail, avail_gpus) > best:
-            best = (avail, avail_gpus)
-            saw_growth = True
-            last_growth = time.monotonic()
-        elif time.monotonic() - last_growth >= (stall_grace if saw_growth else startup_grace):
-            break  # nothing is coming (never started, or grew then stopped)
-    # A CPU-only wait that stalled below its target has learned a ceiling; one that reached
-    # (or grew past a stale ceiling) lifts it. GPU waits don't participate — a 0-GPU snapshot
-    # before a GPU node boots must not cap future GPU requests.
-    if target_gpus <= 0:
-        if reached or avail >= target_cpus:
-            _note_reached(avail)
-        else:
-            _note_ceiling(int(best[0]))
-    return avail

@@ -245,6 +245,20 @@ it was somebody's half-finished tree. `ls -la python/batcher/_native.abi3.so` ag
 start window is the check, and the tables above were produced by stamping the `.so`'s mtime before
 and after each run and discarding any run where it moved.
 
+## ClickBench reached 43/43 against `duckdb_arrow` (2026-07-29)
+
+Earlier entries in this file record **42 of 43**, with `cb-q32` (high-cardinality two-key
+GROUP BY + top-N) as the single loss at 1.17x. That query is now a win: measured 30.2 ms
+against `duckdb_arrow`'s 78.0 ms (**0.39x**) on a release build with every correctness
+check passing, so the suite is **43 of 43**. `docs/`, `README.md` and `paper/main.tex` all
+quote 43/43 and must move together if this is re-measured.
+
+Two caveats on re-running it. Against DuckDB's **native** store the same suite is a
+minority win (15 clear wins, 9 within +/-10%, 19 clear losses), which is the storage gap
+and not a kernel gap; do not conflate the two comparisons. And check
+`python/batcher/_native.abi3.so` is a *release* build first --- a debug build was left in
+the tree at one point in this session, and it makes every timing meaningless.
+
 ## Three learned mechanisms were measuring, and nothing read what they measured (2026-07-26)
 
 TPC-H sf10 was losing to DuckDB by 5-12x on exactly the queries with the most joins — q8 12.4x,

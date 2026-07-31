@@ -197,3 +197,22 @@ def test_stage_energy_includes_the_host_share() -> None:
     joules = stage_joules(60.0, "NVIDIA_H100", 8)
     assert joules == pytest.approx(60.0 * 8 * 875.0)
     assert stage_joules(60.0, "MADE_UP", 8) == 0.0
+
+
+def test_a_non_reducing_shape_pays_the_full_return_trip() -> None:
+    # The default result fraction describes the *reducing* shapes this decision routes — a
+    # group-by returns a group count, not a row count. A projection returns roughly what it
+    # reads, and inheriting the reducing default would understate its copy tenfold.
+    reducing = device_energy_advice("NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0)
+    projection = device_energy_advice(
+        "NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0, result_fraction=1.0
+    )
+    assert projection.speedup < reducing.speedup
+    assert projection.transfer_share >= reducing.transfer_share
+
+
+def test_a_negative_result_fraction_cannot_make_the_copy_free() -> None:
+    advice = device_energy_advice(
+        "NVIDIA_H100", bytes_per_row=64.0, flops_per_row=4.0, result_fraction=-5.0
+    )
+    assert advice.transfer_share > 0

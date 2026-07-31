@@ -1,4 +1,4 @@
-# The exception hierarchy: catching the failure you meant to catch
+# Error handling
 
 Every error the engine raises descends from ``BatcherError``, so a pipeline can catch that one type at its boundary. The specific subclasses let you distinguish a user mistake (``PlanError``) from an environment problem (``IOError``) from a missing extra (``MissingDependencyError``), which is the difference between retrying and giving up.
 
@@ -19,5 +19,5 @@ python examples/operations/error_handling.py
 
 - {doc}`environment`: what is installed, what the engine sees, and what to paste into a bug report.
 - {doc}`inspecting_a_query`: reading a plan, timing a query, and checking what the engine actually ran.
-- {doc}`../../user-guide/performance`: measuring and tuning a query that is correct but slow.
-- {doc}`../../user-guide/observability`: what the engine records about a run, and where.
+- {doc}`/user-guide/operate/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`/user-guide/operate/observability`: what the engine records about a run, and where.

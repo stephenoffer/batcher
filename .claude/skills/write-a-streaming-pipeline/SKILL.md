@@ -262,9 +262,9 @@ StreamingQueryProgress(batch_id=3, num_input_rows=5, num_output_rows=2, ...) 10
 
 ## See also
 
-- `docs/user-guide/streaming.md` (exactly-once at :297, cluster at :331, medallion at :374);
+- `docs/user-guide/moving-data/streaming.md` (exactly-once at :297, cluster at :331, medallion at :374);
   `docs/examples/streaming/{kafka-etl,exactly-once-sink,late-data-watermarks,stream-join,
-  windowed-aggregation,streaming-inference}.md`; `docs/ml/streaming.md`;
+  windowed-aggregation,streaming-inference}.md`; `docs/ml/inference/streaming.md`;
   `docs/examples/data-engineering/{incremental-ingest,cdc-pipeline,late-arriving-data}.md`.
 - Skills: `write-a-batcher-pipeline` (relational core); `read-and-write-data` (sources/sinks);
   `manage-a-lakehouse-table` (Delta/Iceberg upserts — the idempotent sink);

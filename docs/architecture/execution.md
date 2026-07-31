@@ -57,9 +57,9 @@ scan, filter, project, and probe. A breaker is an operator that must collect its
 before it can produce output, such as a hash-join build, an aggregate, a sort, a
 distinct, or a window.
 
-![A streaming Scan-Filter-Project pipeline feeding two pipeline breakers: the HashJoin build, then the Aggregate.](../_static/diagrams/pipeline_breakers.svg)
+![A streaming Scan-Filter-Project pipeline feeding two pipeline breakers: the HashJoin build, then the Aggregate.](/_static/diagrams/pipeline_breakers.svg)
 
-Breakers are the load-bearing points of the model. Data materializes there, spills
+Breakers are where the model does its real work. Data materializes there, spills
 there under memory pressure, shuffles there when a query is distributed, and gets
 re-optimized there once real numbers are known. The unit of work flowing through a
 pipeline is the morsel, a `RecordBatch` of 16,384 rows by default, which keeps
@@ -72,7 +72,7 @@ There is one set of operator semantics, exercised by three paths.
 The Tier-0 sequential interpreter is the reference. It is deterministic and kept
 obviously correct, and the other two paths are tested against it.
 
-![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](../_static/diagrams/execution_tiers.svg)
+![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](/_static/diagrams/execution_tiers.svg)
 
 Tier-0 parallel reuses the same operator code and changes only the scheduling. It
 morselizes, runs on a rayon thread pool, and hash-shuffles into the breakers,

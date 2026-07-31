@@ -544,7 +544,13 @@ def _distributed_map(
                 plan0, partitions[idx], workers, engine_config_json(shares[idx]), write_spec, idx
             )
 
-        results = gather_map_results(_launch, len(partitions))
+        # `task_cpus` is the smallest share any of these tasks asks for, so the
+        # submit-ahead window counts tasks rather than cores. A stage of many small
+        # partitions runs several tasks per core, and a cores-derived window would cap
+        # its concurrency at a fraction of what the cluster can hold.
+        results = gather_map_results(
+            _launch, len(partitions), task_cpus=min(shares) if shares else 1.0
+        )
 
     if write_spec is not None:
         # Only locators came back. Merging them is a commutative concat, so partition order
@@ -1256,11 +1262,31 @@ class _MapActor:
             return _write_udf_output(out, self._write_spec, idx)
         return out
 
+    def node_host(self) -> str:
+        """The host this actor landed on, in the same form a shuffle address carries.
+
+        Lets the streaming driver hand a morsel to a consumer on the *producer's* node, so
+        the fetch below stays on loopback instead of crossing the cluster network. Matches
+        `host_of(addr)` by construction — both are this node's advertised IP — so the two
+        sides of that comparison cannot drift apart.
+        """
+        import os
+
+        import ray
+
+        return os.environ.get("BATCHER_ADVERTISE_HOST") or ray.util.get_node_ip_address()
+
     def run_split(self, addr: str, ticket):
         """Map one prior-stage bucket fetched in place from `(addr, ticket)`, so a
-        resident inference pool is fed directly from upstream output (a co-located
-        bucket reads via shared memory / direct memory — no driver round-trip) instead
-        of waiting for the driver to hand it a materialized partition."""
+        resident inference pool is fed directly from upstream output instead of waiting
+        for the driver to hand it a materialized partition.
+
+        The fetch is Flight in every case: this actor runs no shuffle server of its own,
+        so it has neither a local partition store to read from nor the shared-memory
+        reader that reaching one would need. Locality is bought on the *driver* side
+        instead, by handing a morsel to a consumer on the producer's node (`node_host`),
+        which keeps the transfer on loopback rather than the cluster network.
+        """
         from batcher import core
         from batcher.carbonite.transfer.lifecycle import process_client
         from batcher.io.source import InMemorySource
@@ -1440,7 +1466,9 @@ def _distributed_map_aggregate(above, agg, sources, workers):
             map_plan, partitions[idx], gk, aj, workers
         )
 
-    partials = gather_map_results(_launch, len(partitions))
+    partials = gather_map_results(
+        _launch, len(partitions), task_cpus=min(shares) if shares else 1.0
+    )
     flat = [p for p in partials if p is not None]
     if not flat:
         table = _empty_agg_table(agg)

@@ -35,10 +35,10 @@ from .policies import (
     skew_join_salt,
     speculation_policy,
 )
+from .readiness import await_autoscale
 from .reduce import run_bucket_reduce
 from .scaling import (
     alive_node_count,
-    await_autoscale,
     clamp_workers,
     cluster_topology,
     node_class_selector,

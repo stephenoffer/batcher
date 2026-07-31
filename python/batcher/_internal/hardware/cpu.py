@@ -52,14 +52,48 @@ def _affinity_count() -> int | None:
     return n if n > 0 else None
 
 
+# Slurm's per-task CPU allocation, most specific first. `SLURM_CPUS_PER_TASK` is set when the
+# job asked with `--cpus-per-task`; `SLURM_CPUS_ON_NODE` is the node's whole share of the
+# allocation and is the fallback for a job that did not.
+_SLURM_CPU_VARS = ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE")
+
+
+def _slurm_cpu_count() -> int | None:
+    """Cores this Slurm allocation granted on this node, or `None` off Slurm.
+
+    A container is confined by cgroups, which the affinity mask and CFS quota already
+    report. A Slurm allocation is not, unless the site configured `task/cgroup` confinement
+    — and plenty of HPC sites do not. There the affinity mask reports every core on a
+    shared login-class node, so sizing to it fans a job allocated 8 cores out to 128
+    threads: it oversubscribes the node, steals from the co-tenants Slurm placed there, and
+    at a site with enforcement is exactly what gets the job killed. Slurm publishes the real
+    grant in the environment, so this reads it as one more upper bound rather than trusting
+    a mask the scheduler never narrowed.
+    """
+    for var in _SLURM_CPU_VARS:
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            n = int(raw)
+        except ValueError:
+            # `SLURM_CPUS_ON_NODE` is a plain int, but a heterogeneous-job layout can carry
+            # a "4(x2)"-style expansion. Rather than half-parse it, fall through: a missing
+            # bound degrades to today's behavior, a wrong one silently under-parallelizes.
+            continue
+        if n > 0:
+            return n
+    return None
+
+
 def available_cpu_count() -> int:
     """The number of CPUs this process may actually use — never fewer than 1.
 
-    The minimum of the affinity-mask size (cpuset pin) and the CFS-quota core count (bandwidth
-    throttle), floored by `os.cpu_count()` and finally 1. Prefer this over `os.cpu_count()`
-    anywhere thread pools or task fan-out are sized, so a container throttled to N cores fans
-    out to N — not to the host core count it will never receive (which over-subscribes and
-    thrashes the scheduler).
+    The minimum of the affinity-mask size (cpuset pin), the CFS-quota core count (bandwidth
+    throttle), and the Slurm allocation, floored by `os.cpu_count()` and finally 1. Prefer
+    this over `os.cpu_count()` anywhere thread pools or task fan-out are sized, so a
+    container throttled to N cores fans out to N — not to the host core count it will never
+    receive (which over-subscribes and thrashes the scheduler).
 
     Examples:
         .. doctest::
@@ -71,7 +105,8 @@ def available_cpu_count() -> int:
     Returns:
         The effective logical-core budget, at least 1.
     """
-    candidates = [c for c in (_affinity_count(), cfs_quota_count()) if c is not None]
+    bounds = (_affinity_count(), cfs_quota_count(), _slurm_cpu_count())
+    candidates = [c for c in bounds if c is not None]
     host = os.cpu_count() or 1
     return max(1, min([host, *candidates]))
 

@@ -9,7 +9,7 @@ running it out of memory.
 
 Carbonite sits in the contract loop between the optimizer and the executor:
 
-![The Kyber-Carbonite-Core feedback loop: Kyber decides (plan + estimated cost), Carbonite protects (allocations), Core executes, and measured cardinalities and peak memory flow back to Kyber.](../_static/diagrams/carbonite_loop.svg)
+![The Kyber-Carbonite-Core feedback loop: Kyber decides (plan + estimated cost), Carbonite protects (allocations), Core executes, and measured cardinalities and peak memory flow back to Kyber.](/_static/diagrams/carbonite_loop.svg)
 
 Kyber decides what to run and what it should cost. Carbonite decides whether that
 fits, and protects against OOM and cascading failure. Core runs the plan and
@@ -279,5 +279,5 @@ See {doc}`../configuration/options` for every field.
 - {doc}`kyber`: the optimizer whose plans Carbonite checks feasibility for.
 - {doc}`execution`: where reservations and spill actually happen.
 - {doc}`../configuration/options`: every memory and flow-control knob named on this page.
-- {doc}`../deep-dives/buffer-pool`: how the envelope is accounted, one allocation at a time.
-- {doc}`../deep-dives/credit-flow-control`: the credit protocol in full detail.
+- {doc}`/deep-dives/memory/buffer-pool`: how the envelope is accounted, one allocation at a time.
+- {doc}`/deep-dives/distribution/credit-flow-control`: the credit protocol in full detail.

@@ -124,6 +124,11 @@ RECOVERY = "recovery"
 #: - ``worker_lost``: a worker was first observed dead, and its buckets are gone with it.
 #: - ``recompute``: a recovery round re-ran a lost source and bumped its epoch.
 #: - ``straggler_backup``: a speculative duplicate was launched for a slow task.
+#: - ``doomed_backup``: a speculative duplicate was launched for a task whose *host is being
+#:   reclaimed*, before it looked slow at all. Distinguished from ``straggler_backup``
+#:   because the two mean opposite things operationally — one says a node is degraded, the
+#:   other says a node is leaving on schedule — and counting them together makes a healthy
+#:   autoscaling cluster read as a sick one.
 #: - ``backup_won``: the speculative duplicate finished first; the original was cancelled.
 #: - ``replica_retired``: a stale replica was dropped before its source was reincarnated.
 #:   The one that most needs to be visible — reading a retired replica returns an *empty
@@ -140,6 +145,7 @@ RECOVERY_EVENTS = (
     "worker_lost",
     "recompute",
     "straggler_backup",
+    "doomed_backup",
     "backup_won",
     "replica_retired",
     "preempt_migrate",

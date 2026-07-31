@@ -300,13 +300,13 @@ featured.write.parquet("s3://corpus/features/", distributed=True)
 :gutter: 3
 
 :::{grid-item-card} {octicon}`download;1.1em` Streaming for training
-:link: ../ml/streaming
+:link: /ml/inference/streaming
 :link-type: doc
 Every loader option, in full.
 :::
 
 :::{grid-item-card} {octicon}`plug;1.1em` PyTorch integration
-:link: ../ml/pytorch
+:link: /ml/inference/pytorch
 :link-type: doc
 Device transfer, prefetch, collate, zero-copy.
 :::
@@ -320,13 +320,13 @@ Preprocessors and `Chain`, the step-3 story in full.
 
 ## See also
 
-- {doc}`Distributed training guide <../ml/distributed-training>`: DDP, elasticity, and the
+- {doc}`Distributed training guide </ml/training/distributed-training>`: DDP, elasticity, and the
   resume contract.
-- {doc}`Data loaders <../ml/data-loaders>`: `iter_torch_batches` and `stream_loader` side by
+- {doc}`Data loaders </ml/training/data-loaders>`: `iter_torch_batches` and `stream_loader` side by
   side.
-- {doc}`Tensor columns <../deep-dives/tensor-columns>`: the DLPack path behind the zero-copy
+- {doc}`Tensor columns </deep-dives/memory/tensor-columns>`: the DLPack path behind the zero-copy
   claim in step 4.
-- {doc}`Mergeable algebra <../deep-dives/mergeable-algebra>`: why the `fit` in step 3 gives the
+- {doc}`Mergeable algebra </deep-dives/operators/mergeable-algebra>`: why the `fit` in step 3 gives the
   same statistics on a cluster.
 - {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the 3.0× on `iter_torch_batches`, and
   the configurations it was measured under.

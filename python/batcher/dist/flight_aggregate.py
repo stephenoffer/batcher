@@ -125,7 +125,7 @@ def execute_aggregate_flight(
     # Borrow the query-lifetime fleet if the adaptive loop installed one (pins the
     # worker count to the fleet's, so every stage shuffles over the same actors);
     # otherwise spawn one we tear down. `owns` gates teardown.
-    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_reducers = 1 if n_keys == 0 else aggregate_reducer_count(agg, shuffle_partitions(workers))
 
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
@@ -149,7 +149,11 @@ def execute_aggregate_flight(
         # reducers actually read.
         projection, predicate = consumer_pushdown(agg, map_plan)
         partitions = partition_descriptors(
-            sources[sid], workers, projection=projection, predicate=predicate
+            sources[sid],
+            workers,
+            projection=projection,
+            predicate=predicate,
+            worker_addrs=fleet_addrs,
         )
 
         if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes
@@ -187,7 +191,7 @@ def execute_aggregate_flight(
         fan_in = _shuffle_fan_in()
         # Locality-aware reducer placement (opt-in): host each reducer where its bucket
         # concentrates, so its fetches become same-node hits. None ⇒ default round-robin.
-        reducer_hosts = _locality_reducer_hosts(actors, n_reducers, workers)
+        reducer_hosts = _locality_reducer_hosts(actors, n_reducers, workers, fleet_addrs)
         reduce_args = (actors, addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, workers)
         if workers > fan_in:
             batches = _tree_reduce_with_recovery(
@@ -243,13 +247,20 @@ def execute_aggregate_flight(
     return table if not above else _apply_above(above, table)
 
 
-def _locality_reducer_hosts(actors, n_reducers, workers):
+def _locality_reducer_hosts(actors, n_reducers, workers, fleet_addrs=None):
     """Host-actor index per reducer, placing each where its bucket's bytes concentrate
     (locality-aware scheduling), or ``None`` to keep the default round-robin.
 
-    ``None`` when the feature is off, when nothing is concentrated (an evenly-spread
-    shuffle), or on any error — so the reduce path is unchanged in the common case.
-    Result-preserving: which actor hosts a reducer never changes the output.
+    ``None`` when the feature is off, when the whole fleet is on one node (every fetch is
+    already same-node, so placement has nothing to win), when nothing is concentrated (an
+    evenly-spread shuffle), or on any error — so the reduce path is unchanged in the
+    common case. Result-preserving: which actor hosts a reducer never changes the output.
+
+    Node identity comes from the workers' advertised shuffle addresses when the caller has
+    them, which costs nothing (the driver holds them already) and is the *same* identity
+    `select_mode` routes on — so placement and transport agree on what "same node" means.
+    Falling back to a `node_id` probe costs a round-trip per worker, and paid it even to
+    discover a single-node fleet where the answer was always `None`.
     """
     from batcher.config import active_config
 
@@ -258,10 +269,16 @@ def _locality_reducer_hosts(actors, n_reducers, workers):
 
     import ray
 
+    from batcher.carbonite.transfer.lifecycle import host_of
     from batcher.carbonite.transfer.placement import assign_reducer_hosts, reducer_affinity
 
     try:
-        nodes = ray.get([actors[i].node_id.remote() for i in range(workers)])
+        if fleet_addrs and len(fleet_addrs) >= workers and all(fleet_addrs[:workers]):
+            nodes = [host_of(a) for a in fleet_addrs[:workers]]
+        else:
+            nodes = ray.get([actors[i].node_id.remote() for i in range(workers)])
+        if len(set(nodes)) <= 1:
+            return None  # one node: every fetch is same-node already
         per_mapper = ray.get([actors[i].published_bucket_bytes.remote() for i in range(workers)])
     except Exception as exc:  # locality is best-effort; a probe failure keeps default placement
         note_suppressed("dist", "probe reducer host locality", exc)

@@ -50,6 +50,7 @@ from batcher.dist.executors.ray_runtime import (
     await_autoscale,
     clamp_workers,
     engine_config_json,
+    node_class_selector,
     release_autoscale,
     request_autoscale,
     reset_scheduling_envelope,
@@ -58,6 +59,7 @@ from batcher.dist.executors.ray_runtime import (
     topology_scope,
     worker_node_memory_bytes,
 )
+from batcher.dist.executors.ray_runtime.trace import FanoutTrace
 from batcher.dist.fleet.plan_id import with_query_shuffle_scope
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
@@ -169,6 +171,7 @@ def execute_distributed(
         # it — the data-driven count would size the fleet to the first (maybe tiny) query
         # and then under-provision a later big one. An explicit `num_workers` overrides it;
         # a single node falls back to the data-driven `_even_cpu_share` path below.
+        trace = FanoutTrace(workers)
         fill = None if num_workers is not None else _cluster_fill_workers()
         if fill is not None:
             desired, (workers, num_cpus) = workers, fill
@@ -184,6 +187,11 @@ def execute_distributed(
             )
             reset_scheduling_envelope(token)
             token = set_scheduling_envelope(envelope)
+            trace.step("cluster_fill", workers, f"one worker per {num_cpus:g}-core node slice")
+        elif num_workers is not None:
+            trace.step("explicit", workers, "num_workers was passed by the caller")
+        else:
+            trace.step("single_node", workers, "one node, or topology unreadable")
         # Ray is up, so the live topology is readable: give each worker an EVEN SHARE of
         # the cluster's CPUs (capped at one node's cores), not the single core Carbonite's
         # per-operator `num_cpus` models — a `_FlightWorker` runs the multi-core executor
@@ -199,11 +207,45 @@ def execute_distributed(
             num_cpus = share
             reset_scheduling_envelope(token)
             token = set_scheduling_envelope(envelope)
-        clamped = clamp_workers(workers, num_cpus, num_gpus)
+            trace.step("even_cpu_share", workers, f"raised the per-worker grant to {share:g} cores")
+        # Clamp against everything the fleet's bundle reserves, not cores alone: the
+        # per-worker RAM grant, and the node-class restriction when this (relational) fleet
+        # is held off accelerator nodes. A clamp blind to either lets the fan-out exceed
+        # what any arrangement of nodes can host, and a gang-scheduled placement group that
+        # cannot be satisfied hangs rather than fails.
+        #
+        # `cpu_only` is read from `node_class_selector` rather than from the envelope's
+        # *preference*, because the preference is not always honored: the restriction also
+        # needs the config gate and enough CPU-only capacity. Asking the same function the
+        # bundle asks is what keeps the clamp and the placement agreeing by construction,
+        # instead of two rules that can disagree about which nodes are eligible.
+        restricted = bool(
+            envelope is not None
+            and node_class_selector(envelope.prefer_cpu_only_nodes, workers, num_cpus)
+        )
+        clamped = clamp_workers(
+            workers,
+            num_cpus,
+            num_gpus,
+            memory_bytes=int(envelope.memory_bytes) if envelope is not None else 0,
+            cpu_only=restricted,
+        )
         # Carbonite sized the per-task memory hint against its *desired* fan-out;
         # once the cluster clamp reduces (or the data-driven want exceeds) it, each
         # real task holds a larger share. Rescale the soft memory hint to the actual
         # worker count and re-install the grant so `.options(memory=)` is honest.
+        trace.step(
+            "clamp",
+            clamped,
+            "bounded by schedulable capacity"
+            + (", CPU-only nodes" if restricted else "")
+            + (
+                f", a {envelope.memory_bytes / 1e9:.1f} GB per-worker memory grant"
+                if envelope is not None and envelope.memory_bytes
+                else ""
+            ),
+        )
+        trace.report()
         if envelope is not None and clamped != workers:
             envelope = _rescale_envelope(envelope, workers, clamped)
             reset_scheduling_envelope(token)
@@ -245,20 +287,23 @@ def execute_distributed(
 def _worker_node_cpus() -> list[float]:
     """CPU counts of the nodes eligible to run distributed workers.
 
-    Excludes the Ray **head** node (marker ``node:__internal_head__``) when at least one
-    other node exists: the head runs the GCS / dashboard / job supervisor, and scheduling
-    data operators on it causes contention and instability (Ray Data hits this — the
-    guides' "set `num_cpus=0` on the head" rule). Many managed clusters already give the
-    head 0 CPU, so the `> 0` filter handles it there; excluding by marker makes Batcher
-    correct on a raw Ray cluster whose head has cores too — "works on any cluster type". A
-    single-node cluster (head only) keeps the head, since it must run the work.
-    """
-    import ray
+    Delegates to `scaling.node_classes`, which is the one place that decides what
+    "worker-eligible" means: the Ray head excluded (it runs the GCS / dashboard / job
+    supervisor, and scheduling data operators there causes contention), anything Ray has
+    marked for drain excluded, and neither exclusion allowed to empty the list.
 
-    alive = [n for n in ray.nodes() if n.get("Alive")]
-    non_head = [n for n in alive if "node:__internal_head__" not in n.get("Resources", {})]
-    nodes = non_head if non_head else alive  # keep the head only if it's the whole cluster
-    return [c for c in (float(n.get("Resources", {}).get("CPU", 0.0)) for n in nodes) if c > 0]
+    This used to re-derive that from `ray.nodes()` itself, and the copy had drifted in two
+    ways that matter. It counted **draining** nodes, so the primary fan-out chooser
+    (`_cluster_fill_workers`) sized the fleet onto capacity being reclaimed while
+    `clamp_workers` — reading the same cluster through `scaling` — excluded it, and the two
+    answers to "how many workers fit" disagreed. And it read the cluster directly, so it
+    missed the `topology_scope()` snapshot and paid its own `ray.nodes()` round trip on
+    every call. Sharing the definition is also what the layering asks for: two copies of a
+    rule is the one way to get them out of step.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import node_classes
+
+    return [c for node in node_classes() if (c := float(node["cpus"])) > 0]
 
 
 def _cluster_fill_workers() -> tuple[int, float] | None:
@@ -280,11 +325,66 @@ def _cluster_fill_workers() -> tuple[int, float] | None:
         node_cpus = _worker_node_cpus()
         if len(node_cpus) <= 1:
             return None
-        num_cpus = max(1.0, float(int(min(node_cpus))))
+        num_cpus = _fill_grant(node_cpus)
         workers = sum(max(1, int(c // num_cpus)) for c in node_cpus)
         return workers, num_cpus
     except Exception:
         return None
+
+
+# How much of the best-achievable core occupancy a larger grant may give up before it stops
+# being worth the fatter workers. At 0.9 a grant that strands a tenth of the cluster is
+# rejected, which keeps a genuinely heterogeneous fleet (32 next to 64) tiled by the smaller
+# node exactly as before, while letting one undersized node be skipped rather than obeyed.
+_FILL_STRAND_TOLERANCE = 0.9
+
+
+def _fill_grant(node_cpus: list[float]) -> float:
+    """The per-worker core grant that leaves the fewest cores stranded.
+
+    The grant used to be `min(node_cpus)`, chosen so a worker is placeable on every node.
+    That is right on a cluster whose nodes differ by a factor of two, and pathological when
+    one node is much smaller than the rest: a single 2-core utility node in a fleet of
+    64-core machines pinned *every* worker to 2 cores, so each one ran its scan and fold on
+    a thirty-second of the node it landed on. The smallest node was setting the shape of
+    the whole cluster.
+
+    Nothing actually requires a uniform grant to fit the smallest node. A grant that a node
+    cannot host simply means that node hosts no workers, which costs its cores — and losing
+    one small node's cores is obviously better than crippling every large node's.
+
+    Maximizing cores occupied is *not* the objective, and getting that wrong is instructive:
+    on `[2, 64, 64, 64]` the 2-core grant occupies 194 cores against 64's 192, so "most
+    cores used" picks the pathology it was meant to avoid. A small grant always wins that
+    contest, because it can fill every remainder. What it buys those two extra cores with is
+    97 workers instead of 3 — a shuffle with 97 streams per stage and a scan that runs
+    two-cores-wide on a 64-core box.
+
+    So the rule prefers the **largest** grant that does not strand meaningful capacity: the
+    biggest candidate whose core utilization is within `_FILL_STRAND_TOLERANCE` of the best
+    any candidate achieves. Fat workers unless the cluster genuinely cannot be tiled by
+    them.
+
+    Worked through: `[2, 64, 64, 64]` gives 64 (192 of 194 cores, 1% stranded, three fat
+    workers). `[32, 64]` keeps 32, because a 64-core grant would strand the 32-core node
+    entirely — a third of the cluster, far past the tolerance. `[16, 32, 32]` keeps 16 for
+    the same reason. A homogeneous cluster has one candidate and is unchanged.
+    """
+    candidates = sorted({max(1.0, float(int(c))) for c in node_cpus if c > 0}, reverse=True)
+    if not candidates:
+        return 1.0
+
+    def occupied(grant: float) -> float:
+        return sum(int(c // grant) * grant for c in node_cpus)
+
+    best = max(occupied(g) for g in candidates)
+    if best <= 0:
+        return candidates[-1]
+    # `candidates` is descending, so the first acceptable one is the largest.
+    for grant in candidates:
+        if occupied(grant) >= _FILL_STRAND_TOLERANCE * best:
+            return grant
+    return candidates[-1]
 
 
 def _even_cpu_share(workers: int) -> float:
@@ -302,7 +402,13 @@ def _even_cpu_share(workers: int) -> float:
         node_cpus = _worker_node_cpus()
         if not node_cpus or workers <= 0:
             return 1.0
-        placeable = float(int(min(node_cpus)))  # fits the smallest node (SPREAD-safe)
+        # The placeability cap is the grant `_fill_grant` would choose, not `min(node_cpus)`.
+        # Both answer "how wide may a uniform worker be", so they have to agree: with `min`
+        # here, a single undersized node re-imposed the exact pinning `_fill_grant` exists to
+        # avoid — the fill path would pick a 64-core grant and this would immediately cap it
+        # back to 2. It is still a *cap* (`min` against the oversubscription bound below), so
+        # this only ever raises the grant to what the cluster can actually host.
+        placeable = _fill_grant(node_cpus)
         non_oversubscribing = float(sum(node_cpus) // workers)  # workers x grant <= cluster
         return max(1.0, min(placeable, non_oversubscribing))
     except Exception:

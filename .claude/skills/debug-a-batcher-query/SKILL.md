@@ -226,8 +226,8 @@ layer: `add-relational-operator`, `add-expression-or-function`,
 
 - `.claude/rules/testing.md` — the oracles and the per-change test gates
 - `.claude/rules/rust-engine.md` — seq == par == JIT, mergeable algebra
-- `docs/user-guide/troubleshooting.md`, `docs/user-guide/explain-plans.md`
+- `docs/user-guide/operate/troubleshooting.md`, `docs/user-guide/operate/explain-plans.md`
 - `docs/internals/carbonite.md` — spill, credits, admission
 - `optimize-a-slow-query` — when the query is correct but slow
-- `docs/user-guide/gpu-fleets.md` — the power, fabric, health, and residency controls behind
+- `docs/user-guide/operate/gpu-fleets.md` — the power, fabric, health, and residency controls behind
   section F, and how to turn each on

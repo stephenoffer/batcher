@@ -229,10 +229,10 @@ The same operators, over a source that never ends.
 
 ## See also
 
-- {doc}`SQL guide <../user-guide/sql>`: the supported SQL surface in full, including what is
+- {doc}`SQL guide </user-guide/analyze/sql>`: the supported SQL surface in full, including what is
   not supported.
-- {doc}`Expressions <../user-guide/expressions>`: the column language underneath both spellings.
-- {doc}`Explain plans <../user-guide/explain-plans>`: how to read the thing you just compared.
-- {doc}`Plan IR <../deep-dives/plan-ir>`: the single `LogicalPlan` both front ends build.
-- {doc}`SQL API reference <../api/sql>`: `Session`, `register`, `register_function`.
+- {doc}`Expressions </user-guide/transform/expressions>`: the column language underneath both spellings.
+- {doc}`Explain plans </user-guide/operate/explain-plans>`: how to read the thing you just compared.
+- {doc}`Plan IR </deep-dives/query/plan-ir>`: the single `LogicalPlan` both front ends build.
+- {doc}`SQL API reference </api/relational/sql>`: `Session`, `register`, `register_function`.
 - {doc}`Migration guide <../migration/index>`: if the SQL you know is Spark's or DuckDB's.

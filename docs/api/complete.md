@@ -5,8 +5,8 @@ rendered from the source docstrings. It's the exhaustive backstop behind the
 {doc}`quick reference <reference>` and the example-first {doc}`area pages <index>`. Each
 top-level function links to its own page.
 
-Two large surfaces have their own pages rather than sitting here: {doc}`functions` for
-the scalar, horizontal, aggregate, and window functions, and {doc}`metrics` for the
+Two large surfaces have their own pages rather than sitting here: {doc}`/api/relational/functions` for
+the scalar, horizontal, aggregate, and window functions, and {doc}`/api/models/metrics` for the
 scoring and statistical aggregates.
 
 ## Construction and I/O
@@ -96,7 +96,7 @@ Reference and derive columns, build literals, and branch.
 
 ## Column selectors
 
-A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the {doc}`transformations guide <../user-guide/transformations>` for how they compose.
+A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the {doc}`transformations guide </user-guide/transform/transformations>` for how they compose.
 
 ```{eval-rst}
 .. autosummary::
@@ -129,7 +129,7 @@ A *selector* stands for every column matching a predicate. Pass one anywhere a c
 
 ## Configuration functions
 
-Read and override the engine tunables. See the {doc}`configuration guide <configuration>`.
+Read and override the engine tunables. See the {doc}`configuration guide </api/operations/configuration>`.
 
 ```{eval-rst}
 .. autosummary::
@@ -168,7 +168,7 @@ Address any tunable by its dotted path, in the style of `pandas.set_option` and
 ### Logging and verbosity
 
 One-line switches over `ObservabilityConfig`. See
-{doc}`observability <../user-guide/observability>`.
+{doc}`observability </user-guide/operate/observability>`.
 
 ```{eval-rst}
 .. autofunction:: batcher.config.set_log_level
@@ -209,7 +209,7 @@ Process-wide counters as plain data, for Prometheus, OpenTelemetry, or a log lin
 
 ## Governance
 
-See the {doc}`governance guide <../user-guide/governance>` for how these fit together.
+See the {doc}`governance guide </user-guide/trust/governance>` for how these fit together.
 
 ```{eval-rst}
 .. autoclass:: batcher.SecurityCatalog
@@ -329,7 +329,7 @@ and slowly-changing-dimension workflows.
 
 ## Metadata shortcuts
 
-The `ds.meta` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the {doc}`metadata shortcuts guide <../user-guide/metadata-shortcuts>`.
+The `ds.meta` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the {doc}`metadata shortcuts guide </user-guide/analyze/metadata-shortcuts>`.
 
 ```{eval-rst}
 .. autoclass:: batcher.api.dataset.meta.frame.DatasetMeta
@@ -385,7 +385,7 @@ The `ds.meta` namespace and the accessors it hands out read answers from footers
 
 ## Configuration classes
 
-The tunables, grouped by subsystem. See the {doc}`configuration guide <configuration>`
+The tunables, grouped by subsystem. See the {doc}`configuration guide </api/operations/configuration>`
 for what each one does and when to change it.
 
 ```{eval-rst}
@@ -453,6 +453,6 @@ for what each one does and when to change it.
 ## See also
 
 - {doc}`reference`: the same surface as a short lookup table rather than a full listing.
-- {doc}`dataset`: the `Dataset` methods, with the semantics behind each one.
-- {doc}`expressions`: the `Expr` surface these methods take.
+- {doc}`/api/relational/dataset`: the `Dataset` methods, with the semantics behind each one.
+- {doc}`/api/relational/expressions`: the `Expr` surface these methods take.
 - {doc}`../user-guide/index`: the task-oriented guides behind this reference.

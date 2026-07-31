@@ -1,7 +1,7 @@
 # Batcher
 
-**One data engine for SQL, DataFrames, streaming, and models — from a laptop to a
-cluster, on the same code.**
+**One data engine for SQL, DataFrames, streaming, and models — over any shape of data,
+across CPU and GPU, from a laptop to a cluster, on the same code.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://pypi.org/project/batcher-engine/)
@@ -13,12 +13,17 @@ cluster, on the same code.**
 [Benchmarks](https://stephenoffer.github.io/batcher/benchmarks/index.html) ·
 [Architecture](https://stephenoffer.github.io/batcher/architecture/index.html)
 
-Most data tools make you choose: fast on a single machine, or able to scale across
-many — rarely both. So teams outgrow their tool and rewrite the pipeline, or run one
-system for SQL, another for DataFrames, and a third for ML and pay to keep the seams
-from leaking. Batcher is a single engine for all of it: quick on small data, steady
-at large scale, for SQL, DataFrame, and ML workloads. The same code runs on one core
-or a thousand, so going bigger is a config change, not a rewrite.
+Most data tools make you choose, and then make you choose again. Fast on one machine or
+able to scale. Batch or streaming. Tables or images. SQL or Python. CPU or GPU. Every
+answer is a different system, and the seams between them are where the time goes.
+
+Batcher is one engine for all of it, and mostly because of one decision: every stateful
+operator exists exactly once, as a mergeable `partial → combine → finalize` triple in Rust
+over Arrow. One core, ninety-six cores and a cluster differ only in how that triple is
+scheduled, so going bigger is a config change and not a rewrite. The same triple is the
+incremental form, so a finite table is just a stream that ends. And because decode,
+embedding, vector search and inference are expressions in the same algebra, a filter can
+run *before* a JPEG decode and a tensor never leaves the engine.
 
 ```python
 import batcher as bt
@@ -86,7 +91,7 @@ covers both halves and where each one stops.
 
 | Tool | Where it stops | What Batcher does instead | Measured |
 |------|----------------|---------------------------|----------|
-| **DuckDB** | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **21/22** TPC-H at sf10 (**1.89×** on the suite), **22/22** at sf1, **42/43** ClickBench — all on the same Arrow |
+| **DuckDB** | fast, but single-node and plans once | scales out, and re-optimizes mid-query | **21/22** TPC-H at sf10 (**1.89×** on the suite), **22/22** at sf1, **43/43** ClickBench — all on the same Arrow |
 | **Polars** | fast, but single-node | the same code runs from one core to a cluster | **12×–81×** on JSON; **7×–33×** on windows and top-N |
 | **Daft** | scales, but plans once | adaptive re-optimization, and a correct q6 | **2.4× faster** cluster-vs-cluster, and Daft's q6 is wrong |
 | **Spark** | scales, but heavy on small jobs | runs in-process locally — no cluster to spin up | **5×–33×** on TPC-H |
@@ -150,7 +155,7 @@ Arrow input, so these compare *execution*, not storage formats:
 |---|---|
 | **TPC-H sf10** — all 22 queries, 96 cores | **won 21 of 22**, **1.89×** on the suite total |
 | **TPC-H sf1** — all 22 queries, 16 cores | **won 22 of 22**, 1.1×–6.9× faster |
-| **ClickBench** — 43 queries | **won 42 of 43**, 43/43 correct |
+| **ClickBench** — 43 queries | **won 43 of 43**, 43/43 correct |
 | **Semi-structured JSON** — 5 queries | **won 5 of 5**, 3.5×–12.7× faster (**12×–81×** vs Polars) |
 
 Standout queries: TPC-H q15 **6.9×**, q11 **6.8×**; ClickBench q27 **37×**, q40 **16×**.

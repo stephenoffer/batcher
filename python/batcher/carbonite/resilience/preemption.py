@@ -1,13 +1,22 @@
-"""Spot-preemption detection so the engine drains proactively, not reactively.
+"""Preemption detection so the engine drains proactively, not reactively.
 
-A spot/preemptible node is given a short termination notice before it is reclaimed
-(AWS ~2 min via the metadata ``instance-action`` endpoint, GCP a ``preempted`` flag,
-or a ``SIGTERM`` from the scheduler / Kubernetes). Without watching for it, the
-engine learns of the loss only *after* in-flight work is gone — a failed fetch or a
-dead actor — and pays a full recompute. This monitor turns the notice into an early
-``is_draining()`` signal plus a one-shot drain hook, so the orchestrator can stop
-scheduling new work onto the node and flush in-flight intermediates to durable
-storage before it dies.
+A node under a scheduler is taken away in one of three ways, and the engine has to
+watch for all of them because a given cluster only ever offers one:
+
+* A cloud spot instance announces its own reclamation (AWS ~2 min via the metadata
+  ``instance-action`` endpoint, GCP a ``preempted`` flag, Azure Scheduled Events).
+* An orchestrator sends a signal — ``SIGTERM`` from Kubernetes on eviction, and
+  ``SIGUSR1`` from Slurm when the job was submitted with ``--signal=B:USR1@<lead>``.
+* A batch scheduler gives no notice at all and simply kills the allocation when its
+  wall clock runs out. That case is read from the deadline itself
+  (`batcher.config.deadline`, which sits in layer 0 so the profile resolution below
+  Carbonite and this monitor inside it can share one answer).
+
+Without watching, the engine learns of the loss only *after* in-flight work is gone —
+a failed fetch or a dead actor — and pays a full recompute. This monitor turns any of
+the three into an early ``is_draining()`` signal plus a one-shot drain hook, so the
+orchestrator can stop scheduling new work onto the node and flush in-flight
+intermediates to durable storage before it dies.
 
 Carbonite owns it (a resource "protect" concern); Core and the distributed workers
 consult it. It is a process-wide singleton — one background poller per worker
@@ -24,7 +33,21 @@ from collections.abc import Callable
 
 from batcher._internal.logging import note_suppressed
 
-__all__ = ["PreemptionMonitor", "cloud_preemption_probe", "preemption_monitor"]
+__all__ = [
+    "PreemptionMonitor",
+    "cloud_preemption_probe",
+    "preemption_monitor",
+    "termination_probe",
+]
+
+# Signals that mean "this process is going away shortly". `SIGTERM` is what Kubernetes
+# sends on eviction and what Slurm sends at the time limit (with `KillWait` seconds before
+# the `SIGKILL`). `SIGUSR1` is Slurm's *early warning*: a job submitted with
+# `--signal=B:USR1@120` gets it two minutes before the limit, which is the whole point —
+# it is the only advance notice an HPC allocation ever gets, and by default its disposition
+# is to terminate the process outright, so trapping it is strictly safer than ignoring it.
+# Absent on a platform that lacks one (Windows has no `SIGUSR1`), hence the `getattr`.
+_DRAIN_SIGNAL_NAMES = ("SIGTERM", "SIGUSR1")
 
 # Link-local metadata endpoints answer in microseconds; a tight timeout keeps a
 # probe from ever stalling the poll loop (and reads a partition as "not draining").
@@ -143,12 +166,45 @@ def cloud_preemption_probe() -> bool:
     return False
 
 
+def termination_probe() -> bool:
+    """Return True when this node is going away, from any signal source available.
+
+    The wall-clock deadline is checked *first* and deliberately so. It is a local clock
+    comparison, so it costs nothing and cannot fail; the cloud probes are three link-local
+    HTTP round trips that, on the clusters where a deadline exists (Slurm, a leased VM, a
+    CI runner), all time out and return False every poll. Checking the free and decisive
+    signal before the expensive and usually-absent one keeps the poll loop cheap where it
+    matters most.
+
+    The lead time comes from `DistributedConfig.drain_lead_s`. Reading it per poll rather
+    than capturing it at construction is what lets a worker honor a lead the driver set,
+    since a worker process resolves its own config from the environment.
+
+    Returns:
+        Whether a termination notice or an imminent deadline has been observed.
+    """
+    from batcher.config import active_config
+    from batcher.config.deadline import deadline_probe
+
+    lead = 0.0
+    try:
+        lead = float(active_config().distributed.drain_lead_s)
+    except Exception as exc:  # pragma: no cover - config is resolvable in practice
+        # A worker whose config cannot be resolved must still drain on the cloud/signal
+        # path rather than raise out of the poll thread and stop watching entirely.
+        note_suppressed("carbonite", "read the drain lead time", exc)
+    if deadline_probe(lead)():
+        return True
+    return cloud_preemption_probe()
+
+
 class PreemptionMonitor:
     """Process-wide watcher that flips ``is_draining()`` on a termination notice.
 
-    Polls a `probe` (default: cloud metadata) on a daemon thread and also traps
-    ``SIGTERM`` (what a scheduler / Kubernetes sends on eviction). On the first signal
-    it sets a sticky draining flag and runs each registered drain callback once — the
+    Polls a `probe` (default: the wall-clock deadline, then cloud metadata) on a daemon
+    thread and also traps ``SIGTERM`` (Kubernetes eviction, Slurm's time limit) and
+    ``SIGUSR1`` (Slurm's ``--signal=B:USR1@<lead>`` early warning). On the first of any
+    of them it sets a sticky draining flag and runs each registered drain callback once — the
     hook the orchestrator uses to stop scheduling onto this node and flush in-flight
     intermediates. Sticky by design: a drain is never un-seen. Idempotent — starting
     or triggering twice is a no-op.
@@ -170,14 +226,14 @@ class PreemptionMonitor:
     def __init__(
         self, probe: Callable[[], bool] | None = None, poll_interval_s: float = 5.0
     ) -> None:
-        self._probe = probe or cloud_preemption_probe
+        self._probe = probe or termination_probe
         self._poll_interval_s = poll_interval_s
         self._draining = threading.Event()
         self._callbacks: list[Callable[[], None]] = []
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._prev_sigterm: object = None
+        self._prev_handlers: dict[int, object] = {}
 
     def is_draining(self) -> bool:
         """Whether a termination notice has been observed for this node."""
@@ -192,7 +248,7 @@ class PreemptionMonitor:
             self._safe_call(callback)
 
     def start(self) -> None:
-        """Begin polling and trap SIGTERM. Idempotent."""
+        """Begin polling and trap the drain signals. Idempotent."""
         with self._lock:
             if self._thread is not None:
                 return
@@ -201,11 +257,11 @@ class PreemptionMonitor:
                 target=self._poll_loop, name="batcher-preemption", daemon=True
             )
             self._thread = thread
-        self._install_sigterm()
+        self._install_signals()
         thread.start()
 
     def stop(self) -> None:
-        """Stop polling and restore the prior SIGTERM handler. Idempotent."""
+        """Stop polling and restore the prior signal handlers. Idempotent."""
         self._stop.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -214,7 +270,7 @@ class PreemptionMonitor:
             thread.join(timeout=1.0)
         with self._lock:
             self._thread = None
-        self._restore_sigterm()
+        self._restore_signals()
 
     def trigger(self) -> None:
         """Mark draining now and fire each callback once (SIGTERM / test entry point)."""
@@ -245,25 +301,40 @@ class PreemptionMonitor:
                 if self._thread is threading.current_thread():
                     self._thread = None
 
-    def _install_sigterm(self) -> None:
-        try:
-            self._prev_sigterm = signal.getsignal(signal.SIGTERM)
-            signal.signal(signal.SIGTERM, self._on_sigterm)
-        except (ValueError, OSError):
-            # Not the main thread (e.g. a Ray worker) — rely on the metadata poll.
-            self._prev_sigterm = None
+    def _install_signals(self) -> None:
+        """Trap each drain signal this platform has, chaining to the prior handler.
 
-    def _on_sigterm(self, signum: int, frame: object) -> None:
+        Installed per signal rather than all-or-nothing: `SIGTERM` must still be trapped on
+        a platform with no `SIGUSR1`, and off the main thread (a Ray worker) none of them
+        can be installed at all — there the metadata/deadline poll is the whole mechanism.
+        """
+        for name in _DRAIN_SIGNAL_NAMES:
+            signum = getattr(signal, name, None)
+            if signum is None:  # not on this platform (e.g. SIGUSR1 on Windows)
+                continue
+            try:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, self._on_signal)
+            except (ValueError, OSError):
+                # Not the main thread (e.g. a Ray worker) — rely on the poll instead.
+                continue
+            self._prev_handlers[int(signum)] = previous
+
+    def _on_signal(self, signum: int, frame: object) -> None:
         self.trigger()
-        prev = self._prev_sigterm
+        prev = self._prev_handlers.get(int(signum))
         if callable(prev):
             prev(signum, frame)
 
-    def _restore_sigterm(self) -> None:
-        if self._prev_sigterm is not None:
-            with contextlib.suppress(ValueError, OSError):
-                signal.signal(signal.SIGTERM, self._prev_sigterm)  # type: ignore[arg-type]
-            self._prev_sigterm = None
+    def _restore_signals(self) -> None:
+        for signum, previous in list(self._prev_handlers.items()):
+            if previous is None:
+                # `getsignal` reports None for a handler installed from C, which
+                # `signal.signal` cannot take back — leave that one trapped rather than raise.
+                continue
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(signum, previous)  # type: ignore[arg-type]
+        self._prev_handlers.clear()
 
     @staticmethod
     def _safe_call(callback: Callable[[], None]) -> None:

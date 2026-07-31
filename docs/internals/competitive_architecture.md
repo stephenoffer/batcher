@@ -71,7 +71,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 | Single-node ≤10M rows | **W** | **W** | **W** | — | **W** | — |
 | Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5) | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
-| Optimizer breadth | = (302 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
+| Optimizer breadth | = (375 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
 | Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M) — ceiling 7 | — | — | — | — | — |
 | Learned/adaptive | **W** | **W** | **W** | — | **W** | = |
 | String execution | **L** (no StringView, dict decoded at leaf) | **L** | = | — | L | L |
@@ -369,9 +369,10 @@ tasks from executors (routinely 10k–100k tasks/stage), which is what buys dyna
 work stealing off a slow node, and fine-grained recovery. Batcher's coarse unit means a straggler's
 *entire* partition must be redone, and skew cannot be diluted by over-partitioning.
 
-Compounding it: **salting is off** (`skew_join_salt = 0`) and **locality is off**
-(`locality_aware_scheduling = False`). Out of the box, resilience is Ray task retries +
-single-stage lineage recompute + whole-query retry.
+Compounding it: **salting is off** (`skew_join_salt = 0`). Locality-aware reducer placement
+is now **on** (`locality_aware_scheduling = True`), which does not make the task unit finer —
+it only decides which node a coarse reducer runs on. Out of the box, resilience is Ray task
+retries + single-stage lineage recompute + whole-query retry.
 
 Speculation is **on** (`speculation_max_backups = 1`) — this section previously said it was off
 at `max_backups = 0`, which the config contradicts. The granularity argument above stands

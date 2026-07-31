@@ -814,8 +814,10 @@ def test_locality_aware_scheduling_equals_single_node():
     # Locality-aware reducer placement hosts each reducer where its bucket concentrates,
     # so its fetches become same-node hits. It is RESULT-PRESERVING — which actor runs a
     # reducer never changes the output — so the aggregate must equal single-node whether
-    # placement is on or off. (On a single-node test cluster the placement path is fully
-    # exercised: every bucket's data is on the one node, so affinity fires for each.)
+    # placement is on or off, which is what this asserts. On a single-node test cluster
+    # the decision itself short-circuits (every fetch is already same-node, so there is
+    # nothing to place); the decision is covered directly, on a multi-node fleet, by
+    # `tests/unit/test_reducer_host_locality.py`.
     from batcher.config import DistributedConfig
 
     t = _data()

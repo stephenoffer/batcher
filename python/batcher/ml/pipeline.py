@@ -56,7 +56,7 @@ class Stage:
     `num_gpus` is declared but **not yet consumed**: single-node execution ignores it,
     and the distributed scheduler (`dist/streaming/pipeline.py`) reads its resource
     class from the logical plan, not from this field. It is documented as a placement
-    hint in `docs/ml/model-serving-patterns.md`, so treat it as a promise the engine
+    hint in `docs/ml/training/model-serving-patterns.md`, so treat it as a promise the engine
     still owes rather than as a knob that does anything today.
 
     Examples:

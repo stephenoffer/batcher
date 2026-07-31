@@ -143,8 +143,6 @@ print(ds.group_by("status").agg({"amount": ["min", "max"]}).sort("status").to_py
 
 ## See also
 
-:::{seealso}
 - {doc}`differences`: the APIs Batcher deliberately does not have, and what to use instead.
-- {doc}`../user-guide/transformations`: the same verbs taught rather than tabulated.
-- {doc}`../user-guide/expressions`: the expression language the table above assumes.
-:::
+- {doc}`/user-guide/transform/transformations`: the same verbs taught rather than tabulated.
+- {doc}`/user-guide/transform/expressions`: the expression language the table above assumes.

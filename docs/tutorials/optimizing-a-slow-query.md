@@ -68,7 +68,7 @@ binary-floating-point tail.)
 
 Correct answer. Now find out what it cost.
 
-## 2. Ask the engine to profile it, and read what it cannot tell you
+## 2. Profile it, and read what is missing
 
 `ds.stats()` runs the query and reports what the engine *measured* per operator. A
 `map_batches` stage is measured too, so the bottleneck is named:
@@ -97,9 +97,9 @@ Two things follow, and both are costing you time:
   180,000 of them will immediately throw away.
 - **Every batch round-trips through Python.** Even an *identity* `map_batches` roughly halves
   throughput on a native pipeline. That is not a figure of speech. It is the measured
-  effect that made image ingest 2× slower until the re-type UDF was removed from the read
-  path, and you can read the whole story on the [multimodal ingest
-  benchmark](../benchmarks/multimodal-ingest.md).
+  effect that made image ingest 2x slower until the re-type UDF was removed from the read
+  path, and the whole story is on the {doc}`multimodal ingest benchmark
+  <../benchmarks/multimodal-ingest>`.
 
 ## 3. Say it as an expression instead
 
@@ -284,13 +284,13 @@ To diagnose any slow query, complete the following steps:
 :gutter: 3
 
 :::{grid-item-card} {octicon}`meter;1.1em` Performance and memory
-:link: ../user-guide/performance
+:link: /user-guide/operate/performance
 :link-type: doc
 Every tuning lever, with its default.
 :::
 
 :::{grid-item-card} {octicon}`code;1.1em` Expressions
-:link: ../user-guide/expressions
+:link: /user-guide/transform/expressions
 :link-type: doc
 What you can say without reaching for a UDF.
 :::
@@ -304,13 +304,13 @@ Where the engine is fast, and where it is not.
 
 ## See also
 
-- {doc}`Explain plans <../user-guide/explain-plans>`: every field in the output you just read.
-- {doc}`UDFs <../user-guide/udfs>`: when a `map_batches` *is* the right answer, and how to make
+- {doc}`Explain plans </user-guide/operate/explain-plans>`: every field in the output you just read.
+- {doc}`UDFs </user-guide/transform/udfs>`: when a `map_batches` *is* the right answer, and how to make
   it cost less.
-- {doc}`Caching <../user-guide/caching>`: what `cache()` stores, and when it is evicted.
-- {doc}`Adaptive re-optimization <../deep-dives/adaptive-reoptimization>`: the pipeline-breaker
+- {doc}`Caching </user-guide/operate/caching>`: what `cache()` stores, and when it is evicted.
+- {doc}`Adaptive re-optimization </deep-dives/adaptive/adaptive-reoptimization>`: the pipeline-breaker
   re-plan that step 6 relies on.
-- {doc}`JIT compilation <../deep-dives/jit-compilation>`: what `interp+jit` in the backend
+- {doc}`JIT compilation </deep-dives/query/jit-compilation>`: what `interp+jit` in the backend
   column actually means.
-- {doc}`Spilling <../deep-dives/spilling>`: what happens when the budget in step 8 binds.
-- {doc}`Troubleshooting <../user-guide/troubleshooting>`: the other failure modes.
+- {doc}`Spilling </deep-dives/memory/spilling>`: what happens when the budget in step 8 binds.
+- {doc}`Troubleshooting </user-guide/operate/troubleshooting>`: the other failure modes.

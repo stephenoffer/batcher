@@ -1,62 +1,30 @@
 # API reference
 
-The Batcher API is small and lazy: you build a `Dataset` from a source, transform it
-with expression-based operations, and execute it with a terminal operation that
-returns Arrow or writes to a sink. Everything reachable from `import batcher as bt`
-is documented here. There are three ways in:
+The API is small and lazy. A `Dataset` is a handle to a plan: you chain expression-based operations onto it, and nothing runs until a terminal call returns Arrow or writes to a sink. Everything reachable from `import batcher as bt` is documented here.
 
-::::{grid} 1 3 3 3
-:gutter: 3
+## Three ways in
 
-:::{grid-item-card} {octicon}`zap;1.1em` Quick reference
-:link: reference
-:link-type: doc
-A one-page cheat sheet of the common functions, methods, and patterns.
-:::
-
-:::{grid-item-card} {octicon}`book;1.1em` By area
-:link: dataset
-:link-type: doc
-Example-first pages for one surface at a time, starting with the `Dataset`.
-:::
-
-:::{grid-item-card} {octicon}`list-unordered;1.1em` Complete reference
-:link: complete
-:link-type: doc
-The backstop index: every symbol without an area page of its own.
-:::
-::::
-
-(by-area)=
+| Start with | When |
+|---|---|
+| {doc}`/api/reference` | You want the one-page cheat sheet of the calls you reach for most |
+| The area pages below | You want a runnable example plus the full surface for one area |
+| {doc}`/api/complete` | You want the backstop index of every symbol without an area page |
 
 ## By area
 
-These are the curated, example-first references, grouped the way you'd look something up. Each one leads with a runnable example and then enumerates the surface. {doc}`complete` is the backstop index for anything without a page of its own, and {doc}`reference` is the cheat sheet to keep open while you work.
-
-- {doc}`Dataset <dataset>`: build, transform, aggregate, join, and collect.
-- {doc}`Expressions <expressions>`: column math, predicates, operators, and window methods.
-- {doc}`Expression accessors <expression-accessors>`: every `.str`, `.dt`, `.list`, `.struct`, `.json`, `.map`, `.image`, `.audio`, and `.video` method.
-- {doc}`Functions <functions>`: scalar, horizontal, aggregate, and window functions.
-- {doc}`Metrics <metrics>`: scoring and statistical aggregates.
-- {doc}`Reading and writing <io>`: every reader and writer, with the optional extras.
-- {doc}`SQL <sql>`: the SQL surface and how it lowers to the DataFrame API.
-- {doc}`ML <ml>`: the `.ml` accessor, plus the LLM, serving, loader, and vector surfaces.
-- {doc}`Preprocessors <preprocessors>`: the fit/transform estimators and `Chain`.
-- {doc}`Models and evaluation <ml-models>`: tabular scoring, in-engine estimators, metrics.
-- {doc}`Statistics and validation <ml-statistics>`: drift, fairness, resampling, cross-validation.
-- {doc}`Governance <governance>`: row filters, column masks, grants, and lineage.
-- {doc}`Configuration <configuration>`: the tunables and how they're set.
-- {doc}`Errors <exceptions>`: the typed exceptions and what raises them.
+| Group | Pages | Covers |
+|---|---|---|
+| {doc}`/api/relational/index` | 6 | `Dataset`, expressions, accessors, functions, SQL, and IO |
+| {doc}`/api/models/index` | 5 | The `.ml` accessor, preprocessors, estimators, metrics, and statistics |
+| {doc}`/api/operations/index` | 3 | Configuration, governance, and the typed exceptions |
 
 ## See also
 
-:::{seealso}
-- {doc}`../user-guide/index`: the task-oriented guides these pages are the reference for.
-- {doc}`../getting-started/quickstart`: the shortest path to a running query.
-- {doc}`../migration/index`: the equivalent spelling if you know another engine's API.
-- {doc}`../configuration/options`: the field-by-field configuration reference.
-- {doc}`../agents/index`: the same surface packaged as instructions for a coding agent.
-:::
+- {doc}`/user-guide/index`: the task-oriented guides these pages are the reference for.
+- {doc}`/getting-started/quickstart`: the shortest path to a running query.
+- {doc}`/migration/index`: the equivalent spelling if you know another engine's API.
+- {doc}`/cookbook/index`: a runnable recipe for the call, when a signature is not enough.
+- {doc}`/agents/index`: the same surface packaged as instructions for a coding agent.
 
 ```{toctree}
 :hidden:
@@ -70,18 +38,7 @@ complete
 :hidden:
 :caption: By area
 
-dataset
-expressions
-expression-accessors
-functions
-metrics
-io
-sql
-ml
-preprocessors
-ml-models
-ml-statistics
-governance
-configuration
-exceptions
+relational/index
+models/index
+operations/index
 ```

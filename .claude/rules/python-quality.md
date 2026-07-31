@@ -79,7 +79,7 @@ expression API). Hold it to a higher bar:
   mention alone publishes no docstring); every public name is *taught* outside the
   generated reference (a user guide, tutorial, ML/configuration page, or a runnable
   script under `examples/`), because a name only an `autosummary` table knows about is
-  a name nobody discovers; and the expression reference page (`docs/api/expressions.md`)
+  a name nobody discovers; and the expression reference page (`docs/api/relational/expressions.md`)
   *enumerates every `Expr` method* — the fluent builder and every accessor namespace
   (`.str`/`.dt`/`.list`/`.struct`/`.json`/`.map`/`.image`/`.audio`/`.video`) — so the
   curated reference can't fall behind the surface. The `.. doctest::` examples are then

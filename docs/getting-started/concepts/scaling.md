@@ -5,7 +5,7 @@ is written exactly once, as a *mergeable* primitive: a `partial` step builds
 partition-local state, `combine` merges those states associatively, and `finalize`
 produces rows. `combine` is associative and commutative, so partials merge in any order.
 
-![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](../../_static/diagrams/mergeable.svg)
+![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](/_static/diagrams/mergeable.svg)
 
 That one implementation then serves a single core, many cores, and many machines. On
 many cores the parallel executor morselizes the input and merges the partials. On many
@@ -41,6 +41,6 @@ counts.collect(distributed=True)   # same plan, many machines, identical result
 
 ## See also
 
-- {doc}`../../user-guide/performance`: measuring and tuning before reaching for more machines.
-- {doc}`../../deep-dives/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
-- {doc}`../../integrations/ray`: running the distributed path on a real cluster.
+- {doc}`/user-guide/operate/performance`: measuring and tuning before reaching for more machines.
+- {doc}`/deep-dives/operators/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
+- {doc}`/integrations/compute/ray`: running the distributed path on a real cluster.

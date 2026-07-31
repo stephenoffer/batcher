@@ -15,11 +15,11 @@ batch.
 1. {doc}`Feature engineering <../tutorials/feature-engineering>`: build a model-ready
    feature matrix with fit/transform preprocessors.
 1. {doc}`ML overview <../ml/index>`: the accessor and its operations.
-1. {doc}`Inference <../ml/inference>`: `ds.ml.infer` and `ds.ml.embed`.
-1. {doc}`GPU execution <../ml/gpu>`: reserving and sharing GPUs.
-1. {doc}`PyTorch integration <../ml/pytorch>`.
-1. {doc}`Streaming <../ml/streaming>`: processing batches as a stream.
-1. {doc}`ML API reference <../api/ml>`.
+1. {doc}`Inference </ml/inference/inference>`: `ds.ml.infer` and `ds.ml.embed`.
+1. {doc}`GPU execution </ml/inference/gpu>`: reserving and sharing GPUs.
+1. {doc}`PyTorch integration </ml/inference/pytorch>`.
+1. {doc}`Streaming </ml/inference/streaming>`: processing batches as a stream.
+1. {doc}`ML API reference </api/models/ml>`.
 
 ## Example: map a function over batches
 
@@ -77,13 +77,13 @@ class Embedder:
 - `streaming_pipeline.py` sketches the shape of a streaming inference pipeline. It
   needs a broker to run.
 
-See also the {doc}`performance guide <../user-guide/performance>` for caching feature
-tables, and the {doc}`GPU guide <../ml/gpu>` for accelerator placement.
+See also the {doc}`performance guide </user-guide/operate/performance>` for caching feature
+tables, and the {doc}`GPU guide </ml/inference/gpu>` for accelerator placement.
 
 
 ## Recipes and deeper reading
 
-The {doc}`ML cookbook <../examples/ml/index>` covers the applied path: embeddings, batch
+The {doc}`ML cookbook </cookbook/ml/pipelines/index>` covers the applied path: embeddings, batch
 scoring, RAG indexes, feature pipelines, and the train/test leak you get for free from a
 naive random split.
 
@@ -91,25 +91,25 @@ naive random split.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`search;1.1em` Text embeddings
-:link: ../examples/ml/text-embeddings
+:link: /cookbook/ml/pipelines/text-embeddings
 :link-type: doc
 Encode a corpus, then retrieve from it.
 :::
 
 :::{grid-item-card} {octicon}`beaker;1.1em` LLM batch scoring
-:link: ../examples/ml/llm-batch-scoring
+:link: /cookbook/ml/pipelines/llm-batch-scoring
 :link-type: doc
 Structured output, and why the engine you pick barely matters.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.1em` Train/test split
-:link: ../examples/ml/train-test-split
+:link: /cookbook/ml/pipelines/train-test-split
 :link-type: doc
 The leak a naive random split hands you.
 :::
 
 :::{grid-item-card} {octicon}`zap;1.1em` GPU execution
-:link: ../deep-dives/gpu-execution
+:link: /deep-dives/distribution/gpu-execution
 :link-type: doc
 Why the device idles, and what stage-overlap does about it.
 :::
@@ -117,8 +117,8 @@ Why the device idles, and what stage-overlap does about it.
 
 :::{seealso}
 - {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: ten workload families, measured.
-- {doc}`PyTorch <../integrations/pytorch>` and {doc}`Hugging Face <../integrations/huggingface>`.
-- {doc}`Tensor columns <../deep-dives/tensor-columns>`: how an image becomes a column.
+- {doc}`PyTorch </integrations/compute/pytorch>` and {doc}`Hugging Face </integrations/compute/huggingface>`.
+- {doc}`Tensor columns </deep-dives/memory/tensor-columns>`: how an image becomes a column.
 :::
 
 
@@ -126,4 +126,4 @@ Why the device idles, and what stage-overlap does about it.
 
 - {doc}`data-scientist`: the analysis path that feeds this one.
 - {doc}`platform-engineer`: sizing, scheduling, and observability for the jobs you build.
-- {doc}`../examples/ml/index`: runnable versions of the pipelines above.
+- {doc}`/cookbook/ml/pipelines/index`: runnable versions of the pipelines above.

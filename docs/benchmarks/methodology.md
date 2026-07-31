@@ -97,4 +97,4 @@ marketing document, not a measurement.
   measurement.
 - {doc}`../internals/testing-strategy`: the same discipline applied to the
   engine itself, where DuckDB is the differential oracle.
-- {doc}`../user-guide/performance`: the levers you have on your own query.
+- {doc}`/user-guide/operate/performance`: the levers you have on your own query.

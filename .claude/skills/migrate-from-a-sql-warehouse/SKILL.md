@@ -245,7 +245,7 @@ so `batch_size` is the throughput knob that matters here.
 
 ## See also
 
-- `docs/user-guide/reading-data.md` and `docs/api/io.md` — the reader surface.
+- `docs/user-guide/moving-data/reading-data.md` and `docs/api/relational/io.md` — the reader surface.
 - `python/batcher/io/formats/sql/` — `uri.py` (scheme routing), `partition.py` (the
   cut-point invariant), `dbapi.py` (the PEP 249 fallback).
 - Skills: `read-and-write-data` (the IO boundary generally), `migrate-from-spark` (the rest

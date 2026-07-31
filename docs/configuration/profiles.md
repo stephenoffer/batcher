@@ -135,6 +135,38 @@ print(resilient_cluster.distributed.task_max_retries)
 # 4
 ```
 
+## Time-limited allocation
+
+On a batch scheduler your job is killed when its allocation ends, with no reclamation
+notice to poll. Batcher reads `SLURM_JOB_END_TIME` on its own, and any other launcher can
+export `BATCHER_DEADLINE_EPOCH_S` as Unix epoch seconds. Either one makes the job
+preemptible, which selects the `"spot"` profile automatically.
+
+`drain_lead_s` is the only knob worth tuning: it's how long before the deadline each
+worker stops taking new work and migrates its shuffle output to a survivor. Raise it when
+partitions are large enough that a migration takes longer than the two-minute default.
+
+```python
+base = Config()
+leased = base.replace(
+    distributed=dataclasses.replace(
+        base.distributed,
+        resilience="spot",  # implied by a detected deadline; explicit here
+        drain_lead_s=300.0,  # start migrating 5 min before the allocation ends
+    ),
+)
+
+print(leased.distributed.drain_lead_s)
+# 300.0
+```
+
+Submit the job with an early warning as well, so a lost clock or a shortened allocation
+still gets a signal:
+
+```bash
+sbatch --signal=B:USR1@300 --time=04:00:00 run_batcher.sh
+```
+
 ## Tuning the autoscale wait
 
 Out of the box the engine already fills the cluster. It runs one worker per node, gives each an even share of that node's cores, and scales the reducer count with the fan-out. On an autoscaling cluster it also waits, with a bound, for autoscaler-launched nodes before sizing the fan-out, so a big query runs on the grown cluster. That wait auto-enables when Batcher detects an autoscaling cluster, meaning Anyscale, a spot node, or `BATCHER_AUTOSCALE=1`. The recipe below only tunes it. Set `autoscale_wait_s=0` to opt out on a fixed cluster, or raise it when nodes boot slowly.
@@ -169,7 +201,7 @@ same object can be reused freely and combined by chaining `replace` calls. See
 - {doc}`options`: every configurable field, with its default and its unit.
 - {doc}`environment`: the same settings as `BATCHER_*` variables, and the precedence order
   when both are present.
-- {doc}`../user-guide/performance`: which of these knobs actually moves a slow query, and
+- {doc}`/user-guide/operate/performance`: which of these knobs actually moves a slow query, and
   in what order to try them.
-- {doc}`../integrations/ray`: attaching to a cluster, and what the `distributed.*` fields
+- {doc}`/integrations/compute/ray`: attaching to a cluster, and what the `distributed.*` fields
   above control once you are on one.

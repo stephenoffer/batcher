@@ -8,7 +8,7 @@ description: Take a working single-node Batcher pipeline onto a Ray cluster — 
 Scaling out is a **deployment change, not a rewrite**. The plan you already have runs
 unchanged; you flip one keyword. Everything here assumes the pipeline works and is correct on
 one node — fix it there first, because a distributed run is strictly harder to debug and the
-answer must be identical anyway. `docs/integrations/ray.md` is the canonical page.
+answer must be identical anyway. `docs/integrations/compute/ray.md` is the canonical page.
 
 ## Decide whether to distribute at all
 
@@ -168,7 +168,7 @@ advertises the Ray node IP, so open the node-to-node range rather than hunting a
 Four controls exist for a cluster whose scarce resource is accelerators rather than cores, all
 of them off or unbounded by default so a fleet that configures nothing behaves as before.
 `config.accelerator` is where they live (`docs/configuration/accelerator.md`), and
-`docs/user-guide/gpu-fleets.md` is the walkthrough.
+`docs/user-guide/operate/gpu-fleets.md` is the walkthrough.
 
 - **Power binds before slots.** `accelerator.energy.power_budget_watts` clamps GPU fan-out to
   what a rack can actually power — ten 700 W devices on a 10 kW circuit, not the sixteen its
@@ -249,10 +249,10 @@ distributed one.
 
 ## See also
 
-- `docs/integrations/ray.md`; `docs/architecture/{execution,fault-tolerance}.md`;
+- `docs/integrations/compute/ray.md`; `docs/architecture/{execution,fault-tolerance}.md`;
   `docs/configuration/options.md` (every knob named above).
 - `docs/deep-dives/{shuffle-flight,distributed-scheduling,credit-flow-control,spilling,mergeable-algebra}.md`.
-- `docs/user-guide/gpu-fleets.md` and `docs/configuration/accelerator.md` for a GPU fleet's
+- `docs/user-guide/operate/gpu-fleets.md` and `docs/configuration/accelerator.md` for a GPU fleet's
   power budget, fabric-aware placement, device health, and data residency.
 - `docs/benchmarks/{scaling,vs-spark}.md` — the Spark page is an architectural argument and
   publishes **no** head-to-head timings; do not quote it as a measurement.

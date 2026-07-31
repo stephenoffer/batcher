@@ -167,8 +167,6 @@ dicts, so a multi-epoch training loop streams the query in bounded memory.
 
 ## See also
 
-:::{seealso}
 - {doc}`transforming`: the verbs that run between the read and the write.
-- {doc}`../user-guide/reading-data`: the full reader reference, with cloud paths and globs.
-- {doc}`../user-guide/writing-data`: save modes, partitioning, and atomic writes.
-:::
+- {doc}`/user-guide/moving-data/reading-data`: the full reader reference, with cloud paths and globs.
+- {doc}`/user-guide/moving-data/writing-data`: save modes, partitioning, and atomic writes.

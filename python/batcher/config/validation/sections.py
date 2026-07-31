@@ -184,6 +184,10 @@ def _check_distributed_faults(d: DistributedConfig) -> None:
         f"distributed.placement_timeout_s must be positive, got {d.placement_timeout_s}",
     )
     _check(
+        d.cluster_connect_timeout_s >= 0,
+        f"distributed.cluster_connect_timeout_s must be >= 0, got {d.cluster_connect_timeout_s}",
+    )
+    _check(
         d.autoscale_wait_s >= 0 or d.autoscale_wait_s == AUTOSCALE_WAIT_AUTO,
         f"distributed.autoscale_wait_s must be >= 0 (or {AUTOSCALE_WAIT_AUTO} for auto), "
         f"got {d.autoscale_wait_s}",

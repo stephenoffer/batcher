@@ -42,12 +42,35 @@ class FlightFetchSplit:
     def schema(self) -> pa.Schema:
         return self.schema_
 
-    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
-        from batcher.carbonite.transfer.lifecycle import process_client
+    def affinity(self) -> str:
+        """The shuffle address holding this bucket — the worker that reads it for free.
 
-        # Pooled, so an adaptive stage re-reading this intermediate reuses the channel it
-        # already has to the holding actor rather than dialling it again per read.
-        batches = process_client().fetch(self.addr, str(self.ticket))
+        Consumed by the locality-aware split assignment
+        (`partition_io.affinity.balance_with_affinity`), which routes a bucket to the
+        worker already holding it so `read` takes the `DIRECT_MEMORY` path below.
+        """
+        return self.addr
+
+    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
+        from batcher.carbonite.transfer.lifecycle import local_session, process_client
+
+        # Fetch through this process's shuffle session when it has one, so the transfer
+        # mode is *selected* rather than assumed to be remote: a next-stage worker reading
+        # the bucket its own actor published gets it zero-copy out of the local store
+        # (`DIRECT_MEMORY`), a same-node peer's bucket comes over mmap'd shared memory, and
+        # only a genuinely remote one crosses the network. Going straight to the client
+        # made every cross-stage read a loopback gRPC round-trip, serializing bytes that
+        # were already in the reader's heap. The session also carries the shuffle token,
+        # so a secured (`shuffle_token`) fleet's intermediate is now readable from a
+        # worker at all.
+        session = local_session(self.addr)
+        if session is not None:
+            batches = session.fetch(self.addr, str(self.ticket))
+        else:
+            # No session in this process (the driver collecting an intermediate itself).
+            # Pooled, so an adaptive stage re-reading this intermediate reuses the channel
+            # it already has to the holding actor rather than dialling it again per read.
+            batches = process_client().fetch(self.addr, str(self.ticket))
         if projection is not None:
             batches = [b.select(projection) for b in batches]
         return batches

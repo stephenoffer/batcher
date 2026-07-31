@@ -263,8 +263,8 @@ assuming the port is wrong.
   mapping tables and `from_*`/`to_*` adapters.
 - `docs/benchmarks/vs-daft.md`, `docs/benchmarks/multimodal-ingest.md` — the measured
   comparison and the image/point-cloud pipelines.
-- `docs/api/ml.md`, `docs/ml/` — the inference, embedding, and training-feed surface.
-- `docs/user-guide/udfs.md` — when a UDF is justified and what it costs.
-- `docs/deep-dives/shuffle-flight.md`, `docs/deep-dives/mergeable-algebra.md` — why the
+- `docs/api/models/ml.md`, `docs/ml/` — the inference, embedding, and training-feed surface.
+- `docs/user-guide/transform/udfs.md` — when a UDF is justified and what it costs.
+- `docs/deep-dives/distribution/shuffle-flight.md`, `docs/deep-dives/operators/mergeable-algebra.md` — why the
   distributed result equals the single-node one, without the object store.
 - `/migrate-from-polars-or-pandas`, `/migrate-from-spark` — the sibling migration skills.

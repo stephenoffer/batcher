@@ -96,7 +96,7 @@ canonical spelling above — one obvious way per operation.
 Worth saying out loud when a user asks "why port at all":
 
 - **Adaptive re-optimization** — the plan is re-optimized at pipeline breakers on
-  *measured* cardinalities, not just estimates (`docs/deep-dives/adaptive-reoptimization.md`).
+  *measured* cardinalities, not just estimates (`docs/deep-dives/adaptive/adaptive-reoptimization.md`).
 - **The same code runs distributed** — `ds.collect(distributed=True)` uses the same
   mergeable `partial → combine → finalize` operators, so single-node and multi-node
   results are identical by construction.
@@ -116,7 +116,7 @@ Worth saying out loud when a user asks "why port at all":
    not insert `.collect()` between stages — that defeats the optimizer.
 4. **Move per-row Python into expressions.** `df.apply(...)` / a Python loop becomes an
    `Expr`. Only if the expression language genuinely has no answer, fall back to
-   `ds.map_batches(fn)` over Arrow batches (see `docs/user-guide/udfs.md`), declaring
+   `ds.map_batches(fn)` over Arrow batches (see `docs/user-guide/transform/udfs.md`), declaring
    `input_columns` and `output_columns`.
 5. **Fix the tail.** `ds.write.parquet(path)` / `ds.to_pandas()` at the boundary where
    downstream code still expects a DataFrame.
@@ -174,10 +174,10 @@ For a sorted query, compare `new.to_pylist()` against the oracle **in order**.
 ## See also
 
 - `docs/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
-- `docs/user-guide/expressions.md`, `docs/user-guide/expression-accessors.md`,
-  `docs/api/expressions.md` — the expression surface
+- `docs/user-guide/transform/expressions.md`, `docs/user-guide/transform/expression-accessors.md`,
+  `docs/api/relational/expressions.md` — the expression surface
   and every accessor namespace.
-- `docs/user-guide/udfs.md` — when a UDF is justified and what it costs.
-- `docs/user-guide/window-functions.md`, `docs/user-guide/transformations.md`.
+- `docs/user-guide/transform/udfs.md` — when a UDF is justified and what it costs.
+- `docs/user-guide/analyze/window-functions.md`, `docs/user-guide/transform/transformations.md`.
 - `docs/benchmarks/vs-polars.md` — where Batcher wins and where it does not.
 - `/migrate-from-daft` — the multimodal/ML-first sibling of this skill.

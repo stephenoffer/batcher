@@ -162,6 +162,86 @@ you set explicitly, so an explicit override beats the profile, and the profile b
 the default. A preemptible environment is auto-detected and switched to `"spot"` when
 `resilience` is left at `"default"`.
 
+## Draining before a node goes away
+
+Everything above is reactive. It notices a worker after the worker is already gone, and
+pays a recompute for the work that went with it. When the environment says in advance
+that a node is about to be taken away, Batcher instead migrates that worker's shuffle
+output to a survivor while the worker is still alive, which costs one copy rather than a
+full re-read of the source. Batcher checks three kinds of advance notice, because a given
+cluster offers only one of them:
+
+Cloud metadata answers on a spot instance. Batcher polls the AWS `instance-action`
+endpoint, the Google Cloud `preempted` flag, and Azure Scheduled Events, treating only
+`Preempt` and `Terminate` as reclamation so routine host maintenance doesn't migrate the
+fleet. The AWS probe presents an IMDSv2 session token, without which it is silently dead
+on any instance launched with `HttpTokens=required`.
+
+A signal arrives from an orchestrator. `SIGTERM` is what Kubernetes sends on eviction and
+what Slurm sends when a job hits its time limit. `SIGUSR1` is Slurm's early warning, sent
+ahead of the limit when the job was submitted with `--signal=B:USR1@120`. Batcher chains
+to whatever handler you already installed, so your own checkpoint hook still runs.
+
+A wall-clock deadline is simply known. This is the case a batch scheduler leaves you in:
+a Slurm allocation is not reclaimed with a notice, it just ends at a time fixed when the
+job was submitted, and every process in it is killed then. Batcher reads
+`SLURM_JOB_END_TIME` and begins draining `config.distributed.drain_lead_s` seconds
+before it. Because this is a local clock comparison it needs no metadata service, no
+signal, and no cooperation from the scheduler, which is what makes it work on an on-prem
+HPC cluster where the other two sources are silent.
+
+Any launcher that knows when its own lease expires gets the same behavior by exporting
+the deadline as Unix epoch seconds:
+
+```bash
+export BATCHER_DEADLINE_EPOCH_S=$(( $(date +%s) + 4 * 3600 ))
+```
+
+An allocation with a known deadline is treated as preemptible, so it selects the `"spot"`
+profile automatically. A Slurm job submitted with no time limit is not: Slurm exports a
+saturated sentinel rather than omitting the variable, and Batcher rejects a deadline more
+than a year out, so an unlimited job is left on the default budgets.
+
+Draining only changes *where* a partial result lives, never what it holds, so none of
+this changes a query's output.
+
+## Not scheduling onto capacity that is leaving
+
+A node the autoscaler is scaling in, or whose pod Kubernetes is evicting, stays alive and
+keeps advertising its full resources so the work already on it can finish. Sizing a *new*
+fleet onto it is what costs: the placement group reserves bundles on a node being removed,
+the actors land, and the shuffle pays a recompute for output that was never going to
+survive. Batcher reads Ray's drain list and excludes those nodes from every fan-out
+sizing, so a query mid scale-in is provisioned against the nodes that will still be there.
+
+It never narrows to nothing. If every remaining node is draining, the fleet is placed
+anyway, because running on capacity that is going away beats not running, and the recovery
+machinery above exists for exactly that case.
+
+## Waits under a deadline
+
+The scheduler waits in three places before any work happens: for the head to answer, for
+the autoscaler to deliver capacity, and for a placement group to become satisfiable. Each
+is bounded, and each bound was chosen for a cluster with no horizon, where waiting two
+minutes for capacity is free if the alternative is running under-provisioned.
+
+Under a lease it is not free, it is the entire remaining budget. A Slurm allocation with 90
+seconds left would spend 180 waiting for autoscaler nodes that arrive after the kill, and
+die having computed nothing. So when a deadline is known, each wait shrinks to the time
+actually left, minus `drain_lead_s` for the migration window. Giving up sooner falls back
+to running on the capacity already present, which is what these waits already do when the
+autoscaler stalls.
+
+A wait cut short this way records nothing about the cluster. Running out of time is a fact
+about the job, not about how far the autoscaler would have gone, and treating it as a
+learned capacity ceiling would make every later query in the process skip a wait it never
+actually probed.
+
+Being killed is also what leaks an autoscaler floor. `request_resources` is sticky and
+lives in the autoscaler rather than the driver, so a job killed before its teardown runs
+leaves the cluster pinned at full size with nothing running against it. The drain hook
+drops the floor, which is why it is armed for preemptible deployments.
+
 ## Shuffle-output replication
 
 Losing a mapper normally forces a recompute: re-read its source partition from object
@@ -191,6 +271,12 @@ overhead.
   raises it.
 - `speculation_max_backups` defaults to 0, so speculative execution is off until you
   turn it on or select the `"spot"` profile.
+- Draining runs only under the `"spot"` profile, so a stable cluster starts no monitor
+  and pays nothing. A preemptible or time-limited environment selects that profile
+  automatically, but a cluster whose signals Batcher can't see needs `BATCHER_SPOT=1`,
+  an exported `BATCHER_DEADLINE_EPOCH_S`, or an explicit `resilience="spot"`.
+- The signal traps need the main thread. A worker that can't install them, which is the
+  usual case inside a Ray actor, falls back to the metadata and deadline polls.
 
 ## See also
 

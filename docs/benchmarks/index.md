@@ -32,13 +32,13 @@ Hardware, correctness gating, and the commands to reproduce every number.
 
 ## The short version
 
-Batcher leads the classical analytics suites against DuckDB reading the same Arrow: 22 of 22 TPC-H at scale factor 1, 21 of 22 at scale factor 10, 42 of 43 ClickBench, and 5 of 5 JSON. Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
+Batcher leads the classical analytics suites against DuckDB reading the same Arrow: 22 of 22 TPC-H at scale factor 1, 21 of 22 at scale factor 10, 43 of 43 ClickBench, and 5 of 5 JSON. Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
 
 | Workload | Measured |
 |---|---|
 | **TPC-H sf1**, all 22 queries | vs DuckDB on the same Arrow: **won 22 of 22** |
 | **TPC-H sf10**, all 22 queries | vs DuckDB on the same Arrow: **won 21 of 22**, **1.89x** on the suite; vs Polars **2.26x** |
-| **ClickBench**, 43 queries | vs DuckDB on the same Arrow: **won 42 of 43**, 43/43 correct |
+| **ClickBench**, 43 queries | vs DuckDB on the same Arrow: **won 43 of 43**, 43/43 correct |
 | **Semi-structured JSON**, 5 queries | **3.6x to 12.5x** DuckDB, **11x to 100x** Polars |
 | **Operator mix**, 11 kernels | vs DuckDB on the same Arrow: **won 10 of 11** |
 | **Sort → top-N, window functions** | **5x to 50x** Polars |
@@ -56,7 +56,7 @@ Those rows were not all measured on the same machine, because the workload famil
 
 ## Where the wins come from
 
-**Execution over the same bytes.** DuckDB reading the identical zero-copy Arrow input is the like-for-like execution comparison, and Batcher wins every TPC-H query on it. A filtered count is 5x DuckDB because it fuses to a `count_if` over the one column the predicate touches and never materializes the rest.
+**Execution over the same bytes.** DuckDB reading the identical zero-copy Arrow input is the like-for-like execution comparison, and Batcher wins 22 of 22 TPC-H queries on it at sf1 and 21 of 22 at sf10. A filtered count is 5x DuckDB because it fuses to a `count_if` over the one column the predicate touches and never materializes the rest.
 
 **A control plane that answers what it can without scanning.** `count()` after a transform chain returns in 0.05 ms from Parquet footer statistics and plan-level reasoning. Seven ClickBench queries return in about 0.2 ms for the same reason. Those are excluded from the ranges above, so the headline reflects execution rather than planning.
 
@@ -153,10 +153,10 @@ The distributed runs, and a measured negative result.
 
 ## See also
 
-- {doc}`../user-guide/performance` for making your own query faster, with the levers these numbers come from.
-- {doc}`../deep-dives/morsel-parallelism` and {doc}`../deep-dives/jit-compilation` for the two mechanisms behind most of the operator wins.
-- {doc}`../deep-dives/mergeable-algebra` for why the distributed result is bit-identical to the single-node one.
-- {doc}`../deep-dives/adaptive-reoptimization` for the stage-boundary re-optimization and the cross-query learned-stats loop, which no number on this page captures.
+- {doc}`/user-guide/operate/performance` for making your own query faster, with the levers these numbers come from.
+- {doc}`/deep-dives/operators/morsel-parallelism` and {doc}`/deep-dives/query/jit-compilation` for the two mechanisms behind most of the operator wins.
+- {doc}`/deep-dives/operators/mergeable-algebra` for why the distributed result is bit-identical to the single-node one.
+- {doc}`/deep-dives/adaptive/adaptive-reoptimization` for the stage-boundary re-optimization and the cross-query learned-stats loop, which no number on this page captures.
 - {doc}`../tutorials/optimizing-a-slow-query` for the diagnosis loop.
 
 ```{toctree}

@@ -41,7 +41,7 @@ verbs carry over, and so do the save modes and `MERGE INTO`.
 :::
 
 :::{grid-item-card} {octicon}`database;1.1em` DuckDB and SQL
-:link: ../user-guide/sql
+:link: /user-guide/analyze/sql
 :link-type: doc
 The query itself often ports unchanged. `bt.sql(...)` builds the same plan the
 DataFrame verbs build, so you can mix the two.
@@ -135,12 +135,10 @@ same information as a dict.
 
 ## See also
 
-:::{seealso}
 - {doc}`../agents/index`: the migration skills, with the failure modes and the
   verification procedure.
 - {doc}`../user-guide/index`: the task-oriented guides for the API these pages map onto.
 - {doc}`../architecture/overview`: why a `Dataset` is lazy, and what runs where.
-:::
 
 ```{toctree}
 :hidden:

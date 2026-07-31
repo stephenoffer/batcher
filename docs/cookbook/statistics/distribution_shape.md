@@ -1,4 +1,4 @@
-# Is this column symmetric, skewed, or heavy-tailed?
+# Distribution shape
 
 Shape decides which summary is honest. On a skewed column the mean is not the typical value, and a normality-assuming test is not valid. These aggregates answer that question before you pick the summary rather than after someone questions the dashboard.
 
@@ -19,5 +19,5 @@ python examples/statistics/distribution_shape.py
 
 - {doc}`association`: how strongly does one column relate to another?
 - {doc}`quantiles_and_histograms`: quantiles, histograms, and the exact-versus-approximate trade.
-- {doc}`../../ml/statistics-and-drift`: the statistics surface in full, with drift and validation.
-- {doc}`../../api/ml-statistics`: the reference for every statistical function.
+- {doc}`/ml/evaluation/statistics-and-drift`: the statistics surface in full, with drift and validation.
+- {doc}`/api/models/ml-statistics`: the reference for every statistical function.

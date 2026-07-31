@@ -21,7 +21,7 @@ down because the design difference is specific and testable.
 | Measured distributed results | Real, but against {doc}`vs-daft`, not Spark. See {doc}`scaling`. |
 | API migration | Mapped verb by verb in the {doc}`../migration/index`. |
 
-## Adaptation: stage boundaries versus pipeline breakers
+## Adaptation granularity
 
 Spark's Adaptive Query Execution re-plans between stages. When a shuffle finishes, AQE reads
 the materialized shuffle statistics and can coalesce partitions, switch a sort-merge join to
@@ -89,9 +89,9 @@ triggers, watermarks, and output modes all mirror the Spark spelling. The
 - {doc}`scaling`: the distributed measurements that do exist.
 - {doc}`methodology`: what has to be true before a number is published.
 - {doc}`../architecture/optimization`: how breaker-level re-planning works.
-- {doc}`../deep-dives/adaptive-reoptimization`: the pipeline-breaker
+- {doc}`/deep-dives/adaptive/adaptive-reoptimization`: the pipeline-breaker
   mechanism, in detail.
-- {doc}`../deep-dives/learned-metadata`: the feedback that outlives the
+- {doc}`/deep-dives/adaptive/learned-metadata`: the feedback that outlives the
   query.
 - {doc}`../migration/index`: `Session`, SQL, triggers, watermarks, output
   modes, verb by verb.

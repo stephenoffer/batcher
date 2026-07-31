@@ -25,7 +25,7 @@ optimizer sees the whole thing at once.
 Chaining calls only grows the plan. The optimizer runs, and the engine executes, when
 you call a *terminal* operation.
 
-![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](../../_static/diagrams/lifecycle.svg)
+![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](/_static/diagrams/lifecycle.svg)
 
 The common terminals:
 
@@ -54,4 +54,4 @@ print(plan.explain())
 
 - {doc}`expressions`: what goes inside a plan once you have one.
 - {doc}`adaptive`: how a lazy plan gets re-planned on measured row counts.
-- {doc}`../../user-guide/explain-plans`: reading what the optimizer decided.
+- {doc}`/user-guide/operate/explain-plans`: reading what the optimizer decided.

@@ -30,7 +30,7 @@ from batcher.carbonite.transfer.server import ShuffleClient
 if TYPE_CHECKING:
     from batcher.carbonite.transfer.session import ShuffleSession
 
-__all__ = ["host_of", "process_client", "register_session"]
+__all__ = ["host_of", "local_session", "process_client", "register_session"]
 
 _shared_client: ShuffleClient | None = None
 # Guards the lazy build. A join reducer gathers its two sides on two threads, and both
@@ -79,6 +79,38 @@ def register_session(session: ShuffleSession) -> None:
     if not _atexit_registered:
         atexit.register(_drain_live_sessions)
         _atexit_registered = True
+
+
+def local_session(prefer_addr: str | None = None) -> ShuffleSession | None:
+    """A live `ShuffleSession` in this process, preferring the one serving `prefer_addr`.
+
+    A worker process holds exactly one session, but a *reader* of an already-published
+    partition (a next-stage scan of an intermediate left on the fleet) reaches the
+    transport through a `Split`, not through the session it happens to share a process
+    with — so without this it dials its own Flight server over loopback gRPC for bytes
+    already sitting in its heap. Handing it the session restores the mode selection:
+    `DIRECT_MEMORY` when this process published the bucket, `SHARED_MEMORY` when a peer
+    on this node did, `NETWORK` otherwise.
+
+    Any live session fetches *correctly* — `select_mode` compares the source address to
+    the session's own, so a non-matching one simply resolves to the remote path — but the
+    match is what makes the local fast path reachable and attributes the locality counters
+    to the session that actually served the bytes.
+
+    Args:
+        prefer_addr: The advertised address the caller is fetching from; a session serving
+            it is returned ahead of any other.
+
+    Returns:
+        A live session, or `None` in a process that has none (the driver).
+    """
+    fallback: ShuffleSession | None = None
+    for session in _live_sessions:
+        if prefer_addr and session.addr == prefer_addr:
+            return session
+        if fallback is None:
+            fallback = session
+    return fallback
 
 
 def host_of(addr: str) -> str:

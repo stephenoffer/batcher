@@ -23,7 +23,7 @@ the pipeline-and-breaker structure and the lazy API, and is the better place to 
 There is one set of operator semantics, exercised by three execution paths. The
 sequential interpreter is the oracle; the other two must agree with it.
 
-![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](../_static/diagrams/execution_tiers.svg)
+![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](/_static/diagrams/execution_tiers.svg)
 
 - **Tier-0 sequential** (`bc-interp`, `execute`) is the reference. It is simple,
   deterministic, and obviously correct, and every other path is tested against it.
@@ -58,7 +58,7 @@ is capped at the sequential path, and the failure surfaces at cluster scale as w
 results rather than as an error. CI asserts the invariant directly: single-node output
 must equal multi-worker output for every stateful operator. See
 {doc}`../architecture/execution` for why the algebra is shaped this way, and
-{doc}`../deep-dives/mergeable-algebra` for a worked example.
+{doc}`/deep-dives/operators/mergeable-algebra` for a worked example.
 
 ## The thresholds, and what they are called
 
@@ -156,8 +156,8 @@ assert ds.filter(bt.col("x") > 100).is_empty()
   which this page assumes.
 - {doc}`kyber`: query planning and the re-optimization loop.
 - {doc}`carbonite`: memory, spill, and flow control.
-- {doc}`../user-guide/metadata-shortcuts`: the metadata layer above, from the caller's
+- {doc}`/user-guide/analyze/metadata-shortcuts`: the metadata layer above, from the caller's
   side, with every terminal it covers.
 - {doc}`../configuration/options`: every execution knob.
-- {doc}`../deep-dives/query-lifecycle`: the same journey traced call by call.
-- {doc}`../deep-dives/morsel-parallelism`: how a morsel becomes a unit of scheduling.
+- {doc}`/deep-dives/query/query-lifecycle`: the same journey traced call by call.
+- {doc}`/deep-dives/operators/morsel-parallelism`: how a morsel becomes a unit of scheduling.

@@ -1,8 +1,8 @@
 # Learning paths
 
-Pick the path that matches your job. Each one is an ordered reading list with a few
-runnable examples dropped in. Follow it top to bottom and you land on the parts of
-Batcher your work actually uses.
+This section holds four ordered reading lists, one per role. Pick the path that matches your job, follow it top to bottom, and you land on the parts of Batcher your work actually uses.
+
+Each path is a sequence through the guides and examples, with a few runnable scripts dropped in, rather than new material of its own.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -34,12 +34,10 @@ Configure the engine, bound its memory, and keep it running under load.
 
 ## See also
 
-:::{seealso}
 - {doc}`../getting-started/index`: install and run a first query before starting a path.
 - {doc}`../user-guide/index`: the capability-by-capability reference each path points into.
-- {doc}`../examples/index`: runnable code for the workloads the paths describe.
+- {doc}`../cookbook/index`: runnable code for the workloads the paths describe.
 - {doc}`../migration/index`: start here instead if you are porting existing code.
-:::
 
 ```{toctree}
 :hidden:

@@ -164,6 +164,6 @@ python benchmarks/cluster/vs_ray_daft.py 10
 - {doc}`multimodal-ingest` for the image and point-cloud pipelines.
 - {doc}`scaling` for the full distributed cluster runs.
 - {doc}`vs-duckdb` for the same join gap against the other native engine.
-- {doc}`../deep-dives/join-algorithms` and {doc}`../deep-dives/morsel-parallelism` for the two mechanisms the loss lives in.
-- {doc}`../deep-dives/cost-model` for the build-side selection that took q3 from 7.7x to 3.8x.
-- {doc}`../user-guide/udfs` for why a per-batch Python callback costs what it costs.
+- {doc}`/deep-dives/operators/join-algorithms` and {doc}`/deep-dives/operators/morsel-parallelism` for the two mechanisms the loss lives in.
+- {doc}`/deep-dives/adaptive/cost-model` for the build-side selection that took q3 from 7.7x to 3.8x.
+- {doc}`/user-guide/transform/udfs` for why a per-batch Python callback costs what it costs.

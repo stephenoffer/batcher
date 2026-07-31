@@ -266,7 +266,7 @@ the benchmark from 634 ms to 4.9 ms.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`database;1.1em` Lakehouse guide
-:link: ../user-guide/lakehouse
+:link: /user-guide/moving-data/lakehouse
 :link-type: doc
 Iceberg, Hudi, SCD types, CDC feeds.
 :::
@@ -278,7 +278,7 @@ Make the bronze layer continuous.
 :::
 
 :::{grid-item-card} {octicon}`check;1.1em` Data quality
-:link: ../user-guide/data-quality
+:link: /user-guide/trust/data-quality
 :link-type: doc
 Validate and quarantine before you commit.
 :::
@@ -286,13 +286,13 @@ Validate and quarantine before you commit.
 
 ## See also
 
-- {doc}`Delta Lake integration <../integrations/delta-lake>` and
-  {doc}`Iceberg <../integrations/iceberg>`: the connectors underneath.
-- {doc}`Writing data <../user-guide/writing-data>`: every write mode, in one place.
+- {doc}`Delta Lake integration </integrations/lakehouse/delta-lake>` and
+  {doc}`Iceberg </integrations/lakehouse/iceberg>`: the connectors underneath.
+- {doc}`Writing data </user-guide/moving-data/writing-data>`: every write mode, in one place.
 - {doc}`vs DuckDB <../benchmarks/vs-duckdb>`: the file-skipping measurement, and the optimizer
   bug that used to break it.
-- {doc}`Partition backfill <../examples/data-engineering/partition-backfill>` and
-  {doc}`slowly changing dimensions <../examples/data-engineering/slowly-changing-dimensions>`:
+- {doc}`Partition backfill </cookbook/data-engineering/partition-backfill>` and
+  {doc}`slowly changing dimensions </cookbook/data-engineering/slowly-changing-dimensions>`:
   the recipes step 7 generalizes to.
-- {doc}`Governance <../user-guide/governance>`: row filters and column masks on the curated
+- {doc}`Governance </user-guide/trust/governance>`: row filters and column masks on the curated
   table.
