@@ -91,6 +91,11 @@ def feeder_cpus_for_device(ordinal: int = 0) -> tuple[int, ...]:
 def bind_host_threads_to_device(ordinal: int = 0) -> tuple[int, ...]:
     """Pin this process to the cores next to its device, where that is safe and possible.
 
+    **Call this before anything sizes itself.** The mask decides how wide every thread pool
+    in the process should be, and the probes that report it are memoized, so binding after
+    they have been read leaves the pools sized for a machine this process no longer has. A
+    change here therefore invalidates them.
+
     Idempotent and safe to call on every task: a process already bound to exactly the right
     set is left alone, and every failure path returns empty rather than raising. Turned off
     entirely by `accelerator.bind_host_to_device_numa`, for a deployment whose own scheduler
@@ -123,6 +128,14 @@ def bind_host_threads_to_device(ordinal: int = 0) -> tuple[int, ...]:
         setaffinity(0, set(cpus))
     except OSError:
         return ()
+    # Narrowing the mask changes what `available_cpu_count` and every probe derived from it
+    # should answer, and those are memoized for the process. Left stale, a worker bound to
+    # half a node's cores would keep sizing its thread pools to the whole node — which is the
+    # oversubscription those probes exist to prevent, reintroduced by the very call that was
+    # supposed to place the work well. Both engines re-read the mask on the next probe.
+    from batcher._internal.hardware import reset_hardware_probes
+
+    reset_hardware_probes()
     return cpus
 
 

@@ -302,3 +302,30 @@ def test_the_pool_reserves_against_the_neighbour_not_against_itself():
     assert pool.external_bytes[0] == 40 * gib  # accounting: total minus what we admitted
     pool.observe_external(0, 50 * gib, own_bytes=20 * gib)
     assert pool.external_bytes[0] == 30 * gib  # measured: total minus what we actually hold
+
+
+def test_binding_invalidates_the_probes_that_report_the_mask(monkeypatch, eight_devices):
+    # The hazard the ordering exists for: `available_cpu_count` is memoized, so a worker
+    # bound to half a node's cores would keep sizing its pools to the whole node — the
+    # oversubscription that probe exists to prevent, reintroduced by the call meant to place
+    # the work well.
+    reset_calls = []
+    monkeypatch.setattr(
+        "batcher._internal.hardware.reset_hardware_probes", lambda: reset_calls.append(1)
+    )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(96)))
+    monkeypatch.setattr(os, "sched_setaffinity", lambda pid, cpus: None)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
+    assert affinity.bind_host_threads_to_device() == tuple(range(48, 96))
+    assert reset_calls == [1]
+
+
+def test_a_worker_already_bound_does_not_invalidate_anything(monkeypatch, eight_devices):
+    # The second task on a worker must not throw away probes that are still correct.
+    monkeypatch.setattr(
+        "batcher._internal.hardware.reset_hardware_probes",
+        lambda: pytest.fail("re-probed without changing the mask"),
+    )
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(48, 96)))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6")
+    assert affinity.bind_host_threads_to_device() == tuple(range(48, 96))

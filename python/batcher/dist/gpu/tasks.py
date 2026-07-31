@@ -78,13 +78,15 @@ def _device() -> DfBackend:
     from batcher.carbonite.accel import bind_host_threads_to_device, prepare_device_memory
     from batcher.core.gpu_plan import DfBackend
 
-    prepare_device_memory()
-    # The worker's *host* half — the reader, the decoder, the staging buffer — belongs on the
-    # cores next to the device it feeds. Left alone on a two-socket node, half the workers land
-    # across the inter-socket link and pay for it twice per batch, at full device utilization
-    # and with nothing in the timings to say so. Refuses itself where the mapping is unreadable
-    # or the local core set is too small to decode in.
+    # Binding comes first, before anything in this process sizes itself. The worker's *host*
+    # half — the reader, the decoder, the staging buffer — belongs on the cores next to the
+    # device it feeds; left alone on a two-socket node, half the workers land across the
+    # inter-socket link and pay for it twice per batch, at full device utilization and with
+    # nothing in the timings to say so. Doing it after the allocator would leave every pool
+    # sized for the whole node while the process runs on half of it. Refuses itself where the
+    # mapping is unreadable or the local core set is too small to decode in.
     bind_host_threads_to_device()
+    prepare_device_memory()
     return DfBackend(cudf)
 
 
