@@ -20,6 +20,7 @@ pure.
 from __future__ import annotations
 
 import functools
+import threading
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from batcher.plan.logical import LogicalPlan
 
 __all__ = [
+    "SustainedUtilization",
     "actors_per_gpu_from_learned_vram",
     "autocast_call",
     "detect_backend",
@@ -1005,6 +1007,100 @@ def actors_per_gpu_from_learned_vram(
         return None
     usable = max(0.0, 1.0 - headroom)
     return max(1, int(usable / peak_vram_fraction))
+
+
+# --- Sustained utilization: the number the packing loop actually needs -------------------
+
+#: How often the background sampler reads the device. Fast enough to see the idle gaps
+#: between one batch's forward and the next (tens of ms on a real inference stage), cheap
+#: enough that the poll itself is noise — an NVML read is ~100 us.
+_UTIL_SAMPLE_INTERVAL_S = 0.05
+
+
+class SustainedUtilization:
+    """Time-weighted mean accelerator utilization across an actor's working window.
+
+    The adaptive loop asks "is this GPU being kept busy?", and the honest answer is a mean
+    over time. Sampling the device *right after a forward pass* — which is where the engine
+    used to take its one reading per batch — answers a different question: it samples at
+    precisely the instant the device is busiest, so it reports near-saturation for a stage
+    that is in fact idle most of the time.
+
+    That is not a small bias. Measured on a four-T4 ResNet-50 inference stage: the
+    post-forward reading peaked at **86%** while NVML sampled on a timer put the sustained
+    figure at **13%**. `recommend_num_gpus` packs a stage onto a fraction of a device only
+    below `_PACK_BELOW` (50%), so the peak reading kept every stage on a whole GPU each,
+    three quarters idle, and `recommend_inflight_depth` likewise stayed shallow — the two
+    levers that exist to fix a starved GPU were held shut by the measurement that was
+    supposed to open them.
+
+    So this samples on a daemon thread instead, and reports the mean over the window
+    **between the first call's start and the last call's end** — excluding the model load
+    before any work arrives and the idle tail after the last partition, neither of which the
+    scheduler can do anything about. The idle *between* calls is deliberately included: that
+    gap is the starvation this measurement exists to find.
+
+    Best-effort throughout: a device that reports no utilization (Apple MPS, Cloud TPU, CPU)
+    yields `None` and the caller keeps its declared request.
+    """
+
+    def __init__(self, interval_s: float = _UTIL_SAMPLE_INTERVAL_S) -> None:
+        self._interval = interval_s
+        self._sum = 0.0
+        self._n = 0
+        self._peak: float | None = None
+        self._window_start: tuple[float, int] | None = None
+        self._window_end: tuple[float, int] | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample_loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            util = sample_gpu_utilization()
+            if util is None:
+                continue
+            self._sum += util
+            self._n += 1
+            self._peak = util if self._peak is None else max(self._peak, util)
+
+    def begin_call(self) -> None:
+        """Mark the start of a unit of work; starts sampling on the first one."""
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+            self._thread.start()
+        if self._window_start is None:
+            self._window_start = (self._sum, self._n)
+
+    def end_call(self) -> None:
+        """Mark the end of a unit of work, closing the window at this instant."""
+        self._window_end = (self._sum, self._n)
+
+    def mean(self) -> float | None:
+        """Sustained utilization over the working window, or `None` if nothing was sampled."""
+        if self._window_start is None or self._window_end is None:
+            return None
+        samples = self._window_end[1] - self._window_start[1]
+        if samples <= 0:
+            # The whole stage finished inside one sampling interval, so there is no window to
+            # average. A single reading is still better than nothing for the packing decision.
+            return self._peak
+        return max(0.0, min(1.0, (self._window_end[0] - self._window_start[0]) / samples))
+
+    def peak(self) -> float | None:
+        """The highest single reading seen, or `None`."""
+        return self._peak
+
+    def close(self) -> None:
+        """Stop sampling and wait for the sampler to exit. Idempotent.
+
+        Joins rather than merely signalling, so a closed monitor cannot still be polling the
+        driver a moment later — which for a caller that swapped the probe out (a test, a
+        vendor fallback) means the swapped-in probe is what the thread was last using.
+        """
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=max(1.0, self._interval * 4))
 
 
 # --- Auto mixed-precision (the tensor-core ~2x hardware lever) ---------------------------

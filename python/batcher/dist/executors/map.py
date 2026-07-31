@@ -245,6 +245,30 @@ def _actor_inflight_depth() -> int:
     return max(1, min(_MAP_INFLIGHT_MAX, int(depth)))
 
 
+def _emptiest_actor(actors, slots: dict):
+    """The actor with the most free in-flight slots, or `None` when the pool is full.
+
+    Both actor-pool drivers used to take "the first actor with a free slot", which fills
+    actor 0 to its submit depth before actor 1 receives anything. Whenever the partition
+    count is at or below ``len(actors) x depth`` — the ordinary case for an inference stage,
+    whose partitions are few and wide — the tail of the pool never runs at all.
+
+    The deeper the submit-ahead, the worse it gets, and the depth is raised by exactly the
+    signal that means "this GPU is starved" (`recommend_inflight_depth`). So the lever meant
+    to keep one device fed took work away from the others: measured on four T4s with four
+    partitions, two GPUs sat at 0% at depth 2, and at depth 4 a single actor ran the whole
+    stage while three GPUs idled — at a throughput high enough to look healthy.
+
+    `max` returns the first of equal keys, so an idle pool fills round-robin (every actor
+    gets its first partition before any gets its second) and the depth still stacks once
+    every actor is busy, which is what it is for.
+    """
+    if not actors:
+        return None
+    actor = max(actors, key=lambda a: slots[a])
+    return actor if slots[actor] > 0 else None
+
+
 def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
     """Run `partitions` through a FIXED pool of `actors`, up to `depth` in flight per actor,
     preserving partition order.
@@ -268,7 +292,7 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
 
     def _assign() -> None:
         while pending:
-            actor = next((a for a in actors if slots[a] > 0), None)
+            actor = _emptiest_actor(actors, slots)
             if actor is None:
                 break
             idx = pending.popleft()
@@ -288,7 +312,13 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
 
 def _run_resident_pool(plan0, partitions, opts, size, registry):
     """Map `partitions` through the resident pool for `plan0` in `registry` (model loaded
-    once), preserving submission order. Returns ``(ordered_results, peak_gpu_util, peak_vram)``."""
+    once), preserving submission order.
+
+    Returns ``(ordered_results, gpu_util, peak_vram)``. The utilization is the *most loaded*
+    actor's **sustained** figure: packing keyed on the fleet mean would oversubscribe a device
+    that is already busy while its idle neighbours pull the average down, so the binding
+    device decides. VRAM stays the peak across actors, for the same capacity reason.
+    """
     import ray
 
     actors = _resident_pool_for(plan0, opts, size, registry)
@@ -1068,7 +1098,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write
 
     def _assign() -> None:
         while pending:
-            actor = next((a for a in actors if slots[a] > 0), None)
+            actor = _emptiest_actor(actors, slots)
             if actor is None:
                 break
             idx = pending.popleft()
@@ -1241,14 +1271,21 @@ class _MapActor:
         # Build the (class) UDFs locally, once — the model load happens here. The pool's
         # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
+        from batcher.ml.gpu import SustainedUtilization
+
         self._plan = _with_inference_workers(_prebuild_factories(plan0))
         self._write_spec = write_spec
-        self._gpu_util_max: float | None = None
         self._gpu_vram_max: float | None = None
+        # Sustained utilization, sampled on a timer for the actor's working window — NOT the
+        # post-forward reading this used to take. See `SustainedUtilization`: sampling right
+        # after a forward pass reads the device at its busiest, which reported 86% for a stage
+        # whose true sustained figure was 13%, and that is above every threshold the packing
+        # and submit-depth levers trigger on. The measurement held its own fix shut.
+        self._util = SustainedUtilization()
 
     def run(self, partition: dict, idx: int = 0):
         from batcher import core
-        from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
+        from batcher.ml.gpu import sample_gpu_vram_fraction
 
         # A LAZY source over the descriptor: the scan reads its splits (storage) / iterates
         # its shipped batches incrementally, so `stream_linear_chain` overlaps reading chunk
@@ -1257,9 +1294,12 @@ class _MapActor:
         source = _lazy_partition_source(partition)
         if source is None:
             return None
+        self._util.begin_call()
         out = core.execute_with_udfs(self._plan, [source])
-        # Sample GPU load + VRAM right after the forward pass (None on a GPU-less host).
-        self._observe_gpu(sample_gpu_utilization(), sample_gpu_vram_fraction())
+        self._util.end_call()
+        # VRAM stays a PEAK: it is a capacity constraint, and the largest footprint the run
+        # ever reached is what the next run must fit. Utilization is a rate, so it is a mean.
+        self._observe_gpu(sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
             return [] if self._write_spec is not None else None
         # Writing stage: this actor writes its own inference output straight to the sink and
@@ -1298,7 +1338,7 @@ class _MapActor:
         from batcher import core
         from batcher.carbonite.transfer.lifecycle import process_client
         from batcher.io.source import InMemorySource
-        from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
+        from batcher.ml.gpu import sample_gpu_vram_fraction
 
         # The *pooled* client, not the one-shot `server.fetch`. This runs once per morsel
         # on the GPU consumer of the streaming pipeline — the hottest fetch in the engine —
@@ -1309,20 +1349,29 @@ class _MapActor:
         rows = process_client().fetch(addr, str(ticket))
         if not rows:
             return None
+        self._util.begin_call()
         out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])
-        self._observe_gpu(sample_gpu_utilization(), sample_gpu_vram_fraction())
+        self._util.end_call()
+        self._observe_gpu(sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
             return None
         return out
 
-    def _observe_gpu(self, util: float | None, vram: float | None) -> None:
-        """Fold one post-forward GPU sample into this actor's running peaks (util + VRAM)."""
-        self._gpu_util_max = _max_opt(self._gpu_util_max, util)
+    def _observe_gpu(self, vram: float | None) -> None:
+        """Fold one post-forward VRAM sample into this actor's running peak."""
         self._gpu_vram_max = _max_opt(self._gpu_vram_max, vram)
 
     def gpu_stats(self) -> float | None:
-        """The peak GPU utilization this actor observed, or `None` if no GPU."""
-        return self._gpu_util_max
+        """This actor's **sustained** GPU utilization, or `None` if the device reports none.
+
+        A mean over the actor's working window, not the peak — that is the quantity
+        `recommend_num_gpus` and `recommend_inflight_depth` are defined against, and a peak
+        reading silently keeps both of them from ever firing (see `SustainedUtilization`).
+
+        Doubles as this pool's liveness probe (`_live_actors`), so it must stay cheap and
+        must never raise: it reads two accumulated counters.
+        """
+        return self._util.mean()
 
     def gpu_vram_stats(self) -> float | None:
         """The peak VRAM fraction this actor observed, or `None` if no GPU — the memory
