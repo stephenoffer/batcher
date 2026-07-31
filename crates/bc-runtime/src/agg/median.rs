@@ -410,8 +410,14 @@ pub(crate) fn finalize_mode(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> 
         idxs.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
         let (mut best_idx, mut best_len) = (idxs[0], 1usize);
         let (mut run_start, mut run_len) = (0usize, 1usize);
+        // One encoded-row read per element: the previous element's row was read on the
+        // previous iteration, and `idxs` is a permutation so neither index is sequential.
+        let mut prev = rows.row(idxs[0] as usize);
         for j in 1..idxs.len() {
-            if rows.row(idxs[j] as usize) == rows.row(idxs[j - 1] as usize) {
+            let cur = rows.row(idxs[j] as usize);
+            let same = cur == prev;
+            prev = cur;
+            if same {
                 run_len += 1;
             } else {
                 if run_len > best_len {
@@ -467,13 +473,18 @@ pub(crate) fn finalize_histogram(state: &ArrayRef) -> Result<ArrayRef, RuntimeEr
             let mut idxs: Vec<u32> = (start as u32..end as u32).collect();
             idxs.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
             let mut run_start = 0usize;
+            // The run's first element is re-read on every step of the run. It only changes
+            // when the run does, so hold it instead — one read per element rather than two.
+            let mut run_row = rows.row(idxs[0] as usize);
             for j in 1..=idxs.len() {
-                let breaks = j == idxs.len()
-                    || rows.row(idxs[j] as usize) != rows.row(idxs[run_start] as usize);
+                let breaks = j == idxs.len() || rows.row(idxs[j] as usize) != run_row;
                 if breaks {
                     key_idx.push(idxs[run_start]);
                     counts.push((j - run_start) as i64);
                     run_start = j;
+                    if j < idxs.len() {
+                        run_row = rows.row(idxs[j] as usize);
+                    }
                 }
             }
         }
