@@ -27,8 +27,20 @@ def build_udf_callable(fn: object) -> object:
     other callable is used directly. This is what lets a model load once per worker
     instead of once per batch — the GPU-inference pattern. Called once per worker
     (locally: once; distributed: once per actor).
+
+    This is also the last point before a model loads that Batcher still controls, which is
+    where the node's model cache has to be chosen: `huggingface_hub` fixes its cache path at
+    import, so a worker that has already loaded a model cannot be moved off the container
+    overlay afterwards. The call is memoized, self-limiting (it declines when an operator named
+    a cache, when the default one already holds weights, and when no local volume is mounted),
+    and returns without touching anything on a UDF that has nothing to do with models.
     """
-    return fn() if isinstance(fn, type) else fn
+    if not isinstance(fn, type):
+        return fn
+    from batcher._internal.site.model_cache import use_node_local_model_cache
+
+    use_node_local_model_cache()
+    return fn()
 
 
 def teardown_udf(built: object, op: MapBatches) -> None:
