@@ -33,6 +33,7 @@ import contextlib
 from collections import deque
 
 import pyarrow as pa
+import ray
 
 from batcher._internal.mathx import clamp
 from batcher.config import active_config
@@ -42,100 +43,15 @@ from batcher.dist.streaming.consumers import (
     record_consumer_feedback,
     take_consumer,
 )
+from batcher.dist.streaming.producers import ProducerActor, consumer_batch_rows
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
 __all__ = ["stream_distributed_pipeline"]
 
+
 # Ticket stage id for the CPU→GPU hand-off (stage 0 is the source; 1 is this channel).
 _STAGE_ID = 1
-
-
-try:
-    import ray
-
-    @ray.remote
-    class _ProducerActor:
-        """A CPU producer stage: streams a partition through its sub-plan and publishes
-        each output morsel on its node-local Flight server for the consumer to fetch.
-
-        The model/decoder (a class UDF) builds once here (`_prebuild_factories`), so a
-        load-once preprocess stage reuses it across partitions. The partition is
-        consumed one input batch at a time (`iter_partition_descriptor`) and each input
-        batch's mapped output is buffered and published morsel by morsel, so the
-        producer never materializes the whole partition — only one input chunk's output
-        plus the published-but-unreleased window. Only `(addr, ticket)` ever crosses
-        Ray; the batches move over credit-bounded Flight.
-        """
-
-        def __init__(self, plan0: LogicalPlan, credits: int) -> None:
-            from batcher.carbonite.transfer import ShuffleSession
-            from batcher.dist.executors.map import _prebuild_factories
-
-            self._plan = _prebuild_factories(plan0)
-            # Advertise the node's routable IP so a consumer on another host can dial
-            # this server (loopback would be unreachable cross-node).
-            host = ray.util.get_node_ip_address()
-            self.session = ShuffleSession(credits, advertise_host=host)
-            self._it = None  # iterator over the current partition's input batches
-            self._pending: deque = deque()  # mapped output morsels awaiting publish
-            self._peak = 0  # peak published-but-unreleased morsels (memory-bound probe)
-
-        def addr(self) -> str:
-            return self.session.addr
-
-        def open(self, partition: dict) -> str:
-            """Begin streaming `partition`: reset the per-partition input iterator and
-            output buffer. Returns this server's address."""
-            from batcher.dist.executors.partition_io import iter_partition_descriptor
-
-            self._it = iter_partition_descriptor(partition)
-            self._pending = deque()
-            return self.session.addr
-
-        def publish_next(self, ticket) -> bool:
-            """Publish the next output morsel under `ticket`; `False` when the partition
-            is exhausted. Holds only one input chunk's output at a time, so producer
-            memory is bounded by the chunk plus the unreleased window."""
-            batch = self._next_output()
-            if batch is None:
-                return False
-            self.session.publish(ticket, [batch])
-            self._peak = max(self._peak, self.session.partition_count)
-            return True
-
-        def _next_output(self):
-            """The next mapped output morsel, advancing the input stream as needed.
-
-            Running the CPU sub-plan over one input batch at a time yields exactly the
-            concatenation of the whole-partition result, because the stage is
-            breaker-free (only per-batch Filter/Project/MapBatches) — so this streams
-            without changing the result."""
-            from batcher import core
-            from batcher.io.source import InMemorySource
-
-            while not self._pending:
-                try:
-                    inp = next(self._it)
-                except StopIteration:
-                    return None
-                if inp.num_rows == 0:
-                    continue
-                self._pending.extend(core.execute_with_udfs(self._plan, [InMemorySource([inp])]))
-            return self._pending.popleft()
-
-        def release(self, ticket) -> None:
-            """Evict a published morsel once its consumer has fetched it — frees one
-            production credit and bounds the producer's resident output."""
-            self.session.release(ticket)
-
-        def peak_retained(self) -> int:
-            """Peak number of published-but-unreleased morsels this producer ever held
-            (a test probe for the production-window memory bound)."""
-            return self._peak
-
-except ImportError:  # pragma: no cover - ray optional
-    _ProducerActor = None  # type: ignore
 
 
 def stream_distributed_pipeline(
@@ -179,8 +95,12 @@ def stream_distributed_pipeline(
 
     consumer_cls = _MapActor.options(**gpu_opts) if gpu_opts else _MapActor
 
+    # The consumer's declared batch is what a published morsel must carry: one morsel is one
+    # model call, so a morsel below it is a small forward pass the consumer cannot re-group.
+    target_rows = consumer_batch_rows(gpu_stage.sub_plan)
+
     def _spawn_producer():
-        return _ProducerActor.remote(cpu_stage.sub_plan, credits)
+        return ProducerActor.remote(cpu_stage.sub_plan, credits, target_rows)
 
     def _spawn_consumer():
         return consumer_cls.remote(gpu_stage.sub_plan)

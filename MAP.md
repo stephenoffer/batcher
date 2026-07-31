@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1132 Python modules across 174 packages and 190 Rust files across 13 crates.
+Covering 1133 Python modules across 174 packages and 190 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -855,7 +855,8 @@ Distributed streaming heterogeneous execution — overlapped, resource-class sta
 |---|---|---|
 | `consumers.py` | 90 | The GPU consumer pool of the streaming pipeline: how many, and which one next. |
 | `microbatch.py` | 431 | A streaming micro-batch, run across the cluster — one epoch, one transaction. |
-| `pipeline.py` | 455 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
+| `pipeline.py` | 375 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
+| `producers.py` | 166 | The CPU producer stage of the streaming CPU-to-GPU pipeline. |
 
 ### `batcher/kyber/` — 3 · subsystem
 
