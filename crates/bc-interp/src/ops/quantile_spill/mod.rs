@@ -659,9 +659,12 @@ pub(crate) fn bounded_group_mode(
                 None
             };
             let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
+            // Same as the two passes above: compare the borrowed row, own only on a change,
+            // and resolve the `dyn Array` null buffer once instead of per row.
+            let vnulls = vcol.nulls();
             for i in 0..batch.num_rows() {
-                let group = grows.as_ref().map(|g| g.row(i).owned());
-                if !started || (n_keys > 0 && prev_group != group) {
+                let group = grows.as_ref().map(|g| g.row(i));
+                if !started || (n_keys > 0 && prev_group.as_ref().map(|p| p.row()) != group) {
                     if started {
                         // Close the previous group: fold its last run into `best`
                         // (strict `>` keeps the smaller value on a frequency tie),
@@ -672,7 +675,7 @@ pub(crate) fn bounded_group_mode(
                         winners.push(best_val.take().unwrap_or_else(|| null_row.clone()));
                     }
                     started = true;
-                    prev_group = group;
+                    prev_group = group.map(|r| r.owned());
                     cur_val = None;
                     cur_len = 0;
                     best_val = None;
@@ -681,16 +684,16 @@ pub(crate) fn bounded_group_mode(
                         firsts.push(i as u32);
                     }
                 }
-                if vcol.is_valid(i) {
-                    let vr = vrows.row(i).owned();
-                    if cur_val.as_ref() == Some(&vr) {
+                if vnulls.is_none_or(|n| n.is_valid(i)) {
+                    let vr = vrows.row(i);
+                    if cur_val.as_ref().map(|c| c.row()) == Some(vr) {
                         cur_len += 1;
                     } else {
                         if cur_len > best_len {
                             best_len = cur_len;
                             best_val = cur_val.take();
                         }
-                        cur_val = Some(vr);
+                        cur_val = Some(vr.owned());
                         cur_len = 1;
                     }
                 }
