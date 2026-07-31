@@ -51,13 +51,21 @@ def gpu_pci_addresses() -> tuple[str, ...]:
     query would silently attribute one board's NUMA node, host link, and degradation ratio to
     a different board. On a node of identical devices that answer even looks right.
 
+    On a host with no NVML the AMD devices are used instead, in the order the `amdgpu` driver
+    enumerates them, which is the order every index here already means on that host. Without
+    it an Instinct node had no addresses, so its NUMA homes, its nearest NICs, and every
+    renegotiated host link were invisible — the failure this whole module exists to catch,
+    skipped for a whole vendor.
+
     Returns:
-        Lowercased addresses with `""` where the driver did not publish one, empty when NVML
-        is unavailable.
+        Lowercased addresses with `""` where the driver did not publish one, empty when
+        neither vendor is readable.
     """
     nv = _nvml()
     if nv is None:
-        return ()
+        from batcher._internal.hardware.amd import amd_devices
+
+        return tuple(device.address.lower() for device in amd_devices())
     out: list[str] = []
     for index in range(_device_count(nv)):
         handle = _read(lambda i=index: nv.nvmlDeviceGetHandleByIndex(i), None)

@@ -91,6 +91,12 @@ def _add_amd_reading(row: dict, device) -> None:
         row["temperature_c"] = round(device.temperature_c, 1)
     if device.serial_number:
         row["serial_number"] = device.serial_number
+    if device.compute_partition:
+        # AMD's MIG. Reported unconditionally, like MIG, because it changes what every other
+        # figure on the row means: a CPX board presents eight slices, not one device.
+        row["partition"] = device.compute_partition
+        if device.memory_partition:
+            row["partition"] += f"/{device.memory_partition}"
     if device.uncorrectable_errors:
         row["ecc_uncorrected"] = device.uncorrectable_errors
     if device.memory_uncorrectable_errors:

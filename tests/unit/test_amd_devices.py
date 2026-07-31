@@ -396,3 +396,92 @@ def test_an_amd_fault_reaches_the_node_condition_gauge(drm):
 
     _card(drm, 0, ras={"umc": (0, 2)})
     assert _node_conditions()["faulted_devices"] >= 1
+
+
+def test_an_amd_board_s_host_link_is_visible_too(drm, monkeypatch, tmp_path):
+    # `device_links` joined NVML indices to PCI addresses, so on an Instinct node it had none
+    # and every NUMA home, nearest NIC, and renegotiated host link went unread — the exact
+    # failure that module exists to catch, skipped for a whole vendor.
+    from batcher._internal.hardware.fabric import device_links, pcie
+
+    # Sysfs makes `card0/device` a symlink into the PCI tree; the attributes live on the PCI
+    # device, and reading the address means resolving that link.
+    address = "0000:c1:00.0"
+    pci_device = tmp_path / "pci" / address
+    pci_device.mkdir(parents=True)
+    for name, value in (
+        ("vendor", "0x1002"),
+        ("product_name", "AMD Instinct MI300X"),
+        ("mem_info_vram_total", str(192 * (1 << 30))),
+        ("current_link_speed", "8.0 GT/s PCIe"),
+        ("max_link_speed", "32.0 GT/s PCIe"),
+        ("current_link_width", "16"),
+        ("max_link_width", "16"),
+        ("numa_node", "1"),
+    ):
+        (pci_device / name).write_text(f"{value}\n")
+    (drm / "card0").mkdir()
+    (drm / "card0" / "device").symlink_to(pci_device)
+
+    monkeypatch.setattr(pcie, "PCIE_SYSFS_ROOT", str(tmp_path / "pci"))
+    monkeypatch.setattr(device_links, "_nvml", lambda: None)
+    amdgpu.reset_amd_probe()
+
+    (device,) = amdgpu.amd_devices()
+    assert device.address == address, "the address comes from resolving the sysfs symlink"
+    assert device.name == "AMD Instinct MI300X"
+    assert device_links.gpu_pci_addresses() == (address,)
+    (link,) = device_links.device_pcie_links()
+    assert link.numa_node == 1
+    assert link.degraded is True, "gen3 negotiated in a gen5-capable slot"
+    assert 0.0 < link.degradation_ratio < 0.5
+
+
+def test_a_partitioned_board_says_so(drm):
+    # AMD's MIG. An MI300X in CPX presents eight logical devices with an eighth of the
+    # compute, so memory, occupancy and power on the row are a slice rather than a board.
+    _card(
+        drm,
+        0,
+        product_name="AMD Instinct MI300X",
+        current_compute_partition="CPX",
+        current_memory_partition="NPS4",
+    )
+    (device,) = amdgpu.amd_devices()
+    assert (device.compute_partition, device.memory_partition) == ("CPX", "NPS4")
+    assert device.partitioned is True
+
+
+def test_a_whole_board_is_not_partitioned(drm):
+    _card(drm, 0, current_compute_partition="SPX", current_memory_partition="NPS1")
+    (device,) = amdgpu.amd_devices()
+    assert device.compute_partition == "SPX"
+    assert device.partitioned is False, "SPX is the whole board, which is not a partitioning"
+
+
+def test_a_part_that_does_not_publish_a_partition_reports_unknown(drm):
+    _card(drm, 0, product_name="mi210")
+    (device,) = amdgpu.amd_devices()
+    assert (device.compute_partition, device.memory_partition) == ("", "")
+    assert device.partitioned is False, "unknown is not partitioned"
+
+
+def test_the_partition_reaches_the_report_row(drm, monkeypatch):
+    from batcher._internal import accelerators
+    from batcher.api.session.accelerators.rows import device_rows
+
+    _card(
+        drm,
+        0,
+        product_name="AMD Instinct MI300X",
+        mem_info_vram_total=str(24 * (1 << 30)),
+        current_compute_partition="CPX",
+        current_memory_partition="NPS4",
+    )
+    monkeypatch.setattr(accelerators, "_nvml_inventory", lambda: [])
+    accelerators._gpu_inventory_probe.cache_clear()
+    try:
+        (row,) = device_rows()
+    finally:
+        accelerators._gpu_inventory_probe.cache_clear()
+    assert row["partition"] == "CPX/NPS4"

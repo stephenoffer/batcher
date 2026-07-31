@@ -214,6 +214,11 @@ def _show_silent_faults(devices: list[dict]) -> None:
             print(f"gpu {row['index']}  memory repair pending: schedule a device reset")
         for finding in row.get("config", ()):
             print(f"gpu {row['index']}  {_CONFIG_ADVICE.get(finding, finding)}")
+        if row.get("partition"):
+            print(
+                f"gpu {row['index']}  partitioned as {row['partition']}:"
+                " every figure above is a slice, not the board"
+            )
         if row.get("mig_instances"):
             print(
                 f"gpu {row['index']}  partitioned into {row['mig_instances']} MIG instance(s):"

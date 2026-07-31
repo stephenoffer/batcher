@@ -23,6 +23,11 @@ root, and no device context:
 * `ras/*_err_count` — the RAS blocks' correctable and uncorrectable counts. An uncorrectable
   error in the memory controller block is AMD's equivalent of a double-bit ECC Xid, and it is
   the one signal here that should take a device out of service.
+* `current_compute_partition` / `current_memory_partition` — how the board is carved up. This
+  is AMD's MIG, and it matters for the same reason: an MI300X in `CPX` presents eight logical
+  devices with an eighth of the compute each, so every other figure on the row is a slice
+  rather than a board. Reported unconditionally when published, because partitioning is
+  usually deliberate and is never irrelevant.
 
 Two deliberate omissions. There is no attempt to read the XGMI fabric: the sysfs names for it
 have moved between kernel releases and a fabric figure that is wrong is worse than one that is
@@ -123,6 +128,9 @@ class AmdDevice:
         power_cap_watts: The cap the board is running under, which on a rented node is
             whatever the operator set and is frequently below the part's rating.
         ras: Per-block error counts, empty when the driver publishes no RAS tree.
+        compute_partition: How the compute is carved up (`"SPX"` whole-board, `"CPX"`
+            per-die), or `""` on a part or kernel that does not publish it.
+        memory_partition: How the memory is interleaved (`"NPS1"` through `"NPS8"`), or `""`.
     """
 
     index: int
@@ -139,6 +147,17 @@ class AmdDevice:
     power_watts: float = 0.0
     power_cap_watts: float = 0.0
     ras: tuple[RasCounts, ...] = field(default_factory=tuple)
+    compute_partition: str = ""
+    memory_partition: str = ""
+
+    @property
+    def partitioned(self) -> bool:
+        """Whether this board is presenting slices rather than itself.
+
+        `SPX` is the whole board and is not partitioning. Anything else published here is,
+        and a caller reading memory or occupancy off this row is reading a slice.
+        """
+        return bool(self.compute_partition) and self.compute_partition.upper() != "SPX"
 
     @property
     def memory_free_bytes(self) -> int:
@@ -289,6 +308,12 @@ def _probe() -> tuple[AmdDevice, ...]:
                     _read_int(os.path.join(hwmon, "power1_cap"), 1_000_000.0) if hwmon else 0.0
                 ),
                 ras=_ras_counts(device_dir),
+                compute_partition=_read_text(
+                    os.path.join(device_dir, "current_compute_partition")
+                ).upper(),
+                memory_partition=_read_text(
+                    os.path.join(device_dir, "current_memory_partition")
+                ).upper(),
             )
         )
     # Re-index so the numbering is dense over AMD cards, not over every DRM node. A host with
