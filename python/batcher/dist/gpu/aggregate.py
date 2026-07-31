@@ -21,13 +21,15 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.dist.gpu.fabric import adaptive_shard_factor
+from batcher.dist.gpu.shards import plan_shard_count, source_bytes
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
     from batcher.io.source import Source
 
-__all__ = ["merge_shards", "shard_descriptors", "sharded_gpu_aggregate"]
+__all__ = ["fold_shards", "merge_shards", "shard_descriptors", "sharded_gpu_aggregate"]
 
 
 def sharded_gpu_aggregate(
@@ -59,13 +61,42 @@ def sharded_gpu_aggregate(
     )
     if descriptors is None:
         return None
-    partials = _run_shards(descriptors, split.shard_ops)
+    partials = _run_shards(descriptors, split.shard_ops, _source_schema(source), gpu_count)
     if not partials:
         return None
-    return merge_shards(partials, [*split.merge_ops, *split.tail_ops])
+    return fold_shards(partials, split)
 
 
-def shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve_order: bool):
+def _fleet_throughputs() -> tuple[float, ...]:
+    """Rows per second per distinct device model in the fleet, from the learned statistics.
+
+    Per *model* rather than per device: that is the granularity the learner keys on, and it is
+    the one that matters — a fleet is uneven because it mixes an H100 with an L4, not because
+    two H100s differ. Empty on a fleet whose models are unknown or unmeasured, which every
+    consumer reads as "keep the configured shape".
+    """
+    try:
+        from batcher.core.runtime import default_hub
+        from batcher.dist.executors.ray_runtime.fabric import gpu_node_topology
+        from batcher.kyber.gpu.adaptive import learned_device_throughput
+
+        hub = default_hub()
+        models = {node.accelerator_type for node in gpu_node_topology() if node.accelerator_type}
+        rates = tuple(learned_device_throughput(hub, model) for model in sorted(models))
+    except Exception as exc:  # a sizing hint must never fail a fan-out
+        note_suppressed("dist", "read the fleet's measured device throughput", exc)
+        return ()
+    return tuple(r for r in rates if r > 0.0)
+
+
+def shard_descriptors(
+    source: Source,
+    gpu_count: int,
+    *,
+    sharded: bool,
+    preserve_order: bool,
+    projection: list[str] | None = None,
+):
     """One partition descriptor per shard, or `None` when the source cannot be fanned out.
 
     A shard reads itself from storage, so the driver never materializes the source to hand it
@@ -76,6 +107,11 @@ def shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve
     shard order: the shards have to *be* contiguous slices of the source for reassembling them
     to reproduce the single-node result. A fold does not care, and asking for ordering it does
     not need would only constrain how the source may be divided.
+
+    `projection` narrows what each shard reads to the columns the plan actually uses. It is the
+    difference between moving a fact table's sixteen columns onto a device and moving the four
+    the query names — off storage, across the host link, and as resident device memory the shard
+    is then sized against. `None` reads the relation as it is.
     """
     # Only Ray is optional here, so only Ray's import is tolerated. The batcher imports are
     # deliberately NOT in the `try`: they were, and when `_scan_splits` stopped being re-exported
@@ -101,15 +137,65 @@ def shard_descriptors(source: Source, gpu_count: int, *, sharded: bool, preserve
         # OOM on a large source), work load-balances finely across a heterogeneous fleet, and
         # a preempted shard's retry is 1/N of the work. Ray runs at most `gpu_count`
         # single-device tasks at once, so the surplus pipelines behind them.
-        factor = max(1, int(active_config().distributed.gpu_shard_oversubscribe))
-        n_shards = gpu_count * factor
+        # Divided more finely when the fleet's own measurements say its devices differ. Ray
+        # runs one task per device at a time, so an equal number of shards each means the
+        # stage ends when the slowest device ends and the fast ones idle from then on. A
+        # uniform (or unmeasured) fleet keeps exactly the configured factor.
+        #
+        # ...and then bounded by how much data there actually is. The factor above says how
+        # many shards a device *may* pipeline; it does not say that cutting them pays. Sized
+        # from the fleet alone, a 6M-row scan on sixteen devices became 64 tasks of a hundred
+        # thousand rows, each paying a worker dispatch, a cuDF first touch and a device
+        # allocator setup: TPC-H q6 at sf1 measured **196 s** that way against 0.12 s on the
+        # CPU engine, essentially all of it fixed cost. `plan_shard_count` keeps the fan-out
+        # wide where the data is wide and collapses it to one shard where it is not.
+        factor = adaptive_shard_factor(
+            int(active_config().distributed.gpu_shard_oversubscribe), _fleet_throughputs()
+        )
+        n_shards = min(
+            gpu_count * factor,
+            plan_shard_count(source_bytes(source, projection), gpu_count, _device_bytes()),
+        )
     else:
         n_shards = 1
     _ensure_ray(gpu_count)
-    return partition_descriptors(source, n_shards, preserve_order=preserve_order)
+    return partition_descriptors(
+        source, n_shards, projection=projection, preserve_order=preserve_order
+    )
 
 
-def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
+def _device_bytes() -> float:
+    """One device's usable memory, or `0.0` when the cluster will not say.
+
+    The *binding* device on a mixed fleet, since a shard sized for the largest one is a shard
+    the smallest cannot hold. `0.0` leaves `plan_shard_count` to size on granularity alone,
+    which is the bound that matters at small scale anyway.
+    """
+    from batcher.dist.executors.ray_runtime.accelerators import cluster_gpu_memory_gb
+
+    try:
+        gb = cluster_gpu_memory_gb()
+    except Exception as exc:
+        note_suppressed("dist", "read the fleet's device memory for shard sizing", exc)
+        return 0.0
+    return float(gb) * 1e9 if gb else 0.0
+
+
+def _source_schema(source: Source):
+    """The source's schema, or `None` when it cannot be read.
+
+    Only ever used to price the shards for packing, so a source that will not describe itself
+    costs the fan-out its fractional share and nothing else — the tasks then ask for whole
+    devices, which is what they always did.
+    """
+    try:
+        return source.schema()
+    except Exception as exc:
+        note_suppressed("dist", "read the source schema for gpu shard packing", exc)
+        return None
+
+
+def _run_shards(descriptors: list, shard_ops: list[dict], schema=None, gpu_count: int = 0) -> list:
     """Reduce every shard on a device, recovering from a failed one rather than the query.
 
     Uses the same straggler-backup barrier the CPU shuffle does: a shard is a pure function of
@@ -137,15 +223,30 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
 
     from batcher.carbonite.resilience import gather_with_backups
     from batcher.dist.executors.ray_runtime import engine_config_json, speculation_policy
+    from batcher.dist.gpu.resources import gpu_shard_options
     from batcher.dist.gpu.shards import ShardReport, is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import cpu_shard_partial, gpu_shard_partial, gpu_task_options
 
     dc = active_config().distributed
     cfg_json = engine_config_json()
-    gpu_task = ray.remote(**gpu_task_options())(gpu_shard_partial)
+    # The fan-out already cut these shards small on purpose. Asking for a whole device per shard
+    # then serializes them one per device, which is the cost the oversubscription was paying to
+    # avoid. A shard that turns out not to fit its share falls into the subdivision ladder below,
+    # so the packing can only make the run faster or make it subdivide — never make it fail.
+    opts, packing = gpu_shard_options(descriptors, schema, gpu_count=gpu_count)
+    gpu_task = ray.remote(**opts)(gpu_shard_partial)
+    # The *retry* of a shard that did not fit goes back with a whole device. Retrying it on the
+    # same share is the one combination with no argument for it: the share is the thing that was
+    # just shown to be too small, and the pieces would be divided against it again. Un-packing
+    # costs the co-tenancy for one shard's recovery and makes that recovery far more likely to
+    # be the last one. Identical to `gpu_task` when nothing was packed, so an unpacked fan-out
+    # builds no second handle.
+    retry_task = (
+        ray.remote(**gpu_task_options())(gpu_shard_partial) if packing.packed else gpu_task
+    )
     cpu_task = ray.remote(max_retries=int(dc.task_max_retries))(cpu_shard_partial)
 
-    report = ShardReport("gpu-chain", len(descriptors))
+    report = ShardReport("gpu-chain", len(descriptors), packing=packing)
 
     def _launch(i: int):
         return gpu_task.remote(descriptors[i], shard_ops)
@@ -157,9 +258,10 @@ def _run_shards(descriptors: list, shard_ops: list[dict]) -> list:
                 report.note_subdivided()
                 return run_subdivided(
                     descriptors[i],
-                    lambda d: ray.get(gpu_task.remote(d, shard_ops)),
+                    lambda d: ray.get(retry_task.remote(d, shard_ops)),
                     parts=int(dc.gpu_shard_subdivide),
                     rounds=int(dc.gpu_shard_subdivide_rounds),
+                    cause=exc,
                 )
             except Exception as sub_exc:
                 exc = sub_exc
@@ -223,3 +325,50 @@ def merge_shards(partials: list, ops: list[dict]) -> pa.Table:
 
     be = DfBackend(pd)
     return be.to_arrow(run_chain(combined, ops, be))
+
+
+def fold_shards(partials: list, split) -> pa.Table:
+    """Merge the shards' partials without ever holding all of them at once.
+
+    "Small by construction" is true of one partial and false of a thousand of them. The fan-out
+    bounds *device* memory by dividing the input; the merge then concatenates every shard's
+    output on the **driver** before a single row is combined, so a group-by over a million
+    groups fanned across a thousand shards materializes a billion rows in one process. That is
+    the same failure the sharding was built to avoid, moved to the host — and it arrives
+    precisely on the large multi-GPU clusters the fan-out exists for, because the shard count
+    grows with the fleet.
+
+    Folding in waves fixes it: combine `gpu_merge_wave` partials, keep the one result, drop the
+    wave. Peak driver memory becomes a function of the wave size and the number of distinct
+    groups, not of the shard count. It is *exact* rather than approximate because the fold is
+    associative and commutative over its own output — see `plan.distribution.recombine`, which
+    is the form that reads what the fold just wrote.
+
+    Args:
+        partials: Every shard's Arrow partial.
+        split: The `ShardSplit` the fan-out was built from.
+
+    Returns:
+        The merged result, identical to `merge_shards(partials, merge_ops + tail_ops)` for any
+        wave size.
+    """
+    from batcher.config import active_config
+
+    tail = [*split.merge_ops, *split.tail_ops]
+    wave = max(0, int(active_config().distributed.gpu_merge_wave))
+    if not split.foldable or wave < 2 or len(partials) <= wave:
+        return merge_shards(partials, tail)
+
+    # First wave: the combine reads the partial stage's private columns, so each wave of raw
+    # partials goes through `fold_ops`. Every wave after that reads results, so they go through
+    # `refold_ops`. Reversing the two is the one way this could be wrong, and it fails loudly
+    # (a missing column) rather than quietly.
+    folded = [merge_shards(chunk, split.fold_ops) for chunk in _waves(partials, wave)]
+    while len(folded) > 1:
+        folded = [merge_shards(chunk, split.refold_ops) for chunk in _waves(folded, wave)]
+    return merge_shards(folded, [*split.finalize_ops, *split.tail_ops])
+
+
+def _waves(items: list, size: int) -> list[list]:
+    """`items` in contiguous groups of at most `size`."""
+    return [items[i : i + size] for i in range(0, len(items), size)]

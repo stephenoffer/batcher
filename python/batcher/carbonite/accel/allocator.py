@@ -108,7 +108,8 @@ def plan_allocator(cfg, usable_bytes: int) -> AllocatorPlan:
 
             >>> from batcher.config import DeviceMemoryConfig
             >>> from batcher.carbonite.accel import plan_allocator
-            >>> plan_allocator(DeviceMemoryConfig(), 40 << 30).is_inert
+            >>> bare = DeviceMemoryConfig(allocator="default", statistics=False)
+            >>> plan_allocator(bare, 40 << 30).is_inert
             True
             >>> pooled = DeviceMemoryConfig(allocator="pool")
             >>> plan_allocator(pooled, 40 << 30).initial_bytes >> 30
@@ -267,15 +268,27 @@ def _peak_bytes() -> int:
         return 0
 
 
-def prepare_device_memory() -> bool:
-    """Configure this worker's device allocator from the active config and its own device.
+def prepare_device_memory(*, tenants: int = 1) -> bool:
+    """Configure this worker's device allocators from the active config and its own device.
 
     The one call a GPU task body makes. It measures the device this process can actually see
     rather than taking the driver's word for the fleet, sizes the pool through a `VramPool` so
     the headroom matches what admission already reserved, and applies the plan once.
 
+    Configures **both** allocators a GPU worker can end up allocating through, because a
+    process routinely uses both and they fail differently: RAPIDS/RMM for the relational
+    kernels, and PyTorch's caching allocator for anything running a model. Only the first was
+    configured, so an inference stage — the workload that spends the most of a device — got
+    none of this and kept PyTorch's fragmentation-prone defaults.
+
+    Args:
+        tenants: Processes packed onto this worker's device (the fractional `num_gpus`
+            denominator). It divides the per-process memory cap, so four actors sharing a
+            board are each capped at roughly a quarter of it rather than each believing they
+            may address the whole thing.
+
     Returns:
-        True when this process is now running on a configured allocator.
+        True when this process is now running on at least one configured allocator.
 
     Examples:
         .. doctest::
@@ -284,11 +297,26 @@ def prepare_device_memory() -> bool:
             >>> prepare_device_memory()  # no device on this host, so nothing to configure
             False
     """
+    from batcher.carbonite.accel.device import configure_torch_allocator, plan_torch_allocator
     from batcher.config import active_config
+
+    # Already configured: say so without re-measuring. `configure_device_memory` is idempotent
+    # and returns early, but only *after* this function has priced the device — a call into
+    # NVML for the inventory, one for the live telemetry, and one for this process's own share.
+    # Measured on a T4 worker serving shard after shard, that is **414 ms every shard**, spent
+    # re-deriving a pool that was built once and cannot be rebuilt. It went unnoticed while Ray
+    # tore the worker down between tasks and the answer genuinely was different each time; with
+    # `max_calls=0` it became the largest per-shard cost left.
+    settled = _applied
+    if settled is not None:
+        return settled.allocator != "default" or settled.statistics or settled.spill_to_host
 
     cfg = active_config().accelerator
     plan = plan_allocator(cfg.memory, _visible_device_usable_bytes(cfg.vram_headroom))
-    return configure_device_memory(plan)
+    applied = configure_device_memory(plan)
+    # Deliberately not short-circuited: an RMM plan that was inert (the default) must not stop
+    # the PyTorch allocator from being configured, since the two govern different callers.
+    return configure_torch_allocator(plan_torch_allocator(cfg, tenants=tenants)) or applied
 
 
 def _visible_device_usable_bytes(headroom: float) -> int:
@@ -299,6 +327,7 @@ def _visible_device_usable_bytes(headroom: float) -> int:
     out of a device it does not have to itself.
     """
     from batcher._internal.accelerators import gpu_inventory
+    from batcher._internal.hardware.devices import current_physical_index
     from batcher._internal.hardware.nvml import device_telemetry, own_device_memory
     from batcher.carbonite.accel.vram import VramPool
 
@@ -311,21 +340,28 @@ def _visible_device_usable_bytes(headroom: float) -> int:
     # tenancy is unpublished, which is the sizing this pool has always done.
     from batcher.carbonite.accel.affinity import mps_client_share
 
-    pool = VramPool(
-        capacity_bytes=int(devices[0].get("memory_bytes", 0) or 0),
-        headroom=headroom,
-        share=mps_client_share(),
-    )
+    # The device this worker is *bound to*, not physical 0. Sizing a pool from device 0's
+    # capacity and device 0's residency, then reserving it on device 3, is wrong in both terms
+    # at once: the wrong capacity on a mixed node, and a co-tenant's footprint read off a board
+    # nobody involved is using. It was invisible on a one-GPU host and wrong on every node the
+    # engine is meant to run on.
+    bound = current_physical_index()
+    telemetry = {t.index: t for t in device_telemetry()}
+    index = bound if bound is not None and bound in telemetry else 0
+    capacity = telemetry[index].memory_total_bytes if index in telemetry else 0
+    if not capacity:  # no live telemetry — fall back to the static inventory's first device
+        capacity = int(devices[0].get("memory_bytes", 0) or 0)
+    pool = VramPool(capacity_bytes=capacity, headroom=headroom, share=mps_client_share())
     if not pool.capacity_bytes:
         return 0
-    for telemetry in device_telemetry()[:1]:
+    if index in telemetry:
         # Measured rather than accounted where the driver will attribute it: what this
         # process holds is not what this pool admitted, and on a shared device the
         # difference is charged to the co-tenant.
         pool.observe_external(
             0,
-            int(telemetry.memory_used_bytes),
-            own_bytes=own_device_memory(telemetry.index),
+            int(telemetry[index].memory_used_bytes),
+            own_bytes=own_device_memory(index),
         )
     return pool.usable_bytes(0)
 

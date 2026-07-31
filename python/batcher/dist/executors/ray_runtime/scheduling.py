@@ -325,6 +325,56 @@ def _report_collective_fabric(workers: int, env: SchedulingEnvelope | None) -> N
         note_suppressed("dist", "report collective fabric", exc)
 
 
+def _collective_bundles(
+    workers: int, env: SchedulingEnvelope | None, node_class: dict
+) -> list[dict] | None:
+    """The fabric-aware bundle layout for a GPU collective, or `None` to use uniform bundles.
+
+    `plan_collective` already knew how to lay a collective out — inside one coherent domain
+    where it fits, filling the largest domain first where it does not, and skipping nodes a
+    residency rule or a power-zone budget has excluded. It had no caller: this path built
+    `workers` identical bundles and left every one of those constraints to be discovered by
+    the placement failing or by the stage running slowly.
+
+    Its bundles carry devices, not worker slots, so they are only usable when the two agree —
+    one device per worker. A stage that packs several workers onto a device, or asks for
+    several devices each, keeps the uniform layout rather than being reshaped into a gang of a
+    different width. The node-class resources are merged in either way, since a CPU-only
+    restriction that lives outside the bundle reserves nothing.
+
+    Args:
+        workers: Bundles being reserved.
+        env: The scheduling envelope, or `None`.
+        node_class: Precomputed node-class bundle resources.
+
+    Returns:
+        The bundles, or `None` when this is not a collective, the plan produced none, or the
+        stage's device-per-worker shape is not the one the plan describes.
+    """
+    if env is None or not env.gpu_collective or workers <= 1 or env.num_gpus != 1:
+        return None
+    try:
+        from batcher.dist.executors.ray_runtime.fabric import plan_collective
+
+        placement = plan_collective(workers, cpus_per_device=max(env.num_cpus, 1.0))
+    except Exception as exc:  # pragma: no cover - a placement hint never fails a placement
+        note_suppressed("dist", "plan the collective's bundle layout", exc)
+        return None
+    if not placement.bundles or sum(b.get("GPU", 0.0) for b in placement.bundles) != workers:
+        # A short plan means the fleet cannot host the collective. Reserving the *partial* gang
+        # it describes would succeed and then hang the stage on a world size it never gets, so
+        # the uniform request is made instead and Ray's own pending path reports it.
+        return None
+    bundles = [dict(b) for b in placement.bundles]
+    if node_class:
+        for bundle in bundles:
+            bundle.update(node_class)
+    if env.memory_bytes > 0:
+        for bundle in bundles:
+            bundle["memory"] = int(env.memory_bytes * bundle.get("GPU", 1.0))
+    return bundles
+
+
 def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     """Gang-schedule a placement group of `workers` bundles across nodes.
 
@@ -348,7 +398,10 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     node_class = _fleet_node_class_resources(env)
     strategy = _resolve_placement_strategy(env, workers)
     _report_collective_fabric(workers, env)
-    pg = placement_group([_bundle(env, node_class) for _ in range(workers)], strategy=strategy)
+    bundles = _collective_bundles(workers, env, node_class) or [
+        _bundle(env, node_class) for _ in range(workers)
+    ]
+    pg = placement_group(bundles, strategy=strategy)
     ready, _ = ray.wait([pg.ready()], timeout=_placement_timeout_s())
     if not ready:
         with contextlib.suppress(Exception):

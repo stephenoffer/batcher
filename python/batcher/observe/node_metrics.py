@@ -112,6 +112,11 @@ NODE_CONDITION_HELP = {
     "nvlink_down_devices": "Devices with one or more NVLink links not up",
     "fabric_errors": "Summed RDMA port error counters on this node",
     "fabric_ports_down": "Cabled RDMA ports that are not carrying traffic",
+    "throttled_devices": "Devices whose clocks the driver is currently clamping",
+    "transfer_bound_devices": "Devices whose host link is saturated while their SMs are not",
+    "power_capped_devices": "Devices an operator has capped below their default power limit",
+    "bar1_pressured_devices": "Devices whose host-mappable aperture is close to exhausted",
+    "clock_limited_devices": "Devices held below their clock ceiling, transiently or by pinning",
 }
 
 
@@ -158,4 +163,52 @@ def node_conditions() -> dict[str, int]:
         out["fabric_ports_down"] = max(0, int(rdma["ports"]) - int(rdma["active_ports"]))
     except Exception as exc:  # pragma: no cover - a scrape must never fail a process
         note_suppressed("observe", "read the node's hardware conditions", exc)
+    out.update(_device_state_conditions())
+    return out
+
+
+def _device_state_conditions() -> dict[str, int]:
+    """The five conditions read from the deep NVML detail, all zero when it is unreadable.
+
+    Held apart from the block above so one unreadable source cannot zero the other's counts:
+    the `/sys` fabric probes and NVML's per-device queries fail independently and for different
+    reasons, and a container that mounts one without the other is the normal case rather than
+    an odd one.
+
+    Each of these is a *state* rather than an event, and each is invisible to every existing
+    series: a clamped device, a saturated host link, a board capped below its default, an
+    exhausted mapping aperture, and a clock held below its ceiling all leave every query
+    correct and the node a fraction as fast.
+    """
+    out = {
+        "throttled_devices": 0,
+        "transfer_bound_devices": 0,
+        "power_capped_devices": 0,
+        "bar1_pressured_devices": 0,
+        "clock_limited_devices": 0,
+    }
+    try:
+        from batcher._internal.hardware.nvml import throttled_devices
+        from batcher._internal.hardware.telemetry.clocks import clock_limited_devices
+        from batcher._internal.hardware.telemetry.energy import capped_below_default
+        from batcher._internal.hardware.telemetry.memory import bar1_pressured_devices
+        from batcher._internal.hardware.telemetry.throughput import transfer_bound_devices
+
+        out["throttled_devices"] = len(throttled_devices())
+        out["transfer_bound_devices"] = len(transfer_bound_devices())
+        out["power_capped_devices"] = len(capped_below_default())
+        out["bar1_pressured_devices"] = len(bar1_pressured_devices())
+        out["clock_limited_devices"] = len(clock_limited_devices())
+    except Exception as exc:  # pragma: no cover - a scrape must never fail a process
+        note_suppressed("observe", "read the node's device state conditions", exc)
+    try:
+        from batcher._internal.hardware.amd import throttled_amd_devices, visible_vram_pressured
+
+        # Both vendors in one gauge, as `faulted_devices` already does. A fleet does not want
+        # two alerts for "a device is clamped", and NVML reports nothing at all on the AMD half
+        # of a mixed host. Added rather than replaced, because a mixed host has both.
+        out["throttled_devices"] += len(throttled_amd_devices())
+        out["bar1_pressured_devices"] += len(visible_vram_pressured())
+    except Exception as exc:  # pragma: no cover - a scrape must never fail a process
+        note_suppressed("observe", "read the node's AMD device state conditions", exc)
     return out

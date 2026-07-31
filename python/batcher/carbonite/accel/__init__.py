@@ -1,23 +1,20 @@
 """Accelerator resource management: device memory, partitioning, KV cache, and health.
 
 Carbonite protects a run from the resources it does not have. On a GPU fleet the scarcest of
-those is device memory — 80 GiB with no swap behind it and a failure mode that kills a worker
-rather than degrading it — and the second scarcest is a healthy device.
-
-Eight modules, one question each:
+those is device memory, with no swap behind it and a failure mode that kills a worker rather
+than degrading it; the second scarcest is a healthy device. Nine modules, one question each:
 
 * `vram` — device memory as a pool: reserve, release, headroom, and what another tenant is
-  already holding, the binding figure when sizing a stage on a shared device.
-* `allocator` — how the allocations `vram` admitted are actually served: a suballocated pool
-  in front of the driver, host spilling, and the measured high-water mark.
+  already holding, the binding figure when sizing a stage on a shared device. `allocator` —
+  how those admitted allocations are served: a suballocated pool in front of the driver, host
+  spilling, and the measured high-water mark.
 * `mig` — partitioning one device into isolated instances, so a small model stops holding a
-  large device.
-* `kv_cache` — the LLM cache budget that actually sets an inference stage's concurrency.
-* `health` — turning live telemetry into a schedule/derate/quarantine verdict, and
-  `amd_health` — the same verdict for a vendor NVML cannot see.
+  large device. `kv_cache` — the LLM cache budget that sets an inference stage's concurrency,
+  and `parallelism` — how to spread a model too large for one device, and what that costs.
+* `health` — live telemetry as a schedule/derate/quarantine verdict, and `amd_health` — the
+  same verdict for a vendor NVML cannot see.
 * `power` — the deployment's power envelope as an admission decision, with a counter-offer.
-* `affinity` — putting a device's host-side work on the cores next to it, and noticing when
-  the device is shared with another process rather than this one's alone.
+  `affinity` — putting a device's host-side work on the cores next to it.
 
 Nothing here allocates device memory or touches a tensor: these are the control-plane
 decisions, and the framework doing the allocating carries them out.
@@ -70,6 +67,7 @@ from batcher.carbonite.accel.mig import (
     mig_supported,
     smallest_profile_for,
 )
+from batcher.carbonite.accel.parallelism import ParallelPlan, plan_parallelism
 from batcher.carbonite.accel.power import (
     devices_within_budget,
     validate_fleet_power,
@@ -86,6 +84,7 @@ __all__ = [
     "KvCacheBudget",
     "MigPlan",
     "MigProfile",
+    "ParallelPlan",
     "VramPool",
     "VramReservation",
     "amd_verdicts",
@@ -110,6 +109,7 @@ __all__ = [
     "mps_active",
     "mps_client_share",
     "plan_allocator",
+    "plan_parallelism",
     "prepare_device_memory",
     "reset_device_allocator",
     "schedulable_device_count",

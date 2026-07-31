@@ -26,11 +26,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["KvCacheBudget", "kv_bytes_per_token", "kv_cache_bytes", "max_concurrent_sequences"]
+__all__ = [
+    "DEFAULT_BLOCK_TOKENS",
+    "KvCacheBudget",
+    "kv_bytes_per_token",
+    "kv_cache_bytes",
+    "max_concurrent_sequences",
+    "paged_tokens",
+]
 
 #: Bytes per element for the cache dtypes a serving engine offers. FP8 KV cache halves the
 #: cache against FP16 at a small quality cost, and is the single largest lever on concurrency.
 _DTYPE_BYTES = {"fp32": 4, "float32": 4, "fp16": 2, "float16": 2, "bf16": 2, "fp8": 1, "int8": 1}
+
+#: Tokens in one cache block under paged attention. Every serving engine that pages allocates
+#: in whole blocks, so a sequence occupies a multiple of this many tokens' worth of cache
+#: regardless of its true length. vLLM's default is 16, and it is the figure that makes the
+#: difference between an estimate and a guess on a short-prompt workload.
+DEFAULT_BLOCK_TOKENS = 16
 
 
 def kv_bytes_per_token(
@@ -99,6 +112,37 @@ def max_concurrent_sequences(
     return int(available_bytes // per_sequence)
 
 
+def paged_tokens(context_tokens: int, block_tokens: int = DEFAULT_BLOCK_TOKENS) -> int:
+    """`context_tokens` rounded up to a whole number of cache blocks.
+
+    Paged attention allocates cache a block at a time, so a sequence never occupies the tokens
+    it has — it occupies the tokens its blocks cover. The gap is invisible on a long context
+    and dominates a short one: at a 16-token block, a batch of 20-token prompts wastes nearly a
+    third of every block it touches, which is a third of the concurrency the device was sized
+    for. Batch inference over short rows is exactly the workload that hits this.
+
+    Args:
+        context_tokens: Tokens the sequence actually holds.
+        block_tokens: Tokens per cache block; `0` or less disables the rounding, which is the
+            right answer for an engine that does not page.
+
+    Returns:
+        Tokens the cache is actually charged for.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.carbonite.accel.kv_cache import paged_tokens
+            >>> paged_tokens(20)
+            32
+            >>> paged_tokens(8192)
+            8192
+    """
+    if context_tokens <= 0 or block_tokens <= 1:
+        return max(0, context_tokens)
+    return -(-context_tokens // block_tokens) * block_tokens
+
+
 @dataclass(frozen=True, slots=True)
 class KvCacheBudget:
     """One LLM stage's device-memory plan: weights, cache, and the concurrency they imply.
@@ -111,6 +155,9 @@ class KvCacheBudget:
         context_tokens: Peak context length the stage must support.
         headroom: Fraction of the device left free for activations, the CUDA context, and
             allocator fragmentation.
+        block_tokens: Tokens per cache block under paged attention. Every sequence is charged
+            for whole blocks, so a workload of short rows holds materially more cache than its
+            token counts suggest. Set to `0` for an engine that does not page.
     """
 
     device_bytes: int
@@ -118,6 +165,7 @@ class KvCacheBudget:
     bytes_per_token: int
     context_tokens: int
     headroom: float = 0.1
+    block_tokens: int = DEFAULT_BLOCK_TOKENS
 
     @property
     def usable_bytes(self) -> int:
@@ -137,7 +185,7 @@ class KvCacheBudget:
     @property
     def max_sequences(self) -> int:
         """Concurrent sequences the stage can hold at its peak context length."""
-        return max_concurrent_sequences(self.cache_bytes, self.context_tokens, self.bytes_per_token)
+        return self.sequences_at(self.context_tokens)
 
     @property
     def cache_fraction(self) -> float:
@@ -157,13 +205,18 @@ class KvCacheBudget:
         concurrency, and most batch workloads have a long tail of short prompts that never
         needed the maximum.
 
+        The length is rounded up to a whole cache block first, because that is what the engine
+        charges for. Skipping that step is how a short-prompt workload is sized for a
+        concurrency it cannot reach and then spends the run preempting.
+
         Args:
             context_tokens: The context length to size for.
 
         Returns:
             Sequences that fit at that length.
         """
-        return max_concurrent_sequences(self.cache_bytes, context_tokens, self.bytes_per_token)
+        charged = paged_tokens(context_tokens, self.block_tokens)
+        return max_concurrent_sequences(self.cache_bytes, charged, self.bytes_per_token)
 
     def devices_for(self, sequences: int) -> int:
         """Devices needed to hold a target concurrency, replicating weights on each.

@@ -46,9 +46,9 @@ so the batch maps onto the server's tensor signature:
 
 | Adapter | Backend |
 | --- | --- |
-| `triton_client(url, model, *, input_columns, output_columns, protocol="http", model_version="")` | NVIDIA Triton over HTTP or gRPC (`protocol="grpc"`), sending binary tensors. Needs `batcher-engine[triton]`. |
-| `torchserve_client(base_url, model, *, input_columns, output_columns, timeout=30.0)` | TorchServe `/predictions/{model}`. |
-| `http_client(url, *, input_columns, output_columns, headers=None, timeout=30.0, retries=3)` | Any columnar-JSON REST endpoint (KServe-style). |
+| `triton_client(url, model, *, input_columns, output_columns, protocol="http", model_version="", max_batch_size=None)` | NVIDIA Triton over HTTP or gRPC (`protocol="grpc"`), sending binary tensors. Needs `batcher-engine[triton]`. |
+| `torchserve_client(base_url, model, *, input_columns, output_columns, timeout=30.0, max_batch_size=None)` | TorchServe `/predictions/{model}`. |
+| `http_client(url, *, input_columns, output_columns, headers=None, timeout=30.0, retries=3, max_batch_size=None)` | Any columnar-JSON REST endpoint (KServe-style). |
 | `serving_udf(connect, *, input_columns, output_columns=None)` | Build your own adapter from a zero-arg `connect()` returning a `ServingClient`. |
 
 Use `triton_client` for tensor inputs (decoded images, embeddings): it sends binary
@@ -58,6 +58,32 @@ scalar and text features. JSON-encoding a tensor is slow and bloated, so it warn
 if asked to. `torchserve_client` is `http_client` pointed at `/predictions/{model}`, so
 a TorchServe handler that accepts and returns `{column: [values...]}` works with no
 extra glue.
+
+## How many rows go in one request
+
+An engine batch is thousands of rows and a serving endpoint is configured for far fewer. A
+Triton model config commonly names `max_batch_size: 8`, and Triton answers a request above
+that window with an error rather than with predictions. An HTTP endpoint answers it with a
+413, a timeout, or an out-of-memory error on its own GPU. So `max_batch_size` splits an
+Arrow batch into requests the server can hold, and `pipeline_depth` keeps that many in flight
+so the remote GPU is not idle while this worker encodes and decodes. Results stay in input
+order either way.
+
+`triton_client` reads the window from the model's own configuration on the server when you
+leave `max_batch_size` unset, which is where the number is declared and where it can be right.
+The other adapters cannot ask, so state it yourself: for TorchServe it is the model's
+registered `batch_size`, and for a custom endpoint it is whatever that endpoint was built for.
+
+```python
+# docs: skip
+udf = triton_client(
+    "triton:8000",
+    "resnet50",
+    input_columns=["image"],
+    output_columns=["logits"],
+    pipeline_depth=4,      # four requests in flight; the window comes from the server
+)
+```
 
 ## Writing your own adapter
 

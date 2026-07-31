@@ -16,6 +16,7 @@ Python — so the control plane never touches a tuple in the hot path.
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
@@ -39,72 +40,93 @@ WorkerFactory = Callable[[], Worker]
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
-    """Whether `exc` is a CUDA out-of-memory error, checked structurally so torch is
-    not a hard import (the name covers `torch.cuda.OutOfMemoryError`; the message
-    covers the older `RuntimeError: CUDA out of memory`)."""
-    if type(exc).__name__ in ("OutOfMemoryError", "ResourceExhaustedError"):
-        return True
-    # XLA (TPU) reports exhaustion as "RESOURCE_EXHAUSTED" rather than "out of memory", so
-    # matching only the CUDA phrasing left the halving retry disabled on a TPU: the batch
-    # simply failed where a CUDA host would have recovered.
-    message = str(exc).lower()
-    return isinstance(exc, RuntimeError) and (
-        "out of memory" in message or "resource_exhausted" in message
-    )
+    """Whether `exc` is an accelerator out-of-memory error.
+
+    Delegates to the one classifier in `_internal.hardware.devices`, because the same question
+    is asked by the distributed fault policy and by the OOM ladder, and three copies of a
+    substring list is how one of them silently stops recognizing a vendor the others handle
+    (this copy did not know HIP's phrasing, so the halving retry was inert on every ROCm host).
+    """
+    from batcher._internal.hardware.devices import is_device_oom
+
+    return is_device_oom(exc)
 
 
 def _empty_cuda_cache() -> None:
     """Best-effort release of cached accelerator blocks so a halved retry has room to run.
 
-    Vendor-agnostic: NVIDIA/AMD share ``torch.cuda.empty_cache`` (ROCm shims the CUDA API),
-    Intel is ``torch.xpu``, Apple ``torch.mps`` — so the OOM-halving safety net works on any
-    accelerator, not just CUDA. A no-op where the backend or method is absent."""
-    try:
-        import torch
-    except Exception:
-        return
-    for name in ("cuda", "xpu", "mps"):
-        backend = getattr(torch, name, None)
-        empty = getattr(backend, "empty_cache", None)
-        if empty is None:
-            continue
-        with contextlib.suppress(Exception):
-            avail = getattr(backend, "is_available", None)
-            if name == "mps" or avail is None or avail():
-                empty()
-    # XLA (TPU) is not a `torch.<backend>` module and has no `empty_cache`; its allocator
-    # is freed by stepping the execution graph. Without this the halved retry re-ran with
-    # exactly the memory that just overflowed, so the safety net could not help a TPU.
+    Delegates to `release_device_cache`, which collects Python garbage *before* emptying the
+    cache. That ordering is what the local version was missing: on this path the failing
+    batch's tensors are still referenced by the exception's traceback frames, so the allocator
+    cannot return their blocks and the retry re-ran with much of the memory that just
+    overflowed."""
+    from batcher._internal.hardware.devices import release_device_cache
+
     with contextlib.suppress(Exception):
-        import importlib.util
-
-        if importlib.util.find_spec("torch_xla") is not None:
-            import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
-
-            xm.mark_step()
+        release_device_cache()
 
 
-def _run_with_oom_retry(worker: Worker, batch: pa.RecordBatch) -> tuple[pa.RecordBatch, float]:
-    """Run `worker(batch)`, surviving a CUDA OOM by halving and retrying.
+def _run_with_oom_retry(
+    worker: Worker, batch: pa.RecordBatch, on_oom: Callable[[int], None] | None = None
+) -> tuple[pa.RecordBatch, float]:
+    """Run `worker(batch)`, surviving a device OOM by releasing memory and shrinking.
 
-    A transient VRAM spike (a fragmented allocator, a co-tenant model) can OOM a batch
-    that would fit at half the size. Rather than fail the job, free the cache and run
-    the two halves independently, concatenating their per-row-independent inference
-    outputs — equivalent to the whole batch. Re-raises once a single row still OOMs (a
-    genuine over-allocation, not a too-large batch) or for any non-OOM error. Returns
-    `(output_batch, latency_ms)`; on a split, latency is the halves' sum.
+    A transient VRAM spike (a fragmented allocator, a co-tenant model) can OOM a batch that
+    would fit at half the size. Rather than fail the job, free the cache and run the two halves
+    independently, concatenating their per-row-independent inference outputs — equivalent to
+    the whole batch. Re-raises once a single row still OOMs (a genuine over-allocation, not a
+    too-large batch) or for any non-OOM error.
+
+    Two refinements over halving unconditionally, both from `classify_oom`:
+
+    * A **fragmented** allocator is retried once at the *same* size after its cached blocks are
+      released. The memory was there all along in pieces too small to serve the request, so
+      halving throws away half the throughput to work around a problem that releasing the
+      cache just solved. If it fails again the size really is the issue and the split proceeds.
+    * An **occupied** device — one whose memory a co-tenant holds — is not split at all. This
+      process's batch is not what filled the device, so halving it sixteen times recovers
+      nothing and turns one placement mistake into minutes of wasted GPU time. The error is
+      re-raised with what was measured, which is what a scheduler needs to act on.
+
+    Args:
+        worker: The per-batch transform to run.
+        batch: The batch to run it on.
+        on_oom: Called with the row count that failed, before the batch is split. This is how
+            the batch-size controller learns of a failure it could not predict; without it the
+            halved batch succeeds, reports good throughput, and the climb grows straight back
+            into the same OOM.
+
+    Returns:
+        `(output_batch, latency_ms)`; on a split, latency is the halves' sum.
     """
     start = time.perf_counter()
     try:
         out = worker(batch)
         return out, (time.perf_counter() - start) * 1000.0
     except Exception as exc:
-        if not _is_cuda_oom(exc) or batch.num_rows <= 1:
+        if not _is_cuda_oom(exc):
             raise
+        from batcher._internal.hardware.devices import classify_oom
+
+        verdict = classify_oom(exc)
+        if not verdict.should_shrink:
+            raise
+        if on_oom is not None:
+            with contextlib.suppress(Exception):  # telemetry must never fail a recoverable batch
+                on_oom(batch.num_rows)
         _empty_cuda_cache()
+        if verdict.should_retry_same_size:
+            try:
+                out = worker(batch)
+                return out, (time.perf_counter() - start) * 1000.0
+            except Exception as retry_exc:
+                if not _is_cuda_oom(retry_exc):
+                    raise
+        if batch.num_rows <= 1:
+            raise
         mid = batch.num_rows // 2
-        left, left_ms = _run_with_oom_retry(worker, batch.slice(0, mid))
-        right, right_ms = _run_with_oom_retry(worker, batch.slice(mid))
+        left, left_ms = _run_with_oom_retry(worker, batch.slice(0, mid), on_oom)
+        right, right_ms = _run_with_oom_retry(worker, batch.slice(mid), on_oom)
         import pyarrow as pa
 
         # Concatenate the halves into a single batch. `concat_batches` keeps every
@@ -295,10 +317,51 @@ class InferencePool:
             )
         elif objective != "latency":
             raise ValueError(f"objective must be 'latency' or 'throughput', got {objective!r}")
+        # The controllers are read-modify-written from two threads now: `_next_target` from
+        # the consumer as it drains results, and `_note_oom` from whichever worker thread hit
+        # the failure. Neither is a hot path — one call per batch — so a plain lock is the
+        # right cost, and without it an OOM's ceiling could be overwritten by a concurrent
+        # `update` that had already read the pre-failure size.
+        self._ctl_lock = threading.Lock()
+
+    def _note_oom(self, rows: int) -> None:
+        """Lower the batch-size target after a batch ran out of device memory.
+
+        The retry recovers the *rows*; this is what stops the same failure recurring on the
+        next batch. Both controllers need it and neither could infer it: the throughput
+        controller is fed rows-per-second, and a batch that OOMs and is retried in halves
+        produces a perfectly respectable one, so nothing in the measurement says a failure
+        happened at all.
+
+        Applied to the dispatch batcher too, so the *next* batch is actually built smaller
+        rather than merely being re-split by the retry after failing again.
+        """
+        target: int | None = None
+        with self._ctl_lock:
+            target = self._oom_target(rows)
+        if target is not None:
+            self._batcher.set_target(target)
+
+    def _oom_target(self, rows: int) -> int | None:
+        """The post-OOM batch-size target from whichever controller is engaged."""
+        if self._throughput_ctl is not None:
+            return self._throughput_ctl.note_oom(rows=rows)
+        if self._latency_ctl is not None:
+            # The latency PID has no failure input, and adding one would mean giving it a
+            # second, incommensurable objective. Halving the batcher's target directly is the
+            # equivalent action: the PID keeps steering from latency and simply does so from a
+            # size that fits, converging back up if the OOM really was transient.
+            return max(1, rows // 2)
+        return None
 
     def _next_target(self, out: pa.RecordBatch, latency_ms: float) -> int | None:
         """The next batch-size target from the active controller, or None if neither
         is engaged (a fixed batch size)."""
+        with self._ctl_lock:
+            return self._observe(out, latency_ms)
+
+    def _observe(self, out: pa.RecordBatch, latency_ms: float) -> int | None:
+        """`_next_target`'s body, called with the controller lock already held."""
         if self._latency_ctl is not None:
             return self._latency_ctl.update(latency_ms)
         if self._throughput_ctl is not None:
@@ -330,15 +393,24 @@ class InferencePool:
         """
         workers: Queue[Worker] = Queue()
         built: list[Worker] = []
-        for _ in range(self._num_workers):
-            worker = self._factory()
-            built.append(worker)
-            workers.put(worker)
+        # A factory that raises partway through — the second of eight models finding the device
+        # already full is the ordinary way this happens — must not leave the models it already
+        # built resident. Each one can hold a CUDA context and a set of weights, so leaking them
+        # turns a recoverable "size the pool smaller" into an OOM that outlives the failure and
+        # takes the next attempt with it.
+        try:
+            for _ in range(self._num_workers):
+                worker = self._factory()
+                built.append(worker)
+                workers.put(worker)
+        except BaseException:
+            _close_workers(built)
+            raise
 
         def dispatch(batch: pa.RecordBatch) -> tuple[pa.RecordBatch, float]:
             worker = workers.get()
             try:
-                return _run_with_oom_retry(worker, batch)
+                return _run_with_oom_retry(worker, batch, self._note_oom)
             finally:
                 workers.put(worker)
 
@@ -366,13 +438,23 @@ class InferencePool:
                         yield pop_head()
                     pending.append(pool.submit(dispatch, rebatched))
 
-                for batch in batches:
-                    for rebatched in self._batcher.push(batch):
-                        yield from submit(rebatched)
-                        yield from drain(block=False)
-                for tail in self._batcher.flush():
-                    yield from submit(tail)
-                yield from drain(block=True)
+                try:
+                    for batch in batches:
+                        for rebatched in self._batcher.push(batch):
+                            yield from submit(rebatched)
+                            yield from drain(block=False)
+                    for tail in self._batcher.flush():
+                        yield from submit(tail)
+                    yield from drain(block=True)
+                finally:
+                    # A consumer that stops early — a `limit`, a `break`, an exception — leaves
+                    # up to `max_inflight` batches submitted. The executor's shutdown waits for
+                    # every one of them, so without this a query that read ten rows of a
+                    # streamed inference still paid for the whole in-flight window of forward
+                    # passes before returning. Cancelling only affects batches that have not
+                    # started; the ones already on a device still finish, as they must.
+                    for future in pending:
+                        future.cancel()
         finally:
             _close_workers(built)
 

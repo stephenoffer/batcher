@@ -1,139 +1,19 @@
-"""Resource contracts between Kyber (optimizer) and Carbonite (resource manager).
+"""The resource contracts Kyber annotates, Carbonite validates, and `dist` schedules against.
 
-Kyber annotates each physical operator with the resources it expects to need
-(`ResourceBounds`); Carbonite validates the plan against the cluster/machine and
-returns a `FeasibilityVerdict`. If infeasible, the verdict carries a counter-offer
-that Kyber can re-plan around (e.g. force a spill-friendly join) — closing the
-optimizer↔resource loop without either layer importing the other.
+Kyber sizes each physical operator (`ResourceBounds`); Carbonite answers whether the plan fits
+(`FeasibilityVerdict`) and derives the per-task grant (`SchedulingEnvelope`) the distributed
+executor turns into Ray options. Every one is a plain frozen dataclass in the neutral layer, so
+the three subsystems exchange them without importing each other.
+
+Kept apart from `hardware`, which describes the machine being planned *for* rather than the
+demand a plan places on it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = [
-    "FeasibilityVerdict",
-    "HardwareProfile",
-    "ResourceBounds",
-    "SchedulingEnvelope",
-]
-
-
-@dataclass(frozen=True, slots=True)
-class HardwareProfile:
-    """The hardware Kyber is planning *for* — detected, never assumed.
-
-    Kyber otherwise plans against fixed constants tuned on one machine (a 4 MiB broadcast
-    threshold, a 12 GB GPU, `target_rows_per_task` blind to core count), so the same plan is
-    produced on a 4-core laptop and a 128-core server and is wrong on both. This is the neutral
-    contract that carries the real numbers into the optimizer: the conductor resolves it once —
-    from this machine single-node, from the cluster's topology when distributed — and threads it
-    through `OptimizerContext`. It lives in `plan` so Kyber can read it and `api`/`dist` can
-    populate it without any layer importing another.
-
-    On a **heterogeneous cluster** the fields describe the *binding* node for each resource, not
-    an average: `gpu_memory_bytes` is the **smallest** GPU (a working set sized to the largest
-    would OOM every other one), and `memory_bytes` the representative worker. Sizing to the
-    weakest node is what keeps a plan valid on every node it might land on.
-
-    All fields default to `0` meaning "unknown", so a partial profile (a CPU-only driver that
-    cannot see remote GPUs) degrades to the caller's own default rather than to a wrong number.
-
-    * `cpu_cores`         — usable cores per worker (cgroup-quota aware, not host count).
-    * `memory_bytes`      — usable RAM per worker (host RAM ∧ cgroup limit).
-    * `l3_cache_bytes`    — last-level cache per cache domain; the broadcast-residency bound.
-    * `gpu_count`         — GPU **devices** reachable by the plan (`0` on a CPU-only host):
-                            this machine's devices single-node, the cluster's device total
-                            distributed. Devices, never GPU-bearing *nodes* — it is consumed
-                            as a multiplier for the whole-fleet VRAM budget
-                            (`one_gpu_bytes * gpu_count`), which counting nodes would
-                            under-state eightfold on an 8-GPU box.
-    * `gpu_memory_bytes`  — usable VRAM of the *smallest* visible GPU; `0` when unknown.
-    * `worker_count`      — workers the plan will run across (`1` single-node); lets Kyber
-                            reason about total vs per-node budgets on a cluster.
-    * `accelerator_type`  — the *model* of the binding GPU (`"NVIDIA_H100"`), `""` when
-                            unknown or when the fleet is mixed. VRAM alone cannot answer
-                            "how fast is the host link", "can this device be partitioned",
-                            or "what does it draw" — every one of which changes a plan, and
-                            none of which is derivable from a byte count. `""` is the
-                            pre-existing behavior: every model-specific decision then reports
-                            no opinion and the plan is sized exactly as it was before.
-    """
-
-    cpu_cores: int = 0
-    memory_bytes: int = 0
-    l3_cache_bytes: int = 0
-    gpu_count: int = 0
-    gpu_memory_bytes: int = 0
-    worker_count: int = 1
-    accelerator_type: str = ""
-
-    @classmethod
-    def local(cls) -> HardwareProfile:
-        """Detect the profile of *this* machine — the single-node and driver default.
-
-        Reads the neutral hardware layer only, so it is safe to call from anywhere and needs
-        no cluster. A distributed run replaces this with a cluster-derived profile via
-        [`for_cluster`]; every field a probe cannot answer stays `0` ("unknown").
-        """
-        from batcher._internal.device_specs import resolve_device_name
-        from batcher._internal.hardware import (
-            available_cpu_count,
-            gpu_inventory,
-            l3_cache_bytes,
-            machine_memory_bytes,
-        )
-
-        gpus = gpu_inventory()
-        vram = min((int(g.get("memory_bytes") or 0) for g in gpus), default=0)
-        # The device *model*, resolved from whatever the driver called it. Only when every
-        # local device is the same model: a mixed host has no single binding model, and
-        # naming one of them would attach one device's power and host link to another's plan.
-        names = {resolve_device_name(str(g.get("name") or "")) or "" for g in gpus}
-        model = names.pop() if len(names) == 1 else ""
-        return cls(
-            cpu_cores=available_cpu_count(),
-            memory_bytes=machine_memory_bytes(),
-            l3_cache_bytes=l3_cache_bytes(),
-            gpu_count=len(gpus),
-            gpu_memory_bytes=vram,
-            worker_count=1,
-            accelerator_type=model,
-        )
-
-    @classmethod
-    def for_cluster(
-        cls,
-        *,
-        cpu_cores: int,
-        memory_bytes: int,
-        worker_count: int,
-        gpu_count: int = 0,
-        gpu_memory_bytes: int = 0,
-        l3_cache_bytes: int = 0,
-        accelerator_type: str = "",
-    ) -> HardwareProfile:
-        """A profile for a distributed run, built by the conductor from live cluster topology.
-
-        The caller passes the *binding* node's figures (smallest GPU VRAM, representative
-        worker RAM/cores) so a plan sized against this profile is valid on every node it may
-        land on. `l3_cache_bytes` is the binding worker's cache when the caller could probe the
-        workers for it (Ray's topology omits cache), and `0` when it couldn't — which keeps a
-        cache-sized threshold at its default rather than guessing from the driver's machine.
-
-        `accelerator_type` is the model every GPU node shares, or `""` on a mixed fleet — the
-        same rule `cluster_accelerator_type()` follows, because there is no honest single
-        answer when the models differ.
-        """
-        return cls(
-            cpu_cores=max(0, cpu_cores),
-            memory_bytes=max(0, memory_bytes),
-            l3_cache_bytes=max(0, l3_cache_bytes),
-            gpu_count=max(0, gpu_count),
-            gpu_memory_bytes=max(0, gpu_memory_bytes),
-            worker_count=max(1, worker_count),
-            accelerator_type=accelerator_type,
-        )
+__all__ = ["FeasibilityVerdict", "ResourceBounds", "SchedulingEnvelope"]
 
 
 @dataclass(frozen=True, slots=True)

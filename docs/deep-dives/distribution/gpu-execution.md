@@ -44,6 +44,22 @@ A **join** splits its probe side, and every device reads the whole build side it
 
 The decomposition is expressed as more plan IR (`plan/distribution/`) rather than as a second set of kernels, so partial and combine run through the same translator every other operator does, and the multi-device answer equals the single-device one by construction. The same module answers the optimizer's question. A plan that shards is bounded by its shard size rather than by one device's memory, which changes where Kyber routes it.
 
+### Sharing a device between shards
+
+The fan-out cuts several times more shards than there are devices, so each one is small, work balances across an uneven fleet, and a preempted shard's retry is a fraction of the query. A shard that then asks for a *whole* device undoes half of that: Ray runs one per device and queues the rest, so a fleet whose own shard count says each piece is a quarter of a device runs at a quarter of its capacity while every utilization counter reads full.
+
+Each shard therefore asks for the fraction of a device it needs. The share is derived from the largest shard's estimated working set against one device's memory, rounded up to a packing quantum, and it is chosen from the *largest* shard rather than the average, because one fraction is granted to the whole fan-out and sizing it to the average is how the shard that most needed room is the one that doesn't get it. A broadcast join charges its replicated build side to every co-tenant, since four tasks on a device hold four copies of it rather than one between them.
+
+Over-packing degrades rather than fails. A shard granted a share it turns out not to fit falls into the subdivision ladder below, exactly as an under-estimated shard always did, and its retry goes back with a whole device. Under-packing has no such ladder: the idle device simply stays idle, and nothing reports it.
+
+Set `gpu_pack_shards` to `False` to keep the previous one-device-per-shard behavior, `gpu_task_fraction` to pin the share for a fleet the estimator can't see, `gpu_max_tasks_per_device` to cap co-tenancy, and `gpu_shard_expansion` for a chain that materializes more than one intermediate.
+
+### Folding without holding every shard
+
+The fan-out bounds *device* memory by dividing the input. The merge then has to avoid moving that bound to the host: concatenating every shard's output on the driver before combining a single row means a group-by over a million groups across a thousand shards materializes a billion rows in one process, and the shard count grows with the fleet, so the failure arrives precisely on the large clusters the fan-out exists for.
+
+Partials are folded a wave at a time instead. A wave of `gpu_merge_wave` partials is combined, the result is kept, and the wave is discarded, so peak driver memory tracks the wave size and the group count rather than the shard count. The result is exact at any wave size, because the fold is associative and commutative over its own output: `plan/distribution/mergeable.py` carries the second form of each combine, the one that reads the columns the first application wrote. Anything above the fold, such as a mean's final division, runs exactly once. Set `gpu_merge_wave` to `0` to fold everything at once.
+
 ### When a device is lost, or too small
 
 A fan-out that abandons the accelerated path because one shard failed is not much of a fan-out. Failures are handled where they happen:
@@ -232,6 +248,9 @@ rules on this page can be read directly:
 | Plan and expression translation to cuDF | `python/batcher/core/gpu_plan/` |
 | Mergeable split, shared by the optimizer and the backend | `python/batcher/plan/distribution/` |
 | Multi-device fan-out, shard recovery, worker-side reads | `python/batcher/dist/gpu/` |
+| Per-shard device share, Ray options for a fan-out | `python/batcher/dist/gpu/resources.py` |
+| Co-tenancy admission, MIG preference, health derate | `python/batcher/carbonite/accel/fractional.py` |
+| The packing quanta both of those round against | `python/batcher/_internal/device_share.py` |
 | cuDF and torch scatter-reduce kernels | `python/batcher/core/gpu_transform.py` |
 
 ## See also

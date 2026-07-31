@@ -20,10 +20,24 @@ result rather than failing the batch — the multimodal convention.
 `transfer` moves bytes in and out (download/upload), `media` decodes images and audio,
 `video` samples frames from clips, and `stage` holds the scaffolding all three share.
 The private names re-exported below are the seams the decode tests drive directly.
+
+`accelerated` is the alternative to all of it on a GPU node: decoding on the *device* means
+the bus carries the compressed payload rather than the pixels, which for a photographic JPEG
+is roughly twelve times less traffic, and for video means NVDEC does the work instead of the
+SMs the model wanted. It reports an unavailable backend rather than failing wherever the
+libraries are absent, which is most CPU images.
 """
 
 from __future__ import annotations
 
+from batcher.ml.decode.accelerated import (
+    DecodeBackend,
+    decode_jpeg_batch,
+    hardware_decode_confirmed,
+    image_decode_backend,
+    transfer_saving_ratio,
+    video_decode_backend,
+)
 from batcher.ml.decode.media import audio_dataset, image_tensor_dataset
 from batcher.ml.decode.stage import (
     _bounded_map as _bounded_map,
@@ -40,9 +54,15 @@ from batcher.ml.decode.video import (
 )
 
 __all__ = [
+    "DecodeBackend",
     "audio_dataset",
+    "decode_jpeg_batch",
     "download_dataset",
+    "hardware_decode_confirmed",
+    "image_decode_backend",
     "image_tensor_dataset",
+    "transfer_saving_ratio",
     "upload_dataset",
     "video_dataset",
+    "video_decode_backend",
 ]

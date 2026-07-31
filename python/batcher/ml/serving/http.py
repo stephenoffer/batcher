@@ -159,6 +159,8 @@ def http_client(
     timeout: float = 30.0,
     retries: int = 3,
     tensor_encoding: str = "auto",
+    max_batch_size: int | None = None,
+    pipeline_depth: int = 1,
 ) -> type:
     """A `map_batches` class UDF posting each batch to a JSON inference endpoint.
 
@@ -184,6 +186,15 @@ def http_client(
             binary envelope for rank > 1 and plain lists otherwise, ``"binary"`` always
             uses the envelope, and ``"json"`` keeps the legacy nested-list shape (and
             warns, because it costs an ``O(rows x dims)`` Python conversion).
+        max_batch_size: rows per request. An engine batch is thousands of rows, and an
+            endpoint sized for a serving batch answers one of those with a 413, a timeout,
+            or an out-of-memory error on its own GPU rather than with predictions. Set this
+            to the window the endpoint was built for and a large batch is split into
+            requests it can hold. ``None`` posts the batch whole, which is right only for
+            an endpoint that declared no window.
+        pipeline_depth: how many of those requests to keep in flight. Above 1 the endpoint
+            keeps working while this worker encodes and decodes, which is what stops a
+            remote GPU idling between requests. Results stay in input order.
 
     Returns:
         A class for ``ds.ml.map_batches(...)`` — the client connects once per worker.
@@ -203,7 +214,12 @@ def http_client(
     # retryable status from a fatal 4xx, which the generic wrapper cannot). Letting both
     # layers retry would multiply the attempts and the tail latency.
     return serving_udf(
-        connect, input_columns=input_columns, output_columns=output_columns, retries=0
+        connect,
+        input_columns=input_columns,
+        output_columns=output_columns,
+        max_batch_size=max_batch_size,
+        pipeline_depth=pipeline_depth,
+        retries=0,
     )
 
 

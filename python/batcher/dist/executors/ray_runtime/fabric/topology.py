@@ -32,6 +32,7 @@ __all__ = [
     "POWER_ZONE_LABEL",
     "RACK_LABEL",
     "GpuNodeTopology",
+    "devices_of_class",
     "domain_groups",
     "fits_one_domain",
     "gpu_node_topology",
@@ -167,6 +168,38 @@ def nvlink_domain_size(accelerator_type: str | None, gpus_on_node: int) -> int:
     node_devices = max(1, gpus_on_node)
     domain = device_nvlink_domain(accelerator_type)
     return node_devices if domain <= 0 else min(domain, node_devices)
+
+
+def devices_of_class(
+    accelerator_type: str | None,
+    nodes: tuple[GpuNodeTopology, ...] | None = None,
+) -> int:
+    """How many accelerators of one model the fleet has.
+
+    Ray publishes a custom resource named `accelerator_type:<MODEL>` and it is tempting to
+    read as a device count, but it is a **per-node marker worth 1.0**: on this four-node,
+    sixteen-device fleet `accelerator_type:T4` totals 4.0 while `GPU` totals 16.0. Anything
+    sizing a pool against the marker gets the number of *nodes* carrying that model, and on
+    any multi-device node that is a silent under-count in exactly the case a caller pinned a
+    model to be precise about.
+
+    The count is therefore taken from the topology, which carries each node's device count
+    beside the model it advertises, and summed over the nodes that match.
+
+    Args:
+        accelerator_type: The model to count, matched case-insensitively against the node's
+            `ray.io/accelerator-type` label. `None` or empty counts every accelerator.
+        nodes: Topology records, or `None` to read them live.
+
+    Returns:
+        Devices of that model, or `0` when the fleet has none, the model is unrecognized, or
+        the topology could not be read — the same "unknown" a caller already falls back from.
+    """
+    records = gpu_node_topology() if nodes is None else nodes
+    if not accelerator_type:
+        return sum(n.gpus for n in records)
+    wanted = accelerator_type.strip().upper()
+    return sum(n.gpus for n in records if (n.accelerator_type or "").strip().upper() == wanted)
 
 
 def largest_local_domain(nodes: tuple[GpuNodeTopology, ...] | None = None) -> int:

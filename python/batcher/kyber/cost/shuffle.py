@@ -138,6 +138,8 @@ def net_cost(
     rows_of,
     row_bytes_of,
     workers: int,
+    locality: float = 1.0,
+    stats_of=None,
 ) -> float:
     """Bytes `node` moves across the network, excluding its inputs.
 
@@ -150,12 +152,54 @@ def net_cost(
         rows_of: Callable returning a node's estimated output row count.
         row_bytes_of: Callable returning a node's estimated average row width in bytes.
         workers: Workers the plan will run across; `1` for single-node.
+        locality: What a byte of this exchange costs relative to a cross-rack byte, from
+            `cost.locality.locality_factor`. `1.0` — the default, and what an unreadable fleet
+            yields — charges every byte at the network rate, which is exactly what this axis
+            charged before the tier model existed. Applied uniformly to volume *and* fan-out,
+            because a fragment that never leaves its host opens no connection and negotiates no
+            credit window either.
+        stats_of: Callable returning a node's `RelStats`, or `None` to skip the straggler
+            term. Only a partitioned window reads it — the one shuffling shape whose skew the
+            engine can neither pre-reduce away nor salt (see `cost.imbalance`). `None`, and an
+            unmeasured partition column, both leave the cost exactly as it was.
 
     Returns:
-        Estimated bytes on the `net` axis.
+        Estimated cross-rack-equivalent bytes on the `net` axis.
     """
     if workers <= 1:
         return 0.0
+    flat = _flat_net_cost(node, rows_of, row_bytes_of, workers)
+    return flat * max(0.0, locality) * _straggler(node, stats_of, workers)
+
+
+def _straggler(node: LogicalPlan, stats_of, workers: int) -> float:
+    """How much longer this exchange takes than a balanced one, `1.0` when it is balanced.
+
+    Applied only to a partitioned window. An aggregate and a distinct pre-reduce their hot key
+    to one partial row per worker before shuffling, and a join's hot values are salted across
+    reducers by `dist`; charging either for skew would penalize the mechanism that removes it.
+    A window can do neither — its frame spans a whole partition, so the hot partition lands
+    whole on one worker and the stage waits for it.
+    """
+    if stats_of is None or not isinstance(node, Window) or not node.partition_keys:
+        return 1.0
+    keys = tuple(k.name for k in node.partition_keys if isinstance(k, Col))
+    if len(keys) != len(node.partition_keys):
+        return 1.0
+    try:
+        from batcher.kyber.cost.imbalance import partition_imbalance
+
+        stats = stats_of(node.input)
+        return partition_imbalance([dict(stats.column(k).mcv or {}) for k in keys], workers)
+    except Exception as exc:  # pragma: no cover - cost must never break a plan
+        from batcher._internal.logging import note_suppressed
+
+        note_suppressed("kyber", "price a window's partition skew", exc)
+        return 1.0
+
+
+def _flat_net_cost(node: LogicalPlan, rows_of, row_bytes_of, workers: int) -> float:
+    """`net_cost` before the locality re-pricing — every byte charged at the network rate."""
     if isinstance(node, Aggregate):
         return _aggregate_net(node, rows_of, row_bytes_of, workers)
     if isinstance(node, Distinct):

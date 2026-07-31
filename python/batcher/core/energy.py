@@ -5,17 +5,27 @@ Kyber decides against them, Carbonite protects a budget, and **Core measures**. 
 that measurement: it brackets a stage, reads the device draw at both ends, and records one
 `StageEnergy` into the run's ledger. It makes no decision and rewrites no plan.
 
-**Measured beats modelled, and the difference is recorded.** With NVML available the energy is
-the mean of the draw at each end times the duration, which is a real reading of a real board.
-Without it the figure falls back to the datasheet model at the measured utilization, and the
-record is marked `measured=False` so a report can say which it is. A cost figure that cannot
-be told apart from an estimate is worth less than either.
+**Three sources, in falling order of trust, and the record says which one it got.**
+
+1. *Integrated.* On Volta and later the driver keeps a hardware joule counter per board, and the
+   difference between two readings of it is the energy a stage actually consumed — every
+   transient included. That is a measurement rather than an inference, and it is what a
+   chargeback or a carbon figure needs. Recorded as `integrated=True`.
+2. *Sampled.* Where the counter is absent, the draw is read at each end and multiplied by the
+   duration. Real readings of a real board, and an approximation: it assumes the draw between
+   the samples was the mean of them, which a stage alternating between a 60 W staged transfer
+   and a 700 W kernel violates badly. Recorded as `measured=True, integrated=False`.
+3. *Modelled.* Where NVML answers nothing, the datasheet model at the measured utilization.
+   Recorded as `measured=False`.
+
+A cost figure that cannot be told apart from an estimate is worth less than either, which is
+why the distinction travels on every record rather than being decided once for the run.
 
 **Sampling is at the ends, not on a timer.** A background thread per stage would cost more than
-it measures on a short stage and would need shutting down on every failure path. Two readings
-across a stage that runs for seconds to minutes track a workload whose draw is roughly steady,
-which is what a saturated accelerator stage is; the honest limitation is a stage whose draw
-swings wildly, and that shows up as a utilization figure that disagrees with the power one.
+it measures on a short stage and would need shutting down on every failure path. That is why
+source 2 degrades on a stage whose draw swings wildly — and why source 1 exists, since a counter
+the hardware integrates continuously has no such limitation at any stage length that spans a
+sampling interval.
 """
 
 from __future__ import annotations
@@ -146,6 +156,56 @@ def _sampled_draw() -> tuple[float, float, bool]:
     return reading
 
 
+#: The last energy-counter reading and when it was taken, cached on the same interval and for
+#: the same reason as `_LAST_DRAW`.
+_LAST_ENERGY: list[tuple[float, tuple]] = []
+
+
+def _sampled_energy() -> tuple:
+    """The devices' integrated joule counters, at most once per telemetry interval.
+
+    Shares `_LAST_DRAW`'s caching discipline, which has a consequence worth stating: a stage
+    shorter than the interval sees the *same* cached reading at both ends, the delta is zero,
+    and the caller falls back to the sampled-power figure. That is the correct outcome rather
+    than a limitation — a stage too short to span a sampling interval is also too short for two
+    NVML round trips per device to be worth paying.
+    """
+    from batcher.config import active_config
+
+    interval = active_config().accelerator.energy.telemetry_interval_s
+    now = time.monotonic()
+    if _LAST_ENERGY and now - _LAST_ENERGY[0][0] < interval:
+        return _LAST_ENERGY[0][1]
+    try:
+        from batcher._internal.hardware.telemetry.energy import device_energy
+
+        reading = device_energy()
+    except Exception:
+        reading = ()
+    _LAST_ENERGY[:] = [(now, reading)]
+    return reading
+
+
+def _integrated_joules(before: tuple, after: tuple) -> float | None:
+    """Exact joules across an interval from the hardware counters, or `None` when unavailable.
+
+    Preferred over `watts * seconds` whenever it answers, because the sampled figure assumes
+    the draw between the samples was the mean of them and a GPU stage is the workload that
+    violates that hardest. `None` covers every reason it cannot answer — no counter on the part,
+    no driver, a driver reload mid-stage, or a stage shorter than the sampling interval — and
+    each of those means the caller keeps the sampled figure rather than recording nothing.
+    """
+    if not before or not after:
+        return None
+    try:
+        from batcher._internal.hardware.telemetry.energy import interval_energy_joules
+
+        joules = interval_energy_joules(before, after)
+    except Exception:
+        return None
+    return joules if joules and joules > 0 else None
+
+
 def reset_energy_sampling() -> None:
     """Forget the cached telemetry reading, so the next measurement re-reads the devices.
 
@@ -154,6 +214,7 @@ def reset_energy_sampling() -> None:
     and by any test that fakes a device draw.
     """
     _LAST_DRAW.clear()
+    _LAST_ENERGY.clear()
 
 
 def _draw() -> tuple[float, float, bool]:
@@ -209,12 +270,14 @@ def measure_stage(
         return
 
     start_watts, start_util, start_ok = _sampled_draw()
+    start_energy = _sampled_energy()
     started = time.perf_counter()
     try:
         yield meter
     finally:
         seconds = max(0.0, time.perf_counter() - started)
         end_watts, end_util, end_ok = _sampled_draw()
+        exact = _integrated_joules(start_energy, _sampled_energy())
         measured = start_ok and end_ok
         if measured:
             watts = (start_watts + end_watts) / 2.0
@@ -233,9 +296,14 @@ def measure_stage(
                 device_count=device_count,
                 seconds=seconds,
                 utilization=util,
-                joules=max(0.0, watts) * seconds,
+                joules=exact if exact is not None else max(0.0, watts) * seconds,
                 rows=meter.rows,
                 tokens=meter.tokens,
-                measured=measured,
+                # The counter is a measurement whether or not the power sampling worked, so a
+                # stage the driver metered exactly is `measured` even when `_draw` reported
+                # nothing — which is the case on a part that publishes the energy counter and
+                # refuses instantaneous power, and there are several.
+                measured=measured or exact is not None,
+                integrated=exact is not None,
             )
         )

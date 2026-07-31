@@ -542,6 +542,35 @@ pub(crate) fn shm_available() -> bool {
     bc_transport::shm_available()
 }
 
+/// What this process fetched from each shuffle peer, as `(addr, bytes, seconds, fetches,
+/// retries)` per peer, sorted by address.
+///
+/// The measurement a slow shuffle needs and none of the existing figures carry. A locality
+/// ratio says where the bytes came from and a credit window says how the producer was paced;
+/// neither says how fast any of it moved, so one peer on a renegotiated link, one reducer
+/// pulling across a rack, and a fleet that is simply busy all read the same.
+///
+/// `seconds` is summed across fetches rather than elapsed wall time, so a reducer striping a
+/// peer's bucket over several flows reports each flow's own duration — which is what makes
+/// `bytes / seconds` a *per-stream* rate, the figure that is comparable against a link's
+/// capability. Retries are counted separately and their failed attempt is not timed, so a
+/// stale connection's timeout is never charged to the peer's bandwidth.
+#[pyfunction]
+pub(crate) fn shuffle_peer_stats() -> Vec<(String, u64, f64, u64, u64)> {
+    bc_transport::peer_transfers()
+        .into_iter()
+        .map(|(addr, bytes, nanos, fetches, retries)| {
+            (addr, bytes, nanos as f64 / 1e9, fetches, retries)
+        })
+        .collect()
+}
+
+/// Forget every peer's transfer totals, so the next reading measures one stage.
+#[pyfunction]
+pub(crate) fn reset_shuffle_peer_stats() {
+    bc_transport::reset_peer_transfers();
+}
+
 /// A pooled, persistent shuffle consumer.
 ///
 /// Holds a `ClientPool` for its lifetime, so a reducer's many `fetch`es reuse gRPC

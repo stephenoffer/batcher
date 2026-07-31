@@ -30,6 +30,8 @@ from collections.abc import Callable
 from typing import Any
 
 from batcher._internal import events
+from batcher.observe.accelerators.diagnosis import window_snapshot
+from batcher.observe.accelerators.gauges import accelerator_gauges
 from batcher.observe.node_metrics import (
     NODE_CONDITION_HELP,
     device_gauges,
@@ -216,6 +218,12 @@ class _Collector:
                 "gpu": {
                     "util_pct_max": self.gpu_util_pct_max,
                     "devices": {device: dict(stats) for device, stats in sorted(self._gpu.items())},
+                    # The sampled *window*, which the per-device gauges above cannot express:
+                    # they are instantaneous by design, and a consumer stitching a series out
+                    # of repeated snapshots still cannot tell a steadily half-fed device from
+                    # one alternating between saturated and idle. Empty and flagged unsampled
+                    # unless sampling was turned on, so nothing here invents a quiet fleet.
+                    "window": window_snapshot(),
                 },
                 "node": node_conditions(),
             }
@@ -408,6 +416,12 @@ def prometheus_text() -> str:
                 f'batcher_gpu_memory_used_bytes{{device="{device}"}} {stats["mem_used_bytes"]}'
             )
     out.extend(device_gauges())
+    # The deep per-device series: link throughput and derate, clock headroom, codec engines,
+    # the memory reserve and BAR1, the integrated energy counter, and the DCGM counters where
+    # they exist. Appended rather than folded into `device_gauges` because that function is
+    # vendor-normalized across NVIDIA and AMD, and these are read from NVML's own detail —
+    # merging them would either lose the detail or invent AMD equivalents that do not exist.
+    out.extend(accelerator_gauges())
     node = snap.get("node") or {}
     for name, help_text in NODE_CONDITION_HELP.items():
         if name in node:

@@ -136,6 +136,21 @@ RECOVERY = "recovery"
 #:   have happened.
 #: - ``preempt_migrate``: a draining (spot-preempted) worker's work moved before it died.
 #: - ``give_up``: the recovery budget was exhausted and the query is failing.
+#: - ``budget_exhausted``: the job-wide retry budget ran out, so the next failure is raised
+#:   rather than retried. Published once, on the transition — every task still in flight will
+#:   ask again, and an event per refusal would bury the one that matters.
+#: - ``quarantined``: a node or device stopped being scheduled because work placed on it kept
+#:   failing. Carries ``target``, the decayed failure ``weight``, and the ``reasons`` seen.
+#: - ``released``: a quarantined target succeeded on probation and is back in rotation. The
+#:   counterpart of ``quarantined``, and the one that says a fleet is recovering rather than
+#:   shrinking.
+#: - ``oom_backoff``: an accelerator refused an allocation and the work is being retried at a
+#:   smaller size. Carries ``failed_rows`` and ``retry_rows``. The only record that a stage was
+#:   memory-bound rather than merely slow — it produced the right answer either way.
+#: - ``quarantine_capped``: a target met the quarantine threshold and was *not* taken out,
+#:   because doing so would have exceeded the blast-radius cap. The signal that the failures
+#:   have gone systemic — at that point the job's own cause is the likelier culprit, and
+#:   condemning more of the fleet only turns a degraded run into a dead one.
 #: - ``shard_degraded``: a GPU fan-out finished, but not every shard ran the way it was meant
 #:   to — some were subdivided to fit a device, or recomputed on the CPU engine because their
 #:   device was lost. The answer is the same either way, which is exactly why it needs an
@@ -151,6 +166,11 @@ RECOVERY_EVENTS = (
     "preempt_migrate",
     "give_up",
     "shard_degraded",
+    "budget_exhausted",
+    "quarantined",
+    "released",
+    "quarantine_capped",
+    "oom_backoff",
 )
 
 

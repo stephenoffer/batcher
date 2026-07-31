@@ -119,17 +119,26 @@ def _round_up(value: int) -> int:
     return -(-value // _BUCKET) * _BUCKET
 
 
-def sized_window(prompts: list, sampling_kwargs: dict) -> int | None:
+def sized_window(
+    prompts: list, sampling_kwargs: dict, model_default: int | None = None
+) -> int | None:
     """The `max_model_len` this batch's prompts call for, or `None` to leave it unset.
 
     Sizing is by characters rather than tokens because the tokenizer lives inside the engine
     this is choosing the shape of. `sizing.estimate_tokens` is deliberately an upper bound,
     so the character route can only over-reserve — and over-reserving costs cache, while
     under-reserving would truncate a prompt.
+
+    `model_default` is the model's own declared maximum, and passing it is what keeps a corpus
+    of long prompts from proposing a window the model refuses. The refusal is otherwise only
+    discovered by building the engine: the weights load, the allocation happens, and the error
+    arrives minutes later, after which the fallback build pays for all of it again.
     """
     longest = max((len(prompt_text(p)) for p in prompts), default=0)
     budget = sampling_kwargs.get("max_tokens")
-    return auto_max_model_len(longest, max_gen_tokens=int(budget) if budget else 0)
+    return auto_max_model_len(
+        longest, max_gen_tokens=int(budget) if budget else 0, model_default=model_default
+    )
 
 
 def prompt_text(prompt: object) -> str:
@@ -139,12 +148,25 @@ def prompt_text(prompt: object) -> str:
     return str(prompt)
 
 
-def prompt_window(llm: object, engine_kwargs: dict) -> int | None:
+def prompt_window(
+    llm: object, engine_kwargs: dict, max_gen_tokens: int | None = None
+) -> int | None:
     """The token budget a prompt must fit in, or `None` when it cannot be determined.
 
     Prefers the explicit `max_model_len`, else asks the live vLLM config. Reserves a
     slice of the window for the generation itself: filling the whole context with prompt
     leaves no room to decode, which fails just as hard as an over-long prompt.
+
+    The reserve has to cover what the caller actually asked to generate. A fixed 512 is right
+    for a short answer and wrong for `max_tokens=4096`, where a prompt filling everything but
+    the reserve leaves an eighth of the room the request needs — and the generation is then cut
+    short rather than refused, which reads as the model losing the thread.
+
+    Args:
+        llm: The live engine, consulted when the window is not stated in `engine_kwargs`.
+        engine_kwargs: The engine options, whose `max_model_len` wins when it is set.
+        max_gen_tokens: The largest number of tokens generation may add, when the caller
+            declared one. `None` keeps the default reserve.
     """
     declared = engine_kwargs.get("max_model_len")
     if not isinstance(declared, int):
@@ -152,7 +174,8 @@ def prompt_window(llm: object, engine_kwargs: dict) -> int | None:
         declared = getattr(config, "max_model_len", None)
     if not isinstance(declared, int) or declared <= 0:
         return None
-    return max(1, declared - _RESERVED_OUTPUT_TOKENS)
+    reserved = max(_RESERVED_OUTPUT_TOKENS, int(max_gen_tokens or 0))
+    return max(1, declared - reserved)
 
 
 #: Tokens held back from the context window for the generation itself.
@@ -241,8 +264,9 @@ def kv_cache_concurrency(
     weight_bytes: int,
     device_bytes: int | None = None,
     dtype: str | None = None,
+    tensor_parallel: int = 1,
 ) -> int:
-    """Concurrent sequences one device can hold at a given context length.
+    """Concurrent sequences one replica can hold at a given context length.
 
     The other half of `auto_max_model_len`: that chooses the window, and this says what the
     window buys. A serving engine's throughput is set by how many sequences it can keep in
@@ -268,6 +292,12 @@ def kv_cache_concurrency(
             to a per-process allocator. Reports `0` when no device is visible.
         dtype: Cache element type. `None` reads `accelerator.kv_cache_dtype` from the active
             configuration, where FP8 halves the cache against FP16.
+        tensor_parallel: Devices the model is split across. Both the weights and the cache
+            divide by the degree, so a group holds far more sequences than one device would —
+            sizing a TP=4 engine against one device's arithmetic understates its concurrency
+            fourfold, and `max_num_seqs` set from that number leaves three quarters of a
+            booked group idle. The count returned is the *replica's*, not a per-device figure:
+            every device in the group holds its slice of the same sequences.
 
     Returns:
         Sequences that fit, or `0` when the weights alone do not fit or no device is visible.
@@ -288,16 +318,18 @@ def kv_cache_concurrency(
             56
     """
     from batcher.carbonite.accel import KvCacheBudget, kv_bytes_per_token
+    from batcher.carbonite.accel.parallelism import shard_bytes_per_token, shard_weight_bytes
     from batcher.config import active_config
 
     accel = active_config().accelerator
     if device_bytes is None:
         device_bytes = _free_device_bytes()
+    degree = max(1, tensor_parallel)
     per_token = kv_bytes_per_token(layers, kv_heads, head_dim, dtype or accel.kv_cache_dtype)
     budget = KvCacheBudget(
         device_bytes=max(0, device_bytes),
-        weight_bytes=max(0, weight_bytes),
-        bytes_per_token=per_token,
+        weight_bytes=shard_weight_bytes(max(0, weight_bytes), degree),
+        bytes_per_token=shard_bytes_per_token(per_token, degree),
         context_tokens=max(0, accel.max_context_tokens or context_tokens),
         headroom=accel.kv_cache_headroom,
     )

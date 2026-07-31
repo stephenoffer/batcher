@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import functools
 
-from batcher._internal.device_specs.table import SPECS, DeviceSpec
+from batcher._internal.device_specs.table import RAY_LABEL_ALIASES, SPECS, DeviceSpec
 
 __all__ = [
     "device_fp8_tflops",
@@ -32,11 +32,28 @@ __all__ = [
 ]
 
 
+def _canonical(name: str) -> str:
+    """A device name flattened to the table's key alphabet: uppercase, `_` for punctuation.
+
+    `AMD-Instinct-MI300X` and `amd_instinct_mi300x` are the same part written two ways, and a
+    node label picks its spelling from whichever tool wrote it.
+    """
+    return "".join(c if c.isalnum() else "_" for c in name).upper()
+
+
 def device_spec(accelerator_type: str | None) -> DeviceSpec | None:
     """The full specification for a Ray accelerator-type name, or `None` when unrecognized.
 
+    Matches the table key directly, then the same name with punctuation flattened, then the
+    `RAY_LABEL_ALIASES` map that carries the bare part names Ray labels nodes with (`"T4"` for
+    the `NVIDIA_TESLA_T4` row). Deliberately exact at every step: the fuzzy, token-scoring
+    match a *driver-reported* name needs lives in `resolve_device_name`, and keeping the two
+    apart is what lets a caller ask strictly when it has a label and loosely when it has
+    whatever NVML printed.
+
     Args:
-        accelerator_type: A `ray.util.accelerators` model name such as `"NVIDIA_H100"`,
+        accelerator_type: A `ray.util.accelerators` model name — either the constant's
+            identifier (`"NVIDIA_H100"`) or the value a node is labelled with (`"H100"`),
             matched case-insensitively. `None` and the empty string report unknown.
 
     Returns:
@@ -44,7 +61,16 @@ def device_spec(accelerator_type: str | None) -> DeviceSpec | None:
     """
     if not accelerator_type:
         return None
-    return SPECS.get(accelerator_type.upper())
+    upper = accelerator_type.upper()
+    spec = SPECS.get(upper)
+    if spec is not None:
+        return spec
+    canonical = _canonical(accelerator_type)
+    spec = SPECS.get(canonical)
+    if spec is not None:
+        return spec
+    aliased = RAY_LABEL_ALIASES.get(upper) or RAY_LABEL_ALIASES.get(canonical)
+    return SPECS.get(aliased) if aliased else None
 
 
 def known_device_names() -> tuple[str, ...]:
@@ -281,9 +307,12 @@ def resolve_device_name(reported: str | None) -> str | None:
     """
     if not reported:
         return None
-    normalized = "".join(c if c.isalnum() else "_" for c in reported).upper()
+    normalized = _canonical(reported)
     if normalized in SPECS:
         return normalized
+    aliased = RAY_LABEL_ALIASES.get(normalized)
+    if aliased is not None:
+        return aliased
     name_tokens = _tokens(reported)
     if not name_tokens:
         return None

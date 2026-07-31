@@ -232,6 +232,8 @@ out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
   query gets slower rather than dying.
 - {doc}`Distributed fault tolerance </architecture/fault-tolerance>`: diagnosing a
   failed task, shuffle, or node.
+- {doc}`Unstable nodes </user-guide/operate/unstable-nodes>`: when the job is failing because
+  the GPUs and nodes under it are, and the query itself is fine.
 - {doc}`Configuration options </configuration/options>`: every tunable and its default.
 - {doc}`Agent skills </agents/index>`: `debug-a-batcher-query` is the triage tree a
   coding agent follows, organized by symptom, with the bisect procedure against DuckDB.

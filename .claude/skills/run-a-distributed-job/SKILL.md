@@ -165,7 +165,7 @@ advertises the Ray node IP, so open the node-to-node range rather than hunting a
 
 ## On a GPU fleet
 
-Four controls exist for a cluster whose scarce resource is accelerators rather than cores, all
+Seven controls exist for a cluster whose scarce resource is accelerators rather than cores, all
 of them off or unbounded by default so a fleet that configures nothing behaves as before.
 `config.accelerator` is where they live (`docs/configuration/accelerator.md`), and
 `docs/user-guide/operate/gpu-fleets.md` is the walkthrough.
@@ -187,6 +187,21 @@ of them off or unbounded by default so a fleet that configures nothing behaves a
   marking whether the figure came from a device reading or a datasheet, and `merge_ledgers`
   folds per-worker ledgers into one figure equal to the single-node one. Report it with
   `observe.format_energy_report`; the idle share is the number to act on.
+
+- **The wires decide as much as the devices.** `bt.accelerators()["fabric"]` carries the rail
+  map (which NIC each device leaves through), the peer islands (which pairs copy without
+  touching host memory), and what a byte off a device costs against a local one. Two conditions
+  appear in `bt.accelerator_problems()` and nowhere else: devices piled onto one rail, so a
+  cross-node stage uses a fraction of the port rate, and a node where no pair can copy
+  directly. The GPU task's environment carries the rail-aligned NIC list to the collective
+  library, so a UDF running its own NCCL group is not left to probe for it.
+- **Compression is a trade against the link.** `distributed.flight_compression="auto"` picks
+  the wire codec from the measured fabric: past roughly 25 Gb/s a compressor becomes the
+  ceiling rather than the wire, and on a 400 Gb/s port compressing costs throughput. An
+  explicitly named codec is never overruled.
+- **A slow shuffle can name its slow peer.** `ShuffleSession.stats()` carries per-rail
+  throughput and a straggler figure alongside the locality ratio. A fleet with one node on a
+  renegotiated link reads exactly like a fleet that is uniformly busy in every other figure.
 
 Two failure modes worth naming, because neither surfaces as an error: a device the driver has
 clamped runs at a fraction of its rate with the job's own timings as the only symptom

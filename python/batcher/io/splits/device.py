@@ -21,6 +21,11 @@ Two rules keep it from becoming a source of wrong answers rather than a source o
   to skip row groups is not expressible here, and a device read that ignores it would move far
   more bytes than the path it replaced. Declining is the honest answer: a selective query keeps
   the reader that can be selective.
+* **Only when the device can undo the compression.** Parquet pages are compressed, and a codec
+  the device reader has no kernel for is decompressed on the host — so the pages cross to the
+  host, come back, and the "device read" has crossed PCIe twice while using the CPU anyway.
+  That is strictly worse than the host reader, and it looks identical in every log.
+  `codecs.device_decompressible` is the check; see that module for why the allowlist is short.
 """
 
 from __future__ import annotations
@@ -59,8 +64,9 @@ def device_read_specs(splits: list, projection: list[str] | None) -> list[Device
             unsupported column can still be read on the device when nobody selected it.
 
     Returns:
-        One spec per split, or `None` when any split is not a plain Parquet locator or reads a
-        type the two readers may not agree on.
+        One spec per split, or `None` when any split is not a plain Parquet locator, reads a
+        type the two readers may not agree on, or is compressed with a codec the device cannot
+        decompress.
 
     Examples:
         .. doctest::
@@ -84,7 +90,28 @@ def device_read_specs(splits: list, projection: list[str] | None) -> list[Device
             return None
     if not _device_readable_schema(splits[0].schema(), projection):
         return None
+    if _hostile_codec(specs[0]):
+        return None
     return specs
+
+
+def _hostile_codec(spec: DeviceReadSpec) -> bool:
+    """Whether the first file is *known* to use compression the device would punt to the host.
+
+    The first file only, exactly as the type check reads only the first split's schema, and for
+    the same reason: a descriptor's splits come from one table written by one job, so the codec
+    is a property of the corpus rather than of the file. Checking every file would turn a
+    planning decision into a footer read per split, and a corpus mixed enough to defeat this
+    assumption already defeats the schema one.
+
+    Phrased as a veto rather than as a requirement, which is the opposite of the type gate
+    above. The type gate protects correctness and so refuses whatever it cannot prove safe; this
+    one protects throughput, so a footer it could not read leaves the read alone instead of
+    disabling the device path for every corpus whose metadata was momentarily unavailable.
+    """
+    from batcher.io.splits.codecs import device_hostile_codec
+
+    return device_hostile_codec(spec.path, spec.row_groups)
 
 
 def _device_readable_schema(schema: pa.Schema, projection: list[str] | None) -> bool:

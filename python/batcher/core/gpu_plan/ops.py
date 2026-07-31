@@ -29,7 +29,18 @@ if TYPE_CHECKING:
 
 __all__ = ["SUPPORTED_OPS", "apply_op", "distinct_rows", "fold_zero", "supported_op"]
 
-SUPPORTED_OPS = ("filter", "project", "aggregate", "sort", "distinct", "limit", "window")
+SUPPORTED_OPS = (
+    "filter",
+    "project",
+    "aggregate",
+    "sort",
+    "distinct",
+    "limit",
+    "window",
+    "unnest",
+    "unpivot",
+    "row_id",
+)
 
 
 def supported_op(ir: dict) -> bool:
@@ -88,8 +99,17 @@ def _project(df, ir: dict, be: DfBackend):
 
 
 def _sort(df, ir: dict, be: DfBackend):
-    keys = ir["keys"]
-    names, ascending = _sort_columns(df, keys, be)
+    # The output columns are the ones the frame arrived with. Read *before* the private sort
+    # keys and null indicators are added, because `_sort_columns` adds them to this same frame:
+    # asking the mutated frame what its columns are returned `__bt_sn0` and `__bt_sk0` as part
+    # of the answer, so every GPU query whose last operator was a sort came back with columns
+    # the CPU engine does not produce.
+    output = list(df.columns)
+    # Shallow: the copy shares every column's buffer, so this costs a Python object and not a
+    # device allocation. What it buys is that the caller's frame is not mutated — which matters
+    # in a plan tree, where one leaf's frame can be an input to two operators.
+    df = df.copy(deep=False)
+    names, ascending = _sort_columns(df, ir["keys"], be)
     out = df.sort_values(
         names,
         ascending=ascending,
@@ -100,7 +120,7 @@ def _sort(df, ir: dict, be: DfBackend):
     )
     if ir.get("limit"):
         out = out.head(ir["limit"])
-    return out.reset_index(drop=True)[list(df.columns)]
+    return out.reset_index(drop=True)[output]
 
 
 def _sort_columns(df, keys: list[dict], be: DfBackend) -> tuple[list[str], list[bool]]:
@@ -182,6 +202,114 @@ def _distinct(df, _ir: dict, be: DfBackend):
     return distinct_rows(df, be)
 
 
+#: Private columns `unnest` carries across the explode: each pre-explode row's position, so an
+#: element can be numbered within its own list, and whether that row's list held no elements at
+#: all, which decides whether the row the explode invented has a position.
+_ROW = "__bt_unnest_row"
+_EMPTY = "__bt_unnest_empty"
+
+
+def _unnest(df, ir: dict, be: DfBackend):
+    """`UNNEST` — one row per element of a list column.
+
+    Both libraries' `explode` implements the *outer* form: a row whose list is null or empty
+    comes back once, carrying a null element. SQL's `UNNEST` and DuckDB's default do the
+    opposite and drop such a row, so the plan's `outer` flag decides whether those rows are
+    filtered back out. Getting this backwards is invisible row loss rather than an error — a
+    document that chunked to nothing would silently take its id and metadata with it.
+
+    The exploded column stays in the position it already occupied, because that is what the
+    plan's own `available_columns` promises; only the optional element index is appended.
+    """
+    column, alias = ir["column"], ir["alias"]
+    index_alias = ir.get("index_alias")
+    outer = bool(ir.get("outer", False))
+    order = [alias if c == column else c for c in df.columns]
+    df = _marked(df, column, be, number=index_alias is not None)
+    out = df.explode(column).reset_index(drop=True)
+    if not outer:
+        # A row the explode invented for an empty or null list is the row the default
+        # semantics drop. It is identified by the marker, NEVER by the element being null: a
+        # list may legitimately *contain* a null, and that element is a row the engine keeps.
+        out = out[~out[_EMPTY]].reset_index(drop=True)
+    out = (
+        _with_element_index(out, index_alias, be)
+        if index_alias is not None
+        else out.drop(columns=[_EMPTY])
+    )
+    if index_alias is not None:
+        order = [*order, index_alias]
+    return out.rename(columns={column: alias})[order]
+
+
+def _marked(df, column: str, be: DfBackend, *, number: bool):
+    """`df` with the private columns the explode needs carried across it.
+
+    The emptiness test is taken *before* the explode, because afterwards it cannot be taken at
+    all: a row invented for an empty list and a row carrying a list's own null element are the
+    same row by then, and they need opposite answers. The first is not a row at all under the
+    default semantics; the second is a row whose value happens to be null.
+    """
+    df = df.copy()
+    lengths = df[column].list.len()
+    # `fillna(True)`: a null list has no length, and no elements either, so it is empty.
+    df[_EMPTY] = be.column((lengths.isna() | (lengths == 0)).fillna(True), df)
+    if number:
+        df[_ROW] = range(len(df))
+    return df
+
+
+def _with_element_index(out, index_alias: str, be: DfBackend):
+    """Number each exploded element within its own list, 0-based.
+
+    A row kept only by `outer` has no element and so has no position. The engine reports null
+    there rather than zero, which would read as "the first element" of a list that has none.
+    """
+    import pyarrow as pa
+
+    out = out.copy()
+    counted = out.groupby(_ROW).cumcount()
+    numbered = be.column(counted, out).astype(be.dtype(pa.int64()))
+    out[index_alias] = numbered.where(~out[_EMPTY], None)
+    return out.drop(columns=[_ROW, _EMPTY])
+
+
+def _row_id(df, ir: dict, be: DfBackend):
+    """`with_row_index` — a sequential index column, **prepended**.
+
+    Prepended rather than appended, because that is what the plan's own `available_columns`
+    promises and what Polars' `with_row_index` does. Appending it would put every column of
+    every result in the wrong place, which a comparison by column *name* would never notice.
+
+    The numbering is over the whole relation, which is exactly why a chain carrying this
+    operator must not be split across devices: each shard would restart at the offset. Nothing
+    here enforces that, and nothing needs to — `row_id` has no mergeable form, so the shard
+    planner declines the chain and it runs on one device (`plan.distribution._split_reducer`).
+    """
+    import pyarrow as pa
+
+    offset = int(ir.get("offset", 0))
+    out = df.copy()
+    out[ir["alias"]] = be.series(range(offset, offset + len(out))).astype(be.dtype(pa.int64()))
+    return out[[ir["alias"], *df.columns]]
+
+
+def _unpivot(df, ir: dict, be: DfBackend):
+    """`UNPIVOT` — wide to long, the `melt` both libraries spell the same way.
+
+    Every column outside `index` and `on` is dropped, which is the operator's contract rather
+    than an accident of the library: the plan's own `available_columns` is exactly
+    `[*index, variable_name, value_name]`.
+    """
+    return be.lib.melt(
+        df,
+        id_vars=list(ir["index"]),
+        value_vars=list(ir["on"]),
+        var_name=ir["variable_name"],
+        value_name=ir["value_name"],
+    ).reset_index(drop=True)
+
+
 def _limit(df, ir: dict, _be: DfBackend):
     offset = ir.get("offset", 0)
     return df.iloc[offset : offset + ir["n"]].reset_index(drop=True)
@@ -195,4 +323,7 @@ _HANDLERS = {
     "distinct": _distinct,
     "limit": _limit,
     "window": window,
+    "unnest": _unnest,
+    "unpivot": _unpivot,
+    "row_id": _row_id,
 }

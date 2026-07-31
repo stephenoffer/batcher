@@ -25,9 +25,11 @@ from dataclasses import dataclass, replace
 from batcher.config import CostCoefficients, CostWeights, active_config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost.fabric import fabric_adjusted_weights
+from batcher.kyber.cost.locality import plan_locality_factor
 from batcher.kyber.cost.shuffle import net_cost
 from batcher.kyber.cost.terms import (
     cache_factor,
+    memory_budget,
     merge_io,
     sort_comparisons,
     spill_io,
@@ -101,6 +103,7 @@ class CostModel:
         coeffs: CostCoefficients | None = None,
         workers: int = 1,
         source_io_factors: list[float] | None = None,
+        hardware=None,
     ) -> None:
         self._est = estimator
         self._c = coeffs or active_config().optimizer.cost_coeffs
@@ -114,6 +117,16 @@ class CostModel:
         # default every existing caller gets — makes the `net` axis identically zero, so a
         # single-node plan is ranked exactly as it was before that axis was populated.
         self._workers = max(1, int(workers))
+        # What a byte of an exchange across this fleet costs relative to a cross-rack byte.
+        # Computed once per model rather than per node: it is a property of the cluster and the
+        # worker count, neither of which moves while a plan is being optimized, and `net_cost`
+        # is called for every candidate the enumerator considers.
+        self._locality = plan_locality_factor(hardware, self._workers)
+        # The spill threshold this plan's operators will actually meet. The configured budget
+        # is sensed on the *driver*; on the usual cluster shape that is a fat head node beside
+        # small workers, and a plan ranked against it believes an operator that will spill on
+        # every worker does not. Combined with `min`, so a single-node run is unchanged.
+        self._budget = memory_budget(getattr(hardware, "memory_bytes", 0) or 0)
         self._cost_cache: dict[int, tuple[LogicalPlan, Cost]] = {}
 
     def _rows(self, node: LogicalPlan) -> float:
@@ -224,7 +237,17 @@ class CostModel:
         local = self._local_cost(node)
         if self._workers <= 1:
             return local
-        return replace(local, net=net_cost(node, self._rows, self.row_bytes, self._workers))
+        return replace(
+            local,
+            net=net_cost(
+                node,
+                self._rows,
+                self.row_bytes,
+                self._workers,
+                self._locality,
+                self._est.estimate,
+            ),
+        )
 
     def _source_io_factor(self, source_id: int) -> float:
         """What a byte scanned from this source costs, relative to the plan's median source.
@@ -294,7 +317,7 @@ class CostModel:
                 cpu=c.hash_build_row * in_rows * cache_factor(state_bytes)
                 + c.output_row * out_rows,
                 mem=state_bytes,
-                io=spill_io(state_bytes),
+                io=spill_io(state_bytes, self._budget),
             )
 
         if isinstance(node, Sort):
@@ -306,7 +329,7 @@ class CostModel:
                 mem=state_bytes,
                 # An out-of-core sort rewrites its runs once per merge pass, and the pass count
                 # grows only logarithmically in how far over budget it is.
-                io=merge_io(state_bytes),
+                io=merge_io(state_bytes, self._budget),
             )
 
         if isinstance(node, Join):
@@ -339,7 +362,7 @@ class CostModel:
                 # A build side past the memory budget partitions to disk and reads both sides
                 # back — the grace-hash fallback. Costing it at zero made a plan that spills
                 # look identical to one that does not.
-                io=spill_io(build_bytes),
+                io=spill_io(build_bytes, self._budget),
             )
 
         if isinstance(node, Distinct):
@@ -348,7 +371,7 @@ class CostModel:
             return Cost(
                 cpu=c.distinct_row * in_rows * cache_factor(state_bytes),
                 mem=state_bytes,
-                io=spill_io(state_bytes),
+                io=spill_io(state_bytes, self._budget),
             )
 
         if isinstance(node, Window):
@@ -383,7 +406,7 @@ class CostModel:
             return Cost(
                 cpu=c.union_row * in_rows + c.distinct_row * in_rows * cache_factor(state_bytes),
                 mem=state_bytes,
-                io=spill_io(state_bytes),
+                io=spill_io(state_bytes, self._budget),
             )
 
         if isinstance(node, Limit):

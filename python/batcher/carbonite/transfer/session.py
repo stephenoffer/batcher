@@ -20,13 +20,14 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
-from batcher.carbonite.transfer.fabric_usage import fabric_baseline, fabric_usage
+from batcher.carbonite.transfer.fabric_usage import fabric_baseline, fabric_usage, rail_usage
 from batcher.carbonite.transfer.lifecycle import host_of, process_client, register_session
 from batcher.carbonite.transfer.locality import (
     TransferMode,
     locality_ratio_counts,
     select_mode,
 )
+from batcher.carbonite.transfer.peers import straggler_peer
 from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleTicket
 
 if TYPE_CHECKING:
@@ -413,6 +414,20 @@ class ShuffleSession:
         elif self._credits is not None:
             out["credit_window"] = self._credits
         out.update(fabric_usage(self._fabric_baseline, self._fabric_started))
+        # Per rail as well as summed, on a node with more than one. The summed figure cannot
+        # distinguish a shuffle that used an eighth of the fabric from one that used one rail
+        # of eight at capacity, and those have opposite fixes.
+        straggler = straggler_peer()
+        if straggler is not None:
+            # One peer well below the fleet's median is a node to drain, and it is invisible
+            # in every other figure here: a fleet with one slow member reads exactly like a
+            # fleet that is uniformly busy.
+            out["straggler_peer_gbps"] = round(straggler.gbps, 3)
+        rails = rail_usage(self._fabric_baseline, self._fabric_started)
+        if rails:
+            out["rail_busiest_gbps"] = rails["busiest_gbps"]
+            out["rails_idle"] = rails["idle_rails"]
+            out["rail_spread"] = rails["spread"]
         return out
 
     def release(self, ticket: ShuffleTicket) -> None:

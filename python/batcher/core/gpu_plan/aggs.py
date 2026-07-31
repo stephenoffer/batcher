@@ -132,6 +132,27 @@ def _normalized_key(df, name: str, be: DfBackend, *, slot: int) -> str:
     return normalized
 
 
+def _null_if_empty(series, reduced):
+    """`reduced`, nulled for every group that had no non-null value to fold.
+
+    The engine's rule, and SQL's: a `sum` over nothing is null, not `0`; a `product` is not `1`;
+    an `all` is not `True`. Both dataframe libraries return the operator's identity instead,
+    which reads as a real measurement.
+
+    pandas spells the fix `min_count=1`, and that is what this used to pass — but **cuDF has no
+    `min_count`**, and raises `NotImplementedError` for it on every reduction that takes one.
+    So the one parameter that made `sum` correct was also the one that made `sum` impossible on
+    a device, and since `sum` is in essentially every analytical query, the GPU backend declined
+    essentially every analytical query and fell back to the host. It cost the whole path, and it
+    was invisible from here because the verification backend is pandas, where `min_count` works.
+
+    Counting and masking is the same answer through an operation both libraries have. It is
+    what the boolean folds already did, for the same reason — they never had a `min_count` to
+    reach for — so this is now one statement rather than two.
+    """
+    return reduced.where(_call(series, "count") > 0)
+
+
 def _reduce(grouped, spec: dict, column: str | None):
     """One reduction over the shared `GroupBy`, as a Series indexed by the group key."""
     func = spec["func"]
@@ -141,11 +162,9 @@ def _reduce(grouped, spec: dict, column: str | None):
     if func in _PLAIN:
         return _call(series, _PLAIN[func])
     if func in _MIN_COUNT:
-        return _call(series, _MIN_COUNT[func], min_count=1)
+        return _null_if_empty(series, _call(series, _MIN_COUNT[func]))
     if func in _BOOL_FOLD:
-        # `.where(cond)` nulls the entries where `cond` is false, which is the `min_count=1`
-        # the boolean folds do not offer: a group that folded nothing folded to null.
-        return _call(series, _BOOL_FOLD[func]).where(_call(series, "count") > 0)
+        return _null_if_empty(series, _call(series, _BOOL_FOLD[func]))
     if func in _SAMPLE_MOMENT:
         return _call(series, _SAMPLE_MOMENT[func])
     if func == "quantile":
@@ -237,9 +256,12 @@ def aggregate(df, ir: dict, be: DfBackend):
     Raises:
         Unsupported: For a reduction outside the translated subset.
     """
-    keys, aliases = _key_columns(df, ir, be)
-    if not keys:
+    if not ir["group_keys"]:
         return _global(df, ir, be)
+    # Shallow: the private key and input columns below are added to this frame, and the caller's
+    # frame must not grow them. Sharing every existing column's buffer makes that free.
+    df = df.copy(deep=False)
+    keys, aliases = _key_columns(df, ir, be)
     inputs = _materialize_inputs(df, ir, be)
     # `dropna=False`: a null key is a group, exactly as it is in the engine and in SQL.
     # The libraries drop it by default, which silently deletes rows from the answer.
@@ -269,7 +291,10 @@ def _global(df, ir: dict, be: DfBackend):
     none. Grouping an empty frame produces no groups, so the empty case is finished by hand.
     """
     key = "__bt_all"
-    df = df.copy()
+    # Shallow rather than deep: the only mutation is the constant key column added next, and a
+    # deep copy here duplicated the whole frame on the device — for a keyless aggregate, which is
+    # every distributed *combine* step, so the fan-out paid for a second copy of every partial.
+    df = df.copy(deep=False)
     df[key] = 0
     inputs = _materialize_inputs(df, ir, be)
     grouped = df.groupby([key], sort=False, dropna=False)

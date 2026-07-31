@@ -20,7 +20,10 @@ from ._faults import (
     _DEFAULT_PENDING_WINDOW,
     _is_fatal_ray_error,
     _is_transient_udf_error,
+    check_results_trusted,
+    node_ledger,
     recovery_policy,
+    retry_budget,
 )
 
 __all__ = ["gather_map_results", "map_barrier"]
@@ -75,6 +78,7 @@ def gather_map_results(
     on_lost=None,
     on_done=None,
     task_cpus: float = 1.0,
+    budget=None,
 ) -> list:
     """Gather `n` partition results, resubmitting any whose task died to preemption.
 
@@ -101,6 +105,14 @@ def gather_map_results(
     ordinary queries are unchanged. A preempted partition is requeued at the front so it
     keeps priority for a slot and cannot be starved past `max_attempts`.
 
+    Retries are additionally drawn from a **job-wide budget** (`budget`, or the configured
+    one). The per-partition `max_attempts` above bounds each partition and bounds nothing
+    about the stage: at a hundred thousand partitions it authorizes hundreds of thousands of
+    retries, and a fleet that is broken in some way no probe catches will spend the whole run
+    using them — finishing hours later with whatever error happened to be last rather than
+    with the first one, which said exactly what was wrong. When the budget is spent the next
+    failure is raised with its own traceback instead of being retried.
+
     This is the map/inference analogue of the shuffle recompute loop
     (`ShuffleRecovery`): a stateless map partition has no published lineage, but it
     *is* its own lineage — a map/inference UDF recomputes idempotently from its durable
@@ -115,6 +127,8 @@ def gather_map_results(
     policy = policy or recovery_policy()
     if n <= 0:
         return []
+    budget = retry_budget() if budget is None else budget
+    budget.record_attempt(n)
     window = max_pending if (max_pending and max_pending > 0) else _pending_window(task_cpus)
     window = max(1, min(window, n))
     results: list = [None] * n
@@ -145,8 +159,14 @@ def gather_map_results(
             # Failing the whole job on one used to discard hours of completed inference.
             if not _is_transient_udf_error(exc):
                 raise
+            # Almost every failure loses work, which is what a retry is for. A device that
+            # took an uncontained ECC fault did something else: it kept running and returned
+            # a wrong number, so the partitions that already *succeeded* on it are suspect
+            # too. Retrying past that produces a job that completes and writes out
+            # corruption, which is worse than the crash it avoided.
+            check_results_trusted(exc)
             attempts[idx] += 1
-            if attempts[idx] > policy.max_attempts:
+            if attempts[idx] > policy.max_attempts or not budget.try_consume():
                 raise
             pending.appendleft(idx)
         except RayError as exc:
@@ -165,7 +185,11 @@ def gather_map_results(
             progressed = bool(on_lost(idx)) if on_lost is not None else False
             if not progressed:
                 attempts[idx] += 1
-                if attempts[idx] > policy.max_attempts:
+                # Charged to the job-wide budget for the same reason it is charged to the
+                # partition's: a retry that taught us nothing is a retry, and a cluster
+                # losing workers faster than the stage can finish must fail on the loss
+                # rather than resubmit into it indefinitely.
+                if attempts[idx] > policy.max_attempts or not budget.try_consume():
                     raise
             pending.appendleft(idx)
         _fill()
@@ -197,8 +221,24 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
 
     The returned `dead` set must be threaded into the reduce stage so it never hosts a
     reducer on a worker known to be gone.
+
+    `dead` is per-stage, and that is the gap the **fault ledger** fills. A worker that failed
+    every source of the previous shuffle is not in *this* barrier's `dead` set, so relocation
+    would pick it again, discover it again, and pay another attempt for the privilege — once
+    per barrier, for the whole query. The ledger remembers across stages, so a host that has
+    been failing is deprioritized from the start. It is only ever a *preference*: when every
+    live worker is quarantined the barrier still uses them, because a stage that cannot place
+    work is worse than a stage placed badly, and the ledger's own blast-radius cap means that
+    state is already telling us the fault is systemic.
     """
     from batcher._internal.errors import ResourceError
+
+    ledger = node_ledger()
+    if ledger is not None:
+        # The fleet size the blast-radius cap is measured against. Without it the cap sees
+        # only the workers that have already failed — "one of one is blocked" — and engages
+        # on the first fault instead of on a systemic one.
+        ledger.observe([str(i) for i in range(workers)])
 
     # slot -> the worker its latest attempt was launched on. Initially `src`, but a
     # relocated source diverges, and it is the *host* that died, not the source id.
@@ -219,6 +259,12 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
         ]
         if not live:
             raise ResourceError("no surviving worker to recompute the lost map partition on")
+        if ledger is not None:
+            # Prefer hosts the ledger has nothing against. `or live` is the whole safety
+            # argument: when every survivor is quarantined the barrier proceeds anyway,
+            # because failing to place work is worse than placing it on a suspect host — and
+            # a fleet in that state is one the ledger's cap has already declared systemic.
+            live = [i for i in live if not ledger.is_blocked(str(i))] or live
         rotation += 1
         return sorted(live)[rotation % len(live)]  # spread relocations, don't pile on one host
 
@@ -231,6 +277,8 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
         host = assigned.get(src, src)  # the HOST died; `src` may be a relocated slot
         newly_dead = host not in dead
         dead.add(host)
+        if ledger is not None:
+            ledger.record_failure(str(host), "worker_lost")
         confirmed.discard(host)  # a host that completed earlier can still be preempted
         if newly_dead:
             # The first moment anything in the engine knows this worker is gone. Published
@@ -247,6 +295,11 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
 
     def _on_done(src: int) -> None:
         confirmed.add(assigned[src])
+        if ledger is not None:
+            # The only evidence that clears a quarantine. Without recording successes the
+            # ledger is a one-way record of everything that ever went wrong, and the fleet it
+            # describes only ever shrinks.
+            ledger.record_success(str(assigned[src]))
 
     results = gather_map_results(_submit, workers, policy, on_lost=_on_lost, on_done=_on_done)
     return results, dead

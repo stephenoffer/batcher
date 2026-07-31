@@ -30,11 +30,18 @@ def test_transfer_modes_carry_their_own_cost_order() -> None:
     """The enum declared itself cheapest-first but carried no order to compare with."""
     modes = sorted(TransferMode, key=lambda m: m.rank)
     assert modes == [
+        TransferMode.DEVICE_LOCAL,
         TransferMode.DIRECT_MEMORY,
+        TransferMode.DEVICE_P2P,
         TransferMode.SHARED_MEMORY,
         TransferMode.NETWORK,
     ]
+    # Every member is ranked, and no two share a rank: the ordering is what three call sites
+    # compare with, and a duplicate would make two modes indistinguishable to all of them.
+    assert len({m.rank for m in TransferMode}) == len(list(TransferMode))
+    assert TransferMode.DEVICE_LOCAL.is_local
     assert TransferMode.DIRECT_MEMORY.is_local
+    assert TransferMode.DEVICE_P2P.is_local
     assert TransferMode.SHARED_MEMORY.is_local
     assert not TransferMode.NETWORK.is_local
     assert locality_ratio([TransferMode.DIRECT_MEMORY, TransferMode.NETWORK]) == 0.5

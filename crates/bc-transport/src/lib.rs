@@ -99,6 +99,7 @@ use crate::store::PartitionStore;
 
 mod exchange;
 mod handler;
+mod peers;
 mod shared;
 mod store;
 mod ticket;
@@ -107,6 +108,9 @@ mod tls;
 mod tls_test_certs;
 
 pub use exchange::{classify, ClientPool, FetchFault, ShuffleExchange};
+pub use peers::{
+    peer_transfers, record_fetch, record_retry, reset_peer_transfers, slowest_peer, PeerTransfer,
+};
 pub use shared::{clear_plan_shared, clear_shared, fetch_shared, publish_shared, shm_available};
 pub use ticket::ShuffleTicket;
 pub use tls::{TlsClientConfig, TlsIdentity, TlsServerConfig};

@@ -21,6 +21,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from batcher._internal.device_share import pack_fraction
 from batcher.config import active_config
 from batcher.kyber.gpu.shape import broadcast_join, is_shardable
 
@@ -31,10 +32,13 @@ if TYPE_CHECKING:
 
 __all__ = ["GpuDecision", "GpuMapParams", "decide_gpu_backend", "decide_gpu_map_params"]
 
-# The GPU-packing quanta a model's memory fraction is rounded UP to, so Ray can co-locate
-# several light inference stages on one GPU (a 3 GB model on a 12 GB GPU → 0.25 → 4 per GPU)
-# instead of each wasting a whole device. A model larger than one GPU reserves whole GPUs.
-_PACK_QUANTA = (0.25, 0.5, 1.0)
+# VRAM headroom left free when packing: activations, allocator fragmentation, and the CUDA
+# context, none of which appear in a declared model footprint. The packing quanta themselves
+# live in `_internal.device_share` — Carbonite admits co-tenants against the same ladder and
+# `dist` turns it into Ray options, and three subsystems that cannot import one another
+# rounding "a quarter of a device" to three different byte counts is five tenants on a device
+# sized for four.
+_PACK_HEADROOM = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +140,14 @@ def decide_gpu_backend(
     # The row threshold below which the GPU overhead isn't amortized: the measured crossover
     # learned from this hub's own GPU/CPU runs when available (Core measures, Kyber consumes),
     # else the config default. This is what makes the backend choice adaptive to the hardware.
-    from batcher.kyber.gpu.adaptive import learned_gpu_min_rows
+    from batcher.kyber.gpu.adaptive import learned_gpu_min_rows, shape_key
 
-    learned_min = learned_gpu_min_rows(hub, accelerator_type)
+    # Keyed by the query's own shape where this hub has seen it enough times, because two
+    # pipelines on one device have different crossovers: a wide projection is transfer-bound
+    # and a narrow group-by is not. The signature is memoized on the node, and the reader falls
+    # back to this device's pooled fit and then to the fleet's, so a shape seen for the first
+    # time keeps exactly the threshold it had.
+    learned_min = learned_gpu_min_rows(hub, accelerator_type, shape_key(plan))
     # `is None`, not truthiness: `learned_gpu_min_rows` clamps to `[default/8, default*8]`, so a
     # legitimately-configured small `gpu_min_rows` (the config invites retuning) can learn a 0 —
     # which `or` discarded, silently reverting to the default *and* dropping the "learned "
@@ -367,22 +376,24 @@ def decide_gpu_map_params(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
         1e-9,
     )
-    cap = 0.85  # leave VRAM headroom for activations + fragmentation (the guides' ~80-85%)
+    cap = 1.0 - _PACK_HEADROOM  # the guides' ~80-85% of a device
 
     if model_memory_gb <= 0.0:
         return GpuMapParams(num_gpus, batch_size, "model memory unknown; left as given")
 
     out_gpus = num_gpus
     if assign_num_gpus and num_gpus <= 0.0:  # user left it unset → decide the packing fraction
-        frac = model_memory_gb / (gpu_gb * cap)
-        if frac <= 1.0:
-            # No `next()` default: this branch is guarded by `frac <= 1.0` and `_PACK_QUANTA`
-            # ends at 1.0, so a quantum always matches. A default here would disguise that.
-            out_gpus = _mig_fraction(model_memory_gb, accelerator_type, gpu_gb) or next(
-                q for q in _PACK_QUANTA if q >= frac
-            )
+        # Bytes, not gigabytes: the shared ladder floors its usable figure, and flooring a
+        # gigabyte count would round a 12 GB device's usable share from 10.2 down to 10.
+        quantum = pack_fraction(model_memory_gb * 1e9, gpu_gb * 1e9, headroom=_PACK_HEADROOM)
+        if quantum <= 0.0:
+            # The ladder declines only when it cannot see a device to divide. A whole device is
+            # the answer that runs; a `0.0` `num_gpus` is a GPU stage scheduled onto a CPU.
+            out_gpus = 1.0
+        elif quantum <= 1.0:
+            out_gpus = _mig_fraction(model_memory_gb, accelerator_type, gpu_gb) or quantum
         else:
-            out_gpus = float(math.ceil(frac))
+            out_gpus = quantum
 
     # The device-memory budget the batch seed spends: the packed GPU fraction, or one whole
     # device for a non-GPU accelerator (its cross-chip packing is the user's resource count).

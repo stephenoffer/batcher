@@ -51,9 +51,7 @@ The remaining execution fields are **power-user performance thresholds**: they t
 
 ## memory
 
-Buffer-pool envelope and the out-of-core spill story.
-
-Setting `max_memory_bytes` is what opts the in-memory engine into spilling. The data plane receives a per-operator spill budget of `max_memory_bytes` times `hard_limit`, and the Rust runtime memory pool spills any stateful operator that exceeds it rather than letting the process run out of memory. That covers aggregate, distinct, sort, join, and windowed-by-partition. Leave it `None`, the default, to run fully in memory at the lowest overhead. See the bounded-memory recipe in {doc}`profiles`.
+Buffer-pool envelope and the out-of-core spill story. Setting `max_memory_bytes` is what opts the in-memory engine into spilling. The data plane receives a per-operator spill budget of `max_memory_bytes` times `hard_limit`, and the Rust runtime memory pool spills any stateful operator that exceeds it rather than letting the process run out of memory. That covers aggregate, distinct, sort, join, and windowed-by-partition. Leave it `None`, the default, to run fully in memory at the lowest overhead. See the bounded-memory recipe in {doc}`profiles`.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -69,6 +67,9 @@ Setting `max_memory_bytes` is what opts the in-memory engine into spilling. The 
 | `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path, with no out-of-core spilling. Set it when you'd rather a query fail fast than spill to disk. |
 | `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing `Dataset.cache()`, described in {doc}`/user-guide/operate/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
 | `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear `ResourceError` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
+| `respect_cgroup_high` | `True` | Budget against the cgroup v2 `memory.high` throttle threshold, not just the `memory.max` kill threshold. Inert wherever `memory.high` is unset. |
+| `stall_aware_pressure` | `True` | Let the kernel's memory PSI raise the pressure level, so the engine spills while reclaim is still coping. It can only raise a level, never lower one. |
+| `oom_kill_backoff` | `0.8` | Fraction of the auto-sensed envelope kept when this container's `memory.events` shows it has already been OOM-killed. `1.0` disables the backoff. An explicit `max_memory_bytes` is never scaled. See {doc}`/deep-dives/memory/buffer-pool` for what these three kernel signals measure. |
 
 ## flow_control
 

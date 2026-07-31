@@ -12,7 +12,7 @@ import pytest
 
 import batcher as bt
 from batcher import col
-from batcher.api.terminal.gpu_backend import _gpu_agg_spec
+from batcher.api.terminal.gpu_backend.translate import _gpu_agg_spec
 
 pytestmark = pytest.mark.unit
 
@@ -118,7 +118,10 @@ def test_the_translated_path_is_tried_before_the_legacy_group_by(monkeypatch):
     both paths return the right answer; only one of them returns it at scale.
     """
     import batcher as bt
-    from batcher.api.terminal import gpu_backend
+
+    # `route` rather than the package: `try_gpu_collect` resolves these from its own
+    # module globals, so patching the facade would be a no-op that still passes.
+    from batcher.api.terminal.gpu_backend import route as gpu_backend
     from batcher.kyber.gpu.policy import GpuDecision
 
     called: list[str] = []
@@ -150,7 +153,9 @@ def test_a_gpu_kernel_that_raises_falls_back_instead_of_failing_the_query(monkey
     the user: the legacy torch kernel raised a bare `TypeError` on a string group key, which is
     an ordinary column, and the query failed rather than running on the CPU engine.
     """
-    from batcher.api.terminal import gpu_backend
+    # `route` rather than the package: `try_gpu_collect` resolves these from its own
+    # module globals, so patching the facade would be a no-op that still passes.
+    from batcher.api.terminal.gpu_backend import route as gpu_backend
 
     monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 2)
 

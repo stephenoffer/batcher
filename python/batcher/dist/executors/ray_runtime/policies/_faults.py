@@ -4,6 +4,12 @@ executor.
 These are pure ``active_config()`` → policy/option builders plus the map-stage
 resilience helpers (``gather_map_results``, ``map_barrier``, ``draining_workers``). They
 hold no Ray lifecycle state, so they import nothing from the rest of the package.
+
+The *classification* they build on lives in `carbonite.resilience.classify`, not here: the
+single-node executor and this scheduler have to agree about what a failure means, and a
+retry rule that two subsystems each keep their own copy of is a retry rule that behaves
+differently depending on which path a failure took to reach it. What stays here is the part
+that is genuinely about Ray — which of its own exception types are deaths and which are not.
 """
 
 from __future__ import annotations
@@ -69,52 +75,101 @@ def _is_fatal_ray_error(exc: BaseException) -> bool:
     return bool(fatal) and isinstance(exc, fatal)
 
 
-# A UDF failure whose cause is a *resource or remote-service* condition rather than a bug in
-# the UDF. These are the failure modes of large-scale GPU inference: a CUDA OOM when several
-# actors peak together, a model server returning 429/503, a socket timeout to a weight store.
-# Retrying one on a fresh worker routinely succeeds, whereas a `TypeError` in the UDF never will.
-_TRANSIENT_UDF_ERROR_MARKERS = (
-    "cuda out of memory",
-    "out of memory",
-    "cublas_status_alloc_failed",
-    "cudnn_status_alloc_failed",
-    "nccl timeout",
-    "connection reset",
-    "connection aborted",
-    "connection refused",
-    "timed out",
-    "timeout",
-    "too many requests",
-    "service unavailable",
-    "temporarily unavailable",
-    "slow_down",
-    "internal server error",
-    "bad gateway",
-    "502",
-    "503",
-    "429",
-)
-
-
 def _is_transient_udf_error(exc: BaseException) -> bool:
     """Whether a `RayTaskError` looks like a retryable resource/remote condition.
 
     A deterministic UDF bug fails identically on every worker, so retrying it only burns
     the budget and delays the error. A transient one — CUDA OOM under a concurrency spike,
     a throttled model endpoint — usually succeeds on the next attempt, and failing the whole
-    job on it throws away hours of completed inference. Matching is on the message text
-    because the real cause is raised by torch / an HTTP client / a vendor SDK and arrives
-    here already wrapped in Ray's `RayTaskError`.
+    job on it throws away hours of completed inference.
+
+    The classification itself lives in `carbonite.resilience.classify`, which is the one
+    taxonomy the single-node executor and this scheduler share. It used to be a marker list
+    here and a second, different marker list nowhere — and a retry rule that two subsystems
+    disagree about is a retry rule that behaves differently depending on which path a failure
+    took to reach it. The classifier also answers the question this predicate structurally
+    cannot: *where* the retry should land. See `must_move`.
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        text = f"{type(cur).__name__} {cur}".lower()
-        if any(marker in text for marker in _TRANSIENT_UDF_ERROR_MARKERS):
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
+    from batcher.carbonite.resilience import is_retryable
+
+    return is_retryable(exc)
+
+
+def check_results_trusted(exc: BaseException) -> None:
+    """Raise instead of retrying when a failure means data already computed is wrong.
+
+    Almost every failure loses work, and losing work is what a retry is for. A handful do
+    something else: an uncontained ECC fault, a double-bit ECC error, a device that kept
+    running and answered incorrectly. Those do not lose a result, they *replace* it with a
+    wrong one, and the tasks that already completed on that device are as suspect as the one
+    that failed.
+
+    Retrying past one of those produces a job that finishes successfully and writes out
+    corruption, which is strictly worse than the crash it avoided — and, because nothing in
+    the output says otherwise, it is discovered downstream by whoever trusted the numbers.
+    So this is the one failure class the recovery loop refuses to absorb.
+
+    Governed by `fault_tolerance.fail_on_untrusted_results`, which a deployment can turn off
+    where the workload is itself tolerant (a resumable job that re-derives everything, a
+    checksum downstream). It is not a performance knob and is on by default.
+
+    Args:
+        exc: The failure about to be retried.
+
+    Raises:
+        ExecutionError: When the failure indicates the device returned corrupted data.
+    """
+    from batcher.carbonite.resilience import results_untrusted
+
+    if not active_config().fault_tolerance.fail_on_untrusted_results:
+        return
+    if not results_untrusted(exc):
+        return
+    from batcher._internal.errors import ExecutionError
+
+    raise ExecutionError(
+        "an accelerator reported a fault that corrupts data already computed on it, so this "
+        "run is not being retried past it: results produced on that device cannot be trusted. "
+        "Reset or replace the device and re-run. Set "
+        "fault_tolerance.fail_on_untrusted_results=False to retry anyway."
+    ) from exc
+
+
+def retry_budget():
+    """The job-wide retry budget, built from the active config.
+
+    Per-task retry limits do not bound a job: `task_max_retries=2` over a hundred thousand
+    partitions authorizes two hundred thousand retries, and a fleet broken in a way no probe
+    catches will use every one of them. What an operator then sees is hours at a fraction of
+    the rate followed by whatever error happened to be last, long after the first one said
+    exactly what was wrong.
+
+    Returns:
+        A `RetryBudget` sized from `fault_tolerance.retry_budget_*`.
+    """
+    from batcher.carbonite.resilience import RetryBudget
+
+    ft = active_config().fault_tolerance
+    return RetryBudget(
+        fraction=ft.retry_budget_fraction,
+        floor=ft.retry_budget_floor,
+        label="map",
+    )
+
+
+def node_ledger():
+    """The process-wide ledger of which workers have been failing, or `None` when disabled.
+
+    Returns:
+        The shared `FaultLedger`, or `None` when `fault_tolerance.quarantine.enabled` is off —
+        in which case every caller keeps the placement behavior it had before the ledger
+        existed, rather than consulting a ledger that records nothing.
+    """
+    if not active_config().fault_tolerance.quarantine.enabled:
+        return None
+    from batcher.carbonite.resilience import default_ledger
+
+    return default_ledger("worker")
 
 
 def speculation_policy():

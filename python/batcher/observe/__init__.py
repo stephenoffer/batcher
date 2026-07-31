@@ -19,6 +19,7 @@ from batcher.observe.energy import (
     format_energy_report,
     format_fleet_efficiency,
 )
+from batcher.observe.fabric import fabric_metrics
 from batcher.observe.inference import InferenceProgress
 from batcher.observe.metrics import (
     metrics_snapshot,
@@ -35,6 +36,7 @@ __all__ = [
     "InferenceProgress",
     "energy_metrics",
     "ensure_sinks",
+    "fabric_metrics",
     "format_device_table",
     "format_energy_report",
     "format_fleet_efficiency",

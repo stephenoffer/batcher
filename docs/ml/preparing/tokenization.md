@@ -151,12 +151,47 @@ print(packed[0].to_pydict())
 
 Three documents of 3, 2, and 4 tokens, plus one EOS each, became three dense sequences of
 exactly 4 tokens, with nothing padded. The second sequence holds the end of document 2
-and the start of document 3. That is the point, and it is why the EOS token matters,
-since it is the only signal that a document boundary was crossed.
+and the start of document 3. That is the point, and it is also the problem the next
+section solves.
 
 `drop_remainder=True` discards the tail that does not fill a block. Set it `False` and
 pass `pad_token` to keep the tail, padded. `rows_per_batch` controls how many packed
 sequences come back per output batch.
+
+### Telling the model where the documents end
+
+A packed sequence holds several unrelated documents, and plain causal attention lets every
+token attend straight across the joins. The cost is invisible in the data and shows up in the
+model, because the packed column is exactly as wide either way and nothing in it says which
+token started a document. The EOS token marks the seams to a reader, not to the attention
+mask.
+
+`boundaries_column` emits the segment lengths inside each sequence:
+
+```python
+packed = list(
+    pack_sequences(
+        corpus.iter_batches(),
+        token_column="tokens",
+        seq_len=4,
+        eos_token=0,
+        boundaries_column="seq_lens",
+    )
+)
+print(packed[0].to_pydict())
+# {'tokens': [[1, 2, 3, 0], [4, 5, 0, 6], [7, 8, 9, 0]],
+#  'seq_lens': [[4], [3, 1], [4]]}
+```
+
+The lengths of each row sum to `seq_len`, so a cumulative sum of one row is the `cu_seqlens`
+FlashAttention's variable-length path takes, and the same list restarts position ids per
+document. A document that straddles a cut contributes a segment on each side, which is what a
+block-diagonal mask wants: inside a sequence the piece really is contiguous. When
+`drop_remainder=False`, the final sequence's padding is its own segment, so every row still
+sums to its width and the padding can be masked by length rather than by scanning for a pad
+token.
+
+Omit the argument and the emitted schema is exactly what it was.
 
 It operates on a batch iterator rather than a `Dataset`, so it composes with anything
 that yields batches, and it holds one buffer of tokens at a time, so a trillion-token

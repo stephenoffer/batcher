@@ -182,6 +182,33 @@ hash table costs more than probing one. They are recalibrated from measured oper
 times once enough samples accumulate, clamped so timing noise cannot produce a
 degenerate model.
 
+### What a shuffled byte costs on this cluster
+
+The network axis is not one price. A hash exchange sends each row to one of `W`
+buckets, and on a fleet of dense nodes many of those buckets are on the producer's own
+host, where a byte moves at host-memory or NVLink rate rather than at the NIC's.
+Thirty-two devices on four eight-GPU hosts and thirty-two devices on thirty-two
+one-GPU hosts report the same device count and the same worker count, and their
+exchanges differ by a factor of eight.
+
+`HardwareProfile.cluster` carries the fleet's shape into the optimizer: one record per
+node with its cores, devices, coherent-fabric width, rack, and egress rate. From it
+Kyber derives what share of an exchange stays inside a worker, a NVLink domain, a
+host, and a rack, prices each tier against the node's measured fabric rate, and
+charges the network axis the weighted result. A shuffle that never leaves a host stops
+being priced as though it crossed a network.
+
+The same shape decides whether an operator's workers prefer to be packed onto few
+nodes or spread across many. Packing is preferred when the gang fits a handful of
+nodes and doing so moves a material fraction of the exchange onto a faster tier.
+
+Two things are deliberately left alone. Every tier whose bandwidth cannot be read is
+charged the network rate, so an unlabelled fleet, a container that cannot see the
+host's `/sys`, and a single-node run are all ranked exactly as they were before any of
+this existed. And skew is charged only to a partitioned window, which can neither
+pre-aggregate its hot partition away the way an aggregate does nor spread it across
+reducers the way a salted join does.
+
 Cardinality estimation drives those costs. Before anything is learned, Kyber falls
 back to Selinger-style selectivities, where `col = literal` passes 10% of rows, a
 range predicate passes a third, and `IS NULL` passes 5%. Sketches built during execution (HyperLogLog for

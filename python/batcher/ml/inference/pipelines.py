@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 __all__ = ["transformers_pipeline_encoder"]
 
 
-def _pipeline_accel_kwargs() -> dict[str, Any]:
+def _pipeline_accel_kwargs(model: str = "") -> dict[str, Any]:
     """Zero-config accelerator placement + precision for a ``transformers.pipeline``.
 
     On a GPU worker: put the model on the detected device and, when the GPU has fast
@@ -42,7 +42,7 @@ def _pipeline_accel_kwargs() -> dict[str, Any]:
         backend = detect_backend()
         if backend != "cpu":
             dev = torch_device(backend)
-            if _should_shard_across_devices(dev):
+            if _should_shard_across_devices(dev, model):
                 # `device=0` pins the whole model to ONE device, so a model larger than a
                 # single GPU raises OOM at load even on a node with room across its cards.
                 # `device_map="auto"` lets accelerate shard the layers over every visible
@@ -77,15 +77,22 @@ def _pipeline_accel_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-def _should_shard_across_devices(device: str) -> bool:
+def _should_shard_across_devices(device: str, model: str = "") -> bool:
     """Whether a ``transformers.pipeline`` should shard with ``device_map="auto"``.
 
-    True only when this process sees more than one CUDA device *and* ``accelerate`` is
-    installed to do the sharding. A single-GPU actor keeps the explicit `device` pin, which
-    is cheaper and avoids accelerate's dispatch hooks; without `accelerate`, `device_map`
-    would raise where the pin at least loads. Ray pins a one-GPU actor to one visible
-    device, so a packed inference actor keeps the pin and only a genuinely multi-GPU
-    process shards."""
+    True only when this process sees more than one CUDA device, ``accelerate`` is installed
+    to do the sharding, and the model does not fit one of those devices. A single-GPU actor
+    keeps the explicit `device` pin, which is cheaper and avoids accelerate's dispatch hooks;
+    without `accelerate`, `device_map` would raise where the pin at least loads. Ray pins a
+    one-GPU actor to one visible device, so a packed inference actor keeps the pin.
+
+    The footprint check is what keeps a *local* multi-GPU run honest. `device_map="auto"` is
+    accelerate's **balanced** map, not a fill-first one: it spreads the layers evenly over
+    every visible device whether or not they need spreading. A model that fits one card then
+    runs as a naive pipeline with no micro-batching, so one device computes while the rest
+    wait and a transfer crosses the bus at every stage boundary — slower than the single-device
+    pin it replaced, on more hardware. An unreadable footprint keeps the old behaviour, because
+    sharding a model that turns out not to fit is recoverable and pinning it is not."""
     if device != "cuda":
         return False  # xpu/mps/xla: accelerate's auto map is not a supported placement here
     try:
@@ -95,9 +102,35 @@ def _should_shard_across_devices(device: str) -> bool:
 
         if importlib.util.find_spec("accelerate") is None:
             return False
-        return torch.cuda.device_count() > 1
+        if torch.cuda.device_count() <= 1:
+            return False
     except Exception:
         return False
+    return not _fits_one_device(model)
+
+
+def _fits_one_device(model: str) -> bool:
+    """Whether `model`'s weights fit one visible device, `False` when that is unknown.
+
+    Sized against the smallest visible device, since a heterogeneous node is bounded by its
+    smallest card, and with the configured VRAM headroom — activations, the CUDA context, and
+    allocator fragmentation are not in a weight footprint.
+
+    The headroom is read from the configuration rather than from Carbonite's constant, and
+    that is a layering constraint rather than a preference: `core.udf` reaches up into
+    `ml.inference` (the debt recorded in the architecture rule), so anything this module
+    imports becomes reachable from `core` — and a `core -> carbonite` edge breaks the
+    subsystem-independence contract. `config` is neutral, and the operator's number is the
+    better one to use anyway.
+    """
+    from batcher.config import active_config
+    from batcher.ml.llm.engines.footprint import device_total_bytes, model_weight_bytes
+
+    weights = model_weight_bytes(model) if model else None
+    device = device_total_bytes()
+    if not weights or not device:
+        return False
+    return weights <= device * (1.0 - active_config().accelerator.vram_headroom)
 
 
 def _cpu_inference_thread_target() -> int:
@@ -222,7 +255,7 @@ def transformers_pipeline_encoder(
                 provides="transformers",
                 extra="transformers",
             )
-            kwargs = _pipeline_accel_kwargs()
+            kwargs = _pipeline_accel_kwargs(model)
             if device is not None:
                 from batcher.ml.devices import resolve_device
 

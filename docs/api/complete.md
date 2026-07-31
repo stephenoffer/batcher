@@ -434,6 +434,12 @@ for what each one does and when to change it.
 .. autoclass:: batcher.config.DeviceMemoryConfig
    :members:
 
+.. autoclass:: batcher.config.FaultToleranceConfig
+   :members:
+
+.. autoclass:: batcher.config.QuarantineConfig
+   :members:
+
 .. autoclass:: batcher.GovernanceConfig
    :members:
 

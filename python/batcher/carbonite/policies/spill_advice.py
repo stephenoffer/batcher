@@ -121,7 +121,36 @@ class SpillAdvisor:
         level = self._pressure.classify()
         if level >= PressureLevel.SPILL:
             return f"live memory pressure is {level.name}"
-        return None
+        return self._oom_history_reason(estimated)
+
+    def _oom_history_reason(self, estimated: int) -> str | None:
+        """Spill an **un-sized** plan in a cgroup that has already been OOM-killed.
+
+        The third signal, and the only one that is evidence rather than inference. The first
+        two both go quiet in the same situation: Kyber emits `0` for an operator whose
+        cardinality it cannot estimate, and live pressure is measured *now*, before the query
+        that will cause the problem has allocated anything. A worker that was killed, restarted
+        by the scheduler, and handed the same un-sized plan therefore takes the "fits" fast path
+        straight back into the kill — and because the kill is a signal from the kernel rather
+        than an exception, each iteration looks like a fresh cold start.
+
+        Deliberately narrow. It applies only when the estimate is absent, because a plan Kyber
+        *did* size has already been compared against the budget by the first signal and
+        overruling that would spill queries that measurably fit. Spilling is result-invariant,
+        so the cost of acting on stale evidence is latency; the cost of ignoring it is the
+        process.
+        """
+        if estimated > 0:
+            return None
+        from batcher.carbonite.memory.kernel import kernel_memory_state
+
+        state = kernel_memory_state()
+        if not state.was_oom_killed:
+            return None
+        return (
+            f"this container has been OOM-killed {state.oom_kills} time(s) and the plan is "
+            "un-sized, so it goes out-of-core rather than repeating the kill"
+        )
 
     def input_exceeds_budget(self, input_bytes: int) -> bool:
         """Whether reading the sources whole would not fit the memory envelope.

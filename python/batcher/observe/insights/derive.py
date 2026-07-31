@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from batcher.observe.insights.dataflow import exploding_join, late_filter, wide_scan
+from batcher.observe.insights.devices import derated_host_link, device_bottleneck
 from batcher.observe.insights.kinds import Insight
 from batcher.observe.insights.planning import (
     bad_estimates,
@@ -56,6 +57,12 @@ _RULES = (
     udf_dominates,
     row_exploding_stage,
     per_row_map,
+    # Findings about the *devices* rather than the plan. They read the sampling window and the
+    # live link geometry, not the profile, because none of what they detect changes what the
+    # plan did — a clamped device and a derated slot produce a profile identical to a healthy
+    # run's, with larger numbers in it.
+    device_bottleneck,
+    derated_host_link,
 )
 
 

@@ -83,7 +83,14 @@ class Optimizer:
         # makes that axis identically zero — so a single-node plan is ranked exactly as it
         # was before shuffle volume was costed at all.
         cost_model = CostModel(
-            estimator, coeffs, workers=self._hardware.worker_count, source_io_factors=io_factors
+            estimator,
+            coeffs,
+            workers=self._hardware.worker_count,
+            source_io_factors=io_factors,
+            # The whole profile, not just its worker count: the `net` axis is priced against
+            # the fleet's interconnect *tiers*, and how a shuffle splits over them is a
+            # question about node density and fabric width that a worker count cannot answer.
+            hardware=self._hardware,
         )
         return OptimizerContext(
             config=self._config,
@@ -152,6 +159,10 @@ class Optimizer:
                 ctx.config,
                 ctx.costs(),
                 load_cpu_utilization(self._hub, self._config),
+                # The fleet shape, so the PACK/SPREAD preference can be a comparison rather
+                # than a constant: on dense nodes, concentrating a gang moves a large exchange
+                # off the network entirely, which an absolute byte threshold cannot express.
+                self._hardware,
             ),
             source_projections=required_columns_per_source(plan),
             source_predicates=_source_predicates(logical, plan),

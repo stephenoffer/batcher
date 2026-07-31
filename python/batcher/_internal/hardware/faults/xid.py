@@ -17,6 +17,13 @@ subset of NVIDIA's own Xid table whose documented remedy is a device reset or an
 outside the table reports as unknown severity, which callers treat as "log it, keep scheduling"
 — inventing a severity for an unseen code is how a future driver release quarantines a fleet.
 
+**An Xid has an age, and the age decides whether it still means anything.** The ring buffer
+holds a node's history, not its present: an entry from before the last device reset, or from
+the tenant who had the node yesterday, is still sitting there. Quarantining on it takes a
+repaired device out of the fleet and never puts it back, because the evidence never expires.
+So every read here can be windowed, `recent_xid_events(within_s=...)`, and the scheduler-facing
+maps default to a window rather than to all of history.
+
 Reads the kernel ring buffer, which needs `CAP_SYSLOG` or a readable `/dev/kmsg`. Without
 permission, off Linux, or inside a container that did not share the host's log, this reports
 nothing and `xid_readable()` is False. Nothing is inferred from silence.
@@ -24,27 +31,42 @@ nothing and `xid_readable()` is False. Nothing is inferred from silence.
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
+
+from batcher._internal.hardware.faults.kmsg import (
+    KMSG_PATH,
+    kmsg_readable,
+    monotonic_now_s,
+    read_kmsg,
+)
 
 __all__ = [
     "KMSG_PATH",
     "XID_APPLICATION",
     "XID_DESCRIPTIONS",
     "XID_FATAL",
+    "XID_WINDOW_S",
     "XidEvent",
     "describe_xid",
     "recent_xid_events",
     "xid_application_faults",
+    "xid_counts",
     "xid_fatal",
     "xid_readable",
     "xid_severity",
+    "xid_unclassified",
 ]
 
-#: The kernel ring buffer. A constant so a test can point it at a fixture and so a deployment
-#: that exposes the log elsewhere (a mounted `kmsg`, a journal export) can redirect it.
-KMSG_PATH = "/dev/kmsg"
+#: How far back a scheduling decision looks by default, in seconds. Six hours is long enough
+#: to cover a job that started this morning and short enough that a device reset yesterday is
+#: not still being punished for what it did before it.
+#:
+#: The number matters in one direction only. Too *long* is the dangerous end: a device that was
+#: reset, repaired, or reprovisioned stays quarantined on evidence that has no expiry, and the
+#: fleet shrinks monotonically over a node's lifetime with nothing in any log to say why. Too
+#: short merely re-learns a still-broken device the next time it faults, which it will.
+XID_WINDOW_S = 6 * 60 * 60.0
 
 #: Xid codes whose documented remedy is a device reset or a replacement — the set that makes a
 #: device unschedulable rather than merely noteworthy. Taken from NVIDIA's published Xid table;
@@ -111,11 +133,6 @@ XID_DESCRIPTIONS: dict[int, str] = {
 #: half worth logging, and it is `_normalize_pci` that decides the event names no device.
 _XID_RE = re.compile(r"NVRM:\s*Xid\s*\(PCI:([^)]*)\)\s*:\s*(\d+)")
 
-#: How much of the ring buffer to read. The buffer is a few hundred kilobytes at most and a
-#: node's Xid history is what matters, so this is a bound against a pathological log rather
-#: than a sampling window.
-_MAX_RECORDS = 4096
-
 
 @dataclass(frozen=True, slots=True)
 class XidEvent:
@@ -127,11 +144,16 @@ class XidEvent:
             `0000:0c:00.0` form so it joins against `hardware.fabric.pcie`. `""` when the
             driver did not name a device, which happens for a few system-scope codes.
         message: The remainder of the driver's line, for a log an operator will read.
+        timestamp_s: Seconds since boot, from the kernel record's own header. `-1.0` when the
+            log carried no usable timestamp, which a caller must read as "unknown age" — an
+            unknown-age event is kept by every window rather than aged out, because dropping
+            a fault you cannot date is how a live one goes unseen.
     """
 
     code: int
     pci_address: str = ""
     message: str = ""
+    timestamp_s: float = -1.0
 
     @property
     def fatal(self) -> bool:
@@ -164,32 +186,6 @@ def _normalize_pci(raw: str) -> str:
     return ""
 
 
-def _kmsg_lines(path: str) -> list[str]:
-    """Lines currently in the kernel ring buffer, or `[]` when it cannot be read.
-
-    Opened non-blocking so a caller is never parked waiting for the next kernel message: the
-    ring buffer replays its history from the start of the file and then would block for new
-    records, and this only wants the history.
-    """
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError:
-        return []
-    lines: list[str] = []
-    try:
-        for _ in range(_MAX_RECORDS):
-            try:
-                chunk = os.read(fd, 8192)
-            except OSError:
-                break  # EAGAIN: the history is exhausted and the next record has not arrived
-            if not chunk:
-                break
-            lines.extend(chunk.decode("utf-8", "replace").splitlines())
-    finally:
-        os.close(fd)
-    return lines
-
-
 def xid_readable(path: str | None = None) -> bool:
     """Whether the kernel log can be read at all on this host.
 
@@ -204,16 +200,13 @@ def xid_readable(path: str | None = None) -> bool:
         True when the log opened. False without permission, off Linux, or in a container that
         did not share it.
     """
-    try:
-        fd = os.open(path or KMSG_PATH, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError:
-        return False
-    os.close(fd)
-    return True
+    return kmsg_readable(path)
 
 
-def recent_xid_events(path: str | None = None) -> tuple[XidEvent, ...]:
-    """Every Xid error currently in the kernel ring buffer, oldest first.
+def recent_xid_events(
+    path: str | None = None, within_s: float | None = None
+) -> tuple[XidEvent, ...]:
+    """Xid errors in the kernel ring buffer, oldest first.
 
     Not memoized: the whole value is that a device that faulted a minute ago is seen now. The
     read costs a few hundred kilobytes of kernel buffer, so it belongs on a per-stage or
@@ -221,28 +214,52 @@ def recent_xid_events(path: str | None = None) -> tuple[XidEvent, ...]:
 
     Args:
         path: Kernel log to read, defaulting to `KMSG_PATH`.
+        within_s: Keep only events written within this many seconds, or `None` for the whole
+            buffer. An event the log did not date is kept either way — an undated fault is
+            unknown, not old, and aging it out is how a live one disappears.
 
     Returns:
         The events, empty when the log holds none *or* cannot be read — call `xid_readable()`
         to tell those apart.
     """
+    now = monotonic_now_s()
     events: list[XidEvent] = []
-    for line in _kmsg_lines(path or KMSG_PATH):
-        match = _XID_RE.search(line)
+    for record in read_kmsg(path):
+        match = _XID_RE.search(record.text)
         if match is None:
             continue
-        try:
-            code = int(match.group(2))
-        except ValueError:
+        if within_s is not None and record.timestamp_s >= 0.0 and record.age_s(now) > within_s:
             continue
-        tail = line[match.end() :].lstrip(" ,:")
+        tail = record.text[match.end() :].lstrip(" ,:")
         events.append(
-            XidEvent(code=code, pci_address=_normalize_pci(match.group(1)), message=tail.strip())
+            XidEvent(
+                code=int(match.group(2)),
+                pci_address=_normalize_pci(match.group(1)),
+                message=tail.strip(),
+                timestamp_s=record.timestamp_s,
+            )
         )
     return tuple(events)
 
 
-def xid_fatal(events: tuple[XidEvent, ...] | None = None) -> dict[str, tuple[int, ...]]:
+def _by_address(
+    events: tuple[XidEvent, ...] | None,
+    within_s: float | None,
+    keep,
+) -> dict[str, tuple[int, ...]]:
+    """`{pci address: codes}` for the events `keep` accepts, read live when none are given."""
+    records = recent_xid_events(within_s=within_s) if events is None else events
+    out: dict[str, set[int]] = {}
+    for event in records:
+        if event.pci_address and keep(event):
+            out.setdefault(event.pci_address, set()).add(event.code)
+    return {address: tuple(sorted(codes)) for address, codes in sorted(out.items())}
+
+
+def xid_fatal(
+    events: tuple[XidEvent, ...] | None = None,
+    within_s: float | None = XID_WINDOW_S,
+) -> dict[str, tuple[int, ...]]:
     """Fatal Xid codes seen per device, keyed by PCI address.
 
     The map a scheduler acts on: a device present here should not be given work until it has
@@ -251,18 +268,18 @@ def xid_fatal(events: tuple[XidEvent, ...] | None = None) -> dict[str, tuple[int
 
     Args:
         events: Events to inspect, or `None` to read them live.
+        within_s: Ignore events older than this many seconds. Defaults to `XID_WINDOW_S`
+            rather than to the whole buffer, because a fatal Xid with no expiry quarantines a
+            device that has since been reset and never releases it. Pass `None` for a
+            forensic read of everything the buffer still holds. Ignored when `events` is
+            given — window those at the read.
 
     Returns:
         PCI address to the fatal codes seen for it, ascending and deduplicated. Events the
         driver did not attribute to a device are dropped rather than being attributed to an
         arbitrary one. Empty when nothing fatal was seen or the log is unreadable.
     """
-    records = recent_xid_events() if events is None else events
-    out: dict[str, set[int]] = {}
-    for event in records:
-        if event.fatal and event.pci_address:
-            out.setdefault(event.pci_address, set()).add(event.code)
-    return {address: tuple(sorted(codes)) for address, codes in sorted(out.items())}
+    return _by_address(events, within_s, lambda e: e.fatal)
 
 
 def describe_xid(code: int) -> str:
@@ -306,6 +323,7 @@ def xid_severity(code: int) -> str:
 
 def xid_application_faults(
     events: tuple[XidEvent, ...] | None = None,
+    within_s: float | None = XID_WINDOW_S,
 ) -> dict[str, tuple[int, ...]]:
     """Workload-caused Xid codes seen per device, keyed by PCI address.
 
@@ -316,14 +334,73 @@ def xid_application_faults(
 
     Args:
         events: Events to inspect, or `None` to read them live.
+        within_s: Ignore events older than this many seconds; `None` reads the whole buffer.
+            Ignored when `events` is given.
 
     Returns:
         PCI address to the application codes seen for it, ascending and deduplicated. Empty
         when none were seen or the log is unreadable.
     """
-    records = recent_xid_events() if events is None else events
-    out: dict[str, set[int]] = {}
+    return _by_address(events, within_s, lambda e: xid_severity(e.code) == "application")
+
+
+def xid_unclassified(
+    events: tuple[XidEvent, ...] | None = None,
+    within_s: float | None = XID_WINDOW_S,
+) -> dict[str, tuple[int, ...]]:
+    """Xid codes this build recognizes as neither hardware nor workload, per device.
+
+    The counterpart of the module's refusal to guess. A code outside both tables is reported
+    as unknown severity and deliberately does not quarantine anything — but it is also the
+    single most interesting line in the log for an operator on a node that keeps failing,
+    because it is the one the vendor's documentation has an entry for and this build does not.
+    Dropping it silently is how a driver release introduces a fault mode that a fleet then
+    experiences for months as "nodes are just flaky".
+
+    Nothing acts on this. It exists to be *reported*, which is the correct treatment for
+    evidence that has not been classified.
+
+    Args:
+        events: Events to inspect, or `None` to read them live.
+        within_s: Ignore events older than this many seconds; `None` reads the whole buffer.
+            Ignored when `events` is given.
+
+    Returns:
+        PCI address to the unrecognized codes seen for it, ascending and deduplicated.
+    """
+    return _by_address(events, within_s, lambda e: xid_severity(e.code) == "unknown")
+
+
+def xid_counts(
+    events: tuple[XidEvent, ...] | None = None,
+    within_s: float | None = XID_WINDOW_S,
+) -> dict[tuple[str, int], int]:
+    """How many times each `(pci address, code)` pair was reported.
+
+    A repeat count is a different signal from the codes themselves, and it separates two
+    situations the set-valued maps above cannot. One Xid 31 is a job that indexed past the end
+    of a buffer. Four hundred Xid 31s in an hour is a device whose MMU is mistranslating, and
+    the fact that the code classifies as `"application"` stops being the right read — no
+    workload produces that rate by being buggy. The same holds in reverse for a single Xid 63:
+    the code is fatal, and one occurrence is a row remap being *recorded*, which is the device
+    repairing itself successfully.
+
+    Callers use it as a rate gate. Nothing here turns a count into a verdict, because how many
+    is too many depends on the fleet and belongs with the policy that owns the thresholds.
+
+    Args:
+        events: Events to inspect, or `None` to read them live.
+        within_s: Ignore events older than this many seconds; `None` reads the whole buffer.
+            Ignored when `events` is given.
+
+    Returns:
+        `(pci address, code)` to occurrence count. Events with no attributed device are keyed
+        on `""`, unlike the maps above that drop them: a rate is still meaningful without
+        knowing which device produced it, where a quarantine decision is not.
+    """
+    records = recent_xid_events(within_s=within_s) if events is None else events
+    out: dict[tuple[str, int], int] = {}
     for event in records:
-        if event.pci_address and xid_severity(event.code) == "application":
-            out.setdefault(event.pci_address, set()).add(event.code)
-    return {address: tuple(sorted(codes)) for address, codes in sorted(out.items())}
+        key = (event.pci_address, event.code)
+        out[key] = out.get(key, 0) + 1
+    return out

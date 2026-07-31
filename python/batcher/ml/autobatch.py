@@ -128,6 +128,17 @@ class ThroughputController:
         self._stale = 0
         self._hub = hub
         self._signature = signature
+        # A ceiling learned from actual out-of-memory failures, distinct from `max_rows` (a
+        # caller's declared bound). Without it the climb has no memory of an OOM: the batch
+        # that died is halved, the halved batch succeeds and reports good throughput, and
+        # `improving` promptly grows the size straight back into the same failure. That
+        # oscillation is what makes an inference job spend its life at the edge of an OOM,
+        # paying the retry cost on a large fraction of its batches.
+        self._oom_ceiling: float | None = None
+        # Consecutive OOMs. Each one backs the ceiling off further, so a device that keeps
+        # failing converges downward instead of hovering just under a ceiling that is itself
+        # too high (a co-tenant that grew, a longer-sequence shard).
+        self._oom_streak = 0
         # Warm-start the climb from the learned plateau when one exists (clamped to bounds).
         learned = learned_batch_size(hub, signature)
         seed = learned if learned is not None else initial
@@ -135,8 +146,54 @@ class ThroughputController:
         self._best_throughput: float | None = None
         self._best_size: float | None = None
 
+    def note_oom(self, *, rows: int | None = None) -> int:
+        """Record that a batch ran out of device memory; return the size to use next.
+
+        The predictive VRAM guard in `update` prevents most out-of-memory failures and cannot
+        prevent all of them: it sees this process's VRAM, so a co-tenant that grows between
+        two batches, an unusually long sequence in one shard, or allocator fragmentation all
+        produce an OOM at a size that measured safe. What made that expensive was that nothing
+        told the controller. The failing batch was halved by the retry, the halved batch
+        reported perfectly good throughput, and the climb grew straight back into the same
+        failure — so a job could spend most of its life failing and retrying while every
+        measurement said it was improving.
+
+        This records a **ceiling** below the size that failed. The ceiling is permanent for
+        the run (the climb may approach it but never exceed it) and ratchets down on each
+        consecutive failure, so a device that keeps failing converges instead of hovering.
+        A subsequent success clears the streak but not the ceiling: one batch fitting is not
+        evidence that a size which already failed has become safe.
+
+        The batch size only shards rows, so this never changes a result — only how many rows
+        are handed to the model at once.
+
+        Args:
+            rows: The size that failed, when the caller knows it. Defaults to the current
+                target, which is what it will be unless the caller re-batched underneath.
+
+        Returns:
+            The next batch-size target, always at least `min_rows`.
+        """
+        failed = float(rows if rows is not None and rows > 0 else self.current())
+        self._oom_streak += 1
+        # Back off harder the more consecutive failures there have been: the first OOM only
+        # proves this size is too big, while a third in a row means the estimate of how much
+        # too big is itself wrong.
+        backoff = self._shrink**self._oom_streak
+        ceiling = max(float(self._min), failed * backoff)
+        current = self._oom_ceiling
+        self._oom_ceiling = ceiling if current is None else min(current, ceiling)
+        self._cur = self._oom_ceiling
+        # The plateau was measured at a size that has now failed, so it is not a target to
+        # settle back to. Forget it and let the climb re-find one under the new ceiling.
+        self._best_throughput = None
+        self._best_size = None
+        self._stale = 0
+        return self.current()
+
     def update(self, throughput_rows_per_s: float, vram_fraction: float | None = None) -> int:
         """Observe throughput (and optional VRAM) at the current size; return the next."""
+        self._oom_streak = 0  # a batch completed, so the run of consecutive failures is over
         # VRAM is a hard cap: over it, shrink and restart the climb from here.
         if vram_fraction is not None and vram_fraction > self._vram_cap:
             self._cur = max(float(self._min), self._cur * self._shrink)
@@ -181,8 +238,15 @@ class ThroughputController:
         return self.current()
 
     def current(self) -> int:
-        """The current batch-size target (clamped, rounded to a whole row count)."""
-        return int(min(self._max, max(self._min, round(self._cur))))
+        """The current batch-size target (clamped, rounded to a whole row count).
+
+        Clamped by the OOM ceiling as well as the caller's bounds, so every path that grows
+        the size — the hill-climb, the settle-back, the learned warm start — is bounded by
+        what has actually been observed to fit. Enforcing it here rather than at each of those
+        sites is what makes it impossible for a new growth path to be added that forgets it.
+        """
+        target = self._cur if self._oom_ceiling is None else min(self._cur, self._oom_ceiling)
+        return int(min(self._max, max(self._min, round(target))))
 
     def best_size(self) -> int:
         """The best (throughput-optimal) size observed so far — the settled plateau.
@@ -190,4 +254,9 @@ class ThroughputController:
         Falls back to the current size before any observation. This is the value the learned
         store persists so a future run can warm-start the climb."""
         best = self._best_size if self._best_size is not None else self._cur
+        if self._oom_ceiling is not None:
+            # This is the figure the learned store persists for the *next* run to warm-start
+            # from, so a plateau measured before an out-of-memory must not escape through it —
+            # that would hand the failing size straight back on the following run.
+            best = min(best, self._oom_ceiling)
         return int(min(self._max, max(self._min, round(best))))

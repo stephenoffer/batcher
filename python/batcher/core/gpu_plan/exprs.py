@@ -332,6 +332,55 @@ def _in_list(ir, df, be):
     return be.column(eval_expr(ir["input"], df, be), df).isin(values)
 
 
+def _list(ir, df, be: DfBackend):
+    """A scalar reduction over each row's list — of which only the length is translatable.
+
+    `.list.len()` is the one reduction both libraries spell the same way. The arithmetic ones
+    (`sum`, `mean`, `min`) exist on cuDF's list accessor and not on the host backend's, so
+    translating them would ship a path only the device can run and only the device could be
+    wrong about. `list_get` is absent for the opposite reason and is worth stating: both
+    libraries have it, but they disagree about an out-of-range index — the host backend raises
+    where the engine and cuDF return null — so the verification backend cannot model the device.
+    """
+    fn = ir["fn"]
+    if fn != "len":
+        raise Unsupported(f"list fn {fn}")
+    import pyarrow as pa
+
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    return x.list.len().astype(be.dtype(pa.int64()))
+
+
+def _make_temporal(ir, df, be: DfBackend):
+    """An epoch or calendar constructor, whose arguments are sub-expressions."""
+    from batcher.core.gpu_plan.temporal import eval_make_temporal
+
+    args = [be.column(eval_expr(a, df, be), df) for a in ir["args"]]
+    return eval_make_temporal(ir["fn"], args, be)
+
+
+def _window_start(ir, df, be: DfBackend):
+    """`window_start` — the tumbling-window bucket key, whose width and origin are constants."""
+    from batcher.core.gpu_plan.temporal import eval_window_start
+
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    return eval_window_start(x, int(ir["width_micros"]), int(ir.get("origin_micros", 0)), be)
+
+
+def _date_offset(ir, df, be: DfBackend):
+    """`offset_by` — a shift by months, days and micros, of which the zero ones are omitted.
+
+    Not routed through `_named`: the offset components are fields of the node rather than a
+    sub-expression, so the evaluator takes them directly and never needs `eval_expr`.
+    """
+    from batcher.core.gpu_plan.temporal import eval_date_offset
+
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    return eval_date_offset(
+        x, int(ir.get("months", 0)), int(ir.get("days", 0)), int(ir.get("micros", 0)), be
+    )
+
+
 def _named(handler):
     """Adapt a function-family evaluator to the handler signature.
 
@@ -362,5 +411,9 @@ _HANDLERS = {
     "str": _named(eval_str),
     "date": _named(eval_date),
     "date_trunc": _named(eval_date_trunc),
+    "date_offset": _date_offset,
+    "list": _list,
+    "window_start": _window_start,
+    "make_temporal": _make_temporal,
     "strftime": _named(eval_strftime),
 }

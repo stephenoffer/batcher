@@ -108,9 +108,7 @@ def test_a_non_collective_stage_is_not_examined(monkeypatch, caplog) -> None:
     def _fail(*a, **k):  # pragma: no cover - the point is that it is never called
         raise AssertionError("topology must not be read for a non-collective stage")
 
-    monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.fabric.largest_local_domain", _fail
-    )
+    monkeypatch.setattr("batcher.dist.executors.ray_runtime.fabric.largest_local_domain", _fail)
     with caplog.at_level(logging.DEBUG, logger="batcher.dist"):
         _report_collective_fabric(16, SchedulingEnvelope())
         _report_collective_fabric(1, SchedulingEnvelope(gpu_collective=True))
@@ -121,9 +119,7 @@ def test_the_report_never_fails_a_placement(monkeypatch, caplog) -> None:
     def _boom(*a, **k):
         raise RuntimeError("topology exploded")
 
-    monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.fabric.largest_local_domain", _boom
-    )
+    monkeypatch.setattr("batcher.dist.executors.ray_runtime.fabric.largest_local_domain", _boom)
     _report_collective_fabric(16, SchedulingEnvelope(gpu_collective=True))  # must not raise
 
 
@@ -131,9 +127,7 @@ def test_the_report_is_off_when_fabric_placement_is_disabled(monkeypatch) -> Non
     def _fail(*a, **k):  # pragma: no cover - the point is that it is never called
         raise AssertionError("topology must not be read when the switch is off")
 
-    monkeypatch.setattr(
-        "batcher.dist.executors.ray_runtime.fabric.largest_local_domain", _fail
-    )
+    monkeypatch.setattr("batcher.dist.executors.ray_runtime.fabric.largest_local_domain", _fail)
     cfg = Config().replace(accelerator=AcceleratorConfig(fabric_aware_placement=False))
     with config_context(cfg):
         _report_collective_fabric(16, SchedulingEnvelope(gpu_collective=True))

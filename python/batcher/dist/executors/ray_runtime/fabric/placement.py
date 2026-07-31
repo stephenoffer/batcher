@@ -25,9 +25,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from batcher.dist.executors.ray_runtime.fabric.topology import (
+    LINK_CLASSES,
     GpuNodeTopology,
     domain_groups,
     gpu_node_topology,
+    interconnect_class,
     largest_local_domain,
 )
 
@@ -47,10 +49,18 @@ class CollectivePlacement:
     Attributes:
         world_size: Devices the stage needs.
         bundles: Ray placement-group bundles, one per node, as `{"GPU": n, "CPU": c}`.
-        strategy: Ray placement strategy — `STRICT_PACK` when the collective fits one node's
-            fabric, `PACK` when it must span nodes but should stay as close as possible.
+        strategy: Ray placement strategy — `STRICT_PACK` when the collective fits one node,
+            `PACK` when it must span nodes but should stay as close as possible.
         spans_fabric: Whether the collective is wider than any single coherent domain, so its
-            all-reduce leaves the fast path.
+            all-reduce leaves the *vendor fabric*. On a PCIe-attached fleet (T4, L4, A10G,
+            L40S — devices whose domain is one) this is True for every collective of two or
+            more, which is why it must not be read as "leaves the machine": see `spans_nodes`.
+        spans_nodes: Whether the bundles land on more than one host, so the all-reduce crosses
+            the network. This is the expensive boundary, and the one distinct from
+            `spans_fabric` on any PCIe-only fleet: four devices on one PCIe host exchange at
+            host-link rates, four devices split across two hosts at NIC rates.
+        link_class: The slowest tier any pair of ranks communicates over, from `LINK_CLASSES`.
+            The single field a caller should rank placements by.
         node_ids: Nodes the bundles target, empty when the topology could not be read.
         reason: One line for the decision log.
     """
@@ -59,6 +69,8 @@ class CollectivePlacement:
     bundles: tuple[dict[str, float], ...] = ()
     strategy: str = "PACK"
     spans_fabric: bool = False
+    spans_nodes: bool = False
+    link_class: str = ""
     node_ids: tuple[str, ...] = ()
     reason: str = ""
 
@@ -117,10 +129,36 @@ def plan_collective(
                 bundles=({"GPU": float(want), "CPU": cpus_per_device * want},),
                 strategy="STRICT_PACK",
                 spans_fabric=False,
+                spans_nodes=False,
+                link_class="nvlink" if node.local_domain > 1 else "intra-node",
                 node_ids=(node.node_id,),
                 reason=(
                     f"fits one {node.accelerator_type or 'GPU'} fabric domain "
                     f"of {node.local_domain}"
+                ),
+            )
+
+    # Failing that, prefer a single node that has the devices even though no vendor fabric
+    # joins them. This tier is the whole PCIe-attached fleet — T4, L4, A10G, L40S, and every
+    # workstation part — where the coherent domain is one device and the test above can never
+    # pass. Skipping it sent a four-way collective on a four-device host down the spanning
+    # path, reported as leaving the fast path, when in truth it never left the machine: an
+    # intra-host exchange runs at host-link rates and a spanning one at NIC rates, and
+    # treating them alike is the difference the placement exists to see.
+    for node in _preferred_order(records, by_capacity=True):
+        if node.gpus >= want:
+            return CollectivePlacement(
+                world_size=want,
+                bundles=({"GPU": float(want), "CPU": cpus_per_device * want},),
+                strategy="STRICT_PACK",
+                spans_fabric=True,
+                spans_nodes=False,
+                link_class="intra-node",
+                node_ids=(node.node_id,),
+                reason=(
+                    f"fits one node's {node.gpus} {node.accelerator_type or 'GPU'} devices; "
+                    f"no vendor fabric joins them (domain of {node.local_domain}), so the "
+                    "all-reduce crosses the host link but stays off the network"
                 ),
             )
 
@@ -139,12 +177,16 @@ def plan_collective(
         if remaining <= 0:
             break
     widest = largest_local_domain(records)
+    chosen = tuple(n for n in records if n.node_id in set(ids))
+    worst = _worst_link_class(chosen)
     if remaining > 0:
         return CollectivePlacement(
             world_size=want,
             bundles=tuple(bundles),
             strategy="PACK",
             spans_fabric=True,
+            spans_nodes=len(ids) > 1,
+            link_class=worst,
             node_ids=tuple(ids),
             reason=(
                 f"fleet has {want - remaining} of {want} devices: "
@@ -156,12 +198,33 @@ def plan_collective(
         bundles=tuple(bundles),
         strategy="PACK",
         spans_fabric=True,
+        spans_nodes=len(ids) > 1,
+        link_class=worst,
         node_ids=tuple(ids),
         reason=(
             f"world size {want} exceeds the widest fabric domain ({widest}): "
-            f"the collective spans {len(bundles)} nodes and its all-reduce leaves the fast path"
+            f"the collective spans {len(bundles)} nodes over {worst} and its all-reduce "
+            "leaves the fast path"
         ),
     )
+
+
+def _worst_link_class(chosen: tuple[GpuNodeTopology, ...]) -> str:
+    """The slowest tier any pair among `chosen` communicates over.
+
+    A collective runs at the rate of its slowest hop, so the ranking field names that hop
+    rather than the best one available.
+    """
+    if not chosen:
+        return ""
+    if len(chosen) == 1:
+        node = chosen[0]
+        return "nvlink" if node.local_domain > 1 else "intra-node"
+    worst = 0
+    for i, a in enumerate(chosen):
+        for b in chosen[i + 1 :]:
+            worst = max(worst, LINK_CLASSES.index(interconnect_class(a, b)))
+    return LINK_CLASSES[worst]
 
 
 def _eligible(

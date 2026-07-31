@@ -21,12 +21,19 @@ from collections.abc import Mapping, Sequence
 
 __all__ = ["assign_replica_hosts"]
 
+#: Load a suspect worker is seeded with, so it ranks behind every healthy one. Large enough
+#: that no realistic primary count can outweigh it, finite so a fleet where *every* worker is
+#: suspect still places its copies rather than silently placing none — which is the state a
+#: systemic failure produces, and the state in which a replica is most likely to be needed.
+_SUSPECT_LOAD = 1_000_000
+
 
 def assign_replica_hosts(
     primaries: Mapping[int, int],
     nodes: Sequence[str],
     factor: int,
     dead: frozenset[int] | set[int] = frozenset(),
+    suspect: frozenset[int] | set[int] = frozenset(),
 ) -> dict[int, list[int]]:
     """Pick the workers that hold a replica of each source's shuffle output.
 
@@ -43,6 +50,13 @@ def assign_replica_hosts(
         nodes: Node id per worker index, so a replica can be placed off the primary's node.
         factor: Total copies wanted per source (1 = no replica, the default).
         dead: Workers known to be gone; never assigned a copy.
+        suspect: Workers the fault ledger has been quarantining. *Deprioritized*, not
+            excluded: a replica exists to die independently of its primary, and a copy on a
+            host that has been failing every task is a copy that will not be there when it is
+            needed. Excluding them outright would be worse — on a fleet where most workers
+            are suspect there would be nowhere left to put a copy, and no replica at all is
+            strictly worse than one on a shaky host. Ranked last instead, so they are used
+            only when nothing healthier is available.
 
     Returns:
         Source id → the worker indices holding a replica, excluding the primary.
@@ -78,6 +92,13 @@ def assign_replica_hosts(
     for primary in primaries.values():
         if primary in load:
             load[primary] += 1
+    # Suspect workers enter the ranking already "full". Expressed as load rather than as a
+    # separate exclusion pass so the least-loaded tie-break and the off-node preference both
+    # keep working unchanged: a suspect host is simply the last one anything is offered to,
+    # and it is still offered to when the alternative is placing no copy at all.
+    for worker in suspect:
+        if worker in load:
+            load[worker] += _SUSPECT_LOAD
     for src in sorted(primaries):
         primary = primaries[src]
         primary_node = nodes[primary] if primary < len(nodes) else None

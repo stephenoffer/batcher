@@ -34,6 +34,7 @@ from batcher.config.config import (
     set_config,
     tenant,
 )
+from batcher.config.fault_tolerance import FaultToleranceConfig, QuarantineConfig
 from batcher.config.logs import (
     disable_logging,
     enable_logging,
@@ -63,6 +64,7 @@ __all__ = [
     "DistributedConfig",
     "EnergyConfig",
     "ExecutionConfig",
+    "FaultToleranceConfig",
     "FlowControlConfig",
     "GovernanceConfig",
     "MemoryConfig",
@@ -70,6 +72,7 @@ __all__ = [
     "ObservabilityConfig",
     "OptimizerConfig",
     "PIDConfig",
+    "QuarantineConfig",
     "ShuffleTlsConfig",
     "TenantConfig",
     "active_config",

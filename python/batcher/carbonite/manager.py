@@ -65,13 +65,11 @@ from batcher.plan.resource import FeasibilityVerdict, ResourceBounds, Scheduling
 __all__ = ["ResourceManager"]
 
 # Re-exported under their historical private names: the morsel-sizing rules moved to
-# `policies.morsel`, but tests and callers name them from here.
+# `policies.morsel` and the spill sizing to `policies.spill_shape`, but callers and tests
+# still name both from here.
 _MORSEL_PRESSURE_FACTORS = PRESSURE_FACTORS
 _MIN_MORSEL_ROWS = MIN_MORSEL_ROWS
 _MIN_MORSEL_BYTES = MIN_MORSEL_BYTES
-
-# Re-exported under their historical private names: the sizing rules moved to
-# `policies.spill_shape`, but callers and tests name them from here.
 _SPILL_BYTES_PER_PARTITION = SPILL_BYTES_PER_PARTITION
 _MIN_SPILL_PARTITIONS = MIN_SPILL_PARTITIONS
 _MAX_SPILL_PARTITIONS = MAX_SPILL_PARTITIONS
@@ -348,6 +346,7 @@ class ResourceManager:
             thing that does not exist.
         """
         from batcher.carbonite.cache import current_result_cache
+        from batcher.carbonite.memory.kernel import kernel_stats
         from batcher.carbonite.memory.pool import current_process_pool
 
         level = self._pressure.classify()
@@ -357,6 +356,10 @@ class ResourceManager:
             "soft_budget_bytes": self._spill.soft_budget(),
             "hard_budget_bytes": self._spill.hard_budget(),
             "headroom_bytes": self._pressure.headroom_bytes(),
+            # The kernel's own verdict, which the byte accounting cannot supply: a query that
+            # spilled with an empty pool and no cache was throttled at `memory.high` or is in a
+            # cgroup already carrying an OOM kill. Empty off Linux.
+            **kernel_stats(),
         }
         pool = current_process_pool()
         if pool is not None:

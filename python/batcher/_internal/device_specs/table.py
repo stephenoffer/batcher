@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["SPECS", "DeviceSpec"]
+__all__ = ["RAY_LABEL_ALIASES", "SPECS", "DeviceSpec"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +49,13 @@ class DeviceSpec:
         vendor: `nvidia`, `amd`, `intel`, or `google`.
         generation: Vendor architecture family, used to group devices that share a
             capability set (`hopper`, `blackwell`, `ampere`, ...).
-        memory_gib: Device memory of the smallest shipping variant, in GiB.
+        memory_gib: Device memory of the smallest shipping variant, in GiB — the size the
+            *device reports*, not the size it is sold as. The two differ, because vendors
+            market in decimal GB while this column is binary, and the gap runs the wrong way:
+            a T4 sold as "16 GB" reports 15.0 GiB, and a caller that believed 16 sized a
+            working set the card could not hold. Where a row has not been checked against
+            real hardware it still carries the nameplate figure, so prefer measuring a device
+            over trusting its row when a decision turns on the last gibibyte.
         memory_bandwidth_gbps: Peak device-memory bandwidth in GB/s.
         tdp_watts: Board power limit at full load.
         idle_watts: Board power at idle with the driver loaded — what a reserved but
@@ -108,7 +114,14 @@ _ROWS: tuple[tuple, ...] = (
     ("NVIDIA_A10G", "nvidia", "ampere", 24, 600, 300, 30, 70, 0, 1, 0, 0),
     ("NVIDIA_A10", "nvidia", "ampere", 24, 600, 150, 25, 62.5, 0, 1, 0, 0),
     ("NVIDIA_RTX_A6000", "nvidia", "ampere", 48, 768, 300, 0, 0, 0, 2, 112, 0),
-    ("NVIDIA_TESLA_T4", "nvidia", "turing", 16, 320, 70, 12, 65, 0, 1, 0, 0),
+    # 15, not the 16 the part is sold as: NVIDIA markets this board in decimal GB and the
+    # column is GiB. Measured on a `g4dn.12xlarge`, NVML reports 16106127360 bytes = 15.0 GiB
+    # exactly, of which torch can allocate 14.56. The old 16 was the marketing figure read as
+    # binary, and it over-stated the device by a gibibyte in the one direction this table says
+    # it must never err: `decide_gpu_backend` compares a working set against this number with
+    # no headroom at all, so a 15.5 GB working set was declared to "fit one GPU" and dispatched
+    # single-device to a card that could not hold it.
+    ("NVIDIA_TESLA_T4", "nvidia", "turing", 15, 320, 70, 12, 65, 0, 1, 0, 0),
     ("NVIDIA_TESLA_V100", "nvidia", "volta", 16, 900, 300, 50, 125, 0, 8, 300, 0),
     ("NVIDIA_TESLA_P100", "nvidia", "pascal", 16, 732, 300, 40, 19, 0, 4, 160, 0),
     ("NVIDIA_TESLA_P4", "nvidia", "pascal", 8, 192, 75, 10, 0, 0, 1, 0, 0),
@@ -185,6 +198,58 @@ _HOST_LINK: dict[str, tuple[str, float]] = {
     "AMD_INSTINCT_MI210": ("pcie4", 25.0),
     "INTEL_MAX_1550": ("pcie5", 50.0),
     "INTEL_MAX_1100": ("pcie5", 50.0),
+}
+
+#: What a node is *labelled* with, mapped to what this table *calls* the same part.
+#:
+#: The row keys above read like `ray.util.accelerators` names because they are that module's
+#: constant **identifiers** — `NVIDIA_TESLA_T4`. A node is labelled with the constant's
+#: **value**, which is the bare part name `"T4"`, and the two are not the same string. Nothing
+#: reconciled them, so every NVIDIA datacenter part Ray actually labels — T4, V100, P100, P4,
+#: K80, A100, A10G, L4, H100 — missed the table and read as unknown. That is not a visible
+#: failure: it is the "unknown stays unknown" path working exactly as designed, on a cluster
+#: where the facts were in fact known, so VRAM sizing fell back to a default, the fabric width
+#: read as one device, MIG read as unpartitionable, and every energy figure read as zero.
+#:
+#: Only the parts whose label differs from the row key need an entry. The AMD and Intel rows
+#: are already spelled the way Ray spells them (`AMD-Instinct-MI300X` normalizes onto
+#: `AMD_INSTINCT_MI300X`), and the TPU rows are labelled with their row key verbatim.
+#:
+#: `tests/unit/test_device_specs_ray_labels.py` checks this map against the live
+#: `ray.util.accelerators` module, so a part Ray adds later fails a test rather than silently
+#: rejoining the unknown path.
+RAY_LABEL_ALIASES: dict[str, str] = {
+    "T4": "NVIDIA_TESLA_T4",
+    "V100": "NVIDIA_TESLA_V100",
+    "P100": "NVIDIA_TESLA_P100",
+    "P4": "NVIDIA_TESLA_P4",
+    "K80": "NVIDIA_TESLA_K80",
+    # A bare `A100` carries no memory size, so it takes the conservative 40 GB base row for
+    # the same reason the table records the smallest shipping variant: a working set sized to
+    # 80 GB OOMs on the 40 GB card, and the reverse merely shards more than it had to.
+    "A100": "NVIDIA_A100",
+    "A100_40G": "NVIDIA_A100_40G",
+    "A100_40GB": "NVIDIA_A100_40G",
+    "A100_80G": "NVIDIA_A100_80G",
+    "A100_80GB": "NVIDIA_A100_80G",
+    "A10": "NVIDIA_A10",
+    "A10G": "NVIDIA_A10G",
+    "A30": "NVIDIA_A30",
+    "A40": "NVIDIA_A40",
+    "L4": "NVIDIA_L4",
+    "L40": "NVIDIA_L40",
+    "L40S": "NVIDIA_L40S",
+    "H20": "NVIDIA_H20",
+    "H100": "NVIDIA_H100",
+    "H200": "NVIDIA_H200",
+    "B200": "NVIDIA_B200",
+    "GB200": "NVIDIA_GB200",
+    # Ray labels the MI250 and MI250X with one shared string. The X is the larger part, and
+    # the row it points at is the one this table carries.
+    "AMD_INSTINCT_MI250X_MI250": "AMD_INSTINCT_MI250X",
+    # Ray spells the Intel parts with the `GPU` segment the row keys leave out.
+    "INTEL_GPU_MAX_1550": "INTEL_MAX_1550",
+    "INTEL_GPU_MAX_1100": "INTEL_MAX_1100",
 }
 
 SPECS: dict[str, DeviceSpec] = {

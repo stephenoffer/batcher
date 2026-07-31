@@ -143,6 +143,16 @@ def test_each_condition_is_counted_from_the_probe_that_owns_it(monkeypatch, clea
         "nvlink_down_devices": 3,
         "fabric_errors": 13,
         "fabric_ports_down": 2,
+        # The five device-state conditions read straight from NVML rather than from the
+        # fabric probes stubbed above. `clean_node` leaves NVML unavailable, so each reports
+        # zero — which is the point of asserting them here: a host that cannot read them must
+        # emit the series at zero rather than omit it, or every alert built on one silently
+        # stops evaluating the moment a container loses its driver mount.
+        "throttled_devices": 0,
+        "transfer_bound_devices": 0,
+        "power_capped_devices": 0,
+        "bar1_pressured_devices": 0,
+        "clock_limited_devices": 0,
     }
 
 

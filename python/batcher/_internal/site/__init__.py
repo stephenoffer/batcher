@@ -1,10 +1,10 @@
-"""Where this process is running — the provider, the scheduler, and the local scratch.
+"""Where this process is running — the provider, the scheduler, and the node's local disks.
 
 `hardware` describes the machine. This describes the *site*: which GPU cloud it belongs to,
 what launched the process, and which of the mounted filesystems is the fast local one. None of
 it changes what a query computes, and all of it changes what a query should choose.
 
-The three questions, one module each:
+The four questions, one module each:
 
 * `provider` — which GPU cloud this is, from environment markers only. A neocloud is not AWS
   with a different logo: the instance names, the scratch mount, the object-store endpoint, and
@@ -15,6 +15,8 @@ The three questions, one module each:
 * `scratch` — the node-local fast filesystem. Container roots are small overlays; the terabytes
   of NVMe a GPU node ships with are mounted somewhere else under a name that varies by provider,
   and a spill that defaults to `/tmp` finds the overlay.
+* `model_cache` — where model weights land, which is the same overlay by default, wanted by
+  every GPU worker on the node at once and at tens of gigabytes each.
 
 Everything here is read from environment variables and the filesystem. **No metadata-service
 call, ever** — a network round trip on a control-plane path is a hang waiting for a firewall,
@@ -33,6 +35,11 @@ from batcher._internal.site.container import (
     shm_bytes,
     shm_root,
     usable_shm,
+)
+from batcher._internal.site.model_cache import (
+    model_cache_root,
+    reset_model_cache_probe,
+    use_node_local_model_cache,
 )
 from batcher._internal.site.provider import (
     PROVIDERS,
@@ -68,7 +75,9 @@ __all__ = [
     "in_container",
     "local_scratch_root",
     "memlock_limit_bytes",
+    "model_cache_root",
     "open_files_limit",
+    "reset_model_cache_probe",
     "reset_provider_probe",
     "reset_scratch_probe",
     "scheduler_job",
@@ -79,4 +88,5 @@ __all__ = [
     "site_profile",
     "site_summary",
     "usable_shm",
+    "use_node_local_model_cache",
 ]

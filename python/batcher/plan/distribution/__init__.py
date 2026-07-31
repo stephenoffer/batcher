@@ -17,15 +17,25 @@ from batcher.plan.distribution.mergeable import (
     decompose,
     flatten_ops,
     nest_ops,
+    recombine,
     shard_plan,
+)
+from batcher.plan.distribution.tree_shard import (
+    LEFT_DRIVEN_JOINS,
+    RIGHT_DRIVEN_JOINS,
+    shardable_leaves,
 )
 
 __all__ = [
     "BROADCAST_SAFE_JOINS",
+    "LEFT_DRIVEN_JOINS",
+    "RIGHT_DRIVEN_JOINS",
     "ROW_LOCAL_OPS",
     "ShardSplit",
     "decompose",
     "flatten_ops",
     "nest_ops",
+    "recombine",
     "shard_plan",
+    "shardable_leaves",
 ]

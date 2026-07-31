@@ -25,6 +25,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
 from batcher.config.accelerator import AcceleratorConfig
+from batcher.config.fault_tolerance import FaultToleranceConfig
 
 __all__ = [
     "CardinalityConfig",
@@ -307,6 +308,27 @@ class MemoryConfig:
     # Fallback total RAM (bytes) assumed when neither `max_memory_bytes` is set nor
     # the OS reports a usable figure. One home for what was a copy-pasted literal.
     default_total_bytes: int = 8 << 30  # 8 GiB
+    # Treat the cgroup v2 `memory.high` throttle threshold — not just the `memory.max`
+    # kill threshold — as the ceiling the engine budgets against. Past `memory.high` the
+    # kernel does not fail an allocation; it puts every allocating task to sleep in direct
+    # reclaim, so a query planned to sit between `high` and `max` runs at a fraction of its
+    # rate for its whole duration while every counter reports success. Kubernetes memory QoS
+    # sets `memory.high` from the pod's *request* and `memory.max` from its *limit*, which is
+    # exactly that gap. On by default and inert wherever `memory.high` is unset (bare metal,
+    # cgroup v1, most non-K8s containers), which is the behavior the engine already had.
+    respect_cgroup_high: bool = True
+    # Let the kernel's memory PSI `full` share raise the pressure level. `full` is the share
+    # of a window in which *every* runnable task in the cgroup was stalled on memory: it
+    # climbs for seconds before an OOM kill while `memory.current` sits pinned at the limit
+    # the reclaim is defending, so it is the only warning early enough to spill on. It can
+    # only ever raise the level (never lower one the byte accounting reported), so with it on
+    # the engine spills sooner and never later.
+    stall_aware_pressure: bool = True
+    # Fraction of the memory envelope kept when this cgroup's `memory.events` shows it has
+    # already been OOM-killed. A kill is proof — not a prediction — that the workload does not
+    # fit at the size it last ran, so a restarted worker that re-derives the same envelope
+    # walks into the same kill. `1.0` disables the backoff.
+    oom_kill_backoff: float = 0.8
     # Out-of-core spill tiers. The local tier (NVMe) is fast and capacity-bounded;
     # once `spill_local_budget_bytes` is exhausted, new buckets overflow to
     # `spill_remote_uri` (any fsspec URL: s3://, gs://, …) so a PB-scale spill does
@@ -1115,12 +1137,15 @@ class DistributedConfig:
     # so a cold peer still costs one connection. Default 4 saturates a 10–25 Gbps NIC;
     # 1 restores the single-connection behavior.
     flight_connections_per_peer: int = 4
-    # Wire compression for shuffle batches: "none", "lz4", or "zstd". A cross-node fetch
-    # is NIC-bound, so compressing the Arrow buffers before they cross the wire is the
+    # Wire compression for shuffle batches: "none", "lz4", "zstd", or "auto". A cross-node
+    # fetch is NIC-bound, so compressing the Arrow buffers before they cross the wire is the
     # only way past line rate — and real shuffle data (sorted runs, repeated group keys,
     # dictionary strings, nulls) compresses several-fold, unlike the object store's
     # uncompressed blocks. "lz4" (~GB/s/core, gives up fast on incompressible data) is a
-    # near-free default; "zstd" trades CPU for a higher ratio; "none" disables it.
+    # near-free default; "zstd" trades CPU for a higher ratio; "none" disables it. "auto"
+    # decides against the node's measured fabric: past roughly 25 Gb/s a compressor becomes
+    # the ceiling rather than the wire, and on a 400 Gb/s port compressing costs throughput
+    # rather than buying it (`carbonite.transfer.codec`).
     flight_compression: str = "lz4"
     placement_timeout_s: float = 60.0
     # Bounded retry window for *attaching* to a Ray cluster whose head is not answering yet.
@@ -1342,6 +1367,11 @@ class DistributedConfig:
     # cluster and makes a spot-preempted shard's retry cheap (1/N the work). The mergeable
     # combine is correct for any shard count. 1 = one shard per GPU (the old behavior).
     gpu_shard_oversubscribe: int = 4
+    # The most devices a single query may ask the autoscaler to grow to. The request is sized
+    # from the working set (how many devices would hold it in one wave), so a badly-estimated
+    # query would otherwise be able to ask a cluster to grow without bound. Reaching the cap is
+    # not a failure: the query simply runs in more waves on fewer devices.
+    gpu_max_autoscale_devices: int = 64
     # A shard that did not FIT the device is divided into this many pieces and rerun on the
     # device, for up to `rounds` further halvings. The shard count is fixed before the query
     # runs, from an estimate, and estimates are wrong exactly where it matters — a skewed key, a
@@ -1349,13 +1379,101 @@ class DistributedConfig:
     # can miss while every other one fits. Subdividing is exact, because the stage is mergeable:
     # a shard's partial and the concatenation of its pieces' partials are the same value. `1`
     # disables it, sending an over-large shard straight to the host.
-    # The most devices a single query may ask the autoscaler to grow to. The request is sized
-    # from the working set (how many devices would hold it in one wave), so a badly-estimated
-    # query would otherwise be able to ask a cluster to grow without bound. Reaching the cap is
-    # not a failure: the query simply runs in more waves on fewer devices.
-    gpu_max_autoscale_devices: int = 64
     gpu_shard_subdivide: int = 4
     gpu_shard_subdivide_rounds: int = 3
+    # Let several shards of one fan-out share a device, by requesting a FRACTION of a GPU per
+    # shard instead of a whole one. `gpu_shard_oversubscribe` already cuts four times as many
+    # shards as there are devices, precisely so each is small — and then every shard asked for a
+    # whole device, so Ray ran one per device and queued the rest. A fleet whose own shard count
+    # says each piece is a quarter of a device was running at a quarter of its capacity while
+    # every utilization counter read full. The share is derived from the largest shard's
+    # estimated working set against one device's memory and rounded UP to a packing quantum
+    # (`_internal.device_share`), so a shard that needs a whole device still gets one. Over-
+    # packing degrades rather than fails: a shard that does not fit its share is caught by the
+    # subdivision ladder above and rerun in pieces, exactly as an under-estimated shard always
+    # was. Result-identical either way — the mergeable combine is correct for any placement.
+    # Off → the previous one-whole-device-per-shard behavior.
+    gpu_pack_shards: bool = True
+    # Pin the per-shard device share instead of deriving it. `0.0` (the default) derives it.
+    # A positive value is an operator statement about a fleet the estimator cannot see — a
+    # device shared with a long-running service, a part whose memory the driver misreports —
+    # and is applied as given. Use `1.0` to force whole devices for one job without turning
+    # `gpu_pack_shards` off fleet-wide.
+    gpu_task_fraction: float = 0.0
+    # Ceiling on shards resident on one device, which floors the derived share. The memory
+    # arithmetic can allow more tenants than a device should actually run: each is a CUDA
+    # context, a share of one copy engine, and a process whose allocation spike the others
+    # feel. A deployment property rather than a derivable one, so it is a knob.
+    gpu_max_tasks_per_device: int = 4
+    # Multiple of a shard's INPUT bytes the device must hold for it. At the moment a partial
+    # aggregate emits its last group, both the input batch it is reading and the hash table it
+    # has built are resident; a factor below 2 asserts one of the two is free, which is not
+    # true of any operator this path runs. Raise it for a chain that materializes more than one
+    # intermediate (a join followed by a wide projection); the subdivision ladder is what
+    # catches the cases it still under-states.
+    gpu_shard_expansion: float = 2.0
+    # How many shard partials the driver folds together at once. The fan-out bounds *device*
+    # memory by dividing the input, and then concatenated every shard's output on the driver
+    # before combining a single row: a group-by over a million groups fanned across a thousand
+    # shards materialized a billion rows in one process — the same failure the sharding exists
+    # to prevent, moved to the host, and arriving precisely on the large multi-GPU clusters the
+    # fan-out is for, because the shard count grows with the fleet. Folding in waves keeps one
+    # accumulator and drops each wave, so peak driver memory tracks the wave size and the group
+    # count rather than the shard count. Exact at any wave size: the fold is associative and
+    # commutative over its own output (`plan.distribution.recombine`). `0` or `1` folds
+    # everything at once, which is the previous behavior; a fan-out with fewer partials than
+    # one wave is unchanged either way.
+    gpu_merge_wave: int = 32
+    # Fraction of one device's memory the REPLICATED leaves of a multi-way plan tree may
+    # occupy. A tree fan-out splits one leaf and gives every worker the whole of the others, so
+    # those others are resident on every device simultaneously, beside that device's own shard
+    # and whatever the joins above them build. This is the bound that turns a star-schema query
+    # (small dimensions, huge fact table) into a fan-out and a big-to-big join into a declined
+    # one — and declining is the point: the alternative is an out-of-memory on every device at
+    # once, which is the single failure mode a GPU query has no way to recover from cheaply.
+    # Raise it on a fleet whose devices are large relative to the dimensions; lower it for a
+    # plan that materializes wide intermediates above its joins.
+    gpu_tree_broadcast_fraction: float = 0.35
+    # How long a GPU fan-out waits for a device to actually be free before giving the query to
+    # the CPU engine. A GPU task asks Ray for a device *and* a core, and on a busy cluster the
+    # core is the one it does not get: a placement group holding every CPU (a shuffle, another
+    # tenant's stage) leaves the fan-out's tasks PENDING with devices sitting idle, and
+    # `ray.get` on a pending task waits forever. That is the one failure a GPU backend
+    # documented as "always safe to request" must not have — the answer was available on the
+    # host the whole time. Measured here on a 16-device fleet: every GPU query blocked
+    # indefinitely behind a leaked placement group until the driver was killed.
+    # `0` restores the unbounded wait.
+    gpu_admission_wait_s: float = 30.0
+    # Smallest shard a GPU fan-out will cut. `gpu_shard_oversubscribe` says how many shards a
+    # device *may* pipeline; this says when cutting another one stops paying for itself.
+    #
+    # Shard count used to be `#devices x oversubscribe` regardless of how much data there was,
+    # so a 6M-row scan on a 16-device fleet was cut into 64 shards — each a Ray task, each
+    # paying a worker dispatch, a cuDF first touch and a device-allocator setup to process
+    # about a hundred thousand rows. Measured here: TPC-H q6 at sf1 took **196 seconds** that
+    # way against 0.12 s on the CPU engine, and essentially all of it was per-task fixed cost.
+    # Sizing from bytes instead keeps the fan-out wide where the data is wide and collapses it
+    # to a single shard where it is not.
+    #
+    # 128 MiB is roughly where one T4 shard's compute (a few tens of milliseconds) overtakes
+    # the dispatch that delivered it. Raise it on a fleet with slower task dispatch; lower it
+    # where per-shard work is unusually expensive per byte.
+    gpu_min_shard_bytes: int = 128 << 20
+    # Let a GPU worker process serve more than one shard (`max_calls=0`).
+    #
+    # Ray tears a worker down after every GPU task by default, to guarantee the device memory
+    # is released. For this path that guarantee is bought at a price nothing else pays: each
+    # shard starts a new Python process, imports cuDF and rebuilds the RMM pool before it can
+    # touch a row. Measured on a T4 against one 7.3M-row shard of TPC-H `lineitem` — 1.07 s to
+    # import cuDF, 0.98 s to configure the allocator, 0.26 s to read the shard onto the device,
+    # and 0.15 s to run the kernels. Two seconds of set-up per sixth of a second of work, on
+    # every shard of every query.
+    #
+    # Reuse is safe here because the leak the default guards against is not one this path has:
+    # a shard builds cuDF frames and drops them, and the async allocator returns freed blocks
+    # to the driver. Set False for a fleet running a UDF that does hold device memory, and get
+    # process-per-task isolation back at that cost.
+    gpu_worker_reuse: bool = True
     # A GPU shard that fails for any other reason — a lost worker, an untranslatable expression —
     # is recomputed by the native CPU engine on a CPU worker, instead of the whole query
     # abandoning the accelerated path. Both compute the same mergeable partial, so the combined
@@ -1769,6 +1887,7 @@ class Config:
     # ruff can prove they are frozen and allows the call; `AcceleratorConfig` is imported, so
     # it cannot, and RUF009 fires. The value is identical either way.
     accelerator: AcceleratorConfig = dataclasses.field(default_factory=AcceleratorConfig)
+    fault_tolerance: FaultToleranceConfig = dataclasses.field(default_factory=FaultToleranceConfig)
 
     def replace(self, **section_overrides: object) -> Config:
         """Return a new Config with whole sections replaced.

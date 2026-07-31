@@ -94,7 +94,7 @@ def _fake_descriptors(monkeypatch, per_source: dict[str, int] | None = None):
 def test_every_input_contributes_its_shards_in_input_order(monkeypatch):
     _fake_descriptors(monkeypatch)
     above = ShardSplit([], [], [], ordered=True)
-    plan = _shard_plan_per_input(
+    plan, _bytes = _shard_plan_per_input(
         [_Source("a", 2), _Source("b", 3)], [[], []], above, 8, sharded=True
     )
     assert [d["src"] for d, _ in plan] == ["a", "a", "b", "b", "b"]
@@ -106,7 +106,7 @@ def test_each_shard_carries_its_own_inputs_chain_then_the_shared_one(monkeypatch
     _fake_descriptors(monkeypatch)
     left_chain = [{"op": "filter", "predicate": {"e": "col", "name": "x"}}]
     above = ShardSplit([{"op": "project", "exprs": []}], [], [], ordered=False)
-    plan = _shard_plan_per_input(
+    plan, _bytes = _shard_plan_per_input(
         [_Source("a", 1), _Source("b", 1)], [left_chain, []], above, 8, sharded=True
     )
     assert plan[0][1] == [*left_chain, *above.shard_ops]

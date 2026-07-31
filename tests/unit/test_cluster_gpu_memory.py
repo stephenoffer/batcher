@@ -26,7 +26,9 @@ _GIB = 1 << 30
 @pytest.mark.parametrize(
     ("name", "expected_gib"),
     [
-        ("NVIDIA_TESLA_T4", 16),
+        # 15, not the 16 it is sold as: measured on a g4dn.12xlarge, NVML reports exactly
+        # 15.0 GiB. The vendor markets the board in decimal GB and this column is binary.
+        ("NVIDIA_TESLA_T4", 15),
         ("NVIDIA_A100", 40),  # the smallest variant sold under this name
         ("NVIDIA_A100_80G", 80),
         ("NVIDIA_H100", 80),
@@ -65,7 +67,7 @@ def test_vram_binds_to_the_smallest_device_in_a_mixed_fleet(monkeypatch):
         ],
     )
     assert hw is not None
-    assert hw.gpu_memory_bytes == 16 * _GIB  # the T4, not the A100
+    assert hw.gpu_memory_bytes == 15 * _GIB  # the T4's measured 15 GiB, not the A100's 40
 
 
 def test_gpu_count_is_devices_not_gpu_bearing_nodes(monkeypatch):
