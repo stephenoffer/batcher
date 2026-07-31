@@ -307,8 +307,34 @@ def _gpu_inventory_probe() -> tuple[dict[str, object], ...]:
     nvml = _nvml_inventory()
     if nvml:
         return tuple(nvml)
+    # AMD before torch, and for the same reason NVML comes before torch: it is a handful of
+    # sysfs reads against an import that costs over a second, it needs no ROCm install, and it
+    # reports the real HBM size where the device-node fallback below reports zero. Without it
+    # an MI300X node with a CPU-only wheel enumerated no devices at all.
+    amd = _amd_inventory()
+    if amd:
+        return tuple(amd)
     torch_devices = [] if gpu_devices_absent() else _torch_inventory()
     return tuple(torch_devices or _other_accelerator_inventory())
+
+
+def _amd_inventory() -> list[dict[str, object]]:
+    """AMD accelerators via the `amdgpu` driver's sysfs tree, or `[]`.
+
+    Dependency-free by construction: `amdsmi` ships with ROCm and is absent from the framework
+    containers most of this hardware is rented with, so the driver's own files are the only
+    source that is always there.
+    """
+    from batcher._internal.hardware.amd import amd_devices
+
+    return [
+        {
+            "index": device.index,
+            "name": device.name or f"AMD GPU ({device.card})",
+            "memory_bytes": device.memory_total_bytes,
+        }
+        for device in amd_devices()
+    ]
 
 
 def _nvml_inventory() -> list[dict[str, object]]:

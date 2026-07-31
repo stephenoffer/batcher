@@ -15,11 +15,17 @@ def device_rows() -> list[dict]:
     """Per-device rows: nameplate figures for what is attached, live readings where available."""
     from batcher._internal.device_specs import device_spec, resolve_device_name
     from batcher._internal.hardware import device_telemetry, gpu_inventory
+    from batcher._internal.hardware.amd import amd_devices
     from batcher._internal.hardware.faults import device_faults, device_modes
 
     live = {d.index: d for d in device_telemetry()}
     faults = {f.index: f for f in device_faults()}
     modes = {m.index: m for m in device_modes()}
+    # NVML covers NVIDIA and nothing else, so an MI300X node reached here with every reading
+    # empty and read as a healthy idle host. The AMD readings land in the *same* row keys, so
+    # every consumer downstream — the printed report, `accelerator_problems`, the Prometheus
+    # gauges — works on an AMD node without knowing one exists.
+    amd = {d.index: d for d in amd_devices()}
     rows: list[dict] = []
     for index, device in enumerate(gpu_inventory()):
         name = str(device.get("name") or "")
@@ -48,11 +54,57 @@ def device_rows() -> list[dict]:
                 row["throttled"] = list(reading.throttle_reasons)
             if reading.ecc_uncorrected:
                 row["ecc_uncorrected"] = reading.ecc_uncorrected
+        else:
+            _add_amd_reading(row, amd.get(index))
         _add_measured_link(row, index)
         _add_faults(row, faults.get(index))
         _add_modes(row, modes.get(index))
         rows.append(row)
     return rows
+
+
+def _add_amd_reading(row: dict, device) -> None:
+    """Fill an AMD device's row from sysfs, using the keys the NVIDIA path already uses.
+
+    Only when NVML reported nothing for this index, so a host with both vendors keeps NVML's
+    richer reading for the NVIDIA half rather than having it overwritten by a card that
+    happens to sit at the same position.
+
+    Two figures have no NVIDIA counterpart and get their own keys. `hbm_uncorrectable` is an
+    unrepairable error in the memory controller, which is what a fatal Xid means on the other
+    vendor and carries the same consequence. `serial_number` is here because an AMD board
+    publishes one and it is what an RMA is filed against.
+    """
+    from batcher._internal.hardware.amd import throttled_amd_devices
+
+    if device is None:
+        return
+    if device.name and not row.get("name"):
+        row["name"] = device.name
+    if device.memory_total_bytes and not row.get("memory_gib"):
+        row["memory_gib"] = round(device.memory_total_bytes / (1 << 30), 1)
+    if device.power_watts:
+        row["power_watts"] = round(device.power_watts, 1)
+    if device.busy_percent:
+        row["sm_utilization"] = round(device.busy_percent / 100.0, 3)
+    if device.temperature_c:
+        row["temperature_c"] = round(device.temperature_c, 1)
+    if device.serial_number:
+        row["serial_number"] = device.serial_number
+    if device.uncorrectable_errors:
+        row["ecc_uncorrected"] = device.uncorrectable_errors
+    if device.memory_uncorrectable_errors:
+        row["hbm_uncorrectable"] = device.memory_uncorrectable_errors
+    # The reason, not just the fact: an AMD board publishes its own cap and its own critical
+    # temperature, so the report can say which of the two is holding the clock down instead of
+    # printing a bare "throttled" the reader then has to go and diagnose.
+    if throttled_amd_devices((device,)):
+        reasons = []
+        if device.power_cap_watts > 0.0 and device.power_headroom <= 0.02:
+            reasons.append(f"at the {device.power_cap_watts:.0f} W board cap")
+        if 0.0 < device.thermal_headroom_c <= 3.0:
+            reasons.append(f"{device.thermal_headroom_c:.0f} C below the critical limit")
+        row["throttled"] = reasons or ["clock limited"]
 
 
 def _add_measured_link(row: dict, index: int) -> None:

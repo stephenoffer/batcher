@@ -160,6 +160,13 @@ def accelerator_problems() -> list[str]:
         index = row.get("index")
         if row.get("remap_failure"):
             out.append(f"gpu {index}: memory row remapping has failed, the device needs replacing")
+        if row.get("hbm_uncorrectable"):
+            # AMD's equivalent of a fatal Xid: the memory controller could not repair the
+            # error, so the data is gone and a reset does not clear it.
+            out.append(
+                f"gpu {index}: {row['hbm_uncorrectable']} unrepairable HBM error(s), "
+                "the device needs replacing"
+            )
         if row.get("ecc_uncorrected"):
             out.append(f"gpu {index}: {row['ecc_uncorrected']} uncorrectable ECC error(s)")
         for finding in row.get("config", ()):
@@ -197,6 +204,8 @@ def _show_silent_faults(devices: list[dict]) -> None:
                 f"gpu {row['index']}  host link at {row['link_degraded']} "
                 f"({row['link_efficiency']:.0%} of nameplate bandwidth)"
             )
+        if row.get("hbm_uncorrectable"):
+            print(f"gpu {row['index']}  unrepairable HBM error: device needs replacing")
         if row.get("remap_failure"):
             print(f"gpu {row['index']}  memory row remapping has FAILED: device needs replacing")
         elif row.get("reset_pending"):
