@@ -285,3 +285,60 @@ def test_partitioning_reaches_the_device_row_but_is_not_a_finding():
     )
     assert row["mig_instances"] == 7
     assert "config" not in row  # deliberate partitioning is not a misconfiguration
+
+
+# --- Admission against the cap the fleet is actually running under -------------------------
+
+
+def test_a_capped_device_is_priced_at_its_cap_not_its_datasheet():
+    # A power-constrained hall running a 700 W part at 500 is ordinary, and an admission
+    # check still using the datasheet over-states the draw by forty percent — refusing
+    # fan-outs the rack can power.
+    from batcher.plan.energy.power import device_power_watts
+
+    nameplate = device_power_watts("NVIDIA_H100", 1.0)
+    capped = device_power_watts("NVIDIA_H100", 1.0, enforced_limit_watts=500.0)
+    assert capped < nameplate
+    assert capped == pytest.approx(500.0)
+
+
+def test_a_cap_above_the_nameplate_is_ignored():
+    # A device does not draw more than its own TDP because someone typed a larger number.
+    from batcher.plan.energy.power import device_power_watts
+
+    nameplate = device_power_watts("NVIDIA_H100", 1.0)
+    assert device_power_watts("NVIDIA_H100", 1.0, enforced_limit_watts=2000.0) == nameplate
+    assert device_power_watts("NVIDIA_H100", 1.0, enforced_limit_watts=0.0) == nameplate
+
+
+def test_an_unknown_device_stays_unknown_however_it_is_capped():
+    from batcher.plan.energy.power import device_power_watts
+
+    assert device_power_watts("NOT_A_DEVICE", 1.0, enforced_limit_watts=500.0) == 0.0
+
+
+def test_the_highest_cap_on_the_node_is_the_one_that_binds(monkeypatch):
+    # This figure bounds what a fleet may draw, and a mean would under-state a node whose
+    # devices are capped unevenly — the one direction with a physical consequence.
+    from batcher.carbonite.accel.power import enforced_limit_watts
+
+    monkeypatch.setattr(
+        "batcher._internal.hardware.nvml.device_telemetry",
+        lambda: (
+            DeviceTelemetry(index=0, power_limit_watts=400.0),
+            DeviceTelemetry(index=1, power_limit_watts=700.0),
+        ),
+    )
+    assert enforced_limit_watts() == pytest.approx(700.0)
+
+
+def test_an_unreadable_limit_leaves_the_datasheet_in_charge(monkeypatch):
+    from batcher.carbonite.accel.power import enforced_limit_watts
+
+    monkeypatch.setattr("batcher._internal.hardware.nvml.device_telemetry", lambda: ())
+    assert enforced_limit_watts() == 0.0
+    monkeypatch.setattr(
+        "batcher._internal.hardware.nvml.device_telemetry",
+        lambda: (DeviceTelemetry(index=0, power_limit_watts=0.0),),
+    )
+    assert enforced_limit_watts() == 0.0

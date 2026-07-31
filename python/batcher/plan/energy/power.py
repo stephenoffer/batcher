@@ -64,6 +64,7 @@ def device_power_watts(
     utilization: float = 1.0,
     *,
     include_host: bool = False,
+    enforced_limit_watts: float = 0.0,
 ) -> float:
     """Power draw of one device at a given utilization, in watts.
 
@@ -73,6 +74,12 @@ def device_power_watts(
             reports the idle draw — a reserved-but-unused device is not free.
         include_host: Add the host share (`host_overhead_watts`) so the figure describes a
             whole server slot rather than a bare board.
+        enforced_limit_watts: The cap the driver reports for these devices, when a caller
+            could measure one. A power-constrained hall commonly runs a 700 W part at 500,
+            and a model that keeps using the datasheet then over-states the draw by forty
+            percent — refusing fan-outs the rack can actually power. Only ever applied
+            *downward*: a figure at or above the nameplate is ignored, since a device cannot
+            draw more than its own TDP because someone typed a larger number.
 
     Returns:
         Watts, or `0.0` when the device's power figures are unknown.
@@ -82,6 +89,8 @@ def device_power_watts(
     tdp = device_tdp_watts(accelerator_type)
     if tdp <= 0:
         return 0.0
+    if 0.0 < enforced_limit_watts < tdp:
+        tdp = enforced_limit_watts
     idle = device_idle_watts(accelerator_type)
     u = min(1.0, max(0.0, utilization))
     watts = idle + (tdp - idle) * u

@@ -21,10 +21,11 @@ because clamping a fleet against fabricated watts is worse than not clamping it 
 
 from __future__ import annotations
 
+from batcher._internal.logging import note_suppressed
 from batcher.plan.energy.power import configured_power_envelope, device_power_watts
 from batcher.plan.resource import FeasibilityVerdict, ResourceBounds
 
-__all__ = ["devices_within_budget", "validate_fleet_power"]
+__all__ = ["devices_within_budget", "enforced_limit_watts", "validate_fleet_power"]
 
 
 def devices_within_budget(
@@ -81,7 +82,12 @@ def validate_fleet_power(
     envelope = configured_power_envelope()
     if envelope.unbounded or devices <= 0:
         return FeasibilityVerdict(feasible=True)
-    per_device = device_power_watts(accelerator_type, utilization, include_host=True)
+    per_device = device_power_watts(
+        accelerator_type,
+        utilization,
+        include_host=True,
+        enforced_limit_watts=enforced_limit_watts(),
+    )
     if per_device <= 0:
         return FeasibilityVerdict(feasible=True)  # unknown device: no opinion
     expected = per_device * devices
@@ -99,3 +105,27 @@ def validate_fleet_power(
         binding_op=accelerator_type or "gpu",
         advisory=True,
     )
+
+
+def enforced_limit_watts() -> float:
+    """The power cap this node's devices are actually running under, or `0.0`.
+
+    A power-constrained hall runs its parts below nameplate — a 700 W device capped at 500 is
+    ordinary — and an admission check still using the datasheet over-states the draw by the
+    difference, refusing fan-outs the rack can power. The driver knows the enforced limit; the
+    datasheet does not.
+
+    Returns:
+        The *highest* limit across the node's devices, `0.0` when nothing could be read. The
+        maximum rather than the mean, because this figure bounds what a fleet may draw and a
+        mean would under-state a node whose devices are capped unevenly — and under-stating a
+        breaker's load is the one direction with a physical consequence.
+    """
+    from batcher._internal.hardware.nvml import device_telemetry
+
+    try:
+        limits = [d.power_limit_watts for d in device_telemetry() if d.power_limit_watts > 0]
+    except Exception as exc:  # pragma: no cover - a probe must never break admission
+        note_suppressed("carbonite", "read the enforced device power limit", exc)
+        return 0.0
+    return max(limits) if limits else 0.0
