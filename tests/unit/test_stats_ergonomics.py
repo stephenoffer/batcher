@@ -182,6 +182,10 @@ def test_metrics_snapshot_shape(clean_metrics):
         "gpu",
         "inference",
         "logs",
+        # Hardware conditions rather than engine counters: a degraded host link, memory
+        # repairing itself, an NVLink fabric down. Each leaves a job correct and slow, so
+        # none of the counters above can carry it.
+        "node",
         "operators",
         "partitions",
         "queries",
