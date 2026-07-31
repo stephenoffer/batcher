@@ -172,7 +172,17 @@ def execute_distributed(
         # and then under-provision a later big one. An explicit `num_workers` overrides it;
         # a single node falls back to the data-driven `_even_cpu_share` path below.
         trace = FanoutTrace(workers)
-        fill = None if num_workers is not None else _cluster_fill_workers()
+        # A stage that holds a device is tiled by devices, not by cores: the core-shaped fill
+        # below caps the fan-out at the node count, which on a multi-device node leaves most
+        # of the fleet's accelerators idle. Falls back to the core fill whenever that is not
+        # what this stage is (no device grant, no accelerator nodes, unreadable topology).
+        fill = None
+        by_device = False
+        if num_workers is None:
+            fill = _accelerator_fill_workers(num_gpus)
+            by_device = fill is not None
+            if fill is None:
+                fill = _cluster_fill_workers()
         if fill is not None:
             desired, (workers, num_cpus) = workers, fill
             mem = (
@@ -187,7 +197,15 @@ def execute_distributed(
             )
             reset_scheduling_envelope(token)
             token = set_scheduling_envelope(envelope)
-            trace.step("cluster_fill", workers, f"one worker per {num_cpus:g}-core node slice")
+            trace.step(
+                "accelerator_fill" if by_device else "cluster_fill",
+                workers,
+                (
+                    f"one worker per {num_gpus:g}-device slice, {num_cpus:g} cores each"
+                    if by_device
+                    else f"one worker per {num_cpus:g}-core node slice"
+                ),
+            )
         elif num_workers is not None:
             trace.step("explicit", workers, "num_workers was passed by the caller")
         else:
@@ -197,7 +215,14 @@ def execute_distributed(
         # per-operator `num_cpus` models — a `_FlightWorker` runs the multi-core executor
         # over a whole partition and a managed cgroup would pin it to 1 core, throttling
         # the scan ~Ncores×. MUST run after `_ensure_ray` (`ray.nodes()` is empty before).
-        share = _even_cpu_share(workers)
+        # Not when the fan-out was tiled by devices: that grant is already "an accelerator
+        # node's cores divided among its accelerators", and raising it makes the workers
+        # unplaceable. `_even_cpu_share` averages over every worker-eligible node, so on a
+        # fleet with CPU-only nodes beside the accelerator ones it would hand each device
+        # worker a share no GPU node can host — and the clamp below would then collapse the
+        # fan-out to one worker per node, which is the behavior the device tiling exists to
+        # replace.
+        share = 0.0 if by_device else _even_cpu_share(workers)
         if share > num_cpus:
             envelope = (
                 dataclasses.replace(envelope, num_cpus=share)
@@ -304,6 +329,54 @@ def _worker_node_cpus() -> list[float]:
     from batcher.dist.executors.ray_runtime.scaling import node_classes
 
     return [c for node in node_classes() if (c := float(node["cpus"])) > 0]
+
+
+def _accelerator_fill_workers(num_gpus: float) -> tuple[int, float] | None:
+    """The device-filling fan-out for a stage that needs `num_gpus` accelerators per worker.
+
+    `_cluster_fill_workers` tiles the fleet by *cores*, and its reasoning — "more workers than
+    nodes cannot add CPU parallelism, since cores are the limit" — is exactly right for a
+    relational query and exactly wrong for a stage holding a device. When each worker needs an
+    accelerator, the limit is devices, and a core-shaped fill caps the fan-out at the node
+    count however many devices a node holds. On the common four-devices-per-node shape that
+    stranded three quarters of the fleet: a 16-GPU cluster ran its inference stage on 4.
+
+    So tile by devices instead: each node hosts ``floor(node_devices / num_gpus)`` workers, and
+    the per-worker core grant is the smallest such node's cores divided by the workers it will
+    host, which keeps one worker placeable on every accelerator node the way the core-shaped
+    grant does. Nodes with no device host nothing — they cannot run this stage at all.
+
+    Args:
+        num_gpus: Devices one worker holds. `0` or less means this is not an accelerator
+            stage and the core-shaped fill is the right one.
+
+    Returns:
+        `(workers, num_cpus)`, or `None` when this is not an accelerator stage, the fleet has
+        no devices, the topology is unreadable, or the answer is a single worker — in every
+        one of those the caller's existing sizing is already correct.
+    """
+    if num_gpus <= 0:
+        return None
+    try:
+        from batcher.dist.executors.ray_runtime.scaling import node_classes
+
+        nodes = [
+            (float(n["cpus"]), int(float(n["gpus"]) // num_gpus))
+            for n in node_classes()
+            if float(n.get("gpus") or 0.0) >= num_gpus and float(n["cpus"]) > 0
+        ]
+        hosts = [(cores, held) for cores, held in nodes if held > 0]
+        if not hosts:
+            return None
+        workers = sum(held for _, held in hosts)
+        if workers <= 1:
+            return None
+        # Floored to a whole core so the grant is a number Ray can actually reserve, and at
+        # least one so a device-dense node cannot ask for a fractional-core worker.
+        num_cpus = max(1.0, float(int(min(cores / held for cores, held in hosts))))
+        return workers, num_cpus
+    except Exception:
+        return None
 
 
 def _cluster_fill_workers() -> tuple[int, float] | None:

@@ -70,19 +70,20 @@ def sharded_gpu_union(
     if above is None:
         return None
 
-    plan = _shard_plan_per_input(sources, input_ops, above, gpu_count, sharded=sharded)
-    if plan is None:
+    built = _shard_plan_per_input(sources, input_ops, above, gpu_count, sharded=sharded)
+    if built is None:
         return None
-    shards = _run_union_shards(plan)
+    plan, shard_bytes = built
+    shards = _run_union_shards(plan, shard_bytes=shard_bytes, gpu_count=gpu_count)
     if not shards:
         return None
-    from batcher.dist.gpu.aggregate import merge_shards
+    from batcher.dist.gpu.aggregate import fold_shards
 
-    return merge_shards(shards, [*above.merge_ops, *above.tail_ops])
+    return fold_shards(shards, above)
 
 
 def _shard_plan_per_input(sources, input_ops, above, gpu_count: int, *, sharded: bool):
-    """`[(descriptor, ops), ...]` across every input, or `None` when one cannot be split.
+    """`([(descriptor, ops), ...], largest_shard_bytes)`, or `None` when an input cannot split.
 
     All-or-nothing: an input that has to be read whole would have to run beside the sharded
     ones as a shard of its own, and its size is exactly why the fan-out was wanted. Falling
@@ -90,6 +91,11 @@ def _shard_plan_per_input(sources, input_ops, above, gpu_count: int, *, sharded:
 
     Each shard carries its *own* input's chain followed by the shared chain above the union, so
     one task body serves every input without knowing which one it is reading.
+
+    The byte figure is measured *here*, where each descriptor is still beside the source it came
+    from. One task body runs every input, so one device share is chosen for all of them, and it
+    has to be the largest across inputs of possibly very different widths — a narrow input's
+    row width would size the share for a payload input's shards and guarantee they do not fit.
     """
     from batcher.dist.gpu.aggregate import shard_descriptors
 
@@ -98,6 +104,7 @@ def _shard_plan_per_input(sources, input_ops, above, gpu_count: int, *, sharded:
     # fail, but each shard would be sized as though it had a device to itself.
     per_input = max(1, gpu_count // max(1, len(sources)))
     plan: list[tuple[dict, list[dict]]] = []
+    widest = 0
     for source, chain in zip(sources, input_ops, strict=True):
         descriptors = shard_descriptors(
             source, per_input, sharded=sharded, preserve_order=above.ordered
@@ -106,10 +113,32 @@ def _shard_plan_per_input(sources, input_ops, above, gpu_count: int, *, sharded:
             return None
         shard_ops = [*chain, *above.shard_ops]
         plan.extend((descriptor, shard_ops) for descriptor in descriptors)
-    return plan or None
+        widest = max(widest, _input_shard_bytes(source, descriptors))
+    return (plan, widest) if plan else None
 
 
-def _run_union_shards(plan: list[tuple[dict, list[dict]]]) -> list:
+def _input_shard_bytes(source, descriptors: list[dict]) -> int:
+    """The largest shard of one union input, in bytes, or `0` when it cannot be priced.
+
+    A zero here is not a failure: it makes the packing under-state the need for that input,
+    which the shared decision then resolves to whole devices rather than to a share the input's
+    shards may not fit.
+    """
+    from batcher.dist.gpu.resources import largest_shard_bytes
+
+    try:
+        schema = source.schema()
+    except Exception as exc:
+        note_suppressed("dist", "read a union input schema for gpu shard packing", exc)
+        return 0
+    from batcher.plan.types import schema_row_bytes
+
+    return largest_shard_bytes(descriptors, schema_row_bytes(schema))
+
+
+def _run_union_shards(
+    plan: list[tuple[dict, list[dict]]], *, shard_bytes: int = 0, gpu_count: int = 0
+) -> list:
     """Run every shard on a device, recovering a failed one rather than the query.
 
     The same two-rung ladder the chain fan-out uses, and for the same reasons: a shard that did
@@ -126,6 +155,7 @@ def _run_union_shards(plan: list[tuple[dict, list[dict]]]) -> list:
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime import engine_config_json, speculation_policy
     from batcher.dist.gpu.aggregate import _await_recoveries, _Recovering
+    from batcher.dist.gpu.resources import share_for_bytes
     from batcher.dist.gpu.shards import ShardReport, is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import (
         cpu_shard_partial,
@@ -135,10 +165,14 @@ def _run_union_shards(plan: list[tuple[dict, list[dict]]]) -> list:
 
     dc = active_config().distributed
     cfg_json = engine_config_json()
-    gpu_task = ray.remote(**gpu_task_options())(gpu_shard_partial)
+    packing = share_for_bytes(shard_bytes, len(plan), gpu_count=gpu_count)
+    gpu_task = ray.remote(**gpu_task_options(num_gpus=packing.fraction))(gpu_shard_partial)
+    # A slice that did not fit its packed share is retried on a whole device rather than divided
+    # against the share that was just shown to be too small. Identical when nothing was packed.
+    retry_task = ray.remote(**gpu_task_options())(gpu_shard_partial) if packing.packed else gpu_task
     cpu_task = ray.remote(max_retries=int(dc.task_max_retries))(cpu_shard_partial)
 
-    report = ShardReport("gpu-union", len(plan))
+    report = ShardReport("gpu-union", len(plan), packing=packing)
 
     def _launch(i: int):
         descriptor, shard_ops = plan[i]
@@ -152,9 +186,10 @@ def _run_union_shards(plan: list[tuple[dict, list[dict]]]) -> list:
                 report.note_subdivided()
                 return run_subdivided(
                     descriptor,
-                    lambda d: ray.get(gpu_task.remote(d, shard_ops)),
+                    lambda d: ray.get(retry_task.remote(d, shard_ops)),
                     parts=int(dc.gpu_shard_subdivide),
                     rounds=int(dc.gpu_shard_subdivide_rounds),
+                    cause=exc,
                 )
             except Exception as sub_exc:
                 exc = sub_exc

@@ -25,6 +25,13 @@ Recovery is defense in depth. The cheapest mechanism handles the common case, an
 heavier machinery engages only when it can't. The knobs live in `config.distributed`,
 documented in {doc}`../configuration/options`.
 
+Every layer below is a mechanism for *repeating* work that was lost. Two things bound them,
+because repetition alone is not recovery. A failure is first classified — retry here, retry
+elsewhere, or do not retry — since a failure local to one machine that is retried in place
+walks the whole queue onto it. And retries are drawn from a job-wide budget, so a fleet broken
+in some way no probe catches fails quickly with the first real error rather than slowly with
+the last one. Both are configured in {doc}`../configuration/fault-tolerance`.
+
 ### Ray-level task and actor retries
 
 The first line of defense is the scheduler itself. Ray retries a transient task
@@ -286,3 +293,7 @@ overhead.
   that makes recovery sound.
 - {doc}`Configuration options <../configuration/options>`: every fault-tolerance,
   memory, and flow-control field with its default.
+- {doc}`Fault-tolerance options <../configuration/fault-tolerance>`: the quarantine
+  thresholds and the job-wide retry budget.
+- {doc}`Unstable nodes <../user-guide/operate/unstable-nodes>`: the operator's walkthrough
+  for a GPU fleet whose nodes and devices fail underneath a running job.

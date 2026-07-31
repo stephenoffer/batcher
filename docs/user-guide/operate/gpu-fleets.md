@@ -363,6 +363,10 @@ devices that passed the health verdicts, or `None` when there is no telemetry to
 Size to `None` by keeping whatever count you had, since an absent probe is not evidence that a
 fleet is unhealthy.
 
+When that sentence is not enough, {doc}`/user-guide/operate/gpu-diagnosis` samples the devices
+across a run and returns one verdict per device: whether it was compute bound, waiting on its
+host link, clamped, contended, starved, or held back by the shape of its own kernels.
+
 ## Constrain where regulated data is computed
 
 Storage residency is the half most systems cover: the bytes live in a bucket in a named region.
@@ -441,6 +445,7 @@ that is merely busy.
 
 ## See also
 
+- {doc}`/user-guide/operate/gpu-diagnosis`: why a GPU stage was slow, once it is correct.
 - {doc}`/ml/inference/gpu`: choosing devices and batch sizes for a model, from the pipeline side.
 - {doc}`/user-guide/trust/governance`: the row and column half of the same policy layer.
 - {doc}`/configuration/options`: every accelerator field with its default and unit.

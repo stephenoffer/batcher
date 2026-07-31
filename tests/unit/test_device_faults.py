@@ -318,7 +318,21 @@ def test_several_fatal_codes_on_one_device_are_all_recorded():
     verdicts = (health.HealthVerdict(device_index=0, uuid="GPU-0"),)
     faults = (DeviceFaults(index=0, pci_address="0000:0c:00.0", readable=True),)
     out = health.xid_verdicts(verdicts, faults, {"0000:0c:00.0": (48, 95)})
-    assert set(out[0].reasons) == {"xid_48", "xid_95"}
+    assert {"xid_48", "xid_95"} <= set(out[0].reasons)
+
+
+def test_a_corrupting_fault_says_so_beyond_naming_its_code():
+    # 48 and 95 are the two codes where the device kept running and returned a *wrong* number
+    # rather than none at all, so work already completed on it is suspect. A reason list that
+    # said only "xid_95" leaves a caller unable to tell that from an ordinary device fault,
+    # and the correct responses differ: one is retried elsewhere, the other fails the run.
+    verdicts = (health.HealthVerdict(device_index=0, uuid="GPU-0"),)
+    faults = (DeviceFaults(index=0, pci_address="0000:0c:00.0", readable=True),)
+    corrupt = health.xid_verdicts(verdicts, faults, {"0000:0c:00.0": (95,)})
+    assert "results_untrusted" in corrupt[0].reasons
+    # A device that fell off the bus returned nothing, so nothing it produced is suspect.
+    lost = health.xid_verdicts(verdicts, faults, {"0000:0c:00.0": (79,)})
+    assert "results_untrusted" not in lost[0].reasons
 
 
 # --- Who an Xid is addressed to --------------------------------------------------------

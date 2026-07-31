@@ -70,3 +70,47 @@ def test_teardown_runs_even_when_a_worker_raises() -> None:
 def test_a_worker_without_close_is_fine() -> None:
     pool = InferencePool(lambda: lambda batch: batch, num_workers=2, target_batch_rows=1)
     assert sum(b.num_rows for b in pool.run(iter(_batches()))) == 4
+
+
+def test_a_factory_that_fails_partway_releases_what_it_already_built() -> None:
+    """The ordinary multi-GPU failure: the second of several models finds the device full.
+
+    Leaking the ones already loaded turns a recoverable "size the pool smaller" into an OOM
+    that outlives the failure and takes the retry with it.
+    """
+    calls = {"n": 0}
+
+    def factory() -> _Model:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise MemoryError("CUDA out of memory")
+        return _Model()
+
+    pool = InferencePool(factory, num_workers=4, target_batch_rows=1)
+    with pytest.raises(MemoryError, match="out of memory"):
+        list(pool.run(iter(_batches())))
+    assert _Model.built == 2
+    assert _Model.closed == 2
+
+
+def test_a_consumer_that_stops_early_does_not_pay_for_the_whole_inflight_window() -> None:
+    """Abandoning the iterator cancels the batches that have not started.
+
+    A `limit` over a streamed inference otherwise waited on every submitted forward pass
+    before returning, because the executor's shutdown waits for its whole queue.
+    """
+    seen: list[int] = []
+
+    class _Slow(_Model):
+        def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+            seen.append(batch.num_rows)
+            return batch
+
+    pool = InferencePool(_Slow, num_workers=1, target_batch_rows=1, max_inflight=1)
+    stream = pool.run(iter(_batches(64)))
+    assert next(stream).num_rows == 1
+    stream.close()
+    # One worker with an in-flight bound of one cannot have started more than a couple; the
+    # point is that it is bounded rather than the whole 64-batch input.
+    assert len(seen) < 8
+    assert _Model.closed == 1

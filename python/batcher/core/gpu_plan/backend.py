@@ -88,10 +88,12 @@ class Unsupported(Exception):
 class DfBackend:
     """One dataframe library (cuDF or pandas) behind the small surface the translator needs.
 
-    Holds no state beyond the module, so it is free to construct per execution.
+    Constructed per execution. The only state it keeps is which columns arrived as Arrow DATEs,
+    because neither library has a date type and both hand one back as a timestamp — see
+    `remember_dates`.
     """
 
-    __slots__ = ("_arrow_native", "lib")
+    __slots__ = ("_arrow_native", "_date_types", "lib")
 
     def __init__(self, lib: Any) -> None:
         """Wrap dataframe module `lib` (``cudf`` on a GPU, ``pandas`` for verification)."""
@@ -99,6 +101,30 @@ class DfBackend:
         # cuDF reads Arrow natively and keeps the null mask; pandas needs the ArrowDtype
         # mapper below to do the same.
         self._arrow_native = hasattr(lib.DataFrame, "from_arrow")
+        self._date_types: dict[str, Any] = {}
+
+    def remember_dates(self, schema) -> None:
+        """Record which of `schema`'s columns are Arrow DATEs, so `to_arrow` can restore them.
+
+        Neither dataframe library has a calendar-day type: a `date32` becomes a datetime the
+        moment it enters a frame, and comes back out of `to_arrow` as a `timestamp`. The values
+        are right and the *column* is wrong, which is the failure this package is most careful
+        about elsewhere — a shard that contributes a `timestamp` column cannot be concatenated
+        with a CPU-recovered shard's `date32`, and a query that returns one has quietly changed
+        its own schema. Measured on TPC-H q3, whose `o_orderdate` came back as
+        `datetime(1995, 2, 3, 0, 0)` where the engine returns `date(1995, 2, 3)`.
+
+        Called by every reader — `from_arrow` here, and the device Parquet reader, which never
+        goes through it.
+
+        Args:
+            schema: The Arrow schema the rows were read with.
+        """
+        import pyarrow as pa
+
+        for field in schema:
+            if pa.types.is_date(field.type):
+                self._date_types[field.name] = field.type
 
     @property
     def is_gpu(self) -> bool:
@@ -108,6 +134,7 @@ class DfBackend:
     def from_arrow(self, table: pa.Table):
         """An Arrow table as a dataframe, preserving Arrow's null mask on both libraries."""
         table = widen_narrow(table)
+        self.remember_dates(table.schema)
         if self._arrow_native:
             return self.lib.DataFrame.from_arrow(table)
         return table.to_pandas(types_mapper=self.lib.ArrowDtype)
@@ -115,10 +142,34 @@ class DfBackend:
     def to_arrow(self, df) -> pa.Table:
         """A dataframe back as an Arrow table, dropping the index (never part of the result)."""
         if self._arrow_native:
-            return df.to_arrow()
+            return self._restore_dates(df.to_arrow())
         import pyarrow as pa
 
-        return pa.Table.from_pandas(df, preserve_index=False).replace_schema_metadata(None)
+        table = pa.Table.from_pandas(df, preserve_index=False).replace_schema_metadata(None)
+        return self._restore_dates(table)
+
+    def _restore_dates(self, table: pa.Table) -> pa.Table:
+        """`table` with any column that arrived as a DATE cast back from the library's timestamp.
+
+        Keyed by name and applied only where the column *is* now a timestamp, so a column the
+        plan genuinely converted keeps its conversion and one that was never a date is untouched.
+        A no-op — and not even a schema walk — when nothing this backend read was a date, which
+        is most plans.
+        """
+        if not self._date_types:
+            return table
+        import pyarrow as pa
+
+        fields = []
+        changed = False
+        for field in table.schema:
+            target = self._date_types.get(field.name)
+            if target is not None and pa.types.is_timestamp(field.type):
+                fields.append(pa.field(field.name, target, field.nullable))
+                changed = True
+            else:
+                fields.append(field)
+        return table.cast(pa.schema(fields)) if changed else table
 
     def concat(self, frames: list):
         """Row-wise concatenation with a fresh index."""

@@ -2,9 +2,9 @@
 
 This page describes how to build a Batcher `Config`, make it active, and load one from the environment or a file.
 
-The pages beneath it are the reference: {doc}`options` is the field-by-field listing, {doc}`accelerator` covers the GPU and device settings, {doc}`environment` covers the `BATCHER_*` variables and the JSON file format, and {doc}`profiles` shows worked configurations for common deployments.
+The pages beneath it are the reference: {doc}`options` is the field-by-field listing, {doc}`accelerator` covers the GPU and device settings, {doc}`fault-tolerance` covers what happens when nodes and devices fail underneath a running job, {doc}`environment` covers the `BATCHER_*` variables and the JSON file format, and {doc}`profiles` shows worked configurations for common deployments.
 
-Most of the time you don't configure Batcher at all. The defaults are tuned to saturate your cores and stay within memory on their own. When you do need to tune a memory limit, the thread count, or how aggressively the engine spills, every knob lives on one `Config` object. It's a typed, immutable dataclass grouped by concern: `execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`, `distributed`, `observability`, and `accelerator`. There's no global mutable state and no dict of loose keys. You build a `Config`, then make it active.
+Most of the time you don't configure Batcher at all. The defaults are tuned to saturate your cores and stay within memory on their own. When you do need to tune a memory limit, the thread count, or how aggressively the engine spills, every knob lives on one `Config` object. It's a typed, immutable dataclass grouped by concern: `execution`, `memory`, `flow_control`, `optimizer`, `pid`, `metadata`, `distributed`, `observability`, `accelerator`, and `fault_tolerance`. There's no global mutable state and no dict of loose keys. You build a `Config`, then make it active.
 
 ```python
 import batcher as bt
@@ -181,6 +181,7 @@ The environment and file layers are read once when `batcher` is imported.
 
 options
 accelerator
+fault-tolerance
 environment
 profiles
 ```

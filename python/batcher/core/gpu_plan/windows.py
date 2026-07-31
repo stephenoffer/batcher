@@ -64,10 +64,10 @@ def supported_window(ir: dict) -> bool:
     Returns:
         True when every partition key, order key and function in the node is translatable.
     """
-    if any(k.get("e") != "col" for k in ir["partition_keys"]):
-        return False
-    if any(k["expr"].get("e") != "col" for k in ir["order_keys"]):
-        return False
+    # A computed partition or order key is NOT rejected here. It is evaluated into a private
+    # column at execution, exactly as a computed group key is (`aggs._key_columns`), because
+    # `PARTITION BY date_trunc('month', ts)` is an ordinary way to write a monthly ranking and
+    # rejecting it dropped the whole chain to the CPU engine over the shape of one key.
     if ir.get("rank_limit") is not None:
         return False  # a per-partition top-N pushdown, with its own row-elimination semantics
     if len({bool(k.get("nulls_first")) for k in ir["order_keys"]}) > 1:
@@ -142,13 +142,14 @@ def window(df, ir: dict, be: DfBackend):
     Raises:
         Unsupported: For a function or frame outside the translated subset.
     """
-    part = [k["name"] for k in ir["partition_keys"]]
-    order = [k["expr"]["name"] for k in ir["order_keys"]]
     ascending = [not k["descending"] for k in ir["order_keys"]]
     nulls_first = bool(ir["order_keys"] and ir["order_keys"][0].get("nulls_first"))
 
     out = df.copy()
     out[_ROW] = _arange(be, len(out))
+    computed: list[str] = []
+    part = _key_names(out, ir["partition_keys"], be, computed, kind="p")
+    order = _key_names(out, [k["expr"] for k in ir["order_keys"]], be, computed, kind="o")
     if part or order:
         out = out.sort_values(
             part + order,
@@ -168,7 +169,29 @@ def window(df, ir: dict, be: DfBackend):
     # Restore the arrival order, then drop the private columns: the engine's Window keeps the
     # input's row order, and a sorted result would differ from it row-for-row.
     out = out.sort_values(_ROW, kind="stable").reset_index(drop=True)
-    return out.drop(columns=[_ROW, _POS, _PID])
+    return out.drop(columns=[_ROW, _POS, _PID, *computed])
+
+
+def _key_names(out, keys: list[dict], be: DfBackend, computed: list[str], *, kind: str):
+    """The column names to partition or order by, materializing the ones that are expressions.
+
+    A key that is already a plain column is used in place; anything else is evaluated into a
+    private column, whose name is recorded in `computed` so the caller drops it again. The
+    window operator's contract is that it *adds* one column per function to the input's
+    columns, so a materialized key that survived would be an extra output column.
+    """
+    from batcher.core.gpu_plan.exprs import eval_expr
+
+    names: list[str] = []
+    for i, key in enumerate(keys):
+        if key.get("e") == "col":
+            names.append(key["name"])
+            continue
+        name = f"__bt_wk{kind}{i}"
+        out[name] = be.column(eval_expr(key, out, be), out)
+        computed.append(name)
+        names.append(name)
+    return names
 
 
 def _arange(be: DfBackend, n: int):

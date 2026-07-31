@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING
 from batcher._internal.errors import ConfigError
 from batcher.config.accelerator import validate_accelerator
 from batcher.config.config import VERBOSITY_LEVELS
+from batcher.config.fault_tolerance import validate_fault_tolerance
 from batcher.config.profiles import AUTOSCALE_WAIT_AUTO, RESILIENCE_PROFILES
+from batcher.config.validation.gpu import check_gpu_packing
 
 if TYPE_CHECKING:
     from batcher.config.config import (
@@ -50,6 +52,7 @@ def run_checks(cfg: Config) -> None:
     _check_flow_control(cfg.flow_control)
     _check_optimizer(cfg.optimizer)
     validate_accelerator(cfg.accelerator)
+    validate_fault_tolerance(cfg.fault_tolerance)
     _check_pid(cfg.pid)
     _check_metadata(cfg.metadata)
     _check_observability(cfg.observability)
@@ -88,6 +91,10 @@ def _check_memory(m: MemoryConfig) -> None:
         m.spill_local_budget_bytes is None or m.spill_local_budget_bytes >= 0,
         f"memory.spill_local_budget_bytes must be non-negative or None, "
         f"got {m.spill_local_budget_bytes}",
+    )
+    _check(
+        0.0 < m.oom_kill_backoff <= 1.0,
+        f"memory.oom_kill_backoff must be in (0, 1], got {m.oom_kill_backoff}",
     )
 
 
@@ -137,6 +144,7 @@ def _check_distributed(d: DistributedConfig) -> None:
     """Every distributed tunable: failure budgets, placement, and the shuffle's TLS."""
     _check_distributed_faults(d)
     _check_distributed_placement(d)
+    check_gpu_packing(d)
     _check_shuffle_tls(d.tls)
 
 

@@ -89,6 +89,11 @@ def _widen(frame, descriptor: dict, projection: list[str] | None, be: DfBackend)
     from batcher.core.gpu_plan.backend import widened_type
 
     schema = descriptor["splits"][0].schema()
+    # This reader never goes through `from_arrow`, so the backend would not otherwise learn
+    # which columns were calendar days — and a DATE that entered a frame comes back out of
+    # `to_arrow` as a timestamp. Registering the source schema here is what keeps a device-read
+    # shard's schema equal to a host-read one's.
+    be.remember_dates(schema)
     names = list(projection) if projection is not None else list(frame.columns)
     for name in names:
         target = widened_type(schema.field(name).type)

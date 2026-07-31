@@ -1107,10 +1107,18 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write
                 # under a concurrency spike, a throttled model endpoint) clears on a retry —
                 # and killing a multi-hour inference job on one discards every completed
                 # partition. Charged to the same per-partition attempt budget as a preemption.
-                from batcher.dist.executors.ray_runtime.policies import _is_transient_udf_error
+                from batcher.dist.executors.ray_runtime.policies import (
+                    _is_transient_udf_error,
+                    check_results_trusted,
+                )
 
                 if not _is_transient_udf_error(exc):
                     raise
+                # A device that took an uncontained ECC fault kept running and returned a
+                # wrong number, so the partitions this actor already completed are suspect
+                # too. That is the one failure a retry must not absorb: it would finish the
+                # job successfully and write the corruption out.
+                check_results_trusted(exc)
                 attempts[idx] += 1
                 if attempts[idx] > policy.max_attempts:
                     raise

@@ -41,6 +41,12 @@ class StageEnergy:
         measured: Whether `joules` came from a device power reading rather than from the
             datasheet model. A cost figure that cannot be told apart from an estimate is
             worth less than either, so the distinction travels with the record.
+        integrated: Whether `joules` came from the driver's own hardware energy counter rather
+            than from power sampled at the ends of the stage. Both are `measured`; only this
+            one is *exact*. The difference is not cosmetic — sampling assumes the draw between
+            the samples was the mean of them, and a GPU stage alternating between a staged
+            transfer at 60 W and a kernel at 700 W violates that by an order of magnitude. A
+            chargeback or a carbon figure should say which it had.
     """
 
     stage: str
@@ -52,6 +58,7 @@ class StageEnergy:
     rows: int = 0
     tokens: int = 0
     measured: bool = False
+    integrated: bool = False
 
     @property
     def rows_per_joule(self) -> float | None:
@@ -125,6 +132,21 @@ class EnergyLedger:
     def total_idle_joules(self) -> float:
         """Total energy spent holding devices rather than computing on them."""
         return sum(s.idle_joules for s in self.stages)
+
+    @property
+    def integrated_fraction(self) -> float:
+        """Fraction of the run's energy that came from a hardware counter, in [0, 1].
+
+        The confidence qualifier a total needs before it is quoted. A run at `1.0` has an exact
+        figure; a run at `0.0` has one assembled from power samples and datasheet models, which
+        is fine for comparing two runs on the same hardware and not fine for a bill. Weighted by
+        joules rather than by stage count, because one long stage dominating the total decides
+        how trustworthy the total is regardless of how many short ones surround it.
+        """
+        total = self.total_joules
+        if total <= 0:
+            return 0.0
+        return sum(s.joules for s in self.stages if s.integrated) / total
 
     @property
     def total_tokens(self) -> int:

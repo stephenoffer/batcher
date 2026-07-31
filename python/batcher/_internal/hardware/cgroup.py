@@ -23,6 +23,8 @@ __all__ = [
     "cgroup_throttled_ratio",
     "cgroup_v2_dirs",
     "read_cgroup_bytes",
+    "read_cgroup_stat",
+    "read_psi",
 ]
 
 
@@ -165,8 +167,22 @@ def cfs_quota_count() -> int | None:
     return None
 
 
-def _cgroup_stat(base: str, name: str) -> dict[str, int]:
-    """Parse a two-column ``key value`` cgroup stat file into a dict (empty when unreadable)."""
+def read_cgroup_stat(base: str, name: str) -> dict[str, int]:
+    """Parse a two-column ``key value`` cgroup stat file into a dict (empty when unreadable).
+
+    Public within `_internal` because three unrelated readers want the same parser:
+    `cgroup_throttled_ratio` here, Carbonite's page-cache term (``memory.stat``), and its
+    OOM-kill / reclaim-throttle counters (``memory.events``). Those files share exactly this
+    format, and a second copy of the parser is how one of them ends up handling a malformed
+    line differently from the others.
+
+    Args:
+        base: The cgroup directory to read from.
+        name: The stat file's name within it.
+
+    Returns:
+        The parsed counters, empty when the file is absent or unreadable.
+    """
     try:
         with open(os.path.join(base, name)) as f:
             return {
@@ -194,7 +210,7 @@ def cgroup_throttled_ratio() -> float | None:
         Throttled period fraction in [0, 1], or `None` when the counters are unavailable.
     """
     for base in cgroup_v2_dirs():
-        stat = _cgroup_stat(base, "cpu.stat")
+        stat = read_cgroup_stat(base, "cpu.stat")
         periods = stat.get("nr_periods", 0)
         if periods > 0:
             return stat.get("nr_throttled", 0) / periods
@@ -247,22 +263,52 @@ def _cgroup_pressure_sampled() -> dict[str, float]:
 
 
 def _psi_some_avg10(path: str) -> float | None:
-    """The ``some avg10`` share from a PSI file as a fraction, or `None` when unreadable.
+    """The ``some avg10`` share from a PSI file as a fraction, or `None` when unreadable."""
+    return read_psi(path).get("some_avg10")
 
-    PSI reports ``avg10`` as a *percentage*; this normalizes to [0, 1] so every contention
-    signal in the codebase carries the same units.
+
+def read_psi(path: str) -> dict[str, float]:
+    """Every ``some``/``full`` stall average in one PSI file, as fractions in [0, 1].
+
+    PSI reports each average as a *percentage*; this normalizes to [0, 1] so every contention
+    signal in the codebase carries the same units. Keys are ``<line>_avg<window>`` —
+    ``some_avg10``, ``full_avg10``, ``some_avg60``, and so on.
+
+    The ``full`` line is the one that matters for memory and has no reader anywhere else:
+    ``some`` means *at least one* task stalled, which a healthy memory-tight process does
+    constantly as it faults pages in, while ``full`` means **every** runnable task was stalled
+    at once — the whole cgroup made no progress. A container thrashing reclaim on its way to an
+    OOM kill shows a rising ``full`` share for seconds beforehand, and that is the only warning
+    the kernel gives that is early enough to act on: `memory.current` is already at the limit by
+    then, because the limit is what the reclaim is defending.
+
+    Args:
+        path: The PSI file to read (``<cgroup>/memory.pressure``, ``/proc/pressure/memory``).
+
+    Returns:
+        The available stall shares, empty when PSI is off, the file is absent, or this is not
+        Linux. Empty is deliberately distinct from all-zeros, which would read as "measured, no
+        pressure" for a kernel that measured nothing.
     """
+    out: dict[str, float] = {}
     try:
         with open(path) as f:
-            for line in f:
-                if not line.startswith("some "):
-                    continue
-                for field in line.split():
-                    if field.startswith("avg10="):
-                        return max(0.0, min(1.0, float(field[6:]) / 100.0))
-    except (OSError, ValueError):
-        return None
-    return None
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        fields = line.split()
+        if not fields or fields[0] not in ("some", "full"):
+            continue
+        for field in fields[1:]:
+            name, _, raw = field.partition("=")
+            if not name.startswith("avg"):
+                continue
+            try:
+                out[f"{fields[0]}_{name}"] = max(0.0, min(1.0, float(raw) / 100.0))
+            except ValueError:
+                continue
+    return out
 
 
 def read_cgroup_bytes(path: str) -> int | None:

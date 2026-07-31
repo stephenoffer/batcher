@@ -135,11 +135,67 @@ class PressureMonitor:
         Sampled once per query by the `ResourceManager` and threaded through the
         `ResourceContext` so admission, spill, and reserve all reason about the
         same figure instead of each re-sampling live free RAM.
+
+        An auto-sensed envelope is scaled down by `memory.oom_kill_backoff` when this cgroup's
+        `memory.events` shows a task in it has already been OOM-killed. That counter is proof,
+        not a forecast: the workload did not fit at the size it last ran, and a restarted
+        worker re-deriving the envelope from the same box gets the same number and walks into
+        the same kill. An explicitly configured `max_memory_bytes` is an instruction and is
+        never scaled — an operator who pinned a cap gets exactly it.
         """
         mem = self._config.memory
         if mem.max_memory_bytes is not None:
             return mem.max_memory_bytes
-        return self.available_bytes()
+        return int(self.available_bytes() * self._oom_history_factor())
+
+    def _oom_history_factor(self) -> float:
+        """`memory.oom_kill_backoff` when this cgroup has been OOM-killed before, else `1.0`."""
+        backoff = self._config.memory.oom_kill_backoff
+        if backoff >= 1.0:
+            return 1.0
+        from batcher.carbonite.memory.kernel import oom_kill_count
+
+        return backoff if oom_kill_count() else 1.0
+
+    def stall_floor(self) -> PressureLevel:
+        """The lowest level the kernel's own memory PSI justifies, from its `full` share.
+
+        The byte accounting this monitor otherwise runs on answers "how much is reserved",
+        which is not the same question as "is the kernel coping". A cgroup can sit at 70% of
+        its limit and still spend most of every second in direct reclaim — because the limit
+        being defended is `memory.high`, or because the resident set is nearly all anonymous
+        and there is no cache left to drop. In that state the byte reading says NORMAL while
+        the container is seconds from a kill.
+
+        PSI `full` is the share of the window in which *every* runnable task was stalled on
+        memory, so it measures exactly the thing the byte reading cannot see. It is used only
+        as a **floor**: it can raise the level the accounting reported and never lower it, so
+        turning it on makes the engine spill sooner and never later.
+
+        Returns:
+            The floor, `NORMAL` when PSI is unavailable or the config opts out.
+        """
+        if not self._config.memory.stall_aware_pressure:
+            return PressureLevel.NORMAL
+        from batcher.carbonite.memory.kernel import (
+            STALL_CRITICAL,
+            STALL_ELEVATED,
+            memory_stall_full,
+        )
+
+        stall = memory_stall_full()
+        if stall is None:
+            return PressureLevel.NORMAL
+        # Deliberately capped at SPILL rather than CRITICAL. CRITICAL pauses producers
+        # outright, and a stall share is a *rate*, not a headroom figure — a burst of reclaim
+        # while the engine still has gigabytes free would otherwise stop the query dead. SPILL
+        # is the strongest response that is always safe: it takes state out of core, which is
+        # what relieves reclaim in the first place.
+        if stall >= STALL_CRITICAL:
+            return PressureLevel.SPILL
+        if stall >= STALL_ELEVATED:
+            return PressureLevel.ELEVATED
+        return PressureLevel.NORMAL
 
     def level(self) -> PressureLevel:
         """Classify the **engine's** envelope usage against the soft/hard limits.
@@ -162,7 +218,7 @@ class PressureMonitor:
         """
         raw = self._engine_used_fraction()
         prev = self._ewma if self._ewma is not None else raw
-        level = self._classify(max(raw, prev))
+        level = max(self._classify(max(raw, prev)), self.stall_floor())
         self._ewma = self._alpha * raw + (1.0 - self._alpha) * prev
         self._observe_flap(level)
         return level
@@ -209,7 +265,7 @@ class PressureMonitor:
         """
         raw = self._engine_used_fraction()
         prev = self._ewma if self._ewma is not None else raw
-        return self._classify(max(raw, prev))
+        return max(self._classify(max(raw, prev)), self.stall_floor())
 
     def _classify(self, used: float) -> PressureLevel:
         """Bucket a used-fraction into a level. Pure.
@@ -284,7 +340,11 @@ class PressureMonitor:
         pool = current_process_pool()
         if pool is not None and pool.limit > 0:
             candidates.append(pool.utilization)
-        total = probe.total_memory_bytes()
+        # Against the ceiling that actually binds, which is `memory.high` where one is set.
+        # Dividing by `memory.max` reports a container as half-full at the exact moment the
+        # kernel starts sleeping it in direct reclaim, so the level stays NORMAL through the
+        # whole throttled band and the engine never spills its way out of it.
+        total = probe.effective_limit_bytes() or probe.total_memory_bytes()
         if total:
             footprint = probe.cgroup_current_bytes() or probe.process_rss_bytes()
             if footprint is not None:

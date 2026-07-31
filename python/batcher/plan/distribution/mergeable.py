@@ -33,7 +33,7 @@ gets a plausible wrong answer:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from batcher.plan.ir_tags import Op
@@ -45,6 +45,7 @@ __all__ = [
     "decompose",
     "flatten_ops",
     "nest_ops",
+    "recombine",
     "shard_plan",
 ]
 
@@ -62,12 +63,48 @@ class ShardSplit:
     mean different things to the executor: a fold may collect its shards in any order, and a
     concatenation may not. Reading one as the other reorders the result of every filter that
     ever fans out.
+
+    `fold_ops` and `refold_ops` are the same algebra stated so it can be applied **in waves**
+    rather than all at once. `merge_ops` folds every shard's output together, which means the
+    driver holds all of them at once: a thousand shards of a group-by over a million groups is
+    a billion rows resident on one process before a single one is combined, and the fan-out
+    that was built to bound *device* memory then fails on the *host*. `fold_ops` is the prefix
+    of `merge_ops` that may be applied to any subset of shard outputs, and `refold_ops` folds
+    those results again — so a caller can combine a wave, keep one accumulator, and discard the
+    wave. Both are empty when the chain does not fold at all (a row-local chain, whose merge is
+    an ordered concatenation and whose output is the answer's own size anyway).
+
+    The pair is what makes the wave form *exact* rather than approximately equal: a combine
+    renames its inputs, so applying it twice would look for columns the first application
+    consumed, and `refold_ops` is the form that reads its own output. Anything above the fold —
+    a `mean`'s final division, for instance — stays in `merge_ops` and runs exactly once.
     """
 
     shard_ops: list[dict]
     merge_ops: list[dict]
     tail_ops: list[dict]
     ordered: bool = False
+    fold_ops: list[dict] = field(default_factory=list)
+    refold_ops: list[dict] = field(default_factory=list)
+
+    @property
+    def finalize_ops(self) -> list[dict]:
+        """What runs once on the folded result, after the last fold — often empty.
+
+        The suffix of `merge_ops` that `fold_ops` does not cover: an aggregate's finalize
+        projection, and nothing at all for a distinct or a top-N, whose merge is entirely a
+        repeatable fold.
+        """
+        return self.merge_ops[len(self.fold_ops) :]
+
+    @property
+    def foldable(self) -> bool:
+        """Whether the shards' outputs can be combined a wave at a time.
+
+        `False` for a row-local chain and for any reducer whose fold cannot be repeated, where
+        a caller must hold every partial and merge once — the behavior every fan-out had.
+        """
+        return bool(self.fold_ops and self.refold_ops)
 
 
 #: Operators whose output for a row depends only on that row, so a shard can run them over the
@@ -127,14 +164,26 @@ def shard_plan(ops: list[dict]) -> ShardSplit | None:
     split = _split_reducer(ops[cut], ops[cut + 1 :])
     if split is None:
         return None
-    shard_stage, merge_stage, consumed = split
+    shard_stage, merge_stage, consumed, fold, refold = split
     return ShardSplit(
-        [*ops[:cut], *shard_stage], merge_stage, ops[cut + 1 + consumed :], ordered=False
+        [*ops[:cut], *shard_stage],
+        merge_stage,
+        ops[cut + 1 + consumed :],
+        ordered=False,
+        fold_ops=fold,
+        refold_ops=refold,
     )
 
 
-def _split_reducer(op: dict, rest: list[dict]) -> tuple[list[dict], list[dict], int] | None:
-    """The per-shard and merge forms of one reducing operator, plus how many followers it ate.
+def _split_reducer(
+    op: dict, rest: list[dict]
+) -> tuple[list[dict], list[dict], int, list[dict], list[dict]] | None:
+    """One reducing operator's shard form, merge form, followers eaten, and repeatable fold.
+
+    The last two entries are the wave form (see `ShardSplit`): `fold_ops` combines a subset of
+    the shards' outputs and `refold_ops` combines those results again. They are returned here,
+    beside the merge they are derived from, because the derivation is per-reducer — an
+    aggregate's fold is a *different node* from its merge, while a distinct's is the same node.
 
     Returns `None` when the operator has no mergeable form.
     """
@@ -144,11 +193,12 @@ def _split_reducer(op: dict, rest: list[dict]) -> tuple[list[dict], list[dict], 
         if parts is None:
             return None
         partial_ir, combine_ir, finalize_ir = parts
-        return [partial_ir], [combine_ir, finalize_ir], 0
+        return [partial_ir], [combine_ir, finalize_ir], 0, [combine_ir], [recombine(combine_ir)]
     if kind == Op.DISTINCT:
         # Idempotent: deduplicating each shard and then the concatenation gives the same set as
-        # deduplicating once. Row order is not preserved, which no distinct promises.
-        return [op], [op], 0
+        # deduplicating once. Row order is not preserved, which no distinct promises. The same
+        # idempotence is what lets it fold in waves with no second form.
+        return [op], [op], 0, [op], [op]
     if kind != Op.SORT:
         return None
     # A global top-N is the top-N of the shards' top-Ns, and the merge re-sorts, so the result
@@ -156,15 +206,61 @@ def _split_reducer(op: dict, rest: list[dict]) -> tuple[list[dict], list[dict], 
     # excluded on purpose: it is still correct, but the merge would carry every row, so it buys
     # parallel sorting at the cost of moving the whole dataset.
     if op.get("limit"):
-        return [op], [op], 0
+        # The top-N of a set of top-Ns is the same top-N, at any grouping and to any depth, so
+        # this folds in waves with no second form either.
+        return [op], [op], 0, [op], [op]
     # ...and the limit is as often a *separate* operator above the sort, which is the shape
     # `sort(...).limit(n)` lowers to when nothing fuses them. Matching only the fused form left
     # the most common top-N spelling unable to use more than one device. An `offset` breaks it —
     # a shard's rows 10..20 are not the global rows 10..20 — so only the offset-free form pairs.
     if rest and rest[0].get("op") == Op.LIMIT and not rest[0].get("offset"):
         pair = [op, rest[0]]
-        return pair, pair, 1
+        return pair, pair, 1, pair, pair
     return None
+
+
+def recombine(combine_ir: dict) -> dict:
+    """The form of a combine that folds results the combine has already produced.
+
+    A combine reads the partial stage's private columns (`__bt_pa0`) and writes the user's
+    aliases, so it can be applied exactly once: a second application would look for columns the
+    first one consumed. Folding a fan-out in waves needs a node that reads its *own* output,
+    which is the same reduction over the alias it just wrote.
+
+    That substitution is sound for every combine `decompose` can produce, and only because of
+    what those combines are: `sum`, `min`, `max`, `product`, `bool_and`, `bool_or`. Each is
+    associative and commutative over its own results, so folding waves and folding once give
+    the same value for any wave size and any assignment of shards to waves. A reduction whose
+    combine were not self-combining could not appear here — `decompose` returns `None` for it
+    and the chain does not shard at all.
+
+    Args:
+        combine_ir: The combine `aggregate` node from `decompose`.
+
+    Returns:
+        An `aggregate` node grouping by the same keys and reducing each alias into itself.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.plan.distribution import recombine
+            >>> combine = {
+            ...     "op": "aggregate",
+            ...     "group_keys": [{"expr": {"e": "col", "name": "k"}, "alias": "k"}],
+            ...     "aggregates": [
+            ...         {"func": "sum", "alias": "total", "input": {"e": "col", "name": "__bt_pa0"}}
+            ...     ],
+            ... }
+            >>> recombine(combine)["aggregates"]
+            [{'func': 'sum', 'alias': 'total', 'input': {'e': 'col', 'name': 'total'}}]
+    """
+    return {
+        **combine_ir,
+        "aggregates": [
+            {"func": spec["func"], "alias": spec["alias"], "input": _col(spec["alias"])}
+            for spec in combine_ir["aggregates"]
+        ],
+    }
 
 
 def decompose(ir: dict) -> tuple[dict, dict, dict] | None:

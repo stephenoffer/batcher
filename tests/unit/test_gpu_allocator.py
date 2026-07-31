@@ -33,8 +33,29 @@ def _clean_allocator():
     reset_device_allocator()
 
 
-def test_default_config_plans_nothing():
+def test_the_shipped_config_plans_a_stream_ordered_pool():
+    """The default is a pool, because the driver allocator is 3.25x slower on a real chain.
+
+    Measured on a T4: twenty rounds of filter → project → group-by-sum over 4M rows takes
+    459 ms on the driver allocator and 141 ms on `async`, and the whole gap is `cudaMalloc`
+    synchronizing the device once per intermediate column. `async` rather than `pool` because
+    a stream-ordered pool returns freed memory to the driver, so a co-tenant on the same
+    device still sees it — which is the objection that kept this off.
+    """
     plan = plan_allocator(DeviceMemoryConfig(), 40 * GIB)
+    assert not plan.is_inert
+    assert plan.allocator == "async"
+    assert plan.initial_bytes > 0
+    # ...and statistics on, which the subdivision ladder needs to divide an over-large shard
+    # in one round instead of three blind halvings that each re-read it from storage. Measured
+    # cost on the same benchmark: none (142.1 ms either way).
+    assert plan.statistics
+
+
+def test_an_explicit_default_allocator_still_plans_nothing():
+    """An operator who asks for the driver allocator gets it — the change is to the default,
+    not to what the knob means."""
+    plan = plan_allocator(DeviceMemoryConfig(allocator="default", statistics=False), 40 * GIB)
     assert plan.is_inert
     assert plan.allocator == "default"
     assert plan.initial_bytes == 0

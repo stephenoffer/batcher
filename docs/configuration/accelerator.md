@@ -70,9 +70,36 @@ served.
 | `pool_max_fraction` | `1.0` | Fraction the pool may grow to. Below `1.0` leaves the remainder to a co-tenant. |
 | `spill_to_host` | `False` | Let cuDF move columns to host memory rather than fail when the device fills. |
 | `statistics` | `False` | Track allocation counts and the device high-water mark. |
+| `torch_expandable_segments` | `True` | Back PyTorch's allocator segments with growable virtual reservations, so a workload with varying tensor sizes stops fragmenting. |
+| `torch_memory_fraction` | `True` | Cap each process at its share of its device through PyTorch's own allocator, so one stage's overrun cannot take down its co-tenants. |
+| `torch_gc_threshold` | `0.0` | Share of the per-process cap past which PyTorch reclaims cached blocks proactively. `0.0` keeps the allocator's reactive default. |
 
 These fields are the {py:class}`DeviceMemoryConfig <batcher.config.DeviceMemoryConfig>`
 dataclass.
+
+### Two allocators, two failure modes
+
+The first five fields configure RAPIDS/RMM, which the relational GPU kernels allocate through.
+The three `torch_` fields configure PyTorch's caching allocator, which is what every inference
+stage allocates through. A worker routinely uses both, and they fail differently, so both are
+configured before the first tensor is allocated.
+
+PyTorch's failure mode is fragmentation. The allocator carves the device into fixed segments
+and splits blocks out of them, so a workload whose tensor sizes vary, meaning mixed image
+resolutions or mixed sequence lengths and therefore every real batch, leaves each segment
+holding a live block too small to reuse. The job then dies at 60% VRAM with a message saying
+plenty is free, and the free bytes are real and unusable at the size being asked for.
+`torch_expandable_segments` is the fix, and PyTorch ships it off.
+
+`torch_memory_fraction` matters most when several actors share a device. Without a cap, a stage
+that misjudges its footprint exhausts the device and every co-tenant fails with it. With one,
+the process that overran fails its own allocation and the retry recovers it. The share is
+derived from `vram_headroom` and how many actors the stage packs onto the device, so it agrees
+with the budget admission already reserved.
+
+Both are skipped when `PYTORCH_CUDA_ALLOC_CONF` is already set: an operator who tuned the
+allocator by hand outranks these defaults, and the settings interact, so merging would be worse
+than either.
 
 Unconfigured, RAPIDS asks the CUDA driver for every intermediate column a query produces, and
 a driver allocation is a synchronizing call. A translated chain of a dozen operators over a

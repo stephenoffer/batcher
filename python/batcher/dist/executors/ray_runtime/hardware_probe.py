@@ -236,10 +236,17 @@ def _device_health_on_this_worker() -> dict:
         nvlink_summary,
     )
     from batcher._internal.hardware.faults import (
+        device_remedy,
         faulted_devices,
         misconfigured_devices,
+        node_fault_counts,
+        node_faults,
+        node_faults_readable,
+        worst_severity,
         xid_application_faults,
+        xid_fatal,
         xid_readable,
+        xid_unclassified,
     )
     from batcher.carbonite.accel import (
         assess_fleet,
@@ -279,7 +286,50 @@ def _device_health_on_this_worker() -> dict:
         "xid_application": sorted(
             {code for codes in xid_application_faults().values() for code in codes}
         ),
+        # Codes this build classifies as neither hardware nor workload. Nothing acts on them
+        # — inventing a severity for an unseen code is how a driver release quarantines a
+        # fleet — but they are the most interesting line in the log on a node that keeps
+        # failing, because the vendor documents them and this build does not. Dropped
+        # silently, they become months of "those nodes are just flaky".
+        "xid_unclassified": sorted(
+            {code for codes in xid_unclassified().values() for code in codes}
+        ),
+        # What to *do* about each condemned device, per PCI address. A drain list that says
+        # "quarantined" and nothing else leaves an operator to look up whether the board comes
+        # back after a reset — and for an exhausted row remapper it never does, so a slot sits
+        # down while its ticket reads "pending reset".
+        "remedies": {
+            address: device_remedy(codes) for address, codes in sorted(xid_fatal().items())
+        },
+        # The node faults that are not about the device at all, and that leave no trace
+        # anywhere a Python traceback can reach: the OOM killer having already fired here, a
+        # filesystem remounted read-only under the spill directory, a PCIe link retraining.
+        # A node failing every task for one of these looks identical, from the driver, to a
+        # node with a bad GPU.
+        "node_faults": node_fault_counts(node_faults()),
+        "node_fault_severity": worst_severity(node_faults()),
+        "kernel_log_readable": node_faults_readable(),
+        # Whether this node can still write where it spills. Every stateful operator spills,
+        # so a node whose scratch filesystem filled or went read-only fails every task placed
+        # on it — with every GPU on it reading perfectly healthy, and with the scheduler
+        # still seeing a free slot, which is what turns it into a retry storm.
+        "scratch": _scratch_status(),
     }
+
+
+def _scratch_status() -> str:
+    """This node's spill directory as `"ok"`, `"warn"`, `"failed"`, or `"unknown"`.
+
+    Reuses Carbonite's node readiness check rather than restating it, so the answer a fleet
+    report gives and the answer a worker's own check gives cannot diverge — two different
+    notions of "can this node spill" is exactly the kind of drift that makes a health report
+    stop being believed.
+    """
+    from batcher.carbonite.resilience import preflight_check
+    from batcher.config import active_config
+
+    report = preflight_check(scratch_path=active_config().memory.spill_dir or "")
+    return next((c.status for c in report.checks if c.name == "scratch"), "unknown")
 
 
 #: How long a fleet-health sample is reused before every accelerator node is asked again.
@@ -382,9 +432,9 @@ def unhealthy_nodes(records: tuple[dict, ...] | None = None) -> tuple[dict, ...]
 
     Returns:
         The subset with a quarantined device, a degraded device, a pending reset, a degraded
-        host link, a partially-down NVLink fabric, or an RDMA port that has dropped. Empty on
-        a healthy fleet *and* on one that could not be probed; `cluster_device_health()`
-        returning nothing is what distinguishes them.
+        host link, a partially-down NVLink fabric, an RDMA port that has dropped, or a *node*
+        fault the kernel called fatal. Empty on a healthy fleet *and* on one that could not be
+        probed; `cluster_device_health()` returning nothing is what distinguishes them.
     """
     probed = cluster_device_health() if records is None else records
     return tuple(
@@ -398,4 +448,12 @@ def unhealthy_nodes(records: tuple[dict, ...] | None = None) -> tuple[dict, ...]
         # A link that has actually dropped, as opposed to one merely accumulating symbol
         # errors: the first cost a stage its in-flight transfers, the second is a warning.
         or (r.get("fabric_errors") or {}).get("link_downed")
+        # A node whose kernel has already OOM-killed a process here, or remounted the spill
+        # filesystem read-only, fails every task placed on it while every device on it reads
+        # perfectly healthy — so without this the drain list has no entry for the most common
+        # way a node goes bad.
+        or r.get("node_fault_severity") == "fatal"
+        # Same shape, different cause: a node that cannot write where it spills fails every
+        # stateful operator placed on it and reads healthy by every other measure here.
+        or r.get("scratch") == "failed"
     )

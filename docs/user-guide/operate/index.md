@@ -41,6 +41,18 @@ Patterns for pipelines that stay fast.
 Power budgets, fabric-aware placement, device health, residency.
 :::
 
+:::{grid-item-card} {octicon}`pulse;1.1em` GPU diagnosis
+:link: /user-guide/operate/gpu-diagnosis
+:link-type: doc
+Why a GPU stage was slow, when the answer is not in the plan.
+:::
+
+:::{grid-item-card} {octicon}`shield;1.1em` Unstable nodes
+:link: /user-guide/operate/unstable-nodes
+:link-type: doc
+Keeping a job alive when GPUs and nodes fail underneath it.
+:::
+
 :::{grid-item-card} {octicon}`bug;1.1em` Troubleshooting
 :link: /user-guide/operate/troubleshooting
 :link-type: doc
@@ -56,6 +68,8 @@ caching
 explain-plans
 observability
 gpu-fleets
+gpu-diagnosis
+unstable-nodes
 best-practices
 troubleshooting
 ```

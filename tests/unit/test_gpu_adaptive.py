@@ -124,7 +124,10 @@ def test_decision_consumes_the_learned_threshold(monkeypatch):
 def test_record_cpu_crossover_feeds_the_learner_when_a_gpu_is_present(monkeypatch):
     # The executor's CPU-side hook records a sample only on a GPU cluster (else it's a no-op that
     # never calls the estimator). Mock the GPU count so the gated path runs without a cluster.
-    from batcher.api.terminal import gpu_backend
+    # `route` rather than the package facade: `record_cpu_crossover` resolves
+    # `_cluster_gpu_count` from its own module globals, so patching the facade would
+    # be a no-op that still passes.
+    from batcher.api.terminal.gpu_backend import route as gpu_backend
 
     monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 4)
     hub = _hub()
@@ -138,7 +141,10 @@ def test_record_cpu_crossover_feeds_the_learner_when_a_gpu_is_present(monkeypatc
 
 
 def test_record_cpu_crossover_is_a_noop_without_a_gpu(monkeypatch):
-    from batcher.api.terminal import gpu_backend
+    # `route` rather than the package facade: `record_cpu_crossover` resolves
+    # `_cluster_gpu_count` from its own module globals, so patching the facade would
+    # be a no-op that still passes.
+    from batcher.api.terminal.gpu_backend import route as gpu_backend
     from batcher.kyber.gpu.adaptive import _NS
 
     monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 0)

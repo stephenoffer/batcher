@@ -51,6 +51,8 @@ The section dataclasses are exported so you can construct one and slot it into
 | `EnergyConfig` | the site's power budget, energy price, grid carbon intensity, and PUE |
 | `DeviceHealthConfig` | when a device is derated or taken out of rotation |
 | `DeviceMemoryConfig` | the device allocator, its pool sizing, and host spilling |
+| `FaultToleranceConfig` | the retry budget and what happens when a device corrupts rather than loses |
+| `QuarantineConfig` | when repeated task failures take a node or device out of rotation |
 
 ### Config.replace
 

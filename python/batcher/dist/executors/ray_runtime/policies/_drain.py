@@ -42,6 +42,14 @@ def draining_workers(actors, workers: int) -> set[int]:
       per worker, and the monitors only run under the spot profile, so it stays gated
       there.
 
+    A third signal joins them, and it is the only one that is not about a *planned*
+    departure: **what the job itself has learned.** A worker the fault ledger has quarantined
+    is not leaving — it is staying, and failing. Its shuffle output is on a host that has been
+    losing tasks, so the next fetch from it is the one most likely to fail, and the recovery
+    that follows is the expensive kind. Migrating it at a stage boundary costs one copy and
+    removes the whole class. It reads from a process-local ledger, so unlike the other two it
+    costs no round trip at all.
+
     A worker that errors on the ping is already gone, so it is reported as draining (it
     needs migrating regardless).
 
@@ -61,6 +69,7 @@ def draining_workers(actors, workers: int) -> set[int]:
         return set(cached[2])  # a copy: callers mutate the result
 
     out = _nodes_draining(actors, workers)
+    out |= _quarantined_workers(workers)
     if active_config().distributed.resilience == "spot":
         import ray
 
@@ -73,6 +82,28 @@ def draining_workers(actors, workers: int) -> set[int]:
                 out.add(i)  # unreachable already ⇒ migrate it proactively
     _draining_cache = (key, now + _DRAIN_POLL_TTL_S, frozenset(out))
     return out
+
+
+def _quarantined_workers(workers: int) -> set[int]:
+    """Worker ids the fault ledger is currently keeping work off, empty when it is disabled.
+
+    Reads a process-local ledger, so this costs no round trip and is safe on the barrier's
+    poll path. Ids outside the current fleet's range are dropped rather than trusted: the
+    ledger is keyed by a string, and a stale key from a previous fleet must not migrate a
+    worker that happens to share its index.
+    """
+    from batcher.dist.executors.ray_runtime.policies._faults import node_ledger
+
+    try:
+        ledger = node_ledger()
+        if ledger is None:
+            return set()
+        return {int(k) for k in ledger.blocked_keys() if k.isdigit() and int(k) < workers}
+    except Exception as exc:
+        # Proactive migration is an optimization over the reactive recompute path, so a
+        # ledger read that fails must degrade to that path, never fail a query.
+        note_suppressed("dist", "read the fault ledger for draining workers", exc)
+        return set()
 
 
 #: Single-slot memo of `(actor handles) -> node id per worker`. One fleet is active at a

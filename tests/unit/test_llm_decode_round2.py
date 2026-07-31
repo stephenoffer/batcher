@@ -24,18 +24,29 @@ pa = pytest.importorskip("pyarrow")
 
 
 def test_decode_public_import_path_survives_the_package_split() -> None:
-    """`batcher.ml.decode` must keep exporting the same five helpers from the same path.
+    """`batcher.ml.decode` must keep exporting its helpers from the same path.
 
     Package-izing a module silently moves every name it held. The public path is the
     contract; the submodules behind it are not.
+
+    The list is pinned rather than merely checked for the original five, so a name that
+    *leaves* the package is caught as loudly as one that never arrived. The device-decode
+    entry points below were added to it deliberately; growing this list is a decision, and
+    having to edit the test is what makes it one.
     """
     decode = importlib.import_module("batcher.ml.decode")
     assert sorted(decode.__all__) == [
+        "DecodeBackend",
         "audio_dataset",
+        "decode_jpeg_batch",
         "download_dataset",
+        "hardware_decode_confirmed",
+        "image_decode_backend",
         "image_tensor_dataset",
+        "transfer_saving_ratio",
         "upload_dataset",
         "video_dataset",
+        "video_decode_backend",
     ]
     for name in decode.__all__:
         assert callable(getattr(decode, name)), name

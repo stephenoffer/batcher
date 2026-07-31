@@ -28,18 +28,93 @@ if TYPE_CHECKING:
     from batcher.io.source import Source
 
 __all__ = [
+    "await_gpu_admission",
     "gpu_chain_on_worker",
     "gpu_join_on_worker",
+    "gpu_tree_on_worker",
     "gpu_union_on_worker",
     "whole_source_descriptor",
 ]
 
 
-def whole_source_descriptor(source: Source) -> dict | None:
+def await_gpu_admission(devices: float = 1.0) -> bool:
+    """Whether the cluster can actually start a GPU task now, waiting a bounded time for it.
+
+    A GPU task asks Ray for a device **and** a core, and on a busy cluster the core is the one
+    it does not get. A placement group holding every CPU — another tenant's shuffle, a leaked
+    reservation from a failed stage — leaves the fan-out's tasks PENDING with the devices
+    sitting idle, and `ray.get` on a pending task does not time out. The query then blocks
+    forever, on a backend documented as always safe to request, while the CPU engine could have
+    answered it the whole time.
+
+    Checked against *available* resources rather than the cluster's totals, which is the
+    distinction `await_autoscale` deliberately does not make: it asks whether the fleet is big
+    enough, and this asks whether any of it is free.
+
+    Args:
+        devices: Device share one task needs, so a packed fan-out asking for a quarter of a GPU
+            is admitted by a device that is three-quarters busy.
+
+    Returns:
+        True when a task could be placed — including whenever the answer cannot be determined,
+        because refusing the GPU on an unreadable cluster would disable the backend on every
+        deployment whose resource view differs from this one. False only on a positive reading
+        that nothing is free.
+    """
+    from batcher.config import active_config
+
+    budget = float(active_config().distributed.gpu_admission_wait_s)
+    if budget <= 0:
+        return True
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return True
+    except ImportError as exc:  # the `[ray]` extra is not installed
+        note_suppressed("dist", "import ray for the GPU admission check", exc)
+        return True
+    import time
+
+    deadline = time.monotonic() + budget
+    poll = min(0.5, max(0.05, budget / 20.0))
+    while True:
+        free = _free_resources()
+        if free is None or (free.get("GPU", 0.0) >= devices and free.get("CPU", 0.0) >= 1.0):
+            return True
+        if time.monotonic() >= deadline:
+            note_suppressed(
+                "dist",
+                "admit a GPU stage",
+                TimeoutError(
+                    f"no device free after {budget:.0f}s "
+                    f"(GPU {free.get('GPU', 0.0):.2f}, CPU {free.get('CPU', 0.0):.1f} available)"
+                ),
+            )
+            return False
+        time.sleep(poll)
+
+
+def _free_resources() -> dict | None:
+    """Ray's currently *available* resources, or `None` when they cannot be read."""
+    try:
+        import ray
+
+        return dict(ray.available_resources())
+    except Exception as exc:
+        note_suppressed("dist", "read the cluster's free resources", exc)
+        return None
+
+
+def whole_source_descriptor(source: Source, projection: list[str] | None = None) -> dict | None:
     """One descriptor covering all of `source`, or `None` when it cannot be described.
 
     `None` means the source is in-memory (its rows are already on the driver, so there is
     nothing to save) or the cluster is unreadable.
+
+    `projection` narrows the read to the columns the plan uses. It matters most exactly here,
+    on a relation every worker reads a whole copy of: the wasted columns are paid for once per
+    device rather than once per query.
     """
     # Only Ray is optional; the batcher imports stay outside the `try` so a refactor that moves
     # one fails loudly instead of reading as "this source cannot be described to a worker".
@@ -57,7 +132,7 @@ def whole_source_descriptor(source: Source) -> dict | None:
     splits = _scan_splits(source, 1)
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         return None
-    descriptors = partition_descriptors(source, 1)
+    descriptors = partition_descriptors(source, 1, projection=projection)
     return descriptors[0] if descriptors else None
 
 
@@ -137,6 +212,39 @@ def gpu_union_on_worker(
     return _remote(gpu_union_task, descriptors, input_ops, distinct, ops)
 
 
+def gpu_tree_on_worker(spec: dict, sources: list) -> pa.Table | None:
+    """Run a whole plan tree on one GPU worker that reads every leaf itself.
+
+    The fallback behind the tree fan-out, for a tree with no splittable leaf or one whose
+    replicated side the fan-out would not fit across devices — and, at small scale, the cheaper
+    answer outright, since one device that reads four small relations beats sixteen that each
+    read three of them.
+
+    Args:
+        spec: A GPU plan-tree spec from `gpu_tree_spec`.
+        sources: The query's sources, indexed by a leaf's `source_id`.
+
+    Returns:
+        The tree's result, or `None` when any leaf cannot be described to a worker (an in-memory
+        source, whose rows are on the driver already) or the dispatch failed.
+    """
+    from batcher.core.gpu_plan.pruning import prune_tree
+    from batcher.core.gpu_plan.tree import tree_leaves
+
+    spec, projections = prune_tree(spec)
+    descriptors: list[dict] = []
+    for leaf in tree_leaves(spec):
+        descriptor = whole_source_descriptor(
+            sources[leaf["source_id"]], projections.get(leaf["leaf"])
+        )
+        if descriptor is None:
+            return None
+        descriptors.append(descriptor)
+    from batcher.dist.gpu.tasks import gpu_tree_task
+
+    return _remote(gpu_tree_task, descriptors, spec)
+
+
 def _remote(task, *args) -> pa.Table | None:
     """Run `task` on one GPU worker, returning `None` on any failure.
 
@@ -155,9 +263,24 @@ def _remote(task, *args) -> pa.Table | None:
     except ImportError as exc:  # the `[ray]` extra is not installed
         note_suppressed("dist", "import ray for the GPU dispatch", exc)
         return None
+    from batcher.dist.gpu.cudf_probe import mark_cudf_missing
+
     try:
         _ensure_ray(1)
+        if not await_gpu_admission():
+            # Nothing is free and nothing is going to be within the budget. Submitting anyway
+            # would leave the task PENDING and this `ray.get` waiting on it without a deadline.
+            return None
         return ray.get(ray.remote(**gpu_task_options())(task).remote(*args))
     except Exception as exc:
+        if mark_cudf_missing(exc):
+            # The cuDF probe guessed present and was wrong. It has now recorded otherwise, so
+            # a second attempt carries the pip block that installs it — once per session, on
+            # the fleets that actually need it rather than on all of them.
+            try:
+                return ray.get(ray.remote(**gpu_task_options())(task).remote(*args))
+            except Exception as retry_exc:
+                note_suppressed("dist", "dispatch a GPU chain with cuDF installed", retry_exc)
+                return None
         note_suppressed("dist", "dispatch a GPU chain to a worker", exc)
         return None

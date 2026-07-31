@@ -107,6 +107,7 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, stages=(0
     import ray
 
     from batcher.carbonite.resilience.replication import assign_replica_hosts
+    from batcher.dist.executors.ray_runtime.policies import node_ledger
 
     try:
         nodes = ray.get([actors[i].node_id.remote() for i in range(workers)])
@@ -125,7 +126,14 @@ def replicate_shuffle_output(actors, addrs, n_reducers, workers, dead, stages=(0
     if not primaries:
         return None
 
-    assignment = assign_replica_hosts(primaries, nodes, factor, frozenset(dead or ()))
+    # A replica exists to die independently of its primary, so putting the only spare copy on
+    # a worker the ledger has been quarantining defeats the whole point — that copy is the one
+    # least likely to be there when it is needed. Deprioritized rather than excluded, so a
+    # fleet where most workers are suspect still gets its copies placed.
+    ledger = node_ledger()
+    blocked = ledger.blocked_keys() if ledger is not None else ()
+    suspect = frozenset(int(k) for k in blocked if k.isdigit())
+    assignment = assign_replica_hosts(primaries, nodes, factor, frozenset(dead or ()), suspect)
     refs: dict[tuple[int, int], list[object]] = {}
     for src, hosts in assignment.items():
         for host in hosts:

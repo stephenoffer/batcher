@@ -189,6 +189,18 @@ with bt.config_context(cfg):
 The data-plane budget under that context is `512 MiB × 0.90`, about 461 MiB, and any
 stateful operator whose estimated footprint exceeds it goes out of core instead of OOMing.
 
+## What the kernel says
+
+The pool's accounting answers how much the engine reserved. It cannot answer whether the kernel is coping, and the two disagree in exactly the cases that kill a container. Three cgroup v2 signals close that gap, each read only from the container's own cgroup slice.
+
+`memory.high` is the threshold Kubernetes memory QoS derives from a pod's *request*, while `memory.max` comes from its *limit*. Past `memory.high` the kernel does not fail an allocation. It puts every allocating task to sleep in direct reclaim, so a query sized against `memory.max` spends its whole life being throttled while every counter reports success. With `memory.respect_cgroup_high` on, the engine treats the lower of the two as the ceiling, and the pressure fraction is measured against it.
+
+Pressure Stall Information answers the coping question directly. A cgroup can sit at 70% of its limit and still spend most of every second in reclaim, because the limit being defended is `memory.high`, or because its resident set is nearly all anonymous and there is no cache left to drop. Batcher reads the `full` share, meaning the fraction of the window in which every runnable task was stalled, and uses it only as a floor on the pressure level, capped at `SPILL`. A stall share is a rate rather than a headroom figure, so it must never be the thing that halts a query with gigabytes free. A host-wide reading is deliberately ignored: acting on it would make one container spill because a different one is thrashing.
+
+`memory.events` records whether this cgroup has already been OOM-killed. That is evidence rather than a forecast, so a restarted worker scales its envelope by `memory.oom_kill_backoff` instead of re-deriving the number that got it killed, and an un-sized plan spills rather than repeating the kill.
+
+Read what the kernel published through `Dataset.explain(analyze=True)`, whose Carbonite resource decision carries a `kernel` block. The block is absent on a host with no cgroups, which is deliberately distinct from a block of zeros.
+
 ## Storage yields to execution
 
 `ResourceManager.reserve` in `carbonite/manager.py` implements Spark's unified memory

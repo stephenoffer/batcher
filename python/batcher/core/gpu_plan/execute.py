@@ -21,12 +21,14 @@ __all__ = [
     "execute_cudf_join",
     "execute_cudf_plan",
     "execute_cudf_union",
+    "join_frames",
     "run_chain",
     "run_join",
     "run_join_frames",
     "run_ops",
     "run_union",
     "run_union_frames",
+    "union_frames",
 ]
 
 _LEFT = "L__"
@@ -118,12 +120,48 @@ def run_join_frames(left, right, left_ops, right_ops, join_ir: dict, ops: list[d
     """
     left = run_ops(left, left_ops, be)
     right = run_ops(right, right_ops, be)
+    return run_ops(join_frames(left, right, join_ir, be), ops, be)
+
+
+def join_frames(left, right, join_ir: dict, be: DfBackend):
+    """Join two frames that are already on the backend — the join kernel itself.
+
+    Split out from `run_join_frames` so the tree executor, whose inputs are whole sub-plans
+    rather than chains over scans, reaches the same kernel instead of restating it. A second
+    statement of the null-key rule or the semi/anti membership test is the one way the linear
+    and tree forms could ever disagree about a join.
+
+    Args:
+        left: The left input, already a frame on `be`.
+        right: The right input, already a frame on `be`.
+        join_ir: The join node's IR.
+        be: The dataframe backend to compute on.
+
+    Returns:
+        The joined frame, carrying the columns and order `join_ir["output"]` asks for.
+    """
     how = JOIN_HOW[join_ir["join_type"]]
     if how in ("semi", "anti"):
-        out = _semi_join(left, right, join_ir, be, keep=how == "semi")
-    else:
-        out = _equi_join(left, right, join_ir, how, be)
-    return run_ops(out, ops, be)
+        return _semi_join(left, right, join_ir, be, keep=how == "semi")
+    return _equi_join(left, right, join_ir, how, be)
+
+
+def union_frames(frames: list, distinct: bool, be: DfBackend):
+    """Concatenate frames already on the backend, deduplicating when the union asks for it.
+
+    Args:
+        frames: The inputs, already frames on `be`.
+        distinct: Whether the union deduplicates.
+        be: The dataframe backend to compute on.
+
+    Returns:
+        The concatenated (and optionally deduplicated) frame.
+    """
+    out = be.concat(frames)
+    if distinct:
+        # The same fold DISTINCT needs: a UNION deduplicates rows, so it decides identity.
+        out = distinct_rows(out, be)
+    return out
 
 
 def _equi_join(left, right, join_ir: dict, how: str, be: DfBackend):
@@ -287,11 +325,7 @@ def run_union_frames(frames: list, input_ops: list[list[dict]], distinct: bool, 
         The union's result, as a frame on `be`.
     """
     reduced = [run_ops(f, o, be) for f, o in zip(frames, input_ops, strict=True)]
-    out = be.concat(reduced)
-    if distinct:
-        # The same fold DISTINCT needs: a UNION deduplicates rows, so it decides identity.
-        out = distinct_rows(out, be)
-    return run_ops(out, ops, be)
+    return run_ops(union_frames(reduced, distinct, be), ops, be)
 
 
 def execute_cudf_union(

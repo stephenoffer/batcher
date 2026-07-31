@@ -20,6 +20,7 @@ import functools
 from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import accelerator_backend, gpu_devices_absent
+from batcher._internal.instrument import operator_range
 from batcher._internal.logging import note_suppressed
 from batcher.core.energy import measure_stage
 
@@ -138,9 +139,16 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
     # A stable label, not a per-invocation one: this kernel runs once per morsel on a large
     # input, and a report with one row per call is unreadable on exactly the workload it is
     # for. The ledger rolls repeats up by name.
-    with measure_stage(
-        "GpuGroupBy", accelerator_type=_local_device_model(), device_count=1
-    ) as meter:
+    # The same bracket serves an external device profiler. A Nsight Systems capture of this
+    # path is otherwise a wall of anonymous `cudf::` kernels with no indication which operator
+    # issued them — and the gap in the middle of the timeline, which is the reason anyone
+    # opened the capture, is exactly the part it cannot label. Free when profiling is off.
+    with (
+        operator_range("GpuGroupBy"),
+        measure_stage(
+            "GpuGroupBy", accelerator_type=_local_device_model(), device_count=1
+        ) as meter,
+    ):
         out = _dispatch_groupby(table, key, aggs, backend=backend, device=device)
         meter.add_rows(out.num_rows)
         return out

@@ -81,9 +81,57 @@ class VramPool:
     headroom: float = DEFAULT_HEADROOM
     share: float = 1.0
     external_bytes: dict[int, int] = field(default_factory=dict)
+    capacities: dict[int, int] = field(default_factory=dict)
     _held: dict[int, int] = field(default_factory=dict, repr=False)
     _peak: dict[int, int] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @classmethod
+    def from_devices(
+        cls, capacities: dict[int, int], *, headroom: float = DEFAULT_HEADROOM, share: float = 1.0
+    ) -> VramPool:
+        """Build a pool over devices that are not all the same size.
+
+        The scalar `capacity_bytes` describes a node whose devices are interchangeable, which
+        is the node everyone develops on and not the node a fleet actually accumulates: a box
+        part-way through an upgrade, an L4 beside an A100, a partitioned device beside a whole
+        one. Governing those with one capacity is wrong in both directions at once — it strands
+        the large device and over-admits onto the small one, and the over-admission surfaces as
+        a job that fails only on certain nodes.
+
+        Args:
+            capacities: Total bytes per device index. Devices absent from it are not governed.
+            headroom: Fraction of each device held back from reservation.
+            share: Fraction of each device this pool may plan for.
+
+        Returns:
+            A pool whose per-device budgets follow each device's own capacity.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.carbonite.accel import VramPool
+                >>> pool = VramPool.from_devices({0: 80 << 30, 1: 24 << 30})
+                >>> pool.usable_bytes(0) > pool.usable_bytes(1)
+                True
+        """
+        return cls(
+            capacity_bytes=min(capacities.values()) if capacities else 0,
+            device_count=max(1, len(capacities)),
+            headroom=headroom,
+            share=share,
+            capacities=dict(capacities),
+        )
+
+    def capacity_of(self, device: int = 0) -> int:
+        """Total memory of one governed device.
+
+        Falls back to the scalar `capacity_bytes` for a device the per-device map does not
+        name, so a pool built the original way is unchanged and a partially-populated map
+        degrades to the uniform assumption rather than to zero — reporting a real device as
+        having no memory would refuse every reservation on it.
+        """
+        return self.capacities.get(device, self.capacity_bytes)
 
     def usable_bytes(self, device: int = 0) -> int:
         """Bytes a caller may reserve on one device, after headroom and external usage.
@@ -95,7 +143,7 @@ class VramPool:
             Reservable bytes, `0` when the device is already oversubscribed by other processes.
         """
         share = min(1.0, max(0.0, self.share))
-        budget = int(self.capacity_bytes * share * (1.0 - min(0.9, max(0.0, self.headroom))))
+        budget = int(self.capacity_of(device) * share * (1.0 - min(0.9, max(0.0, self.headroom))))
         return max(0, budget - self.external_bytes.get(device, 0))
 
     def held_bytes(self, device: int = 0) -> int:
@@ -172,7 +220,7 @@ class VramPool:
                 raise ResourceError(
                     f"device {target} cannot hold {nbytes / (1 << 30):.2f} GiB: "
                     f"{available / (1 << 30):.2f} GiB reservable of "
-                    f"{self.capacity_bytes / (1 << 30):.2f} GiB "
+                    f"{self.capacity_of(target) / (1 << 30):.2f} GiB "
                     f"({self.headroom:.0%} headroom, "
                     f"{self.external_bytes.get(target, 0) / (1 << 30):.2f} GiB external)"
                 )
@@ -232,7 +280,9 @@ class VramPool:
         """
         devices = range(max(1, self.device_count))
         return {
-            "capacity_bytes": float(self.capacity_bytes * max(1, self.device_count)),
+            # Summed per device rather than `capacity_bytes * device_count`, which silently
+            # reports a mixed node as though every board were the smallest one.
+            "capacity_bytes": float(sum(self.capacity_of(d) for d in devices)),
             "usable_bytes": float(sum(self.usable_bytes(d) for d in devices)),
             "held_bytes": float(sum(self.held_bytes(d) for d in devices)),
             "available_bytes": float(sum(self.available_bytes(d) for d in devices)),

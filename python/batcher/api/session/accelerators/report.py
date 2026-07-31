@@ -8,6 +8,7 @@ correctness, which are the ones a job's own timings never reveal.
 
 from __future__ import annotations
 
+from batcher.api.session.accelerators.node import node_problems
 from batcher.api.session.accelerators.rows import device_rows
 from batcher.api.session.accelerators.wires import wire_problems
 
@@ -61,6 +62,9 @@ def accelerators() -> dict:
     if fleet.get("gpu_nodes"):
         _add_fleet_health(fleet)
         report["fleet"] = fleet
+    from batcher.api.session.accelerators.planning import add_planning
+
+    add_planning(report)
 
     energy = active_config().accelerator.energy
     power: dict = {}
@@ -117,6 +121,15 @@ def _add_fleet_health(fleet: dict) -> None:
                 "reset_pending": r.get("reset_pending", []),
                 "degraded_links": r.get("degraded_links", []),
                 "reasons": r.get("reasons", []),
+                # What repairs each condemned device, and the node-level faults that are not
+                # about a device at all. Without the first, "quarantined" leaves an operator
+                # to look up whether the board comes back after a reset — and for an
+                # exhausted row remapper it never does. Without the second, the most common
+                # way a node goes bad (the kernel OOM-killing its workers, a spill
+                # filesystem remounted read-only) has no entry in the drain list, because
+                # every device on such a node reads perfectly healthy.
+                "remedies": r.get("remedies", {}),
+                "node_faults": r.get("node_faults", {}),
             }
             for r in unhealthy_nodes(records)
         ],
@@ -196,6 +209,14 @@ def accelerator_problems() -> list[str]:
         down = fabric["ports"] - fabric["active_ports"]
         out.append(f"fabric: {down} of {fabric['ports']} RDMA port(s) are not carrying traffic")
     out.extend(wire_problems(wires))
+    out.extend(node_problems())
+    if len(report.get("devices", [])) > 1:
+        # Only where a collective can actually happen. On a single-device host the settings
+        # are inert, and reporting them would put four lines of advice about multi-GPU
+        # failure modes in front of everyone who ran this on a laptop.
+        from batcher.carbonite.resilience import collective_findings
+
+        out.extend(collective_findings())
     for node in ((report.get("fleet") or {}).get("health") or {}).get("unhealthy", []):
         reasons = ", ".join(node.get("reasons", ())) or "a degraded device"
         out.append(f"node {node['node_id'][:12]}: {reasons}")

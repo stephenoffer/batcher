@@ -190,7 +190,23 @@ def gpu_aware_pool_default(
         resources = ray.cluster_resources()
         total = float(resources.get("GPU", 0.0))
         if accelerator_type:
-            typed = float(resources.get(f"accelerator_type:{accelerator_type}", 0.0))
+            # The topology first, and NOT `resources["accelerator_type:<MODEL>"]`. That
+            # resource reads like a device count and is a per-node constraint *marker*: Ray
+            # sets it to exactly 1 per node (`_private/resource_and_label_spec.py`) and a task
+            # requests 0.001 of it. On a four-node, sixteen-device T4 fleet it totals 4.0
+            # against `GPU`'s 16.0, so `min` sized this pool to the number of GPU *nodes* and
+            # left three quarters of the devices without an actor — silently, and only for
+            # callers who pinned a model to be precise about which devices they get.
+            from batcher.dist.executors.ray_runtime.fabric.topology import devices_of_class
+
+            typed = float(devices_of_class(accelerator_type))
+            if typed <= 0:
+                # No readable topology (Ray down mid-call, a stubbed cluster, a fleet whose
+                # nodes carry no accelerator label). The marker is not a device count, but it
+                # is still a *bound* — one per node is never more than the devices on it — so
+                # falling back to it keeps a pinned stage from being sized against the whole
+                # cluster, which is the one direction that over-provisions.
+                typed = float(resources.get(f"accelerator_type:{accelerator_type}", 0.0))
             if typed > 0:
                 total = min(total, typed)
     except Exception:
@@ -405,10 +421,23 @@ def _visible_device_indices(n_handles: int) -> tuple[int, ...]:
     to a node-wide mean that a co-located actor's idle or busy device would distort. Returns every
     in-range physical index named by the first env var set (a multi-GPU actor sees several), or
     **all** devices when none is set/parseable (an unpinned driver or monitor — the safe historical
-    behavior). A UUID-form entry that can't be indexed by ordinal is skipped.
+    behavior).
+
+    Resolution goes through Carbonite's device scope first, which understands the two forms this
+    used to discard. Ray writes ordinals, but the **Kubernetes device plugin writes UUIDs** and
+    **MIG writes partition handles**, and an ordinal-only parse treated both as unparseable and
+    fell through to "every device on the node" — so on exactly the fleets that pin hardest, every
+    pinned actor sampled the whole node and averaged its own busy device with its neighbours' idle
+    ones. The ordinal parse remains as the fallback for a vendor whose devices the NVML-backed
+    scope cannot enumerate (AMD), where it is the behavior this always had.
     """
     import os
 
+    from batcher._internal.hardware.devices import visible_device_indices
+
+    resolved = tuple(i for i in visible_device_indices() if i < n_handles)
+    if resolved:
+        return resolved
     for env in _VISIBLE_DEVICE_ENVS:
         raw = os.environ.get(env, "").strip()
         if not raw:
@@ -433,12 +462,43 @@ def _vram_handle() -> Any | None:
     return handles[_visible_device_indices(len(handles))[0]]
 
 
+def _bound_ordinal(backend: Any) -> int:
+    """The device ordinal `backend` is currently computing on, or `0` when it cannot say.
+
+    A worker pinned to two boards runs on one at a time, and which one is a framework fact
+    (`set_device` moves it) rather than an environment fact — so reading properties off
+    ordinal 0 is right only by coincidence, and on a mixed node it is a different card's
+    capacity. Tolerates a backend with no `current_device` (older torch builds, and the
+    minimal fakes the XPU tests stand in for a driver), which is exactly the case where `0`
+    is the only ordinal there is.
+    """
+    getter = getattr(backend, "current_device", None)
+    if getter is None:
+        return 0
+    try:
+        return int(getter())
+    except Exception:
+        return 0
+
+
 def gpu_vram_gb() -> float | None:
-    """Total VRAM (GB) of accelerator 0, or `None` when it can't be determined.
+    """Total VRAM (GB) of the **smallest** device this process can see, or `None` if unknown.
 
     Used to VRAM-pack inference actors. Tries the vendor SMI (NVML) first, then torch's
     device properties (covers CUDA/ROCm/XPU); returns `None` on a host with no
-    accelerator (e.g. a GPU-less driver), where packing is simply skipped."""
+    accelerator (e.g. a GPU-less driver), where packing is simply skipped.
+
+    The smallest rather than the first, because this figure sizes one actor-count for the whole
+    stage and a node's devices are not always the same size — a fleet part-way through an
+    upgrade, or a box with an A100 beside an L4. Packing to the larger card's capacity produces
+    a replica count that fits on some devices and OOMs on the rest, which surfaces as a job
+    that fails only on certain nodes. On the ordinary homogeneous node every device reports the
+    same number and this is exactly what it always returned."""
+    from batcher._internal.hardware.devices import min_visible_capacity_bytes
+
+    smallest = min_visible_capacity_bytes()
+    if smallest:
+        return smallest / (1 << 30)
     handle = _vram_handle()  # this process's visible device, not physical 0
     if handle is not None:  # NVML reports total memory without allocating a CUDA context
         try:
@@ -449,12 +509,17 @@ def gpu_vram_gb() -> float | None:
         import torch
 
         if torch.cuda.is_available():
-            return torch.cuda.get_device_properties(0).total_memory / (1 << 30)
+            # `current_device()`, not `0`: a worker that has been `set_device`d onto its second
+            # visible board reads a different card's capacity from physical 0, and on a mixed
+            # node that is a different number.
+            return torch.cuda.get_device_properties(_bound_ordinal(torch.cuda)).total_memory / (
+                1 << 30
+            )
         # Intel XPU: `cuda.is_available()` is False here, so without this branch the
         # docstring's XPU claim was empty and an Intel GPU packed nothing.
         xpu = getattr(torch, "xpu", None)
         if xpu is not None and xpu.is_available():
-            return xpu.get_device_properties(0).total_memory / (1 << 30)
+            return xpu.get_device_properties(_bound_ordinal(xpu)).total_memory / (1 << 30)
         # Apple MPS shares unified memory; `recommended_max_memory` is the working
         # budget torch will use before paging — the right number to pack against.
         mps = getattr(torch.backends, "mps", None)
@@ -543,16 +608,22 @@ def sample_gpu_vram_fraction() -> float | None:
         import torch
 
         if torch.cuda.is_available():
-            total = torch.cuda.get_device_properties(0).total_memory
+            # The *current* device throughout, not physical 0. A worker pinned to its second
+            # visible board was dividing its own reserved bytes by another card's capacity —
+            # a ratio of two different devices, which on a mixed node is not even a fraction
+            # of anything. On the single-GPU host these develop on, the two are the same.
+            device = _bound_ordinal(torch.cuda)
+            total = torch.cuda.get_device_properties(device).total_memory
             # torch's reserved bytes are already this process's own allocator, so this
             # path needs no per-process attribution.
-            return torch.cuda.memory_reserved(0) / total if total else None
+            return torch.cuda.memory_reserved(device) / total if total else None
         # Intel XPU: without this branch the predictive VRAM cap was inert on Intel GPUs,
         # so the throughput hill-climb grew until a hard OOM — the failure the cap prevents.
         xpu = getattr(torch, "xpu", None)
         if xpu is not None and xpu.is_available():
-            total = xpu.get_device_properties(0).total_memory
-            return xpu.memory_reserved(0) / total if total else None
+            device = _bound_ordinal(xpu)  # the bound board, not physical 0 — see the CUDA case
+            total = xpu.get_device_properties(device).total_memory
+            return xpu.memory_reserved(device) / total if total else None
         # MPS unified memory: current allocation against the recommended budget.
         mps = getattr(torch.backends, "mps", None)
         if mps is not None and mps.is_available():
@@ -573,6 +644,7 @@ def max_actors_per_gpu(
     batch_rows: int | None = None,
     seq_len: int | None = None,
     activation_dtype_bytes: int | None = None,
+    respect_co_tenants: bool = True,
 ) -> int:
     """How many inference actors fit on one GPU, VRAM-budgeted.
 
@@ -587,6 +659,14 @@ def max_actors_per_gpu(
     `batch_rows` / `seq_len` / `activation_dtype_bytes` — the three drivers of peak
     activation memory. Passing none of them reproduces the flat 1.5x this used before.
     An explicit `inference_multiplier` overrides the workload scaling entirely.
+
+    With `respect_co_tenants` (the default) the budget is the device's *free* memory when the
+    driver reports less than its capacity, rather than the capacity itself. Packing against
+    capacity is correct only on a device this process has to itself, and that is the one case
+    where the two figures are equal anyway — everywhere else it counts memory another tenant
+    is already holding, which is the single most common way a fractional-GPU stage that
+    "obviously fits" OOMs on landing. Pass `False` to size a device that is expected to be
+    empty by the time the stage runs.
     """
     if model_vram_gb <= 0 or gpu_vram_gb <= 0:
         return 1
@@ -595,9 +675,25 @@ def max_actors_per_gpu(
             batch_rows=batch_rows, seq_len=seq_len, activation_dtype_bytes=activation_dtype_bytes
         )
     overhead = vram_context_overhead() if context_overhead_gb is None else context_overhead_gb
-    usable = gpu_vram_gb * (1.0 - headroom)
+    budget_gb = _free_vram_gb(gpu_vram_gb) if respect_co_tenants else gpu_vram_gb
+    usable = budget_gb * (1.0 - headroom)
     per_actor = model_vram_gb * inference_multiplier + overhead
     return max(1, int(usable // per_actor))
+
+
+def _free_vram_gb(capacity_gb: float) -> float:
+    """The device's free memory in GB, or `capacity_gb` when the driver will not say.
+
+    Never larger than the declared capacity: a caller that passed a deliberately reduced
+    figure (a MIG slice, a hand-set budget) must not have it widened by a driver reading of
+    the whole board.
+    """
+    from batcher._internal.hardware.devices import device_free_bytes
+
+    free = device_free_bytes()
+    if free is None or free <= 0:
+        return capacity_gb
+    return min(capacity_gb, free / (1 << 30))
 
 
 def recommend_gpu_fraction(model_vram_gb: float, gpu_vram_gb: float, **kwargs: Any) -> float:
@@ -680,7 +776,9 @@ def _xpu_utilization() -> float | None:
         xpu = getattr(torch, "xpu", None)
         if xpu is None or not xpu.is_available():
             return None
-        util = xpu.utilization(0)  # percent, newer torch with Level-Zero sysman
+        # The bound device, not physical 0: an actor pinned to its second visible board was
+        # adapting `num_gpus` from a neighbour's load.
+        util = xpu.utilization(_bound_ordinal(xpu))  # percent, newer torch w/ Level-Zero sysman
         return max(0.0, min(1.0, float(util) / 100.0))
     except Exception:
         return None

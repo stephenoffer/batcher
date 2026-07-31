@@ -34,7 +34,7 @@ _console_detach: Callable[[], None] | None = None
 _server: UIServer | None = None
 # The observability settings the attached sinks reflect, so a repeat `ensure_sinks` with an
 # unchanged config is a tuple compare and a changed one re-syncs. `None` means "never run".
-_applied: tuple[str, bool, str, int] | None = None
+_applied: tuple[str, bool, str, int, bool] | None = None
 
 
 def ensure_sinks() -> None:
@@ -49,8 +49,10 @@ def ensure_sinks() -> None:
     global _applied
     from batcher.config import active_config
 
-    cfg = active_config().observability
-    key = (cfg.resolved_progress, cfg.ui, cfg.ui_host, cfg.ui_port)
+    config = active_config()
+    cfg = config.observability
+    sampling = config.accelerator.telemetry_sampling
+    key = (cfg.resolved_progress, cfg.ui, cfg.ui_host, cfg.ui_port, sampling)
     if key == _applied:
         return
     ensure_configured()
@@ -58,7 +60,32 @@ def ensure_sinks() -> None:
         _sync_console(cfg.resolved_progress)
     if cfg.ui and _server is None:
         start_ui(port=cfg.ui_port, host=cfg.ui_host)
+    _sync_device_series(sampling)
     _applied = key
+
+
+def _sync_device_series(wanted: bool) -> None:
+    """Start or stop the device sampler to match `accelerator.telemetry_sampling`.
+
+    Sampling is a thread and a driver round trip per device per interval, so it is off unless
+    asked for. It belongs on this path rather than at import for the reason the dashboard does:
+    a library that started a background thread when it was imported would start one in every
+    short-lived Ray worker on the cluster, where the sampling would cost more than the stage it
+    was measuring.
+
+    Both directions are handled, so a `config_context` that turns sampling off inside a block
+    actually stops the thread rather than leaving it running until the process exits.
+    """
+    from batcher.observe.accelerators.series import (
+        sampling_active,
+        start_device_series,
+        stop_device_series,
+    )
+
+    if wanted:
+        start_device_series()
+    elif sampling_active():
+        stop_device_series()
 
 
 def _sync_console(mode: str) -> None:
@@ -194,6 +221,15 @@ def stop_ui() -> None:
         server, _server = _server, None
     if server is not None:
         server.stop()
+    # The dashboard is the usual reason a device sampler is running, and a stopped dashboard
+    # with a thread still hitting NVML every second is a leak nobody would look for. The stop
+    # sticks for the same reason the dashboard's does — `ensure_sinks` short-circuits on an
+    # unchanged config — so a process that wants sampling back changes the setting or calls
+    # `start_device_series` itself. The accumulated window survives either way.
+    from batcher.observe.accelerators.series import sampling_active, stop_device_series
+
+    if sampling_active():
+        stop_device_series()
 
 
 def ui_url() -> str | None:

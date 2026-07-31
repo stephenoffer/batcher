@@ -263,14 +263,18 @@ def test_every_silent_condition_becomes_a_sentence_naming_its_device(monkeypatch
             {"index": 5, "name": "H100", "throttled": ["thermal"]},
         ],
     )
-    problems = report_mod.accelerator_problems()
-    assert len(problems) == 6
-    assert problems[0].startswith("gpu 0: memory row remapping has failed")
-    assert "2 uncorrectable ECC" in problems[1]
-    assert "ECC is OFF" in problems[2]
-    assert "waiting for a device reset" in problems[3]
-    assert "12% of nameplate" in problems[4]
-    assert "clocks clamped (thermal)" in problems[5]
+    # Filtered to the device sentences, which is what this test is about. The same report also
+    # carries node- and collective-level findings, and on a multi-device host those are not
+    # noise — a fleet whose collectives hang forever on a lost rank is a fleet whose device
+    # conditions never get looked at.
+    devices = [p for p in report_mod.accelerator_problems() if p.startswith("gpu ")]
+    assert len(devices) == 6
+    assert devices[0].startswith("gpu 0: memory row remapping has failed")
+    assert "2 uncorrectable ECC" in devices[1]
+    assert "ECC is OFF" in devices[2]
+    assert "waiting for a device reset" in devices[3]
+    assert "12% of nameplate" in devices[4]
+    assert "clocks clamped (thermal)" in devices[5]
 
 
 def test_a_port_that_is_down_is_a_problem_too(monkeypatch):

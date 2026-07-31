@@ -31,6 +31,7 @@ __all__ = [
     "cap_to_cgroup_headroom",
     "cgroup_current_bytes",
     "cgroup_limit_bytes",
+    "effective_limit_bytes",
     "proc_meminfo_available",
     "process_rss_bytes",
     "read_available_bytes",
@@ -82,11 +83,17 @@ def reset_memory_sampling() -> None:
     work while the number it was supposed to refresh never moved.
     """
     global _host_ram_bytes, _available_cache, _file_cache_cache, _total_cache
+    from batcher.carbonite.memory.kernel import reset_kernel_sampling
+
     _host_ram_bytes = None
     _available_cache = None
     _file_cache_cache = None
     _total_cache = None
     cgroup_limit_bytes.cache_clear()
+    # The kernel snapshot (`memory.high`, `memory.events`, PSI) is sampled on its own TTL and
+    # now feeds `effective_limit_bytes`, so a reset that left it cached would keep the same
+    # silent-override failure this function's docstring describes for the cgroup cap.
+    reset_kernel_sampling()
 
 
 @functools.lru_cache(maxsize=1)
@@ -219,14 +226,41 @@ def cap_to_cgroup_headroom(host_available: int) -> int:
     `cgroup_current_bytes`) — cache the kernel will evict on demand is headroom, not usage.
     Take the smaller of that and the host figure. No cgroup cap (bare metal / unlimited)
     leaves the reading untouched.
+
+    The `limit` here is the **effective** ceiling, not `memory.max` alone: where cgroup v2
+    publishes a lower `memory.high` the kernel throttles every allocating task into direct
+    reclaim at that point, so memory above it is not headroom in any sense a query can use.
+    Under Kubernetes memory QoS the two differ by the whole request-to-limit gap, and budgeting
+    to `memory.max` there plans a query into a band it will spend its entire life being slept
+    in. `memory.respect_cgroup_high` turns this off; it is inert where `memory.high` is unset.
     """
-    limit = cgroup_limit_bytes()
+    limit = effective_limit_bytes()
     if limit is None:
         return host_available
     current = cgroup_current_bytes()
     if current is None:
         return host_available
     return min(host_available, max(0, limit - current))
+
+
+def effective_limit_bytes() -> int | None:
+    """The cgroup ceiling that binds this process, or `None` when none does.
+
+    `memory.max` alone unless the config opts into the `memory.high` throttle threshold and
+    one is published, in which case the lower of the two. Kept beside the other cgroup readers
+    rather than in `kernel` so the one function that clamps headroom reads a single figure.
+
+    Returns:
+        The binding ceiling in bytes, or `None` outside a cgroup.
+    """
+    limit = cgroup_limit_bytes()
+    if not active_config().memory.respect_cgroup_high:
+        return limit
+    from batcher.carbonite.memory.kernel import cgroup_high_bytes
+
+    high = cgroup_high_bytes()
+    candidates = [v for v in (limit, high) if v is not None]
+    return min(candidates) if candidates else None
 
 
 def process_rss_bytes() -> int | None:

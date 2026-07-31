@@ -313,14 +313,18 @@ def _gpu_inventory_probe() -> tuple[dict[str, object], ...]:
     True only when every vendor device node is missing, and `torch.cuda.is_available()` on
     such a host returns False, so the branch it skips is provably empty.
     """
-    nvml = _nvml_inventory()
+    # Both driver probes below enumerate what is physically attached, so each is narrowed to
+    # what this process may address. `_torch_inventory` is deliberately NOT narrowed: torch
+    # applies the same variable itself and already reports the visible set renumbered from
+    # zero, so filtering it again would select visible devices by physical slot.
+    nvml = _visible_devices(_nvml_inventory())
     if nvml:
         return tuple(nvml)
     # AMD before torch, and for the same reason NVML comes before torch: it is a handful of
     # sysfs reads against an import that costs over a second, it needs no ROCm install, and it
     # reports the real HBM size where the device-node fallback below reports zero. Without it
     # an MI300X node with a CPU-only wheel enumerated no devices at all.
-    amd = _amd_inventory()
+    amd = _visible_devices(_amd_inventory())
     if amd:
         return tuple(amd)
     torch_devices = [] if gpu_devices_absent() else _torch_inventory()
@@ -344,6 +348,62 @@ def _amd_inventory() -> list[dict[str, object]]:
         }
         for device in amd_devices()
     ]
+
+
+#: The env vars a runtime uses to hand a process a *subset* of a node's accelerators, per
+#: vendor. Ray sets the NVIDIA one on every task and actor holding a `num_gpus` grant, which
+#: is what makes this the normal case on a multi-device node rather than an exotic one.
+_VISIBLE_DEVICE_VARS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+
+
+def _visible_devices(devices: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Restrict a driver-probed device list to the ones this process may actually use.
+
+    NVML and the AMD sysfs tree both enumerate every device *physically present*, and neither
+    honors the visibility env var the way a framework does. That is the whole gap: on a
+    four-device node an actor granted one GPU sees `CUDA_VISIBLE_DEVICES=0`, `torch` reports a
+    device count of one, and the driver probe reports four — so the same function answered
+    "four devices, 60 GiB" for a process entitled to one device and 15 GiB, purely according
+    to which backend happened to answer. The torch fallback in this module already returns the
+    visible set, so the two paths disagreed with each other as well as with the docstring.
+
+    Indices are renumbered from zero in the order the variable lists them, which is what CUDA
+    itself does and therefore what makes `gpu_inventory()[i]` line up with `torch.cuda`'s
+    device `i` rather than with a physical slot the process cannot address.
+
+    Deliberately conservative in two places. An **unset** variable means "everything is
+    visible", the pre-existing answer. And a value this cannot parse as indices — the UUID
+    form (`GPU-<uuid>`) a Kubernetes device plugin writes, or a `MIG-<uuid>` partition handle
+    — leaves the list untouched rather than guessing, since mapping those back to slots needs
+    a driver lookup this probe did not record, and reporting too many devices is the behavior
+    callers already had. `_internal.hardware.devices.scope.visible_device_indices` resolves
+    both of those forms; fold this onto it once that module is on a released path, so the two
+    parses cannot drift.
+
+    Args:
+        devices: The physically probed devices, in driver order.
+
+    Returns:
+        The visible subset, renumbered from zero, or `devices` unchanged when visibility is
+        not restricted or cannot be read as indices.
+    """
+    raw = next((os.environ[v] for v in _VISIBLE_DEVICE_VARS if v in os.environ), None)
+    if raw is None:
+        return devices
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return []  # explicitly empty: the runtime hid every device
+    picked: list[dict[str, object]] = []
+    for token in tokens:
+        # CUDA stops enumerating at the first entry it cannot resolve, so a trailing bad
+        # index truncates rather than invalidating the whole list.
+        if not token.isdigit():
+            return devices  # a UUID or MIG id: not resolvable from what the probe recorded
+        slot = int(token)
+        if slot >= len(devices):
+            break
+        picked.append(dict(devices[slot], index=len(picked)))
+    return picked
 
 
 def _nvml_inventory() -> list[dict[str, object]]:

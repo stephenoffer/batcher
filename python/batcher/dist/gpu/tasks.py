@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
+from batcher.dist.gpu.cudf_probe import cluster_has_cudf
 from batcher.plan.distribution import nest_ops
 
 if TYPE_CHECKING:
@@ -30,9 +32,11 @@ __all__ = [
     "gpu_shard_partial",
     "gpu_task_options",
     "gpu_task_runtime_env",
+    "gpu_tree_task",
     "gpu_union_task",
     "run_shard_chain",
     "run_shard_join",
+    "run_shard_tree",
     "run_shard_union",
 ]
 
@@ -62,6 +66,47 @@ def _frame(descriptor: dict, be: DfBackend):
         return frame if len(frame) else None
     table = _read(descriptor)
     return None if table is None else be.from_arrow(table)
+
+
+def _empty_frame(descriptor: dict, be: DfBackend):
+    """A zero-row frame carrying the descriptor's own schema, or `None` when it has none.
+
+    A leaf that read nothing is not the same event in a tree as it is in a chain. A chain's
+    empty shard contributes nothing and is dropped; a tree's empty *leaf* is still an input to a
+    join, and a LEFT join over an empty right side has to emit every left row with nulls rather
+    than emit nothing. Handing the join a typed empty frame is what makes that the join's
+    decision instead of the reader's.
+    """
+    splits = descriptor.get("splits")
+    if not splits:
+        return None
+    try:
+        schema = splits[0].schema()
+    except Exception as exc:
+        note_suppressed("dist", "read a shard's schema for an empty leaf", exc)
+        return None
+    projection = descriptor.get("projection")
+    if projection is not None:
+        schema = _select_fields(schema, projection)
+        if schema is None:
+            return None
+    return be.from_arrow(schema.empty_table())
+
+
+def _select_fields(schema, projection: list[str]):
+    """`schema` narrowed to `projection`, in that order, or `None` when a name is absent."""
+    import pyarrow as pa
+
+    try:
+        return pa.schema([schema.field(name) for name in projection])
+    except KeyError:
+        return None
+
+
+def _leaf_frame(descriptor: dict, be: DfBackend):
+    """One leaf's rows as a frame, falling back to a typed empty frame when it read nothing."""
+    frame = _frame(descriptor, be)
+    return _empty_frame(descriptor, be) if frame is None else frame
 
 
 def _device() -> DfBackend:
@@ -111,9 +156,37 @@ def run_shard_chain(descriptor: dict, ops: list[dict], be: DfBackend):
     return None if frame is None else be.to_arrow(run_ops(frame, ops, be))
 
 
+def _measured(run):
+    """Run a device task, and if it overflows, re-raise with what the device had actually drawn.
+
+    The subdivision that follows an overflow is decided on the **driver**, which has no device;
+    asking its own allocator for the high-water mark — which is what it did — returns nothing on
+    every distributed run, so the "measured" division silently degraded to blind halving and a
+    shard eight times too large took three failed rounds, each re-reading it from storage, to
+    find a size that fits.
+
+    The figure exists only here, in the process that overflowed. Appending it to the error is
+    what carries it to the process that needs it, and it is the one channel a task failure is
+    guaranteed to travel through intact.
+
+    Re-raised as a `MemoryError` chained to the original, so the classification is unchanged
+    (`is_memory_failure` already reads a `MemoryError` as one) and the real traceback is still
+    attached to whatever finally reports it.
+    """
+    from batcher.dist.gpu.shards import device_peak_marker, is_memory_failure
+
+    try:
+        return run()
+    except Exception as exc:
+        marker = device_peak_marker() if is_memory_failure(exc) else ""
+        if not marker:
+            raise
+        raise MemoryError(f"{type(exc).__name__}: {exc}{marker}") from exc
+
+
 def gpu_shard_partial(descriptor: dict, ops: list[dict]):
     """On a GPU worker: read this shard from storage and replay `ops` on the device."""
-    return run_shard_chain(descriptor, ops, _device())
+    return _measured(lambda: run_shard_chain(descriptor, ops, _device()))
 
 
 def run_shard_join(
@@ -166,7 +239,7 @@ def gpu_union_task(
     descriptors: list[dict], input_ops: list[list[dict]], distinct: bool, ops: list[dict]
 ):
     """On a GPU worker: read every union input from storage and run the union on the device."""
-    return run_shard_union(descriptors, input_ops, distinct, ops, _device())
+    return _measured(lambda: run_shard_union(descriptors, input_ops, distinct, ops, _device()))
 
 
 def gpu_join_task(
@@ -178,7 +251,38 @@ def gpu_join_task(
     ops: list[dict],
 ):
     """On a GPU worker: read both join inputs from storage and run the join on the device."""
-    return run_shard_join(left_desc, right_desc, left_ops, right_ops, join_ir, ops, _device())
+    return _measured(
+        lambda: run_shard_join(left_desc, right_desc, left_ops, right_ops, join_ir, ops, _device())
+    )
+
+
+def run_shard_tree(descriptors: list[dict], spec: dict, be: DfBackend):
+    """Read every leaf of a plan tree and execute it on `be` — the body of the GPU tree task.
+
+    `descriptors` is positional by leaf index, which is the numbering `gpu_tree_spec` assigns.
+    Positional rather than keyed by source, because a self-join has two leaves over one source
+    and they read different things: one is this worker's shard, the other is the whole relation.
+
+    Returns `None` when the tree produced no rows, which the driver drops rather than
+    concatenating an empty table of possibly-different schema into the partials.
+    """
+    from batcher.core.gpu_plan.tree import run_tree
+
+    frames = {}
+    for leaf, descriptor in enumerate(descriptors):
+        frame = _leaf_frame(descriptor, be)
+        if frame is None:
+            # No rows and no schema to invent one from. Every join above this leaf would be over
+            # an unknown-width input, so the shard declines and the driver recovers it.
+            return None
+        frames[leaf] = frame
+    out = run_tree(spec, frames, be)
+    return be.to_arrow(out) if len(out) else None
+
+
+def gpu_tree_task(descriptors: list[dict], spec: dict):
+    """On a GPU worker: read every leaf of a plan tree from storage and run it on the device."""
+    return _measured(lambda: run_shard_tree(descriptors, spec, _device()))
 
 
 def cpu_shard_partial(descriptor: dict, ops: list[dict], engine_config: str):
@@ -210,34 +314,78 @@ def gpu_task_runtime_env() -> dict | None:
 
     The fabric block (`collective_env`) tells a collective library which NIC each device is
     rail-aligned with, which interfaces carry the fabric, and whether peer-to-peer can help
-    here, instead of leaving it to re-derive all three by probing. It is empty on a node whose
+    here, instead of letting it re-derive all three by probing. It is empty on a node whose
     wires cannot be read, and it never overwrites a variable the deployment set itself, so the
     worst case is exactly the environment the task had before.
+
+    The stability block (`carbonite.resilience.collectives`) answers the other half: what
+    happens when one of those wires, or a rank on the end of it, goes away. A collective's
+    default there is to wait forever — the surviving ranks hold their GPUs and never raise, so
+    the task looks alive and makes no progress, and every recovery mechanism in the engine is
+    downstream of a failure being reported. Asynchronous error handling turns that into an
+    ordinary task failure. The two blocks set disjoint variables, and both defer to anything
+    the deployment set for itself.
     """
+    from batcher.carbonite.resilience import stability_env
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
     from batcher.dist.gpu.fabric import merge_env, node_collective_env
 
     rt = dict(worker_runtime_env() or {})
-    if active_config().distributed.gpu_backend_cudf:
+    if active_config().distributed.gpu_backend_cudf and not cluster_has_cudf():
         rt["pip"] = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
-    fabric = node_collective_env()
-    if fabric:
-        rt["env_vars"] = merge_env(rt.get("env_vars"), fabric)
+    block = {**stability_env(), **node_collective_env()}
+    if block:
+        rt["env_vars"] = merge_env(rt.get("env_vars"), block)
     return rt or None
 
 
-def gpu_task_options() -> dict:
-    """Ray remote options for a GPU task: one device, the runtime_env, and a retry budget.
+def gpu_task_options(num_gpus: float = 1.0) -> dict:
+    """Ray remote options for a GPU task: a device share, the runtime_env, and a retry budget.
 
     `max_retries` reruns a task whose worker or node was lost (spot reclamation) on surviving
     capacity. `retry_exceptions` is deliberately left off: a deterministic application error —
     a device OOM, an untranslatable expression — must be handled immediately rather than
     repeated N times to the same conclusion.
+
+    `max_calls=0` is the one that costs real time to omit. **Ray does not reuse a worker
+    between GPU tasks by default** — it tears the process down after each one to guarantee the
+    device memory is released — so every shard of a fan-out started a new Python process,
+    imported cuDF again, and built the RMM pool again. Measured on a T4 against one 7.3M-row
+    shard of TPC-H `lineitem`: 1.07 s to import cuDF, 0.98 s to configure the allocator, 0.26 s
+    to read the shard onto the device and **0.15 s to run the kernels**. Two seconds of set-up
+    for a sixth of a second of work, paid per shard, on every query.
+
+    It also made a comment elsewhere in this module untrue: `prepare_device_memory` is
+    documented as idempotent "so a worker reused across tasks keeps the pool the first one paid
+    for", and no worker was ever reused. With reuse, that is finally the behaviour.
+
+    The device memory Ray's default protects against is memory this path does not leak: each
+    task builds cuDF frames and drops them, and the RMM async pool returns freed blocks to the
+    driver. A fleet running something that does leak can set `gpu_worker_reuse=False` and get
+    the old process-per-task isolation back.
+
+    Args:
+        num_gpus: The device share to request. `1.0` — the default, and what every caller that
+            has not measured its shards passes — is one whole device, which is what this path
+            asked for unconditionally before. A fraction from `resources.shard_task_share` lets
+            several shards of a deliberately oversubscribed fan-out run on one device instead
+            of queueing behind each other. Values at or below zero are refused rather than
+            passed through: Ray reads `num_gpus=0` as a CPU task, so a mis-derived share would
+            schedule a cuDF kernel onto a node with no device at all.
+
+    Returns:
+        The options dict, ready for `ray.remote(**opts)`.
     """
     from batcher.config import active_config
 
-    opts: dict = {"num_gpus": 1, "max_retries": int(active_config().distributed.task_max_retries)}
+    dc = active_config().distributed
+    opts: dict = {
+        "num_gpus": num_gpus if num_gpus > 0 else 1.0,
+        "max_retries": int(dc.task_max_retries),
+    }
+    if dc.gpu_worker_reuse:
+        opts["max_calls"] = 0
     rt = gpu_task_runtime_env()
     if rt is not None:
         opts["runtime_env"] = rt

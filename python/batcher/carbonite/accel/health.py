@@ -366,6 +366,13 @@ def xid_verdicts(
     Joined by PCI address, because that is the only identifier an Xid line carries; the
     counters supply the address-to-device mapping.
 
+    **Only recent codes count.** The ring buffer is a node's history, not its present, so a
+    fatal Xid from before the last device reset is still sitting in it. Quarantining on that
+    takes a repaired device out and never puts it back, because the evidence has no expiry —
+    a fleet then shrinks monotonically over its lifetime with nothing in any log to say why.
+    The live read is windowed (`faults.XID_WINDOW_S`); a caller passing `events` has already
+    chosen its own window.
+
     Args:
         verdicts: Verdicts so far, one per device.
         faults: The same devices' counters, for their PCI addresses.
@@ -377,11 +384,11 @@ def xid_verdicts(
         must not quarantine a fleet, so silence is never treated as a signal.
     """
     if events is None:
-        from batcher._internal.hardware.faults import recent_xid_events, xid_fatal, xid_readable
+        from batcher._internal.hardware.faults import xid_fatal, xid_readable
 
         if not xid_readable():
             return verdicts
-        events = xid_fatal(recent_xid_events())
+        events = xid_fatal()
     if not events:
         return verdicts
     by_index = {f.index: f.pci_address for f in faults if f.pci_address}
@@ -391,24 +398,34 @@ def xid_verdicts(
         if not codes:
             out.append(verdict)
             continue
-        from batcher._internal.hardware.faults import describe_xid
+        from batcher._internal.hardware.faults import device_remedy, explain_codes, xid_untrusted
 
-        reasons = tuple(dict.fromkeys([*verdict.reasons, *(f"xid_{c}" for c in codes)]))
+        reasons = list(dict.fromkeys([*verdict.reasons, *(f"xid_{c}" for c in codes)]))
+        # A device that fell off the bus corrupts nothing — it returned no results at all. One
+        # that took a double-bit or uncontained ECC error kept running and returned a wrong
+        # number, so anything already computed on it is suspect. Carrying that as its own
+        # reason is what lets a caller decide to fail the run rather than retry past it; the
+        # two cases are otherwise indistinguishable in a reason list that says only "xid_95".
+        if any(xid_untrusted(code) for code in codes):
+            reasons.append("results_untrusted")
         out.append(
             HealthVerdict(
                 device_index=verdict.device_index,
                 uuid=verdict.uuid,
                 state="quarantine",
-                reasons=reasons,
+                reasons=tuple(reasons),
                 derate=0.0,
             )
         )
         from batcher._internal.logging import get_logger
 
+        # Naming the repair, not just the fault. An operator reading "quarantined: Xid 64" has
+        # to go and look up whether that device comes back after a reset (it does not).
         get_logger("carbonite").warning(
-            "device %s quarantined: %s",
+            "device %s quarantined: %s — remedy: %s",
             verdict.uuid or verdict.device_index,
-            ", ".join(describe_xid(code) for code in codes),
+            explain_codes(codes),
+            device_remedy(codes),
         )
     return tuple(out)
 

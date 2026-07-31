@@ -88,16 +88,70 @@ def sharded_gpu_join(
     if probes is None:
         return None
 
-    shards = _run_join_shards(probes, build, left_ops, right_ops, join_ir, above.shard_ops)
+    shards = _run_join_shards(
+        probes,
+        build,
+        left_ops,
+        right_ops,
+        join_ir,
+        above.shard_ops,
+        gpu_count=gpu_count,
+        probe_schema=_schema_of(left),
+        build_bytes=_build_side_bytes(build, right),
+    )
     if not shards:
         return None
-    from batcher.dist.gpu.aggregate import merge_shards
+    from batcher.dist.gpu.aggregate import fold_shards
 
-    return merge_shards(shards, [*above.merge_ops, *above.tail_ops])
+    return fold_shards(shards, above)
+
+
+def _schema_of(source):
+    """A source's schema, or `None` when it will not describe itself.
+
+    Used only to price the probe shards for packing, so a source that declines costs the join
+    its fractional share and nothing else — the tasks then ask for whole devices, as they did.
+    """
+    try:
+        return source.schema()
+    except Exception as exc:
+        note_suppressed("dist", "read the probe schema for gpu join packing", exc)
+        return None
+
+
+def _build_side_bytes(build: dict, right) -> float:
+    """How much device memory the replicated build side occupies in *each* task.
+
+    A broadcast join hands every task the whole build side. Co-tenants on one device therefore
+    hold one copy each, not one between them, and a packing decision that charged the build
+    side once would put four tasks on a device that is about to hold four copies of it. This
+    is the figure that keeps the join from being the one shape where packing OOMs a device.
+
+    Returns:
+        Bytes, `0.0` when the build side's size cannot be read — which makes the packing
+        under-state the need, so the caller must keep the subdivision ladder behind it.
+    """
+    from batcher.dist.gpu.resources import descriptor_bytes
+
+    schema = _schema_of(right)
+    if schema is None:
+        return 0.0
+    from batcher.plan.types import schema_row_bytes
+
+    return float(descriptor_bytes(build, schema_row_bytes(schema)))
 
 
 def _run_join_shards(
-    probes: list, build: dict, left_ops, right_ops, join_ir: dict, above_ops: list[dict]
+    probes: list,
+    build: dict,
+    left_ops,
+    right_ops,
+    join_ir: dict,
+    above_ops: list[dict],
+    *,
+    gpu_count: int = 0,
+    probe_schema=None,
+    build_bytes: float = 0.0,
 ) -> list:
     """Join every probe shard against the whole build side, recovering from a failed shard.
 
@@ -112,13 +166,22 @@ def _run_join_shards(
     from batcher.carbonite.resilience import gather_with_backups
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime import speculation_policy
+    from batcher.dist.gpu.resources import gpu_shard_options
     from batcher.dist.gpu.shards import ShardReport, is_memory_failure, run_subdivided
     from batcher.dist.gpu.tasks import gpu_join_task, gpu_task_options
 
     dc = active_config().distributed
-    task = ray.remote(**gpu_task_options())(gpu_join_task)
+    opts, packing = gpu_shard_options(
+        probes, probe_schema, gpu_count=gpu_count, resident_bytes=build_bytes
+    )
+    task = ray.remote(**opts)(gpu_join_task)
+    # A probe shard that did not fit its packed share is retried on a whole device: the share is
+    # the thing that was just shown to be too small, and a join's retry also carries the whole
+    # replicated build side, which is the part of the footprint subdividing the probe cannot
+    # shrink. Identical to `task` when nothing was packed.
+    retry_task = ray.remote(**gpu_task_options())(gpu_join_task) if packing.packed else task
 
-    report = ShardReport("gpu-join", len(probes))
+    report = ShardReport("gpu-join", len(probes), packing=packing)
 
     def _launch(i: int):
         return task.remote(probes[i], build, left_ops, right_ops, join_ir, above_ops)
@@ -130,9 +193,10 @@ def _run_join_shards(
         report.note_subdivided()
         return run_subdivided(
             probes[i],
-            lambda d: ray.get(task.remote(d, build, left_ops, right_ops, join_ir, above_ops)),
+            lambda d: ray.get(retry_task.remote(d, build, left_ops, right_ops, join_ir, above_ops)),
             parts=int(dc.gpu_shard_subdivide),
             rounds=int(dc.gpu_shard_subdivide_rounds),
+            cause=exc,
         )
 
     refs = [_launch(i) for i in range(len(probes))]

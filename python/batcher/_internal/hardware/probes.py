@@ -14,6 +14,8 @@ from batcher._internal.accelerators import reset_accelerator_probes
 from batcher._internal.hardware import cache, cgroup, isa, memory, nvml, profile, storage, topology
 from batcher._internal.hardware.engine import detected as engine_detected
 from batcher._internal.hardware.fabric.rdma import reset_fabric_probes
+from batcher._internal.hardware.telemetry.dcgm import reset_dcgm_probe
+from batcher._internal.hardware.telemetry.identity import reset_identity_probe
 
 __all__ = ["reset_hardware_probes"]
 
@@ -68,3 +70,11 @@ def reset_hardware_probes() -> None:
     # The interconnect readings memoize per PCI address rather than once, so they clear
     # through their own hook instead of being listed above.
     reset_fabric_probes()
+    # Device identity is the one telemetry reading that is memoized — nothing about a device's
+    # compute capability or bus width changes within a process — so it needs clearing too. The
+    # rest of `telemetry` is deliberately uncached: every field there is meant to move.
+    reset_identity_probe()
+    # DCGM memoizes a started embedded engine and a field watch, neither of which is a reading.
+    # Clearing it is what lets a test substitute the bindings, and what recovers a process whose
+    # engine was torn down under it.
+    reset_dcgm_probe()

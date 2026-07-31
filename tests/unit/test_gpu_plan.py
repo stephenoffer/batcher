@@ -242,6 +242,30 @@ def test_sort_then_limit_matches_cpu_engine(be):
     _assert_same_order(got, exp, be)
 
 
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda ds: ds.sort("v"),
+        lambda ds: ds.sort("g", "v", descending=[False, True]),
+        lambda ds: ds.sort(col("v") * 2),
+    ],
+)
+def test_sort_emits_exactly_the_engines_columns(build, be):
+    """A sort must return the frame's own columns and nothing else.
+
+    The sort materializes a private null indicator per key, and a private column for a computed
+    key, into the frame it is sorting — and then read that same, now-mutated frame to decide
+    which columns to return, so `__bt_sn0` and `__bt_sk0` came back as part of the answer.
+
+    Every other assertion in this file selects the engine's columns out of the translated result
+    before comparing, which is the right way to compare *values* and is exactly why nothing here
+    saw this: the extra columns were projected away by the check itself. This one asserts the
+    schema, which is the only assertion that can fail on it.
+    """
+    got, exp = _run(build, _nulls(), be)
+    assert be.to_arrow(got).column_names == exp.column_names
+
+
 # --- expressions ---------------------------------------------------------------------
 
 
