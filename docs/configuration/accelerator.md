@@ -118,6 +118,13 @@ These fields are the {py:class}`DeviceHealthConfig <batcher.config.DeviceHealthC
 dataclass. A clamped device is derated rather than removed; one reporting uncorrectable ECC
 errors is quarantined outright. Absent telemetry never quarantines anything.
 
+The same thresholds apply to AMD accelerators, which are read from the `amdgpu` driver's own
+sysfs tree rather than from ROCm, so an Instinct node is judged with no ROCm install and no
+`pynvml`. Two conditions are AMD's own. An unrepairable error in the memory controller is the
+counterpart of an uncorrectable ECC error and quarantines the board. The same class of error
+in a compute block derates it instead, because that one can come from a single bad command and
+clears on a reset.
+
 `max_temperature_c` is a ceiling rather than the whole rule. Where the driver publishes the
 part's own slowdown point, the lower of the two applies, because parts clamp themselves tens
 of degrees apart and one fleet-wide figure is simultaneously too strict on some and too lax on
@@ -143,13 +150,41 @@ silent conditions called out by device:
 - memory that has repaired itself as far as it can, or is holding a repair for the next reset;
 - ECC disabled, an exclusive compute mode, a power limit at the part's floor, or persistence
   mode off, each of which costs throughput or correctness without raising anything;
-- how many MIG instances the device is partitioned into, which changes what every other
-  figure on the row is about;
-- the RDMA ports that are up, what they have carried, and what they got wrong carrying it.
+- how many MIG instances the device is partitioned into, or the AMD compute and memory
+  partition it is in, which changes what every other figure on the row is about;
+- the RDMA ports that are up, what they have carried, and what they got wrong carrying it, or
+  where there is no RDMA, the Ethernet links and the rate a shuffle is priced against;
+- the container limits that cost the job something: a `/dev/shm` too small to stage a worker's
+  input through, a memlock ceiling that stops host memory being pinned, or a descriptor limit
+  a partitioned scan will exhaust. Each names the flag that raises it.
 
 On a Ray cluster the report also probes every accelerator node, because NVML answers only
 about the host it runs on: `fleet.health` carries the nodes with a device that should not be
 scheduled on.
+
+### Checking a node before it takes work
+
+A report is something an operator reads after a job came back slow. A deployment check runs
+before the fleet takes work at all, and wants a list rather than a page:
+
+```python
+import batcher as bt
+
+for problem in bt.accelerator_problems():
+    print(problem)
+```
+
+Each entry is a complete sentence naming the device and the condition, so a failing check can
+be pasted into an alert without a lookup table. Run it once on each node shape you rent.
+
+An empty list means the node is healthy *or* that nothing could be read, and those are not the
+same. {py:func}`bt.accelerators() <batcher.accelerators>` is where they are told apart, and a
+check that treated an unreadable node as a broken one would fail a fleet the day a base image
+stopped shipping `pynvml`.
+
+```{eval-rst}
+.. autofunction:: batcher.accelerator_problems
+```
 
 ## See also
 

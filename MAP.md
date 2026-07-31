@@ -2278,7 +2278,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/group/combine.rs` | 649 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/mod.rs` | 24 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/hll.rs` | 104 | APPROX_COUNT_DISTINCT — bounded-memory distinct count via per-group HyperLogLog. |
-| `agg/median.rs` | 503 | MEDIAN / continuous-quantile — exact, mergeable via a per-group value list (no dedup, unlike COUNT(DISTINCT)). |
+| `agg/median.rs` | 514 | MEDIAN / continuous-quantile — exact, mergeable via a per-group value list (no dedup, unlike COUNT(DISTINCT)). |
 | `agg/mod.rs` | 796 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/qsketch.rs` | 87 | APPROX_QUANTILE / APPROX_MEDIAN — bounded-memory quantiles via per-group DDSketch. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |
@@ -2303,7 +2303,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `lib.rs` | 36 | `bc-runtime` — the engine's runtime library. |
 | `shuffle.rs` | 1003 | Hash repartitioning — the shuffle primitive. |
 | `topn.rs` | 250 | A shared, monotonically tightening bound on a top-N's cut-off, so a morsel that cannot reach the answer is never examined. |
-| `window.rs` | 1102 | Window functions — partition, order, and append one column per function. |
+| `window.rs` | 1109 | Window functions — partition, order, and append one column per function. |
 | `window_agg.rs` | 578 | The window aggregates beyond `sum`/`avg`/`min`/`max`/`count`. |
 | `window_fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window_frame.rs` | 720 | Explicit `ROWS` window frames — sliding-window aggregates. |
