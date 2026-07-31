@@ -392,10 +392,10 @@ def test_passing_no_readings_deliberately_still_means_no_verdicts(drm, monkeypat
 def test_an_amd_fault_reaches_the_node_condition_gauge(drm):
     # One gauge for both vendors: a fleet does not want two alerts for "a device's memory has
     # failed", and NVML reports nothing at all on the AMD half of a mixed fleet.
-    from batcher.observe.metrics import _node_conditions
+    from batcher.observe.node_metrics import node_conditions
 
     _card(drm, 0, ras={"umc": (0, 2)})
-    assert _node_conditions()["faulted_devices"] >= 1
+    assert node_conditions()["faulted_devices"] >= 1
 
 
 def test_an_amd_board_s_host_link_is_visible_too(drm, monkeypatch, tmp_path):
