@@ -74,6 +74,30 @@ def test_field_extraction_vs_duckdb(duck, t, method, sql):
     assert_same(out, expected)
 
 
+def test_dt_date_returns_a_date_not_a_midnight_timestamp(duck, t):
+    """``dt.date()`` must be ``CAST(ts AS DATE)``, and must return a DATE (regression).
+
+    It used to be an alias for ``truncate('day')``, which returns a midnight TIMESTAMP.
+    Both Polars' ``dt.date`` and DuckDB's ``CAST(ts AS DATE)`` return a date, so a user
+    reaching for the name the reference engines use got a different type than either.
+
+    Both assertions were checked against the old implementation rather than assumed:
+    ``assert_same`` alone fails it (rendering a midnight timestamp does not match a date),
+    and the explicit type check states the actual contract, which is what a future rewrite
+    that renders identically but returns the wrong type would still have to satisfy.
+
+    What the old behaviour did **not** do, despite the obvious worry, is break comparison
+    against a date column: Batcher coerces timestamp against date, so
+    ``ts.dt.date() == d`` selected the same rows either way. The defect was the returned
+    type and the schema, not a silently-empty filter.
+    """
+    out = bt.from_arrow(t).select(v=col("ts").dt.date()).collect()
+    assert_same(out, duck.sql("SELECT CAST(ts AS DATE) AS v FROM t"))
+    assert out.schema.field("v").type == pa.date32(), (
+        f"dt.date() returned {out.schema.field('v').type}, not date32"
+    )
+
+
 def test_epoch_floors_negative_subsecond(duck, t):
     """epoch must floor: 1969-12-31T23:59:59.5 → -1 second, not 0 (regression)."""
     out = bt.from_arrow(t).select(v=col("ts").dt.epoch()).collect()

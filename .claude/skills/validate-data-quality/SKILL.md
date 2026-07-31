@@ -168,7 +168,7 @@ dataset** when the footers already prove the range holds. Keep constraints total
 eligible — `check()` is never provable (it always executes), and composite uniqueness
 generally falls back to a real scan. The broader metadata surface (`ds.meta`, exact vs
 approximate stats, what is provable from footers) is its own topic; see
-`docs/user-guide/metadata-shortcuts.md` rather than duplicating it here.
+`docs/user-guide/analyze/metadata-shortcuts.md` rather than duplicating it here.
 
 ## Self-check
 
@@ -190,8 +190,8 @@ approximate stats, what is provable from footers) is its own topic; see
 
 ## See also
 
-- `docs/user-guide/data-quality.md`; `docs/user-guide/metadata-shortcuts.md`;
-  `docs/examples/data-engineering/quality-gates.md`;
+- `docs/user-guide/trust/data-quality.md`; `docs/user-guide/analyze/metadata-shortcuts.md`;
+  `docs/cookbook/data-engineering/quality-gates.md`;
   `docs/examples/data-engineering/{deduplication,schema-evolution,cdc-pipeline}.md`.
 - Skills: `write-a-batcher-pipeline` (relational basics, `map_batches`);
   `write-a-streaming-pipeline` (gating micro-batches with `for_each_batch`);

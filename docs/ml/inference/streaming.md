@@ -1,0 +1,282 @@
+# Streaming for training
+
+A training loop wants a stream of batches, not one materialized result. Batcher
+produces that with `iter_batches()`. The engine yields Arrow
+`RecordBatch`es as they are produced, so memory stays bounded and the loop starts
+consuming before the full dataset is read.
+
+Transforms applied before the stream, such as `map_batches`, `select`, and `filter`, run
+inside the engine, so the batches arrive already shaped for training.
+
+## Streaming consumption
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"x": [1, 2, 3, 4, 5, 6], "label": [0, 1, 0, 1, 0, 1]})
+
+seen = 0
+for batch in ds.iter_batches():
+    seen += batch.num_rows
+print(seen)
+# 6
+```
+
+`iter_batches` picks the execution mode automatically. A breaker-free pipeline, and a
+top-level aggregate, distinct, or top-N over one, is delivered incrementally in
+bounded memory, so large or unbounded inputs stream without materializing. Other
+plans materialize first. Set `batch_size` to control rows per batch.
+
+```python
+for batch in ds.iter_batches(batch_size=2):
+    print(batch.num_rows)
+# 2
+# 2
+# 2
+```
+
+The yielded objects are ordinary `pyarrow.RecordBatch`es, so PyArrow's compute kernels,
+its NumPy and pandas conversions, and its tensor extraction all work on them without
+copying through Python lists.
+
+## Shaping batches before the stream
+
+Do feature engineering with expressions and `map_batches` so the work runs in the
+engine, not the training loop. The loop then receives ready-to-use Arrow batches.
+
+```python
+import pyarrow.compute as pc
+
+
+def normalize(batch):
+    scaled = pc.divide(pc.cast(batch.column("x"), "float64"), 6.0)
+    return batch.set_column(0, "x", scaled)
+
+
+prepared = ds.map_batches(normalize)
+first = next(prepared.iter_batches())
+print(first.column("x").to_pylist())
+# [0.16666666666666666, 0.3333333333333333, 0.5, 0.6666666666666666, 0.8333333333333334, 1.0]
+```
+
+For learned feature statistics such as standardization, encoding, or imputation, fit a
+{doc}`preprocessor </ml/preparing/preprocessors/index>` on the training split and `transform` the stream. The
+fit is one mergeable pass, and the transform stays inside the engine. Neither touches the
+training hot path.
+
+## Building a training-data pipeline
+
+The pattern is to shape the data with the DataFrame and `map_batches` API, then
+stream batches into the framework. Each Arrow batch converts to tensors with zero
+or one copy. The framework-specific part, such as a PyTorch `IterableDataset` or a
+training actor, is outside the engine, so it is shown but not run here.
+
+```python
+# docs: skip
+import torch
+
+
+def to_tensors(batch):
+    x = torch.tensor(batch.column("x").to_pylist())
+    y = torch.tensor(batch.column("label").to_pylist())
+    return x, y
+
+
+for batch in prepared.iter_batches(batch_size=256):
+    x, y = to_tensors(batch)
+    # forward, loss, backward, step ...
+```
+
+## Tensor batches without the boilerplate
+
+`ds.ml.iter_torch_batches` folds the convert-to-tensor step into the stream. It
+consumes `iter_batches()` incrementally and yields `{column: tensor}` dicts over the
+numeric columns, dropping the rest, moving each batch to `device` and overlapping that
+move with the next batch's host work. It is the single-process training-iteration path,
+in bounded memory, so it scales to larger-than-memory and streaming sources.
+
+```python
+# docs: skip
+import batcher as bt
+
+ds = bt.read.parquet("s3://bucket/train/*.parquet")
+for batch in ds.ml.iter_torch_batches(
+    batch_size=256,
+    device="auto",                   # CUDA / ROCm / XPU / MPS / CPU
+    pin_memory=True,                 # fast async host→device copies
+    local_shuffle_buffer_size=8192,  # streaming approximation of a shuffle
+):
+    train_step(batch["features"], batch["label"])
+```
+
+See {doc}`PyTorch integration </ml/inference/pytorch>` for the device-transfer, prefetch, collate, and
+zero-copy options in full, along with a runnable in-memory example.
+
+## Distributed and resumable training
+
+For data-parallel training across ranks, `ds.ml.stream_loader` gives each rank a
+`torch.utils.data.IterableDataset` over its slice of a single, seed-reproducible global
+order. It is the streaming-ingest path for PyTorch DDP, FSDP, and DeepSpeed, and it holds
+four guarantees a distributed loop needs.
+
+The ranks stay **balanced**. Every rank yields the same number of batches, so none
+finishes early and stalls the others at the all-reduce barrier. The default
+`drop_last=True` trims the epoch's tail to a multiple of `world_size`. `drop_last=False`
+keeps every sample and pads instead, repeating a few. Neither mode hands the ranks
+unequal counts.
+
+The order is **deterministic and elastic**. The same `(seed, epoch)` produces the same
+global order *regardless of `world_size`*, so a job can resume on a differently-sized
+cluster. It is **resumable**. Pass `global_consumed`, the sample count already processed
+this epoch as read from a checkpoint, and a rank picks up mid-epoch with no repeated or
+skipped samples. And the ranks are **independent**, each reading its own index slice with
+no central coordinator, so a slow rank never blocks the others.
+
+```python
+# docs: skip
+import batcher as bt
+from torch.utils.data import DataLoader
+
+ds = bt.read.parquet("s3://bucket/train/*.parquet")
+iterable = ds.ml.stream_loader(
+    batch_size=256,
+    world_size=world_size,
+    rank=rank,
+    epoch=epoch,
+    seed=42,
+    columns=["features", "label"],
+    global_consumed=resume_offset,  # 0 for a fresh epoch
+)
+# stream_loader is the only shard authority — do not add a DistributedSampler.
+for batch in DataLoader(iterable, batch_size=None):  # batches are already sized
+    train_step(batch["features"].cuda(), batch["label"].cuda())
+```
+
+`stream_loader` materializes the dataset once, which is fine up to RAM. For a
+larger-than-RAM corpus, write it with `batcher.io.formats.ml.write_shards` and stream from
+disk with `batcher.ml.shard_stream_loader`, which keeps a bounded shard cache and the
+identical sample-order contract. For an unbounded or streaming source with no global
+length, use `batcher.ml.streaming_split` instead, which fans one read of the stream out to
+`world_size` rank iterators, consumed concurrently and with backpressure.
+
+At the top of each epoch, bump `epoch` so the shuffle reseeds. On restart, pass the
+checkpointed `global_consumed` so the rank picks up exactly where it stopped.
+
+### Shuffling at petabyte and exabyte scale
+
+The global order is **computed, never materialized**. A shuffled list of every sample
+index costs about 28 bytes per sample in CPython, so the index order alone would need
+roughly 280 GB of driver RAM for a 10-billion-sample corpus, before a single row is read.
+Instead, `epoch_permutation` is a keyed pseudorandom bijection on `[0, n)`. An index goes
+in, a shuffled index comes out, and nothing is stored.
+
+The table below contrasts what an in-RAM index list costs at each corpus size against
+Batcher's computed order, whose memory does not grow with the corpus at all.
+
+| Corpus samples | Shuffled index list | Batcher |
+| --- | --- | --- |
+| 10 M | about 280 MB | constant |
+| 1 B | about 28 GB | constant |
+| 10 B | about 280 GB | constant |
+| 1 T | about 28 TB | constant |
+
+Because the order is a function rather than a table, resuming is also O(1). Seeking to
+sample 900,000,000,000 of a trillion-sample epoch is a modular-arithmetic step, not a
+walk. Indices are generated in vectorized batches, so ordering never gates a training
+step.
+
+`shard_stream_loader`, the larger-than-RAM path, draws its indices from
+`rank_index_batches`, which holds one batch of indices at a time. `stream_loader`
+materializes the dataset with `collect()` anyway, so it keeps the simpler list path.
+
+```python
+from batcher.ml import rank_index_batches
+
+# Rank 3 of 1024, over a trillion-sample corpus, in constant memory.
+for indices in rank_index_batches(10**12, batch_size=8192, world_size=1024, rank=3, seed=1):
+    ...  # fetch these rows; each rank sees a disjoint, balanced, reproducible slice
+    break
+```
+
+### The ordering, without a loader
+
+The two functions the whole contract rests on are usable on their own, which is the
+easiest way to see what a resumed run will actually read.
+
+`epoch_order(n, epoch=, seed=)` materializes the epoch's global order as a list, the
+same order the loaders stride over. It costs O(`n`) memory, so use it for a corpus that
+fits in driver RAM, for a test, or to inspect what an epoch will look like. When it does
+not fit, `rank_index_batches` above is the one to reach for. `usable_length(total,
+world_size)` reports how many sample positions the epoch spans. That is always a multiple
+of `world_size`, rounded down with `drop_last=True`, which drops the remainder, or up with
+`drop_last=False`, which pads the remainder by repeating a few samples.
+
+```python
+from batcher.ml import epoch_order, usable_length
+
+print(epoch_order(8, seed=42))
+# [6, 4, 7, 3, 2, 5, 0, 1]
+print(epoch_order(8, seed=42, epoch=1))  # the next epoch reshuffles
+# [4, 0, 6, 5, 7, 3, 1, 2]
+
+print(usable_length(8, 3), usable_length(8, 3, drop_last=False))
+# 6 9
+```
+
+The order is a function of `(seed, epoch)` alone. Neither the world size nor the last
+run's progress enters into it. That is what makes a resume honest. A job that dies at
+step 40,000 restarts against the *same* permutation and seeks to the checkpointed
+`global_consumed` position in it, so it sees the samples it had not reached, in the
+order it would have seen them. An order re-drawn at startup would quietly re-show data
+the model already trained on, and nothing in the loss curve would tell you.
+
+### How this compares
+
+The table sets Batcher's ordering contract against the loaders it replaces, on the four
+properties a distributed training run depends on.
+
+| System | Global shuffle | Mid-epoch resume | Balanced ranks | Elastic world size |
+| --- | --- | --- | --- | --- |
+| `DistributedSampler` | in-RAM index list (O(n) per rank) | no | yes (pads) | no |
+| WebDataset | shard order + local buffer (approximate) | no | `ddp_equalize` heuristic | no |
+| MosaicML Streaming | shard/block shuffle, bounded | yes (`state_dict`) | yes | yes |
+| **Batcher** | **exact, O(1) memory** | **yes (`state_dict`)** | **yes (drop or pad)** | **yes** |
+
+One distinction is worth being precise about. WebDataset and MosaicML shuffle
+*approximately*, using a shard permutation plus a local buffer, so two samples in the
+same shard stay correlated. Batcher's is an exact permutation of the whole corpus, and it
+costs less memory than either, because it is never stored.
+
+### Checkpointing the position
+
+`ResumableSampler` owns the `(epoch, global_consumed)` pair for you, with the
+`state_dict` and `load_state_dict` protocol a checkpoint already speaks, so the training
+loop never computes a sample offset by hand.
+
+```python
+from itertools import islice
+from batcher.ml import ResumableSampler
+
+sampler = ResumableSampler(1000, world_size=2, rank=0, seed=42)
+seen = list(islice(sampler, 3))          # train three steps
+state = sampler.state_dict()             # checkpoint between steps
+
+resumed = ResumableSampler(1000, world_size=2, rank=0, seed=42)
+resumed.load_state_dict(state)
+print(len(resumed), set(seen) & set(resumed))
+# 497 set()
+```
+
+Take the `state_dict` **between steps**, where every rank has consumed the same count.
+`set_epoch(n)` reshuffles and rewinds, the `DistributedSampler` protocol. Restoring a
+state from a different corpus or seed raises rather than silently reshuffling samples
+the model has already trained on. And because the global order does not depend on
+`world_size`, a state may be restored onto a differently sized cluster.
+
+## See also
+
+- {doc}`PyTorch integration </ml/inference/pytorch>`: feed Arrow batches to a `DataLoader`, device
+  transfer, and DDP and FSDP.
+- {doc}`Preprocessors </ml/preparing/preprocessors/index>`: fit feature transforms before the stream.
+- {doc}`Inference </ml/inference/inference>`: batch prediction and embeddings.
+- {doc}`GPU scheduling </ml/inference/gpu>`: run transforms on GPU workers.

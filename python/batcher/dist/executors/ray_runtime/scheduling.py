@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import logging
 
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.plan.resource import SchedulingEnvelope
 
@@ -36,8 +38,17 @@ def _placement_timeout_s() -> float:
     window shuffle stuck in `ray.wait` for 17+ minutes with no error. The barrier now
     says so after two minutes; making it *fail* instead of wait is an open decision,
     because a legitimately slow first task looks identical from inside `ray.wait`.
+
+    Under a wall-clock lease the budget shrinks to what is left. Spending a job's last
+    minute waiting for a gang that would be reclaimed the moment it formed leaves nothing
+    to run in; giving up sooner falls back to default scheduling, which at least starts.
+    `drain_lead_s` is held back so the fallback still has the migration window the drain
+    path assumes.
     """
-    return active_config().distributed.placement_timeout_s
+    dc = active_config().distributed
+    from batcher.config.deadline import remaining_budget
+
+    return remaining_budget(dc.placement_timeout_s, reserve_s=dc.drain_lead_s)
 
 
 def current_envelope() -> SchedulingEnvelope | None:
@@ -192,16 +203,31 @@ def _bundle(env: SchedulingEnvelope | None, node_class: dict | None = None) -> d
     return bundle
 
 
-def _resolve_placement_strategy(env: SchedulingEnvelope | None) -> str:
+def _resolve_placement_strategy(env: SchedulingEnvelope | None, workers: int | None = None) -> str:
     """The placement strategy for the fleet, resolving the envelope's preference against
     the live cluster.
 
     Carbonite sets a *preference* (`SPREAD` by default, `PACK`/`STRICT_PACK` for a
-    small-shuffle breaker or a co-located GPU collective). A SPREAD-family preference
-    buys nothing on a single-node cluster — every bundle lands on the one node anyway,
-    and PACK skips the (pointless) spread bookkeeping — so it degrades to PACK when Ray
-    reports a single alive node. A PACK-family preference is honored as-is. Defaults to
-    SPREAD with no envelope.
+    small-shuffle breaker or a co-located GPU collective). This reconciles it with the
+    cluster, in both directions:
+
+    * A SPREAD-family preference buys nothing on a single-node cluster — every bundle lands
+      on the one node anyway, and PACK skips the (pointless) spread bookkeeping — so it
+      degrades to PACK when Ray reports a single alive node.
+    * A plain `PACK` preference asks to co-locate the fleet, and Carbonite decides that
+      against `cpu_budget`, which is the *driver's* core count because Carbonite has no
+      live topology. On a cluster whose nodes are smaller than the driver, that is a
+      request to pack a gang no node can hold. Ray's PACK is best-effort so it does not
+      hang, but it spends the attempt and then lands the fleet unevenly — the bundles pile
+      onto whichever nodes fit until they do not. Downgrading to SPREAD when no single node
+      can host the gang asks for the arrangement that is actually available.
+
+    `STRICT_PACK` is never downgraded: it is requested only for a GPU collective, whose
+    actors must be co-located to run their own NCCL ring at all. If no node can host that
+    world size the gang is genuinely unsatisfiable, and `_report_collective_fabric` says so
+    rather than this silently spreading a collective that cannot work spread out.
+
+    Defaults to SPREAD with no envelope.
     """
     # A GPU-collective stage runs its own multi-GPU collective (NCCL/etc.) internally, so
     # its actors must be co-located — gang-schedule them STRICT_PACK regardless of the
@@ -209,12 +235,94 @@ def _resolve_placement_strategy(env: SchedulingEnvelope | None) -> str:
     if env is not None and env.gpu_collective:
         return "STRICT_PACK"
     pref = env.placement_strategy if env is not None else "SPREAD"
-    if pref in ("PACK", "STRICT_PACK"):
-        return pref
     from batcher.dist.executors.ray_runtime.scaling import alive_node_count
 
+    if pref == "STRICT_PACK":
+        return pref
+    if pref == "PACK":
+        return pref if _gang_fits_one_node(env, workers) else "SPREAD"
     nodes = alive_node_count()  # snapshot-aware: no extra `ray.nodes()` RPC inside a scope
     return "PACK" if nodes == 1 else pref
+
+
+def _gang_fits_one_node(env: SchedulingEnvelope | None, workers: int | None = None) -> bool:
+    """Whether some single node could host the whole gang at this envelope's grant.
+
+    `workers` is the number of bundles actually being reserved and is what the question is
+    about. It is not always `env.n_tasks`: the fleet path spawns a worker count of its own
+    (a reused warm fleet, or a count `clamp_workers` reduced) against whatever envelope is
+    ambient, so reading the gang size off the envelope tests a fleet that is not the one
+    being placed — and gets the answer wrong in both directions, spreading a gang that would
+    have fitted or packing one that will not. Falls back to `env.n_tasks` only when the
+    caller does not know.
+
+    True when the topology is unreadable, so an unmeasurable cluster keeps the preference
+    it was given rather than being second-guessed on no evidence.
+    """
+    if env is None:
+        return True
+    from batcher.dist.executors.ray_runtime.scaling import node_classes
+
+    try:
+        nodes = node_classes()
+    except Exception as exc:  # pragma: no cover - topology read is best-effort
+        note_suppressed("dist", "read node classes for the pack decision", exc)
+        return True
+    if not nodes:
+        return True
+    # `capacity.placeable_workers` answers a different question — how many fit across the
+    # *whole* cluster. PACK needs the widest single node, so the same per-node rule is
+    # applied here and the maximum taken instead of the sum.
+    widest = 0
+    for node in nodes:
+        fits = int(float(node["cpus"]) // max(env.num_cpus, 1e-9))
+        if env.num_gpus > 0:
+            fits = min(fits, int(float(node["gpus"]) // env.num_gpus))
+        node_memory = float(node.get("memory", 0.0))
+        if env.memory_bytes > 0 and node_memory > 0:
+            fits = min(fits, int(node_memory // env.memory_bytes))
+        widest = max(widest, fits)
+    needed = max(1, int(workers) if workers is not None else env.n_tasks)
+    return widest >= needed
+
+
+def _report_collective_fabric(workers: int, env: SchedulingEnvelope | None) -> None:
+    """Log where a gang-scheduled collective sits relative to the fleet's fabric domains.
+
+    STRICT_PACK already puts a collective's actors on one node. What it cannot do is make a
+    node wide enough: a world size above the widest NVLink domain the fleet has runs its
+    all-reduce over PCIe or the network at a fraction of the fabric rate. That is invisible
+    from the job's own timings — the run is simply slower — so it is recorded here, where the
+    world size and the topology are both known, rather than left to be rediscovered.
+
+    Best-effort and never raises: this is an observation about a placement that has already
+    been decided, and a fleet whose topology cannot be read keeps the placement it had.
+    """
+    if env is None or not env.gpu_collective or workers <= 1:
+        return
+    if not active_config().accelerator.fabric_aware_placement:
+        return
+    try:
+        from batcher._internal.logging import get_logger, log_kv
+        from batcher.dist.executors.ray_runtime.fabric import largest_local_domain
+
+        widest = largest_local_domain()
+        if widest <= 0:
+            return  # unreadable or unlabelled topology: no observation to make
+        log = get_logger("dist")
+        if workers > widest:
+            log_kv(
+                log,
+                logging.WARNING,
+                "collective wider than the fleet's fabric domain",
+                world_size=workers,
+                widest_domain=widest,
+                effect="all-reduce leaves NVLink for the host bus or network",
+            )
+        else:
+            log_kv(log, logging.DEBUG, "collective fits one fabric domain", world_size=workers)
+    except Exception as exc:  # observation only: never fail a placement over it
+        note_suppressed("dist", "report collective fabric", exc)
 
 
 def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
@@ -238,7 +346,8 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     # Resolve the topology-dependent bits ONCE for the whole fleet (each reads `ray.nodes()`);
     # building W bundles must not re-read the cluster W times (O(workers x nodes)).
     node_class = _fleet_node_class_resources(env)
-    strategy = _resolve_placement_strategy(env)
+    strategy = _resolve_placement_strategy(env, workers)
+    _report_collective_fabric(workers, env)
     pg = placement_group([_bundle(env, node_class) for _ in range(workers)], strategy=strategy)
     ready, _ = ray.wait([pg.ready()], timeout=_placement_timeout_s())
     if not ready:

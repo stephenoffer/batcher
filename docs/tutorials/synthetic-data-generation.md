@@ -159,7 +159,7 @@ Now make a 200,000-row query tell you why it is slow.
 
 ## See also
 
-- {doc}`Joins <../user-guide/joins>`: the operator the last section sets up.
-- {doc}`Writing data <../user-guide/writing-data>`: turning a generated dataset into files.
-- {doc}`Data quality <../user-guide/data-quality>`: validating a corpus, synthetic or not.
-- {doc}`Dataset API <../api/dataset>`: `from_pydict`, `join`, and the rest.
+- {doc}`Joins </user-guide/analyze/joins>`: the operator the last section sets up.
+- {doc}`Writing data </user-guide/moving-data/writing-data>`: turning a generated dataset into files.
+- {doc}`Data quality </user-guide/trust/data-quality>`: validating a corpus, synthetic or not.
+- {doc}`Dataset API </api/relational/dataset>`: `from_pydict`, `join`, and the rest.

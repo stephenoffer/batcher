@@ -22,8 +22,34 @@ fn sort_indices_if_unsorted(idx: &mut [u32], enc: &Rows) {
     let already = idx
         .windows(2)
         .all(|w| enc.row(w[0] as usize) <= enc.row(w[1] as usize));
-    if !already {
-        idx.sort_by(|&a, &b| enc.row(a as usize).cmp(&enc.row(b as usize)));
+    if already {
+        return;
+    }
+    // Sort `(prefix, index)` pairs rather than bare indices. Comparing indices reads
+    // `enc.row(a)` and `enc.row(b)` at random positions in the encoded buffer on every
+    // comparison — `n log n` cache misses over a buffer that leaves cache on exactly the
+    // large inputs sort-merge exists for. The inline prefix settles most comparisons in a
+    // register; the full row comparison stays as the tie-break, so the order is unchanged.
+    //
+    // Trailing `a.cmp(&b)` on the original index makes the comparator a total order, which
+    // is what lets this be `sort_unstable_by` (pattern-defeating quicksort, no scratch
+    // allocation) while producing exactly the permutation the stable sort produced.
+    let mut keyed: Vec<(u64, u32)> = idx
+        .iter()
+        .map(|&i| {
+            (
+                bc_arrow::row_sort::row_prefix(enc.row(i as usize).data()),
+                i,
+            )
+        })
+        .collect();
+    keyed.sort_unstable_by(|&(pa, a), &(pb, b)| {
+        pa.cmp(&pb)
+            .then_with(|| enc.row(a as usize).cmp(&enc.row(b as usize)))
+            .then(a.cmp(&b))
+    });
+    for (slot, (_, i)) in idx.iter_mut().zip(keyed) {
+        *slot = i;
     }
 }
 

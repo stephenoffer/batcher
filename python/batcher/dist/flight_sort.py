@@ -103,7 +103,7 @@ def execute_topn_flight(
     # Driver merge plan: top-N over the concatenated per-worker top-Ns (scan 0).
     merge_ir = _sort_ir(sort.keys, sort.limit, {"op": "scan", "source_id": 0})
 
-    actors, pg, _addrs, workers, owns = acquire_fleet(workers, _shuffle_credits(), cfg_json)
+    actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, _shuffle_credits(), cfg_json)
     try:
         # Partition to the fleet's ACTUAL worker count. `acquire_fleet` may hand back a
         # reused session fleet whose size differs from the requested `workers` (it reassigns
@@ -116,7 +116,11 @@ def execute_topn_flight(
         # 0) missed the lookup and silently read every column.
         projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
-            sources[sid], workers, projection=projection, predicate=predicate
+            sources[sid],
+            workers,
+            projection=projection,
+            predicate=predicate,
+            worker_addrs=fleet_addrs,
         )
         results = ray.get([actors[i].local_topn.remote(local_ir, parts[i]) for i in range(workers)])
     finally:
@@ -176,7 +180,7 @@ def execute_sort_flight(
     _ps = _tt.perf_counter()
     # Borrow the query-lifetime fleet if installed (every Flight operator must, or a
     # second placement group deadlocks against the fleet's bundles); else spawn our own.
-    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
     _phase("acquire_fleet", _tt.perf_counter() - _ps, workers=workers, buckets=n_buckets)
     try:
@@ -189,7 +193,11 @@ def execute_sort_flight(
         # 0) missed the lookup and silently read every column.
         projection, predicate = source_pushdown(map_plan, 0)
         parts = partition_descriptors(
-            sources[sid], workers, projection=projection, predicate=predicate
+            sources[sid],
+            workers,
+            projection=projection,
+            predicate=predicate,
+            worker_addrs=fleet_addrs,
         )
 
         import time as _t

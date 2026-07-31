@@ -24,6 +24,8 @@ import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from batcher.config.accelerator import AcceleratorConfig
+
 __all__ = [
     "CardinalityConfig",
     "Config",
@@ -340,6 +342,13 @@ class MemoryConfig:
     # remote files there, byte-bounded to `file_cache_max_bytes` with LRU eviction. It
     # only accelerates re-reads of the same remote file — transparent, ephemeral, and
     # result-invariant (a cache miss just re-fetches). Local paths are never cached.
+    #
+    # `"auto"` puts it on whatever fast local disk each node has, which is the only way to
+    # enable it once for a fleet: the right directory is a per-node fact (`/ephemeral` on one
+    # provider, `/mnt/local_disk` on the next), so a literal path in a shared config is the
+    # wrong one everywhere but the machine it was written for. A node with no fast local disk
+    # resolves `"auto"` to no cache at all rather than competing for the container overlay
+    # that the read it is caching would otherwise never touch.
     file_cache_dir: str | None = None
     file_cache_max_bytes: int = 8 << 30  # 8 GiB budget (used only when enabled)
     # Cap on one streaming operator's in-memory state (windowed-aggregate partials,
@@ -1058,6 +1067,21 @@ class DistributedConfig:
     #       error can't be attributed to one split, is bypassed for the per-split reader),
     #       so one bad file never discards its healthy siblings in the same partition.
     on_read_error: str = "error"
+    # Advertise each worker's *fabric* address for the shuffle instead of the address Ray
+    # knows it by. Off by default, and worth turning on for exactly one shape of cluster: a
+    # GPU node whose Ray IP is its management Ethernet while its InfiniBand ports — two orders
+    # of magnitude faster — carry nothing, because nothing addresses them. With it on, each
+    # worker resolves its own active fabric interface's IPv4 address and advertises that, which
+    # is the same fix `BATCHER_ADVERTISE_HOST` performs by hand except that it needs setting
+    # once for the cluster rather than once per node.
+    #
+    # Off by default because it can only be verified per deployment: the fabric address has to
+    # be routable *between workers*, and a fleet where some nodes have IPoIB configured and
+    # others do not would advertise addresses half its peers cannot dial. A worker that finds
+    # no fabric address keeps its Ray address, so a partially-configured fleet degrades one
+    # node at a time rather than failing the shuffle; `BATCHER_ADVERTISE_HOST` still wins over
+    # both, because a node that names its own address has already settled the question.
+    prefer_fabric_interface: bool = False
     # Ray-level task/actor fault tolerance — the *first* line of defense, beneath the
     # shuffle recompute loop above. A transient task failure (a flaky node, a dropped
     # connection) is retried by Ray itself before the heavier app-level recompute
@@ -1099,6 +1123,24 @@ class DistributedConfig:
     # near-free default; "zstd" trades CPU for a higher ratio; "none" disables it.
     flight_compression: str = "lz4"
     placement_timeout_s: float = 60.0
+    # Bounded retry window for *attaching* to a Ray cluster whose head is not answering yet.
+    #
+    # The driver and the head come up concurrently in every orchestrated environment: a
+    # KubeRay driver pod is admitted before the head pod passes its readiness probe, and a
+    # Slurm job's `ray start --head` on the first node races the step that runs the query.
+    # A single failed attach there is not "there is no cluster", it is "not yet" — and
+    # treating the two alike is expensive, because the fallback is to start a *local*
+    # single-node Ray and run what the user asked to distribute on one machine, silently.
+    #
+    # Retried with exponential backoff for this many seconds before giving up. Set to 0 to
+    # restore the old single-attempt behavior (a local dev run inside a workspace whose
+    # cluster is deliberately down falls back immediately rather than pausing here).
+    #
+    # Exhausting the window is only a *fallback* when the address was merely detected. An
+    # address the user configured explicitly (`ray_address`, or `RAY_ADDRESS`) raises
+    # instead: they named a cluster, and running single-node in its place is a wrong answer
+    # to a question they asked precisely.
+    cluster_connect_timeout_s: float = 30.0
     # Bounded wait for the Ray autoscaler to grow the cluster before clamping a query's
     # worker fan-out. When a query wants more workers than the cluster can schedule now,
     # `clamp_workers` asks the autoscaler to scale up (`request_resources`) and then
@@ -1194,10 +1236,16 @@ class DistributedConfig:
     # on one node is hosted on an actor on that node, so the bulk of its fetches become
     # same-node (shared-memory/direct) hits instead of network transfers. Result-
     # preserving (placement never changes the output, only where bytes travel), so it is
-    # safe; off by default keeps the plain round-robin placement. Pays off on a
-    # multi-node cluster with a skewed/co-partitioned shuffle; a no-op for an evenly
-    # spread bucket (no node dominates) and on a single node (everything is same-node).
-    locality_aware_scheduling: bool = False
+    # safe. Pays off on a multi-node cluster with a skewed/co-partitioned shuffle; a
+    # no-op for an evenly spread bucket (no node dominates).
+    #
+    # On by default. It was off because deciding placement meant a `node_id` round-trip
+    # per worker, charged to every shuffle — including the single-node case, where the
+    # answer is always "nothing to place". Node identity now comes from the workers'
+    # advertised shuffle addresses, which the driver already holds, so a single-node
+    # fleet resolves to "no placement" with no remote call at all and a multi-node one
+    # pays a single fan-out for the per-mapper byte sizes.
+    locality_aware_scheduling: bool = True
     # Persistent shuffle-actor fleet for the adaptive Flight path. When on, an adaptive
     # multi-stage query reserves ONE placement group + worker fleet for the whole query
     # and reuses it across breaker stages: a stage's intermediate stays partitioned on
@@ -1294,6 +1342,26 @@ class DistributedConfig:
     # cluster and makes a spot-preempted shard's retry cheap (1/N the work). The mergeable
     # combine is correct for any shard count. 1 = one shard per GPU (the old behavior).
     gpu_shard_oversubscribe: int = 4
+    # A shard that did not FIT the device is divided into this many pieces and rerun on the
+    # device, for up to `rounds` further halvings. The shard count is fixed before the query
+    # runs, from an estimate, and estimates are wrong exactly where it matters — a skewed key, a
+    # wider row than the footer suggested, a neighbouring tenant on the device — so one shard
+    # can miss while every other one fits. Subdividing is exact, because the stage is mergeable:
+    # a shard's partial and the concatenation of its pieces' partials are the same value. `1`
+    # disables it, sending an over-large shard straight to the host.
+    # The most devices a single query may ask the autoscaler to grow to. The request is sized
+    # from the working set (how many devices would hold it in one wave), so a badly-estimated
+    # query would otherwise be able to ask a cluster to grow without bound. Reaching the cap is
+    # not a failure: the query simply runs in more waves on fewer devices.
+    gpu_max_autoscale_devices: int = 64
+    gpu_shard_subdivide: int = 4
+    gpu_shard_subdivide_rounds: int = 3
+    # A GPU shard that fails for any other reason — a lost worker, an untranslatable expression —
+    # is recomputed by the native CPU engine on a CPU worker, instead of the whole query
+    # abandoning the accelerated path. Both compute the same mergeable partial, so the combined
+    # answer is identical either way; only that shard is slower. Off → a lost shard fails the GPU
+    # attempt and the caller re-runs everything on the host, which is the older, coarser behavior.
+    gpu_shard_cpu_fallback: bool = True
     # Kyber's cost-based GPU-backend policy (`backend="auto"`, and the memory routing under an
     # explicit `backend="gpu"`). Below `gpu_min_rows` estimated rows the fixed GPU overhead —
     # host<->device transfer, kernel launch, first-touch cuDF import — is not amortized, so
@@ -1406,6 +1474,18 @@ class DistributedConfig:
     # override just that one while keeping the rest of the profile. Resolved once at
     # every config entry point (see `batcher.config.profiles`).
     resilience: str = "default"
+    # How long before a known termination deadline a worker starts draining — enough time
+    # to migrate its published shuffle output to a survivor before the kill lands. Only
+    # consulted when a deadline is discoverable (`SLURM_JOB_END_TIME`, or an explicit
+    # `BATCHER_DEADLINE_EPOCH_S` from any launcher that knows when its lease expires); a
+    # cluster with no lease never reaches this. The default matches both AWS's ~2 minute
+    # spot notice and the `--signal=B:USR1@120` an HPC job is conventionally submitted
+    # with, so the deadline path and the signal path drain on the same budget. Too short
+    # and the kill lands mid-migration, which costs the same recompute as not draining;
+    # too long and the fleet stops taking work while it still had useful time. Draining
+    # only moves *where* a partial lives, never what it holds, so this never changes a
+    # result. See `carbonite/resilience/deadline.py`.
+    drain_lead_s: float = 120.0
 
     def resolved_gpu_memory_gb(self) -> float:
         """The usable memory budget of one GPU, detected when `gpu_memory_gb` is `0.0`.
@@ -1655,7 +1735,8 @@ class Config:
     envelope and spill tiers), `flow_control` (credit-based shuffle backpressure),
     `optimizer` (Kyber join planning, cost, and cardinality), `pid` (the adaptive
     batch-size controller gains), `metadata` (where learned statistics live and how
-    fast they age), and `distributed` (Ray attachment and shuffle transport).
+    fast they age), `distributed` (Ray attachment and shuffle transport), and
+    `accelerator` (a GPU fleet's power envelope, health thresholds, and placement).
 
     Immutable: derive a variant with `replace` (whole-section swap) rather than
     mutating, and read the one in effect via `active_config`. The Rust-relevant
@@ -1684,6 +1765,10 @@ class Config:
     observability: ObservabilityConfig = ObservabilityConfig()
     governance: GovernanceConfig = GovernanceConfig()
     tenant: TenantConfig = TenantConfig()
+    # `default_factory`, unlike the sections above it: those are defined in this module, so
+    # ruff can prove they are frozen and allows the call; `AcceleratorConfig` is imported, so
+    # it cannot, and RUF009 fires. The value is identical either way.
+    accelerator: AcceleratorConfig = dataclasses.field(default_factory=AcceleratorConfig)
 
     def replace(self, **section_overrides: object) -> Config:
         """Return a new Config with whole sections replaced.

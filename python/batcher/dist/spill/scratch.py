@@ -25,11 +25,21 @@ def _work_dir(spill_dir: str | None, prefix: str) -> tuple[str, bool]:
     An explicit `spill_dir` is caller-owned (not removed). Otherwise, if the config
     sets `MemoryConfig.spill_dir`, create a unique per-query subdir *under* that root
     (so striping onto fast/large disks is honored and rmtree only ever removes our
-    own subdir — never a shared root). With neither, fall back to a system tempdir.
+    own subdir — never a shared root). With neither, fall back to the node's measured
+    local scratch volume, and to a system tempdir only when there is none.
+
+    That last step matters on a GPU node, where a system tempdir is an overlay on the
+    container root — commonly under 100 GB and shared with the image and every other
+    tenant — while the several terabytes of local NVMe the node ships with are mounted
+    under a provider-specific name. Spilling to the tempdir there fails with `ENOSPC`
+    beside unused storage, and the failure looks like an undersized query rather than a
+    misplaced directory.
     """
+    from batcher._internal.site import local_scratch_root
+
     if spill_dir is not None:
         return spill_dir, False
-    root = active_config().memory.spill_dir
+    root = active_config().memory.spill_dir or local_scratch_root()
     if root:
         os.makedirs(root, exist_ok=True)
         return tempfile.mkdtemp(prefix=prefix, dir=root), True

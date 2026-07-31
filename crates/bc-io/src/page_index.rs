@@ -99,7 +99,7 @@ fn column_selection(
     // Match the column by its FULL path being the single part `col`, not by leaf name — the
     // pushed predicate only ever names top-level columns, and matching a leaf let a nested
     // field (`s.a`) shadow a top-level `a` and prune with the wrong column's bounds. This
-    // mirrors `predicate::col_stats` deliberately; the two must not drift.
+    // mirrors `predicate::ColumnIndex::stats` deliberately; the two must not drift.
     let leaf = (0..group.num_columns()).find(|&i| {
         let parts = group.column(i).column_path().parts();
         parts.len() == 1 && parts[0] == col

@@ -83,6 +83,35 @@ from batcher import Config
 cfg = Config.from_file("/etc/batcher/config.json")
 ```
 
+## Environment detection
+
+A second, smaller group of variables doesn't name a config field. Batcher reads them to
+work out what kind of machine it's running on, then picks defaults to match. Each is read
+from the environment only, never from a metadata service on a hot path, so detection
+costs nothing and can't hang.
+
+Set one of these when Batcher can't see a signal your deployment does have:
+
+| Variable | Effect |
+|---|---|
+| `BATCHER_SPOT` | Truthy marks the node preemptible, selecting the `"spot"` resilience profile. |
+| `BATCHER_AUTOSCALE` | Authoritative in both directions: truthy forces the bounded autoscale wait on, falsey forces it off even on a managed cluster. |
+| `BATCHER_RAY_CLUSTER` | Any non-empty value attaches to the running Ray cluster instead of starting a local one. |
+| `BATCHER_DEADLINE_EPOCH_S` | The Unix time this process will be killed at. Makes the job preemptible and starts the drain `distributed.drain_lead_s` seconds ahead. |
+| `BATCHER_METADATA_URI` | An fsspec URL for learned statistics, so cross-run learning survives a driver that moves between nodes. |
+| `BATCHER_SHUFFLE_PORT_RANGE` | A `40000-40100` range the shuffle listeners must bind inside, to match a firewall rule. |
+| `BATCHER_SHUFFLE_TOKEN` | The shared secret fencing shuffle tickets, injectable without a config file. |
+
+Batcher also reads variables it doesn't own, exported by the scheduler that launched the
+job. You don't set these; they're listed so you can tell what Batcher already knows:
+
+| Variable | Read for |
+|---|---|
+| `SLURM_JOB_END_TIME` | When the allocation ends, so workers drain before the kill. Slurm's unlimited-job sentinel is ignored. |
+| `SLURM_CPUS_PER_TASK`, `SLURM_CPUS_ON_NODE` | The cores this job was granted, capping fan-out on a node without cgroup confinement. |
+| `RAY_CLUSTER_NAME`, `RAY_CLUSTER_NAMESPACE` | A KubeRay-operated cluster, which implies an autoscaler. |
+| `ANYSCALE_SESSION_ID`, `ANYSCALE_ARTIFACT_STORAGE` | A managed control plane, and durable storage for learned statistics. |
+
 ## Precedence
 
 The two layers here sit in the middle of the resolution order, highest first:
@@ -101,6 +130,6 @@ runtime `set_config` or `config_context` overrides both.
 - {doc}`index`: the runtime entry points these variables are overridden by.
 - {doc}`options`: every field a `BATCHER_*` variable can name, with its default.
 - {doc}`profiles`: ready-made configurations for common machine shapes.
-- {doc}`../user-guide/secrets`: why credentials belong in `env:` and `file:` references
+- {doc}`/user-guide/trust/secrets`: why credentials belong in `env:` and `file:` references
   rather than in a config value.
-- {doc}`../integrations/ray`: the variables a cluster reads, including the shuffle token.
+- {doc}`/integrations/compute/ray`: the variables a cluster reads, including the shuffle token.

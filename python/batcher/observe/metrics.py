@@ -30,8 +30,19 @@ from collections.abc import Callable
 from typing import Any
 
 from batcher._internal import events
+from batcher.observe.node_metrics import (
+    NODE_CONDITION_HELP,
+    device_gauges,
+    node_conditions,
+)
 
-__all__ = ["metrics_snapshot", "prometheus_text", "reset_metrics", "start_metrics"]
+__all__ = [
+    "metrics_snapshot",
+    "prometheus_text",
+    "reset_metrics",
+    "start_metrics",
+    "stop_metrics",
+]
 
 # Duration buckets in milliseconds, Prometheus-style cumulative histogram boundaries.
 # Chosen to straddle Batcher's stated range: sub-millisecond planning through multi-minute
@@ -206,6 +217,7 @@ class _Collector:
                     "util_pct_max": self.gpu_util_pct_max,
                     "devices": {device: dict(stats) for device, stats in sorted(self._gpu.items())},
                 },
+                "node": node_conditions(),
             }
 
 
@@ -245,6 +257,27 @@ def start_metrics() -> None:
             _detach = events.subscribe(_collector.handle)
 
 
+def stop_metrics() -> None:
+    """Stop collecting, and leave the module able to start again.
+
+    The counterpart `start_metrics` needs and did not have. Detaching by calling the stored
+    unsubscribe function is not enough on its own: the handle stays set, and `start_metrics`
+    treats a non-`None` handle as "already attached", so collection can never be resumed in
+    that process. A test that detached to avoid leaking a subscriber therefore silenced every
+    later one instead, which is a worse leak in the other direction.
+
+    Idempotent: stopping a collector that is not running does nothing.
+
+    Returns:
+        None.
+    """
+    global _detach
+    with _attach_lock:
+        detach, _detach = _detach, None
+    if detach is not None:
+        detach()
+
+
 def metrics_snapshot() -> dict[str, Any]:
     """Every engine counter and timing as a nested dict of plain numbers.
 
@@ -259,14 +292,23 @@ def metrics_snapshot() -> dict[str, Any]:
     ``partitions``, ``skipped`` (dropped rows under ``on_read_error="skip"``), ``inference``
     (batches, rows, and latency), and ``gpu`` (peak plus per-device utilization and VRAM).
 
+    ``node`` carries the hardware conditions worth alerting on rather than counting: devices
+    on a degraded host link, devices whose memory is failing, an NVLink fabric that is down,
+    and the RDMA ports' own error counters. Facts rather than verdicts — whether a device is
+    schedulable is a subsystem's decision, and this layer does not ask. Every one of these
+    conditions leaves a job correct and slow, so none shows up in any of the counters above —
+    which is exactly why they belong in the thing an operator has already wired an alert to.
+    All zero where nothing could be read, so a CPU-only host exports the section as zeros
+    rather than omitting it and making a scrape config conditional.
+
     Examples:
         .. doctest::
 
             >>> from batcher.observe import metrics_snapshot
             >>> snap = metrics_snapshot()
             >>> sorted(snap)  # doctest: +NORMALIZE_WHITESPACE
-            ['bytes', 'gpu', 'inference', 'logs', 'operators', 'partitions', 'queries',
-             'recovery', 'rows', 'skipped', 'spills', 'uptime_seconds']
+            ['bytes', 'gpu', 'inference', 'logs', 'node', 'operators', 'partitions',
+             'queries', 'recovery', 'rows', 'skipped', 'spills', 'uptime_seconds']
             >>> snap["queries"]["total"] >= 0
             True
 
@@ -365,6 +407,13 @@ def prometheus_text() -> str:
             out.append(
                 f'batcher_gpu_memory_used_bytes{{device="{device}"}} {stats["mem_used_bytes"]}'
             )
+    out.extend(device_gauges())
+    node = snap.get("node") or {}
+    for name, help_text in NODE_CONDITION_HELP.items():
+        if name in node:
+            out.append(f"# HELP batcher_node_{name} {help_text}")
+            out.append(f"# TYPE batcher_node_{name} gauge")
+            out.append(f"batcher_node_{name} {node[name]}")
     return "\n".join(out) + "\n"
 
 

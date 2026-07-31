@@ -752,6 +752,38 @@ class _ListNamespace:
         """
         return ListSet("array_concat", self._e, _wrap(other))
 
+    def gather(self, indices: Any) -> ListSet:
+        """Take each row's elements at the positions `indices` names (→ list).
+
+        The operation that makes :meth:`arg_sort` usable. `arg_sort` hands back the positions
+        that put a row's scores in order; without a way to spend them the reranking has to
+        leave the engine and happen a row at a time in Python. Together they are a rerank in
+        two expressions: sort the scores, reverse for descending, `head(k)` for the cutoff,
+        then gather the candidates with the result.
+
+        A negative index counts from the end, as :meth:`get` does. An index outside the row
+        yields a null element rather than an error, because a `head(k)` wider than the row is
+        an ordinary thing to write. A null row on either side gives a null row.
+
+        Args:
+            indices: A list-of-integer column giving the positions to take, per row.
+
+        Returns:
+            A new list expression holding the gathered elements, in the order given.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"docs": [["low", "high", "mid"]], "scores": [[0.1, 0.9, 0.5]]}
+                ... )
+                >>> ranked = bt.col("scores").list.arg_sort().list.reverse()
+                >>> ds.select(top2=bt.col("docs").list.gather(ranked.list.head(2))).to_pydict()
+                {'top2': [['high', 'mid']]}
+        """
+        return ListSet("array_gather", self._e, _wrap(indices))
+
     def has_all(self, other: Any) -> Expr:
         """Whether every element of ``other`` is present in this list (→ Boolean).
 
@@ -1413,6 +1445,72 @@ class _ListNamespace:
         """
         return ListBinary("jaccard", self._e, _wrap(other))
 
+    def multiset_overlap(self, other: Any) -> ListBinary:
+        """How many of this list's elements `other` accounts for, counting repeats (→ Float64).
+
+        The clipped multiset intersection size ``Σ min(count_here(v), count_there(v))``. It
+        differs from ``set_intersection(other).len()`` in exactly one way, and that way is the
+        point: a value repeated four times here against one occurrence there contributes 1,
+        not 4. That clip is how BLEU's modified n-gram precision refuses to reward a
+        degenerate ``the the the the``, and it is ROUGE-N's numerator read from the other
+        side. Pair it with :meth:`~batcher.Expr.str.token_ngrams` to score generated text.
+
+        Order does not matter and the lists need not be the same length. Null if either list
+        is null; a null element matches nothing.
+
+        Args:
+            other: The other list column to account for this one's elements.
+
+        Returns:
+            A new Float64 expression: the clipped overlap count.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [["the", "the", "cat"]], "b": [["the", "cat"]]})
+                >>> ds.select(o=bt.col("a").list.multiset_overlap(bt.col("b"))).to_pydict()
+                {'o': [2.0]}
+        """
+        return ListBinary("multiset_overlap", self._e, _wrap(other))
+
+    def lcs_length(self, other: Any) -> ListBinary:
+        """The length of the longest common subsequence of the two lists (→ Float64).
+
+        The one overlap measure that reads *order*. :meth:`multiset_overlap` cannot tell
+        ``the cat sat`` from ``sat cat the`` — both share the same three tokens — while an LCS
+        scores the reordering far lower. That difference is exactly what separates ROUGE-N from
+        ROUGE-L, and why summarization is scored with the latter: a summary using the right
+        words in the wrong order is not a summary.
+
+        The subsequence need not be contiguous, so ``a x b y c`` and ``a b c`` share three.
+
+        **This is the expensive one.** It is ``O(n·m)`` in the two rows' lengths, against
+        ``O(n+m)`` for every other list operation here. On tokenized sentences that is nothing;
+        on two thousand-token documents it is a million cell updates per row. Truncate, or score
+        at the sentence level, rather than reaching for it on whole documents.
+
+        Args:
+            other: The other list column to find a common subsequence with.
+
+        Returns:
+            A new Float64 expression: the longest common subsequence length.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [["the", "cat", "sat"]], "b": [["sat", "cat", "the"]]}
+                ... )
+                >>> ds.select(
+                ...     ordered=bt.col("a").list.lcs_length(bt.col("a")),
+                ...     shuffled=bt.col("a").list.lcs_length(bt.col("b")),
+                ... ).to_pydict()
+                {'ordered': [3.0], 'shuffled': [1.0]}
+        """
+        return ListBinary("lcs_length", self._e, _wrap(other))
+
     def cosine_similarity(self, other: Any) -> ListBinary:
         """Cosine similarity with another vector column, in ``[-1, 1]`` (→ Float64).
 
@@ -1551,6 +1649,8 @@ _LIST_FUNCS = {
     "max_abs": "max_abs",  # max absolute value = the MaxAbs-scaling divisor (-> Float64)
     "normalize": "normalize",  # L2-normalize to unit length (→ list); embedding prep
     "softmax": "softmax",  # logits → probability distribution per row (→ list)
+    "log_softmax": "log_softmax",  # logits → log-domain distribution (→ list); no underflow
+    "entropy": "entropy",  # per-row Shannon entropy in nats (→ Float64); uncertainty
     "cum_sum": "cum_sum",  # cumulative sum per row (→ list)
     "diff": "diff",  # first difference xᵢ−xᵢ₋₁ per row, leading null (→ list)
 }

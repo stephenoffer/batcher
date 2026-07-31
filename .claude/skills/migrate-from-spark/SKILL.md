@@ -171,5 +171,5 @@ counts and a checksum against the original job's output, not the eyeball.
 
 - `docs/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
 - `docs/user-guide/{sql,udfs,window-functions,writing-data,explain-plans}.md`.
-- `docs/integrations/ray.md` — how distribution actually works (scheduling only).
+- `docs/integrations/compute/ray.md` — how distribution actually works (scheduling only).
 - Skills: `run-quality-gate` (if the port changes repo code).

@@ -13,7 +13,7 @@ The fix is namespacing, not a new subsystem — and the tests below are mostly a
 A cooperating workload, not an adversary. Two tenants in one process share an address
 space; one can read the other's memory directly and no Python-level control changes that.
 `tenant()` stops accidental sharing and bounds consumption. It does not isolate mutually
-untrusting parties — run one process per trust domain. `docs/user-guide/hardening.md` says
+untrusting parties — run one process per trust domain. `docs/user-guide/trust/hardening.md` says
 this in the user's language, and it is repeated here because a test file is where someone
 checks whether the claim is bigger than the code.
 """

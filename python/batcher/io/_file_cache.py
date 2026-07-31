@@ -121,17 +121,57 @@ _CACHES_LOCK = threading.Lock()
 def get_file_cache() -> FileBytesCache | None:
     """The process-wide file cache for the active config, or `None` when disabled.
 
-    Memoized per cache directory, so `config_context` overriding `file_cache_dir`
-    (e.g. in a test) yields a distinct cache without disturbing the default one.
+    Memoized per *resolved* cache directory, so `config_context` overriding `file_cache_dir`
+    (e.g. in a test) yields a distinct cache without disturbing the default one. Keyed on the
+    resolved path rather than the configured one, so `"auto"` and the path it resolves to are
+    one cache rather than two views of the same files.
     """
     from batcher.config import active_config
 
     mem = active_config().memory
-    if not mem.file_cache_dir:
+    directory = resolve_cache_dir(mem.file_cache_dir)
+    if not directory:
         return None
     with _CACHES_LOCK:
-        cache = _CACHES.get(mem.file_cache_dir)
+        cache = _CACHES.get(directory)
         if cache is None:
-            cache = FileBytesCache(mem.file_cache_dir, mem.file_cache_max_bytes)
-            _CACHES[mem.file_cache_dir] = cache
+            cache = FileBytesCache(directory, mem.file_cache_max_bytes)
+            _CACHES[directory] = cache
         return cache
+
+
+#: The sentinel that means "put the cache on whatever fast local disk this node has".
+#:
+#: A cache directory is a per-node fact — `/ephemeral` on one provider, `/mnt/local_disk` on
+#: the next, a small container overlay on a laptop — so naming one in the config means naming
+#: the wrong one everywhere but the machine it was written for. The sentinel lets a fleet
+#: enable the cache once and have each node resolve its own volume, which is the same shape
+#: `AUTOSCALE_WAIT_AUTO` uses for a figure only the node can know.
+FILE_CACHE_AUTO = "auto"
+
+#: The subdirectory Batcher takes under a node's scratch volume. The volume belongs to the
+#: node — Ray's object spill is on the same mount — so the cache lives in a directory of its
+#: own rather than scattering hashed filenames across a shared one.
+_CACHE_SUBDIR = "batcher_file_cache"
+
+
+def resolve_cache_dir(configured: str | None) -> str | None:
+    """The directory the file cache should use, or `None` when it stays disabled.
+
+    Args:
+        configured: `MemoryConfig.file_cache_dir` — a path, the `"auto"` sentinel, or `None`.
+
+    Returns:
+        The path to cache into. An explicit path is used as given. `"auto"` resolves to a
+        subdirectory of the node's measured local scratch volume, and to `None` on a node
+        with no fast local disk — where a cache would be competing for the container overlay
+        that the read it is caching would otherwise not touch.
+    """
+    if not configured:
+        return None
+    if configured != FILE_CACHE_AUTO:
+        return configured
+    from batcher._internal.site import local_scratch_root
+
+    root = local_scratch_root()
+    return os.path.join(root, _CACHE_SUBDIR) if root else None

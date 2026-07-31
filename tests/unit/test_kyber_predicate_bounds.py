@@ -223,3 +223,71 @@ def test_range_union_works_on_dates():
 def test_optimizer_is_idempotent(expr):
     once = optimize_logical(_proj(expr))
     assert optimize_logical(once).to_ir() == once.to_ir()
+
+
+# --- collapse_degenerate_range_to_equality ----------------------------------
+#
+# The one rule here that reads a *conjunction* of two ordered bounds rather than a
+# disjunction. It exists because an equality is a different kind of predicate to the skipping
+# machinery, not because it is shorter: a bloom filter refutes an equality and says nothing
+# about a range, and equality selectivity comes off the most-common-values sketch instead of
+# being interpolated from the quantile grid.
+
+_DEGENERATE = "collapse_degenerate_range_to_equality"
+
+
+def test_zero_width_range_becomes_an_equality():
+    got = _fire(_DEGENERATE, (col("x") >= lit(3)) & (col("x") <= lit(3)))
+    assert got == (col("x") == lit(3)).to_ir()
+
+
+def test_zero_width_range_in_either_order():
+    got = _fire(_DEGENERATE, (col("x") <= lit(3)) & (col("x") >= lit(3)))
+    assert got == (col("x") == lit(3)).to_ir()
+
+
+def test_zero_width_range_over_a_string():
+    got = _fire(_DEGENERATE, (col("s") >= lit("b")) & (col("s") <= lit("b")))
+    assert got == (col("s") == lit("b")).to_ir()
+
+
+def test_zero_width_range_over_a_date():
+    day = dt.date(2020, 5, 1)
+    got = _fire(_DEGENERATE, (col("x") >= lit(day)) & (col("x") <= lit(day)))
+    assert got == (col("x") == lit(day)).to_ir()
+
+
+def test_zero_width_range_with_the_literal_written_first():
+    # `3 <= x AND 3 >= x` is the same pair mirrored; `_comparison` normalizes both.
+    got = _fire(_DEGENERATE, (lit(3) <= col("x")) & (lit(3) >= col("x")))
+    assert got == (col("x") == lit(3)).to_ir()
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # A real interval, not a point.
+        (col("x") >= lit(3)) & (col("x") <= lit(4)),
+        # Strict bounds at one literal are a *contradiction*, which is
+        # `filter_range_contradiction`'s job — this rule must not turn one into an equality.
+        (col("x") > lit(3)) & (col("x") < lit(3)),
+        (col("x") > lit(3)) & (col("x") <= lit(3)),
+        (col("x") >= lit(3)) & (col("x") < lit(3)),
+        # Same direction twice is `tighten_comparison_bounds`'s job.
+        (col("x") >= lit(3)) & (col("x") >= lit(3)),
+        # Different columns share no point.
+        (col("x") >= lit(3)) & (col("y") <= lit(3)),
+        # Incomparable literals decline rather than guessing the engine's coercion.
+        (col("x") >= lit(3)) & (col("x") <= lit("3")),
+        # A disjunction is a different rule's shape entirely.
+        (col("x") >= lit(3)) | (col("x") <= lit(3)),
+    ],
+)
+def test_degenerate_range_declines(expr):
+    node = _proj(expr)
+    assert _rule(_DEGENERATE).apply(node, None).to_ir() == node.to_ir()
+
+
+def test_degenerate_range_collapse_is_idempotent():
+    once = optimize_logical(_proj((col("x") >= lit(3)) & (col("x") <= lit(3))))
+    assert optimize_logical(once).to_ir() == once.to_ir()

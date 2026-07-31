@@ -81,12 +81,13 @@ _LIST_SAME = frozenset({"reverse", "sort", "unique"})
 # list's mean/median/product/std/var/l2_norm all come back as `double`). `sum` is NOT
 # here: it preserves the element type (Int list → Int64, like `min`/`max`), and
 # classifying it as float made `Dataset.schema` disagree with execution.
-_LIST_FLOAT_REDUCE = frozenset({"mean", "median", "product", "std", "var", "l2_norm"})
+_LIST_FLOAT_REDUCE = frozenset({"mean", "median", "product", "std", "var", "l2_norm", "entropy"})
 # Reductions that preserve the (numeric) element type: `sum` alongside `min`/`max`.
 _LIST_ELEMENT_REDUCE = frozenset({"sum", "min", "max"})
 
 _STR_STR = frozenset(
     {
+        "squad_normalize",
         "strip_html",
         "upper",
         "lower",
@@ -300,8 +301,8 @@ def _listfunc_type(fn: str, input_t: pa.DataType | None) -> pa.DataType | None:
         # `sum`/`min`/`max` preserve the element type (already widened at the scan leaf):
         # summing/minning an Int list yields Int64, a Float list yields Float64.
         return _list_element_type(input_t)
-    if fn == "normalize":
-        # Rescale each element to unit L2 norm → a list of Float64.
+    if fn in ("normalize", "log_softmax"):
+        # Rescale each element (unit L2 norm, or the log-domain distribution) → List<Float64>.
         return pa.list_(pa.float64()) if _list_element_type(input_t) is not None else None
     if fn == "flatten":
         # `List<List<T>>` → `List<T>`: the flattened output IS the (list) element type.
@@ -439,6 +440,8 @@ def _strfunc_type(fn: str) -> pa.DataType | None:
         return pa.list_(pa.int64())  # the signature: one value per permutation
     if fn == "chunk":
         return pa.list_(pa.string())
+    if fn == "token_ngrams":
+        return pa.list_(pa.string())  # one joined n-gram per window
     if fn == "split":
         return pa.list_(pa.string())
     if fn == "regexp_extract_all":

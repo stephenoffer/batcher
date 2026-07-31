@@ -282,7 +282,7 @@ These sit outside the `Dataset` and `Expr` surfaces:
   `.pct_change(n=1)`, `.shift(n)`, `.rank(method="min")`, `.is_duplicated()` /
   `.is_unique()`
 - Full list, plus the `.str` / `.dt` / `.list` / `.struct` / `.json` / `.map` /
-  `.image` / `.audio` / `.video` accessors: the {doc}`expressions API page <expressions>`.
+  `.image` / `.audio` / `.video` accessors: the {doc}`expressions API page </api/relational/expressions>`.
 
 ```python
 out = ds.select(
@@ -307,12 +307,12 @@ Typed methods hang off an expression by namespace rather than crowding `Expr` it
 | `.map` | Arrow `Map` columns: `keys()`, `values()`, `get(key)` |
 | `.json` | `extract_string(path)` |
 | `.image` | `decode()`, `to_tensor(width, height)`, `to_tensor_f32(width, height, mean=, std=, channels_first=)`, `center_crop(width, height)`, `to_grayscale(width, height)`, `resize(width, height)` |
-| `.audio` | native WAV/FLAC decode: `decode()` (metadata struct), `to_waveform()` (mono `List<Float32>`), `resample(rate)`, `mel_spectrogram(rate, n_fft=, hop_length=, n_mels=)` (speech-model mel power spectrogram, torchaudio-matching), `mfcc(rate, n_fft=, hop_length=, n_mels=, n_mfcc=)` (MFCC feature, torchaudio-matching) |
+| `.audio` | native WAV/FLAC decode: `decode()` (metadata struct), `to_waveform()` (mono `List<Float32>`), `resample(rate)`, `trim_silence(threshold_db=-40)` (drop the leading and trailing quiet; a clip silent throughout trims to an empty list, which is how a silent recording is filtered out), `peak_normalize()` (scale so the loudest sample sits at full scale, the level-matching step before batching clips from different sources), `zero_crossing_rate()` (the voiced/unvoiced descriptor, in `[0, 1]`), `mel_spectrogram(rate, n_fft=, hop_length=, n_mels=)` (speech-model mel power spectrogram, torchaudio-matching), `mfcc(rate, n_fft=, hop_length=, n_mels=, n_mfcc=)` (MFCC feature, torchaudio-matching) |
 | `.video` | native FFmpeg decode: `decode()` returns a metadata struct, and needs the `video` engine build feature |
 
 ## SQL
 
-`bt.sql(query, table_name=ds_or_table, ...)` returns a Dataset. Each table named in the query is bound by a keyword argument. The {doc}`SQL page <sql>` lists the supported clauses and features in full.
+`bt.sql(query, table_name=ds_or_table, ...)` returns a Dataset. Each table named in the query is bound by a keyword argument. The {doc}`SQL page </api/relational/sql>` lists the supported clauses and features in full.
 
 ```python
 out = bt.sql("SELECT category, SUM(price) AS total FROM t GROUP BY category ORDER BY category", t=ds)
@@ -350,8 +350,8 @@ model once per worker.
 | `Tokenizer` / `Concatenator` | stateless text split / feature-vector assembly |
 | `Chain` | each step, fit on the previous step's output |
 
-See the {doc}`preprocessors guide <../ml/preprocessors/index>` for the workflow and the
-{doc}`ML API page <ml>` for the per-class reference.
+See the {doc}`preprocessors guide </ml/preparing/preprocessors/index>` for the workflow and the
+{doc}`ML API page </api/models/ml>` for the per-class reference.
 
 ## Configuration
 
@@ -367,10 +367,11 @@ See the configuration page for the full pattern.
 
 ## See also
 
-- {doc}`dataset`: every `Dataset` method, with its arguments and its return type.
-- {doc}`expressions` and {doc}`expression-accessors`: the column language and the
+- {doc}`/api/relational/dataset`: every `Dataset` method, with its arguments and its return type.
+- {doc}`/api/relational/expressions` and {doc}`/api/relational/expression-accessors`: the column language and the
   `.str` / `.dt` / `.list` / `.struct` / `.json` namespaces.
-- {doc}`functions`: the free functions, grouped by family.
-- {doc}`io`: readers, writers, save modes, and the format-specific options.
+- {doc}`/api/relational/functions`: the free functions, grouped by family.
+- {doc}`/api/relational/io`: readers, writers, save modes, and the format-specific options.
 - {doc}`../user-guide/index`: the task-oriented guides behind these signatures.
 - {doc}`../getting-started/quickstart`: the same surface as a five-minute walkthrough.
+- {doc}`../cookbook/index`: 100 runnable recipes, when the signature is not enough.

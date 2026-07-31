@@ -11,9 +11,9 @@ reference is `.claude/rules/rust-engine.md` (+ `maintainability.md`, `testing.md
                     ┌→ bc-ir → bc-runtime ┐
 bc-arrow → bc-expr →┤                     ├→ bc-interp → bc-py
                     └→ bc-codegen ────────┘
-leaves (no bc-* deps), consumed higher up:
+near-leaves (nothing below them but bc-arrow, the DAG root), consumed higher up:
   bc-sketches → bc-runtime, bc-py      bc-resource → bc-interp, bc-py
-  bc-transport → bc-py                 bc-io       → bc-py
+  bc-transport → bc-py                 bc-io       → bc-py (+ bc-arrow, for usable_cores)
   bc-secrets  → bc-expr (secret-reference resolution; NO cloud SDK by design)
   bc-udf → (nothing depends on it — not on a live path)
 ```

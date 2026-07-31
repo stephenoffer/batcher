@@ -1,6 +1,6 @@
-# Watching a query run: verbosity, logging, and execution statistics
+# Observability
 
-Observability is configuration, not instrumentation you sprinkle through the pipeline. Turn it up for one block, read what happened, and turn it back down -- the query code is unchanged either way.
+Observability is configuration, not instrumentation you sprinkle through the pipeline. Turn it up for one block, read what happened, and turn it back down. The query code is unchanged either way.
 
 The whole script, executed on every test run:
 
@@ -17,7 +17,7 @@ python examples/operations/observability.py
 
 ## See also
 
-- {doc}`memory_and_caching`: bounded memory: caching a reused branch and spilling under a tight budget.
-- {doc}`streaming_basics`: batch as the bounded case of streaming: the same operators, incrementally.
-- {doc}`../../user-guide/performance`: measuring and tuning a query that is correct but slow.
-- {doc}`../../user-guide/observability`: what the engine records about a run, and where.
+- {doc}`memory_and_caching`: caching a reused branch and spilling under a tight budget.
+- {doc}`streaming_basics`: the same operators, incrementally.
+- {doc}`/user-guide/operate/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`/user-guide/operate/observability`: what the engine records about a run, and where.

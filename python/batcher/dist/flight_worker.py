@@ -82,6 +82,31 @@ def _reduce_spill_opts(engine_config: str) -> tuple[int, str | None, str | None]
     )
 
 
+def _reduce_work_dir(prefix: str, spill_dir: str | None) -> str:
+    """A scratch directory for a bounded reduce, on the fastest disk this worker actually has.
+
+    The configured `spill_dir` wins, because an operator who named one has already decided.
+    With none, this prefers the node's measured local volume over a bare tempdir: on a GPU
+    node the tempdir is an overlay on the container root — commonly under 100 GB and shared
+    with the image — while the terabytes of NVMe the node ships with sit under a
+    provider-specific mount. A reduce that spills to the overlay fails with `ENOSPC` beside
+    unused storage, and the failure reads as an undersized query rather than a misplaced
+    directory.
+
+    Args:
+        prefix: The temporary directory's name prefix.
+        spill_dir: The configured scratch root, or `None`.
+
+    Returns:
+        A fresh directory the caller owns and removes.
+    """
+    import tempfile
+
+    from batcher._internal.site import local_scratch_root
+
+    return tempfile.mkdtemp(prefix=prefix, dir=spill_dir or local_scratch_root() or None)
+
+
 def new_plan_id() -> int:
     """A fresh, process-unique-enough shuffle plan id (63-bit, fits the ticket field).
 
@@ -190,6 +215,7 @@ try:
             tls_config: ShuffleTlsConfig | None = None,
             port_range: tuple[int, int] | None = None,
             credit_ceiling: int = 0,
+            prefer_fabric: bool = False,
         ) -> None:
             nat = engine()
             from batcher.carbonite.transfer import ShuffleSession
@@ -261,11 +287,22 @@ try:
             # per node — a single driver-side setting would hand every worker one host and
             # be wrong everywhere but one. Set it per node (pod spec, node env) and each
             # worker advertises its own address.
+            #
+            # `prefer_fabric` is the same fix expressed once for the cluster instead of once
+            # per node: each worker resolves *its own* fabric interface address, so one
+            # setting covers a fleet whose nodes each need a different value. It is shipped
+            # from the driver rather than read from config here, because a Ray actor cannot
+            # see the driver's `config_context`. A node with no IPoIB address configured
+            # finds nothing and keeps its Ray address, so a partially-configured fleet
+            # degrades one node at a time instead of advertising an address nobody can dial.
             import os
 
-            advertise_host = (
-                os.environ.get("BATCHER_ADVERTISE_HOST") or ray.util.get_node_ip_address()
-            )
+            from batcher._internal.hardware.fabric import fabric_interface_address
+
+            advertise_host = os.environ.get("BATCHER_ADVERTISE_HOST") or ""
+            if not advertise_host and prefer_fabric:
+                advertise_host = fabric_interface_address()
+            advertise_host = advertise_host or ray.util.get_node_ip_address()
             shuffle_token = token or None
             # Opt-in AIMD adaptive credits: the window adjusts to this worker's memory
             # pressure per fetch. Decided on the driver (the worker can't see the
@@ -505,13 +542,12 @@ try:
             or grace-partition out of core if not. Result-identical to `gather_combine`."""
             import os
             import shutil
-            import tempfile
 
             from batcher.dist.shuffle_io import read_ipc
 
             nat = engine()
             budget, sdir, codec = _reduce_spill_opts(self._engine_config)
-            work = tempfile.mkdtemp(prefix="bc_flight_reduce_", dir=sdir or None)
+            work = _reduce_work_dir("bc_flight_reduce_", sdir)
             try:
                 paths, unreachable = self.session.gather_to_files(sources, work, replicas=replicas)
                 if unreachable:
@@ -776,7 +812,6 @@ try:
             import json
             import os
             import shutil
-            import tempfile
 
             from batcher.dist.spill_breakers.join import reduce_join_paths_spilling
 
@@ -785,7 +820,7 @@ try:
             spec = json.loads(join_ir)
             left_keys = list(spec.get("left_keys", []))
             right_keys = list(spec.get("right_keys", []))
-            work = tempfile.mkdtemp(prefix="bc_flight_joinreduce_", dir=sdir or None)
+            work = _reduce_work_dir("bc_flight_joinreduce_", sdir)
             try:
                 # Stage the two sides concurrently, each into its own subdir so the two
                 # `gather_to_files` waves cannot collide on a ticket-named file, and each
@@ -1104,6 +1139,7 @@ def spawn_flight_workers(workers: int, credits: int, cfg_json: str, plan_id: int
             dc.tls,
             port_range,
             ceiling,
+            dc.prefer_fabric_interface,
         )
         for i in range(workers)
     ]

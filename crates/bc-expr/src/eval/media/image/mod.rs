@@ -7,6 +7,8 @@
 //! are null or fail to decode yields a null result (corrupt inputs don't fail
 //! the batch), matching the multimodal source's header-metadata convention.
 
+mod quality;
+
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -150,6 +152,8 @@ fn eval_image_sized<O: OffsetSizeTrait>(
         ImageFunc::Encode => encode(bytes, args.format),
         ImageFunc::Convert => convert(bytes, args.format),
         ImageFunc::Dhash => dhash(bytes),
+        ImageFunc::Brightness => quality::brightness(bytes),
+        ImageFunc::Sharpness => quality::sharpness(bytes),
     }
 }
 

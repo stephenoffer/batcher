@@ -13,10 +13,10 @@ its budget.
 1. {doc}`Environment variables <../configuration/environment>`: `BATCHER_*` and
    `BATCHER_CONFIG_FILE`.
 1. {doc}`Configuration recipes <../configuration/profiles>`: configs for common goals.
-1. {doc}`Cloud storage <../user-guide/cloud-storage>`: object-store access.
-1. {doc}`Best practices <../user-guide/best-practices>` and
-   {doc}`troubleshooting <../user-guide/troubleshooting>`.
-1. {doc}`Configuration API reference <../api/configuration>`.
+1. {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: object-store access.
+1. {doc}`Best practices </user-guide/operate/best-practices>` and
+   {doc}`troubleshooting </user-guide/operate/troubleshooting>`.
+1. {doc}`Configuration API reference </api/operations/configuration>`.
 
 ## Example: set process-wide defaults
 
@@ -61,7 +61,7 @@ print((cfg.execution.parallelism, cfg.memory.soft_limit))
 - `distributed.py` compares a single node against a cluster and gets identical results.
   It needs the `[ray]` extra.
 
-See also {doc}`performance and memory <../user-guide/performance>` and
+See also {doc}`performance and memory </user-guide/operate/performance>` and
 {doc}`distributed fault tolerance <../architecture/fault-tolerance>`.
 
 
@@ -75,19 +75,19 @@ plan re-tunes itself mid-query.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`database;1.1em` Spilling
-:link: ../deep-dives/spilling
+:link: /deep-dives/memory/spilling
 :link-type: doc
 Staying alive when the data does not fit.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Credit-based flow control
-:link: ../deep-dives/credit-flow-control
+:link: /deep-dives/distribution/credit-flow-control
 :link-type: doc
 One credit is one batch slot, and the producer blocks at zero.
 :::
 
 :::{grid-item-card} {octicon}`gear;1.1em` Adaptive re-optimization
-:link: ../deep-dives/adaptive-reoptimization
+:link: /deep-dives/adaptive/adaptive-reoptimization
 :link-type: doc
 Re-planning on measured cardinalities, not estimates.
 :::
@@ -101,13 +101,13 @@ What actually happens when you add nodes.
 
 :::{seealso}
 - {doc}`Optimizing a slow query <../tutorials/optimizing-a-slow-query>`: a real diagnosis, start to finish.
-- {doc}`Explain plans <../user-guide/explain-plans>`: reading what the optimizer decided.
-- {doc}`Ray <../integrations/ray>`: scheduling only. The data plane goes over Arrow Flight.
+- {doc}`Explain plans </user-guide/operate/explain-plans>`: reading what the optimizer decided.
+- {doc}`Ray </integrations/compute/ray>`: scheduling only. The data plane goes over Arrow Flight.
 :::
 
 
 ## See also
 
 - {doc}`data-engineer`: the pipelines you are operating.
-- {doc}`../user-guide/hardening`: the trust boundaries to establish before a shared deployment.
+- {doc}`/user-guide/trust/hardening`: the trust boundaries to establish before a shared deployment.
 - {doc}`../internals/index`: how the engine works, when an incident needs it.

@@ -104,6 +104,11 @@ class HardwareProfile:
     storage_class: str = "unknown"
     #: Accelerator model names in sorted order, one entry per device.
     accelerators: tuple[str, ...] = ()
+    #: The node's RDMA fabric as a coarse, stable bucket (`"infiniband-1600g"`), or `""` on a
+    #: node with none. Bucketed rather than exact, for the reason every capacity here is: two
+    #: nodes of one instance type must share a key, and a rate that differs by a port's
+    #: negotiated speed would give each its own.
+    fabric_class: str = ""
     #: Operating system name, since the same silicon behaves differently across kernels.
     platform_system: str = ""
 
@@ -171,6 +176,9 @@ class HardwareProfile:
           minute; a fingerprint that changes under load would re-learn from scratch every
           time the box got busy, which is exactly when the learned values matter most.
 
+        The fabric is included, but only on a node that has one, so adding it cost no existing
+        deployment its history.
+
         Returns:
             A 12-character hex digest identifying this machine class.
         """
@@ -191,6 +199,13 @@ class HardwareProfile:
                 f"os={self.platform_system}",
             )
         )
+        if self.fabric_class:
+            # Appended only when there *is* a fabric, so a node without one keeps the key it
+            # has always had and loses nothing it learned. Two otherwise-identical nodes, one
+            # on eight 400 Gb/s InfiniBand ports and one on a 25 Gb/s Ethernet NIC, converge
+            # on shuffle windows and spill thresholds an order of magnitude apart — blending
+            # them is exactly what this key exists to prevent.
+            material = f"{material}|fabric={self.fabric_class}"
         return hashlib.sha256(material.encode()).hexdigest()[:_DIGEST_CHARS]
 
     def to_dict(self) -> dict[str, Any]:
@@ -213,6 +228,7 @@ class HardwareProfile:
             "model": self.model,
             "page_bytes": self.page_bytes,
             "storage_class": self.storage_class,
+            "fabric_class": self.fabric_class,
             "accelerators": list(self.accelerators),
             "platform_system": self.platform_system,
         }
@@ -284,8 +300,9 @@ def hardware_profile() -> HardwareProfile:
             vendor=cpu_vendor(),
             model=cpu_model_name(),
             page_bytes=page_size_bytes(),
-            storage_class=device_class(tempfile.gettempdir()),
+            storage_class=device_class(_scratch_dir()),
             accelerators=_accelerator_names(),
+            fabric_class=_fabric_class(),
             platform_system=platform.system(),
         )
     return _PROFILE
@@ -319,3 +336,53 @@ def _reset_profile() -> None:
     global _PROFILE, _FINGERPRINT
     _PROFILE = None
     _FINGERPRINT = None
+
+
+def _scratch_dir() -> str:
+    """The directory whose device class describes where this machine spills.
+
+    The same three-step resolution the spill paths use — configured root, measured local
+    scratch, system tempdir — because the fingerprint is meant to name the machine a learned
+    spill threshold was measured on. Reading the tempdir instead described the container's
+    overlay while the spill landed on the node's NVMe, which merged two machine classes that
+    behave nothing alike.
+    """
+    from batcher._internal.site import local_scratch_root
+
+    try:
+        from batcher.config import active_config
+
+        configured = active_config().memory.spill_dir
+    except Exception:  # pragma: no cover - config unavailable this early in a process
+        configured = None
+    return configured or local_scratch_root() or tempfile.gettempdir()
+
+
+def _fabric_class() -> str:
+    """A coarse, stable name for the node's RDMA fabric, or `""` when it has none.
+
+    Built from the *per-port* rate and the link layer rather than the aggregate, and bucketed
+    to a power of two on top of that. Both choices are about stability rather than precision:
+
+    * A port rate is a property of the hardware, so it does not move when a port goes down.
+      Keying on the aggregate would make a node with one of eight links down a different
+      machine class from its identical neighbours, and it would re-learn every coefficient
+      over a condition the health path already reports and an operator is about to fix.
+    * The bucket absorbs the difference between a port negotiating 200 and 212 Gb/s, which is
+      the granularity at which two nodes of one instance type must still share a key.
+
+    What it does *not* absorb is the distinction worth keeping: a 25 Gb/s Ethernet NIC, a
+    100 Gb/s RoCE port and a 400 Gb/s InfiniBand port land in three different classes, and a
+    shuffle window learned on one says nothing about the others.
+    """
+    from batcher._internal.hardware.fabric import active_rdma_devices
+
+    ports = active_rdma_devices()
+    rated = [p for p in ports if p.rate_gbps > 0]
+    if not rated:
+        # Ports that are up but publish no rate still mean "this node has a fabric", and the
+        # unrated bucket keeps it apart from a node that has none at all.
+        return "rdma-unrated" if ports else ""
+    fastest = max(rated, key=lambda p: p.rate_gbps)
+    layer = (fastest.link_layer or "rdma").lower()
+    return f"{layer}-{_nearest_power_of_two(int(fastest.rate_gbps))}g"

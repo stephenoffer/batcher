@@ -11,7 +11,9 @@ re-export list.
 from __future__ import annotations
 
 from batcher._internal.accelerators import reset_accelerator_probes
-from batcher._internal.hardware import cache, cgroup, isa, memory, profile, storage, topology
+from batcher._internal.hardware import cache, cgroup, isa, memory, nvml, profile, storage, topology
+from batcher._internal.hardware.engine import detected as engine_detected
+from batcher._internal.hardware.fabric.rdma import reset_fabric_probes
 
 __all__ = ["reset_hardware_probes"]
 
@@ -36,6 +38,16 @@ _MEMOIZED = (
     (isa, ("_cpuinfo_fields", "cpu_features", "cpu_vendor", "cpu_model_name")),
     (topology, ("numa_node_count", "cpus_per_numa_node", "physical_core_count")),
     (storage, ("device_class",)),
+    # The NVML handshake, not a reading: telemetry itself is deliberately never cached.
+    (nvml, ("_nvml",)),
+    # What the engine reported about its own CPU. Memoized for the same reason the `/sys`
+    # probes are, and resettable for one more: a test that substitutes a stub engine in
+    # `sys.modules` would otherwise keep reading the real one's answers. The allocator
+    # readings are not listed because they are deliberately uncached — they are meant to move.
+    (
+        engine_detected,
+        ("engine_hardware", "engine_pinning_order", "engine_numa_map"),
+    ),
 )
 
 
@@ -53,3 +65,6 @@ def reset_hardware_probes() -> None:
                 clear()
     profile._reset_profile()
     reset_accelerator_probes()
+    # The interconnect readings memoize per PCI address rather than once, so they clear
+    # through their own hook instead of being listed above.
+    reset_fabric_probes()

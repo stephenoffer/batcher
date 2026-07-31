@@ -71,8 +71,8 @@ python benchmarks/cluster/gpu_video.py
 
 - {doc}`ai-and-gpu`: the ten GPU workload families.
 - {doc}`vs-daft`: the engine the image pipeline is measured against.
-- {doc}`../ml/multimodal`: how to write these pipelines.
-- {doc}`../deep-dives/tensor-columns`: the `fixed_shape_tensor` representation fix 2 turned on.
-- {doc}`../deep-dives/morsel-parallelism`: the pool sizing that fix 1 corrected.
-- {doc}`../user-guide/udfs`: the cost of the Python boundary, and how to avoid paying it.
+- {doc}`/ml/preparing/multimodal/index`: how to write these pipelines.
+- {doc}`/deep-dives/memory/tensor-columns`: the `fixed_shape_tensor` representation fix 2 turned on.
+- {doc}`/deep-dives/operators/morsel-parallelism`: the pool sizing that fix 1 corrected.
+- {doc}`/user-guide/transform/udfs`: the cost of the Python boundary, and how to avoid paying it.
 - {doc}`methodology`: the machines; the 96-core and 8xT4 tables above are not comparable with each other.

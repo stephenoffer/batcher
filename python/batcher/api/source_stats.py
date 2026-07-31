@@ -34,6 +34,20 @@ __all__ = [
     "persist_written_source_stats",
 ]
 
+#: The aggregate functions whose *input column's* statistics a rule reads, and therefore the only
+#: ones whose input is worth fetching. Each has a named consumer:
+#:
+#:   `min`/`max`  -> `global_min_max_from_exact_bounds` (the bound *is* the answer) and
+#:                   `min_max_of_constant_column`;
+#:   `sum`/`mean` -> `sum_of_constant_column` / `mean_of_constant_column`, which need min == max;
+#:   `count`      -> `count_of_non_null_column`, which turns `count(x)` into `count(*)` once the
+#:                   column's null count is known to be an exact zero.
+#:
+#: Kept to that list on purpose rather than "every aggregate" — see `column_bounds_needed`, where
+#: fetching a column for one aggregate was found to change what an `approx_*` terminal on the *same*
+#: column returns.
+_STAT_READING_AGGREGATES = frozenset({"min", "max", "sum", "mean", "count"})
+
 # Session cache of per-source statistics, keyed by source identity (see collect_source_stats).
 _SOURCE_STATS_CACHE: dict[str, object] = {}
 
@@ -152,26 +166,56 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
 
 
 def column_bounds_needed(plan: LogicalPlan) -> set[str]:
-    """The column names whose min/max bounds the plan could consume — predicates *and* join keys.
+    """The column names whose per-column statistics the plan could consume.
 
-    Two consumers read a source's column bounds on the execution path:
+    Four kinds of operator read a source's column statistics on the execution path, and every
+    one of them must be listed here or the rules that depend on it go quietly blind:
 
-    * a `Filter`, for zone-map pruning and range selectivity — the union of its predicate's
-      referenced columns; and
+    * a `Filter`, for zone-map pruning, range selectivity, and the sargable transposition that
+      needs a column's range to prove its arithmetic cannot wrap — the union of its predicate's
+      referenced columns;
     * a **`Join`**, for the disjointness proof. If the two sides' key ranges do not overlap,
       no pair can be equal and an inner/semi join emits nothing — provable from four numbers,
-      with neither side read (`join_disjoint_keys_to_empty`, `no_match_join_to_preserved_side`).
+      with neither side read (`join_disjoint_keys_to_empty`, `no_match_join_to_preserved_side`);
+    * an **`Aggregate`**, whose global `MIN`/`MAX` *is* an exact bound
+      (`global_min_max_from_exact_bounds`) — so the whole scan collapses to a literal — and whose
+      group key is droppable when the column is constant (`drop_constant_group_key`), and whose
+      `count(x)` becomes `count(*)` once the column has a known-zero null count
+      (`count_of_non_null_column`). Only the inputs of the aggregates that read them
+      (`_STAT_READING_AGGREGATES`), deliberately: see the caveat below;
+    * a **`Sort`**, whose key is droppable when the column is constant
+      (`prune_constant_sort_keys`), when an earlier key is already unique
+      (`prune_sort_keys_after_unique_key`), or when the relation holds one row
+      (`skip_sort_of_single_row`).
 
     The join half used to be missing, and the omission was self-concealing: the rules were
     written, tested, and correct, but the bounds they needed were never *fetched*, so on a real
     query they had nothing to reason about and a join whose key ranges provably cannot overlap
     ran a full shuffle. A rule that cannot see is indistinguishable from a rule that is absent.
 
-    Computing a column the optimizer does not read only wastes a little footer work; omitting
-    one only forgoes pruning (it never changes a result), so a superset is exactly right.
+    The aggregate and sort halves were missing the same way and for longer, with a sharper
+    symptom: `SELECT min(x), max(x) FROM t` over a resident relation has *no* filter and *no*
+    join, so this returned the empty set, the narrowing then dropped every column's min/max, and
+    the rule that exists to answer the query from metadata declined and scanned instead. The
+    guard against a fifth recurrence is
+    `tests/unit/test_source_stats_needed.py::test_every_metadata_shortcut_still_fires_when_narrowed`,
+    which drives each shortcut through the *narrowed* statistics the execution path really passes.
+
+    Computing a column the optimizer does not read only wastes a little footer work; omitting one
+    only forgoes an optimization, so a superset is *almost* always right.
+
+    **The one exception, and the reason the aggregate half names only `min`/`max`.** Requesting a
+    column's bounds materializes its whole `ColumnStat`, quantile grid included, and the
+    `kyber.shortcuts.approx` family answers from a sketch **when one exists** — `None` there means
+    "nothing measured yet", not "not provable". So making a sketch available can change what an
+    `approx_*` terminal returns: `ds.approx_percentile("x", 50)` over `[1, 2, 3, 4]` falls back to
+    exact `2.5` with no grid and answers the grid's `2.0` with one. Both are within that API's
+    contract, but which one a query gets should not depend on whether an unrelated rule wanted
+    bounds. Requesting every aggregate's input column did exactly that, so this asks only for what
+    the consumer above actually reads.
     """
-    from batcher.plan.expr_ir import referenced_columns
-    from batcher.plan.logical import AsofJoin, Filter, Join
+    from batcher.plan.expr_ir import Col, referenced_columns
+    from batcher.plan.logical import Aggregate, AsofJoin, Filter, Join, Sort
     from batcher.plan.visitor import walk
 
     needed: set[str] = set()
@@ -185,6 +229,14 @@ def column_bounds_needed(plan: LogicalPlan) -> set[str]:
             # `by` keys are equi-keys like a hash join's.
             needed |= {node.left_on, node.right_on}
             needed |= set(node.left_by) | set(node.right_by)
+        elif isinstance(node, Aggregate):
+            for key in node.group_keys:
+                needed |= referenced_columns(key.expr)
+            for spec in node.aggregates:
+                if spec.agg.func in _STAT_READING_AGGREGATES and spec.agg.input is not None:
+                    needed |= referenced_columns(spec.agg.input)
+        elif isinstance(node, Sort):
+            needed |= {k.expr.name for k in node.keys if isinstance(k.expr, Col)}
     return needed
 
 

@@ -9,15 +9,15 @@ is what materializes the result.
 
 1. {doc}`Getting started <../getting-started/index>`: install and run a first query.
 1. {doc}`Concepts <../getting-started/concepts/index>`: datasets, laziness, expressions.
-1. {doc}`Expressions <../user-guide/expressions>`: column math, conditionals, string
+1. {doc}`Expressions </user-guide/transform/expressions>`: column math, conditionals, string
    and date accessors.
-1. {doc}`Filtering <../user-guide/filtering>`: predicates and `is_in` / `between`.
-1. {doc}`Aggregations <../user-guide/aggregations>`: `group_by`, `.agg`, quantiles.
-1. {doc}`SQL <../user-guide/sql>`: query a dataset with {py:obj}`bt.sql <batcher.sql>`.
-1. {doc}`Window functions <../user-guide/window-functions>`: ranking and rolling
+1. {doc}`Filtering </user-guide/transform/filtering>`: predicates and `is_in` / `between`.
+1. {doc}`Aggregations </user-guide/analyze/aggregations>`: `group_by`, `.agg`, quantiles.
+1. {doc}`SQL </user-guide/analyze/sql>`: query a dataset with {py:obj}`bt.sql <batcher.sql>`.
+1. {doc}`Window functions </user-guide/analyze/window-functions>`: ranking and rolling
    aggregates.
-1. {doc}`Expression API reference <../api/expressions>` and
-   {doc}`SQL API reference <../api/sql>`.
+1. {doc}`Expression API reference </api/relational/expressions>` and
+   {doc}`SQL API reference </api/relational/sql>`.
 
 ## Example: derive and summarize
 
@@ -71,7 +71,7 @@ Run any of these directly with `python examples/<name>.py`:
 
 ## Recipes
 
-The {doc}`analytics cookbook <../examples/analytics/index>` works through the queries you
+The {doc}`analytics cookbook </cookbook/analytics/index>` works through the queries you
 actually write, and the trap in each one: the cohort query that puts one user in three
 cohorts, the 3-sigma rule that never fires because the outlier inflates its own sigma, the
 funnel self-join that cross-products inside each user.
@@ -80,25 +80,25 @@ funnel self-join that cross-products inside each user.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`graph;1.1em` Cohort analysis
-:link: ../examples/analytics/cohort-analysis
+:link: /cookbook/analytics/cohort-analysis
 :link-type: doc
 Assign the cohort once, not per row.
 :::
 
 :::{grid-item-card} {octicon}`filter;1.1em` Funnel analysis
-:link: ../examples/analytics/funnel-analysis
+:link: /cookbook/analytics/funnel-analysis
 :link-type: doc
 Ordering matters, and the naive join explodes.
 :::
 
 :::{grid-item-card} {octicon}`versions;1.1em` Sessionization
-:link: ../examples/analytics/sessionization
+:link: /cookbook/analytics/sessionization
 :link-type: doc
 A gap, a flag, a cumulative sum.
 :::
 
 :::{grid-item-card} {octicon}`check;1.1em` A/B testing
-:link: ../examples/analytics/ab-testing
+:link: /cookbook/analytics/ab-testing
 :link-type: doc
 Per-event and per-user disagree, and one of them is wrong.
 :::
@@ -106,8 +106,8 @@ Per-event and per-user disagree, and one of them is wrong.
 
 :::{seealso}
 - {doc}`SQL to DataFrame <../tutorials/sql-to-dataframe>`: the same query, both ways.
-- {doc}`Window functions <../user-guide/window-functions>` and {doc}`pivoting <../user-guide/pivoting>`.
-- {doc}`Explain plans <../user-guide/explain-plans>`: why your query did what it did.
+- {doc}`Window functions </user-guide/analyze/window-functions>` and {doc}`pivoting </user-guide/analyze/pivoting>`.
+- {doc}`Explain plans </user-guide/operate/explain-plans>`: why your query did what it did.
 :::
 
 
@@ -115,4 +115,4 @@ Per-event and per-user disagree, and one of them is wrong.
 
 - {doc}`ml-engineer`: the path onward, once a model needs to run in production.
 - {doc}`../cookbook/statistics/index`: short runnable recipes for the analysis steps.
-- {doc}`../examples/analytics/index`: worked analytics problems end to end.
+- {doc}`/cookbook/analytics/index`: worked analytics problems end to end.

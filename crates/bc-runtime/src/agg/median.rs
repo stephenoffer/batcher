@@ -1,6 +1,7 @@
 //! MEDIAN / continuous-quantile — exact, mergeable via a per-group value list
 //! (no dedup, unlike COUNT(DISTINCT)).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float64Builder, Int64Array, UInt32Array};
@@ -21,10 +22,24 @@ pub(crate) fn median_state(
     // the geometric reallocations these two parallel Vecs would otherwise churn through.
     let mut keep: Vec<u32> = Vec::with_capacity(group_ids.len());
     let mut kept_groups: Vec<i64> = Vec::with_capacity(group_ids.len());
-    for (i, &g) in group_ids.iter().enumerate() {
-        if values.is_valid(i) {
-            keep.push(i as u32);
-            kept_groups.push(g as i64);
+    // `values` is an `Arc<dyn Array>`, so `values.is_valid(i)` is a **virtual call per row** —
+    // and one the optimizer cannot see through, so it also blocks inlining the loop body.
+    // Resolving the null buffer once turns the per-row check into an inlinable bit test, and
+    // the null-free case (much the commonest) into no check at all.
+    match values.nulls() {
+        None => {
+            for (i, &g) in group_ids.iter().enumerate() {
+                keep.push(i as u32);
+                kept_groups.push(g as i64);
+            }
+        }
+        Some(nulls) => {
+            for (i, &g) in group_ids.iter().enumerate() {
+                if nulls.is_valid(i) {
+                    keep.push(i as u32);
+                    kept_groups.push(g as i64);
+                }
+            }
         }
     }
     let kept_values = take(values.as_ref(), &UInt32Array::from(keep), None)?;
@@ -300,8 +315,12 @@ pub(crate) fn finalize_top_k(state: &ArrayRef, k: usize) -> Result<ArrayRef, Run
     for row in 0..list.len() {
         let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
         // (row bytes → count, first index) so the winner can be `take`n back out.
-        let mut seen: std::collections::HashMap<Vec<u8>, (i64, u32)> =
-            std::collections::HashMap::new();
+        //
+        // `ahash`, not std's SipHash: this map is rebuilt for every list row, so the per-probe
+        // hash is paid once per element per row, and `bc-runtime` already hashes its join and
+        // group tables this way. Safe by construction — the ranking below is a strict total
+        // order (distinct keys), so nothing observable comes from the map's iteration order.
+        let mut seen: HashMap<Vec<u8>, (i64, u32), ahash::RandomState> = HashMap::default();
         for i in lo..hi {
             if child.is_null(i) {
                 continue; // DuckDB's top-k ignores nulls, as every value aggregate does
@@ -316,7 +335,12 @@ pub(crate) fn finalize_top_k(state: &ArrayRef, k: usize) -> Result<ArrayRef, Run
             .collect();
         // Descending by count, then ascending by the encoded value: the row encoding is
         // order-preserving, so comparing its bytes is comparing the values themselves.
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        //
+        // `sort_unstable_by` is safe here and not merely faster: the entries come from a map
+        // keyed by those very bytes, so no two compare equal and the comparator is already a
+        // total order. That makes the unstable sort deterministic, and it skips the `n/2`
+        // scratch buffer the stable merge sort allocates.
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         for (_, _, idx) in ranked.into_iter().take(k) {
             keep.push(idx);
         }
@@ -350,7 +374,10 @@ fn per_group_value_counts(state: &ArrayRef) -> Result<Vec<Vec<i64>>, RuntimeErro
     let mut out = Vec::with_capacity(list.len());
     for row in 0..list.len() {
         let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
-        let mut seen: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        // `ahash` for the same reason as `finalize_mode`'s map. The hasher cannot reach the
+        // result: the only consumer sorts these counts before summing them, precisely because
+        // a hash map's iteration order is arbitrary and float addition is not associative.
+        let mut seen: HashMap<Vec<u8>, i64, ahash::RandomState> = HashMap::default();
         for i in lo..hi {
             if child.is_null(i) {
                 continue;
@@ -397,8 +424,14 @@ pub(crate) fn finalize_mode(state: &ArrayRef) -> Result<ArrayRef, RuntimeError> 
         idxs.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
         let (mut best_idx, mut best_len) = (idxs[0], 1usize);
         let (mut run_start, mut run_len) = (0usize, 1usize);
+        // One encoded-row read per element: the previous element's row was read on the
+        // previous iteration, and `idxs` is a permutation so neither index is sequential.
+        let mut prev = rows.row(idxs[0] as usize);
         for j in 1..idxs.len() {
-            if rows.row(idxs[j] as usize) == rows.row(idxs[j - 1] as usize) {
+            let cur = rows.row(idxs[j] as usize);
+            let same = cur == prev;
+            prev = cur;
+            if same {
                 run_len += 1;
             } else {
                 if run_len > best_len {
@@ -454,13 +487,18 @@ pub(crate) fn finalize_histogram(state: &ArrayRef) -> Result<ArrayRef, RuntimeEr
             let mut idxs: Vec<u32> = (start as u32..end as u32).collect();
             idxs.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
             let mut run_start = 0usize;
+            // The run's first element is re-read on every step of the run. It only changes
+            // when the run does, so hold it instead — one read per element rather than two.
+            let mut run_row = rows.row(idxs[0] as usize);
             for j in 1..=idxs.len() {
-                let breaks = j == idxs.len()
-                    || rows.row(idxs[j] as usize) != rows.row(idxs[run_start] as usize);
+                let breaks = j == idxs.len() || rows.row(idxs[j] as usize) != run_row;
                 if breaks {
                     key_idx.push(idxs[run_start]);
                     counts.push((j - run_start) as i64);
                     run_start = j;
+                    if j < idxs.len() {
+                        run_row = rows.row(idxs[j] as usize);
+                    }
                 }
             }
         }

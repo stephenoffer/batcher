@@ -188,7 +188,7 @@ and benchmark those skills require, verified through `/run-quality-gate`.
 ## See also
 
 - `.claude/rules/performance.md` — the competitive mandate and how we win
-- `docs/tutorials/optimizing-a-slow-query.md`, `docs/user-guide/performance.md`
-- `docs/user-guide/explain-plans.md`, `docs/user-guide/caching.md`, `docs/user-guide/best-practices.md`
+- `docs/tutorials/optimizing-a-slow-query.md`, `docs/user-guide/operate/performance.md`
+- `docs/user-guide/operate/explain-plans.md`, `docs/user-guide/operate/caching.md`, `docs/user-guide/operate/best-practices.md`
 - `docs/internals/kyber.md`, `docs/architecture/optimization.md`
 - `debug-a-batcher-query` — when the answer is wrong, not merely slow

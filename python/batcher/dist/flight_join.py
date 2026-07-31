@@ -119,7 +119,7 @@ def execute_join_flight(
     # Borrow the query-lifetime fleet when the adaptive loop installed one; else spawn
     # one we tear down. Every Flight operator must borrow it — spawning a second
     # placement group would contend with the fleet's held bundles and deadlock.
-    actors, pg, _addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
+    actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_buckets = shuffle_partitions(workers)
     # Keep the join's output ON the workers only when it is a plain intermediate: nothing
     # to apply above it, and no fused aggregate (which already shrinks the bucket to a
@@ -137,8 +137,12 @@ def execute_join_flight(
         # agreed with the relabeled id, which is why only the right side paid for it.
         lproj, lpred = source_pushdown(left_plan, 0)
         rproj, rpred = source_pushdown(right_plan, 0)
-        lparts = partition_descriptors(sources[lsid], workers, projection=lproj, predicate=lpred)
-        rparts = partition_descriptors(sources[rsid], workers, projection=rproj, predicate=rpred)
+        lparts = partition_descriptors(
+            sources[lsid], workers, projection=lproj, predicate=lpred, worker_addrs=fleet_addrs
+        )
+        rparts = partition_descriptors(
+            sources[rsid], workers, projection=rproj, predicate=rpred, worker_addrs=fleet_addrs
+        )
 
         # Simulate worker loss BEFORE the map barrier (test hook).
         if _fault_inject_map:

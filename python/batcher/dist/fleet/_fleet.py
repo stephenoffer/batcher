@@ -442,6 +442,7 @@ def maybe_spawn_query_fleet(num_workers: int | None, transport: str) -> ShuffleF
     from batcher.dist.executors.ray_runtime import (
         _ensure_ray,
         clamp_workers,
+        current_envelope,
         engine_config_json,
         release_autoscale,
         request_autoscale,
@@ -450,12 +451,23 @@ def maybe_spawn_query_fleet(num_workers: int | None, transport: str) -> ShuffleF
 
     workers = num_workers or available_cpu_count()
     _ensure_ray(workers)
+    # Size the ask and the clamp against the grant the fleet's actors will actually
+    # request. `_spawn_fleet_with_addrs` builds both its placement-group bundles and its
+    # actor options from the ambient envelope, so a fleet sized as though each worker
+    # needed a single core asks the autoscaler for a fraction of the cores it will demand
+    # and clamps to a fan-out the cluster cannot place — the placement group then goes
+    # unsatisfiable and the fleet degrades to the one or two actors that fit, which is the
+    # 0.6 s -> 16 s collapse the comment below describes from the other direction. With no
+    # envelope this is `1.0` and `0`, exactly the previous behavior.
+    env = current_envelope()
+    per_cpu = env.num_cpus if env is not None else 1.0
+    per_mem = int(env.memory_bytes) if env is not None else 0
     # Ask the autoscaler for the fleet's cores and wait (bounded) for them while sizing
     # it; release the request once sized — the spawned actors keep the nodes busy, so the
     # autoscaler never reclaims them under the fleet, and the floor needn't stay pinned.
-    request_autoscale(math.ceil(workers))
+    request_autoscale(math.ceil(workers * per_cpu))
     try:
-        workers = clamp_workers(workers)
+        workers = clamp_workers(workers, per_cpu, memory_bytes=per_mem)
         if workers <= 1 or resolve_transport(transport, workers) != "flight":
             return None
         from batcher.dist.flight_aggregate import _shuffle_credits

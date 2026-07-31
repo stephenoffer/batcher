@@ -82,8 +82,9 @@ def stragglers_to_backup(
     finished: dict[int, float],
     elapsed: dict[int, float],
     policy: SpeculationPolicy,
+    doomed: frozenset[int] = frozenset(),
 ) -> list[int]:
-    """Indices of still-running tasks that warrant a backup, slowest first.
+    """Indices of still-running tasks that warrant a backup, most urgent first.
 
     Pure (no Ray, no clock): `finished` maps a finished task index to its completion
     time, `elapsed` maps a still-running task index to its current elapsed time.
@@ -96,26 +97,47 @@ def stragglers_to_backup(
     median, every task at 8 ms is a "straggler" by ratio, and duplicating it costs strictly
     more than it can save.
 
+    `doomed` names slots whose *host is going away* — a node the autoscaler is scaling in,
+    a pod being evicted, a spot instance under a reclamation notice. Those bypass every
+    test above, because none of the tests are about them. A doomed task is not slow, it is
+    about to be lost, and the entire question the straggler heuristic answers ("is
+    duplicating this worth the resource?") has already been settled: the copy is going to
+    be needed. Waiting for it to look slow first spends the notice period — the one window
+    in which a backup can still finish somewhere else — proving something already known.
+    They sort first for the same reason, so a scarce backup slot goes to the task that will
+    certainly need it rather than to the one that is merely lagging.
+
+    `max_backups` still caps the total. It exists to stop speculation oversubscribing the
+    cluster, and a correlated preemption can doom many slots at once — exactly when adding
+    unbounded duplicate load is least affordable.
+
     Args:
         n: Total tasks at the barrier.
         finished: Finished task index → its completion time in seconds.
         elapsed: Still-running task index → its elapsed time in seconds.
         policy: When to speculate.
+        doomed: Still-running slots whose host is about to be reclaimed.
 
     Returns:
-        The indices to back up, slowest first.
+        The indices to back up, doomed first and then slowest first.
     """
-    if policy.max_backups <= 0 or not finished:
+    if policy.max_backups <= 0:
         return []
-    if len(finished) < max(1, math.ceil(policy.min_finished_frac * n)):
-        return []
+    urgent = [i for i in elapsed if i in doomed]
+    urgent.sort(key=lambda i: elapsed[i], reverse=True)
+    if len(urgent) >= policy.max_backups:
+        return urgent[: policy.max_backups]
+    # The relative test needs a median to compare against, so it only engages once enough
+    # tasks have finished. A doomed slot never needed that and is already collected above.
+    if not finished or len(finished) < max(1, math.ceil(policy.min_finished_frac * n)):
+        return urgent
     threshold = max(
         policy.straggler_factor * statistics.median(finished.values()),
         policy.min_elapsed_s,
     )
-    laggards = [i for i, e in elapsed.items() if e > threshold]
+    laggards = [i for i, e in elapsed.items() if e > threshold and i not in doomed]
     laggards.sort(key=lambda i: elapsed[i], reverse=True)  # slowest first
-    return laggards[: policy.max_backups]
+    return (urgent + laggards)[: policy.max_backups]
 
 
 def gather_with_backups(
@@ -124,6 +146,7 @@ def gather_with_backups(
     policy: SpeculationPolicy | None = None,
     poll_seconds: float = 0.5,
     on_failure: Callable[[int, Any, Exception], Any] | None = None,
+    doomed_slots: Callable[[], frozenset[int]] | None = None,
 ) -> list[Any]:
     """Gather `len(refs)` Ray results, launching backups for stragglers.
 
@@ -140,6 +163,12 @@ def gather_with_backups(
     right host (a dying *backup* never finalizes a slot whose original is still
     running). `None` (the default) re-raises on the first error — the pure-straggler
     behavior for tasks that do not fail.
+
+    `doomed_slots()`, when given, is polled each wake for slots whose host is being
+    reclaimed; those are backed up immediately rather than waiting to look slow (see
+    `stragglers_to_backup`). Polled rather than passed once because a drain notice arrives
+    *during* the barrier — that is the whole point of it — so a set captured at entry would
+    be empty in every case worth acting on.
     """
     import time
 
@@ -212,13 +241,18 @@ def gather_with_backups(
         if policy.max_backups > 0 and len(result_of) < n:
             elapsed = {i: now - started[i] for i in range(n) if i not in result_of}
             in_flight = len(backed_up) - sum(1 for i in backed_up if i in result_of)
-            for i in stragglers_to_backup(n, finished_times, elapsed, policy):
+            doomed = _poll_doomed(doomed_slots)
+            for i in stragglers_to_backup(n, finished_times, elapsed, policy, doomed):
                 if i not in backed_up and in_flight < policy.max_backups:
                     backed_up.add(i)
                     in_flight += 1
                     events.publish(
                         events.RECOVERY,
-                        event="straggler_backup",
+                        # Distinguished in the event stream because they mean different
+                        # things operationally: a straggler backup says a node is slow, a
+                        # doomed one says a node is leaving. Reading them as one number
+                        # makes a healthy autoscaling cluster look like a sick one.
+                        event="doomed_backup" if i in doomed else "straggler_backup",
                         slot=i,
                         elapsed_s=round(elapsed[i], 3),
                         finished=len(result_of),
@@ -239,6 +273,20 @@ def gather_with_backups(
             # soft cancel would leave wedged on a stuck straggler.
             ray.cancel(r, force=True)
     return [result_of[i] for i in range(n)]
+
+
+def _poll_doomed(doomed_slots: Callable[[], frozenset[int]] | None) -> frozenset[int]:
+    """The slots whose host is being reclaimed, or empty when unknown.
+
+    Never raises: speculation is an optimization over the recovery path, so a probe that
+    fails must leave the barrier behaving exactly as it did without one.
+    """
+    if doomed_slots is None:
+        return frozenset()
+    try:
+        return frozenset(doomed_slots() or ())
+    except Exception:
+        return frozenset()
 
 
 def _warn_barrier_stalled(waited_s: float, tasks: int) -> None:

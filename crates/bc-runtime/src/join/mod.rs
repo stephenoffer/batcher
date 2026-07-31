@@ -258,6 +258,17 @@ pub(crate) fn hash_join_indices_impl(
     // same key identity as every other operator, which is the invariant `keys.rs` exists to
     // hold. A key set with no float column is returned unchanged (`None`), so the integer
     // fast paths below are untouched.
+    // Decode dictionary keys *before* the float fold, in the order the two demand: a dictionary
+    // of floats must be decoded before its floats can be canonicalized. The two sides of a join
+    // are reached by different operator chains, so one can carry a dictionary while the other
+    // carries decoded values, and `RowConverter` — built from one side's type and fed both —
+    // then rejects the join outright. Same "one canonical form" argument as the fold below; see
+    // `keys::decode_dict_keys`. `None` when no key is a dictionary, so nothing is allocated.
+    let l_dec = crate::keys::decode_dict_keys(left_keys);
+    let r_dec = crate::keys::decode_dict_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_dec.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_dec.as_deref().unwrap_or(right_keys);
+
     let l_canon = crate::keys::canonicalize_float_keys(left_keys);
     let r_canon = crate::keys::canonicalize_float_keys(right_keys);
     let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
@@ -840,9 +851,54 @@ fn radix_eligible(join_type: JoinType) -> bool {
     )
 }
 
-/// Target build rows per radix partition — sized so a partition's hash table + chain
-/// stays cache-resident, which is the whole point (a probe into it then hits cache).
+/// Target build rows per radix partition when the key width is unknown — sized so a
+/// partition's hash table + chain stays cache-resident, which is the whole point (a probe
+/// into it then hits cache).
+///
+/// The historical fixed value, kept as the fallback and as the reference for
+/// [`radix_part_rows`]: 32,768 rows of an `i64` key is ~800 KiB of partition-local state,
+/// which is resident on a 1 MiB-L2 part and roughly 1.6x over on a 512 KiB one. That spread
+/// is exactly why the live path computes the figure instead of assuming it.
 const RADIX_PART_ROWS: usize = 1 << 15;
+
+/// Partition-local bytes one build row costs, for a key of `key_bytes`.
+///
+/// Everything a probe into a partition touches, and nothing it does not — this is the
+/// working set the L2 budget has to cover:
+///
+/// * the gathered `(key, abs_row)` pair, which is what the probe compares against;
+/// * one `u32` of `next_local`, the partition-local collision chain;
+/// * the `HashTable<u32>` slot: 4 bytes of index plus 1 control byte, held by hashbrown at a
+///   7/8 load factor, so ~5.7 bytes of table per row present.
+///
+/// The probe-side partition vector is deliberately excluded: it is streamed once in order,
+/// so it costs bandwidth rather than residency, and counting it would halve every partition
+/// for no cache benefit.
+fn radix_row_bytes(key_bytes: usize) -> usize {
+    // The gathered pair is `(O, u32)`, laid out with the alignment padding a real struct has.
+    let pair = key_bytes.next_multiple_of(4) + 4;
+    let chain = 4;
+    let table = 5 * 8 / 7 + 1; // 4-byte index + 1 control byte at a 7/8 load factor
+    pair + chain + table
+}
+
+/// Build rows per radix partition that keep the partition's state resident in **this host's**
+/// L2, for a key of `key_bytes`.
+///
+/// The fixed 32,768 this replaces was measured on one machine and is wrong on the next by the
+/// ratio of the two L2s, which spans 4x across the parts the engine runs on (512 KiB on a
+/// small ARM core, 1 MiB on Cascade Lake, 2 MiB on Zen 4). Too large and the per-partition
+/// probe misses cache, which is the entire cost the radix path exists to remove; too small and
+/// the fan-out grows for nothing, paying scatter and TLB pressure to over-partition.
+///
+/// Clamped to `[4096, RADIX_PART_ROWS]`: never so small that the per-partition table setup
+/// dominates, and never larger than the historical value, so on a big-cache host this can only
+/// keep the previous behavior rather than widen into an unmeasured regime.
+fn radix_part_rows(key_bytes: usize) -> usize {
+    bc_arrow::CpuTopology::detect()
+        .l2_resident_rows(radix_row_bytes(key_bytes))
+        .clamp(1 << 12, RADIX_PART_ROWS)
+}
 
 /// Cap on radix fan-out: enough partitions to make any realistic build cache-resident
 /// without the partition vectors themselves thrashing cache on the scatter.
@@ -921,7 +977,10 @@ fn radix_join_scalar<O: Copy + std::hash::Hash + Eq + Send + Sync>(
         }
     } else {
         // One table, reused per partition (each partition's build rows are disjoint).
-        let mut heads: HashTable<u32> = HashTable::with_capacity(RADIX_PART_ROWS);
+        // Sized to the largest partition the split can produce, so the reused table is
+        // allocated once here rather than growing (and rehashing) inside the partition loop.
+        let mut heads: HashTable<u32> =
+            HashTable::with_capacity(build_parts.iter().map(|b| b.len()).max().unwrap_or(0));
         for (b, probe) in build_parts.iter().zip(&probe_parts) {
             join_partition_into(
                 b,
@@ -987,10 +1046,16 @@ fn radix_join_scalar_parallel<O: Copy + std::hash::Hash + Eq + Send + Sync>(
     out
 }
 
-/// Number of cache-sized partitions for a build of `build_rows`, and the high-bit shift
-/// that maps a 64-bit hash to a partition.
-fn radix_parts(build_rows: usize) -> (usize, u32) {
-    let parts = (build_rows / RADIX_PART_ROWS)
+/// Number of cache-sized partitions for a build of `build_rows` keyed by `O`, and the
+/// high-bit shift that maps a 64-bit hash to a partition.
+///
+/// The target partition size comes from [`radix_part_rows`], which reads the host's real L2
+/// rather than assuming one — a wide key (a 16-byte composite) partitions more finely than an
+/// `i64` on the same machine, and the same key partitions more finely on a small-cache part
+/// than on a large one. Both are the point: the partition has to fit the cache it will be
+/// probed in.
+fn radix_parts<O>(build_rows: usize) -> (usize, u32) {
+    let parts = (build_rows / radix_part_rows(std::mem::size_of::<O>()))
         .next_power_of_two()
         .clamp(2, RADIX_MAX_PARTS);
     (parts, 64 - parts.trailing_zeros())
@@ -1010,7 +1075,7 @@ fn radix_partition<O: Copy + std::hash::Hash + Eq + Send + Sync>(
     build_null: &[bool],
     probe_null: &[bool],
 ) -> (ahash::RandomState, Vec<Vec<(O, u32)>>, Vec<Vec<(O, u32)>>) {
-    let (parts, shift) = radix_parts(build_rows);
+    let (parts, shift) = radix_parts::<O>(build_rows);
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     let part_of = |k: &O| (state.hash_one(k) >> shift) as usize;
     // Both scatters run histogram → prefix-sum → parallel write (`join::radix`), which
@@ -1210,6 +1275,17 @@ pub fn broadcast_hash_join_indices(
     // same key identity as every other operator, which is the invariant `keys.rs` exists to
     // hold. A key set with no float column is returned unchanged (`None`), so the integer
     // fast paths below are untouched.
+    // Decode dictionary keys *before* the float fold, in the order the two demand: a dictionary
+    // of floats must be decoded before its floats can be canonicalized. The two sides of a join
+    // are reached by different operator chains, so one can carry a dictionary while the other
+    // carries decoded values, and `RowConverter` — built from one side's type and fed both —
+    // then rejects the join outright. Same "one canonical form" argument as the fold below; see
+    // `keys::decode_dict_keys`. `None` when no key is a dictionary, so nothing is allocated.
+    let l_dec = crate::keys::decode_dict_keys(left_keys);
+    let r_dec = crate::keys::decode_dict_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_dec.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_dec.as_deref().unwrap_or(right_keys);
+
     let l_canon = crate::keys::canonicalize_float_keys(left_keys);
     let r_canon = crate::keys::canonicalize_float_keys(right_keys);
     let left_keys: &[ArrayRef] = l_canon.as_deref().unwrap_or(left_keys);
@@ -1328,6 +1404,56 @@ mod tests {
 
     fn keys(v: &[i64]) -> Vec<ArrayRef> {
         vec![Arc::new(Int64Array::from(v.to_vec())) as ArrayRef]
+    }
+
+    #[test]
+    fn radix_row_bytes_counts_only_what_the_probe_touches() {
+        // An `i64` key: the (i64, u32) pair costs 12 bytes of payload, the chain 4, the
+        // table ~6. A wider key must cost strictly more, or the sizing is ignoring it.
+        let i64_row = radix_row_bytes(8);
+        assert_eq!(i64_row, 12 + 4 + (5 * 8 / 7 + 1));
+        assert!(radix_row_bytes(16) > i64_row);
+        assert!(radix_row_bytes(4) < i64_row);
+        // Never zero: it is a divisor in the partition-size computation.
+        assert!(radix_row_bytes(0) > 0);
+    }
+
+    #[test]
+    fn radix_part_rows_stay_inside_the_hosts_l2() {
+        for key_bytes in [4usize, 8, 16, 32] {
+            let rows = radix_part_rows(key_bytes);
+            assert!(
+                (1 << 12..=RADIX_PART_ROWS).contains(&rows),
+                "{key_bytes}-byte key produced {rows} rows, outside the clamp"
+            );
+            // Unless the clamp bound it, the partition's state must fit the L2 budget the
+            // topology reports — that is the entire claim this sizing makes.
+            let budget = bc_arrow::CpuTopology::detect().l2_bytes / 2;
+            if rows > 1 << 12 {
+                assert!(
+                    rows * radix_row_bytes(key_bytes) <= budget,
+                    "{key_bytes}-byte key: {rows} rows exceeds the {budget}-byte L2 budget"
+                );
+            }
+        }
+        // A wider key never partitions more coarsely than a narrow one.
+        assert!(radix_part_rows(32) <= radix_part_rows(8));
+    }
+
+    #[test]
+    fn radix_parts_grow_with_the_build_and_stay_powers_of_two() {
+        let (small, small_shift) = radix_parts::<i64>(1_000);
+        let (big, big_shift) = radix_parts::<i64>(50_000_000);
+        assert!(small.is_power_of_two() && big.is_power_of_two());
+        assert_eq!(small, 2, "a tiny build needs the floor, not a fan-out");
+        assert!(big > small, "a large build must partition more finely");
+        assert!(big <= RADIX_MAX_PARTS);
+        // The shift must select exactly `log2(parts)` high bits of the hash.
+        assert_eq!(small_shift, 64 - small.trailing_zeros());
+        assert_eq!(64 - big_shift, big.trailing_zeros());
+        // A wider key partitions at least as finely for the same row count.
+        let (wide, _) = radix_parts::<[u8; 32]>(50_000_000);
+        assert!(wide >= big);
     }
 
     /// Build a table over `build` and probe it with `probe` in `chunk`-row ranges — the way a

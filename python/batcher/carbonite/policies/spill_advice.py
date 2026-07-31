@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher._internal.logging import note_suppressed
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.carbonite.policies.spill_shape import (
     SPILL_BYTES_PER_PARTITION,
@@ -143,6 +144,41 @@ class SpillAdvisor:
         """
         return input_bytes > 0 and input_bytes > self.hard_budget()
 
+    def resident_total_exceeds_budget(self, input_bytes: int, plan: PhysicalPlan) -> bool:
+        """Whether the resident input **plus** the plan's peak operator state overflows the
+        envelope.
+
+        `input_exceeds_budget` and `should_spill` are two halves of one total, and each was
+        compared against the whole budget on its own. Nothing summed them — yet on the
+        in-memory path they are *concurrent*, not alternatives: the sources are resolved to
+        Arrow batches before the engine starts and stay resident for the whole execution,
+        while the breaker builds its state on top of them. A query whose input is 70% of the
+        envelope and whose breaker is 70% of it passes both checks and needs 140%.
+
+        Measured on a 24 M-row group-by under a 537 MB envelope: input 384 MB, live partial
+        state 384 MB, neither over the budget alone, both over it together — and the query
+        stayed on the in-memory path and peaked at 2.4 GB.
+
+        Summing is the right reading of the in-memory path specifically, and the double-count
+        worry does not apply: `peak_bytes` is an operator's *working set*, so a sort's peak is
+        its output and an aggregate's is its partials, in both cases memory that lives
+        alongside the input rather than replacing it.
+
+        A `0` input stays "no evidence" rather than "fits", as it is for
+        `input_exceeds_budget`: an unsizable source must not be read as a small one. The other
+        signals (`should_spill`, live pressure) still apply in that case.
+
+        Args:
+            input_bytes: Metadata-only estimate of the resident input, or `0` for unknown.
+            plan: The physical plan about to run.
+
+        Returns:
+            True when the two together do not fit, so the query should go out of core.
+        """
+        if input_bytes <= 0:
+            return False
+        return input_bytes + max(0, self.peak_bytes(plan)) > self.hard_budget()
+
     def partitions(self, plan: PhysicalPlan) -> int | None:
         """Out-of-core buckets to shard `plan`'s spilled state into, or ``None``.
 
@@ -196,13 +232,39 @@ class SpillAdvisor:
         `SPILL_COMPRESS_ABOVE` of measured peak, trading CPU for fewer bytes pays; below it
         the CPU is not worth it. Compression is lossless, so this is a pure throughput lever.
 
+        The size rule is only half of it: whether the trade pays is also a question about the
+        *device*. On local flash the codec is the bottleneck; on a network volume at a tenth
+        of that bandwidth every byte not written is time not spent, and a state well under the
+        size threshold is still worth compressing. The device's measured class supplies that
+        half.
+
         Args:
             plan: The physical plan about to be spilled.
 
         Returns:
             The decision, or `None` for an un-sized plan (keep the configured default).
         """
-        return should_compress(self.peak_bytes(plan))
+        return should_compress(self.peak_bytes(plan), self._spill_device_factor())
+
+    def _spill_device_factor(self) -> float:
+        """What a byte costs on the device this query will spill to, against local flash.
+
+        Resolved the same three ways the spill paths resolve their directory — configured
+        root, measured local scratch, system tempdir — so the policy and the write agree about
+        which disk is being reasoned about. `1.0` on anything unidentified, which is the
+        size-only behaviour this had before.
+        """
+        import tempfile
+
+        from batcher._internal.hardware.storage import device_cost_factor
+        from batcher._internal.site import local_scratch_root
+
+        try:
+            target = self._config.memory.spill_dir or local_scratch_root() or tempfile.gettempdir()
+            return device_cost_factor(target)
+        except Exception as exc:  # pragma: no cover - a probe must never break spilling
+            note_suppressed("carbonite", "read the spill device class", exc)
+            return 1.0
 
     def soft_budget(self) -> int:
         """Bytes a query aims to stay under (the admission/throttle threshold)."""

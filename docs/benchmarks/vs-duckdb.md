@@ -2,7 +2,7 @@
 
 This page compares Batcher against DuckDB on single-node analytics: the operator shapes Batcher takes, the query shapes DuckDB takes, and why.
 
-DuckDB is the single-node analytical engine to beat. On identical Arrow input Batcher wins every TPC-H query and takes most of the operator mix; on DuckDB's own compressed store, join-heavy SQL is where DuckDB still leads.
+DuckDB is the single-node analytical engine to beat. On identical Arrow input Batcher wins 22 of 22 TPC-H queries at sf1 and 21 of 22 at sf10, and takes most of the operator mix; on DuckDB's own compressed store, join-heavy SQL is where DuckDB still leads.
 
 :::{important}
 Every number below was produced by a run that had to pass the correctness gate first: the
@@ -131,7 +131,7 @@ python benchmarks/run.py --benchmark tpch      --tier single --scale 1
 - {doc}`tpch` for the per-query breakdown.
 - {doc}`analytics` for operators, connectors, and the lazy control plane.
 - {doc}`vs-polars` and {doc}`vs-daft` for the other two single-node engines.
-- {doc}`../deep-dives/aggregation-internals` for the quickselect finalize behind the median and quantile wins.
-- {doc}`../deep-dives/join-algorithms` for the operator the TPC-H gap lives in.
-- {doc}`../deep-dives/adaptive-reoptimization` for what a static optimizer can't do.
+- {doc}`/deep-dives/operators/aggregation-internals` for the quickselect finalize behind the median and quantile wins.
+- {doc}`/deep-dives/operators/join-algorithms` for the operator the TPC-H gap lives in.
+- {doc}`/deep-dives/adaptive/adaptive-reoptimization` for what a static optimizer can't do.
 - {doc}`methodology` for hardware, gating, and why cross-hardware comparison is meaningless.

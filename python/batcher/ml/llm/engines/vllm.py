@@ -397,22 +397,22 @@ def _chat_messages(prompt: object, system: str | None) -> list[dict[str, str]]:
 def _construct(LLM: object, model: str, enable_lora: bool, kwargs: dict) -> object:
     """Build the vLLM engine, retrying once without a sized window if that window is refused.
 
-    A `max_model_len` above what the model's config allows is a hard error in vLLM, and the
-    model's true maximum is not known until the engine exists. Rather than guess it from a
-    side channel, an auto-sized window that the model rejects falls back to the model's own
-    default — the pre-sizing behavior — so auto-sizing can cost throughput but never a run.
+    A `max_model_len` above the model's config is a hard error in vLLM, and the model's true
+    maximum is unknown until the engine exists, so a rejected auto-sized window falls back to
+    the default: auto-sizing can cost throughput but never a run. The original error is quoted
+    rather than described, since the retry cannot tell a refused window from a missing model.
     """
     try:
         return LLM(model=model, enable_lora=enable_lora, **kwargs)  # type: ignore[operator]
-    except Exception:
+    except Exception as first:
         if "max_model_len" not in kwargs:
             raise
         import warnings
 
         warnings.warn(
             f"vllm_engine(max_model_len='auto') proposed a {kwargs['max_model_len']}-token "
-            f"window that this model refused; falling back to its default window. Pass an "
-            f"explicit max_model_len to size the KV cache yourself.",
+            f"window and the engine failed to start ({type(first).__name__}: {first}); "
+            f"retrying with its default. If that fails too, pass an explicit max_model_len.",
             UserWarning,
             stacklevel=2,
         )

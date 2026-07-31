@@ -428,11 +428,14 @@ class JSONSink(FileSink):
     def _write_parallel(self, table: pa.Table, fh: IO[Any], workers: int) -> None:
         import contextlib
         import shutil
-        import tempfile
 
         global _JSON_COUNTER
         _JSON_COUNTER += 1
-        root = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+        from batcher._internal.site.container import shm_root
+
+        # Sized against the table, because a `/dev/shm` large enough in general is not large
+        # enough for this write, and the failure lands mid-encode as ENOSPC.
+        root = shm_root(table.nbytes)
         rows = -(-n // workers) if (n := table.num_rows) else 1
         tasks = []
         for i, off in enumerate(range(0, table.num_rows, rows)):

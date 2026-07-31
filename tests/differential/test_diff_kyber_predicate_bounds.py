@@ -157,3 +157,54 @@ def test_bound_union_matches_duckdb_on_empty_input(duck, empty, expr, sql):
 def test_bound_union_inside_a_filter_matches_duckdb(duck, t, expr, sql):
     out = bt.from_arrow(t).filter(expr()).select(x=col("x")).collect()
     assert_same(out, duck.sql(f"SELECT x FROM t WHERE {sql}"))
+
+
+# --- collapse_degenerate_range_to_equality -----------------------------------
+#
+# `x >= c AND x <= c` becomes `x = c`, so the rows kept must be identical. Written here as the
+# range and evaluated by DuckDB as written. The NULL row is what makes this worth checking
+# against an oracle rather than by inspection: the range answers `NULL AND NULL` and the
+# equality answers `NULL`, and a filter drops both — but only an oracle proves the two
+# spellings really do agree on the boundary row and the null one at once.
+
+
+@pytest.mark.parametrize(
+    ("pred", "sql"),
+    [
+        (lambda: (col("x") >= lit(3)) & (col("x") <= lit(3)), "x >= 3 AND x <= 3"),
+        (lambda: (col("x") <= lit(3)) & (col("x") >= lit(3)), "x <= 3 AND x >= 3"),
+        # A value not present in the column: the collapse must keep zero rows, not all of them.
+        (lambda: (col("x") >= lit(6)) & (col("x") <= lit(6)), "x >= 6 AND x <= 6"),
+        # The extremes of the fixture.
+        (lambda: (col("x") >= lit(0)) & (col("x") <= lit(0)), "x >= 0 AND x <= 0"),
+        (lambda: (col("x") >= lit(10)) & (col("x") <= lit(10)), "x >= 10 AND x <= 10"),
+        # A date column, where the equality is against a date literal rather than an int.
+        (
+            lambda: (col("d") >= lit(dt.date(2020, 5, 1))) & (col("d") <= lit(dt.date(2020, 5, 1))),
+            "d >= DATE '2020-05-01' AND d <= DATE '2020-05-01'",
+        ),
+        # Alongside another conjunct, so the collapse happens inside a larger predicate.
+        (
+            lambda: (col("x") >= lit(3)) & (col("x") <= lit(3)) & (col("y") == lit(5)),
+            "x >= 3 AND x <= 3 AND y = 5",
+        ),
+        # Inside a disjunction, where the collapsed equality is not the controlling term.
+        (
+            lambda: ((col("x") >= lit(3)) & (col("x") <= lit(3))) | (col("x") > lit(9)),
+            "(x >= 3 AND x <= 3) OR x > 9",
+        ),
+        # Under a NOT, where turning the range into an equality must not change the negation.
+        (lambda: ~((col("x") >= lit(3)) & (col("x") <= lit(3))), "NOT (x >= 3 AND x <= 3)"),
+    ],
+)
+def test_degenerate_range_collapse_matches_duckdb(duck, t, pred, sql):
+    out = bt.from_arrow(t).filter(pred()).collect()
+    assert_same(out, duck.sql(f"SELECT * FROM t WHERE {sql}"))
+
+
+def test_degenerate_range_collapse_in_a_projection_matches_duckdb(duck, t):
+    # In a projection the three-valued result itself is observable, not just which rows pass —
+    # so this is where a NULL turning into FALSE would show up.
+    expr = (col("x") >= lit(3)) & (col("x") <= lit(3))
+    out = bt.from_arrow(t).select(x=col("x"), r=expr).collect()
+    assert_same(out, duck.sql("SELECT x, x >= 3 AND x <= 3 AS r FROM t"))

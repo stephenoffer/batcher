@@ -1,9 +1,8 @@
 # Quickstart
 
-This page walks a complete pipeline from start to finish, building a dataset and
-transforming, aggregating, joining, and reading it back. The data is small and
-in-memory so the examples run anywhere, and the API is the same one you'd point at a
-terabyte of Parquet.
+This page builds a complete pipeline, from an in-memory dataset through to a file on
+disk. The data is small so every example runs anywhere. The API is the one you would
+point at a terabyte of Parquet.
 
 ## Import and build a dataset
 
@@ -42,7 +41,7 @@ print(filtered.to_pydict())
 # {'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'category': ['a', 'b', 'a'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
 ```
 
-Null handling, `is_in`, and sampling are in {doc}`../user-guide/filtering`.
+Null handling, `is_in`, and sampling are in {doc}`/user-guide/transform/filtering`.
 
 ## Select and transform columns
 
@@ -60,8 +59,8 @@ print(enriched.columns)
 ```
 
 Column work is expressed rather than looped, and the expression language has typed
-accessors for strings, dates, lists, and structs. See {doc}`../user-guide/transformations`
-and {doc}`../user-guide/expressions`.
+accessors for strings, dates, lists, and structs. See {doc}`/user-guide/transform/transformations`
+and {doc}`/user-guide/transform/expressions`.
 
 ## Aggregate
 
@@ -79,8 +78,8 @@ print(summary.to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'orders': [3, 2]}
 ```
 
-{doc}`../user-guide/aggregations` covers the full aggregate list, pivots, and rollups, and
-{doc}`../user-guide/window-functions` covers ranking and running totals, which aggregate
+{doc}`/user-guide/analyze/aggregations` covers the full aggregate list, pivots, and rollups, and
+{doc}`/user-guide/analyze/window-functions` covers ranking and running totals, which aggregate
 without collapsing rows.
 
 ## Join
@@ -94,7 +93,7 @@ print(joined.to_pydict())
 # {'id': [1, 2, 3, 4, 5], 'category': ['a', 'b', 'a', 'b', 'a'], 'region': ['west', 'east', 'west', 'east', 'west']}
 ```
 
-Left, outer, semi, anti, and as-of joins take the same shape. See {doc}`../user-guide/joins`.
+Left, outer, semi, anti, and as-of joins take the same shape. See {doc}`/user-guide/analyze/joins`.
 
 ## Write SQL instead, if you prefer
 
@@ -109,7 +108,7 @@ print(revenue.sort("category").to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
 ```
 
-{doc}`../user-guide/sql` lists the supported surface, and {doc}`../tutorials/sql-to-dataframe`
+{doc}`/user-guide/analyze/sql` lists the supported surface, and {doc}`../tutorials/sql-to-dataframe`
 translates a SQL query into DataFrame verbs step by step.
 
 ## Execute and inspect
@@ -134,10 +133,10 @@ filter reached the scan instead of running after it:
 print(ds.filter(bt.col("price") > 25.0).explain())
 ```
 
-Reading a plan is a skill worth ten minutes: {doc}`../user-guide/explain-plans`.
+Reading a plan is a skill worth ten minutes: {doc}`/user-guide/operate/explain-plans`.
 
 Some questions never need a scan at all. A `count()` on a Parquet source is answered from
-file metadata, and {doc}`../user-guide/metadata-shortcuts` lists the rest.
+file metadata, and {doc}`/user-guide/analyze/metadata-shortcuts` lists the rest.
 
 ## Read and write files
 
@@ -159,9 +158,9 @@ print(back.count())
 # 5
 ```
 
-Every format, glob, and credential path is in {doc}`../user-guide/reading-data` and
-{doc}`../user-guide/writing-data`, and object stores are in
-{doc}`../user-guide/cloud-storage`.
+Every format, glob, and credential path is in {doc}`/user-guide/moving-data/reading-data` and
+{doc}`/user-guide/moving-data/writing-data`, and object stores are in
+{doc}`/user-guide/moving-data/cloud-storage`.
 
 ## What you have now
 
@@ -172,34 +171,9 @@ source and the machine, not the code.
 
 ## See also
 
-::::{grid} 1 3 3 3
-:gutter: 3
-
-:::{grid-item-card} {octicon}`light-bulb;1.1em` Core concepts
-:link: concepts/index
-:link-type: doc
-The lazy, immutable execution model.
-:::
-
-:::{grid-item-card} {octicon}`code;1.1em` User guide
-:link: ../user-guide/index
-:link-type: doc
-Every operator, with runnable examples.
-:::
-
-:::{grid-item-card} {octicon}`book;1.1em` Tutorials & examples
-:link: ../examples/index
-:link-type: doc
-End-to-end walkthroughs you can run.
-:::
-::::
-
-## See also
-
 - {doc}`../tutorials/first-pipeline`: the same shape again, on a realistic dataset.
-- {doc}`concepts/index`: lazy evaluation, expressions, scaling, and the adaptive loop, one
-  short page each.
-- {doc}`../migration/index`: the verb-by-verb table if you already know pandas, Polars,
-  Spark, or SQL.
-- {doc}`../api/reference`: a one-page cheat sheet to keep open while you work.
-- {doc}`../user-guide/troubleshooting`: what to read when the first query misbehaves.
+- {doc}`concepts/index`: lazy evaluation, expressions, scaling, and the adaptive loop, one short page each.
+- {doc}`../user-guide/index`: every operator, with runnable examples.
+- {doc}`../migration/index`: the verb-by-verb table if you already know pandas, Polars, Spark, or SQL.
+- {doc}`../api/reference`: a cheat sheet to keep open while you work.
+- {doc}`/user-guide/operate/troubleshooting`: what to read when the first query misbehaves.

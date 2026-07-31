@@ -74,6 +74,49 @@ use arrow::row::{RowConverter, SortField};
 /// data shape, not a law — re-run the equivalence test before moving it.
 pub const MIN_KEYS_FOR_ROW_ENCODING: usize = 3;
 
+/// The leading eight bytes of an encoded row, as a big-endian `u64`, zero-padded if shorter.
+///
+/// Arrow's row format is byte-lexicographic by construction, so ordering this integer orders
+/// the rows for every pair whose prefixes differ. Padding a short row with zeros is correct
+/// for the same reason it is when comparing the bytes themselves: no byte is less than zero,
+/// and a row that runs out is a prefix of one that does not. Equal prefixes prove nothing and
+/// must fall through to a full row comparison.
+///
+/// Carrying this *inline* beside a row index is what turns a comparison from a random read of
+/// a multi-megabyte encoded buffer into a register compare. Shared with `bc-runtime`'s window
+/// partitioner, which found the technique first: sorting bare indices there made the cache
+/// misses "the whole window cost".
+pub fn row_prefix(encoded: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = encoded.len().min(8);
+    buf[..n].copy_from_slice(&encoded[..n]);
+    u64::from_be_bytes(buf)
+}
+
+/// Rows sampled to decide whether the packed prefix will discriminate.
+const PREFIX_SAMPLE_ROWS: usize = 512;
+
+/// One distinct prefix per this many sampled rows is the floor for packing one.
+///
+/// When the leading key is near-constant — `ORDER BY country, city` over one country, or a
+/// URL column whose values all begin `https://` — every prefix ties, the full row comparison
+/// happens anyway, and the packing is pure overhead.
+///
+/// Measured here on 3 M rows over three keys (best of three, each repeated three times):
+///
+/// | distinct leading values | plain | packed  | ratio |
+/// |------------------------:|------:|--------:|------:|
+/// | 3,000,000               | 2301 ms | 1148 ms | 2.00x |
+/// | 1,000                   | 2313 ms | 2314 ms | 1.00x |
+/// | 4                       | 2399 ms | 2385 ms | declined by the gate |
+///
+/// The middle row is the honest limit of a sampled gate: 1,000 distinct values over 3 M rows
+/// samples as *mostly* distinct, so the gate lets the packing through — but the sort's later
+/// comparisons are all *within* a leading-key block, where the prefix ties anyway. It costs
+/// nothing (the packing pass is linear against an `n log n` sort), so the gate is set to
+/// exclude only the case that actually loses, not every case that fails to win.
+const PREFIX_MIN_DISTINCT_RATIO: usize = 32;
+
 /// The permutation that sorts `columns` lexicographically under `options`, with rows tied on
 /// every column left in input order.
 ///
@@ -103,17 +146,57 @@ pub fn stable_lexsort_indices(
     let converter = RowConverter::new(fields).ok()?;
     let rows = converter.convert_columns(columns).ok()?;
 
-    let mut permutation: Vec<u32> = (0..rows_len as u32).collect();
-    // The `.then(a.cmp(&b))` is the whole stability argument: it makes the comparator a total
-    // order over distinct indices, so an unstable sort cannot place tied rows arbitrarily —
-    // it must place them in ascending original position. See the module docs for why this is
-    // identical to encoding the index as a trailing key column.
-    permutation.sort_unstable_by(|&a, &b| {
-        rows.row(a as usize)
-            .cmp(&rows.row(b as usize))
+    // The `.then(a.cmp(&b))` in both branches below is the whole stability argument: it makes
+    // the comparator a total order over distinct indices, so an unstable sort cannot place
+    // tied rows arbitrarily — it must place them in ascending original position. See the
+    // module docs for why this is identical to encoding the index as a trailing key column.
+    if !prefix_discriminates(&rows, rows_len) {
+        let mut permutation: Vec<u32> = (0..rows_len as u32).collect();
+        permutation.sort_unstable_by(|&a, &b| {
+            rows.row(a as usize)
+                .cmp(&rows.row(b as usize))
+                .then(a.cmp(&b))
+        });
+        return Some(UInt32Array::from(permutation));
+    }
+
+    // Sort `(prefix, row)` pairs. Comparing bare indices reads `rows.row(a)` and `rows.row(b)`
+    // at random positions in the encoded buffer on *every* comparison — `n log n` cache misses
+    // over a buffer that leaves cache on any sort large enough to reach this path. The inline
+    // prefix answers most of them in-register; the full row comparison stays as the tie-break,
+    // so the total order is unchanged and the permutation is identical either way.
+    let mut keyed: Vec<(u64, u32)> = (0..rows_len)
+        .map(|i| (row_prefix(rows.row(i).data()), i as u32))
+        .collect();
+    keyed.sort_unstable_by(|&(pa, a), &(pb, b)| {
+        pa.cmp(&pb)
+            .then_with(|| rows.row(a as usize).cmp(&rows.row(b as usize)))
             .then(a.cmp(&b))
     });
-    Some(UInt32Array::from(permutation))
+    Some(UInt32Array::from(
+        keyed.into_iter().map(|(_, i)| i).collect::<Vec<u32>>(),
+    ))
+}
+
+/// Whether the leading eight encoded bytes separate enough rows for a packed prefix to pay.
+///
+/// Sampled with a stride rather than from the head: the first 512 rows of a partitioned or
+/// already-clustered scan are not a sample of the relation, and this decision is exactly
+/// about how varied the leading key is.
+fn prefix_discriminates(rows: &arrow::row::Rows, rows_len: usize) -> bool {
+    if rows_len < PREFIX_SAMPLE_ROWS {
+        // Too small for the difference to matter either way; the packed path is no worse.
+        return true;
+    }
+    let step = (rows_len / PREFIX_SAMPLE_ROWS).max(1);
+    let mut sampled: Vec<u64> = (0..rows_len)
+        .step_by(step)
+        .take(PREFIX_SAMPLE_ROWS)
+        .map(|i| row_prefix(rows.row(i).data()))
+        .collect();
+    sampled.sort_unstable();
+    sampled.dedup();
+    sampled.len() * PREFIX_MIN_DISTINCT_RATIO >= PREFIX_SAMPLE_ROWS
 }
 
 #[cfg(test)]

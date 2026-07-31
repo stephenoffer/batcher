@@ -862,6 +862,121 @@ mod tests {
     /// keys must land in one group each — the shuffle must route them exactly as single-node
     /// grouping does. A split here returns more groups distributed than single-node.
     #[test]
+    fn dictionary_group_keys_route_identically() {
+        // The distributed hazard a dictionary creates is specific: bucket assignment reads a
+        // hash of the key column, and a dictionary's *codes* are assigned per batch. Two
+        // morsels that both contain "a" can encode it as code 0 and code 1, so anything that
+        // hashes the physical key rather than the logical value sends one "a" to one reducer
+        // and the other "a" to another -- and the query returns two groups where the oracle
+        // returns one. That is invariant #7's failure mode, and it is invisible single-node:
+        // it needs `partition_batches` and more than one reducer to appear at all.
+        //
+        // The two morsels below are built with *deliberately disagreeing* code assignments,
+        // which is what makes this adversarial rather than incidental. Nulls are included
+        // because a null key routes by `NULL_HASH` and has its own encoding in a dictionary.
+        //
+        // It passes today, and the reason is worth stating rather than assuming: the hazard
+        // cannot currently arise, because `partial_aggregate` evaluates its group keys through
+        // `Expr::eval`, which decodes a dictionary at the `Col` leaf — so the key column
+        // `partition_batches` hashes is already `Utf8` and the codes never reach the hash. The
+        // shuffle is therefore safe *by construction* rather than by handling dictionaries.
+        //
+        // That construction is what `rfc-streaming-executor.md` Proposal 3 changes, and this
+        // test is the tripwire for it: preserve the encoding far enough that a dictionary
+        // reaches the hash and the group count goes wrong here, at more than one reducer, in
+        // the one place that is invisible single-node.
+        let dict_of = |vals: Vec<Option<&str>>, order: Vec<Option<&str>>| -> ArrayRef {
+            let keys: Vec<Option<i32>> = vals
+                .iter()
+                .map(|v| v.map(|s| order.iter().position(|d| *d == Some(s)).unwrap() as i32))
+                .collect();
+            Arc::new(
+                arrow::array::DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+                    arrow::array::Int32Array::from(keys),
+                    Arc::new(arrow::array::StringArray::from(order)) as ArrayRef,
+                )
+                .unwrap(),
+            )
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "k",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let morsels: Vec<RecordBatch> = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    // "a" is code 0 here.
+                    dict_of(
+                        vec![Some("a"), Some("b"), None, Some("a")],
+                        vec![Some("a"), Some("b")],
+                    ),
+                    Arc::new(Int64Array::from(vec![
+                        Some(1i64),
+                        Some(2),
+                        Some(3),
+                        Some(4),
+                    ])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    // ... and code 1 here, for the same value.
+                    dict_of(
+                        vec![Some("a"), Some("b"), None, Some("b")],
+                        vec![Some("b"), Some("a")],
+                    ),
+                    Arc::new(Int64Array::from(vec![
+                        Some(5i64),
+                        Some(6),
+                        Some(7),
+                        Some(8),
+                    ])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        ];
+
+        let g = gk("k");
+        let aggs = vec![
+            agg(AggFunc::Sum, Some("v"), None, None, "s"),
+            agg(AggFunc::CountStar, None, None, None, "c"),
+        ];
+        let want = result_map(&[single_node(&g, &aggs, &morsels)]);
+        // {a, b, NULL} -- three groups, whichever codes happened to be assigned.
+        assert_eq!(
+            want.len(),
+            3,
+            "single-node group count over dictionary keys"
+        );
+
+        for n in [1usize, 2, 3, 7, 64] {
+            let maps = vec![morsels[..1].to_vec(), morsels[1..].to_vec()];
+            let got = result_map(&distributed(&g, &aggs, &maps, n));
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "reducers={n}: distributed split a dictionary-keyed group the single-node \
+                 oracle merged — the two morsels encode the same value under different codes"
+            );
+            for (k, wv) in &want {
+                for (wc, gc) in wv.iter().zip(&got[k]) {
+                    assert!(
+                        values_match(wc, gc),
+                        "reducers={n} key {k}: {gc:?} != {wc:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn edge_float_group_keys_route_identically() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Float64, true),

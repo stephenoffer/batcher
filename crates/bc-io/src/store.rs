@@ -93,6 +93,11 @@ fn cached_store(
 fn store_options(url: &Url) -> Vec<(String, String)> {
     let mut opts: Vec<(String, String)> = Vec::new();
     let scheme = url.scheme();
+    // Set from `AWS_ALLOW_HTTP` by *value*, not by presence: `AWS_ALLOW_HTTP=false` had been
+    // switching plain HTTP on, which is the opposite of what the operator wrote and the kind
+    // of setting nobody re-reads once it is set. Applied after the borrow of `opts` the
+    // environment reader holds.
+    let mut allow_http = false;
 
     // Environment defaults (object_store's `parse_url_opts` does not read env itself).
     //
@@ -121,10 +126,33 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
             env_opt("aws_access_key_id", &["AWS_ACCESS_KEY_ID"]);
             env_opt("aws_secret_access_key", &["AWS_SECRET_ACCESS_KEY"]);
             env_opt("aws_session_token", &["AWS_SESSION_TOKEN"]);
-            // Allow virtual-hosted-style off for path-style endpoints (MinIO/Ceph).
-            if std::env::var("AWS_ALLOW_HTTP").is_ok() {
-                opts.push(("aws_allow_http".into(), "true".into()));
-            }
+            // Plain HTTP for an on-prem endpoint. Read by *value*, not by presence:
+            // `AWS_ALLOW_HTTP=false` had been switching it on, which is the opposite of what
+            // the operator wrote and the kind of setting nobody re-reads once it is set.
+            // Path-style addressing, which most on-prem and GPU-cloud S3 endpoints require.
+            env_opt(
+                "aws_virtual_hosted_style_request",
+                &["AWS_VIRTUAL_HOSTED_STYLE_REQUEST"],
+            );
+            allow_http = std::env::var("AWS_ALLOW_HTTP")
+                .map(|v| is_truthy(&v))
+                .unwrap_or_else(|_| {
+                    // An `http://` endpoint from the environment implies plain HTTP, the same
+                    // way one written into the query string already does. Without this the
+                    // asymmetry bites exactly the deployment the endpoint variable exists for:
+                    // a MinIO or Ceph gateway on an internal network, reached over HTTP
+                    // because there is no certificate for `minio.internal`. `object_store`
+                    // refuses the connection, the reader is unusable, and the scan degrades
+                    // to the slower PyArrow path with correct results and no diagnostic.
+                    //
+                    // Only when the operator has not said otherwise: an explicit
+                    // `AWS_ALLOW_HTTP=false` against an `http://` endpoint is a contradiction,
+                    // and the explicit half wins.
+                    std::env::var("AWS_ENDPOINT_URL")
+                        .or_else(|_| std::env::var("AWS_ENDPOINT"))
+                        .map(|e| e.trim_start().to_ascii_lowercase().starts_with("http://"))
+                        .unwrap_or(false)
+                });
         }
         "gs" | "gcs" => {
             env_opt(
@@ -150,10 +178,34 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
         _ => {}
     }
 
-    // Query-string overrides win over env. Map the friendly names the Python façade
-    // accepts (`endpoint_override`, `region`, `anonymous`) onto object_store keys.
+    if allow_http {
+        opts.push(("aws_allow_http".into(), "true".into()));
+    }
+
+    // Query-string overrides win over env, and every friendly name the Python façade accepts
+    // is translated here.
+    //
+    // **A name this does not translate is silently dropped**, because `object_store`'s
+    // builders ignore config keys they do not recognize. That is the divergence worth naming:
+    // the same URI then authenticates through PyArrow and not through this reader, or reaches
+    // one endpoint through one and another through the other — and since an unusable native
+    // reader falls back to PyArrow, the symptom is a scan that is quietly slower rather than
+    // one that fails. Credentials (`access_key`), addressing style
+    // (`force_virtual_addressing`) and the timeouts were all being dropped that way.
+    // Only an S3-family URL gets the `aws_*` translations. The env reader above is already
+    // per-scheme and its test says why: an `aws_*` key on a GCS store is not merely useless,
+    // it makes the cache key differ for no reason, so two identical stores are built and
+    // credential resolution runs twice. The query path had been translating regardless.
+    let s3_family = matches!(scheme, "s3" | "s3a");
     for (k, v) in url.query_pairs() {
         let (k, v) = (k.to_string(), v.to_string());
+        if !s3_family {
+            // A non-S3 scheme keeps whatever the caller wrote; `object_store` ignores a key
+            // it does not know, which is the same outcome as translating it wrongly minus the
+            // spurious cache entry.
+            opts.push((k, v));
+            continue;
+        }
         match k.as_str() {
             "region" => opts.push(("aws_region".into(), v)),
             "endpoint" | "endpoint_override" => {
@@ -162,10 +214,47 @@ fn store_options(url: &Url) -> Vec<(String, String)> {
             }
             "anonymous" | "skip_signature" => opts.push(("aws_skip_signature".into(), v)),
             "allow_http" => opts.push(("aws_allow_http".into(), v)),
+            // PyArrow's spelling of the credential triple.
+            "access_key" => opts.push(("aws_access_key_id".into(), v)),
+            "secret_key" => opts.push(("aws_secret_access_key".into(), v)),
+            "session_token" => opts.push(("aws_session_token".into(), v)),
+            // PyArrow inverts the sense: `force_virtual_addressing=false` means path style.
+            "force_virtual_addressing" => opts.push((
+                "aws_virtual_hosted_style_request".into(),
+                if is_truthy(&v) {
+                    "true".into()
+                } else {
+                    "false".into()
+                },
+            )),
+            // PyArrow takes whole seconds; `object_store` parses a humantime duration, so a
+            // bare number would be rejected and the option lost.
+            "connect_timeout" => opts.push(("connect_timeout".into(), as_duration(&v))),
+            "request_timeout" | "timeout" => opts.push(("timeout".into(), as_duration(&v))),
             other => opts.push((other.to_string(), v)),
         }
     }
     opts
+}
+
+/// Whether a configuration string means "on". Accepts the spellings an operator writes in a
+/// URI or an environment variable, so `1`, `true`, `yes` and `on` all agree.
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// A timeout as `object_store` parses it. A bare number is read as seconds — the unit PyArrow
+/// uses — and anything already carrying a unit suffix is passed through untouched.
+fn as_duration(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().all(|c| c.is_ascii_digit()) && !trimmed.is_empty() {
+        format!("{trimmed}s")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +267,25 @@ mod tests {
             .collect()
     }
 
+    /// Serializes the tests that write process-global environment variables.
+    ///
+    /// The environment is shared by every thread cargo runs a test on, so two of these
+    /// interleave: one sets `AWS_ENDPOINT_URL` and the other removes it in its cleanup, and
+    /// the first then reads an option that is not there. That is a *flake*, which is worse
+    /// than a failure — it passes on a rerun, so it teaches whoever hits it to rerun.
+    ///
+    /// A plain `Mutex` rather than a crate: this is the only place in the crate that needs
+    /// one. A poisoned lock is recovered from rather than propagated, since a panic in one
+    /// env test has already been reported and must not turn every later one into a second
+    /// failure pointing at the wrong test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Static credentials in the environment must reach the builder for every cloud, not
     /// just AWS. Without this the on-prem case (MinIO/Ceph with `AWS_ACCESS_KEY_ID`, where
     /// there is no metadata service to fall back on) fails to authenticate and the scan
@@ -187,6 +295,7 @@ mod tests {
     /// across functions would race under cargo's parallel test threads.
     #[test]
     fn env_credentials_reach_every_scheme() {
+        let _guard = env_guard();
         std::env::set_var("AWS_ACCESS_KEY_ID", "AK");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "SK");
         std::env::set_var("AWS_ENDPOINT_URL", "http://minio.internal:9000");
@@ -227,14 +336,120 @@ mod tests {
             Some("eu-west-1")
         );
 
+        // An `http://` endpoint from the environment implies plain HTTP, the same way one in
+        // the query string does. Without it `object_store` refuses the connection to an
+        // internal MinIO or Ceph gateway, the reader is unusable, and the scan degrades to
+        // PyArrow with correct results and nothing to say why.
+        assert_eq!(s3.get("aws_allow_http").map(String::as_str), Some("true"));
+
+        // An https endpoint implies nothing, because it does not need to.
+        std::env::set_var("AWS_ENDPOINT_URL", "https://object.example.net");
+        assert!(!opts_for("s3://bucket/key.parquet").contains_key("aws_allow_http"));
+
+        // And an operator who said no outranks the inference: an explicit `false` against an
+        // `http://` endpoint is a contradiction, and the explicit half wins.
+        std::env::set_var("AWS_ENDPOINT_URL", "http://minio.internal:9000");
+        std::env::set_var("AWS_ALLOW_HTTP", "false");
+        assert!(!opts_for("s3://bucket/key.parquet").contains_key("aws_allow_http"));
+        std::env::remove_var("AWS_ALLOW_HTTP");
+
         for v in [
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_ENDPOINT_URL",
+            "AWS_ALLOW_HTTP",
             "AZURE_STORAGE_ACCOUNT_KEY",
             "GOOGLE_SERVICE_ACCOUNT",
         ] {
             std::env::remove_var(v);
         }
+    }
+    /// Every friendly name the Python façade accepts must reach the builder here too.
+    ///
+    /// `object_store` ignores a config key it does not recognize, so a name this reader fails
+    /// to translate is *silently dropped* — and because an unusable native reader falls back
+    /// to PyArrow, the symptom is a scan that is quietly slower, or one that reaches a
+    /// different endpoint through each of the two readers. Credentials, addressing style and
+    /// the timeouts were all being dropped that way.
+    #[test]
+    fn the_python_facade_option_names_are_translated() {
+        let opts = opts_for(
+            "s3://bucket/key.parquet?access_key=AK&secret_key=SK&session_token=TOK\
+             &force_virtual_addressing=false&connect_timeout=5&request_timeout=90",
+        );
+        assert_eq!(
+            opts.get("aws_access_key_id").map(String::as_str),
+            Some("AK")
+        );
+        assert_eq!(
+            opts.get("aws_secret_access_key").map(String::as_str),
+            Some("SK")
+        );
+        assert_eq!(
+            opts.get("aws_session_token").map(String::as_str),
+            Some("TOK")
+        );
+        // PyArrow inverts the sense of this one: "not virtual hosted" is path style.
+        assert_eq!(
+            opts.get("aws_virtual_hosted_style_request")
+                .map(String::as_str),
+            Some("false")
+        );
+        // PyArrow takes whole seconds; object_store parses a humantime duration, so a bare
+        // number would be rejected and the option lost.
+        assert_eq!(opts.get("connect_timeout").map(String::as_str), Some("5s"));
+        assert_eq!(opts.get("timeout").map(String::as_str), Some("90s"));
+    }
+
+    /// An `aws_*` key on a GCS or Azure store is not merely useless: it changes the cache key,
+    /// so two identical stores are built and the credential chain resolves twice. The
+    /// environment reader was already per-scheme; the query-string path was not.
+    #[test]
+    fn the_aws_translations_do_not_leak_onto_other_schemes() {
+        let gs = opts_for("gs://bucket/key.parquet?region=eu-west-1&access_key=AK");
+        assert!(!gs.contains_key("aws_region"));
+        assert!(!gs.contains_key("aws_access_key_id"));
+        // The caller's own spelling survives, and object_store ignores what it does not know.
+        assert_eq!(gs.get("region").map(String::as_str), Some("eu-west-1"));
+
+        let s3 = opts_for("s3://bucket/key.parquet?region=eu-west-1");
+        assert_eq!(s3.get("aws_region").map(String::as_str), Some("eu-west-1"));
+    }
+
+    /// A duration that already carries a unit is passed through rather than re-suffixed.
+    #[test]
+    fn a_duration_with_a_unit_survives() {
+        let opts = opts_for("s3://bucket/key.parquet?request_timeout=500ms");
+        assert_eq!(opts.get("timeout").map(String::as_str), Some("500ms"));
+    }
+
+    /// Addressing style is a three-way answer: path, virtual-hosted, or unstated.
+    #[test]
+    fn addressing_style_is_only_set_when_asked_for() {
+        assert_eq!(
+            opts_for("s3://b/k?force_virtual_addressing=true")
+                .get("aws_virtual_hosted_style_request")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(!opts_for("s3://b/k").contains_key("aws_virtual_hosted_style_request"));
+    }
+
+    /// `AWS_ALLOW_HTTP=false` must not switch plain HTTP *on*. It had, because the variable
+    /// was read by presence — the opposite of what the operator wrote, in a setting nobody
+    /// re-reads once it is set.
+    #[test]
+    fn allow_http_is_read_by_value_not_by_presence() {
+        let _guard = env_guard();
+        std::env::set_var("AWS_ALLOW_HTTP", "false");
+        assert!(!opts_for("s3://bucket/key.parquet").contains_key("aws_allow_http"));
+        std::env::set_var("AWS_ALLOW_HTTP", "1");
+        assert_eq!(
+            opts_for("s3://bucket/key.parquet")
+                .get("aws_allow_http")
+                .map(String::as_str),
+            Some("true")
+        );
+        std::env::remove_var("AWS_ALLOW_HTTP");
     }
 }

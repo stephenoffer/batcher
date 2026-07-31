@@ -216,13 +216,14 @@ def test_distributed_sort_equals_single_node_sort(key, descending, nulls_first):
     both sides are the same engine and the comparison is ordered.
 
     The sort is on `(key, rid)`, not `key` alone, and that is the whole point rather than a
-    convenience. `docs/user-guide/sorting.md` states the contract outright: "Two rows with the
-    same key can come back in either order, and the order can change between a sequential run,
-    a multi-core run, and a distributed one", and names `-0.0` against `0.0` as a tie like any
-    other. Asserting row-for-row on a duplicated key therefore pins behaviour the engine
-    explicitly disclaims — and it did: `MULTIBATCH.f` holds both `-0.0` and `0.0`, and the two
-    paths interleave them differently while every pair compares equal. Every key here repeats,
-    so without `rid` all twelve parameterisations assert undefined behaviour. `rid` makes the
+    convenience. `docs/user-guide/transform/sorting.md` states the contract outright: "Two rows
+    with the same key can come back in either order, and the order can change between a
+    sequential run, a multi-core run, and a distributed one", and names `-0.0` against `0.0` as
+    a tie like any other. Asserting row-for-row on a duplicated key therefore pins behaviour the
+    engine explicitly disclaims — and it did: `MULTIBATCH.f` holds both `-0.0` and `0.0`, and
+    the two paths interleave them differently while every pair compares equal. Every key here
+    repeats, so without `rid` all twelve parameterisations assert undefined behaviour. `rid`
+    makes the
     order total, which is what turns this into a real statement about the *partitioner*: with
     ties broken, any surviving difference is a row in the wrong bucket or a bucket concatenated
     out of key order, which is exactly the class of bug this file exists to catch.

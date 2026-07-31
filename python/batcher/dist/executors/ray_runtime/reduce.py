@@ -153,8 +153,31 @@ def run_bucket_reduce(
         def _on_failure(_idx: int, ref: Any, _exc: Exception) -> tuple[str, int | None]:
             return ("__dead__", ref_host.get(ref))
 
+        def _doomed() -> frozenset[int]:
+            """Slots whose host is being reclaimed, so a backup is certainly needed.
+
+            A drain notice arrives *during* the barrier, which is precisely when it is
+            worth acting on: waiting for the doomed reducer to also look slow spends the
+            notice period, and then the loss costs a full recovery round instead of a
+            duplicate that was already running elsewhere. `draining_workers` short-circuits
+            to an empty set when the cluster reports nothing draining, so a healthy fleet
+            pays one GCS read per poll rather than a round trip per worker.
+            """
+            hosts = draining_workers(actors, workers)
+            if not hosts:
+                return frozenset()
+            return frozenset(
+                slot
+                for slot, ref in enumerate(refs)
+                if ref_host.get(ref) in hosts  # the host it is running on, not the bucket
+            )
+
         gathered = gather_with_backups(
-            refs, _relaunch, speculation_policy(), on_failure=_on_failure
+            refs,
+            _relaunch,
+            speculation_policy(),
+            on_failure=_on_failure,
+            doomed_slots=_doomed,
         )
         for bucket, (status, payload) in zip(pending, gathered, strict=True):
             if status == "ok":

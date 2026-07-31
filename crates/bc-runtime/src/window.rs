@@ -562,12 +562,19 @@ fn ordered_partitions_by_global_sort(
     // leaves behind — see the matching note in `try_ordered_partitions_packed`.
     let mut out: Vec<Vec<usize>> = Vec::new();
     let mut start = 0usize;
+    // The run's first row is compared against on every step of the run but only changes when
+    // the run ends, so hold it. `sorted` is a permutation, so re-reading it was a random
+    // access into the encoded partition-key buffer once per row — on a single-partition
+    // window, the entire scan reading one row over and over.
+    let mut start_row = (!sorted.is_empty()).then(|| prows.row(sorted[0] as usize));
     for pos in 1..=sorted.len() {
-        let boundary = pos == sorted.len()
-            || prows.row(sorted[pos] as usize) != prows.row(sorted[start] as usize);
+        let boundary = pos == sorted.len() || start_row != Some(prows.row(sorted[pos] as usize));
         if boundary {
             out.push(sorted[start..pos].iter().map(|&r| r as usize).collect());
             start = pos;
+            if pos < sorted.len() {
+                start_row = Some(prows.row(sorted[pos] as usize));
+            }
         }
     }
     Ok(out)
@@ -683,18 +690,12 @@ fn try_ordered_partitions_packed(
 
 /// The order-preserving leading 8 bytes of an encoded row, as a `u64`.
 ///
-/// arrow's row format is byte-lexicographic, so the big-endian `u64` of a row's first 8 bytes
-/// orders identically to the row's leading bytes; carrying this inline with the row index
-/// (see the sort in [`ordered_partitions_by_global_sort`]) resolves almost every comparison
-/// in-register, without dereferencing the full (wider, randomly accessed) Rows buffer. Rows
-/// shorter than 8 bytes are zero-padded — correct, since a shorter row is lexicographically
-/// smaller and the full-row tie-break handles the pad-equal case.
-fn row_prefix(d: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    let n = d.len().min(8);
-    buf[..n].copy_from_slice(&d[..n]);
-    u64::from_be_bytes(buf)
-}
+/// This crate found the technique — carrying the prefix inline with the row index (see the
+/// sort in [`ordered_partitions_by_global_sort`]) resolves almost every comparison in-register
+/// instead of dereferencing the wider, randomly accessed `Rows` buffer, which was the whole
+/// window cost. `bc-arrow`'s multi-key row sort now uses the same trick, so the definition
+/// lives there, in the lowest crate both can see, rather than in two places.
+use bc_arrow::row_sort::row_prefix;
 
 /// `row_number`: 1..n in order, unique per row. Scattered to original positions.
 fn row_number(ordered: &[Vec<usize>], num_rows: usize) -> ArrayRef {
@@ -723,13 +724,20 @@ fn rank(
     let mut out = vec![0i64; num_rows];
     for part in ordered {
         let mut current = 0i64; // last assigned rank
+                                // Carry the previous position's encoded row. Comparing `part[pos - 1]` against `row`
+                                // is two random reads of the encoded buffer per position, and the first was already
+                                // read on the previous iteration — `part` is a sort permutation, so neither index is
+                                // sequential in `rows`.
+        let mut prev = None;
         for (pos, &row) in part.iter().enumerate() {
-            let tie = pos > 0 && rows_equal(rows, part[pos - 1], row);
+            let cur = rows.row(row);
+            let tie = prev == Some(cur);
             if pos == 0 {
                 current = 1;
             } else if !tie {
                 current = if dense { current + 1 } else { pos as i64 + 1 };
             }
+            prev = Some(cur);
             out[row] = current;
         }
     }
@@ -753,8 +761,12 @@ fn percent_rank(
     for part in ordered {
         let n = part.len();
         let mut current = 0i64; // last assigned RANK (1-based, gaps after ties)
+                                // As in `rank`: one encoded-row read per position instead of two.
+        let mut prev = None;
         for (pos, &row) in part.iter().enumerate() {
-            let tie = pos > 0 && rows_equal(rows, part[pos - 1], row);
+            let cur = rows.row(row);
+            let tie = prev == Some(cur);
+            prev = Some(cur);
             if pos == 0 {
                 current = 1;
             } else if !tie {

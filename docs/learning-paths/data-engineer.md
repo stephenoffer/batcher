@@ -8,23 +8,23 @@ operation, and all per-row work runs in Rust.
 
 1. {doc}`Getting started <../getting-started/index>`: install and run a first query.
 1. {doc}`Your first pipeline <../tutorials/first-pipeline>`: the end-to-end flow.
-1. {doc}`Reading data <../user-guide/reading-data>`: sources and file formats.
-1. {doc}`Transformations <../user-guide/transformations>`: `select`, `with_columns`,
+1. {doc}`Reading data </user-guide/moving-data/reading-data>`: sources and file formats.
+1. {doc}`Transformations </user-guide/transform/transformations>`: `select`, `with_columns`,
    `filter`, `sort`.
-1. {doc}`Filtering <../user-guide/filtering>`: predicate expressions.
-1. {doc}`Aggregations <../user-guide/aggregations>`: `group_by` and `.agg`.
-1. {doc}`Joins <../user-guide/joins>`: join kinds and keys.
-1. {doc}`Window functions <../user-guide/window-functions>`: ranking and rolling
+1. {doc}`Filtering </user-guide/transform/filtering>`: predicate expressions.
+1. {doc}`Aggregations </user-guide/analyze/aggregations>`: `group_by` and `.agg`.
+1. {doc}`Joins </user-guide/analyze/joins>`: join kinds and keys.
+1. {doc}`Window functions </user-guide/analyze/window-functions>`: ranking and rolling
    aggregates.
-1. {doc}`Writing data <../user-guide/writing-data>`: output formats and partitioning.
-1. {doc}`Lakehouse tables <../user-guide/lakehouse>`: Delta read/write/merge and SCD.
-1. {doc}`Data quality <../user-guide/data-quality>`: validate against a contract and
+1. {doc}`Writing data </user-guide/moving-data/writing-data>`: output formats and partitioning.
+1. {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: Delta read/write/merge and SCD.
+1. {doc}`Data quality </user-guide/trust/data-quality>`: validate against a contract and
    quarantine what fails it.
-1. {doc}`Cloud storage <../user-guide/cloud-storage>`: object-store paths.
-1. {doc}`Performance and memory <../user-guide/performance>`: caching and spill.
-1. {doc}`Best practices <../user-guide/best-practices>` and
-   {doc}`troubleshooting <../user-guide/troubleshooting>`.
-1. {doc}`Dataset API reference <../api/dataset>`.
+1. {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: object-store paths.
+1. {doc}`Performance and memory </user-guide/operate/performance>`: caching and spill.
+1. {doc}`Best practices </user-guide/operate/best-practices>` and
+   {doc}`troubleshooting </user-guide/operate/troubleshooting>`.
+1. {doc}`Dataset API reference </api/relational/dataset>`.
 
 ## Example: transform and aggregate
 
@@ -73,32 +73,32 @@ These scripts build their own data and run directly with `python examples/<name>
 
 ## Recipes for the problems you will actually hit
 
-The {doc}`data-engineering cookbook <../examples/data-engineering/index>` is the applied half
+The {doc}`data-engineering cookbook </cookbook/data-engineering/index>` is the applied half
 of this path. Each recipe opens on the failure and shows the code that avoids it.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
 :::{grid-item-card} {octicon}`download;1.1em` Incremental ingest
-:link: ../examples/data-engineering/incremental-ingest
+:link: /cookbook/data-engineering/incremental-ingest
 :link-type: doc
 Read only what is new.
 :::
 
 :::{grid-item-card} {octicon}`git-merge;1.1em` CDC pipeline
-:link: ../examples/data-engineering/cdc-pipeline
+:link: /cookbook/data-engineering/cdc-pipeline
 :link-type: doc
 Apply a change feed in the order the changes happened.
 :::
 
 :::{grid-item-card} {octicon}`filter;1.1em` Deduplication
-:link: ../examples/data-engineering/deduplication
+:link: /cookbook/data-engineering/deduplication
 :link-type: doc
 Exactly-once is a property you build.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.1em` Schema evolution
-:link: ../examples/data-engineering/schema-evolution
+:link: /cookbook/data-engineering/schema-evolution
 :link-type: doc
 The column that changed type under you.
 :::
@@ -107,7 +107,7 @@ The column that changed type under you.
 :::{seealso}
 - {doc}`Integrations <../integrations/index>`: connecting to Kafka, Snowflake, Delta, and the rest.
 - {doc}`Building a lakehouse <../tutorials/building-a-lakehouse>`: the same pieces, end to end.
-- {doc}`Custom connectors <../user-guide/custom-connectors>`: when the format you need isn't built in.
+- {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: when the format you need isn't built in.
 :::
 
 
@@ -115,4 +115,4 @@ The column that changed type under you.
 
 - {doc}`platform-engineer`: the operational half, once the pipelines exist.
 - {doc}`../user-guide/index`: the reference guides this path draws on.
-- {doc}`../examples/data-engineering/index`: runnable versions of the patterns above.
+- {doc}`/cookbook/data-engineering/index`: runnable versions of the patterns above.

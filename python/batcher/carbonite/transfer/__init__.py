@@ -9,6 +9,7 @@ data plane) — Carbonite as the transfer sublibrary, not glue inside the engine
 
 from __future__ import annotations
 
+from batcher.carbonite.transfer.lifecycle import local_session
 from batcher.carbonite.transfer.locality import TransferMode, locality_ratio, select_mode
 from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleTicket, fetch
 from batcher.carbonite.transfer.session import ShuffleSession
@@ -19,6 +20,7 @@ __all__ = [
     "ShuffleTicket",
     "TransferMode",
     "fetch",
+    "local_session",
     "locality_ratio",
     "select_mode",
 ]

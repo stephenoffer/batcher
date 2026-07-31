@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from batcher._internal.mathx import clamp01
 from batcher.config import CardinalityConfig
 from batcher.kyber.stats.distribution import mcv_join_rows, residual_eq_frequency
 from batcher.kyber.stats.selectivity.patterns import (
@@ -30,6 +31,7 @@ from batcher.kyber.stats.selectivity.scalars import (
     _outside_bounds,
     _point_mass,
     comparison_col_side,
+    discrete_step_mass,
     fraction_left_below_right,
 )
 from batcher.plan.expr_ir import (
@@ -235,6 +237,45 @@ def _date_part_cardinality(expr: Binary) -> float | None:
     return None
 
 
+def _from_cdf(eff: str, frac_le: float, eq: float) -> float:
+    """One comparison's selectivity from `F(x) = P(v <= x)` and `eq = P(v = x)`.
+
+    The mapping is `le: F`, `lt: F - eq`, `gt: 1 - F`, `ge: 1 - F + eq`. Splitting on the
+    boundary's point mass is what distinguishes strict from non-strict: treating `lt` as `le`
+    (and `ge` as `gt`) drops that mass entirely, so `x <= 5` and `x < 5` estimated identically —
+    wrong by a whole distinct value on a low-cardinality integer or date column, which is exactly
+    where a range predicate is most selective. (The Rust `stats.rs` path already subtracts it.)
+
+    `F` is floored at `eq` for the two comparisons that read it directly, because a CDF is never
+    below the point mass at the same value and an interpolation can violate that on a skewed
+    column, where a measured MCV frequency exceeds the uniform fraction. Deliberately *not* for
+    `lt`, whose answer is `F - eq`: raising `F` to `eq` there would force it to zero and claim
+    nothing lies below an interior `x`.
+
+    Args:
+        eff: The comparison, normalized so the column is on the left.
+        frac_le: `P(v <= x)`, from a quantile grid, from bounds, or from a known domain.
+        eq: `P(v = x)`, the mass sitting exactly on the boundary.
+
+    Returns:
+        The fraction of rows the comparison keeps, in `[0, 1]`.
+    """
+    floor_le = max(frac_le, eq)
+    if eff == "le":
+        raw = floor_le
+    elif eff == "lt":
+        raw = frac_le - eq
+    elif eff == "gt":
+        raw = 1.0 - floor_le
+    else:  # ge
+        raw = 1.0 - frac_le + eq
+    # `F` and `eq` come from different estimators — a quantile grid or bounds interpolation for
+    # one, an MCV frequency for the other — so their difference is not confined to `[0, 1]`. A
+    # skewed column whose measured mass at `x` exceeds the interpolated `F(x)` made `lt` negative
+    # and `ge` exceed one, and a negative selectivity propagates as a negative row estimate.
+    return clamp01(raw)
+
+
 def _date_part_range_selectivity(expr: Binary, op: str) -> float | None:
     """`date_part(col) OP literal` range selectivity over the field's discrete uniform domain.
 
@@ -265,14 +306,7 @@ def _date_part_range_selectivity(expr: Binary, op: str) -> float | None:
     else:
         frac_le = (xf - lo + 1) / n
     eff = op if col_on_left else _FLIP_OP[op]
-    eq = 1.0 / n
-    if eff == "le":
-        return frac_le
-    if eff == "lt":
-        return frac_le - eq
-    if eff == "gt":
-        return 1.0 - frac_le
-    return 1.0 - frac_le + eq  # ge
+    return _from_cdf(eff, frac_le, 1.0 / n)
 
 
 def _column_pair_selectivity(
@@ -348,23 +382,19 @@ def _range_selectivity(
         frac_le = _fraction_below_bounds(x, bounds.get(col))
     if frac_le is None:
         return cfg.range_selectivity
-    # Normalize so the column is on the left, then split on the boundary's point mass.
-    #
-    # With `F(x) = P(v <= x)` and `eq = P(v = x)`, the four comparisons are
-    # `le: F`, `lt: F - eq`, `gt: 1 - F`, `ge: 1 - F + eq`.
-    # Treating `lt` as `le` (and `ge` as `gt`) drops that point mass entirely, so
-    # `x <= 5` and `x < 5` were estimated identically — wrong by a whole distinct value
-    # on a low-cardinality integer or date column, which is exactly where a range
-    # predicate is most selective. (The Rust `stats.rs` path already subtracts it.)
     eff = op if col_on_left else _FLIP_OP[op]
+    bound = bounds.get(col)
     eq = _point_mass(col, value, ndv or {}, mcv or {})
-    if eff == "le":
-        return frac_le
-    if eff == "lt":
-        return frac_le - eq
-    if eff == "gt":
-        return 1.0 - frac_le
-    return 1.0 - frac_le + eq  # ge
+    if eq == 0.0 and not _outside_bounds(value, bound):
+        # Nothing has measured a distinct count. On a *discrete* column the bounds still imply
+        # one — the step the CDF is already divided by — and without it the strict and
+        # non-strict comparisons cannot separate at all.
+        #
+        # Only for a literal the column can actually hold: the mass at a value outside the
+        # bounds is zero, and claiming a step there makes `d < <above the max>` fall short of the
+        # certain 1.0 and `d >= <above the max>` rise above the certain 0.0.
+        eq = discrete_step_mass(bound) or 0.0
+    return _from_cdf(eff, frac_le, eq)
 
 
 def _equality_selectivity(

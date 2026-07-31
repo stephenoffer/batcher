@@ -276,11 +276,16 @@ pub(crate) fn bounded_group_quantile(
             } else {
                 let grows = key_conv.convert_columns(&batch.columns()[..n_keys])?;
                 for i in 0..batch.num_rows() {
-                    let row = grows.row(i).owned();
-                    if prev.as_ref().is_none_or(|p| *p != row) {
+                    // Compare borrowed, own only on a change. `prev` has to outlive `grows`
+                    // (a group run spans batches, and `grows` is per batch), so it is an
+                    // `OwnedRow` — but owning it per *row* allocated once per row to answer a
+                    // question that changes once per *group*. On a spilled quantile with few
+                    // groups that was an allocation for almost every row of the relation.
+                    let row = grows.row(i);
+                    if prev.as_ref().is_none_or(|p| p.row() != row) {
                         counts.push(0);
                         null_counts.push(0);
-                        prev = Some(row);
+                        prev = Some(row.owned());
                     }
                     *counts.last_mut().unwrap() += 1;
                     if !vcol.is_valid(i) {
@@ -512,9 +517,18 @@ pub(crate) fn bounded_group_distinct(
                 None
             };
             let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
+            // Both `prev_group` and `prev_val` must outlive this batch's `grows`/`vrows`, so
+            // they are owned — but owning them per *row* allocated twice per row to answer
+            // questions that change once per group and once per distinct value. Compare
+            // borrowed and own only on a change.
+            //
+            // `vcol` is an `Arc<dyn Array>`, so its validity check was a virtual call per row
+            // as well; the null buffer is resolved once here.
+            let vnulls = vcol.nulls();
             for i in 0..batch.num_rows() {
-                let group = grows.as_ref().map(|g| g.row(i).owned());
-                let new_group = !started || (n_keys > 0 && prev_group != group);
+                let group = grows.as_ref().map(|g| g.row(i));
+                let new_group =
+                    !started || (n_keys > 0 && prev_group.as_ref().map(|p| p.row()) != group);
                 if new_group {
                     if started {
                         counts.push(cur);
@@ -522,16 +536,16 @@ pub(crate) fn bounded_group_distinct(
                     started = true;
                     cur = 0;
                     prev_val = None;
-                    prev_group = group;
+                    prev_group = group.map(|r| r.owned());
                     if n_keys > 0 {
                         firsts.push(i as u32);
                     }
                 }
-                if vcol.is_valid(i) {
-                    let vr = vrows.row(i).owned();
-                    if prev_val.as_ref() != Some(&vr) {
+                if vnulls.is_none_or(|n| n.is_valid(i)) {
+                    let vr = vrows.row(i);
+                    if prev_val.as_ref().map(|p| p.row()) != Some(vr) {
                         cur += 1;
-                        prev_val = Some(vr);
+                        prev_val = Some(vr.owned());
                     }
                 }
             }
@@ -645,9 +659,12 @@ pub(crate) fn bounded_group_mode(
                 None
             };
             let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
+            // Same as the two passes above: compare the borrowed row, own only on a change,
+            // and resolve the `dyn Array` null buffer once instead of per row.
+            let vnulls = vcol.nulls();
             for i in 0..batch.num_rows() {
-                let group = grows.as_ref().map(|g| g.row(i).owned());
-                if !started || (n_keys > 0 && prev_group != group) {
+                let group = grows.as_ref().map(|g| g.row(i));
+                if !started || (n_keys > 0 && prev_group.as_ref().map(|p| p.row()) != group) {
                     if started {
                         // Close the previous group: fold its last run into `best`
                         // (strict `>` keeps the smaller value on a frequency tie),
@@ -658,7 +675,7 @@ pub(crate) fn bounded_group_mode(
                         winners.push(best_val.take().unwrap_or_else(|| null_row.clone()));
                     }
                     started = true;
-                    prev_group = group;
+                    prev_group = group.map(|r| r.owned());
                     cur_val = None;
                     cur_len = 0;
                     best_val = None;
@@ -667,16 +684,16 @@ pub(crate) fn bounded_group_mode(
                         firsts.push(i as u32);
                     }
                 }
-                if vcol.is_valid(i) {
-                    let vr = vrows.row(i).owned();
-                    if cur_val.as_ref() == Some(&vr) {
+                if vnulls.is_none_or(|n| n.is_valid(i)) {
+                    let vr = vrows.row(i);
+                    if cur_val.as_ref().map(|c| c.row()) == Some(vr) {
                         cur_len += 1;
                     } else {
                         if cur_len > best_len {
                             best_len = cur_len;
                             best_val = cur_val.take();
                         }
-                        cur_val = Some(vr);
+                        cur_val = Some(vr.owned());
                         cur_len = 1;
                     }
                 }

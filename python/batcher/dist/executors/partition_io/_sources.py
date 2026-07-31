@@ -24,7 +24,7 @@ import pickle
 
 import pyarrow as pa
 
-from batcher._internal.mathx import ceil_div
+from batcher.dist.executors.partition_io.assignment import _balance, assign_splits
 from batcher.dist.executors.scan_read import (
     _SCAN_PREFETCH,
     _SPLIT_TARGET_BYTES,
@@ -124,45 +124,6 @@ def _scan_splits(
     if len(coalesced) >= floor:
         return coalesced
     return plan_splits(source, predicate=predicate, projection=projection)
-
-
-def _balance(splits: list[Split], workers: int) -> list[list[Split]]:
-    """Greedily bin-pack splits into `workers` groups balanced by row count.
-
-    Splits with an unknown row count are weighted as 1 so they spread evenly.
-    Largest-first assignment keeps the per-worker load roughly equal.
-    """
-    groups: list[list[Split]] = [[] for _ in range(workers)]
-    loads = [0] * workers
-    ordered = sorted(splits, key=lambda s: s.row_count() or 0, reverse=True)
-    for s in ordered:
-        i = min(range(workers), key=lambda w: loads[w])
-        groups[i].append(s)
-        loads[i] += s.row_count() or 1
-    return groups
-
-
-def _contiguous(splits: list[Split], workers: int) -> list[list[Split]]:
-    """Group splits into `workers` contiguous, source-ordered runs (order preserved).
-
-    Unlike `_balance` (which reorders splits largest-first for even load), group 0 holds the
-    source's first splits, group 1 the next, and so on — each a contiguous near-equal-count
-    run. Callers whose correctness needs the concatenation of per-partition results to
-    reproduce the source's global row order (distributed `LIMIT` / `with_row_index`) require
-    this: a `_balance` assignment puts non-adjacent splits in one partition, so a per-partition
-    prefix interleaves rows from different parts of the source.
-    """
-    groups: list[list[Split]] = [[] for _ in range(workers)]
-    if workers <= 0 or not splits:
-        return groups
-    target = max(1, ceil_div(sum(s.row_count() or 1 for s in splits), workers))  # ceil per group
-    w, load = 0, 0
-    for s in splits:
-        groups[w].append(s)
-        load += s.row_count() or 1
-        if load >= target and w < workers - 1:
-            w, load = w + 1, 0
-    return groups
 
 
 def _slice_rows_evenly(batches: list[pa.RecordBatch], workers: int) -> list[list[pa.RecordBatch]]:
@@ -283,6 +244,7 @@ def partition_descriptors(
     projection: list[str] | None = None,
     predicate: dict | None = None,
     preserve_order: bool = False,
+    worker_addrs: list[str] | None = None,
 ) -> list[dict]:
     """Partition a source into `workers` in-memory descriptors — no shared filesystem.
 
@@ -301,6 +263,13 @@ def partition_descriptors(
     (`_contiguous`) instead of load-balanced (`_balance`), so the partition-index-assembled
     concatenation reproduces the source's global row order — required by the order-sensitive
     `LIMIT` / `with_row_index` paths (the in-memory branch is already order-preserving).
+
+    `worker_addrs` (shuffle address per worker) turns on locality-aware assignment for
+    splits that are already resident on a worker — the buckets of an intermediate a prior
+    stage left on the fleet. Each such split is routed to the worker holding it, so its
+    read is a zero-copy local-store hit instead of a network fetch of bytes already in
+    that process. Load-only balancing is kept for storage-backed splits (every worker is
+    equidistant from object storage) and whenever locality would unbalance the stage.
 
     Read back with `read_partition_descriptor`.
     """
@@ -326,8 +295,9 @@ def partition_descriptors(
 
     schema = source.schema()
     descriptors: list[dict] = []
-    assign = _contiguous if preserve_order else _balance
-    for group in assign(splits, workers):
+    for group in assign_splits(
+        splits, workers, preserve_order=preserve_order, worker_addrs=worker_addrs
+    ):
         if group:
             descriptors.append({"splits": group, "projection": projection, "predicate": predicate})
         else:

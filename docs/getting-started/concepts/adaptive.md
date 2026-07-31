@@ -20,7 +20,7 @@ The half with no equivalent elsewhere is what happens between runs. Batcher reco
 each query actually did into a sketch-backed store, so the next run plans against
 measured history rather than estimates alone.
 
-![Two feedback loops. Within one query, Batcher plans, executes a stage to a pipeline breaker, measures the real cardinalities, and re-plans the remaining stages, which is stage-boundary re-optimization at Spark AQE's granularity and gated off below 20 million input rows. Across runs, it records what happened as sketches into the MetadataHub so the next run plans better.](../../_static/diagrams/adaptive_loop.svg)
+![Two feedback loops. Within one query, Batcher plans, executes a stage to a pipeline breaker, measures the real cardinalities, and re-plans the remaining stages, which is stage-boundary re-optimization at Spark AQE's granularity and gated off below 20 million input rows. Across runs, it records what happened as sketches into the MetadataHub so the next run plans better.](/_static/diagrams/adaptive_loop.svg)
 
 ## A bad estimate, corrected
 
@@ -50,5 +50,5 @@ actually happened.
 ## See also
 
 - {doc}`lazy`: why nothing runs until a terminal call, which is what makes re-planning possible.
-- {doc}`../../user-guide/explain-plans`: reading the plan and the measured numbers behind it.
-- {doc}`../../deep-dives/adaptive-reoptimization`: the re-planning loop, breaker by breaker.
+- {doc}`/user-guide/operate/explain-plans`: reading the plan and the measured numbers behind it.
+- {doc}`/deep-dives/adaptive/adaptive-reoptimization`: the re-planning loop, breaker by breaker.

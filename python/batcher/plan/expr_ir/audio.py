@@ -8,6 +8,7 @@ audio decode off the per-row Python ``map_batches`` path into the native data pl
 
 from __future__ import annotations
 
+from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
@@ -22,7 +23,8 @@ class AudioFunc(IRNode):
     `decode` reads each clip's metadata; `to_waveform` decodes to a mono signal;
     `resample` decodes then band-limited-resamples that signal to `rate` Hz;
     `mel_spectrogram` produces the speech-model mel power-spectrogram front end; `mfcc`
-    produces the classic MFCC feature.
+    produces the classic MFCC feature. `trim_silence`, `peak_normalize` and
+    `zero_crossing_rate` condition or describe the waveform itself.
     """
 
     tag = ExprTag.AUDIO
@@ -35,6 +37,7 @@ class AudioFunc(IRNode):
     hop_length: int | None = scalar(omit_none=True, default=None)
     n_mels: int | None = scalar(omit_none=True, default=None)
     n_mfcc: int | None = scalar(omit_none=True, default=None)  # `mfcc` only
+    threshold_db: int | None = scalar(omit_none=True, default=None)  # `trim_silence` only
 
 
 class _AudioNamespace:
@@ -123,6 +126,94 @@ class _AudioNamespace:
                 >>> ds.select(w=bt.col("bytes").audio.resample(16000))  # doctest: +SKIP
         """
         return AudioFunc("resample", self._e, rate=rate)
+
+    def trim_silence(self, threshold_db: int = -40) -> AudioFunc:
+        """Decode to mono and drop the leading and trailing quiet.
+
+        The first step of an ASR pipeline. Recorded clips carry seconds of room tone at each
+        end, and every one of those samples is paid for twice — once in the spectrogram and
+        again in the model's sequence length.
+
+        Only the *ends* are trimmed. Interior pauses carry the timing an acoustic model reads,
+        so an utterance with its pauses removed is not the same utterance. A clip that is quiet
+        throughout trims to an empty list, which is how you filter silent recordings out:
+        ``filter(col("bytes").audio.trim_silence().list.len() > 0)``.
+
+        The threshold is in dBFS relative to full scale, so it is independent of the recording
+        level. The default of -40 (1% of full scale) is the conventional floor: quiet enough to
+        keep a soft consonant, loud enough to drop room tone.
+
+        Args:
+            threshold_db: The silence floor in dBFS. Must be at most 0, since 0 is full scale.
+
+        Returns:
+            An expression evaluating to a ``List<Float32>`` of the trimmed mono samples;
+            null for null or undecodable input.
+
+        Raises:
+            PlanError: If `threshold_db` is above 0.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.audio("s3://bucket/clips/")  # doctest: +SKIP
+                >>> ds.select(w=bt.col("bytes").audio.trim_silence())  # doctest: +SKIP
+        """
+        threshold_db = require_int(threshold_db, func="audio.trim_silence", arg="threshold_db")
+        if threshold_db > 0:
+            raise PlanError(
+                f"audio.trim_silence(): threshold_db is dBFS relative to full scale, so it "
+                f"must be at most 0, got {threshold_db}"
+            )
+        return AudioFunc("trim_silence", self._e, threshold_db=threshold_db)
+
+    def peak_normalize(self) -> AudioFunc:
+        """Decode to mono and scale so the loudest sample sits at full scale.
+
+        The level-matching step before batching clips from different sources. A model trained
+        on normalized audio reads a quiet recording as a different distribution rather than a
+        quieter one, so mismatched levels cost accuracy in a way that is invisible in the data.
+
+        This is *peak* normalization, not loudness (LUFS) normalization: it equalizes the
+        maximum sample, not the perceived level, so a clip containing one loud click stays
+        quiet everywhere else. An all-zero clip is returned unchanged rather than amplified.
+
+        Returns:
+            An expression evaluating to a ``List<Float32>`` of the normalized mono samples;
+            null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.audio("s3://bucket/clips/")  # doctest: +SKIP
+                >>> ds.select(w=bt.col("bytes").audio.peak_normalize())  # doctest: +SKIP
+        """
+        return AudioFunc("peak_normalize", self._e)
+
+    def zero_crossing_rate(self) -> AudioFunc:
+        """The fraction of adjacent samples that change sign (→ Float64).
+
+        The cheapest useful descriptor of a waveform, and the classic voiced/unvoiced split: a
+        vowel is low-frequency and crosses zero rarely, a fricative or noise crosses constantly.
+        It separates speech from silence-with-hiss without computing a spectrogram, which makes
+        it a good first-pass filter over a corpus nobody has curated.
+
+        A clip shorter than two samples has no adjacent pair and yields null.
+
+        Returns:
+            An expression evaluating to a Float64 crossing rate in ``[0, 1]``; null for null
+            or undecodable input, and for a clip shorter than two samples.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.audio("s3://bucket/clips/")  # doctest: +SKIP
+                >>> ds.select(z=bt.col("bytes").audio.zero_crossing_rate())  # doctest: +SKIP
+        """
+        return AudioFunc("zero_crossing_rate", self._e)
 
     def mel_spectrogram(
         self,

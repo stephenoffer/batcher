@@ -5,13 +5,16 @@ plane. Python builds and optimizes the plan but never touches a row. Rust runs e
 per-row operation over Apache Arrow. The two planes meet at one typed, zero-copy
 boundary, which is also why a result is identical on one core or a hundred.
 
-![Batcher's two planes: a Python control plane hands a JSON IR plus zero-copy Arrow batches to the Rust data plane.](../_static/diagrams/two_planes.svg)
+![Batcher's two planes: a Python control plane hands a JSON IR plus zero-copy Arrow batches to the Rust data plane.](/_static/diagrams/two_planes.svg)
 
-:::{seealso}
-This section is the shape of the system. For one mechanism at a time, such as how the
-JIT falls back, how a morsel is scheduled, or how the shuffle blocks a producer at zero
-credits, see the {doc}`deep dives <../deep-dives/index>`.
-:::
+Three sections describe the engine at three zoom levels, and they are meant to be read in
+this order:
+
+| Section | Zoom level | Read it when |
+|---|---|---|
+| Architecture (this section) | The shape of the system | You want to know how the pieces fit |
+| {doc}`Deep dives <../deep-dives/index>` | One mechanism at a time | You want to know why a query behaved that way |
+| {doc}`Internals <../internals/index>` | One subsystem's design | You are about to change the engine |
 
 ::::{grid} 1 2 2 2
 :gutter: 3

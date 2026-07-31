@@ -17,6 +17,7 @@ from typing import Any
 
 from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
 from batcher.ml.llm.engines.base import Engine, EngineFactory, unpack_request
+from batcher.ml.llm.engines.limits import _estimated_tokens, build_limiter
 
 __all__ = ["http_engine"]
 
@@ -43,6 +44,8 @@ def http_engine(
     retries: int = 3,
     backoff: float = 0.5,
     concurrency: int = 8,
+    requests_per_minute: float | None = None,
+    tokens_per_minute: float | None = None,
 ) -> EngineFactory:
     """An `EngineFactory` calling an OpenAI-compatible HTTP endpoint — a *served* model.
 
@@ -95,6 +98,11 @@ def http_engine(
         retries: retry attempts per request on a transient failure (429/5xx/connection).
         backoff: base seconds for the jittered exponential backoff between retries.
         concurrency: in-flight requests per batch. Set to 1 to serialize.
+        requests_per_minute: client-side cap on requests per minute, **per worker**. Unset
+            means unlimited. Waiting for capacity holds the send rate at the quota, where
+            retrying a 429 only re-sends the burst that caused it.
+        tokens_per_minute: client-side cap on tokens per minute, per worker, counting the
+            prompt plus the reply the request reserved. Unset means unlimited.
 
     Returns:
         A zero-arg factory building the HTTP-backed `Engine` once per worker.
@@ -119,6 +127,8 @@ def http_engine(
         extra_body=extra_body,
     )
 
+    limiter = build_limiter(requests_per_minute, tokens_per_minute)
+
     def factory() -> Engine:
         from concurrent.futures import ThreadPoolExecutor
 
@@ -134,6 +144,10 @@ def http_engine(
                 request, ("max_tokens", "temperature", "stop")
             )
             body = _openai_body(model, prompt, chat, system, defaults, overrides, image)
+            if limiter is not None:
+                # Charged before the call, not after: waiting for capacity is what keeps the
+                # send rate at the quota. Retrying a 429 only re-sends the burst that caused it.
+                limiter.acquire(_estimated_tokens(prompt, body))
             try:
                 # Retries with jittered backoff handle the 429 rate limits hosted APIs return.
                 resp = post_json(

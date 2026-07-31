@@ -56,14 +56,38 @@ _OBJECT_STORE_SCHEMES = frozenset(
 _SCHEME_ALIASES = {"s3a": "s3", "gcs": "gs", "abfss": "abfs", "wasbs": "wasb"}
 
 
+#: IO threads per usable core, and the band the result is clamped into. An IO thread spends
+#: almost all of its life blocked on a socket, so the right count tracks how much the *link*
+#: can carry rather than how much the CPU can compute — which is why it is deliberately an
+#: oversubscription of cores and not a share of them. The floor keeps the previous behavior on
+#: a small container; the ceiling stops a 192-core GPU node from opening connections faster
+#: than any object store will accept them.
+_IO_THREADS_PER_CORE = 4
+_IO_THREADS_FLOOR = 32
+_IO_THREADS_CEILING = 256
+
+
 @functools.cache
 def ensure_io_threads() -> None:
     """Lift pyarrow's IO thread pool above its 8-thread default, once per process.
 
     A wide object-store read is otherwise throttled to ~8 concurrent GETs, so a
     many-small-files scan can't saturate the link. Idempotent/cached; a no-op if the pool
-    is already wider. `BATCHER_IO_THREADS` overrides the target (default 32)."""
-    target = max(8, int(os.environ.get("BATCHER_IO_THREADS", "32")))
+    is already wider. `BATCHER_IO_THREADS` overrides the target.
+
+    The target scales with the cores this process may use rather than sitting at a constant.
+    A dense GPU node reads from object storage over a link two orders of magnitude faster than
+    the small VM the old constant was chosen on, and 32 concurrent GETs leave most of it idle
+    — while the same 32 on a four-core container are more connections than it can service.
+    Both are the same mistake, made in opposite directions by one number."""
+    from batcher._internal.hardware import available_cpu_count
+
+    override = os.environ.get("BATCHER_IO_THREADS")
+    if override:
+        target = max(8, int(override))
+    else:
+        scaled = _IO_THREADS_PER_CORE * available_cpu_count()
+        target = max(_IO_THREADS_FLOOR, min(_IO_THREADS_CEILING, scaled))
     if pa.io_thread_count() < target:
         pa.set_io_thread_count(target)
     cap_arrow_cpu_threads()
@@ -275,6 +299,17 @@ def _split_authority(uri: str) -> tuple[str, str]:
 #: outside this set is rejected by name so a typo is not silently ignored by the builder.
 _S3_BOOL_OPTS = ("anonymous", "force_virtual_addressing", "background_writes")
 _S3_INT_OPTS = ("connect_timeout", "request_timeout")
+
+#: Attempts a throttled S3 request gets before the read fails. pyarrow's default is three,
+#: chosen against a client opening a handful of connections; this engine opens as many as the
+#: machine can drive — up to 256 concurrent GETs on a dense node — and a store's answer to that
+#: is `503 SlowDown`, which is not a failure but a request to wait. Three attempts turns a
+#: throttle into a failed query on exactly the scans worth running on such a machine.
+#:
+#: Raised rather than made unbounded: a store that is genuinely down should still fail the
+#: query rather than retry it for minutes. `retry_max_attempts` in the URI overrides it, in
+#: both directions.
+_S3_DEFAULT_RETRY_ATTEMPTS = 8
 _S3_STR_OPTS = (
     "access_key",
     "secret_key",
@@ -295,13 +330,19 @@ def _s3_with_options(uri: str) -> FileSystem:
     (``force_virtual_addressing=false``), a plain-HTTP endpoint, explicit keys, or a
     longer timeout — none of which `from_uri` accepts. An unknown option is an error
     naming the option, because `S3FileSystem` would otherwise ignore it silently and the
-    user would debug a connection that quietly used none of their settings."""
+    user would debug a connection that quietly used none of their settings.
+
+    Every filesystem built here also gets a retry budget sized for the fan-out this engine
+    actually opens (`_S3_DEFAULT_RETRY_ATTEMPTS`), overridable with ``retry_max_attempts``."""
     from urllib.parse import parse_qsl, urlsplit
 
     parts = urlsplit(uri)
     opts: dict[str, object] = {}
+    attempts = _S3_DEFAULT_RETRY_ATTEMPTS
     for key, value in parse_qsl(parts.query):
-        if key in _S3_BOOL_OPTS:
+        if key == "retry_max_attempts":
+            attempts = max(1, int(value))
+        elif key in _S3_BOOL_OPTS:
             opts[key] = value.strip().lower() in ("1", "true", "yes", "on")
         elif key in _S3_INT_OPTS:
             opts[key] = int(value)
@@ -309,9 +350,10 @@ def _s3_with_options(uri: str) -> FileSystem:
             opts[key] = value
         else:
             raise IOError(
-                f"unknown s3:// option {key!r}. Supported: "
+                f"unknown s3:// option {key!r}. Supported: retry_max_attempts, "
                 f"{', '.join(sorted(_S3_BOOL_OPTS + _S3_INT_OPTS + _S3_STR_OPTS))}"
             )
+    opts["retry_strategy"] = pafs.AwsStandardS3RetryStrategy(max_attempts=attempts)
     try:
         fs = pafs.S3FileSystem(**opts)  # type: ignore[arg-type]
     except (ValueError, OSError, pa.ArrowInvalid) as exc:

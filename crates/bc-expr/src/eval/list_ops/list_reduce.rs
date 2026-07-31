@@ -1,7 +1,8 @@
-//! Per-row, list-returning numeric transforms for `eval/list.rs` (`normalize`, `softmax`,
-//! `arg_sort`, `cum_sum`, `diff`). Each maps a `List`/tensor row to a new list of the same length,
-//! casting the child to `Float64` first. Split out of `list.rs` to keep that file inside its
-//! size budget; the null contract (null row → null; null element preserved) is uniform.
+//! Per-row numeric transforms over a `List` row for `eval/list.rs` (`normalize`, `softmax`,
+//! `log_softmax`, `arg_sort`, `cum_sum`, `diff`, `entropy`). Most map a `List`/tensor row to a
+//! new list of the same length; `entropy` reduces the row to one number. All cast the child to
+//! `Float64` first. Split out of `list.rs` to keep that file inside its size budget; the null
+//! contract (null row → null; null element preserved) is uniform.
 
 use std::sync::Arc;
 
@@ -156,6 +157,87 @@ pub(crate) fn diff(list: &GenericListArray<i32>) -> Result<ArrayRef, ExprError> 
             }
         }
         b.append(true);
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+/// `log_softmax` — `xᵢ − max − ln Σ exp(xⱼ − max)`, the log-domain sibling of `softmax`.
+///
+/// Computed in the log domain rather than as `softmax(...).ln()`: a probability that
+/// underflows to 0 in the linear form gives `-inf` there, while here it stays a large
+/// negative finite number, which is the whole reason a training or scoring pipeline reads
+/// log-probabilities instead of probabilities.
+pub(crate) fn log_softmax(list: &GenericListArray<i32>) -> Result<ArrayRef, ExprError> {
+    let (child, off) = f64_child(list)?;
+    let f = child.as_primitive::<Float64Type>();
+    let mut b = ListBuilder::new(Float64Builder::new());
+    for i in 0..list.len() {
+        if list.is_null(i) {
+            b.append_null();
+            continue;
+        }
+        let (s, e) = (off[i], off[i + 1]);
+        let max = (s..e)
+            .filter(|&k| f.is_valid(k))
+            .map(|k| f.value(k))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let sum: f64 = (s..e)
+            .filter(|&k| f.is_valid(k))
+            .map(|k| (f.value(k) - max).exp())
+            .sum();
+        let log_sum = sum.ln();
+        let vb = b.values();
+        for k in s..e {
+            if f.is_valid(k) {
+                vb.append_value(f.value(k) - max - log_sum);
+            } else {
+                vb.append_null();
+            }
+        }
+        b.append(true);
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+/// Shannon entropy in **nats** of each row read as a distribution: `−Σ pᵢ ln pᵢ`.
+///
+/// The row is normalized by its own sum first, so it works on a probability vector, a raw
+/// count vector, or an unnormalized weight vector alike. A zero or negative total has no
+/// distribution to measure and yields null; a non-positive element is skipped, since
+/// `p ln p` is undefined there and treating it as zero is the convention.
+///
+/// This is the per-row uncertainty of a classifier's output or an attention distribution:
+/// 0 when all the mass is on one outcome, `ln n` when it is spread evenly over `n`.
+pub(crate) fn entropy(list: &GenericListArray<i32>) -> Result<ArrayRef, ExprError> {
+    let (child, off) = f64_child(list)?;
+    let f = child.as_primitive::<Float64Type>();
+    let mut b = Float64Builder::with_capacity(list.len());
+    for i in 0..list.len() {
+        if list.is_null(i) {
+            b.append_null();
+            continue;
+        }
+        let (s, e) = (off[i], off[i + 1]);
+        let total: f64 = (s..e)
+            .filter(|&k| f.is_valid(k) && f.value(k) > 0.0)
+            .map(|k| f.value(k))
+            .sum();
+        // NaN totals fall here too: a row that cannot be normalized has no distribution.
+        if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            b.append_null();
+            continue;
+        }
+        let h: f64 = (s..e)
+            .filter(|&k| f.is_valid(k) && f.value(k) > 0.0)
+            .map(|k| {
+                let p = f.value(k) / total;
+                -p * p.ln()
+            })
+            .sum();
+        // `-p ln p` is `-0.0` when p is 1, so a perfectly certain row would otherwise report
+        // `-0.0`. Adding zero folds it to `0.0`, which is what a reader expects to see and
+        // what `== 0.0` comparisons downstream already assume.
+        b.append_value(h + 0.0);
     }
     Ok(Arc::new(b.finish()))
 }

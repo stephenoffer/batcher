@@ -44,7 +44,7 @@ attributed the error to `interval '1' year`, which was wrong.
 
 ## At scale factor 10
 
-![Diverging bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22. Batcher is 2.08x behind DuckDB on its own native store, winning 4 of 22.](../_static/diagrams/tpch_sf10.svg)
+![Diverging bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22. Batcher is 2.08x behind DuckDB on its own native store, winning 4 of 22.](/_static/diagrams/tpch_sf10.svg)
 
 At sf10 on 96 cores, correctness-gated with all 22 queries reporting `OK`, the suite total is
 **4,453 ms**, down from 4,993 ms earlier in the same session. The three comparisons:
@@ -140,7 +140,7 @@ so **below 1.0 means Batcher is faster**.
 | q13 | **0.99×** | | |
 
 **Batcher is faster on 11 of the 18 queries Daft answers correctly**, and the spread is wider
-in Batcher's favour (up to 7×) than against it (up to 2×). Daft additionally **cannot
+in Batcher's favor (up to 7x) than against it (up to 2x). Daft also **cannot
 complete four**: q6 is wrong (above), q18 returns an unaliased column, q21 fails to bind a
 correlated subquery, and q22 cannot parse `SUBSTRING(x FROM a FOR b)`.
 
@@ -165,7 +165,7 @@ Batcher's kernels beat Daft's on all three and trade with Polars, which is ahead
    built once: 171 ms at 1 core → 43 ms at 8 → 42.8 ms at 16, a 4.0× speedup from 16 cores
    (~25% parallel efficiency). Narrowed by operator, `GROUP BY` alone scales **19.2×** and
    the join alone only **5.9×**, so the join is the ceiling, not the aggregate.
-2. **Batcher does roughly 2× more CPU work per query.**
+1. **Batcher does roughly 2× more CPU work per query.**
 
 One documented cause of (1) is now fixed: the radix join's partition loop ran on a single
 core, so a join too large to broadcast funnelled a fully-parallel build and probe into a
@@ -205,8 +205,8 @@ python benchmarks/run.py --benchmark tpch --engines batcher,daft    # vs Daft
 
 - {doc}`vs-duckdb` and {doc}`vs-daft` for the full engine scorecards.
 - {doc}`analytics` for operators and connectors.
-- {doc}`../deep-dives/join-algorithms` for the shuffle and broadcast paths the gap lives in.
-- {doc}`../deep-dives/cardinality-estimation` for the cold-start NDV problem that ran q5 at 7,115 ms.
-- {doc}`../deep-dives/cost-model` for how the build side is chosen.
-- {doc}`../user-guide/sql` for the supported SQL surface.
+- {doc}`/deep-dives/operators/join-algorithms` for the shuffle and broadcast paths the gap lives in.
+- {doc}`/deep-dives/adaptive/cardinality-estimation` for the cold-start NDV problem that ran q5 at 7,115 ms.
+- {doc}`/deep-dives/adaptive/cost-model` for how the build side is chosen.
+- {doc}`/user-guide/analyze/sql` for the supported SQL surface.
 - {doc}`methodology` for the correctness gate in detail.

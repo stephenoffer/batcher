@@ -101,12 +101,23 @@ def _slow(time_module):
 def test_relational_explain_is_byte_identical() -> None:
     """A pure-relational plan's `explain()` output is unchanged by the UDF fallback.
 
-    The fix adds a branch that only triggers on a `map_batches` plan; a lowerable plan must
-    render exactly as before. The expected string is the captured pre-change output.
+    The fallback branch only triggers on a `map_batches` plan; a lowerable plan must render
+    exactly as this string.
+
+    The filter's estimate reads 3 rather than the 1 this test originally captured, and 3 is the
+    number of rows the filter actually keeps. Two changes got it there. `explain()` used to plan
+    *without* per-source statistics, so it showed a different plan than `collect()` runs and every
+    bound-reading estimate fell back to a blind default. And the range estimate now *counts* an
+    integer column's values instead of interpolating across them as a continuum, which is what
+    makes `a > 1` over `[1, 4]` come out at three quarters rather than all of them.
+
+    It is still labelled `default` rather than `exact`: the provenance describes how the number
+    was derived, and a uniformity assumption over known bounds is not a proof, even when it lands
+    on the right answer.
     """
     expected = (
         "aggregate                       est≈1 (default)\n"
-        "  filter                        est≈1 (default)\n"
+        "  filter                        est≈3 (default)\n"
         "    scan                        est≈4 (exact)"
     )
     assert _relational_plan().explain() == expected

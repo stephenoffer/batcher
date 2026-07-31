@@ -49,9 +49,21 @@ pub(crate) fn broadcast_partition_aggregate(
     if func == WindowFn::Count {
         let values = require(values, func)?;
         let mut counts = vec![0i64; num_groups];
-        for (i, &g) in group_ids.iter().enumerate() {
-            if values.is_valid(i) {
-                counts[g as usize] += 1;
+        // `values` is an `Arc<dyn Array>`; calling `is_valid` on it per row is a virtual call
+        // the optimizer cannot see through. Resolve the null buffer once — a null-free column
+        // then counts every row with no check at all.
+        match values.nulls() {
+            None => {
+                for &g in group_ids {
+                    counts[g as usize] += 1;
+                }
+            }
+            Some(nulls) => {
+                for (i, &g) in group_ids.iter().enumerate() {
+                    if nulls.is_valid(i) {
+                        counts[g as usize] += 1;
+                    }
+                }
             }
         }
         let out: Vec<i64> = group_ids.iter().map(|&g| counts[g as usize]).collect();

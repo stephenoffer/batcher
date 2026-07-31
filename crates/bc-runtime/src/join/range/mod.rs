@@ -8,10 +8,42 @@
 //! Cost, stated precisely because "IEJoin is `O(n log n)`" is the wrong reading: `O(n log n)`
 //! for the sorts, `O(k)` for the `k` emitted pairs, plus a term for *skipping* the unset bits
 //! of the mark array — each left row scans the axis-1 suffix from its own bound to the end.
-//! [`MarkSet`]'s two summary levels make that `~ L x n / 262144` rather than `L x n / 64`, so
-//! the term is quadratic in shape but four orders of magnitude further out. It is what decides
-//! whether the curve stays flat past a million rows, and it is the difference between this
-//! implementation and DuckDB's, which removes the term outright by pruning block *pairs*.
+//! [`MarkSet`] derives its level count from the universe size, and each level multiplies the
+//! span one word read dismisses by 64, so walking an *empty* suffix costs one read per level
+//! (four at ten million entries) rather than one per word. DuckDB removes the term outright by
+//! pruning block *pairs*; this bounds it instead.
+//!
+//! **That term is no longer what the operator spends its time on, and the difference matters
+//! because the two have opposite fixes.** A phase study split the non-sort remainder into the
+//! sweep and the seven passes that build the sweep's inputs, and at five million rows a side
+//! the passes were 781 ms against a single-threaded sweep of 638 ms — while the sweep already
+//! fanned out to rayon and the passes did not. They are pure gathers and scatters over the
+//! universe, so they parallelize completely; three of them re-read `order2` to produce three
+//! arrays indexed identically, so they also fuse.
+//!
+//! Applying that same reading one layer down kept finding the same thing: **every phase of this
+//! operator except the sorts themselves was running on one core.** The `u64` key maps and the
+//! universe gathers in [`keys`]; the dense-rank pass, which looks serial but is a prefix sum in
+//! disguise (count the key changes per chunk, scan those counts, then let each chunk walk its own
+//! range); the one-sided key sorts, which also paid a padded 16-byte `(u64, u32)` where the
+//! packed `u64` [`keys::packed_keys`] already used for the two-sided order fits; and the band's
+//! monotone cursor walk, where each chunk seeks its own start with one binary search — exact,
+//! because the walk is monotone over a sorted array.
+//!
+//! Cumulative effect on the two shapes the phase reports measure, best of three each way at
+//! comparable load:
+//!
+//! | shape | n per side | before | after |
+//! |---|---|---|---|
+//! | general IEJoin | 500,000 | 107 ms | **78 ms** |
+//! | general IEJoin | 2,000,000 | 558 ms | **237 ms** |
+//! | general IEJoin | 5,000,000 | 1.9 s | **522 ms** |
+//! | band | 2,000,000 | 259 ms | **128 ms** |
+//! | band | 5,000,000 | 913 ms | **313 ms** |
+//!
+//! Every one of those is a reindexing or a re-association of the same values, so the arrays each
+//! phase hands the next are byte-for-byte what the sequential code produced. Block-pair pruning
+//! would not have moved any of it: the suffix walk it removes was already the smaller half.
 //!
 //! Three algorithms, picked by the *shape* of the condition rather than only its arity:
 //!
@@ -22,7 +54,8 @@
 //!   L.b`) — see [`band`]. The matches are a contiguous *slice* of one sorted array, and
 //!   both of its bounds are monotone in the left key, so neither the union sort nor the
 //!   mark array is needed. This is the common real-world shape (interval containment,
-//!   temporal overlap, `BETWEEN` against a computed pair) and it is 1.6x the general path.
+//!   temporal overlap, `BETWEEN` against a computed pair) and it is 1.7-2.2x the general
+//!   path from 500K to 5M rows a side.
 //! - **Two inequalities, general** — IEJoin (Khayyat et al., *Lightning Fast and Space
 //!   Efficient Inequality Joins*, VLDB 2015), the algorithm DuckDB's `PhysicalIEJoin`
 //!   implements. Sort the union of both sides on each axis, sweep the second axis marking
@@ -59,6 +92,8 @@
 //! cross-product-plus-filter plan this replaces. `canonicalize_float_keys` folds both
 //! zeros and every NaN bit pattern to one representative, after which arrow's row
 //! encoding *is* that total order.
+
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use arrow::array::{Array, ArrayRef};
 use rayon::prelude::*;
@@ -139,6 +174,14 @@ const SWEEP_MAX_WORKERS: usize = 16;
 
 /// Left rows per worker below which splitting is not worth the per-slice mark rebuild.
 const PARALLEL_SWEEP_MIN_PER_WORKER: usize = 4_096;
+
+/// Chunk length for the parallel setup passes that build the sweep's `u32` inputs.
+///
+/// These passes gather randomly over the whole universe, so the chunk length does not affect
+/// locality and is set purely for scheduling granularity: large enough that rayon's per-task
+/// overhead disappears against the work, small enough that 96 cores all get a share of a
+/// universe of a few hundred thousand. One morsel's worth is both.
+const SETUP_CHUNK: usize = 16_384;
 
 /// Accumulates the index pairs, applying the join type's emission rules once per left row.
 struct Out {
@@ -269,6 +312,18 @@ pub fn range_join_indices(
             ),
         });
     }
+    // Decode dictionary keys *before* the type check below, not after it. The two sides of a
+    // join are reached by different operator chains, so one can arrive dictionary-encoded and
+    // the other decoded; comparing physical types then reads that as "key types differ" and
+    // declines a join it is perfectly able to run. Declining fails safe rather than wrong — the
+    // caller gets an error, not a bad answer — but it is still a query that stops working, so
+    // the encodings are reconciled first and the check then compares the types that matter.
+    // Same argument as `keys::decode_dict_keys`, which the hash join uses for the same reason.
+    let l_dec = crate::keys::decode_dict_keys(left_keys);
+    let r_dec = crate::keys::decode_dict_keys(right_keys);
+    let left_keys: &[ArrayRef] = l_dec.as_deref().unwrap_or(left_keys);
+    let right_keys: &[ArrayRef] = r_dec.as_deref().unwrap_or(right_keys);
+
     for (l, r) in left_keys.iter().zip(right_keys) {
         if l.data_type() != r.data_type() {
             return Err(RuntimeError::UnsupportedRangeJoin {
@@ -414,10 +469,18 @@ fn two_conditions(
     // which is what the mark bitmap is indexed by and what the binary search returns.
     // `drank1` is the *dense* rank, where equal keys share a value, which is what makes a
     // `u32` compare mean the same thing as a key compare.
-    let mut pos1 = vec![0u32; n];
-    for (i, &e) in order1.iter().enumerate() {
-        pos1[e as usize] = i as u32;
-    }
+    //
+    // This is the inverse of `order1`, so every entry is written exactly once and no two
+    // writes target the same slot. The disjointness is a property of `order1` being a
+    // permutation, which the compiler cannot see, so the slot type carries it instead: a
+    // `Relaxed` store compiles to the same move a `u32` write does, and the ordering that
+    // makes the stores visible to the reads below comes from rayon's join, not from the
+    // atomic. It was the largest setup pass at 181 ms for five million rows a side, entirely
+    // because it ran on one core.
+    let pos1: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    order1.par_iter().enumerate().for_each(|(i, &e)| {
+        pos1[e as usize].store(i as u32, AtomicOrdering::Relaxed);
+    });
     // Where each axis-1 dense rank first appears in `order1`. Because the ranks are dense
     // and `order1` is sorted by them, one reverse pass gives the whole table — and it turns
     // every left row's axis-1 bound from a binary search into an array read.
@@ -426,7 +489,7 @@ fn two_conditions(
     // the universe, so at five million rows a side it was ~23 random reads into 40 MB, five
     // million times. The phase study put the sweep at 900 ms of a 1.6 s join, and this is
     // most of it.
-    let sorted_drank1: Vec<u32> = order1.iter().map(|&e| drank1[e as usize]).collect();
+    let sorted_drank1: Vec<u32> = order1.par_iter().map(|&e| drank1[e as usize]).collect();
     let max_rank = sorted_drank1.last().copied().unwrap_or(0) as usize;
     let mut first_at = vec![n as u32; max_rank + 2];
     for (i, &r) in sorted_drank1.iter().enumerate().rev() {
@@ -435,34 +498,49 @@ fn two_conditions(
 
     let (order2, drank2) = k2.sorted_order_and_ranks(n, nl, lmap, rmap);
     // The sweep walks `order2` twice per step — once for the entry, once to look up its
-    // axis-2 rank, and once more to find a right entry's axis-1 bit. Precomputing both in
-    // `order2` order turns those gathers into sequential reads of two flat arrays, which is
+    // axis-2 rank, and once more to find a right entry's axis-1 bit. Precomputing all three in
+    // `order2` order turns those gathers into sequential reads of flat arrays, which is
     // what the marking loop (the largest phase after the sorts) actually spends its time on.
-    let drank2_seq: Vec<u32> = order2.iter().map(|&e| drank2[e as usize]).collect();
-    // Each left row's axis-1 bound, in `order2` order, so the sweep reads it sequentially
-    // instead of gathering a rank and then searching for it. A strict condition starts at
-    // the next rank's first position, a non-strict one at this rank's.
+    //
+    // The three are built in **one** parallel pass rather than three sequential ones, and that
+    // is the difference between 341 ms and 26 ms at five million rows a side. Each was a
+    // separate `order2.iter().map(...).collect()`, so `order2` — 40 MB at that size — was
+    // streamed three times to produce three arrays indexed identically, on one core of a
+    // box with 96. Fusing them reads it once; chunking hands the gathers to rayon.
+    //
+    // `par_chunks`/`par_chunks_mut` are zipped at a common chunk length, so chunk `c` of every
+    // output lines up with chunk `c` of `order2` and each element lands at the index it had
+    // before. That is what keeps this a pure reindexing: the arrays are byte-for-byte what the
+    // sequential passes produced, so no sweep behaviour and no join result can move.
+    //
+    // The scattered reads inside a chunk (`drank2[e]`, `pos1[e]`, `first_at[..]`) are the cost
+    // that parallelizes; they are random over the whole universe, so there is nothing to gain
+    // from a smaller chunk and the chunk length is set for scheduling granularity alone.
     let bump = usize::from(ops[0].strict());
-    let lo_seq: Vec<u32> = order2
-        .iter()
-        .map(|&e| {
-            if (e as usize) < nl {
-                first_at[drank1[e as usize] as usize + bump]
-            } else {
-                0
+    let mut drank2_seq = vec![0u32; n];
+    let mut lo_seq = vec![0u32; n];
+    let mut mark_at = vec![0u32; n];
+    order2
+        .par_chunks(SETUP_CHUNK)
+        .zip(drank2_seq.par_chunks_mut(SETUP_CHUNK))
+        .zip(lo_seq.par_chunks_mut(SETUP_CHUNK))
+        .zip(mark_at.par_chunks_mut(SETUP_CHUNK))
+        .for_each(|(((entries, d2), lo), mark)| {
+            for (j, &e) in entries.iter().enumerate() {
+                let eu = e as usize;
+                d2[j] = drank2[eu];
+                // A left row carries an axis-1 suffix bound and is never marked; a right row
+                // carries a mark bit and no bound. A strict condition starts at the next
+                // rank's first position, a non-strict one at this rank's.
+                if eu < nl {
+                    lo[j] = first_at[drank1[eu] as usize + bump];
+                    mark[j] = NOT_A_RIGHT_ROW;
+                } else {
+                    lo[j] = 0;
+                    mark[j] = pos1[eu].load(AtomicOrdering::Relaxed);
+                }
             }
-        })
-        .collect();
-    let mark_at: Vec<u32> = order2
-        .iter()
-        .map(|&e| {
-            if (e as usize) >= nl {
-                pos1[e as usize]
-            } else {
-                NOT_A_RIGHT_ROW
-            }
-        })
-        .collect();
+        });
 
     let sweep = Sweep {
         nl,
@@ -480,7 +558,11 @@ fn two_conditions(
 
     // Which `order2` positions hold left rows. Only these do any work; the rest are marked
     // by the cursor. Materializing them is what makes the slices below evenly sized.
+    // rayon's `collect` into a `Vec` preserves iteration order, so this is the same ascending
+    // slice of `order2` positions the sequential filter produced — which the sweep relies on
+    // (`Sweep::run` documents that `at` must be contiguous and ascending).
     let left_at: Vec<u32> = (0..n as u32)
+        .into_par_iter()
         .filter(|&i| (order2[i as usize] as usize) < nl)
         .collect();
 
@@ -1114,6 +1196,83 @@ mod tests {
         assert_eq!(got.right, sequential.right);
     }
 
+    /// The band's parallel cursor walk must equal the sequential one row for row.
+    ///
+    /// Nothing else covers it, and the gap was structural rather than an oversight:
+    /// `a_band_over_one_right_key_matches_the_cross_product_oracle` runs at 25 rows a side, and
+    /// `the_parallel_paths_agree_with_an_analytic_answer` hands the two conditions *different*
+    /// right arrays, so `Arc::ptr_eq` fails and it routes to IEJoin. The band's parallel branch
+    /// does not engage below `2 * PARALLEL_MIN_PER_WORKER` left rows, so both of those run the
+    /// sequential merge and a broken seek would pass every band test in the file.
+    ///
+    /// The walk is split by seeking each chunk's starting cursor with a binary search, which is
+    /// exact only because the walk is monotone over a sorted array. **Heavy key duplication is
+    /// the point of this data**: `skip_equal` decides whether an equal-key run is skipped or
+    /// kept, so a chunk boundary landing inside such a run is precisely where a wrong seek
+    /// would surface. At ~250 rows per distinct key, boundaries land inside runs constantly.
+    ///
+    /// All four strictness combinations are bands (`Lt`/`Le` bound the right key from below,
+    /// `Gt`/`Ge` from above), and each is checked against a single-threaded rayon pool, which
+    /// takes the sequential branch and is what makes the two comparable.
+    ///
+    /// This test was mutation-checked rather than assumed to have teeth, and the result is worth
+    /// knowing: replacing the seek with `partition_point(|y| y <= lk)` fails it on the first
+    /// combination, while `partition_point(|y| y < lk)` **passes** — because the walk only
+    /// advances, so an undershooting seek is corrected by it and is merely slower. Only an
+    /// overshoot is a wrong answer, which is the property the comment on the seek records.
+    #[test]
+    fn the_parallel_band_merge_agrees_with_the_sequential_one() {
+        const N: usize = 50_000;
+        const SPAN: u64 = 200;
+
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let ry: Vec<Option<i64>> = (0..N).map(|_| Some((rng.next() % SPAN) as i64)).collect();
+        let la: Vec<Option<i64>> = (0..N).map(|_| Some((rng.next() % SPAN) as i64)).collect();
+        let lb: Vec<Option<i64>> = la.iter().map(|v| Some(v.unwrap() + 3)).collect();
+        // ONE array, cloned, so `Arc::ptr_eq` holds and the band path fires.
+        let ry_arr = arr(&ry);
+
+        for (op_lo, op_hi) in [
+            (RangeOp::Le, RangeOp::Ge),
+            (RangeOp::Lt, RangeOp::Ge),
+            (RangeOp::Le, RangeOp::Gt),
+            (RangeOp::Lt, RangeOp::Gt),
+        ] {
+            let run = || {
+                range_join_indices(
+                    &[arr(&la), arr(&lb)],
+                    &[ry_arr.clone(), ry_arr.clone()],
+                    &[op_lo, op_hi],
+                    JoinType::Inner,
+                )
+                .expect("join runs")
+            };
+
+            let parallel = run();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("single-thread pool");
+            let sequential = pool.install(run);
+
+            assert_eq!(
+                parallel.left, sequential.left,
+                "{op_lo:?}/{op_hi:?}: left indices differ between the parallel and \
+                 sequential band merge"
+            );
+            assert_eq!(
+                parallel.right, sequential.right,
+                "{op_lo:?}/{op_hi:?}: right indices differ between the parallel and \
+                 sequential band merge"
+            );
+            // A shape that matched nothing would make the equality above vacuous.
+            assert!(
+                !parallel.left.is_empty(),
+                "{op_lo:?}/{op_hi:?}: the band matched no rows, so this proves nothing"
+            );
+        }
+    }
+
     #[test]
     fn the_mark_set_finds_every_bit_across_summary_blocks() {
         // Every level boundary: a word (64), and then each successive summary's span
@@ -1271,6 +1430,12 @@ mod tests {
             let sl = k_lo.sorted_left(nl, &lmap, &rmap);
             let sort_l = t.elapsed();
 
+            // NOTE: this is the *sequential, generic-comparison* merge, written out here rather
+            // than called. It is no longer what the operator runs — `bounds_by_merge` takes a
+            // contiguous `u64` fast path and splits it across workers — so read `merge1` as the
+            // reference cost this phase used to have, and read `whole` for what the operator
+            // actually costs. Keeping it is useful (it is the ceiling the fast path is measured
+            // against); mistaking it for the live path is not.
             let t = Instant::now();
             let mut at = vec![0u32; nl];
             let mut p = 0usize;

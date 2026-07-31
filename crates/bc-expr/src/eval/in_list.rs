@@ -16,15 +16,9 @@ use arrow::error::ArrowError;
 
 use crate::{BinaryOp, ExprError, Literal};
 
-/// The set type for the hashed path.
-///
-/// `std::collections::HashSet` defaults to SipHash, which is ~20–30 cycles per probe and was
-/// the whole cost of a large `IN` over a wide column: a 204-member `l_partkey IN (…)` over
-/// TPC-H `lineitem` measured 13.2 ms against 4.4 ms for an 8-member (linear-scan) list on the
-/// same 6M rows, and set size cannot explain that for an O(1) probe — the hash can. `ahash` is
-/// already the workspace's hasher for exactly this reason (`bc-runtime`'s join tables use it),
-/// and membership is hasher-independent, so the mask is unchanged.
-type FastSet<T> = std::collections::HashSet<T, ahash::RandomState>;
+/// The set type for the hashed path — see [`crate::eval::FastSet`] for why it is not
+/// `std::collections::HashSet`, and for the measurement that moved it.
+use crate::eval::FastSet;
 
 /// At/below this many members, a linear scan of the set beats hashing every input row.
 ///

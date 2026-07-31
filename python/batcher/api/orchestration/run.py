@@ -417,7 +417,9 @@ def _run_relational(
     # query, because the in-memory path resolves every source to Arrow *before* the engine
     # runs — a 600M-row scan is resident in full even when the query returns four rows.
     input_bytes = projected_input_bytes(sources, opt.source_projections)
-    if must_spill or rm.should_spill(opt) or rm.input_exceeds_budget(input_bytes):
+    # `resident_total_exceeds_budget` subsumes the input-only check: the input and the
+    # plan's peak state are concurrent on this path, so what matters is their sum.
+    if must_spill or rm.should_spill(opt) or rm.resident_total_exceeds_budget(input_bytes, opt):
         spilled = spill_to_disk(logical_opt, sources, ctx, rm, opt, verdict)
         if spilled is not None:
             _close_resident_free_loops(

@@ -51,6 +51,13 @@ class HardwareProfile:
     * `gpu_memory_bytes`  — usable VRAM of the *smallest* visible GPU; `0` when unknown.
     * `worker_count`      — workers the plan will run across (`1` single-node); lets Kyber
                             reason about total vs per-node budgets on a cluster.
+    * `accelerator_type`  — the *model* of the binding GPU (`"NVIDIA_H100"`), `""` when
+                            unknown or when the fleet is mixed. VRAM alone cannot answer
+                            "how fast is the host link", "can this device be partitioned",
+                            or "what does it draw" — every one of which changes a plan, and
+                            none of which is derivable from a byte count. `""` is the
+                            pre-existing behavior: every model-specific decision then reports
+                            no opinion and the plan is sized exactly as it was before.
     """
 
     cpu_cores: int = 0
@@ -59,6 +66,7 @@ class HardwareProfile:
     gpu_count: int = 0
     gpu_memory_bytes: int = 0
     worker_count: int = 1
+    accelerator_type: str = ""
 
     @classmethod
     def local(cls) -> HardwareProfile:
@@ -68,6 +76,7 @@ class HardwareProfile:
         no cluster. A distributed run replaces this with a cluster-derived profile via
         [`for_cluster`]; every field a probe cannot answer stays `0` ("unknown").
         """
+        from batcher._internal.device_specs import resolve_device_name
         from batcher._internal.hardware import (
             available_cpu_count,
             gpu_inventory,
@@ -77,6 +86,11 @@ class HardwareProfile:
 
         gpus = gpu_inventory()
         vram = min((int(g.get("memory_bytes") or 0) for g in gpus), default=0)
+        # The device *model*, resolved from whatever the driver called it. Only when every
+        # local device is the same model: a mixed host has no single binding model, and
+        # naming one of them would attach one device's power and host link to another's plan.
+        names = {resolve_device_name(str(g.get("name") or "")) or "" for g in gpus}
+        model = names.pop() if len(names) == 1 else ""
         return cls(
             cpu_cores=available_cpu_count(),
             memory_bytes=machine_memory_bytes(),
@@ -84,6 +98,7 @@ class HardwareProfile:
             gpu_count=len(gpus),
             gpu_memory_bytes=vram,
             worker_count=1,
+            accelerator_type=model,
         )
 
     @classmethod
@@ -96,6 +111,7 @@ class HardwareProfile:
         gpu_count: int = 0,
         gpu_memory_bytes: int = 0,
         l3_cache_bytes: int = 0,
+        accelerator_type: str = "",
     ) -> HardwareProfile:
         """A profile for a distributed run, built by the conductor from live cluster topology.
 
@@ -104,6 +120,10 @@ class HardwareProfile:
         land on. `l3_cache_bytes` is the binding worker's cache when the caller could probe the
         workers for it (Ray's topology omits cache), and `0` when it couldn't — which keeps a
         cache-sized threshold at its default rather than guessing from the driver's machine.
+
+        `accelerator_type` is the model every GPU node shares, or `""` on a mixed fleet — the
+        same rule `cluster_accelerator_type()` follows, because there is no honest single
+        answer when the models differ.
         """
         return cls(
             cpu_cores=max(0, cpu_cores),
@@ -112,6 +132,7 @@ class HardwareProfile:
             gpu_count=max(0, gpu_count),
             gpu_memory_bytes=max(0, gpu_memory_bytes),
             worker_count=max(1, worker_count),
+            accelerator_type=accelerator_type,
         )
 
 

@@ -240,8 +240,8 @@ and **must not** import `kyber`, `carbonite`, or `core` (`just lint-layers`).
 
 ## See also
 
-- `docs/user-guide/governance.md` (the full narrative), `docs/api/governance.md`,
-  `docs/user-guide/data-quality.md` (validate/quarantine rows before a consumer sees them).
+- `docs/user-guide/trust/governance.md` (the full narrative), `docs/api/operations/governance.md`,
+  `docs/user-guide/trust/data-quality.md` (validate/quarantine rows before a consumer sees them).
 - Source: `python/batcher/governance/{catalog,principal,policy,masks,filters,enforce,
   lineage,audit}.py`; `python/batcher/api/security/`.
 - Rules: `.claude/rules/architecture.md` (governance is an independent layer-3 subsystem

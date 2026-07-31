@@ -9,15 +9,18 @@ Six rewrites, all of them collapsing `p OR q` on a single column into one compar
     x IN (1, 2) OR x = 3   ->  x IN (1, 2, 3)
     (x >= 1 AND x <= 5) OR (x >= 4 AND x <= 9)  ->  x >= 1 AND x <= 9
 
-plus the conjunction case where an equality already implies its neighbour
-(`x = 5 AND x > 1` -> `x = 5`), and the constant fold `'a' IN ('a', 'b') -> true` — a shape
+plus two conjunction cases — an equality that already implies its neighbour
+(`x = 5 AND x > 1` -> `x = 5`) and a range of width zero
+(`x >= 3 AND x <= 3` -> `x = 3`) — and the constant fold `'a' IN ('a', 'b') -> true`, a shape
 no query writes, but the one the `CASE` push rules produce once a membership test lands on
 a literal branch.
 
 The value is not the saved comparison. It is that each leaves *one* bound or *one* set per
 column, which is the only shape `zonemap_prune_filter` and source predicate pushdown
 recognize; a column mentioned by two disjuncts is skipped by both, so the query reads every
-row group it could have refuted.
+row group it could have refuted. The zero-width range earns its place the same way and then
+some: an equality is a *point lookup*, which a bloom filter can refute and a most-common-values
+sketch can size, neither of which a range admits.
 
 Comparing two bounds means comparing their literals, and that is done with a guarded
 Python comparison rather than assumed. Two literals of incomparable types (an int against
@@ -276,6 +279,44 @@ def _fold_in_list_of_literal(expr: Expr) -> Expr:
     return expr
 
 
+def _collapse_degenerate_range(expr: Expr) -> Expr:
+    """`x >= c AND x <= c` -> `x = c`. A range of width zero is a point.
+
+    The saved comparison is not the point. An equality is a **point lookup**, and the
+    data-skipping machinery treats one differently in kind from a range: a `ColumnStat.bloom`
+    refutes an equality or an `IN` and can say nothing about a range, and equality selectivity
+    is read off the most-common-values sketch rather than interpolated from the quantile grid.
+    So the two spellings prune differently even though they keep the same rows, and the range
+    spelling is the one a generated query produces -- `BETWEEN d AND d` is what a dashboard
+    emits for a single-day filter, and it is also what the `date_trunc` range rewrites leave
+    behind when the truncation unit matches the filter's granularity.
+
+    Exact under three-valued logic with no non-null guard, and for the same reason as every
+    other rule here: a null operand makes both conjuncts NULL, `NULL AND NULL` is NULL, and
+    the equality on that same operand is NULL too. The literals must be *equal*, so a
+    crossing pair (`x >= 5 AND x <= 3`, a contradiction) is not this rule's business --
+    `predicate_infer.filter_range_contradiction` empties the filter for that.
+    """
+    if not isinstance(expr, Binary) or expr.op != "and":
+        return expr
+    left, right = _comparison(expr.left), _comparison(expr.right)
+    if left is None or right is None:
+        return expr
+    (left_op, left_operand, left_value) = left
+    (right_op, right_operand, right_value) = right
+    # One inclusive lower and one inclusive upper bound, in either order. A strict bound
+    # (`>`/`<`) at the same literal is a contradiction rather than a point.
+    if {left_op, right_op} != {"ge", "le"}:
+        return expr
+    if not _same_operand(left_operand, right_operand):
+        return expr
+    # `==` rather than a `_lt` pair: two literals of incomparable types answer False here,
+    # which correctly declines, and `-0.0 == 0.0` is True — the two really are one point.
+    if left_value != right_value:
+        return expr
+    return Binary("eq", left_operand, Lit(left_value))
+
+
 def _register(name: str, leaf: Callable[[Expr], Expr]):
     return DEFAULT_REGISTRY.add(
         node_rule(
@@ -294,7 +335,7 @@ def _register(name: str, leaf: Callable[[Expr], Expr]):
     )
 
 
-#: The eight disjunction/absorption/folding rules this module registers, in the order the
+#: The nine disjunction/absorption/folding rules this module registers, in the order the
 #: module docstring lists them.
 PREDICATE_BOUND_RULES = [
     _register("widen_upper_bound_disjunction", _widen_bound(_UPPER, upper=True)),
@@ -305,4 +346,5 @@ PREDICATE_BOUND_RULES = [
     _register("merge_in_list_disjunction", _merge_in_lists),
     _register("union_overlapping_range_disjunction", _union_ranges),
     _register("fold_in_list_of_literal_input", _fold_in_list_of_literal),
+    _register("collapse_degenerate_range_to_equality", _collapse_degenerate_range),
 ]

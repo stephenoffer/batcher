@@ -104,9 +104,12 @@ pub(crate) fn bounded_group_histogram(
                 None
             };
             let mut firsts: Vec<u32> = Vec::with_capacity(batch.num_rows());
+            // As in the quantile passes next door: compare the borrowed row and own only on a
+            // change, and resolve the `dyn Array` null buffer once rather than per row.
+            let vnulls = vcol.nulls();
             for i in 0..batch.num_rows() {
-                let group = grows.as_ref().map(|g| g.row(i).owned());
-                if !started || (n_keys > 0 && prev_group != group) {
+                let group = grows.as_ref().map(|g| g.row(i));
+                if !started || (n_keys > 0 && prev_group.as_ref().map(|p| p.row()) != group) {
                     if started {
                         if let Some(k) = cur_key.take() {
                             key_rows.push(k);
@@ -116,7 +119,7 @@ pub(crate) fn bounded_group_histogram(
                         valid.push(group_has_value);
                     }
                     started = true;
-                    prev_group = group;
+                    prev_group = group.map(|r| r.owned());
                     cur_key = None;
                     cur_count = 0;
                     group_has_value = false;
@@ -124,17 +127,17 @@ pub(crate) fn bounded_group_histogram(
                         firsts.push(i as u32);
                     }
                 }
-                if vcol.is_valid(i) {
-                    let vr = vrows.row(i).owned();
+                if vnulls.is_none_or(|n| n.is_valid(i)) {
+                    let vr = vrows.row(i);
                     group_has_value = true;
-                    if cur_key.as_ref() == Some(&vr) {
+                    if cur_key.as_ref().map(|c| c.row()) == Some(vr) {
                         cur_count += 1;
                     } else {
                         if let Some(k) = cur_key.take() {
                             key_rows.push(k);
                             counts.push(cur_count);
                         }
-                        cur_key = Some(vr);
+                        cur_key = Some(vr.owned());
                         cur_count = 1;
                     }
                 }

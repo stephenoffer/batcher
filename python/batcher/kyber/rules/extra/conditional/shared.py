@@ -3,19 +3,38 @@
 The delicate one is `_droppable`. `CASE WHEN FALSE THEN 1 ELSE 2.5 END` is a DOUBLE, so
 removing an arm can silently *narrow* the result type; an arm is dropped only when a kept
 arm provably carries the same type. `_pure` stops a drop from erasing an error.
+
+There are two independent ways to name an arm's type here, and `_droppable` accepts either
+as proof. `_type_tag` is schema-free and so bottoms out on a bare column: it can name a
+literal, a cast, and anything boolean-valued, but `CASE WHEN TRUE THEN a ELSE b END` over two
+`int` columns leaves it with `None` on both arms — which read as "unknown", so the whole
+family declined on it. That is the shape a SQL front end, a governance rewrite, or a
+partially-folded predicate produces constantly, and declining meant the fold never happened
+on a real query.
+
+`_arrow_tag` closes that: given the node's schema it asks `infer_type` for the arm's *exact*
+Arrow type, which is both sharper than the coarse classes and available for expressions
+`_type_tag` cannot see into at all. The schema-free path stays, because a node whose schema
+cannot be inferred still gets the literal-only conclusions it always did — so every rule in
+the family declares both leaves and the driver runs whichever it can.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from batcher._internal.mathx import is_nan
 
 # `_key` (structural identity), `_rewrite_node` (leaf Expr rule → rebuilt node, or None) and
 # `_safe` (deterministic + non-erroring) are the sibling family's helpers, imported rather than
 # re-implemented — copy-paste is the one wrong way to share.
-from batcher.kyber.rules.extra.boolean_algebra import _SAFE_BINARY_OPS, _key, _safe
+from batcher.kyber.rules.extra.boolean_algebra import (
+    _SAFE_BINARY_OPS,
+    _key,
+    _rewrite_node,
+    _safe,
+)
 from batcher.plan.expr_ir import (
     Binary,
     Case,
@@ -33,6 +52,8 @@ from batcher.plan.expr_ir import (
 )
 from batcher.plan.expr_ir.core import IsInf, IsNan
 from batcher.plan.logical import Filter, Project
+from batcher.plan.schema import SchemaRef
+from batcher.plan.types import infer_type
 
 # The nodes these rules rewrite: `_rewrite_node` walks every expression a Filter/Project carries.
 _Node = Filter | Project
@@ -101,19 +122,80 @@ def _uniform_tag(exprs: Sequence[Expr]) -> str | None:
     return tags.pop() if len(tags) == 1 else None
 
 
-def _droppable(dropped: Sequence[Expr], kept: Sequence[Expr]) -> bool:
+def _arrow_tag(expr: Expr, schema: SchemaRef | None) -> str | None:
+    """The expression's exact Arrow type as a tag, or ``None`` when it cannot be inferred.
+
+    The schema-aware counterpart to `_type_tag`, and strictly sharper where it applies: two
+    expressions carry the same tag exactly when they have the same Arrow type, which is the
+    relation droppability needs. `infer_type` raising (an expression the inference does not
+    cover, a column the schema lacks) reads as "unknown", the same as a `None` tag.
+    """
+    if schema is None:
+        return None
+    try:
+        return str(infer_type(expr, schema))
+    except Exception:
+        return None
+
+
+def _droppable(
+    dropped: Sequence[Expr], kept: Sequence[Expr], schema: SchemaRef | None = None
+) -> bool:
     """The guard for deleting arms of a type-joining node: each dropped arm is pure, and the output
     type survives. That type is the *join* of the arms' types, and a join is monotone + idempotent —
-    so if a *kept* arm already contributes the dropped arm's type (proven by structural identity, or
-    by a shared `_type_tag`), the join over `kept` alone equals the join over all of them."""
+    so if a *kept* arm already contributes the dropped arm's type, the join over `kept` alone equals
+    the join over all of them.
+
+    Three independent proofs that a kept arm carries a dropped arm's type, and any one suffices:
+    structural identity, a shared schema-free `_type_tag`, or — when `schema` is given — a shared
+    exact Arrow type. The third is what lets the fold happen over bare columns, where the first two
+    are silent."""
     if not kept or not all(_pure(arm) for arm in dropped):
         return False
     kept_keys = {_key(e) for e in kept}
     kept_tags = {tag for tag in (_type_tag(e) for e in kept) if tag is not None}
+    kept_arrow = {tag for tag in (_arrow_tag(e, schema) for e in kept) if tag is not None}
     for arm in dropped:
-        if _key(arm) not in kept_keys and _type_tag(arm) not in kept_tags:  # None ⇒ unknown ⇒ keep
-            return False
+        if _key(arm) in kept_keys:
+            continue
+        if _type_tag(arm) in kept_tags:  # None ⇒ unknown ⇒ falls through to the Arrow tag
+            continue
+        arrow = _arrow_tag(arm, schema)
+        if arrow is not None and arrow in kept_arrow:
+            continue
+        return False
     return True
+
+
+def _rewrite_typed(
+    node: _Node,
+    leaf: Callable[..., Expr],
+    *,
+    carries: tuple[type, ...],
+) -> _Node | None:
+    """The node-local form of a conditional leaf, run schema-free and then schema-aware.
+
+    Every leaf in this family takes an optional `schema`, so this applies the *same* function
+    twice: once with no type information and once with the node's input schema. That mirrors
+    exactly what the driver does for a rule declaring both an `expr` and an `expr_schema` leaf,
+    which is what keeps the standalone form equivalent to the fused one.
+
+    Args:
+        node: The Filter/Project whose expressions should be rewritten.
+        leaf: The leaf rewrite, callable as `leaf(expr)` and as `leaf(expr, schema)`.
+        carries: The expression node types the leaf can act on, so the schema pass declines
+            without resolving a schema when the node carries none of them.
+
+    Returns:
+        The rebuilt node, or ``None`` when neither pass changed anything.
+    """
+    from batcher.kyber.rules.exprs.guards import schema_rule
+
+    plain = _rewrite_node(node, leaf)
+    current = node if plain is None else plain
+    typed = schema_rule(current, leaf, carries=carries)
+    result = current if typed is None else typed
+    return None if result is node else result
 
 
 def _is_true_lit(expr: Expr) -> bool:

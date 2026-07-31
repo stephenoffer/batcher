@@ -58,9 +58,9 @@ them change the core API, so nothing you write has to know which are present.
 
 | Extra | What it turns on | Where it is used |
 |---|---|---|
-| `ray` | Distributed execution and scheduling | {doc}`../integrations/ray`, {doc}`../architecture/execution` |
-| `cloud` | Object-store filesystems (`s3://`, `gs://`, and similar) via fsspec | {doc}`../user-guide/cloud-storage` |
-| `torch`, `tensorflow` | ML data-plane backends for the `.ml` accessor | {doc}`../ml/index`, {doc}`../integrations/pytorch` |
+| `ray` | Distributed execution and scheduling | {doc}`/integrations/compute/ray`, {doc}`../architecture/execution` |
+| `cloud` | Object-store filesystems (`s3://`, `gs://`, and similar) via fsspec | {doc}`/user-guide/moving-data/cloud-storage` |
+| `torch`, `tensorflow` | ML data-plane backends for the `.ml` accessor | {doc}`../ml/index`, {doc}`/integrations/compute/pytorch` |
 | `duckdb`, `polars` | The reference backends the benchmark and differential suites compare against | {doc}`../benchmarks/methodology` |
 
 Ray schedules tasks and actors only. Bulk data moves over Arrow Flight rather than through

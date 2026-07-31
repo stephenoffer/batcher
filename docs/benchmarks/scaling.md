@@ -161,14 +161,14 @@ python benchmarks/scenarios/scale_bench.py
 
 - {doc}`vs-daft`: the single-node half.
 - {doc}`vs-spark`: the architectural comparison these measurements stand in for.
-- {doc}`../deep-dives/mergeable-algebra`: why one core and a hundred nodes
+- {doc}`/deep-dives/operators/mergeable-algebra`: why one core and a hundred nodes
   give the same answer.
-- {doc}`../deep-dives/distributed-scheduling`: what `distributed="auto"`
+- {doc}`/deep-dives/distribution/distributed-scheduling`: what `distributed="auto"`
   is deciding, and on what.
-- {doc}`../deep-dives/shuffle-flight` and
-  {doc}`../deep-dives/credit-flow-control`: the data movement the page
+- {doc}`/deep-dives/distribution/shuffle-flight` and
+  {doc}`/deep-dives/distribution/credit-flow-control`: the data movement the page
   names as the real lever.
-- {doc}`../deep-dives/spilling`: what keeps per-node memory bounded when a partition
+- {doc}`/deep-dives/memory/spilling`: what keeps per-node memory bounded when a partition
   does not fit.
 - {doc}`../architecture/fault-tolerance`: how a distributed query survives
   a lost worker.

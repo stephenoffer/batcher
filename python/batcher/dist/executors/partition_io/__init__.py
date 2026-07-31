@@ -15,9 +15,6 @@ from batcher.dist.executors.partition_io._sources import (
     _apply_above as _apply_above,
 )
 from batcher.dist.executors.partition_io._sources import (
-    _balance as _balance,
-)
-from batcher.dist.executors.partition_io._sources import (
     _eager_range_split as _eager_range_split,
 )
 from batcher.dist.executors.partition_io._sources import (
@@ -40,6 +37,14 @@ from batcher.dist.executors.partition_io._sources import (
     read_partition_descriptor,
     source_pushdown,
 )
+from batcher.dist.executors.partition_io.assignment import (
+    _balance as _balance,
+)
+from batcher.dist.executors.partition_io.assignment import (
+    assign_splits,
+    balance_with_affinity,
+    has_affinity,
+)
 from batcher.dist.executors.partition_io.folds import (
     streaming_partial_aggregate,
     streaming_topn,
@@ -52,9 +57,12 @@ from batcher.dist.executors.partition_io.ranges import (
 
 __all__ = [
     "SAMPLE_PROBS",
+    "assign_splits",
+    "balance_with_affinity",
     "bucketize",
     "consumer_pushdown",
     "descriptor_rows",
+    "has_affinity",
     "iter_partition",
     "iter_partition_descriptor",
     "materialize_reduce_output",

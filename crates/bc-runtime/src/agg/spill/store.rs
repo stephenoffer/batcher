@@ -615,6 +615,8 @@ impl DiskSpillStore {
             return Ok(None);
         }
         let file = File::open(&self.paths[partition])?;
+        // A merge interleaves runs, so the kernel's sequential heuristic never fires on one.
+        bc_arrow::page_cache::advise_sequential(&file);
         Ok(Some(StreamReader::try_new(
             BufReader::with_capacity(SPILL_READ_BUF, file),
             None,
@@ -737,8 +739,12 @@ impl SpillStore for DiskSpillStore {
             return Ok(Vec::new());
         }
         let file = File::open(&self.paths[partition])?;
-        let reader = StreamReader::try_new(BufReader::with_capacity(SPILL_READ_BUF, file), None)?;
-        let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
+        bc_arrow::page_cache::advise_sequential(&file);
+        let mut reader =
+            StreamReader::try_new(BufReader::with_capacity(SPILL_READ_BUF, file), None)?;
+        // `by_ref` outlives `collect`, so the reader can still name its descriptor below.
+        let batches: Vec<RecordBatch> = reader.by_ref().collect::<Result<Vec<_>, _>>()?;
+        bc_arrow::page_cache::advise_dontneed(reader.get_ref().get_ref());
         let got: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         self.verify_rows(partition, got)?;
         Ok(batches)

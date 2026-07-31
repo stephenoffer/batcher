@@ -77,49 +77,80 @@ pub(crate) fn surviving_row_groups(
     candidates: &[usize],
 ) -> Vec<usize> {
     let n = meta.num_row_groups();
+    // Resolved once for the file, not once per row group per predicate leaf.
+    let index = ColumnIndex::build(meta);
     candidates
         .iter()
         .copied()
-        .filter(|&rg| rg >= n || rg_survives(meta.row_group(rg), pred))
+        .filter(|&rg| rg >= n || rg_survives(meta.row_group(rg), pred, &index))
         .collect()
 }
 
-fn rg_survives(rg: &RowGroupMetaData, pred: &Pred) -> bool {
+fn rg_survives(rg: &RowGroupMetaData, pred: &Pred, index: &ColumnIndex) -> bool {
     match pred {
-        Pred::And { left, right } => rg_survives(rg, left) && rg_survives(rg, right),
-        Pred::Or { left, right } => rg_survives(rg, left) || rg_survives(rg, right),
-        Pred::IsNull { col, negated } => isnull_survives(rg, col, *negated),
-        Pred::Cmp { col, op, lit } => cmp_survives(rg, col, *op, lit),
+        Pred::And { left, right } => rg_survives(rg, left, index) && rg_survives(rg, right, index),
+        Pred::Or { left, right } => rg_survives(rg, left, index) || rg_survives(rg, right, index),
+        Pred::IsNull { col, negated } => isnull_survives(rg, col, *negated, index),
+        Pred::Cmp { col, op, lit } => cmp_survives(rg, col, *op, lit, index),
     }
 }
 
-/// The `Statistics` for the *top-level* column `col`, plus whether it is an *unsigned*
-/// integer, if present as a flat leaf.
+/// Top-level column name to its column-chunk index and unsigned flag, resolved once per file.
 ///
-/// The pushed predicate only ever names a top-level column (`to_native_predicate` emits
-/// bare column names), so the match must be against the column's *full* path being the
-/// single part `col` — NOT its leaf name. Matching on the leaf alone let a nested field
-/// (`s.a`) whose leaf collides with a top-level column (`a`) shadow it: the wrong
-/// column's min/max was then used to prune, which silently dropped every matching row of
-/// a file that happened to carry a like-named struct field. A predicate on a genuinely
-/// nested column therefore finds no stats and (correctly, conservatively) keeps the group.
+/// This replaces a per-lookup linear scan over a row group's columns. That scan was called once
+/// per predicate leaf per *row group*, and a file's column layout is identical across its row
+/// groups — so it recomputed one answer `row_groups x leaves` times. On a 200-column table with 1,000 row groups and a three-conjunct predicate that is
+/// 600,000 path comparisons to answer three questions, and the many-small-files scan pays it
+/// per file.
 ///
-/// The unsigned flag is load-bearing: Parquet stores UINT_8/16/32/64 in a *signed*
-/// physical `INT32`/`INT64`, with its min/max computed by *unsigned* order. A large
-/// unsigned value (e.g. 3e9 in a `UInt32`) therefore surfaces as a negative `i32` stat, so
-/// interpreting it as signed silently prunes away the rows that actually match. The caller
-/// reinterprets the bits as unsigned when this is set.
-pub(crate) fn col_stats<'a>(rg: &'a RowGroupMetaData, col: &str) -> Option<(&'a Statistics, bool)> {
-    (0..rg.num_columns()).find_map(|i| {
-        let cc = rg.column(i);
-        let parts = cc.column_path().parts();
-        if parts.len() == 1 && parts[0] == col {
-            cc.statistics()
-                .map(|s| (s, is_unsigned_int(cc.column_descr())))
-        } else {
-            None
+/// Built from the *schema descriptor* rather than a row group, because the leaf order it
+/// enumerates is exactly the column-chunk order every row group uses, and it exists even for a
+/// file with no row groups at all.
+pub(crate) struct ColumnIndex {
+    by_name: std::collections::HashMap<String, (usize, bool)>,
+}
+
+impl ColumnIndex {
+    /// Resolve every flat top-level column of `meta`'s schema.
+    ///
+    /// Nested leaves are deliberately absent: the pushed predicate only ever names a
+    /// top-level column, and matching a nested leaf by its final name is what once let
+    /// `s.a` shadow a top-level `a` and prune away every matching row. Keeping only
+    /// single-part paths preserves that, so a predicate on a nested column finds nothing
+    /// and (correctly, conservatively) keeps the group.
+    pub(crate) fn build(meta: &ParquetMetaData) -> Self {
+        let descr = meta.file_metadata().schema_descr();
+        let mut by_name = std::collections::HashMap::with_capacity(descr.num_columns());
+        for i in 0..descr.num_columns() {
+            let c = descr.column(i);
+            let parts = c.path().parts();
+            if parts.len() == 1 {
+                by_name.insert(parts[0].clone(), (i, is_unsigned_int(c.as_ref())));
+            }
         }
-    })
+        Self { by_name }
+    }
+
+    /// `col`'s statistics in `rg`, plus whether it is an *unsigned* integer.
+    ///
+    /// The unsigned flag is load-bearing: Parquet stores UINT_8/16/32/64 in a *signed* physical
+    /// `INT32`/`INT64`, with its min/max computed by *unsigned* order. A large unsigned value
+    /// (3e9 in a `UInt32`, say) therefore surfaces as a negative `i32` stat, and reading it as
+    /// signed silently prunes away the rows that actually match. The caller reinterprets the
+    /// bits as unsigned when this is set.
+    pub(crate) fn stats<'a>(
+        &self,
+        rg: &'a RowGroupMetaData,
+        col: &str,
+    ) -> Option<(&'a Statistics, bool)> {
+        let &(i, unsigned) = self.by_name.get(col)?;
+        // A row group with fewer chunks than the schema has leaves is malformed; decline
+        // rather than index into it, so pruning stays conservative instead of panicking.
+        if i >= rg.num_columns() {
+            return None;
+        }
+        rg.column(i).statistics().map(|s| (s, unsigned))
+    }
 }
 
 /// Whether a column's logical/converted type is an *unsigned* integer, so its signed
@@ -141,8 +172,8 @@ pub(crate) fn is_unsigned_int(descr: &parquet::schema::types::ColumnDescriptor) 
 
 /// `IS [NOT] NULL` pruning: a group with a known null count can be skipped when it holds
 /// no nulls (`IS NULL`) or only nulls (`IS NOT NULL`); an unknown count keeps the group.
-fn isnull_survives(rg: &RowGroupMetaData, col: &str, negated: bool) -> bool {
-    let Some((stats, _unsigned)) = col_stats(rg, col) else {
+fn isnull_survives(rg: &RowGroupMetaData, col: &str, negated: bool, index: &ColumnIndex) -> bool {
+    let Some((stats, _unsigned)) = index.stats(rg, col) else {
         return true;
     };
     let Some(nulls) = stats.null_count_opt() else {
@@ -155,8 +186,14 @@ fn isnull_survives(rg: &RowGroupMetaData, col: &str, negated: bool) -> bool {
     }
 }
 
-fn cmp_survives(rg: &RowGroupMetaData, col: &str, op: CmpOp, lit: &Lit) -> bool {
-    let Some((stats, unsigned)) = col_stats(rg, col) else {
+fn cmp_survives(
+    rg: &RowGroupMetaData,
+    col: &str,
+    op: CmpOp,
+    lit: &Lit,
+    index: &ColumnIndex,
+) -> bool {
+    let Some((stats, unsigned)) = index.stats(rg, col) else {
         return true; // no stats for this column → cannot prune
     };
     match (stats, lit) {

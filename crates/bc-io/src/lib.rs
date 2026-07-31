@@ -93,10 +93,20 @@ pub enum IoError {
 /// parquet reader needs an executor; sharing one runtime lets concurrent split reads
 /// (one per worker thread) overlap their object-store I/O on a common thread pool
 /// instead of each spinning up its own.
+///
+/// Sized to [`bc_arrow::usable_cores`] rather than tokio's default. The default is
+/// `available_parallelism`, which honors the CPU *affinity mask* but not the cgroup CFS
+/// *bandwidth* quota — and Kubernetes' `cpu` limit is the latter. A pod limited to 15 cores
+/// on a 16-core node therefore got 16 decode workers, and exceeding the quota does not merely
+/// waste a thread: it gets the whole cgroup throttled for the rest of the CFS period, so the
+/// extra worker buys stalls for every other thread in the process. Parquet decode is
+/// CPU-bound, so this pool is exactly where that shows up.
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(bc_arrow::usable_cores())
+            .thread_name("bc-io")
             .enable_all()
             .build()
             .expect("build tokio runtime")
@@ -388,11 +398,14 @@ async fn read_parquet_async(
             let permissive = {
                 let (mut weighted, mut rows) = (0.0f64, 0.0f64);
                 let mut usable = true;
+                // Column positions resolved once for the file; the loop below asks for the
+                // same columns in every row group.
+                let col_index = predicate::ColumnIndex::build(arrow_meta.metadata());
                 for &rg in &targets {
                     let Some(meta) = row_groups.get(rg) else {
                         continue;
                     };
-                    match row_filter::estimate(pred, meta) {
+                    match row_filter::estimate(pred, meta, &col_index) {
                         Some(f) => {
                             weighted += f * meta.num_rows() as f64;
                             rows += meta.num_rows() as f64;
@@ -699,6 +712,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `ColumnIndex` must resolve exactly the columns the scan it replaced resolved.
+    ///
+    /// It exists to stop re-deriving one answer per row group, so the risk is that the
+    /// cached answer is a *different* answer. Two properties carry the correctness: a flat
+    /// top-level column resolves to statistics, and a nested leaf whose final name collides
+    /// with a top-level column does **not** — matching that leaf is what once let `s.a`
+    /// shadow `a` and prune away every matching row.
+    #[test]
+    fn the_column_index_resolves_flat_columns_and_never_a_nested_leaf() {
+        use arrow::array::{ArrayRef, StructArray};
+        use arrow::datatypes::Fields;
+
+        let dir = std::env::temp_dir().join(format!("bcio_colidx_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.parquet");
+        // `s{a}` collides on the leaf name with the top-level `a`, and `b` is flat.
+        let inner_a = Arc::new(Int64Array::from(vec![0i64, 1])) as ArrayRef;
+        let struct_fields: Fields = vec![Field::new("a", DataType::Int64, false)].into();
+        let s = StructArray::new(struct_fields.clone(), vec![inner_a], None);
+        let top_a = Arc::new(Int64Array::from(vec![500i64, 600])) as ArrayRef;
+        let b = Arc::new(Int64Array::from(vec![7i64, 8])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Struct(struct_fields), false),
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(s), top_a, b]).unwrap();
+        write_parquet(&p, &[batch], 1000);
+
+        let file = std::fs::File::open(&p).unwrap();
+        let md = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).unwrap();
+        let idx = predicate::ColumnIndex::build(md.metadata());
+        let rg = md.metadata().row_group(0);
+
+        // The top-level `a` resolves, and to its own statistics (500..600), not `s.a`'s 0..1.
+        let (stats, unsigned) = idx.stats(rg, "a").expect("top-level `a` resolves");
+        assert!(!unsigned);
+        match stats {
+            parquet::file::statistics::Statistics::Int64(v) => {
+                assert_eq!(
+                    *v.min_opt().unwrap(),
+                    500,
+                    "resolved the nested `s.a` instead"
+                );
+                assert_eq!(*v.max_opt().unwrap(), 600);
+            }
+            other => panic!("unexpected statistics type: {other:?}"),
+        }
+        assert!(
+            idx.stats(rg, "b").is_some(),
+            "a second flat column resolves"
+        );
+        // The nested leaf is reachable by neither its leaf name (that is `a`, already taken
+        // by the top-level column) nor its dotted path — a predicate on it finds nothing and
+        // conservatively keeps the group.
+        assert!(idx.stats(rg, "s.a").is_none());
+        assert!(
+            idx.stats(rg, "s").is_none(),
+            "a struct itself has no leaf stats"
+        );
+        assert!(idx.stats(rg, "absent").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn predicate_ignores_nested_field_with_colliding_leaf_name() {
         // A struct column `s{a}` shares the leaf name `a` with a top-level column `a`.
@@ -926,10 +1003,11 @@ mod tests {
         let file = std::fs::File::open(&p).unwrap();
         let md = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).unwrap();
         let rg = md.metadata().row_group(0);
+        let idx = predicate::ColumnIndex::build(md.metadata());
 
         let est = |json: &str| {
             let pred = predicate::parse(json).unwrap();
-            row_filter::estimate(&pred, rg).unwrap()
+            row_filter::estimate(&pred, rg, &idx).unwrap()
         };
 
         // 2 % of the [0, 9999] span sits below 200.
@@ -955,7 +1033,7 @@ mod tests {
         // A non-numeric literal has no meaningful span, so the estimator abstains and the
         // caller falls through to the measured probe rather than inventing a number.
         let s = predicate::parse(r#"{"node":"cmp","col":"a","op":"eq","lit":"x"}"#).unwrap();
-        assert!(row_filter::estimate(&s, rg).is_none());
+        assert!(row_filter::estimate(&s, rg, &idx).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -34,7 +34,12 @@ from batcher.plan.logical import (
     Sort,
     Union,
 )
-from batcher.plan.stats import ColumnStat, RelStats, ambiguous_float_bound
+from batcher.plan.stats import (
+    ColumnStat,
+    RelStats,
+    ambiguous_float_bound,
+    mismatched_exactness,
+)
 
 __all__ = ["propagate_empty_relation", "zonemap_prune_filter"]
 
@@ -304,6 +309,12 @@ def _comparison_status(expr: Binary, stats: RelStats) -> bool | None:
     if col.min is None or col.max is None:
         return None
     if _float_order_is_ambiguous(col.min) or _float_order_is_ambiguous(col.max):
+        return None
+    # A decimal bound against a float literal is compared *exactly* by Python and in Float64
+    # by the engine, so Python can prove a predicate empty that the engine satisfies. Decimal
+    # literals arrive here as floats (the IR has no decimal literal), which puts every exact
+    # money predicate on this path — see `mismatched_exactness`.
+    if mismatched_exactness(col.min, value) or mismatched_exactness(col.max, value):
         return None
     no_nulls = col.null_count == 0
     try:

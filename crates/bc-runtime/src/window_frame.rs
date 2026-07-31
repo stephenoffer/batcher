@@ -81,14 +81,21 @@ impl PeerGroups {
         let mut group_start = Vec::new();
         let mut group_end = Vec::new();
         let mut g = 0usize;
-        for pos in 0..len {
+        // Carry the previous position's encoded row rather than re-reading it. `part` holds
+        // row indices into a sort permutation, so `rows.row(part[pos])` is a random access
+        // into the encoded buffer — and the old form did two of them per position to compare
+        // neighbours, when one of the two was already read on the previous iteration.
+        let mut prev = None;
+        for (pos, &p) in part.iter().enumerate() {
+            let cur = rows.row(p);
             if pos == 0 {
                 group_start.push(0);
-            } else if rows.row(part[pos - 1]) != rows.row(part[pos]) {
+            } else if prev != Some(cur) {
                 group_end.push(pos);
                 group_start.push(pos);
                 g += 1;
             }
+            prev = Some(cur);
             group_of.push(g);
         }
         if len > 0 {

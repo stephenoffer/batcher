@@ -104,50 +104,16 @@ def is_accelerator_node(node_class: dict) -> bool:
     return node_class.get("gpus", 0.0) > 0 or node_class.get("accelerators", 0.0) > 0
 
 
-#: Nameplate device memory per `ray.util.accelerators` model name, in GiB. Keys are
-#: uppercased at lookup, so Ray's inconsistent casing (`NVIDIA_TESLA_T4` beside
-#: `AMD_Instinct_MI300X`) resolves either way. Where one name covers several memory
-#: configurations the smallest shipping variant is recorded — see the module docstring.
-_DEVICE_MEMORY_GIB: dict[str, int] = {
-    # NVIDIA datacenter
-    "NVIDIA_TESLA_K80": 12,
-    "NVIDIA_TESLA_P4": 8,
-    "NVIDIA_TESLA_P100": 16,
-    "NVIDIA_TESLA_V100": 16,  # also ships 32 GB
-    "NVIDIA_TESLA_T4": 16,
-    "NVIDIA_A10": 24,
-    "NVIDIA_A10G": 24,
-    "NVIDIA_L4": 24,
-    "NVIDIA_L40S": 48,
-    "NVIDIA_A100": 40,  # also ships 80 GB — see the explicit variants below
-    "NVIDIA_A100_40G": 40,
-    "NVIDIA_A100_80G": 80,
-    "NVIDIA_H100": 80,
-    "NVIDIA_H200": 141,
-    "NVIDIA_B200": 180,
-    # AMD Instinct
-    "AMD_INSTINCT_MI210": 64,
-    "AMD_INSTINCT_MI250X": 128,
-    "AMD_INSTINCT_MI300X": 192,
-    # Intel Data Center GPU Max
-    "INTEL_MAX_1100": 48,
-    "INTEL_MAX_1550": 128,
-    # Google Cloud TPU — HBM per chip (the unit Ray's `TPU` resource counts). Version names
-    # are determinate, unlike the vendor-generic labels below, so their memory is knowable.
-    "TPU-V2": 8,
-    "TPU-V3": 16,
-    "TPU-V4": 32,
-    "TPU-V5E": 16,
-    "TPU-V5LITEPOD": 16,  # Ray's name for the v5e generation
-    "TPU-V5P": 95,
-    "TPU-V6E": 32,  # Trillium
-    #
-    # Deliberately absent: AWS Neuron (`aws-neuron-core`) and Intel Gaudi (`Intel-GAUDI`).
-    # Ray exposes each generation under ONE label — `aws-neuron-core` covers inf2 (32 GB/chip)
-    # and trn1/trn2 (32/96 GB) alike, `Intel-GAUDI` covers Gaudi2 (96 GB) and Gaudi3 (128 GB) —
-    # so the label does not determine the memory. Per this module's contract an ambiguous name
-    # returns `0` ("unknown") rather than a fabricated figure, which is safer than guessing wrong.
-}
+#: Device memory lives in `device_specs.py`, which records it beside the rest of a model's
+#: nameplate figures (power, bandwidth, fabric width, partitionability). It is read from
+#: there rather than kept a second time here: two tables of the same fact drift, and the one
+#: that drifts is always the one a given caller does not happen to use.
+#:
+#: Deliberately absent from that table: AWS Neuron (`aws-neuron-core`) and Intel Gaudi
+#: (`Intel-GAUDI`). Ray exposes each generation under ONE label — `aws-neuron-core` covers
+#: inf2 (32 GB/chip) and trn1/trn2 (32/96 GB) alike, `Intel-GAUDI` covers Gaudi2 (96 GB) and
+#: Gaudi3 (128 GB) — so the label does not determine the memory. Per this module's contract an
+#: ambiguous name returns `0` ("unknown") rather than a fabricated figure.
 
 
 def binding_gpu_memory_bytes(classes: list[dict]) -> int:
@@ -189,9 +155,10 @@ def accelerator_memory_bytes(accelerator_type: str | None) -> int:
     Returns:
         Total device memory in bytes, or `0` if the model is not recognized.
     """
-    if not accelerator_type:
-        return 0
-    return _DEVICE_MEMORY_GIB.get(accelerator_type.upper(), 0) * _GIB
+    from batcher._internal.device_specs import device_spec
+
+    spec = device_spec(accelerator_type)
+    return spec.memory_gib * _GIB if spec is not None else 0
 
 
 # Device nodes of accelerators that are not NVIDIA GPUs: Google TPU (`/dev/accel*`, and
@@ -276,7 +243,16 @@ def accelerator_backend() -> str:
         return "tpu"
     if has_neuron_device():
         return "neuron"
-    return "hpu" if has_gaudi_device() else "cpu"
+    if has_gaudi_device():
+        return "hpu"
+    # AMD last among the device-node checks, and only once torch has declined: a ROCm torch
+    # answers `torch.cuda.is_available()` above and is the better source. Without one, an
+    # Instinct node with the driver loaded reported `cpu` — the same "nobody looked" that the
+    # rest of the AMD path exists to remove, and here it named the wrong hardware rather than
+    # naming none. Device nodes are already the accepted evidence for `neuron` and `hpu`.
+    from batcher._internal.hardware.amd import amd_present
+
+    return "rocm" if amd_present() else "cpu"
 
 
 def _tpu_available() -> bool:
@@ -340,8 +316,34 @@ def _gpu_inventory_probe() -> tuple[dict[str, object], ...]:
     nvml = _nvml_inventory()
     if nvml:
         return tuple(nvml)
+    # AMD before torch, and for the same reason NVML comes before torch: it is a handful of
+    # sysfs reads against an import that costs over a second, it needs no ROCm install, and it
+    # reports the real HBM size where the device-node fallback below reports zero. Without it
+    # an MI300X node with a CPU-only wheel enumerated no devices at all.
+    amd = _amd_inventory()
+    if amd:
+        return tuple(amd)
     torch_devices = [] if gpu_devices_absent() else _torch_inventory()
     return tuple(torch_devices or _other_accelerator_inventory())
+
+
+def _amd_inventory() -> list[dict[str, object]]:
+    """AMD accelerators via the `amdgpu` driver's sysfs tree, or `[]`.
+
+    Dependency-free by construction: `amdsmi` ships with ROCm and is absent from the framework
+    containers most of this hardware is rented with, so the driver's own files are the only
+    source that is always there.
+    """
+    from batcher._internal.hardware.amd import amd_devices
+
+    return [
+        {
+            "index": device.index,
+            "name": device.name or f"AMD GPU ({device.card})",
+            "memory_bytes": device.memory_total_bytes,
+        }
+        for device in amd_devices()
+    ]
 
 
 def _nvml_inventory() -> list[dict[str, object]]:

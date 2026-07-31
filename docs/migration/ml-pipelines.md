@@ -90,8 +90,6 @@ for out in llm_generate(
 
 ## See also
 
-:::{seealso}
 - {doc}`../ml/index`: the ML guides in full, from preprocessing to serving.
-- {doc}`../ml/inference`: batch inference, GPU pools, and adaptive batch sizing.
-- {doc}`../ml/data-loaders`: `stream_loader` and the distributed training feed.
-:::
+- {doc}`/ml/inference/inference`: batch inference, GPU pools, and adaptive batch sizing.
+- {doc}`/ml/training/data-loaders`: `stream_loader` and the distributed training feed.

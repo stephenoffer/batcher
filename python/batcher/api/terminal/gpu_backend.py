@@ -8,8 +8,10 @@ engine for everything else (and when no GPU is present). Two routes:
   it fans out one shard per GPU (mergeable combine) when the working set exceeds one GPU — so it
   scales past one GPU's memory (2B rows where single-GPU cuDF/Polars-GPU OOM) — or runs a single
   worker-read shard when it fits one GPU. Only a non-splittable in-memory source is shipped whole.
-* A linear chain of ops — filter, project / with_columns, multi-key group-by, sort, distinct,
-  limit, window — is translated to a cuDF execution (`core.gpu_plan`) and run on one GPU.
+* A linear chain of ops — filter, project / with_columns, group-by aggregate, sort, distinct,
+  limit, window, join, union — is translated to a cuDF execution (`core.gpu_plan`). A chain
+  ending in a **mergeable** aggregate fans out across every GPU (`dist.gpu`), each device
+  reducing the shard it reads itself; anything else runs as a single dispatch on one GPU.
 
 The GPU tasks ship batcher (`worker_runtime_env`) + cuDF (a merged runtime_env) so the worker
 runs the tested kernels. This is the "CPU and GPU backends for data transformations" seam: same
@@ -25,6 +27,8 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
 from batcher.api.terminal.routing import _ray_already_live
+from batcher.dist.gpu import gpu_task_options
+from batcher.dist.gpu.groupby import dispatch_gpu_aggregate, distributed_gpu_aggregate
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -68,74 +72,231 @@ def try_gpu_collect(
     )
     if not decision.use_gpu:
         return None
+
+    import time
+
+    # The TRANSLATED path is tried first, because it is a strict superset of what the legacy
+    # group-by kernel below covers: more reductions, chains above and below the reducer,
+    # per-shard recovery, and shard sizing from what the plan wants. Trying the legacy path
+    # first, as this used to, meant the single most common GPU shape — a one-key group-by over
+    # a scan — never reached any of it.
+    t0 = time.perf_counter()
+    try:
+        result = _translated(plan, sources, gpu_count, decision)
+        if result is None:
+            result = _legacy_groupby(plan, sources, decision)
+    except Exception as exc:
+        # `backend="gpu"` is documented as always safe: an unsupported shape, a lost device or
+        # a kernel that cannot handle this data uses the CPU engine and returns the same rows.
+        # Nothing enforced that. A raise from here reached the caller, which has no handler,
+        # so a query the GPU could not run *failed* instead of running — the legacy kernel
+        # raised a bare `TypeError` on a string group key, which is an ordinary column.
+        note_suppressed("api", "run this plan on the GPU; using the CPU engine", exc)
+        return None
+    if result is None:
+        return None
+    # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
+    # consumes). Keyed on the source's ACTUAL input rows — the same exact x the CPU side records
+    # against — so the two fitted lines are directly comparable.
+    _record_gpu_timing(hub, plan, sources, decision.est_rows, (time.perf_counter() - t0) * 1000.0)
+    return result
+
+
+def _translated(plan: LogicalPlan, sources: list[Source], gpu_count: int, decision):
+    """Run `plan` through the plan translator, or `None` when it does not apply.
+
+    Three attempts in descending order of ambition, each a fallback for the one before:
+
+    1. **Fan out.** Every chain whose shape divides — a mergeable reducer to fold, or a
+       row-local chain to reassemble — runs a shard per device, each device reading its own
+       shard from storage.
+    2. **One worker, reading for itself.** Reached when the fan-out declined or failed, so this
+       is a retry as a single shard rather than the usual path. It still keeps the source off
+       the driver, which is the point: staging a large relation on the driver to send it to a
+       GPU is the wrong end of the machine, and the driver is routinely the smallest node.
+    3. **Ship the table.** Only for an in-memory source, whose rows are on the driver by
+       construction, or a process that owns a device but has no Ray to schedule with.
+    """
     import pyarrow as pa
 
-    # Fast path: a pure single-key group-by aggregate over a scan runs DISTRIBUTED (each GPU
-    # worker partial-aggregates its own shard, mergeable combine) — scales past one GPU's memory.
-    spec = _gpu_agg_spec(plan)
-    if spec is not None:
-        import time
-
-        key_out, key_src, aggs, scan = spec
-        # Kyber routes by working-set size: shard across GPUs when it exceeds one GPU, else one
-        # GPU. Either way the WORKER reads its shard from storage (no driver materialization); the
-        # helper returns None only for a non-splittable in-memory source, which we then ship whole.
-        t0 = time.perf_counter()
-        result = _distributed_gpu_aggregate(
-            sources[scan.source_id], key_src, aggs, sharded=decision.distributed
-        )
-        if result is None:
-            batches = list(sources[scan.source_id].read())
-            if not batches:
-                return None
-            result = _dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
-        # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
-        # consumes). Keyed on the source's ACTUAL input rows — the same exact x the CPU side
-        # records against — so the two fitted lines are directly comparable.
-        gpu_ms = (time.perf_counter() - t0) * 1000.0
-        _record_gpu_timing(hub, plan, sources, decision.est_rows, gpu_ms)
-        if key_out != key_src and key_src in result.column_names:
-            result = result.rename_columns(
-                [key_out if n == key_src else n for n in result.column_names]
-            )
-        return result
-
-    # General path: a linear chain of supported ops (filter / project / sort / distinct / limit /
-    # multi-key aggregate) is translated to cuDF and run on ONE GPU (single-dispatch). Correct for
-    # any data that fits a GPU; OOM / an unsupported expression falls back to the CPU engine.
     from batcher.core.gpu_plan import gpu_join_spec, gpu_plan_ops, gpu_union_spec
+    from batcher.dist.gpu import gpu_chain_on_worker, gpu_join_on_worker, gpu_union_on_worker
 
     plan_spec = gpu_plan_ops(plan)
     if plan_spec is not None:
         scan, ops = plan_spec
-        batches = list(sources[scan.source_id].read())
+        source = sources[scan.source_id]
+        fanned = _try_sharded_aggregate(source, ops, gpu_count, decision)
+        if fanned is not None:
+            return fanned
+        on_worker = gpu_chain_on_worker(source, ops)
+        if on_worker is not None:
+            return on_worker
+        batches = list(source.read())  # in-memory source: the rows are on the driver already
         if not batches:
             return None
         return _dispatch_cudf_plan(pa.Table.from_batches(batches), ops)
 
-    # A `[supported ops] over Join(scan, scan)` — an equi-join plus a chain — runs on one GPU.
+    # A `[ops] over Join(chain, chain)`. A join the planner marked `broadcast` splits its probe
+    # side across every device, each reading the whole build side itself; anything else runs on
+    # one GPU, which reads both sides itself.
     join_spec = gpu_join_spec(plan)
     if join_spec is not None:
-        lscan, rscan, join_ir, ops = join_spec
-        lb = list(sources[lscan.source_id].read())
-        rb = list(sources[rscan.source_id].read())
+        (lscan, lops), (rscan, rops), join_ir, ops = join_spec
+        left, right = sources[lscan.source_id], sources[rscan.source_id]
+        fanned = _try_sharded_join(left, right, lops, rops, join_ir, ops, gpu_count, decision)
+        if fanned is not None:
+            return fanned
+        on_worker = gpu_join_on_worker(left, right, lops, rops, join_ir, ops)
+        if on_worker is not None:
+            return on_worker
+        lb, rb = list(left.read()), list(right.read())
         if not lb or not rb:
             return None
         return _dispatch_cudf_join(
-            pa.Table.from_batches(lb), pa.Table.from_batches(rb), join_ir, ops
+            pa.Table.from_batches(lb), pa.Table.from_batches(rb), lops, rops, join_ir, ops
         )
 
-    # A `[supported ops] over Union(scans)` — concat (+ optional dedup) + a chain — on one GPU.
+    # A `[ops] over Union(chains)` — concat (+ optional dedup) + a chain. A `UNION ALL` shards
+    # each of its inputs across every device; anything else runs on one GPU, which reads every
+    # input itself.
     union_spec = gpu_union_spec(plan)
     if union_spec is not None:
-        scans, distinct, ops = union_spec
-        tables = [
-            pa.Table.from_batches(b) for sc in scans if (b := list(sources[sc.source_id].read()))
-        ]
+        inputs, distinct, ops = union_spec
+        usources = [sources[sc.source_id] for sc, _ in inputs]
+        input_ops = [o for _, o in inputs]
+        fanned = _try_sharded_union(usources, input_ops, distinct, ops, gpu_count, decision)
+        if fanned is not None:
+            return fanned
+        on_worker = gpu_union_on_worker(usources, input_ops, distinct, ops)
+        if on_worker is not None:
+            return on_worker
+        read = [(list(sources[sc.source_id].read()), iops) for sc, iops in inputs]
+        tables = [(pa.Table.from_batches(b), iops) for b, iops in read if b]
         if not tables:
             return None
-        return _dispatch_cudf_union(tables, distinct, ops)
+        return _dispatch_cudf_union([t for t, _ in tables], [o for _, o in tables], distinct, ops)
     return None
+
+
+def _legacy_groupby(plan: LogicalPlan, sources: list[Source], decision):
+    """The single-key group-by fan-out, for a fleet whose workers have torch but not cuDF.
+
+    Reached only when the translator declined or could not run — which on a normal cluster is
+    never, since cuDF ships with the task's runtime_env. Its kernel falls back to a torch
+    scatter-reduce, so it is the difference between an accelerated group-by and none at all on
+    a RAPIDS-less fleet.
+    """
+    import pyarrow as pa
+
+    spec = _gpu_agg_spec(plan)
+    if spec is None:
+        return None
+    key_out, key_src, aggs, scan = spec
+    result = distributed_gpu_aggregate(
+        sources[scan.source_id], key_src, aggs, sharded=decision.distributed
+    )
+    if result is None:
+        batches = list(sources[scan.source_id].read())
+        if not batches:
+            return None
+        result = dispatch_gpu_aggregate(pa.Table.from_batches(batches), key_src, aggs)
+    if key_out != key_src and key_src in result.column_names:
+        return result.rename_columns([key_out if n == key_src else n for n in result.column_names])
+    return result
+
+
+def _with_gpu_capacity(gpu_count: int, decision, run):
+    """Run a fan-out with the cluster grown to the devices the plan wants, then released.
+
+    Asks the autoscaler for `decision.desired_gpus` — enough to hold the working set in one
+    wave — rather than for the devices the cluster already has. Asking for what is already
+    there pins the floor against reclamation and can never grow the cluster, so a query that
+    could use thirty-two devices ran on the four it happened to find. It then waits (bounded,
+    and a no-op on a fixed cluster) before `run` sizes its shards, since sizing against the
+    pre-scale topology is how a query asks for capacity and then declines to use it.
+
+    `run` receives the device count the wait actually produced. Any failure inside is a
+    `None` — every fan-out has a slower path behind it, and none of them change the answer.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import (
+        await_autoscale,
+        release_autoscale,
+        request_autoscale,
+    )
+
+    wanted = max(gpu_count, int(decision.desired_gpus))
+    request_autoscale(gpu_count, target_gpus=float(wanted))
+    try:
+        # One core per device task is the floor a GPU stage needs; the GPU target is the
+        # binding one. A zero CPU target would make the wait a no-op, since it reads as
+        # "this query wants nothing".
+        await_autoscale(wanted, target_gpus=float(wanted))
+        return run(_cluster_gpu_count())
+    except Exception as exc:
+        note_suppressed("api", "fan a GPU stage out across devices", exc)
+        return None
+    finally:
+        release_autoscale()
+
+
+def _try_sharded_aggregate(source: Source, ops: list[dict], gpu_count: int, decision):
+    """Fan a chain with a mergeable reducer out across the cluster's GPUs, or `None`.
+
+    `None` means the fan-out does not apply — the chain has no shardable split, the source is
+    not splittable, or the cluster is unreadable — and the caller then uses the single-device
+    dispatch. Every failure mode is a slower path, never a different answer: the fan-out is the
+    mergeable decomposition of the same chain."""
+    from batcher.dist.gpu import sharded_gpu_aggregate
+
+    return _with_gpu_capacity(
+        gpu_count,
+        decision,
+        lambda live: sharded_gpu_aggregate(
+            source, ops, gpu_count=live, sharded=decision.distributed
+        ),
+    )
+
+
+def _try_sharded_join(left, right, lops, rops, join_ir, ops, gpu_count: int, decision):
+    """Fan a broadcast-safe join out across the cluster's GPUs, or `None`."""
+    from batcher.dist.gpu import sharded_gpu_join
+
+    return _with_gpu_capacity(
+        gpu_count,
+        decision,
+        lambda live: sharded_gpu_join(
+            left,
+            right,
+            lops,
+            rops,
+            join_ir,
+            ops,
+            gpu_count=live,
+            sharded=decision.distributed,
+        ),
+    )
+
+
+def _try_sharded_union(usources, input_ops, distinct, ops, gpu_count: int, decision):
+    """Fan a `UNION ALL` out across the cluster's GPUs, or `None`.
+
+    A deduplicating union declines inside the fan-out rather than here, so the rule about why
+    lives beside the algebra that cannot honour it."""
+    from batcher.dist.gpu import sharded_gpu_union
+
+    return _with_gpu_capacity(
+        gpu_count,
+        decision,
+        lambda live: sharded_gpu_union(
+            usources,
+            input_ops,
+            distinct,
+            ops,
+            gpu_count=live,
+            sharded=decision.distributed,
+        ),
+    )
 
 
 def _agg_input_rows(plan, sources, fallback: int = 0) -> int:
@@ -188,208 +349,81 @@ def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:
         return
 
 
-def _partial_aggs(aggs: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:
-    """The mergeable partial reductions a GPU worker computes per shard. A mean needs both a
-    sum and a count partial; sum/count/min/max carry through as themselves."""
-    partial: dict[str, tuple[str, str]] = {}
-    for alias, (col_name, func) in aggs.items():
-        if func == "mean":
-            partial[f"{alias}__s"] = (col_name, "sum")
-            partial[f"{alias}__n"] = (col_name, "count")
-        else:
-            partial[f"{alias}__{func}"] = (col_name, func)
-    return partial
+def _on_device():
+    """Configure this worker's device allocator before it computes.
 
+    Runs inside the task body rather than at submission: only the process that was handed a
+    device knows how much of it is free, and the pool it builds has to live in that process.
+    Idempotent, so a worker reused across tasks keeps the pool the first one paid for.
+    """
+    from batcher.carbonite.accel import prepare_device_memory
 
-def _combine_partials(
-    partials: list[pa.Table], key: str, aggs: dict[str, tuple[str, str]]
-) -> pa.Table:
-    """Combine per-shard GPU partials into the final aggregate (the mergeable `combine` step),
-    reusing Batcher's own engine so the fold is native and tested."""
-    import pyarrow as pa
-
-    import batcher as bt
-    from batcher import col
-
-    combined = pa.concat_tables(partials)
-    final: dict = {}
-    means: dict[str, tuple[str, str]] = {}
-    for alias, (_col, func) in aggs.items():
-        if func == "sum":
-            final[alias] = col(f"{alias}__sum").sum()
-        elif func == "count":
-            final[alias] = col(f"{alias}__count").sum()
-        elif func == "min":
-            final[alias] = col(f"{alias}__min").min()
-        elif func == "max":
-            final[alias] = col(f"{alias}__max").max()
-        elif func == "mean":
-            final[f"{alias}__st"] = col(f"{alias}__s").sum()
-            final[f"{alias}__nt"] = col(f"{alias}__n").sum()
-            means[alias] = (f"{alias}__st", f"{alias}__nt")
-    ds = bt.from_arrow(combined).group_by(key).agg(**final)
-    if means:
-        ds = ds.with_columns(**{a: col(s) / col(n) for a, (s, n) in means.items()})
-        ds = ds.select(key, *aggs.keys())
-    return ds.collect()
-
-
-def _gpu_partial_task(desc: dict, key: str, partial_aggs: dict):
-    """On a GPU worker: read this shard directly from storage, then partial-aggregate it on the
-    GPU. Returns a small (one-row-per-group) partial table, or None for an empty shard."""
-    import pyarrow as pa
-
-    from batcher.core.gpu_transform import gpu_groupby_agg
-    from batcher.dist.executors.partition_io import read_partition_descriptor
-
-    batches = read_partition_descriptor(desc)
-    if not batches:
-        return None
-    return gpu_groupby_agg(pa.Table.from_batches(batches), key, partial_aggs)
-
-
-def _distributed_gpu_aggregate(
-    source: Source, key: str, aggs: dict[str, tuple[str, str]], *, sharded: bool
-) -> pa.Table | None:
-    """GPU aggregate where the GPU WORKER reads its shard directly from storage — no
-    whole-table transfer through the driver.
-
-    `sharded=True` (Kyber says the working set exceeds one GPU) fans out `n_gpus x oversubscribe`
-    shards across the cluster and combines the mergeable partials; `sharded=False` (fits one GPU)
-    runs ONE shard on ONE GPU that reads the whole source itself, so even the single-GPU case
-    avoids materializing the source on the driver and shipping it. Returns `None` when the source
-    isn't splittable (an in-memory handle) or the cluster has no GPUs → the caller ships the
-    in-memory table directly."""
-    try:
-        import ray
-
-        from batcher.dist.executors.partition_io import _scan_splits
-        from batcher.dist.executors.ray_runtime import _ensure_ray, cluster_topology
-        from batcher.dist.executors.ray_runtime.scaling import (
-            release_autoscale,
-            request_autoscale,
-        )
-    except Exception:
-        return None
-
-    if not ray.is_initialized():
-        return None
-    n_gpus = int(cluster_topology().get("gpus", 0))
-    if n_gpus < 1:
-        return None
-    # Only worth it for a genuinely splittable source (shared-nothing shard reads). An
-    # in-memory source has no splits → let the driver-ships-table path handle it.
-    from batcher.config import active_config
-    from batcher.dist.executors.partition_io import WholeSourceSplit, partition_descriptors
-
-    splits = _scan_splits(source, n_gpus)
-    if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
-        return None
-
-    if sharded:
-        # Oversubscribe shards past the GPU count: bound each shard (no single-GPU OOM on a big
-        # source), load-balance finely across the cluster, and keep a spot-preempted shard's
-        # retry cheap. Ray runs at most `n_gpus` `num_gpus=1` tasks at once, so the rest pipeline.
-        factor = max(1, int(active_config().distributed.gpu_shard_oversubscribe))
-        n_shards = n_gpus * factor
-    else:
-        n_shards = 1  # fits one GPU: one worker reads the whole source, no distribution overhead
-
-    # Hold a GPU autoscale floor for the query so a churning spot cluster keeps (or grows) the
-    # GPU nodes instead of the autoscaler reclaiming them mid-aggregate; released in `finally`.
-    request_autoscale(n_gpus, target_gpus=float(n_gpus))
-    try:
-        _ensure_ray(n_gpus)
-        descs = partition_descriptors(source, n_shards)
-        partial_aggs = _partial_aggs(aggs)
-        opts = _gpu_task_opts()
-        task = ray.remote(**opts)(_gpu_partial_task)
-        partials = ray.get([task.remote(d, key, partial_aggs) for d in descs])
-    finally:
-        release_autoscale()
-    partials = [p for p in partials if p is not None]
-    if not partials:
-        return None
-    return _combine_partials(partials, key, aggs)
+    prepare_device_memory()
 
 
 def _cudf_plan_worker(table, ops):
     from batcher.core.gpu_plan import execute_cudf_plan
 
+    _on_device()
     return execute_cudf_plan(table, ops)
 
 
-def _cudf_join_worker(left_t, right_t, join_ir, ops):
+def _cudf_join_worker(left_t, right_t, left_ops, right_ops, join_ir, ops):
     from batcher.core.gpu_plan import execute_cudf_join
 
-    return execute_cudf_join(left_t, right_t, join_ir, ops)
+    _on_device()
+    return execute_cudf_join(left_t, right_t, left_ops, right_ops, join_ir, ops)
 
 
-def _cudf_union_worker(tables, distinct, ops):
+def _cudf_union_worker(tables, input_ops, distinct, ops):
     from batcher.core.gpu_plan import execute_cudf_union
 
-    return execute_cudf_union(tables, distinct, ops)
+    _on_device()
+    return execute_cudf_union(tables, input_ops, distinct, ops)
 
 
-def _dispatch_cudf_union(tables: list, distinct: bool, ops: list[dict]) -> pa.Table | None:
+def _dispatch_cudf_union(
+    tables: list, input_ops: list[list[dict]], distinct: bool, ops: list[dict]
+) -> pa.Table | None:
     """Run a union (+ op chain) on one GPU via cuDF; `None` on failure → CPU fallback."""
-    from batcher.core.gpu_transform import gpu_available
-
-    try:
-        if gpu_available():
-            with contextlib.suppress(Exception):
-                return _cudf_union_worker(tables, distinct, ops)
-        import ray
-
-        from batcher.dist.executors.ray_runtime import _ensure_ray
-
-        _ensure_ray(1)
-        opts = _gpu_task_opts()
-        return ray.get(ray.remote(**opts)(_cudf_union_worker).remote(tables, distinct, ops))
-    except Exception:
-        return None
+    return _dispatch_on_gpu(_cudf_union_worker, tables, input_ops, distinct, ops)
 
 
-def _dispatch_cudf_join(left_t, right_t, join_ir: dict, ops: list[dict]) -> pa.Table | None:
-    """Run an equi-join + op chain on one GPU via cuDF (in-process if this process owns a GPU
-    with cuDF, else a GPU worker). `None` on any failure → CPU fallback."""
-    from batcher.core.gpu_transform import gpu_available
-
-    try:
-        if gpu_available():
-            with contextlib.suppress(Exception):
-                return _cudf_join_worker(left_t, right_t, join_ir, ops)
-        import ray
-
-        from batcher.dist.executors.ray_runtime import _ensure_ray
-
-        _ensure_ray(1)
-        opts = _gpu_task_opts()
-        return ray.get(ray.remote(**opts)(_cudf_join_worker).remote(left_t, right_t, join_ir, ops))
-    except Exception:
-        return None
+def _dispatch_cudf_join(
+    left_t, right_t, left_ops: list[dict], right_ops: list[dict], join_ir: dict, ops: list[dict]
+) -> pa.Table | None:
+    """Run a join + op chain on one GPU via cuDF (in-process if this process owns a GPU with
+    cuDF, else a GPU worker). `None` on any failure → CPU fallback."""
+    return _dispatch_on_gpu(_cudf_join_worker, left_t, right_t, left_ops, right_ops, join_ir, ops)
 
 
 def _dispatch_cudf_plan(table: pa.Table, ops: list[dict]) -> pa.Table | None:
-    """Run a translated op chain on ONE GPU via cuDF — in-process if this process owns a GPU with
-    cuDF, else on a GPU worker (cuDF shipped in the runtime_env). Returns `None` on any failure —
-    an unsupported expression, a cuDF-less worker, or a GPU OOM — so the caller uses the CPU
-    engine. GPU is an accelerator, never a requirement."""
+    """Run a translated op chain on ONE GPU via cuDF; `None` on failure → CPU fallback."""
+    return _dispatch_on_gpu(_cudf_plan_worker, table, ops)
+
+
+def _dispatch_on_gpu(worker, *args) -> pa.Table | None:
+    """Run `worker(*args)` on a GPU — in-process when this process owns one with cuDF, else on
+    a GPU worker (cuDF shipped in the runtime_env).
+
+    Returns `None` on any failure — an untranslatable expression, a cuDF-less worker, or a GPU
+    OOM — so the caller uses the CPU engine. GPU is an accelerator, never a requirement, and
+    every dispatch shape (chain, join, union) needs exactly this behavior, so they share it
+    rather than restating it three times with three chances to drift."""
     from batcher.core.gpu_transform import gpu_available
 
     try:
         if gpu_available():
             with contextlib.suppress(Exception):
-                return _cudf_plan_worker(table, ops)  # GPU-equipped process with cuDF
+                return worker(*args)  # GPU-equipped process with cuDF
         import ray
 
         from batcher.dist.executors.ray_runtime import _ensure_ray
 
         _ensure_ray(1)
-        opts = _gpu_task_opts()
-        return ray.get(ray.remote(**opts)(_cudf_plan_worker).remote(table, ops))
+        return ray.get(ray.remote(**gpu_task_options())(worker).remote(*args))
     except Exception:
-        return None  # cuDF-less / OOM / unsupported expr -> CPU fallback
+        return None
 
 
 def _gpu_agg_spec(plan: LogicalPlan):
@@ -414,38 +448,6 @@ def _gpu_agg_spec(plan: LogicalPlan):
     return gk.alias, gk.expr.name, aggs, plan.input
 
 
-def _gpu_task_runtime_env() -> dict | None:
-    """The runtime_env for a GPU dispatch task: batcher (via `worker_runtime_env`, so the worker
-    can import the kernel) plus — when `distributed.gpu_backend_cudf` is on — cuDF (pip) so the
-    group-by uses cuDF's fast kernels. numpy is pinned to the cluster version so arrays returned
-    from the task unpickle on the driver (cuDF's install otherwise drags numpy to 2.x)."""
-    from batcher.config import active_config
-    from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
-
-    rt = dict(worker_runtime_env() or {})
-    if active_config().distributed.gpu_backend_cudf:
-        rt["pip"] = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
-    return rt or None
-
-
-def _gpu_task_opts() -> dict:
-    """Ray remote-options for a GPU dispatch task: one GPU, the batcher+cuDF runtime_env, and a
-    spot-preemption retry budget.
-
-    `max_retries` reruns a task whose GPU worker/node was lost (spot reclamation) on surviving
-    capacity — so a large GPU query on a churning spot cluster self-heals instead of one lost
-    shard collapsing it to the single-node CPU fallback. `retry_exceptions` is deliberately left
-    off: a deterministic application error (a GPU OOM, an unsupported expression) must fall back
-    to the CPU engine immediately, not after N pointless retries."""
-    from batcher.config import active_config
-
-    opts: dict = {"num_gpus": 1, "max_retries": int(active_config().distributed.task_max_retries)}
-    rt = _gpu_task_runtime_env()
-    if rt is not None:
-        opts["runtime_env"] = rt
-    return opts
-
-
 def _cluster_gpu_count() -> int:
     """Live GPU count across the cluster (or 1 for a GPU-equipped local process), else 0.
 
@@ -468,27 +470,3 @@ def _cluster_gpu_count() -> int:
     from batcher.core.gpu_transform import gpu_available
 
     return 1 if gpu_available() else 0
-
-
-def _gpu_aggregate_worker(table, key: str, aggs: dict):
-    from batcher.core.gpu_transform import gpu_groupby_agg
-
-    return gpu_groupby_agg(table, key, aggs)
-
-
-def _dispatch_gpu_aggregate(table: pa.Table, key: str, aggs: dict) -> pa.Table:
-    """Run the group-by aggregate on a GPU — locally if this process owns one, else on a GPU
-    worker (shipping batcher via `worker_runtime_env` so the worker can import the kernel)."""
-    from batcher.core.gpu_transform import gpu_available
-
-    if gpu_available():  # a GPU-equipped driver runs it in-process
-        return _gpu_aggregate_worker(table, key, aggs)
-
-    import ray
-
-    from batcher.dist.executors.ray_runtime import _ensure_ray
-
-    _ensure_ray(1)
-    opts = _gpu_task_opts()
-    task = ray.remote(**opts)(_gpu_aggregate_worker)
-    return ray.get(task.remote(table, key, aggs))

@@ -45,7 +45,7 @@ Against DuckDB reading the same zero-copy Arrow, which is the like-for-like exec
 | Suite | Result |
 |---|---|
 | TPC-H, 22 comparable queries | **won 22 of 22** |
-| ClickBench, 43 queries | **won 42 of 43**, 43 of 43 correct |
+| ClickBench, 43 queries | **won 43 of 43**, 43 of 43 correct |
 | Semi-structured JSON, 5 queries | **won 5 of 5**: 3.6x to 12.5x DuckDB, 11x to 100x Polars |
 
 Against DuckDB on its own native compressed store, DuckDB is faster on 15 of 22 TPC-H queries, geometric mean about 1.40x. That comparison is not like-for-like: DuckDB decompresses its own format as it scans and never pays an Arrow ingest, which is exactly what an engine gives up to keep Arrow as its only columnar contract. Batcher wins the scan-and-aggregate-dominated queries there too (q15 0.46x, q12 0.74x, q11 0.80x, q1 and q9 0.88x) and trails on the join- and subquery-heavy ones. {doc}`tpch` has both columns per query.
@@ -107,7 +107,7 @@ Batcher is faster on 11 of the 18 queries Daft answers correctly, and the spread
 - {doc}`tpch`: the per-query detail behind both comparisons.
 - {doc}`vs-duckdb`, {doc}`vs-polars`, {doc}`vs-daft`: the same numbers arranged one engine at a time.
 - {doc}`ai-and-gpu`: the other half of the measurement.
-- {doc}`../deep-dives/expression-evaluation` and {doc}`../deep-dives/jit-compilation`: where the filtered count's 5x comes from.
-- {doc}`../deep-dives/aggregation-internals`: the radix combine behind the group-by numbers.
-- {doc}`../user-guide/performance`: making *your* query faster.
+- {doc}`/deep-dives/query/expression-evaluation` and {doc}`/deep-dives/query/jit-compilation`: where the filtered count's 5x comes from.
+- {doc}`/deep-dives/operators/aggregation-internals`: the radix combine behind the group-by numbers.
+- {doc}`/user-guide/operate/performance`: making *your* query faster.
 - {doc}`methodology`: hardware, gating, and the reproduce commands.

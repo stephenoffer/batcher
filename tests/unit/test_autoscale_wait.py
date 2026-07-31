@@ -17,7 +17,7 @@ import time
 import pytest
 
 from batcher.config import active_config, config_context
-from batcher.dist.executors.ray_runtime import scaling
+from batcher.dist.executors.ray_runtime import readiness, scaling
 
 pytestmark = pytest.mark.unit
 
@@ -27,9 +27,9 @@ def _fresh_ceiling():
     # The learned ceiling is process-global; reset it before each test so one test's fixed
     # cluster doesn't cap another's. The persistence tests drive their own two `_run` calls
     # within a single test, so this per-test reset doesn't undercut them.
-    scaling._reset_capacity_ceiling()
+    readiness._reset_capacity_ceiling()
     yield
-    scaling._reset_capacity_ceiling()
+    readiness._reset_capacity_ceiling()
 
 
 class _FakeClock:
@@ -73,7 +73,7 @@ def _run(monkeypatch, cpus_series, *, target, wait=180.0, poll=5.0, stall=90.0, 
 
         monkeypatch.setattr(ray, "is_initialized", lambda: True)
         before = clock.t
-        scaling.await_autoscale(target, 0.0)
+        readiness.await_autoscale(target, 0.0)
         # `await_autoscale` returns None; recover the observed capacity from the topology at
         # the clock position it left off (the same value `_await_autoscale` would have
         # returned), and whether it actually waited from the elapsed time.
@@ -145,21 +145,21 @@ def test_flat_wait_learns_a_ceiling_that_short_circuits_later_waits(monkeypatch)
     # is remembered: a later query asking for more than the observed capacity must skip the
     # wait entirely (0 elapsed), so a fixed-at-max cluster pays the startup grace ONCE, not on
     # every cold query — the whole point of the ceiling.
-    scaling._reset_capacity_ceiling()
+    readiness._reset_capacity_ceiling()
     try:
         _r1, e1 = _run(monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, startup=12.0)
         assert e1 > 0.0  # the first wait actually probed (and learned 8 is the ceiling)
         _r2, e2 = _run(monkeypatch, lambda _t: 8, target=64, wait=180.0, poll=5.0, startup=12.0)
         assert e2 == 0.0  # a larger request than the learned ceiling short-circuits
     finally:
-        scaling._reset_capacity_ceiling()
+        readiness._reset_capacity_ceiling()
 
 
 def test_reached_target_lifts_a_stale_ceiling(monkeypatch):
     # A ceiling is not permanent: once capacity has climbed past it (the cluster recovered /
     # more nodes joined), the bound is dropped so a later request that the grown cluster can
     # now satisfy is served immediately instead of being wrongly short-circuited.
-    scaling._reset_capacity_ceiling()
+    readiness._reset_capacity_ceiling()
     try:
         _run(monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, startup=12.0)  # ceiling=8
         # The cluster has since grown to 40 cores; a 40-core request is now satisfiable and
@@ -167,7 +167,7 @@ def test_reached_target_lifts_a_stale_ceiling(monkeypatch):
         _r, e = _run(monkeypatch, lambda _t: 40, target=40, wait=180.0, poll=5.0)
         assert _r >= 40 and e == 0.0
     finally:
-        scaling._reset_capacity_ceiling()
+        readiness._reset_capacity_ceiling()
 
 
 def test_disabled_wait_is_immediate(monkeypatch):
@@ -185,7 +185,7 @@ def test_await_autoscale_noop_when_disabled(monkeypatch):
     called = {"topo": 0}
     monkeypatch.setattr(scaling, "cluster_topology", lambda: called.__setitem__("topo", 1))
     with config_context(base.replace(distributed=dc)):
-        scaling.await_autoscale(64, 0.0)
+        readiness.await_autoscale(64, 0.0)
     assert called["topo"] == 0  # never consulted the cluster
 
 
@@ -197,4 +197,4 @@ def test_await_autoscale_noop_when_target_nonpositive(monkeypatch):
         scaling, "cluster_topology", lambda: pytest.fail("should not read topology")
     )
     with config_context(base.replace(distributed=dc)):
-        scaling.await_autoscale(0, 0.0)
+        readiness.await_autoscale(0, 0.0)

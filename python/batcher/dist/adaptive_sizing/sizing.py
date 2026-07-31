@@ -216,10 +216,37 @@ def learned_shuffle_fanout(hub: MetadataHub | None, family: str | None, workers:
         rows.extend(r for r in _family_samples(hub, fam, "n_input") if r > 0.0)
     if len(rows) < _MIN_SAMPLES:
         return None
-    mean_rows = sum(rows) / len(rows)
     target = max(1, active_config().optimizer.target_rows_per_task)
-    want = math.ceil(mean_rows / target)
+    want = math.ceil(_sizing_quantile(rows) / target)
     return max(1, min(int(workers), want))
+
+
+# Which point of a family's measured input-volume history to size the exchange from. The
+# errors here are not symmetric, which is what picks the statistic:
+#
+#   * This count only ever *reduces* the fan-out (it is clamped to `[1, workers]`), so an
+#     under-estimate gives each reducer more state than it can hold and spills, while an
+#     over-estimate is capped at the worker count the query would have used anyway.
+#   * A family's history is routinely multi-modal — the same aggregate runs over a day and
+#     over a year — and a mean sits between the modes, describing neither.
+#
+# So the sizing point is a high quantile: fan out for the larger runs the family actually
+# sees. The `1 - 1/n` guard keeps a short history from picking anything but its maximum,
+# which is the conservative reading when there is little to go on.
+_SIZING_QUANTILE = 0.9
+
+
+def _sizing_quantile(values: list[float]) -> float:
+    """The `_SIZING_QUANTILE` point of `values` by nearest-rank; `0.0` when empty.
+
+    Nearest-rank rather than an interpolating quantile so the result is always a volume the
+    family was actually measured at, never a number between two modes that no run produced.
+    """
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = math.ceil(_SIZING_QUANTILE * len(ordered))
+    return ordered[min(len(ordered), max(1, rank)) - 1]
 
 
 # --- Inference actor-pool size (measured reuse) ------------------------------------------

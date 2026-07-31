@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from batcher.config import active_config
+from batcher.kyber.gpu.shape import broadcast_join, is_shardable
 
 if TYPE_CHECKING:
     from batcher.io.source import Source
@@ -44,30 +45,46 @@ class GpuDecision:
     one GPU's memory so the run must fan out across GPUs (the mergeable distributed aggregate);
     False means a single-device dispatch fits. `est_rows` is the estimated input cardinality the
     decision used (`-1` when unknown) — the x-coordinate the adaptive crossover records against.
-    `reason` is a short human string for the decision log / `explain()`."""
+    `reason` is a short human string for the decision log / `explain()`.
+
+    `desired_gpus` is how many devices would let the working set run in ONE wave — the number
+    the autoscaler should be asked for, which is not the number the cluster currently has. A
+    fan-out that asks for its current device count pins the floor against scale-down and can
+    never scale *up*, so a query that could use thirty-two devices runs on the four it happened
+    to find. `0` means the plan does not want devices at all."""
 
     use_gpu: bool
     distributed: bool
     reason: str
     est_rows: int = -1
+    desired_gpus: int = 0
+    broadcast_join: bool = False
 
 
 def _estimate(plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None):
     """`(rows, working_set_gb)` for the volume the GPU actually processes, or `(None, None)` when
     the size is unknown (an estimator failure or an unbounded source).
 
-    For a *reducing* top operator (a group-by aggregate or a distinct) the plan's OUTPUT
-    cardinality is the group/distinct count — a handful of rows — which massively understates the
-    work and the memory: the GPU reads and reduces the whole INPUT. So we estimate the input to a
-    reducing top node, not its output. A map-shaped plan (filter/project) already has
-    output ≈ processed, so it estimates the plan directly."""
+    For a *reducing* operator the plan's OUTPUT cardinality massively understates the work and
+    the memory: the GPU reads and reduces the whole INPUT. So the estimate descends past every
+    reducing node to the first one whose output is what it processes.
+
+    Descending past a **run** of them, rather than only the top node, is what makes the common
+    analytical shape estimable at all: `group_by().agg().sort().limit(10)` has a `Limit` on top,
+    whose output cardinality is ten. Estimating that put every such query below the small-input
+    threshold and refused it the GPU on the grounds that ten rows do not amortize a kernel
+    launch — while the scan underneath it was a billion rows. A map-shaped plan (filter/project)
+    already has output ~ processed, so it estimates directly."""
     from batcher.kyber import load_learned_stats
     from batcher.kyber.cardinality import CardinalityEstimator
-    from batcher.plan.logical import Aggregate, Distinct
+    from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
 
     target = plan
-    if isinstance(plan, (Aggregate, Distinct)) and getattr(plan, "input", None) is not None:
-        target = plan.input
+    while isinstance(target, (Aggregate, Distinct, Limit, Sort)):
+        below = getattr(target, "input", None)
+        if below is None:
+            break
+        target = below
     try:
         learned = load_learned_stats(hub) if hub is not None else None
         est = CardinalityEstimator(sources=sources, learned=learned)
@@ -152,19 +169,73 @@ def decide_gpu_backend(
             rows,
         )
 
+    # Size is necessary but not sufficient. A relational stage's bytes cross the host link
+    # before a kernel sees them, and on PCIe that link is slower than a server's own memory:
+    # a big enough scan can clear every threshold above and still finish sooner on the CPU.
+    # The verdict is only consulted when the device model is known and only ever *refuses* —
+    # a forced request is still honored, and an unrecognized device has no opinion.
+    # ...and only while this fleet has measured nothing. A learned crossover means the GPU
+    # path actually ran here and was timed against the CPU on this hardware, which outranks a
+    # model whose CPU-bandwidth constant may not describe this machine. Measurement wins.
+    if not force and accelerator_type and rows > 0 and ws_gb > 0 and learned_min is None:
+        veto = _transfer_veto(accelerator_type, ws_gb, rows)
+        if veto is not None:
+            return GpuDecision(False, False, veto, rows)
+
     one_gpu_gb = max(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
         1e-9,
     )
     if ws_gb <= one_gpu_gb:
-        return GpuDecision(True, False, f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)", rows)
-    if ws_gb <= one_gpu_gb * gpu_count:
         return GpuDecision(
-            True, True, f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs", rows
+            True,
+            False,
+            f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)",
+            rows,
+            1,
+            broadcast_join(plan, sources),
         )
-    return GpuDecision(
-        False, False, f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs: CPU engine (spillable)", rows
-    )
+    shardable = is_shardable(plan)
+    broadcast = broadcast_join(plan, sources)
+    # How many devices would hold the working set in one wave, which is what the autoscaler is
+    # asked for. Capped so a badly-estimated query cannot ask a cluster to grow without bound.
+    wanted = min(math.ceil(ws_gb / one_gpu_gb), max(1, int(dc.gpu_max_autoscale_devices)))
+    if ws_gb <= one_gpu_gb * gpu_count and shardable:
+        return GpuDecision(
+            True,
+            True,
+            f"~{ws_gb:.1f}GB exceeds one GPU: shard across {gpu_count} GPUs",
+            rows,
+            wanted,
+            broadcast,
+        )
+    # Beyond the cluster's *aggregate* VRAM the question is no longer how much memory the
+    # cluster has at once, but how small a shard can be made. A plan with a mergeable reducer
+    # oversubscribes shards past the device count and pipelines them, so what has to fit a
+    # device is one shard, not the working set — and each shard reduces to one row per group
+    # before anything is folded. Refusing those outright meant the fan-out built for exactly
+    # this case could never be reached: the rule turned "too big for one pass" into "too big
+    # for the GPU at all".
+    #
+    # A plan with NO mergeable reducer genuinely does need the whole set resident, so it still
+    # goes to the (spillable) CPU engine.
+    shards = gpu_count * max(1, int(dc.gpu_shard_oversubscribe))
+    if shardable and ws_gb / shards <= one_gpu_gb:
+        return GpuDecision(
+            True,
+            True,
+            f"~{ws_gb:.1f}GB exceeds all {gpu_count} GPUs, but shards to "
+            f"~{ws_gb / shards:.2f}GB across {shards}",
+            rows,
+            wanted,
+            broadcast,
+        )
+    # Not shardable, and larger than one device. A single dispatch is the only accelerated form
+    # available and it does not fit, so it would OOM and fall back anyway; the CPU engine spills
+    # and is the honest destination. Reported as such rather than attempted and abandoned.
+    scope = f"exceeds all {gpu_count} GPUs" if ws_gb > one_gpu_gb * gpu_count else "exceeds one GPU"
+    why = "nothing to shard on" if not shardable else "CPU engine (spillable)"
+    return GpuDecision(False, False, f"~{ws_gb:.1f}GB {scope}: {why}", rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +248,74 @@ class GpuMapParams:
     reason: str
 
 
+#: Floating-point work a relational row costs on average: a few comparisons and an
+#: accumulate. Relational operators are not compute-bound by any margin, which is the whole
+#: reason the host copy decides the verdict for them and not for inference.
+_RELATIONAL_FLOPS_PER_ROW = 4.0
+
+
+def _transfer_veto(accelerator_type: str, working_set_gb: float, rows: int) -> str | None:
+    """A reason to stay on the CPU when the host copy would cost more than the device saves.
+
+    `None` when the device is worth using, when its model is unrecognized, or when the
+    arithmetic cannot be formed — so this only ever removes a GPU choice that the transfer
+    model says loses, and never adds one.
+
+    The caller applies it only where nothing has been measured. The model's CPU-bandwidth
+    figure is a constant, and a constant that is wrong for one machine would otherwise
+    disable a path that machine had been winning with — so a fleet with a learned crossover
+    keeps deciding on its own timings.
+    """
+    from batcher._internal.hardware.fabric.device_links import device_link_efficiency
+    from batcher.kyber.gpu.energy import device_energy_advice
+
+    bytes_per_row = working_set_gb * 1e9 / max(1, rows)
+    advice = device_energy_advice(
+        accelerator_type,
+        bytes_per_row=bytes_per_row,
+        flops_per_row=_RELATIONAL_FLOPS_PER_ROW,
+        # The copy is charged at the link the device *has*, not the one its datasheet lists.
+        # A board that renegotiated to half width is the case this veto exists for and the one
+        # a nameplate figure is blindest to: it passes every health check and feeds at half
+        # rate. Unreadable links report 1.0, which is the assumption made here before.
+        link_efficiency=device_link_efficiency(),
+    )
+    if advice.speedup <= 0 or advice.speedup >= 1.0:
+        return None
+    return (
+        f"{accelerator_type} would run this at {advice.speedup:.2f}x the CPU once the host "
+        f"copy is charged ({advice.transfer_share:.0%} of device time is transfer): CPU wins"
+    )
+
+
+def _mig_fraction(model_memory_gb: float, accelerator_type: str, gpu_gb: float) -> float | None:
+    """The device fraction a MIG instance would give this model, or `None` to use the quanta.
+
+    Preferred over the coarse packing quanta wherever it applies, because it is both finer (a
+    seventh of a device rather than a quarter) and stronger: a partition isolates memory and
+    faults, while a fractional request only shares a scheduler. `None` whenever partitioning
+    does not apply — no device model, the switch off, a device that cannot partition, or a
+    model that needs the whole device — and the caller then packs exactly as it did before.
+
+    `gpu_gb` is the memory the *binding device* actually reports, and the label is only
+    trusted when the two agree. They can disagree: a stage may be pinned to a device class the
+    fleet does not currently have, or the memory figure may be the config's fallback constant
+    rather than a probe. A seventh of an H100 handed to a device that is not one is an
+    under-allocation nothing downstream would catch, so a mismatch falls back to the quanta,
+    which size against the memory figure directly.
+    """
+    if not accelerator_type or not active_config().accelerator.prefer_mig:
+        return None
+    from batcher._internal.device_specs import device_spec
+    from batcher._internal.hardware.mig import smallest_profile_for
+
+    spec = device_spec(accelerator_type)
+    if spec is None or gpu_gb <= 0 or abs(spec.memory_gib - gpu_gb) > 0.1 * spec.memory_gib:
+        return None
+    profile = smallest_profile_for(model_memory_gb, accelerator_type)
+    return profile.gpu_fraction if profile is not None else None
+
+
 def decide_gpu_map_params(
     model_memory_gb: float,
     num_gpus: float,
@@ -185,6 +324,7 @@ def decide_gpu_map_params(
     *,
     assign_num_gpus: bool = True,
     input_row_bytes: float = 0.0,
+    accelerator_type: str = "",
 ) -> GpuMapParams:
     """Size a GPU inference stage from the model's memory footprint vs one GPU's memory.
 
@@ -214,7 +354,14 @@ def decide_gpu_map_params(
     `input_row_bytes` is the estimated Arrow width of one input row, which the batch seed
     charges alongside the activation prior because both are resident on the device at once.
     `0.0` — the default, and what a caller with no estimator passes — reproduces the previous
-    activation-only budget exactly."""
+    activation-only budget exactly.
+
+    `accelerator_type` is the binding device's model, when the topology could name it. Given
+    one, and with `accelerator.prefer_mig` on, the packing fraction comes from the device's
+    *own* MIG profiles instead of the coarse quanta: a model that fits a `1g` instance asks for
+    a seventh of an H100 rather than a quarter, and gets memory and fault isolation the
+    fractional request does not provide. `""` — an unlabelled or mixed fleet — keeps the
+    quanta, which is exactly the behavior before this."""
     dc = active_config().distributed
     gpu_gb = max(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
@@ -231,7 +378,9 @@ def decide_gpu_map_params(
         if frac <= 1.0:
             # No `next()` default: this branch is guarded by `frac <= 1.0` and `_PACK_QUANTA`
             # ends at 1.0, so a quantum always matches. A default here would disguise that.
-            out_gpus = next(q for q in _PACK_QUANTA if q >= frac)
+            out_gpus = _mig_fraction(model_memory_gb, accelerator_type, gpu_gb) or next(
+                q for q in _PACK_QUANTA if q >= frac
+            )
         else:
             out_gpus = float(math.ceil(frac))
 

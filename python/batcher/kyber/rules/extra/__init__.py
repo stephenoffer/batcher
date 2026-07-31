@@ -41,10 +41,24 @@ from batcher.kyber.rules.extra import null_shapes as _null_shapes  # noqa: F401
 
 # isort: on
 from batcher.kyber.rules.extra import predicate_infer as _predicate_infer  # noqa: F401
+
+# Registered directly after `predicate_infer`: the same statistics-free reasoning over a
+# Filter's conjunction, from arithmetic invariants rather than from sibling bounds --
+# registration order is run order, and the two answer the same question. Sorted position would
+# put it *before* `predicate_infer`, so the ordering is pinned rather than alphabetical.
+# isort: off
+from batcher.kyber.rules.extra import predicate_impossible as _predicate_impossible  # noqa: F401
+
+# isort: on
 from batcher.kyber.rules.extra import projection_scan as _projection_scan  # noqa: F401
 from batcher.kyber.rules.extra import pushdown_gaps as _pushdown_gaps  # noqa: F401
 from batcher.kyber.rules.extra import runtime_filters as _runtime_filters  # noqa: F401
 from batcher.kyber.rules.extra import sargable as _sargable  # noqa: F401
+
+# The ordered-comparison half of the sargable family, registered directly after the
+# equality half it extends -- registration order is run order, and the two normalize the
+# same predicate shape.
+from batcher.kyber.rules.extra import sargable_range as _sargable_range  # noqa: F401
 from batcher.kyber.rules.extra import setops as _setops  # noqa: F401
 from batcher.kyber.rules.extra import setops_extra as _setops_extra  # noqa: F401
 from batcher.kyber.rules.extra import strings as _strings  # noqa: F401
@@ -56,6 +70,9 @@ from batcher.kyber.rules.extra import strings as _strings  # noqa: F401
 from batcher.kyber.rules.extra import string_folds as _string_folds  # noqa: F401
 
 # isort: on
+# Registered directly after `temporal_sargable`: the same extraction-to-range family, for the
+# timestamp-to-date cast rather than a field extraction, and built on that module's helpers.
+from batcher.kyber.rules.extra import temporal_date_cast as _temporal_date_cast  # noqa: F401
 from batcher.kyber.rules.extra import temporal_extra as _temporal_extra  # noqa: F401
 
 # Imported immediately after `temporal_extra`: the folding rules were split out of it and

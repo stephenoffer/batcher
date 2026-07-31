@@ -5,6 +5,8 @@
 //! the answer: an order-preserving `u64` per value where the type allows one, the encoder
 //! where it does not, and a dense rank so the sweep compares `u32`s and never an encoded key.
 
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
 use arrow::array::{Array, ArrayRef};
 use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
@@ -105,7 +107,7 @@ pub(super) fn u64_order_keys(arr: &ArrayRef, descending: bool) -> Option<Vec<u64
         ($ty:ty, $f:expr) => {{
             let a = arr.as_any().downcast_ref::<PrimitiveArray<$ty>>()?;
             #[allow(clippy::redundant_closure_call)]
-            Some(a.values().iter().map(|&v| $f(v)).collect::<Vec<u64>>())
+            Some(map_u64(a.values(), |v| $f(v)))
         }};
     }
 
@@ -140,8 +142,14 @@ pub(super) fn u64_order_keys(arr: &ArrayRef, descending: bool) -> Option<Vec<u64
     };
     keys.map(|mut k| {
         if descending {
-            for v in &mut k {
-                *v = !*v;
+            // Complementing an order-preserving key reverses the order, and it is elementwise,
+            // so it fans out on the same terms as the map above.
+            if k.len() >= PARALLEL_MAP_MIN {
+                k.par_iter_mut().for_each(|v| *v = !*v);
+            } else {
+                for v in &mut k {
+                    *v = !*v;
+                }
             }
         }
         k
@@ -173,46 +181,137 @@ fn packed_keys(keys: &[u64]) -> Option<Vec<u64>> {
     if keys.is_empty() || keys.len() > u32::MAX as usize {
         return None;
     }
-    let (mut lo, mut hi) = (u64::MAX, 0u64);
-    for &k in keys {
-        lo = lo.min(k);
-        hi = hi.max(k);
-    }
+    // min/max is associative, so the fold order cannot change the result.
+    let (lo, hi) = if keys.len() >= PARALLEL_MAP_MIN {
+        keys.par_iter()
+            .fold(|| (u64::MAX, 0u64), |(lo, hi), &k| (lo.min(k), hi.max(k)))
+            .reduce(|| (u64::MAX, 0u64), |a, b| (a.0.min(b.0), a.1.max(b.1)))
+    } else {
+        keys.iter()
+            .fold((u64::MAX, 0u64), |(lo, hi), &k| (lo.min(k), hi.max(k)))
+    };
     if hi - lo >= 1u64 << 32 {
         return None;
     }
-    Some(
-        keys.iter()
-            .enumerate()
-            .map(|(e, &k)| ((k - lo) << 32) | e as u64)
-            .collect(),
-    )
+    // Each packed value is a pure function of its key and its own index, so an indexed
+    // parallel `collect` writes exactly what the sequential `enumerate` did.
+    if keys.len() >= PARALLEL_MAP_MIN {
+        Some(
+            keys.par_iter()
+                .enumerate()
+                .map(|(e, &k)| ((k - lo) << 32) | e as u64)
+                .collect(),
+        )
+    } else {
+        Some(
+            keys.iter()
+                .enumerate()
+                .map(|(e, &k)| ((k - lo) << 32) | e as u64)
+                .collect(),
+        )
+    }
 }
 
-/// Sort the packed keys and read the order and dense ranks off them in one pass.
+/// Sort the packed keys and read the order and dense ranks off them.
+///
+/// The ranking looks inherently serial — a running counter bumped on every key change — but it
+/// is a prefix sum in disguise, and that is what lets it be split. The rank at sorted position
+/// `i` is exactly *the number of key changes in `1..=i`*, so a chunk needs only the count of
+/// changes before it in order to compute all of its own ranks independently. Three phases:
+/// count the changes per chunk in parallel, exclusive-scan those per-chunk counts (one pass over
+/// as many entries as there are chunks, so it stays serial without mattering), then have each
+/// chunk walk its own range from its base.
+///
+/// This was the last serial pass over the universe on either axis, and at five million rows a
+/// side there are ten million entries of it, twice — once per axis, inside a phase whose sort
+/// half was already parallel.
+///
+/// Every write is a reindexing of the same values: `order` is written at the index it is read
+/// from, and `ranks` is scattered through `order`, which is a permutation, so each slot is
+/// written exactly once. The slot type carries that disjointness the way `pos1` does in the
+/// IEJoin sweep. The chunk-boundary comparison reads `packed[start - 1]`, i.e. across the chunk
+/// edge, which is why the phases index the whole array rather than the chunk slices.
 fn rank_packed(mut packed: Vec<u64>) -> (Vec<u32>, Vec<u32>) {
     if packed.len() >= PARALLEL_SORT_MIN_ROWS {
         packed.par_sort_unstable();
     } else {
         packed.sort_unstable();
     }
-    let mut order = Vec::with_capacity(packed.len());
-    let mut ranks = vec![0u32; packed.len()];
-    let mut rank = 0u32;
-    let mut prev = u64::MAX;
-    for (i, &p) in packed.iter().enumerate() {
-        let k = p >> 32;
-        if i == 0 || k != prev {
-            if i != 0 {
+    let n = packed.len();
+
+    // `i` opens a new dense rank when its key differs from its predecessor's. Position 0 never
+    // does, which is what makes the first rank 0 rather than 1.
+    let changes = |lo: usize, hi: usize| -> u32 {
+        let mut c = 0u32;
+        for i in lo.max(1)..hi {
+            if packed[i] >> 32 != packed[i - 1] >> 32 {
+                c += 1;
+            }
+        }
+        c
+    };
+
+    if n < PARALLEL_MAP_MIN {
+        let mut order = vec![0u32; n];
+        let mut ranks = vec![0u32; n];
+        let mut rank = 0u32;
+        for i in 0..n {
+            if i > 0 && packed[i] >> 32 != packed[i - 1] >> 32 {
                 rank += 1;
             }
-            prev = k;
+            let e = (packed[i] & 0xFFFF_FFFF) as u32;
+            ranks[e as usize] = rank;
+            order[i] = e;
         }
-        let e = (p & 0xFFFF_FFFF) as u32;
-        ranks[e as usize] = rank;
-        order.push(e);
+        return (order, ranks);
     }
-    (order, ranks)
+
+    // One chunk per worker, floored so a modest universe is not split into slivers whose
+    // scheduling costs more than their scan.
+    let per = n
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(super::SETUP_CHUNK);
+    let bounds: Vec<(usize, usize)> = (0..n.div_ceil(per))
+        .map(|c| (c * per, ((c + 1) * per).min(n)))
+        .collect();
+
+    // Phase 1: how many ranks each chunk opens, counted independently.
+    let counts: Vec<u32> = bounds.par_iter().map(|&(lo, hi)| changes(lo, hi)).collect();
+
+    // Phase 2: exclusive scan, so `base[c]` is the number of changes strictly before chunk `c`
+    // — which is the rank its first element carries before its own change is counted.
+    let mut base = Vec::with_capacity(bounds.len());
+    let mut acc = 0u32;
+    for &c in &counts {
+        base.push(acc);
+        acc += c;
+    }
+
+    // Phase 3: each chunk walks its own range from its base.
+    let order_slots: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let rank_slots: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    bounds
+        .par_iter()
+        .zip(base.par_iter())
+        .for_each(|(&(lo, hi), &b)| {
+            let mut rank = b;
+            for i in lo..hi {
+                if i > 0 && packed[i] >> 32 != packed[i - 1] >> 32 {
+                    rank += 1;
+                }
+                let e = (packed[i] & 0xFFFF_FFFF) as u32;
+                rank_slots[e as usize].store(rank, AtomicOrdering::Relaxed);
+                order_slots[i].store(e, AtomicOrdering::Relaxed);
+            }
+        });
+
+    let unwrap = |slots: Vec<AtomicU32>| -> Vec<u32> {
+        slots
+            .into_iter()
+            .map(|s| s.into_inner())
+            .collect::<Vec<u32>>()
+    };
+    (unwrap(order_slots), unwrap(rank_slots))
 }
 
 /// Sort `(key, entry)` pairs, on rayon once the input is large enough.
@@ -221,6 +320,65 @@ fn sort_u64_pairs(pairs: &mut [(u64, u32)]) {
         pairs.par_sort_unstable();
     } else {
         pairs.sort_unstable();
+    }
+}
+
+/// The universe entries `first..last` in ascending key order, ties broken by entry.
+///
+/// Entries in that half-open range index `keys` directly, so the keys involved are a contiguous
+/// subslice and the whole thing is one sort of one array.
+///
+/// Both one-sided orders — the band's sorted left and sorted right — used to build a
+/// `Vec<(u64, u32)>`, sort that, and map the entries back out. Three costs, all avoidable: the
+/// tuple pads to **16 bytes** where the information is 12 and fits in 8, and a sort is
+/// memory-bound; and the build and extract passes ran on one core. This packs key and entry into
+/// a single `u64` exactly as [`packed_keys`] does for the two-sided order, which was already
+/// doing it — the one-sided paths simply never got the same treatment.
+///
+/// The order is **identical**, not merely equivalent: with the key in the high bits and the
+/// entry in the low ones, ordering by the packed value orders by key and breaks ties by entry,
+/// which is what the pair sort did. Packing needs the key span to fit in 32 bits, and the pair
+/// sort remains for the spans that do not.
+fn sorted_entries(keys: &[u64], first: u32, last: u32) -> Vec<u32> {
+    let sub = &keys[first as usize..last as usize];
+    let n = sub.len();
+
+    // min/max is associative, so the fold order cannot change the span.
+    let (lo, hi) = if n >= PARALLEL_MAP_MIN {
+        sub.par_iter()
+            .fold(|| (u64::MAX, 0u64), |(l, h), &k| (l.min(k), h.max(k)))
+            .reduce(|| (u64::MAX, 0u64), |a, b| (a.0.min(b.0), a.1.max(b.1)))
+    } else {
+        sub.iter()
+            .fold((u64::MAX, 0u64), |(l, h), &k| (l.min(k), h.max(k)))
+    };
+
+    if n == 0 || n > u32::MAX as usize || hi.wrapping_sub(lo) >= 1u64 << 32 {
+        let mut pairs: Vec<(u64, u32)> = (first..last).map(|e| (keys[e as usize], e)).collect();
+        sort_u64_pairs(&mut pairs);
+        return pairs.into_iter().map(|(_, e)| e).collect();
+    }
+
+    let mut packed: Vec<u64> = if n >= PARALLEL_MAP_MIN {
+        sub.par_iter()
+            .enumerate()
+            .map(|(i, &k)| ((k - lo) << 32) | (first as u64 + i as u64))
+            .collect()
+    } else {
+        sub.iter()
+            .enumerate()
+            .map(|(i, &k)| ((k - lo) << 32) | (first as u64 + i as u64))
+            .collect()
+    };
+    if n >= PARALLEL_SORT_MIN_ROWS {
+        packed.par_sort_unstable();
+    } else {
+        packed.sort_unstable();
+    }
+    if n >= PARALLEL_MAP_MIN {
+        packed.par_iter().map(|&p| p as u32).collect()
+    } else {
+        packed.iter().map(|&p| p as u32).collect()
     }
 }
 
@@ -237,9 +395,13 @@ impl AxisKeys {
             u64_order_keys(left, descending),
             u64_order_keys(right, descending),
         ) {
-            let mut keys = Vec::with_capacity(lmap.len() + rmap.len());
-            keys.extend(lmap.iter().map(|&i| l[i as usize]));
-            keys.extend(rmap.iter().map(|&i| r[i as usize]));
+            // The universe is the left rows' keys followed by the right rows', each gathered
+            // through its side's row map. Preallocating and splitting lets both halves be
+            // gathered in parallel; `extend` could not, and this is a pass over the whole
+            // universe on every axis of every range join.
+            let mut keys = vec![0u64; lmap.len() + rmap.len()];
+            let (kl, kr) = keys.split_at_mut(lmap.len());
+            rayon::join(|| gather_u64(kl, lmap, &l), || gather_u64(kr, rmap, &r));
             return Ok(AxisKeys::Fast(keys));
         }
         let (left, right) = encode_axis(left, right, descending)?;
@@ -323,17 +485,7 @@ impl AxisKeys {
     /// The right-side universe entries in ascending key order.
     pub(super) fn sorted_right(&self, n: usize, nl: usize, lmap: &[u32], rmap: &[u32]) -> Vec<u32> {
         match self {
-            AxisKeys::Fast(keys) => {
-                let mut pairs: Vec<(u64, u32)> = ((nl as u32)..(n as u32))
-                    .map(|e| (keys[e as usize], e))
-                    .collect();
-                if pairs.len() >= PARALLEL_SORT_MIN_ROWS {
-                    pairs.par_sort_unstable();
-                } else {
-                    pairs.sort_unstable();
-                }
-                pairs.into_iter().map(|(_, e)| e).collect()
-            }
+            AxisKeys::Fast(keys) => sorted_entries(keys, nl as u32, n as u32),
             AxisKeys::Encoded { left, right } => {
                 let mut idx: Vec<u32> = ((nl as u32)..(n as u32)).collect();
                 sort_by_key(&mut idx, |e| key(e, nl, left, right, lmap, rmap));
@@ -363,16 +515,7 @@ impl AxisKeys {
     /// million times over, which no amount of parallelism makes cache-friendly.
     pub(super) fn sorted_left(&self, nl: usize, lmap: &[u32], rmap: &[u32]) -> Vec<u32> {
         match self {
-            AxisKeys::Fast(keys) => {
-                let mut pairs: Vec<(u64, u32)> =
-                    (0..nl as u32).map(|e| (keys[e as usize], e)).collect();
-                if pairs.len() >= PARALLEL_SORT_MIN_ROWS {
-                    pairs.par_sort_unstable();
-                } else {
-                    pairs.sort_unstable();
-                }
-                pairs.into_iter().map(|(_, e)| e).collect()
-            }
+            AxisKeys::Fast(keys) => sorted_entries(keys, 0, nl as u32),
             AxisKeys::Encoded { left, right } => {
                 let mut idx: Vec<u32> = (0..nl as u32).collect();
                 sort_by_key(&mut idx, |e| key(e, nl, left, right, lmap, rmap));
@@ -411,6 +554,45 @@ pub(super) fn dense_ranks(
 /// Below it the pool hand-off costs more than the sort saves; a few thousand encoded rows
 /// sort in well under the time it takes to schedule them.
 const PARALLEL_SORT_MIN_ROWS: usize = 32_768;
+
+/// Element floor above which an elementwise pass over the universe is worth handing to rayon.
+///
+/// The same trade as [`PARALLEL_SORT_MIN_ROWS`] and deliberately the same size, but it guards a
+/// *linear* pass rather than an `n log n` one, so it earns less per element and matters more
+/// that it does not fire early. This operator answers a 10,000-row join in under four
+/// milliseconds; a few hundred microseconds of pool hand-off would be visible there, while at
+/// five million rows a side these passes were 200 ms of a 900 ms join, on one core of 96.
+const PARALLEL_MAP_MIN: usize = 32_768;
+
+/// Map a slice elementwise into a fresh `Vec`, on rayon once it is large enough to pay.
+///
+/// `collect` from an indexed parallel iterator writes each element at the index it was read
+/// from, so the result is the sequential `map`'s output element for element. Every caller here
+/// passes a pure function of one value, which is what makes that equivalence hold.
+fn map_u64<T: Copy + Send + Sync>(src: &[T], f: impl Fn(T) -> u64 + Send + Sync) -> Vec<u64> {
+    if src.len() >= PARALLEL_MAP_MIN {
+        src.par_iter().map(|&v| f(v)).collect()
+    } else {
+        src.iter().map(|&v| f(v)).collect()
+    }
+}
+
+/// Gather `src[i]` for each `i` in `idx` into `dst`, on rayon once it is large enough to pay.
+///
+/// `dst` and `idx` are the same length and are walked in lockstep, so element `j` of `dst`
+/// receives `src[idx[j]]` exactly as the sequential loop wrote it.
+fn gather_u64(dst: &mut [u64], idx: &[u32], src: &[u64]) {
+    debug_assert_eq!(dst.len(), idx.len());
+    if dst.len() >= PARALLEL_MAP_MIN {
+        dst.par_iter_mut()
+            .zip(idx.par_iter())
+            .for_each(|(d, &i)| *d = src[i as usize]);
+    } else {
+        for (d, &i) in dst.iter_mut().zip(idx) {
+            *d = src[i as usize];
+        }
+    }
+}
 
 /// Sort `idx` by each entry's encoded key, in parallel once the input is large enough.
 ///

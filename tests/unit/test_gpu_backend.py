@@ -58,10 +58,10 @@ def test_gpu_task_opts_carry_spot_preemption_retry_budget():
     # Every GPU dispatch task must retry a lost (spot-preempted) worker on a survivor rather than
     # collapsing the distributed GPU query to the single-node CPU fallback. The budget is the same
     # config knob the flight shuffle tasks use.
-    from batcher.api.terminal.gpu_backend import _gpu_task_opts
     from batcher.config import active_config
+    from batcher.dist.gpu import gpu_task_options
 
-    opts = _gpu_task_opts()
+    opts = gpu_task_options()
     assert opts["num_gpus"] == 1
     assert opts["max_retries"] == active_config().distributed.task_max_retries
     # A deterministic app error (OOM / unsupported expr) must fall back to CPU immediately, not
@@ -76,20 +76,20 @@ def test_oversubscribed_shards_combine_to_the_same_aggregate():
     import pandas as pd
     import pyarrow as pa
 
-    from batcher.api.terminal.gpu_backend import _combine_partials, _partial_aggs
+    from batcher.dist.gpu.groupby import _combine_partials, partial_aggs
 
     rng = np.random.default_rng(0)
     n = 5000
     full = pd.DataFrame({"k": rng.integers(0, 7, n), "v": rng.random(n)})
     aggs = {"s": ("v", "sum"), "c": ("v", "count"), "m": ("v", "mean"), "mx": ("v", "max")}
-    partial_aggs = _partial_aggs(aggs)
+    reductions = partial_aggs(aggs)
 
     def shard_partial(df: pd.DataFrame) -> pa.Table:
         cols: dict[str, list] = {"k": []}
-        agg_map: dict[str, list] = {a: [] for a in partial_aggs}
+        agg_map: dict[str, list] = {a: [] for a in reductions}
         for kval, grp in df.groupby("k"):
             cols["k"].append(kval)
-            for alias, (colname, func) in partial_aggs.items():
+            for alias, (colname, func) in reductions.items():
                 agg_map[alias].append(getattr(grp[colname], func)())
         return pa.table({**cols, **agg_map})
 
@@ -107,3 +107,58 @@ def test_oversubscribed_shards_combine_to_the_same_aggregate():
         assert got["c"].tolist() == exp["c"].tolist()
         assert got["m"].tolist() == exp["m"].round(6).tolist()
         assert got["mx"].tolist() == exp["mx"].round(6).tolist()
+
+
+def test_the_translated_path_is_tried_before_the_legacy_group_by(monkeypatch):
+    """The legacy kernel used to shadow the translator on the commonest GPU shape.
+
+    A one-key group-by over a scan matches both, and the legacy path ran first — so every query
+    of that shape missed the translator's wider reductions, its chains above and below the
+    reducer, its per-shard recovery, and its device sizing. Nothing else pins the order, because
+    both paths return the right answer; only one of them returns it at scale.
+    """
+    import batcher as bt
+    from batcher.api.terminal import gpu_backend
+    from batcher.kyber.gpu.policy import GpuDecision
+
+    called: list[str] = []
+
+    def _note(name):
+        def _fn(*_args, **_kwargs):
+            called.append(name)
+            return None
+
+        return _fn
+
+    monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 1)
+    monkeypatch.setattr(gpu_backend, "_translated", _note("translated"))
+    monkeypatch.setattr(gpu_backend, "_legacy_groupby", _note("legacy"))
+    monkeypatch.setattr(
+        "batcher.kyber.gpu.policy.decide_gpu_backend",
+        lambda *a, **k: GpuDecision(True, False, "test", 100, 1),
+    )
+
+    q = bt.from_pydict({"k": [1, 2], "v": [1.0, 2.0]}).group_by("k").agg(s=bt.col("v").sum())
+    assert gpu_backend.try_gpu_collect(q._plan, q._sources) is None
+    assert called == ["translated", "legacy"]
+
+
+def test_a_gpu_kernel_that_raises_falls_back_instead_of_failing_the_query(monkeypatch):
+    """`backend="gpu"` is documented as always safe, and nothing enforced it.
+
+    The caller in `api/terminal/core.py` has no handler, so a raise from the GPU path reached
+    the user: the legacy torch kernel raised a bare `TypeError` on a string group key, which is
+    an ordinary column, and the query failed rather than running on the CPU engine.
+    """
+    from batcher.api.terminal import gpu_backend
+
+    monkeypatch.setattr(gpu_backend, "_cluster_gpu_count", lambda: 2)
+
+    def _boom(*_args, **_kwargs):
+        raise TypeError("can't convert np.ndarray of type numpy.object_")
+
+    monkeypatch.setattr(gpu_backend, "_translated", _boom)
+    monkeypatch.setattr(gpu_backend, "_legacy_groupby", _boom)
+
+    ds = bt.from_pydict({"k": ["a", "b"], "v": [1.0, 2.0]}).group_by("k").agg(s=col("v").sum())
+    assert gpu_backend.try_gpu_collect(_plan(ds), ds._sources, None, force=True) is None

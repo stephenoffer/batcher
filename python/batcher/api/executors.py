@@ -21,6 +21,7 @@ from collections.abc import Callable
 import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
+from batcher._internal.logging import note_suppressed
 from batcher._internal.registry import Registry
 from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.orchestration import run_relational
@@ -61,6 +62,7 @@ class DistributedExecutor:
                 hub=ctx.hub,
             )
             collect_source_metadata(ctx.hub, sources)
+            record_udf_cardinality(ctx.hub, plan, table.num_rows)
             return table
         # Relational distributed result — deterministic and identical to single-node,
         # so it shares the same result cache (`Dataset.cache()`).
@@ -92,6 +94,7 @@ class UdfExecutor:
         schema = batches[0].schema if batches else _empty_result_schema(plan, ctx.columns)
         table = pa.Table.from_batches(batches, schema=schema)
         collect_source_metadata(ctx.hub, sources)
+        record_udf_cardinality(ctx.hub, plan, table.num_rows)
         return table
 
 
@@ -102,6 +105,47 @@ class LocalNativeExecutor:
         return _cached_or_run(
             plan, sources, ctx, lambda: run_relational(plan, sources, ctx, distributed=False)[0]
         )
+
+
+def record_udf_cardinality(hub, plan: LogicalPlan, out_rows: int) -> None:
+    """Teach the estimator what this UDF pipeline's fan-out actually was.
+
+    The estimator already *expects* to learn this. `MapBatches` is in its `_CORRECTABLE`
+    set, keyed by UDF identity, with the reasoning spelled out there: a UDF may filter,
+    explode, or pass rows through 1:1, and which one is a property of the *code*, not the
+    plan, so no structural rule can derive it. Absent a measurement it assumes 1:1 and tags
+    the result `Provenance.DEFAULT`.
+
+    Nothing was supplying the measurement. Both UDF routes — this single-node orchestrator
+    and the distributed `map_batches` branch — bypass `run_relational`, which is the one
+    place `record_cardinality_outcome` is called, so a pipeline's measured output count was
+    thrown away on every run. The correction machinery was in place and had nothing to
+    correct from, which is the same shape as a rule that is written, tested, and never
+    reached: indistinguishable from absent.
+
+    What it costs to be wrong is not small on this shape. An inference stage that explodes
+    one row into N detections, or a classifier that keeps two percent, is mis-sized by
+    orders of magnitude — and everything downstream is sized from it: a join after the
+    inference, the partition count, the admission envelope, the output file sizing.
+
+    Only the *cardinality* loop is closed here, not `record_selectivity`: that one attributes
+    a measured ratio to a `Filter` over a scan, and a UDF pipeline's output count says
+    nothing about any predicate in it.
+
+    Best-effort, like every other write on this path — a learning failure must not break a
+    query that has already produced its answer.
+
+    Args:
+        hub: The metadata hub; a `None` hub is a no-op.
+        plan: The pre-optimization plan, whose signature carries the UDF's identity.
+        out_rows: Rows the pipeline actually produced.
+    """
+    from batcher import kyber
+
+    try:
+        kyber.record_execution(hub, plan, out_rows)
+    except Exception as exc:  # pragma: no cover - learning must never break a completed run
+        note_suppressed("api", "record UDF pipeline cardinality", exc)
 
 
 def _cached_or_run(
@@ -187,6 +231,33 @@ def _cache_scope() -> str:
     # under the catalog that produced it.
     viewer = f"{context.principal.name}:{sorted(context.principal.roles)}:{id(context.catalog)}"
     return f"t={tenant_id}|v={viewer}"
+
+
+def _gpu_device_count() -> int:
+    """Devices the cluster reports, or this host's when there is no cluster.
+
+    Deliberately *not* fused with the VRAM read below into one topology call. That fusion was
+    tried and was wrong twice over: the binding-VRAM figure has its own accessor
+    (`cluster_gpu_memory_gb`) whose semantics are "the smallest device in the fleet", and
+    routing around it packed a fraction derived from the driver's device onto a smaller
+    worker — the exact OOM that accessor exists to prevent. The cost the fusion was chasing is
+    not there either: topology reads inside a scheduling phase are served from a snapshot.
+
+    `0` means "no GPU visible", which makes the fan-out clamp a no-op rather than a refusal: a
+    stage that declared `num_gpus` on a fleet whose inventory cannot be read keeps what it
+    asked for.
+    """
+    from batcher._internal.hardware import gpu_inventory
+
+    try:
+        from batcher.dist.executors.ray_runtime.scaling import cluster_hardware_profile
+
+        profile = cluster_hardware_profile()
+        if profile is not None and profile.gpu_count > 0:
+            return profile.gpu_count
+    except Exception:  # pragma: no cover - an unreadable cluster falls back to this host
+        pass
+    return len(gpu_inventory())
 
 
 def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
@@ -280,6 +351,22 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     )
 
     n_tasks = num_workers or (cfg.execution.parallelism or available_cpu_count())
+    # A GPU stage's fan-out is bounded by devices, not by cores. Asking for one actor per CPU
+    # on an eight-GPU cluster leaves most of them holding a GPU request the cluster cannot
+    # satisfy — pending, not failing, which is the shape that looks like a hang. Carbonite
+    # owns that clamp (it protects), and applies three ceilings at once: the devices that
+    # exist, the devices the power budget can run, and the devices that are healthy enough to
+    # schedule on. Only the first is on by default, so an unbudgeted fleet with health checking
+    # off gets exactly the inventory clamp and nothing else.
+    if num_gpus > 0:
+        from batcher.carbonite.policies.scheduling import DefaultSchedulingPolicy
+
+        n_tasks = DefaultSchedulingPolicy.gpu_envelope(
+            num_gpus=num_gpus,
+            n_tasks=n_tasks,
+            gpu_count=_gpu_device_count(),
+            accelerator_type=accelerator_type,
+        ).n_tasks
     # A CPU-only map stage (no GPU) is usually IO/decode-bound preprocessing — request
     # a fractional CPU so more actors pack per node, mirroring the GPU-fraction packing
     # above. A GPU stage keeps a full CPU (the GPU is the binding resource there).

@@ -165,16 +165,15 @@ def pack_sequences(
             yield _emit(carry[:chunk], seq_len, name)
             carry = carry[chunk:]
         whole = (carry.size // seq_len) * seq_len
-        if whole and carry.size - whole < seq_len:
+        if whole:
             # A partial output batch is still whole sequences; emitting it now keeps the
-            # carry bounded by `seq_len` rather than by the input batch size.
+            # carry bounded by `seq_len` rather than by the input batch size, which is what
+            # makes the memory cost independent of how the caller chunked its input.
             yield _emit(carry[:whole], seq_len, name)
             carry = carry[whole:]
 
-    if carry.size >= seq_len:  # pragma: no cover - the loop above drains these
-        whole = (carry.size // seq_len) * seq_len
-        yield _emit(carry[:whole], seq_len, name)
-        carry = carry[whole:]
+    # The loop above drains every whole sequence from `carry` after each input batch, so what
+    # reaches here is strictly shorter than one sequence. Only the remainder is left to decide.
     if carry.size and not drop_remainder:
         # Pad rather than emit a narrower `FixedSizeList`: a final batch of a different
         # width has a different schema, and the run's batches could not be concatenated.

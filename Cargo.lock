@@ -492,6 +492,7 @@ name = "bc-arrow"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "libc",
 ]
 
 [[package]]
@@ -574,6 +575,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-avro",
+ "bc-arrow",
  "bytes",
  "futures",
  "object_store",
@@ -609,6 +611,7 @@ dependencies = [
  "bc-resource",
  "bc-sketches",
  "bc-transport",
+ "libmimalloc-sys",
  "mimalloc",
  "pyo3",
  "rayon",
@@ -1174,6 +1177,12 @@ checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
  "cipher",
 ]
+
+[[package]]
+name = "cty"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
 
 [[package]]
 name = "dashmap"
@@ -2143,6 +2152,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
 dependencies = [
  "cc",
+ "cty",
 ]
 
 [[package]]

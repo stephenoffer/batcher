@@ -13,6 +13,9 @@ The package keeps the four-axis model in one place while separating the question
   volume, external-merge passes, sort comparison counts).
 * `shuffle` — the `net` axis: what a plan costs to move across a cluster, which is zero
   by construction on a single node and dominant at ten thousand of them.
+* `fabric` — what one shuffled byte is worth on *this* cluster's interconnect, measured,
+  so the `net` weight is not the same constant on a 400 Gb/s InfiniBand node and a 10 Gb/s
+  virtual machine.
 
 The public surface is unchanged from when this was one module.
 """

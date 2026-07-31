@@ -398,16 +398,21 @@ pub(crate) fn eval_list_binary(
     let right = as_var_list(right, &format!("list.{func:?} (right)"))?;
     let (la, ra) = (left.as_list::<i32>(), right.as_list::<i32>());
 
-    // `Jaccard` is a positional *equality* rate, not a numeric reduction, so it is
-    // meaningful over strings — a token list, a list of ids. The shared path below casts
-    // every element array to Float64, and casting Utf8 to Float64 yields nulls rather than
-    // an error, so a string list scored 0.0 agreement even against an identical list. Route
-    // string elements through a native comparison instead of that lossy cast.
-    if matches!(func, ListBinaryFunc::Jaccard)
-        && crate::eval::list_ops::jaccard_str::is_string_list(la)
-        && crate::eval::list_ops::jaccard_str::is_string_list(ra)
-    {
-        return crate::eval::list_ops::jaccard_str::jaccard_utf8(la, ra);
+    // Three of these compare elements for *equality* — positionally, over a bag, and in order
+    // — rather than reducing them numerically, so their natural element type is a token
+    // string. The shared path below casts every element array to Float64, and Utf8 -> Float64
+    // is a lossy safe cast yielding nulls rather than an error: a string list scored 0.0
+    // agreement against an identical copy of itself. They exit before that cast.
+    use crate::eval::list_ops::{eval_lcs_length, eval_multiset_overlap, jaccard_str};
+    match func {
+        ListBinaryFunc::Jaccard
+            if jaccard_str::is_string_list(la) && jaccard_str::is_string_list(ra) =>
+        {
+            return jaccard_str::jaccard_utf8(la, ra);
+        }
+        ListBinaryFunc::MultisetOverlap => return eval_multiset_overlap(la, ra),
+        ListBinaryFunc::LcsLength => return eval_lcs_length(la, ra),
+        _ => {}
     }
 
     // Embeddings are overwhelmingly `f32`; keeping them at native width halves the bytes
@@ -491,6 +496,10 @@ pub(crate) fn eval_list_binary(
                     b.append_value(s.dot / denom);
                 }
             }
+            // Both returned above, before the numeric cast.
+            ListBinaryFunc::MultisetOverlap | ListBinaryFunc::LcsLength => {
+                unreachable!("routed to its own kernel")
+            }
         }
     }
     Ok(Arc::new(b.finish()))
@@ -557,6 +566,8 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     match func {
         ListFunc::Normalize => return crate::eval::list_ops::list_reduce::normalize(list),
         ListFunc::Softmax => return crate::eval::list_ops::list_reduce::softmax(list),
+        ListFunc::LogSoftmax => return crate::eval::list_ops::list_reduce::log_softmax(list),
+        ListFunc::Entropy => return crate::eval::list_ops::list_reduce::entropy(list),
         ListFunc::ArgSort => return crate::eval::list_ops::list_reduce::arg_sort(list),
         ListFunc::CumSum => return crate::eval::list_ops::list_reduce::cum_sum(list),
         ListFunc::Diff => return crate::eval::list_ops::list_reduce::diff(list),

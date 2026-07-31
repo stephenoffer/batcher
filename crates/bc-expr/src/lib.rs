@@ -169,6 +169,9 @@ pub enum Expr {
         /// `Mfcc` only: number of cepstral coefficients to keep.
         #[serde(default)]
         n_mfcc: Option<i64>,
+        /// `TrimSilence` only: the silence floor in dBFS (negative), defaulting to -40.
+        #[serde(default)]
+        threshold_db: Option<i64>,
     },
 
     /// A video decode op over a binary (video-bytes) sub-expression. Backed by the
@@ -432,6 +435,25 @@ pub enum ListBinaryFunc {
     /// `minhash` signatures this is the standard unbiased estimator of the documents'
     /// Jaccard similarity; over arbitrary lists it is simply the agreement rate.
     Jaccard,
+    /// The clipped multiset intersection size `Σ_v min(count_left(v), count_right(v))` —
+    /// how many of the left list's elements the right can account for, **counting
+    /// repeats**. Unlike `array_intersect(...).len()` a value repeated four times on the
+    /// left and once on the right contributes 1, not 4. That clip is the definition of
+    /// BLEU's modified n-gram precision and of ROUGE-N's numerator, and it is what stops a
+    /// degenerate `the the the the` from scoring a perfect unigram precision. Order-free
+    /// and type-general (n-gram strings, token ids); a null row on either side → null, a
+    /// null element matches nothing.
+    MultisetOverlap,
+    /// The length of the longest common **subsequence** of the two lists — the one overlap
+    /// measure that reads order. `MultisetOverlap` cannot tell `the cat sat` from
+    /// `sat cat the`; this scores the second far lower, which is the difference between
+    /// ROUGE-N and ROUGE-L and why summarization is scored with the latter. The subsequence
+    /// need not be contiguous.
+    ///
+    /// **`O(n·m)` per row**, against `O(n+m)` for every other list op here. Fine on tokenized
+    /// sentences, a real cost on two thousand-token documents. A null row on either side →
+    /// null; a null element matches nothing and cannot extend a subsequence.
+    LcsLength,
 }
 
 /// Two-argument math functions (→ Float64).
@@ -462,6 +484,19 @@ pub enum Math2Func {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFunc {
+    /// `brightness()` → the mean luma of the image, normalized to `[0, 1]` (→ Float64).
+    /// The blank-image detector: a placeholder tile, a blown-out scan, and the grey box a CDN
+    /// serves for a missing asset all sit at an extreme, while a photograph of anything lands
+    /// in the middle. Measured on a downsampled luma plane, so the cost is independent of the
+    /// source resolution. Null/undecodable → null.
+    Brightness,
+    /// `sharpness()` → the variance of the Laplacian of the luma plane, normalized to
+    /// `[0, 1]` (→ Float64). The standard focus measure: a sharp image has strong second
+    /// derivatives at its edges, a blurred or empty one has almost none. Downsampled first,
+    /// deliberately — full-resolution sensor noise reads as detail and makes a blurry large
+    /// photograph score like a sharp one. It measures *detail*, not quality: a brick wall
+    /// outscores a portrait. Null/undecodable → null.
+    Sharpness,
     Decode,
     ToTensor,
     /// `to_grayscale(width, height)` → decode, resize to `(width, height)`, and convert to a
@@ -544,6 +579,15 @@ pub enum ListSetOp {
     /// NULL).
     #[serde(rename = "array_concat")]
     Concat,
+    /// `array_gather(values, indices)` — each row's elements at the positions its `indices`
+    /// row names. Like `Concat` it rides this family for its shape (two lists in, one list
+    /// out) rather than because it is a set operation. It is what makes `arg_sort` usable:
+    /// the indices that rank a score vector are spent by gathering the candidates with them,
+    /// so a rerank stays in the engine. A negative index counts from the end (as `list.get`
+    /// does) and an out-of-range one yields a null element rather than an error, because a
+    /// `head(k)` wider than the row is ordinary. A null row on either side → null row.
+    #[serde(rename = "array_gather")]
+    Gather,
 }
 
 /// Audio-decode operations for the `.audio` namespace. `Decode` reads each clip's
@@ -566,6 +610,21 @@ pub enum AudioFunc {
     /// `mel_scale="htk"`, `center=True`, `pad_mode="reflect"`) — the log/normalization step
     /// varies by model, so it is applied downstream, not baked in. Null/undecodable → null.
     MelSpectrogram,
+    /// `trim_silence(threshold_db)` → the decoded waveform with leading and trailing samples
+    /// below the threshold removed, as a mono `List<Float32>`. dBFS relative to full scale;
+    /// -40 (1% of full scale) is the conventional default. Only the *ends* are trimmed —
+    /// interior pauses carry the timing an acoustic model reads. A clip quiet throughout
+    /// trims to an empty list, which is what makes a silent-recording filter expressible.
+    TrimSilence,
+    /// `peak_normalize()` → the decoded waveform scaled so its loudest sample sits at full
+    /// scale, as a mono `List<Float32>`. The level-matching step before batching clips from
+    /// different sources. Peak, not loudness (LUFS): it equalizes the maximum, not the
+    /// perceived level. An all-zero clip is returned unchanged rather than divided by zero.
+    PeakNormalize,
+    /// `zero_crossing_rate()` → the fraction of adjacent sample pairs that change sign, as
+    /// Float64. The classic voiced/unvoiced descriptor: a vowel crosses zero rarely, a
+    /// fricative constantly. A clip shorter than two samples yields null.
+    ZeroCrossingRate,
     /// `mfcc(rate, n_fft, hop_length, n_mels, n_mfcc)` → the Mel-Frequency Cepstral
     /// Coefficients, the classic compact speech feature: mel power spectrogram →
     /// `AmplitudeToDB` → orthonormal DCT-II, keeping the first `n_mfcc` coefficients.
@@ -665,6 +724,20 @@ pub enum ListFunc {
     /// `flatten`; Polars `list.explode`-free flatten). Null inner lists are skipped;
     /// a null outer row stays null. Element type `T` is preserved.
     Flatten,
+    /// `log_softmax(x)` — `xᵢ − max − ln Σ exp(xⱼ − max)` → `List<Float64>`. The log-domain
+    /// sibling of `Softmax`, and not the same as taking its log: a probability that underflows
+    /// to 0 in the linear form becomes `-inf` there, while here it stays a large negative
+    /// finite number. That is the reason scoring and training pipelines carry
+    /// log-probabilities, so the conversion has to happen in the log domain to be worth
+    /// anything. Per-element nulls are preserved; a null/empty row stays null/empty.
+    LogSoftmax,
+    /// Shannon entropy of each row read as a distribution, in **nats**: `−Σ pᵢ ln pᵢ` after
+    /// normalizing the row by its own sum → Float64. Works on a probability vector, a count
+    /// vector, or unnormalized weights alike. 0 when all the mass is on one outcome, `ln n`
+    /// when spread evenly over `n` — the per-row uncertainty of a classifier's output, a
+    /// retrieval score distribution, or an attention row. A non-positive element is skipped
+    /// (`p ln p` is undefined there); a row totalling zero has no distribution and yields null.
+    Entropy,
     /// First difference over each row's list → `List<Float64>` of the **same length**:
     /// element `i` is `xᵢ − xᵢ₋₁`, with element 0 null (no predecessor). If either
     /// neighbor is null the difference is null (Polars `list.diff`). The delta-feature
@@ -789,6 +862,15 @@ pub enum StrFunc {
     /// and the primitive the multiset generation metrics (BLEU/ROUGE-N/Distinct-n) build
     /// their token n-gram sets from.
     TokenNgrams,
+    /// The SQuAD answer normalization every word-level text metric runs first: lowercase,
+    /// drop the standalone articles `a`/`an`/`the`, delete punctuation, collapse whitespace,
+    /// trim. → Utf8; null → null.
+    ///
+    /// It replaces a composition of `lower` and three `regexp_replace_all` passes, which cost
+    /// ninety times a bare `len` over the same column and which every word metric paid twice.
+    /// One pass, one allocation. `eval/str/squad.rs` documents how the five steps reduce to a
+    /// scan over word and non-word runs, and pins the result against the composition.
+    SquadNormalize,
     /// True where `pattern` (a regex) matches anywhere in the string. → Boolean.
     RegexpMatches,
     /// Replace the first match of regex `pattern` with `replacement`. → Utf8.

@@ -15,15 +15,20 @@ from batcher.plan.expr_ir.constructors import lit, when
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.functions.collection import element
 
-__all__ = ["char_ngrams", "mean_ratio", "normalize", "tokens"]
+__all__ = ["char_ngrams", "mean_ratio", "normalize", "token_ngrams", "tokens"]
 
 
 def normalize(text: Expr) -> Expr:
-    """The SQuAD answer normalization: lowercase, drop articles and punctuation, collapse spaces."""
-    lowered = text.str.lower()
-    without_articles = lowered.str.regexp_replace_all(r"\b(a|an|the)\b", " ")
-    without_punct = without_articles.str.remove_punctuation()
-    return without_punct.str.normalize_whitespace().str.strip()
+    """The SQuAD answer normalization: lowercase, drop articles and punctuation, collapse spaces.
+
+    One engine kernel, not the five-expression composition it reads as. That composition —
+    `lower`, three `regexp_replace_all` passes, two trims — measured ninety times the cost of a
+    bare `len` over the same column, and every word-level metric in this package paid it once
+    per text column (BLEU, eight times). The kernel is pinned byte-for-byte against the
+    composition in `bc-expr`'s own tests, including the Unicode cases where the two classes of
+    "word character" could have diverged.
+    """
+    return text.str.squad_normalize()
 
 
 def tokens(text: Expr) -> Expr:
@@ -37,6 +42,21 @@ def tokens(text: Expr) -> Expr:
     genuinely empty so `mean_ratio`'s zero-denominator guard fires.
     """
     return normalize(text).str.split(" ").list.filter(element() != lit(""))
+
+
+def token_ngrams(text: Expr, n: int) -> Expr:
+    """The word n-grams of a SQuAD-normalized text column, as a list of joined strings.
+
+    The word-level sibling of `char_ngrams`, and it normalizes the same way `tokens` does —
+    lowercased, articles and punctuation dropped — so every word-level metric in this package
+    agrees on what a token is. That is a deliberate departure from the reference BLEU
+    implementations, which n-gram the text exactly as tokenized; the functions built on this
+    say so in their own documentation.
+
+    A row with fewer than `n` tokens still yields one n-gram of everything it has, so a short
+    reference is scored rather than silently skipped.
+    """
+    return normalize(text).str.token_ngrams(n)
 
 
 def char_ngrams(text: Expr, n: int) -> Expr:

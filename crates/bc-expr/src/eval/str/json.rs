@@ -93,14 +93,16 @@ fn seek_key(bytes: &[u8], pos: usize, key: &str) -> Option<usize> {
         return None; // empty object
     }
     loop {
-        // Key (always a JSON string).
-        let (k, after_key) = parse_string(bytes, i)?;
+        // Key (always a JSON string). Compared in place — a non-matching key costs a slice
+        // compare, not the owned `String` this used to build and immediately discard for
+        // every key it stepped over.
+        let (matches, after_key) = key_matches(bytes, i, key)?;
         i = skip_ws(bytes, after_key);
         if bytes.get(i)? != &b':' {
             return None;
         }
         i = skip_ws(bytes, i + 1);
-        if k == key {
+        if matches {
             return Some(i);
         }
         i = skip_value(bytes, i)?;
@@ -167,7 +169,10 @@ fn seek_index(bytes: &[u8], pos: usize, idx: i64) -> Option<usize> {
 /// Position just past the complete JSON value that starts at `pos`.
 fn skip_value(bytes: &[u8], pos: usize) -> Option<usize> {
     match bytes.get(pos)? {
-        b'"' => parse_string(bytes, pos).map(|(_, end)| end),
+        // `scan_string`, not `parse_string`: skipping a value only needs to know where it
+        // ends, and decoding it into a `String` to find out was the cost of every string
+        // field the seek stepped over.
+        b'"' => scan_string(bytes, pos).map(|(end, _)| end),
         b'{' | b'[' => skip_container(bytes, pos),
         _ => Some(skip_scalar(bytes, pos)),
     }
@@ -181,7 +186,8 @@ fn skip_container(bytes: &[u8], pos: usize) -> Option<usize> {
     while i < bytes.len() {
         match bytes[i] {
             b'"' => {
-                i = parse_string(bytes, i)?.1;
+                // A string inside the container being skipped: find its end, do not decode it.
+                i = scan_string(bytes, i)?.0;
                 continue;
             }
             b'{' | b'[' => depth += 1,
@@ -216,34 +222,65 @@ fn skip_scalar(bytes: &[u8], pos: usize) -> usize {
 /// `serde_json` for the (rare) escaped case; the common unescaped case is a borrow-free
 /// slice compare done by the caller.
 fn parse_string(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
+    let (end, escaped) = scan_string(bytes, pos)?;
+    let s = if escaped {
+        // Delegate escape decoding to `serde_json` for exact semantics.
+        serde_json::from_slice::<String>(&bytes[pos..end]).ok()?
+    } else {
+        // The slice is within a validated `&str` and holds no escapes, so it is valid
+        // UTF-8 string content.
+        std::str::from_utf8(&bytes[pos + 1..end - 1])
+            .ok()?
+            .to_string()
+    };
+    Some((s, end))
+}
+
+/// Find the end of the JSON string starting at `pos` (`"`) **without decoding it**.
+///
+/// Returns the index just past the closing quote, and whether any escape was seen along the
+/// way (which is what decides between a borrow-free slice and a `serde_json` decode).
+///
+/// Two costs this removes from the seek. Most callers only want to know *where the string
+/// ends* — skipping a value, stepping over a key that does not match — and were paying an
+/// owned `String` per string to learn it: seeking `$.z` in a fifty-field object allocated a
+/// `String` for each of the preceding keys and each of their string values, then dropped
+/// every one. And the scan walked a byte at a time; `memchr2` finds the next `"` or `\` with
+/// a vector compare, which is the whole point of a structural skip over a wide document.
+fn scan_string(bytes: &[u8], pos: usize) -> Option<(usize, bool)> {
     if bytes.get(pos)? != &b'"' {
         return None;
     }
     let mut i = pos + 1;
     let mut escaped = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                escaped = true;
-                i += 2; // skip the escape and its following char
-                continue;
-            }
-            b'"' => {
-                let raw = &bytes[pos..=i];
-                let s = if escaped {
-                    // Delegate escape decoding to serde_json for exact semantics.
-                    serde_json::from_slice::<String>(raw).ok()?
-                } else {
-                    // SAFETY-equivalent: the slice is within a validated &str and holds
-                    // no escapes, so it is valid UTF-8 string content.
-                    std::str::from_utf8(&bytes[pos + 1..i]).ok()?.to_string()
-                };
-                return Some((s, i + 1));
-            }
-            _ => i += 1,
+    loop {
+        // `get` rather than indexing: an escape at the very end can push `i` past the buffer,
+        // and an unterminated string is a malformed document, not a panic. `i == len` yields
+        // an empty slice, where `memchr2` finds nothing and this returns `None` the same way.
+        let off = memchr::memchr2(b'"', b'\\', bytes.get(i..)?)?;
+        let j = i + off;
+        if bytes[j] == b'\\' {
+            escaped = true;
+            i = j + 2; // skip the escape and the character it escapes
+            continue;
         }
+        return Some((j + 1, escaped));
     }
-    None
+}
+
+/// Whether the JSON string at `pos` is exactly `key`, plus the index just past it.
+///
+/// The comparison the seek actually needs. An unescaped key — which is nearly all of them —
+/// is a byte-slice compare against the needle with no allocation at all; only a key carrying
+/// an escape is decoded, and only then.
+fn key_matches(bytes: &[u8], pos: usize, key: &str) -> Option<(bool, usize)> {
+    let (end, escaped) = scan_string(bytes, pos)?;
+    if escaped {
+        let decoded = serde_json::from_slice::<String>(&bytes[pos..end]).ok()?;
+        Some((decoded == key, end))
+    } else {
+        Some((&bytes[pos + 1..end - 1] == key.as_bytes(), end))
+    }
 }
 
 fn skip_ws(bytes: &[u8], pos: usize) -> usize {
@@ -910,6 +947,89 @@ mod tests {
     fn tolerates_whitespace() {
         let doc = " { \"a\" : { \"b\" : 5 } } ";
         assert_eq!(extract_int(doc, &parts("$.a.b")), Some(5));
+    }
+
+    /// The allocation-free scanner must land on exactly the byte `parse_string` lands on, and
+    /// agree with it about whether the string carried an escape.
+    ///
+    /// `scan_string` is what every skip and key comparison now runs, while `parse_string` —
+    /// the decoding form, still used for extracted leaves — is the reference it was split out
+    /// of. An off-by-one between them would not corrupt a value; it would resume the seek one
+    /// byte inside or past the closing quote, and the document would read as malformed from
+    /// there on. The malformed inputs are included because that resumption is where an
+    /// unterminated or dangling-escape string has to stop rather than run off the buffer.
+    #[test]
+    fn the_scanner_and_the_decoder_end_at_the_same_byte() {
+        let cases = [
+            r#""""#,
+            r#""a""#,
+            r#""hello world""#,
+            r#""with \"escaped\" quotes""#,
+            r#""trailing backslash \\""#,
+            r#""tab\there""#,
+            r#""unicode é""#,
+            r#""}{][ braces""#,
+            r#""unterminated"#,      // malformed: no closing quote
+            r#""dangling escape \"#, // malformed: escape at the very end
+            r#"notastring"#,
+        ];
+        for c in cases {
+            let b = c.as_bytes();
+            let scanned = scan_string(b, 0);
+            let parsed = parse_string(b, 0);
+            assert_eq!(
+                scanned.map(|(end, _)| end),
+                parsed.as_ref().map(|(_, end)| *end),
+                "end position disagreed for {c}"
+            );
+            // Where both succeed, the escape flag must match what decoding actually needed.
+            if let (Some((_, escaped)), Some((decoded, _))) = (scanned, parsed.as_ref()) {
+                assert_eq!(
+                    escaped,
+                    decoded.as_bytes() != &b[1..b.len() - 1],
+                    "escape flag disagreed for {c}"
+                );
+            }
+        }
+    }
+
+    /// `key_matches` must answer what comparing the decoded key would, escapes included.
+    #[test]
+    fn key_matching_agrees_with_decoding_the_key() {
+        let cases: [(&str, &str); 6] = [
+            (r#""a""#, "a"),
+            (r#""a""#, "b"),
+            (r#""""#, ""),
+            (r#""a\tb""#, "a\tb"),
+            (r#""a\tb""#, "atb"),
+            (r#""long-ish key name""#, "long-ish key name"),
+        ];
+        for (raw, needle) in cases {
+            let b = raw.as_bytes();
+            let (got, end) = key_matches(b, 0, needle).expect("scannable");
+            let (decoded, want_end) = parse_string(b, 0).expect("parsable");
+            assert_eq!(end, want_end, "{raw} vs {needle}");
+            assert_eq!(got, decoded == needle, "{raw} vs {needle}");
+        }
+    }
+
+    /// Stepping over many non-matching keys must still find the last one.
+    ///
+    /// This is the shape the in-place comparison exists for — a wide object where the wanted
+    /// field is last, so every preceding key and value is skipped.
+    #[test]
+    fn a_wide_object_is_seeked_to_its_last_field() {
+        let mut doc = String::from("{");
+        for i in 0..200 {
+            doc.push_str(&format!(r#""field_{i}":"value_{i} with spaces","#));
+        }
+        doc.push_str(r#""target":7}"#);
+        assert_eq!(extract_int(&doc, &parts("$.target")), Some(7));
+        assert_eq!(
+            extract_string(&doc, &parts("$.field_199")),
+            Some("value_199 with spaces".into())
+        );
+        assert_eq!(extract_int(&doc, &parts("$.absent")), None);
     }
 
     /// A/B micro-benchmark isolating the lazy scanner from the old full-parse-per-field

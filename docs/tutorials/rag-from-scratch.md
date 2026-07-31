@@ -258,13 +258,13 @@ adaptive batch size that does not have to be tuned.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`zap;1.1em` LLM inference
-:link: ../ml/llm
+:link: /ml/retrieval/llm/index
 :link-type: doc
 vLLM engines, chat templates, structured output.
 :::
 
 :::{grid-item-card} {octicon}`search;1.1em` Vector search
-:link: ../ml/vector-search
+:link: /ml/retrieval/vector-search
 :link-type: doc
 The ANN index, for when the brute-force scan stops being enough.
 :::
@@ -279,11 +279,11 @@ Where the embedding and generation throughput comes from.
 ## See also
 
 - {doc}`Batch inference <batch-inference>`: the `.ml` accessor, in full.
-- {doc}`RAG guide <../ml/rag>` and {doc}`embeddings <../ml/embeddings>`: the production shape of
+- {doc}`RAG guide </ml/retrieval/rag>` and {doc}`embeddings </ml/retrieval/embeddings>`: the production shape of
   each half.
-- {doc}`RAG index recipe <../examples/ml/rag-index>` and
-  {doc}`text embeddings recipe <../examples/ml/text-embeddings>`: the short versions.
-- {doc}`Expressions <../user-guide/expressions>`: `.str.chunk`, `.list.cosine_similarity`, and
+- {doc}`RAG index recipe </cookbook/ml/pipelines/rag-index>` and
+  {doc}`text embeddings recipe </cookbook/ml/pipelines/text-embeddings>`: the short versions.
+- {doc}`Expressions </user-guide/transform/expressions>`: `.str.chunk`, `.list.cosine_similarity`, and
   the rest of the column language this page leans on.
 - {doc}`AI and GPU benchmarks <../benchmarks/ai-and-gpu>`: the warm pool and the stage overlap
   behind both halves.

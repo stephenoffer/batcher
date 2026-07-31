@@ -24,7 +24,13 @@ splitting them across modules is how a window gets chosen that nothing enforces.
 
 from __future__ import annotations
 
-__all__ = ["auto_max_model_len", "estimate_tokens", "fit_to_window", "prompt_window"]
+__all__ = [
+    "auto_max_model_len",
+    "estimate_tokens",
+    "fit_to_window",
+    "kv_cache_concurrency",
+    "prompt_window",
+]
 
 #: Tokens per character, deliberately **over**-estimated. English text averages ~4 chars per
 #: token (0.25); code, non-Latin scripts, and heavy punctuation run denser. 0.5 assumes two
@@ -197,3 +203,102 @@ def _truncate_to_window(prompts: list, tokenizer: object, max_tokens: int) -> li
             stacklevel=3,
         )
     return out
+
+
+def _free_device_bytes() -> int:
+    """Device memory the smallest visible GPU actually has free, or `0` when none is visible.
+
+    Nominal capacity is the wrong number on a shared device: sizing a KV cache against total
+    VRAM when another process holds half of it is how a serving engine OOMs on its first full
+    batch. The pool takes the measured resident figure and reserves against the remainder.
+    """
+    from batcher._internal.hardware import device_telemetry, gpu_inventory
+    from batcher._internal.hardware.nvml import own_device_memory
+    from batcher.carbonite.accel import VramPool
+
+    capacity = min((int(g.get("memory_bytes") or 0) for g in gpu_inventory()), default=0)
+    if capacity <= 0:
+        return 0
+    pool = VramPool(capacity_bytes=capacity, headroom=0.0)
+    for reading in device_telemetry():
+        pool.observe_external(
+            reading.index,
+            reading.memory_used_bytes,
+            own_bytes=own_device_memory(reading.index),
+        )
+    return min(
+        (pool.available_bytes(r.index) for r in device_telemetry()),
+        default=pool.available_bytes(0),
+    )
+
+
+def kv_cache_concurrency(
+    *,
+    context_tokens: int,
+    layers: int,
+    kv_heads: int,
+    head_dim: int,
+    weight_bytes: int,
+    device_bytes: int | None = None,
+    dtype: str | None = None,
+) -> int:
+    """Concurrent sequences one device can hold at a given context length.
+
+    The other half of `auto_max_model_len`: that chooses the window, and this says what the
+    window buys. A serving engine's throughput is set by how many sequences it can keep in
+    flight, and that is decided by the key/value cache rather than by the weights — a model
+    whose weights fit comfortably can still be limited to a handful of sequences once the
+    cache for a long context is reserved.
+
+    Pass the result as an engine's `max_num_seqs` to stop it admitting more sequences than the
+    device can hold, which otherwise shows up as preemption and recomputation rather than as
+    an error.
+
+    Args:
+        context_tokens: Peak tokens cached per sequence, prompt plus generation.
+        layers: Transformer layers in the model.
+        kv_heads: Key/value heads per layer. Under grouped-query attention this is the
+            *grouped* count, well below the attention-head count, and the cache scales with
+            it — a model with 8 KV heads against 64 attention heads has an eighth of the cache.
+        head_dim: Dimension of one attention head.
+        weight_bytes: Resident model weights after any quantization.
+        device_bytes: Device memory available to the stage. `None` reads the smallest GPU
+            this process can see *and subtracts what other processes already hold on it*,
+            because the memory a co-tenant is using is the binding constraint and is invisible
+            to a per-process allocator. Reports `0` when no device is visible.
+        dtype: Cache element type. `None` reads `accelerator.kv_cache_dtype` from the active
+            configuration, where FP8 halves the cache against FP16.
+
+    Returns:
+        Sequences that fit, or `0` when the weights alone do not fit or no device is visible.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml.llm.sizing import kv_cache_concurrency
+            >>> kv_cache_concurrency(
+            ...     context_tokens=8192,
+            ...     layers=32,
+            ...     kv_heads=8,
+            ...     head_dim=128,
+            ...     weight_bytes=16 << 30,
+            ...     device_bytes=80 << 30,
+            ...     dtype="fp16",
+            ... )
+            56
+    """
+    from batcher.carbonite.accel import KvCacheBudget, kv_bytes_per_token
+    from batcher.config import active_config
+
+    accel = active_config().accelerator
+    if device_bytes is None:
+        device_bytes = _free_device_bytes()
+    per_token = kv_bytes_per_token(layers, kv_heads, head_dim, dtype or accel.kv_cache_dtype)
+    budget = KvCacheBudget(
+        device_bytes=max(0, device_bytes),
+        weight_bytes=max(0, weight_bytes),
+        bytes_per_token=per_token,
+        context_tokens=max(0, accel.max_context_tokens or context_tokens),
+        headroom=accel.kv_cache_headroom,
+    )
+    return budget.max_sequences

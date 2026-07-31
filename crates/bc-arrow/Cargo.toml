@@ -7,6 +7,14 @@ license.workspace = true
 
 [dependencies]
 arrow.workspace = true
+# `posix_fadvise` / `posix_fallocate` for the spill paths (`page_cache`). Every out-of-core
+# operator writes a run once and reads it back once, front to back, and the kernel cannot
+# infer that through an interleaved k-way merge — one syscall per file doubles the readahead
+# window and lets a consumed run's pages be dropped instead of pinning page cache the engine
+# spilled because it did not have. Unix-only in effect; the module compiles to no-ops
+# elsewhere. `libc` is already in the workspace graph (bc-interp uses it for `getrusage`), so
+# this edge adds no third-party code to the build.
+libc.workspace = true
 
 [lints]
 workspace = true

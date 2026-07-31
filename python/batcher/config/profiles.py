@@ -31,6 +31,7 @@ __all__ = [
     "RESILIENCE_PROFILES",
     "apply_resilience_profile",
     "detect_autoscaling_environment",
+    "detect_leased_allocation",
     "detect_managed_cluster",
     "detect_spot_environment",
     "resolve_autoscale_wait",
@@ -80,23 +81,47 @@ _MANAGED_AUTOSCALE_VARS = (
 )
 
 
+def detect_leased_allocation() -> bool:
+    """Whether this process runs under a wall-clock lease that will be killed at its end.
+
+    A batch scheduler hands out a fixed lease rather than a preemption notice: a Slurm
+    allocation ends at a time set when the job was submitted, and every process in it is
+    killed then, with no metadata endpoint to poll and often no warning signal. That is
+    the same *engineering* problem as a spot reclamation — finish or migrate before the
+    node goes away — so it earns the same hardened budgets.
+
+    True only when a deadline is actually discoverable, which is what keeps this honest.
+    A Slurm job submitted with no time limit exports a saturated sentinel that
+    `config.deadline` rejects, so it reads as unleased and is treated like any stable
+    cluster. No network call, matching `detect_spot_environment`.
+    """
+    from batcher.config.deadline import deadline_epoch_s
+
+    return deadline_epoch_s() is not None
+
+
 def detect_spot_environment() -> bool:
     """Best-effort detection of a preemptible/spot environment from cheap local signals.
 
-    True when an explicit spot flag env var is truthy, or a node-lifecycle env var names
-    a spot/preemptible instance. No network call (the cloud metadata service is avoided
-    on the hot path). When detected and the user has not chosen a resilience profile, the
-    config layer auto-selects ``"spot"`` so a job rides out preemption without tuning —
-    while ``recovery_max_attempts`` etc. already give every job baseline recovery.
+    True when an explicit spot flag env var is truthy, a node-lifecycle env var names a
+    spot/preemptible instance, or the process runs under a wall-clock lease that will be
+    killed at its end (`detect_leased_allocation` — a Slurm allocation with a time limit,
+    or any launcher exporting `BATCHER_DEADLINE_EPOCH_S`). No network call (the cloud
+    metadata service is avoided on the hot path). When detected and the user has not
+    chosen a resilience profile, the config layer auto-selects ``"spot"`` so a job rides
+    out preemption without tuning — while ``recovery_max_attempts`` etc. already give
+    every job baseline recovery.
     """
     import os
 
     if any(os.environ.get(v, "").strip().lower() in _SPOT_TRUE for v in _SPOT_FLAG_VARS):
         return True
-    return any(
+    if any(
         "spot" in os.environ.get(v, "").lower() or "preempt" in os.environ.get(v, "").lower()
         for v in _SPOT_LIFECYCLE_VARS
-    )
+    ):
+        return True
+    return detect_leased_allocation()
 
 
 def detect_autoscaling_environment() -> bool:

@@ -23,6 +23,10 @@ Each row is a distinct model and modality, run out of the box with no per-worklo
 | Image generation | diffusers ddpm-cifar10, 20 DDIM steps | **169.1 img/s** |
 | Training-data ingest | `iter_torch_batches`, zero-copy DLPack | **1.06 M rows/s** |
 
+On every family where device utilization was sampled, the GPU holds at or above the 80% target:
+
+![Horizontal bar chart of sustained GPU utilization by workload family on 8xT4 with real models and 100 percent output agreement. Compute-bound ResNet-50 FP16 inference holds 100 percent at 4,707 images per second, a decode-heavy JPEG to ResNet pipeline 93.4 percent at 3,860, fractional GPU packing of EfficientNet-B0 89 percent at 6,764, zero-config inference with no batch size given 82 percent at 2,451, ResNet-50 batch inference 81 percent at 2,504, and image embeddings 80 percent at 2,502. A dashed line marks the 80 percent target.](/_static/diagrams/gpu_utilization.svg)
+
 These come from general engine mechanisms rather than per-workload tuning, which is why they carry to workloads nobody benchmarked. RAG, for instance, is retrieval plus an LLM, and both halves are on this list.
 
 The three sections below are those mechanisms.
@@ -35,6 +39,8 @@ The naive way to run decode into inference is to decode the whole partition, the
 |---|---:|---:|
 | Sequential stages | 942 | ~30% |
 | Stage-overlapped | **2,504** | **81%** |
+
+![Two panels comparing a two-stage ResNet-50 pipeline before and after stage overlap, with the same result and the same order. Throughput rises from 942 to 2,504 images per second. GPU utilization rises from 30 percent to 81 percent of the device kept busy.](/_static/diagrams/stage_overlap.svg)
 
 Same result, same hardware. The device stops waiting. This is an execution property of the engine rather than a feature of the inference operator, so any CPU-to-GPU pipeline inherits it, single-node and distributed, on every modality.
 
@@ -101,8 +107,8 @@ The point-cloud result needed no modality-specific work. It falls out of the sam
 ## See also
 
 - {doc}`multimodal-ingest`: the image, point-cloud, audio, and video pipelines in full, including the regression that started the work.
-- {doc}`../deep-dives/gpu-execution`: stage overlap and the warm pool, from the inside.
-- {doc}`../deep-dives/tensor-columns`: the representation the point-cloud result falls out of.
-- {doc}`../ml/index` and {doc}`../ml/gpu`: how to write these pipelines.
+- {doc}`/deep-dives/distribution/gpu-execution`: stage overlap and the warm pool, from the inside.
+- {doc}`/deep-dives/memory/tensor-columns`: the representation the point-cloud result falls out of.
+- {doc}`../ml/index` and {doc}`/ml/inference/gpu`: how to write these pipelines.
 - {doc}`analytics`: the relational half of the measurement.
 - {doc}`methodology`: the machines, and the correctness gate.

@@ -110,7 +110,7 @@ def column_predicate_count(build: ColumnBuilder, op: str, name: str, value: obje
         return None
     try:
         col = _decoded(build(name))
-        if _float_order_differs(col):
+        if _float_order_differs(col) or _decimal_against_float(col, value):
             return None  # see below — this count would not be the count the engine produces
         count = pc.sum(kernel(col, _literal_scalar(value, col.type)), skip_nulls=True).as_py()
         return int(count) if count is not None else 0
@@ -168,3 +168,31 @@ def _float_order_differs(col: pa.ChunkedArray | pa.Array) -> bool:
     has_nan = pc.any(pc.is_nan(col), min_count=0).as_py()
     has_zero = pc.any(pc.equal(col, pa.scalar(0.0, col.type)), min_count=0).as_py()
     return bool(has_nan) or bool(has_zero)
+
+
+def _decimal_against_float(col: pa.ChunkedArray | pa.Array, value: object) -> bool:
+    """Whether this is a decimal column compared to a float literal — where the two Arrows differ.
+
+    The counts here run on **pyarrow** (Arrow C++); the engine executes on **arrow-rs**. For a
+    decimal column against a float literal the two do not agree, and not in a way either side
+    is obviously wrong about: over a `decimal(20,3)` column holding `2.675`, pyarrow counts
+    zero rows equal to the float `2.675` and three greater than it, while the engine counts one
+    and two. Both are defensible readings of a comparison between an exact value and an
+    approximate one; what matters is that a count taken from one cannot answer for the other.
+
+    This is the same disagreement `plan.stats.mismatched_exactness` declines on the bound side,
+    reached through a different door: the IR has no decimal literal, so every exact money
+    predicate arrives as a float and lands here. Declining costs a scan; answering cost a
+    `count()` that contradicted `collect()` on the same plan.
+
+    An integer literal is fine — both implementations widen it into the decimal exactly — and
+    so is a `Decimal` literal, which never becomes a float in the first place.
+
+    Args:
+        col: The column the predicate compares.
+        value: The literal it is compared against.
+
+    Returns:
+        ``True`` when the pair is a decimal column and a float literal.
+    """
+    return pa.types.is_decimal(col.type) and isinstance(value, float)

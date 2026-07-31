@@ -70,6 +70,14 @@ def size_gpu_map_batches(node: LogicalPlan, ctx: OptimizerContext) -> LogicalPla
         gpu_memory_gb=device_gb,
         assign_num_gpus=not is_non_gpu_accel,
         input_row_bytes=input_row_bytes,
+        # The device this stage will actually run on: its own pin first, then the fleet's
+        # binding model. The order matters — a stage pinned to one class while the fleet's
+        # binding model is another would otherwise be packed against the device it is not
+        # going to get, and a fraction sized for an 80 GB part on a 48 GB one is an OOM.
+        # `""` (unpinned and an unlabelled fleet) keeps the previous behavior.
+        accelerator_type=(
+            "" if is_non_gpu_accel else (node.accelerator_type or ctx.hardware.accelerator_type)
+        ),
     )
     if params.num_gpus == node.num_gpus and params.batch_size == node.batch_size:
         return None

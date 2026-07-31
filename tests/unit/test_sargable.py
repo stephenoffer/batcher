@@ -269,5 +269,15 @@ def test_registered_rule_still_rewrites(name):
 
 def test_every_sargable_rule_is_covered_above():
     # If a rule is added to the family, this fails until it gets a firing case.
-    registered = {r.name for r in DEFAULT_REGISTRY.rules() if r.name.startswith("sarg_")}
+    #
+    # Scoped to *this* module's family. The ordered-comparison family
+    # (`sarg_bounded_*`, from `rules/extra/sargable_range`) is a separate module with the
+    # same completeness guard over its own twelve rules, in
+    # `tests/unit/test_sargable_ordered_bounds.py` — it has to live there because those
+    # rewrites need recorded column bounds, which the plain fixture above does not supply.
+    registered = {
+        r.name
+        for r in DEFAULT_REGISTRY.rules()
+        if r.name.startswith("sarg_") and not r.name.startswith("sarg_bounded_")
+    }
     assert registered == set(_FIRES)

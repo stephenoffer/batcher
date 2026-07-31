@@ -143,3 +143,109 @@ def test_coalesce_does_not_propagate_null():
 
 def test_is_null_rejects_nothing():
     assert _null_rejecting_cols(Col("x").is_null()) == set()
+
+
+# --- full join as the API actually builds it ---------------------------------
+#
+# The hand-built nodes above are `Filter(Join(..., full))`, which is a shape no query produces:
+# `Dataset.join` always wraps a full join in a projection that coalesces the two sides' key
+# columns into the single output key. So those tests passed while the entire `full` branch was
+# unreachable on a real plan. These drive the API shape instead, which is what proves the rule
+# can see it.
+
+
+def _full(pred):
+    return _joined("full").filter(pred)._plan
+
+
+def test_the_api_puts_a_coalescing_projection_above_a_full_join():
+    # Pinned explicitly: if this ever stops being true, the look-through below is dead weight
+    # and the tests that depend on it are testing nothing.
+    from batcher.plan.logical import Project
+
+    plan = _full(col("dept") == "eng")
+    assert isinstance(plan, Filter)
+    assert isinstance(plan.input, Project)
+    assert isinstance(plan.input.input, Join)
+    assert any(isinstance(item.expr, Coalesce) for item in plan.input.items)
+
+
+def test_api_full_join_rejecting_right_becomes_right():
+    out = outer_to_inner_join(_full(col("dept") == "eng"), None)
+    assert out is not None
+    assert out.input.input.join_type == "right"
+
+
+def test_api_full_join_rejecting_left_becomes_left():
+    out = outer_to_inner_join(_full(col("name") == "a"), None)
+    assert out is not None
+    assert out.input.input.join_type == "left"
+
+
+def test_api_full_join_rejecting_both_becomes_inner():
+    out = outer_to_inner_join(_full((col("dept") == "eng") & (col("name") == "a")), None)
+    assert out is not None
+    assert out.input.input.join_type == "inner"
+
+
+def test_api_full_join_on_the_coalesced_key_is_a_noop():
+    # The output key is `coalesce(left_key, right_key)`, which is non-null on a left-only row
+    # AND on a right-only row — so rejecting nulls on it rejects neither side. Treating the
+    # coalesced key as a left (or right) reference would drop rows the query must keep, which
+    # makes this the most important case in the file.
+    assert outer_to_inner_join(_full(col("dept_id") > 5), None) is None
+
+
+def test_api_full_join_is_null_is_a_noop():
+    assert outer_to_inner_join(_full(col("dept").is_null()), None) is None
+
+
+def test_api_full_join_rewrite_preserves_the_projection():
+    before = _full(col("dept") == "eng")
+    out = outer_to_inner_join(before, None)
+    assert out is not None
+    assert [i.alias for i in out.input.items] == [i.alias for i in before.input.items]
+    assert [i.expr.to_ir() for i in out.input.items] == [i.expr.to_ir() for i in before.input.items]
+
+
+def test_api_full_join_rewrite_is_idempotent():
+    once = outer_to_inner_join(_full(col("dept") == "eng"), None)
+    assert outer_to_inner_join(once, None) is None
+
+
+def test_the_optimizer_reaches_it_end_to_end():
+    from batcher.kyber.optimizer import optimize_logical
+    from batcher.plan.visitor import walk
+
+    out = optimize_logical(_full(col("dept") == "eng"))
+    assert [n.join_type for n in walk(out) if isinstance(n, Join)] == ["right"]
+
+
+# --- the shared pass-through helper ------------------------------------------
+#
+# `passthrough_renames` lives in `plan.logical.transforms` because two rules need the same
+# question answered: predicate pushdown, to move a conjunct below a `Project`, and this rewrite,
+# to see past the projection a full outer join carries. Both depend on *computed* items being
+# excluded, so that exclusion is pinned here rather than left to each caller's confidence.
+
+
+def test_passthrough_renames_maps_bare_references():
+    from batcher.plan.logical import Projection, passthrough_renames
+
+    items = (Projection("out", Col("src")), Projection("same", Col("same")))
+    assert passthrough_renames(items) == {"out": "src", "same": "same"}
+
+
+def test_passthrough_renames_excludes_a_computed_item():
+    from batcher.plan.logical import Projection, passthrough_renames
+
+    # `coalesce(a, b)` is the case that makes the exclusion load-bearing: it is non-null
+    # wherever *either* argument is, so a fact about the output implies nothing about either
+    # input. A literal and an arithmetic item are excluded for the same reason.
+    items = (
+        Projection("k", Coalesce([Col("a"), Col("b")])),
+        Projection("one", Lit(1)),
+        Projection("sum", Col("a") + Lit(1)),
+        Projection("plain", Col("c")),
+    )
+    assert passthrough_renames(items) == {"plain": "c"}

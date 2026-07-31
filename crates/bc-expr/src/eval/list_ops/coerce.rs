@@ -124,6 +124,29 @@ where
     }
     s
 }
+/// Both list children under one element type, so a single `RowConverter` can encode them.
+///
+/// A `List<Null>` is what an all-empty (or all-null) list column infers to, and it turns up in
+/// ordinary use: one side of a comparison whose rows all came back empty. Concatenating its
+/// child with a `List<Utf8>` child fails outright, so an empty retrieval against a populated
+/// one raised where it should have scored zero. Casting the `Null` child to the other side's
+/// type is exact — it has no values to lose — and leaves the answer the same.
+///
+/// A genuine element-type mismatch (`List<Utf8>` against `List<Int64>`) still reaches the
+/// caller's `concat`, which reports it as the error it is.
+pub(crate) fn align_children(
+    left: &arrow::array::ArrayRef,
+    right: &arrow::array::ArrayRef,
+) -> Result<(arrow::array::ArrayRef, arrow::array::ArrayRef), ExprError> {
+    use arrow::compute::cast;
+    use arrow::datatypes::DataType::Null;
+
+    match (left.data_type(), right.data_type()) {
+        (Null, other) if !matches!(other, Null) => Ok((cast(left, other)?, right.clone())),
+        (other, Null) if !matches!(other, Null) => Ok((left.clone(), cast(right, other)?)),
+        _ => Ok((left.clone(), right.clone())),
+    }
+}
 
 #[cfg(test)]
 mod tests {

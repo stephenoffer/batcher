@@ -24,6 +24,7 @@ from dataclasses import dataclass, replace
 # unchanged.
 from batcher.config import CostCoefficients, CostWeights, active_config
 from batcher.kyber.cardinality import CardinalityEstimator
+from batcher.kyber.cost.fabric import fabric_adjusted_weights
 from batcher.kyber.cost.shuffle import net_cost
 from batcher.kyber.cost.terms import (
     cache_factor,
@@ -82,7 +83,12 @@ class Cost:
         """Collapse to a single comparable scalar. `mem` is a peak (a max along the
         tree), so it is *not* summed into the scalar here — it gates feasibility,
         not throughput. Default weights treat cpu/io/net as comparable units."""
-        w = weights or active_config().optimizer.cost_weights
+        # The `net` weight is priced against the node's *measured* fabric where one is
+        # readable and the operator has not set it: a shuffled byte on a 400 Gb/s InfiniBand
+        # node costs about what a local one does, and on a 10 Gb/s VM it costs sixteen times
+        # as much. Unreadable fabric and an explicit setting both keep the configured weight,
+        # so single-node ranking is untouched.
+        w = fabric_adjusted_weights(weights or active_config().optimizer.cost_weights)
         return w.cpu * self.cpu + w.io * self.io + w.net * self.net
 
 

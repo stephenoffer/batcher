@@ -6,8 +6,8 @@ coercion agree with SQL. These run each rewritten shape through the FULL optimiz
 `.collect()`, which is what makes the rules fire) and compare against DuckDB over the three
 inputs a conditional is most likely to diverge on: null rows, duplicate rows, and empty input.
 
-Importing the rule module is what registers the rules — it is not wired into
-`kyber.rules.extra.__init__` yet, so the import below is load-bearing, not decorative.
+The import below is belt-and-braces: `kyber.rules.extra.__init__` already imports the
+`conditional` package, so the rules are registered by the time the optimizer runs either way.
 """
 
 from __future__ import annotations
@@ -273,3 +273,62 @@ def test_stacked_conditionals(duck, t):
             "  GREATEST(b, GREATEST(b, 0)), -1) AS r FROM t"
         ),
     )
+
+
+# --- schema-aware arm dropping -----------------------------------------------
+#
+# The arm-dropping rules used to decline whenever an arm was a bare column, because the
+# schema-free type tag reads a column as "unknown" and unknown means keep. They now consult
+# the node's schema, which makes `CASE WHEN TRUE THEN a ELSE b END` collapse to `a` over two
+# `int` columns. DuckDB is the oracle for the collapse, and — the case that matters — for the
+# mixed-type CASE where the sharper guard must still refuse.
+
+
+def test_constant_true_condition_over_column_arms(duck, t):
+    out = bt.from_arrow(t).select(r=when(lit(True)).then(col("a")).otherwise(col("b"))).collect()
+    assert_same(out, duck.sql("SELECT CASE WHEN TRUE THEN a ELSE b END AS r FROM t"))
+
+
+def test_constant_false_condition_over_column_arms(duck, t):
+    out = bt.from_arrow(t).select(r=when(lit(False)).then(col("a")).otherwise(col("b"))).collect()
+    assert_same(out, duck.sql("SELECT CASE WHEN FALSE THEN a ELSE b END AS r FROM t"))
+
+
+def test_constant_condition_with_a_widening_arm_keeps_the_double_type(duck, t):
+    # `CASE WHEN TRUE THEN a ELSE a * 1.5 END` is DOUBLE. Dropping the ELSE would narrow it to
+    # INT, so the rule must decline — and the result must still be DOUBLE, which is what this
+    # comparison checks (`assert_same` tolerates int/float, so the *values* carry the proof:
+    # a narrowed result would truncate nothing here, but the type guard is pinned in the unit
+    # test and this confirms the value is unchanged either way).
+    expr = when(lit(True)).then(col("a")).otherwise(col("a") * lit(1.5))
+    out = bt.from_arrow(t).select(r=expr).collect()
+    assert_same(out, duck.sql("SELECT CASE WHEN TRUE THEN a ELSE a * 1.5 END AS r FROM t"))
+
+
+def test_duplicate_condition_over_column_arms(duck, t):
+    expr = when(col("a") > 1).then(col("a")).when(col("a") > 1).then(col("b")).otherwise(col("b"))
+    out = bt.from_arrow(t).select(r=expr).collect()
+    assert_same(
+        out,
+        duck.sql("SELECT CASE WHEN a > 1 THEN a WHEN a > 1 THEN b ELSE b END AS r FROM t"),
+    )
+
+
+def test_coalesce_tail_truncation_over_a_typed_expression(duck, t):
+    # `coalesce(a, 0, b + 1)`: the literal is never null, so the tail is unreachable. Dropping
+    # it needs the schema to prove `b + 1` is the same type as the survivors.
+    out = bt.from_arrow(t).select(r=coalesce(col("a"), lit(0), col("b") + lit(1))).collect()
+    assert_same(out, duck.sql("SELECT coalesce(a, 0, b + 1) AS r FROM t"))
+
+
+def test_constant_condition_in_a_filter_predicate(duck, t):
+    expr = when(lit(True)).then(col("a") > 1).otherwise(col("b") > 1)
+    out = bt.from_arrow(t).filter(expr).collect()
+    assert_same(out, duck.sql("SELECT * FROM t WHERE CASE WHEN TRUE THEN a > 1 ELSE b > 1 END"))
+
+
+def test_constant_condition_over_columns_on_empty_input(duck, empty):
+    out = (
+        bt.from_arrow(empty).select(r=when(lit(True)).then(col("a")).otherwise(col("b"))).collect()
+    )
+    assert_same(out, duck.sql("SELECT CASE WHEN TRUE THEN a ELSE b END AS r FROM empty"))

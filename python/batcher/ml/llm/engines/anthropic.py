@@ -17,6 +17,7 @@ from typing import Any
 
 from batcher.ml.llm.channels import finish_reason_sink, usage_sink
 from batcher.ml.llm.engines.base import Engine, EngineFactory, unpack_request
+from batcher.ml.llm.engines.limits import _estimated_tokens, build_limiter
 
 __all__ = ["anthropic_engine"]
 
@@ -43,6 +44,8 @@ def anthropic_engine(
     retries: int = 3,
     backoff: float = 0.5,
     concurrency: int = 8,
+    requests_per_minute: float | None = None,
+    tokens_per_minute: float | None = None,
 ) -> EngineFactory:
     """An `EngineFactory` calling the Anthropic Messages API — a hosted Claude model.
 
@@ -82,6 +85,11 @@ def anthropic_engine(
         retries: retry attempts per request on a transient failure (429/5xx/connection).
         backoff: base seconds for the jittered exponential backoff between retries.
         concurrency: in-flight requests per batch. Set to 1 to serialize.
+        requests_per_minute: client-side cap on requests per minute, **per worker**. Unset
+            means unlimited. Waiting for capacity holds the send rate at the quota, where
+            retrying a 429 only re-sends the burst that caused it.
+        tokens_per_minute: client-side cap on tokens per minute, per worker, counting the
+            prompt plus the reply the request reserved. Unset means unlimited.
 
     Returns:
         A zero-arg factory building the Anthropic-backed `Engine` once per worker.
@@ -93,6 +101,8 @@ def anthropic_engine(
         from batcher._internal.errors import PlanError
 
         raise PlanError(f"on_error must be 'raise' or 'null', got {on_error!r}")
+
+    limiter = build_limiter(requests_per_minute, tokens_per_minute)
 
     def factory() -> Engine:
         import os
@@ -119,6 +129,10 @@ def anthropic_engine(
                 image,
                 extra_body,
             )
+            if limiter is not None:
+                # Charged before the call: waiting for capacity holds the send rate at the
+                # quota, where retrying a 429 only re-sends the burst that caused it.
+                limiter.acquire(_estimated_tokens(prompt, body))
             try:
                 resp = post_json(
                     url, body, headers=headers, timeout=timeout, retries=retries, backoff=backoff

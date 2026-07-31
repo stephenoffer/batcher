@@ -36,6 +36,12 @@ import pyarrow as pa
 
 from batcher._internal.mathx import clamp
 from batcher.config import active_config
+from batcher.dist.streaming.consumers import (
+    consumer_pool_size,
+    probe_consumer_hosts,
+    record_consumer_feedback,
+    take_consumer,
+)
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
@@ -132,23 +138,6 @@ except ImportError:  # pragma: no cover - ray optional
     _ProducerActor = None  # type: ignore
 
 
-def _consumer_pool_size(gpu_stage, workers: int, num_partitions: int) -> int:
-    """Actor count for the GPU consumer stage: its explicit `concurrency`, else a
-    GPU-aware default (one actor per GPU), clamped to the partition count."""
-    from batcher.dist.executors.map import _resolve_pool_size
-    from batcher.ml.gpu import gpu_aware_pool_default
-
-    default = gpu_aware_pool_default(
-        gpu_stage.num_gpus,
-        workers,
-        num_partitions,
-        getattr(gpu_stage, "accelerator_type", None),
-        resources=dict(getattr(gpu_stage, "resources", ()) or ()),
-    )
-    size = _resolve_pool_size(gpu_stage.concurrency, num_partitions, default)
-    return clamp(num_partitions, 1, size)
-
-
 def stream_distributed_pipeline(
     plan: LogicalPlan, sources: list[Source], workers: int, hub=None
 ) -> pa.Table:
@@ -185,7 +174,7 @@ def stream_distributed_pipeline(
 
     credits = max(1, active_config().flow_control.default_credits)
     n_producers = clamp(n, 1, workers)
-    n_consumers = _consumer_pool_size(gpu_stage, workers, n)
+    n_consumers = consumer_pool_size(gpu_stage, workers, n)
     gpu_opts = _gpu_options(gpu_stage.num_gpus, gpu_stage.accelerator_type)
 
     consumer_cls = _MapActor.options(**gpu_opts) if gpu_opts else _MapActor
@@ -214,7 +203,7 @@ def stream_distributed_pipeline(
         )
         # The GPU consumers measured their utilization; record it so the next run's
         # `num_gpus` request adapts (the feedback half of GPU scheduling).
-        _record_consumer_feedback(consumers, plan, hub)
+        record_consumer_feedback(consumers, plan, hub)
     finally:
         for actor in alive:
             with contextlib.suppress(Exception):
@@ -241,15 +230,6 @@ def _empty(plan: LogicalPlan) -> pa.Table:
     from batcher.dist.executors.plan_analysis import empty_result_table
 
     return empty_result_table(plan, plan.available_columns())
-
-
-def _record_consumer_feedback(consumers, plan: LogicalPlan, hub) -> None:
-    """Persist the GPU consumers' peak utilization for next-run `num_gpus` adaptation
-    (a no-op when `hub` is None or no GPU was observed)."""
-    from batcher.dist.executors.map import _record_gpu_feedback
-
-    samples = [s for s in ray.get([c.gpu_stats.remote() for c in consumers]) if s is not None]
-    _record_gpu_feedback(hub, plan, max(samples) if samples else None)
 
 
 def _worker_loss_errors() -> tuple[type[BaseException], ...]:
@@ -315,6 +295,7 @@ def _run_streamed(
     publish_inflight: dict = {}  # ref -> (producer, partition_idx, seq, ticket)
     consume_inflight: dict = {}  # ref -> (consumer, producer, key, addr, ticket, attempts)
     free_consumers = deque(consumers)
+    consumer_hosts = probe_consumer_hosts(consumers)  # consumer -> node host ({} on failure)
     ready: deque = deque()  # (addr, ticket, producer, key, attempts) awaiting a consumer
     results: dict = {}
     part_attempts: dict = {}  # pidx -> re-run count (bounds a deterministic producer crash)
@@ -350,6 +331,7 @@ def _run_streamed(
                 alive.add(fresh)
             consumers.append(fresh)
             free_consumers.append(fresh)
+            consumer_hosts.update(probe_consumer_hosts([fresh]))
 
     def lose_producer(dead, *, exc) -> None:
         """Re-queue a lost producer's partition for a full deterministic re-run."""
@@ -395,10 +377,10 @@ def _run_streamed(
                 ref = prod.publish_next.remote(ticket)
                 publish_inflight[ref] = (prod, st["pidx"], seq, ticket)
 
-        # Assign ready morsels to free consumers.
+        # Assign ready morsels to free consumers, preferring one on the producing node.
         while ready and free_consumers:
             addr, ticket, prod, key, attempts = ready.popleft()
-            consumer = free_consumers.popleft()
+            consumer = take_consumer(free_consumers, consumer_hosts, addr)
             ref = consumer.run_split.remote(addr, ticket)
             consume_inflight[ref] = (consumer, prod, key, addr, ticket, attempts)
 

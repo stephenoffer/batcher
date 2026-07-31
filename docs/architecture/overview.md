@@ -17,7 +17,7 @@ mid-query, possible.
 
 ## The two planes
 
-![Batcher's two planes: a Python control plane (Dataset/SQL, Kyber, Carbonite, Core) handing a JSON IR plus Arrow batches to the Rust data plane (bc-py, bc-interp, bc-runtime, bc-codegen, bc-sketches, bc-transport).](../_static/diagrams/two_planes.svg)
+![Batcher's two planes: a Python control plane (Dataset/SQL, Kyber, Carbonite, Core) handing a JSON IR plus Arrow batches to the Rust data plane (bc-py, bc-interp, bc-runtime, bc-codegen, bc-sketches, bc-transport).](/_static/diagrams/two_planes.svg)
 
 The Python side carries the plan as JSON IR across the FFI boundary in `bc-py`, and the
 data comes back as Arrow `RecordBatch`es with no copy and no serialization. Only
@@ -70,7 +70,7 @@ result = (
 )
 ```
 
-![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](../_static/diagrams/lifecycle.svg)
+![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](/_static/diagrams/lifecycle.svg)
 
 1. **Build.** Each operation returns a new `Dataset` wrapping a `LogicalPlan`.
    Nothing executes, and the plan accumulates.
@@ -94,7 +94,7 @@ DuckDB optimizes once before it runs. Batcher's loop is stage-boundary re-optimi
 the same granularity as Spark AQE, but it's available single-node as well as
 distributed. On top of it sits a sketch-backed cross-query learned-stats and bandit
 loop, so a plan improves the more a query runs. Both mechanisms are described in
-{doc}`../deep-dives/adaptive-reoptimization`.
+{doc}`/deep-dives/adaptive/adaptive-reoptimization`.
 
 ## One algebra, single node to cluster
 
@@ -106,7 +106,7 @@ the identical primitives over Ray workers. A result is the same whether it ran o
 laptop or a cluster, because there is no second distributed code path with its own
 semantics.
 
-![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](../_static/diagrams/mergeable.svg)
+![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](/_static/diagrams/mergeable.svg)
 
 ## Distribution
 

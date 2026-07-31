@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.hardware import accelerator_backend, gpu_devices_absent
 from batcher._internal.logging import note_suppressed
+from batcher.core.energy import measure_stage
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -129,6 +130,31 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
             f"gpu_groupby_agg found no usable accelerator (detected backend {backend!r}); "
             "the caller should use the CPU engine"
         )
+    # Bracketed so the stage's energy is recorded wherever one is being collected: this is
+    # the one place every GPU relational stage passes through, local dispatch and Ray worker
+    # alike, and it is the only point that knows both the device and the rows it produced.
+    # Outside an `energy_scope` the meter returns immediately, so the untraced path is
+    # unchanged.
+    # A stable label, not a per-invocation one: this kernel runs once per morsel on a large
+    # input, and a report with one row per call is unreadable on exactly the workload it is
+    # for. The ledger rolls repeats up by name.
+    with measure_stage(
+        "GpuGroupBy", accelerator_type=_local_device_model(), device_count=1
+    ) as meter:
+        out = _dispatch_groupby(table, key, aggs, backend=backend, device=device)
+        meter.add_rows(out.num_rows)
+        return out
+
+
+def _dispatch_groupby(
+    table: pa.Table,
+    key: str,
+    aggs: dict[str, tuple[str, str]],
+    *,
+    backend: str,
+    device: str,
+) -> pa.Table:
+    """Run the group-by on the best kernel this backend has: cuDF where installed, else torch."""
     if backend in ("cuda", "rocm"):
         try:
             import cudf  # noqa: F401
@@ -137,6 +163,23 @@ def gpu_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]])
         except ImportError:
             pass  # cudf not installed -> fall through to the next backend, then the CPU
     return _torch_groupby_agg(table, key, aggs, device=device)
+
+
+@functools.lru_cache(maxsize=1)
+def _local_device_model() -> str:
+    """This host's device model as a `device_specs` key, or `""` when it cannot be resolved.
+
+    Memoized: the attached hardware does not change within a process, and the lookup would
+    otherwise run per stage on a path that is meant to be free when nothing is measuring.
+    """
+    from batcher._internal.device_specs import resolve_device_name
+    from batcher._internal.hardware import gpu_inventory
+
+    for device in gpu_inventory():
+        resolved = resolve_device_name(str(device.get("name") or ""))
+        if resolved:
+            return resolved
+    return ""
 
 
 def _cudf_groupby_agg(table: pa.Table, key: str, aggs: dict[str, tuple[str, str]]) -> pa.Table:
@@ -164,7 +207,16 @@ def _torch_groupby_agg(
 
     Identical code on ``device="cuda"`` (the accelerated backend) and ``device="cpu"`` (so the
     densify + scatter-reduce algorithm is verifiable against the CPU engine without a GPU — the
-    GPU is only *where* it runs)."""
+    GPU is only *where* it runs).
+
+    **Nulls are skipped, not summed.** A dense tensor has no null mask, so reading the column
+    through NumPy turns every null into `NaN` — and one `NaN` in a group makes its `scatter_add`
+    `NaN`, which is a measurement where the engine reports the sum of the values that were
+    there. `count` had the mirror of the same bug: it counted the group's *rows*, where the
+    engine counts its non-null values. The validity mask is therefore carried alongside the
+    values and every reduction is computed over the valid entries only, with a group that had
+    none reported as null rather than as the reduction's identity.
+    """
     import numpy as np
     import pyarrow as pa
     import torch
@@ -172,30 +224,83 @@ def _torch_groupby_agg(
     _validate_aggs(aggs)
 
     dev = torch.device(device)
-    keys_np = table.column(key).to_numpy(zero_copy_only=False)
-    keys_t = torch.from_numpy(np.ascontiguousarray(keys_np)).to(dev)
-    uniq, inv = torch.unique(keys_t, sorted=True, return_inverse=True)
-    n_groups = int(uniq.numel())
-    counts = torch.zeros(n_groups, device=dev, dtype=torch.float64).scatter_add_(
-        0, inv, torch.ones_like(inv, dtype=torch.float64)
-    )
-
-    out_cols: dict[str, object] = {key: uniq.cpu().numpy()}
+    uniq, inv, n_groups = _dense_group_ids(table.column(key), dev)
+    out_cols: dict[str, object] = {key: uniq}
     for name, (col, red) in aggs.items():
+        column = table.column(col)
+        valid = torch.from_numpy(
+            np.ascontiguousarray(column.is_valid().to_numpy(zero_copy_only=False))
+        ).to(dev)
+        counts = _scatter_add(valid.to(torch.float64), inv, n_groups, dev)
         if red == "count":
             out_cols[name] = counts.to(torch.int64).cpu().numpy()
             continue
-        vals = torch.from_numpy(
-            np.ascontiguousarray(table.column(col).to_numpy(zero_copy_only=False))
-        ).to(dev, dtype=torch.float64)
-        if red in ("sum", "mean"):
-            acc = torch.zeros(n_groups, device=dev, dtype=torch.float64).scatter_add_(0, inv, vals)
-            res = acc / counts if red == "mean" else acc
-        else:  # min / max via scatter_reduce
-            init = float("inf") if red == "min" else float("-inf")
-            acc = torch.full((n_groups,), init, device=dev, dtype=torch.float64)
-            acc = acc.scatter_reduce(0, inv, vals, reduce="amin" if red == "min" else "amax")
-            res = acc
-        out_cols[name] = res.cpu().numpy()
+        vals = torch.from_numpy(np.ascontiguousarray(column.to_numpy(zero_copy_only=False))).to(
+            dev, dtype=torch.float64
+        )
+        res = _reduce_valid(red, vals, valid, inv, counts, n_groups, dev)
+        # A group with no non-null value has no sum, mean, minimum or maximum. Presenting the
+        # accumulator's seed instead would read as a measurement of zero (or of an infinity).
+        out_cols[name] = np.where(counts.cpu().numpy() > 0, res.cpu().numpy(), None)
 
     return pa.table({k: pa.array(v) for k, v in out_cols.items()})
+
+
+def _dense_group_ids(column, dev):
+    """`(group keys, per-row group id, group count)` for a key column.
+
+    Raises `BackendError` rather than a raw `TypeError` for a key this kernel cannot densify —
+    a string key has no tensor form, and a key carrying nulls comes back from NumPy as a float
+    column whose null has become `NaN`, which is a different key *and* a different type from the
+    one the engine groups by. Both are for the caller to route around, and a typed refusal is
+    what lets it.
+    """
+    import numpy as np
+    import torch
+
+    from batcher._internal.errors import BackendError
+
+    if column.null_count:
+        raise BackendError("the torch group-by kernel cannot densify a key column with nulls")
+    keys_np = column.to_numpy(zero_copy_only=False)
+    if keys_np.dtype == object or keys_np.dtype.kind in ("U", "S"):
+        raise BackendError(f"the torch group-by kernel cannot densify a {keys_np.dtype} key")
+    keys_t = torch.from_numpy(np.ascontiguousarray(keys_np)).to(dev)
+    uniq, inv = torch.unique(keys_t, sorted=True, return_inverse=True)
+    return uniq.cpu().numpy(), inv, int(uniq.numel())
+
+
+def _scatter_add(values, inv, n_groups: int, dev):
+    """Per-group sum of `values`, as a dense float64 tensor."""
+    import torch
+
+    return torch.zeros(n_groups, device=dev, dtype=torch.float64).scatter_add_(0, inv, values)
+
+
+def _reduce_valid(red: str, vals, valid, inv, counts, n_groups: int, dev):
+    """One reduction over the *valid* entries of each group.
+
+    Each reduction gets the identity that leaves it unchanged where a value is missing: zero
+    for a sum, and the infinity that loses every comparison for a minimum or a maximum.
+
+    `NaN` propagates through a sum, a mean and a maximum, which is what the engine does: it
+    orders `NaN` above every number, so it wins a maximum and is carried by any arithmetic. For
+    the same reason it must *lose* a minimum, and `amin` propagates it instead — so a minimum
+    takes `NaN` out of the comparison and puts it back only for a group that held nothing else.
+    """
+    import torch
+
+    if red in ("sum", "mean"):
+        total = _scatter_add(torch.where(valid, vals, 0.0), inv, n_groups, dev)
+        return total / counts if red == "mean" else total
+    seed = float("inf") if red == "min" else float("-inf")
+    usable = valid & (vals == vals) if red == "min" else valid
+    acc = torch.full((n_groups,), seed, device=dev, dtype=torch.float64)
+    acc = acc.scatter_reduce(
+        0, inv, torch.where(usable, vals, seed), reduce="amin" if red == "min" else "amax"
+    )
+    if red != "min":
+        return acc
+    # Every valid value in the group was `NaN`, so `NaN` is its minimum as well as its maximum.
+    all_nan = _scatter_add(usable.to(torch.float64), inv, n_groups, dev) == 0
+    return torch.where(all_nan & (counts > 0), torch.full_like(acc, float("nan")), acc)

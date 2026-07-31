@@ -46,6 +46,7 @@ from batcher.plan.logical import (
     LogicalPlan,
     Project,
     Projection,
+    passthrough_renames,
 )
 from batcher.plan.logical.transforms import is_cartesian_key_pair
 from batcher.plan.stats import ColumnStat, ambiguous_float_bound
@@ -178,14 +179,34 @@ def outer_to_inner_join(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | N
     join, null-extended on both sides, weakens one preserved side per rejecting
     side (and to `inner` when both reject). Returns None for inner/semi/anti joins
     and when nothing is provably rejected (so the rule is idempotent).
+
+    Looks through **one intervening pass-through projection**, which is what makes the `full`
+    case reachable rather than dead code: `Dataset.join` never emits a bare `full` join, it
+    always wraps one in a projection coalescing the two sides' keys into the single output key.
+    So `Filter(Join(..., full), p)` is a shape no query produces, and the whole `full` branch of
+    `_strengthened` could not fire on any plan. Worth reaching, because a full outer join is the
+    most constrained shape there is: unreorderable, both sides materialized, neither prunable.
     """
     inner = node.input
+    # `renames` maps the predicate's column names back to the join's own output aliases.
+    # Empty (the identity) when the filter sits directly on the join.
+    renames: dict[str, str] = {}
+    projection: Project | None = None
+    if isinstance(inner, Project) and isinstance(inner.input, Join):
+        projection, inner = inner, inner.input
+        renames = passthrough_renames(projection.items)
     if not isinstance(inner, Join) or inner.join_type not in {"left", "right", "full"}:
         return None
 
     rejected = _null_rejecting_cols(node.predicate)
     if not rejected:
         return None
+    if projection is not None:
+        # A rejected alias the projection does not pass through (the coalesced key, or any
+        # computed column) is dropped here rather than guessed at.
+        rejected = {renames[name] for name in rejected if name in renames}
+        if not rejected:
+            return None
     left_aliases = {o.alias for o in inner.output if o.side == "left"}
     right_aliases = {o.alias for o in inner.output if o.side == "right"}
     rejects_left = bool(rejected & left_aliases)
@@ -203,7 +224,9 @@ def outer_to_inner_join(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | N
         inner.output,
         inner.strategy,
     )
-    return Filter(new_join, node.predicate)
+    if projection is None:
+        return Filter(new_join, node.predicate)
+    return Filter(dataclasses.replace(projection, input=new_join), node.predicate)
 
 
 def _strengthened(join_type: str, rejects_left: bool, rejects_right: bool) -> str:

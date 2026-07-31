@@ -20,7 +20,7 @@ The practical consequence is that scaling out is a scheduling decision rather th
 
 There is exactly one scalar expression type and one relational plan type, and all three execution paths consume the same one.
 
-![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](../_static/diagrams/execution_tiers.svg)
+![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](/_static/diagrams/execution_tiers.svg)
 
 The sequential interpreter is the correctness oracle: simple, deterministic, and checked by everything else. The parallel path reuses the same operator code and changes only the scheduling. The Cranelift JIT compiles the supported subset of scalar expressions once per operator and reuses that across every morsel.
 
@@ -34,7 +34,7 @@ This is why performance work here does not accumulate risk. A new tier can be ad
 
 This is the differentiator most often overstated, so it is worth stating precisely.
 
-![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running on a single node, and carrying what was learned into the next run. DuckDB optimizes once and keeps no cross-run state. Spark AQE re-plans at stage boundaries but needs shuffle stages and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the same loop on a single node, and carries sketches, calibrated costs, and a bandit into the next run.](../_static/diagrams/adaptive_positioning.svg)
+![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running on a single node, and carrying what was learned into the next run. DuckDB optimizes once and keeps no cross-run state. Spark AQE re-plans at stage boundaries but needs shuffle stages and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the same loop on a single node, and carries sketches, calibrated costs, and a bandit into the next run.](/_static/diagrams/adaptive_positioning.svg)
 
 Batcher re-optimizes during a query at pipeline breakers, using cardinalities it has *measured* rather than estimated. When an estimate was wrong by more than `optimizer.reoptimize_error` (2x by default), Kyber re-plans the remainder of the query on the real numbers.
 
@@ -91,5 +91,5 @@ Streaming cannot express Flink's guarantees, and lakehouse format support is rea
 - {doc}`execution`: the tiers and the scheduler in detail.
 - {doc}`optimization`: Kyber's passes and the cost model behind the learned loop.
 - {doc}`../benchmarks/index`: the measured numbers, with the methodology behind each.
-- {doc}`../deep-dives/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
-- {doc}`../deep-dives/adaptive-reoptimization`: the re-planning loop, breaker by breaker.
+- {doc}`/deep-dives/operators/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
+- {doc}`/deep-dives/adaptive/adaptive-reoptimization`: the re-planning loop, breaker by breaker.

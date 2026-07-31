@@ -25,7 +25,10 @@ def spill_device(monkeypatch):
     """Pin the class of the device backing the spill directory."""
 
     def configure(device: str):
-        monkeypatch.setattr(storage_cost, "device_class", lambda path: device)
+        # Patched where the probe *lives* rather than where it is used: the class table moved
+        # down to layer 0 so Carbonite could read the same figures Kyber does without the two
+        # subsystems importing each other, and `device_cost_factor` calls it from there.
+        monkeypatch.setattr("batcher._internal.hardware.storage.device_class", lambda path: device)
 
     return configure
 
@@ -93,3 +96,46 @@ def test_an_unbounded_budget_still_charges_no_spill(spill_device, monkeypatch):
     spill_device("rotational")
     assert terms.spill_io(state_bytes=10**12) == 0.0
     assert terms.merge_io(state_bytes=10**12) == 0.0
+
+
+# --- The same table, read by Carbonite ------------------------------------------------------
+
+
+def test_compression_on_local_flash_is_the_size_rule_it_always_was():
+    from batcher.carbonite.policies.spill_shape import SPILL_COMPRESS_ABOVE, should_compress
+
+    assert should_compress(0) is None
+    assert should_compress(SPILL_COMPRESS_ABOVE) is True
+    assert should_compress(SPILL_COMPRESS_ABOVE // 4) is False
+    # An unidentified device is local flash for this purpose, so nothing moves.
+    assert should_compress(SPILL_COMPRESS_ABOVE // 4, 1.0) is False
+
+
+def test_a_slow_device_compresses_a_state_the_size_rule_would_write_raw():
+    # On a network volume every byte not written is time not spent, so the trade pays well
+    # below the size at which it pays on flash.
+    from batcher._internal.hardware.storage import SPILL_DEVICE_FACTOR
+    from batcher.carbonite.policies.spill_shape import SPILL_COMPRESS_ABOVE, should_compress
+
+    modest = min(SPILL_COMPRESS_ABOVE // 4, 1 << 30)
+    assert should_compress(modest, SPILL_DEVICE_FACTOR["network"]) is True
+    assert should_compress(modest, SPILL_DEVICE_FACTOR["rotational"]) is True
+
+
+def test_a_tiny_state_is_not_compressed_however_slow_the_device():
+    # The whole spill is a handful of buffers; the codec's own setup dominates.
+    from batcher._internal.hardware.storage import SPILL_DEVICE_FACTOR
+    from batcher.carbonite.policies.spill_shape import should_compress
+
+    assert should_compress(1 << 20, SPILL_DEVICE_FACTOR["network"]) is False
+
+
+def test_both_subsystems_read_one_table_rather_than_two():
+    # The failure this pins is the one the layer rules call out by name: Kyber and Carbonite
+    # cannot import each other, so a shared figure pasted into both is the only wrong way to
+    # share it — and the two copies then drift.
+    from batcher._internal.hardware import storage as layer0
+    from batcher.kyber import storage_cost as kyber_side
+
+    assert kyber_side.SPILL_DEVICE_FACTOR is layer0.SPILL_DEVICE_FACTOR
+    assert kyber_side.SPILL_DEVICE_FACTOR_DEFAULT == layer0.SPILL_DEVICE_FACTOR_DEFAULT

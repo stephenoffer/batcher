@@ -36,6 +36,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod bloom;
 mod errors;
 mod flight;
+mod hardware;
 mod normalize;
 mod pool;
 mod process;
@@ -714,6 +715,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(supported_cast_dtypes, m)?)?;
     m.add_class::<flight::ShuffleClient>()?;
     m.add_class::<pool::MemoryPool>()?;
+    // What the engine process itself detected about its CPU, and what its allocator is
+    // holding — neither is observable from the Python side (see `hardware.rs`).
+    hardware::register(m)?;
     // Classified shuffle-fetch exceptions: the control plane catches `Retryable` as
     // worker loss (recompute + retry) and lets `Fatal` propagate (fail fast).
     errors::register(m)?;

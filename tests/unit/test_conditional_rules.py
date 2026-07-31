@@ -244,9 +244,21 @@ def test_coalesce_refuses_to_drop_a_null_that_carries_the_type():
     assert cd.coalesce_drop_nulls_after_first_non_null(_proj(expr), None) is None
 
 
-def test_coalesce_refuses_to_truncate_an_untypeable_tail():
-    expr = coalesce(col("a"), lit(0), col("b") + lit(1))
+def test_coalesce_refuses_to_truncate_a_differently_typed_tail():
+    # `coalesce(int, 0, 2.5)` is DOUBLE; truncating after the first non-null literal would
+    # narrow it to INT. This is the guard — a *type* the survivors do not carry — and it holds
+    # whether or not a schema is available.
+    expr = coalesce(col("a"), lit(0), lit(2.5))
     assert cd.coalesce_drop_nulls_after_first_non_null(_proj(expr), None) is None
+
+
+def test_coalesce_truncates_a_tail_the_schema_proves_same_typed():
+    # `b + 1` has no schema-free type tag, so this used to be declined as "unknown". With the
+    # node's schema it is provably int64, the same as the surviving `a` and `0`, so the
+    # unreachable tail goes. This is the case the schema-aware droppability guard exists for.
+    expr = coalesce(col("a"), lit(0), col("b") + lit(1))
+    out = cd.coalesce_drop_nulls_after_first_non_null(_proj(expr), None)
+    assert _expr_ir(out) == _ir(coalesce(col("a"), lit(0)))
 
 
 def test_coalesce_single_arg_fires():
@@ -343,3 +355,54 @@ def test_a_rule_leaves_an_unrelated_plan_alone():
     assert cd.case_to_coalesce(_proj(col("a") + lit(1)), None) is None
     assert cd.coalesce_flatten_nested(_flt(col("a") > 1), None) is None
     assert cd.greatest_least_fold_literals(_proj(NullIf(col("a"), lit(2))), None) is None
+
+
+# --- schema-aware droppability ------------------------------------------------
+#
+# `_type_tag` is schema-free and so has nothing to say about a bare column: two `int` columns
+# both read as "unknown", and an unknown type reads as "keep". That silenced the whole
+# arm-dropping half of this family on the shape a SQL front end produces most —
+# `CASE WHEN <folded constant> THEN col_a ELSE col_b END`. These pin the schema-aware path
+# that closes it, and the type guard that must survive it.
+
+
+def test_constant_true_branch_wins_over_column_arms():
+    expr = when(lit(True)).then(col("a")).otherwise(col("b"))
+    out = cd.case_first_true_branch_wins(_proj(expr), None)
+    # A CASE with no branches left is its ELSE, which `case_no_branches_to_else` then collapses.
+    assert _expr_ir(out) == _ir(Case([], col("a")))
+
+
+def test_constant_false_branch_drops_with_column_arms():
+    expr = when(lit(False)).then(col("a")).otherwise(col("b"))
+    out = cd.case_drop_unreachable_branches(_proj(expr), None)
+    assert _expr_ir(out) == _ir(Case([], col("b")))
+
+
+def test_duplicate_condition_drops_with_column_arms():
+    expr = when(col("a") > 1).then(col("a")).when(col("a") > 1).then(col("b")).otherwise(col("b"))
+    out = cd.case_drop_duplicate_conditions(_proj(expr), None)
+    assert _expr_ir(out) == _ir(when(col("a") > 1).then(col("a")).otherwise(col("b")))
+
+
+def test_schema_aware_drop_still_refuses_to_narrow_the_result_type():
+    # `a` is INT and `c` is DOUBLE, so `CASE WHEN TRUE THEN a ELSE c END` is DOUBLE. Knowing
+    # both types exactly is precisely what proves the drop *unsound* here — the sharper guard
+    # must refuse more, not less.
+    ds = bt.from_pydict({"a": [1, 2, 3], "c": [1.5, 2.5, 3.5]})
+    node = ds.select(r=when(lit(True)).then(col("a")).otherwise(col("c")))._plan
+    assert cd.case_first_true_branch_wins(node, None) is None
+
+
+def test_constant_condition_folds_through_the_whole_optimizer():
+    # The end-to-end shape: driven through the registry, both the branch drop and the husk
+    # collapse have to fire for the projection to become a bare column reference.
+    from batcher.kyber.optimizer import optimize_logical
+    from batcher.plan.logical import Project
+    from batcher.plan.visitor import walk
+
+    ds = bt.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]})
+    plan = ds.select(r=when(lit(True)).then(col("a")).otherwise(col("b")))._plan
+    out = optimize_logical(plan)
+    items = [it for n in walk(out) if isinstance(n, Project) for it in n.items if it.alias == "r"]
+    assert [it.expr.to_ir() for it in items] == [_ir(col("a"))]

@@ -110,8 +110,8 @@ python benchmarks/run.py --benchmark tpch      --tier single --scale 1
 
 - {doc}`analytics` for the full operator table with DuckDB alongside.
 - {doc}`vs-duckdb` and {doc}`vs-daft` for the other single-node comparisons.
-- {doc}`../deep-dives/sort-internals` for the fused top-N heap behind the 50x, and the sample-sort that narrowed the float-sort loss.
-- {doc}`../deep-dives/window-internals` for why `lag()` is ahead and the partitioned `SUM` is behind.
-- {doc}`../deep-dives/gpu-execution` for cuDF as the per-GPU data plane.
-- {doc}`../user-guide/sorting` for `top_k` and `sort` in the API.
+- {doc}`/deep-dives/operators/sort-internals` for the fused top-N heap behind the 50x, and the sample-sort that narrowed the float-sort loss.
+- {doc}`/deep-dives/operators/window-internals` for why `lag()` is ahead and the partitioned `SUM` is behind.
+- {doc}`/deep-dives/distribution/gpu-execution` for cuDF as the per-GPU data plane.
+- {doc}`/user-guide/transform/sorting` for `top_k` and `sort` in the API.
 - {doc}`methodology` for hardware and correctness gating.

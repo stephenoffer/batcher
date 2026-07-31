@@ -1,7 +1,7 @@
 # Feature engineering with preprocessors
 
 Build a **model-ready feature matrix** from a raw table with Batcher's
-scikit-learn-style {doc}`preprocessors <../ml/preprocessors/index>`. You impute missing
+scikit-learn-style {doc}`preprocessors </ml/preparing/preprocessors/index>`. You impute missing
 values, scale the numerics, encode a categorical, bin a continuous column, and compose
 the lot with `Chain`, fitting every step on the training split and replaying it on the
 test split with the *same* learned statistics. That last discipline is what keeps a
@@ -312,7 +312,7 @@ written once, and it is itself a `Preprocessor`, so it nests.
 :gutter: 3
 
 :::{grid-item-card} {octicon}`stack;1.1em` Preprocessors guide
-:link: ../ml/preprocessors/index
+:link: /ml/preparing/preprocessors/index
 :link-type: doc
 Every preprocessor there is, plus splitting, fuzzy dedup, and where the transforms run.
 :::
@@ -324,7 +324,7 @@ Feed these features to DDP ranks, balanced and resumable.
 :::
 
 :::{grid-item-card} {octicon}`plug;1.1em` PyTorch integration
-:link: ../ml/pytorch
+:link: /ml/inference/pytorch
 :link-type: doc
 The training-loop side: device transfer, prefetch, zero-copy.
 :::
@@ -332,12 +332,12 @@ The training-loop side: device transfer, prefetch, zero-copy.
 
 ## See also
 
-- {doc}`Expressions <../user-guide/expressions>`: the same feature work said as column math,
+- {doc}`Expressions </user-guide/transform/expressions>`: the same feature work said as column math,
   which is what these objects lower to.
-- {doc}`Aggregations <../user-guide/aggregations>`: the mergeable pass every `fit` runs.
-- {doc}`Mergeable algebra <../deep-dives/mergeable-algebra>`: why a `fit` gives the same answer
+- {doc}`Aggregations </user-guide/analyze/aggregations>`: the mergeable pass every `fit` runs.
+- {doc}`Mergeable algebra </deep-dives/operators/mergeable-algebra>`: why a `fit` gives the same answer
   on one core and on a cluster.
-- {doc}`ML API reference <../api/ml>`: the full `Preprocessor` surface.
-- {doc}`Feature pipeline recipe <../examples/ml/feature-pipeline>` and
-  {doc}`train/test split recipe <../examples/ml/train-test-split>`: the short versions.
+- {doc}`ML API reference </api/models/ml>`: the full `Preprocessor` surface.
+- {doc}`Feature pipeline recipe </cookbook/ml/pipelines/feature-pipeline>` and
+  {doc}`train/test split recipe </cookbook/ml/pipelines/train-test-split>`: the short versions.
 - `examples/preprocessors.py`: this workflow as a runnable, asserted script.

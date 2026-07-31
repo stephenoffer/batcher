@@ -68,6 +68,58 @@ What to do about it:
 - **Re-run before reporting.** A crashed run has no result, not a bad one.
 - If you must run the whole suite, do it right after your own build, and expect to repeat.
 
+### The long-lived Ray cluster holds a stale copy too
+
+The same rebuild breaks the **shared Ray cluster**, and it looks nothing like the local case.
+Ray's workers imported the engine when the cluster started, so after any `just build` they hold
+the old `.so` memory-mapped for the rest of their lives. Every distributed test then dies —
+`SystemExit: 1` from a worker, a raylet stack dump, or a nine-minute hang — while the identical
+test passes single-node.
+
+The tell is that it is not your test. Check with the smallest possible query before reading a
+line of your own code:
+
+```
+python -c "import batcher as bt; \
+  print(bt.from_pydict({'a':[1,2]}).agg(s=bt.col('a').sum()).collect(distributed=True).to_pydict())"
+```
+
+If a two-row sum crashes, nothing about your operator is under test. Confirm by running the same
+file against a fresh cluster, which needs no coordination with anyone and takes one env var:
+
+```
+RAY_ADDRESS=local python -m pytest tests/integration/test_your_thing.py -q
+```
+
+A file that goes from a nine-minute hang to `9 passed in 15s` under that variable was never
+failing on its own account. Prefer this over `ray stop`: the cluster is shared, another session
+may have work on it, and a fresh instance answers the question without touching theirs.
+
+### You do not have to wait: build into a sandbox instead
+
+`just build` is what clobbers the shared `.so`. Building the crate does not. So an FFI or
+Rust-side change can be tested end to end, with the real Python suite, while another session
+is mid-run — which otherwise blocks the whole `bc-py` surface for as long as they are active:
+
+```
+cargo build --release -p bc-py --features pyo3/extension-module   # -> target/release/lib_native.so
+SB=<scratchpad>/sandbox && rm -rf $SB && mkdir -p $SB
+git archive HEAD python tests | tar -x -C $SB                     # committed state, not their WIP
+cp target/release/lib_native.so $SB/python/batcher/_native.abi3.so
+PYTHONPATH=$SB/python python -m pytest $SB/tests/differential -q
+```
+
+Three things make this work and are worth keeping: `bc-py`'s `[lib] name = "_native"` is a
+plain `cdylib`, so the file cargo produces *is* the extension module under a different name;
+`git archive HEAD` gives you the committed tree rather than the other session's half-finished
+edits, so their broken imports do not become your test failures; and `PYTHONPATH` wins over the
+installed package, so nothing outside the scratchpad is touched. Confirm you are in the sandbox
+with `bt.versions()["engine_profile"]` and `bt._native.__file__`.
+
+This was used to build, benchmark and then **reject** the dictionary-preserving boundary change
+(`competitor_technique_review.md` item 6) during a session where another agent held 20-27
+pytest processes against the installed `.so` for its entire duration.
+
 The same swap is why a benchmark can silently measure the *other* agent's build: check
 `bt.versions()["engine_profile"]`, which the suite now does for you.
 
@@ -92,6 +144,31 @@ usually clears it. Do not:
 
 The same applies to `MAP.md`: it goes stale the moment any session adds a module, so
 regenerate it *inside* the retry loop rather than before it.
+
+## A retry loop must own its message and its path list
+
+The contention above makes a retry loop around `git commit` the standard fix, and it has now
+produced two malformed commits here. Both failed the same way: the loop re-read a message file
+and a path list that had been *edited underneath it* between attempts, so what eventually
+landed was neither the message the author wrote nor the files they meant.
+
+One of the two lost its subject line entirely and committed with a paragraph of body text as
+the summary; the other committed against a stale path list and carried two unrelated changes
+together. Neither is recoverable once another session commits on top, because rewriting shared
+history in this tree is worse than the defect.
+
+Three rules keep the loop honest:
+
+- **Snapshot the message before the loop starts** (`cp msg.txt msg.lock`) and point `-F` at the
+  copy. A `cat >>` that appends to the live file mid-run, or a `pkill` that truncates it, then
+  cannot reach the commit.
+- **Freeze the path list too.** Editing the script a running loop is reading is how a path that
+  no longer exists (or one that now belongs to another session) ends up in `--only`.
+- **Never `pkill` your own loop by a pattern that can match the shell running it.** That is what
+  truncated the message file here: the kill landed mid-heredoc.
+
+And verify after: `git log -1 --format=%s | wc -c`. A subject over ~72 characters means the
+message did not survive.
 
 ## Prove "pre-existing", never assume it
 

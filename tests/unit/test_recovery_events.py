@@ -108,6 +108,20 @@ class TestObservabilityCannotBreakRecovery:
 
 
 class TestObserveFoldsRecovery:
+    @pytest.fixture(autouse=True)
+    def _stop_collecting(self):
+        """Detach the metrics collector afterwards, so the bus is quiet for the next test.
+
+        Attaching any sink tells the engine something is consuming per-query profiles, and
+        `event_log_collector` reads exactly that to decide whether to assemble one. Left
+        attached, these tests make a later assertion about a *disabled* event log fail — an
+        ordering dependency that only appears in some orders, which is the worst kind.
+        """
+        from batcher.observe.metrics import stop_metrics
+
+        yield
+        stop_metrics()
+
     def test_metrics_counts_by_event_kind(self) -> None:
         from batcher.observe.metrics import metrics_snapshot, reset_metrics, start_metrics
 

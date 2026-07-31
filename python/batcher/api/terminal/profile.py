@@ -301,14 +301,26 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
 
     A plan carrying a `map_batches`/inference UDF has no engine IR to lower or optimize, so
     it renders the un-lowered logical tree (`_udf_planned_profile`) instead of crashing.
+
+    Collects the per-source statistics first, exactly as the execution path does. Without
+    them this showed a *different* plan than `collect()` runs, silently and in the direction
+    that matters: every rewrite that reasons about a column's recorded min/max — zone-map
+    pruning, the join-disjointness proof, ordered sargable transposition — has nothing to read
+    without a footer, so `explain()` reported the un-pruned plan for a query that prunes. The
+    plan memo is keyed on the statistics too, so supplying them is also what lets `explain()`
+    and `collect()` share one cache entry instead of planning the same query twice.
     """
     from batcher import core, kyber
+    from batcher.api.source_stats import collect_source_stats, column_bounds_needed
     from batcher.plan.profile import build_op_profiles
 
     hub = core.default_hub()
     if core.has_map_batches(plan):
         return _udf_planned_profile(plan, sources, hub)
-    opt, decisions = kyber.optimize_traced(plan, sources=sources, hub=hub)
+    source_stats = collect_source_stats(sources, hub, need_columns=column_bounds_needed(plan))
+    opt, decisions = kyber.optimize_traced(
+        plan, sources=sources, hub=hub, source_stats=source_stats
+    )
     return QueryProfile(
         ops=build_op_profiles(opt.ir, opt.ops, None),
         decisions=(*build_side_decisions(decisions), *_io_throughput_decisions(sources, hub)),

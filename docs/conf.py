@@ -146,6 +146,11 @@ exclude_patterns = [
     "internals/snowflake_parity.md",
     "internals/anyscale_parity.md",
     "internals/orchestration_parity.md",
+    # The record of the GPU-datacenter alignment program: what landed, the rules it followed,
+    # and an explicit register of what it did not do (no Rust data-plane work, no measurement
+    # on real GPU hardware). A working document for contributors, and the "what we did not do"
+    # register is exactly what a published page must not carry.
+    "internals/gpu_datacenter_program.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
@@ -177,11 +182,11 @@ exclude_patterns = [
     # which it still inherits, read against a field-engineering corpus. A contributor
     # working record like the parity scorecards above, not a site page.
     "internals/ray_pitfall_parity.md",
-    # The running record of the spill / OOM / larger-than-memory work: each entry names what
-    # was wrong, why it passed the gate anyway, and the test that now fails without the fix.
-    # A contributor working record like the ledgers above, and it says so in its own opening
-    # line, so it is excluded rather than wired into a toctree.
-    "internals/spill_oom_improvements_ledger.md",
+    # The tombstone for the fourteen working ledgers retired on 2026-07-29: what they were,
+    # what was still open, and why they are not coming back. It exists so a contributor (or an
+    # agent) who finds one missing reads "retired on purpose" instead of restoring it. Written
+    # for that reader, not for a user, so it is excluded rather than wired into a toctree.
+    "internals/retired_ledgers.md",
     # The authoring guide for the diagram sources that live beside it (palette, the
     # rsvg-convert render step). A contributor note in an asset directory, not a page.
     "_static/diagrams/README.md",
