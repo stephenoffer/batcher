@@ -300,3 +300,45 @@ def test_the_degraded_link_helpers_are_one_implementation(monkeypatch):
     monkeypatch.setattr(device_links, "gpu_pci_addresses", lambda: ("0000:1a:00.0",))
     monkeypatch.setattr(pcie, "pcie_link", lambda a: bad)
     assert [link.address for link in device_links.degraded_device_links()] == ["0000:1a:00.0"]
+
+
+# --- Telling a starved pipeline from a narrow wire -------------------------------------------
+
+
+def _starved(monkeypatch, links):
+    from batcher._internal.hardware.nvml import DeviceTelemetry
+
+    monkeypatch.setattr(
+        "batcher._internal.hardware.nvml.device_telemetry",
+        lambda: (DeviceTelemetry(index=0, sm_utilization=0.2),),
+    )
+    monkeypatch.setattr("batcher._internal.hardware.fabric.degraded_device_links", lambda: links)
+    from batcher.ml.devices import device_feed_advice
+
+    return device_feed_advice()
+
+
+def test_a_starved_device_on_a_healthy_link_is_a_pipeline_to_tune(monkeypatch):
+    advice = _starved(monkeypatch, ())
+    assert "starving them" in advice
+    assert "deeper prefetch" in advice
+
+
+def test_a_starved_device_on_a_narrow_link_is_a_node_to_drain(monkeypatch):
+    # The pipeline may already be feeding as fast as the wire allows, and every upstream
+    # lever in the other sentence is wasted effort against a hardware fault.
+    narrow = pcie.PcieLink("0000:0c:00.0", gen=3, width=8, max_gen=5, max_width=16)
+    advice = _starved(monkeypatch, (narrow,))
+    assert "host link is the ceiling" in advice
+    assert "node fault to drain" in advice
+    assert "12% of nameplate" in advice
+
+
+def test_the_link_clause_never_breaks_the_sentence(monkeypatch):
+    from batcher.ml.devices import _narrow_host_link
+
+    def _boom():
+        raise RuntimeError("driver gone")
+
+    monkeypatch.setattr("batcher._internal.hardware.fabric.degraded_device_links", _boom)
+    assert _narrow_host_link() == ""

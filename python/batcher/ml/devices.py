@@ -14,6 +14,7 @@ validation a Python user expects, keeping `gpu` focused on the accelerator facts
 from __future__ import annotations
 
 from batcher._internal.errors import PlanError, did_you_mean
+from batcher._internal.logging import note_suppressed
 
 __all__ = [
     "available_devices",
@@ -394,6 +395,17 @@ def device_feed_advice() -> str:
             f"{mean:.0%} mean utilization: the ceiling is the device, not the pipeline"
         )
     if mean < 0.4:
+        # A starved device has two very different causes and the advice above only covers
+        # one. When the host link came up below what the slot and the card support, the
+        # pipeline may already be feeding as fast as the wire allows, and every upstream lever
+        # in that sentence is wasted effort against a hardware fault.
+        narrow = _narrow_host_link()
+        if narrow:
+            return (
+                f"devices at {mean:.0%} mean utilization, and {narrow}: the host link is the "
+                "ceiling, so deeper prefetch and larger batches will not help — this is a "
+                "node fault to drain rather than a pipeline to tune"
+            )
         return (
             f"devices at {mean:.0%} mean utilization: the pipeline is starving them, so the "
             "lever is upstream (deeper prefetch, larger batches, fewer devices)"
@@ -404,3 +416,26 @@ def device_feed_advice() -> str:
             "devices or a cheaper model rather than a faster feed"
         )
     return f"devices at {mean:.0%} mean utilization: fed, with headroom in both directions"
+
+
+def _narrow_host_link() -> str:
+    """A phrase naming the worst degraded host link on this node, or `""` when none is.
+
+    Read only on the starved branch above, where it is the difference between a pipeline to
+    tune and a node to drain. Never raises: this is one clause of an advisory sentence, and a
+    probe that can fail the sentence is worse than a sentence missing a clause.
+    """
+    try:
+        from batcher._internal.hardware.fabric import degraded_device_links
+
+        links = degraded_device_links()
+    except Exception as exc:  # pragma: no cover - advice must never fail
+        note_suppressed("ml", "read the device host links", exc)
+        return ""
+    if not links:
+        return ""
+    worst = min(links, key=lambda link: link.degradation_ratio)
+    return (
+        f"{len(links)} device(s) on a degraded host link "
+        f"(worst at {worst.degradation_ratio:.0%} of nameplate bandwidth)"
+    )
