@@ -58,9 +58,20 @@ pub(crate) fn approx_distinct_state(
     let encode = canon.as_ref().map_or(values, |c| &c[0]);
     let converter = RowConverter::new(vec![SortField::new(encode.data_type().clone())])?;
     let rows = converter.convert_columns(std::slice::from_ref(encode))?;
-    for (i, &g) in group_ids.iter().enumerate() {
-        if values.is_valid(i) {
-            hlls[g as usize].add_hash(SEED.hash_one(rows.row(i)));
+    // `values` is an `Arc<dyn Array>`, so checking validity on it per row is a virtual call.
+    // Resolve the null buffer once; a null-free column then hashes every row unconditionally.
+    match values.nulls() {
+        None => {
+            for (i, &g) in group_ids.iter().enumerate() {
+                hlls[g as usize].add_hash(SEED.hash_one(rows.row(i)));
+            }
+        }
+        Some(nulls) => {
+            for (i, &g) in group_ids.iter().enumerate() {
+                if nulls.is_valid(i) {
+                    hlls[g as usize].add_hash(SEED.hash_one(rows.row(i)));
+                }
+            }
         }
     }
     Ok(serialize(&hlls))

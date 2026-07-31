@@ -44,12 +44,18 @@ pub(crate) fn arg_extreme_pick(
     let vrows = vconv.convert_columns(std::slice::from_ref(values_k))?;
 
     let mut best: Vec<Option<usize>> = vec![None; num_groups];
+    // Both `keys` and `values` are `Arc<dyn Array>`, so the two validity checks below were
+    // two virtual calls per row. Resolved once here; `None` means "no nulls", which the
+    // closure then answers without touching memory at all.
+    let (knulls, vnulls) = (keys.nulls(), values.nulls());
+    let live =
+        |i: usize| knulls.is_none_or(|n| n.is_valid(i)) && vnulls.is_none_or(|n| n.is_valid(i));
     for (i, &g) in group_ids.iter().enumerate() {
         // A null key can't be an extreme, and a null value can't be selected — DuckDB
         // ignores the whole row if either is null, so `arg_max(v, k)` returns the value
         // at the largest key *among rows with a non-null value* (not NULL because the
         // absolute-max-key row happened to have a null value).
-        if !keys.is_valid(i) || !values.is_valid(i) {
+        if !live(i) {
             continue;
         }
         let g = g as usize;
