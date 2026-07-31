@@ -65,8 +65,63 @@ def test_range_beyond_the_bounds_is_saturated_not_guessed():
 
 
 def test_numeric_range_interpolates_between_exact_bounds():
+    """An *integer* column's range is counted, not interpolated as a continuum.
+
+    `d <= 25` over integer bounds `[0, 100]` keeps 26 of the 101 values the range contains, not
+    the 25/100 a continuous reading gives. The two barely differ over a span this wide; they
+    differ a great deal at the ends and on a narrow range, which is why the count is what
+    `_fraction_below_bounds` uses for a discrete column — the same form
+    `_date_part_range_selectivity` already used for a bounded field like `month`.
+    """
     sel = predicate_selectivity(Binary("le", Col("d"), Lit(25)), {}, CFG, bounds=_bounds(0, 100))
+    assert sel == pytest.approx(26 / 101, abs=1e-9)
+
+
+def test_a_float_column_keeps_the_continuous_reading():
+    """A continuous column must NOT be counted: there is no "next" value to divide by.
+
+    Deciding discreteness from whether the bounds *happen* to be whole numbers would catch this
+    one — `0.0` and `100.0` both are — and then read a `Float64` column as holding 101 values.
+    The type is what decides, so this stays at the interpolated 0.25.
+    """
+    sel = predicate_selectivity(
+        Binary("le", Col("d"), Lit(25.0)), {}, CFG, bounds=_bounds(0.0, 100.0)
+    )
     assert sel == pytest.approx(0.25, abs=1e-9)
+
+
+def test_a_predicate_at_the_minimum_no_longer_estimates_zero_rows():
+    """`d <= min` matches every row holding the minimum, so it cannot be zero.
+
+    The continuous form answered a flat 0 at the lower bound, unable to tell "below the minimum"
+    from "equal to it" — and a zero-row estimate is the worst kind to be wrong by, because
+    build-side choice, join order, broadcast sizing and the adaptive gate all read it as "this
+    subtree is empty". Over integer bounds `[1, 4]` the answer is one value's worth.
+    """
+    sel = predicate_selectivity(Binary("le", Col("d"), Lit(1)), {}, CFG, bounds=_bounds(1, 4))
+    assert sel == pytest.approx(0.25, abs=1e-9)
+    # ...and strictly below the minimum really is zero.
+    below = predicate_selectivity(Binary("lt", Col("d"), Lit(1)), {}, CFG, bounds=_bounds(1, 4))
+    assert below == 0.0
+
+
+def test_a_comparison_selectivity_stays_within_zero_and_one():
+    """`F` and `eq` come from different estimators, so their difference is not bounded.
+
+    A skewed column whose measured mass at `x` exceeds the interpolated `F(x)` made `lt` come
+    back negative and `ge` exceed one, and a negative selectivity propagates as a negative row
+    estimate. Both are clamped now, and the mass is also used as a floor on `F` for the two
+    comparisons that read it directly, since a CDF is never below the point mass at that value.
+    """
+    from batcher.kyber.stats.selectivity.leaves import _from_cdf
+
+    for op in ("le", "lt", "gt", "ge"):
+        assert 0.0 <= _from_cdf(op, 0.1, 0.4) <= 1.0
+        assert 0.0 <= _from_cdf(op, 0.9, 0.05) <= 1.0
+    # The floor: `P(v <= x)` is at least `P(v = x)`.
+    assert _from_cdf("le", 0.1, 0.4) == pytest.approx(0.4)
+    # ...but `lt` is not floored, or it would claim nothing lies below an interior `x`.
+    assert _from_cdf("lt", 0.5, 0.25) == pytest.approx(0.25)
 
 
 def test_range_without_bounds_still_falls_back_to_the_constant():

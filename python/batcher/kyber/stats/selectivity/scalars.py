@@ -11,6 +11,7 @@ estimators (`leaves`) and the combiner (`combine`) can both build on them.
 from __future__ import annotations
 
 import datetime
+import math
 from collections.abc import Iterator
 from decimal import Decimal
 from typing import Any
@@ -150,19 +151,88 @@ def _fraction_below_quantiles(x: float, q: dict[str, Any] | None) -> float | Non
     return _fraction_below(x, q.get("probs", []), q.get("values", []))
 
 
+def _is_discrete(bound: tuple[Any, Any]) -> bool:
+    """Whether a column's bounds step through whole units, so its range can be *counted*.
+
+    Decided from the bound values' **types**, not from whether they happen to be whole numbers.
+    A `Float64` column whose min and max are exactly `0.0` and `1.0` would pass an
+    `is_integer()` test and then be counted as holding two values — badly wrong on a continuous
+    column, and wrong at exactly the narrow ranges where counting is meant to help.
+
+    `int` and `date` qualify: their ordinals step by one, so `hi - lo + 1` is the number of
+    values the range contains. A `datetime` does not, and excluding it costs nothing — its
+    ordinal is in seconds, so the count would be enormous and the two forms agree to within a
+    rounding error anyway. `bool` is excluded because `_ordinal` refuses it upstream.
+    """
+    lo, hi = bound
+    if isinstance(lo, bool) or isinstance(hi, bool):
+        return False
+    if isinstance(lo, int) and isinstance(hi, int):
+        return True
+    return (
+        isinstance(lo, datetime.date)
+        and isinstance(hi, datetime.date)
+        and not isinstance(lo, datetime.datetime)
+        and not isinstance(hi, datetime.datetime)
+    )
+
+
+def discrete_step_mass(bound: tuple[Any, Any] | None) -> float | None:
+    """`P(v = x)` implied by a discrete column's own bounds, or ``None``.
+
+    The uniform mass of one step across the `hi - lo + 1` values the range contains — the same
+    number `_fraction_below_bounds` divides by, and the same one
+    `_date_part_range_selectivity` uses for a bounded field like `month`.
+
+    Used only as a *fallback* where nothing has measured a distinct count. `_point_mass` answers
+    0 there, deliberately, so as not to invent a mass — but on a discrete column the mass is not
+    invented: it follows from the same uniformity assumption the CDF already rests on. Without it
+    the strict and non-strict comparisons cannot separate, and `d < min` came back as a quarter of
+    a four-value range rather than the nothing it is.
+    """
+    if bound is None or not _is_discrete(bound):
+        return None
+    lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
+    if lo is None or hi is None or hi < lo:
+        return None
+    return 1.0 / (hi - lo + 1)
+
+
 def _fraction_below_bounds(x: float, bound: tuple[Any, Any] | None) -> float | None:
-    """The fraction of rows ≤ `x` assuming values spread uniformly over `[min, max]`."""
+    """The fraction of rows ≤ `x` assuming values spread uniformly over `[min, max]`.
+
+    **Counted discretely for a discrete column** (see `_is_discrete`). The continuous form
+    `(x - lo) / (hi - lo)` answers a flat `0` at `x == lo`, because it cannot tell "below the
+    minimum" (genuinely zero) from "equal to the minimum" (every row holding it). That made
+    `d <= min` estimate **zero rows** for a predicate matching every row at the column's first
+    value — a partition boundary or a `>= min` sentinel, so often a large fraction of the table —
+    and a zero-row estimate is the worst kind to be wrong by, since build-side choice, join order,
+    broadcast sizing and the adaptive gate all read it as "this subtree is empty".
+
+    The discrete form spreads the rows over the `hi - lo + 1` values the range contains, so
+    `F(lo)` is one value's worth rather than none and `F(hi)` is still 1. It rests on the same
+    uniformity assumption as the continuous form, applied to the values that actually exist
+    rather than to a continuum they do not live on — and it is the form
+    `_date_part_range_selectivity` already uses for a bounded field like `month`, so this brings
+    the general path in line with it. A float or decimal column keeps the continuous form, where
+    the endpoint problem is real but unfixable from bounds alone: there is no "next" value to
+    divide by.
+    """
     if bound is None:
         return None
     lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
     if lo is None or hi is None:
         return None
-    if x <= lo:
+    if x < lo:
         return 0.0
     if x >= hi:
         return 1.0
     if hi == lo:
         return 1.0
+    if _is_discrete(bound):
+        # `floor(x)` because a fractional literal against a discrete column selects the same
+        # rows as the whole step below it: `i <= 2.5` is `i <= 2`.
+        return (math.floor(x) - lo + 1) / (hi - lo + 1)
     return (x - lo) / (hi - lo)
 
 
