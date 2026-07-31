@@ -430,12 +430,18 @@ where
         if arr.is_valid(i) {
             let g = g as usize;
             let v: &[u8] = arr.value(i).as_ref();
-            let replace = match &cur[g] {
-                None => true,
-                Some(c) => (is_min && v < c.as_slice()) || (!is_min && v > c.as_slice()),
-            };
-            if replace {
-                cur[g] = Some(v.to_vec());
+            // Overwrite the held bytes in place rather than allocating a fresh `Vec` for each
+            // new extreme. On input that arrives already ordered — a sorted file, a column
+            // read back from a sorted lakehouse table — every row is a new extreme, so the
+            // old form allocated once per *row* instead of once per group.
+            match &mut cur[g] {
+                slot @ None => *slot = Some(v.to_vec()),
+                Some(c) => {
+                    if (is_min && v < c.as_slice()) || (!is_min && v > c.as_slice()) {
+                        c.clear();
+                        c.extend_from_slice(v);
+                    }
+                }
             }
         }
     }
