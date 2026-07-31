@@ -1,6 +1,7 @@
 //! MEDIAN / continuous-quantile — exact, mergeable via a per-group value list
 //! (no dedup, unlike COUNT(DISTINCT)).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float64Builder, Int64Array, UInt32Array};
@@ -300,8 +301,12 @@ pub(crate) fn finalize_top_k(state: &ArrayRef, k: usize) -> Result<ArrayRef, Run
     for row in 0..list.len() {
         let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
         // (row bytes → count, first index) so the winner can be `take`n back out.
-        let mut seen: std::collections::HashMap<Vec<u8>, (i64, u32)> =
-            std::collections::HashMap::new();
+        //
+        // `ahash`, not std's SipHash: this map is rebuilt for every list row, so the per-probe
+        // hash is paid once per element per row, and `bc-runtime` already hashes its join and
+        // group tables this way. Safe by construction — the ranking below is a strict total
+        // order (distinct keys), so nothing observable comes from the map's iteration order.
+        let mut seen: HashMap<Vec<u8>, (i64, u32), ahash::RandomState> = HashMap::default();
         for i in lo..hi {
             if child.is_null(i) {
                 continue; // DuckDB's top-k ignores nulls, as every value aggregate does
@@ -355,7 +360,10 @@ fn per_group_value_counts(state: &ArrayRef) -> Result<Vec<Vec<i64>>, RuntimeErro
     let mut out = Vec::with_capacity(list.len());
     for row in 0..list.len() {
         let (lo, hi) = (offsets[row] as usize, offsets[row + 1] as usize);
-        let mut seen: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+        // `ahash` for the same reason as `finalize_mode`'s map. The hasher cannot reach the
+        // result: the only consumer sorts these counts before summing them, precisely because
+        // a hash map's iteration order is arbitrary and float addition is not associative.
+        let mut seen: HashMap<Vec<u8>, i64, ahash::RandomState> = HashMap::default();
         for i in lo..hi {
             if child.is_null(i) {
                 continue;
