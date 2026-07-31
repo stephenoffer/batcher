@@ -11,6 +11,8 @@ however many are free.
   per-power-zone budgets, and an efficiency order for a heterogeneous fleet.
 * `residency` is where a sovereignty rule reaches the scheduler: the nodes whose region every
   input of a stage permits.
+* `shape` projects the same live topology onto the neutral `plan.resource.ClusterShape`, which
+  is how the optimizer — forbidden from importing `dist` — gets to see the fleet at all.
 
 Both degrade to the pre-existing, topology-blind behavior when the cluster is unreadable or
 unlabelled, because a placement hint that fires on missing data moves work for a reason that is
@@ -31,6 +33,7 @@ from batcher.dist.executors.ray_runtime.fabric.residency import (
     permitted_nodes,
     residency_report,
 )
+from batcher.dist.executors.ray_runtime.fabric.shape import cluster_shape
 from batcher.dist.executors.ray_runtime.fabric.topology import (
     FABRIC_LABEL,
     LINK_CLASSES,
@@ -53,6 +56,7 @@ __all__ = [
     "RACK_LABEL",
     "CollectivePlacement",
     "GpuNodeTopology",
+    "cluster_shape",
     "devices_within_power_budget",
     "domain_groups",
     "fits_one_domain",

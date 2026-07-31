@@ -355,6 +355,10 @@ def cluster_hardware_profile() -> HardwareProfile | None:
     VRAM budget is `one_gpu_gb * gpu_count`), so reporting nodes under-counted an 8-GPU box
     eightfold and refused work the cluster could hold.
 
+    `cluster` carries what the binding-node fields cannot: how those devices and cores are
+    *distributed* (see `plan.resource.cluster`), and the binding device model is derived from
+    it rather than restated here.
+
     Returns `None` when the topology is unreadable (Ray down), so the caller falls back to the
     single-node local profile rather than a fabricated one.
     """
@@ -364,14 +368,15 @@ def cluster_hardware_profile() -> HardwareProfile | None:
     worker_count = len(classes)
     min_cores = min((int(c["cpus"]) for c in classes if c["cpus"] > 0), default=0)
     gpu_devices = int(sum(c["gpus"] for c in classes))
+    from batcher.dist.executors.ray_runtime.fabric.shape import cluster_shape
     from batcher.dist.executors.ray_runtime.hardware_probe import (
         cluster_l3_cache_bytes,
         warn_once_if_fleet_is_mixed,
     )
 
     warn_once_if_fleet_is_mixed()
-
     return HardwareProfile.for_cluster(
+        cluster=cluster_shape(),
         cpu_cores=min_cores,
         memory_bytes=worker_node_memory_bytes(),
         worker_count=worker_count,

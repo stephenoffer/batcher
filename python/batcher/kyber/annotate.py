@@ -18,6 +18,7 @@ from batcher._internal.logging import note_suppressed
 from batcher.config import Config
 from batcher.kyber.cardinality import CardinalityEstimator
 from batcher.kyber.cost import CostModel
+from batcher.kyber.cost.placement import prefers_locality as placement_advice
 from batcher.kyber.cpu_shares import class_ir_tag, recommend_num_cpus
 from batcher.plan.ids import OpId
 from batcher.plan.logical import LogicalPlan
@@ -332,6 +333,7 @@ def annotate_ops(
     config: Config,
     cost_model: CostModel,
     cpu_util: dict[str, float] | None = None,
+    hardware=None,
 ) -> tuple[PhysicalOp, ...]:
     """Tag each operator with its estimated rows + memory envelope for Carbonite.
 
@@ -342,6 +344,11 @@ def annotate_ops(
     `cpu_util` is the learned per-kind CPU utilization (from prior runs); when a kind
     has a measurement it overrides the static CPU-share prior, so the per-task
     `num_cpus` request adapts to how CPU-bound each operator family actually is.
+
+    `hardware` is the `HardwareProfile` the plan targets. Only the PACK/SPREAD preference
+    reads it, and only through `cost.placement`, which falls back to the absolute byte
+    threshold whenever the fleet's shape is unknown — so `None`, what a caller without a
+    profile passes, reproduces the previous placement decision exactly.
 
     Each op also carries the feedback keys Core echoes back (see `PlanProperties`).
     """
@@ -409,13 +416,22 @@ def annotate_ops(
                 in_rows = sum(usable) if len(usable) == len(child_rows) else rows
                 in_rows = in_rows or rows
                 n_par = _desired_parallelism(in_rows, width, target_rows, target_bytes)
-                # A breaker whose shuffle volume is small enough to keep node-local prefers
-                # PACK over SPREAD: co-locating its few workers avoids a cross-node shuffle that
-                # buys nothing. Large shuffles keep SPREAD so the network load distributes; dist
-                # makes the final call. This is a *network* threshold (`locality_max_bytes`),
+                # PACK or SPREAD. A shuffle small enough to keep node-local prefers PACK —
+                # co-locating a handful of workers avoids a cross-node exchange that buys
+                # nothing — and that is a *network* threshold (`locality_max_bytes`),
                 # deliberately separate from the *cache*-sized broadcast threshold the two used
-                # to share — an L3-derived broadcast size must not drag this placement choice.
-                prefers_local = int(in_rows * width) <= config.optimizer.locality_max_bytes
+                # to share. Above it the answer used to be an unconditional SPREAD, which is
+                # wrong on a dense fleet in the one direction that costs most: packing a gang
+                # onto two eight-way nodes moves half of a large exchange off the NIC and onto
+                # host memory, and the saving grows with the shuffle rather than shrinking.
+                # `cost.placement` weighs that, and falls back to exactly this threshold
+                # wherever the fleet's shape is unreadable. `dist` makes the final call.
+                prefers_local = placement_advice(
+                    hardware,
+                    n_par,
+                    in_rows * width,
+                    config.optimizer.locality_max_bytes,
+                ).pack
             else:
                 n_par = 0
             # Desired credit window: enough in-flight batch slots to cover one task's

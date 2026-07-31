@@ -61,5 +61,6 @@ class OptimizerContext:
                 self.estimator,
                 self.config.optimizer.cost_coeffs,
                 workers=self.hardware.worker_count,
+                hardware=self.hardware,
             )
         return self.cost_model

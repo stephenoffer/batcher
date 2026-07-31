@@ -179,12 +179,37 @@ def _hardware_key(hardware: Any) -> str:
     threshold, so reusing the driver's cached plan for the cluster run would ship the wrong one.
     Keyed only on the fields that actually steer a decision (`|`-free integers), so an
     unchanged machine keeps hitting its cached plan.
+
+    The fleet's **shape** is keyed too, and by structure rather than by identity. Thirty-two
+    devices on four nodes and thirty-two on thirty-two produce identical values for every scalar
+    field above while ranking a shuffle a factor of eight apart, so a key built from the scalars
+    alone would serve one fleet's plan to the other. Keyed on the *shape* — node count, device
+    density, domain width, rack spread — and not on node ids, so an autoscaler replacing a node
+    with an identical one keeps its cached plans instead of re-optimizing the workload from
+    scratch on every reschedule.
     """
     if hardware is None:
         return "-"
     h = hardware
-    return (
+    scalars = (
         f"{h.cpu_cores},{h.memory_bytes},{h.l3_cache_bytes},{h.gpu_memory_bytes},{h.worker_count}"
+    )
+    return f"{scalars},{_cluster_key(getattr(h, 'cluster', None))}"
+
+
+def _cluster_key(cluster: Any) -> str:
+    """A structural fingerprint of the fleet, or ``"-"`` when its shape is unknown.
+
+    Deliberately lossy: the counts that change a ranking, not the nodes that carry them. Two
+    fleets that agree on every figure here rank every plan identically, which is exactly the
+    condition for sharing a memoized plan.
+    """
+    if cluster is None or not getattr(cluster, "known", False):
+        return "-"
+    return (
+        f"{cluster.node_count}n{len(cluster.gpu_nodes)}g{cluster.total_gpus}d"
+        f"{cluster.max_gpus_per_node}x{cluster.largest_nvlink_domain}v"
+        f"{cluster.racks}r{len(cluster.device_models)}m"
     )
 
 

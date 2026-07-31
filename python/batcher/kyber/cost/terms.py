@@ -56,17 +56,44 @@ _SPILL_WRITE_READ_PASSES = 2.0
 _EXTERNAL_MERGE_RUN_BUFFER_BYTES = 1 << 20
 
 
-def memory_budget() -> float:
+def memory_budget(worker_memory_bytes: int = 0) -> float:
     """The working-set budget an operator has before it must spill, in bytes.
 
     The same static envelope the data plane is given, so the cost model's idea of "this
     will spill" is the engine's. `0` means the user opted out of bounded memory entirely,
     in which case nothing spills and the spill terms vanish.
 
+    **The config figure is sensed on the driver.** `api.orchestration.autoconfig` fills
+    `max_memory_bytes` from this process's live free RAM, and on the usual cluster shape the
+    driver is a fat head node next to small workers. The plan is then ranked against a budget
+    no worker has: an operator whose state sits between the worker's memory and the driver's
+    is predicted not to spill, and `terms` itself calls costing a spill at zero "the single
+    largest cost error a plan can contain". This is the same gap `cluster_hardware_profile`
+    closes for the cache- and memory-sized thresholds elsewhere in the optimizer.
+
+    The two figures combine with `min`, never by substitution, because they are not
+    interchangeable and each is wrong in a different direction. The config value is *free* RAM
+    on the driver; `HardwareProfile.memory_bytes` is the binding worker's *total* RAM. Taking
+    the smaller keeps a single-node run exactly where it was (a machine's total RAM always
+    exceeds its free RAM, so the sensed value wins), fixes the fat-driver cluster (the worker's
+    figure wins), and errs toward predicting a spill that does not happen on the reverse shape
+    — which costs a pessimistic ranking rather than an unbudgeted spill.
+
+    Args:
+        worker_memory_bytes: Usable RAM on the node the operator will actually run on, from
+            `HardwareProfile.memory_bytes`. `0` — what every caller without a profile passes —
+            uses the config budget alone, exactly as before.
+
     Returns:
         The per-operator spill budget in bytes.
     """
-    return float(active_config().spill_budget_bytes())
+    configured = float(active_config().spill_budget_bytes())
+    if worker_memory_bytes <= 0 or configured <= 0.0:
+        # A zero configured budget is the explicit opt-out of bounded memory, and a worker
+        # figure must not re-arm it: the user asked for nothing to spill.
+        return configured
+    worker = float(worker_memory_bytes) * active_config().memory.hard_limit
+    return min(configured, worker)
 
 
 def cache_factor(state_bytes: float) -> float:
@@ -89,7 +116,7 @@ def cache_factor(state_bytes: float) -> float:
     return min(_CACHE_MISS_MAX_FACTOR, 1.0 + _CACHE_MISS_PENALTY_PER_OCTAVE * octaves)
 
 
-def spill_io(state_bytes: float) -> float:
+def spill_io(state_bytes: float, budget: float | None = None) -> float:
     """Bytes of spill IO an operator whose state is `state_bytes` will move.
 
     Zero while the state fits the memory budget. Past it, everything that does not fit is
@@ -103,17 +130,20 @@ def spill_io(state_bytes: float) -> float:
 
     Args:
         state_bytes: The operator's resident state size.
+        budget: The spill threshold, or `None` to read the configured one. A caller with a
+            `HardwareProfile` passes the worker-aware budget so the prediction is about the
+            node the operator runs on rather than about the driver.
 
     Returns:
         Spill bytes on the `io` axis, `0.0` when the state fits.
     """
-    budget = memory_budget()
+    budget = memory_budget() if budget is None else budget
     if budget <= 0.0 or state_bytes <= budget:
         return 0.0
     return _SPILL_WRITE_READ_PASSES * (state_bytes - budget) * spill_device_factor()
 
 
-def merge_passes(state_bytes: float) -> float:
+def merge_passes(state_bytes: float, budget: float | None = None) -> float:
     """External-merge passes an out-of-core sort of `state_bytes` needs.
 
     A sort that does not fit runs `ceil(log_F(state/budget))` merge passes, each of which
@@ -125,11 +155,12 @@ def merge_passes(state_bytes: float) -> float:
 
     Args:
         state_bytes: The sort's total state size.
+        budget: The spill threshold, or `None` to read the configured one.
 
     Returns:
         The number of merge passes, `0.0` when the sort fits in memory.
     """
-    budget = memory_budget()
+    budget = memory_budget() if budget is None else budget
     if budget <= 0.0 or state_bytes <= budget:
         return 0.0
     runs = state_bytes / budget
@@ -137,7 +168,7 @@ def merge_passes(state_bytes: float) -> float:
     return max(1.0, math.ceil(math.log(runs, fan_in)))
 
 
-def merge_io(state_bytes: float) -> float:
+def merge_io(state_bytes: float, budget: float | None = None) -> float:
     """Bytes an out-of-core sort of `state_bytes` moves, across all its merge passes.
 
     A sort rewrites its runs once per merge pass, so unlike a hash operator's one-shot
@@ -145,13 +176,13 @@ def merge_io(state_bytes: float) -> float:
 
     Args:
         state_bytes: The sort's total state size.
+        budget: The spill threshold, or `None` to read the configured one.
 
     Returns:
         Spill bytes on the `io` axis, `0.0` when the sort fits in memory.
     """
-    return (
-        _SPILL_WRITE_READ_PASSES * state_bytes * merge_passes(state_bytes) * spill_device_factor()
-    )
+    passes = merge_passes(state_bytes, budget)
+    return _SPILL_WRITE_READ_PASSES * state_bytes * passes * spill_device_factor()
 
 
 def sort_comparisons(n: float, heap: float) -> float:
