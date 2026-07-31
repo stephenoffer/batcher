@@ -155,6 +155,10 @@ exclude_patterns = [
     # exchange schedule, and the first Rust data-plane work in this area. Same reason again —
     # it carries an explicit "decided against reported" register and a "not done" list.
     "internals/gpu_fabric_program.md",
+    # The record of the cluster-topology work that gave the optimizer the fleet's shape. Same
+    # reason as the program above: it carries an explicit "not done" register and an explicit
+    # "not benchmarked" caveat, neither of which belongs on a published page.
+    "internals/cluster_topology_program.md",
     # Design proposal (RFC), not a published page — kept in-tree for contributors,
     # excluded from the site build until/unless its proposals are accepted.
     "internals/rfc-gpu-transport.md",
