@@ -208,22 +208,116 @@ def _evict_stale_configurations(key: tuple, registry: dict) -> None:
                 ray.kill(actor)
 
 
-def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict) -> list:
+def _resident_pool_for(
+    plan0: LogicalPlan, opts: dict, size: int, registry: dict, devices: int = 0
+) -> list:
     """The resident actor pool for `plan0` in `registry` (built once, reused after).
 
     The model is built in each actor's `__init__`, so reuse means it loads once per
     registry lifetime (a query scope, or the whole session for the warm registry). A pool
     whose actors have died (preemption between reuses) is healed — dead actors are dropped
-    and respawned to the requested size — so a session-warm pool survives node churn."""
+    and respawned to the requested size — so a session-warm pool survives node churn.
+
+    `devices` (non-zero only on a *first*, unmeasured run) asks for the cold-start fill: the
+    pool starts at one actor per device, and once the models have loaded their footprint is
+    read and a second actor per device is added if the device shows room. That is what gives
+    run 0 the packing the measured loop would otherwise only reach on run 1 — and it cannot
+    over-pack, because it grows on a measurement rather than on a guess.
+    """
     sig = _pool_key(plan0, opts)
     _evict_stale_configurations(sig, registry)
     pool = registry.get(sig)
     pool = _healthy_actors(pool) if pool else []
     if len(pool) < max(1, size):
         pool = pool + [_new_map_actor(plan0, opts) for _ in range(max(1, size) - len(pool))]
+    if devices > 0:
+        want = devices * _cold_start_density(pool)
+        if want > len(pool):
+            pool = pool + [_new_map_actor(plan0, opts) for _ in range(want - len(pool))]
     registry[sig] = pool
     _pin_pool_key(sig, plan0)
     return pool
+
+
+#: A partition ceiling high enough that `gpu_aware_pool_default`'s "never more actors than
+#: partitions" clamp cannot bind while we are asking it how many actors the devices want.
+_UNCLAMPED_PARTITIONS = 1 << 30
+
+
+def _pool_partition_count(
+    workers: int,
+    num_gpus: float,
+    accelerator_type: str | None,
+    resources: dict[str, float] | None,
+    concurrency: object,
+) -> int:
+    """Partitions for an accelerator actor pool: at least one per actor the devices want.
+
+    The pool is sized by devices and then clamped to the partition count so no actor sits
+    idle — which inverts the causality, because the partition count is sized from *data*. A
+    2.4 GB image corpus is under one `target_bytes_per_task`, so it took the four-partition
+    floor, and four partitions is what decided that a twelve-actor pool would run four
+    actors. The data was choosing how many accelerators were allowed to work.
+
+    One partition per actor, not more: an inference partition carries its own dispatch, lazy
+    source and result gather, so over-sharding costs real time — sizing these at
+    `replicas x submit-depth` instead measured **1,287 img/s against 2,576** for the same
+    work. The aim is that no device is idle, not that every device is oversubscribed.
+
+    Never below the caller's `workers`, and a partition count only shards, so the merged
+    result is identical for any value.
+    """
+    if concurrency is not None:  # the caller sized their own pool; don't second-guess it
+        return workers
+    from batcher.ml.gpu import gpu_aware_pool_default
+
+    replicas = gpu_aware_pool_default(
+        num_gpus, workers, _UNCLAMPED_PARTITIONS, accelerator_type, resources=resources
+    )
+    return max(workers, replicas)
+
+
+def _cold_start_devices(hub, plan: LogicalPlan, concurrency: object, num_gpus: float) -> int:
+    """Accelerators to fill on a first, unmeasured run — 0 when the cold fill does not apply.
+
+    Applies only when every one of these holds: the stage asked for an accelerator, it left
+    `concurrency` to the engine, and nothing has been measured for this pipeline yet. The
+    last is what keeps this a *cold start* rather than a competing policy: from the first
+    recorded utilization onward, `recommend_num_gpus` owns the density and this returns 0.
+    """
+    if concurrency is not None or num_gpus <= 0:
+        return 0
+    try:
+        import ray
+
+        from batcher.ml.gpu import gpu_feedback_key, load_gpu_utilization
+
+        if load_gpu_utilization(_learning_hub(hub), gpu_feedback_key(plan)) is not None:
+            return 0
+        return int(float(ray.cluster_resources().get("GPU", 0.0)))
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "size the cold-start accelerator fill", exc)
+        return 0
+
+
+def _cold_start_density(pool: list) -> int:
+    """Actors per device this pool's *measured* model footprint leaves room for.
+
+    Reads one loaded actor rather than all of them: they run the same model on the same
+    device class, so the first answer is the answer. Falls back to 1 — unpacked, the previous
+    behaviour — if nothing can be measured, so a device is never packed on a guess.
+    """
+    import ray
+
+    from batcher.ml.gpu import cold_start_actors_per_device
+
+    if not pool:
+        return 1
+    try:
+        return cold_start_actors_per_device(ray.get(pool[0].loaded_vram.remote()))
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "probe the loaded model's VRAM for cold-start packing", exc)
+        return 1
 
 
 def _healthy_actors(pool: list) -> list:
@@ -341,7 +435,7 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
     return results
 
 
-def _run_resident_pool(plan0, partitions, opts, size, registry):
+def _run_resident_pool(plan0, partitions, opts, size, registry, devices: int = 0):
     """Map `partitions` through the resident pool for `plan0` in `registry` (model loaded
     once), preserving submission order.
 
@@ -352,14 +446,14 @@ def _run_resident_pool(plan0, partitions, opts, size, registry):
     """
     import ray
 
-    actors = _resident_pool_for(plan0, opts, size, registry)
+    actors = _resident_pool_for(plan0, opts, size, registry, devices)
     results = _pipeline_actor_pool(actors, partitions, _actor_inflight_depth())
     samples = [s for s in ray.get([a.gpu_stats.remote() for a in actors]) if s is not None]
     vram = [v for v in (_drain_gpu_vram(a) for a in actors) if v is not None]
     return results, (max(samples) if samples else None), (max(vram) if vram else None)
 
 
-def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope):
+def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope, devices: int = 0):
     """Run `partitions` through the query-resident pool for `plan0`, healing a lost pool.
 
     The `resident_inference_pools()` scope reuses one model-loaded pool across a query's
@@ -375,7 +469,7 @@ def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope):
     from batcher.dist.executors.ray_runtime import recovery_policy
 
     try:
-        return _run_resident_pool(plan0, partitions, opts, hi, scope)
+        return _run_resident_pool(plan0, partitions, opts, hi, scope, devices)
     except RayError:
         _evict_scoped_pool(plan0, scope)
         return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
@@ -386,7 +480,7 @@ def _evict_scoped_pool(plan0, scope) -> None:
     _evict_pipeline_pools(plan0, scope)
 
 
-def _run_warm_pool(plan0, partitions, opts, lo, hi):
+def _run_warm_pool(plan0, partitions, opts, lo, hi, devices: int = 0):
     """Run `partitions` through the SESSION-warm pool for `plan0`, healing a lost pool.
 
     On the rare case the warm pool loses actors mid-run (a node preempted after the liveness
@@ -398,7 +492,7 @@ def _run_warm_pool(plan0, partitions, opts, lo, hi):
     from batcher.dist.executors.ray_runtime import recovery_policy
 
     try:
-        return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS)
+        return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS, devices)
     except RayError:
         _evict_session_pool(plan0)
         return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
@@ -530,7 +624,11 @@ def _distributed_map(
     # `partition_descriptors` row-balances those partitions across every worker, so a source
     # arriving as one large batch fans out evenly (one balanced slice per GPU actor) instead
     # of landing whole on worker 0.
-    n_parts = workers if wants_pool else _adaptive_partition_count(sources[sid], plan, workers, hub)
+    n_parts = (
+        _pool_partition_count(workers, num_gpus, accelerator_type, resources, concurrency)
+        if wants_pool
+        else _adaptive_partition_count(sources[sid], plan, workers, hub)
+    )
     proj, pred = _scan_pushdown(plan0)
     partitions = partition_descriptors(
         sources[sid], n_parts, projection=proj, predicate=pred, preserve_order=preserve_order
@@ -558,6 +656,15 @@ def _distributed_map(
                 if learned is not None:
                     lo = hi = learned
         _record_actor_pool_reuse(hub, plan0, len(partitions))
+        # A first, unmeasured run starts at one actor per device and fills the devices from
+        # the model's measured footprint once it has loaded (`_resident_pool_for`). Without
+        # this, run 0 of every new pipeline is the unpacked configuration the measured loop
+        # exists to replace — which for a single-shot job is the only configuration it ever
+        # gets. Zero (no cold fill) as soon as anything has been measured, and for an
+        # explicit `concurrency`, which is the caller sizing their own pool.
+        cold_devices = _cold_start_devices(hub, plan, concurrency, num_gpus)
+        if cold_devices:
+            lo = hi = max(1, cold_devices)
         # Pick the pool lifetime: an explicit `resident_inference_pools()` scope (query
         # lifetime) wins; else the SESSION-warm registry when `warm_inference_pools` is on
         # (model loads once per session, reused across `collect()`s — the 2x win on repeated
@@ -575,9 +682,13 @@ def _distributed_map(
                 plan0, partitions, opts, lo, hi, recovery_policy(), write_spec
             )
         elif scope is not None:
-            results, gpu_util, gpu_vram = _run_scoped_pool(plan0, partitions, opts, lo, hi, scope)
+            results, gpu_util, gpu_vram = _run_scoped_pool(
+                plan0, partitions, opts, lo, hi, scope, cold_devices
+            )
         elif warm:
-            results, gpu_util, gpu_vram = _run_warm_pool(plan0, partitions, opts, lo, hi)
+            results, gpu_util, gpu_vram = _run_warm_pool(
+                plan0, partitions, opts, lo, hi, cold_devices
+            )
         else:
             results, gpu_util, gpu_vram = _drive_actor_pool(
                 plan0, partitions, opts, lo, hi, recovery_policy()
@@ -1430,15 +1541,32 @@ class _MapActor:
         `recommend_num_gpus` and `recommend_inflight_depth` are defined against, and a peak
         reading silently keeps both of them from ever firing (see `SustainedUtilization`).
 
+        Draining rather than reading: the window is scoped to a *run*. A warm actor outlives
+        the run that used it, and a window left open keeps accumulating the idle time between
+        runs — which reported 25.7% for a pool that had just held four T4s at 92.7%.
+
         Doubles as this pool's liveness probe (`_live_actors`), so it must stay cheap and
-        must never raise: it reads two accumulated counters.
+        must never raise: it reads two accumulated counters. The probe runs immediately
+        before a run dispatches, which is exactly where the window should open.
         """
-        return self._util.mean()
+        return self._util.drain()
 
     def gpu_vram_stats(self) -> float | None:
         """The peak VRAM fraction this actor observed, or `None` if no GPU — the memory
         twin of `gpu_stats`, sized so the next run packs actors by measured footprint."""
         return self._gpu_vram_max
+
+    def loaded_vram(self) -> float | None:
+        """VRAM the device holds *now* — after the model load, before any batch has run.
+
+        The one fact about an opaque model that is available without a prior execution, and
+        therefore the only thing a *first* run can size its packing from. Ray queues actor
+        methods behind the constructor, so simply calling this also waits for the load to
+        finish, which is what makes the answer meaningful rather than a race.
+        """
+        from batcher.ml.gpu import sample_gpu_vram_fraction
+
+        return sample_gpu_vram_fraction()
 
 
 # Threads a CPU (preprocess/decode) stage runs inside a GPU inference actor, so it keeps a

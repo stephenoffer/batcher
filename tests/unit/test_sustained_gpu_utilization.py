@@ -122,3 +122,32 @@ def test_the_sustained_reading_is_what_turns_the_packing_levers(monkeypatch) -> 
         assert recommend_inflight_depth(sustained, 2) > 2
     finally:
         monitor.close()
+
+
+def test_the_window_is_scoped_to_a_run_not_to_the_actor(monkeypatch) -> None:
+    """A warm actor outlives its run; a window left open accumulates the idle time between.
+
+    Measured: a pool that had just held four T4s at 92.7% through a 5.7-second run reported
+    25.7%, because its window still contained the half-minute of driver-side work since the
+    previous run — and the packing loop, reading 25.7%, doubled a pool already saturated.
+    """
+    monitor = _monitor(monkeypatch, [0.9])
+    try:
+        _drain(monitor, 0.1)
+        assert monitor.drain() == pytest.approx(0.9, abs=0.05)
+        # The gap between runs must not land in the next run's reading.
+        monkeypatch.setattr("batcher.ml.gpu.sample_gpu_utilization", lambda: 0.0)
+        time.sleep(0.1)
+        monkeypatch.setattr("batcher.ml.gpu.sample_gpu_utilization", lambda: 0.9)
+        _drain(monitor, 0.1)
+        assert monitor.drain() == pytest.approx(0.9, abs=0.1)
+    finally:
+        monitor.close()
+
+
+def test_draining_an_unused_actor_reports_nothing(monkeypatch) -> None:
+    monitor = _monitor(monkeypatch, [0.9])
+    try:
+        assert monitor.drain() is None
+    finally:
+        monitor.close()
