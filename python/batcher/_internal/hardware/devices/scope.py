@@ -37,19 +37,65 @@ from dataclasses import dataclass
 from batcher._internal.hardware.nvml import device_telemetry
 
 __all__ = [
+    "DEVICE_ORDER_ENV",
+    "PCI_BUS_ORDER",
     "VISIBLE_DEVICE_ENVS",
     "DeviceScope",
+    "current_ordinal",
     "current_physical_index",
     "device_free_bytes",
+    "device_order_env",
     "device_scope",
     "min_visible_capacity_bytes",
     "visible_device_indices",
+    "visible_device_telemetry",
 ]
 
 #: The environment variables a scheduler pins a process's *visible* devices through, in
 #: priority order. NVIDIA and HIP both honor ``CUDA_VISIBLE_DEVICES``; AMD ROCm adds its own
 #: two. A host runs one vendor, so consulting all three is safe and the first one set wins.
 VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+
+#: The variable that decides how the CUDA runtime *numbers* devices.
+DEVICE_ORDER_ENV = "CUDA_DEVICE_ORDER"
+
+#: The one ordering under which a CUDA ordinal and an NVML index mean the same board.
+PCI_BUS_ORDER = "PCI_BUS_ID"
+
+
+def device_order_env(process_env: dict[str, str] | None = None) -> dict[str, str]:
+    """The device-ordering variable a worker needs set, or `{}` when it is already decided.
+
+    This whole module translates between two numberings — the ordinals a framework uses and the
+    indices NVML reports — and every translation in it assumes the two enumerate in the same
+    order. **Unset, they do not.** The CUDA runtime defaults to ``FASTEST_FIRST``, which sorts
+    devices by capability, while NVML always enumerates by PCI bus address. On a node whose
+    boards are identical the two orders coincide and nothing is wrong; on a mixed node — an L4
+    beside an A100, a fleet part-way through an upgrade, a box with a display adapter in it —
+    they do not, and then:
+
+    * ``CUDA_VISIBLE_DEVICES=1`` selects a different board than `visible_device_indices` reports,
+      so the pool is sized against one device's capacity and reserved on another;
+    * `current_physical_index` names the wrong board, so its telemetry, its NUMA node, and its
+      health verdict all belong to a device this process is not using;
+    * `feeder_cpus_for_device` binds the worker's decode threads to the wrong socket.
+
+    None of it raises, and none of it reproduces on a homogeneous node, which is every node
+    anybody develops on. Pinning the order to PCI is what makes the assumption true rather than
+    merely usual, and it costs nothing where it was already true.
+
+    Args:
+        process_env: The environment to inspect, or `None` for this process's own.
+
+    Returns:
+        ``{"CUDA_DEVICE_ORDER": "PCI_BUS_ID"}``, or an empty dict when the deployment has
+        already set the variable — including to something else, which is a decision with a
+        reason no probe can see.
+    """
+    ambient = os.environ if process_env is None else process_env
+    if ambient.get(DEVICE_ORDER_ENV, "").strip():
+        return {}
+    return {DEVICE_ORDER_ENV: PCI_BUS_ORDER}
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +211,7 @@ def current_physical_index() -> int | None:
     indices = visible_device_indices()
     if not indices:
         return None
-    ordinal = _current_ordinal()
+    ordinal = current_ordinal()
     if ordinal is None or ordinal >= len(indices):
         return indices[0]
     return indices[ordinal]
@@ -197,6 +243,38 @@ def device_free_bytes(index: int | None = None) -> int | None:
 def min_visible_capacity_bytes() -> int | None:
     """The smallest visible device's total memory — see `DeviceScope.min_capacity_bytes`."""
     return device_scope().min_capacity_bytes
+
+
+def visible_device_telemetry():
+    """Live readings for the devices **this process may use**, in visibility order.
+
+    `nvml.device_telemetry` reports every device on the host, which is the right answer for a
+    monitor and the wrong one for a worker deciding anything about itself. A pinned actor on an
+    eight-device node that averages, minimizes, or maximizes over all eight is reading seven
+    boards it cannot touch: its utilization advice is diluted by idle neighbours, and its memory
+    sizing is bounded by whichever stranger happens to be busiest. Both readings look plausible
+    and neither is about this process.
+
+    Falls back to the full host list when nothing is pinned — an unpinned process really can
+    use every device — and when the visibility value cannot be resolved, which is the same
+    conservative reading `visible_device_indices` already takes.
+
+    Returns:
+        The visible subset of `nvml.device_telemetry()`, in the order visibility named the
+        devices. Empty when telemetry is unavailable.
+    """
+    # Resolved through the module at call time rather than through this file's own bound name.
+    # The readings are the one thing every test of a caller has to fake, and they all fake it
+    # by patching `nvml.device_telemetry` — which a name bound at import silently ignores,
+    # leaving the test passing against the real (empty) host instead of the fixture it wrote.
+    from batcher._internal.hardware import nvml
+
+    readings = nvml.device_telemetry()
+    if not readings:
+        return ()
+    by_index = {r.index: r for r in readings}
+    visible = [by_index[i] for i in visible_device_indices() if i in by_index]
+    return tuple(visible) if visible else readings
 
 
 def device_scope() -> DeviceScope:
@@ -246,11 +324,20 @@ def _visibility_env() -> tuple[str, bool]:
 
 
 def _resolve(raw: str, telemetry) -> tuple[int, ...]:
-    """Map one visibility value onto physical indices.
+    """Map one visibility value onto physical indices, as the CUDA runtime itself would.
 
-    An entry that resolves to nothing is skipped rather than failing the whole parse: a stale
-    UUID for a device that has since been replaced should cost that one device, not the
-    process's entire view of the node.
+    **The list is truncated at the first entry that names no live device, not filtered.** That
+    is what the runtime does, and the difference is a mis-mapping rather than a missing device:
+    given ``CUDA_VISIBLE_DEVICES=0,9,1`` on a four-device node, CUDA exposes exactly one device
+    and calls it ordinal 0. Skipping the bad entry instead yields `(0, 1)`, so ordinal 1 maps
+    to physical device 1 — a board this process cannot address — and every reading taken
+    against it (its free memory, its NUMA node, its link) belongs to a device the framework
+    will never place work on.
+
+    A value where *nothing* resolves is a different case and still falls back to the whole
+    host: that is a value this code does not understand rather than a device list it disagrees
+    with, and the conservative reading of "I cannot tell which device is mine" is the one every
+    caller already handles.
     """
     if not raw:
         return ()
@@ -259,12 +346,10 @@ def _resolve(raw: str, telemetry) -> tuple[int, ...]:
     out: list[int] = []
     for token in (t.strip() for t in raw.split(",")):
         index = _resolve_token(token, by_uuid, count)
-        if index is not None and index not in out:
+        if index is None:
+            break
+        if index not in out:
             out.append(index)
-    # An unparseable value is not evidence that this process owns the node. It is a value this
-    # code does not understand, and the conservative reading of "I cannot tell which device is
-    # mine" is the whole host — which is what an unpinned process gets, and what every caller
-    # already handled.
     return tuple(out) if out else tuple(t.index for t in telemetry)
 
 
@@ -289,20 +374,50 @@ def _resolve_token(token: str, by_uuid: dict[str, int], count: int) -> int | Non
     return None
 
 
-def _current_ordinal() -> int | None:
-    """The framework's current device ordinal, or `None` when there is no framework."""
+def current_ordinal() -> int | None:
+    """The device ordinal this process is computing on, as CUDA numbers it, or `None`.
+
+    "Ordinal" is the framework-visible index — `0` for the first device
+    ``CUDA_VISIBLE_DEVICES`` names, whatever physical board that is. `current_physical_index`
+    translates it; this is the untranslated half, and it is what RMM's per-device resource
+    table is keyed by.
+
+    Asked of whichever accelerator library is **already loaded**, never by importing one: this
+    is on the path of a decision about placement, and importing torch to answer it would cost
+    more than the decision saves and would initialize a CUDA context as a side effect. A
+    relational cuDF worker has no torch at all, which is why CuPy and Numba are consulted too —
+    without them that worker reported "no framework" and every caller fell back to ordinal
+    zero, which is right on a one-device node and silently wrong on the eight-device nodes this
+    engine is meant to run on.
+
+    Returns:
+        The current ordinal, or `None` when no accelerator library in this process can say.
+    """
     import sys
 
-    torch = sys.modules.get("torch")  # never import torch to answer a placement question
-    if torch is None:
-        return None
-    for name in ("cuda", "xpu"):
-        backend = getattr(torch, name, None)
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        for name in ("cuda", "xpu"):
+            backend = getattr(torch, name, None)
+            try:
+                if backend is not None and backend.is_available():
+                    return int(backend.current_device())
+            except Exception:
+                continue
+    cupy = sys.modules.get("cupy")
+    if cupy is not None:
         try:
-            if backend is not None and backend.is_available():
-                return int(backend.current_device())
+            return int(cupy.cuda.runtime.getDevice())
         except Exception:
-            continue
+            pass
+    numba = sys.modules.get("numba")
+    if numba is not None:
+        try:
+            from numba import cuda as numba_cuda
+
+            return int(numba_cuda.get_current_device().id)
+        except Exception:
+            pass
     return None
 
 

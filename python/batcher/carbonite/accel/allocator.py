@@ -36,6 +36,7 @@ import threading
 from dataclasses import dataclass
 
 from batcher._internal.logging import note_suppressed
+from batcher.carbonite.accel.device.rmm_adopt import adopt_rmm_everywhere, install_rmm_resource
 
 __all__ = [
     "AllocatorPlan",
@@ -58,6 +59,12 @@ _ALIGN = 256 << 20
 _lock = threading.Lock()
 _applied: AllocatorPlan | None = None
 _statistics_adaptor = None
+#: `prepare_device_memory`'s own settled answer, per `tenants` value it has been asked for.
+#: Distinct from `_applied`, which records only a plan that was successfully *installed*: a
+#: worker where RMM is absent or the device refused the reservation never sets `_applied`, so
+#: keying the early return on it re-priced the device on every single shard — three NVML round
+#: trips, measured at 414 ms — for a plan that had already been decided and could not change.
+_prepared: dict[int, bool] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,11 +190,15 @@ def _apply_resource(plan: AllocatorPlan) -> bool:
             if adaptor is not None:
                 resource = adaptor(resource)
                 _statistics_adaptor = resource
-        rmm.mr.set_current_device_resource(resource)
+        install_rmm_resource(rmm, resource)
     except Exception as exc:  # pragma: no cover - a device-side refusal
         note_suppressed("carbonite", f"install a {plan.allocator} device allocator", exc)
         _statistics_adaptor = None
         return False
+    # cuDF is not the only library allocating out of this device: CuPy and Numba each ship their
+    # own allocator, and a second pool on one board is what turns a healthy reservation into an
+    # out-of-memory nobody can account for. See `device.rmm_adopt`.
+    adopt_rmm_everywhere()
     return True
 
 
@@ -283,9 +294,16 @@ def prepare_device_memory(*, tenants: int = 1) -> bool:
 
     Args:
         tenants: Processes packed onto this worker's device (the fractional `num_gpus`
-            denominator). It divides the per-process memory cap, so four actors sharing a
+            denominator). It divides **both** per-process budgets, so four actors sharing a
             board are each capped at roughly a quarter of it rather than each believing they
-            may address the whole thing.
+            may address the whole thing. It reached only the PyTorch cap before, which left the
+            RMM pool — the allocator the relational fan-out actually runs on — sized for the
+            whole device in every co-tenant. Four tasks at the default
+            `pool_initial_fraction` of 0.5 then reserved 200% of the board between them, and
+            the fan-out is deliberately built to pack: `gpu_shard_oversubscribe` cuts four
+            times as many shards as there are devices precisely so several share one. The
+            arithmetic is only ever exercised at a tenancy above one, which is why a
+            single-device host never reproduced it.
 
     Returns:
         True when this process is now running on at least one configured allocator.
@@ -300,31 +318,46 @@ def prepare_device_memory(*, tenants: int = 1) -> bool:
     from batcher.carbonite.accel.device import configure_torch_allocator, plan_torch_allocator
     from batcher.config import active_config
 
-    # Already configured: say so without re-measuring. `configure_device_memory` is idempotent
-    # and returns early, but only *after* this function has priced the device — a call into
-    # NVML for the inventory, one for the live telemetry, and one for this process's own share.
-    # Measured on a T4 worker serving shard after shard, that is **414 ms every shard**, spent
-    # re-deriving a pool that was built once and cannot be rebuilt. It went unnoticed while Ray
-    # tore the worker down between tasks and the answer genuinely was different each time; with
+    # Already decided: say so without re-measuring. `configure_device_memory` is idempotent and
+    # returns early, but only *after* this function has priced the device — a call into NVML for
+    # the inventory, one for the live telemetry, and one for this process's own share. Measured
+    # on a T4 worker serving shard after shard, that is **414 ms every shard**, spent re-deriving
+    # a pool that was built once and cannot be rebuilt. It went unnoticed while Ray tore the
+    # worker down between tasks and the answer genuinely was different each time; with
     # `max_calls=0` it became the largest per-shard cost left.
-    settled = _applied
+    #
+    # Keyed on `tenants`, because that is the one input that legitimately differs between two
+    # calls in one worker — a stage packed four to a device asks for a different PyTorch cap
+    # than one that had the device to itself — and memoizing across it would silently hand the
+    # second stage the first stage's cap.
+    key = max(1, int(tenants))
+    settled = _prepared.get(key)
     if settled is not None:
-        return settled.allocator != "default" or settled.statistics or settled.spill_to_host
+        return settled
 
     cfg = active_config().accelerator
-    plan = plan_allocator(cfg.memory, _visible_device_usable_bytes(cfg.vram_headroom))
+    plan = plan_allocator(cfg.memory, _visible_device_usable_bytes(cfg.vram_headroom, key))
     applied = configure_device_memory(plan)
     # Deliberately not short-circuited: an RMM plan that was inert (the default) must not stop
     # the PyTorch allocator from being configured, since the two govern different callers.
-    return configure_torch_allocator(plan_torch_allocator(cfg, tenants=tenants)) or applied
+    result = configure_torch_allocator(plan_torch_allocator(cfg, tenants=key)) or applied
+    _prepared[key] = result
+    return result
 
 
-def _visible_device_usable_bytes(headroom: float) -> int:
+def _visible_device_usable_bytes(headroom: float, tenants: int = 1) -> int:
     """Reservable bytes on the device this process is bound to, or `0` when it cannot tell.
 
     Reads capacity from the local inventory and subtracts what is already resident, so a
     worker sharing a device with another tenant plans a pool out of the remainder rather than
     out of a device it does not have to itself.
+
+    Args:
+        headroom: Fraction of the device held back for the CUDA context and fragmentation.
+        tenants: Processes packed onto this device by the scheduler. Folded into the pool's
+            declared `share`, which is exactly the case that attribute exists for: co-tenants
+            that start *together* each measure an empty device, because measurement can only
+            see a neighbour that has already allocated, and the neighbour has not yet.
     """
     from batcher._internal.accelerators import gpu_inventory
     from batcher._internal.hardware.devices import current_physical_index
@@ -351,7 +384,16 @@ def _visible_device_usable_bytes(headroom: float) -> int:
     capacity = telemetry[index].memory_total_bytes if index in telemetry else 0
     if not capacity:  # no live telemetry — fall back to the static inventory's first device
         capacity = int(devices[0].get("memory_bytes", 0) or 0)
-    pool = VramPool(capacity_bytes=capacity, headroom=headroom, share=mps_client_share())
+    # The smaller of the two shares, not their product. They are usually two readings of the
+    # *same* processes — Ray packs four tasks onto a board, and those four tasks are the four
+    # MPS clients — so multiplying would divide the device by sixteen for four tenants. That is
+    # safe against an out-of-memory and expensive in the other direction: past a certain point
+    # the planned pool falls under `MIN_POOL_BYTES`, no pool is built at all, and the worker
+    # spends the query on the driver allocator that is 3.25x slower. Taking the minimum honors
+    # whichever signal reports the device as more crowded without assuming the two count
+    # disjoint sets, which nothing here can establish.
+    share = min(mps_client_share(), 1.0 / max(1, int(tenants)))
+    pool = VramPool(capacity_bytes=capacity, headroom=headroom, share=share)
     if not pool.capacity_bytes:
         return 0
     if index in telemetry:
@@ -376,3 +418,4 @@ def reset_device_allocator() -> None:
     with _lock:
         _applied = None
         _statistics_adaptor = None
+        _prepared.clear()

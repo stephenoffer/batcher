@@ -53,15 +53,15 @@ def _with_gpu_capacity(gpu_count: int, decision, run):
     wanted = max(gpu_count, int(decision.desired_gpus))
     request_autoscale(gpu_count, target_gpus=float(wanted))
     try:
-        # One core per device task is the floor a GPU stage needs; the GPU target is the
-        # binding one. A zero CPU target would make the wait a no-op, since it reads as
-        # "this query wants nothing".
+        # The CPU figure is what makes the *wait* meaningful — a zero CPU target reads as "this
+        # query wants nothing" and turns it into a no-op — while the GPU target is the one the
+        # fleet is actually grown against. The shard tasks themselves request no core.
         await_autoscale(wanted, target_gpus=float(wanted))
         # ...and then whether any of that capacity is actually free. The wait above asks
-        # whether the fleet is big enough, which it can be while every core of it is held by
-        # someone else's placement group — and a GPU task that cannot get a core does not fail,
-        # it pends, and `ray.get` on a pending task waits for as long as the query is willing
-        # to. Declining here is what turns that into a slower answer instead of no answer.
+        # whether the fleet is big *enough*, which it can be while every device of it is held
+        # by another stage — and a GPU task that cannot be placed does not fail, it pends, and
+        # `ray.get` on a pending task waits for as long as the query is willing to. Declining
+        # here is what turns that into a slower answer instead of no answer.
         if not await_gpu_admission():
             return None
         return run(_cluster_gpu_count())
@@ -161,14 +161,21 @@ def _broadcast_budget_bytes() -> float:
     Sized from the cluster's *binding* (smallest) device where the topology can report one,
     because a fan-out is only as safe as the device it runs worst on. A mixed fleet planned
     against its largest device is a fleet where the small ones all fail together.
+
+    A fraction of the device's **usable** memory, not of its nameplate capacity. The replicated
+    leaves sit beside this device's own shard, the joins built above them, and the CUDA context
+    — so charging them a share of memory that includes the part nothing may allocate spends a
+    budget twice. Both suppliers report a capacity, and `device_headroom()` is what turns one
+    into the other, once.
     """
+    from batcher._internal.device_share import device_headroom
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime.accelerators import cluster_gpu_memory_gb
 
     dc = active_config().distributed
     gpu_gb = cluster_gpu_memory_gb() or dc.resolved_gpu_memory_gb()
     fraction = min(0.9, max(0.0, float(dc.gpu_tree_broadcast_fraction)))
-    return float(gpu_gb) * 1e9 * fraction
+    return float(gpu_gb) * 1e9 * (1.0 - device_headroom()) * fraction
 
 
 def _cluster_gpu_count() -> int:

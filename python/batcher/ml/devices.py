@@ -370,6 +370,11 @@ def device_feed_advice() -> str:
     wants more devices or a cheaper model. Reported rather than acted on, because the fix
     depends on the pipeline rather than on the device.
 
+    Read over the devices **this process may use**, not every device on the host. A pinned
+    actor on an eight-device node was averaging seven boards belonging to other actors, so its
+    own saturated device read as a starved fleet whenever the neighbours happened to be idle —
+    and the advice that follows from that is the opposite of the right one.
+
     Returns:
         A sentence naming the mean utilization and what it implies, or a note that telemetry
         is unavailable.
@@ -381,9 +386,9 @@ def device_feed_advice() -> str:
             >>> isinstance(device_feed_advice(), str)
             True
     """
-    from batcher._internal.hardware.nvml import device_telemetry
+    from batcher._internal.hardware.devices import visible_device_telemetry
 
-    readings = device_telemetry()
+    readings = visible_device_telemetry()
     if not readings:
         return "no device telemetry on this host (install pynvml to see utilization)"
     mean = sum(r.sm_utilization for r in readings) / len(readings)

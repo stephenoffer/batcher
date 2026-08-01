@@ -547,7 +547,14 @@ def _visible_device_indices(n_handles: int) -> tuple[int, ...]:
 
 
 def _vram_handle() -> Any | None:
-    """The NVML handle for this process's *visible* GPU 0, honoring ``CUDA_VISIBLE_DEVICES``.
+    """The NVML handle for the device this process is computing on, through the visibility pin.
+
+    Two translations, and both of them matter on a worker granted more than one board. The
+    visibility environment says *which physical devices* are addressable; the framework's
+    current ordinal says *which of those* this process is on right now. Reading visible device
+    zero — which is what this did — is right only while nothing has called `set_device`, and
+    the VRAM sample it feeds is the one the autobatcher shrinks against. On a mixed node it was
+    sampling a different card's memory pressure than the one about to run out.
 
     Falls back to physical device 0 when the pin resolves to nothing in range, so a bad env
     never breaks the sample — it only reverts to the old behavior. `None` when NVML exposes
@@ -556,7 +563,12 @@ def _vram_handle() -> Any | None:
     handles = _nvml_handles()
     if not handles:
         return None
-    return handles[_visible_device_indices(len(handles))[0]]
+    visible = _visible_device_indices(len(handles))
+    import sys
+
+    torch = sys.modules.get("torch")  # never import torch to answer a placement question
+    ordinal = _bound_ordinal(getattr(torch, "cuda", None)) if torch is not None else 0
+    return handles[visible[ordinal if 0 <= ordinal < len(visible) else 0]]
 
 
 def _bound_ordinal(backend: Any) -> int:
@@ -660,23 +672,37 @@ def _nvml_own_vram_fraction(handle: Any) -> float | None:
     `None` (rather than a guess) whenever NVML cannot attribute memory per process — an
     older driver with no ``nvmlDeviceGetComputeRunningProcesses``, or a container without
     the PID namespace visibility it needs — so the caller falls back to the device-wide
-    reading instead of silently reporting zero usage."""
+    reading instead of silently reporting zero usage.
+
+    The PID comparison goes through `own_process_ids` rather than `os.getpid()`, because NVML
+    reports the **host** namespace's number. Matching on the container-local one found nothing,
+    and the arithmetic below then reported this process as using **0%** of its budget — so the
+    autobatcher, whose entire job here is to shrink before an out-of-memory, grew the batch
+    instead and hit a hard CUDA OOM. That failure needs a container to reproduce and cannot
+    happen on the single-GPU box the guard was written on."""
+    from batcher._internal.hardware.nvml import own_process_ids
+
     nvml = _nvml()
     query = getattr(nvml, "nvmlDeviceGetComputeRunningProcesses", None)
     if query is None:
         return None
     try:
-        import os
-
         procs = query(handle)
         total = nvml.nvmlDeviceGetMemoryInfo(handle).total
-        pid = os.getpid()
+        pids = set(own_process_ids())
         # `usedGpuMemory` is None when the driver won't attribute it (permission, MIG).
         # Such an entry still proves a tenant exists, so it counts toward the divisor.
         accounted = [p for p in procs if getattr(p, "usedGpuMemory", None) is not None]
         if not accounted:
             return None
-        used = sum(float(p.usedGpuMemory) for p in accounted if getattr(p, "pid", None) == pid)
+        mine = [p for p in accounted if getattr(p, "pid", None) in pids]
+        if not mine:
+            # Processes are resident and none of them is recognizably this one. Reporting the
+            # `0.0` that the sum would produce is the dangerous reading: it tells the caller
+            # there is a whole budget free. Decline, and let it fall back to the device-wide
+            # figure, which is at least an over-estimate rather than an under-estimate.
+            return None
+        used = sum(float(p.usedGpuMemory) for p in mine)
         return _own_budget_fraction(used, float(total), len(procs))
     except Exception:
         return None

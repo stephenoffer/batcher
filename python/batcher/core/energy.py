@@ -164,6 +164,12 @@ _LAST_ENERGY: list[tuple[float, tuple]] = []
 def _sampled_energy() -> tuple:
     """The devices' integrated joule counters, at most once per telemetry interval.
 
+    Narrowed to the devices this process may use, for the same reason `_draw` is: the delta is
+    attributed to a *stage*, and a node-wide counter charges a stage holding one device for the
+    seven boards its neighbours are turning. The hardware counter makes that worse rather than
+    better — it is exact, so the wrong attribution arrives with none of the caveats a sampled
+    figure carries, and it is the number the ledger bills from.
+
     Shares `_LAST_DRAW`'s caching discipline, which has a consequence worth stating: a stage
     shorter than the interval sees the *same* cached reading at both ends, the delta is zero,
     and the caller falls back to the sampled-power figure. That is the correct outcome rather
@@ -177,9 +183,15 @@ def _sampled_energy() -> tuple:
     if _LAST_ENERGY and now - _LAST_ENERGY[0][0] < interval:
         return _LAST_ENERGY[0][1]
     try:
+        from batcher._internal.hardware.devices import visible_device_indices
         from batcher._internal.hardware.telemetry.energy import device_energy
 
-        reading = device_energy()
+        readings = device_energy()
+        visible = set(visible_device_indices())
+        # An empty visible set is "no accelerator detected", not "no device is mine" — the
+        # counters themselves are then the better evidence and are kept, which is what an
+        # unpinned process and a host with no readable visibility both get.
+        reading = tuple(r for r in readings if r.index in visible) if visible else readings
     except Exception:
         reading = ()
     _LAST_ENERGY[:] = [(now, reading)]
@@ -218,15 +230,22 @@ def reset_energy_sampling() -> None:
 
 
 def _draw() -> tuple[float, float, bool]:
-    """`(watts, utilization, measured)` across this host's devices, right now.
+    """`(watts, utilization, measured)` across the devices **this process may use**, right now.
+
+    The visible set rather than the host's, because the number is attributed to a *stage*.
+    Summing every board on the node bills a stage holding one device for the draw of the seven
+    its neighbours are using — and does so in the direction that looks like a real result, since
+    a busy node makes every stage on it appear to cost more. It is exactly right on a
+    single-device box and wrong by the co-tenancy factor everywhere else, which is why an
+    energy figure that had never been checked against a second tenant looked plausible.
 
     `measured` is False when NVML answered nothing, in which case the two figures are zero and
     the caller falls back to the datasheet model.
     """
     try:
-        from batcher._internal.hardware.nvml import device_telemetry
+        from batcher._internal.hardware.devices import visible_device_telemetry
 
-        readings = device_telemetry()
+        readings = visible_device_telemetry()
     except Exception:
         return 0.0, 0.0, False
     if not readings:

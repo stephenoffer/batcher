@@ -44,8 +44,10 @@ __all__ = [
     "DeviceTelemetry",
     "device_processes",
     "device_telemetry",
+    "host_pid",
     "nvml_available",
     "own_device_memory",
+    "own_process_ids",
     "reset_nvml_probe",
     "throttled_devices",
     "total_power_watts",
@@ -168,9 +170,11 @@ def reset_nvml_probe() -> None:
     """Forget the memoized NVML handshake so the next call re-initializes.
 
     The hook a test faking `pynvml` needs; there is nothing else in a running process that can
-    change the answer.
+    change the answer. `host_pid` is cleared alongside it because a test that fakes NVML's
+    process list has to be able to fake which PID counts as this one.
     """
     _nvml.cache_clear()
+    host_pid.cache_clear()
 
 
 def _read(fn, default):
@@ -358,6 +362,69 @@ def device_processes(index: int) -> tuple[tuple[int, int], ...]:
     return tuple(out)
 
 
+@functools.lru_cache(maxsize=1)
+def host_pid() -> int | None:
+    """This process's PID as the **host** kernel numbers it, or `None` when it cannot be read.
+
+    The identifier every NVML process query has to be compared against, and the one nothing
+    was comparing against. NVML runs in the driver and reports PIDs from the initial PID
+    namespace; a Ray worker on Kubernetes — or in any Docker container that did not ask for
+    `hostPID` — reads its own `os.getpid()` from the *container's* namespace, where it is
+    usually a small number like `7`. The two never match, so every per-process attribution in
+    the engine silently failed on exactly the fleets it was written for, and each failure was
+    worse than no answer at all:
+
+    * `own_device_memory` returned `0` rather than `None`, because NVML *did* list processes —
+      so the VRAM pool charged this worker's own allocations to a phantom co-tenant, concluded
+      the device was full, and planned no allocator at all. The worker then ran the whole query
+      on the synchronizing driver allocator that `carbonite.accel.allocator` exists to replace.
+    * `device_shared_with_others` saw only PIDs unequal to its own and reported every
+      exclusively-held device as contended, which is the reading that tells autobatching not to
+      trust its own utilization measurements.
+
+    Read from `/proc/self/sched`, whose first line carries `task->pid` — the *global* PID —
+    rather than from `/proc/self/status`, whose `Pid:`/`NSpid:` fields are relative to the
+    namespace that mounted the procfs and so report the container-local number from inside a
+    container. Memoized: a process does not get renumbered.
+
+    Returns:
+        The host-namespace PID, or `None` on a platform with no procfs or a kernel whose
+        `sched` file does not carry it — where the caller must treat attribution as
+        unavailable rather than as zero.
+    """
+    try:
+        with open("/proc/self/sched", encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return None  # not Linux, or procfs not mounted
+    # `comm (pid, #threads: n)` — and `comm` may itself contain parentheses, so the opening
+    # bracket is found from the right.
+    start = first.rfind("(")
+    if start < 0:
+        return None
+    token = first[start + 1 :].split(",", 1)[0].strip()
+    return int(token) if token.isdigit() else None
+
+
+def own_process_ids() -> tuple[int, ...]:
+    """Every PID this process may be listed under by the driver, most authoritative first.
+
+    Both are tried because neither is always right. `host_pid` is the correct comparison inside
+    a container and is unavailable off Linux; `os.getpid` is correct whenever the process shares
+    the host's PID namespace — a bare-metal worker, or a pod with `hostPID: true` — and is the
+    only one available when procfs cannot be read. They are identical outside a namespace, which
+    is why the bug this exists for was invisible on a development box.
+
+    Returns:
+        One or two distinct PIDs. Never empty.
+    """
+    import os
+
+    local = os.getpid()
+    host = host_pid()
+    return (host, local) if host is not None and host != local else (local,)
+
+
 def own_device_memory(index: int) -> int | None:
     """Device memory this process itself holds, in bytes, or `None` when unattributable.
 
@@ -376,10 +443,16 @@ def own_device_memory(index: int) -> int | None:
         is distinct from `0`: a caller keeps its previous accounting rather than concluding it
         holds nothing.
     """
-    import os
-
     procs = device_processes(index)
     if not procs:
         return None
-    mine = os.getpid()
-    return sum(used for pid, used in procs if pid == mine)
+    mine = set(own_process_ids())
+    listed = {pid for pid, _ in procs}
+    if not (mine & listed):
+        # NVML listed processes and none of them is this one. On a device this process has
+        # genuinely not allocated on, `0` would be the honest answer — but so would it be when
+        # the PID namespaces simply do not line up, and the two are indistinguishable from here.
+        # `None` is the safe reading of that ambiguity: it leaves the caller on its own
+        # accounting instead of charging this worker's memory to an imaginary neighbour.
+        return None
+    return sum(used for pid, used in procs if pid in mine)

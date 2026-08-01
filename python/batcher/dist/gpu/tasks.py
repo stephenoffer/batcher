@@ -118,20 +118,33 @@ def _device() -> DfBackend:
     The call is idempotent, so the second task this worker runs pays nothing and keeps the
     pool the first one built.
     """
+    from batcher.carbonite.accel import bind_host_threads_to_device, prepare_device_memory
+
+    # Binding comes first, before anything in this process sizes itself **and before cuDF is
+    # imported**. The worker's *host* half — the reader, the decoder, the staging buffer —
+    # belongs on the cores next to the device it feeds; left alone on a two-socket node, half
+    # the workers land across the inter-socket link and pay for it twice per batch, at full
+    # device utilization and with nothing in the timings to say so. Doing it after the
+    # allocator would leave every pool sized for the whole node while the process runs on half
+    # of it. Refuses itself where the mapping is unreadable or the local core set is too small
+    # to decode in.
+    #
+    # Importing cuDF first — which is what this did — creates the CUDA context, and the
+    # context's pinned host staging buffers are allocated on whichever NUMA node the process
+    # happened to be on at that moment. Those buffers are what every host-to-device copy for
+    # the life of the worker passes through, and they cannot be moved afterwards, so binding
+    # after the import placed the threads correctly and left the memory they use on the far
+    # socket. On a one-socket development box the two orders are indistinguishable.
+    bind_host_threads_to_device()
+
     import cudf
 
-    from batcher.carbonite.accel import bind_host_threads_to_device, prepare_device_memory
     from batcher.core.gpu_plan import DfBackend
+    from batcher.dist.gpu.resources import task_device_tenants
 
-    # Binding comes first, before anything in this process sizes itself. The worker's *host*
-    # half — the reader, the decoder, the staging buffer — belongs on the cores next to the
-    # device it feeds; left alone on a two-socket node, half the workers land across the
-    # inter-socket link and pay for it twice per batch, at full device utilization and with
-    # nothing in the timings to say so. Doing it after the allocator would leave every pool
-    # sized for the whole node while the process runs on half of it. Refuses itself where the
-    # mapping is unreadable or the local core set is too small to decode in.
-    bind_host_threads_to_device()
-    prepare_device_memory()
+    # The tenancy Ray actually granted, not an assumption of one. A packed fan-out runs several
+    # of these bodies on one board, and each of them is about to reserve a memory pool.
+    prepare_device_memory(tenants=task_device_tenants())
     return DfBackend(cudf)
 
 
@@ -325,7 +338,15 @@ def gpu_task_runtime_env() -> dict | None:
     downstream of a failure being reported. Asynchronous error handling turns that into an
     ordinary task failure. The two blocks set disjoint variables, and both defer to anything
     the deployment set for itself.
+
+    The ordering block (`devices.device_order_env`) is the smallest of the three and the one
+    that makes the other two mean anything: it pins the CUDA runtime to PCI-bus device
+    numbering, so the ordinal a worker computes on and the NVML index its telemetry, its NUMA
+    mapping, and its memory pool are all read from name the same board. Unset, CUDA sorts by
+    capability instead, and every one of those lookups silently addresses a different device on
+    a node whose GPUs are not identical.
     """
+    from batcher._internal.hardware.devices import device_order_env
     from batcher.carbonite.resilience import stability_env
     from batcher.config import active_config
     from batcher.dist.executors.ray_runtime.scheduling import worker_runtime_env
@@ -334,7 +355,7 @@ def gpu_task_runtime_env() -> dict | None:
     rt = dict(worker_runtime_env() or {})
     if active_config().distributed.gpu_backend_cudf and not cluster_has_cudf():
         rt["pip"] = ["cudf-cu13==26.6.0", "numpy==1.26.4"]
-    block = {**stability_env(), **node_collective_env()}
+    block = {**device_order_env(), **stability_env(), **node_collective_env()}
     if block:
         rt["env_vars"] = merge_env(rt.get("env_vars"), block)
     return rt or None
