@@ -732,7 +732,7 @@ Per-operator distributed executor implementations.
 | `aggregate.py` | 278 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 48 | Distributed DISTINCT — deduplicate across workers via the aggregate shuffle. |
 | `join.py` | 866 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
-| `map.py` | 1779 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 1771 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 413 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 551 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 215 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -797,7 +797,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 
 | module | lines | what it is |
 |---|---|---|
-| `_fleet.py` | 461 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
+| `_fleet.py` | 421 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
 | `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `query.py` | 83 | The query-lifetime fleet: one placement group held for the whole adaptive query. |
