@@ -9,6 +9,7 @@ specializes in. Reached as `ds.ml.infer(...)` / `ds.ml.embed(...)`.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -162,7 +163,10 @@ def _require_query_vector(ds: Dataset, query: list[float], column: str, *, metho
     """
     from batcher._internal.errors import PlanError
 
-    _require_column(ds, column, param="column")
+    # The column has to be an embedding column before its width is worth discussing: a text
+    # column here is the mistake one step earlier (embed it first), and reporting a width
+    # mismatch for it would point at the query rather than at the column.
+    _require_vector_column(ds, column, method=method)
     if not query:
         raise PlanError(
             f"{method} got an empty query vector; pass the embedding to search for, with the "
@@ -192,6 +196,128 @@ def _fixed_width(ds: Dataset, column: str) -> int | None:
     if is_tensor_column(field.type) and len(field.type.shape) == 1:
         return int(field.type.shape[0])
     return None
+
+
+def _column_type(ds: Dataset, column: str):
+    """`column`'s Arrow type, or ``None`` when the schema cannot be read for it.
+
+    Every type check below is advisory in exactly one direction: it may only *reject*, and
+    only on a type it positively recognizes as wrong. A schema that cannot be resolved
+    (an unbound source, a plan the binder has not typed yet) returns ``None`` and the check
+    passes, leaving the engine to decide as it did before.
+    """
+    with contextlib.suppress(Exception):
+        schema = ds.schema
+        if column in schema.names:
+            return schema.field(column).type
+    return None
+
+
+def _is_vector_type(dtype) -> bool:
+    """Whether `dtype` is an embedding column — a list/tensor of numbers."""
+    import pyarrow as pa
+
+    if dtype is None:
+        return False
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    if is_tensor_column(dtype):
+        return True
+    if not (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or pa.types.is_fixed_size_list(dtype)
+    ):
+        return False
+    return pa.types.is_floating(dtype.value_type) or pa.types.is_integer(dtype.value_type)
+
+
+def _is_text_type(dtype) -> bool:
+    """Whether `dtype` is a text column the string kernels can read."""
+    import pyarrow as pa
+
+    if dtype is None:
+        return False
+    if pa.types.is_dictionary(dtype):
+        return _is_text_type(dtype.value_type)
+    return pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
+
+
+def _is_scalar_type(dtype) -> bool:
+    """Whether `dtype` is a per-row scalar — wrong for both a text and a vector operator.
+
+    Deliberately excludes Arrow's ``null``. A lazily-derived column has no resolved type until
+    the plan is bound, and a projection's output reads as ``null`` in the schema long before it
+    is one: `binarize_embeddings` writes a perfectly good bit code that the schema still calls
+    ``null``, and rejecting that would refuse the pipeline the docs recommend. These checks may
+    only reject a type they positively recognize as wrong, never one they cannot resolve.
+    """
+    import pyarrow as pa
+
+    if dtype is None or pa.types.is_null(dtype):
+        return False
+    return bool(
+        pa.types.is_boolean(dtype)
+        or pa.types.is_integer(dtype)
+        or pa.types.is_floating(dtype)
+        or pa.types.is_decimal(dtype)
+        or pa.types.is_temporal(dtype)
+    )
+
+
+def _require_text_column(ds: Dataset, column: str, *, method: str, param: str = "column") -> None:
+    """Reject a non-text `column` here, where the message can name the vector alternative.
+
+    The text and embedding halves of this namespace take the same-shaped argument and sit
+    beside each other in the docs, so passing an embedding column to a text operator is the
+    natural mistake — `similarity_join` takes a vector, `near_duplicates` takes text. The
+    engine's answer to it was a `RuntimeError` raised inside a distributed worker, after the
+    whole fleet had spun up: ``string function MinHash expected a Utf8 argument, got
+    List(Field { name: "item", data_type: Float64, ... })``, which names an internal kernel
+    and no way forward.
+    """
+    from batcher._internal.errors import PlanError
+
+    _require_column(ds, column, param=param)
+    dtype = _column_type(ds, column)
+    if not _is_vector_type(dtype) and not _is_scalar_type(dtype):
+        return  # text, or a type this check does not positively recognize as wrong
+    hint = ""
+    if _is_vector_type(dtype):
+        hint = (
+            " That looks like an embedding column: the vector equivalents are "
+            "`similarity_join` (matching pairs across two datasets), "
+            "`batched_nearest_neighbors`, and `near_duplicates` over a text column instead."
+        )
+    raise PlanError(
+        f"{method} needs a text column, but {column!r} is {dtype}.{hint}"
+        if hint
+        else f"{method} needs a text column, but {column!r} is {dtype}. Cast it with "
+        f"`bt.col({column!r}).cast('string')` if it holds text in another type."
+    )
+
+
+def _require_vector_column(ds: Dataset, column: str, *, method: str, param: str = "column") -> None:
+    """Reject a non-embedding `column` here, where the message can name the text alternative.
+
+    The mirror of `_require_text_column`, and the same failure without it: a cosine/simhash
+    kernel raising from inside a worker about a type the user never named.
+    """
+    from batcher._internal.errors import PlanError
+
+    _require_column(ds, column, param=param)
+    dtype = _column_type(ds, column)
+    if not _is_text_type(dtype) and not _is_scalar_type(dtype):
+        return  # a vector, or a type this check does not positively recognize as wrong
+    hint = ""
+    if _is_text_type(dtype):
+        hint = (
+            " That looks like a text column: embed it first with `ds.ml.embed(...)`, or use "
+            "the text-similarity operators (`near_duplicates`, `drop_near_duplicates`)."
+        )
+    raise PlanError(
+        f"{method} needs an embedding column (a list of numbers), but {column!r} is {dtype}.{hint}"
+    )
 
 
 def _warn_extract_overwrites(ds: Dataset, schema: dict, prompt_column: str | None) -> None:
@@ -1575,6 +1701,7 @@ class DatasetML:
                 >>> ds.ml.near_duplicates("t", threshold=0.5).count()
                 1
         """
+        _require_text_column(self._ds, column, method="near_duplicates")
         return build_near_duplicates(
             self._ds,
             column,
@@ -1621,6 +1748,7 @@ class DatasetML:
                 >>> sorted(ds.ml.drop_near_duplicates("t", threshold=0.5).to_pydict()["t"])
                 ['a b c d e f g', 'zzz']
         """
+        _require_text_column(self._ds, column, method="drop_near_duplicates")
         return build_drop_near_duplicates(
             self._ds,
             column,
@@ -1702,6 +1830,13 @@ class DatasetML:
                 >>> pairs.select("key_a", "key_b").to_pydict()
                 {'key_a': [1], 'key_b': [10]}
         """
+        _require_vector_column(self._ds, left_on, method="similarity_join", param="left_on")
+        _require_vector_column(
+            other,
+            right_on if right_on is not None else left_on,
+            method="similarity_join",
+            param="right_on",
+        )
         return build_similarity_join(
             self._ds,
             other,
@@ -1814,6 +1949,7 @@ class DatasetML:
                 >>> ds.ml.normalize_embeddings("emb").to_pydict()
                 {'emb': [[0.6, 0.8]]}
         """
+        _require_vector_column(self._ds, column, method="normalize_embeddings")
         from batcher.plan.expr_ir import col
 
         out = output_column or column
@@ -1863,6 +1999,7 @@ class DatasetML:
 
         if dim < 1:
             raise PlanError(f"truncate_embeddings dim must be >= 1, got {dim}")
+        _require_vector_column(self._ds, column, method="truncate_embeddings")
         out = output_column or column
         vec = col(column).list.slice(0, dim)
         if normalize:
@@ -1894,6 +2031,7 @@ class DatasetML:
                 >>> ds.ml.drop_degenerate_embeddings("emb").to_pydict()["id"]
                 [1, 3]
         """
+        _require_vector_column(self._ds, column, method="drop_degenerate_embeddings")
         from batcher.plan.expr_ir import col, lit
 
         # is_zero_vector is null for a null vector, so `== False` drops both the zero and
@@ -1924,6 +2062,7 @@ class DatasetML:
                 >>> ds.ml.binarize_embeddings("emb", output_column="code").to_pydict()["code"]
                 [[1, 0, 1, 0]]
         """
+        _require_vector_column(self._ds, column, method="binarize_embeddings")
         from batcher.plan.expr_ir import col, lit
         from batcher.plan.functions.collection import element
 
@@ -2047,6 +2186,10 @@ class DatasetML:
 
         if k < 1:
             raise PlanError(f"batched_nearest_neighbors k must be >= 1, got {k}")
+        _require_vector_column(self._ds, column, method="batched_nearest_neighbors")
+        _require_vector_column(
+            queries, query_column, method="batched_nearest_neighbors", param="query_column"
+        )
         vec, qvec = col(column), col("_bnn_qvec")
         # All but dot are distances (smaller = nearer, ascending rank); dot is a similarity.
         distances = {

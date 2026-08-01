@@ -122,3 +122,62 @@ def test_chain_is_itself_a_preprocessor():
     from batcher.ml import Preprocessor
 
     assert isinstance(Chain(SimpleImputer(["age"])), Preprocessor)
+
+
+def test_a_fitted_chain_saves_and_loads(tmp_path):
+    """Persisting a fitted *pipeline* is the thing users actually save, and it could not be.
+
+    Two independent gaps made `to_dict(Chain(...))` impossible. The encoder had no case for a
+    nested `Preprocessor`, so a chain hit "cannot serialize fitted state of type
+    StandardScaler" — naming a step the user never asked about. And `get_params` reports
+    `Chain`'s `*steps` by name, which is exactly how a var-positional parameter cannot be
+    passed back, so reconstruction raised `TypeError` and was reported as a version mismatch
+    that had not happened.
+    """
+    from batcher.ml import OutlierClipper, load, save
+
+    train = bt.from_pydict({"age": [10.0, 20.0, None, 40.0], "score": [1.0, 5.0, 2.0, 90.0]})
+    chain = Chain(SimpleImputer(["age"]), StandardScaler(["age"]), OutlierClipper(["score"]))
+    chain.fit(train)
+    expected = chain.transform(train).to_pydict()
+
+    path = str(tmp_path / "pipeline.json")
+    save(chain, path)
+    restored = load(path)
+
+    assert isinstance(restored, Chain)
+    assert restored.is_fitted
+    assert [type(s).__name__ for s in restored.get_params()["steps"]] == [
+        "SimpleImputer",
+        "StandardScaler",
+        "OutlierClipper",
+    ]
+    # The point of persisting it: the loaded pipeline must transform held-out data exactly as
+    # the fitted one did. A step restored unfitted would still produce numbers, just wrong ones.
+    assert restored.transform(train).to_pydict() == expected
+
+
+def test_every_reachable_preprocessor_can_be_loaded_back():
+    """The registry is built from `__all__` so a new preprocessor "cannot be forgotten".
+
+    It could: it scanned only the `preprocessors` package, and `OutlierClipper` lives in
+    `batcher.ml.outliers` beside the outlier functions. It was a `Preprocessor`, exported from
+    `batcher.ml` like every other one, and the single one `save`/`load` could not reconstruct —
+    discovered at load time, after the fitting was done.
+    """
+    import inspect
+
+    from batcher import ml
+    from batcher.ml import Preprocessor
+    from batcher.ml.preprocessors.persistence import _registry
+
+    known = _registry()
+    reachable = [
+        name
+        for name in ml.__all__
+        if inspect.isclass(getattr(ml, name))
+        and issubclass(getattr(ml, name), Preprocessor)
+        and getattr(ml, name) is not Preprocessor
+    ]
+    assert reachable, "the ml facade should export preprocessors"
+    assert [n for n in reachable if n not in known] == []

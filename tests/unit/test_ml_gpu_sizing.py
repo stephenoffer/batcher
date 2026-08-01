@@ -21,12 +21,25 @@ from batcher.ml import gpu
 
 @pytest.fixture
 def clear_nvml_caches():
-    """Drop the process-wide NVML session/handle caches around a fake-NVML test."""
-    gpu._nvml.cache_clear()
-    gpu._nvml_handles.cache_clear()
+    """Drop the process-wide NVML session/handle caches around a fake-NVML test.
+
+    `ml.gpu` is not the only module that memoizes the NVML handshake: the hardware layer
+    under it does too, and that is the one `min_visible_capacity_bytes` reads. Clearing only
+    this module's caches left a fake device cached there for the rest of the session — a
+    later test asserting an 8 GB XPU read 80 GB from an A100 fixture this file had installed
+    and torn down, and failed only when the two ran in the same process. Its own reset hook
+    (`reset_nvml_probe`) exists for exactly this; it just was not being called.
+    """
+    from batcher._internal.hardware.nvml import reset_nvml_probe
+
+    def _clear() -> None:
+        gpu._nvml.cache_clear()
+        gpu._nvml_handles.cache_clear()
+        reset_nvml_probe()
+
+    _clear()
     yield
-    gpu._nvml.cache_clear()
-    gpu._nvml_handles.cache_clear()
+    _clear()
 
 
 def _fake_nvml(*, total: int, procs: list | None, used: int = 0) -> types.ModuleType:
