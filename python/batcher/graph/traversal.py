@@ -24,9 +24,12 @@ __all__ = [
     "bfs",
     "diameter_estimate",
     "harmonic_centrality",
+    "is_dag",
     "k_hop_neighbors",
+    "nodes_in_cycles",
     "reachable_from",
     "shortest_path_lengths",
+    "topological_order",
 ]
 
 
@@ -331,3 +334,113 @@ def diameter_estimate(
     """
     got = bfs(g, sources, node=node, max_depth=max_depth).agg(d=bt.max("depth")).to_pydict()["d"]
     return int(got[0]) if got and got[0] is not None else 0
+
+
+def topological_order(g: Graph, *, max_iterations: int = 100) -> Dataset:
+    """Order the nodes so every edge points forward, by repeated source peeling.
+
+    Kahn's algorithm: take every node with no incoming edge, emit them as one level,
+    remove them, repeat. Nodes at the same level are mutually independent, which is more
+    useful than a total order -- a build system or a task scheduler can run a whole level
+    in parallel, and a flat sequence would hide that.
+
+    Args:
+        g: The graph. It must be acyclic; see the return value for what happens when it
+            is not.
+        max_iterations: The cap on peeling rounds, which bounds the longest chain.
+
+    Returns:
+        A dataset of `node` and `level`, holding **only the nodes that could be ordered**.
+        A node inside or downstream of a cycle can never lose its last incoming edge, so
+        it is absent -- which makes `topological_order(g).count() == g.num_nodes()` the
+        acyclicity test, and is exactly what `is_dag` does.
+
+    Raises:
+        PlanError: If `max_iterations` is not positive.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.graph import Graph, topological_order
+            >>> # b and c both depend on a; d depends on both.
+            >>> e = bt.from_pydict({"src": ["a", "a", "b", "c"], "dst": ["b", "c", "d", "d"]})
+            >>> topological_order(Graph.from_edges(e)).sort("node").to_pydict()
+            {'node': ['a', 'b', 'c', 'd'], 'level': [0, 1, 1, 2]}
+    """
+    if max_iterations < 1:
+        raise PlanError(f"max_iterations must be at least 1, got {max_iterations}")
+    remaining = checkpoint(g.nodes())
+    edges = g.edges.cache()
+    ordered: Dataset | None = None
+    for level in range(max_iterations):
+        if remaining.count() == 0:
+            break
+        live = edges.join(remaining.select(**{SRC: bt.col(NODE)}), on=SRC, how="semi").join(
+            remaining.select(**{DST: bt.col(NODE)}), on=DST, how="semi"
+        )
+        targets = live.select(**{NODE: bt.col(DST)}).distinct()
+        sources = checkpoint(remaining.join(targets, on=NODE, how="anti"))
+        if sources.count() == 0:
+            # Everything left has an incoming edge, so everything left is in or after a
+            # cycle. Stopping here is what makes the result the orderable subset.
+            break
+        levelled = sources.select(**{NODE: bt.col(NODE), "level": bt.lit(level)})
+        ordered = levelled if ordered is None else checkpoint(ordered.union(levelled))
+        remaining = checkpoint(remaining.join(sources, on=NODE, how="anti"))
+    if ordered is None:
+        return g.nodes().select(**{NODE: bt.col(NODE), "level": bt.lit(0)}).limit(0)
+    return ordered
+
+
+def is_dag(g: Graph, *, max_iterations: int = 100) -> bool:
+    """Whether the graph is acyclic.
+
+    Decided by whether every node can be peeled off in topological order, since a node in
+    or downstream of a cycle never loses its last incoming edge.
+
+    Args:
+        g: The graph.
+        max_iterations: The cap on peeling rounds. A graph whose longest chain exceeds
+            this reports False, so raise it for a very deep dependency graph.
+
+    Returns:
+        True when the graph has no directed cycle.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.graph import Graph, is_dag
+            >>> deps = bt.from_pydict({"src": ["a", "b"], "dst": ["b", "c"]})
+            >>> cyclic = bt.from_pydict({"src": ["a", "b", "c"], "dst": ["b", "c", "a"]})
+            >>> is_dag(Graph.from_edges(deps)), is_dag(Graph.from_edges(cyclic))
+            (True, False)
+    """
+    return topological_order(g, max_iterations=max_iterations).count() == g.num_nodes()
+
+
+def nodes_in_cycles(g: Graph, *, max_iterations: int = 100) -> Dataset:
+    """The nodes that a topological order cannot place: those in or after a cycle.
+
+    The diagnostic that goes with `is_dag`. A boolean tells you a dependency graph is
+    broken; this tells you which packages to look at.
+
+    Args:
+        g: The graph.
+        max_iterations: The cap on peeling rounds.
+
+    Returns:
+        A one-column dataset of `node`, empty for an acyclic graph.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.graph import Graph, nodes_in_cycles
+            >>> e = bt.from_pydict({"src": ["a", "b", "c", "c"], "dst": ["b", "c", "b", "d"]})
+            >>> sorted(nodes_in_cycles(Graph.from_edges(e)).to_pydict()["node"])
+            ['b', 'c', 'd']
+    """
+    placed = topological_order(g, max_iterations=max_iterations).select(NODE)
+    return g.nodes().join(placed, on=NODE, how="anti")

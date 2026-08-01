@@ -29,6 +29,7 @@ __all__ = [
     "is_connected",
     "k_core",
     "largest_component",
+    "strongly_connected_components",
 ]
 
 
@@ -244,3 +245,108 @@ def k_core(g: Graph, k: int, *, max_iterations: int = 100) -> Graph:
         peeled = current.subgraph(survivors)
         current = replace(peeled, edges=checkpoint(peeled.edges))
     return current
+
+
+def _propagate_max_label(edges: Dataset, labels: Dataset, rounds: int) -> Dataset:
+    """Push the largest label along `edges` to a fixpoint.
+
+    Shared by the forward and backward halves of the colouring algorithm, which differ
+    only in which edge table they walk -- writing it twice is how the two would drift.
+    """
+    current = checkpoint(labels)
+    for _ in range(rounds):
+        offered = (
+            edges.join(
+                current.select(**{SRC: bt.col(NODE), "_offer": bt.col("_c")}),
+                on=SRC,
+                how="inner",
+            )
+            .select(**{NODE: bt.col(DST), "_offer": bt.col("_offer")})
+            .group_by(NODE)
+            .agg(_offer=bt.max("_offer"))
+        )
+        nxt = checkpoint(
+            current.join(offered, on=NODE, how="left").select(
+                **{
+                    NODE: bt.col(NODE),
+                    "_c": bt.max_horizontal(
+                        bt.col("_c"), bt.coalesce(bt.col("_offer"), bt.col("_c"))
+                    ),
+                }
+            )
+        )
+        if count_changed(NODE, "_c")(current, nxt) == 0:
+            return nxt
+        current = nxt
+    return current
+
+
+def strongly_connected_components(g: Graph, *, max_iterations: int = 20) -> Dataset:
+    """Label each node with the strongly connected component it belongs to.
+
+    Two nodes are in the same component when each can reach the other *following edge
+    direction*. That is a much stronger claim than `connected_components` makes, and the
+    difference is the whole point on a directed graph: a chain `a -> b -> c` is one weak
+    component and three strong ones, because nothing gets back to `a`.
+
+    Found by the colouring algorithm rather than by Tarjan's, whose depth-first search has
+    no relational form. Each round propagates the largest reachable label forward to a
+    fixpoint, then propagates it backward; a node whose two labels agree is mutually
+    reachable with that label's node, which is exactly the definition, so it settles into
+    that component. What is left goes round again.
+
+    Args:
+        g: The graph. Direction is respected, which is the entire difference from
+            `connected_components`.
+        max_iterations: The cap on rounds, inner and outer. Each outer round settles at
+            least one component, so a graph of many small components needs more of them;
+            whatever the cap leaves over is reported as singletons rather than dropped.
+
+    Returns:
+        A dataset of `node` and `component`, labelled by the largest node id in each.
+
+    Raises:
+        PlanError: If `max_iterations` is not positive.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.graph import Graph, strongly_connected_components
+            >>> # A 3-cycle, plus a tail that cannot be returned to.
+            >>> e = bt.from_pydict({"src": [1, 2, 3, 3], "dst": [2, 3, 1, 4]})
+            >>> out = strongly_connected_components(Graph.from_edges(e)).sort("node")
+            >>> out.to_pydict()
+            {'node': [1, 2, 3, 4], 'component': [3, 3, 3, 4]}
+    """
+    if max_iterations < 1:
+        raise PlanError(f"max_iterations must be at least 1, got {max_iterations}")
+    reversed_g = g.reverse()
+    remaining = checkpoint(g.nodes())
+    settled: Dataset | None = None
+
+    for _ in range(max_iterations):
+        if remaining.count() == 0:
+            break
+        live = g.subgraph(remaining).edges.cache()
+        live_reversed = reversed_g.subgraph(remaining).edges.cache()
+        seed = remaining.select(**{NODE: bt.col(NODE), "_c": bt.col(NODE)})
+        forward = _propagate_max_label(live, seed, max_iterations)
+        backward = _propagate_max_label(live_reversed, seed, max_iterations)
+        agreed = checkpoint(
+            forward.select(**{NODE: bt.col(NODE), "_f": bt.col("_c")})
+            .join(backward.select(**{NODE: bt.col(NODE), "_r": bt.col("_c")}), on=NODE)
+            .filter(bt.col("_f") == bt.col("_r"))
+            .select(**{NODE: bt.col(NODE), "component": bt.col("_f")})
+        )
+        if agreed.count() == 0:
+            # No node agreed with itself, which can only happen once nothing is left to
+            # settle; the rest are singletons.
+            break
+        settled = agreed if settled is None else checkpoint(settled.union(agreed))
+        remaining = checkpoint(remaining.join(agreed.select(NODE), on=NODE, how="anti"))
+
+    leftovers = remaining.select(**{NODE: bt.col(NODE), "component": bt.col(NODE)})
+    if settled is None:
+        return leftovers
+    return settled.union(leftovers) if remaining.count() > 0 else settled

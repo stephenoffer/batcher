@@ -20,6 +20,7 @@ Katz is the fix for that, and takes a decay instead.
 
 from __future__ import annotations
 
+from batcher.graph.centrality.betweenness import betweenness_centrality
 from batcher.graph.centrality.rank import (
     degree_centrality,
     pagerank,
@@ -32,6 +33,7 @@ from batcher.graph.centrality.spectral import (
 )
 
 __all__ = [
+    "betweenness_centrality",
     "degree_centrality",
     "eigenvector_centrality",
     "hits",

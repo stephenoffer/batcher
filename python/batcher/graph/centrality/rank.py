@@ -233,9 +233,7 @@ def personalized_pagerank(
                 **{
                     NODE: bt.col(NODE),
                     "pagerank": bt.lit(1.0 - damping) * bt.col("_seed")
-                    + bt.lit(damping)
-                    * bt.coalesce(bt.col("_leak"), bt.lit(0.0))
-                    * bt.col("_seed")
+                    + bt.lit(damping) * bt.coalesce(bt.col("_leak"), bt.lit(0.0)) * bt.col("_seed")
                     + bt.lit(damping) * bt.coalesce(bt.col("_in"), bt.lit(0.0)),
                 }
             )
