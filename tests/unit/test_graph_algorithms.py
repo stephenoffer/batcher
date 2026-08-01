@@ -489,3 +489,49 @@ def test_betweenness_splits_credit_between_tied_shortest_paths():
     assert scores["b"] == pytest.approx(0.5)
     assert scores["c"] == pytest.approx(0.5)
     assert scores["e"] == pytest.approx(1.0), "the sole route carries the whole path"
+
+
+def _ops(ds: bt.Dataset) -> set[str]:
+    """Every `op` tag in a dataset's lowered IR, at any depth."""
+    seen: set[str] = set()
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("op"), str):
+                seen.add(node["op"])
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(ds._plan.to_ir())
+    return seen
+
+
+@pytest.mark.parametrize("fn", [bg.degree, bg.out_degree, bg.in_degree, bg.weighted_degree])
+def test_degree_stays_join_free_because_a_join_here_cannot_distribute(fn):
+    """The degree plans must stay `union -> group_by`, with no join anywhere.
+
+    These once restored their zero rows with a left join from `nodes()`, making the plan
+    `union -> distinct  LEFT JOIN  union -> group_by`. That shape has no distributed path:
+    `collect(distributed=True)` raised `PlanError` rather than running, so degree was a
+    single-node-only algorithm on exactly the graphs big enough to need a cluster.
+
+    A join reappearing here is that bug returning, and it is invisible to every other test
+    in this file because all of them run single-node, where the join is merely slower.
+    """
+    e = bt.from_pydict({"src": [1, 1, 2], "dst": [2, 3, 3], "w": [1.0, 2.0, 3.0]})
+    g = bg.Graph.from_edges(e, weight="w").with_nodes(bt.from_pydict({"node": [1, 2, 3, 9]}))
+    ops = _ops(fn(g))
+    assert not {o for o in ops if "join" in o}, f"{fn.__name__} plan has a join: {sorted(ops)}"
+
+
+def test_degree_keeps_the_nodes_that_have_no_edge_on_the_counted_side():
+    """The zero rows the union arm exists to produce, on a sink and an isolated node."""
+    e = bt.from_pydict({"src": [1, 1], "dst": [2, 3]})
+    g = bg.Graph.from_edges(e).with_nodes(bt.from_pydict({"node": [1, 2, 3, 9]}))
+    out = dict(zip(*(bg.out_degree(g).to_pydict()[k] for k in ("node", "out_degree")), strict=True))
+    assert out == {1: 2, 2: 0, 3: 0, 9: 0}, "sinks and the isolated node must survive with 0"
+    assert bg.isolated_nodes(g).to_pydict()["node"] == [9]
+    assert sum(bg.degree(g).to_pydict()["degree"]) == 2 * 2, "handshake identity"

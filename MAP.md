@@ -710,7 +710,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 378 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 196 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1304 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1314 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 174 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -2367,12 +2367,12 @@ Graph analytics and graph-ML features over an edge table.
 
 | module | lines | what it is |
 |---|---|---|
-| `_graph.py` | 395 | The `Graph` handle: an edge table, plus what the algorithms need to know about it. |
+| `_graph.py` | 413 | The `Graph` handle: an edge table, plus what the algorithms need to know about it. |
 | `_iterate.py` | 210 | The fixpoint driver every iterative graph algorithm runs on. |
 | `build.py` | 382 | Building a graph out of data that is not already an edge list. |
 | `community.py` | 356 | Communities, triangles, and how tightly a neighbourhood closes on itself. |
 | `components.py` | 352 | Connected components, and the cores that survive peeling the graph down. |
-| `degree.py` | 225 | Degree: how many edges touch each node, and how those counts are distributed. |
+| `degree.py` | 233 | Degree: how many edges touch each node, and how those counts are distributed. |
 | `features.py` | 227 | Turning a graph into a feature table a model can train on. |
 | `sampling.py` | 283 | Sampling a graph: random walks, bounded neighbourhoods, and induced subgraphs. |
 | `similarity.py` | 315 | How alike two nodes are, judged by who they are connected to. |

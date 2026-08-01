@@ -145,6 +145,20 @@ class Graph:
         right = self.edges.select(**{NODE: bt.col(DST)})
         return left.union(right).distinct()
 
+    def extra_nodes(self) -> Dataset | None:
+        """The nodes an edge table cannot name, or `None` when the endpoints are all of them.
+
+        This exists so a per-node aggregate can restore its zero rows with a `union` arm
+        instead of an outer join from `nodes()`. The two are equivalent, but the join form
+        puts a `distinct` under a `group_by`, and that shape has no distributed path -- it
+        raises rather than running. Returning `None` here lets the caller build the cheaper
+        plan for the common graph and pay for the extra arm only when there is one.
+
+        Returns:
+            A one-column dataset of `node`, or `None` if no node table was attached.
+        """
+        return None
+
     def with_nodes(self, nodes: Dataset, *, node: str = "node") -> Graph:
         """Attach an explicit node table, so isolated nodes are counted.
 
@@ -387,6 +401,10 @@ class _GraphWithNodes(Graph):
         if self.declared is None:
             return endpoints
         return self.declared.union(endpoints).distinct()
+
+    def extra_nodes(self) -> Dataset | None:
+        """The declared table, which is the only place an isolated node can come from."""
+        return self.declared
 
     def _rebuild(self, edges: Dataset, keep: Dataset | None) -> Graph:
         """Restrict the declared nodes alongside the edges."""

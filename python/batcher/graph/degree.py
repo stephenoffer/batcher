@@ -27,18 +27,39 @@ __all__ = [
 ]
 
 
+#: The per-endpoint contribution being summed. Private, and never in a returned schema:
+#: every function here aggregates it away in the same expression that introduces it.
+_C = "_contribution"
+
+
+def _totalled(g: Graph, contributions: Dataset, name: str, zero: object) -> Dataset:
+    """Sum each node's contributions, keeping the nodes that contribute nothing.
+
+    The zero rows are what make this correct rather than merely fast. A node with no edge
+    on the counted side contributes no row at all, so without them a sink is simply absent
+    from an out-degree table and every downstream average divides by the wrong denominator.
+
+    Emitting them as another `union` arm rather than as an outer join from `nodes()` is
+    deliberate. The two compute the same table, but the join form is
+    `union -> distinct  LEFT JOIN  union -> group_by`, which has no distributed path and
+    raises under `distributed=True`. This form is one `union` into one `group_by`: a single
+    shuffle, no join build, no distinct, and it runs on a cluster.
+    """
+    extra = g.extra_nodes()
+    if extra is not None:
+        contributions = contributions.union(extra.select(**{NODE: bt.col(NODE), _C: bt.lit(zero)}))
+    return contributions.group_by(NODE).agg(**{name: bt.sum(_C)})
+
+
 def _side_count(g: Graph, side: str, name: str) -> Dataset:
-    """Count edges by one endpoint, then restore the nodes that endpoint never names."""
-    counted = g.edges.group_by(side).agg(**{name: bt.count()})
-    counted = counted.select(**{NODE: bt.col(side), name: bt.col(name)})
-    # A left join from the full node set is what makes a zero appear for a node that has
-    # no edge on this side. Without it a sink node is simply absent from an out-degree
-    # table, and every downstream average is computed over the wrong denominator.
-    return (
-        g.nodes()
-        .join(counted, on=NODE, how="left")
-        .select(**{NODE: bt.col(NODE), name: bt.coalesce(bt.col(name), bt.lit(0))})
+    """Count edges by one endpoint, giving the nodes it never names a zero."""
+    other = DST if side == SRC else SRC
+    # Every endpoint on the *other* side contributes zero, which is what puts a node with
+    # no edge on this side into the output without needing the distinct node set.
+    counted = g.edges.select(**{NODE: bt.col(side), _C: bt.lit(1)}).union(
+        g.edges.select(**{NODE: bt.col(other), _C: bt.lit(0)})
     )
+    return _totalled(g, counted, name, 0)
 
 
 def out_degree(g: Graph) -> Dataset:
@@ -105,13 +126,10 @@ def degree(g: Graph) -> Dataset:
             >>> degree(g).sort("node").to_pydict()
             {'node': [1, 2, 3], 'degree': [2, 2, 2]}
     """
-    both = g.edges.select(**{NODE: bt.col(SRC)}).union(g.edges.select(**{NODE: bt.col(DST)}))
-    counted = both.group_by(NODE).agg(degree=bt.count())
-    return (
-        g.nodes()
-        .join(counted, on=NODE, how="left")
-        .select(**{NODE: bt.col(NODE), "degree": bt.coalesce(bt.col("degree"), bt.lit(0))})
+    both = g.edges.select(**{NODE: bt.col(SRC), _C: bt.lit(1)}).union(
+        g.edges.select(**{NODE: bt.col(DST), _C: bt.lit(1)})
     )
+    return _totalled(g, both, "degree", 0)
 
 
 def weighted_degree(g: Graph) -> Dataset:
@@ -137,20 +155,10 @@ def weighted_degree(g: Graph) -> Dataset:
             >>> weighted_degree(g).sort("node").to_pydict()
             {'node': [1, 2, 3], 'weighted_degree': [5.5, 5.0, 0.5]}
     """
-    both = g.edges.select(**{NODE: bt.col(SRC), "w": bt.col(WEIGHT)}).union(
-        g.edges.select(**{NODE: bt.col(DST), "w": bt.col(WEIGHT)})
+    both = g.edges.select(**{NODE: bt.col(SRC), _C: bt.col(WEIGHT)}).union(
+        g.edges.select(**{NODE: bt.col(DST), _C: bt.col(WEIGHT)})
     )
-    summed = both.group_by(NODE).agg(weighted_degree=bt.sum("w"))
-    return (
-        g.nodes()
-        .join(summed, on=NODE, how="left")
-        .select(
-            **{
-                NODE: bt.col(NODE),
-                "weighted_degree": bt.coalesce(bt.col("weighted_degree"), bt.lit(0.0)),
-            }
-        )
-    )
+    return _totalled(g, both, "weighted_degree", 0.0)
 
 
 def degree_distribution(g: Graph) -> Dataset:
