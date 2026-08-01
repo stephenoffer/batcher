@@ -286,6 +286,26 @@ print(
 # {'before': [6], 'after': [2], 'error': [0.002]}
 ```
 
+## What it costs
+
+Every `ST_*` function is a scalar expression evaluated per row in Rust, so cost is linear
+in rows and independent of how many rows there are. `benchmarks/geospatial.py` measures
+it; on a 16-core machine at 200k and 800k rows the throughput is flat, which is what
+linear scaling looks like:
+
+| Expression | Throughput |
+| --- | --- |
+| `st_area` over a constructed point | ~6 M rows/s |
+| `geohash_encode` | ~6 M rows/s |
+| `st_s2_cell` | ~6 M rows/s |
+| `st_transform` to UTM | ~1.6 M rows/s |
+| `st_intersects` against a box | ~0.8 M rows/s |
+
+The ordering is the useful part. The grid and accessor functions are cheap. The predicates
+are roughly an order of magnitude dearer, because each row decodes two geometries and walks
+their segments, which is exactly why `st_intersects_extent` in front of `st_intersects` is
+worth the extra clause and why materializing the four bound columns is worth the storage.
+
 ## Requirements and limitations
 
 - **`st_buffer` is an approximation and over-estimates for a concave input.** It buffers
