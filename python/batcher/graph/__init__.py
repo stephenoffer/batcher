@@ -1,10 +1,17 @@
 """Graph analytics and graph-ML features over an edge table.
 
 A graph here is a `Dataset` of edges, and every algorithm is a sequence of joins and
-aggregations over it. That is the whole design: a join is a join, so PageRank over a
-billion edges distributes across a Ray cluster and spills under memory pressure using
-exactly the machinery any other query uses, with no second execution path to keep in
-agreement and no graph-shaped index to build first.
+aggregations over it. That is the whole design: a join is a join, so the edge-side work
+distributes across a Ray cluster and spills under memory pressure using exactly the
+machinery any other query uses, with no second execution path to keep in agreement and no
+graph-shaped index to build first.
+
+Two limits that follow from it and are worth knowing before sizing a job. The iterative
+algorithms (PageRank, components, communities) pass per-node state through the driver once
+per round, so the *node* count is their ceiling even when the edge count is not. And
+`distributed="auto"` keeps a plan whose sources are all resident in the driver on one
+machine at any size, so an edge table built with `from_pydict` stays local -- read it from
+Parquet to get the cluster.
 
 Start with `Graph.from_edges` and `summarize`. The cheap diagnostics tell you which of
 the expensive algorithms are worth running: a graph that is one giant component behaves

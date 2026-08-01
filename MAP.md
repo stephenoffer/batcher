@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1172 Python modules across 178 packages and 218 Rust files across 14 crates.
+Covering 1173 Python modules across 178 packages and 218 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -353,7 +353,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 493 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 820 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 822 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 412 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
@@ -367,10 +367,11 @@ The opt-in GPU execution backend for supported relational shapes.
 
 | module | lines | what it is |
 |---|---|---|
-| `failure.py` | 56 | Telling a GPU backend that declined from one that is broken. |
+| `failure.py` | 62 | Telling a GPU backend that declined from one that is broken. |
 | `fanout.py` | 202 | Grow the cluster to the devices a plan wants, check one is free, and fan the work out. |
-| `route.py` | 249 | Decide whether a plan runs on the GPU, run it, and record what that cost. |
+| `route.py` | 265 | Decide whether a plan runs on the GPU, run it, and record what that cost. |
 | `translate.py` | 257 | Match a plan to a translated GPU execution, from the most specific shape to the general one. |
+| `verify.py` | 156 | Run the device result against the CPU engine and report where they disagree. |
 
 ### `batcher/api/terminal/metadata_answer/` — 5 · conductor
 
@@ -705,11 +706,11 @@ Subquery handling and decorrelation for the SQL translator.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 1719 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 705 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 721 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 378 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 196 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1276 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1304 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 174 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -845,7 +846,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 
 | module | lines | what it is |
 |---|---|---|
-| `join.py` | 426 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
+| `join.py` | 476 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
 | `sort.py` | 277 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
 | `window.py` | 162 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
@@ -1389,17 +1390,17 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 
 | module | lines | what it is |
 |---|---|---|
-| `aggs.py` | 338 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
-| `backend.py` | 390 | The dataframe-library adapter the GPU translator runs against. |
+| `aggs.py` | 362 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
+| `backend.py` | 457 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 142 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 346 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
-| `exprs.py` | 352 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
-| `ops.py` | 343 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
+| `exprs.py` | 385 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
+| `ops.py` | 371 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
 | `pruning.py` | 240 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
 | `scalar_fns.py` | 395 | The named scalar-function families: math, two-argument math, and dates. |
 | `temporal.py` | 413 | The calendar half of the date vocabulary: `date_trunc`, `offset_by`, the year-derived |
 | `tree.py` | 212 | The whole-plan form of the translator: any tree of scans, joins and unions on the device. |
-| `windows.py` | 447 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
+| `windows.py` | 462 | Window functions on a dataframe backend — ranking, value, and partition/running aggregates. |
 
 ### `batcher/core/gpu_plan/vocab/` — 3 · subsystem
 
@@ -1409,7 +1410,7 @@ The translator's *named* vocabularies, one module per family — package façade
 |---|---|---|
 | `dates.py` | 149 | What the engine types as a calendar day, and how a temporal value is built from numbers. |
 | `lists.py` | 449 | List and vector expressions, built from the two primitives both dataframe libraries have. |
-| `operators.py` | 241 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
+| `operators.py` | 240 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
 | `regex.py` | 241 | The regular-expression functions, for the patterns three regex engines agree on. |
 | `strings.py` | 147 | The string function family — one entry per named function the engine ships. |
 
@@ -2192,7 +2193,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 334 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 2548 | The single frozen `Config` and its typed sections. |
+| `config.py` | 2560 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 200 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |

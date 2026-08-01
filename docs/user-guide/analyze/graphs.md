@@ -384,10 +384,22 @@ an optimization to add later.
 
 ## Requirements and limitations
 
-- **Iterative algorithms materialize per-node state once per round.** A lazy plan built
-  fifty iterations deep would re-run every earlier iteration on execution, so the state is
-  collected and re-wrapped each round. That is bounded by the node count rather than the
-  edge count, but it does mean the state passes through the client process.
+- **Iterative algorithms pass per-node state through the driver once per round.** A lazy
+  plan built fifty iterations deep would re-run every earlier iteration on execution, so
+  each round's state is collected and re-wrapped. The edge-side joins still distribute --
+  the state is one row per *node*, not per edge -- but the driver round-trip is the real
+  ceiling on an iterative algorithm here: a graph with more nodes than the driver can hold
+  will not finish, however many workers you add. Degree, triangles and the link-prediction
+  scores are single-pass and have no such limit.
+- **An in-memory edge table never distributes, by design.** `distributed="auto"` routes a
+  plan whose sources are all resident in the driver to single-node at any size, because
+  shipping resident data out and gathering it back costs more than the compute it
+  parallelizes. Read the edges from Parquet or a lakehouse table to get the distributed
+  path; `bt.from_pydict` will stay local no matter how large it is.
+- **`Graph.cache` helps single-node only.** `Dataset.cache` memoizes a result in a
+  process-local LRU, which the distributed executor does not consult. Caching a graph
+  before running several algorithms is worth it locally and is inert on a cluster, where
+  each algorithm re-reads the edge table.
 - **`connected_components` is weakly connected.** The graph is symmetrized first, so
   `a -> b -> c` is one component even though nothing reaches `a`.
   `strongly_connected_components` is the direction-respecting version, and is more

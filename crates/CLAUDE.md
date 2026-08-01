@@ -15,6 +15,9 @@ near-leaves (nothing below them but bc-arrow, the DAG root), consumed higher up:
   bc-sketches → bc-runtime, bc-py      bc-resource → bc-interp, bc-py
   bc-transport → bc-py                 bc-io       → bc-py (+ bc-arrow, for usable_cores)
   bc-secrets  → bc-expr (secret-reference resolution; NO cloud SDK by design)
+  bc-geo      → bc-expr (geometry model, WKB/WKT/GeoJSON, planar algorithms, grids,
+                CRS transforms). Knows nothing about Arrow: the array-level plumbing
+                is bc-expr's `eval/geo`, which keeps the geometry pure and testable
   bc-udf → (nothing depends on it — not on a live path)
 ```
 
