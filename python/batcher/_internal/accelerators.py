@@ -371,21 +371,26 @@ def _visible_devices(devices: list[dict[str, object]]) -> list[dict[str, object]
     itself does and therefore what makes `gpu_inventory()[i]` line up with `torch.cuda`'s
     device `i` rather than with a physical slot the process cannot address.
 
-    Deliberately conservative in two places. An **unset** variable means "everything is
-    visible", the pre-existing answer. And a value this cannot parse as indices — the UUID
-    form (`GPU-<uuid>`) a Kubernetes device plugin writes, or a `MIG-<uuid>` partition handle
-    — leaves the list untouched rather than guessing, since mapping those back to slots needs
-    a driver lookup this probe did not record, and reporting too many devices is the behavior
-    callers already had. `_internal.hardware.devices.scope.visible_device_indices` resolves
-    both of those forms; fold this onto it once that module is on a released path, so the two
-    parses cannot drift.
+    An **unset** variable means "everything is visible", the pre-existing answer.
+
+    A value that is *not* a list of ordinals — the UUID form (`GPU-<uuid>`) a Kubernetes device
+    plugin writes, or a `MIG-<uuid>` partition handle — is resolved through
+    `hardware.devices.scope`, which asks the driver which board each identifier names. That
+    matters most on the fleets that pin hardest: index-only parsing could not read either form,
+    and the fallback was to report *every device on the node*, so the pool sizing, the health
+    check, and the accelerator report all described eight boards to a pod entitled to one.
+
+    Falling back to `devices` unchanged when that resolution finds nothing is why this is not
+    delegated wholesale: `scope` reads NVML and an AMD host has none, so a wholesale fold would
+    hide every device on an Instinct node — a worse error than reporting too many, which is
+    also what every caller already handled.
 
     Args:
         devices: The physically probed devices, in driver order.
 
     Returns:
         The visible subset, renumbered from zero, or `devices` unchanged when visibility is
-        not restricted or cannot be read as indices.
+        not restricted or cannot be resolved at all.
     """
     raw = next((os.environ[v] for v in _VISIBLE_DEVICE_VARS if v in os.environ), None)
     if raw is None:
@@ -393,17 +398,40 @@ def _visible_devices(devices: list[dict[str, object]]) -> list[dict[str, object]
     tokens = [t.strip() for t in raw.split(",") if t.strip()]
     if not tokens:
         return []  # explicitly empty: the runtime hid every device
+    if not all(t.isdigit() for t in tokens):
+        return _resolved_by_driver(devices) or devices
     picked: list[dict[str, object]] = []
     for token in tokens:
         # CUDA stops enumerating at the first entry it cannot resolve, so a trailing bad
         # index truncates rather than invalidating the whole list.
-        if not token.isdigit():
-            return devices  # a UUID or MIG id: not resolvable from what the probe recorded
         slot = int(token)
         if slot >= len(devices):
             break
         picked.append(dict(devices[slot], index=len(picked)))
     return picked
+
+
+def _resolved_by_driver(devices: list[dict[str, object]]) -> list[dict[str, object]]:
+    """The visible subset for a UUID/MIG pin, resolved against the driver, or `[]`.
+
+    Imported inside the call because this is the uncommon branch and the module it reaches for
+    initializes NVML; a host pinned by ordinals — every Ray worker — must not pay for it.
+    """
+    try:
+        from batcher._internal.hardware.devices.scope import visible_device_indices
+
+        indices = visible_device_indices()
+    except Exception:
+        return []
+    # A scope covering every device is what an *unresolvable* pin also produces, so it carries
+    # no information here and is treated as "could not resolve".
+    if not indices or len(indices) >= len(devices):
+        return []
+    return [
+        dict(devices[i], index=position)
+        for position, i in enumerate(indices)
+        if 0 <= i < len(devices)
+    ]
 
 
 def _nvml_inventory() -> list[dict[str, object]]:
