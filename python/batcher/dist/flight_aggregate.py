@@ -35,7 +35,7 @@ from batcher.dist.executors.ray_runtime import (
     release_placement,
     shuffle_partitions,
 )
-from batcher.dist.fleet.plan_id import next_result_stage
+from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_worker import _ticket, current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
@@ -167,10 +167,24 @@ def execute_aggregate_flight(
         # fail the whole query on a bare `ray.get`; instead the lost worker's source is
         # republished on a survivor under the same `src`, so the reducers' tickets still
         # resolve, and `dead` keeps the reduce off a worker that is gone.
+        # One ticket stage for THIS aggregate's map buckets. Every aggregate published under
+        # the fixed stage 0, so a query with two of them (a decorrelated subquery beside its
+        # outer aggregate) had two sets of map buckets at identical coordinates on the same
+        # worker — see `fleet.plan_id.next_stage_base`.
+        stage_base = next_stage_base(1)
         addrs, dead = map_barrier(
             workers,
             lambda host, src: actors[host].map_publish.remote(
-                map_ir, gk, aj, partitions[src], n_keys, n_reducers, src, 0, current_plan_id()
+                map_ir,
+                gk,
+                aj,
+                partitions[src],
+                n_keys,
+                n_reducers,
+                src,
+                0,
+                current_plan_id(),
+                stage_base,
             ),
         )
 
@@ -208,6 +222,7 @@ def execute_aggregate_flight(
                 workers,
                 dead,
                 replicas,
+                stage_base,
             )
         else:
             # `on_actors`: keep the result on the workers — each reducer publishes its
@@ -220,6 +235,7 @@ def execute_aggregate_flight(
                 reducer_hosts=reducer_hosts,
                 dead=dead,
                 replicas=replicas,
+                stage_base=stage_base,
             )
             if on_actors:
                 from batcher.dist.fleet import FlightMaterializedSource
@@ -312,6 +328,7 @@ def _reduce_with_recovery(
     reducer_hosts=None,
     dead=None,
     replicas=None,
+    stage_base=0,
 ):
     """Run the reduce stage under Carbonite recompute-on-worker-loss recovery.
 
@@ -393,7 +410,7 @@ def _reduce_with_recovery(
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
-            extra = (result_stage,) if materialize else ()
+            extra = (result_stage, stage_base) if materialize else (stage_base,)
             ref = getattr(actors[host], method).remote(
                 gk, aj, mapper_addrs, r, epochs, replicas, current_plan_id(), *extra
             )
@@ -457,6 +474,7 @@ def _reduce_with_recovery(
                     src,
                     lineage[src].epoch,
                     current_plan_id(),
+                    stage_base,
                 )
             )
 
@@ -564,6 +582,7 @@ def _tree_reduce_with_recovery(
     workers,
     dead=None,
     replicas=None,
+    stage_base=0,
 ):
     """Run the tree reduce under Carbonite recompute-on-worker-loss recovery.
 
@@ -640,7 +659,16 @@ def _tree_reduce_with_recovery(
             target = next(j for j in range(workers) if j not in dead)
             leaf_addrs[src] = ray.get(
                 actors[target].map_publish.remote(
-                    map_ir, gk, aj, partitions[src], n_keys, n_reducers, src, 0, current_plan_id()
+                    map_ir,
+                    gk,
+                    aj,
+                    partitions[src],
+                    n_keys,
+                    n_reducers,
+                    src,
+                    0,
+                    current_plan_id(),
+                    stage_base,
                 )
             )
 

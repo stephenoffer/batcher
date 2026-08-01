@@ -24,7 +24,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.fleet import acquire_fleet, release_fleet
-from batcher.dist.fleet.plan_id import next_result_stage
+from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
@@ -116,6 +116,10 @@ def execute_join_flight(
         return out[0] if out else empty
 
     credits = _shuffle_credits()
+    # Two consecutive ticket stages for THIS join's map buckets (left, right). Every join
+    # used the fixed stages 0 and 1, so a query with two joins had two sets of map buckets at
+    # identical coordinates on the same worker — see `fleet.plan_id.next_stage_base`.
+    stage_base = next_stage_base(2)
 
     # Borrow the query-lifetime fleet when the adaptive loop installed one; else spawn
     # one we tear down. Every Flight operator must borrow it — spawning a second
@@ -166,7 +170,7 @@ def execute_join_flight(
         def _launch(host: int, src: int):
             left, right = _sides(src)
             return actors[host].map_publish_join.remote(
-                left, right, n_buckets, src, 0, current_plan_id()
+                left, right, n_buckets, src, 0, current_plan_id(), stage_base
             )
 
         mapper_addrs, mapper_dead = map_barrier(workers, _launch)
@@ -203,6 +207,7 @@ def execute_join_flight(
             dead=mapper_dead,
             publish=publish,
             replicas=replicas,
+            stage_base=stage_base,
         )
         if publish:
             from batcher.dist.fleet import FlightMaterializedSource
@@ -294,6 +299,7 @@ def _join_reduce_with_recovery(
     dead=None,
     publish=False,
     replicas=None,
+    stage_base=0,
 ):
     """Run the join reduce under recompute-on-worker-loss recovery.
 
@@ -336,6 +342,7 @@ def _join_reduce_with_recovery(
                 replicas,
                 current_plan_id(),
                 result_stage,
+                stage_base,
             )
         return actors[host].reduce_join.remote(
             join_ir,
@@ -349,6 +356,7 @@ def _join_reduce_with_recovery(
             None,
             replicas,
             current_plan_id(),
+            stage_base,
         )
 
     def republish(target: int, src: int) -> None:
@@ -365,6 +373,7 @@ def _join_reduce_with_recovery(
                 src,
                 0,
                 current_plan_id(),
+                stage_base,
             )
         )
 

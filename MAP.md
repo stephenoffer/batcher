@@ -705,11 +705,11 @@ Subquery handling and decorrelation for the SQL translator.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 1516 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 647 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_join.py` | 389 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 675 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 179 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1211 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1239 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 174 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -798,7 +798,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 |---|---|---|
 | `_fleet.py` | 488 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
-| `plan_id.py` | 187 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
+| `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `source.py` | 193 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
 
 ### `batcher/dist/gpu/` — 4 · backend

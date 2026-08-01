@@ -22,12 +22,12 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
-import itertools
 import threading
 
 __all__ = [
     "adopt_plan_id",
     "next_result_stage",
+    "next_stage_base",
     "mint_query_plan_id",
     "query_plan_id",
     "query_shuffle_scope",
@@ -42,8 +42,26 @@ _QUERY_PLAN_ID: contextvars.ContextVar[int | None] = contextvars.ContextVar(
 # Where published-result ticket stages start. Above every fixed shuffle stage a worker uses
 # (0 and 1 are the two sides of a join's map), so a result can never alias one.
 _RESULT_STAGE_BASE = 100
-_result_stages = itertools.count(_RESULT_STAGE_BASE)
+_next_stage = _RESULT_STAGE_BASE
 _result_stage_lock = threading.Lock()
+
+
+def next_stage_base(count: int = 1) -> int:
+    """A block of `count` consecutive ticket stages no other shuffle in this process uses.
+
+    The generalization of `next_result_stage`, and it exists for the same reason one step
+    earlier in the pipeline: a shuffle's *map* buckets are addressed by
+    `(plan, stage, src, dst, epoch)` too, and every join published its two sides under the
+    fixed stages 0 and 1 while every aggregate used 0. A query with two shuffles therefore
+    had two sets of map buckets at identical coordinates on the same worker.
+
+    A join reserves two (one per side); an aggregate and a published result reserve one.
+    """
+    global _next_stage
+    with _result_stage_lock:
+        base = _next_stage
+        _next_stage += max(1, int(count))
+        return base
 
 
 def next_result_stage() -> int:
@@ -65,8 +83,7 @@ def next_result_stage() -> int:
     A process-global counter is enough: the ticket already carries the plan id, so stages
     only have to be unique within one query, and monotonic-per-process is strictly stronger.
     """
-    with _result_stage_lock:
-        return next(_result_stages)
+    return next_stage_base(1)
 
 
 # How many queries hold a shuffle scope in this process right now. The `ContextVar` above
