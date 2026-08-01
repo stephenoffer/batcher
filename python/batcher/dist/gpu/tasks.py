@@ -382,6 +382,19 @@ def gpu_task_options(num_gpus: float = 1.0) -> dict:
     dc = active_config().distributed
     opts: dict = {
         "num_gpus": num_gpus if num_gpus > 0 else 1.0,
+        # No CPU reservation. Ray gives a task `num_cpus=1` by default, and that default is
+        # what deadlocks a distributed GPU query: the shuffle fleet takes its workers in a
+        # placement group, so on a cluster fanned out to one worker per core the group holds
+        # **every** CPU — and a GPU shard task submitted outside it then waits for a core that
+        # will never come free. It does not fail; the query hangs with all four devices idle
+        # and `ray status` reporting the cluster fully reserved. Measured on four T4s: TPC-H
+        # q1 at 32 partitions hung indefinitely, and completed in 11.5 s at 8.
+        #
+        # Zero is also the honest figure. The work is on the device; the host thread submits
+        # kernels and moves buffers, and concurrency is already bounded by `num_gpus` — the
+        # device share is the resource being contended, not the core. It is what Ray's own
+        # guidance gives a GPU stage, and what Ray Data requests for its own.
+        "num_cpus": 0,
         "max_retries": int(dc.task_max_retries),
     }
     if dc.gpu_worker_reuse:

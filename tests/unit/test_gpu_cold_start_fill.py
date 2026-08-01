@@ -124,3 +124,18 @@ def test_a_device_at_the_goal_is_left_alone() -> None:
 def test_a_starved_device_still_packs() -> None:
     assert recommend_num_gpus(0.45, 1.0, 2, 6) == pytest.approx(0.25)
     assert recommend_num_gpus(0.78, 1.0, 1, 6) == pytest.approx(0.5)
+
+
+def test_a_gpu_relational_task_reserves_no_cpu() -> None:
+    """The deadlock this prevents: the shuffle fleet takes its workers in a placement group,
+    so on a cluster fanned out to one worker per core the group holds every CPU — and a GPU
+    shard task submitted outside it waits for a core that never comes free. The query hangs
+    with every device idle. Measured: TPC-H q1 on four T4s hung indefinitely at 32 partitions
+    and completed in 11.5s at 8.
+    """
+    from batcher.dist.gpu.tasks import gpu_task_options
+
+    opts = gpu_task_options()
+    assert opts["num_cpus"] == 0, "a GPU task must not queue behind a CPU reservation"
+    assert opts["num_gpus"] == 1.0, "the device share is the resource it does contend for"
+    assert gpu_task_options(0.25)["num_cpus"] == 0

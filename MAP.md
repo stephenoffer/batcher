@@ -815,7 +815,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | `join.py` | 205 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `resources.py` | 352 | What a GPU task asks Ray for — the fractional half of the relational fan-out. |
 | `shards.py` | 453 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
-| `tasks.py` | 392 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 405 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 | `tree.py` | 260 | Fan a whole plan tree out across the cluster's GPUs: split one leaf, replicate the rest. |
 | `union.py` | 208 | Run a translated union across every GPU, by sharding each of its inputs. |
 
