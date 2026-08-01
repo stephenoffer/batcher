@@ -25,6 +25,14 @@ from batcher.plan.functions.aggregate import (
     var,
 )
 from batcher.plan.functions.collection import element, named_struct, sequence, struct
+
+# The geospatial family re-exports through its own curated `__all__` rather than being
+# restated here. It is 113 names across nine modules, and spelling them out in this
+# facade *and* in `api/functions.py` would be 226 lines whose only job is to drift from
+# the list they copy. `geo.__all__` is the single source; the star import is governed
+# by it, and `_GEO_ALL` splices it into this module's own.
+from batcher.plan.functions.geo import *  # noqa: F403
+from batcher.plan.functions.geo import __all__ as _GEO_ALL
 from batcher.plan.functions.horizontal import (
     all_horizontal,
     any_horizontal,
@@ -181,3 +189,5 @@ __all__ = [
     "window",
     "wrap_tag",
 ]
+
+__all__ += _GEO_ALL

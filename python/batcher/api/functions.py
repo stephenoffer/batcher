@@ -179,6 +179,11 @@ from batcher.plan.functions.analysis import (
     welch_df,
     welch_t_statistic,
 )
+
+# The geospatial family, re-exported through its own curated `__all__`. See the note in
+# `plan/functions/__init__.py` for why these 113 names are spliced rather than listed.
+from batcher.plan.functions.geo import *  # noqa: F403
+from batcher.plan.functions.geo import __all__ as _GEO_ALL
 from batcher.plan.functions.metrics import (
     accuracy,
     all_caps_rate,
@@ -783,3 +788,5 @@ __all__ = [
     "wrap_tag",
     "zero_vector_rate",
 ]
+
+__all__ += _GEO_ALL

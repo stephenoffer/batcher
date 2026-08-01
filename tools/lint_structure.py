@@ -251,6 +251,13 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # line, grown just past 120 by the LLM-output-parsing family. Collapsing the import/`__all__`
     # would hide the surface the coverage linter walks.
     "python/batcher/plan/functions/__init__.py": "re-export-only function facade; one line per public name for discoverability",
+    "python/batcher/plan/functions/geo/__init__.py": (
+        "the geospatial family facade: 113 PostGIS-named functions across nine modules, one "
+        "import line per public name. It is the single curated list of the family — both "
+        "`plan/functions/__init__.py` and `api/functions.py` splice `geo.__all__` rather than "
+        "restating it — so compressing it here would only move the same names somewhere less "
+        "greppable"
+    ),
     # The GPU/accelerator module: vendor-agnostic backend detection plus the per-GPU
     # zero-config *recommendation* family (`recommend_quantization` / `recommend_inference_dtype`
     # / `recommend_num_gpus` / `recommend_gpu_fraction`) and the utilization-feedback loop, all

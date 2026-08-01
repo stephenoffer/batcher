@@ -1,0 +1,15 @@
+[package]
+name = "bc-geo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# GeoJSON is a JSON dialect, and `serde_json` is already in the workspace graph
+# (the plan IR is a JSON document), so parsing it here costs no new third-party code.
+serde_json = "1"
+thiserror.workspace = true
+
+[lints]
+workspace = true

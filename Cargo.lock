@@ -519,6 +519,7 @@ dependencies = [
  "arrow",
  "base64",
  "bc-arrow",
+ "bc-geo",
  "bc-secrets",
  "brotli",
  "chrono",
@@ -548,6 +549,14 @@ dependencies = [
  "thiserror",
  "twox-hash 1.6.3",
  "zstd",
+]
+
+[[package]]
+name = "bc-geo"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

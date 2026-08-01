@@ -165,6 +165,13 @@ impl Expr {
             Expr::Cast { .. }
             | Expr::Case { .. }
             | Expr::Date { .. }
+            // A geo function raises on a *caller* error (a negative radius, an
+            // unsupported EPSG code) rather than on a row's value, so it would qualify
+            // as schema-driven — but it is also the most expensive thing an expression
+            // can do per row, and short-circuiting exists to avoid evaluating a
+            // predicate on rows a cheaper conjunct already rejected. Classifying it
+            // fallible keeps it on the far side of that reordering.
+            | Expr::Geo { .. }
             | Expr::Image { .. }
             | Expr::Audio { .. }
             | Expr::Video { .. }
@@ -350,6 +357,7 @@ impl Expr {
             | Expr::Greatest { inputs }
             | Expr::Least { inputs } => inputs.iter().for_each(visit),
             Expr::Array { elements } => elements.iter().for_each(visit),
+            Expr::Geo { args, .. } => args.iter().for_each(visit),
             Expr::MakeTemporal { args, .. } => args.iter().for_each(visit),
             Expr::MakeStruct { fields } => fields.iter().for_each(|f| visit(&f.value)),
             Expr::Case {

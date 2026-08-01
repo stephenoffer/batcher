@@ -279,6 +279,11 @@ pub(crate) fn analyze(
         Expr::Image { .. } => Err(CodegenError::Unsupported("image function".into())),
         Expr::Audio { .. } => Err(CodegenError::Unsupported("audio function".into())),
         Expr::Video { .. } => Err(CodegenError::Unsupported("video function".into())),
+        // Geospatial work decodes WKB and walks variable-length geometry per row, which
+        // has no scalar-register form at all — there is nothing here for a JIT to
+        // compile, and falling back is the correct and permanent answer rather than a
+        // gap waiting to be filled.
+        Expr::Geo { .. } => Err(CodegenError::Unsupported("geospatial function".into())),
         Expr::Coalesce { .. } => Err(CodegenError::Unsupported("coalesce".into())),
         // `x IN (lit, ...)`: compiled as an OR-chain of equality compares, so the whole
         // surrounding predicate stays in one JIT pass instead of falling back wholesale.

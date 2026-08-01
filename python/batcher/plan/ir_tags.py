@@ -92,10 +92,28 @@ class ExprTag:
     MAKE_STRUCT: Final = "make_struct"
     MAKE_TEMPORAL: Final = "make_temporal"
     MAP: Final = "map"
+    GEO: Final = "geo"
     IMAGE: Final = "image"
     AUDIO: Final = "audio"
     VIDEO: Final = "video"
 
+
+# The `Binary` comparison operators, mirroring the Rust `BinaryOp` serde tags.
+#
+# Fourteen modules across Kyber were spelling this set out for themselves — as a frozenset, a
+# tuple, a dict keyed by it, and (twice, adjacently, in one file) the same dict literal — and
+# `ruff` reports none of that: `F811` does not fire on a module-level constant reassignment.
+# The spellings had already drifted apart, which is the cost: one of them omitted `eq`/`ne`
+# while carrying the same name as the ones that did not, so whether a rule saw an equality
+# predicate depended on which module it happened to be written in.
+#
+# A rule that genuinely wants a *subset* takes `ORDERING_COMPARISONS` or names its own for
+# what it is; what it must not do is redefine "the comparisons" to mean something narrower.
+COMPARISON_OPS: Final = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
+# The order-only comparisons. Separate because range/zonemap reasoning is defined by an
+# interval endpoint moving, which `eq`/`ne` do not do: `eq` is a degenerate interval and `ne`
+# is not an interval at all, so admitting them to a bounds walk widens it wrongly.
+ORDERING_COMPARISONS: Final = frozenset({"lt", "le", "gt", "ge"})
 
 # Window-function names, mirroring the Rust `WindowFn` enum (serde snake_case).
 # Ranking functions take no input; "value" functions select a row's value by offset
