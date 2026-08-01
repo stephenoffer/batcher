@@ -40,7 +40,7 @@ def _install_tracking_ray(monkeypatch) -> tuple[dict, type, type]:
 
     ray_mod = types.ModuleType("ray")
     ray_mod.exceptions = exc
-    ray_mod.wait = lambda refs, num_returns=1: ([refs[0]], refs[1:])
+    ray_mod.wait = lambda refs, num_returns=1, timeout=None: ([refs[0]], refs[1:])
 
     def _get(ref):
         state["live"] -= 1

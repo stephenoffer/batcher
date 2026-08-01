@@ -74,14 +74,63 @@ def test_envelope_stays_hashable_with_resources():
 @pytest.mark.parametrize(
     ("num_gpus", "accel", "resources", "expected"),
     [
-        (0.0, "TPU-V6E", {"TPU": 4}, {"resources": {"TPU": 4}, "accelerator_type": "TPU-V6E"}),
-        (0.0, None, {"neuron_cores": 2}, {"resources": {"neuron_cores": 2}}),
-        (1.0, "NVIDIA_A100", None, {"num_gpus": 1.0, "accelerator_type": "NVIDIA_A100"}),
+        (
+            0.0,
+            "TPU-V6E",
+            {"TPU": 4},
+            {"resources": {"TPU": 4}, "accelerator_type": "TPU-V6E", "num_cpus": 0},
+        ),
+        (0.0, None, {"neuron_cores": 2}, {"resources": {"neuron_cores": 2}, "num_cpus": 0}),
+        (
+            1.0,
+            "NVIDIA_A100",
+            None,
+            {"num_gpus": 1.0, "accelerator_type": "NVIDIA_A100", "num_cpus": 0},
+        ),
         (0.0, None, None, {}),
     ],
 )
 def test_map_stage_options(num_gpus, accel, resources, expected):
     assert _gpu_options(num_gpus, accel, resources) == expected
+
+
+def test_an_accelerator_stage_reserves_no_cpu():
+    """The deadlock this prevents, and why the CPU grant has to be spelled explicitly.
+
+    Ray's rule is that an actor naming *any* resource takes a core for its whole lifetime
+    (`DEFAULT_ACTOR_CREATION_CPU_SPECIFIED = 1`), and naming `num_gpus` is naming one. The
+    shuffle fleet takes its workers in a placement group sized to the cluster's whole CPU
+    capacity, so on any pipeline that shuffles before it infers — a `group_by`/`join`/`sort`
+    feeding `ds.ml.map_batches`, which is the heterogeneous CPU+GPU shape the API documents —
+    that core never comes free. The pool never places, every device sits idle, and
+    `ray status` reports a fully reserved cluster, so it reads as busy rather than stuck.
+
+    The GPU *relational* path already fixed this in `gpu_task_options`; this is the
+    *inference* path, which is the one an ML user reaches for.
+    """
+    assert _gpu_options(1.0, None, None)["num_cpus"] == 0
+    assert _gpu_options(0.25, None, None)["num_cpus"] == 0
+    # Every other accelerator is a custom resource rather than `num_gpus`, and queues behind
+    # exactly the same core.
+    assert _gpu_options(0.0, None, {"TPU": 4})["num_cpus"] == 0
+    assert _gpu_options(0.0, None, {"neuron_cores": 2})["num_cpus"] == 0
+    # A CPU-only stage is untouched: it has no device to bound its concurrency, so the core
+    # *is* the resource it contends for and it must keep asking for one.
+    assert "num_cpus" not in _gpu_options(0.0, None, None)
+
+
+def test_an_accelerator_task_keeps_its_zero_over_the_skew_adaptive_share():
+    """The stateless-task branch spells `num_cpus` itself, from the skew-adaptive share.
+
+    A custom-resource stage (TPU/Trainium) takes that branch — it wants no actor pool — so
+    ordering decides whether it escapes the reservation. Spelling the share last overrode
+    the accelerator zero and put it straight back behind the core.
+    """
+    opts = _gpu_options(0.0, None, {"TPU": 4})
+    merged = {"num_cpus": 3.0, **opts}
+    assert merged["num_cpus"] == 0, "the accelerator grant must win over the CPU share"
+    # ...and a CPU-only stage still gets its adaptive share, since `opts` names no CPU.
+    assert {"num_cpus": 3.0, **_gpu_options(0.0, None, None)}["num_cpus"] == 3.0
 
 
 def test_custom_resources_are_reserved_in_the_placement_bundle():
@@ -223,3 +272,28 @@ def test_a_non_gpu_accelerator_stage_is_costed_as_inference():
     assert model.op_cost(tpu).cpu > model.op_cost(plain).cpu
     # And it is costed the same as the equivalent GPU stage — the device differs, not the work.
     assert model.op_cost(tpu).cpu == model.op_cost(gpu).cpu
+
+
+def test_the_pool_bundle_reserves_what_the_actor_requests():
+    """A bundle reserves; the actor then requests from its bundle. The two must agree.
+
+    They did not for an inference pool. The device-tiled fan-out grants each worker a whole
+    accelerator node's cores divided by its devices, so on a 4-node, 8-core, 1-device cluster
+    a 4-actor pool reserved all 32 cores — for cores its actors no longer ask for. It is the
+    reservation that then fails: anything else holding one core makes the gang unsatisfiable,
+    and the pool burns the entire placement timeout before degrading to the default
+    scheduling that would have worked at once.
+    """
+    from batcher.dist.executors.map import _gpu_options, _pool_placement_envelope
+
+    device = SchedulingEnvelope(num_cpus=8.0, num_gpus=1.0, n_tasks=4)
+    tuned = _pool_placement_envelope(device, _gpu_options(1.0, None, None))
+    assert tuned.num_cpus == 0.0, "the bundle must not reserve cores the actor never requests"
+    assert tuned.num_gpus == 1.0, "the device grant is what the bundle is actually for"
+    assert tuned.n_tasks == 4, "only the CPU grant is restated"
+
+    # A CPU-only pool (a class `fn` with no device) is untouched: there the core *is* the
+    # resource being reserved, and the bundle was already honest.
+    cpu = SchedulingEnvelope(num_cpus=4.0, n_tasks=2)
+    assert _pool_placement_envelope(cpu, _gpu_options(0.0, None, None)) is cpu
+    assert _pool_placement_envelope(None, _gpu_options(1.0, None, None)) is None

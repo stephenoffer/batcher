@@ -718,7 +718,13 @@ def _distributed_map(
             # tasks on a 16-core node each opened a 16-thread pool: hundreds of threads
             # thrashing 16 cores, and the session config (morsel size, memory budget)
             # silently ignored on every distributed scan.
-            return _map_udf_task.options(**{**opts, "num_cpus": shares[idx], **sched}).remote(
+            # The skew-adaptive share is the CPU-only task's grant. An *accelerator* task's
+            # grant comes from `opts` instead (zero — see `_gpu_options`), so `opts` is
+            # applied after it rather than before: spelling the share last overrode the
+            # accelerator zero and put a custom-resource stage (a TPU/Trainium task, which
+            # takes this branch because it wants no actor pool) back behind the CPU
+            # reservation the zero exists to escape.
+            return _map_udf_task.options(**{"num_cpus": shares[idx], **opts, **sched}).remote(
                 plan0, partitions[idx], workers, engine_config_json(shares[idx]), write_spec, idx
             )
 
@@ -1153,7 +1159,22 @@ def _gpu_options(
     `accelerator_type` is applied whenever it is set, **not** only alongside `num_gpus`.
     Gating it on GPUs silently dropped the pin on exactly the hardware that needs it most:
     a TPU or Trainium node has `num_gpus == 0`, so a job asking for a specific device model
-    got no pin at all and could land on any node in the cluster."""
+    got no pin at all and could land on any node in the cluster.
+
+    An accelerator stage additionally reserves **no CPU**, which is not a detail: Ray's rule
+    is that an actor asking for *any* resource takes one core for its whole lifetime
+    (`DEFAULT_ACTOR_CREATION_CPU_SPECIFIED`), and naming `num_gpus` is asking for one. So an
+    inference pool that named only its devices still queued behind a core — and the shuffle
+    fleet takes its workers in a placement group holding the cluster's whole CPU capacity, so
+    on any pipeline that shuffles before it infers (a `group_by`/`join`/`sort` feeding
+    `ds.ml.map_batches`, the documented heterogeneous CPU+GPU shape) that core never comes
+    free. It does not fail: the pool never places, every device sits idle, and `ray status`
+    reports a fully reserved cluster, which reads as busy rather than stuck. This is the same
+    deadlock `bc`'s GPU *relational* path fixed in `gpu_task_options`, on the *inference* path.
+
+    Zero is also the honest request, for the reason it is there: the work is on the device,
+    the host thread submits kernels and moves buffers, and concurrency is already bounded by
+    `num_gpus` — the device share is what is being contended, not the core."""
     opts: dict = {}
     if num_gpus:
         opts["num_gpus"] = num_gpus
@@ -1161,7 +1182,32 @@ def _gpu_options(
         opts["resources"] = dict(resources)
     if accelerator_type and (num_gpus or resources):
         opts["accelerator_type"] = accelerator_type
+    if opts:
+        opts["num_cpus"] = 0
     return opts
+
+
+def _pool_placement_envelope(env, opts: dict):
+    """`env` with its per-bundle CPU grant reduced to what an accelerator actor actually asks.
+
+    A placement-group bundle reserves resources; an actor then requests them again from its
+    bundle. Those two numbers have to agree, and for an inference pool they did not. The
+    device-tiled fan-out grants each worker a whole accelerator node's cores divided by its
+    devices (`_accelerator_fill_workers`) — on a 4-node, 8-core, 1-device-per-node cluster
+    that is 8 cores per actor, so a 4-actor pool reserved all 32 cores in the cluster. The
+    actors themselves now ask for none (`_gpu_options`), so the reservation was for cores
+    nothing would use, and it is the reservation that fails: anything else holding a single
+    core makes the gang unsatisfiable, and the pool spends the whole placement timeout before
+    degrading to the default scheduling that would have worked immediately.
+
+    Left alone for a CPU-only stage, where the core *is* the resource being reserved and the
+    bundle is already honest.
+    """
+    if env is None or "num_cpus" not in opts:
+        return env
+    import dataclasses
+
+    return dataclasses.replace(env, num_cpus=float(opts["num_cpus"]))
 
 
 def _autoscale_action(
@@ -1219,7 +1265,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write
     # `gpu_collective` stage reaches STRICT_PACK: the strategy is resolved inside
     # `create_worker_placement`, so a path that never called it could not express NCCL
     # co-location at all.
-    env = current_envelope()
+    env = _pool_placement_envelope(current_envelope(), opts)
     # Reserving the group is an optimization, never a correctness requirement: the pool
     # runs correctly under default scheduling. So a reservation that times out (returns
     # None) or outright fails (raises — no placement API, a Ray version without it) must

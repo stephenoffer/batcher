@@ -28,6 +28,12 @@ from ._faults import (
 
 __all__ = ["gather_map_results", "map_barrier"]
 
+#: How often the map barrier wakes while nothing has completed, so a stage that cannot be
+#: scheduled can be *reported* rather than waited on in silence. Only the reporting cadence:
+#: a wake with no result costs one `ray.wait` round-trip and changes no scheduling decision,
+#: so it is well below the two-minute warning threshold and well above a spin.
+_STALL_POLL_S = 5.0
+
 
 def _pending_window(task_cpus: float = 1.0) -> int:
     """The max map tasks kept in flight at once — a submit-ahead cap.
@@ -144,8 +150,32 @@ def gather_map_results(
             inflight[submit(idx)] = idx
 
     _fill()
+    # A map/inference stage that cannot be scheduled looks exactly like one that is merely
+    # slow, and an unbounded `ray.wait` reports neither: the query sits in this loop with no
+    # output for as long as the cluster stays full. That is the common shape on a shared
+    # cluster — a shuffle fleet's placement group holds every core, and the map tasks
+    # submitted outside it wait for a core that never comes free — and it presents as a hung
+    # job with idle devices. The shuffle barrier already says so after two minutes
+    # (`warn_barrier_stalled`, which reads Ray's own view of the reservation); this is the
+    # same wait on the path an inference user is actually on. Waiting is still the behavior:
+    # a legitimately slow first task is indistinguishable from a stuck one, so the barrier
+    # reports rather than fails.
+    import time
+
+    from batcher.carbonite.resilience import STALL_WARN_AFTER_S, warn_barrier_stalled
+
+    barrier_started = time.monotonic()
+    stall_warnings = 0
+    finished = 0
     while inflight:
-        done, _ = ray.wait(list(inflight), num_returns=1)
+        done, _ = ray.wait(list(inflight), num_returns=1, timeout=_STALL_POLL_S)
+        if not done:
+            waited = time.monotonic() - barrier_started
+            if not finished and waited > STALL_WARN_AFTER_S * (stall_warnings + 1):
+                stall_warnings += 1
+                warn_barrier_stalled(waited, n)
+            continue
+        finished += 1
         ref = done[0]
         idx = inflight.pop(ref)
         try:

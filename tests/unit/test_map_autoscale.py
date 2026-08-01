@@ -49,9 +49,16 @@ def test_merge_concurrency():
 def test_gpu_options_pins_only_with_gpu():
     from batcher.dist.executors.map import _gpu_options
 
-    assert _gpu_options(0.0, "NVIDIA_A100") == {}  # no GPU -> no accelerator_type
-    assert _gpu_options(1.0, None) == {"num_gpus": 1.0}
-    assert _gpu_options(1.0, "NVIDIA_A100") == {"num_gpus": 1.0, "accelerator_type": "NVIDIA_A100"}
+    assert _gpu_options(0.0, "NVIDIA_A100") == {}  # no GPU -> no accelerator_type, no grant
+    # `num_cpus: 0` rides along with every accelerator request: Ray charges an actor a core
+    # for its lifetime the moment it names any resource, and that core is what deadlocks an
+    # inference pool behind the shuffle fleet's reservation (see `_gpu_options`).
+    assert _gpu_options(1.0, None) == {"num_gpus": 1.0, "num_cpus": 0}
+    assert _gpu_options(1.0, "NVIDIA_A100") == {
+        "num_gpus": 1.0,
+        "accelerator_type": "NVIDIA_A100",
+        "num_cpus": 0,
+    }
 
 
 def test_task_options_accelerator_type():
