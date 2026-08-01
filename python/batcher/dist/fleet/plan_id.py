@@ -22,10 +22,12 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+import itertools
 import threading
 
 __all__ = [
     "adopt_plan_id",
+    "next_result_stage",
     "mint_query_plan_id",
     "query_plan_id",
     "query_shuffle_scope",
@@ -36,6 +38,36 @@ __all__ = [
 _QUERY_PLAN_ID: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "batcher_query_plan_id", default=None
 )
+
+# Where published-result ticket stages start. Above every fixed shuffle stage a worker uses
+# (0 and 1 are the two sides of a join's map), so a result can never alias one.
+_RESULT_STAGE_BASE = 100
+_result_stages = itertools.count(_RESULT_STAGE_BASE)
+_result_stage_lock = threading.Lock()
+
+
+def next_result_stage() -> int:
+    """A ticket stage no other published result in this process will use.
+
+    The plan id fences one *query's* published partitions from another's, and the same
+    argument applies **within** a query: a result kept on the workers is addressed by
+    `(plan, stage, src, dst, epoch)`, so two results published under one fixed stage
+    constant are byte-identical tickets on the same worker. The second silently overwrites
+    the first, and the reader of the first gets the second's rows.
+
+    That is not hypothetical — it is what a multi-join query does. TPC-H q9 materializes
+    `part x lineitem` and `supplier x nation` on the same fleet; both published under stage
+    100, and the join that then read the first bucket got the second's columns
+    (`n_name, n_nationkey, s_nationkey, s_suppkey` where it asked for `p_partkey, l_*`).
+    Seven of the twenty-two TPC-H queries failed this way, and the one that surfaced did so
+    as a projection `KeyError` three call frames from the cause.
+
+    A process-global counter is enough: the ticket already carries the plan id, so stages
+    only have to be unique within one query, and monotonic-per-process is strictly stronger.
+    """
+    with _result_stage_lock:
+        return next(_result_stages)
+
 
 # How many queries hold a shuffle scope in this process right now. The `ContextVar` above
 # answers "which query am I?"; this answers "is anyone else running?", which is what the

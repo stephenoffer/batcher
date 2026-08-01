@@ -35,6 +35,7 @@ from batcher.dist.executors.ray_runtime import (
     release_placement,
     shuffle_partitions,
 )
+from batcher.dist.fleet.plan_id import next_result_stage
 from batcher.dist.flight_worker import _ticket, current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
@@ -385,12 +386,16 @@ def _reduce_with_recovery(
         # is classified as a lost host (recompute), exactly as the serial path did.
         epochs = _epochs()
         method = "reduce_fetch_publish" if materialize else "reduce_fetch"
+        # One stage id for every bucket of THIS published result, so two materialized
+        # intermediates of the same query cannot share a ticket (`next_result_stage`).
+        result_stage = next_result_stage() if materialize else 0
         ref_host: dict[object, int] = {}
 
         def _launch(r: int, avoid: set[int]):
             host = _host_for(r, avoid)
+            extra = (result_stage,) if materialize else ()
             ref = getattr(actors[host], method).remote(
-                gk, aj, mapper_addrs, r, epochs, replicas, current_plan_id()
+                gk, aj, mapper_addrs, r, epochs, replicas, current_plan_id(), *extra
             )
             ref_host[ref] = host
             return ref

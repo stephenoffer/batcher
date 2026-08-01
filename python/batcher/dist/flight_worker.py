@@ -59,7 +59,11 @@ _DEFAULT_PLAN_ID = 1
 _current_plan_id: contextvars.ContextVar[int] = contextvars.ContextVar(
     "batcher_shuffle_plan_id", default=_DEFAULT_PLAN_ID
 )
-_RESULT_STAGE = 100  # ticket stage for a stage's *finalized* result (kept on the actor)
+# Default ticket stage for a stage's *finalized* result (kept on the actor). Every publish
+# should pass its own `result_stage` from `fleet.plan_id.next_result_stage` — two results
+# sharing one stage are byte-identical tickets on the same worker, and the second overwrites
+# the first. This constant remains only so an older caller keeps working.
+_RESULT_STAGE = 100
 # Sub-buckets a memory-bounded join reduce re-partitions each staged side into on disk, so
 # it joins one sub-bucket pair at a time rather than the whole bucket. Matches the
 # single-node spilling join's default fan-out (`execute_spilling_join`).
@@ -580,7 +584,15 @@ try:
                 shutil.rmtree(work, ignore_errors=True)
 
         def reduce_fetch_publish(
-            self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None, plan_id=None
+            self,
+            gk,
+            aj,
+            mapper_addrs,
+            reducer_id,
+            epochs=None,
+            replicas=None,
+            plan_id=None,
+            result_stage=_RESULT_STAGE,
         ):
             """Like `reduce_fetch`, but PUBLISH the finalized result on this worker's own
             Flight server and return only a `(addr, ticket, rows, schema)` handle.
@@ -594,7 +606,7 @@ try:
             status, payload = self.reduce_fetch(gk, aj, mapper_addrs, reducer_id, epochs, replicas)
             if status != "ok" or payload is None:
                 return (status, payload)  # retry, or an empty bucket (no handle)
-            ticket = _ticket(_RESULT_STAGE, self.id, reducer_id)
+            ticket = _ticket(result_stage, self.id, reducer_id)
             self.session.publish(ticket, [payload])
             return ("ok", (self.session.addr, ticket, payload.num_rows, payload.schema))
 
@@ -885,6 +897,7 @@ try:
             epochs=None,
             replicas=None,
             plan_id=None,
+            result_stage=_RESULT_STAGE,
         ):
             """Like `reduce_join`, but PUBLISH this bucket's joined rows on the worker's own
             Flight server and hand back only an `(addr, ticket, rows, schema)` handle.
@@ -927,7 +940,7 @@ try:
             batches = [b for b in (batches or []) if b.num_rows > 0]
             if not batches:
                 return ("ok", None)
-            ticket = _ticket(_RESULT_STAGE, self.id, reducer_id)
+            ticket = _ticket(result_stage, self.id, reducer_id)
             self.session.publish(ticket, batches)
             rows = sum(b.num_rows for b in batches)
             return ("ok", (self.session.addr, ticket, rows, batches[0].schema))

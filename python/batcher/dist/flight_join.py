@@ -24,6 +24,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.fleet import acquire_fleet, release_fleet
+from batcher.dist.fleet.plan_id import next_result_stage
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
@@ -311,6 +312,10 @@ def _join_reduce_with_recovery(
 
     from batcher.dist.executors.ray_runtime import run_bucket_reduce
 
+    # One stage id for every bucket of THIS published result. Without it two materialized
+    # intermediates of the same query share a ticket and the second overwrites the first —
+    # see `fleet.plan_id.next_result_stage`.
+    result_stage = next_result_stage() if publish else 0
     lparts, rparts = parts
     left_ir, right_ir = irs
     left_keys, right_keys = keys
@@ -322,7 +327,15 @@ def _join_reduce_with_recovery(
         # Otherwise the reducer ships its batches back.
         if publish:
             return actors[host].reduce_join_publish.remote(
-                join_ir, addrs, bucket, lschema, rschema, None, replicas, current_plan_id()
+                join_ir,
+                addrs,
+                bucket,
+                lschema,
+                rschema,
+                None,
+                replicas,
+                current_plan_id(),
+                result_stage,
             )
         return actors[host].reduce_join.remote(
             join_ir,
