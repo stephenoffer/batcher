@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1155 Python modules across 176 packages and 218 Rust files across 14 crates.
+Covering 1169 Python modules across 178 packages and 218 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -2358,6 +2358,32 @@ Where this process is running — the provider, the scheduler, and the node's lo
 | `provider.py` | 377 | Which GPU cloud this is — read from the environment, never from a metadata service. |
 | `scheduler.py` | 324 | What launched this process — Slurm, PBS, LSF, Kubernetes, Ray, or nothing. |
 | `scratch.py` | 205 | The node-local fast filesystem — where a spill should actually go. |
+
+### `batcher/graph/` — ?
+
+Graph analytics and graph-ML features over an edge table.
+
+| module | lines | what it is |
+|---|---|---|
+| `_graph.py` | 395 | The `Graph` handle: an edge table, plus what the algorithms need to know about it. |
+| `_iterate.py` | 210 | The fixpoint driver every iterative graph algorithm runs on. |
+| `community.py` | 356 | Communities, triangles, and how tightly a neighbourhood closes on itself. |
+| `components.py` | 246 | Connected components, and the cores that survive peeling the graph down. |
+| `degree.py` | 225 | Degree: how many edges touch each node, and how those counts are distributed. |
+| `features.py` | 227 | Turning a graph into a feature table a model can train on. |
+| `sampling.py` | 283 | Sampling a graph: random walks, bounded neighbourhoods, and induced subgraphs. |
+| `similarity.py` | 315 | How alike two nodes are, judged by who they are connected to. |
+| `summary.py` | 168 | Graph-level numbers: the ones to look at before running anything else. |
+| `traversal.py` | 333 | Distances: how far each node is from a starting set, in hops or in weight. |
+
+### `batcher/graph/centrality/` — ?
+
+Centrality: which nodes matter, by five different definitions of "matter".
+
+| module | lines | what it is |
+|---|---|---|
+| `rank.py` | 285 | PageRank and the degree-based centralities. |
+| `spectral.py` | 243 | The eigen-family centralities: eigenvector, Katz, and HITS. |
 
 ## Rust data plane — `crates/`
 

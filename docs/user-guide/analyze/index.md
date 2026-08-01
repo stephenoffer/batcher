@@ -35,6 +35,12 @@ Long to wide and back.
 Geometry, spatial joins, projections, and grid keys.
 :::
 
+:::{grid-item-card} {octicon}`share-android;1.1em` Graphs
+:link: /user-guide/analyze/graphs
+:link-type: doc
+PageRank, components, communities, and graph-ML features.
+:::
+
 :::{grid-item-card} {octicon}`database;1.1em` SQL
 :link: /user-guide/analyze/sql
 :link-type: doc
@@ -56,6 +62,7 @@ joins
 window-functions
 pivoting
 geospatial
+graphs
 sql
 metadata-shortcuts
 ```

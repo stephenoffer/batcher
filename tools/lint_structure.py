@@ -251,6 +251,11 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # line, grown just past 120 by the LLM-output-parsing family. Collapsing the import/`__all__`
     # would hide the surface the coverage linter walks.
     "python/batcher/plan/functions/__init__.py": "re-export-only function facade; one line per public name for discoverability",
+    "python/batcher/graph/__init__.py": (
+        "the graph-analytics facade: ~50 algorithms across ten modules, one import line per "
+        "public name. Users import from `batcher.graph` directly, so the names have to be "
+        "here; the modules below it are all under the size limit"
+    ),
     "python/batcher/plan/functions/geo/__init__.py": (
         "the geospatial family facade: 113 PostGIS-named functions across nine modules, one "
         "import line per public name. It is the single curated list of the family — both "

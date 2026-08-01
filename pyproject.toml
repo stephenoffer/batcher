@@ -257,6 +257,7 @@ forbidden_modules = [
     "batcher.dist",
     "batcher.api",
     "batcher.ml",
+    "batcher.graph",
 ]
 
 # `observe` holds the observability *sinks* (terminal reporter, activity store, web UI). Every
@@ -276,6 +277,7 @@ forbidden_modules = [
     "batcher.dist",
     "batcher.api",
     "batcher.ml",
+    "batcher.graph",
     "batcher.io",
 ]
 

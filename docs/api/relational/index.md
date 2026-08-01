@@ -9,6 +9,7 @@ The verbs, the column language, and the boundary data crosses. Each page leads w
 | {doc}`/api/relational/expression-accessors` | Every `.str`, `.dt`, `.list`, `.struct`, `.json`, `.map`, `.image`, `.audio`, and `.video` method |
 | {doc}`/api/relational/functions` | Scalar, horizontal, aggregate, and window functions |
 | {doc}`/api/relational/geospatial` | Every `ST_*` function: geometry, predicates, measures, grids |
+| {doc}`/api/relational/graph` | Graph analytics and graph-ML features over an edge table |
 | {doc}`/api/relational/sql` | The SQL surface, and how it lowers to the DataFrame API |
 | {doc}`/api/relational/io` | Every reader and writer, with the optional extras |
 
@@ -20,6 +21,7 @@ expressions
 expression-accessors
 functions
 geospatial
+graph
 sql
 io
 ```

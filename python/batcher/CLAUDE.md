@@ -10,7 +10,7 @@ A package may import anything **strictly below** its line, never above or sidewa
 
 | Layer | Package | May import |
 |---|---|---|
-| 6 · front-ends | `ml`, `_sql` — user surfaces built *on* the public API | `api` + below |
+| 6 · front-ends | `ml`, `graph`, `_sql` — user surfaces built *on* the public API | `api` + below |
 | 5 · conductor | `api` — the ONLY layer that imports the subsystems | everything below |
 | 4 · backend | `dist` — distributed *scheduling* of the same operators | layers 0–3. **MUST NOT import `api`** (a cycle) |
 | 3 · subsystems | `kyber` (decides) · `carbonite` (protects) · `core` (measures/executes) · `governance` (policy) | layers 0–2 |

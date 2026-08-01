@@ -28,7 +28,7 @@ Read it bottom-up: a package may import anything **below** its line, never above
 
 | Layer | Package | Responsibility | May import |
 |---|---|---|---|
-| 6 · front-ends | `ml`, `_sql` | User-facing feature surfaces built *on* the public API: ML/inference/loaders; the SQL parser+translator. They lower to the same `Dataset`/`LogicalPlan` everything else uses — they never build a second plan or a second executor. | `api` + everything below |
+| 6 · front-ends | `ml`, `graph`, `_sql` | User-facing feature surfaces built *on* the public API: ML/inference/loaders; graph analytics and graph-ML features over an edge table; the SQL parser+translator. They lower to the same `Dataset`/`LogicalPlan` everything else uses — they never build a second plan or a second executor. | `api` + everything below |
 | 5 · conductor | `api` | **The only conductor.** The single place allowed to import all subsystems; it sequences them on a terminal op: Kyber optimizes → Carbonite checks feasibility → Core executes → metadata flows back. | everything below |
 | 4 · backend | `dist` | Distributed **scheduling** of the same operators (Ray tasks, Arrow Flight shuffle, out-of-core spill). A *scheduling* concern, not a second semantics — it composes the same mergeable primitives. | `kyber`, `carbonite`, `core` + everything below. **MUST NOT import `api`** (that is the conductor calling *into* its own backend — a cycle). |
 | 3 · subsystems | `kyber` | **Optimizer.** Plan → plan passes; cardinality/cost; learned stats. Decides, never executes. | layers 0–2 |
