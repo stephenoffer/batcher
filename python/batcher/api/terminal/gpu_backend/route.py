@@ -47,6 +47,8 @@ def try_gpu_collect(
     one table to one GPU."""
     gpu_count = _cluster_gpu_count()
     if gpu_count < 1:
+        if force:
+            _note_no_visible_device()
         return None
     from batcher.dist.executors.ray_runtime.accelerators import (
         cluster_accelerator_type,
@@ -112,13 +114,54 @@ def try_gpu_collect(
     return result
 
 
-#: Exception types that mean the GPU backend itself is broken rather than that this plan cannot
-#: run on a device. A missing symbol, a renamed attribute, a call whose signature no longer
-#: matches: none of those are properties of the query, and every one of them is silent under a
-#: handler written for "the device declined". Both of the whole-path outages this file has had
-#: were of exactly this shape — an `ImportError` from a moved autoscale helper that disabled
-#: every multi-device fan-out, and a `TypeError` from a fan-out called without one of its
-#: keyword arguments — and both looked, from the outside, like a query that was simply slow.
+#: Whether the "no device for an explicit GPU request" warning has already been given. Once per
+#: process: the condition is a property of the cluster, not of the query, so repeating it on
+#: every terminal op would be noise around a fact that cannot change mid-run.
+_NOTED_NO_DEVICE = False
+
+
+def _note_no_visible_device() -> None:
+    """Say why an explicit `backend="gpu"` found no device, once per process.
+
+    `backend="gpu"` is documented as always safe, and it is — the CPU engine returns the same
+    rows. What it was not is *audible*: on a cluster whose driver is CPU-only, every explicit
+    GPU request fell back silently and the user's only signal was the running time.
+
+    And the reason is almost never "there are no GPUs". The device count is read from the live
+    Ray topology, and only when Ray is already initialized in this process — a `sys.modules`
+    gate that exists so an ordinary small query does not pay a 0.44 s `import ray` to be told
+    it is single-node. A CPU-only head node with four GPU workers therefore reports zero
+    devices until something initializes Ray, which a plain `collect()` never does. That is an
+    actionable difference and it is what this message carries.
+    """
+    global _NOTED_NO_DEVICE
+    if _NOTED_NO_DEVICE:
+        return
+    _NOTED_NO_DEVICE = True
+
+    import logging
+
+    from batcher._internal.logging import get_logger, log_kv
+    from batcher.api.terminal.routing import _ray_already_live
+
+    detail = (
+        "the cluster reports no GPU"
+        if _ray_already_live()
+        else (
+            "no GPU is visible from this process: the cluster's devices are read from the live "
+            "Ray topology, and Ray is not initialized here. Run with distributed=True, or "
+            "initialize Ray first, to reach the cluster's GPUs"
+        )
+    )
+    # Warned rather than noted: this is a decline, not a defect, so it is not routed through
+    # `note_gpu_failure` — but it is a decline of something the caller asked for *explicitly*,
+    # and the only signal it otherwise leaves is the running time.
+    log_kv(
+        get_logger("api"),
+        logging.WARNING,
+        'backend="gpu" was requested and the CPU engine ran this query instead',
+        reason=detail,
+    )
 
 
 def _optimized(plan: LogicalPlan, sources: list[Source], hub):
@@ -172,7 +215,14 @@ def _record_gpu_timing(hub, plan, sources, est_rows: int, wall_ms: float) -> Non
     # The same run, as a throughput rather than as a point on a line. It is what a fan-out
     # divides its shards by, and it is learnable from GPU runs alone — the crossover fit needs
     # CPU samples this fleet may never produce.
-    record_device_throughput(hub, device, rows, wall_ms / 1000.0)
+    #
+    # Divided by the devices that shared the work, because what is measured here is a whole
+    # query: `rows` is the source's total and `wall_ms` is the collect. On an eight-device
+    # fan-out that is eight boards' throughput recorded under one board's name, and the
+    # consumer deals shards *between* device models on the assumption it is per device — so
+    # two models measured at different fan-out widths are compared as though the wider one
+    # were the faster part.
+    record_device_throughput(hub, device, rows, wall_ms / 1000.0, devices=_cluster_gpu_count())
 
 
 def record_cpu_crossover(plan, sources, hub, wall_ms: float) -> None:

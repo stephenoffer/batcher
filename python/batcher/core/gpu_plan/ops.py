@@ -94,7 +94,21 @@ def _filter(df, ir: dict, be: DfBackend):
 
 
 def _project(df, ir: dict, be: DfBackend):
-    cols = {p["alias"]: be.column(eval_expr(p["expr"], df, be), df) for p in ir["exprs"]}
+    import pyarrow as pa
+
+    from batcher.core.gpu_plan.vocab.dates import date_typed
+
+    cols = {}
+    for p in ir["exprs"]:
+        alias = p["alias"]
+        cols[alias] = be.column(eval_expr(p["expr"], df, be), df)
+        # Neither library has a calendar-day type, so a projection that *computes* a date has
+        # to say so — the column itself cannot. Recorded or cleared per alias, so the last
+        # projection to produce a name decides what that name is.
+        if date_typed(p["expr"], be):
+            be.remember_date_alias(alias, pa.date32())
+        else:
+            be.forget_date_alias(alias)
     return be.lib.DataFrame(cols).reset_index(drop=True)
 
 

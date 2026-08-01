@@ -21,9 +21,10 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from batcher._internal.device_share import pack_fraction
+from batcher._internal.device_share import device_headroom, pack_fraction
 from batcher.config import active_config
 from batcher.kyber.gpu.shape import broadcast_join, is_shardable
+from batcher.kyber.gpu.spread import devices_worth_using
 
 if TYPE_CHECKING:
     from batcher.io.source import Source
@@ -33,12 +34,13 @@ if TYPE_CHECKING:
 __all__ = ["GpuDecision", "GpuMapParams", "decide_gpu_backend", "decide_gpu_map_params"]
 
 # VRAM headroom left free when packing: activations, allocator fragmentation, and the CUDA
-# context, none of which appear in a declared model footprint. The packing quanta themselves
-# live in `_internal.device_share` — Carbonite admits co-tenants against the same ladder and
-# `dist` turns it into Ray options, and three subsystems that cannot import one another
-# rounding "a quarter of a device" to three different byte counts is five tenants on a device
-# sized for four.
-_PACK_HEADROOM = 0.15
+# context, none of which appear in a declared model footprint. Read from
+# `_internal.device_share`, never restated — Carbonite admits co-tenants against the same
+# ladder and `dist` turns it into Ray options, and three subsystems that cannot import one
+# another rounding "a quarter of a device" to three different byte counts is five tenants on a
+# device sized for four. It was a private `0.15` here, so raising `accelerator.vram_headroom`
+# for a fleet with a co-tenant moved Carbonite's admission and left Kyber packing against
+# memory Carbonite had already promised away.
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +118,10 @@ def decide_gpu_backend(
     `gpu_count` is the live cluster's GPU count (0 → always CPU). `force=True` (an explicit
     `backend="gpu"`) honors the user past the small-input threshold but still routes by memory —
     so even a forced request avoids a single-dispatch OOM on data larger than one GPU. The
-    memory budget per GPU is `gpu_memory_gb` when the caller could read it from the live cluster,
-    else `distributed.gpu_memory_gb`; the whole-cluster budget is that times `gpu_count`.
+    per-GPU *capacity* is `gpu_memory_gb` when the caller could read it from the live cluster,
+    else `distributed.gpu_memory_gb`; `accelerator.vram_headroom` is subtracted from it here to
+    get the budget a working set is actually routed against, and the whole-cluster budget is
+    that times `gpu_count`.
 
     The distinction matters on a mixed fleet. The config fallback probes the **driver's** devices,
     so a CPU-only head node scheduling eight A100s planned against a 12 GB T4 constant and sharded
@@ -191,21 +195,35 @@ def decide_gpu_backend(
         if veto is not None:
             return GpuDecision(False, False, veto, rows)
 
-    one_gpu_gb = max(
-        gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
-        1e-9,
+    # The device's *capacity* — both suppliers now report the same thing — less the headroom
+    # every other consumer already subtracts. This alone did not, so a working set was routed
+    # to a single device at 100% of its VRAM, with nothing left for the CUDA context, the hash
+    # table the kernel builds over the input, or the output it materializes beside both. That
+    # is an out-of-memory dressed as a routing decision, and the fallback it triggers costs
+    # the whole GPU attempt.
+    capacity_gb = (
+        gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb()
     )
+    one_gpu_gb = max(capacity_gb * (1.0 - device_headroom()), 1e-9)
     if ws_gb <= one_gpu_gb:
+        # Fitting one device is a floor, not a target. This used to end the decision, so a plan
+        # small enough for a single GPU ran on a single GPU whatever the fleet had — on four
+        # devices, three of them idle for every query under one card's memory, which is most
+        # queries. The stage is mergeable, so spreading it is a scheduling choice with no
+        # semantic content; `devices_worth_using` only declines when a piece would be too small
+        # to be worth its own dispatch, under the same floor the shard planner cuts by.
+        spread = devices_worth_using(ws_gb, gpu_count) if is_shardable(plan) else 1
         return GpuDecision(
             True,
-            False,
-            f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)",
+            spread > 1,
+            f"~{ws_gb:.1f}GB fits one GPU ({one_gpu_gb:.0f}GB)"
+            + (f"; spread across {spread} for throughput" if spread > 1 else ""),
             rows,
-            1,
-            broadcast_join(plan, sources),
+            spread,
+            broadcast_join(plan, sources, hub),
         )
     shardable = is_shardable(plan)
-    broadcast = broadcast_join(plan, sources)
+    broadcast = broadcast_join(plan, sources, hub)
     # How many devices would hold the working set in one wave, which is what the autoscaler is
     # asked for. Capped so a badly-estimated query cannot ask a cluster to grow without bound.
     wanted = min(math.ceil(ws_gb / one_gpu_gb), max(1, int(dc.gpu_max_autoscale_devices)))
@@ -312,6 +330,13 @@ def _mig_fraction(model_memory_gb: float, accelerator_type: str, gpu_gb: float) 
     rather than a probe. A seventh of an H100 handed to a device that is not one is an
     under-allocation nothing downstream would catch, so a mismatch falls back to the quanta,
     which size against the memory figure directly.
+
+    **Both comparisons are made in GiB**, which is the unit the spec table and the MIG profiles
+    are written in; `model_memory_gb` and `gpu_gb` arrive as decimal GB. Mixing them is a 7.4%
+    error in two places that point opposite ways: the label check compared 80 GiB against
+    85.9 GB and survived only because its tolerance is 10%, and the profile lookup under-stated
+    the model, which picks an instance too small for it — an out-of-memory inside a partition
+    that, unlike a co-tenancy, cannot borrow a byte from its neighbour to recover.
     """
     if not accelerator_type or not active_config().accelerator.prefer_mig:
         return None
@@ -319,9 +344,10 @@ def _mig_fraction(model_memory_gb: float, accelerator_type: str, gpu_gb: float) 
     from batcher._internal.hardware.mig import smallest_profile_for
 
     spec = device_spec(accelerator_type)
-    if spec is None or gpu_gb <= 0 or abs(spec.memory_gib - gpu_gb) > 0.1 * spec.memory_gib:
+    gpu_gib = gpu_gb * 1e9 / (1 << 30)
+    if spec is None or gpu_gib <= 0 or abs(spec.memory_gib - gpu_gib) > 0.1 * spec.memory_gib:
         return None
-    profile = smallest_profile_for(model_memory_gb, accelerator_type)
+    profile = smallest_profile_for(model_memory_gb * 1e9 / (1 << 30), accelerator_type)
     return profile.gpu_fraction if profile is not None else None
 
 
@@ -376,7 +402,8 @@ def decide_gpu_map_params(
         gpu_memory_gb if gpu_memory_gb and gpu_memory_gb > 0 else dc.resolved_gpu_memory_gb(),
         1e-9,
     )
-    cap = 1.0 - _PACK_HEADROOM  # the guides' ~80-85% of a device
+    headroom = device_headroom()
+    cap = 1.0 - headroom  # the guides' ~80-85% of a device
 
     if model_memory_gb <= 0.0:
         return GpuMapParams(num_gpus, batch_size, "model memory unknown; left as given")
@@ -385,7 +412,7 @@ def decide_gpu_map_params(
     if assign_num_gpus and num_gpus <= 0.0:  # user left it unset → decide the packing fraction
         # Bytes, not gigabytes: the shared ladder floors its usable figure, and flooring a
         # gigabyte count would round a 12 GB device's usable share from 10.2 down to 10.
-        quantum = pack_fraction(model_memory_gb * 1e9, gpu_gb * 1e9, headroom=_PACK_HEADROOM)
+        quantum = pack_fraction(model_memory_gb * 1e9, gpu_gb * 1e9, headroom=headroom)
         if quantum <= 0.0:
             # The ladder declines only when it cannot see a device to divide. A whole device is
             # the answer that runs; a `0.0` `num_gpus` is a GPU stage scheduled onto a CPU.

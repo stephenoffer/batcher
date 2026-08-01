@@ -83,8 +83,8 @@ def _supported_function(f: dict, *, ordered: bool) -> bool:
     if func in _RANKING:
         return ordered or func == "ntile"
     if func in _VALUE or func in _FILL:
-        return ordered and f.get("input", {}).get("e") == "col"
-    if func not in _PARTITION_AGG or f.get("input", {}).get("e") != "col":
+        return ordered
+    if func not in _PARTITION_AGG:
         return False
     frame = f.get("frame")
     if frame is None:
@@ -163,8 +163,9 @@ def window(df, ir: dict, be: DfBackend):
     out[_POS] = grp.cumcount()
     size = _partition_sizes(out)
 
-    for f in ir["functions"]:
-        out[f["alias"]] = _evaluate(out, f, be, order=order, size=size)
+    names = _function_inputs(out, ir, be, computed)
+    for f, name in zip(ir["functions"], names, strict=True):
+        out[f["alias"]] = _evaluate(out, f, be, order=order, size=size, name=name)
 
     # Restore the arrival order, then drop the private columns: the engine's Window keeps the
     # input's row order, and a sorted result would differ from it row-for-row.
@@ -189,6 +190,35 @@ def _key_names(out, keys: list[dict], be: DfBackend, computed: list[str], *, kin
             continue
         name = f"__bt_wk{kind}{i}"
         out[name] = be.column(eval_expr(key, out, be), out)
+        computed.append(name)
+        names.append(name)
+    return names
+
+
+def _function_inputs(out, ir: dict, be: DfBackend, computed: list[str]) -> list[str | None]:
+    """Each window function's input column, materializing the ones that are expressions.
+
+    The same treatment a computed *key* already gets, and needed for the same reason: `sum(a *
+    b) OVER (...)` is an ordinary weighted total, and requiring a bare column here declined the
+    whole chain over the shape of one argument. It is also what `zscore`, `is_outlier`,
+    `maxabs_scale` and `normalize_l1` lower to — each of them a window over an expression — so
+    every one of them ran on the host.
+
+    A ranking function reads no column and gets `None`.
+    """
+    from batcher.core.gpu_plan.exprs import eval_expr
+
+    names: list[str | None] = []
+    for i, f in enumerate(ir["functions"]):
+        expr = f.get("input")
+        if f["func"] in _RANKING or expr is None:
+            names.append(None)
+            continue
+        if expr.get("e") == "col":
+            names.append(expr["name"])
+            continue
+        name = f"__bt_wi{i}"
+        out[name] = be.column(eval_expr(expr, out, be), out)
         computed.append(name)
         names.append(name)
     return names
@@ -247,23 +277,23 @@ def _tie_flag(out, order: list[str]):
     return first | ~same
 
 
-def _evaluate(out, f: dict, be: DfBackend, *, order, size):
+def _evaluate(out, f: dict, be: DfBackend, *, order, size, name: str | None):
     func = f["func"]
     if func in _RANKING:
         return _ranking(out, f, order=order, size=size)
     if func in _FILL:
-        grp = out.groupby(_PID, sort=False)[f["input"]["name"]]
+        grp = out.groupby(_PID, sort=False)[name]
         return grp.ffill() if func == "forward_fill" else grp.bfill()
     if func in _VALUE:
-        return _value(out, f, size=size)
+        return _value(out, f, size=size, name=name)
     frame = f.get("frame")
     if frame is not None and not _is_running_frame(frame):
         width = _rolling_width(frame)
         if width is None:
             raise Unsupported(f"window frame {frame}")
-        return _rolling(out, f, be, width)
+        return _rolling(out, f, be, width, name)
     running = bool(order) if frame is None else True
-    return _running(out, f, be) if running else _partition_agg(out, f, be)
+    return _running(out, f, be, name) if running else _partition_agg(out, f, be, name)
 
 
 def _ranking(out, f: dict, *, order, size):
@@ -298,9 +328,8 @@ def _ranking(out, f: dict, *, order, size):
     return last / size
 
 
-def _value(out, f: dict, *, size):
+def _value(out, f: dict, *, size, name: str):
     func = f["func"]
-    name = f["input"]["name"]
     grp = out.groupby(_PID, sort=False)[name]
     offset = int(f.get("offset", 1))
     if func == "lag":
@@ -317,40 +346,50 @@ def _value(out, f: dict, *, size):
     return filled.bfill() if target is None else filled.ffill()
 
 
-def _agg_input(out, f: dict, be: DfBackend) -> str:
-    """The column a windowed reduction reads, declining a `NaN`-bearing one.
+def _agg_input(out, name: str, be: DfBackend) -> str:
+    """`name`, after declining a `NaN`-bearing column.
 
     Same reason as the grouped case in `aggs`: the engine orders `NaN` above every number,
     both backends treat it as missing, and the difference shows up as a plausible-looking
     number rather than an error.
     """
-    name = f["input"]["name"]
     if be.has_nan(out[name]):
         raise Unsupported(f"windowed aggregate over NaN-bearing column {name!r}")
     return name
 
 
-def _partition_agg(out, f: dict, be: DfBackend):
+#: Whole-partition reductions whose answer over a partition with nothing to fold is the
+#: operator's identity in both libraries and null in the engine — the same set, and the same
+#: correction, as the grouped case.
+_IDENTITY_RISK = frozenset({"sum", "product", "bool_and", "bool_or"})
+
+
+def _partition_agg(out, f: dict, be: DfBackend, name: str):
     """A whole-partition reduction, broadcast to every row of the partition."""
-    name = _agg_input(out, f, be)
-    method = _PARTITION_AGG[f["func"]]
-    kwargs = {"min_count": 1} if f["func"] in ("sum", "product") else {}
+    name = _agg_input(out, name, be)
+    func = f["func"]
     grouped = out.groupby(_PID, sort=False)[name]
-    reducer = getattr(grouped, method, None)
+    reducer = getattr(grouped, _PARTITION_AGG[func], None)
     if reducer is None:
-        raise Unsupported(f"windowed {f['func']}")
-    per_partition = reducer(**kwargs)
+        raise Unsupported(f"windowed {func}")
+    per_partition = reducer()
+    if func in _IDENTITY_RISK:
+        # Counting and masking rather than `min_count=1`: **cuDF has no `min_count`** and
+        # raises for it on every reduction that takes one, so the one keyword that made a
+        # windowed `sum` correct was also the one that made it impossible on a device. The
+        # grouped path learned this the same way (`aggs._null_if_empty`).
+        per_partition = per_partition.where(grouped.count() > 0, None)
     return out[_PID].map(per_partition)
 
 
-def _running(out, f: dict, be: DfBackend):
+def _running(out, f: dict, be: DfBackend, name: str):
     """A running (unbounded preceding → current row) reduction over the sorted partition.
 
     Every form is expressed so that nulls are *skipped*, and so that a prefix containing no
     non-null value yields null rather than the operator's identity — `sum` over nothing is
     null, not `0`.
     """
-    name = _agg_input(out, f, be)
+    name = _agg_input(out, name, be)
     func = f["func"]
     values = out[name]
     grp = values.groupby(out[_PID], sort=False)
@@ -368,7 +407,7 @@ def _running(out, f: dict, be: DfBackend):
     raise Unsupported(f"running {func}")
 
 
-def _rolling(out, f: dict, be: DfBackend, width: int):
+def _rolling(out, f: dict, be: DfBackend, width: int, name: str):
     """A reduction over the `width` rows ending at the current one.
 
     `sum`, `count` and `avg` are differences of running totals: the total through this row minus
@@ -379,7 +418,7 @@ def _rolling(out, f: dict, be: DfBackend, width: int):
     `min` and `max` have no such closed form (a value leaving the window can be the one that was
     the extreme), so they go through the backend's own `rolling`, and decline if it is absent.
     """
-    name = _agg_input(out, f, be)
+    name = _agg_input(out, name, be)
     func = f["func"]
     values = out[name]
     pid = out[_PID]

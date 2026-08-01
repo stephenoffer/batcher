@@ -44,7 +44,50 @@ __all__ = [
     "largest_shard_bytes",
     "shard_task_share",
     "share_for_bytes",
+    "task_device_tenants",
 ]
+
+
+def task_device_tenants() -> int:
+    """How many tasks this worker's device is packed with, read from Ray's own grant.
+
+    The worker-side inverse of everything above. The driver decides a fraction, Ray enforces it
+    as a *scheduling* constraint, and the worker then has to size its **memory** to match —
+    because Ray does not. `num_gpus=0.25` means four tasks may run on one board; it does not
+    stop any of them allocating the whole of it, and until this existed none of them knew not
+    to. Every co-tenant read the device's full capacity, planned an RMM pool against it, and
+    with the default `pool_initial_fraction` of 0.5 four of them reserved 200% of the device
+    between them. On a single-GPU box, where the fan-out never packs, the figure is always one
+    and the bug cannot occur.
+
+    Read from the assigned resources rather than passed down from the driver so the two cannot
+    drift: what Ray actually granted this task is the only figure that is true after a retry, a
+    rescheduling onto a different node, or a packing the driver revised.
+
+    Returns:
+        Co-tenants per device, at least `1`. `1` whenever Ray is not the scheduler, the grant
+        cannot be read, or a whole device was granted — every one of which is the unpacked
+        behavior this path had before.
+    """
+    try:
+        import ray
+
+        # Guarded rather than merely wrapped: `get_runtime_context()` will *initialize* Ray on a
+        # process that has not connected, so an unguarded call turns a question about this
+        # task's share into a cluster connection — on the head node, during a single-node run,
+        # from inside a memory-sizing path that has no business starting a cluster at all.
+        if not ray.is_initialized():
+            return 1
+        granted = float(ray.get_runtime_context().get_assigned_resources().get("GPU", 0.0))
+    except Exception as exc:
+        note_suppressed("dist", "read this task's device share", exc)
+        return 1
+    if granted <= 0.0 or granted >= 1.0:
+        return 1
+    # Round rather than ceil: Ray reports the fraction back as a float, so a share of one third
+    # arrives as 0.33 and `1 / 0.33` is 3.03. Ceiling that would claim a fourth co-tenant that
+    # cannot be scheduled and shrink every pool by a quarter for a rounding artifact.
+    return max(1, min(MAX_COTENANTS, round(1.0 / granted)))
 
 
 def descriptor_bytes(descriptor: dict, row_bytes: float) -> int:
@@ -235,6 +278,13 @@ def share_for_bytes(
         return whole_device_packing(want, "gpu_pack_shards is off")
     if dc.gpu_task_fraction > 0.0:
         return _pinned_share(min(1.0, dc.gpu_task_fraction), want)
+    if 0 < want <= gpu_count:
+        # Packing exists to fit *more* shards than devices onto the fleet. With no more shards
+        # than devices there is nothing to gain and a fleet to lose: a fractional request lets
+        # Ray put several shards on one board, and it does — measured on four T4s, a four-shard
+        # fan-out placed three shards on one node and one on another, leaving two devices idle
+        # for the whole query. A whole device per shard is what makes Ray spread them.
+        return whole_device_packing(want, "one shard per device; nothing to pack")
     if shard_bytes <= 0:
         return whole_device_packing(want, "shard size unknown; whole devices")
 
