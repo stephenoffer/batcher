@@ -789,4 +789,9 @@ __all__ = [
     "zero_vector_rate",
 ]
 
-__all__ += _GEO_ALL
+# Merged rather than appended: the façade's contract is one *sorted*, duplicate-free list
+# (`tests/unit/test_public_function_surface.py`), and `+=` left the 113 spliced geospatial
+# names in a sorted block after the curated one — globally unsorted, so the gate went red the
+# moment they landed. Sorting here keeps the splice a one-liner without the curated list
+# having to restate names it deliberately does not spell out.
+__all__ = sorted(__all__ + _GEO_ALL)

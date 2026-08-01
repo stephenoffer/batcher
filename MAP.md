@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1169 Python modules across 178 packages and 218 Rust files across 14 crates.
+Covering 1172 Python modules across 178 packages and 218 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -164,7 +164,7 @@ The public, fluent, lazy, expression-first API surface.
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `executors.py` | 427 | Execution strategies and their registry (the conductor's wiring). |
-| `functions.py` | 792 | Top-level expression constructors re-exported for the public API. |
+| `functions.py` | 797 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `multi_group.py` | 136 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
@@ -704,12 +704,12 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 1666 | The distributed executor — the dispatcher. |
+| `executor.py` | 1719 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 683 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 378 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 196 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1277 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1276 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 174 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -748,7 +748,7 @@ Partitioning for the distributed operators — by *source split* and by *key ran
 |---|---|---|
 | `_sources.py` | 468 | Shared partitioning + post-breaker helpers for the distributed operators. |
 | `assignment.py` | 188 | How a source's splits are divided among the workers — the three assignment strategies. |
-| `folds.py` | 89 | Streaming, byte-bounded folds of a shuffle map-side partition. |
+| `folds.py` | 159 | Streaming, byte-bounded folds of a shuffle map-side partition. |
 | `ranges.py` | 197 | Range partitioning: split rows by *value* into globally ordered buckets. |
 
 ### `batcher/dist/executors/ray_runtime/` — 4 · backend
@@ -759,13 +759,14 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 |---|---|---|
 | `accelerators.py` | 174 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 196 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
-| `capacity.py` | 145 | How many workers a cluster can actually *place*, as opposed to afford. |
+| `capacity.py` | 183 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `hardware_probe.py` | 500 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 471 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 268 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
-| `scaling.py` | 500 | What the live cluster is, and what of it a query may use. |
+| `reducers.py` | 56 | How many reducers a shuffle fans out to. |
+| `scaling.py` | 472 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 454 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 127 | Why this query got the fan-out it got. |
 
@@ -2367,14 +2368,15 @@ Graph analytics and graph-ML features over an edge table.
 |---|---|---|
 | `_graph.py` | 395 | The `Graph` handle: an edge table, plus what the algorithms need to know about it. |
 | `_iterate.py` | 210 | The fixpoint driver every iterative graph algorithm runs on. |
+| `build.py` | 382 | Building a graph out of data that is not already an edge list. |
 | `community.py` | 356 | Communities, triangles, and how tightly a neighbourhood closes on itself. |
-| `components.py` | 246 | Connected components, and the cores that survive peeling the graph down. |
+| `components.py` | 352 | Connected components, and the cores that survive peeling the graph down. |
 | `degree.py` | 225 | Degree: how many edges touch each node, and how those counts are distributed. |
 | `features.py` | 227 | Turning a graph into a feature table a model can train on. |
 | `sampling.py` | 283 | Sampling a graph: random walks, bounded neighbourhoods, and induced subgraphs. |
 | `similarity.py` | 315 | How alike two nodes are, judged by who they are connected to. |
 | `summary.py` | 168 | Graph-level numbers: the ones to look at before running anything else. |
-| `traversal.py` | 333 | Distances: how far each node is from a starting set, in hops or in weight. |
+| `traversal.py` | 446 | Distances: how far each node is from a starting set, in hops or in weight. |
 
 ### `batcher/graph/centrality/` — ?
 
@@ -2382,7 +2384,8 @@ Centrality: which nodes matter, by five different definitions of "matter".
 
 | module | lines | what it is |
 |---|---|---|
-| `rank.py` | 285 | PageRank and the degree-based centralities. |
+| `betweenness.py` | 185 | Betweenness: how much of the graph's shortest-path traffic flows through each node. |
+| `rank.py` | 283 | PageRank and the degree-based centralities. |
 | `spectral.py` | 243 | The eigen-family centralities: eigenvector, Katz, and HITS. |
 
 ## Rust data plane — `crates/`

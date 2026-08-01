@@ -190,4 +190,9 @@ __all__ = [
     "wrap_tag",
 ]
 
-__all__ += _GEO_ALL
+# Merged rather than appended: the façade's contract is one *sorted*, duplicate-free list
+# (`tests/unit/test_public_function_surface.py`), and `+=` leaves the spliced geospatial
+# names in a sorted block after the curated one, which is globally unsorted. Sorting here
+# keeps the splice a one-liner without the curated list restating names it deliberately
+# does not spell out.
+__all__ = sorted(__all__ + _GEO_ALL)
