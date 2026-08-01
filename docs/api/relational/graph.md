@@ -25,6 +25,25 @@ A graph is an edge table plus the conventions the algorithms read: which columns
    Graph
 ```
 
+## Building a graph from other data
+
+Most data that wants graph analysis does not arrive as edges. It arrives as embeddings,
+coordinates, or an interaction log, and the graph is a decision you make from it. All
+four are quadratic in the worst case, because "which pairs are close" is a question about
+pairs; each takes a blocking key, and choosing it is the engineering.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   knn_graph
+   threshold_graph
+   spatial_graph
+   co_occurrence_graph
+```
+
+
 ## Degree
 
 The cheapest thing you can ask a graph, and usually the first. One `group_by` over the edge list. Note that on a symmetrized graph `degree` counts each edge twice, so `out_degree` is the neighbour count there.
@@ -54,6 +73,7 @@ Which nodes matter, by six different definitions of matter. `pagerank` is the de
 
    pagerank
    personalized_pagerank
+   betweenness_centrality
    degree_centrality
    eigenvector_centrality
    katz_centrality
@@ -70,6 +90,7 @@ What the separate pieces are, and what survives peeling the sparse parts away. R
    :nosignatures:
 
    connected_components
+   strongly_connected_components
    component_sizes
    largest_component
    is_connected
@@ -107,6 +128,9 @@ Single-source and multi-source, never all-pairs: an all-pairs matrix is quadrati
    shortest_path_lengths
    k_hop_neighbors
    reachable_from
+   topological_order
+   is_dag
+   nodes_in_cycles
    harmonic_centrality
    diameter_estimate
 ```

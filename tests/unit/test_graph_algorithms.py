@@ -312,3 +312,180 @@ def test_summary_statistics_match_hand_computation():
     assert bg.reciprocity(g) == 0.0
     # A star is maximally disassortative: the hub attaches only to leaves.
     assert bg.assortativity(star()) == pytest.approx(-1.0)
+
+
+# --- constructors: building a graph from data that is not an edge list --------------
+
+
+def test_knn_graph_links_each_vector_to_its_nearest():
+    vecs = bt.from_pydict({"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]})
+    got = bg.knn_graph(vecs, 1).edges.sort("src").to_pydict()
+    assert got["dst"] == ["b", "a", "b"]
+    # A distance metric must rank the same way a similarity metric does, which is the
+    # thing a single ascending window ordering has to get right for both.
+    assert bg.knn_graph(vecs, 1, metric="euclidean").edges.sort("src").to_pydict()["dst"] == [
+        "b",
+        "a",
+        "b",
+    ]
+
+
+def test_threshold_graph_keeps_a_row_that_matched_nothing():
+    """Entity resolution needs the unmatched rows back, as singleton clusters."""
+    vecs = bt.from_pydict(
+        {"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.99, 0.01], [0.0, 1.0]]}
+    )
+    g = bg.threshold_graph(vecs, 0.9)
+    assert bg.connected_components(g).sort("node").to_pydict() == {
+        "node": ["a", "b", "c"],
+        "component": ["a", "a", "c"],
+    }
+
+
+def test_spatial_graph_uses_a_geodesic_radius_in_metres():
+    sites = bt.from_pydict(
+        {
+            "node": ["ferry", "pier", "opera"],
+            "geometry": [
+                "POINT(-122.3937 37.7955)",
+                "POINT(-122.3930 37.7960)",
+                "POINT(151.2153 -33.8568)",
+            ],
+        }
+    )
+    near = bg.spatial_graph(sites, 200.0)
+    assert sorted(near.nodes().to_pydict()["node"]) == ["ferry", "opera", "pier"]
+    assert near.num_edges() == 2, "one undirected edge, materialized both ways"
+    # The two San Francisco sites are about 83 m apart, so a tighter radius drops them.
+    assert bg.spatial_graph(sites, 50.0).num_edges() == 0
+
+
+def test_co_occurrence_graph_counts_shared_groups_and_prunes():
+    log = bt.from_pydict(
+        {
+            "user": ["u1", "u1", "u2", "u2", "u3"],
+            "item": ["bread", "jam", "bread", "jam", "shovel"],
+        }
+    )
+    g = bg.co_occurrence_graph(log, min_count=2)
+    assert g.edges.sort("src").to_pydict() == {
+        "src": ["bread", "jam"],
+        "dst": ["jam", "bread"],
+        "weight": [2.0, 2.0],
+    }
+    assert sorted(g.nodes().to_pydict()["node"]) == ["bread", "jam", "shovel"]
+    # Raising the threshold past the observed count leaves the nodes and no edges.
+    assert bg.co_occurrence_graph(log, min_count=3).num_edges() == 0
+
+
+def test_a_blocking_key_restricts_comparison_to_its_own_block():
+    """Blocking is what makes these constructors affordable, and it is exact per block."""
+    vecs = bt.from_pydict(
+        {
+            "node": ["a", "b", "c"],
+            "vector": [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            "day": ["mon", "mon", "tue"],
+        }
+    )
+    unblocked = bg.threshold_graph(vecs, 0.99)
+    blocked = bg.threshold_graph(vecs, 0.99, block="day")
+    assert unblocked.num_edges() > blocked.num_edges()
+    assert blocked.edges.to_pydict()["src"] == ["a", "b"], "no cross-day pair"
+
+
+def test_an_unknown_metric_is_refused():
+    vecs = bt.from_pydict({"node": ["a"], "vector": [[1.0]]})
+    with pytest.raises(Exception, match="metric"):
+        bg.knn_graph(vecs, 1, metric="jaccard")
+
+
+# --- direction-respecting components and dependency order --------------------------
+
+
+def test_strong_components_respect_direction_where_weak_ones_do_not():
+    """A cycle with a tail: one weak component, two strong ones."""
+    g = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2, 3, 3], "dst": [2, 3, 1, 4]}))
+    assert bg.strongly_connected_components(g).sort("node").to_pydict() == {
+        "node": [1, 2, 3, 4],
+        "component": [3, 3, 3, 4],
+    }
+    assert bg.connected_components(g).sort("node").to_pydict()["component"] == [1, 1, 1, 1]
+
+
+def test_a_chain_has_one_weak_component_and_a_strong_one_per_node():
+    g = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2], "dst": [2, 3]}))
+    strong = bg.strongly_connected_components(g).sort("node").to_pydict()["component"]
+    assert strong == [1, 2, 3], "nothing gets back, so nothing is mutually reachable"
+
+
+def test_two_cycles_joined_one_way_stay_two_strong_components():
+    g = bg.Graph.from_edges(bt.from_pydict({"src": [1, 2, 3, 4, 4], "dst": [2, 1, 4, 3, 1]}))
+    got = bg.strongly_connected_components(g).sort("node").to_pydict()["component"]
+    assert got[0] == got[1] and got[2] == got[3] and got[0] != got[2]
+
+
+def test_topological_order_groups_independent_nodes_into_one_level():
+    """Levels rather than a flat sequence, so a scheduler can run a level at once."""
+    e = bt.from_pydict({"src": ["a", "a", "b", "c"], "dst": ["b", "c", "d", "d"]})
+    assert bg.topological_order(bg.Graph.from_edges(e)).sort("node").to_pydict() == {
+        "node": ["a", "b", "c", "d"],
+        "level": [0, 1, 1, 2],
+    }
+
+
+def test_a_cycle_is_absent_from_the_order_which_is_what_makes_is_dag_work():
+    acyclic = bg.Graph.from_edges(bt.from_pydict({"src": ["a", "b"], "dst": ["b", "c"]}))
+    cyclic = bg.Graph.from_edges(bt.from_pydict({"src": ["a", "b", "c"], "dst": ["b", "c", "a"]}))
+    assert bg.is_dag(acyclic)
+    assert not bg.is_dag(cyclic)
+    assert bg.topological_order(cyclic).count() == 0
+
+
+def test_nodes_in_cycles_names_the_nodes_blocking_the_order():
+    """A boolean says the graph is broken; this says which nodes to look at."""
+    e = bt.from_pydict({"src": ["a", "b", "c", "c"], "dst": ["b", "c", "b", "d"]})
+    g = bg.Graph.from_edges(e)
+    assert sorted(bg.nodes_in_cycles(g).to_pydict()["node"]) == ["b", "c", "d"]
+    assert (
+        bg.nodes_in_cycles(
+            bg.Graph.from_edges(bt.from_pydict({"src": ["a"], "dst": ["b"]}))
+        ).count()
+        == 0
+    )
+
+
+def test_betweenness_finds_the_bridge_not_the_hub():
+    """Everything from the left must pass through 'c', then 'd'; endpoints score zero."""
+    e = bt.from_pydict({"src": ["a", "b", "c", "d"], "dst": ["c", "c", "d", "e"]})
+    g = bg.Graph.from_edges(e)
+    got = bg.betweenness_centrality(g, bt.from_pydict({"node": ["a", "b"]}))
+    assert got.sort("betweenness", descending=True).to_pydict() == {
+        "node": ["c", "d", "a", "b", "e"],
+        "betweenness": [4.0, 2.0, 0.0, 0.0, 0.0],
+    }
+
+
+def test_betweenness_refuses_sources_outside_the_graph():
+    g = bg.Graph.from_edges(bt.from_pydict({"src": ["a"], "dst": ["b"]}))
+    with pytest.raises(Exception, match="shortest paths"):
+        bg.betweenness_centrality(g, bt.from_pydict({"node": ["zzz"]}))
+
+
+def test_betweenness_splits_credit_between_tied_shortest_paths():
+    """Two equally short routes each carry half the traffic, which is what sigma is for.
+
+    A version that tracked only distance and not the *number* of shortest paths would
+    give both intermediates full credit and rank them above a node that really does carry
+    everything.
+    """
+    # a reaches d via b or via c, both in two hops; e sits on the only route to f.
+    e = bt.from_pydict(
+        {"src": ["a", "a", "b", "c", "a", "e"], "dst": ["b", "c", "d", "d", "e", "f"]}
+    )
+    got = bg.betweenness_centrality(
+        bg.Graph.from_edges(e), bt.from_pydict({"node": ["a"]})
+    ).to_pydict()
+    scores = dict(zip(got["node"], got["betweenness"], strict=True))
+    assert scores["b"] == pytest.approx(0.5)
+    assert scores["c"] == pytest.approx(0.5)
+    assert scores["e"] == pytest.approx(1.0), "the sole route carries the whole path"

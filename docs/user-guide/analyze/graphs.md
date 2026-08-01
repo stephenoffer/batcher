@@ -88,6 +88,22 @@ print([(n, round(v, 3)) for n, v in zip(*near_1.sort("pagerank", descending=True
 seminal paper are both important, in opposite directions. It reports a hub score and an
 authority score per node.
 
+`betweenness_centrality` finds *bridges* rather than hubs: a node joining two dense
+clusters can have a small degree and a tiny PageRank while every path between the clusters
+runs through it. That is the single-point-of-failure measure.
+
+```python
+bridge = bt.from_pydict({"src": ["a", "b", "c", "d"], "dst": ["c", "c", "d", "e"]})
+bg2 = bg.Graph.from_edges(bridge)
+scored = bg.betweenness_centrality(bg2, bt.from_pydict({"node": ["a", "b"]}))
+print(scored.sort("betweenness", descending=True).to_pydict())
+# {'node': ['c', 'd', 'a', 'b', 'e'], 'betweenness': [4.0, 2.0, 0.0, 0.0, 0.0]}
+```
+
+It is an estimate over the sources you give it, because the exact measure needs shortest
+paths from every node. The values scale with the source count, so compare ranks between
+runs rather than magnitudes.
+
 ## Components: what the pieces are
 
 ```python
@@ -119,6 +135,44 @@ print(sorted(bg.k_core(tg, 2).nodes().to_pydict()["node"]))
 symmetrized graph. Getting this wrong is why a k-core would keep the pendant nodes it
 exists to peel.
 :::
+
+On a *directed* graph, "connected" has a second, stronger meaning: two nodes are in the
+same **strongly** connected component only when each can reach the other following edge
+direction. A chain is one weak component and N strong ones, because nothing gets back:
+
+```python
+chain_and_cycle = bt.from_pydict({"src": [1, 2, 3, 3], "dst": [2, 3, 1, 4]})
+dg = bg.Graph.from_edges(chain_and_cycle)
+print(bg.strongly_connected_components(dg).sort("node").to_pydict()["component"])
+# [3, 3, 3, 4]
+print(bg.connected_components(dg).sort("node").to_pydict()["component"])
+# [1, 1, 1, 1]
+```
+
+## Dependency graphs
+
+A build order, a task schedule and a package graph are all the same question: can these
+be ordered so every edge points forward, and if not, what is in the way.
+
+`topological_order` returns *levels* rather than a flat sequence, because nodes at the
+same level are mutually independent and a scheduler can run a whole level at once:
+
+```python
+deps = bt.from_pydict({"src": ["a", "a", "b", "c"], "dst": ["b", "c", "d", "d"]})
+print(bg.topological_order(bg.Graph.from_edges(deps)).sort("node").to_pydict())
+# {'node': ['a', 'b', 'c', 'd'], 'level': [0, 1, 1, 2]}
+```
+
+A node inside or downstream of a cycle can never lose its last incoming edge, so it is
+simply absent from the order. That makes the count the acyclicity test, and it means the
+diagnostic comes free:
+
+```python
+broken = bt.from_pydict({"src": ["a", "b", "c", "c"], "dst": ["b", "c", "b", "d"]})
+bg_broken = bg.Graph.from_edges(broken)
+print(bg.is_dag(bg_broken), sorted(bg.nodes_in_cycles(bg_broken).to_pydict()["node"]))
+# False ['b', 'c', 'd']
+```
 
 ## Triangles, clustering and communities
 
@@ -255,18 +309,96 @@ needing no node attributes at all. On fraud and abuse problems those columns are
 frequently the strongest signal available, because the behaviour is a shape in the graph
 rather than a property of any single account.
 
+## When the data is not already an edge list
+
+Embeddings, coordinates and interaction logs all want graph analysis, and none of them
+arrive as edges. Four constructors make that step explicit.
+
+`knn_graph` connects each vector to its nearest neighbours, which is the bridge from an
+embedding space to every algorithm above:
+
+```python
+vecs = bt.from_pydict(
+    {"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]}
+)
+print(bg.knn_graph(vecs, 1).edges.sort("src").to_pydict()["dst"])
+# ['b', 'a', 'b']
+```
+
+`threshold_graph` connects everything closer than a cut-off, which is the deduplication
+shape: take `connected_components` of the result and each component is a cluster of
+records that are the same thing. The transitive closure is the point, since A matching B
+and B matching C groups all three even when A and C do not match directly. A record that
+matched nothing comes back as its own cluster rather than vanishing:
+
+```python
+records = bt.from_pydict(
+    {"node": ["a", "b", "c"], "vector": [[1.0, 0.0], [0.99, 0.01], [0.0, 1.0]]}
+)
+dedup = bg.threshold_graph(records, 0.9)
+print(bg.connected_components(dedup).sort("node").to_pydict()["component"])
+# ['a', 'a', 'c']
+```
+
+`spatial_graph` connects positions within a geodesic radius in metres, so the radius
+means the same thing at every latitude:
+
+```python
+sites = bt.from_pydict(
+    {
+        "node": ["ferry", "pier", "opera"],
+        "geometry": [
+            "POINT(-122.3937 37.7955)",
+            "POINT(-122.3930 37.7960)",
+            "POINT(151.2153 -33.8568)",
+        ],
+    }
+)
+near = bg.spatial_graph(sites, 200.0)
+print(near.edges.sort("src").to_pydict()["src"], near.num_nodes())
+# ['ferry', 'pier'] 3
+```
+
+`co_occurrence_graph` projects a user-item log into an item-item graph, which is the
+classic collaborative-filtering signal:
+
+```python
+baskets = bt.from_pydict(
+    {
+        "user": ["u1", "u1", "u2", "u2", "u3"],
+        "item": ["bread", "jam", "bread", "jam", "shovel"],
+    }
+)
+print(bg.co_occurrence_graph(baskets, min_count=2).edges.sort("src").to_pydict())
+# {'src': ['bread', 'jam'], 'dst': ['jam', 'bread'], 'weight': [2.0, 2.0]}
+```
+
+:::{warning}
+All four compare every pair unless you block them. A million rows is a trillion
+comparisons. Every one takes a `block` argument that restricts comparison to rows sharing
+a key, and it is exact within each block: partition by a coarse cluster id, a date, a
+category, or a geohash prefix. Choosing that key is the engineering in each of these, not
+an optimization to add later.
+:::
+
+
 ## Requirements and limitations
 
 - **Iterative algorithms materialize per-node state once per round.** A lazy plan built
   fifty iterations deep would re-run every earlier iteration on execution, so the state is
   collected and re-wrapped each round. That is bounded by the node count rather than the
   edge count, but it does mean the state passes through the client process.
-- **Components are weakly connected.** The graph is symmetrized first, so `a -> b -> c` is
-  one component even though nothing reaches `a`. There is no strongly-connected-components
-  function.
-- **Distances are single-source or multi-source, never all-pairs.** `harmonic_centrality`
-  and `diameter_estimate` take a source set and are estimates over it; there is no exact
-  betweenness or closeness centrality, both of which need all-pairs.
+- **`connected_components` is weakly connected.** The graph is symmetrized first, so
+  `a -> b -> c` is one component even though nothing reaches `a`.
+  `strongly_connected_components` is the direction-respecting version, and is more
+  expensive: it is a colouring algorithm rather than Tarjan's, whose depth-first search
+  has no relational form.
+- **Distances are single-source or multi-source, never all-pairs.**
+  `harmonic_centrality`, `diameter_estimate` and `betweenness_centrality` all take a
+  source set and are estimates over it. There is no *exact* betweenness or closeness
+  centrality, because both need all-pairs shortest paths, which is quadratic in node
+  count. For betweenness the ranking stabilizes long before the values do, so sample a
+  few dozen high-degree sources and compare ranks rather than magnitudes.
 - **`label_propagation` is not stable under small changes.** Ties break deterministically,
   so a run is reproducible, but a slightly different graph can produce a very different
   partition. Score with `modularity` rather than trusting the label count.

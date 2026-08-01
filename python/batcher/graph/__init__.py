@@ -15,7 +15,14 @@ triangle counting cost far more than its average degree suggests.
 from __future__ import annotations
 
 from batcher.graph._graph import Graph
+from batcher.graph.build import (
+    co_occurrence_graph,
+    knn_graph,
+    spatial_graph,
+    threshold_graph,
+)
 from batcher.graph.centrality import (
+    betweenness_centrality,
     degree_centrality,
     eigenvector_centrality,
     hits,
@@ -38,6 +45,7 @@ from batcher.graph.components import (
     is_connected,
     k_core,
     largest_component,
+    strongly_connected_components,
 )
 from batcher.graph.degree import (
     average_degree,
@@ -73,9 +81,12 @@ from batcher.graph.traversal import (
     bfs,
     diameter_estimate,
     harmonic_centrality,
+    is_dag,
     k_hop_neighbors,
+    nodes_in_cycles,
     reachable_from,
     shortest_path_lengths,
+    topological_order,
 )
 
 __all__ = [
@@ -85,9 +96,11 @@ __all__ = [
     "assortativity",
     "average_clustering",
     "average_degree",
+    "betweenness_centrality",
     "bfs",
     "candidate_pairs",
     "clustering_coefficient",
+    "co_occurrence_graph",
     "common_neighbors",
     "component_sizes",
     "connected_components",
@@ -103,16 +116,19 @@ __all__ = [
     "hits",
     "in_degree",
     "is_connected",
+    "is_dag",
     "isolated_nodes",
     "jaccard_similarity",
     "k_core",
     "k_hop_neighbors",
     "katz_centrality",
+    "knn_graph",
     "label_propagation",
     "largest_component",
     "modularity",
     "neighbor_sample",
     "node_sample",
+    "nodes_in_cycles",
     "out_degree",
     "pagerank",
     "personalized_pagerank",
@@ -123,8 +139,12 @@ __all__ = [
     "reciprocity",
     "resource_allocation",
     "shortest_path_lengths",
+    "spatial_graph",
+    "strongly_connected_components",
     "structural_features",
     "summarize",
+    "threshold_graph",
+    "topological_order",
     "transitivity",
     "triangle_count",
     "triangles",
