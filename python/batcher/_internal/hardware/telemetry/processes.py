@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from batcher._internal.hardware.nvml import _device_count, _nvml, _read
+from batcher._internal.hardware.nvml import _device_count, _nvml, _read, own_process_ids
 
 __all__ = [
     "ProcessUtilization",
@@ -46,9 +46,10 @@ class ProcessUtilization:
 
     Attributes:
         index: NVML device index the process is running on.
-        pid: Operating-system process id, as the *driver* sees it. Inside a PID namespace that
-            is not the id this process knows itself by, which is why `own_utilization` matches
-            on memory attribution rather than on the number alone.
+        pid: Operating-system process id, as the *driver* sees it — which is the **host**
+            namespace's number. Inside a container that is not the id `os.getpid` reports, so
+            every comparison against it goes through `nvml.own_process_ids` rather than against
+            `os.getpid()` alone.
         sm: Fraction of the window this process had SMs busy, in [0, 1].
         memory: Fraction of the window this process had device memory busy, in [0, 1].
         encoder: Fraction of the window this process used NVENC, in [0, 1].
@@ -147,11 +148,9 @@ def own_utilization(index: int, since_us: int = 0) -> float | None:
     Returns:
         Fraction in [0, 1], or `None` when no sample was attributed to this process.
     """
-    import os
-
-    mine = os.getpid()
+    mine = set(own_process_ids())
     samples = [
-        s for s in device_process_utilization(since_us) if s.index == index and s.pid == mine
+        s for s in device_process_utilization(since_us) if s.index == index and s.pid in mine
     ]
     if not samples:
         return None
@@ -176,12 +175,18 @@ def device_shared_with_others(index: int, since_us: int = 0) -> bool | None:
 
     Returns:
         True when a process other than this one was active, False when only this one was, and
-        `None` when nothing was attributed at all.
+        `None` when nothing was attributed at all — including when samples exist but none of
+        them is recognizably this process, which is the containerized case and reads as "we
+        cannot see" rather than as "the device is contended".
     """
-    import os
-
-    mine = os.getpid()
+    mine = set(own_process_ids())
     samples = [s for s in device_process_utilization(since_us) if s.index == index and s.active]
     if not samples:
         return None
-    return any(s.pid != mine for s in samples)
+    if not any(s.pid in mine for s in samples):
+        # Every active sample belongs to a PID this process does not recognize as its own. That
+        # is what a PID-namespace mismatch looks like *and* what a genuinely busy neighbour
+        # looks like, and reporting the latter would tell a caller its own device readings are
+        # untrustworthy on every containerized worker in the fleet. `None` says so honestly.
+        return None
+    return any(s.pid not in mine for s in samples)

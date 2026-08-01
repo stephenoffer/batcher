@@ -1,4 +1,4 @@
-"""The named scalar-function families: math, two-argument math, strings, and dates.
+"""The named scalar-function families: math, two-argument math, and dates.
 
 Split from `exprs` on the seam that matters for reading them: that module is operators and
 control flow — how values combine and how nulls propagate through a `CASE` — while this one is
@@ -7,9 +7,9 @@ thing here as in the engine.
 
 Almost every entry exists because the obvious translation is wrong in a way that produces a
 plausible number rather than an error. `substr` is 1-based, `lpad` truncates as well as pads,
-`day_of_week` counts from a different day, `round` breaks halves away from zero rather than to
-even, and `position` reports 0 rather than -1 for "not found". Each is spelled out and pinned
-by a case comparing it against the engine.
+`day_of_week` counts from a different day and `round` breaks halves away from zero rather than
+to even. Each is spelled out and pinned by a case comparing it against the engine. The string
+family is the same idea and lives in `vocab.strings`.
 
 Two differences are known and deliberately left, because neither is a claim this vocabulary
 can make and neither changes a value:
@@ -46,7 +46,6 @@ __all__ = [
     "eval_date_trunc",
     "eval_math",
     "eval_math2",
-    "eval_str",
     "eval_strftime",
     "round_half_away",
 ]
@@ -64,37 +63,46 @@ def _float64():
     return pa.float64()
 
 
-# Unary math functions, as `(device method, NumPy ufunc)`. Both names are spelled out rather
-# than derived from the engine's name, because guessing either is a silent-wrong-answer bug:
-# `trunc` was resolved by name to pandas' `Series.truncate`, which slices *rows by index* and
-# has nothing to do with truncating a value — it returned a different table without raising.
-# A `None` device method means the ufunc is used on both backends.
+# Unary math functions, as the NumPy ufunc each one is. Spelled out rather than derived from
+# the engine's name, because guessing is a silent-wrong-answer bug: `trunc` was resolved by
+# name to pandas' `Series.truncate`, which slices *rows by index* and has nothing to do with
+# truncating a value — it returned a different table without raising.
+#
+# The ufunc is used on **both** backends. This used to prefer a same-named method on the device
+# (`x.sqrt()`, `x.exp()`, `x.sin()`), and cuDF no longer has any of them: every one of those
+# calls raised `AttributeError` on a real GPU, which is not an `Unsupported` and so was reported
+# as "the GPU backend is not usable" — for `sqrt`. The pandas verification backend could not see
+# it, because the preference was `is_gpu`-gated and pandas took the ufunc branch. Measured on a
+# T4 fleet: thirty-one functions, every one of them broken on the device and green in CI.
+#
+# cuDF dispatches a NumPy ufunc over a column on the GPU, so the ufunc branch is not a host
+# fallback — it is the device path, and it is the one that was already being exercised.
 _MATH_FNS = {
-    "abs": ("abs", "absolute"),
-    "acos": ("acos", "arccos"),
-    "asin": ("asin", "arcsin"),
-    "atan": ("atan", "arctan"),
-    "cbrt": (None, "cbrt"),
-    "ceil": ("ceil", "ceil"),
-    "cos": ("cos", "cos"),
-    "cosh": (None, "cosh"),
-    "degrees": (None, "degrees"),
-    "exp": ("exp", "exp"),
-    "floor": ("floor", "floor"),
-    "ln": ("log", "log"),
-    "log10": (None, "log10"),
-    "log2": (None, "log2"),
-    "radians": (None, "radians"),
-    "sin": ("sin", "sin"),
-    "sinh": (None, "sinh"),
-    "sqrt": ("sqrt", "sqrt"),
-    "tan": ("tan", "tan"),
-    "tanh": (None, "tanh"),
-    "trunc": (None, "trunc"),
+    "abs": "absolute",
+    "acos": "arccos",
+    "asin": "arcsin",
+    "atan": "arctan",
+    "cbrt": "cbrt",
+    "ceil": "ceil",
+    "cos": "cos",
+    "cosh": "cosh",
+    "degrees": "degrees",
+    "exp": "exp",
+    "floor": "floor",
+    "ln": "log",
+    "log10": "log10",
+    "log2": "log2",
+    "radians": "radians",
+    "sin": "sin",
+    "sinh": "sinh",
+    "sqrt": "sqrt",
+    "tan": "tan",
+    "tanh": "tanh",
+    "trunc": "trunc",
     # IEEE-754 `roundTiesToEven`, which is NumPy's `rint` exactly. Deliberately a different
     # function from `round`, which breaks halves away from zero — the engine ships both and
     # translating one as the other is a half-unit error on precisely the values people round.
-    "rint": (None, "rint"),
+    "rint": "rint",
 }
 
 #: Reciprocal trigonometric functions, as the function each is one over. Neither backend has
@@ -114,23 +122,16 @@ _RECIPROCAL_FNS = {"cot": "tan", "sec": "cos", "csc": "sin"}
 # handled explicitly below, because each disagrees with the engine on something: `day_of_week`
 # counts from a different day, `week` is the ISO week rather than an attribute, and `epoch` is
 # a unit conversion.
-_DATE_ATTRS = frozenset({"day", "day_of_year", "days_in_month", "hour", "is_leap_year",
+_DATE_ATTRS = frozenset({"day", "day_of_year", "days_in_month", "hour",
                          "microsecond", "minute", "month", "quarter", "second",
                          "year"})  # fmt: skip
 
-# String functions that are a no-argument `.str` method, named where the two differ. Spelled
-# out rather than passed through by name: a name that happens to exist on a Series is not the
-# same as one that means what the engine means (see the `trunc` case in `_MATH_FNS`), and a
-# name that exists on cuDF but not pandas is a path nothing verifies.
-_STR_METHODS = {"lower": "lower", "upper": "upper", "initcap": "title"}
-
-# String functions taking a single `pattern` argument, mapped to their `.str` method. Both of
-# these match literally on both libraries, which is what the engine does. `contains` is NOT here
-# because it does not: it defaults to a regular expression and is handled explicitly.
-_STR_PATTERN_METHODS = {
-    "starts_with": "startswith",
-    "ends_with": "endswith",
-}
+#: Date functions that are a `.dt` attribute returning a **boolean**, so they must not take the
+#: int64 cast every other attribute takes. `is_leap_year` did, and came back as `1`/`0` where
+#: the engine returns `true`/`false` — the right answer in the wrong column, which a fan-out
+#: cannot concatenate against a CPU-recovered shard and which broke every `CASE` built on it
+#: (`days_in_year` lowers to exactly that, and raised rather than returning a number).
+_DATE_BOOL_ATTRS = frozenset({"is_leap_year"})
 
 
 def eval_math(ir, df, be, eval_expr):
@@ -154,12 +155,9 @@ def eval_math(ir, df, be, eval_expr):
         return 1.0 / apply_ufunc(_RECIPROCAL_FNS[fn], x, be)
     if fn == "even":
         return _even(x, be)
-    names = _MATH_FNS.get(fn)
-    if names is None:
+    ufunc = _MATH_FNS.get(fn)
+    if ufunc is None:
         raise Unsupported(f"math fn {fn}")
-    device_method, ufunc = names
-    if be.is_gpu and device_method is not None:
-        return getattr(x, device_method)()
     return apply_ufunc(ufunc, x, be)
 
 
@@ -313,103 +311,15 @@ def _binary_ufunc(name: str, left, right, df, be, *, integer: bool = False):
     return out.where(present, None)
 
 
-def eval_str(ir, df, be, eval_expr):
-    x = be.column(eval_expr(ir["input"], df, be), df)
-    fn = ir["fn"]
-    if fn in _STR_METHODS:
-        return getattr(x.str, _STR_METHODS[fn])()
-    if fn in ("lpad", "rpad"):
-        return _pad(x, int(ir["start"]), str(ir["pattern"]), left=fn == "lpad")
-    if fn == "repeat":
-        return x.str.repeat(int(ir["start"]))
-    if fn == "right":
-        return x.str.slice(-int(ir["start"]))
-    if fn == "position":
-        # SQL `position` is 1-based and reports 0 for "not found"; `find` is 0-based and -1.
-        return (x.str.find(ir["pattern"]) + 1).astype(be.dtype(_int64()))
-    if fn == "len":
-        return x.str.len().astype(be.dtype(_int64()))
-    if fn == "like":
-        return _like(x, str(ir["pattern"]))
-    if fn == "reverse":
-        # A negative-step slice, which is the one spelling of "reversed" both libraries have —
-        # neither exposes a `.str.reverse` that the other also does. It steps over characters,
-        # not bytes, which is what the engine reverses too.
-        return x.str.slice(step=-1)
-    if fn == "contains":
-        # The engine matches a **literal** substring, exactly as `replace` does. Both
-        # libraries' `contains` defaults to a regular expression instead, so any pattern
-        # carrying a metacharacter matches rows the engine does not — and `.` is in every path,
-        # hostname, version string and email domain anyone filters on. `contains("a.b")` was
-        # matching "axb"; `contains("a|b")` was matching everything.
-        return x.str.contains(ir["pattern"], regex=False)
-    if fn in _STR_PATTERN_METHODS:
-        return getattr(x.str, _STR_PATTERN_METHODS[fn])(ir["pattern"])
-    if fn == "replace":
-        # The engine replaces every occurrence and treats the pattern as a literal.
-        return x.str.replace(ir["pattern"], ir["replacement"], regex=False)
-    if fn == "substr":
-        # SQL's 1-based, inclusive `substring(s, start, length)`: a `start` below 1 spends
-        # part of the length before the string begins, so `substr(s, 0, 1)` is the empty
-        # string. Slicing from a 0-based `start` instead silently returns a shifted window.
-        start, length = int(ir["start"]), int(ir["length"])
-        return x.str.slice(max(start - 1, 0), max(start + length - 1, 0))
-    if fn in ("trim", "l_trim", "r_trim"):
-        return {"trim": x.str.strip, "l_trim": x.str.lstrip, "r_trim": x.str.rstrip}[fn]()
-    raise Unsupported(f"str fn {fn}")
-
-
-def _like(x, pattern: str):
-    """SQL `LIKE`, for the patterns that reduce to a literal substring test.
-
-    The engine classifies a `LIKE` pattern exactly this way and only reaches for a regex when
-    it has to (`eval::str::like::LikeMatcher::classify`), so this is the same reduction rather
-    than an approximation of it — `%foo%` is a substring scan on both sides, not two regex
-    dialects that happen to agree.
-
-    That matters because a regex is the one thing here that could not be checked: the engine
-    compiles Rust's, the host backend Python's and the device cuDF's, and the three disagree on
-    exactly the classes a test over ASCII data would never reach. `ILIKE` and any pattern
-    carrying `_` are the cases the engine itself needs a regex for, and they are declined here
-    for the same reason. A pattern with a literal in the middle (`a%b`) is declined too: the
-    engine scans its segments in order, which no single `.str` call expresses.
-    """
-    if "_" in pattern:
-        raise Unsupported("like with a single-character wildcard")
-    parts = pattern.split("%")
-    if len(parts) == 1:
-        return x == pattern  # no wildcard at all: LIKE is equality
-    prefix, suffix = parts[0], parts[-1]
-    middles = [p for p in parts[1:-1] if p]  # `%%` constrains nothing
-    if prefix and not suffix and not middles:
-        return x.str.startswith(prefix)
-    if suffix and not prefix and not middles:
-        return x.str.endswith(suffix)
-    if not prefix and not suffix and len(middles) == 1:
-        # Literal, not a regular expression — the same reason `contains` is spelled this way.
-        return x.str.contains(middles[0], regex=False)
-    if not prefix and not suffix and not middles:
-        # A pattern of nothing but `%` matches every row it is given, and a null is still not
-        # a row it was given: `LIKE` on an unknown is unknown.
-        return x.notna().where(x.notna(), None)
-    raise Unsupported(f"like pattern {pattern!r}")
-
-
-def _pad(x, width: int, fill: str, *, left: bool):
-    """SQL `lpad`/`rpad`: pad to `width`, and **truncate** to it when the value is longer.
-
-    The libraries' `rjust`/`ljust` only ever pad, so a value longer than the width came back
-    unchanged where the engine returns its first `width` characters.
-    """
-    padded = x.str.pad(width, side="left" if left else "right", fillchar=fill)
-    return padded.str.slice(0, width)
-
-
 def eval_date(ir, df, be, eval_expr):
     fn = ir["fn"]
     x = be.column(eval_expr(ir["input"], df, be), df)
     if fn in _DATE_ATTRS:
         return getattr(x.dt, fn).astype(be.dtype(_int64()))
+    if fn in _DATE_BOOL_ATTRS:
+        import pyarrow as pa
+
+        return getattr(x.dt, fn).astype(be.dtype(pa.bool_())).where(x.notna(), None)
     if fn == "day_of_week":
         # The engine numbers from Sunday; both backends number from Monday. Same values, a
         # different origin — the sort of difference that is invisible until a Sunday. Written

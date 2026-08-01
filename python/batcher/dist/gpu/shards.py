@@ -174,6 +174,15 @@ _MEMORY_MARKERS = (
     "memoryerror",
     "insufficient memory",
     "resource_exhausted",
+    # RMM's `PoolMemoryResource` refuses past its ceiling with this and no other wording, and
+    # none of the markers above appear in it. It arrives at the driver wrapped by Ray as a
+    # `RayTaskError`, so the exception *type* that would otherwise have carried the word "rmm"
+    # is gone by the time it is classified — leaving the one overflow that a bounded pool
+    # produces by design as the one overflow the subdivision ladder did not recognize. It read
+    # as a deterministic error and the shard went straight to the CPU engine.
+    "maximum pool size exceeded",
+    # cuDF's spill manager, when `spill_to_host` is on and the host has nothing left either.
+    "failed to allocate",
 )
 
 
@@ -354,7 +363,11 @@ def run_subdivided(descriptor, run, *, parts: int, rounds: int, split=None, caus
     parts = measured_parts(parts, cause)
     pending = [((i,), d) for i, d in enumerate(divide(descriptor, parts))]
     if len(pending) == 1:
-        raise MemoryError("a shard of one split cannot be divided further")
+        # Chained to the overflow that got here. The caller falls back to the host on this
+        # error and reports it as the reason, and a bare `MemoryError` erased the device-side
+        # detail — the driver, the allocator, the byte figure — leaving "cannot be divided
+        # further" as the whole account of why a GPU query ran on the CPU.
+        raise MemoryError("a shard of one split cannot be divided further") from cause
     # Keyed by position, and sorted before concatenating. A row-local chain's shard is a
     # contiguous slice of the source and its pieces are contiguous slices of that, so their
     # order IS part of the answer; appending them as they happen to finish would reorder the

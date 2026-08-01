@@ -391,7 +391,7 @@ def _interval_selectivity(
         _, value, col_on_left = side
         eff = c.op if col_on_left else _FLIP_OP[c.op]
         x = _ordinal(value)
-        frac = _fraction_below_quantiles(x, q)
+        frac = _fraction_below_quantiles(value, q)
         if frac is None:
             frac = _fraction_below_bounds(x, bnd)
         if frac is None:

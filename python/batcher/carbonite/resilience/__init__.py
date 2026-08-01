@@ -60,14 +60,17 @@ from batcher.carbonite.resilience.preflight import (
 from batcher.carbonite.resilience.recovery import RecoveryPolicy, ShuffleRecovery
 from batcher.carbonite.resilience.replication import assign_replica_hosts
 from batcher.carbonite.resilience.speculative import (
+    STALL_WARN_AFTER_S,
     SpeculationPolicy,
     gather_with_backups,
     stragglers_to_backup,
+    warn_barrier_stalled,
 )
 
 __all__ = [
     "CATEGORIES",
     "STABILITY_VARS",
+    "STALL_WARN_AFTER_S",
     "BudgetState",
     "CheckResult",
     "FailureClass",
@@ -97,4 +100,5 @@ __all__ = [
     "stability_env",
     "stragglers_to_backup",
     "termination_probe",
+    "warn_barrier_stalled",
 ]

@@ -59,7 +59,11 @@ _DEFAULT_PLAN_ID = 1
 _current_plan_id: contextvars.ContextVar[int] = contextvars.ContextVar(
     "batcher_shuffle_plan_id", default=_DEFAULT_PLAN_ID
 )
-_RESULT_STAGE = 100  # ticket stage for a stage's *finalized* result (kept on the actor)
+# Default ticket stage for a stage's *finalized* result (kept on the actor). Every publish
+# should pass its own `result_stage` from `fleet.plan_id.next_result_stage` — two results
+# sharing one stage are byte-identical tickets on the same worker, and the second overwrites
+# the first. This constant remains only so an older caller keeps working.
+_RESULT_STAGE = 100
 # Sub-buckets a memory-bounded join reduce re-partitions each staged side into on disk, so
 # it joins one sub-bucket pair at a time rather than the whole bucket. Matches the
 # single-node spilling join's default fan-out (`execute_spilling_join`).
@@ -437,7 +441,17 @@ try:
             return self.session.partition_count
 
         def map_publish(
-            self, map_ir, gk, aj, partition, n_keys, n_reducers, src=None, epoch=0, plan_id=None
+            self,
+            map_ir,
+            gk,
+            aj,
+            partition,
+            n_keys,
+            n_reducers,
+            src=None,
+            epoch=0,
+            plan_id=None,
+            stage_base=0,
         ) -> str:
             _use_plan(plan_id)
             nat = engine()
@@ -470,7 +484,7 @@ try:
             self._bucket_bytes = {}
             for r in range(n_reducers):
                 bucket = buckets[r] if r < len(buckets) else []
-                self.session.publish(_ticket(0, src, r, epoch), bucket)
+                self.session.publish(_ticket(stage_base, src, r, epoch), bucket)
                 # `nbytes`, deliberately, where the memory guards nearby use
                 # `plan.types.retained_bytes`: this figure predicts what a reducer will
                 # *pull over the wire*, and Arrow IPC writes only the rows a batch
@@ -505,7 +519,15 @@ try:
             return self.session.addr
 
         def reduce_fetch(
-            self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None, plan_id=None
+            self,
+            gk,
+            aj,
+            mapper_addrs,
+            reducer_id,
+            epochs=None,
+            replicas=None,
+            plan_id=None,
+            stage_base=0,
         ):
             _use_plan(plan_id)
             # Fetch every mapper's partial *concurrently* and fold them into one running
@@ -523,7 +545,7 @@ try:
             # fault propagates and fails the query fast.
             epochs = epochs or {}
             sources = [
-                (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
+                (addr, _ticket(stage_base, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(mapper_addrs)
             ]
             budget, _sdir, _codec = _reduce_spill_opts(self._engine_config)
@@ -580,7 +602,16 @@ try:
                 shutil.rmtree(work, ignore_errors=True)
 
         def reduce_fetch_publish(
-            self, gk, aj, mapper_addrs, reducer_id, epochs=None, replicas=None, plan_id=None
+            self,
+            gk,
+            aj,
+            mapper_addrs,
+            reducer_id,
+            epochs=None,
+            replicas=None,
+            plan_id=None,
+            result_stage=_RESULT_STAGE,
+            stage_base=0,
         ):
             """Like `reduce_fetch`, but PUBLISH the finalized result on this worker's own
             Flight server and return only a `(addr, ticket, rows, schema)` handle.
@@ -591,10 +622,12 @@ try:
             (`"retry"` on a lost mapper), so it composes with the recovery loop.
             """
             _use_plan(plan_id)
-            status, payload = self.reduce_fetch(gk, aj, mapper_addrs, reducer_id, epochs, replicas)
+            status, payload = self.reduce_fetch(
+                gk, aj, mapper_addrs, reducer_id, epochs, replicas, None, stage_base
+            )
             if status != "ok" or payload is None:
                 return (status, payload)  # retry, or an empty bucket (no handle)
-            ticket = _ticket(_RESULT_STAGE, self.id, reducer_id)
+            ticket = _ticket(result_stage, self.id, reducer_id)
             self.session.publish(ticket, [payload])
             return ("ok", (self.session.addr, ticket, payload.num_rows, payload.schema))
 
@@ -660,7 +693,9 @@ try:
                     buckets[r] = []
             return self.session.addr
 
-        def map_publish_join(self, left, right, n_buckets, src=None, epoch=0, plan_id=None) -> str:
+        def map_publish_join(
+            self, left, right, n_buckets, src=None, epoch=0, plan_id=None, stage_base=0
+        ) -> str:
             """Publish BOTH sides of one join source partition in a single actor call.
 
             `left`/`right` are each `(sub_ir, key_names, partition)`.
@@ -675,9 +710,11 @@ try:
             it actually is.
             """
             _use_plan(plan_id)
-            self.map_publish_raw(left[0], left[1], left[2], n_buckets, 0, src, epoch, plan_id)
+            self.map_publish_raw(
+                left[0], left[1], left[2], n_buckets, stage_base, src, epoch, plan_id
+            )
             return self.map_publish_raw(
-                right[0], right[1], right[2], n_buckets, 1, src, epoch, plan_id
+                right[0], right[1], right[2], n_buckets, stage_base + 1, src, epoch, plan_id
             )
 
         def reduce_window(
@@ -715,6 +752,7 @@ try:
             epochs=None,
             replicas=None,
             plan_id=None,
+            stage_base=0,
         ):
             import functools
 
@@ -728,11 +766,11 @@ try:
             # source live on the same worker, so one `replicas` list covers them both.
             epochs = epochs or {}
             left_sources = [
-                (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
+                (addr, _ticket(stage_base, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(addrs)
             ]
             right_sources = [
-                (addr, _ticket(1, src, reducer_id, epochs.get(src, 0)))
+                (addr, _ticket(stage_base + 1, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(addrs)
             ]
             budget, _sdir, _codec = _reduce_spill_opts(self._engine_config)
@@ -885,6 +923,8 @@ try:
             epochs=None,
             replicas=None,
             plan_id=None,
+            result_stage=_RESULT_STAGE,
+            stage_base=0,
         ):
             """Like `reduce_join`, but PUBLISH this bucket's joined rows on the worker's own
             Flight server and hand back only an `(addr, ticket, rows, schema)` handle.
@@ -915,6 +955,7 @@ try:
                 epochs,
                 replicas,
                 plan_id,
+                stage_base,
             )
             if status != "ok":
                 return (status, batches)  # retry: `batches` carries the unreachable mappers
@@ -927,7 +968,7 @@ try:
             batches = [b for b in (batches or []) if b.num_rows > 0]
             if not batches:
                 return ("ok", None)
-            ticket = _ticket(_RESULT_STAGE, self.id, reducer_id)
+            ticket = _ticket(result_stage, self.id, reducer_id)
             self.session.publish(ticket, batches)
             rows = sum(b.num_rows for b in batches)
             return ("ok", (self.session.addr, ticket, rows, batches[0].schema))

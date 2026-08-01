@@ -280,8 +280,10 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
     from batcher.dist.executors.ray_runtime.accelerators import cluster_gpu_memory_gb
     from batcher.ml.gpu import (
         actors_per_gpu_from_learned_vram,
+        cold_start_gpu_fraction,
         gpu_feedback_key,
         gpu_vram_gb,
+        load_gpu_actors_per_device,
         load_gpu_peak_vram,
         load_gpu_utilization,
         recommend_gpu_fraction,
@@ -327,14 +329,35 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
         base_gpus = recommend_gpu_fraction(model_gb, vram)
     key = gpu_feedback_key(plan)
     util = load_gpu_utilization(hub, key)
-    num_gpus = recommend_num_gpus(util, base_gpus)
+    # The density that produced `util`, and the density VRAM allows: with both, the request
+    # is sized to land the device at the packing target instead of merely "not wasted". A
+    # stage measured at 78% on one actor per device is leaving a fifth of the GPU to its own
+    # UDF's CPU work, which only a second actor can fill.
+    density = load_gpu_actors_per_device(hub, key)
+    vram_cap = actors_per_gpu_from_learned_vram(
+        load_gpu_peak_vram(hub, key), actors_per_device=density
+    )
+    num_gpus = recommend_num_gpus(util, base_gpus, density, vram_cap)
+    if util is None and num_gpus > 0 and model_gb <= 0:
+        # Nothing measured and nothing declared: *reserve* the packable fraction so the
+        # cold-start fill has somewhere to put a second actor. Ray fixes an actor's fraction
+        # at creation, so a first run that reserved a whole GPU each can never add one
+        # however much room the model turns out to leave — the reservation, not the model,
+        # would be the reason run 0 stays unpacked. How many actors actually start is decided
+        # afterwards, from the loaded model's footprint (`dist.executors.map`).
+        #
+        # A stage that *declared* `model_memory_gb` is left alone: the caller has said how
+        # big the model is, `recommend_gpu_fraction` above has already sized the packing from
+        # it against real VRAM, and second-guessing a 40 GB model onto half an 80 GB card is
+        # exactly the kind of packing the declaration exists to prevent.
+        num_gpus = cold_start_gpu_fraction(num_gpus)
     # Refine packing from the MEASURED peak VRAM a prior run of this pipeline actually used,
     # not just the declared model size: if the model really consumed more VRAM than declared,
     # pack fewer actors per GPU (a larger num_gpus fraction) so it doesn't OOM. `max` means
     # the measurement only ever tightens toward safety — it never packs looser than declared,
     # so this can prevent an OOM but never cause one. Result-invariant (a scheduling hint).
     peak_vram = load_gpu_peak_vram(hub, key)
-    packed = actors_per_gpu_from_learned_vram(peak_vram)
+    packed = actors_per_gpu_from_learned_vram(peak_vram, actors_per_device=density)
     if packed is not None and num_gpus > 0:
         num_gpus = min(1.0, max(num_gpus, round(1.0 / packed, 2)))
 

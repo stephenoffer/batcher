@@ -41,7 +41,7 @@ from batcher.kyber.stats.distribution import (
     union_ndv,
 )
 from batcher.kyber.stats.selectivity import predicate_selectivity
-from batcher.kyber.stats.selectivity.scalars import _fraction_below_quantiles, _ordinal
+from batcher.kyber.stats.selectivity.scalars import _fraction_below_on_axis, _ordinal
 from batcher.plan.expr_ir import Col, Expr, IsNotNull, Lit
 from batcher.plan.logical import (
     Aggregate,
@@ -65,7 +65,7 @@ from batcher.plan.logical import (
     is_cartesian_key_pair,
 )
 from batcher.plan.source_stats import SourceStatistics, source_stats_key
-from batcher.plan.stats import ColumnStat, Provenance, RelStats, weakest
+from batcher.plan.stats import ColumnStat, Provenance, RelStats, ordinal_with_axis, weakest
 from batcher.plan.types import column_bytes
 
 __all__ = ["StatsEstimator", "combine_ndv"]
@@ -1360,9 +1360,12 @@ def _overlap_share(
     if hi < lo:
         return 0.0
     grid = stat.quantiles
-    if grid:
-        below_hi = _fraction_below_quantiles(hi, grid)
-        below_lo = _fraction_below_quantiles(lo, grid)
+    placed = ordinal_with_axis(stat.min)
+    if grid and placed is not None:
+        # `lo`/`hi` are ordinals of *this* column's bounds, so the axis to read the grid on
+        # is the one its own `min` sits on.
+        below_hi = _fraction_below_on_axis(hi, placed[0], grid)
+        below_lo = _fraction_below_on_axis(lo, placed[0], grid)
         if below_hi is not None and below_lo is not None:
             return max(0.0, min(1.0, below_hi - below_lo))
     return overlap_fraction(own, (lo, hi))

@@ -126,12 +126,22 @@ _HARDWARE_CLAMPS = {"thermal", "hw_slowdown"}
 def assess_device(
     telemetry: DeviceTelemetry,
     thresholds: HealthThresholds | None = None,
+    own_bytes: int = 0,
 ) -> HealthVerdict:
     """Decide whether one device should be scheduled, and at what derate.
 
     Args:
         telemetry: A `DeviceTelemetry` reading.
         thresholds: Threshold set to apply; the permissive defaults when omitted.
+        own_bytes: Device memory this process itself holds, discounted from the residency
+            check. `max_memory_fraction` means "a device **another tenant** has filled", and
+            the figure it was compared against was the device *total* — this worker's own
+            allocations included. A worker that had correctly grown its pool into the memory it
+            was entitled to therefore crossed the threshold on its own account and quarantined
+            the device it was computing on, which reaches `fleet_derate` as a fleet reporting
+            itself sick the moment it gets busy. The two figures are one number on a
+            single-process box. Default `0` keeps the old arithmetic where nothing can
+            attribute.
 
     Returns:
         The verdict. A device whose telemetry reported nothing at all reads healthy: absent
@@ -171,8 +181,8 @@ def assess_device(
         reasons.append("hot")
         derate = min(derate, 0.75)
     if telemetry.memory_total_bytes > 0:
-        resident = telemetry.memory_used_bytes / telemetry.memory_total_bytes
-        if resident > th.max_memory_fraction:
+        external = max(0, telemetry.memory_used_bytes - max(0, own_bytes))
+        if external / telemetry.memory_total_bytes > th.max_memory_fraction:
             reasons.append("memory_full")
             derate = min(derate, 0.25)
 
@@ -228,12 +238,26 @@ def assess_fleet(
     by_index = {f.index: f for f in faults}
     verdicts = []
     for reading in readings:
-        verdict = assess_device(reading, thresholds)
+        verdict = assess_device(reading, thresholds, own_bytes=_own_bytes(live, reading.index))
         fault = by_index.get(reading.index)
         verdicts.append(assess_faults(verdict, fault, thresholds) if fault else verdict)
     # The driver's own error log last, because it is the only source that can condemn a
     # device every other reading calls healthy.
     return xid_verdicts(tuple(verdicts), tuple(faults))
+
+
+def _own_bytes(live: bool, index: int) -> int:
+    """This process's own device memory, for discounting from the residency check.
+
+    Only on the live path: a caller that supplied readings may be judging a device that is not
+    even on this host. Unattributable (`None` across a PID namespace, or on MIG) becomes `0`,
+    the pre-existing reading, which counts the whole residency as external.
+    """
+    if not live:
+        return 0
+    from batcher._internal.hardware.nvml import own_device_memory
+
+    return own_device_memory(index) or 0
 
 
 def schedulable_devices(

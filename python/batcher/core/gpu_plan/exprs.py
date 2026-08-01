@@ -16,7 +16,6 @@ match on the common input, because a fallback costs time while a wrong answer co
 from __future__ import annotations
 
 import datetime as _dt
-import operator
 from typing import TYPE_CHECKING, Any
 
 from batcher.core.gpu_plan.backend import Unsupported
@@ -26,39 +25,15 @@ from batcher.core.gpu_plan.scalar_fns import (
     eval_date_trunc,
     eval_math,
     eval_math2,
-    eval_str,
     eval_strftime,
 )
+from batcher.core.gpu_plan.vocab.operators import compare, eval_binary
+from batcher.core.gpu_plan.vocab.strings import eval_str
 
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
 
 __all__ = ["eval_expr", "literal_value"]
-
-# Arithmetic, comparison and boolean operators that map straight onto the libraries'
-# element-wise dunders. Both backends implement Kleene logic for `and`/`or` and propagate
-# nulls through arithmetic, which is exactly what the CPU engine does.
-_BINOPS = {
-    "add": operator.add,
-    "sub": operator.sub,
-    "mul": operator.mul,
-    "div": operator.truediv,
-    "mod": operator.mod,
-    "floor_div": operator.floordiv,
-    "gt": operator.gt,
-    "lt": operator.lt,
-    "ge": operator.ge,
-    "le": operator.le,
-    "eq": operator.eq,
-    "ne": operator.ne,
-    "and": operator.and_,
-    "or": operator.or_,
-    "bit_and": operator.and_,
-    "bit_or": operator.or_,
-    "bit_xor": operator.xor,
-    "shift_left": operator.lshift,
-    "shift_right": operator.rshift,
-}
 
 
 def literal_value(tagged: dict) -> Any:
@@ -132,91 +107,6 @@ def _col(ir, df, _be):
     if name not in df.columns:
         raise Unsupported(f"column {name!r} absent from the GPU frame")
     return df[name]
-
-
-def _binary(ir, df, be):
-    op = ir["op"]
-    left = eval_expr(ir["left"], df, be)
-    right = eval_expr(ir["right"], df, be)
-    if op == "concat":
-        # String concatenation, not addition: `+` on two string Series does concatenate on
-        # both backends, but a scalar operand has to become a column first or pandas raises.
-        return be.column(left, df) + be.column(right, df)
-    if op == "add_months":
-        raise Unsupported("add_months")  # calendar arithmetic differs across the backends
-    if not be.is_series(left) and not be.is_series(right):
-        raise Unsupported("constant-folded binary")  # nothing to align against
-    if op == "sub" and be.is_date(left) and be.is_date(right):
-        return _date_difference(left, right, be)
-    if op == "mod":
-        return _truncated_mod(be.column(left, df), right, df, be)
-    if op in _COMPARISONS and (be.is_float(left) or be.is_float(right)):
-        return _compare(op, be.column(left, df), be.column(right, df))
-    fn = _BINOPS.get(op)
-    if fn is None:
-        raise Unsupported(f"binary op {op}")
-    return fn(left, right)
-
-
-def _date_difference(left, right, be):
-    """`DATE - DATE` as a count of days, which is the engine's answer and not the libraries'.
-
-    Subtracting two dates gives a *duration* on both backends and an integer number of days in
-    the engine. The values agree; the column does not, and a shard contributing `duration[s]`
-    beside a CPU-fallback shard's `int64` is a concatenation nobody can complete.
-
-    A timestamp difference is a duration on both sides and is left alone — this is the only
-    arithmetic where the two disagree about the unit rather than the number.
-    """
-    import pyarrow as pa
-
-    days = getattr((left - right).dt, "days", None)
-    if days is None:
-        raise Unsupported("date difference")
-    return days.astype(be.dtype(pa.int64()))
-
-
-_COMPARISONS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
-
-
-def _compare(op: str, left, right):
-    """A float comparison under the engine's total order, where `NaN` is the largest value.
-
-    Both dataframe libraries use IEEE comparison, in which every comparison involving `NaN`
-    is false — so `NaN > 1.0` is False there and True in the engine (and in DuckDB), and
-    `NaN = NaN` is False there and True in the engine. Left alone, that silently drops or
-    keeps the wrong rows in a `WHERE` over a column that happens to carry a `NaN`.
-
-    Nulls still propagate: a comparison with a null operand is null, which the naive form
-    already gives, so the corrections are applied only where neither side is null.
-    """
-    ln, rn = left != left, right != right  # NaN masks (null-safe: null yields null)
-    ln, rn = ln.fillna(False), rn.fillna(False)
-    naive = _BINOPS[op](left, right)
-    if op == "eq":
-        return naive.where(~(ln & rn), True).where(~(ln ^ rn), False)
-    if op == "ne":
-        return naive.where(~(ln & rn), False).where(~(ln ^ rn), True)
-    if op in ("gt", "ge"):
-        # NaN exceeds every non-NaN value; two NaNs are equal, so `>` is false and `>=` true.
-        out = naive.where(~(ln & ~rn), True).where(~(rn & ~ln), False)
-        return out.where(~(ln & rn), op == "ge")
-    out = naive.where(~(ln & ~rn), False).where(~(rn & ~ln), True)
-    return out.where(~(ln & rn), op == "le")
-
-
-def _truncated_mod(left, right, df, be):
-    """`a % b` with the sign of the *dividend*, which is what the engine computes.
-
-    Both `%` implementations available here are the floored form (Python's, whose result
-    takes the sign of the divisor), and one of the two backends does not implement `%` on
-    Arrow-typed columns at all. Deriving the truncated remainder from floored division uses
-    only operators both support, and makes the two paths provably the same expression.
-    """
-    right = be.column(right, df)
-    floored = left - (left // right) * right
-    differs = ((floored != 0) & ((floored < 0) != (left < 0))).fillna(False)
-    return floored - right * differs.astype("int64")
 
 
 def _not(ir, df, be):
@@ -319,7 +209,7 @@ def _extreme(ir, df, be, *, want_max: bool):
         # argument instead.
         op = "ge" if want_max else "le"
         picked = (
-            _compare(op, out, nxt)
+            compare(op, out, nxt)
             if be.is_float(out) or be.is_float(nxt)
             else ((out >= nxt) if want_max else (out <= nxt))
         )
@@ -333,27 +223,65 @@ def _in_list(ir, df, be):
 
 
 def _list(ir, df, be: DfBackend):
-    """A scalar reduction over each row's list — of which only the length is translatable.
+    """A scalar reduction over each row's list.
 
-    `.list.len()` is the one reduction both libraries spell the same way. The arithmetic ones
-    (`sum`, `mean`, `min`) exist on cuDF's list accessor and not on the host backend's, so
-    translating them would ship a path only the device can run and only the device could be
-    wrong about. `list_get` is absent for the opposite reason and is worth stating: both
-    libraries have it, but they disagree about an out-of-range index — the host backend raises
-    where the engine and cuDF return null — so the verification backend cannot model the device.
+    Neither library exposes these as a call both of them have, so they are built from `explode`
+    plus `groupby` — see `vocab.lists`, which states why that construction is exact rather than
+    close. The list→list functions (`sort`, `normalize`, `softmax`) are still declined: their
+    result has to be reassembled into a list, and the only portable way to do that materializes
+    a Python object per row, which is a hot-path tuple touch rather than a translation.
     """
-    fn = ir["fn"]
-    if fn != "len":
-        raise Unsupported(f"list fn {fn}")
-    import pyarrow as pa
+    from batcher.core.gpu_plan.vocab import eval_list_fn
+
+    return eval_list_fn(ir["fn"], be.column(eval_expr(ir["input"], df, be), df), be)
+
+
+def _list_binary(ir, df, be: DfBackend):
+    """A pairwise reduction over two list columns — the vector distances and the dot product."""
+    from batcher.core.gpu_plan.vocab import eval_list_binary
+
+    left = be.column(eval_expr(ir["left"], df, be), df)
+    right = be.column(eval_expr(ir["right"], df, be), df)
+    return eval_list_binary(ir["fn"], left, right, be)
+
+
+def _list_get(ir, df, be: DfBackend):
+    """`list[index]` — the index is a constant in every plan the engine builds."""
+    from batcher.core.gpu_plan.vocab import eval_list_get
+
+    return eval_list_get(be.column(eval_expr(ir["input"], df, be), df), int(ir["index"]), be)
+
+
+def _list_contains(ir, df, be: DfBackend):
+    from batcher.core.gpu_plan.vocab import eval_list_contains
 
     x = be.column(eval_expr(ir["input"], df, be), df)
-    return x.list.len().astype(be.dtype(pa.int64()))
+    return eval_list_contains(x, literal_value(ir["value"]), be)
+
+
+def _list_position(ir, df, be: DfBackend):
+    from batcher.core.gpu_plan.vocab import eval_list_position
+
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    return eval_list_position(x, literal_value(ir["value"]), be)
+
+
+def _struct_field(ir, df, be: DfBackend):
+    """`struct.field(name)` — one field of a struct column.
+
+    The one struct operation both libraries spell the same way, and the one worth having: a
+    struct column is how every semi-structured source arrives, so a plan that reads one field
+    of one used to send its whole chain to the host.
+    """
+    from batcher.core.gpu_plan.backend import call_or_decline
+
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    return call_or_decline(x.struct, "field", ir["field"])
 
 
 def _make_temporal(ir, df, be: DfBackend):
     """An epoch or calendar constructor, whose arguments are sub-expressions."""
-    from batcher.core.gpu_plan.temporal import eval_make_temporal
+    from batcher.core.gpu_plan.vocab.dates import eval_make_temporal
 
     args = [be.column(eval_expr(a, df, be), df) for a in ir["args"]]
     return eval_make_temporal(ir["fn"], args, be)
@@ -361,7 +289,7 @@ def _make_temporal(ir, df, be: DfBackend):
 
 def _window_start(ir, df, be: DfBackend):
     """`window_start` — the tumbling-window bucket key, whose width and origin are constants."""
-    from batcher.core.gpu_plan.temporal import eval_window_start
+    from batcher.core.gpu_plan.vocab.dates import eval_window_start
 
     x = be.column(eval_expr(ir["input"], df, be), df)
     return eval_window_start(x, int(ir["width_micros"]), int(ir.get("origin_micros", 0)), be)
@@ -393,7 +321,7 @@ def _named(handler):
 _HANDLERS = {
     "col": _col,
     "lit": lambda ir, _df, _be: literal_value(ir["value"]),
-    "binary": _binary,
+    "binary": _named(eval_binary),
     "not": _not,
     "is_null": _is_null,
     "is_not_null": _is_not_null,
@@ -413,6 +341,11 @@ _HANDLERS = {
     "date_trunc": _named(eval_date_trunc),
     "date_offset": _date_offset,
     "list": _list,
+    "list_binary": _list_binary,
+    "list_get": _list_get,
+    "list_contains": _list_contains,
+    "list_position": _list_position,
+    "struct_field": _struct_field,
     "window_start": _window_start,
     "make_temporal": _make_temporal,
     "strftime": _named(eval_strftime),

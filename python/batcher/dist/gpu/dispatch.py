@@ -40,12 +40,20 @@ __all__ = [
 def await_gpu_admission(devices: float = 1.0) -> bool:
     """Whether the cluster can actually start a GPU task now, waiting a bounded time for it.
 
-    A GPU task asks Ray for a device **and** a core, and on a busy cluster the core is the one
-    it does not get. A placement group holding every CPU — another tenant's shuffle, a leaked
-    reservation from a failed stage — leaves the fan-out's tasks PENDING with the devices
-    sitting idle, and `ray.get` on a pending task does not time out. The query then blocks
-    forever, on a backend documented as always safe to request, while the CPU engine could have
-    answered it the whole time.
+    A GPU task that cannot be placed does not fail — it pends, and `ray.get` on a pending task
+    waits for as long as the query is willing to. Declining here is what turns that into a
+    slower answer instead of no answer.
+
+    **Only the device is checked.** This gate was written when a GPU shard task took Ray's
+    default `num_cpus=1`, and it therefore also required a free core. That requirement outlived
+    the task option it described: `gpu_task_options` now requests `num_cpus=0`, because the work
+    is on the device and concurrency is already bounded by the device share. Left in, the check
+    refused admission on exactly the cluster the zero-CPU request was introduced to rescue — a
+    shuffle fleet holding every core in a placement group — so the deadlock it once prevented
+    came back as something quieter and no better: the query stalled for the whole admission
+    budget and then abandoned the GPU backend, on a fleet whose devices were entirely idle.
+    Asking for a resource the task does not request can only ever refuse work that would have
+    run.
 
     Checked against *available* resources rather than the cluster's totals, which is the
     distinction `await_autoscale` deliberately does not make: it asks whether the fleet is big
@@ -59,7 +67,7 @@ def await_gpu_admission(devices: float = 1.0) -> bool:
         True when a task could be placed — including whenever the answer cannot be determined,
         because refusing the GPU on an unreadable cluster would disable the backend on every
         deployment whose resource view differs from this one. False only on a positive reading
-        that nothing is free.
+        that no device is free.
     """
     from batcher.config import active_config
 
@@ -80,7 +88,7 @@ def await_gpu_admission(devices: float = 1.0) -> bool:
     poll = min(0.5, max(0.05, budget / 20.0))
     while True:
         free = _free_resources()
-        if free is None or (free.get("GPU", 0.0) >= devices and free.get("CPU", 0.0) >= 1.0):
+        if free is None or free.get("GPU", 0.0) >= devices:
             return True
         if time.monotonic() >= deadline:
             note_suppressed(
@@ -88,7 +96,7 @@ def await_gpu_admission(devices: float = 1.0) -> bool:
                 "admit a GPU stage",
                 TimeoutError(
                     f"no device free after {budget:.0f}s "
-                    f"(GPU {free.get('GPU', 0.0):.2f}, CPU {free.get('CPU', 0.0):.1f} available)"
+                    f"({free.get('GPU', 0.0):.2f} of a needed {devices:.2f} GPU available)"
                 ),
             )
             return False

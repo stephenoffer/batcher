@@ -93,6 +93,34 @@ def test_a_small_shard_is_granted_a_share_of_a_device(packing_config) -> None:
     assert packing.devices <= 2
 
 
+def test_no_more_shards_than_devices_takes_a_whole_device_each(packing_config) -> None:
+    """Packing exists to fit *more* shards than devices onto the fleet. With no more shards
+    than devices there is nothing to gain and a fleet to lose: a fractional request lets Ray
+    place several shards on one board, and it does — measured on four T4s, a four-shard fan-out
+    put three on one node and one on another and left two devices idle for the whole query.
+    """
+    packing_config()
+    packing = share_for_bytes(2 * GIB, concurrency=4, gpu_count=4)
+    assert packing.fraction == 1.0
+    assert packing.per_device == 1
+    assert packing.devices == 4
+
+
+def test_one_more_shard_than_devices_packs_again(packing_config) -> None:
+    """The rule turns off exactly where packing starts to buy something."""
+    packing_config()
+    packing = share_for_bytes(2 * GIB, concurrency=5, gpu_count=4)
+    assert packing.fraction < 1.0
+
+
+def test_a_pinned_fraction_still_wins_over_the_one_per_device_rule(packing_config) -> None:
+    """An explicit `gpu_task_fraction` is an operator statement about a fleet the estimator
+    cannot see, so it outranks the throughput default."""
+    packing_config(gpu_task_fraction=0.25)
+    packing = share_for_bytes(2 * GIB, concurrency=4, gpu_count=4)
+    assert packing.fraction == 0.25
+
+
 def test_a_shard_that_needs_the_whole_device_gets_it(packing_config) -> None:
     packing_config()
     packing = share_for_bytes(60 * GIB, concurrency=8, gpu_count=2)

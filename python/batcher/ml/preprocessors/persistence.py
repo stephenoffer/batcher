@@ -36,9 +36,21 @@ SCHEMA_VERSION = 1
 #: silently flattened into a list — which would round-trip to a *different* object.
 _TUPLE_TAG = "__tuple__"
 
+#: A preprocessor nested inside another one's parameters — `Chain`'s steps. Written as its
+#: own `to_dict` document under this tag so a whole fitted pipeline saves and loads as one
+#: file, which is the thing users actually persist. Without it `to_dict(Chain(...))` failed
+#: with "cannot serialize fitted state of type StandardScaler": the chain named the one
+#: value the encoder had no case for, and the pipeline was the only preprocessor that could
+#: not be saved.
+_PREPROCESSOR_TAG = "__preprocessor__"
+
 
 def _encode(value: Any) -> Any:
     """Convert fitted state into JSON-representable form, tagging what JSON would lose."""
+    from batcher.ml.preprocessors.base import Preprocessor
+
+    if isinstance(value, Preprocessor):
+        return {_PREPROCESSOR_TAG: to_dict(value)}
     if isinstance(value, tuple):
         return {_TUPLE_TAG: [_encode(v) for v in value]}
     if isinstance(value, list):
@@ -60,6 +72,8 @@ def _encode(value: Any) -> Any:
 def _decode(value: Any) -> Any:
     """Restore what `_encode` wrote, including tuples and non-string dict keys."""
     if isinstance(value, dict):
+        if _PREPROCESSOR_TAG in value:
+            return from_dict(value[_PREPROCESSOR_TAG])
         if _TUPLE_TAG in value:
             return tuple(_decode(v) for v in value[_TUPLE_TAG])
         if "__items__" in value:
@@ -118,10 +132,19 @@ def to_dict(preprocessor: Preprocessor) -> dict[str, Any]:
 
 
 def _registry() -> dict[str, type]:
-    """Every preprocessor class this package exports, by name.
+    """Every preprocessor a user can reach, by name.
 
-    Built from the package's own ``__all__`` rather than a hand-kept list, so a new
-    preprocessor is loadable the moment it is exported and cannot be forgotten here.
+    Built from ``__all__`` rather than a hand-kept list, so a new preprocessor is loadable
+    the moment it is exported and cannot be forgotten here.
+
+    Two ``__all__``s, because one was not enough. A `Preprocessor` does not have to live in
+    this package to be one: `OutlierClipper` sits in `batcher.ml.outliers` beside the outlier
+    functions it belongs with, is exported from `batcher.ml` like every other preprocessor,
+    and subclasses the same base — but scanning only this package's exports meant it was the
+    one preprocessor `save`/`load` could not reconstruct. Fitting it into a pipeline and
+    saving that pipeline succeeded; loading it back failed with "unknown preprocessor class",
+    which is the worst possible time to find out. Anything reachable from `batcher.ml` that
+    *is* a `Preprocessor` is therefore registered too, wherever its module happens to be.
     """
     from batcher.ml import preprocessors
 
@@ -130,7 +153,43 @@ def _registry() -> dict[str, type]:
         candidate = getattr(preprocessors, name)
         if isinstance(candidate, type):
             classes[name] = candidate
+
+    import batcher.ml as ml_package
+    from batcher.ml.preprocessors.base import Preprocessor
+
+    for name in getattr(ml_package, "__all__", ()):
+        if name in classes:
+            continue
+        candidate = getattr(ml_package, name, None)
+        if isinstance(candidate, type) and issubclass(candidate, Preprocessor):
+            classes[name] = candidate
     return classes
+
+
+def _split_var_positional(klass: type, params: dict[str, Any]) -> tuple[tuple, dict[str, Any]]:
+    """Pull the value for `klass`'s ``*args`` parameter out of `params`, if it has one.
+
+    `get_params` reports every constructor parameter by name, including one declared
+    ``*steps`` — and a name is exactly how a var-positional parameter cannot be passed.
+    `Chain` is the case: its steps round-tripped into the document correctly and then
+    `Chain(steps=[...])` raised ``TypeError``, reported as "no longer accepts the saved
+    parameters", which points at a version mismatch that had not happened.
+
+    Reading the signature rather than special-casing `Chain` keeps this true for any future
+    preprocessor that takes its inputs positionally.
+    """
+    import inspect
+
+    try:
+        signature = inspect.signature(klass.__init__)
+    except (TypeError, ValueError):  # a C-level or otherwise unreadable __init__
+        return (), params
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL and parameter.name in params:
+            rest = dict(params)
+            value = rest.pop(parameter.name)
+            return tuple(value), rest
+    return (), params
 
 
 def from_dict(document: dict[str, Any]) -> Preprocessor:
@@ -170,8 +229,9 @@ def from_dict(document: dict[str, Any]) -> Preprocessor:
         tail = f" {hint}" if hint else ""
         raise PlanError(f"unknown preprocessor class {name!r}.{tail}")
     params = {k: _decode(v) for k, v in document.get("params", {}).items()}
+    positional, params = _split_var_positional(classes[name], params)
     try:
-        instance = classes[name](**params)
+        instance = classes[name](*positional, **params)
     except TypeError as exc:
         raise PlanError(
             f"{name} no longer accepts the saved parameters ({exc}). The preprocessor was "

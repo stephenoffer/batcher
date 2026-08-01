@@ -234,23 +234,35 @@ def _free_device_bytes() -> int:
     Nominal capacity is the wrong number on a shared device: sizing a KV cache against total
     VRAM when another process holds half of it is how a serving engine OOMs on its first full
     batch. The pool takes the measured resident figure and reserves against the remainder.
+
+    **Visible** devices, as the summary line says and as the implementation did not: this read
+    the whole host, so an actor granted one GPU on an eight-GPU node sized its cache against
+    whichever of the other seven a stranger had filled most. The minimum across devices is the
+    right reduction — a replica has to fit the worst board it may land on — and taking it over
+    boards this process cannot address makes it an arbitrary one.
+
+    The readings are taken **once**. Sampling twice, as this did, prices the reservation against
+    one snapshot and the remainder against another, so a co-tenant allocating between the two
+    calls produces a figure that was never true of any single moment.
     """
-    from batcher._internal.hardware import device_telemetry, gpu_inventory
+    from batcher._internal.hardware import gpu_inventory
+    from batcher._internal.hardware.devices import visible_device_telemetry
     from batcher._internal.hardware.nvml import own_device_memory
     from batcher.carbonite.accel import VramPool
 
     capacity = min((int(g.get("memory_bytes") or 0) for g in gpu_inventory()), default=0)
     if capacity <= 0:
         return 0
+    readings = visible_device_telemetry()
     pool = VramPool(capacity_bytes=capacity, headroom=0.0)
-    for reading in device_telemetry():
+    for reading in readings:
         pool.observe_external(
             reading.index,
             reading.memory_used_bytes,
             own_bytes=own_device_memory(reading.index),
         )
     return min(
-        (pool.available_bytes(r.index) for r in device_telemetry()),
+        (pool.available_bytes(r.index) for r in readings),
         default=pool.available_bytes(0),
     )
 

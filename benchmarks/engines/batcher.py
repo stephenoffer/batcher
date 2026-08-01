@@ -43,11 +43,19 @@ _PARTITIONS: int | None = (
 )
 
 
+# Execution backend. ``BENCH_BATCHER_BACKEND=gpu`` runs the suite through the GPU relational
+# backend (`collect(backend="gpu")`), which is how TPC-H / ClickBench are measured on
+# accelerators; the default `cpu` is the native engine. Kyber still decides per operator
+# whether the GPU is the right place for it, so a query it declines runs on the CPU path and
+# is reported as such — the flag opts in, it does not force.
+_BACKEND: str = os.environ.get("BENCH_BATCHER_BACKEND", "cpu")
+
+
 def _collect(dataset):
-    """Collect under the benchmark's execution mode (single-node, or distributed fan-out)."""
+    """Collect under the benchmark's execution mode (single-node, distributed, CPU or GPU)."""
     if not _DISTRIBUTED:
-        return dataset.collect()
-    return dataset.collect(distributed=True, num_partitions=_PARTITIONS)
+        return dataset.collect(backend=_BACKEND)
+    return dataset.collect(distributed=True, num_partitions=_PARTITIONS, backend=_BACKEND)
 
 
 class BatcherEngine(Engine):

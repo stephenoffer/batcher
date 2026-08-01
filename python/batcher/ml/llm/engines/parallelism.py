@@ -258,6 +258,11 @@ def local_device_name() -> str | None:
     Read from torch rather than NVML because the LLM path already requires torch and this
     runs on the GPU worker, where the device is present by construction.
 
+    Asked of the ordinal this process is *on*, not of ordinal `0`. A worker granted two devices
+    and moved onto its second by `set_device` reported the first one's model, which is the same
+    string on a homogeneous node and a different card on a mixed one — and the name is what the
+    sizing above reads a memory figure and a tensor-parallel degree out of.
+
     Returns:
         The card's reported name, e.g. ``"NVIDIA L4"``.
     """
@@ -266,7 +271,7 @@ def local_device_name() -> str | None:
 
         if not torch.cuda.is_available():
             return None
-        return str(torch.cuda.get_device_name(0))
+        return str(torch.cuda.get_device_name(torch.cuda.current_device()))
     except Exception:  # pragma: no cover - no driver, no device, or an older torch
         return None
 

@@ -39,13 +39,7 @@ __all__ = [
     "eval_calendar_date",
     "eval_calendar_trunc",
     "eval_date_offset",
-    "eval_make_temporal",
-    "eval_window_start",
 ]
-
-#: Epoch conversions that are a scaling into microseconds, as their multiplier. `from_unix_nanos`
-#: is absent because it *divides*, and with a floor rather than a truncation.
-_UNIX_SCALE = {"from_unix_seconds": 1_000_000, "from_unix_millis": 1_000, "from_unix_micros": 1}
 
 #: The widest value `Date32` holds, so a day count outside it becomes null rather than a
 #: wrapped date — the engine's `i32::try_from` in column form.
@@ -281,87 +275,6 @@ def eval_date_offset(x, months: int, days: int, micros: int, be):
     shifted = base + (days * _DAY_US + micros)
     stepped = shifted.astype(be.dtype(_timestamp_us()))
     return stepped.astype(be.dtype(_date32())) if is_date else stepped
-
-
-def eval_make_temporal(fn: str, args: list, be):
-    """The epoch constructors — an integer column read as an instant.
-
-    Only the `from_unix_*` family is translated. `make_date` and `make_timestamp` are not: the
-    engine builds them through a calendar type that *validates*, so a February 30 or a month 13
-    comes back null, and a construction that computed a day count instead would silently return
-    the following month's first day. `days_from_civil` is a mapping, not a validator, and the
-    validation is the whole contract of those two.
-
-    Args:
-        fn: The constructor's name.
-        args: Its evaluated arguments, positionally.
-        be: The dataframe backend to compute on.
-
-    Returns:
-        The constructed column, typed as the engine types it.
-
-    Raises:
-        Unsupported: For a constructor outside the `from_unix_*` family.
-    """
-    if fn not in _UNIX_SCALE and fn not in ("from_unix_nanos", "from_unix_date"):
-        raise Unsupported(f"make_temporal {fn}")
-    value = args[0].astype(be.dtype(_int64()))
-    if fn == "from_unix_nanos":
-        # Floor, not truncation, so a pre-1970 sub-microsecond instant lands in the microsecond
-        # that contains it rather than one later — the same rule `epoch` follows.
-        return (value // 1_000).astype(be.dtype(_timestamp_us()))
-    if fn == "from_unix_date":
-        # A day count, so it is already a DATE's own representation and needs no scaling —
-        # which is just as well, because the widest Date32 is a year in the millions and
-        # multiplying it up to microseconds would not fit in an instant at all. Outside the
-        # 32-bit range the engine yields null rather than a wrapped date.
-        inside = ((value <= _I32_MAX) & (value >= -_I32_MAX - 1)).fillna(False)
-        narrowed = value.where(inside, 0).astype(be.dtype(_int32()))
-        return narrowed.where(inside & value.notna(), None).astype(be.dtype(_date32()))
-    # The engine scales *checked*, so a value too large to be an instant is null rather than a
-    # wrapped one — a plausible date in the wrong millennium.
-    scale = _UNIX_SCALE[fn]
-    return _scaled(value, scale, (2**63 - 1) // scale).astype(be.dtype(_timestamp_us()))
-
-
-def _scaled(value, scale: int, limit: int):
-    """`value * scale`, null wherever the product would not fit, without ever computing it.
-
-    The out-of-range rows are replaced with zero *before* the multiply rather than masked
-    after it. Arrow's multiply is checked and evaluates the slots under a null mask too, so
-    masking first still raises on the value it was told to ignore — which turns a row the
-    engine reports as null into a failure of the whole column, and on the device into a silent
-    fallback of the whole query.
-    """
-    inside = ((value <= limit) & (value >= -limit - 1)).fillna(False)
-    return (value.where(inside, 0) * scale).where(inside & value.notna(), None)
-
-
-def eval_window_start(x, width_micros: int, origin_micros: int, be):
-    """`window_start` — the start of the fixed-width tumbling window containing each instant.
-
-    The bucketing key a streaming aggregate groups by, and pure integer arithmetic: the offset
-    from the origin, floored to a multiple of the width, put back on the origin. Flooring is
-    what makes an instant before the origin land in the window that contains it rather than the
-    one after, which is the only case truncation would get wrong.
-
-    Args:
-        x: The timestamp column to bucket.
-        width_micros: The window width; must be positive.
-        origin_micros: The instant the window grid is anchored to.
-        be: The dataframe backend to compute on.
-
-    Returns:
-        Each instant's window start, as `timestamp[us]`.
-
-    Raises:
-        Unsupported: For a non-positive width, which the engine rejects outright.
-    """
-    if width_micros <= 0:
-        raise Unsupported("window_start with a non-positive width")
-    us = epoch_micros(x, be)
-    floored = ((us - origin_micros) // width_micros) * width_micros
-    return (floored + origin_micros).astype(be.dtype(_timestamp_us()))
 
 
 def _shifted_months(x, us, months: int, be):

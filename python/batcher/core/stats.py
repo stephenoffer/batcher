@@ -16,6 +16,7 @@ import pyarrow as pa
 from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.config import active_config
+from batcher.plan.stats import arrow_ordinal_axis
 
 __all__ = [
     "column_ndv",
@@ -65,13 +66,19 @@ def column_statistics(
     """Measure per-column ndv, quantile boundaries, and average byte width.
 
     Returns `(ndv, quantiles, avg_bytes)` where `ndv` is `{col: distinct_estimate}`,
-    `quantiles` is `{col: {"probs": [...], "values": [...]}}` (only for numeric
-    columns with a full set of boundaries), and `avg_bytes` is `{col: bytes/row}`
+    `quantiles` is `{col: {"probs": [...], "values": [...], "axis": ...}}` (only for
+    ordered columns with a full set of boundaries), and `avg_bytes` is `{col: bytes/row}`
     (the measured per-row width that turns Kyber's memory/broadcast estimates
     byte-true). The quantile grid defaults to `OptimizerConfig.quantile_probs` (a
     coarse min/quartiles/max grid, enough to interpolate `fraction <= literal`
     without a full histogram). Best-effort: returns empty dicts if the native
     engine is unavailable or the inputs are empty.
+
+    The native sketch measures a column in its **storage** unit — epoch days for a
+    `date32`, epoch microseconds for a `timestamp[us]` — while the estimator consults the
+    grid with a Python `date`/`datetime` from the predicate. Each grid is therefore
+    converted onto the shared axis named by `plan.stats.arrow_ordinal_axis` and carries
+    that axis, so a consumer can only read it against a literal on the same number line.
     """
     if probs is None:
         probs = active_config().optimizer.quantile_probs
@@ -87,9 +94,31 @@ def column_statistics(
         return {}, {}, {}
 
     ndv = {c: d["ndv"] for c, d in stats.items() if d.get("ndv") is not None}
-    quantiles = {c: {"probs": list(probs), "values": vals} for c, vals in quants.items() if vals}
+    quantiles = _quantiles_on_axis(quants, batches[0].schema, probs)
     avg_bytes = {c: d["avg_bytes"] for c, d in stats.items() if d.get("avg_bytes") is not None}
     return ndv, quantiles, avg_bytes
+
+
+def _quantiles_on_axis(
+    quants: dict[str, list[float]], schema: pa.Schema, probs: tuple[float, ...]
+) -> dict[str, dict[str, list[float] | str]]:
+    """Move each measured grid onto its column's shared ordinal axis and label it.
+
+    A column whose type has no linear order (and so no axis) is dropped rather than
+    recorded on an axis no literal can name.
+    """
+    out: dict[str, dict[str, list[float] | str]] = {}
+    for col, values in quants.items():
+        if not values:
+            continue
+        field = schema.field(col) if col in schema.names else None
+        axis = arrow_ordinal_axis(field.type) if field is not None else None
+        if axis is None:
+            continue
+        name, divisor = axis
+        scaled = list(values) if divisor == 1.0 else [v / divisor for v in values]
+        out[col] = {"probs": list(probs), "values": scaled, "axis": name}
+    return out
 
 
 def tail_quantiles(

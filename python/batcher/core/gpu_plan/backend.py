@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import pyarrow as pa
 
-__all__ = ["DfBackend", "Unsupported", "widen_narrow", "widened_type"]
+__all__ = ["DfBackend", "Unsupported", "call_or_decline", "widen_narrow", "widened_type"]
 
 
 def widened_type(dtype: pa.DataType):
@@ -85,6 +85,37 @@ class Unsupported(Exception):
     """
 
 
+def call_or_decline(obj: Any, name: str, *args: Any, **kwargs: Any):
+    """Invoke `obj.name(*args)`, declining rather than crashing when it is absent or refuses.
+
+    cuDF's surface is a subset of pandas' — a reduction, an accessor method or a keyword pandas
+    offers may simply not exist on the device. An `AttributeError` or a `NotImplementedError`
+    from that escapes as a crash, and worse, is classified as a *backend defect* rather than as
+    a decline (`api.terminal.gpu_backend.failure`), so an ordinary expression reports the GPU
+    path as broken. Turning it into `Unsupported` routes the stage to the CPU engine, which is
+    the contract every other case in this package follows.
+
+    Args:
+        obj: The object to call the method on.
+        name: The method name.
+        *args: Positional arguments for the call.
+        **kwargs: Keyword arguments for the call.
+
+    Returns:
+        Whatever the method returns.
+
+    Raises:
+        Unsupported: When the method is absent, or refuses these arguments.
+    """
+    method = getattr(obj, name, None)
+    if method is None:
+        raise Unsupported(f"{type(obj).__name__}.{name}")
+    try:
+        return method(*args, **kwargs)
+    except (TypeError, ValueError, NotImplementedError, AttributeError) as exc:
+        raise Unsupported(f"{name}: {exc}") from exc
+
+
 class DfBackend:
     """One dataframe library (cuDF or pandas) behind the small surface the translator needs.
 
@@ -125,6 +156,46 @@ class DfBackend:
         for field in schema:
             if pa.types.is_date(field.type):
                 self._date_types[field.name] = field.type
+
+    def remember_date_alias(self, name: str, arrow_type: Any) -> None:
+        """Record that the projection producing `name` is DATE-typed, so `to_arrow` restores it.
+
+        `remember_dates` covers a date the plan *read*; this covers one it *computes* —
+        `col("ts").dt.date()`, `last_day`, a day offset over a date. Neither library has a
+        calendar-day type, so such a column comes back as a timestamp, and on the host backend
+        the `astype` happens to land on `date32` anyway while on the device it cannot. The
+        result was a column that was right in CI and a `timestamp[ms]` on a real GPU — the
+        wrong-column failure a fan-out cannot concatenate, visible only on the device.
+
+        Args:
+            name: The output column's name.
+            arrow_type: The Arrow DATE type it should be presented as.
+        """
+        self._date_types[name] = arrow_type
+
+    def forget_date_alias(self, name: str) -> None:
+        """Drop any DATE claim on `name`, because the projection now producing it is not one.
+
+        A chain may reuse a name for a different expression, and the *last* projection decides
+        what the column is. Without this, a date read early would keep casting a timestamp
+        computed later under the same name.
+
+        Args:
+            name: The output column's name.
+        """
+        self._date_types.pop(name, None)
+
+    def is_date_column(self, name: str) -> bool:
+        """Whether `name` is known to be a DATE — asked when deciding what an expression over
+        it produces.
+
+        Args:
+            name: The column's name.
+
+        Returns:
+            True when the column arrived as, or was computed as, an Arrow DATE.
+        """
+        return name in self._date_types
 
     @property
     def is_gpu(self) -> bool:
@@ -266,6 +337,23 @@ class DfBackend:
 
             return pa.types.is_integer(arrow)
         return getattr(dtype, "kind", "") in ("i", "u")
+
+    def is_boolean(self, value: Any) -> bool:
+        """Whether `value` is a boolean column or scalar.
+
+        Asked because the bit operators answer in a different *type* over a boolean than the
+        libraries do: the engine (and DuckDB) return an integer, both libraries route `&`, `|`
+        and `^` to logical operators and return a boolean. Same values, wrong column.
+        """
+        if not self.is_series(value):
+            return isinstance(value, bool)
+        dtype = getattr(value, "dtype", None)
+        arrow = getattr(dtype, "pyarrow_dtype", None)
+        if arrow is not None:
+            import pyarrow as pa
+
+            return pa.types.is_boolean(arrow)
+        return getattr(dtype, "kind", "") == "b"
 
     def has_nan(self, value: Any) -> bool:
         """Whether a float column actually carries a `NaN` (as opposed to a null).

@@ -50,7 +50,7 @@ _LOG = get_logger("carbonite")
 # 96-CPU node, `ray status` reporting `96.0/96.0 CPU (96.0 used ... in placement groups)`
 # against `{'CPU': 48.0}: 2+ pending tasks/actors`, and a window shuffle stuck 17+ minutes
 # in `ray.wait` with no error and no output.
-_STALL_WARN_AFTER_S = 120.0
+STALL_WARN_AFTER_S = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,9 +211,9 @@ def gather_with_backups(
         # below is unchanged (it re-evaluates at most once per poll window).
         done, pending = ray.wait(pending, num_returns=len(pending), timeout=poll_seconds)
         now = time.monotonic()
-        if not result_of and now - barrier_started > _STALL_WARN_AFTER_S * (stall_warnings + 1):
+        if not result_of and now - barrier_started > STALL_WARN_AFTER_S * (stall_warnings + 1):
             stall_warnings += 1
-            _warn_barrier_stalled(now - barrier_started, n)
+            warn_barrier_stalled(now - barrier_started, n)
         for r in done:
             i = ref_to_idx[r]
             if i in result_of:  # slot already won by another copy
@@ -289,7 +289,7 @@ def _poll_doomed(doomed_slots: Callable[[], frozenset[int]] | None) -> frozenset
         return frozenset()
 
 
-def _warn_barrier_stalled(waited_s: float, tasks: int) -> None:
+def warn_barrier_stalled(waited_s: float, tasks: int) -> None:
     """Report a barrier that has waited `waited_s` with zero of `tasks` finished.
 
     Names Ray's own view of the cluster, because the actionable distinction is not visible

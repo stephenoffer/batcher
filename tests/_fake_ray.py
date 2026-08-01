@@ -38,7 +38,11 @@ def install_fake_ray(monkeypatch) -> tuple[type, type]:
 
     ray_mod = types.ModuleType("ray")
     ray_mod.exceptions = exc
-    ray_mod.wait = lambda refs, num_returns=1: ([refs[0]], refs[1:])
+    # `timeout` is accepted and ignored: a ref here is a thunk that is always ready, so
+    # there is nothing to wait for. Matching the real signature matters — a barrier that
+    # polls with a deadline (to report a stage the cluster cannot schedule) would otherwise
+    # fail against the stub for a reason that has nothing to do with what it is testing.
+    ray_mod.wait = lambda refs, num_returns=1, timeout=None: ([refs[0]], refs[1:])
     ray_mod.get = lambda ref: ref()
     ray_mod.kill = lambda actor: None
 

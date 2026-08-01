@@ -28,13 +28,18 @@ from batcher._internal.hardware.devices.oom import (
     release_device_cache,
 )
 from batcher._internal.hardware.devices.scope import (
+    DEVICE_ORDER_ENV,
+    PCI_BUS_ORDER,
     VISIBLE_DEVICE_ENVS,
     DeviceScope,
+    current_ordinal,
     current_physical_index,
     device_free_bytes,
+    device_order_env,
     device_scope,
     min_visible_capacity_bytes,
     visible_device_indices,
+    visible_device_telemetry,
 )
 from batcher._internal.hardware.devices.torch_memory import (
     ALLOC_CONF_ENV,
@@ -47,15 +52,19 @@ from batcher._internal.hardware.devices.torch_memory import (
 
 __all__ = [
     "ALLOC_CONF_ENV",
+    "DEVICE_ORDER_ENV",
     "FRAGMENTATION_THRESHOLD",
+    "PCI_BUS_ORDER",
     "VISIBLE_DEVICE_ENVS",
     "DeviceScope",
     "OomKind",
     "OomVerdict",
     "allocator_initialized",
     "classify_oom",
+    "current_ordinal",
     "current_physical_index",
     "device_free_bytes",
+    "device_order_env",
     "device_scope",
     "fragmentation_ratio",
     "is_device_oom",
@@ -64,4 +73,5 @@ __all__ = [
     "set_alloc_conf",
     "set_memory_fraction",
     "visible_device_indices",
+    "visible_device_telemetry",
 ]

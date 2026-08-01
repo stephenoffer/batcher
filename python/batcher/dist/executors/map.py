@@ -178,21 +178,146 @@ def _new_map_actor(plan0: LogicalPlan, opts: dict):
     return cls.remote(plan0)
 
 
-def _resident_pool_for(plan0: LogicalPlan, opts: dict, size: int, registry: dict) -> list:
+def _pool_key(plan0: LogicalPlan, opts: dict) -> tuple:
+    """The registry key for a resident pool: its pipeline **and its resource request**.
+
+    Keying on the pipeline alone makes two actors interchangeable when they are not. The
+    adaptive loop re-sizes `num_gpus` between runs, and a pool keyed only by UDF identity
+    then *grows* to the new replica count instead of being replaced — so four whole-GPU
+    actors from the previous run stay alive holding every device while the eight half-GPU
+    actors that replaced them wait for a GPU that will never come free. The query does not
+    fail; it hangs, with the cluster fully reserved and nothing running.
+    """
+    resources = tuple(sorted((k, repr(v)) for k, v in (opts or {}).items()))
+    return (_pipeline_signature(plan0), resources)
+
+
+def _evict_stale_configurations(key: tuple, registry: dict) -> None:
+    """Kill any pool for the same pipeline built against a *different* resource request.
+
+    Its actors cannot serve this run — they were placed against the old fraction — and they
+    hold exactly the devices the new pool needs, so leaving them warm is a deadlock rather
+    than a wasted reservation.
+    """
+    import ray
+
+    stale = [k for k in registry if k[0] == key[0] and k != key]
+    for k in stale:
+        for actor in registry.pop(k, []):
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+
+
+def _resident_pool_for(
+    plan0: LogicalPlan, opts: dict, size: int, registry: dict, devices: int = 0
+) -> list:
     """The resident actor pool for `plan0` in `registry` (built once, reused after).
 
     The model is built in each actor's `__init__`, so reuse means it loads once per
     registry lifetime (a query scope, or the whole session for the warm registry). A pool
     whose actors have died (preemption between reuses) is healed — dead actors are dropped
-    and respawned to the requested size — so a session-warm pool survives node churn."""
-    sig = _pipeline_signature(plan0)
+    and respawned to the requested size — so a session-warm pool survives node churn.
+
+    `devices` (non-zero only on a *first*, unmeasured run) asks for the cold-start fill: the
+    pool starts at one actor per device, and once the models have loaded their footprint is
+    read and a second actor per device is added if the device shows room. That is what gives
+    run 0 the packing the measured loop would otherwise only reach on run 1 — and it cannot
+    over-pack, because it grows on a measurement rather than on a guess.
+    """
+    sig = _pool_key(plan0, opts)
+    _evict_stale_configurations(sig, registry)
     pool = registry.get(sig)
     pool = _healthy_actors(pool) if pool else []
     if len(pool) < max(1, size):
         pool = pool + [_new_map_actor(plan0, opts) for _ in range(max(1, size) - len(pool))]
+    if devices > 0:
+        want = devices * _cold_start_density(pool)
+        if want > len(pool):
+            pool = pool + [_new_map_actor(plan0, opts) for _ in range(want - len(pool))]
     registry[sig] = pool
     _pin_pool_key(sig, plan0)
     return pool
+
+
+#: A partition ceiling high enough that `gpu_aware_pool_default`'s "never more actors than
+#: partitions" clamp cannot bind while we are asking it how many actors the devices want.
+_UNCLAMPED_PARTITIONS = 1 << 30
+
+
+def _pool_partition_count(
+    workers: int,
+    num_gpus: float,
+    accelerator_type: str | None,
+    resources: dict[str, float] | None,
+    concurrency: object,
+) -> int:
+    """Partitions for an accelerator actor pool: at least one per actor the devices want.
+
+    The pool is sized by devices and then clamped to the partition count so no actor sits
+    idle — which inverts the causality, because the partition count is sized from *data*. A
+    2.4 GB image corpus is under one `target_bytes_per_task`, so it took the four-partition
+    floor, and four partitions is what decided that a twelve-actor pool would run four
+    actors. The data was choosing how many accelerators were allowed to work.
+
+    One partition per actor, not more: an inference partition carries its own dispatch, lazy
+    source and result gather, so over-sharding costs real time — sizing these at
+    `replicas x submit-depth` instead measured **1,287 img/s against 2,576** for the same
+    work. The aim is that no device is idle, not that every device is oversubscribed.
+
+    Never below the caller's `workers`, and a partition count only shards, so the merged
+    result is identical for any value.
+    """
+    if concurrency is not None:  # the caller sized their own pool; don't second-guess it
+        return workers
+    from batcher.ml.gpu import gpu_aware_pool_default
+
+    replicas = gpu_aware_pool_default(
+        num_gpus, workers, _UNCLAMPED_PARTITIONS, accelerator_type, resources=resources
+    )
+    return max(workers, replicas)
+
+
+def _cold_start_devices(hub, plan: LogicalPlan, concurrency: object, num_gpus: float) -> int:
+    """Accelerators to fill on a first, unmeasured run — 0 when the cold fill does not apply.
+
+    Applies only when every one of these holds: the stage asked for an accelerator, it left
+    `concurrency` to the engine, and nothing has been measured for this pipeline yet. The
+    last is what keeps this a *cold start* rather than a competing policy: from the first
+    recorded utilization onward, `recommend_num_gpus` owns the density and this returns 0.
+    """
+    if concurrency is not None or num_gpus <= 0:
+        return 0
+    try:
+        import ray
+
+        from batcher.ml.gpu import gpu_feedback_key, load_gpu_utilization
+
+        if load_gpu_utilization(_learning_hub(hub), gpu_feedback_key(plan)) is not None:
+            return 0
+        return int(float(ray.cluster_resources().get("GPU", 0.0)))
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "size the cold-start accelerator fill", exc)
+        return 0
+
+
+def _cold_start_density(pool: list) -> int:
+    """Actors per device this pool's *measured* model footprint leaves room for.
+
+    Reads one loaded actor rather than all of them: they run the same model on the same
+    device class, so the first answer is the answer. Falls back to 1 — unpacked, the previous
+    behaviour — if nothing can be measured, so a device is never packed on a guess.
+    """
+    import ray
+
+    from batcher.ml.gpu import cold_start_actors_per_device
+
+    if not pool:
+        return 1
+    try:
+        return cold_start_actors_per_device(ray.get(pool[0].loaded_vram.remote()))
+    except Exception as exc:  # pragma: no cover - sizing must never break a query
+        note_suppressed("dist", "probe the loaded model's VRAM for cold-start packing", exc)
+        return 1
 
 
 def _healthy_actors(pool: list) -> list:
@@ -245,6 +370,30 @@ def _actor_inflight_depth() -> int:
     return max(1, min(_MAP_INFLIGHT_MAX, int(depth)))
 
 
+def _emptiest_actor(actors, slots: dict):
+    """The actor with the most free in-flight slots, or `None` when the pool is full.
+
+    Both actor-pool drivers used to take "the first actor with a free slot", which fills
+    actor 0 to its submit depth before actor 1 receives anything. Whenever the partition
+    count is at or below ``len(actors) x depth`` — the ordinary case for an inference stage,
+    whose partitions are few and wide — the tail of the pool never runs at all.
+
+    The deeper the submit-ahead, the worse it gets, and the depth is raised by exactly the
+    signal that means "this GPU is starved" (`recommend_inflight_depth`). So the lever meant
+    to keep one device fed took work away from the others: measured on four T4s with four
+    partitions, two GPUs sat at 0% at depth 2, and at depth 4 a single actor ran the whole
+    stage while three GPUs idled — at a throughput high enough to look healthy.
+
+    `max` returns the first of equal keys, so an idle pool fills round-robin (every actor
+    gets its first partition before any gets its second) and the depth still stacks once
+    every actor is busy, which is what it is for.
+    """
+    if not actors:
+        return None
+    actor = max(actors, key=lambda a: slots[a])
+    return actor if slots[actor] > 0 else None
+
+
 def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
     """Run `partitions` through a FIXED pool of `actors`, up to `depth` in flight per actor,
     preserving partition order.
@@ -268,7 +417,7 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
 
     def _assign() -> None:
         while pending:
-            actor = next((a for a in actors if slots[a] > 0), None)
+            actor = _emptiest_actor(actors, slots)
             if actor is None:
                 break
             idx = pending.popleft()
@@ -286,19 +435,25 @@ def _pipeline_actor_pool(actors, partitions, depth: int) -> list:
     return results
 
 
-def _run_resident_pool(plan0, partitions, opts, size, registry):
+def _run_resident_pool(plan0, partitions, opts, size, registry, devices: int = 0):
     """Map `partitions` through the resident pool for `plan0` in `registry` (model loaded
-    once), preserving submission order. Returns ``(ordered_results, peak_gpu_util, peak_vram)``."""
+    once), preserving submission order.
+
+    Returns ``(ordered_results, gpu_util, peak_vram)``. The utilization is the *most loaded*
+    actor's **sustained** figure: packing keyed on the fleet mean would oversubscribe a device
+    that is already busy while its idle neighbours pull the average down, so the binding
+    device decides. VRAM stays the peak across actors, for the same capacity reason.
+    """
     import ray
 
-    actors = _resident_pool_for(plan0, opts, size, registry)
+    actors = _resident_pool_for(plan0, opts, size, registry, devices)
     results = _pipeline_actor_pool(actors, partitions, _actor_inflight_depth())
     samples = [s for s in ray.get([a.gpu_stats.remote() for a in actors]) if s is not None]
     vram = [v for v in (_drain_gpu_vram(a) for a in actors) if v is not None]
     return results, (max(samples) if samples else None), (max(vram) if vram else None)
 
 
-def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope):
+def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope, devices: int = 0):
     """Run `partitions` through the query-resident pool for `plan0`, healing a lost pool.
 
     The `resident_inference_pools()` scope reuses one model-loaded pool across a query's
@@ -314,7 +469,7 @@ def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope):
     from batcher.dist.executors.ray_runtime import recovery_policy
 
     try:
-        return _run_resident_pool(plan0, partitions, opts, hi, scope)
+        return _run_resident_pool(plan0, partitions, opts, hi, scope, devices)
     except RayError:
         _evict_scoped_pool(plan0, scope)
         return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
@@ -322,16 +477,10 @@ def _run_scoped_pool(plan0, partitions, opts, lo, hi, scope):
 
 def _evict_scoped_pool(plan0, scope) -> None:
     """Drop (and kill) the resident pool for `plan0` from a `resident_inference_pools` scope."""
-    import ray
-
-    sig = _pipeline_signature(plan0)
-    for actor in scope.pop(sig, []):
-        with contextlib.suppress(Exception):
-            ray.kill(actor)
-    _unpin_pool_keys([sig])
+    _evict_pipeline_pools(plan0, scope)
 
 
-def _run_warm_pool(plan0, partitions, opts, lo, hi):
+def _run_warm_pool(plan0, partitions, opts, lo, hi, devices: int = 0):
     """Run `partitions` through the SESSION-warm pool for `plan0`, healing a lost pool.
 
     On the rare case the warm pool loses actors mid-run (a node preempted after the liveness
@@ -343,7 +492,7 @@ def _run_warm_pool(plan0, partitions, opts, lo, hi):
     from batcher.dist.executors.ray_runtime import recovery_policy
 
     try:
-        return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS)
+        return _run_resident_pool(plan0, partitions, opts, hi, _SESSION_POOLS, devices)
     except RayError:
         _evict_session_pool(plan0)
         return _drive_actor_pool(plan0, partitions, opts, lo, hi, recovery_policy())
@@ -351,13 +500,25 @@ def _run_warm_pool(plan0, partitions, opts, lo, hi):
 
 def _evict_session_pool(plan0) -> None:
     """Drop (and kill) the session-warm pool for `plan0` — after a preemption or on demand."""
+    _evict_pipeline_pools(plan0, _SESSION_POOLS)
+
+
+def _evict_pipeline_pools(plan0, registry: dict) -> None:
+    """Kill every pool `registry` holds for `plan0`, whatever resource request built it.
+
+    A pipeline can have more than one entry, because the key carries the resource request
+    (`_pool_key`) — so an eviction that matched only one exact key would leave the other
+    configuration's actors alive holding their devices.
+    """
     import ray
 
     sig = _pipeline_signature(plan0)
-    for actor in _SESSION_POOLS.pop(sig, []):
-        with contextlib.suppress(Exception):
-            ray.kill(actor)
-    _unpin_pool_keys([sig])
+    keys = [k for k in list(registry) if k[0] == sig]
+    for key in keys:
+        for actor in registry.pop(key, []):
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+    _unpin_pool_keys(keys)
 
 
 def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
@@ -463,7 +624,11 @@ def _distributed_map(
     # `partition_descriptors` row-balances those partitions across every worker, so a source
     # arriving as one large batch fans out evenly (one balanced slice per GPU actor) instead
     # of landing whole on worker 0.
-    n_parts = workers if wants_pool else _adaptive_partition_count(sources[sid], plan, workers, hub)
+    n_parts = (
+        _pool_partition_count(workers, num_gpus, accelerator_type, resources, concurrency)
+        if wants_pool
+        else _adaptive_partition_count(sources[sid], plan, workers, hub)
+    )
     proj, pred = _scan_pushdown(plan0)
     partitions = partition_descriptors(
         sources[sid], n_parts, projection=proj, predicate=pred, preserve_order=preserve_order
@@ -491,6 +656,15 @@ def _distributed_map(
                 if learned is not None:
                     lo = hi = learned
         _record_actor_pool_reuse(hub, plan0, len(partitions))
+        # A first, unmeasured run starts at one actor per device and fills the devices from
+        # the model's measured footprint once it has loaded (`_resident_pool_for`). Without
+        # this, run 0 of every new pipeline is the unpacked configuration the measured loop
+        # exists to replace — which for a single-shot job is the only configuration it ever
+        # gets. Zero (no cold fill) as soon as anything has been measured, and for an
+        # explicit `concurrency`, which is the caller sizing their own pool.
+        cold_devices = _cold_start_devices(hub, plan, concurrency, num_gpus)
+        if cold_devices:
+            lo = hi = max(1, cold_devices)
         # Pick the pool lifetime: an explicit `resident_inference_pools()` scope (query
         # lifetime) wins; else the SESSION-warm registry when `warm_inference_pools` is on
         # (model loads once per session, reused across `collect()`s — the 2x win on repeated
@@ -508,14 +682,18 @@ def _distributed_map(
                 plan0, partitions, opts, lo, hi, recovery_policy(), write_spec
             )
         elif scope is not None:
-            results, gpu_util, gpu_vram = _run_scoped_pool(plan0, partitions, opts, lo, hi, scope)
+            results, gpu_util, gpu_vram = _run_scoped_pool(
+                plan0, partitions, opts, lo, hi, scope, cold_devices
+            )
         elif warm:
-            results, gpu_util, gpu_vram = _run_warm_pool(plan0, partitions, opts, lo, hi)
+            results, gpu_util, gpu_vram = _run_warm_pool(
+                plan0, partitions, opts, lo, hi, cold_devices
+            )
         else:
             results, gpu_util, gpu_vram = _drive_actor_pool(
                 plan0, partitions, opts, lo, hi, recovery_policy()
             )
-        _record_gpu_feedback(hub, plan, gpu_util, gpu_vram)
+        _record_gpu_feedback(hub, plan, gpu_util, gpu_vram, _actors_per_device(hi, num_gpus))
     else:
         # Skew-aware adaptive CPU: each stateless task requests a CPU share sized to its
         # own partition's data (x the plan's compute weight) — fractional for a tiny
@@ -540,7 +718,13 @@ def _distributed_map(
             # tasks on a 16-core node each opened a 16-thread pool: hundreds of threads
             # thrashing 16 cores, and the session config (morsel size, memory budget)
             # silently ignored on every distributed scan.
-            return _map_udf_task.options(**{**opts, "num_cpus": shares[idx], **sched}).remote(
+            # The skew-adaptive share is the CPU-only task's grant. An *accelerator* task's
+            # grant comes from `opts` instead (zero — see `_gpu_options`), so `opts` is
+            # applied after it rather than before: spelling the share last overrode the
+            # accelerator zero and put a custom-resource stage (a TPU/Trainium task, which
+            # takes this branch because it wants no actor pool) back behind the CPU
+            # reservation the zero exists to escape.
+            return _map_udf_task.options(**{"num_cpus": shares[idx], **opts, **sched}).remote(
                 plan0, partitions[idx], workers, engine_config_json(shares[idx]), write_spec, idx
             )
 
@@ -917,20 +1101,45 @@ def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: in
 
 
 def _record_gpu_feedback(
-    hub, plan: LogicalPlan, gpu_util: float | None, gpu_vram: float | None = None
+    hub,
+    plan: LogicalPlan,
+    gpu_util: float | None,
+    gpu_vram: float | None = None,
+    actors_per_device: float | None = None,
 ) -> None:
-    """Persist the pipeline's observed GPU utilization *and* peak VRAM for next-run adaptation.
+    """Persist the pipeline's observed GPU utilization, peak VRAM, and packing density.
 
     Utilization adapts `num_gpus`; the peak VRAM fraction adapts how many inference actors
-    pack onto one device (`actors_per_gpu_from_learned_vram`). Both keyed by the pipeline's
+    pack onto one device (`actors_per_gpu_from_learned_vram`). `actors_per_device` is the
+    density that *produced* this utilization, without which the reading cannot be acted on:
+    78% means "add an actor" at one per device and "leave it alone" at two, and a loop that
+    cannot tell those apart alternates between them forever. All keyed by the pipeline's
     stable identity; best-effort (each recorder no-ops on `None`)."""
     if hub is None:
         return
-    from batcher.ml.gpu import gpu_feedback_key, record_gpu_peak_vram, record_gpu_utilization
+    from batcher.ml.gpu import (
+        gpu_feedback_key,
+        record_gpu_actors_per_device,
+        record_gpu_peak_vram,
+        record_gpu_utilization,
+    )
 
     key = gpu_feedback_key(plan)
     record_gpu_utilization(hub, key, gpu_util)
     record_gpu_peak_vram(hub, key, gpu_vram)
+    record_gpu_actors_per_device(hub, key, actors_per_device)
+
+
+def _actors_per_device(pool_size: int, num_gpus: float) -> float | None:
+    """How many actors of this pool shared one device, or `None` when it is not a GPU stage.
+
+    Derived from the *request*, not from a placement probe: an actor asking for `num_gpus`
+    of a device is one of `1 / num_gpus` that fit on it, and Ray honors that by construction.
+    A whole-GPU request is one actor per device.
+    """
+    if num_gpus <= 0 or pool_size <= 0:
+        return None
+    return max(1.0, 1.0 / num_gpus)
 
 
 def _gpu_options(
@@ -950,7 +1159,22 @@ def _gpu_options(
     `accelerator_type` is applied whenever it is set, **not** only alongside `num_gpus`.
     Gating it on GPUs silently dropped the pin on exactly the hardware that needs it most:
     a TPU or Trainium node has `num_gpus == 0`, so a job asking for a specific device model
-    got no pin at all and could land on any node in the cluster."""
+    got no pin at all and could land on any node in the cluster.
+
+    An accelerator stage additionally reserves **no CPU**, which is not a detail: Ray's rule
+    is that an actor asking for *any* resource takes one core for its whole lifetime
+    (`DEFAULT_ACTOR_CREATION_CPU_SPECIFIED`), and naming `num_gpus` is asking for one. So an
+    inference pool that named only its devices still queued behind a core — and the shuffle
+    fleet takes its workers in a placement group holding the cluster's whole CPU capacity, so
+    on any pipeline that shuffles before it infers (a `group_by`/`join`/`sort` feeding
+    `ds.ml.map_batches`, the documented heterogeneous CPU+GPU shape) that core never comes
+    free. It does not fail: the pool never places, every device sits idle, and `ray status`
+    reports a fully reserved cluster, which reads as busy rather than stuck. This is the same
+    deadlock `bc`'s GPU *relational* path fixed in `gpu_task_options`, on the *inference* path.
+
+    Zero is also the honest request, for the reason it is there: the work is on the device,
+    the host thread submits kernels and moves buffers, and concurrency is already bounded by
+    `num_gpus` — the device share is what is being contended, not the core."""
     opts: dict = {}
     if num_gpus:
         opts["num_gpus"] = num_gpus
@@ -958,7 +1182,32 @@ def _gpu_options(
         opts["resources"] = dict(resources)
     if accelerator_type and (num_gpus or resources):
         opts["accelerator_type"] = accelerator_type
+    if opts:
+        opts["num_cpus"] = 0
     return opts
+
+
+def _pool_placement_envelope(env, opts: dict):
+    """`env` with its per-bundle CPU grant reduced to what an accelerator actor actually asks.
+
+    A placement-group bundle reserves resources; an actor then requests them again from its
+    bundle. Those two numbers have to agree, and for an inference pool they did not. The
+    device-tiled fan-out grants each worker a whole accelerator node's cores divided by its
+    devices (`_accelerator_fill_workers`) — on a 4-node, 8-core, 1-device-per-node cluster
+    that is 8 cores per actor, so a 4-actor pool reserved all 32 cores in the cluster. The
+    actors themselves now ask for none (`_gpu_options`), so the reservation was for cores
+    nothing would use, and it is the reservation that fails: anything else holding a single
+    core makes the gang unsatisfiable, and the pool spends the whole placement timeout before
+    degrading to the default scheduling that would have worked immediately.
+
+    Left alone for a CPU-only stage, where the core *is* the resource being reserved and the
+    bundle is already honest.
+    """
+    if env is None or "num_cpus" not in opts:
+        return env
+    import dataclasses
+
+    return dataclasses.replace(env, num_cpus=float(opts["num_cpus"]))
 
 
 def _autoscale_action(
@@ -1016,7 +1265,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write
     # `gpu_collective` stage reaches STRICT_PACK: the strategy is resolved inside
     # `create_worker_placement`, so a path that never called it could not express NCCL
     # co-location at all.
-    env = current_envelope()
+    env = _pool_placement_envelope(current_envelope(), opts)
     # Reserving the group is an optimization, never a correctness requirement: the pool
     # runs correctly under default scheduling. So a reservation that times out (returns
     # None) or outright fails (raises — no placement API, a Ray version without it) must
@@ -1068,7 +1317,7 @@ def _drive_actor_pool(plan0, partitions, opts, min_size, max_size, policy, write
 
     def _assign() -> None:
         while pending:
-            actor = next((a for a in actors if slots[a] > 0), None)
+            actor = _emptiest_actor(actors, slots)
             if actor is None:
                 break
             idx = pending.popleft()
@@ -1241,14 +1490,21 @@ class _MapActor:
         # Build the (class) UDFs locally, once — the model load happens here. The pool's
         # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
+        from batcher.ml.gpu import SustainedUtilization
+
         self._plan = _with_inference_workers(_prebuild_factories(plan0))
         self._write_spec = write_spec
-        self._gpu_util_max: float | None = None
         self._gpu_vram_max: float | None = None
+        # Sustained utilization, sampled on a timer for the actor's working window — NOT the
+        # post-forward reading this used to take. See `SustainedUtilization`: sampling right
+        # after a forward pass reads the device at its busiest, which reported 86% for a stage
+        # whose true sustained figure was 13%, and that is above every threshold the packing
+        # and submit-depth levers trigger on. The measurement held its own fix shut.
+        self._util = SustainedUtilization()
 
     def run(self, partition: dict, idx: int = 0):
         from batcher import core
-        from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
+        from batcher.ml.gpu import sample_gpu_vram_fraction
 
         # A LAZY source over the descriptor: the scan reads its splits (storage) / iterates
         # its shipped batches incrementally, so `stream_linear_chain` overlaps reading chunk
@@ -1257,9 +1513,12 @@ class _MapActor:
         source = _lazy_partition_source(partition)
         if source is None:
             return None
+        self._util.begin_call()
         out = core.execute_with_udfs(self._plan, [source])
-        # Sample GPU load + VRAM right after the forward pass (None on a GPU-less host).
-        self._observe_gpu(sample_gpu_utilization(), sample_gpu_vram_fraction())
+        self._util.end_call()
+        # VRAM stays a PEAK: it is a capacity constraint, and the largest footprint the run
+        # ever reached is what the next run must fit. Utilization is a rate, so it is a mean.
+        self._observe_gpu(sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
             return [] if self._write_spec is not None else None
         # Writing stage: this actor writes its own inference output straight to the sink and
@@ -1298,7 +1557,7 @@ class _MapActor:
         from batcher import core
         from batcher.carbonite.transfer.lifecycle import process_client
         from batcher.io.source import InMemorySource
-        from batcher.ml.gpu import sample_gpu_utilization, sample_gpu_vram_fraction
+        from batcher.ml.gpu import sample_gpu_vram_fraction
 
         # The *pooled* client, not the one-shot `server.fetch`. This runs once per morsel
         # on the GPU consumer of the streaming pipeline — the hottest fetch in the engine —
@@ -1309,25 +1568,51 @@ class _MapActor:
         rows = process_client().fetch(addr, str(ticket))
         if not rows:
             return None
+        self._util.begin_call()
         out = core.execute_with_udfs(self._plan, [InMemorySource(rows)])
-        self._observe_gpu(sample_gpu_utilization(), sample_gpu_vram_fraction())
+        self._util.end_call()
+        self._observe_gpu(sample_gpu_vram_fraction())
         if not out or sum(b.num_rows for b in out) == 0:
             return None
         return out
 
-    def _observe_gpu(self, util: float | None, vram: float | None) -> None:
-        """Fold one post-forward GPU sample into this actor's running peaks (util + VRAM)."""
-        self._gpu_util_max = _max_opt(self._gpu_util_max, util)
+    def _observe_gpu(self, vram: float | None) -> None:
+        """Fold one post-forward VRAM sample into this actor's running peak."""
         self._gpu_vram_max = _max_opt(self._gpu_vram_max, vram)
 
     def gpu_stats(self) -> float | None:
-        """The peak GPU utilization this actor observed, or `None` if no GPU."""
-        return self._gpu_util_max
+        """This actor's **sustained** GPU utilization, or `None` if the device reports none.
+
+        A mean over the actor's working window, not the peak — that is the quantity
+        `recommend_num_gpus` and `recommend_inflight_depth` are defined against, and a peak
+        reading silently keeps both of them from ever firing (see `SustainedUtilization`).
+
+        Draining rather than reading: the window is scoped to a *run*. A warm actor outlives
+        the run that used it, and a window left open keeps accumulating the idle time between
+        runs — which reported 25.7% for a pool that had just held four T4s at 92.7%.
+
+        Doubles as this pool's liveness probe (`_live_actors`), so it must stay cheap and
+        must never raise: it reads two accumulated counters. The probe runs immediately
+        before a run dispatches, which is exactly where the window should open.
+        """
+        return self._util.drain()
 
     def gpu_vram_stats(self) -> float | None:
         """The peak VRAM fraction this actor observed, or `None` if no GPU — the memory
         twin of `gpu_stats`, sized so the next run packs actors by measured footprint."""
         return self._gpu_vram_max
+
+    def loaded_vram(self) -> float | None:
+        """VRAM the device holds *now* — after the model load, before any batch has run.
+
+        The one fact about an opaque model that is available without a prior execution, and
+        therefore the only thing a *first* run can size its packing from. Ray queues actor
+        methods behind the constructor, so simply calling this also waits for the load to
+        finish, which is what makes the answer meaningful rather than a race.
+        """
+        from batcher.ml.gpu import sample_gpu_vram_fraction
+
+        return sample_gpu_vram_fraction()
 
 
 # Threads a CPU (preprocess/decode) stage runs inside a GPU inference actor, so it keeps a

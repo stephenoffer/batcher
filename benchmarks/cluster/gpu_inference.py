@@ -23,14 +23,13 @@ Run (from the env that carries ray + torch + torchvision, batcher installed):
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import functools
 import os
 import time
 
 import numpy as np
 import pyarrow as pa
-from _ray_env import with_timeout
+from _ray_env import init_batcher_ray, with_timeout
 
 print = functools.partial(print, flush=True)
 
@@ -317,33 +316,13 @@ def _fmt_util(u: dict) -> str:
 
 
 def _init_ray() -> None:
-    import importlib.util
+    """Ship the working-tree Batcher to the cluster and attach to it.
 
-    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
-        v = os.environ.get(var)
-        if v:
-            head = v.lstrip("[{\"' ").split(".")[0].split("[")[0]
-            if head and importlib.util.find_spec(head) is None:
-                os.environ.pop(var, None)
-    import batcher
-    from batcher.config import active_config, set_config
-
-    pkg = os.path.dirname(os.path.abspath(batcher.__file__))
-    runtime_env = {"py_modules": [pkg], "pip": None, "env_vars": {}}
-    cfg = active_config()
-    set_config(
-        cfg.replace(
-            distributed=dataclasses.replace(
-                cfg.distributed, ray_address="auto", runtime_env=runtime_env
-            )
-        )
-    )
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(
-            address="auto", runtime_env=runtime_env, logging_level="ERROR", log_to_driver=False
-        )
+    Delegates to the shared bootstrap so this script cannot drift from its siblings — in
+    particular it inherits the driver-matching numpy pin, without which every actor here
+    dies in its constructor (see `_ray_env.worker_pip`).
+    """
+    init_batcher_ray(forward=("BENCH_GPU_MODEL",))
 
 
 def main() -> int:

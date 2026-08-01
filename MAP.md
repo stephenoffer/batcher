@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1132 Python modules across 174 packages and 190 Rust files across 13 crates.
+Covering 1133 Python modules across 174 packages and 190 Rust files across 13 crates.
 
 ## How to use this map
 
@@ -163,7 +163,7 @@ The public, fluent, lazy, expression-first API surface.
 | module | lines | what it is |
 |---|---|---|
 | `_join_helpers.py` | 212 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
-| `executors.py` | 404 | Execution strategies and their registry (the conductor's wiring). |
+| `executors.py` | 427 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 785 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 171 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 936 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
@@ -421,7 +421,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `feature_scores.py` | 268 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 331 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
 | `glm.py` | 344 | Generalized linear models fitted by iteratively reweighted least squares. |
-| `gpu.py` | 1261 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
+| `gpu.py` | 1547 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 500 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 374 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
@@ -705,11 +705,11 @@ Subquery handling and decorrelation for the SQL translator.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 1516 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 642 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_join.py` | 376 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 675 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 367 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 179 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1198 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1239 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 174 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -732,7 +732,7 @@ Per-operator distributed executor implementations.
 | `aggregate.py` | 245 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 48 | Distributed DISTINCT — deduplicate across workers via the aggregate shuffle. |
 | `join.py` | 866 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
-| `map.py` | 1486 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 1725 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 329 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 544 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 216 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -798,7 +798,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 |---|---|---|
 | `_fleet.py` | 488 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
-| `plan_id.py` | 155 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
+| `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `source.py` | 193 | A relation whose batches stay partitioned on the shuffle fleet between stages. |
 
 ### `batcher/dist/gpu/` — 4 · backend
@@ -815,7 +815,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | `join.py` | 205 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
 | `resources.py` | 352 | What a GPU task asks Ray for — the fractional half of the relational fan-out. |
 | `shards.py` | 453 | What to do with a shard the device could not hold: make it smaller, not somebody else's. |
-| `tasks.py` | 392 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
+| `tasks.py` | 405 | The Ray-side of a GPU fan-out: what a GPU worker runs, and what it is scheduled with. |
 | `tree.py` | 260 | Fan a whole plan tree out across the cluster's GPUs: split one leaf, replicate the rest. |
 | `union.py` | 208 | Run a translated union across every GPU, by sharding each of its inputs. |
 
@@ -855,7 +855,8 @@ Distributed streaming heterogeneous execution — overlapped, resource-class sta
 |---|---|---|
 | `consumers.py` | 90 | The GPU consumer pool of the streaming pipeline: how many, and which one next. |
 | `microbatch.py` | 431 | A streaming micro-batch, run across the cluster — one epoch, one transaction. |
-| `pipeline.py` | 455 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
+| `pipeline.py` | 375 | Distributed streaming heterogeneous inference pipeline (the GPU-feeding moat). |
+| `producers.py` | 166 | The CPU producer stage of the streaming CPU-to-GPU pipeline. |
 
 ### `batcher/kyber/` — 3 · subsystem
 
@@ -1238,7 +1239,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 234 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 429 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 1577 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 1580 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `join_columns.py` | 208 | Join column-statistics propagation. |
 | `skew.py` | 149 | Join-key skew that Kyber already knows — no detection pass, no prior run of the shape. |
 
@@ -1251,7 +1252,7 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 | `combine.py` | 423 | Composing leaf selectivities into a whole-predicate estimate. |
 | `leaves.py` | 480 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 188 | What a text pattern says about how many rows it matches. |
-| `scalars.py` | 319 | Scalar and column-statistic primitives shared by every selectivity estimator. |
+| `scalars.py` | 331 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
 ### `batcher/carbonite/` — 3 · subsystem
 
@@ -1375,7 +1376,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
-| `stats.py` | 160 | Column-statistics measurement — Core's lane. |
+| `stats.py` | 189 | Column-statistics measurement — Core's lane. |
 | `streaming_runner.py` | 215 | How one micro-batch gets run — the seam between the loop and where the work happens. |
 
 ### `batcher/core/gpu_plan/` — 3 · subsystem
@@ -1885,7 +1886,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 232 | `plan.source_stats` — what a connector declares about a source, cheaply. |
-| `stats.py` | 300 | `plan.stats` — the neutral statistics algebra shared across every layer. |
+| `stats.py` | 396 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract

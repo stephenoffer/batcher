@@ -72,7 +72,13 @@ def _probe_cluster_cudf() -> bool:
         if not ray.is_initialized():
             return True
         env = worker_runtime_env() or None
-        options = {"num_gpus": 0.01, "max_retries": 0}
+        # `num_cpus=0`, matching the GPU tasks this is probing on behalf of. Ray hands an
+        # unspecified task one core, and the cluster this probe most needs to answer quickly is
+        # the one whose cores are all inside somebody's placement group — so the probe pended,
+        # spent its whole timeout, and reached the "inconclusive means present" branch by way
+        # of an eight-second stall on every session. Asking for a core the probe does not use
+        # can only delay it.
+        options = {"num_gpus": 0.01, "num_cpus": 0, "max_retries": 0}
         if env:
             options["runtime_env"] = env
         ref = ray.remote(**options)(_import_cudf).remote()

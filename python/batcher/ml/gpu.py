@@ -20,6 +20,8 @@ pure.
 from __future__ import annotations
 
 import functools
+import math
+import threading
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -36,14 +38,18 @@ if TYPE_CHECKING:
     from batcher.plan.logical import LogicalPlan
 
 __all__ = [
+    "SustainedUtilization",
     "actors_per_gpu_from_learned_vram",
     "autocast_call",
+    "cold_start_actors_per_device",
+    "cold_start_gpu_fraction",
     "detect_backend",
     "gpu_aware_pool_default",
     "gpu_feedback_key",
     "gpu_vram_gb",
     "inference_mode_call",
     "inference_vram_multiplier",
+    "load_gpu_actors_per_device",
     "load_gpu_peak_vram",
     "load_gpu_utilization",
     "max_actors_per_gpu",
@@ -52,6 +58,7 @@ __all__ = [
     "recommend_inflight_depth",
     "recommend_num_gpus",
     "recommend_quantization",
+    "record_gpu_actors_per_device",
     "record_gpu_peak_vram",
     "record_gpu_utilization",
     "resolve_num_workers",
@@ -221,6 +228,96 @@ _NAMESPACE = "ml.gpu"
 # more tasks onto a fraction of it; above the saturation mark, give it a whole GPU.
 _PACK_BELOW = 0.5
 _SATURATED_ABOVE = 0.9
+# The utilization an inference stage is packed *toward* once its actors-per-device is known.
+#
+# `_PACK_BELOW` is the older, cruder gate: it asks "is this device being wasted?" and 50% is
+# a defensible answer to that. But a stage that measures 78% is not being wasted and is still
+# leaving a fifth of the device idle, and no amount of re-measuring moves it — 78% is above
+# every threshold, so the loop declares success and stops. Measured on four T4s: one actor
+# per device held ResNet-50 at 78% and 2,576 img/s; a second actor per device, whose CPU
+# preprocessing interleaves with its neighbour's forward pass, reached **92% and 2,903
+# img/s**. The idle fifth was the UDF's own CPU work, which only another actor can fill.
+#
+# Deliberately below 1.0. Packing toward saturation would keep adding actors for the last
+# few percent, and each one costs VRAM, a CUDA context and SM time-slicing; the returns go
+# negative well before 100%. 0.9 is the point where one more actor stops paying, and it is
+# also what makes the loop a fixed point: a stage at 92% with two actors per device computes
+# `ceil(2 * 0.9 / 0.92) == 2` and stays there.
+_PACK_TOWARD = 0.9
+# The utilization at which a device counts as fed, so the loop stops adding actors.
+#
+# Without a satisfied band the loop chases `_PACK_TOWARD` exactly, and every step it takes is
+# a pool rebuild — a full model reload on every device. Measured: a stage sitting at 83% on
+# two actors per device asked for a third, which over-shards a 32-file corpus into twelve
+# uneven partitions (three files for some actors, two for others) and came out *slower* and
+# less even than the two it left: 2,602 img/s at 77/94/95/75% against 2,787 at 95/93/94/93%.
+# The last few points of a utilization target are not worth a rebuild and an imbalance.
+#
+# Set at the goal itself: a device at or above this is fed, and the loop leaves it alone.
+_PACK_SATISFIED = 0.8
+# Ceiling on utilization-driven packing. VRAM (`actors_per_gpu_from_learned_vram`) is the
+# other bound and the binding one for a large model; this one keeps a *cheap* model from
+# packing to a density where per-actor CUDA contexts cost more than the SMs they win.
+_MAX_ACTORS_PER_DEVICE = 8
+# Actors per device a *first* run may grow to, before anything has been measured.
+#
+# The adaptive loop is a measure-then-adapt loop, so run 0 of a new pipeline necessarily
+# runs whatever the cold default is — and one actor per device is the wrong cold default for
+# an inference stage. A `map_batches` UDF spends part of every batch on the host (decode,
+# normalize, the H2D copy) with the device idle, which is why one actor per device measured
+# 78% and two measured 92% on the same four T4s. A first run that cannot pack pays that gap
+# in full, and for a single-shot job there is no second run to fix it.
+#
+# Two, not more: it is the step that closes most of the gap (78% -> 92%), it doubles VRAM
+# demand rather than multiplying it, and the measured loop refines from there on the next
+# run. The device must still *show* the room — `cold_start_actors_per_device` is only
+# consulted after the model has loaded and its footprint has been read.
+_COLD_START_ACTORS_PER_DEVICE = 2
+
+
+def cold_start_gpu_fraction(requested: float) -> float:
+    """The `num_gpus` a first, unmeasured run should *reserve* per inference actor.
+
+    A reservation, not a decision about how many actors to start: Ray fixes an actor's
+    fraction at creation, so a pool that reserved a whole GPU each can never add a second
+    actor to a device however much room the model turns out to leave. Reserving the packable
+    fraction up front keeps that option open; how many actors actually start is decided
+    afterwards, from the model's measured footprint (`cold_start_actors_per_device`).
+
+    Leaves an explicit sub-whole request alone — that caller has already sized its own
+    packing — and never reserves *more* than was asked for.
+
+    Args:
+        requested: The `num_gpus` the stage declared (after any VRAM-based sizing).
+
+    Returns:
+        The fraction to reserve per actor.
+    """
+    if requested < 1.0:
+        return requested
+    return min(requested, round(1.0 / _COLD_START_ACTORS_PER_DEVICE, 2))
+
+
+def cold_start_actors_per_device(loaded_vram_fraction: float | None) -> int:
+    """Actors a first run may put on one device, given the model's *measured* footprint.
+
+    Read after the model has loaded and before any batch runs, so it is the one fact about
+    an opaque UDF available without a prior execution. Returns 1 — unpacked, exactly the
+    previous behaviour — when nothing was measured or the model leaves no room, so this can
+    only ever pack a device it has seen fit.
+
+    Args:
+        loaded_vram_fraction: Device VRAM in use after the model load, in [0, 1].
+
+    Returns:
+        Actors per device, at least 1 and at most `_COLD_START_ACTORS_PER_DEVICE`.
+    """
+    fits = actors_per_gpu_from_learned_vram(loaded_vram_fraction)
+    if fits is None:
+        return 1
+    return max(1, min(_COLD_START_ACTORS_PER_DEVICE, fits))
+
+
 # Don't fragment a GPU finer than this (avoids requesting unschedulable slivers).
 # Raised back from 0.25: the old value silently CAPPED packing at 4 actors/GPU, so a
 # 0.1 GB embedding model that VRAM-fits 36 actors on an 80 GB card still got 4 and
@@ -450,7 +547,14 @@ def _visible_device_indices(n_handles: int) -> tuple[int, ...]:
 
 
 def _vram_handle() -> Any | None:
-    """The NVML handle for this process's *visible* GPU 0, honoring ``CUDA_VISIBLE_DEVICES``.
+    """The NVML handle for the device this process is computing on, through the visibility pin.
+
+    Two translations, and both of them matter on a worker granted more than one board. The
+    visibility environment says *which physical devices* are addressable; the framework's
+    current ordinal says *which of those* this process is on right now. Reading visible device
+    zero — which is what this did — is right only while nothing has called `set_device`, and
+    the VRAM sample it feeds is the one the autobatcher shrinks against. On a mixed node it was
+    sampling a different card's memory pressure than the one about to run out.
 
     Falls back to physical device 0 when the pin resolves to nothing in range, so a bad env
     never breaks the sample — it only reverts to the old behavior. `None` when NVML exposes
@@ -459,7 +563,12 @@ def _vram_handle() -> Any | None:
     handles = _nvml_handles()
     if not handles:
         return None
-    return handles[_visible_device_indices(len(handles))[0]]
+    visible = _visible_device_indices(len(handles))
+    import sys
+
+    torch = sys.modules.get("torch")  # never import torch to answer a placement question
+    ordinal = _bound_ordinal(getattr(torch, "cuda", None)) if torch is not None else 0
+    return handles[visible[ordinal if 0 <= ordinal < len(visible) else 0]]
 
 
 def _bound_ordinal(backend: Any) -> int:
@@ -563,23 +672,37 @@ def _nvml_own_vram_fraction(handle: Any) -> float | None:
     `None` (rather than a guess) whenever NVML cannot attribute memory per process — an
     older driver with no ``nvmlDeviceGetComputeRunningProcesses``, or a container without
     the PID namespace visibility it needs — so the caller falls back to the device-wide
-    reading instead of silently reporting zero usage."""
+    reading instead of silently reporting zero usage.
+
+    The PID comparison goes through `own_process_ids` rather than `os.getpid()`, because NVML
+    reports the **host** namespace's number. Matching on the container-local one found nothing,
+    and the arithmetic below then reported this process as using **0%** of its budget — so the
+    autobatcher, whose entire job here is to shrink before an out-of-memory, grew the batch
+    instead and hit a hard CUDA OOM. That failure needs a container to reproduce and cannot
+    happen on the single-GPU box the guard was written on."""
+    from batcher._internal.hardware.nvml import own_process_ids
+
     nvml = _nvml()
     query = getattr(nvml, "nvmlDeviceGetComputeRunningProcesses", None)
     if query is None:
         return None
     try:
-        import os
-
         procs = query(handle)
         total = nvml.nvmlDeviceGetMemoryInfo(handle).total
-        pid = os.getpid()
+        pids = set(own_process_ids())
         # `usedGpuMemory` is None when the driver won't attribute it (permission, MIG).
         # Such an entry still proves a tenant exists, so it counts toward the divisor.
         accounted = [p for p in procs if getattr(p, "usedGpuMemory", None) is not None]
         if not accounted:
             return None
-        used = sum(float(p.usedGpuMemory) for p in accounted if getattr(p, "pid", None) == pid)
+        mine = [p for p in accounted if getattr(p, "pid", None) in pids]
+        if not mine:
+            # Processes are resident and none of them is recognizably this one. Reporting the
+            # `0.0` that the sum would produce is the dangerous reading: it tells the caller
+            # there is a whole budget free. Decline, and let it fall back to the device-wide
+            # figure, which is at least an over-estimate rather than an under-estimate.
+            return None
+        used = sum(float(p.usedGpuMemory) for p in mine)
         return _own_budget_fraction(used, float(total), len(procs))
     except Exception:
         return None
@@ -869,17 +992,56 @@ def recommend_inference_dtype(backend: str | None = None) -> str | None:
     return None
 
 
-def recommend_num_gpus(util_fraction: float | None, requested: float) -> float:
+def recommend_num_gpus(
+    util_fraction: float | None,
+    requested: float,
+    actors_per_device: float | None = None,
+    max_actors: int | None = None,
+) -> float:
     """Adapt a per-task `num_gpus` request from measured utilization.
+
+    With `actors_per_device` — how many actors shared one device when `util_fraction` was
+    measured — the request is sized to land the device at `_PACK_TOWARD`:
+    ``ceil(actors x _PACK_TOWARD / util)`` actors per device, bounded by `max_actors` (what
+    VRAM allows) and `_MAX_ACTORS_PER_DEVICE`. Knowing the *configuration* that produced the
+    measurement is what makes this stable: the same 78% means "add an actor" at one per
+    device and "leave it alone" at two, and a loop that cannot tell those apart oscillates
+    between them forever.
+
+    Without it, the older utilization-only rule stands:
 
     * `None` utilization (no measurement) or no GPU requested → keep `requested`.
     * Under-utilized whole GPU → request a fraction (≈ the measured load, floored at
-      `_MIN_FRACTION`) so several tasks share one device.
+      `_UTIL_MIN_FRACTION`) so several tasks share one device.
     * Saturated fractional request → grow toward a whole GPU.
     * Otherwise keep the current request.
+
+    Args:
+        util_fraction: Sustained utilization measured on the device, in [0, 1].
+        requested: The `num_gpus` the stage declared.
+        actors_per_device: Actors that shared one device during that measurement.
+        max_actors: Upper bound from measured VRAM, if known.
+
+    Returns:
+        The per-actor `num_gpus` to request.
     """
     if util_fraction is None or requested <= 0.0:
         return requested
+    if actors_per_device and actors_per_device > 0 and util_fraction > 0.0:
+        held = max(1, round(actors_per_device))
+        if util_fraction >= _PACK_SATISFIED:
+            # Fed. Hold this density rather than chase the last few points: every change is
+            # a pool rebuild (a model reload on every device), and the step past a satisfied
+            # device measured both slower and less evenly spread than the density it left.
+            return min(requested, max(_UTIL_MIN_FRACTION, round(1.0 / held, 2)))
+        ceiling = (
+            _MAX_ACTORS_PER_DEVICE
+            if max_actors is None
+            else min(max_actors, _MAX_ACTORS_PER_DEVICE)
+        )
+        want = math.ceil(actors_per_device * _PACK_TOWARD / util_fraction)
+        want = max(1, min(int(ceiling), want))
+        return min(requested, max(_UTIL_MIN_FRACTION, round(1.0 / want, 2)))
     if requested >= 1.0 and util_fraction < _PACK_BELOW:
         frac = max(_UTIL_MIN_FRACTION, round(util_fraction, 2))
         return min(1.0, frac)
@@ -974,6 +1136,31 @@ def record_gpu_utilization(hub: MetadataHub | None, key: str, util_fraction: flo
     record_smoothed_scalar(hub, scoped(_NAMESPACE), key, float(util_fraction))
 
 
+_PACKING_NAMESPACE = "ml.gpu.actors_per_device"
+
+
+def load_gpu_actors_per_device(hub: MetadataHub | None, key: str) -> float | None:
+    """How many inference actors shared one device when `key`'s utilization was measured.
+
+    Utilization alone cannot be acted on twice. A stage measured at 78% on one actor per
+    device wants a second actor; the same 78% measured *with* two actors already means the
+    packing worked and must be left alone. Without this the loop reads the two cases
+    identically and alternates between them forever — pack, measure saturation, unpack,
+    measure starvation — which is worse than never packing at all, because half the runs are
+    the bad configuration.
+    """
+    return load_scalar(hub, scoped(_PACKING_NAMESPACE), key)
+
+
+def record_gpu_actors_per_device(
+    hub: MetadataHub | None, key: str, actors_per_device: float | None
+) -> None:
+    """Record the actors-per-device that produced `key`'s utilization. Best-effort."""
+    if actors_per_device is None or actors_per_device <= 0:
+        return
+    record_smoothed_scalar(hub, scoped(_PACKING_NAMESPACE), key, float(actors_per_device))
+
+
 _VRAM_NAMESPACE = "ml.gpu.peak_vram"
 
 
@@ -994,17 +1181,142 @@ def record_gpu_peak_vram(hub: MetadataHub | None, key: str, vram_fraction: float
 
 
 def actors_per_gpu_from_learned_vram(
-    peak_vram_fraction: float | None, *, headroom: float = 0.2
+    peak_vram_fraction: float | None,
+    *,
+    headroom: float = 0.2,
+    actors_per_device: float | None = None,
 ) -> int | None:
     """Inference actors that fit on one GPU from the *measured* peak-VRAM fraction one used.
 
     The learned counterpart to the declared-size `max_actors_per_gpu`: if a prior run's actor
     peaked at 30% of VRAM, ~2 fit within a `headroom`-reduced budget. At least 1; `None` (no
-    measurement) leaves the caller on its declared-size estimate. Pure — it only sizes packing."""
+    measurement) leaves the caller on its declared-size estimate. Pure — it only sizes packing.
+
+    `peak_vram_fraction` is what the **device** held, so on an already-packed run it is every
+    resident actor's footprint added together. Dividing that by `actors_per_device` recovers
+    one actor's share, which is the quantity this is defined against. Without it the cap moves
+    every time the density does — two actors reading 24% look like one 24% actor, so the cap
+    falls as the pool grows, the recommendation falls with it, and the pool is rebuilt (a full
+    model reload on every device) run after run without ever settling.
+    """
     if peak_vram_fraction is None or peak_vram_fraction <= 0.0:
         return None
+    per_actor = peak_vram_fraction / max(1.0, float(actors_per_device or 1.0))
+    if per_actor <= 0.0:
+        return None
     usable = max(0.0, 1.0 - headroom)
-    return max(1, int(usable / peak_vram_fraction))
+    return max(1, int(usable / per_actor))
+
+
+# --- Sustained utilization: the number the packing loop actually needs -------------------
+
+#: How often the background sampler reads the device. Fast enough to see the idle gaps
+#: between one batch's forward and the next (tens of ms on a real inference stage), cheap
+#: enough that the poll itself is noise — an NVML read is ~100 us.
+_UTIL_SAMPLE_INTERVAL_S = 0.05
+
+
+class SustainedUtilization:
+    """Time-weighted mean accelerator utilization across an actor's working window.
+
+    The adaptive loop asks "is this GPU being kept busy?", and the honest answer is a mean
+    over time. Sampling the device *right after a forward pass* — which is where the engine
+    used to take its one reading per batch — answers a different question: it samples at
+    precisely the instant the device is busiest, so it reports near-saturation for a stage
+    that is in fact idle most of the time.
+
+    That is not a small bias. Measured on a four-T4 ResNet-50 inference stage: the
+    post-forward reading peaked at **86%** while NVML sampled on a timer put the sustained
+    figure at **13%**. `recommend_num_gpus` packs a stage onto a fraction of a device only
+    below `_PACK_BELOW` (50%), so the peak reading kept every stage on a whole GPU each,
+    three quarters idle, and `recommend_inflight_depth` likewise stayed shallow — the two
+    levers that exist to fix a starved GPU were held shut by the measurement that was
+    supposed to open them.
+
+    So this samples on a daemon thread instead, and reports the mean over the window
+    **between the first call's start and the last call's end** — excluding the model load
+    before any work arrives and the idle tail after the last partition, neither of which the
+    scheduler can do anything about. The idle *between* calls is deliberately included: that
+    gap is the starvation this measurement exists to find.
+
+    Best-effort throughout: a device that reports no utilization (Apple MPS, Cloud TPU, CPU)
+    yields `None` and the caller keeps its declared request.
+    """
+
+    def __init__(self, interval_s: float = _UTIL_SAMPLE_INTERVAL_S) -> None:
+        self._interval = interval_s
+        self._sum = 0.0
+        self._n = 0
+        self._peak: float | None = None
+        self._window_start: tuple[float, int] | None = None
+        self._window_end: tuple[float, int] | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample_loop(self) -> None:
+        while not self._stop.wait(self._interval):
+            util = sample_gpu_utilization()
+            if util is None:
+                continue
+            self._sum += util
+            self._n += 1
+            self._peak = util if self._peak is None else max(self._peak, util)
+
+    def begin_call(self) -> None:
+        """Mark the start of a unit of work; starts sampling on the first one."""
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._sample_loop, daemon=True)
+            self._thread.start()
+        if self._window_start is None:
+            self._window_start = (self._sum, self._n)
+
+    def end_call(self) -> None:
+        """Mark the end of a unit of work, closing the window at this instant."""
+        self._window_end = (self._sum, self._n)
+
+    def mean(self) -> float | None:
+        """Sustained utilization over the working window, or `None` if nothing was sampled."""
+        if self._window_start is None or self._window_end is None:
+            return None
+        samples = self._window_end[1] - self._window_start[1]
+        if samples <= 0:
+            # The whole stage finished inside one sampling interval, so there is no window to
+            # average. A single reading is still better than nothing for the packing decision.
+            return self._peak
+        return max(0.0, min(1.0, (self._window_end[0] - self._window_start[0]) / samples))
+
+    def drain(self) -> float | None:
+        """`mean()`, then start a fresh window — the per-*run* reading, not a lifetime one.
+
+        A warm actor outlives the run that used it, so a window opened at its first ever call
+        and never closed keeps accumulating the idle time *between* runs. Measured: an actor
+        pool that held four T4s at 92.7% during a 5.7-second run reported 25.7%, because its
+        window still contained the half-minute of driver-side work since the previous run —
+        and the packing loop, reading 25.7%, doubled a pool that was already saturated.
+
+        The driver reads this once per run, so draining here is what scopes the measurement
+        to the run without an extra round-trip to every actor.
+        """
+        value = self.mean()
+        self._window_start = None
+        self._window_end = None
+        return value
+
+    def peak(self) -> float | None:
+        """The highest single reading seen, or `None`."""
+        return self._peak
+
+    def close(self) -> None:
+        """Stop sampling and wait for the sampler to exit. Idempotent.
+
+        Joins rather than merely signalling, so a closed monitor cannot still be polling the
+        driver a moment later — which for a caller that swapped the probe out (a test, a
+        vendor fallback) means the swapped-in probe is what the thread was last using.
+        """
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=max(1.0, self._interval * 4))
 
 
 # --- Auto mixed-precision (the tensor-core ~2x hardware lever) ---------------------------

@@ -1,5 +1,49 @@
 # Batcher CPU benchmark results
 
+## A learned date grid and a date literal were on different number lines (2026-07-31)
+
+TPC-H sf1, 16-core c5-class head node, release build, correctness-gated (all 22 `OK`): the
+suite total falls from **1,843 ms to 871 ms — 2.12x**. Two queries carry almost all of it:
+
+| query | before | after | vs DuckDB before | after |
+|---|--:|--:|--:|--:|
+| q8 | 735.0 ms | 20.7 ms | 34.36x | **0.94x** |
+| q7 | 309.5 ms | 30.5 ms | 11.60x | 1.24x |
+| suite | 1,843 ms | 871 ms | 2.58x | 1.23x |
+
+Against the like-for-like bar — `duckdb_arrow`, DuckDB executing the same zero-copy Arrow —
+Batcher is **2.37x faster** overall (871 ms vs 2,062 ms); against Polars, 1.26x (1,101 ms).
+DuckDB's native compressed store still leads by 1.23x.
+
+The cause was not in the join path at all. Core measures a quantile grid from raw Arrow
+values, so a `date32` column's grid counts epoch days and a `timestamp[us]` column's counts
+epoch microseconds; Kyber read it with `date.toordinal()` (which counts from year 1 — a
+719,163-day offset) and `datetime.timestamp()` (local-zone seconds). Every temporal literal
+therefore landed far outside its own column's grid, which interpolates to "no rows match".
+`o_orderdate BETWEEN '1995-01-01' AND '1996-12-31'` over `orders` estimated **0 rows against
+a true 455,112**, and a join with a zero-row side prices as free — so Q8 stopped joining the
+1,327-row filtered `part` to `lineitem` first and carried a 1.8M-row intermediate through
+four joins instead.
+
+It bit only from a query's **second** execution, because the first has no grid to read. That
+is why it survived: a benchmark warms up before it times, so every timed run measured the
+broken state, and the cold run that would have shown the good plan was the one thrown away.
+
+`plan.stats` now names the one axis both sides place a value on, `core.stats` records which
+axis each measured grid is on, and the estimator declines a grid whose axis does not match
+the literal's rather than interpolating across two number lines.
+
+### What this did not fix
+
+q21 remains the worst query at **198 ms (2.65x DuckDB)** and is now 23% of the suite total.
+Its plan is re-optimized on nearly every execution: the plan cache keys on
+`_calibration_epoch`, which advances whenever a cost refit *runs* rather than when the
+coefficients it produced actually *move*, and a query recording ~35-77 operator feedback rows
+triggers a refit almost every run. Measured across nine consecutive executions of q21 the key
+changed on eight of them, and `kyber.optimize_full` cost 23-51 ms of a ~200 ms query until it
+finally settled (150 ms on the first hit). Keying on the coefficients themselves, bucketed,
+is the fix.
+
 ## Three things the join path could not do: plan with statistics, build in parallel, filter across a join (2026-07-27)
 
 TPC-H sf10, 96-core, release build, correctness-gated (all 22 `OK`): the suite total falls from

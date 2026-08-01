@@ -51,9 +51,10 @@ _PLAIN = {
     "any_value": "first",
 }
 
-# Reductions needing `min_count=1` so an all-null (or empty) group yields null rather than
-# the operator's identity element — `sum` of nothing is not `0`, and `product` is not `1`.
-_MIN_COUNT = {"sum": "sum", "product": "prod"}
+# Reductions needing an empty group nulled so it yields null rather than the operator's
+# identity element — the `sum` of nothing is not `0`. `product` needs the same and is handled
+# on its own, because it also has to be retyped (see `_reduce`).
+_MIN_COUNT = {"sum": "sum"}
 
 # Boolean folds with the same problem `_MIN_COUNT` solves, but no `min_count` to solve it
 # with. `all` and `any` skip nulls and then return their identity — `True` and `False` — for a
@@ -73,6 +74,7 @@ _SUPPORTED = (
     | frozenset(_SAMPLE_MOMENT)
     | {
         "count_star",
+        "product",
         "quantile",
     }
 )
@@ -153,7 +155,7 @@ def _null_if_empty(series, reduced):
     return reduced.where(_call(series, "count") > 0)
 
 
-def _reduce(grouped, spec: dict, column: str | None):
+def _reduce(grouped, spec: dict, column: str | None, be: DfBackend):
     """One reduction over the shared `GroupBy`, as a Series indexed by the group key."""
     func = spec["func"]
     if func == "count_star":
@@ -161,6 +163,16 @@ def _reduce(grouped, spec: dict, column: str | None):
     series = grouped[column]
     if func in _PLAIN:
         return _call(series, _PLAIN[func])
+    if func == "product":
+        # The engine (and DuckDB) answer `product` in **double** whatever the input's type,
+        # because the running product of a bigint column leaves its range almost immediately.
+        # Both libraries' `prod` keeps the integer instead, so an int64 column's product came
+        # back int64 — the right number until it overflows, and a column a CPU-recovered shard's
+        # double cannot be concatenated with either way.
+        import pyarrow as pa
+
+        reduced = _null_if_empty(series, _call(series, "prod"))
+        return reduced.astype(be.dtype(pa.float64()))
     if func in _MIN_COUNT:
         return _null_if_empty(series, _call(series, _MIN_COUNT[func]))
     if func in _BOOL_FOLD:
@@ -268,7 +280,7 @@ def aggregate(df, ir: dict, be: DfBackend):
     grouped = df.groupby(keys, sort=False, dropna=False)
     columns = {}
     for spec, column in zip(ir["aggregates"], inputs, strict=True):
-        columns[spec["alias"]] = _reduce(grouped, spec, column)
+        columns[spec["alias"]] = _reduce(grouped, spec, column, be)
     out = be.lib.DataFrame(columns) if columns else be.lib.DataFrame(index=grouped.size().index)
     out = out.reset_index()
     # `reset_index` restores the key columns under their *source* names; rename to the
@@ -300,7 +312,7 @@ def _global(df, ir: dict, be: DfBackend):
     grouped = df.groupby([key], sort=False, dropna=False)
     columns = {}
     for spec, column in zip(ir["aggregates"], inputs, strict=True):
-        columns[spec["alias"]] = _reduce(grouped, spec, column)
+        columns[spec["alias"]] = _reduce(grouped, spec, column, be)
     out = be.lib.DataFrame(columns).reset_index(drop=True)
     if not len(df):
         out = _empty_global_row(out, ir)

@@ -27,6 +27,7 @@ provenance may only *inform* cost/cardinality or power an explicitly-named
 
 from __future__ import annotations
 
+import datetime
 import enum
 import math
 from collections.abc import Mapping
@@ -35,13 +36,108 @@ from decimal import Decimal
 from typing import Any
 
 __all__ = [
+    "AXIS_DATE",
+    "AXIS_DATETIME",
+    "AXIS_NUMERIC",
     "ColumnStat",
     "Provenance",
     "RelStats",
     "ambiguous_float_bound",
+    "arrow_ordinal_axis",
     "mismatched_exactness",
+    "ordinal_with_axis",
     "weakest",
 ]
+
+# --------------------------------------------------------------------------- #
+# The ordinal axis: one number line per column kind
+# --------------------------------------------------------------------------- #
+# Core *measures* a column's quantile grid from raw Arrow values; Kyber *consults* it
+# with a Python literal from the predicate. Those two are only comparable if both name
+# the same number line, and they did not: a `date32` grid is stored in epoch days while
+# `datetime.date.toordinal()` counts from year 1 (a 719,163-day offset), and a
+# `timestamp[us]` grid is in epoch microseconds while `datetime.timestamp()` is in
+# epoch seconds *of the local zone*. Either mismatch puts every predicate literal far
+# outside the grid, so a range filter interpolates to ~0 selectivity and the join order
+# built on it collapses. Both sides now go through this module.
+AXIS_NUMERIC = "numeric"  # the value itself
+AXIS_DATE = "epoch_day"  # days since 1970-01-01 (Arrow `date32`'s own unit)
+AXIS_DATETIME = "epoch_second"  # seconds since the epoch, UTC
+
+_EPOCH_DATE = datetime.date(1970, 1, 1)
+
+#: Divisor turning an Arrow temporal column's raw ordinal into its axis, by type id.
+_ARROW_TEMPORAL_AXES: dict[str, tuple[str, float]] = {
+    "date32[day]": (AXIS_DATE, 1.0),
+    "date64[ms]": (AXIS_DATE, 86_400_000.0),
+    "timestamp[s]": (AXIS_DATETIME, 1.0),
+    "timestamp[ms]": (AXIS_DATETIME, 1e3),
+    "timestamp[us]": (AXIS_DATETIME, 1e6),
+    "timestamp[ns]": (AXIS_DATETIME, 1e9),
+}
+
+
+def ordinal_with_axis(value: Any) -> tuple[str, float] | None:
+    """`(axis, position)` of a scalar on its number line, or None if it has no linear order.
+
+    Numbers (and `Decimal`) sit on `AXIS_NUMERIC` as themselves. A `date` sits on
+    `AXIS_DATE` at its epoch-day offset and a `datetime` on `AXIS_DATETIME` at its
+    epoch-second offset, both matching what Arrow stores — a naive `datetime` is read as
+    UTC, because that is how Arrow reads a timestamp with no zone. `bool` is excluded:
+    `True` would otherwise interpolate as `1.0`.
+
+    Two values are only comparable when their axes agree, so callers must check the axis
+    rather than assume it.
+
+    Args:
+        value: The scalar to place.
+
+    Returns:
+        The axis name and the position on it, or None for a value with no linear order.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return AXIS_NUMERIC, float(value)
+    if isinstance(value, datetime.datetime):
+        stamp = value if value.tzinfo is not None else value.replace(tzinfo=datetime.timezone.utc)
+        return AXIS_DATETIME, stamp.timestamp()
+    if isinstance(value, datetime.date):
+        return AXIS_DATE, float((value - _EPOCH_DATE).days)
+    return None
+
+
+def arrow_ordinal_axis(arrow_type: Any) -> tuple[str, float] | None:
+    """`(axis, divisor)` placing an Arrow column's raw values on their axis, or None.
+
+    Dividing a measured statistic by `divisor` moves it from the column's storage unit
+    onto `axis`, where a predicate literal placed by `ordinal_with_axis` can meet it. A
+    non-temporal column needs no conversion and reports `(AXIS_NUMERIC, 1.0)`; a type with
+    no linear order (string, list, struct) reports None.
+
+    Args:
+        arrow_type: The column's `pyarrow.DataType`.
+
+    Returns:
+        The axis name and the divisor, or None for a type with no linear order.
+    """
+    import pyarrow as pa
+
+    if pa.types.is_boolean(arrow_type):
+        return None
+    if pa.types.is_date(arrow_type) or pa.types.is_timestamp(arrow_type):
+        # `timestamp[us, tz=UTC]` and `timestamp[us]` share a storage unit and epoch.
+        key = str(arrow_type).split(",")[0].strip()
+        if not key.endswith("]"):
+            key += "]"
+        return _ARROW_TEMPORAL_AXES.get(key)
+    if (
+        pa.types.is_integer(arrow_type)
+        or pa.types.is_floating(arrow_type)
+        or pa.types.is_decimal(arrow_type)
+    ):
+        return AXIS_NUMERIC, 1.0
+    return None
 
 
 def ambiguous_float_bound(value: Any) -> bool:

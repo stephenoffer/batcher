@@ -377,7 +377,7 @@ def _range_selectivity(
     x = _ordinal(value)
     if x is None:
         return cfg.range_selectivity
-    frac_le = _fraction_below_quantiles(x, quantiles.get(col))
+    frac_le = _fraction_below_quantiles(value, quantiles.get(col))
     if frac_le is None:
         frac_le = _fraction_below_bounds(x, bounds.get(col))
     if frac_le is None:

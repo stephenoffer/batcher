@@ -363,16 +363,25 @@ def test_list_len_matches_the_engine(be):
     _assert_matches_engine(ds, table, be)
 
 
-def test_a_list_reduction_the_host_backend_lacks_is_declined(be):
-    """`sum` over a list exists on cuDF's accessor and not on the host backend's.
+def test_a_list_reduction_runs_through_the_element_view(be):
+    """`sum` over a list is on cuDF's accessor and not on the host backend's, so it is built
+    from `explode` plus `groupby` instead — the two primitives both libraries do have.
 
-    Translating it would ship a path only the device can run, and so only the device could be
-    wrong about — the failure mode this package's whole two-backend design exists to prevent.
+    The vocabulary and its edge cases live in `test_gpu_list_vocabulary`; this is the reshape
+    module's own check that the construction composes with the operators around it.
     """
+    table = _lists()
+    ds = bt.from_arrow(table).select(r=col("xs").list.sum())
+    _assert_matches_engine(ds, table, be)
+
+
+def test_a_list_to_list_function_is_still_declined(be):
+    """Reassembling a list result is the one thing the element view cannot do without
+    materializing a Python object per row, which is a hot-path tuple touch."""
     from batcher.core.gpu_plan.backend import Unsupported
 
     table = _lists()
-    ds = bt.from_arrow(table).select(r=col("xs").list.sum())
+    ds = bt.from_arrow(table).select(r=col("xs").list.sort())
     with pytest.raises(Unsupported):
         _translated(ds, table, be)
 
