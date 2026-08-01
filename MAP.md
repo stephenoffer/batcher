@@ -704,7 +704,7 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 1719 | The distributed executor — the dispatcher. |
+| `executor.py` | 1720 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 683 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 378 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
