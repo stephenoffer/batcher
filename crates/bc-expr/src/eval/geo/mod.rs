@@ -36,7 +36,7 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 
-use bc_geo::{Geom, GeoError};
+use bc_geo::{GeoError, Geom};
 
 use crate::{Expr, ExprError, GeoFunc};
 
@@ -45,19 +45,11 @@ mod grid;
 mod scalar;
 
 /// Evaluate a geospatial function over a batch.
-pub fn eval_geo(
-    func: GeoFunc,
-    args: &[Expr],
-    batch: &RecordBatch,
-) -> Result<ArrayRef, ExprError> {
+pub fn eval_geo(func: GeoFunc, args: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExprError> {
     if args.len() != func.arity() {
         return Err(ExprError::InvalidArgument {
             func: format!("{func:?}"),
-            reason: format!(
-                "expects {} argument(s), got {}",
-                func.arity(),
-                args.len()
-            ),
+            reason: format!("expects {} argument(s), got {}", func.arity(), args.len()),
         });
     }
     let cols: Vec<ArrayRef> = args
@@ -101,11 +93,7 @@ pub(crate) fn caller_error(func: GeoFunc, e: GeoError) -> ExprError {
 ///
 /// `Ok(None)` covers both "the row is null" and "the bytes are not a geometry"; see the
 /// module documentation for why those share an outcome.
-pub(crate) fn geom_at(
-    col: &ArrayRef,
-    i: usize,
-    func: GeoFunc,
-) -> Result<Option<Geom>, ExprError> {
+pub(crate) fn geom_at(col: &ArrayRef, i: usize, func: GeoFunc) -> Result<Option<Geom>, ExprError> {
     if col.is_null(i) {
         return Ok(None);
     }
@@ -219,11 +207,7 @@ pub(crate) fn i64_at(col: &ArrayRef, i: usize, func: GeoFunc) -> Result<Option<i
 }
 
 /// Read row `i` of a text column.
-pub(crate) fn str_at(
-    col: &ArrayRef,
-    i: usize,
-    func: GeoFunc,
-) -> Result<Option<&str>, ExprError> {
+pub(crate) fn str_at(col: &ArrayRef, i: usize, func: GeoFunc) -> Result<Option<&str>, ExprError> {
     if col.is_null(i) {
         return Ok(None);
     }
@@ -274,10 +258,7 @@ impl GeomOut {
 }
 
 /// A row-local `bc_geo` result: `Invalid` raises, everything else nulls.
-pub(crate) fn row_result<T>(
-    r: Result<T, GeoError>,
-    func: GeoFunc,
-) -> Result<Option<T>, ExprError> {
+pub(crate) fn row_result<T>(r: Result<T, GeoError>, func: GeoFunc) -> Result<Option<T>, ExprError> {
     match r {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.is_row_local() => Ok(None),
@@ -375,39 +356,118 @@ mod tests {
 
     /// Every `GeoFunc`, for the routing tests above.
     pub(super) const ALL: [GeoFunc; 113] = [
-        GeoFunc::StPoint, GeoFunc::StPointZ, GeoFunc::StMakeLine, GeoFunc::StMakePolygon,
-        GeoFunc::StMakeEnvelope, GeoFunc::StGeomFromText, GeoFunc::StGeomFromWkb,
-        GeoFunc::StGeomFromGeojson, GeoFunc::StGeomFromGeohash, GeoFunc::StAsText,
-        GeoFunc::StAsEwkt, GeoFunc::StAsBinary, GeoFunc::StAsEwkb, GeoFunc::StAsHexWkb,
-        GeoFunc::StAsGeojson, GeoFunc::StX, GeoFunc::StY, GeoFunc::StZ, GeoFunc::StXmin,
-        GeoFunc::StYmin, GeoFunc::StXmax, GeoFunc::StYmax, GeoFunc::StGeometryType,
-        GeoFunc::StDimension, GeoFunc::StSrid, GeoFunc::StSetSrid, GeoFunc::StNumPoints,
-        GeoFunc::StNumGeometries, GeoFunc::StNumInteriorRings, GeoFunc::StGeometryN,
-        GeoFunc::StPointN, GeoFunc::StStartPoint, GeoFunc::StEndPoint,
-        GeoFunc::StExteriorRing, GeoFunc::StInteriorRingN, GeoFunc::StIsEmpty,
-        GeoFunc::StIsValid, GeoFunc::StIsValidReason, GeoFunc::StIsClosed,
-        GeoFunc::StIsRing, GeoFunc::StIsSimple, GeoFunc::StIsCollection, GeoFunc::StHasZ,
-        GeoFunc::StCoordDim, GeoFunc::StArea, GeoFunc::StLength, GeoFunc::StPerimeter,
-        GeoFunc::StDistance, GeoFunc::StMaxDistance, GeoFunc::StHausdorffDistance,
-        GeoFunc::StAzimuth, GeoFunc::StDistanceSphere, GeoFunc::StDistanceSpheroid,
-        GeoFunc::StAreaSpheroid, GeoFunc::StLengthSpheroid, GeoFunc::StPerimeterSpheroid,
-        GeoFunc::StIntersects, GeoFunc::StDisjoint, GeoFunc::StContains, GeoFunc::StWithin,
-        GeoFunc::StCovers, GeoFunc::StCoveredBy, GeoFunc::StTouches, GeoFunc::StCrosses,
-        GeoFunc::StOverlaps, GeoFunc::StEquals, GeoFunc::StDwithin,
-        GeoFunc::StDwithinSphere, GeoFunc::StIntersectsExtent, GeoFunc::StContainsExtent,
-        GeoFunc::StCentroid, GeoFunc::StEnvelope, GeoFunc::StBoundary,
-        GeoFunc::StConvexHull, GeoFunc::StPointOnSurface, GeoFunc::StBuffer,
-        GeoFunc::StSimplify, GeoFunc::StReverse, GeoFunc::StForce2d, GeoFunc::StForce3d,
-        GeoFunc::StForcePolygonCcw, GeoFunc::StForcePolygonCw, GeoFunc::StFlipCoordinates,
-        GeoFunc::StTranslate, GeoFunc::StScale, GeoFunc::StRotate, GeoFunc::StAffine,
-        GeoFunc::StSnapToGrid, GeoFunc::StSegmentize, GeoFunc::StExpand,
-        GeoFunc::StCollect, GeoFunc::StRemoveRepeatedPoints,
-        GeoFunc::StLineInterpolatePoint, GeoFunc::StLineLocatePoint,
-        GeoFunc::StLineSubstring, GeoFunc::StClosestPoint, GeoFunc::StShortestLine,
-        GeoFunc::StProject, GeoFunc::StTransform, GeoFunc::StGeohash,
-        GeoFunc::GeohashEncode, GeoFunc::GeohashDecodeLon, GeoFunc::GeohashDecodeLat,
-        GeoFunc::StTileX, GeoFunc::StTileY, GeoFunc::StQuadkey, GeoFunc::StS2Cell,
-        GeoFunc::StS2CellParent, GeoFunc::StHexBin, GeoFunc::StHexCenterX,
-        GeoFunc::StHexCenterY, GeoFunc::StUtmZone, GeoFunc::StUtmEpsg,
+        GeoFunc::StPoint,
+        GeoFunc::StPointZ,
+        GeoFunc::StMakeLine,
+        GeoFunc::StMakePolygon,
+        GeoFunc::StMakeEnvelope,
+        GeoFunc::StGeomFromText,
+        GeoFunc::StGeomFromWkb,
+        GeoFunc::StGeomFromGeojson,
+        GeoFunc::StGeomFromGeohash,
+        GeoFunc::StAsText,
+        GeoFunc::StAsEwkt,
+        GeoFunc::StAsBinary,
+        GeoFunc::StAsEwkb,
+        GeoFunc::StAsHexWkb,
+        GeoFunc::StAsGeojson,
+        GeoFunc::StX,
+        GeoFunc::StY,
+        GeoFunc::StZ,
+        GeoFunc::StXmin,
+        GeoFunc::StYmin,
+        GeoFunc::StXmax,
+        GeoFunc::StYmax,
+        GeoFunc::StGeometryType,
+        GeoFunc::StDimension,
+        GeoFunc::StSrid,
+        GeoFunc::StSetSrid,
+        GeoFunc::StNumPoints,
+        GeoFunc::StNumGeometries,
+        GeoFunc::StNumInteriorRings,
+        GeoFunc::StGeometryN,
+        GeoFunc::StPointN,
+        GeoFunc::StStartPoint,
+        GeoFunc::StEndPoint,
+        GeoFunc::StExteriorRing,
+        GeoFunc::StInteriorRingN,
+        GeoFunc::StIsEmpty,
+        GeoFunc::StIsValid,
+        GeoFunc::StIsValidReason,
+        GeoFunc::StIsClosed,
+        GeoFunc::StIsRing,
+        GeoFunc::StIsSimple,
+        GeoFunc::StIsCollection,
+        GeoFunc::StHasZ,
+        GeoFunc::StCoordDim,
+        GeoFunc::StArea,
+        GeoFunc::StLength,
+        GeoFunc::StPerimeter,
+        GeoFunc::StDistance,
+        GeoFunc::StMaxDistance,
+        GeoFunc::StHausdorffDistance,
+        GeoFunc::StAzimuth,
+        GeoFunc::StDistanceSphere,
+        GeoFunc::StDistanceSpheroid,
+        GeoFunc::StAreaSpheroid,
+        GeoFunc::StLengthSpheroid,
+        GeoFunc::StPerimeterSpheroid,
+        GeoFunc::StIntersects,
+        GeoFunc::StDisjoint,
+        GeoFunc::StContains,
+        GeoFunc::StWithin,
+        GeoFunc::StCovers,
+        GeoFunc::StCoveredBy,
+        GeoFunc::StTouches,
+        GeoFunc::StCrosses,
+        GeoFunc::StOverlaps,
+        GeoFunc::StEquals,
+        GeoFunc::StDwithin,
+        GeoFunc::StDwithinSphere,
+        GeoFunc::StIntersectsExtent,
+        GeoFunc::StContainsExtent,
+        GeoFunc::StCentroid,
+        GeoFunc::StEnvelope,
+        GeoFunc::StBoundary,
+        GeoFunc::StConvexHull,
+        GeoFunc::StPointOnSurface,
+        GeoFunc::StBuffer,
+        GeoFunc::StSimplify,
+        GeoFunc::StReverse,
+        GeoFunc::StForce2d,
+        GeoFunc::StForce3d,
+        GeoFunc::StForcePolygonCcw,
+        GeoFunc::StForcePolygonCw,
+        GeoFunc::StFlipCoordinates,
+        GeoFunc::StTranslate,
+        GeoFunc::StScale,
+        GeoFunc::StRotate,
+        GeoFunc::StAffine,
+        GeoFunc::StSnapToGrid,
+        GeoFunc::StSegmentize,
+        GeoFunc::StExpand,
+        GeoFunc::StCollect,
+        GeoFunc::StRemoveRepeatedPoints,
+        GeoFunc::StLineInterpolatePoint,
+        GeoFunc::StLineLocatePoint,
+        GeoFunc::StLineSubstring,
+        GeoFunc::StClosestPoint,
+        GeoFunc::StShortestLine,
+        GeoFunc::StProject,
+        GeoFunc::StTransform,
+        GeoFunc::StGeohash,
+        GeoFunc::GeohashEncode,
+        GeoFunc::GeohashDecodeLon,
+        GeoFunc::GeohashDecodeLat,
+        GeoFunc::StTileX,
+        GeoFunc::StTileY,
+        GeoFunc::StQuadkey,
+        GeoFunc::StS2Cell,
+        GeoFunc::StS2CellParent,
+        GeoFunc::StHexBin,
+        GeoFunc::StHexCenterX,
+        GeoFunc::StHexCenterY,
+        GeoFunc::StUtmZone,
+        GeoFunc::StUtmEpsg,
     ];
 }

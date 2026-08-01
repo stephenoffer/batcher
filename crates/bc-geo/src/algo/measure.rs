@@ -12,9 +12,7 @@
 //! and are named for it (`st_distance_sphere`, `st_area_geodesic`), so a caller who
 //! needs metres on a globe asks for metres on a globe.
 
-use crate::algo::primitive::{
-    dist, point_segment_distance, segment_segment_distance, PointRing,
-};
+use crate::algo::primitive::{dist, point_segment_distance, segment_segment_distance, PointRing};
 use crate::algo::relate::point_in_polygon;
 use crate::types::{measurement, ring_area, Coord, Geometry, LineString, Polygon};
 use crate::Geom;
@@ -46,12 +44,12 @@ pub fn length(g: &Geometry) -> f64 {
 /// The total boundary length of every polygon, holes included. Zero for a non-areal
 /// geometry, matching PostGIS `ST_Perimeter`.
 pub fn perimeter(g: &Geometry) -> f64 {
-    measurement(g.polygons()
-        .iter()
-        .map(|p| {
-            line_length(&p.exterior) + p.interiors.iter().map(line_length).sum::<f64>()
-        })
-        .sum())
+    measurement(
+        g.polygons()
+            .iter()
+            .map(|p| line_length(&p.exterior) + p.interiors.iter().map(line_length).sum::<f64>())
+            .sum(),
+    )
 }
 
 /// The length of one chain.
@@ -285,7 +283,11 @@ fn area_centroid(polys: &[&Polygon]) -> Option<Coord> {
             } else {
                 -1.0
             };
-            let flip = if (ra > 0.0) == (sign > 0.0) { 1.0 } else { -1.0 };
+            let flip = if (ra > 0.0) == (sign > 0.0) {
+                1.0
+            } else {
+                -1.0
+            };
             a2 += flip * ra;
             cx += flip * rx;
             cy += flip * ry;
@@ -323,7 +325,10 @@ mod tests {
 
     #[test]
     fn area_subtracts_holes() {
-        assert_eq!(area(&g("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))").geometry), 16.0);
+        assert_eq!(
+            area(&g("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))").geometry),
+            16.0
+        );
         assert_eq!(
             area(&g("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (1 1, 2 1, 2 2, 1 2, 1 1))").geometry),
             15.0
@@ -345,8 +350,9 @@ mod tests {
                 assert!(!v.is_sign_negative(), "{t}: {v} is a negative zero");
             }
         }
-        assert!(!crate::proj::geodesy::geodesic_area_m2(&g("POINT(2 2)").geometry)
-            .is_sign_negative());
+        assert!(
+            !crate::proj::geodesy::geodesic_area_m2(&g("POINT(2 2)").geometry).is_sign_negative()
+        );
     }
 
     #[test]
@@ -379,9 +385,14 @@ mod tests {
     fn centroid_prefers_the_highest_dimension() {
         let c = centroid(&g("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))").geometry).unwrap();
         assert!((c.x - 2.0).abs() < 1e-12 && (c.y - 2.0).abs() < 1e-12);
-        let c = centroid(&g("GEOMETRYCOLLECTION(POLYGON((0 0, 2 0, 2 2, 0 2, 0 0)), POINT(100 100))").geometry)
-            .unwrap();
-        assert!((c.x - 1.0).abs() < 1e-12, "the point must not move an areal centroid");
+        let c = centroid(
+            &g("GEOMETRYCOLLECTION(POLYGON((0 0, 2 0, 2 2, 0 2, 0 0)), POINT(100 100))").geometry,
+        )
+        .unwrap();
+        assert!(
+            (c.x - 1.0).abs() < 1e-12,
+            "the point must not move an areal centroid"
+        );
         let c = centroid(&g("MULTIPOINT((0 0), (4 0))").geometry).unwrap();
         assert_eq!((c.x, c.y), (2.0, 0.0));
     }

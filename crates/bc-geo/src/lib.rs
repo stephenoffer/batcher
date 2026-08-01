@@ -86,7 +86,9 @@ mod tests {
         let point = Geometry::Point(Some(Coord::new(1.0, 2.0)));
         assert_eq!(from_text("POINT(1 2)").unwrap().geometry, point);
         assert_eq!(
-            from_text(r#"{"type":"Point","coordinates":[1,2]}"#).unwrap().geometry,
+            from_text(r#"{"type":"Point","coordinates":[1,2]}"#)
+                .unwrap()
+                .geometry,
             point
         );
         let hex = codec::wkb::write_hex_wkb(&Geom::new(point.clone()));
@@ -106,9 +108,15 @@ mod tests {
         ];
         for t in cases {
             let g = codec::wkt::read_wkt(t).unwrap();
-            assert_eq!(from_wkb(&to_wkb(&g)).unwrap().geometry, g.geometry, "WKB: {t}");
             assert_eq!(
-                codec::wkt::read_wkt(&codec::wkt::write_wkt(&g)).unwrap().geometry,
+                from_wkb(&to_wkb(&g)).unwrap().geometry,
+                g.geometry,
+                "WKB: {t}"
+            );
+            assert_eq!(
+                codec::wkt::read_wkt(&codec::wkt::write_wkt(&g))
+                    .unwrap()
+                    .geometry,
                 g.geometry,
                 "WKT: {t}"
             );

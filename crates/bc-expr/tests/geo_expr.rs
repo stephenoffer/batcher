@@ -9,8 +9,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch,
-    StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use bc_expr::Expr;
@@ -27,7 +26,10 @@ fn batch() -> RecordBatch {
     ]);
     let wkb: Vec<Option<Vec<u8>>> = wkt
         .iter()
-        .map(|t| t.and_then(|s| bc_geo::from_text(s).ok()).map(|g| bc_geo::to_wkb(&g)))
+        .map(|t| {
+            t.and_then(|s| bc_geo::from_text(s).ok())
+                .map(|g| bc_geo::to_wkb(&g))
+        })
         .collect();
     let wkb = BinaryArray::from_iter(wkb.iter().map(|o| o.as_deref()));
     let lon = Float64Array::from(vec![
@@ -51,42 +53,53 @@ fn batch() -> RecordBatch {
             Field::new("lon", DataType::Float64, true),
             Field::new("lat", DataType::Float64, true),
         ])),
-        vec![
-            Arc::new(wkt),
-            Arc::new(wkb),
-            Arc::new(lon),
-            Arc::new(lat),
-        ],
+        vec![Arc::new(wkt), Arc::new(wkb), Arc::new(lon), Arc::new(lat)],
     )
     .expect("batch")
 }
 
 fn eval(json: &str) -> ArrayRef {
     let e: Expr = serde_json::from_str(json).unwrap_or_else(|err| panic!("{json}: {err}"));
-    e.eval(&batch()).unwrap_or_else(|err| panic!("{json}: {err}"))
+    e.eval(&batch())
+        .unwrap_or_else(|err| panic!("{json}: {err}"))
 }
 
 fn floats(json: &str) -> Vec<Option<f64>> {
     let a = eval(json);
-    let a = a.as_any().downcast_ref::<Float64Array>().expect("float column");
-    (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect()
+    let a = a
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("float column");
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
 }
 
 fn ints(json: &str) -> Vec<Option<i64>> {
     let a = eval(json);
     let a = a.as_any().downcast_ref::<Int64Array>().expect("int column");
-    (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect()
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
 }
 
 fn bools(json: &str) -> Vec<Option<bool>> {
     let a = eval(json);
-    let a = a.as_any().downcast_ref::<BooleanArray>().expect("bool column");
-    (0..a.len()).map(|i| (!a.is_null(i)).then(|| a.value(i))).collect()
+    let a = a
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("bool column");
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
 }
 
 fn strings(json: &str) -> Vec<Option<String>> {
     let a = eval(json);
-    let a = a.as_any().downcast_ref::<StringArray>().expect("text column");
+    let a = a
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("text column");
     (0..a.len())
         .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
         .collect()
@@ -127,7 +140,10 @@ fn a_malformed_geometry_nulls_its_row_and_leaves_the_others_alone() {
     assert_eq!(areas[0], Some(16.0));
     // And the reason column names the bad rows.
     let reasons = strings(&unary("st_is_valid_reason", "wkt"));
-    assert!(reasons.iter().take(3).all(|r| r.is_none()), "valid rows have no reason");
+    assert!(
+        reasons.iter().take(3).all(|r| r.is_none()),
+        "valid rows have no reason"
+    );
 }
 
 #[test]
@@ -174,7 +190,10 @@ fn predicates_take_a_literal_geometry_on_the_right() {
     let within = r#"{"e":"geo","fn":"st_within","args":[
         {"e":"col","name":"wkt"},
         {"e":"lit","value":{"str":"POLYGON((-1 -1, 5 -1, 5 5, -1 5, -1 -1))"}}]}"#;
-    assert_eq!(bools(within), vec![Some(true), Some(true), Some(true), None, None]);
+    assert_eq!(
+        bools(within),
+        vec![Some(true), Some(true), Some(true), None, None]
+    );
 }
 
 #[test]
@@ -198,7 +217,9 @@ fn a_negative_radius_raises_rather_than_answering_false() {
         {"e":"lit","value":{"str":"POINT(6 2)"}},
         {"e":"lit","value":{"float":-1.0}}]}"#;
     let e: Expr = serde_json::from_str(json).unwrap();
-    let err = e.eval(&batch()).expect_err("a negative radius is a query bug");
+    let err = e
+        .eval(&batch())
+        .expect_err("a negative radius is a query bug");
     let msg = format!("{err}");
     assert!(msg.contains("st_dwithin"), "{msg}");
     assert!(msg.contains("non-negative"), "{msg}");
@@ -216,7 +237,10 @@ fn a_wrong_argument_count_names_the_function_and_the_expected_arity() {
 #[test]
 fn geometry_returning_functions_produce_a_readable_wkb_column() {
     let out = eval(&unary("st_centroid", "wkt"));
-    let bin = out.as_any().downcast_ref::<BinaryArray>().expect("binary column");
+    let bin = out
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("binary column");
     let g = bc_geo::from_wkb(bin.value(0)).expect("valid WKB out");
     let c = g.coords()[0];
     assert!((c.x - 2.0).abs() < 1e-12 && (c.y - 2.0).abs() < 1e-12);
@@ -248,7 +272,10 @@ fn transform_relabels_and_moves_the_coordinates() {
             {"e":"lit","value":{"int":3857}}]}]}"#;
     let out = strings(json);
     let sf = out[0].as_ref().expect("a projected point");
-    assert!(sf.starts_with("POINT(-13"), "San Francisco in Web Mercator metres: {sf}");
+    assert!(
+        sf.starts_with("POINT(-13"),
+        "San Francisco in Web Mercator metres: {sf}"
+    );
     assert_eq!(out[3], None, "a null coordinate stays null");
 }
 

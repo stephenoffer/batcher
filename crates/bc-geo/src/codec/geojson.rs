@@ -25,7 +25,9 @@ fn bad(detail: impl Into<String>) -> GeoError {
 }
 
 fn coord_of(v: &Value) -> GeoResult<Coord> {
-    let a = v.as_array().ok_or_else(|| bad("position must be an array"))?;
+    let a = v
+        .as_array()
+        .ok_or_else(|| bad("position must be an array"))?;
     if a.len() < 2 {
         return Err(bad("position needs at least two ordinates"));
     }
@@ -99,8 +101,7 @@ pub fn read_geojson_value(v: &Value) -> GeoResult<Geom> {
             .get("geometry")
             .ok_or_else(|| bad("Feature has no \"geometry\""))?;
         if inner.is_null() {
-            return Ok(Geom::new(Geometry::GeometryCollection(Vec::new()))
-                .with_srid(GEOJSON_SRID));
+            return Ok(Geom::new(Geometry::GeometryCollection(Vec::new())).with_srid(GEOJSON_SRID));
         }
         return read_geojson_value(inner);
     }
@@ -114,7 +115,11 @@ pub fn read_geojson_value(v: &Value) -> GeoResult<Geom> {
             n => Err(bad(format!(
                 "FeatureCollection holds {n} features, which is {} — read it with the \
                  GeoJSON source, which produces one row per feature",
-                if n == 0 { "none" } else { "many rows, not one geometry" }
+                if n == 0 {
+                    "none"
+                } else {
+                    "many rows, not one geometry"
+                }
             ))),
         };
     }
@@ -329,7 +334,9 @@ mod tests {
     #[test]
     fn geojson_implies_wgs84() {
         assert_eq!(
-            read_geojson(r#"{"type":"Point","coordinates":[1,2]}"#).unwrap().srid,
+            read_geojson(r#"{"type":"Point","coordinates":[1,2]}"#)
+                .unwrap()
+                .srid,
             4326
         );
     }
@@ -358,7 +365,10 @@ mod tests {
     fn three_dimensional_positions_are_detected() {
         let g = read_geojson(r#"{"type":"LineString","coordinates":[[0,0,1],[1,1,2]]}"#).unwrap();
         assert!(g.has_z);
-        assert_eq!(write_geojson(&g), r#"{"type":"LineString","coordinates":[[0,0,1],[1,1,2]]}"#);
+        assert_eq!(
+            write_geojson(&g),
+            r#"{"type":"LineString","coordinates":[[0,0,1],[1,1,2]]}"#
+        );
     }
 
     #[test]

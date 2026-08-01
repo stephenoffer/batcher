@@ -29,7 +29,12 @@ fn decode_char(c: u8) -> GeoResult<u32> {
         .iter()
         .position(|a| *a == c.to_ascii_lowercase())
         .map(|i| i as u32)
-        .ok_or_else(|| GeoError::parse("geohash", format!("{:?} is not a geohash character", c as char)))
+        .ok_or_else(|| {
+            GeoError::parse(
+                "geohash",
+                format!("{:?} is not a geohash character", c as char),
+            )
+        })
 }
 
 fn check_precision(precision: usize) -> GeoResult<()> {
@@ -122,10 +127,7 @@ pub fn decode_bbox(hash: &str) -> GeoResult<Bbox> {
 /// The centre of the cell a hash names.
 pub fn decode(hash: &str) -> GeoResult<Coord> {
     let b = decode_bbox(hash)?;
-    Ok(Coord::new(
-        (b.xmin + b.xmax) / 2.0,
-        (b.ymin + b.ymax) / 2.0,
-    ))
+    Ok(Coord::new((b.xmin + b.xmax) / 2.0, (b.ymin + b.ymax) / 2.0))
 }
 
 /// The eight cells around `hash`, in the order N, NE, E, SE, S, SW, W, NW.
@@ -212,7 +214,12 @@ mod tests {
 
     #[test]
     fn decoding_lands_back_in_the_cell() {
-        for (lon, lat) in [(-122.4194, 37.7749), (0.0, 0.0), (179.9, -89.9), (-180.0, 90.0)] {
+        for (lon, lat) in [
+            (-122.4194, 37.7749),
+            (0.0, 0.0),
+            (179.9, -89.9),
+            (-180.0, 90.0),
+        ] {
             for p in 1..=MAX_PRECISION {
                 let h = encode(lon, lat, p).unwrap();
                 let b = decode_bbox(&h).unwrap();
@@ -221,7 +228,11 @@ mod tests {
                     "{h} at precision {p} does not contain ({lon}, {lat})"
                 );
                 let c = decode(&h).unwrap();
-                assert_eq!(encode(c.x, c.y, p).unwrap(), h, "centre re-encodes to itself");
+                assert_eq!(
+                    encode(c.x, c.y, p).unwrap(),
+                    h,
+                    "centre re-encodes to itself"
+                );
             }
         }
     }
@@ -279,7 +290,9 @@ mod tests {
             xmax: -122.41,
             ymax: 37.78,
         };
-        let p = covering_prefix(&b).unwrap().expect("a small box has a covering cell");
+        let p = covering_prefix(&b)
+            .unwrap()
+            .expect("a small box has a covering cell");
         let cell = decode_bbox(&p).unwrap();
         assert!(cell.contains(&b), "{p} must cover the box");
         // A box spanning the globe shares no prefix.
@@ -298,11 +311,17 @@ mod tests {
         assert!(encode(0.0, 91.0, 5).is_err());
         assert!(encode(0.0, 0.0, 0).is_err());
         assert!(decode_bbox("").is_err());
-        assert!(decode_bbox("aio").is_err(), "a, i and o are not in the alphabet");
+        assert!(
+            decode_bbox("aio").is_err(),
+            "a, i and o are not in the alphabet"
+        );
     }
 
     #[test]
     fn case_is_ignored_on_decode() {
-        assert_eq!(decode_bbox("9Q8YYK").unwrap(), decode_bbox("9q8yyk").unwrap());
+        assert_eq!(
+            decode_bbox("9Q8YYK").unwrap(),
+            decode_bbox("9q8yyk").unwrap()
+        );
     }
 }

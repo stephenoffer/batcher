@@ -167,7 +167,9 @@ pub fn in_interior(p: Coord, g: &Geometry) -> bool {
     // A closed chain has no boundary, so every one of its points is interior — which is
     // why a ring touching another geometry at its own start vertex still "crosses" it.
     for l in linear_parts(g) {
-        if l.len() >= 2 && crate::types::is_closed(l) && l.windows(2).any(|w| on_segment(p, w[0], w[1]))
+        if l.len() >= 2
+            && crate::types::is_closed(l)
+            && l.windows(2).any(|w| on_segment(p, w[0], w[1]))
         {
             return true;
         }
@@ -184,7 +186,8 @@ fn meeting_points(a: &Geometry, b: &Geometry) -> Vec<Coord> {
         for lb in b.lines() {
             for s in la.windows(2) {
                 for t in lb.windows(2) {
-                    if let Some(p) = crate::algo::primitive::segment_intersection(s[0], s[1], t[0], t[1])
+                    if let Some(p) =
+                        crate::algo::primitive::segment_intersection(s[0], s[1], t[0], t[1])
                     {
                         out.push(p);
                     }
@@ -494,8 +497,13 @@ mod tests {
     fn disjoint_geometries_agree_across_every_predicate() {
         let (a, b) = (g(SQUARE), g("POLYGON((20 20, 24 20, 24 24, 20 24, 20 20))"));
         assert!(disjoint(&a, &b));
-        for p in [intersects, touches, crosses, overlaps, contains, within, covers] {
-            assert!(!p(&a, &b), "a disjoint pair satisfies no positive predicate");
+        for p in [
+            intersects, touches, crosses, overlaps, contains, within, covers,
+        ] {
+            assert!(
+                !p(&a, &b),
+                "a disjoint pair satisfies no positive predicate"
+            );
         }
     }
 

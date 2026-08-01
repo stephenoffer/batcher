@@ -44,11 +44,7 @@ pub(super) fn handles(func: GeoFunc) -> bool {
 }
 
 /// Evaluate a grid function over `rows` rows of `cols`.
-pub(super) fn eval(
-    func: GeoFunc,
-    cols: &[ArrayRef],
-    rows: usize,
-) -> Result<ArrayRef, ExprError> {
+pub(super) fn eval(func: GeoFunc, cols: &[ArrayRef], rows: usize) -> Result<ArrayRef, ExprError> {
     use GeoFunc::*;
     let mut out = match func {
         StGeohash | GeohashEncode | StQuadkey => {
@@ -75,11 +71,7 @@ pub(super) fn eval(
 }
 
 /// Read a `(lon, lat)` pair from the first two columns.
-fn lonlat(
-    func: GeoFunc,
-    cols: &[ArrayRef],
-    i: usize,
-) -> Result<Option<(f64, f64)>, ExprError> {
+fn lonlat(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<(f64, f64)>, ExprError> {
     let (Some(lon), Some(lat)) = (f64_at(&cols[0], i, func)?, f64_at(&cols[1], i, func)?) else {
         return Ok(None);
     };
@@ -139,8 +131,7 @@ fn float_row(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<f64>, 
             Some(if func == GeohashDecodeLon { c.x } else { c.y })
         }
         StHexCenterX | StHexCenterY => {
-            let (Some(key), Some(size)) =
-                (i64_at(&cols[0], i, func)?, f64_at(&cols[1], i, func)?)
+            let (Some(key), Some(size)) = (i64_at(&cols[0], i, func)?, f64_at(&cols[1], i, func)?)
             else {
                 return Ok(None);
             };
@@ -256,7 +247,10 @@ mod tests {
     fn every_grid_function_is_claimed_by_this_dispatcher_and_returns_a_scalar() {
         for f in super::super::tests::ALL {
             if handles(f) {
-                assert!(!f.returns_geometry(), "{f:?} is a grid function returning a geometry");
+                assert!(
+                    !f.returns_geometry(),
+                    "{f:?} is a grid function returning a geometry"
+                );
             }
         }
     }

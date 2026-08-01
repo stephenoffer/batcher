@@ -452,7 +452,10 @@ pub fn write_hex_wkb(g: &Geom) -> String {
 
 /// Parse hex-encoded WKB, accepting either case and an optional `0x` prefix.
 pub fn read_hex_wkb(s: &str) -> GeoResult<Geom> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     if s.len() % 2 != 0 {
         return Err(GeoError::parse("WKB", "hex string has an odd length"));
     }
@@ -485,7 +488,10 @@ mod tests {
     fn every_geometry_type_round_trips() {
         let pt = Coord::new(1.5, -2.5);
         roundtrip(Geom::new(Geometry::Point(Some(pt))));
-        roundtrip(Geom::new(Geometry::LineString(vec![pt, Coord::new(3.0, 4.0)])));
+        roundtrip(Geom::new(Geometry::LineString(vec![
+            pt,
+            Coord::new(3.0, 4.0),
+        ])));
         roundtrip(Geom::new(Geometry::Polygon(Polygon {
             exterior: vec![
                 Coord::new(0.0, 0.0),
@@ -554,13 +560,19 @@ mod tests {
         let g = Geom::new(Geometry::Point(Some(Coord::new(30.0, 10.0)))).with_srid(4326);
         let hex = write_hex_wkb(&g);
         assert_eq!(read_hex_wkb(&hex).unwrap(), g);
-        assert_eq!(read_hex_wkb(&format!("0x{}", hex.to_uppercase())).unwrap(), g);
+        assert_eq!(
+            read_hex_wkb(&format!("0x{}", hex.to_uppercase())).unwrap(),
+            g
+        );
     }
 
     #[test]
     fn empty_point_survives_the_nan_convention() {
         let g = Geom::new(Geometry::Point(None));
-        assert_eq!(read_wkb(&write_wkb(&g)).unwrap().geometry, Geometry::Point(None));
+        assert_eq!(
+            read_wkb(&write_wkb(&g)).unwrap().geometry,
+            Geometry::Point(None)
+        );
     }
 
     #[test]

@@ -343,9 +343,15 @@ mod tests {
 
     #[test]
     fn distances_agree_with_hand_computed_values() {
-        assert_eq!(point_segment_distance(c(0.0, 3.0), c(0.0, 0.0), c(4.0, 0.0)), 3.0);
+        assert_eq!(
+            point_segment_distance(c(0.0, 3.0), c(0.0, 0.0), c(4.0, 0.0)),
+            3.0
+        );
         // Past the end of the segment: measured to the endpoint, not the infinite line.
-        assert_eq!(point_segment_distance(c(-3.0, 0.0), c(0.0, 0.0), c(4.0, 0.0)), 3.0);
+        assert_eq!(
+            point_segment_distance(c(-3.0, 0.0), c(0.0, 0.0), c(4.0, 0.0)),
+            3.0
+        );
         assert_eq!(
             segment_segment_distance(c(0.0, 0.0), c(1.0, 0.0), c(0.0, 2.0), c(1.0, 2.0)),
             2.0

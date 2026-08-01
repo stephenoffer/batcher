@@ -699,28 +699,59 @@ impl GeoFunc {
             | StAsGeojson | StX | StY | StZ | StXmin | StYmin | StXmax | StYmax
             | StGeometryType | StDimension | StSrid | StNumPoints | StNumGeometries
             | StNumInteriorRings | StStartPoint | StEndPoint | StExteriorRing | StIsEmpty
-            | StIsValid | StIsValidReason | StIsClosed | StIsRing | StIsSimple
-            | StIsCollection | StHasZ | StCoordDim | StArea | StLength | StPerimeter
-            | StAreaSpheroid | StLengthSpheroid | StPerimeterSpheroid | StCentroid
-            | StEnvelope | StBoundary | StConvexHull | StPointOnSurface | StReverse
-            | StForce2d | StForcePolygonCcw | StForcePolygonCw | StFlipCoordinates
-            | GeohashDecodeLon | GeohashDecodeLat | StUtmZone => 1,
+            | StIsValid | StIsValidReason | StIsClosed | StIsRing | StIsSimple | StIsCollection
+            | StHasZ | StCoordDim | StArea | StLength | StPerimeter | StAreaSpheroid
+            | StLengthSpheroid | StPerimeterSpheroid | StCentroid | StEnvelope | StBoundary
+            | StConvexHull | StPointOnSurface | StReverse | StForce2d | StForcePolygonCcw
+            | StForcePolygonCw | StFlipCoordinates | GeohashDecodeLon | GeohashDecodeLat
+            | StUtmZone => 1,
 
             // Two: a pair of geometries, or a geometry and one parameter.
-            StPoint | StMakeLine | StSetSrid | StGeometryN | StPointN | StInteriorRingN
-            | StDistance | StMaxDistance | StHausdorffDistance | StAzimuth
-            | StDistanceSphere | StDistanceSpheroid | StIntersects | StDisjoint
-            | StContains | StWithin | StCovers | StCoveredBy | StTouches | StCrosses
-            | StOverlaps | StEquals | StIntersectsExtent | StContainsExtent | StSimplify
-            | StForce3d | StRotate | StSnapToGrid | StSegmentize | StCollect
-            | StRemoveRepeatedPoints | StLineInterpolatePoint | StLineLocatePoint
-            | StClosestPoint | StShortestLine | StGeohash | StHexCenterX | StHexCenterY
-            | StS2CellParent | StUtmEpsg => 2,
+            StPoint
+            | StMakeLine
+            | StSetSrid
+            | StGeometryN
+            | StPointN
+            | StInteriorRingN
+            | StDistance
+            | StMaxDistance
+            | StHausdorffDistance
+            | StAzimuth
+            | StDistanceSphere
+            | StDistanceSpheroid
+            | StIntersects
+            | StDisjoint
+            | StContains
+            | StWithin
+            | StCovers
+            | StCoveredBy
+            | StTouches
+            | StCrosses
+            | StOverlaps
+            | StEquals
+            | StIntersectsExtent
+            | StContainsExtent
+            | StSimplify
+            | StForce3d
+            | StRotate
+            | StSnapToGrid
+            | StSegmentize
+            | StCollect
+            | StRemoveRepeatedPoints
+            | StLineInterpolatePoint
+            | StLineLocatePoint
+            | StClosestPoint
+            | StShortestLine
+            | StGeohash
+            | StHexCenterX
+            | StHexCenterY
+            | StS2CellParent
+            | StUtmEpsg => 2,
 
             // Three.
             StPointZ | StDwithin | StDwithinSphere | StBuffer | StTranslate | StScale
-            | StExpand | StLineSubstring | StProject | StTransform | GeohashEncode
-            | StTileX | StTileY | StQuadkey | StS2Cell | StHexBin => 3,
+            | StExpand | StLineSubstring | StProject | StTransform | GeohashEncode | StTileX
+            | StTileY | StQuadkey | StS2Cell | StHexBin => 3,
 
             // Four and up.
             StMakeEnvelope => 4,

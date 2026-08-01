@@ -229,8 +229,12 @@ impl Bbox {
     /// spatial-join prefilter: a pair whose boxes are further apart than the radius
     /// cannot possibly satisfy the predicate, so the expensive test never runs.
     pub fn distance(&self, other: &Bbox) -> f64 {
-        let dx = (other.xmin - self.xmax).max(self.xmin - other.xmax).max(0.0);
-        let dy = (other.ymin - self.ymax).max(self.ymin - other.ymax).max(0.0);
+        let dx = (other.xmin - self.xmax)
+            .max(self.xmin - other.xmax)
+            .max(0.0);
+        let dy = (other.ymin - self.ymax)
+            .max(self.ymin - other.ymax)
+            .max(0.0);
         (dx * dx + dy * dy).sqrt()
     }
 
@@ -677,12 +681,12 @@ mod tests {
 
     #[test]
     fn geometry_n_is_one_based_and_simple_geometries_have_one_member() {
-        let g = Geometry::MultiPoint(vec![
-            Some(Coord::new(0.0, 0.0)),
-            Some(Coord::new(1.0, 1.0)),
-        ]);
+        let g = Geometry::MultiPoint(vec![Some(Coord::new(0.0, 0.0)), Some(Coord::new(1.0, 1.0))]);
         assert_eq!(g.geometry_n(0), None);
-        assert_eq!(g.geometry_n(1), Some(Geometry::Point(Some(Coord::new(0.0, 0.0)))));
+        assert_eq!(
+            g.geometry_n(1),
+            Some(Geometry::Point(Some(Coord::new(0.0, 0.0))))
+        );
         assert_eq!(g.geometry_n(3), None);
         let p = Geometry::Point(Some(Coord::new(2.0, 2.0)));
         assert_eq!(p.geometry_n(1), Some(p.clone()));

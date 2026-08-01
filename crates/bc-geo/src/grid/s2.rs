@@ -208,9 +208,8 @@ pub fn range(id: u64) -> Option<(u64, u64)> {
 
 /// The centre of a cell as lon/lat.
 pub fn cell_center(id: u64) -> GeoResult<Coord> {
-    let level = level_of(id).ok_or_else(|| {
-        GeoError::parse("s2", format!("{id} is not a valid S2 cell id"))
-    })?;
+    let level = level_of(id)
+        .ok_or_else(|| GeoError::parse("s2", format!("{id} is not a valid S2 cell id")))?;
     let (face, i, j) = to_face_ij(id);
     // The centre of a level-`l` cell sits at the midpoint of its leaf-index span.
     let shift = MAX_LEVEL - level;
@@ -228,9 +227,8 @@ pub fn cell_center(id: u64) -> GeoResult<Coord> {
 /// enclosing box and is strictly larger than the cell. Sound as a prefilter, wrong as
 /// a description of the cell's shape — which is why it is named for the box.
 pub fn cell_bbox(id: u64) -> GeoResult<Bbox> {
-    let level = level_of(id).ok_or_else(|| {
-        GeoError::parse("s2", format!("{id} is not a valid S2 cell id"))
-    })?;
+    let level = level_of(id)
+        .ok_or_else(|| GeoError::parse("s2", format!("{id} is not a valid S2 cell id")))?;
     let (face, i, j) = to_face_ij(id);
     let shift = MAX_LEVEL - level;
     let base_i = (i >> shift) << shift;
@@ -279,7 +277,11 @@ mod tests {
                 assert_eq!(level_of(id), Some(level), "level round trip at {level}");
                 let c = cell_center(id).unwrap();
                 // The centre of the containing cell re-encodes to the same cell.
-                assert_eq!(cell_id(c.x, c.y, level).unwrap(), id, "({lon}, {lat}) @ {level}");
+                assert_eq!(
+                    cell_id(c.x, c.y, level).unwrap(),
+                    id,
+                    "({lon}, {lat}) @ {level}"
+                );
             }
         }
     }
@@ -291,7 +293,10 @@ mod tests {
             let p = parent(leaf, level).unwrap();
             assert_eq!(level_of(p), Some(level));
             let (lo, hi) = range(p).unwrap();
-            assert!(lo <= leaf && leaf <= hi, "level {level} range must contain the leaf");
+            assert!(
+                lo <= leaf && leaf <= hi,
+                "level {level} range must contain the leaf"
+            );
             // A finer ancestor's range nests inside a coarser one's.
             if level > 0 {
                 let (plo, phi) = range(parent(leaf, level - 1).unwrap()).unwrap();

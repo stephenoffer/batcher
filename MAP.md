@@ -846,7 +846,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 
 | module | lines | what it is |
 |---|---|---|
-| `join.py` | 476 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
+| `join.py` | 433 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
 | `sort.py` | 277 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
 | `window.py` | 162 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
@@ -2545,9 +2545,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/cast.rs` | 446 | `cast` evaluation with DuckDB float→int rounding semantics. |
 | `eval/dispatch.rs` | 405 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
-| `eval/geo/build.rs` | 385 | The geometry-returning functions: constructors, transforms, derived shapes. |
-| `eval/geo/grid.rs` | 241 | The grid and reference-system functions, which take plain numbers rather than geometry. |
-| `eval/geo/mod.rs` | 339 | Evaluation of the `Expr::Geo` variant — the array-level half of geospatial support. |
+| `eval/geo/build.rs` | 374 | The geometry-returning functions: constructors, transforms, derived shapes. |
+| `eval/geo/grid.rs` | 232 | The grid and reference-system functions, which take plain numbers rather than geometry. |
+| `eval/geo/mod.rs` | 320 | Evaluation of the `Expr::Geo` variant — the array-level half of geospatial support. |
 | `eval/geo/scalar.rs` | 347 | The scalar-returning geospatial functions: accessors, measures, predicates, codecs. |
 | `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
 | `eval/in_list.rs` | 243 | `x IN (lit, lit, …)` — hash-set membership. |
@@ -2595,7 +2595,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1675 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1706 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 412 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
@@ -2702,30 +2702,30 @@ The opaque-operator boundary + dynamic-batching machinery for the UDF / ML infer
 
 | file | lines | what it is |
 |---|---|---|
-| `algo/affine.rs` | 114 | Affine transforms and grid snapping. |
-| `algo/construct.rs` | 460 | Geometries derived from other geometries — hulls, envelopes, buffers, simplification. |
+| `algo/affine.rs` | 120 | Affine transforms and grid snapping. |
+| `algo/construct.rs` | 469 | Geometries derived from other geometries — hulls, envelopes, buffers, simplification. |
 | `algo/linear.rs` | 252 | Linear referencing — positions along a chain, expressed as a fraction of its length. |
-| `algo/measure.rs` | 314 | Planar measurements — area, length, distance, azimuth. |
+| `algo/measure.rs` | 316 | Planar measurements — area, length, distance, azimuth. |
 | `algo/mod.rs` | 16 | Planar geometry algorithms, grouped by what they answer. |
-| `algo/predicate.rs` | 389 | The OGC spatial predicates. |
+| `algo/predicate.rs` | 392 | The OGC spatial predicates. |
 | `algo/primitive.rs` | 246 | The handful of primitives every planar algorithm in the crate is built from. |
 | `algo/relate.rs` | 239 | Locating a point against a geometry, and noding a line against one. |
-| `algo/validity.rs` | 272 | OGC validity — and, more usefully, *why* a geometry is invalid. |
-| `codec/geojson.rs` | 305 | GeoJSON — the interchange encoding, and the one a web map speaks. |
+| `algo/validity.rs` | 268 | OGC validity — and, more usefully, *why* a geometry is invalid. |
+| `codec/geojson.rs` | 310 | GeoJSON — the interchange encoding, and the one a web map speaks. |
 | `codec/mod.rs` | 10 | The three geometry encodings — binary on the wire, text for humans, JSON for maps. |
-| `codec/wkb.rs` | 472 | WKB — the binary encoding a geometry column is actually stored in. |
+| `codec/wkb.rs` | 475 | WKB — the binary encoding a geometry column is actually stored in. |
 | `codec/wkt.rs` | 482 | WKT — the human-readable geometry spelling, and the one users type. |
 | `error.rs` | 64 | The one error type every `bc-geo` entry point returns. |
-| `grid/geohash.rs` | 199 | Geohash — a lon/lat position as a short base-32 string. |
-| `grid/hexbin.rs` | 160 | Hexagonal binning on a projected plane. |
+| `grid/geohash.rs` | 201 | Geohash — a lon/lat position as a short base-32 string. |
+| `grid/hexbin.rs` | 166 | Hexagonal binning on a projected plane. |
 | `grid/mod.rs` | 20 | Discrete spatial grids — the bridge from continuous coordinates to a group key. |
-| `grid/s2.rs` | 263 | S2 cell identifiers — Google's spherical cell hierarchy, as BigQuery and many geospatial warehouses index by. |
-| `grid/tile.rs` | 200 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
+| `grid/s2.rs` | 261 | S2 cell identifiers — Google's spherical cell hierarchy, as BigQuery and many geospatial warehouses index by. |
+| `grid/tile.rs` | 201 | Slippy-map tiles and Bing quadkeys — the grid every map tile server is indexed by. |
 | `lib.rs` | 79 | `bc-geo` — the geometry data plane: codecs, planar algorithms, grids, projections. |
-| `proj/crs.rs` | 350 | Coordinate reference system transforms, for a deliberately small set of systems. |
-| `proj/geodesy.rs` | 283 | Distances and areas on the Earth, in metres. |
+| `proj/crs.rs` | 353 | Coordinate reference system transforms, for a deliberately small set of systems. |
+| `proj/geodesy.rs` | 287 | Distances and areas on the Earth, in metres. |
 | `proj/mod.rs` | 10 | Answers about the Earth rather than about the coordinate plane. |
-| `types.rs` | 606 | The geometry model — one `Geometry` value every codec and algorithm speaks. |
+| `types.rs` | 610 | The geometry model — one `Geometry` value every codec and algorithm speaks. |
 
 ### `bc-secrets`
 

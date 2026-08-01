@@ -24,11 +24,7 @@ pub(super) fn handles(func: GeoFunc) -> bool {
 }
 
 /// Evaluate a geometry-returning function over `rows` rows of `cols`.
-pub(super) fn eval(
-    func: GeoFunc,
-    cols: &[ArrayRef],
-    rows: usize,
-) -> Result<ArrayRef, ExprError> {
+pub(super) fn eval(func: GeoFunc, cols: &[ArrayRef], rows: usize) -> Result<ArrayRef, ExprError> {
     let mut out = GeomOut::with_capacity(rows);
     for i in 0..rows {
         out.push(one(func, cols, i)?.as_ref());
@@ -67,7 +63,9 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             else {
                 return Ok(None);
             };
-            return Ok(Some(Geom::new(Geometry::Point(Some(bc_geo::Coord::new(x, y))))));
+            return Ok(Some(Geom::new(Geometry::Point(Some(bc_geo::Coord::new(
+                x, y,
+            ))))));
         }
         StPointZ => {
             let (Some(x), Some(y), Some(z)) = (
@@ -156,9 +154,7 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             let Some(n) = i64_at(&cols[1], i, func)? else {
                 return Ok(None);
             };
-            g.geometry
-                .geometry_n(n.max(0) as usize)
-                .and_then(rebuilt)
+            g.geometry.geometry_n(n.max(0) as usize).and_then(rebuilt)
         }
         StPointN => {
             let Some(n) = i64_at(&cols[1], i, func)? else {
@@ -204,14 +200,10 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             if segs <= 0 {
                 return Err(caller_error(
                     func,
-                    bc_geo::GeoError::invalid(format!(
-                        "quad_segs must be positive, got {segs}"
-                    )),
+                    bc_geo::GeoError::invalid(format!("quad_segs must be positive, got {segs}")),
                 ));
             }
-            rebuilt(
-                construct::buffer(&g, r, segs as usize).map_err(|e| caller_error(func, e))?,
-            )
+            rebuilt(construct::buffer(&g, r, segs as usize).map_err(|e| caller_error(func, e))?)
         }
         StSimplify => {
             let eps = num_arg!(func, cols, 1, i);
@@ -273,9 +265,7 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
         }
         StSegmentize => {
             let max_len = num_arg!(func, cols, 1, i);
-            rebuilt(
-                linear::segmentize(&g.geometry, max_len).map_err(|e| caller_error(func, e))?,
-            )
+            rebuilt(linear::segmentize(&g.geometry, max_len).map_err(|e| caller_error(func, e))?)
         }
         StExpand => {
             let (dx, dy) = (num_arg!(func, cols, 1, i), num_arg!(func, cols, 2, i));
@@ -338,9 +328,8 @@ fn one(func: GeoFunc, cols: &[ArrayRef], i: usize) -> Result<Option<Geom>, ExprE
             else {
                 return Ok(None);
             };
-            let geometry =
-                bc_geo::proj::crs::transform(&g.geometry, from as i32, to as i32)
-                    .map_err(|e| caller_error(func, e))?;
+            let geometry = bc_geo::proj::crs::transform(&g.geometry, from as i32, to as i32)
+                .map_err(|e| caller_error(func, e))?;
             Some(Geom {
                 srid: to as i32,
                 has_z,

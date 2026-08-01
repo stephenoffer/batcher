@@ -107,10 +107,16 @@ pub fn hex_polygon(h: Hex, size: f64) -> GeoResult<Geometry> {
 pub fn hex_neighbors(h: Hex) -> [Hex; 6] {
     [
         Hex { q: h.q + 1, r: h.r },
-        Hex { q: h.q + 1, r: h.r - 1 },
+        Hex {
+            q: h.q + 1,
+            r: h.r - 1,
+        },
         Hex { q: h.q, r: h.r - 1 },
         Hex { q: h.q - 1, r: h.r },
-        Hex { q: h.q - 1, r: h.r + 1 },
+        Hex {
+            q: h.q - 1,
+            r: h.r + 1,
+        },
         Hex { q: h.q, r: h.r + 1 },
     ]
 }
@@ -161,8 +167,8 @@ pub fn hex_area(size: f64) -> GeoResult<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::algo::relate::point_in_polygon;
     use crate::algo::primitive::PointRing;
+    use crate::algo::relate::point_in_polygon;
 
     #[test]
     fn a_point_is_binned_to_the_hexagon_whose_centre_is_nearest() {

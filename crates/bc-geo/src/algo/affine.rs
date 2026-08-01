@@ -65,7 +65,13 @@ pub fn affine(g: &Geometry, a: f64, b: f64, d: f64, e: f64, xoff: f64, yoff: f64
 /// Snapping can move two distinct vertices onto one position. That is the intended
 /// effect and it can leave a ring with repeated points; run
 /// `construct::remove_repeated_points` after if the result feeds an areal predicate.
-pub fn snap_to_grid(g: &Geometry, size_x: f64, size_y: f64, ox: f64, oy: f64) -> GeoResult<Geometry> {
+pub fn snap_to_grid(
+    g: &Geometry,
+    size_x: f64,
+    size_y: f64,
+    ox: f64,
+    oy: f64,
+) -> GeoResult<Geometry> {
     if size_x.is_nan() || size_y.is_nan() || size_x <= 0.0 || size_y <= 0.0 {
         return Err(GeoError::invalid(format!(
             "grid cell size must be positive, got ({size_x}, {size_y})"
@@ -128,7 +134,10 @@ mod tests {
 
     #[test]
     fn translate_and_scale_compose_as_expected() {
-        assert_eq!(wkt(translate(&geom("POINT(1 2)"), 3.0, 4.0, 0.0)), "POINT(4 6)");
+        assert_eq!(
+            wkt(translate(&geom("POINT(1 2)"), 3.0, 4.0, 0.0)),
+            "POINT(4 6)"
+        );
         assert_eq!(wkt(scale(&geom("POINT(2 3)"), 2.0, 3.0, 1.0)), "POINT(4 9)");
     }
 

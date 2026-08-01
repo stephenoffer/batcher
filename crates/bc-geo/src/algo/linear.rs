@@ -279,16 +279,22 @@ mod tests {
 
     #[test]
     fn interpolate_lands_where_hand_computation_says() {
-        assert_eq!(wkt(interpolate_point(&geom(L), 0.5).unwrap()), "POINT(10 0)");
+        assert_eq!(
+            wkt(interpolate_point(&geom(L), 0.5).unwrap()),
+            "POINT(10 0)"
+        );
         assert_eq!(wkt(interpolate_point(&geom(L), 0.0).unwrap()), "POINT(0 0)");
-        assert_eq!(wkt(interpolate_point(&geom(L), 1.0).unwrap()), "POINT(10 10)");
+        assert_eq!(
+            wkt(interpolate_point(&geom(L), 1.0).unwrap()),
+            "POINT(10 10)"
+        );
         assert!(interpolate_point(&geom(L), 1.5).is_err());
     }
 
     #[test]
     fn a_multi_chain_is_refused_rather_than_answered_arbitrarily() {
-        let err = interpolate_point(&geom("MULTILINESTRING((0 0, 1 0), (5 5, 6 5))"), 0.5)
-            .unwrap_err();
+        let err =
+            interpolate_point(&geom("MULTILINESTRING((0 0, 1 0), (5 5, 6 5))"), 0.5).unwrap_err();
         assert!(matches!(err, GeoError::Unsupported { .. }), "{err:?}");
     }
 
@@ -297,7 +303,10 @@ mod tests {
         let s = substring(&geom(L), 0.25, 0.75).unwrap();
         assert_eq!(wkt(s), "LINESTRING(5 0, 10 0, 10 5)");
         // Reversed fractions are normalized rather than producing an empty result.
-        assert_eq!(wkt(substring(&geom(L), 0.75, 0.25).unwrap()), "LINESTRING(5 0, 10 0, 10 5)");
+        assert_eq!(
+            wkt(substring(&geom(L), 0.75, 0.25).unwrap()),
+            "LINESTRING(5 0, 10 0, 10 5)"
+        );
     }
 
     #[test]

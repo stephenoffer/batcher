@@ -23,10 +23,7 @@ pub fn envelope(g: &Geom) -> Geometry {
         return Geometry::Point(Some(Coord::new(b.xmin, b.ymin)));
     }
     if b.xmin == b.xmax || b.ymin == b.ymax {
-        return Geometry::LineString(vec![
-            Coord::new(b.xmin, b.ymin),
-            Coord::new(b.xmax, b.ymax),
-        ]);
+        return Geometry::LineString(vec![Coord::new(b.xmin, b.ymin), Coord::new(b.xmax, b.ymax)]);
     }
     Geometry::Polygon(Polygon {
         exterior: b.to_ring(),
@@ -37,7 +34,13 @@ pub fn envelope(g: &Geom) -> Geometry {
 /// A rectangle from explicit bounds. Errors when the bounds are inverted, which is
 /// almost always a swapped-argument bug rather than an intentional empty box.
 pub fn make_envelope(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> GeoResult<Geometry> {
-    if xmin.is_nan() || ymin.is_nan() || xmax.is_nan() || ymax.is_nan() || xmin > xmax || ymin > ymax {
+    if xmin.is_nan()
+        || ymin.is_nan()
+        || xmax.is_nan()
+        || ymax.is_nan()
+        || xmin > xmax
+        || ymin > ymax
+    {
         return Err(GeoError::invalid(format!(
             "envelope bounds are inverted: xmin {xmin} > xmax {xmax} or ymin {ymin} > ymax {ymax}"
         )));
@@ -180,11 +183,7 @@ pub fn simplify(g: &Geometry, eps: f64) -> GeoResult<Geometry> {
 fn simplify_polygon(p: &Polygon, eps: f64) -> Polygon {
     Polygon {
         exterior: simplify_ring(&p.exterior, eps),
-        interiors: p
-            .interiors
-            .iter()
-            .map(|r| simplify_ring(r, eps))
-            .collect(),
+        interiors: p.interiors.iter().map(|r| simplify_ring(r, eps)).collect(),
     }
 }
 
@@ -264,18 +263,28 @@ pub fn remove_repeated_points(g: &Geometry, tolerance: f64) -> Geometry {
         }
         Geometry::Polygon(p) => Geometry::Polygon(Polygon {
             exterior: thin_ring(&p.exterior, tolerance),
-            interiors: p.interiors.iter().map(|r| thin_ring(r, tolerance)).collect(),
+            interiors: p
+                .interiors
+                .iter()
+                .map(|r| thin_ring(r, tolerance))
+                .collect(),
         }),
         Geometry::MultiPolygon(ps) => Geometry::MultiPolygon(
             ps.iter()
                 .map(|p| Polygon {
                     exterior: thin_ring(&p.exterior, tolerance),
-                    interiors: p.interiors.iter().map(|r| thin_ring(r, tolerance)).collect(),
+                    interiors: p
+                        .interiors
+                        .iter()
+                        .map(|r| thin_ring(r, tolerance))
+                        .collect(),
                 })
                 .collect(),
         ),
         Geometry::GeometryCollection(gs) => Geometry::GeometryCollection(
-            gs.iter().map(|c| remove_repeated_points(c, tolerance)).collect(),
+            gs.iter()
+                .map(|c| remove_repeated_points(c, tolerance))
+                .collect(),
         ),
         other => other.clone(),
     }
@@ -564,8 +573,15 @@ mod tests {
         let ccw = force_winding(&p.geometry, true);
         let poly = ccw.polygons()[0];
         assert!(is_ccw(&poly.exterior));
-        assert!(!is_ccw(&poly.interiors[0]), "a hole winds against its shell");
-        assert_eq!(area(&ccw), area(&p.geometry), "winding is not an area change");
+        assert!(
+            !is_ccw(&poly.interiors[0]),
+            "a hole winds against its shell"
+        );
+        assert_eq!(
+            area(&ccw),
+            area(&p.geometry),
+            "winding is not an area change"
+        );
     }
 
     #[test]
@@ -579,7 +595,10 @@ mod tests {
     #[test]
     fn collect_produces_the_narrowest_container() {
         assert_eq!(
-            wkt(collect(&g("POINT(0 0)").geometry, &g("POINT(1 1)").geometry)),
+            wkt(collect(
+                &g("POINT(0 0)").geometry,
+                &g("POINT(1 1)").geometry
+            )),
             "MULTIPOINT((0 0), (1 1))"
         );
         assert_eq!(
@@ -593,10 +612,8 @@ mod tests {
 
     #[test]
     fn repeated_points_are_dropped_without_unclosing_a_ring() {
-        let out = remove_repeated_points(
-            &g("POLYGON((0 0, 0 0, 4 0, 4 4, 0 4, 0 0))").geometry,
-            0.0,
-        );
+        let out =
+            remove_repeated_points(&g("POLYGON((0 0, 0 0, 4 0, 4 4, 0 4, 0 0))").geometry, 0.0);
         assert_eq!(wkt(out), "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))");
     }
 }

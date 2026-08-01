@@ -56,7 +56,11 @@ pub fn utm_epsg(lon: f64, lat: f64) -> GeoResult<i32> {
         )));
     }
     let zone = utm_zone(lon)? as i32;
-    Ok(if lat >= 0.0 { 32600 + zone } else { 32700 + zone })
+    Ok(if lat >= 0.0 {
+        32600 + zone
+    } else {
+        32700 + zone
+    })
 }
 
 /// Split a UTM EPSG code into its zone and hemisphere.
@@ -178,7 +182,9 @@ fn from_utm(easting: f64, northing: f64, zone: u32, north: bool) -> Coord {
                     / 720.0);
     let lam = lon0
         + (d - (1.0 + 2.0 * t1 + c1) * d.powi(3) / 6.0
-            + (5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1 + 8.0 * E2 / (1.0 - E2) + 24.0 * t1 * t1)
+            + (5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1
+                + 8.0 * E2 / (1.0 - E2)
+                + 24.0 * t1 * t1)
                 * d.powi(5)
                 / 120.0)
             / phi1.cos();
@@ -193,10 +199,7 @@ fn to_equal_area(lon: f64, lat: f64) -> Coord {
     let phi0 = EASE_STD_PARALLEL;
     let k0 = phi0.cos() / (1.0 - E2 * phi0.sin().powi(2)).sqrt();
     let q = authalic_q(lat.to_radians());
-    Coord::new(
-        WGS84_A * k0 * lon.to_radians(),
-        WGS84_A * q / (2.0 * k0),
-    )
+    Coord::new(WGS84_A * k0 * lon.to_radians(), WGS84_A * q / (2.0 * k0))
 }
 
 /// Invert `to_equal_area`.
@@ -358,7 +361,12 @@ mod tests {
 
     #[test]
     fn every_supported_crs_round_trips() {
-        let cases = [(-122.4194, 37.7749), (0.0, 0.0), (13.4050, 52.5200), (151.2093, -33.8688)];
+        let cases = [
+            (-122.4194, 37.7749),
+            (0.0, 0.0),
+            (13.4050, 52.5200),
+            (151.2093, -33.8688),
+        ];
         for (lon, lat) in cases {
             let utm = utm_epsg(lon, lat).unwrap();
             for epsg in [EPSG_WEB_MERCATOR, EPSG_EQUAL_AREA, utm] {
@@ -404,7 +412,10 @@ mod tests {
             let planar = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
             let geodesic = crate::proj::geodesy::vincenty(lon1, lat1, lon2, lat2).unwrap();
             let err = (planar - geodesic).abs() / geodesic;
-            assert!(err < 1e-3, "EPSG:{epsg}: {planar} vs {geodesic} ({err:.2e})");
+            assert!(
+                err < 1e-3,
+                "EPSG:{epsg}: {planar} vs {geodesic} ({err:.2e})"
+            );
         }
     }
 
@@ -420,8 +431,12 @@ mod tests {
 
     #[test]
     fn web_mercator_matches_the_tile_module() {
-        let a = transform_coord(Coord::new(-122.4194, 37.7749), EPSG_WGS84, EPSG_WEB_MERCATOR)
-            .unwrap();
+        let a = transform_coord(
+            Coord::new(-122.4194, 37.7749),
+            EPSG_WGS84,
+            EPSG_WEB_MERCATOR,
+        )
+        .unwrap();
         // The tile module uses the mean-radius sphere and this uses the WGS 84
         // semi-major axis; they agree to within that radius ratio, which is 0.13%.
         let b = crate::grid::tile::to_web_mercator(-122.4194, 37.7749).unwrap();
@@ -461,7 +476,10 @@ mod tests {
     fn an_unsupported_crs_is_refused_and_the_message_says_what_to_do() {
         let e = transform_coord(Coord::new(0.0, 0.0), EPSG_WGS84, 27700).unwrap_err();
         let msg = format!("{e}");
-        assert!(msg.contains("27700") && msg.contains("st_set_srid"), "{msg}");
+        assert!(
+            msg.contains("27700") && msg.contains("st_set_srid"),
+            "{msg}"
+        );
         assert!(!is_supported(27700));
         assert!(is_supported(32610) && is_supported(4326));
     }

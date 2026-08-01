@@ -6,7 +6,9 @@
 //! what `output_type` states and what lets the planner know a column's type before a row
 //! is read.
 
-use arrow::array::{ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
+use arrow::array::{
+    ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
+};
 use std::sync::Arc;
 
 use bc_geo::algo::{linear, measure, predicate, validity};
@@ -33,21 +35,23 @@ enum Out {
 fn output_type(func: GeoFunc) -> Out {
     use GeoFunc::*;
     match func {
-        StX | StY | StZ | StXmin | StYmin | StXmax | StYmax | StArea | StLength
-        | StPerimeter | StDistance | StMaxDistance | StHausdorffDistance | StAzimuth
-        | StDistanceSphere | StDistanceSpheroid | StAreaSpheroid | StLengthSpheroid
-        | StPerimeterSpheroid | StLineLocatePoint => Out::Float,
+        StX | StY | StZ | StXmin | StYmin | StXmax | StYmax | StArea | StLength | StPerimeter
+        | StDistance | StMaxDistance | StHausdorffDistance | StAzimuth | StDistanceSphere
+        | StDistanceSpheroid | StAreaSpheroid | StLengthSpheroid | StPerimeterSpheroid
+        | StLineLocatePoint => Out::Float,
 
-        StDimension | StSrid | StNumPoints | StNumGeometries | StNumInteriorRings
-        | StCoordDim => Out::Int,
+        StDimension | StSrid | StNumPoints | StNumGeometries | StNumInteriorRings | StCoordDim => {
+            Out::Int
+        }
 
-        StIsEmpty | StIsValid | StIsClosed | StIsRing | StIsSimple | StIsCollection
-        | StHasZ | StIntersects | StDisjoint | StContains | StWithin | StCovers
-        | StCoveredBy | StTouches | StCrosses | StOverlaps | StEquals | StDwithin
-        | StDwithinSphere | StIntersectsExtent | StContainsExtent => Out::Bool,
+        StIsEmpty | StIsValid | StIsClosed | StIsRing | StIsSimple | StIsCollection | StHasZ
+        | StIntersects | StDisjoint | StContains | StWithin | StCovers | StCoveredBy
+        | StTouches | StCrosses | StOverlaps | StEquals | StDwithin | StDwithinSphere
+        | StIntersectsExtent | StContainsExtent => Out::Bool,
 
-        StAsText | StAsEwkt | StAsHexWkb | StAsGeojson | StGeometryType
-        | StIsValidReason => Out::Text,
+        StAsText | StAsEwkt | StAsHexWkb | StAsGeojson | StGeometryType | StIsValidReason => {
+            Out::Text
+        }
 
         StAsBinary | StAsEwkb => Out::Bytes,
 
@@ -57,11 +61,7 @@ fn output_type(func: GeoFunc) -> Out {
 }
 
 /// Evaluate a scalar-returning function over `rows` rows of `cols`.
-pub(super) fn eval(
-    func: GeoFunc,
-    cols: &[ArrayRef],
-    rows: usize,
-) -> Result<ArrayRef, ExprError> {
+pub(super) fn eval(func: GeoFunc, cols: &[ArrayRef], rows: usize) -> Result<ArrayRef, ExprError> {
     if output_type(func) == Out::Bytes {
         return eval_bytes(func, cols, rows);
     }
@@ -359,7 +359,10 @@ mod tests {
             // for every unrouted function is the assertion.
             let t = output_type(f);
             assert!(
-                matches!(t, Out::Float | Out::Int | Out::Bool | Out::Text | Out::Bytes),
+                matches!(
+                    t,
+                    Out::Float | Out::Int | Out::Bool | Out::Text | Out::Bytes
+                ),
                 "{f:?}"
             );
         }

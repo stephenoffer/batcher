@@ -250,16 +250,31 @@ mod tests {
     fn a_hole_makes_the_inside_outside() {
         let p = geom("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))");
         let poly = p.polygons()[0];
-        assert_eq!(point_in_polygon(Coord::new(1.0, 1.0), poly), PointRing::Inside);
-        assert_eq!(point_in_polygon(Coord::new(5.0, 5.0), poly), PointRing::Outside);
-        assert_eq!(point_in_polygon(Coord::new(4.0, 5.0), poly), PointRing::Boundary);
+        assert_eq!(
+            point_in_polygon(Coord::new(1.0, 1.0), poly),
+            PointRing::Inside
+        );
+        assert_eq!(
+            point_in_polygon(Coord::new(5.0, 5.0), poly),
+            PointRing::Outside
+        );
+        assert_eq!(
+            point_in_polygon(Coord::new(4.0, 5.0), poly),
+            PointRing::Boundary
+        );
     }
 
     #[test]
     fn a_line_has_no_interior_in_the_plane() {
         let l = geom("LINESTRING(0 0, 10 0)");
-        assert_eq!(point_in_geometry(Coord::new(5.0, 0.0), &l), PointRing::Boundary);
-        assert_eq!(point_in_geometry(Coord::new(5.0, 1.0), &l), PointRing::Outside);
+        assert_eq!(
+            point_in_geometry(Coord::new(5.0, 0.0), &l),
+            PointRing::Boundary
+        );
+        assert_eq!(
+            point_in_geometry(Coord::new(5.0, 1.0), &l),
+            PointRing::Outside
+        );
     }
 
     #[test]

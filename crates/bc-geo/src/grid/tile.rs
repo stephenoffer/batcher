@@ -168,7 +168,8 @@ pub fn to_web_mercator(lon: f64, lat: f64) -> GeoResult<Coord> {
 /// Invert `to_web_mercator`.
 pub fn from_web_mercator(x: f64, y: f64) -> Coord {
     let lon = (x / crate::proj::geodesy::EARTH_RADIUS_M).to_degrees();
-    let lat = (2.0 * (y / crate::proj::geodesy::EARTH_RADIUS_M).exp().atan() - PI / 2.0).to_degrees();
+    let lat =
+        (2.0 * (y / crate::proj::geodesy::EARTH_RADIUS_M).exp().atan() - PI / 2.0).to_degrees();
     Coord::new(lon, lat)
 }
 
@@ -207,7 +208,11 @@ mod tests {
         // The tile containing San Francisco at zoom 12, from the OSM reference.
         assert_eq!(
             tile_of(-122.4194, 37.7749, 12).unwrap(),
-            Tile { z: 12, x: 655, y: 1583 }
+            Tile {
+                z: 12,
+                x: 655,
+                y: 1583
+            }
         );
         // Zoom 0 is one tile covering the world.
         assert_eq!(tile_of(0.0, 0.0, 0).unwrap(), Tile { z: 0, x: 0, y: 0 });
@@ -262,7 +267,12 @@ mod tests {
 
     #[test]
     fn web_mercator_round_trips_within_the_projection_limit() {
-        for (lon, lat) in [(0.0, 0.0), (-122.4194, 37.7749), (151.0, -33.0), (179.0, 84.0)] {
+        for (lon, lat) in [
+            (0.0, 0.0),
+            (-122.4194, 37.7749),
+            (151.0, -33.0),
+            (179.0, 84.0),
+        ] {
             let m = to_web_mercator(lon, lat).unwrap();
             let back = from_web_mercator(m.x, m.y);
             assert!((back.x - lon).abs() < 1e-9, "{lon} -> {}", back.x);

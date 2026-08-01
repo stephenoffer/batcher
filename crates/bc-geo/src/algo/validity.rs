@@ -48,11 +48,9 @@ pub fn is_simple(g: &Geometry) -> bool {
         Geometry::MultiLineString(ls) => ls.iter().all(|l| !self_intersects(l)),
         Geometry::MultiPoint(ps) => {
             let pts: Vec<Coord> = ps.iter().flatten().copied().collect();
-            !pts.iter().enumerate().any(|(i, a)| {
-                pts.iter()
-                    .skip(i + 1)
-                    .any(|b| a.x == b.x && a.y == b.y)
-            })
+            !pts.iter()
+                .enumerate()
+                .any(|(i, a)| pts.iter().skip(i + 1).any(|b| a.x == b.x && a.y == b.y))
         }
         Geometry::GeometryCollection(gs) => gs.iter().all(is_simple),
         _ => true,
@@ -207,7 +205,9 @@ fn polygon_reason(p: &Polygon) -> Option<String> {
             exterior: p.exterior.clone(),
             interiors: Vec::new(),
         };
-        if let Some(c) = hole.iter().find(|c| point_in_polygon(**c, &shell) == PointRing::Outside)
+        if let Some(c) = hole
+            .iter()
+            .find(|c| point_in_polygon(**c, &shell) == PointRing::Outside)
         {
             return Some(format!(
                 "interior ring {} lies outside the exterior ring at ({}, {})",
@@ -226,11 +226,7 @@ fn polygon_reason(p: &Polygon) -> Option<String> {
                 interiors: Vec::new(),
             };
             if polygons_overlap(&hole_poly, &other_poly) {
-                return Some(format!(
-                    "interior rings {} and {} overlap",
-                    i + 1,
-                    j + 1
-                ));
+                return Some(format!("interior rings {} and {} overlap", i + 1, j + 1));
             }
         }
     }

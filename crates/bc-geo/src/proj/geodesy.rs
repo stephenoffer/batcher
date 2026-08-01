@@ -88,8 +88,7 @@ pub fn destination(lon: f64, lat: f64, bearing_deg: f64, distance_m: f64) -> Geo
     let p1 = lat.to_radians();
     let l1 = lon.to_radians();
     let p2 = (p1.sin() * d.cos() + p1.cos() * d.sin() * brg.cos()).asin();
-    let l2 = l1
-        + (brg.sin() * d.sin() * p1.cos()).atan2(d.cos() - p1.sin() * p2.sin());
+    let l2 = l1 + (brg.sin() * d.sin() * p1.cos()).atan2(d.cos() - p1.sin() * p2.sin());
     // Normalize longitude into [-180, 180] so a route crossing the date line produces a
     // coordinate the rest of the stack accepts.
     let lon2 = (l2.to_degrees() + 540.0) % 360.0 - 180.0;
@@ -122,9 +121,8 @@ pub fn vincenty(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
     let mut cos2_sigma_m;
     for _ in 0..200 {
         let (sin_l, cos_l) = lambda.sin_cos();
-        sin_sigma = ((cos_u2 * sin_l).powi(2)
-            + (cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_l).powi(2))
-        .sqrt();
+        sin_sigma =
+            ((cos_u2 * sin_l).powi(2) + (cos_u1 * sin_u2 - sin_u1 * cos_u2 * cos_l).powi(2)).sqrt();
         if sin_sigma == 0.0 {
             return Ok(0.0); // coincident points
         }
@@ -149,8 +147,8 @@ pub fn vincenty(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
                             + c * cos_sigma * (-1.0 + 2.0 * cos2_sigma_m * cos2_sigma_m)));
         if (lambda - lambda_prev).abs() < 1e-12 {
             let u_sq = cos_sq_alpha * (WGS84_A * WGS84_A - WGS84_B * WGS84_B) / (WGS84_B * WGS84_B);
-            let a = 1.0
-                + u_sq / 16384.0 * (4096.0 + u_sq * (-768.0 + u_sq * (320.0 - 175.0 * u_sq)));
+            let a =
+                1.0 + u_sq / 16384.0 * (4096.0 + u_sq * (-768.0 + u_sq * (320.0 - 175.0 * u_sq)));
             let b = u_sq / 1024.0 * (256.0 + u_sq * (-128.0 + u_sq * (74.0 - 47.0 * u_sq)));
             let delta_sigma = b
                 * sin_sigma
@@ -186,7 +184,11 @@ pub fn rhumb_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f
     let dpsi = ((p2 / 2.0 + std::f64::consts::FRAC_PI_4).tan()
         / (p1 / 2.0 + std::f64::consts::FRAC_PI_4).tan())
     .ln();
-    let q = if dpsi.abs() > 1e-12 { dp / dpsi } else { p1.cos() };
+    let q = if dpsi.abs() > 1e-12 {
+        dp / dpsi
+    } else {
+        p1.cos()
+    };
     // Always take the shorter way round the globe.
     if dl.abs() > std::f64::consts::PI {
         dl = if dl > 0.0 {
@@ -247,14 +249,16 @@ pub fn ring_area_m2(ring: &[Coord]) -> f64 {
 
 /// The geodesic area of a whole geometry in square metres, holes subtracted.
 pub fn geodesic_area_m2(g: &crate::types::Geometry) -> f64 {
-    crate::types::measurement(g.polygons()
-        .iter()
-        .map(|p| {
-            let shell = ring_area_m2(&p.exterior);
-            let holes: f64 = p.interiors.iter().map(|r| ring_area_m2(r)).sum();
-            (shell - holes).max(0.0)
-        })
-        .sum())
+    crate::types::measurement(
+        g.polygons()
+            .iter()
+            .map(|p| {
+                let shell = ring_area_m2(&p.exterior);
+                let holes: f64 = p.interiors.iter().map(|r| ring_area_m2(r)).sum();
+                (shell - holes).max(0.0)
+            })
+            .sum(),
+    )
 }
 
 /// The geodesic length of every chain of a geometry in metres.
@@ -294,7 +298,11 @@ mod tests {
     #[test]
     fn known_distances_match_published_values() {
         // London to New York: 5570 km great circle.
-        close(haversine(-0.1278, 51.5074, -74.0060, 40.7128).unwrap(), 5_570_000.0, 0.5);
+        close(
+            haversine(-0.1278, 51.5074, -74.0060, 40.7128).unwrap(),
+            5_570_000.0,
+            0.5,
+        );
         // One degree of latitude at the equator: about 111.2 km.
         close(haversine(0.0, 0.0, 0.0, 1.0).unwrap(), 111_195.0, 0.1);
         // The same two points are zero apart.
@@ -327,7 +335,10 @@ mod tests {
                 let p = destination(lon, lat, brg, d).unwrap();
                 close(haversine(lon, lat, p.x, p.y).unwrap(), d, 0.01);
                 let back = bearing(lon, lat, p.x, p.y).unwrap();
-                assert!((back - brg).abs() < 1e-6 || (back - brg).abs() > 359.999, "{back} vs {brg}");
+                assert!(
+                    (back - brg).abs() < 1e-6 || (back - brg).abs() > 359.999,
+                    "{back} vs {brg}"
+                );
             }
         }
     }
@@ -386,7 +397,10 @@ mod tests {
                 Coord::new(0.0, lat),
             ])
         };
-        assert!(cell(60.0) < cell(0.0) * 0.6, "a high-latitude cell covers less ground");
+        assert!(
+            cell(60.0) < cell(0.0) * 0.6,
+            "a high-latitude cell covers less ground"
+        );
     }
 
     #[test]
