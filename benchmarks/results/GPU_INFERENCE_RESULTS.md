@@ -144,12 +144,41 @@ before anyone plans against it. TPC-H sf1, four T4s, 16 partitions, against Duck
 | competitive | 8 of 22 within 0.74-1.28x (q1, q3, q5, q6, q10, q12, q14, q19) |
 | device use | **one** GPU at 12-14%; the other three at 0.0% |
 
-Two of those are understood. The errors are a projection applied to a staged intermediate
-whose schema no longer carries the column (`dist/fleet/source.py` selects `p_partkey` from a
-shuffle bucket that does not have it). The single-device use is that sf1 is far too small for
-this path: q1 takes 1.3 s against DuckDB's 47 ms, almost all of it fan-out and shuffle, with
-the kernels themselves a rounding error — so the oversubscribed shard fan-out never has enough
-work to reach a second device. Neither is a scheduling problem the packing loop can solve.
+### The errors were a ticket collision, and they are the *distributed* path's, not the GPU's
+
+The same queries fail with `backend="cpu", distributed=True`, so this was never a GPU bug. A
+shuffle bucket is addressed by `(plan, stage, src, dst, epoch)`, and the stage was a literal:
+every published result used one constant, both sides of every join used 0 and 1, and every
+aggregate used 0. The plan id fences one *query* from another; nothing fenced two shuffles of
+the **same** query, so their tickets were byte-identical on the same worker.
+
+TPC-H q9 materializes `part x lineitem` and `supplier x nation` on one fleet. The join that
+read the first bucket was handed `n_name, n_nationkey, s_nationkey, s_suppkey` where it had
+asked for `p_partkey, l_*`. It surfaced as a projection `KeyError` three frames from the
+cause; siblings surfaced as a phantom "shuffle did not recover after 3 attempts", because a
+map-side failure is reported by the recovery loop as an unreachable worker.
+
+Every shuffle now takes its own stage block (`fleet.plan_id.next_stage_base`). Measured on
+the identical command, TPC-H sf1 distributed over four workers at 16 partitions:
+
+| | pre-session (`f4c22e0`) | now |
+|---|---|---|
+| ticket-collision `KeyError` | q9, q20, q21 | **none** |
+| q21 | PARTIAL | **OK** |
+| `PlanError` (unsupported shape) | q4, q22 | q4, q9, q20, q22 |
+| unreachable shuffle worker | q2, q7, q8, q11 | q2, q7, q8, q11 (unchanged) |
+| failing | 9 | 8 |
+
+q9 and q20 moved from silently reading another join's buckets to failing honestly on a plan
+shape the distributed executor genuinely has no path for. The four `ResourceError` queries and
+q4/q22's `PlanError` are exactly as they were before this session.
+
+### The single-device use is scale, not scheduling
+
+sf1 is far too small for this path: q1 takes 1.3 s against DuckDB's 47 ms, almost all of it
+fan-out and shuffle, with the kernels themselves a rounding error — so the oversubscribed
+shard fan-out never has enough work to reach a second device. sf10 could not be measured
+here: the harness materializes its tables in the driver and that OOMs a 30 GB head node.
 
 **A deadlock was fixed to get this far.** Ray gives a task `num_cpus=1` by default, and a GPU
 relational shard took that default; the shuffle fleet takes its workers in a placement group,
