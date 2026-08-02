@@ -354,7 +354,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `_metadata.py` | 493 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 822 | Terminal/materialization operations for `Dataset`. |
-| `distributed_stream.py` | 116 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
+| `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 412 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `map_stream.py` | 141 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 113 | Emit a query's execution profile as OpenTelemetry spans. |
@@ -654,11 +654,11 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 |---|---|---|
 | `agg_rewrites.py` | 139 | Aggregate pre-pass rewrites for the SQL translator. |
 | `clauses.py` | 287 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
-| `core_utils.py` | 279 | Small stateless AST helpers shared across translator theme modules. |
+| `core_utils.py` | 297 | Small stateless AST helpers shared across translator theme modules. |
 | `from_clause.py` | 428 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
-| `grouping.py` | 406 | Grouping, aggregation, and projection mapping for the SQL translator. |
+| `grouping.py` | 432 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 126 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
-| `translator.py` | 397 | The `_Translator` skeleton plus the public `sql()` entry point. |
+| `translator.py` | 401 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 199 | Registered-Python-function support for the SQL translator. |
 | `windowing.py` | 443 | Window-function handling for the SQL translator. |
 
@@ -990,7 +990,7 @@ Algebraic rewrites: small, local, unconditionally semantics-preserving simplific
 
 | module | lines | what it is |
 |---|---|---|
-| `disjunctions.py` | 223 | Rewrites of a disjunction — factoring an `OR`, and folding one into `IN`. |
+| `disjunctions.py` | 255 | Rewrites of a disjunction — factoring an `OR`, and folding one into `IN`. |
 | `identities.py` | 324 | Algebraic relational identities — small, local, always-correct simplifications. |
 
 ### `batcher/kyber/rules/collections_algebra/` — 3 · subsystem
@@ -2026,14 +2026,14 @@ The geospatial function family: PostGIS-named `ST_*` functions over WKB geometry
 | module | lines | what it is |
 |---|---|---|
 | `_build.py` | 86 | The one builder every geospatial function is written in terms of. |
-| `accessors.py` | 409 | Reading the parts of a geometry: ordinates, bounds, type, and counts. |
-| `codecs.py` | 292 | Reading a geometry in, and writing one back out. |
+| `accessors.py` | 423 | Reading the parts of a geometry: ordinates, bounds, type, and counts. |
+| `codecs.py` | 297 | Reading a geometry in, and writing one back out. |
 | `construct.py` | 390 | Building a geometry, and deriving a simpler shape from one. |
 | `grid.py` | 428 | Turning a position into a discrete cell you can group, sort and join on. |
 | `linear.py` | 187 | Positions along a chain, expressed as a fraction of its length. |
-| `measures.py` | 382 | Measuring geometry: areas, lengths, distances, bearings. |
-| `parts.py` | 392 | Picking a geometry apart, and asking whether it is well formed. |
-| `predicates.py` | 447 | The OGC spatial predicates: does this geometry intersect, contain, touch that one. |
+| `measures.py` | 383 | Measuring geometry: areas, lengths, distances, bearings. |
+| `parts.py` | 401 | Picking a geometry apart, and asking whether it is well formed. |
+| `predicates.py` | 470 | The OGC spatial predicates: does this geometry intersect, contain, touch that one. |
 | `transforms.py` | 463 | Moving, reshaping and reprojecting a geometry. |
 
 ### `batcher/plan/functions/metrics/` — 1 · contract
@@ -2368,13 +2368,13 @@ Graph analytics and graph-ML features over an edge table.
 
 | module | lines | what it is |
 |---|---|---|
-| `_graph.py` | 413 | The `Graph` handle: an edge table, plus what the algorithms need to know about it. |
+| `_graph.py` | 430 | The `Graph` handle: an edge table, plus what the algorithms need to know about it. |
 | `_iterate.py` | 210 | The fixpoint driver every iterative graph algorithm runs on. |
 | `build.py` | 382 | Building a graph out of data that is not already an edge list. |
 | `community.py` | 356 | Communities, triangles, and how tightly a neighbourhood closes on itself. |
 | `components.py` | 352 | Connected components, and the cores that survive peeling the graph down. |
 | `degree.py` | 233 | Degree: how many edges touch each node, and how those counts are distributed. |
-| `features.py` | 227 | Turning a graph into a feature table a model can train on. |
+| `features.py` | 239 | Turning a graph into a feature table a model can train on. |
 | `sampling.py` | 283 | Sampling a graph: random walks, bounded neighbourhoods, and induced subgraphs. |
 | `similarity.py` | 315 | How alike two nodes are, judged by who they are connected to. |
 | `summary.py` | 168 | Graph-level numbers: the ones to look at before running anything else. |

@@ -148,7 +148,12 @@ def propagate_features(
             >>> feats = bt.from_pydict({"node": [1, 2, 3], "x": [1.0, 0.0, 0.0]})
             >>> out = propagate_features(Graph.from_edges(e), feats, ["x"], 2)
             >>> out.sort("node").to_pydict()["x_hop2"]
-            [None, None, 1.0]
+            [None, 0.0, 1.0]
+
+            Node 1 has no in-neighbours at any hop, so its value stays null. Node 2's
+            only neighbour is node 1, whose hop-1 value *was* null and is carried into
+            the next round as ``0.0`` — the deliberate `coalesce` below, which stops one
+            neighbourless node nulling every chain that runs through it.
     """
     if hops < 1:
         raise PlanError(f"hops must be positive, got {hops}")
@@ -205,9 +210,16 @@ def structural_features(g: Graph) -> Dataset:
             >>> import batcher as bt
             >>> from batcher.graph import Graph, structural_features
             >>> e = bt.from_pydict({"src": [1, 2, 1], "dst": [2, 3, 3]})
-            >>> sorted(structural_features(Graph.from_edges(e)).columns)
-            ['clustering', 'degree', 'in_degree', 'node', 'out_degree', 'pagerank',
-             'triangles', 'weighted_degree']
+            >>> for name in sorted(structural_features(Graph.from_edges(e)).columns):
+            ...     print(name)
+            clustering
+            degree
+            in_degree
+            node
+            out_degree
+            pagerank
+            triangles
+            weighted_degree
     """
     from batcher.graph.centrality import pagerank
     from batcher.graph.community import clustering_coefficient, triangle_count

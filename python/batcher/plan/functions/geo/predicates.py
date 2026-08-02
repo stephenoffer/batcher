@@ -60,8 +60,13 @@ def st_intersects(a: Expr | str, b: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'a': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))', 'POLYGON((0 0, 4 0, 4 4, 0
-            ...     4, 0 0))'], 'b': ['POINT(1 1)', 'POINT(9 9)']}
+            ...     {
+            ...         'a': [
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...         ],
+            ...         'b': ['POINT(1 1)', 'POINT(9 9)'],
+            ...     }
             ... )
             >>> got = bt.st_intersects(bt.col("a"), bt.col("b"))
             >>> ds.select(v=got).to_pydict()
@@ -117,8 +122,13 @@ def st_contains(a: Expr | str, b: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'a': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))', 'POLYGON((0 0, 4 0, 4 4, 0
-            ...     4, 0 0))'], 'b': ['POINT(2 2)', 'POINT(0 2)']}
+            ...     {
+            ...         'a': [
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...         ],
+            ...         'b': ['POINT(2 2)', 'POINT(0 2)'],
+            ...     }
             ... )
             >>> got = bt.st_contains(bt.col("a"), bt.col("b"))
             >>> ds.select(v=got).to_pydict()
@@ -226,9 +236,16 @@ def st_touches(a: Expr | str, b: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'a': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))', 'POLYGON((0 0, 4 0, 4 4, 0
-            ...     4, 0 0))'], 'b': ['POLYGON((4 0, 8 0, 8 4, 4 4, 4 0))', 'POLYGON((2 2, 6
-            ...     2, 6 6, 2 6, 2 2))']}
+            ...     {
+            ...         'a': [
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...         ],
+            ...         'b': [
+            ...             'POLYGON((4 0, 8 0, 8 4, 4 4, 4 0))',
+            ...             'POLYGON((2 2, 6 2, 6 6, 2 6, 2 2))',
+            ...         ],
+            ...     }
             ... )
             >>> got = bt.st_touches(bt.col("a"), bt.col("b"))
             >>> ds.select(v=got).to_pydict()
@@ -258,8 +275,10 @@ def st_crosses(a: Expr | str, b: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'a': ['LINESTRING(-1 2, 5 2)'], 'b': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0
-            ...     0))']}
+            ...     {
+            ...         'a': ['LINESTRING(-1 2, 5 2)'],
+            ...         'b': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'],
+            ...     }
             ... )
             >>> got = bt.st_crosses(bt.col("a"), bt.col("b"))
             >>> ds.select(v=got).to_pydict()
@@ -289,8 +308,10 @@ def st_overlaps(a: Expr | str, b: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'a': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'], 'b': ['POLYGON((2 2, 6 2,
-            ...     6 6, 2 6, 2 2))']}
+            ...     {
+            ...         'a': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'],
+            ...         'b': ['POLYGON((2 2, 6 2, 6 6, 2 6, 2 2))'],
+            ...     }
             ... )
             >>> got = bt.st_overlaps(bt.col("a"), bt.col("b"))
             >>> ds.select(v=got).to_pydict()
@@ -319,8 +340,10 @@ def st_equals(a: Expr | str, b: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'a': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'], 'b': ['POLYGON((0 0, 0 4,
-            ...     4 4, 4 0, 0 0))']}
+            ...     {
+            ...         'a': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'],
+            ...         'b': ['POLYGON((0 0, 0 4, 4 4, 4 0, 0 0))'],
+            ...     }
             ... )
             >>> got = bt.st_equals(bt.col("a"), bt.col("b"))
             >>> ds.select(v=got).to_pydict()

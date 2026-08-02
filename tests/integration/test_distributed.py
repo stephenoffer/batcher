@@ -261,7 +261,7 @@ def test_distributed_broadcast_runtime_guard_falls_back_to_shuffle(monkeypatch):
     single = left.join(right, on="k").collect()
     # Planner threshold huge → it marks the join broadcast; config threshold tiny →
     # the executor's runtime guard rejects the actual build side and shuffles instead.
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: 1 << 40)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: 1 << 40)
     cfg = active_config()
     guarded_cfg = cfg.replace(optimizer=dataclasses.replace(cfg.optimizer, broadcast_max_bytes=1))
     with config_context(guarded_cfg):
@@ -281,7 +281,7 @@ def test_distributed_broadcast_equals_shuffle_and_single_node(how, monkeypatch):
     single = left.join(right, on="k", how=how).collect()
     bcast = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)
     shuffled = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
 
     assert _rowset(bcast) == _rowset(single)
@@ -383,7 +383,7 @@ def test_distributed_skew_join_salting_equals_single_node(how, monkeypatch):
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)
 
     rng = np.random.default_rng(7)
     # Left: key 0 is hot (1000 rows ≈ 33%); keys 1..20 are cold (100 each).
@@ -449,7 +449,7 @@ def test_distributed_runtime_bloom_join_equals_single_node(how, monkeypatch):
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)  # force the shuffle path
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)  # force the shuffle path
 
     rng = np.random.default_rng(11)
     lk = rng.integers(0, 1000, 5000).astype("int64")
@@ -480,7 +480,7 @@ def test_distributed_runtime_bloom_join_multikey_equals_single_node(how, monkeyp
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)  # force the shuffle path
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)  # force the shuffle path
 
     rng = np.random.default_rng(7)
     n = 5000

@@ -61,8 +61,9 @@ def st_area(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'g': ['POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4
-            ...     4))']}
+            ...     {
+            ...         'g': ['POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))'],
+            ...     }
             ... )
             >>> got = bt.st_area(bt.col("g"))
             >>> ds.select(v=got).to_pydict()

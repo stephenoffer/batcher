@@ -173,8 +173,9 @@ def st_interior_ring_n(geom: Expr | str, n: Expr | int) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'g': ['POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4
-            ...     4))']}
+            ...     {
+            ...         'g': ['POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))'],
+            ...     }
             ... )
             >>> got = bt.st_length(bt.st_interior_ring_n(bt.col("g"), 1))
             >>> ds.select(v=got).to_pydict()
@@ -227,8 +228,12 @@ def st_is_valid(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'g': ['POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))', 'POLYGON((0 0, 4 4, 4 0, 0
-            ...     4, 0 0))']}
+            ...     {
+            ...         'g': [
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...             'POLYGON((0 0, 4 4, 4 0, 0 4, 0 0))',
+            ...         ],
+            ...     }
             ... )
             >>> got = bt.st_is_valid(bt.col("g"))
             >>> ds.select(v=got).to_pydict()
@@ -306,8 +311,12 @@ def st_is_ring(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'g': ['LINESTRING(0 0, 4 0, 4 4, 0 0)', 'LINESTRING(0 0, 4 4, 4 0, 0 4,
-            ...     0 0)']}
+            ...     {
+            ...         'g': [
+            ...             'LINESTRING(0 0, 4 0, 4 4, 0 0)',
+            ...             'LINESTRING(0 0, 4 4, 4 0, 0 4, 0 0)',
+            ...         ],
+            ...     }
             ... )
             >>> got = bt.st_is_ring(bt.col("g"))
             >>> ds.select(v=got).to_pydict()

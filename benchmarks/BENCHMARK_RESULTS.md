@@ -1,5 +1,91 @@
 # Batcher CPU benchmark results
 
+## Distributed == single-node on a live 16-node cluster, and the two test failures it explains (2026-08-02)
+
+Cluster: 16 x `16cpu-32gb` workers plus a head, **256 CPUs / 544 GiB**, Ray 2.56, release engine.
+Ten operator shapes over a 2M-row in-memory table, each run single-node and with
+`collect(distributed=True)`, compared as a sorted row multiset **with the column types
+asserted exactly** and floats allowed to differ by reassociation:
+
+| shape | single | distributed | agree |
+|---|--:|--:|:--:|
+| `group_by` sum + count (5,000 groups) | 269.6 ms | 5,816.1 ms | yes |
+| `group_by` two keys (35,000 groups) | 117.2 ms | 2,100.0 ms | yes |
+| global aggregate | 65.8 ms | 401.3 ms | yes |
+| `mean` per group — the non-mergeable one, split into sum/count | 120.9 ms | 666.2 ms | yes |
+| `distinct` | 19.8 ms | 599.6 ms | yes |
+| filter → project (998,830 rows out) | 30.6 ms | 173.8 ms | yes |
+| sort descending → limit | 47.6 ms | 1,197.7 ms | yes |
+| `group_by` on a string key | 109.5 ms | 419.1 ms | yes |
+| `count(distinct)` per group | 71.4 ms | 652.8 ms | yes |
+| `min`/`max` on a string per group | 89.6 ms | 586.5 ms | yes |
+
+**10 of 10 agreed** — invariant #7 holds across the matrix, including the shapes that have
+historically broken it: `mean` (not mergeable, so it is decomposed), a descending sort (which
+`assert_same` cannot see, hence the exact-order check here), a float group key, and string
+`min`/`max`.
+
+**Distributed is 3-22x slower at this size, and that is the expected shape rather than a
+finding.** 2M rows is far below the point where fan-out amortizes; the numbers are recorded so
+the crossover is not misread. The gap is widest exactly where the shuffle dominates
+(`group_by` at 5,000 groups, 21.6x) and narrowest where there is no shuffle at all
+(filter → project, 5.7x).
+
+### What running the committed suite on a real cluster found
+
+`tests/integration/test_distributed.py` had **never been run against a multi-node cluster**.
+CI installs no Ray, so the whole file is skipped there; a local single-node Ray is the most it
+had ever seen. On this cluster it opened at **40 failed / 56 passed**, and two of the three
+causes were real defects that a local Ray cannot expose. After fixing both: **25 failed /
+71 passed**, with every remaining failure in one environmental class.
+
+**1. `iter_batches(distributed=True)` silently returned zero rows over Flight.** The
+reproduction is three lines and the contrast is the whole story:
+
+```
+single-node collect()                          -> 1000 rows
+collect(distributed=True)                      -> 1000 rows
+iter_batches(distributed=True, transport=disk) -> 1000 rows
+iter_batches(distributed=True, transport=flight) -> 0 rows      <-- silent
+```
+
+Flight is the transport `resolve_transport` picks on any genuine multi-node cluster, so this
+was the default path. `iter_distributed` runs its stage with `materialize=False` and returns
+handles to buckets the driver reads *afterwards* — but `run_relational`'s internal
+`query_shuffle_scope` closed first, and scope exit evicts the query's buckets on the premise
+that leaving the scope means the query is over. It does not here. The reads then found nothing
+and **did not raise**: an unregistered ticket reads back as an empty bucket, not an error (the
+epoch invariant in `dist/shuffle_replication.py`).
+
+`dist/fleet/eviction.py`'s own docstring predicted this exactly — *"premature eviction ... does
+not fail loudly; it silently returns zero rows. That makes premature eviction a wrong-answer
+bug"* — and then listed `query_shuffle_scope`'s exit as a point where "everything downstream is
+provably finished". For the streaming terminal it is not. Fixed by holding an enclosing scope
+across the whole generator; the scope is already reentrant, so the inner one neither re-mints
+nor evicts, and the buckets are freed when iteration ends. Instrumented before and after:
+handles were always right (4 buckets, 1000 rows) — it was the *fetch* that returned empty.
+
+**2. Five test monkeypatches had been silently dead.** `_broadcast_max_bytes` gained an
+`l3_cache_bytes` parameter; `tests/differential/test_diff_join.py` was updated to
+`lambda *a: -1` and `tests/integration/test_distributed.py` was not, so all five of its patches
+raised `TypeError: <lambda>() takes 0 positional arguments but 1 was given` — 13 test failures.
+The docstring on `_broadcast_max_bytes` says it is a function rather than an inlined read
+"so tests can patch the planner's threshold", and that mechanism had been broken with nothing
+red: the differential copies run in CI, the integration copies need Ray and do not.
+
+**3. The remaining 25 are environmental, not product defects.** 21 are
+`FileNotFoundError: /tmp/pytest-of-ray/.../t.parquet` — fixtures written to pytest's
+**driver-local** `tmp_path`, which a worker on another node cannot open. That is the constraint
+`resolve_transport` already documents for the disk shuffle. The other 4 are a deliberate
+`PlanError` refusing a shape that needs staging under an explicit `adaptive=False`.
+
+The lesson is the one `CLAUDE.md` already states and this run paid for: **a green CI says
+nothing about the distributed path.** Two real defects, one of them a silent wrong answer on
+the default multi-node transport, sat in a committed suite that passes everywhere it is
+actually run. The fixture-locality problem is why: the one environment that could catch them is
+the one the fixtures preclude.
+
+
 ## TPC-H sf1 re-measured: the geomean is parity, and the suite total is one query (2026-08-02)
 
 Re-run on a quiet 16-core box, release engine, `python benchmarks/run.py --benchmark tpch
