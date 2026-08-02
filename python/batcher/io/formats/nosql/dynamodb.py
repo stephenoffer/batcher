@@ -28,6 +28,7 @@ from batcher.io.formats.nosql.base import (
     require_driver,
     rows_to_batches,
 )
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["DynamoDBSource"]
@@ -181,7 +182,6 @@ class DynamoDBSource(ScanSource):
 # IR comparison op → DynamoDB ``FilterExpression`` comparator. ``eq`` maps to
 # DynamoDB's ``=``; ``ne`` to ``<>``. When a literal sits on the left, flip.
 _DYNAMO_OP = {"eq": "=", "ne": "<>", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
-_DYNAMO_FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +254,7 @@ def _build_dynamo(ir: dict[str, Any], builder: _DynamoBuilder) -> str | None:
     if parsed is None:
         return None
     col, value, flipped = parsed
-    effective = _DYNAMO_FLIP[op] if flipped else op
+    effective = COMPARISON_FLIP[op] if flipped else op
     return f"{builder.name(col)} {_DYNAMO_OP[effective]} {builder.value(value)}"
 
 

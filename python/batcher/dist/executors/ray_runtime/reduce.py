@@ -70,6 +70,7 @@ def run_bucket_reduce(
         gather_with_backups,
     )
     from batcher.dist.executors.ray_runtime import (
+        blame_host_for_reduce_failure,
         draining_workers,
         recovery_policy,
         speculation_policy,
@@ -150,8 +151,11 @@ def run_bucket_reduce(
             except ResourceError:
                 return _launch(pending[idx], set())
 
-        def _on_failure(_idx: int, ref: Any, _exc: Exception) -> tuple[str, int | None]:
-            return ("__dead__", ref_host.get(ref))
+        def _on_failure(_idx: int, ref: Any, exc: Exception) -> tuple[str, int | None]:
+            # Only a failure that means *lost data* is charged to a host. A deterministic one
+            # re-raises here, because blaming a healthy worker for it marks the whole fleet
+            # dead one recompute at a time — see `blame_host_for_reduce_failure`.
+            return ("__dead__", blame_host_for_reduce_failure(exc, ref_host.get(ref)))
 
         def _doomed() -> frozenset[int]:
             """Slots whose host is being reclaimed, so a backup is certainly needed.

@@ -135,7 +135,7 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
 
     An OUTER pure theta join is still rejected: cross+filter drops the unmatched rows
     an outer join must null-extend, and preserving them needs a real nested-loop join
-    operator in the engine (tracked in `docs/internals/databricks_parity.md`).
+    operator in the engine (tracked in `docs/architecture/internals/databricks_parity.md`).
     """
     eq_pairs, extra = _split_join_on(on)
     if not eq_pairs:

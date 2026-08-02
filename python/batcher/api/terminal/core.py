@@ -115,7 +115,9 @@ def _collect(
         from batcher import core
         from batcher.api.terminal.gpu_backend import try_gpu_collect
 
-        gpu_result = try_gpu_collect(plan, sources, core.default_hub(), force=(backend == "gpu"))
+        gpu_result = try_gpu_collect(
+            plan, sources, core.default_hub(), force=(backend == "gpu"), columns=columns
+        )
         if gpu_result is not None:
             return gpu_result
     # Opt-in: offload large-payload columns out of line around breakers (the blobs ride

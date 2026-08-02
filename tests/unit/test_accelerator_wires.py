@@ -22,19 +22,40 @@ pytestmark = pytest.mark.unit
 
 def test_an_uneven_rail_spread_is_reported() -> None:
     problems = wire_problems(
-        {"rails": {"loaded_rails": 2, "imbalance": 0.375, "assignment": {"a": [0, 1, 2], "b": [3]}}}
+        {
+            "rails": {
+                "rails": 2,
+                "loaded_rails": 2,
+                "imbalance": 0.375,
+                "assignment": {"a": [0, 1, 2], "b": [3]},
+            }
+        }
     )
     assert len(problems) == 1
     assert "unevenly spread" in problems[0]
     assert "38%" in problems[0]
 
 
+def test_every_device_on_one_rail_is_reported() -> None:
+    """The worst wiring a dense node can have, and the one the alert used to miss.
+
+    It has exactly *one* loaded rail, so gating the alert on `loaded_rails > 1` suppressed it
+    precisely where it mattered — alongside `ACTIVE` on every port and the full summed port
+    rate, while the node carried an eighth of it.
+    """
+    problems = wire_problems(
+        {"rails": {"rails": 8, "loaded_rails": 1, "imbalance": 0.875, "assignment": {"a": [0]}}}
+    )
+    assert len(problems) == 1
+    assert "unevenly spread over 8 rails" in problems[0]
+
+
 def test_even_rails_are_not_a_finding() -> None:
-    assert wire_problems({"rails": {"loaded_rails": 2, "imbalance": 0.0}}) == []
+    assert wire_problems({"rails": {"rails": 2, "loaded_rails": 2, "imbalance": 0.0}}) == []
 
 
 def test_a_single_rail_cannot_be_unbalanced() -> None:
-    assert wire_problems({"rails": {"loaded_rails": 1, "imbalance": 0.9}}) == []
+    assert wire_problems({"rails": {"rails": 1, "loaded_rails": 1, "imbalance": 0.9}}) == []
 
 
 def test_a_node_where_no_pair_can_copy_directly_is_reported() -> None:

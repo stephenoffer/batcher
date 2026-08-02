@@ -19,5 +19,5 @@ python examples/expressions/strings_cleaning.py
 
 - {doc}`/cookbook/expressions/strings/shaping/strings_chunking`: splitting long documents into overlapping chunks for a RAG index.
 - {doc}`/cookbook/expressions/strings/measuring/strings_counts`: words, lines, sentences, and entities.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

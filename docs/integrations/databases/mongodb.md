@@ -172,7 +172,7 @@ recovery story; there is no rollback.
 
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: sources, splits, pushdown.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: sinks, modes, and idempotent re-runs.
-- {doc}`Feature pipeline </cookbook/ml/pipelines/feature-pipeline>`: the shape that ends in an upsert to
+- {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: the shape that ends in an upsert to
   a serving collection.
 - {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the `Source`/`Sink`/`Split` protocol.
 - {doc}`I/O API </api/relational/io>`: the full reader/writer reference.

@@ -24,6 +24,7 @@ from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.bloom_index import BloomIndex
 from batcher.plan.expr_ir import Binary, Expr, IsNotNull, IsNull, Lit, Not
+from batcher.plan.ir_tags import COMPARISON_FLIP, COMPARISON_OPS, LEFT_DRIVEN_JOINS
 from batcher.plan.logical import (
     Distinct,
     Filter,
@@ -47,9 +48,7 @@ __all__ = ["propagate_empty_relation", "zonemap_prune_filter"]
 # (True), provably keeps none (False), or undecidable from metadata (None).
 _TRUE = True
 _FALSE = False
-_COMPARISONS = {"lt", "le", "gt", "ge", "eq", "ne"}
 # Flip a comparison when the column is on the right (`lit < col` ≡ `col > lit`).
-_FLIP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 @rule(name="zonemap_prune_filter", phase=Phase.SELECTION, matches=(Filter,))
@@ -111,7 +110,6 @@ def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> Logic
 # here — `inner` (nothing to match), `left` (every output row is a left row), and
 # `semi`/`anti` (whose output is the left side's columns and rows).
 # An empty *right* side is not the mirror image, so it is handled case by case below.
-_EMPTY_LEFT_IS_EMPTY = frozenset({"inner", "left", "semi", "anti"})
 
 
 def _join_over_empty_side(node: Join) -> LogicalPlan | None:
@@ -141,7 +139,7 @@ def _join_over_empty_side(node: Join) -> LogicalPlan | None:
     rewrites do not wait on it: they remove a subtree rather than mark it empty.
     """
     left_empty, right_empty = _is_empty(node.left), _is_empty(node.right)
-    if left_empty and node.join_type in _EMPTY_LEFT_IS_EMPTY:
+    if left_empty and node.join_type in LEFT_DRIVEN_JOINS:
         return Limit(node, 0)
     if not right_empty:
         return None
@@ -190,7 +188,7 @@ def _predicate_status(expr: Expr, stats: RelStats) -> bool | None:
             return _and(_predicate_status(expr.left, stats), _predicate_status(expr.right, stats))
         if expr.op == "or":
             return _or(_predicate_status(expr.left, stats), _predicate_status(expr.right, stats))
-        if expr.op in _COMPARISONS:
+        if expr.op in COMPARISON_OPS:
             return _comparison_status(expr, stats)
         return None
     if isinstance(expr, Not):
@@ -289,7 +287,7 @@ def _comparison_status(expr: Binary, stats: RelStats) -> bool | None:
         return None
     name, value, col_on_left = side
     col = stats.column(name)
-    op = expr.op if col_on_left else _FLIP[expr.op]
+    op = expr.op if col_on_left else COMPARISON_FLIP[expr.op]
     # Bloom data-skip: for equality, absence from the column's membership index proves
     # the predicate always-false — catching point lookups *inside* [min, max] that
     # min/max can't (`id = 9700123` over a 10M-row column). `IN` reaches this via the
@@ -344,8 +342,8 @@ def _float_order_is_ambiguous(bound: object) -> bool:
     (The deeper problem is that the engine's float comparisons follow arrow-rs's total order
     rather than IEEE, so they *also* disagree with DuckDB — `WHERE f = 0.0` misses `-0.0`,
     `WHERE f > 1` matches NaN. That is a separate, engine-side bug recorded in
-    `docs/internals/bug_hunt_ledger.md`. Declining here is sound under either semantics: it
-    costs a scan, never a row.)
+    `docs/architecture/internals/bug_hunt_ledger.md`. Declining here is sound under either
+    semantics: it costs a scan, never a row.)
     """
     return ambiguous_float_bound(bound)
 

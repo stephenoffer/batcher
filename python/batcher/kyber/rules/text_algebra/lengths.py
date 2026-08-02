@@ -28,12 +28,12 @@ from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.leaf_rewrite import rewrite_node
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["LENGTH_EMPTINESS_RULES", "PAD_COLLAPSE_RULES"]
 
 _NODES = (Filter, Project, Aggregate, Sort, Window)
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 
 #: The three length functions, all of which are zero exactly for the empty string.
 #: `len` counts characters, `octet_length` bytes, `bit_length` bits — the *scale* differs
@@ -63,11 +63,11 @@ _SUFFIX = {
 
 
 def _comparison_against_int(expr: Expr) -> tuple[str, Expr, int] | None:
-    if not isinstance(expr, Binary) or expr.op not in _FLIP:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_FLIP:
         return None
     for computed, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, _FLIP[expr.op]),
+        (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         if (
             isinstance(other, Lit)
@@ -125,7 +125,7 @@ LENGTH_EMPTINESS_RULES = [
         f"{fn}_{_SUFFIX[key]}_to_emptiness_test",
         _emptiness_leaf(fn, key),
         (Binary,),
-        (key[0], _FLIP[key[0]]),
+        (key[0], COMPARISON_FLIP[key[0]]),
     )
     for fn in _LENGTH_FNS
     for key in _emptiness_keys(fn)

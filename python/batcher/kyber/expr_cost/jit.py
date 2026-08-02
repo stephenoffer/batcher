@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime
 
 from batcher.plan.expr_ir import Binary, Case, Cast, Col, Expr, Lit, Math2Expr, MathExpr, Not
+from batcher.plan.ir_tags import COMPARISON_OPS
 
 __all__ = ["JIT_SPEEDUP", "jit_compilable"]
 
@@ -32,7 +33,6 @@ JIT_SPEEDUP = 4.0
 # `analyze` accepts these on numeric operands. `concat` (string), the bitwise family,
 # and `add_months` (calendar) are rejected there, so they fall back here too.
 _JIT_ARITH = frozenset({"add", "sub", "mul", "div", "mod"})
-_JIT_COMPARE = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 _JIT_BOOL = frozenset({"and", "or"})
 # Only Int64/Float64 targets compile, and only the exact widening conversions.
 # `bc_arrow::dtype_from_name` resolves these aliases; anything else falls back.
@@ -229,8 +229,8 @@ def _binary_kind(expr: Binary) -> str | None:
         # (`_ANY`) unifies with the temporal side, which is what makes the ubiquitous
         # `date_col < DATE '1998-01-01'` filter price as the compiled op it is.
         compatible = left == right or _ANY in (left, right)
-        return _BOOL if op in _JIT_COMPARE and compatible else None
-    if op in _JIT_COMPARE:
+        return _BOOL if op in COMPARISON_OPS and compatible else None
+    if op in COMPARISON_OPS:
         return _BOOL
     if op in _JIT_ARITH:
         result = _arith_kind(left, right)

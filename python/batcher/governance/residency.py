@@ -54,20 +54,18 @@ class DataResidency:
             >>> rule = DataResidency("s3://eu-customers/", frozenset({"eu-north-1"}), "GDPR")
             >>> sorted(rule.allowed_regions)
             ['eu-north-1']
-
-    Attributes:
-        dataset: Dataset name or path prefix the rule governs. Prefix matching is longest-wins,
-            so `"s3://eu-customer/"` can carry a default and `"s3://eu-customer/public/"` a
-            narrower exception.
-        allowed_regions: Regions the data may be processed in. Empty means *no* region is
-            permitted, which is a valid and deliberate way to quarantine a dataset — it is not
-            the same as unregistered.
-        obligation: What requires this, in the operator's own words: a regulation, a contract
-            id, a customer commitment. Carried into the verdict so a refusal explains itself.
     """
 
+    #: Dataset name or path prefix the rule governs. Prefix matching is longest-wins, so
+    #: ``"s3://eu-customer/"`` can carry a default and ``"s3://eu-customer/public/"`` a
+    #: narrower exception.
     dataset: str
+    #: Regions the data may be processed in. Empty means *no* region is permitted, which is
+    #: a valid and deliberate way to quarantine a dataset — it is not the same as
+    #: unregistered.
     allowed_regions: frozenset[str] = field(default_factory=frozenset)
+    #: What requires this, in the operator's own words: a regulation, a contract id, a
+    #: customer commitment. Carried into the verdict so a refusal explains itself.
     obligation: str = ""
 
 
@@ -81,21 +79,19 @@ class ResidencyVerdict:
             >>> from batcher.governance import ResidencyVerdict
             >>> ResidencyVerdict(allowed=True).message()
             ''
-
-    Attributes:
-        allowed: Whether the placement may proceed.
-        dataset: The dataset checked.
-        region: The region checked against.
-        allowed_regions: The regions the rule permits, empty when unregistered.
-        obligation: The rule's stated obligation, `""` when unregistered.
-        enforced: Whether a refusal would actually block, as opposed to being advisory.
     """
 
+    #: Whether the placement may proceed.
     allowed: bool
+    #: The dataset checked.
     dataset: str = ""
+    #: The region checked against.
     region: str = ""
+    #: The regions the rule permits, empty when unregistered.
     allowed_regions: frozenset[str] = field(default_factory=frozenset)
+    #: The rule's stated obligation, ``""`` when unregistered.
     obligation: str = ""
+    #: Whether a refusal would actually block, as opposed to being advisory.
     enforced: bool = False
 
     def message(self) -> str:
@@ -140,13 +136,11 @@ class ResidencyCatalog:
             >>> _ = catalog.register(DataResidency("s3://eu/", frozenset({"eu-north-1"})))
             >>> catalog.check("s3://eu/orders", "us-east-1").allowed
             False
-
-    Attributes:
-        mode: One of `RESIDENCY_MODES`. `off` (the default) makes every check pass.
-        rules: Registered rules, keyed by dataset name or path prefix.
     """
 
+    #: One of :data:`RESIDENCY_MODES`. ``off`` (the default) makes every check pass.
     mode: str = "off"
+    #: Registered rules, keyed by dataset name or path prefix.
     rules: dict[str, DataResidency] = field(default_factory=dict)
 
     def register(self, rule: DataResidency) -> ResidencyCatalog:

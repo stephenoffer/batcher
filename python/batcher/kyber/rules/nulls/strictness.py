@@ -58,6 +58,7 @@ from batcher.plan.expr_ir.func_nodes import (
     WindowBuckets,
     WindowStart,
 )
+from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = [
@@ -113,7 +114,6 @@ STRICT_LIST_FNS = frozenset({"len", "n_unique"})
 #: dropping the operation would delete an error), and so are the bitwise operators and
 #: the shifts (they coerce through Int64 and a shift count out of range can abort).
 _STRICT_ARITH_OPS = frozenset({"add", "sub", "mul"})
-_STRICT_COMPARISON_OPS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 
 
 def _math_operand(expr: Expr) -> Expr | None:
@@ -337,7 +337,7 @@ NULL_STRICTNESS_BINARY_RULES = [
     _register_binary(family, ops, positive=positive)
     for family, ops in (
         ("arithmetic", _STRICT_ARITH_OPS),
-        ("comparison", _STRICT_COMPARISON_OPS),
+        ("comparison", COMPARISON_OPS),
         ("math2_fn", _MATH2_MARKER),
         ("list_zip", _LIST_ZIP_MARKER),
         ("list_set_op", _LIST_SET_MARKER),

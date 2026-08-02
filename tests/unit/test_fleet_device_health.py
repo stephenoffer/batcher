@@ -249,3 +249,95 @@ def test_the_worker_record_says_how_its_host_half_is_placed(monkeypatch):
     record = hardware_probe._device_health_on_this_worker()
     assert record["affinity"]["numa_node"] == 1
     assert record["affinity"]["device_share"] == 0.25
+
+
+class _PartlyFailingRay:
+    """A fleet where one node answers and the other's probe raises.
+
+    The realistic shape of a bad node, and the reason this case matters: the probe reads NVML,
+    the kernel log and `/sys`, so the node most likely to raise is the node most likely to be
+    sick. A driver that has wedged, a stale worker build, an NVML that will not initialize —
+    each surfaces here as an exception rather than as a record.
+    """
+
+    def __init__(self, nodes):
+        self._nodes = nodes
+        self._issued: list[str] = []
+
+    def is_initialized(self):
+        return True
+
+    def nodes(self):
+        return self._nodes
+
+    def remote(self, **kw):
+        def make(fn):
+            outer = self
+
+            class _R:
+                def options(self, **o):
+                    return self
+
+                def remote(self):
+                    outer._issued.append(f"ref{len(outer._issued)}")
+                    return outer._issued[-1]
+
+            return _R()
+
+        return make
+
+    def wait(self, refs, num_returns=None, timeout=None):
+        return list(refs), []
+
+    def get(self, ref):
+        if ref == "ref1":
+            raise RuntimeError("NVML_ERROR_DRIVER_NOT_LOADED")
+        return _record("healthy-node")
+
+
+def _gpu_node(node_id):
+    return {"NodeID": node_id, "Alive": True, "Resources": {"CPU": 8.0, "GPU": 1.0}}
+
+
+def test_one_nodes_failure_does_not_discard_every_other_nodes_health(monkeypatch):
+    """A node whose probe raises drops out; it must not take the fleet's health with it.
+
+    Resolving the fan-out with a single `ray.get(list)` raised on the first failed task, and the
+    caller's `except` turned that into `()` — which `unhealthy_nodes()` reads as "nothing to
+    drain" and `fabric.placement` reads as "no condemned devices". So one unreachable node made
+    a fleet with a quarantined GPU report clean and kept scheduling onto it.
+    """
+    import sys
+
+    fake = _PartlyFailingRay([_gpu_node("healthy-node"), _gpu_node("sick-node")])
+    monkeypatch.setitem(sys.modules, "ray", fake)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray.util.scheduling_strategies",
+        __import__("types").SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *a, **k: None),
+    )
+    hardware_probe.reset_fleet_health()
+    records = hardware_probe._probe_fleet_health()
+    assert [r["node_id"] for r in records] == ["healthy-node"]
+
+
+def test_a_condemned_device_still_reaches_the_drain_list_when_a_sibling_probe_fails(monkeypatch):
+    """The end the isolation is for: a quarantined GPU is still drained despite a failed probe."""
+    import sys
+
+    class _Ray(_PartlyFailingRay):
+        def get(self, ref):
+            if ref == "ref1":
+                raise RuntimeError("NVML_ERROR_DRIVER_NOT_LOADED")
+            return _record("healthy-node", quarantined=["GPU-7"], reasons=["xid_79"])
+
+    fake = _Ray([_gpu_node("healthy-node"), _gpu_node("sick-node")])
+    monkeypatch.setitem(sys.modules, "ray", fake)
+    monkeypatch.setitem(
+        sys.modules,
+        "ray.util.scheduling_strategies",
+        __import__("types").SimpleNamespace(NodeAffinitySchedulingStrategy=lambda *a, **k: None),
+    )
+    hardware_probe.reset_fleet_health()
+    records = hardware_probe._probe_fleet_health()
+    assert [r["node_id"] for r in hardware_probe.unhealthy_nodes(records)] == ["healthy-node"]

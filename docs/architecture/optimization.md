@@ -10,7 +10,7 @@ The optimizer runs automatically on every terminal operation, so the plan you de
 and the plan that runs differ, but the result doesn't.
 
 The authoritative model, covering the rule families, cost coefficients, and
-configuration knobs, lives in {doc}`the Kyber reference <../internals/kyber>`.
+configuration knobs, lives in {doc}`the Kyber reference </architecture/internals/kyber>`.
 
 ## The phased pipeline
 
@@ -170,7 +170,7 @@ scan, or that a join was reordered the way you expected.
 
 ## See also
 
-- {doc}`Kyber reference <../internals/kyber>`: the rule families, cost coefficients, and knobs.
+- {doc}`Kyber reference </architecture/internals/kyber>`: the rule families, cost coefficients, and knobs.
 - {doc}`Architecture overview <overview>`: the control-plane and data-plane split.
 - {doc}`Execution model <execution>`: the breakers the adaptive loop measures at.
 - {doc}`Configuration options <../configuration/options>`: the cost-model and cardinality settings.

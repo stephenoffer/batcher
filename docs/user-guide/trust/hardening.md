@@ -257,6 +257,6 @@ Before a deployment that matters, complete the following:
 
 - {doc}`/user-guide/trust/governance`: writing the row filters and column masks this page makes mandatory.
 - {doc}`/user-guide/trust/secrets`: reference schemes for keys and credentials.
-- {doc}`/user-guide/operate/observability`: what the engine records about a query, and where.
+- {doc}`/user-guide/operate/running/observability`: what the engine records about a query, and where.
 - {doc}`/user-guide/moving-data/cloud-storage`: how credentials reach an object store in the first place.
 - {doc}`/cookbook/governance/index`: the masking and lineage recipes behind these settings.

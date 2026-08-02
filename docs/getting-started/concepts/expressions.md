@@ -51,6 +51,6 @@ bt.col("tags").list.contains("ai")    # list / array ops
 
 ## See also
 
-- {doc}`/user-guide/transform/expressions`: the full expression surface, with nulls and casting.
-- {doc}`/user-guide/transform/expression-accessors`: the `.str`, `.dt`, `.list`, and `.json` namespaces.
+- {doc}`/user-guide/transform/columns/expressions`: the full expression surface, with nulls and casting.
+- {doc}`/user-guide/transform/columns/expression-accessors`: the `.str`, `.dt`, `.list`, and `.json` namespaces.
 - {doc}`/api/relational/expressions`: every `Expr` method in one reference.

@@ -44,6 +44,7 @@ from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, node_rule
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
 from batcher.plan.visitor import transform_up
 
@@ -58,7 +59,6 @@ __all__ = [
 
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 # Comparisons that flip when the column moves from the right side to the left.
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 # The additive/multiplicative strength reductions are exact *only* for these ops (a wrap of
 # the arithmetic would break an ordered comparison; equality's bijection is wrap-invariant).
 _EQ_NE = frozenset({"eq", "ne"})
@@ -127,11 +127,11 @@ def flip_comparison_literal(plan: LogicalPlan) -> LogicalPlan:
 def _flip_leaf(expr: Expr) -> Expr:
     if (
         isinstance(expr, Binary)
-        and expr.op in _FLIP
+        and expr.op in COMPARISON_FLIP
         and isinstance(expr.left, Lit)
         and isinstance(expr.right, Col)
     ):
-        return Binary(_FLIP[expr.op], expr.right, expr.left)
+        return Binary(COMPARISON_FLIP[expr.op], expr.right, expr.left)
     return expr
 
 
@@ -331,7 +331,7 @@ def _node_pass(leaf: ExprRule):
 # plan itself. The whole-plan `flip_comparison_literal`/`sarg_*_const` functions above stay
 # as they are: they are the standalone form the unit tests drive directly.
 for _name, _leaf, _ops in (
-    ("sarg_flip_comparison", _flip_leaf, tuple(sorted(_FLIP))),
+    ("sarg_flip_comparison", _flip_leaf, tuple(sorted(COMPARISON_FLIP))),
     ("sarg_add_const", _add_leaf, tuple(sorted(_EQ_NE))),
     ("sarg_sub_const", _sub_leaf, tuple(sorted(_EQ_NE))),
     ("sarg_rsub_const", _rsub_leaf, tuple(sorted(_EQ_NE))),

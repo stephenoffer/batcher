@@ -19,12 +19,13 @@ and its lineage-recovery contract without a circular import.
 from __future__ import annotations
 
 import contextvars
+import logging
 from concurrent import futures
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import ConfigError
 from batcher._internal.hardware.cpu import available_cpu_count
-from batcher._internal.logging import note_suppressed
+from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher._internal.native import engine
 from batcher.carbonite.transfer import ShuffleTicket
 from batcher.carbonite.transfer.codec import resolve_codec
@@ -157,6 +158,9 @@ def _use_plan(plan_id: int | None) -> None:
         set_current_plan_id(plan_id)
 
 
+_worker_log = get_logger("dist.shuffle")
+
+
 def _ticket(stage: int, src: int, dst: int, epoch: int = 0) -> ShuffleTicket:
     """A shuffle ticket for this query: `plan/stage/src(mapper)/dst(reducer)/epoch`.
 
@@ -168,6 +172,21 @@ def _ticket(stage: int, src: int, dst: int, epoch: int = 0) -> ShuffleTicket:
     already does.
     """
     return ShuffleTicket(_current_plan_id.get(), stage, src, dst, epoch)
+
+
+def _lost(unreachable: list[tuple[int, str]]) -> list[int]:
+    """The source indices from a gather's `(index, fault)` pairs, with the faults logged.
+
+    The driver's recovery loop speaks in indices — it recomputes a source and retries — so
+    that is what a reducer returns. But an index on its own is what let a deterministic bug
+    masquerade as worker loss: a ticket collision here surfaced as
+    `shuffle did not recover after 3 attempts`, three frames and one wrong noun from its
+    cause. The transport's own words for *why* a source was unreachable go to the log, on
+    the worker that saw them, before the index is all that is left.
+    """
+    for src, why in unreachable:
+        log_kv(_worker_log, logging.WARNING, "shuffle source unreachable", source=src, fault=why)
+    return sorted({src for src, _ in unreachable})
 
 
 def _combine_sources(session, gk, aj, sources, replicas=None):
@@ -189,7 +208,7 @@ def _combine_sources(session, gk, aj, sources, replicas=None):
         gk, aj, list(sources), finalize=False, replicas=replicas
     )
     if unreachable:
-        raise nat.RetryableShuffleError(f"combiner lost sources {unreachable}")
+        raise nat.RetryableShuffleError(f"combiner lost sources {_lost(unreachable)}")
     return running
 
 
@@ -559,7 +578,7 @@ try:
                 gk, aj, sources, finalize=True, replicas=replicas
             )
             if unreachable:
-                return ("retry", unreachable)
+                return ("retry", _lost(unreachable))
             return ("ok", payload)
 
         def _bounded_reduce(self, gk, aj, sources, replicas):
@@ -577,7 +596,7 @@ try:
             try:
                 paths, unreachable = self.session.gather_to_files(sources, work, replicas=replicas)
                 if unreachable:
-                    return ("retry", unreachable)
+                    return ("retry", _lost(unreachable))
                 if not paths:
                     return ("ok", None)
                 # On-disk IPC is uncompressed here, so its size ≈ the in-memory partials: when
@@ -653,7 +672,10 @@ try:
         ) -> str:
             _use_plan(plan_id)
             nat = engine()
-            from batcher.dist.executors.partition_io import read_partition_descriptor
+            from batcher.dist.executors.partition_io import (
+                iter_partition_descriptor,
+                streaming_map_buckets,
+            )
 
             # `src` overrides the mapper id on recompute (a survivor regenerates a
             # lost worker's side). `epoch` rises on each recompute so the fresh partition
@@ -662,25 +684,21 @@ try:
             # bucket, empty included, so a reducer's failed fetch means a lost worker, not
             # an empty bucket.
             src = self.id if src is None else src
-            rows = nat.execute_plan(
-                sub_ir, [read_partition_descriptor(partition)], self._engine_config
+            # Stream the partition through the map prefix and the hash a chunk at a time, as
+            # the aggregate's `map_publish` does. Reading it whole held three things at once —
+            # the partition, its entire mapped output, and the second full copy
+            # `partition_batches` gathers into — and this is the path the memory envelope does
+            # not cover: `memory_budget_bytes` bounds allocations inside `execute_plan`, not
+            # what the worker keeps afterwards. That gap is what OOM-kills a shuffle worker
+            # (BENCHMARK_RESULTS.md, sf10 q5), and at sf100 it killed two of them on TPC-H q9.
+            buckets = streaming_map_buckets(
+                nat,
+                sub_ir,
+                key_names,
+                iter_partition_descriptor(partition),
+                n_buckets,
+                self._engine_config,
             )
-            if not rows:
-                buckets = []
-            elif n_buckets == 1:
-                buckets = [rows]
-            else:
-                key_idx = [rows[0].schema.get_field_index(k) for k in key_names]
-                buckets = nat.partition_batches(rows, key_idx, n_buckets)
-                # `partition_batches` gathers each row into a *new* buffer — the buckets do
-                # not alias the input — so from here `rows` is a second, complete copy of
-                # this mapper's output with no remaining reader. Holding it across the
-                # publish loop doubled the map side's peak footprint, and this is the path
-                # the memory envelope does not cover: `memory_budget_bytes` bounds
-                # allocations inside `execute_plan`, not what the worker keeps afterwards
-                # or what the Flight store holds until a reducer fetches it. That gap is
-                # what OOM-kills a shuffle worker (BENCHMARK_RESULTS.md, sf10 q5).
-                del rows
             for r in range(n_buckets):
                 self.session.publish(
                     _ticket(stage, src, r, epoch), buckets[r] if r < len(buckets) else []
@@ -718,7 +736,7 @@ try:
             )
 
         def reduce_window(
-            self, win_ir, addrs, reducer_id, epochs=None, replicas=None, plan_id=None
+            self, win_ir, addrs, reducer_id, epochs=None, replicas=None, plan_id=None, stage=0
         ):
             _use_plan(plan_id)
             nat = engine()
@@ -729,12 +747,12 @@ try:
             # recomputes + retries.
             epochs = epochs or {}
             sources = [
-                (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
+                (addr, _ticket(stage, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(addrs)
             ]
             rows, unreachable = self.session.gather_concat(sources, replicas=replicas)
             if unreachable:
-                return ("retry", unreachable)
+                return ("retry", _lost(unreachable))
             if not rows:
                 return ("ok", None)
             return ("ok", nat.execute_plan(win_ir, [rows], self._engine_config))
@@ -744,8 +762,8 @@ try:
             join_ir,
             addrs,
             reducer_id,
-            left_schema,
-            right_schema,
+            left_empty,
+            right_empty,
             gk=None,
             aj=None,
             finalize=True,
@@ -758,6 +776,13 @@ try:
 
             _use_plan(plan_id)
             nat = engine()
+            # `left_empty`/`right_empty` are 0-row RecordBatches, not schemas — the driver's
+            # `probe()` runs each side's sub-plan over an empty input and sends the batch it
+            # gets back, so a bucket missing one side still has something schema-bearing to
+            # null-extend from. They were once called `*_schema`, and the spilling branch
+            # below duly handed them to a parameter typed `pa.Schema`: every multi-way join
+            # whose reduce spilled died on `Schema must be an instance of pyarrow.Schema`,
+            # and the recovery loop reported it as four unreachable workers.
             # A join needs its bucket's whole left and right side, so it holds them
             # both (memory = the bucket's data, which shrinks as workers grow). Fetch
             # every mapper's left (stage 0) and right (stage 1) side concurrently, falling
@@ -784,8 +809,8 @@ try:
                     join_ir,
                     left_sources,
                     right_sources,
-                    left_schema,
-                    right_schema,
+                    left_empty,
+                    right_empty,
                     gk,
                     aj,
                     finalize,
@@ -804,11 +829,11 @@ try:
                 right, lost_right = r_fut.result()
             unreachable = sorted(set(lost_left) | set(lost_right))
             if unreachable:
-                return ("retry", unreachable)
+                return ("retry", _lost(unreachable))
             if not left and not right:
                 return ("ok", None)
             # Schema-bearing empties so an outer join can null-extend the missing side.
-            relations = [left or [left_schema], right or [right_schema]]
+            relations = [left or [left_empty], right or [right_empty]]
             if gk is not None:
                 # Fused post-join aggregate (only a small bucket leaves the worker — the
                 # full join never reaches the driver). `finalize=True` when group keys ⊇
@@ -833,8 +858,8 @@ try:
             join_ir,
             left_sources,
             right_sources,
-            left_schema,
-            right_schema,
+            left_empty,
+            right_empty,
             gk,
             aj,
             finalize,
@@ -858,7 +883,7 @@ try:
             from batcher.dist.spill_breakers.join import reduce_join_paths_spilling
 
             nat = engine()
-            _budget, sdir, _codec = _reduce_spill_opts(self._engine_config)
+            budget, sdir, _codec = _reduce_spill_opts(self._engine_config)
             spec = json.loads(join_ir)
             left_keys = list(spec.get("left_keys", []))
             right_keys = list(spec.get("right_keys", []))
@@ -884,21 +909,49 @@ try:
                     right_paths, lost_right = r_fut.result()
                 unreachable = sorted(set(lost_left) | set(lost_right))
                 if unreachable:
-                    return ("retry", unreachable)
+                    return ("retry", _lost(unreachable))
                 if not left_paths and not right_paths:
                     return ("ok", None)
-                joined = reduce_join_paths_spilling(
-                    join_ir,
-                    left_keys,
-                    right_keys,
-                    left_paths,
-                    right_paths,
-                    work,
-                    _JOIN_REDUCE_SUBBUCKETS,
-                    self._engine_config,
-                    left_schema,
-                    right_schema,
+                # Join in memory when the staged bucket fits the envelope, exactly as the
+                # aggregate's `_bounded_reduce` folds in memory when its partials do. Without
+                # this the bounded path grace-partitioned *every* bucket: fetch to disk, read
+                # it back, re-partition it to disk, read that back, then join — three disk
+                # passes for a bucket that fitted memory all along. On TPC-H sf100 q3 that is
+                # a ten-second plateau in the middle of a twenty-three-second query, sitting at
+                # one core per node with the network carrying 2 MB/s. Neither CPU-bound nor
+                # network-bound: waiting on a disk round trip it did not need.
+                #
+                # Staging first and deciding after is deliberate, and is what the aggregate
+                # does too — the size is not known until the fetch has happened, and it is the
+                # fetch that has to stay bounded.
+                from batcher.dist.shuffle_io import read_ipc
+
+                on_disk = sum(
+                    os.path.getsize(p) for p in (*left_paths, *right_paths) if os.path.exists(p)
                 )
+                if on_disk <= budget:
+                    left = [b for p in left_paths for b in read_ipc(p)]
+                    right = [b for p in right_paths for b in read_ipc(p)]
+                    # Schema-bearing empties so an outer join still null-extends, as the
+                    # unbounded path's `relations` does.
+                    joined = nat.execute_plan(
+                        join_ir,
+                        [left or [left_empty], right or [right_empty]],
+                        self._engine_config,
+                    )
+                else:
+                    joined = reduce_join_paths_spilling(
+                        join_ir,
+                        left_keys,
+                        right_keys,
+                        left_paths,
+                        right_paths,
+                        work,
+                        _JOIN_REDUCE_SUBBUCKETS,
+                        self._engine_config,
+                        left_empty.schema,
+                        right_empty.schema,
+                    )
                 if gk is not None:
                     # Fused post-join aggregate: fold the bounded join output into partial
                     # state (finalize only when each group is whole in this bucket), so only
@@ -918,8 +971,8 @@ try:
             join_ir,
             addrs,
             reducer_id,
-            left_schema,
-            right_schema,
+            left_empty,
+            right_empty,
             epochs=None,
             replicas=None,
             plan_id=None,
@@ -947,8 +1000,8 @@ try:
                 join_ir,
                 addrs,
                 reducer_id,
-                left_schema,
-                right_schema,
+                left_empty,
+                right_empty,
                 None,
                 None,
                 True,
@@ -1010,7 +1063,10 @@ try:
             merges them into range boundaries. Stateless w.r.t. the shuffle session.
             """
             nat = engine()
-            from batcher.dist.executors.partition_io import read_partition_descriptor
+            from batcher.dist.executors.partition_io import (
+                read_partition_descriptor,
+                sample_key_grid,
+            )
 
             rows = nat.execute_plan(
                 map_ir, [read_partition_descriptor(partition)], self._engine_config
@@ -1018,8 +1074,7 @@ try:
             n = sum(b.num_rows for b in rows)
             if n == 0:
                 return ([], 0)
-            grid = nat.column_quantiles([key_name], rows, list(probs)).get(key_name, [])
-            return (grid, n)
+            return (sample_key_grid(rows, key_name, list(probs)), n)
 
         def range_publish(
             self,
@@ -1033,6 +1088,7 @@ try:
             src=None,
             epoch=0,
             plan_id=None,
+            stage_base=0,
         ) -> str:
             """Range-partition this split's rows by `boundaries` and publish each bucket.
 
@@ -1058,10 +1114,19 @@ try:
             # Publish EVERY bucket (empty included) so a reducer's failed fetch means
             # a lost worker, not an empty bucket — the recompute loop's clean signal.
             for r in range(n_buckets):
-                self.session.publish(_ticket(0, src, r, epoch), buckets[r])
+                self.session.publish(_ticket(stage_base, src, r, epoch), buckets[r])
             return self.session.addr
 
-        def sort_reduce(self, sort_ir, addrs, reducer_id, epochs=None, replicas=None, plan_id=None):
+        def sort_reduce(
+            self,
+            sort_ir,
+            addrs,
+            reducer_id,
+            epochs=None,
+            replicas=None,
+            plan_id=None,
+            stage_base=0,
+        ):
             _use_plan(plan_id)
             nat = engine()
             # This reducer owns one contiguous key range; fetch its bucket from every
@@ -1071,12 +1136,12 @@ try:
             # copy is lost is reported retryable for the driver to recompute.
             epochs = epochs or {}
             sources = [
-                (addr, _ticket(0, src, reducer_id, epochs.get(src, 0)))
+                (addr, _ticket(stage_base, src, reducer_id, epochs.get(src, 0)))
                 for src, addr in enumerate(addrs)
             ]
             rows, unreachable = self.session.gather_concat(sources, replicas=replicas)
             if unreachable:
-                return ("retry", unreachable)
+                return ("retry", _lost(unreachable))
             if not rows:
                 return ("ok", None)
             return ("ok", nat.execute_plan(sort_ir, [rows], self._engine_config))

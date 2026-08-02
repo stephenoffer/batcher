@@ -112,8 +112,14 @@ def test_inference_packing_uses_the_cluster_device_not_the_driver():
     not."""
     from batcher.kyber.gpu.policy import decide_gpu_map_params
 
-    on_a100 = decide_gpu_map_params(20.0, 0.0, None, gpu_memory_gb=80.0)
-    fallback = decide_gpu_map_params(20.0, 0.0, None)
+    # A decoded 224x224x3 image row, so the batch seed is bounded by VRAM rather than by the
+    # 65,536-row ceiling. With a narrow row both devices simply hit the ceiling, which would
+    # make the batch-size assertion below true by construction and blind to the budget.
+    image_row_bytes = 224 * 224 * 3
+    on_a100 = decide_gpu_map_params(
+        20.0, 0.0, None, gpu_memory_gb=80.0, input_row_bytes=image_row_bytes
+    )
+    fallback = decide_gpu_map_params(20.0, 0.0, None, input_row_bytes=image_row_bytes)
     assert on_a100.num_gpus < 1.0
     assert on_a100.num_gpus < fallback.num_gpus
     # And the VRAM left after the model seeds a correspondingly larger batch.

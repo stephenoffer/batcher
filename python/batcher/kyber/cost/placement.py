@@ -69,6 +69,34 @@ class PlacementAdvice:
     reason: str = ""
 
 
+def _packing_order(cluster) -> list:
+    """The nodes a relational gang would take, in the order it would take them.
+
+    Two keys, in this order.
+
+    **CPU-only nodes first, on a fleet that has both kinds.** A breaker priced here runs on the
+    host — it is the native relational engine, and its workers want cores, page cache and a
+    NIC. An accelerator node has all three and something else besides: the devices, whose host
+    halves read files, decode, and stage buffers on those same cores. Ranking by density alone
+    sends the gang to exactly those nodes, because an eight-device box carries far more cores
+    than the CPU workers beside it — so the one placement rule that deliberately *concentrates*
+    a fleet concentrated it onto the hardware the GPU stages need, and did it invisibly, as a
+    plan that is merely slower. This is the same interference that made a distributed GPU query
+    wait behind the shuffle fleet's CPU reservation; a GPU task now asks for no core, and the
+    complement of that fix is not to aim the CPU gang at the devices.
+
+    A fleet of one kind is unaffected: with no accelerator nodes, or with nothing else to pack
+    onto, the order is density alone, which is what it always was.
+
+    **Then densest-first**, because a gang packs onto the biggest hosts it can reach. Using the
+    mean would report a fleet of one fat node and many thin ones as unable to pack, which is
+    precisely the fleet where packing is most available. `node_id` breaks ties so the count and
+    the priced view below cannot disagree about which nodes were chosen.
+    """
+    usable = [n for n in cluster.nodes if n.cpu_cores > 0]
+    return sorted(usable, key=lambda n: (n.gpus > 0, -n.cpu_cores, n.node_id))
+
+
 def _packed_nodes(hardware, workers: int) -> int:
     """Nodes a `workers`-wide gang would occupy if packed as tightly as capacity allows.
 
@@ -78,17 +106,14 @@ def _packed_nodes(hardware, workers: int) -> int:
     cluster = getattr(hardware, "cluster", None)
     if cluster is None or not cluster.known:
         return 0
-    # Densest-first, because a gang packs onto the biggest hosts it can reach. Using the mean
-    # would report a fleet of one fat node and many thin ones as unable to pack, which is
-    # precisely the fleet where packing is most available.
-    capacities = sorted((n.cpu_cores for n in cluster.nodes if n.cpu_cores > 0), reverse=True)
-    if not capacities:
+    order = _packing_order(cluster)
+    if not order:
         return 0
     used = 0
-    for capacity in capacities:
+    for node in order:
         if workers <= 0:
             break
-        workers -= capacity
+        workers -= node.cpu_cores
         used += 1
     return used if workers <= 0 else 0
 
@@ -156,10 +181,15 @@ def prefers_locality(
 
 
 def _packed_view(hardware, nodes: int):
-    """`hardware` as it would look with the gang confined to its `nodes` densest hosts.
+    """`hardware` as it would look with the gang confined to the `nodes` hosts it would take.
 
     A view rather than a mutation: the profile is frozen and shared, and the packed shape is
     only ever used to *price* an alternative that has not been chosen yet.
+
+    The same `_packing_order` `_packed_nodes` counted against, not a second sort. Two orderings
+    would price a placement the count never proposed — the saving would be computed for one set
+    of hosts and the decision taken about another — and on a mixed fleet they genuinely differ,
+    since this one prefers the CPU-only nodes.
 
     Falls back to the input profile whenever the narrowed fleet cannot be built, so a failure
     here makes the saving zero and the advice "spread", which is the pre-existing answer.
@@ -171,7 +201,7 @@ def _packed_view(hardware, nodes: int):
     cluster = getattr(hardware, "cluster", None)
     if cluster is None or not cluster.known:
         return hardware
-    densest = sorted(cluster.nodes, key=lambda n: (-n.cpu_cores, n.node_id))[:nodes]
-    if not densest:
+    chosen = _packing_order(cluster)[:nodes]
+    if not chosen:
         return hardware
-    return replace(hardware, cluster=ClusterShape(nodes=tuple(densest)))
+    return replace(hardware, cluster=ClusterShape(nodes=tuple(chosen)))

@@ -26,6 +26,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from batcher.plan.ir_tags import COMPARISON_FLIP
+
 __all__ = ["to_partition_filters", "to_sql"]
 
 _BINARY_SQL = {
@@ -44,7 +46,6 @@ _BINARY_SQL = {
 }
 # The operators delta-rs accepts in a partition filter tuple.
 _PARTITION_OPS = {"eq": "=", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
-_FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def to_partition_filters(
@@ -80,7 +81,7 @@ def to_partition_filters(
         if left.get("e") == "col" and right.get("e") == "lit":
             column, value, operator = left["name"], right, op
         elif left.get("e") == "lit" and right.get("e") == "col":
-            column, value, operator = right["name"], left, _FLIP[op]
+            column, value, operator = right["name"], left, COMPARISON_FLIP[op]
         else:
             return False
         if column not in partitions:

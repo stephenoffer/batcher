@@ -7,7 +7,7 @@ description: Port a PySpark job to Batcher's public Python API — the DataFrame
 
 Use this when you have working PySpark and want it running on Batcher. The DataFrame
 vocabulary carries over almost verbatim; what changes is the *runtime model*, and that
-is where ports go wrong. Read `docs/migration/transforming.md` (the canonical mapping tables)
+is where ports go wrong. Read `docs/getting-started/migration/transforming.md` (the canonical mapping tables)
 before extending anything here — this skill is the porting procedure, that page is the
 reference.
 
@@ -148,7 +148,7 @@ by changing the call. The dialect selects a **parser**. Where Spark and DuckDB g
 disagree on what a function *means*, the engine follows DuckDB, because DuckDB is the
 oracle every differential test in the repo is written against. These are the differences
 a port actually hits, each found by running Spark's own documented examples through
-`bt.sql` (`docs/internals/competitor_parity_census.md`):
+`bt.sql` (`docs/architecture/internals/competitor_parity_census.md`):
 
 | Expression | Spark | Batcher (= DuckDB) |
 |---|---|---|
@@ -169,7 +169,7 @@ counts and a checksum against the original job's output, not the eyeball.
 
 ## See also
 
-- `docs/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
-- `docs/user-guide/{sql,udfs,window-functions,writing-data,explain-plans}.md`.
+- `docs/getting-started/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
+- `docs/user-guide/analyze/sql.md`, `docs/user-guide/transform/columns/udfs.md`, `docs/user-guide/analyze/window-functions.md`, `docs/user-guide/moving-data/writing-data.md`, `docs/user-guide/operate/tuning/explain-plans.md`.
 - `docs/integrations/compute/ray.md` — how distribution actually works (scheduling only).
 - Skills: `run-quality-gate` (if the port changes repo code).

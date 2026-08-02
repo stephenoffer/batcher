@@ -102,7 +102,7 @@ class GroupApply:
         """
         if self.batch_format == "pyarrow":
             return self.fn(group)
-        from batcher.ml.batch_format import result_to_arrowable, to_format
+        from batcher.interop.formats import result_to_arrowable, to_format
 
         return result_to_arrowable(self.fn(to_format(group, self.batch_format)), self.batch_format)
 

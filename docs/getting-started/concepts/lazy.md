@@ -54,4 +54,4 @@ print(plan.explain())
 
 - {doc}`expressions`: what goes inside a plan once you have one.
 - {doc}`adaptive`: how a lazy plan gets re-planned on measured row counts.
-- {doc}`/user-guide/operate/explain-plans`: reading what the optimizer decided.
+- {doc}`/user-guide/operate/tuning/explain-plans`: reading what the optimizer decided.

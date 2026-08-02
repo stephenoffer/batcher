@@ -19,5 +19,5 @@ python examples/dataset/iteration.py
 
 - {doc}`/cookbook/dataset/verbs/grouping`: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
 - {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join for time series.
-- {doc}`/user-guide/transform/transformations`: the full transformation surface these recipes draw on.
+- {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.

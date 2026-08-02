@@ -39,6 +39,7 @@ serde_json = "1"
 bc-arrow = { path = "crates/bc-arrow" }
 bc-secrets = { path = "crates/bc-secrets" }
 bc-resource = { path = "crates/bc-resource" }
+bc-geo = { path = "crates/bc-geo" }
 bc-expr = { path = "crates/bc-expr" }
 bc-ir = { path = "crates/bc-ir" }
 bc-runtime = { path = "crates/bc-runtime" }

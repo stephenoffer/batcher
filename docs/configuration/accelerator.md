@@ -7,7 +7,7 @@ inference stages are sized against their KV cache.
 
 Every default is inert. A deployment that sets none of these places work exactly as it did
 before, which is what makes each control safe to turn on one at a time.
-{doc}`/user-guide/operate/gpu-fleets` is the task-oriented walkthrough; this page is the field
+{doc}`/user-guide/operate/running/gpu-fleets` is the task-oriented walkthrough; this page is the field
 reference.
 
 ## Placement and sizing
@@ -215,7 +215,7 @@ stopped shipping `pynvml`.
 
 ## See also
 
-- {doc}`/user-guide/operate/gpu-fleets`: the same controls in the order you would adopt them.
+- {doc}`/user-guide/operate/running/gpu-fleets`: the same controls in the order you would adopt them.
 - {doc}`options`: every other configuration section.
 - {doc}`environment`: the `BATCHER_ACCELERATOR_*` spelling of these fields.
 - {doc}`/api/operations/governance`: data residency, the placement constraint that pairs with these.

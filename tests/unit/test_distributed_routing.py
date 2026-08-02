@@ -114,3 +114,63 @@ def test_threshold_respects_config(multinode, monkeypatch):
     monkeypatch.setattr("batcher.config.active_config", lambda: lowered)
     # 80k rows now exceeds a tiny threshold -> distribute.
     assert resolve_distributed("auto", None, [_Src(80_000)]) is True
+
+
+def test_an_accelerator_stage_that_stays_local_says_so(monkeypatch, recwarn):
+    """The silent outcome this replaces, on the most ordinary cluster shape there is.
+
+    A CPU head node with GPU workers is the normal Ray/Anyscale layout. `auto` will not start
+    Ray to discover the cluster (a deliberate 444 ms saving on every local query), so a stage
+    carrying `num_gpus` that forgets `distributed=True` resolves to single-node and runs the
+    model on the driver's CPU — the right answer, arbitrarily slower, with nothing said. The
+    routing decision is unchanged; it just stops being silent.
+    """
+    import batcher as bt
+    from batcher._internal.errors import PerformanceWarning
+    from batcher.api.terminal import routing
+
+    monkeypatch.setattr(routing, "_local_accelerator_present", lambda: False)
+    gpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, num_gpus=1)
+
+    assert routing.resolve_distributed(False, gpu._plan, None) is False
+    messages = [str(w.message) for w in recwarn if w.category is PerformanceWarning]
+    assert any("requested an accelerator" in m for m in messages), messages
+    assert any("distributed=True" in m for m in messages), messages
+
+
+def test_no_accelerator_warning_without_an_accelerator_stage(monkeypatch, recwarn):
+    """A plain CPU query must stay quiet — this warning fires on a real GPU pipeline or not
+    at all, or it becomes noise everyone filters."""
+    import batcher as bt
+    from batcher._internal.errors import PerformanceWarning
+    from batcher.api.terminal import routing
+
+    monkeypatch.setattr(routing, "_local_accelerator_present", lambda: False)
+    cpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b)
+
+    routing.resolve_distributed(False, cpu._plan, None)
+    assert [w for w in recwarn if w.category is PerformanceWarning] == []
+
+
+def test_no_accelerator_warning_when_the_device_is_present_or_unknown(monkeypatch, recwarn):
+    """Only a *positively established* absence warns.
+
+    A host whose devices cannot be read is not a host without devices, and warning on every
+    GPU query run on an actual GPU box would be worse than the silence this replaces.
+    """
+    import batcher as bt
+    from batcher._internal.errors import PerformanceWarning
+    from batcher.api.terminal import routing
+
+    gpu = bt.from_pydict({"x": [1]}).ml.map_batches(lambda b: b, num_gpus=1)
+    for verdict in (True, None):
+        monkeypatch.setattr(routing, "_local_accelerator_present", lambda v=verdict: v)
+        routing.resolve_distributed(False, gpu._plan, None)
+    # Matched on the message: building the plan above emits its own PerformanceWarning (a
+    # plain function on a GPU stage reloads the model per batch), which is a different
+    # complaint and not the one under test.
+    assert [
+        str(w.message)
+        for w in recwarn
+        if w.category is PerformanceWarning and "requested an accelerator" in str(w.message)
+    ] == []

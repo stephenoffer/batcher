@@ -19,5 +19,5 @@ python examples/expressions/strings_regex.py
 
 - {doc}`/cookbook/expressions/strings/measuring/strings_ratios`: cheap quality signals for a text corpus.
 - {doc}`/cookbook/expressions/strings/matching/strings_search`: substring tests, multi-pattern tests, and match counting.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

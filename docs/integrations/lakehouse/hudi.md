@@ -157,7 +157,7 @@ fail to open with a `BackendError` naming the table. Pin the reader version agai
 
 - {doc}`Lakehouse </user-guide/moving-data/lakehouse>`: the table-format guide.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: sources, splits, and pushdown.
-- {doc}`CDC pipeline </cookbook/data-engineering/cdc-pipeline>`: what an incremental read
+- {doc}`CDC pipeline </cookbook/data-engineering/ingest/cdc-pipeline>`: what an incremental read
   between two instants usually feeds.
 - {doc}`I/O API </api/relational/io>`: the full reader reference.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>` and {doc}`Iceberg </integrations/lakehouse/iceberg>`: the writable table formats.

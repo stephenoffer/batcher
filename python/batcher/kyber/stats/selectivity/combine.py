@@ -23,8 +23,6 @@ from batcher.kyber.stats.selectivity.leaves import (
     _str_func_selectivity,
 )
 from batcher.kyber.stats.selectivity.scalars import (
-    _COMPARISONS,
-    _FLIP_OP,
     _fraction_below_bounds,
     _fraction_below_quantiles,
     _mcv_lookup,
@@ -46,6 +44,7 @@ from batcher.plan.expr_ir import (
     Not,
     StrFunc,
 )
+from batcher.plan.ir_tags import ORDERING_COMPARISONS, ORDERING_FLIP
 
 
 def predicate_selectivity(
@@ -110,7 +109,7 @@ def _raw_predicate_selectivity(
             return (1.0 - _null_mass(expr, nulls)) - _equality_selectivity(
                 expr, ndv, cfg, mcv, bounds
             )
-        if op in _COMPARISONS:
+        if op in ORDERING_COMPARISONS:
             return _range_selectivity(expr, op, cfg, quantiles, bounds, ndv, mcv)
     if isinstance(expr, Not):
         inner = predicate_selectivity(expr.input, ndv, cfg, quantiles, mcv, bounds, nulls)
@@ -351,7 +350,7 @@ def _range_column(expr: Expr) -> str | None:
     Only orderable literals qualify — the interval combiner interpolates a CDF, which a
     non-orderable value (a string, a bool) has no position on.
     """
-    if not (isinstance(expr, Binary) and expr.op in _COMPARISONS):
+    if not (isinstance(expr, Binary) and expr.op in ORDERING_COMPARISONS):
         return None
     side = comparison_col_side(expr)
     if side is None or _ordinal(side[1]) is None:
@@ -389,7 +388,7 @@ def _interval_selectivity(
         if side is None:
             return None
         _, value, col_on_left = side
-        eff = c.op if col_on_left else _FLIP_OP[c.op]
+        eff = c.op if col_on_left else ORDERING_FLIP[c.op]
         x = _ordinal(value)
         frac = _fraction_below_quantiles(value, q)
         if frac is None:

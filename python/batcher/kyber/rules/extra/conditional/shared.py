@@ -30,7 +30,7 @@ from batcher._internal.mathx import is_nan
 # `_safe` (deterministic + non-erroring) are the sibling family's helpers, imported rather than
 # re-implemented — copy-paste is the one wrong way to share.
 from batcher.kyber.rules.extra.boolean_algebra import (
-    _SAFE_BINARY_OPS,
+    SAFE_BINARY_OPS,
     _key,
     _rewrite_node,
     _safe,
@@ -81,7 +81,7 @@ def _pure(expr: Expr) -> bool:
     if isinstance(expr, Case):
         return all(_pure(c) and _pure(t) for c, t in expr.branches) and _pure(expr.otherwise)
     if isinstance(expr, Binary):
-        return expr.op in _SAFE_BINARY_OPS and _pure(expr.left) and _pure(expr.right)
+        return expr.op in SAFE_BINARY_OPS and _pure(expr.left) and _pure(expr.right)
     if isinstance(expr, _BOOL_NODES):
         return _pure(expr.input)
     return _safe(expr)

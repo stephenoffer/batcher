@@ -153,7 +153,7 @@ These load the result into an external system:
 
 Everything above is built from the same four types, exported from `batcher.io`. You only
 need them to add a format the engine doesn't ship. See
-{doc}`extending Batcher </internals/extending>` for the walkthrough.
+{doc}`extending Batcher </architecture/internals/extending>` for the walkthrough.
 
 ```python
 from batcher.io import Source, Sink, Split, SOURCES
@@ -263,5 +263,5 @@ list of files it produced. That's what makes a write auditable and a failed run 
   the guided tour of these readers and writers.
 - {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: credentials and object-store paths.
 - {doc}`Lakehouse </user-guide/moving-data/lakehouse>`: Delta, Iceberg, and Hudi tables.
-- {doc}`Extending Batcher </internals/extending>`: adding your own source or sink.
+- {doc}`Extending Batcher </architecture/internals/extending>`: adding your own source or sink.
 - {doc}`/cookbook/io/index`: 6 runnable recipes for these readers and writers.

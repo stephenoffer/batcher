@@ -323,3 +323,33 @@ def test_a_row_local_chain_reassembles_in_shard_order(build, shard_count, be):
         ]
 
     assert in_order(got) == in_order(expected)
+
+
+def test_a_means_running_total_is_summed_in_double() -> None:
+    """A mean's partial sum must leave the input's integer type, or it wraps on real data.
+
+    The decomposition is exactly correct in exact arithmetic, which is what made this expensive
+    to find: a mean is asked for over precisely the columns whose totals do not fit an int64.
+    ClickBench q03 is `AVG(UserID)` over ~1e8 identifiers around 1e18, so the exact total is
+    ~1e26 against a 9.2e18 ceiling. It wrapped, and the finalize divided the wrapped total by an
+    honest count to produce 1.26e11 where the CPU engine produces 2.53e18 — an arbitrary number
+    rather than a rounded one. Both dataframe libraries wrap identically here, so the cast has
+    to live in the decomposition rather than in either backend.
+    """
+    from batcher.plan.distribution import decompose
+
+    node = {
+        "op": "aggregate",
+        "group_keys": [],
+        "aggregates": [{"func": "mean", "alias": "m", "input": {"e": "col", "name": "v"}}],
+    }
+    parts = decompose(node)
+    assert parts is not None
+    partial, _combine, _finalize = parts
+    sums = [a for a in partial["aggregates"] if a["func"] == "sum"]
+    assert len(sums) == 1, "a mean decomposes into exactly one running total"
+    assert sums[0]["input"]["e"] == "cast", "the running total must not stay in the input's type"
+    assert sums[0]["input"]["dtype"] == "float64"
+    # The count stays on the raw column: it counts rows, and casting would only cost a kernel.
+    counts = [a for a in partial["aggregates"] if a["func"] == "count"]
+    assert len(counts) == 1 and counts[0]["input"] == {"e": "col", "name": "v"}

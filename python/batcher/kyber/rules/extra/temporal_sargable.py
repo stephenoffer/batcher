@@ -54,6 +54,7 @@ from batcher.kyber.rule import Phase, node_rule
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import DateFunc
 from batcher.plan.expr_rewrite import transform_expr_up
+from batcher.plan.ir_tags import COMPARISON_FLIP, COMPARISON_OPS, COMPARISON_ORDER
 from batcher.plan.logical import Filter, LogicalPlan
 
 __all__ = [
@@ -63,11 +64,9 @@ __all__ = [
 
 # The comparison operators we rewrite (equality + the four inequalities). `ne` is
 # excluded on purpose — see the module docstring.
-_OPS = ("eq", "ne", "lt", "le", "gt", "ge")
 
 # When the literal sits on the *left* (`Y < year(col)`), the effective operator on the
 # extraction is the mirror of the written one.
-_MIRROR = {"eq": "eq", "ne": "ne", "lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}
 
 # A contiguous, monotonic year-bucket extraction: `first_year(V)` is the first calendar
 # year in bucket `V`, and `span` is how many calendar years the bucket covers. `year`
@@ -138,13 +137,13 @@ def _match_extraction(expr: Binary) -> tuple[str, str, int, str] | None:
     a bare-``Col`` extraction input, and rejects bool literals (a bool is an ``int``
     subclass but not a valid year).
     """
-    if expr.op not in _OPS:
+    if expr.op not in COMPARISON_OPS:
         return None
     left, right = expr.left, expr.right
     if isinstance(left, DateFunc) and isinstance(right, Lit):
         func, lit, op = left, right, expr.op
     elif isinstance(right, DateFunc) and isinstance(left, Lit):
-        func, lit, op = right, left, _MIRROR[expr.op]
+        func, lit, op = right, left, COMPARISON_FLIP[expr.op]
     else:
         return None
     if func.fn not in _BUCKETS or not isinstance(func.input, Col):
@@ -272,9 +271,9 @@ TEMPORAL_SARGABLE_RULES = [
             matches=(Filter,),
             expr_schema_fn=_make_leaf(fn, op),
             expr_matches=(Binary,),
-            expr_ops=(op, _MIRROR[op]),
+            expr_ops=(op, COMPARISON_FLIP[op]),
         )
     )
     for fn in _BUCKETS
-    for op in _OPS
+    for op in COMPARISON_ORDER
 ]

@@ -141,5 +141,5 @@ Highest first: `config_context` > `set_config` > `BATCHER_*` env vars > `BATCHER
 - {doc}`/configuration/options`: every field, with its default and unit.
 - {doc}`/configuration/environment`: the `BATCHER_*` spelling of the same settings.
 - {doc}`/configuration/profiles`: ready-made configurations for common machine shapes.
-- {doc}`/user-guide/operate/performance`: which fields are worth changing for a slow query.
+- {doc}`/user-guide/operate/tuning/performance`: which fields are worth changing for a slow query.
 - {doc}`/cookbook/operations/configuration`: options, scoped overrides, and profiles, as a runnable script.

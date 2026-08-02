@@ -19,5 +19,5 @@ python examples/expressions/sorting_and_ranking.py
 
 - {doc}`/cookbook/expressions/scalar/numeric_math`: arithmetic and math functions on numeric columns.
 - {doc}`/cookbook/expressions/strings/shaping/strings_case`: normalizing capitalization before you compare or group.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

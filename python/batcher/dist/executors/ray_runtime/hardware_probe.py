@@ -39,6 +39,21 @@ __all__ = [
 # shape rather than on every query. Autoscaling changes the signature and re-probes.
 _PROFILES_BY_TOPOLOGY: dict[tuple, tuple[dict, ...]] = {}
 
+_UNPROBEABLE_WARNED = False
+
+
+def _note_fleet_unprobeable(shapes: int) -> None:
+    """Say, once per process, that no worker answered — naming a cause the driver cannot see."""
+    global _UNPROBEABLE_WARNED
+    _UNPROBEABLE_WARNED = True
+    get_logger("dist").warning(
+        "no worker answered the hardware probe on any of %d node shape(s); cache-sized and "
+        "device-sized planning falls back to defaults. The usual cause is a worker environment "
+        "running a different Batcher build than the driver",
+        shapes,
+    )
+
+
 # Bound on how long the driver waits for the probe tasks before giving up and returning `0`.
 # Sizing a threshold is not worth stalling a query for, so the wait is short and the fallback
 # is the prior behavior.
@@ -86,6 +101,10 @@ def cluster_hardware_profiles() -> tuple[dict, ...]:
         if cached is not None:
             return cached
         result = _probe_representatives(ray, reps)
+        # A fleet where *no* shape answered differs from one never asked, and only this shows
+        # it: each node's failure is a DEBUG note, so a wholly mute cluster leaves no mark.
+        if not result and not _UNPROBEABLE_WARNED:
+            _note_fleet_unprobeable(len(reps))
         _PROFILES_BY_TOPOLOGY[signature] = result
         return result
     except Exception as exc:  # pragma: no cover - Ray optional / probe unschedulable
@@ -167,6 +186,11 @@ def _probe_representatives(ray, node_ids: list[str]) -> tuple[dict, ...]:
     A hard node-affinity pin is what makes the sample cover each distinct shape rather than
     landing wherever the scheduler prefers. A worker that does not answer within the timeout is
     simply absent from the result — a slow node must not stall a query for a sizing input.
+
+    A worker that *raises* is absent for the same reason, which is why each ref resolves on its
+    own. One `ray.get(ready)` over the list raises on the first failed task and the caller's
+    `except` turns that into `()`, so one unanswerable node discarded every healthy node's
+    profile with it. `dist.executors.map._live_actors` resolves per ref too.
     """
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -178,7 +202,16 @@ def _probe_representatives(ray, node_ids: list[str]) -> tuple[dict, ...]:
         for node_id in node_ids
     ]
     ready, _ = ray.wait(refs, num_returns=len(refs), timeout=_PROBE_TIMEOUT_S)
-    return tuple(p for p in ray.get(ready) if isinstance(p, dict) and p)
+    out: list[dict] = []
+    for ref in ready:
+        try:
+            profile = ray.get(ref)
+        except Exception as exc:
+            note_suppressed("dist", "probe a worker's hardware profile", exc)
+            continue
+        if isinstance(profile, dict) and profile:
+            out.append(profile)
+    return tuple(out)
 
 
 # Set once the mixed-fleet warning has been emitted. A cluster's composition does not change
@@ -413,7 +446,15 @@ def _probe_fleet_health() -> tuple[dict, ...]:
         ready, _ = ray.wait(list(refs), num_returns=len(refs), timeout=_PROBE_TIMEOUT_S)
         out = []
         for ref in ready:
-            record = ray.get(ref)
+            # Per node: the one whose probe raises (NVML throwing, a wedged driver) is
+            # disproportionately the sick one. Letting it escape to the caller's `except`
+            # discarded every record so far and returned `()`, which `unhealthy_nodes()` reads
+            # as "nothing to drain" — one sick node made the fleet report clean.
+            try:
+                record = ray.get(ref)
+            except Exception as exc:
+                note_suppressed("dist", "probe a worker's device health", exc)
+                continue
             if isinstance(record, dict):
                 out.append({"node_id": refs[ref], **record})
         return tuple(out)

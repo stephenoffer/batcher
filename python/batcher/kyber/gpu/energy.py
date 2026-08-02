@@ -56,7 +56,7 @@ def select_device_class(
     model_gib: float,
     *,
     prefer_efficiency: bool | None = None,
-    headroom: float = 0.15,
+    headroom: float | None = None,
     hub: MetadataHub | None = None,
 ) -> str | None:
     """Choose the device class a stage should be pinned to, or `None` to leave it unpinned.
@@ -71,7 +71,10 @@ def select_device_class(
         model_gib: The stage's resident footprint per worker.
         prefer_efficiency: Order by throughput per watt rather than by size. `None` reads
             `accelerator.efficiency_first_placement` from the active config.
-        headroom: Fraction of a device's memory left free when deciding what fits.
+        headroom: Fraction of a device's memory left free when deciding what fits, or `None`
+            for the configured `accelerator.vram_headroom`. A literal default here was one of
+            the private copies of that knob: a fleet that raised it still had stages pinned to
+            a device class chosen against the memory the knob had just reserved.
         hub: The metadata hub, consulted for *measured* efficiency when ordering by it. A
             device this fleet has actually run beats one the datasheet merely rates highly,
             because the datasheet ratio is peak-against-peak and a real stage rarely is. Only
@@ -82,11 +85,13 @@ def select_device_class(
         A device model name to pin to, or `None` when nothing fits, nothing is known, or every
         candidate fits (in which case a pin would only constrain placement).
     """
+    from batcher._internal.device_share import device_headroom
     from batcher._internal.device_specs import device_spec, rank_devices_by_efficiency
 
     if model_gib <= 0 or not candidates:
         return None
-    need = model_gib / (1.0 - min(0.9, max(0.0, headroom)))
+    room = device_headroom() if headroom is None else headroom
+    need = model_gib / (1.0 - min(0.9, max(0.0, room)))
     sized = [(name, device_spec(name)) for name in candidates]
     known = {name: spec.memory_gib for name, spec in sized if spec is not None}
     if len(known) < 2:
@@ -97,8 +102,12 @@ def select_device_class(
     if prefer_efficiency is None:
         prefer_efficiency = active_config().accelerator.efficiency_first_placement
     if prefer_efficiency:
-        measured = {n: learned_work_per_joule(hub, n) for n in fitting}
-        if all(v is not None for v in measured.values()) and measured:
+        # Each candidate's *own* samples. The generation fallback is right for "how efficient
+        # is this part" and wrong here: it hands every unmeasured sibling of one generation the
+        # same figure, so `max` falls through to the name tie-break and picks alphabetically
+        # while reporting that it chose on measurement.
+        measured = {n: learned_work_per_joule(hub, n, allow_generation=False) for n in fitting}
+        if measured and all(v is not None for v in measured.values()):
             return max(measured, key=lambda n: (measured[n], n))
         # The one efficiency ordering, rather than a second sort that could disagree with it.
         # Devices with no published power figure are unrankable and drop out; if that leaves
@@ -269,6 +278,7 @@ def device_energy_advice(
         device_tdp_watts,
         host_transfer_seconds,
     )
+    from batcher.plan.energy.power import device_power_watts
 
     bandwidth = device_memory_bandwidth_gbps(accelerator_type)
     watts = device_tdp_watts(accelerator_type)
@@ -304,7 +314,20 @@ def device_energy_advice(
     device_seconds = kernel_seconds + transfer_seconds
 
     speedup = cpu_seconds / device_seconds if device_seconds > 0 else 0.0
-    power_ratio = (watts + watts * 0.25) / _CPU_PATH_WATTS
+    # The whole server slot, from the one model that owns that arithmetic. This used to be a
+    # local `watts + watts * 0.25`, restating `plan.energy.power`'s host-overhead fraction as a
+    # literal — the copy-paste the layer contract forbids, and `plan` is neutral so consuming
+    # it is the sanctioned direction.
+    #
+    # Charged at **full** utilization, deliberately, and NOT at `reach`. The two are easy to
+    # confuse and mean opposite things here: `achieved_fraction` is how much of the device's
+    # peak *FLOPS* a kernel attains, while the power model's utilization is how hard the board
+    # is being driven. A kernel at 1% of peak is not a board drawing 1% of its power — it is
+    # almost always memory-stalled, drawing close to TDP and delivering very little, which is
+    # precisely the case this advice exists to veto. Charging it at `reach` made the worst
+    # stage in the workload look like the cheapest.
+    device_watts = device_power_watts(accelerator_type, 1.0, include_host=True)
+    power_ratio = (device_watts or watts * 1.25) / _CPU_PATH_WATTS
     energy_ratio = power_ratio / speedup if speedup > 0 else 0.0
     transfer_share = transfer_seconds / device_seconds if device_seconds > 0 else 0.0
     dominated = " (host copy dominates)" if transfer_share > 0.5 else ""
@@ -380,6 +403,7 @@ def learned_work_per_joule(
     accelerator_type: str | None,
     *,
     kind: str = "rows",
+    allow_generation: bool = True,
 ) -> float | None:
     """What this fleet has measured a device to deliver per joule, or `None` when it hasn't.
 
@@ -392,6 +416,11 @@ def learned_work_per_joule(
         hub: The metadata hub, or `None`.
         accelerator_type: Device model to look up.
         kind: `"rows"` or `"tokens"`, matching what was recorded.
+        allow_generation: Fall back to the device's *generation* bucket when it has no samples
+            of its own. Right for "how efficient is this part" and wrong for "which of these
+            parts is most efficient": every unmeasured sibling of one generation resolves to
+            the same number, so a ranking built on it cannot separate them and silently
+            decides on the tie-break instead. A caller comparing candidates passes `False`.
 
     Returns:
         Measured work per joule, or `None` when unknown or under-sampled.
@@ -405,7 +434,7 @@ def learned_work_per_joule(
     # one transfers to the other in a way an Ampere measurement does not — which is what makes
     # a newly added part usable immediately instead of cold for its first thousand runs.
     keys = [f"{accelerator_type}:{kind}"]
-    generation = device_generation(accelerator_type)
+    generation = device_generation(accelerator_type) if allow_generation else ""
     if generation:
         keys.append(f"gen:{generation}:{kind}")
     for key in keys:

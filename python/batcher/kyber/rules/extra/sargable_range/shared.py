@@ -33,10 +33,11 @@ comparison over the same operand, so a null column yields a null answer either w
 from __future__ import annotations
 
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
+from batcher.plan.ir_tags import ORDERING_COMPARISONS, ORDERING_FLIP
 
 __all__ = [
-    "FLIP",
-    "ORDERED",
+    "ORDERING_COMPARISONS",
+    "ORDERING_FLIP",
     "decompose",
     "narrow_int_range",
     "transpose",
@@ -47,12 +48,10 @@ _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 #: The comparisons this family handles. `=`/`<>` are deliberately absent: `sargable.py`
 #: already transposes those unconditionally, because equality's bijection survives the wrap
 #: and so needs no range proof at all.
-ORDERED = ("lt", "le", "gt", "ge")
 
 #: The comparison you get by swapping the operands, used twice: to normalize a predicate
 #: written with the literal on the left, and to negate one when the column's coefficient is
 #: negative (`k - col < lit` is `col > k - lit`).
-FLIP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 
 #: The value range each integer width guarantees, keyed by the Arrow type's name. Every one
 #: of these widens to Int64 at the FFI boundary, so a column of this type contributes values
@@ -127,11 +126,11 @@ def decompose(expr: Expr) -> tuple[str, str, Col, int, int] | None:
         The decomposition, or ``None`` when `expr` is not an ordered comparison between
         integer-constant arithmetic over a bare column and an integer literal.
     """
-    if not isinstance(expr, Binary) or expr.op not in FLIP:
+    if not isinstance(expr, Binary) or expr.op not in ORDERING_FLIP:
         return None
     for inner, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, FLIP[expr.op]),
+        (expr.right, expr.left, ORDERING_FLIP[expr.op]),
     ):
         lit = _int_lit(other)
         if lit is None or not isinstance(inner, Binary):
@@ -155,7 +154,7 @@ def transpose(form: str, op: str, col: Col, k: int, lit: int, low: int, high: in
 
     * `col + k OP lit` -> `col OP lit - k`, exact while `low + k` and `high + k` are i64;
     * `col - k OP lit` -> `col OP lit + k`, exact while `low - k` and `high - k` are i64;
-    * `k - col OP lit` -> `col FLIP(OP) k - lit`, exact while `k - low` and `k - high` are
+    * `k - col OP lit` -> `col ORDERING_FLIP(OP) k - lit`, exact while `k - low` and `k - high` are
       i64 — and with the operator flipped, because the column's coefficient is negative.
 
     Args:
@@ -181,5 +180,5 @@ def transpose(form: str, op: str, col: Col, k: int, lit: int, low: int, high: in
     if form == "rsub":
         if not _in_int64(k - low, k - high, k - lit):
             return None
-        return Binary(FLIP[op], col, Lit(k - lit))
+        return Binary(ORDERING_FLIP[op], col, Lit(k - lit))
     return None

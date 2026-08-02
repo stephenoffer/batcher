@@ -28,13 +28,13 @@ Read it bottom-up: a package may import anything **below** its line, never above
 
 | Layer | Package | Responsibility | May import |
 |---|---|---|---|
-| 6 · front-ends | `ml`, `_sql` | User-facing feature surfaces built *on* the public API: ML/inference/loaders; the SQL parser+translator. They lower to the same `Dataset`/`LogicalPlan` everything else uses — they never build a second plan or a second executor. | `api` + everything below |
-| 5 · conductor | `api` | **The only conductor.** The single place allowed to import all subsystems; it sequences them on a terminal op: Kyber optimizes → Carbonite checks feasibility → Core executes → metadata flows back. | everything below |
+| 5 · surface | `api` · `ml` · `graph` · `_sql` | **One layer, mutually dependent by design.** `api` is the only *conductor* — the single place that imports all four subsystems, sequencing them on a terminal op: Kyber optimizes → Carbonite checks feasibility → Core executes → metadata flows back. `ml`/`graph`/`_sql` are the feature surfaces built on it (ML/inference/loaders; graph analytics over an edge table; the SQL parser), and they lower to the same `Dataset`/`LogicalPlan` — never a second plan or a second executor. They are **not** a layer above `api`: `ml` imports `api` 77 times and `api` imports `ml` 17 times, because `ds.ml` is a façade over `ml` while `ml` is written against `Dataset`. Stating them as stacked described a one-way dependency that does not exist. | everything below |
 | 4 · backend | `dist` | Distributed **scheduling** of the same operators (Ray tasks, Arrow Flight shuffle, out-of-core spill). A *scheduling* concern, not a second semantics — it composes the same mergeable primitives. | `kyber`, `carbonite`, `core` + everything below. **MUST NOT import `api`** (that is the conductor calling *into* its own backend — a cycle). |
 | 3 · subsystems | `kyber` | **Optimizer.** Plan → plan passes; cardinality/cost; learned stats. Decides, never executes. | layers 0–2 |
 | 3 · subsystems | `carbonite` | **Resource manager.** Buffer pool, spill, credit-based flow control, memory envelopes. Also drives the data plane it governs (`bc-resource` pool, `bc-transport` shuffle). | layers 0–2, `_internal.native` |
 | 3 · subsystems | `core` | **Executor.** Drives the engine, runs the adaptive re-optimization loop, **measures** runtime metadata. | layers 0–2, `_internal.native` |
 | 3 · subsystems | `governance` | **Policy.** Row filters / column masks as a pure plan rewrite; lineage. | layers 0–2 |
+| 2.5 · interop | `interop` | **Arrow ↔ framework conversion** — NumPy/PyTorch/pandas/polars/JAX, and the `batch_format` surface `map_batches` presents to a user function. Neutral: it knows about arrays, never about plans or operators. It exists as its own layer because the *executor* needs it (`core.udf` converts around every user call) and the executor must not import the user-facing `ml` package, which is where this used to live. | layers 0–2 |
 | 2 · neutral IO | `io` | Sources, sinks, formats, filesystem, schema evolution. **Neutral**: it imports no subsystem, so anyone may depend on it. | layers 0–1, `_internal.native` |
 | 2 · neutral sinks | `observe` | **Observability sinks**: the terminal progress reporter, the bounded activity store, and the web dashboard (`bt.start_ui()`). Consumes the event bus (`_internal.events`) that every subsystem publishes to; it reads events, never the engine. **Neutral** — it imports no subsystem (not even `io`), which is what keeps observability decoupled from the thing it observes. | layers 0–1 |
 | 1 · contracts | `plan` | `LogicalPlan`/`PhysicalPlan`, `expr_ir`, schema, the JSON IR (`to_ir`), IR tags. | layer 0 |
@@ -60,12 +60,37 @@ This is not theoretical: it is what broke all six independence directions, and t
 Run `just lint-layers` after any change to Python imports. A red contract is a blocking
 failure, not a warning.
 
+### The matrix is a contract, not a diagram
+
+`just lint-layers` checks the whole table above as an import-linter `layers` contract, not just
+the four narrow rules that used to stand in for it. Before that contract existed, **28 upward
+edges had accumulated with every gate green** — all of them function-local imports, and only
+one of the 28 recorded anywhere as debt.
+
+Those 28 are listed individually in `pyproject.toml`'s `ignore_imports`, and
+`just lint-layer-debt` fails if the list grows. An exemption records an edge that predates the
+contract; it is **not** a way to make a new import pass. If you find yourself wanting to add
+one, the layer assignment here is what is wrong, and changing it is a design decision to argue
+for rather than a line to append.
+
 ### Known debt (visible on purpose)
 
-- `core/udf` imports `ml.gpu` / `ml.inference` / `ml.batch_format` — an *upward* edge (layer 3
-  reaching into layer 6). Those are execution concerns (autocast, the inference pool, batch-format
-  conversion) that grew inside the user-facing `ml` package instead of the executor. They belong in
-  `core` or a neutral layer. Don't add more upward edges; move these down when you touch them.
+Started at 28 upward edges; **6 remain**.
+
+- **Paid off (22).** Five `ml.batch_format` edges went when the Arrow-to-framework conversion
+  moved down into `interop`. Seventeen `api → ml`/`_sql` edges went when the matrix itself was
+  corrected: `api` and the front-ends are *mutually* dependent (`ml` imports `api` 77 times,
+  `api` imports `ml` 17), so they are one layer, not two stacked ones. Calling them stacked
+  made ordinary façade-to-implementation calls look like violations while describing the
+  coupling as one-way, which it never was.
+
+- **`core`/`dist` → `ml.gpu` / `ml.inference`** (6 edges, open). Execution concerns — autocast,
+  the inference actor pool, device sizing — still inside the user-facing package. They belong
+  in `interop`. The move is measured, not guessed: the transitive closure of the eight symbols
+  involved is **28 definitions, ~785 lines**, half of `ml/gpu.py`, pulling in NVML handles, the
+  autocast speed probe and backend detection. It is a bisection of the one surface with no
+  automated verification (`.claude/rules/device-tier.md`), so it wants a GPU and a recorded
+  `gpu_shadow_verify` run — not a blind refactor.
 
 ## The contract loop (why the split exists)
 

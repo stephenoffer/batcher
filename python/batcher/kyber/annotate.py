@@ -288,7 +288,8 @@ def _desired_parallelism(in_rows: float, width: float, target_rows: int, target_
     **This is not a new rule, it is the rule the rest of the engine already follows.**
     `api/tuning/decisions.py::auto_num_partitions` and `dist/executors/map.py` both take the
     larger of the row- and byte-derived counts against `target_bytes_per_task`, and
-    `docs/deep-dives/distribution/distributed-scheduling.md` documents that as how a stage is
+    `docs/architecture/deep-dives/distribution/distributed-scheduling.md` documents that as how a
+    stage is
     sized — naming video frames and embeddings as the reason. Kyber's `n_max_parallelism`, which is
     what `SchedulingEnvelope.n_tasks` is actually derived from, was the one place that still
     counted only rows. So the two answers to "how many tasks" disagreed on exactly the data

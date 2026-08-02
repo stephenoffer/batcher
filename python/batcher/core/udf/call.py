@@ -94,7 +94,7 @@ def _record_dropped_row(budget: list[int], exc: Exception) -> None:
 
 def _formatted(fn: Any, fmt: str) -> Any:
     """Wrap `fn` so it receives/returns `fmt` batches while the caller stays Arrow."""
-    from batcher.ml.batch_format import result_to_arrowable, to_format
+    from batcher.interop.formats import result_to_arrowable, to_format
 
     def _call(batch: pa.RecordBatch) -> object:
         return result_to_arrowable(fn(to_format(batch, fmt)), fmt)

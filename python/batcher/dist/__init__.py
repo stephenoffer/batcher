@@ -14,12 +14,13 @@ distribute fall back to the multi-core single-node engine.
 from __future__ import annotations
 
 from batcher.dist.executor import execute_distributed, resolve_worker_fanout
-from batcher.dist.executors.plan_analysis import requires_staging
+from batcher.dist.executors.plan_analysis import fused_union_ids, requires_staging
 from batcher.dist.executors.ray_runtime import cluster_topology, resolve_transport
 
 __all__ = [
     "cluster_topology",
     "execute_distributed",
+    "fused_union_ids",
     "requires_staging",
     "resolve_transport",
     "resolve_worker_fanout",

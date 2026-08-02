@@ -26,6 +26,7 @@ from batcher.plan.logical import (
     Sample,
     Scan,
     Sort,
+    Union,
     Unnest,
     Unpivot,
     remap_sources,
@@ -125,6 +126,76 @@ def _is_linear_map_pipeline(plan: LogicalPlan) -> bool:
             node = node.input
         else:
             return False
+
+
+def shuffle_branches(node: LogicalPlan) -> list[LogicalPlan] | None:
+    """The map-side sub-plans that may feed ONE shuffle for an operator over `node`.
+
+    `[node]` for the ordinary single-source, breaker-free input every shuffle operator
+    already accepts. For a `UNION ALL` of such branches it is the branch list, because the
+    shuffle routes by key hash and `partial → combine → finalize` is associative and
+    commutative: the partials of N branches merged in one reducer are the partials of their
+    concatenation, which is what the union *is*. Returns `None` for any other shape.
+
+    That equality is what makes this a routing fact rather than a second semantics — and it
+    is worth having, because the alternative is the driver. `_distributed_union` runs each
+    branch to a driver table and concatenates there, so every shape that reduces a union —
+    `union(...).group_by(...)`, and `intersect`/`except_`, which lower to an aggregate over a
+    union of tagged branches — moved both inputs whole through one node before reducing them.
+
+    Branch *types* must match exactly, not merely their names. `Union.available_schema`
+    promotes one branch's `Int64` key against another's `Float64`; independent mappers skip
+    that promotion, so `1` and `1.0` would hash to different reducers and one group would
+    come back as two — the split-group failure `CLAUDE.md` names, invisible single-node. An
+    unreadable schema is not a match: it is refused, leaving the shape on the path it had.
+    """
+    if not isinstance(node, Union):
+        return [node] if _single_source(node) and not _has_breaker(node) else None
+    # A DISTINCT union carries a dedup of its own, which map-side partials do not perform;
+    # the dispatcher rewrites that shape to `Distinct(UNION ALL)` before it arrives here.
+    if node.distinct:
+        return None
+    branches = list(node.inputs)
+    if not all(_single_source(b) and not _has_breaker(b) for b in branches):
+        return None
+    schemas = [b.available_schema() for b in branches]
+    if any(s is None for s in schemas):
+        return None
+    first = schemas[0].arrow
+    if any(s.arrow != first for s in schemas[1:]):
+        return None
+    return branches
+
+
+def fused_union_ids(plan: LogicalPlan) -> set[int]:
+    """`id()` of every UNION the aggregate directly above it maps into one shuffle.
+
+    The adaptive loop stages the *lowest* runnable breaker, and a union under an aggregate is
+    one — so it would run the union on its own and splice its result in, which for a union
+    means concatenating every branch on the driver. That is the materialization
+    `shuffle_branches` exists to avoid, and staging it would quietly undo the fusion: the
+    aggregate would then see a single already-concatenated source and never take the fused
+    path at all.
+
+    Identity, not equality, and scoped to a union whose parent is an absorbing aggregate:
+    a union under a sort or a limit still stages exactly as it did, because nothing above it
+    can absorb it and its staged result is what gives that operator a single source to
+    distribute over.
+    """
+    fused: set[int] = set()
+
+    def walk(node: LogicalPlan) -> None:
+        if (
+            isinstance(node, Aggregate)
+            and isinstance(node.input, Union)
+            and shuffle_branches(node.input) is not None
+        ):
+            fused.add(id(node.input))
+        for child in children(node):
+            walk(child)
+
+    walk(plan)
+    return fused
 
 
 @dataclasses.dataclass(frozen=True)
@@ -282,10 +353,23 @@ def _dispatcher_handles_aggregate_input(node: LogicalPlan) -> bool:
     `requires_staging` also recurses into the join's children and catches a breaker side there.
     Mirroring the real predicate here removes that fragile coupling: a join with a breaker side
     now stages directly, never risking a silent `PlanError` if the child recursion ever misses it.
-    """
-    from batcher.plan.logical import AsofJoin
 
-    if isinstance(node, (Join, AsofJoin)):
+    A UNION ALL of map-only branches is handled too: they map into one shuffle
+    (`shuffle_branches`), so staging the union first would materialize on the driver the very
+    concatenation the shuffle exists to avoid.
+
+    An **ASOF** join is deliberately not a `Join` here, and this is the whole point of
+    mirroring rather than approximating. `_fusable_join_aggregate` and `_aggregate_over_join`
+    both test `isinstance(j, Join)`, so the dispatcher has no fused route over an ASOF (or
+    range) join at all — and claiming one made `requires_staging` answer False for
+    `join_asof(...).agg(...)`, which turned off the staging that shape's only distributed path
+    runs through. The query then reached the dispatcher, matched nothing, and raised
+    `PlanError` on splittable data. Widening the claim to cover a shape the dispatcher does
+    not route does not add a route; it removes the fallback.
+    """
+    if isinstance(node, Union):
+        return shuffle_branches(node) is not None
+    if isinstance(node, Join):
         return (
             len(scanned_source_ids(node.left)) == 1
             and len(scanned_source_ids(node.right)) == 1
@@ -311,7 +395,7 @@ def empty_result_table(plan: LogicalPlan, names: list[str]) -> pa.Table:
 
     A distributed stage that produced no rows must return the schema a stage with rows would,
     or `distributed == single-node` is false for every empty result and a downstream concat /
-    `write_parquet` / typed projection breaks only on the empty case. Falls back to null-typed
+    `write.parquet` / typed projection breaks only on the empty case. Falls back to null-typed
     placeholders when the plan cannot state its types (an opaque `map_batches` output) or when
     they disagree with `names` — strictly safer than trusting a mismatched schema.
     """

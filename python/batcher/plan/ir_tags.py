@@ -92,10 +92,69 @@ class ExprTag:
     MAKE_STRUCT: Final = "make_struct"
     MAKE_TEMPORAL: Final = "make_temporal"
     MAP: Final = "map"
+    GEO: Final = "geo"
     IMAGE: Final = "image"
     AUDIO: Final = "audio"
     VIDEO: Final = "video"
 
+
+# The `Binary` comparison operators, mirroring the Rust `BinaryOp` serde tags.
+#
+# Fourteen modules across Kyber were spelling this set out for themselves — as a frozenset, a
+# tuple, a dict keyed by it, and (twice, adjacently, in one file) the same dict literal — and
+# `ruff` reports none of that: `F811` does not fire on a module-level constant reassignment.
+# The spellings had already drifted apart, which is the cost: one of them omitted `eq`/`ne`
+# while carrying the same name as the ones that did not, so whether a rule saw an equality
+# predicate depended on which module it happened to be written in.
+#
+# A rule that genuinely wants a *subset* takes `ORDERING_COMPARISONS` or names its own for
+# what it is; what it must not do is redefine "the comparisons" to mean something narrower.
+COMPARISON_OPS: Final = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
+#: The same six in a FIXED order, for the callers that *generate* something per operator —
+#: Kyber registers one rule per comparison, and registration order is run order. Iterating the
+#: frozenset instead reorders those rules on every interpreter run, which no correctness test
+#: can see (each rule is individually semantics-preserving) and `just lint-rule-order` fails
+#: on. Use `COMPARISON_OPS` to ask "is this a comparison?"; use this to build one thing each.
+COMPARISON_ORDER: Final = ("eq", "ne", "lt", "le", "gt", "ge")
+# The order-only comparisons. Separate because range/zonemap reasoning is defined by an
+# interval endpoint moving, which `eq`/`ne` do not do: `eq` is a degenerate interval and `ne`
+# is not an interval at all, so admitting them to a bounds walk widens it wrongly.
+ORDERING_COMPARISONS: Final = frozenset({"lt", "le", "gt", "ge"})
+#: The ordering comparisons in a FIXED order, for per-operator *generation*. Same reason as
+#: `COMPARISON_ORDER`: a rule built per operator inherits the iteration order as its run order.
+ORDERING_ORDER: Final = ("lt", "le", "gt", "ge")
+
+#: The comparison a predicate becomes when its operands swap: `lit < col` == `col > lit`.
+#: Twenty-three call sites spelled this map out — optimizer rules, the IO predicate pushdown,
+#: and four lakehouse/NoSQL connectors each with their own name for it — which is the same
+#: fact written twenty-three times.
+COMPARISON_FLIP: Final = {
+    "lt": "gt",
+    "gt": "lt",
+    "le": "ge",
+    "ge": "le",
+    "eq": "eq",
+    "ne": "ne",
+}
+#: The flip restricted to the ordering comparisons, for a caller doing interval reasoning
+#: where `eq`/`ne` are not intervals and admitting them widens the walk wrongly.
+ORDERING_FLIP: Final = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
+
+#: Join types whose output rows are bounded by the LEFT side — so an empty left is empty, the
+#: left may drive a broadcast, and a tree-shard may split on it. `right`/`full` are absent
+#: because they pad the other side's rows through.
+LEFT_DRIVEN_JOINS: Final = frozenset({"inner", "left", "semi", "anti"})
+
+#: Aggregates with an O(1) running form and a metadata-answerable value — the set a rolling
+#: window, a pivot, a statistics read and the device translator all independently support.
+#: Spelled `mean` (the public API's name), not `avg` (the IR's).
+RUNNING_AGGREGATES: Final = frozenset({"sum", "min", "max", "count", "mean"})
+
+#: Binary operators safe to hand a compiled/JIT path and to reason about structurally: total
+#: on their input types, no null-propagation surprises, no division.
+SAFE_BINARY_OPS: Final = frozenset(
+    {"add", "sub", "mul", "and", "or", "eq", "ne", "lt", "le", "gt", "ge"}
+)
 
 # Window-function names, mirroring the Rust `WindowFn` enum (serde snake_case).
 # Ranking functions take no input; "value" functions select a row's value by offset

@@ -81,9 +81,17 @@ def test_a_label_that_disagrees_with_the_memory_is_not_trusted() -> None:
     # A stage pinned to a class the fleet does not have, or a memory figure that is the
     # config's fallback constant rather than a probe. A seventh of an H100 handed to a device
     # that is not one is an under-allocation nothing downstream would catch.
+    #
+    # The memory argument is in **decimal GB**, which is what both suppliers of it report; the
+    # spec table's `memory_gib` is in GiB. An 80 GiB H100 is 85.9 GB, and the two figures are
+    # compared in GiB after converting. Mixing them is a 7.4% error against a 10% tolerance —
+    # it survived by luck on the label check here and did not on the profile lookup next door,
+    # where it under-stated the model and picked an instance too small to hold it.
     assert _mig_fraction(6.0, "NVIDIA_H100", 12.0) is None
     assert _mig_fraction(6.0, "NVIDIA_H100", 0.0) is None
-    assert _mig_fraction(6.0, "NVIDIA_H100", 76.0) == pytest.approx(1 / 7), "within tolerance"
+    assert _mig_fraction(6.0, "NVIDIA_H100", 85.9) == pytest.approx(1 / 7), "an actual H100"
+    assert _mig_fraction(6.0, "NVIDIA_H100", 82.0) == pytest.approx(1 / 7), "within tolerance"
+    assert _mig_fraction(6.0, "NVIDIA_H100", 76.0) is None, "70.8 GiB is not an 80 GiB part"
 
 
 def test_the_switch_turns_partition_packing_off() -> None:

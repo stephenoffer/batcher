@@ -111,3 +111,27 @@ def test_distributed_skewed_join_spills_and_matches_single_node():
     with config_context(_TIGHT_MEMORY):
         dist = ds.collect(distributed=True, num_workers=3).to_pylist()
     assert _sort_key(dist, ("id", "v", "w")) == _sort_key(single, ("id", "v", "w"))
+
+
+def test_distributed_join_bucket_with_one_empty_side_spills_and_matches_single_node():
+    """A reducer bucket holding rows on only ONE side must still reduce out of core.
+
+    The spilling reducer infers each side's schema from that side's own data, and falls back
+    to a schema the driver passed when a side contributed nothing at all. The flight worker
+    was passing the driver's 0-row probe *RecordBatch* into that `pa.Schema` parameter, so the
+    fallback raised `TypeError: Schema must be an instance of pyarrow.Schema` — and the
+    recovery loop charged the crash to the worker that ran it, marked the whole fleet dead one
+    recompute at a time, and reported `shuffle did not recover after 3 attempts`. Five TPC-H
+    queries (q2, q5, q7, q8, q15) failed that way on a healthy cluster.
+
+    The fallback only fires when a side is *entirely* empty for a bucket, which the other
+    spilling-join tests never produce: a few distinct left keys against many right keys leaves
+    most buckets right-only, which is what this builds.
+    """
+    left = pa.table({"id": np.zeros(2000, dtype="int64"), "v": np.arange(2000)})
+    right = pa.table({"id": np.arange(4000, dtype="int64"), "w": np.arange(4000)})
+    ds = bt.from_arrow(left).join(bt.from_arrow(right), on="id")
+    single = ds.collect().to_pylist()
+    with config_context(_TIGHT_MEMORY):
+        dist = ds.collect(distributed=True, num_workers=3).to_pylist()
+    assert _sort_key(dist, ("id", "v", "w")) == _sort_key(single, ("id", "v", "w"))

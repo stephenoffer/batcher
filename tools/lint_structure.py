@@ -38,6 +38,15 @@ DIR_MAX_DEPTH = 5  # directory levels under a package/src root
 # grouped-by-family pattern the maintainability rule endorses, and splitting further would
 # fragment one cohesive family registry. Keyed by posix path relative to the repo root.
 DIR_ALLOW: dict[str, str] = {
+    "python/batcher/dist/executors/ray_runtime": (
+        "13 modules against a cap of 12: one per scheduling concern the distributed executor "
+        "separates — topology/scaling, placement capacity, reducer fan-out, placement groups, "
+        "readiness, lifecycle, fault policies, bucket reduce. The 13th (`reducers`) exists "
+        "because `scaling` was exactly at the 500-line limit, so the two caps pull opposite "
+        "ways here; merging any pair back puts a module over the line limit, and nesting a "
+        "package inside this one buys no navigability for modules nothing outside imports "
+        "directly (every caller goes through the package facade)"
+    ),
     "python/batcher/ml/metrics": (
         "the model-metrics family package, 13 modules against a cap of 12: one module per "
         "metric family (regression, ranking, ranked, clustering, cluster_quality, calibration, "
@@ -100,16 +109,6 @@ _ACCESSOR_RE = re.compile(r"Namespace$")
 # the list from becoming the place oversized files go to be forgotten. Every entry
 # is printed on each run so the set stays visible and shrinks over time.
 STRUCTURE_ALLOW: dict[str, str] = {
-    # Sat at exactly 500 lines — the ceiling — so adding a single `__slots__` entry tipped
-    # it over. That entry is `__weakref__`, and it is load-bearing rather than cosmetic:
-    # without it the only per-instance handle on an in-memory source is `id()`, which
-    # CPython reuses the moment an object is freed, so four transient frames shared one
-    # learned-statistics key and each planned from another relation's distinct counts and
-    # most-common-values (see `plan/source_stats.py::source_stats_key`). The real fix is to
-    # split the widening helpers (`_widen_*`, the narrow-type mapping) out of the source
-    # class they sit above — a genuinely separate concern — but that is a refactor to do
-    # deliberately, not as a side effect of a one-line correctness fix.
-    "python/batcher/io/source/inmemory.py": "at the ceiling; one __slots__ entry tipped it — extract the _widen_* helpers next",
     # Sat at 499 lines — one under the ceiling — so wiring shuffle-output replication
     # into the reduce tipped it over. The replication logic itself was extracted to
     # `dist/shuffle_replication.py` rather than left inline; what remains is the reduce
@@ -123,16 +122,6 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # splitting across modules forces a fragile base<->subclass import cycle — the
     # one-Expr invariant (rust-engine.md) wins over the line limit here.
     "python/batcher/plan/expr_ir/core.py": "one-Expr hierarchy; split forces a base/subclass import cycle",
-    # The one exception hierarchy (BatcherError + every subclass). It is a single
-    # cohesive contract — the subclasses are mutually referential (`.of` factories,
-    # shared `__str__`) and each is publicly exported, so the docstring gate requires a
-    # per-class `Examples:` doctest. Those mandatory examples, not logic, are what carry
-    # it past the line limit; the suggestion helpers already live in a sibling module
-    # (`suggest.py`). Splitting the exceptions across files to satisfy the counter would
-    # only scatter one contract and break `from batcher._internal.errors import <Name>`.
-    "python/batcher/_internal/errors/hierarchy.py": (
-        "one exception hierarchy; mandatory per-class doctests inflate it"
-    ),
     # The one `Expr` enum and its `serde` wire tags. `.claude/rules/rust-engine.md` and
     # crates/CLAUDE.md name this as the seam that is never cut across: the enum and its
     # tags stay in the crate's lib.rs, so the wire contract lives in exactly one place.
@@ -142,11 +131,6 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # name it as legitimately wide); its heavy method bodies are already extracted to
     # dataset/_build.py, leaving thin methods + docstrings that shouldn't be cut.
     "python/batcher/api/dataset/frame.py": "Dataset fluent builder; bodies in _build.py",
-    # GroupBy is a wide fluent builder like Dataset/Expr: a class of per-reducer shortcut
-    # methods (sum/mean/product/mode/array_agg/skewness/…), each a thin docstring +
-    # `self._reduce(name, cols)`. The bodies are already trivial; splitting a single class
-    # across modules would force a base/subclass import cycle for no benefit.
-    "python/batcher/api/groupby.py": "GroupBy fluent builder; per-reducer shortcut methods",
     # The single source of truth for every tunable: ~11 frozen dataclasses whose fields
     # map 1:1 to bc_ir::EngineConfig. They are one contract meant to be read together;
     # splitting them across modules would scatter that contract and the env/file/Rust
@@ -168,12 +152,6 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # grows by one small arm per relational operator; splitting the dispatch across
     # files would scatter the column-need logic that must stay consistent between them.
     "python/batcher/kyber/rules/projections.py": "projection-pushdown dispatch hub; per-operator arms",
-    # One aggregate-pushdown rule family (count-distinct rewrite, eager aggregation,
-    # pre-aggregate through/into joins) sharing the `_MIN_PREAGG_REDUCTION` guards and
-    # estimator helpers. At the size limit; splitting across files would reorder Kyber rule
-    # registration within the REWRITE/SELECTION phases (import order == run order, a
-    # documented correctness hazard) — the rule-order invariant wins over the size cap.
-    "python/batcher/kyber/rules/agg_pushdown.py": "agg-pushdown rule family; split reorders rules",
     # The streaming across-cores executor: shard the driving scan, one pipeline per worker
     # over a shard, combine at the breaker. The prebuild cache, shard split, per-breaker
     # combine arms, shard-count cap, and sequential fallback all share one Ctx / build-cache /
@@ -185,26 +163,12 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # fallback the broadcast path depends on. Splitting the broadcast path into a
     # sibling forces a base<->fallback import cycle with `_shuffle_join`.
     "python/batcher/dist/executors/join.py": "distributed-join strategy hub; broadcast/shuffle split forces an import cycle",
-    # Cost-based join reordering: the rule driver plus three cost-DP rebuilders
-    # (exhaustive subset DP, connected-subset DP for large sparse graphs, greedy) that
-    # share the same edge/leaf/schema scaffolding (`_join_plans`/`_final_projection`) —
-    # one memo whose enumerators are chosen by leaf count, so splitting them scatters the
-    # dispatch and duplicates that scaffolding. Tracked to shrink now that the join family
-    # is a package (`rules/joins/`) with room for a sibling.
-    "python/batcher/kyber/rules/joins/order.py": "join-reorder rule + the cost-DP enumerators sharing one memo/scaffolding",
     # The expression accessor namespaces: each is one bound family (`.str` / `.list`)
     # whose every public method carries a Google-style docstring with a runnable
     # `.. doctest::` example (python-quality.md). The examples — not the code — push
     # these over the limit; the methods are one cohesive accessor that the factory
     # binds as a unit, so splitting them would scatter one namespace across files.
     "python/batcher/plan/expr_ir/namespaces/strings.py": "one bound .str accessor; per-method runnable examples push it over",
-    "python/batcher/plan/expr_ir/namespaces/collections.py": "one bound .list accessor; per-method runnable examples push it over",
-    "python/batcher/plan/expr_ir/namespaces/temporal.py": "one bound .dt accessor; per-method runnable examples push it over",
-    # The IO reader/writer namespaces: one method per format/connector, each now
-    # carrying a usage example (runnable for local file formats, illustrative for
-    # service-backed sinks/sources). The examples, not the thin dispatch bodies, push
-    # these over; they are one cohesive `bt.read` / `ds.write` façade.
-    "python/batcher/api/io_namespace/reader.py": "bt.read façade; per-format examples push it over",
     "python/batcher/api/io_namespace/writer.py": "ds.write façade; per-format examples push it over",
     # The `ds.ml` accessor: one bound ML/multimodal namespace (map_batches, infer,
     # embed, the torch loaders, download/upload) whose every public method now carries
@@ -218,16 +182,6 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # more names than 120. Collapsing the imports would hide them from editors and from
     # `just lint-docstrings`, which introspects this list.
     "python/batcher/ml/__init__.py": "ML re-export facade; one name per line over 8 subpackages",
-    "python/batcher/ml/preprocessors/__init__.py": (
-        "the preprocessors re-export facade curates ~45 fit/transform estimators across the "
-        "scalers, encoders, imputers, text, and derived submodules, one name per line so each is "
-        "discoverable"
-    ),
-    "python/batcher/ml/stats/__init__.py": (
-        "the ml.stats re-export facade curates ~60 statistics across nine submodules (descriptive, "
-        "association, robust, drift, multivariate, hypothesis, homogeneity, nonparametric, and the "
-        "__all__), one name per line so each is discoverable"
-    ),
     "python/batcher/ml/metrics/__init__.py": (
         "the ml.metrics re-export facade curates ~80 scoring functions across nine submodules "
         "(evaluate, ranking, clustering, regression, calibration, fairness, comparison, "
@@ -251,6 +205,18 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # line, grown just past 120 by the LLM-output-parsing family. Collapsing the import/`__all__`
     # would hide the surface the coverage linter walks.
     "python/batcher/plan/functions/__init__.py": "re-export-only function facade; one line per public name for discoverability",
+    "python/batcher/graph/__init__.py": (
+        "the graph-analytics facade: ~50 algorithms across ten modules, one import line per "
+        "public name. Users import from `batcher.graph` directly, so the names have to be "
+        "here; the modules below it are all under the size limit"
+    ),
+    "python/batcher/plan/functions/geo/__init__.py": (
+        "the geospatial family facade: 113 PostGIS-named functions across nine modules, one "
+        "import line per public name. It is the single curated list of the family — both "
+        "`plan/functions/__init__.py` and `api/functions.py` splice `geo.__all__` rather than "
+        "restating it — so compressing it here would only move the same names somewhere less "
+        "greppable"
+    ),
     # The GPU/accelerator module: vendor-agnostic backend detection plus the per-GPU
     # zero-config *recommendation* family (`recommend_quantization` / `recommend_inference_dtype`
     # / `recommend_num_gpus` / `recommend_gpu_fraction`) and the utilization-feedback loop, all
@@ -276,13 +242,6 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # stages, map→aggregate) and the data/compute-skew-adaptive task sizing they share.
     # `executors/` is at the 12-file dir cap, so the variants can't move to a sibling.
     "python/batcher/dist/executors/map.py": "distributed map/inference hub; scheduling variants + adaptive sizing, executors/ at 12-file cap",
-    # The worker-side scan driver: split reading, the read-through cache sized to a share
-    # of node RAM, and the `on_read_error="skip"` broken-record accounting all share the
-    # same per-worker module state (the scan cache and the skip counter), so they cannot
-    # move to a sibling without threading that state through. `executors/` is at the
-    # 12-file dir cap. Sat at 495 until the per-query `drain_skipped_splits` (the fix that
-    # makes silent PB-scale data loss observable) tipped it three lines over.
-    "python/batcher/dist/executors/scan_read.py": "worker scan driver + read-through cache + skip accounting share per-worker state; executors/ at 12-file cap",
     # The one shared Flight-shuffle worker actor: every flight_* operator (aggregate /
     # join / sort / window) drives this SAME `_FlightWorker` so they share its session
     # and lineage-recovery contract. The module docstring's whole rationale is keeping
@@ -353,6 +312,35 @@ def rust_code_lines(text: str) -> int:
     return len(lines)
 
 
+def python_code_lines(text: str) -> int:
+    """Line count excluding docstrings — the Python counterpart of `rust_code_lines`.
+
+    Rust files already exclude their trailing `#[cfg(test)]` module, because "counting it
+    would penalize good test density". Python had no equivalent exclusion, and the omission
+    put two gates in direct opposition: `lint-docstrings` *mandates* a Google-style docstring
+    on every public name, with typed `Args:`/`Returns:` sections and a runnable `.. doctest::`
+    example — and then this gate charged the file for having them.
+
+    The result was not close. Measured across the six largest allowlisted modules:
+    `api/dataset/frame.py` is 5,720 lines of which **623 are code and 3,863 are docstrings**;
+    `plan/expr_ir/core.py` is 5,172 lines of which **316 are code**. Both carry an allowlist
+    entry apologising for a size that is almost entirely the other gate's requirement. Several
+    of the 43 exemptions exist for that reason and no other.
+
+    What the limit is for is the code you have to hold in your head to change the file safely.
+    A docstring is the thing that makes that *easier*. Comments stay counted: they interleave
+    with the logic and a file that needs a thousand of them is genuinely dense.
+    """
+    tree = ast.parse(text)
+    docstring_lines = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            doc = ast.get_docstring(node, clean=False)
+            if doc:
+                docstring_lines += doc.count("\n") + 1
+    return max(0, len(text.splitlines()) - docstring_lines)
+
+
 def class_public_methods(node: ast.ClassDef) -> list[str]:
     out = []
     for n in node.body:
@@ -389,7 +377,10 @@ def func_length(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
 def check_python_file(path: Path) -> None:
     rel = path.as_posix()
     text = path.read_text()
-    n = len(text.splitlines())
+    try:
+        n = python_code_lines(text)
+    except SyntaxError:  # a module mid-edit by another session; fall back to raw lines
+        n = len(text.splitlines())
 
     if path.name in BANNED_FILENAMES:
         fail(f"{rel}: banned grab-bag filename '{path.name}' — use a purpose-named module")

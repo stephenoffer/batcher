@@ -422,12 +422,12 @@ print(isinstance(bt.engine_version(), str))
 
 ## See also
 
-- {doc}`Transformations </user-guide/transform/transformations>`: reshape and derive columns.
-- {doc}`Filtering </user-guide/transform/filtering>`: select rows, drop duplicates.
+- {doc}`Transformations </user-guide/transform/rows/transformations>`: reshape and derive columns.
+- {doc}`Filtering </user-guide/transform/rows/filtering>`: select rows, drop duplicates.
 - {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: read Delta and Iceberg tables, and travel back
   through their versions.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate inputs as they arrive.
 - {doc}`IO API </api/relational/io>`: the full `bt.read` reader reference.
-- {doc}`Agent skills </agents/index>`: `read-and-write-data` covers picking a reader or
+- {doc}`Agent skills </agents>`: `read-and-write-data` covers picking a reader or
   sink, cloud paths, globs, schema evolution, and error tolerance.
 - {doc}`/cookbook/io/index`: 6 runnable recipes for readers, writers, and the registries.

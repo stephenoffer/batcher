@@ -10,10 +10,10 @@ A package may import anything **strictly below** its line, never above or sidewa
 
 | Layer | Package | May import |
 |---|---|---|
-| 6 · front-ends | `ml`, `_sql` — user surfaces built *on* the public API | `api` + below |
-| 5 · conductor | `api` — the ONLY layer that imports the subsystems | everything below |
+| 5 · surface | `api` · `ml` · `graph` · `_sql` — the public API and the libraries it composes. **One layer**: they import each other by design (`ml` uses `Dataset`, `ds.ml` calls `ml`). `api` is still the only one that imports the subsystems. | everything below |
 | 4 · backend | `dist` — distributed *scheduling* of the same operators | layers 0–3. **MUST NOT import `api`** (a cycle) |
 | 3 · subsystems | `kyber` (decides) · `carbonite` (protects) · `core` (measures/executes) · `governance` (policy) | layers 0–2 |
+| 2.5 · interop | `interop` — Arrow ↔ NumPy/torch/pandas conversion, `batch_format` | layers 0–2 |
 | 2 · neutral | `io`, `observe` | layers 0–1 |
 | 1 · contracts | `plan` (LogicalPlan, expr_ir, `to_ir`, ir_tags) · `metadata` | layer 0 |
 | 0 · utilities | `config`, `_internal` | each other |
@@ -58,7 +58,11 @@ lists/dicts to move data. Narrow numeric types are normalized once at the bounda
 
 **Ray is scheduling only.** Bulk Arrow batches move via `bc-transport` (Arrow Flight), never
 through the Ray object store. `dist/` composes the *same* mergeable primitives as single-node
-— a result MUST be identical whether produced on one node or a hundred.
+— a result MUST be identical whether produced on one node or a hundred: same row multiset,
+same column names, same column *types*. The one stated exception is float reassociation (IEEE
+addition is not associative, so partition count moves the last bits); see
+`.claude/rules/python-control-plane.md`. Do not restate this as bit-identity — it is not what
+the code does, and `assert_same` cannot see the difference either way.
 
 ## Quality gates
 

@@ -44,6 +44,7 @@ from batcher._internal.logging import note_suppressed
 from batcher._internal.optional import require
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["HudiFileSliceSplit", "HudiSink", "HudiSource"]
@@ -57,7 +58,6 @@ def _require_hudi() -> Any:
 
 
 _HUDI_OP = {"eq": "=", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
-_HUDI_FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def _hudi_filters(predicate: dict | None) -> list[tuple[str, str, str]]:
@@ -91,7 +91,7 @@ def _hudi_filters(predicate: dict | None) -> list[tuple[str, str, str]]:
                 out.append((left["name"], _HUDI_OP[op], literal(right)))
                 return True
             if left.get("e") == "lit" and right.get("e") == "col":
-                out.append((right["name"], _HUDI_OP[_HUDI_FLIP[op]], literal(left)))
+                out.append((right["name"], _HUDI_OP[COMPARISON_FLIP[op]], literal(left)))
                 return True
         return False
 

@@ -175,9 +175,9 @@ rather than failing, so the result is right and the scan is wide. The incrementa
 
 - {doc}`Lakehouse </user-guide/moving-data/lakehouse>`: the table-format guide.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: modes, partitioning, and what a commit is.
-- {doc}`Schema evolution </cookbook/data-engineering/schema-evolution>`: adding a column to a
+- {doc}`Schema evolution </cookbook/data-engineering/modeling/schema-evolution>`: adding a column to a
   table other jobs are reading.
-- {doc}`Partition backfill </cookbook/data-engineering/partition-backfill>`: why `overwrite`
+- {doc}`Partition backfill </cookbook/data-engineering/maintenance/partition-backfill>`: why `overwrite`
   being table-wide matters here.
 - {doc}`I/O API </api/relational/io>`: the full reader/writer reference.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>`: upserts, `replace_where`, vacuum.

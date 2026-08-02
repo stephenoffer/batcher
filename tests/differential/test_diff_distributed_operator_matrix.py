@@ -216,7 +216,7 @@ def test_distributed_sort_equals_single_node_sort(key, descending, nulls_first):
     both sides are the same engine and the comparison is ordered.
 
     The sort is on `(key, rid)`, not `key` alone, and that is the whole point rather than a
-    convenience. `docs/user-guide/transform/sorting.md` states the contract outright: "Two rows
+    convenience. `docs/user-guide/transform/rows/sorting.md` states the contract outright: "Two rows
     with the same key can come back in either order, and the order can change between a
     sequential run, a multi-core run, and a distributed one", and names `-0.0` against `0.0` as
     a tie like any other. Asserting row-for-row on a duplicated key therefore pins behaviour the

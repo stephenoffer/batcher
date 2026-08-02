@@ -19,5 +19,5 @@ python examples/expressions/temporal_truncation.py
 
 - {doc}`/cookbook/expressions/temporal/temporal_timezones`: converting between them, and the reporting-boundary trap.
 - {doc}`/cookbook/expressions/scalar/window_functions`: per-row values computed from a window of related rows.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

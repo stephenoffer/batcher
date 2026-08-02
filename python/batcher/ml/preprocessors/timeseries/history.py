@@ -26,16 +26,19 @@ from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, columns_arg
 from batcher.plan.expr_ir.constructors import col
 from batcher.plan.expr_ir.nodes import lag
+from batcher.plan.ir_tags import RUNNING_AGGREGATES
+
+#: Historical name for `RUNNING_AGGREGATES`, re-exported from `ml.preprocessors.timeseries`.
+ROLLING_AGGREGATES = RUNNING_AGGREGATES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from batcher.api.dataset import Dataset
 
-__all__ = ["ROLLING_AGGREGATES", "LagFeaturizer", "RollingFeaturizer"]
+__all__ = ["RUNNING_AGGREGATES", "LagFeaturizer", "RollingFeaturizer"]
 
 #: The aggregates a rolling window may compute, and the `Expr` builder for each.
-ROLLING_AGGREGATES = ("mean", "sum", "min", "max", "count")
 
 
 def _check_partition(partition_by: Sequence[str] | None) -> list[str]:
@@ -149,7 +152,7 @@ class RollingFeaturizer(Preprocessor):
         columns: The columns to aggregate.
         order_by: The column defining time order within a series.
         window: How many preceding rows the window covers.
-        aggregates: Which aggregates to compute; see `ROLLING_AGGREGATES`.
+        aggregates: Which aggregates to compute; see `RUNNING_AGGREGATES`.
         partition_by: The column(s) identifying one series. Required whenever the table
             holds more than one, or the window reaches across series.
     """
@@ -172,14 +175,14 @@ class RollingFeaturizer(Preprocessor):
         self.window = window
         names = list(aggregates)
         for name in names:
-            if name not in ROLLING_AGGREGATES:
+            if name not in RUNNING_AGGREGATES:
                 from batcher._internal.errors import suggestion
 
-                hint = suggestion(name, ROLLING_AGGREGATES)
+                hint = suggestion(name, RUNNING_AGGREGATES)
                 tail = f" {hint}" if hint else ""
                 raise PlanError(
                     f"unknown rolling aggregate {name!r}; expected one of "
-                    f"{sorted(ROLLING_AGGREGATES)}.{tail}"
+                    f"{sorted(RUNNING_AGGREGATES)}.{tail}"
                 )
         if not names:
             raise PlanError("RollingFeaturizer needs at least one aggregate")

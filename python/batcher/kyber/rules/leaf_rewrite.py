@@ -46,6 +46,7 @@ from batcher.plan.expr_ir import (
 from batcher.plan.expr_ir.core import IsInf, IsNan
 from batcher.plan.expr_ir.nodes import Array, HashRows, MakeStruct
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
+from batcher.plan.ir_tags import SAFE_BINARY_OPS
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.visitor import transform_up
 
@@ -54,7 +55,6 @@ __all__ = ["SAFE_BINARY_OPS", "rewrite_node", "safe_expr", "whole_plan_expr_rule
 #: Binary operators that are deterministic and cannot raise. Wrapping add/sub/mul,
 #: the comparisons, and the Kleene boolean connectives are total. Division and modulo
 #: are absent because a zero divisor aborts the query.
-SAFE_BINARY_OPS = frozenset({"and", "or", "eq", "ne", "lt", "le", "gt", "ge", "add", "sub", "mul"})
 
 
 def safe_expr(expr: Expr) -> bool:

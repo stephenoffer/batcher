@@ -43,14 +43,21 @@ def _chain(node: Any, stop: tuple) -> tuple[Any, list[dict]] | None:
     """Walk down from `node` collecting translatable operators until a `stop` node.
 
     Returns `(stop_node, [op_ir, ...])` bottom-up (nearest the leaf first), or `None` when
-    anything on the way down is untranslatable. A node whose `to_ir()` raises is Python-only
-    (a `map_batches` UDF), which is exactly a "not lowered to the engine IR" answer.
+    anything on the way down is untranslatable.
+
+    Only `NotImplementedError` means "not lowered to the engine IR" — it is what
+    `LogicalPlan.to_ir` and `MapBatches.to_ir` raise, and the two are the whole vocabulary for
+    a Python-only node. Catching every exception here read a *defect* in some other node's
+    `to_ir()` as an ordinary Python-only stage: the plan would quietly become CPU-only for the
+    rest of the process with no error, no log line and no slow path to notice, which is the
+    same failure mode `api.terminal.gpu_backend.failure` exists to end. Anything else
+    propagates to that handler, which classifies it and says so.
     """
     ops: list[dict] = []
     while node is not None and not isinstance(node, stop):
         try:
             ir = node.to_ir()
-        except Exception:
+        except NotImplementedError:
             return None
         if not supported_op(ir):
             return None

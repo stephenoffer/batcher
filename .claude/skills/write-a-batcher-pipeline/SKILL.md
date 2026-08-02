@@ -282,9 +282,7 @@ measured per-operator rows/time/bytes/spill after a run, `ds.schema`/`ds.columns
 
 ## See also
 
-- `docs/getting-started/quickstart.md`; `docs/user-guide/{expressions,joins,aggregations,
-  window-functions,udfs,reading-data,writing-data,streaming,best-practices,explain-plans,
-  performance,troubleshooting}.md`.
+- `docs/getting-started/quickstart.md`; `docs/user-guide/transform/columns/expressions.md`, `docs/user-guide/analyze/joins.md`, `docs/user-guide/analyze/aggregations.md`, `docs/user-guide/analyze/window-functions.md`, `docs/user-guide/transform/columns/udfs.md`, `docs/user-guide/moving-data/reading-data.md`, `docs/user-guide/moving-data/writing-data.md`, `docs/user-guide/moving-data/streaming.md`, `docs/user-guide/operate/tuning/best-practices.md`, `docs/user-guide/operate/tuning/explain-plans.md`, `docs/user-guide/operate/tuning/performance.md`, `docs/user-guide/operate/running/troubleshooting.md`.
 - Skills: `migrate-from-duckdb-sql` (SQL workloads); `migrate-from-spark`,
   `migrate-from-polars-or-pandas`, `migrate-from-daft` (porting an
   existing script); `run-a-distributed-job`; `optimize-a-slow-query`;

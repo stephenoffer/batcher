@@ -15,6 +15,7 @@ use crate::eval::binary::{
 };
 use crate::eval::cast::cast_expr;
 use crate::eval::generate::eval_sequence;
+use crate::eval::geo::eval_geo;
 use crate::eval::in_list::eval_in_list;
 use crate::eval::list::{
     eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_get, eval_list_join,
@@ -324,6 +325,11 @@ impl Expr {
                 let r = right.eval(batch)?;
                 eval_list_binary(*func, &l, &r)
             }
+            // The geo evaluator takes the un-evaluated arguments rather than arrays,
+            // because its arity is per-function: it checks the count against
+            // `GeoFunc::arity` before evaluating anything, so a malformed IR document
+            // fails naming the function instead of panicking on a missing index.
+            Expr::Geo { func, args } => eval_geo(*func, args, batch),
             Expr::DateTrunc { input, unit } => {
                 let arr = input.eval(batch)?;
                 eval_date_trunc(&arr, unit)

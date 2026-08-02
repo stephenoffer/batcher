@@ -26,6 +26,7 @@ pub(crate) mod binary;
 pub(crate) mod cast;
 mod dispatch;
 pub(crate) mod generate;
+pub(crate) mod geo;
 pub(crate) mod hash;
 pub(crate) mod in_list;
 pub(crate) mod list;

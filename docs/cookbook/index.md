@@ -37,8 +37,7 @@ Everything that fits a model or scores one, all of it as aggregates and operator
 | Domain | Pages | Covers |
 |---|---|---|
 | {doc}`/cookbook/ml/index` | 26 | Preprocessors, estimators, validation, inference, and complete ML pipelines |
-| {doc}`/cookbook/metrics/index` | 14 | Model and text metrics as aggregates, so evaluation is a `select` |
-| {doc}`/cookbook/statistics/index` | 6 | Summary statistics, dispersion, distribution shape, association, and A/B inference |
+| {doc}`/cookbook/metrics/index` | 20 | Metrics and statistics as aggregates, so both describing a column and scoring a model are a `select` |
 
 ## Running it safely
 
@@ -60,7 +59,7 @@ Two sections teach by code, and they differ in what they hold constant:
 
 - {doc}`/user-guide/index`: the task-oriented guide behind every recipe here.
 - {doc}`/api/index`: the reference, when you want the signature rather than a worked call.
-- {doc}`/learning-paths/index`: these pages sequenced by the job you do.
+- {doc}`/tutorials/paths/index`: these pages sequenced by the job you do.
 
 ```{toctree}
 :hidden:
@@ -86,7 +85,6 @@ streaming/index
 
 ml/index
 metrics/index
-statistics/index
 ```
 
 ```{toctree}

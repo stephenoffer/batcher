@@ -200,5 +200,5 @@ train on.
 - {doc}`/ml/preparing/tokenization`: sequence packing and the token-id column, the next step after this page.
 - {doc}`/ml/training/data-loaders`: feeding the prepared corpus to a training loop.
 - {doc}`/ml/retrieval/llm-evaluation`: scoring what the trained model produces.
-- {doc}`/user-guide/transform/distinct-and-dedup`: near-duplicate removal, which belongs in the same
+- {doc}`/user-guide/transform/rows/distinct-and-dedup`: near-duplicate removal, which belongs in the same
   pipeline.

@@ -4,7 +4,7 @@ This page describes the design decisions that separate Batcher from DuckDB, Pola
 
 Most engines are fast at one shape of work. The interesting question is not whether Batcher is fast, which {doc}`../benchmarks/index` answers with measured numbers, but which properties survive when the work changes: when the data outgrows a laptop, when the pipeline has to feed a model, when the same query runs every hour for a year.
 
-Six decisions account for most of that. Each section below says what the decision is, what it buys, and where it stops today. The limits are drawn from `docs/internals/competitive_architecture.md`, an audit that checks every claim against code and names the ones the code does not support.
+Six decisions account for most of that. Each section below says what the decision is, what it buys, and where it stops today. The limits are drawn from `docs/architecture/internals/competitive_architecture.md`, an audit that checks every claim against code and names the ones the code does not support.
 
 ## One algebra from one core to a cluster
 
@@ -91,5 +91,5 @@ Streaming cannot express Flink's guarantees, and lakehouse format support is rea
 - {doc}`execution`: the tiers and the scheduler in detail.
 - {doc}`optimization`: Kyber's passes and the cost model behind the learned loop.
 - {doc}`../benchmarks/index`: the measured numbers, with the methodology behind each.
-- {doc}`/deep-dives/operators/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
-- {doc}`/deep-dives/adaptive/adaptive-reoptimization`: the re-planning loop, breaker by breaker.
+- {doc}`/architecture/deep-dives/operators/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
+- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization`: the re-planning loop, breaker by breaker.

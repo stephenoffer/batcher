@@ -2,7 +2,7 @@
 """Draw `adaptive_positioning.svg` -- what the adaptive loop actually buys, honestly.
 
 This diagram carries a claim the project has explicitly disciplined, so read
-`docs/internals/competitive_architecture.md` ("Claims to retire", item 1) before
+`docs/architecture/internals/competitive_architecture.md` ("Claims to retire", item 1) before
 changing it. The retired claim is that Batcher re-optimizes *more finely* than Spark
 AQE. It does not. `python/batcher/api/adaptive/` says so in its own first line:
 stage-boundary re-optimization, the same mechanism and the same granularity as AQE.
@@ -130,7 +130,7 @@ parts += [
     f'roughly 1.3 GB,</text>',
     f'<text x="40" y="{H - 24}" font-family="{FONT}" font-size="11.5" class="t-sub">'
     f'so most small queries never use it. The third column is the half with no DuckDB or Spark '
-    f'equivalent. Source: docs/internals/competitive_architecture.md.</text>',
+    f'equivalent. Source: docs/architecture/internals/competitive_architecture.md.</text>',
 ]
 
 svg = (

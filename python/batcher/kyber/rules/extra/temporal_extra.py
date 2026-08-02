@@ -59,7 +59,7 @@ from collections.abc import Callable
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, node_rule, plan_rule
-from batcher.kyber.rules.extra.temporal_sargable import _MIRROR, _OPS, _column_kind, _range_expr
+from batcher.kyber.rules.extra.temporal_sargable import _column_kind, _range_expr
 from batcher.kyber.rules.leaf_rewrite import whole_plan_expr_rule
 from batcher.kyber.rules.normalize.ranges import (
     _TRUNC_SUBDAY,
@@ -70,6 +70,12 @@ from batcher.kyber.rules.normalize.ranges import (
 from batcher.plan.expr_ir import Binary, Cast, Col, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import DateTrunc, Strftime
 from batcher.plan.expr_rewrite import transform_expr_up
+from batcher.plan.ir_tags import (
+    COMPARISON_FLIP,
+    COMPARISON_OPS,
+    COMPARISON_ORDER,
+    ORDERING_ORDER,
+)
 from batcher.plan.logical import Filter, LogicalPlan
 
 __all__ = [
@@ -83,7 +89,6 @@ __all__ = [
 # --- date_trunc inequalities → raw-column bounds ---------------------------------
 
 # The eq case is `normalize/ranges::date_trunc_to_range`; these are the four it leaves.
-_INEQUALITIES = ("lt", "le", "gt", "ge")
 
 
 def rewrite_date_trunc_filter(node: Filter, op: str) -> Filter | None:
@@ -112,13 +117,13 @@ def rewrite_date_trunc_filter(node: Filter, op: str) -> Filter | None:
 
     def rewrite(expr: Expr) -> Expr:
         nonlocal changed
-        if not isinstance(expr, Binary) or expr.op not in _OPS:
+        if not isinstance(expr, Binary) or expr.op not in COMPARISON_OPS:
             return expr
         trunc, lit = _match_trunc_and_lit(expr.left, expr.right)
         if trunc is None or not isinstance(trunc.input, Col):
             return expr
         # The literal on the left mirrors the operator (`L < trunc(c)` is `trunc(c) > L`).
-        eff_op = expr.op if isinstance(expr.left, DateTrunc) else _MIRROR[expr.op]
+        eff_op = expr.op if isinstance(expr.left, DateTrunc) else COMPARISON_FLIP[expr.op]
         if eff_op != op:
             return expr
         bounds = _trunc_bounds(lit.value, trunc.unit)
@@ -220,13 +225,13 @@ def rewrite_strftime_filter(node: Filter, op: str) -> Filter | None:
 
     def rewrite(expr: Expr) -> Expr:
         nonlocal changed
-        if not isinstance(expr, Binary) or expr.op not in _OPS:
+        if not isinstance(expr, Binary) or expr.op not in COMPARISON_OPS:
             return expr
         left, right = expr.left, expr.right
         if isinstance(left, Strftime) and isinstance(right, Lit):
             fmt_expr, lit, eff_op = left, right, expr.op
         elif isinstance(right, Strftime) and isinstance(left, Lit):
-            fmt_expr, lit, eff_op = right, left, _MIRROR[expr.op]
+            fmt_expr, lit, eff_op = right, left, COMPARISON_FLIP[expr.op]
         else:
             return expr
         if eff_op != op or not isinstance(fmt_expr.input, Col) or not isinstance(lit.value, str):
@@ -420,7 +425,7 @@ DATE_TRUNC_RANGE_RULES = [
             expr_matches=(DateTrunc,),
         )
     )
-    for op in (*_INEQUALITIES, "ne")
+    for op in (*ORDERING_ORDER, "ne")
 ]
 
 #: One rule per (`strftime`, comparison) pair, over the three order-isomorphic formats.
@@ -434,7 +439,7 @@ STRFTIME_RANGE_RULES = [
             expr_matches=(Strftime,),
         )
     )
-    for op in _OPS
+    for op in COMPARISON_ORDER
 ]
 
 DEFAULT_REGISTRY.add(

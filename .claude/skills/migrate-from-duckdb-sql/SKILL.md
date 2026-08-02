@@ -203,7 +203,7 @@ rather than returning a wrong answer.
 ## See also
 
 - `docs/user-guide/analyze/sql.md` — the SQL surface; `docs/api/relational/sql.md` — the feature table.
-- `docs/tutorials/sql-to-dataframe.md`, `docs/benchmarks/vs-duckdb.md`.
-- `docs/user-guide/{joins,aggregations,window-functions,udfs,explain-plans}.md`.
+- `docs/tutorials/foundations/sql-to-dataframe.md`, `docs/benchmarks/comparisons/vs-duckdb.md`.
+- `docs/user-guide/analyze/joins.md`, `docs/user-guide/analyze/aggregations.md`, `docs/user-guide/analyze/window-functions.md`, `docs/user-guide/transform/columns/udfs.md`, `docs/user-guide/operate/tuning/explain-plans.md`.
 - Skills: `write-a-batcher-pipeline` (the DataFrame API you rewrite gaps into),
   `migrate-from-spark`, `migrate-from-polars-or-pandas`, `run-a-distributed-job`.

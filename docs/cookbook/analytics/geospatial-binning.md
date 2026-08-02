@@ -184,12 +184,12 @@ you care about.
 
 ## See also
 
-- {doc}`Time series rollups </cookbook/analytics/time-series-rollups>`: `dt.truncate` is the same snap-to-a-grid
+- {doc}`Time series rollups </cookbook/analytics/aggregates/time-series-rollups>`: `dt.truncate` is the same snap-to-a-grid
   move, one dimension and a calendar.
-- {doc}`Basket analysis </cookbook/analytics/basket-analysis>`: another recipe whose difficulty is entirely in
+- {doc}`Basket analysis </cookbook/analytics/inference/basket-analysis>`: another recipe whose difficulty is entirely in
   choosing a key that groups.
-- {doc}`Filtering </user-guide/transform/filtering>`: `between`, and how predicates reach the scan.
+- {doc}`Filtering </user-guide/transform/rows/filtering>`: `between`, and how predicates reach the scan.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the `group_by` the grid feeds.
 - {doc}`Expressions API </api/relational/expressions>`: `floor`, `concat_ws`, `width_bucket`.
-- {doc}`Aggregation internals </deep-dives/operators/aggregation-internals>`: what the hash shuffle
+- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: what the hash shuffle
   on the cell key actually does.

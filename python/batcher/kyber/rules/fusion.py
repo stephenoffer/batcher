@@ -27,7 +27,7 @@ from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.expr_ir import Binary, Cast, Col, referenced_columns
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts
-from batcher.plan.ir_tags import WINDOW_RANKING
+from batcher.plan.ir_tags import COMPARISON_FLIP, WINDOW_RANKING
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
@@ -54,7 +54,6 @@ __all__ = [
 ]
 
 # Flip a comparison operator when the column is on the right (`lit <= col` ≡ `col >= lit`).
-_FLIP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def fuse_topn(plan: LogicalPlan) -> LogicalPlan:
@@ -174,7 +173,7 @@ def _rank_bound(conj: object, rank_alias: str) -> int | None:
     name, value, col_on_left = side
     if name != rank_alias or isinstance(value, bool) or not isinstance(value, int):
         return None
-    op = conj.op if col_on_left else _FLIP[conj.op]
+    op = conj.op if col_on_left else COMPARISON_FLIP[conj.op]
     if op == "le":
         return value
     if op == "lt":

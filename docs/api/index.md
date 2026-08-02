@@ -22,9 +22,9 @@ The API is small and lazy. A `Dataset` is a handle to a plan: you chain expressi
 
 - {doc}`/user-guide/index`: the task-oriented guides these pages are the reference for.
 - {doc}`/getting-started/quickstart`: the shortest path to a running query.
-- {doc}`/migration/index`: the equivalent spelling if you know another engine's API.
+- {doc}`/getting-started/migration/index`: the equivalent spelling if you know another engine's API.
 - {doc}`/cookbook/index`: a runnable recipe for the call, when a signature is not enough.
-- {doc}`/agents/index`: the same surface packaged as instructions for a coding agent.
+- {doc}`/agents`: the same surface packaged as instructions for a coding agent.
 
 ```{toctree}
 :hidden:

@@ -19,5 +19,5 @@ python examples/dataset/meta_columns.py
 
 - {doc}`/cookbook/dataset/verbs/joins`: join types, key spellings, and the as-of join for time series.
 - {doc}`/cookbook/dataset/inspecting/meta_comparison`: asking about a join before running it, and reading approximate statistics.
-- {doc}`/user-guide/transform/transformations`: the full transformation surface these recipes draw on.
+- {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.

@@ -39,10 +39,15 @@ cov-rust:
     cargo llvm-cov --workspace --exclude bc-py --summary-only
 
 # CI coverage gate: run the deterministic suite under coverage and fail below the
-# ratchet floor. The floor sits just below the achieved baseline so it blocks
-# regressions; raise it as coverage grows (see docs/internals/testing-strategy.md).
+# ratchet floor. The floor sits just below the achieved baseline so it blocks regressions;
+# raise it as coverage grows (see docs/architecture/internals/testing-strategy.md).
+#
+# It was 62 while the suite actually reached **87%** — twenty-five points of slack, about
+# 20,000 statements that could stop being covered with the gate still green. A ratchet nobody
+# tightens is not a ratchet. Measured 2026-08-01 at 87% over COV_PATHS; 85 leaves two points
+# for the ordering variance a randomized run introduces.
 cov-gate:
-    pytest {{COV_PATHS}} --cov=batcher --cov-report=term-missing --cov-fail-under=62
+    pytest {{COV_PATHS}} --cov=batcher --cov-report=term-missing --cov-fail-under=85
 
 # Everything CI runs: full correctness suite (test-py) plus the coverage gate.
 test: check test-rust build test-py cov-gate
@@ -112,6 +117,34 @@ lint-duplication:
 # worse than none — the agent invents a new home for the code instead.
 lint-guardrails:
     python tools/lint_guardrails.py
+
+# How much of the suite CI cannot reach. The PR gate installs no Ray, no torch and no GPU, so
+# every test needing one skips and the run still prints green — the hole is real and the trade
+# is deliberate, but it has to be *visible* or a subsystem stops being exercised with no signal
+# at all. This ratchets the count: `--update` to raise it when a new test genuinely needs
+# hardware, `--report` to just read the table.
+lint-skips:
+    python tools/lint_skips.py
+
+# The layered-architecture contract's exemption list, as a ratchet. It may shrink, never grow —
+# an exemption records an upward edge that predates the contract, and is not a way to pass a
+# new one. The previous attempt at an allowlist here grew by a line per module until it
+# silenced a real breakage in all six directions.
+lint-layer-debt:
+    python tools/lint_layer_debt.py
+
+# Every way of switching a gate off, counted. `# noqa`, `pragma: no cover`, `type: ignore`, an
+# untyped `raise`, a production `assert` — each defensible alone, and the total is the thing
+# that decides whether the gates mean anything. A ratchet: it may fall, never rise.
+lint-suppressions:
+    python tools/lint_suppressions.py
+
+# Kyber's rule ORDER, pinned. Registration order is run order and it is decided by the import
+# graph, so re-exporting a family or splitting a module reorders rules without touching one —
+# a package split once shifted 283 of 302. Re-record deliberately:
+#   python tests/unit/test_kyber_rule_order.py --update
+lint-rule-order:
+    python -m pytest tests/unit/test_kyber_rule_order.py -q
 
 # Tests that cannot fail: an ordered result compared order-independently, an assertion that
 # is true by construction, a test that asserts nothing at all. A green gate is not a green

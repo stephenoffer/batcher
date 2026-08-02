@@ -19,5 +19,5 @@ python examples/expressions/strings_predicates.py
 
 - {doc}`/cookbook/expressions/strings/measuring/strings_paths`: parsing file paths held in a column.
 - {doc}`/cookbook/expressions/strings/measuring/strings_ratios`: cheap quality signals for a text corpus.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

@@ -197,7 +197,7 @@ bug stays invisible. `assert_same_ordered` exists in `tests/_harness.py`; use it
 -0.0/NaN, descending}`. A 62% line-coverage gate says nothing about whether any operator
 was ever run with a non-default flag on a non-default path.
 
-**Claims are code too.** `docs/internals/competitive_architecture.md` is the code-checked
+**Claims are code too.** `docs/architecture/internals/competitive_architecture.md` is the code-checked
 scorecard. A performance claim with no committed benchmark behind it, a docstring
 describing an argument the signature does not have, a `MAP.md` entry for a module that
 moved — each is a defect with the same severity as a wrong result, because it is what the

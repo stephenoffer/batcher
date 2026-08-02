@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 bc-arrow.workspace = true
 bc-secrets.workspace = true
+# Geometry model, codecs and planar algorithms for the `Expr::Geo` variant. Pure Rust,
+# no third-party geometry stack, and it knows nothing about Arrow — this crate is the
+# seam between the two.
+bc-geo.workspace = true
 arrow.workspace = true
 serde.workspace = true
 thiserror.workspace = true

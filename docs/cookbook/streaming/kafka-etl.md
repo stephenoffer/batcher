@@ -221,5 +221,5 @@ window.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the sink surface and Delta commits.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: `files_incremental` and the rest of the
   sources.
-- {doc}`Incremental ingest </cookbook/data-engineering/incremental-ingest>`: the same directory-watching
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: the same directory-watching
   job, run as a batch.

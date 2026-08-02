@@ -18,6 +18,12 @@ near-leaves (nothing but `bc-arrow`, the DAG's root, below them), pulled in wher
                   runtime must be sized by the cgroup CFS quota, not tokio's
                   quota-blind `available_parallelism`, and the alternative was
                   pasting the quota parse into a second crate.
+  bc-geo       → bc-expr. The geometry model, the WKB/WKT/GeoJSON codecs, the planar
+                  predicates and measures, the grids (geohash/tile/S2/hex) and a small set
+                  of CRS transforms. Deliberately Arrow-free: `bc-expr::eval::geo` does the
+                  array-level work, which is what keeps every geometry algorithm unit-
+                  testable without a `RecordBatch` and keeps a third-party geometry stack
+                  out of the build.
   bc-secrets   → bc-expr (resolves `env:`/`file:`/`cmd:` secret references, with a
                   TTL cache). Deliberately dependency-free: it sits under bc-expr,
                   which everything links, so a cloud SDK here would put tokio + a TLS

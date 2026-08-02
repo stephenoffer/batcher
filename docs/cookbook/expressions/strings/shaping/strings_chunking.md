@@ -19,5 +19,5 @@ python examples/expressions/strings_chunking.py
 
 - {doc}`/cookbook/expressions/strings/shaping/strings_case`: normalizing capitalization before you compare or group.
 - {doc}`/cookbook/expressions/strings/shaping/strings_cleaning`: strip markup, URLs, emails, and stray punctuation.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

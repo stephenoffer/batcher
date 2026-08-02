@@ -166,7 +166,7 @@ print(ds.sql("SELECT category FROM self WHERE price >= 50 ORDER BY price").to_py
 
 - {doc}`SQL API </api/relational/sql>`: the `Session`, function registration, and the supported
   SQL surface.
-- {doc}`Expressions </user-guide/transform/expressions>`: the DataFrame column language SQL lowers to.
+- {doc}`Expressions </user-guide/transform/columns/expressions>`: the DataFrame column language SQL lowers to.
 - {doc}`Joins </user-guide/analyze/joins>` and {doc}`Window functions </user-guide/analyze/window-functions>`: the relational
   operations behind `JOIN` and `OVER`.
 - {doc}`/cookbook/dataset/verbs/sql_interface`: mixing SQL with DataFrame verbs, as a runnable script.

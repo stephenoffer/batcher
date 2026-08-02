@@ -4,6 +4,13 @@ Pipeline:  map (run the sub-plan on a source partition → `partial_aggregate`) 
 hash-shuffle partial state to disk → reduce (`combine_finalize` per key
 partition) → collect → run any post-aggregation operators single-node. The
 mergeable primitives are reused verbatim, so the result equals single-node.
+
+The map side takes one sub-plan per *branch* (`shuffle_branches`), which is the one
+input in the ordinary case and the branch list when the aggregate reads a `UNION ALL`.
+Every branch's partials land in the same bucket space, so the reducers see exactly what
+they would have seen had the union been concatenated first — `combine` is associative and
+commutative, which is the whole reason that holds. This is what keeps a reduced union
+(`union(...).group_by(...)`, and the `intersect`/`except_` lowering) off the driver.
 """
 
 from __future__ import annotations
@@ -12,13 +19,18 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher._internal.native import engine
 from batcher.dist.executors.partition_io import (
     _apply_above,
     _partition_source,
     consumer_pushdown,
 )
-from batcher.dist.executors.plan_analysis import _empty_agg_table, _relabel_single_source
+from batcher.dist.executors.plan_analysis import (
+    _empty_agg_table,
+    _relabel_single_source,
+    shuffle_branches,
+)
 from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
     _rmtree,
@@ -46,33 +58,53 @@ def _distributed_aggregate(
     `MaterializedSource` over the reducers' on-disk IPC output, so the adaptive
     executor scans the intermediate in place for the next stage instead of pulling
     every reducer's result back to the driver. Its work_dir is kept alive and owned
-    by the returned source's `cleanup()`."""
+    by the returned source's `cleanup()`.
+
+    `agg.input` is either the usual breaker-free single-source prefix or a `UNION ALL` of
+    them, whose branches all map into this one shuffle (`shuffle_branches`)."""
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to workers
 
     group_keys_json, aggregates_json = agg_spec_json(agg)
-    map_plan, source_id = _relabel_single_source(agg.input)
-    map_ir = json.dumps(map_plan.to_ir())
+    branches = shuffle_branches(agg.input)
+    if branches is None:
+        raise PlanError(
+            "the distributed aggregate shuffle needs a breaker-free single-source map "
+            f"prefix (or a UNION ALL of them), got {type(agg.input).__name__}"
+        )
     n_keys = len(agg.group_keys)
     # Global aggregate (no keys) cannot shuffle by key → a single reducer.
     n_reducers = 1 if n_keys == 0 else shuffle_partitions(workers)
-
-    # Push the projection + predicate into the source read (the map_ir still re-checks the
-    # filter, so this is a pure I/O optimization). Ask about the aggregate *over* the map
-    # prefix: the prefix of a plain `group_by(k).agg(sum(v))` is a bare `Scan`, which requires
-    # every column it has — so asking about the prefix alone read the whole wide table to
-    # answer a two-column aggregate. See `consumer_pushdown`.
-    projection, predicate = consumer_pushdown(agg, map_plan)
 
     from batcher.dist.shuffle_io import distributed_work_dir
 
     work_dir = distributed_work_dir("batcher_shuffle_")
     keep_dir = False  # set when a MaterializedSource takes ownership of work_dir
     try:
-        # Resolve and partition the single source into `workers` map inputs.
-        partitions = _partition_source(
-            sources[source_id], workers, work_dir, projection=projection, predicate=predicate
-        )
+        # One `(sub-plan IR, partition)` map task per partition of every branch. A single
+        # input is the one-branch case and produces exactly the task list it always did;
+        # a UNION ALL contributes its own partitions of its own source, all feeding this
+        # one shuffle. Each branch is pushed down and partitioned separately because each
+        # reads its own source: the projection a branch needs is a fact about that branch.
+        map_specs: list[tuple[str, str]] = []
+        for b, branch in enumerate(branches):
+            map_plan, source_id = _relabel_single_source(branch)
+            # Push the projection + predicate into the source read (the map_ir still re-checks
+            # the filter, so this is a pure I/O optimization). Ask about the aggregate *over*
+            # the map prefix: the prefix of a plain `group_by(k).agg(sum(v))` is a bare `Scan`,
+            # which requires every column it has — so asking about the prefix alone read the
+            # whole wide table to answer a two-column aggregate. See `consumer_pushdown`.
+            projection, predicate = consumer_pushdown(agg, map_plan)
+            parts = _partition_source(
+                sources[source_id],
+                workers,
+                work_dir,
+                tag=f"P{b}",
+                projection=projection,
+                predicate=predicate,
+            )
+            branch_ir = json.dumps(map_plan.to_ir())
+            map_specs.extend((branch_ir, p) for p in parts)
 
         from batcher.carbonite.resilience import gather_with_backups
         from batcher.dist.executors.ray_runtime import speculation_policy
@@ -84,11 +116,12 @@ def _distributed_aggregate(
         # backed up (deterministic → identical output); `gather_with_backups` is a
         # plain barrier when speculation is disabled.
         def _map_for(mid: int):
+            branch_ir, part = map_specs[mid]
             return _map_task.remote(
-                map_ir,
+                branch_ir,
                 group_keys_json,
                 aggregates_json,
-                partitions[mid],
+                part,
                 n_keys,
                 n_reducers,
                 work_dir,
@@ -96,7 +129,7 @@ def _distributed_aggregate(
                 cfg_json,
             )
 
-        map_refs = [_map_for(mid) for mid in range(len(partitions))]
+        map_refs = [_map_for(mid) for mid in range(len(map_specs))]
         # Each mapper returns (per-reducer paths, sub-plan metrics). The driver
         # records the workers' measured operator metrics into the hub so the cost
         # model calibrates from distributed runs too (the measure→consume loop is

@@ -131,7 +131,7 @@ def smallest_profile_for(
     model_gib: float,
     accelerator_type: str | None,
     *,
-    headroom: float = 0.15,
+    headroom: float | None = None,
 ) -> MigProfile | None:
     """The smallest instance that holds a model, or `None` when partitioning does not help.
 
@@ -144,14 +144,18 @@ def smallest_profile_for(
         model_gib: The model's resident footprint, before headroom.
         accelerator_type: A Ray accelerator-type name.
         headroom: Fraction of the instance's memory left free for the CUDA context,
-            activations, and fragmentation.
+            activations, and fragmentation, or `None` for the configured
+            `accelerator.vram_headroom`.
 
     Returns:
         The smallest profile that fits, or `None`.
     """
+    from batcher._internal.device_share import device_headroom
+
     if model_gib <= 0:
         return None
-    need = model_gib / (1.0 - min(0.9, max(0.0, headroom)))
+    room = device_headroom() if headroom is None else headroom
+    need = model_gib / (1.0 - min(0.9, max(0.0, room)))
     for profile in mig_profiles(accelerator_type):
         if profile.memory_gib >= need and profile.instances > 1:
             return profile

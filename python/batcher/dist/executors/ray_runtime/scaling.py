@@ -216,44 +216,6 @@ def alive_node_count() -> int:
         return 0
 
 
-def shuffle_partitions(workers: int) -> int:
-    """The number of shuffle partitions (reducers / hash buckets) for an all-to-all
-    exchange over `workers` mappers — capped by `distributed.max_shuffle_partitions`.
-
-    An exchange creates `mappers * reducers` streams; leaving the reducer count equal to the
-    worker fan-out (one per node) makes it O(nodes^2), which collapses at 10k+ nodes. The
-    reducer count only needs to balance keys and keep each reducer's state in memory, so it
-    is capped: regular clusters (≤ the cap) are unchanged, huge clusters stay bounded.
-
-    When prior runs have measured the shuffle families' real input volume, a learned reducer
-    count (`learned_shuffle_fanout`) trims the fan-out for a shuffle whose measured data needs
-    fewer, fuller buckets than one-per-worker — never above `workers`, so it only ever reduces
-    the stream count. A cold store (no measured history) keeps the worker fan-out unchanged. Any
-    reducer count is result-correct under the mergeable algebra, so this only affects scaling.
-    Always at least 1; the cap is disabled when the config value is 0.
-    """
-    cap = active_config().distributed.max_shuffle_partitions
-    n = max(1, workers)
-    n = _learned_shuffle_fanout(n)
-    return n if cap <= 0 else min(n, cap)
-
-
-def _learned_shuffle_fanout(workers: int) -> int:
-    """The learned reducer count for a shuffle over `workers` mappers, else `workers`.
-
-    Best-effort read of the process-wide MetadataHub's measured shuffle-family input volume; any
-    failure (no hub, cold store) returns `workers` unchanged."""
-    try:
-        from batcher.core import default_hub
-        from batcher.dist.adaptive_sizing import learned_shuffle_fanout
-
-        learned = learned_shuffle_fanout(default_hub(), None, workers)
-        return learned if learned is not None else workers
-    except Exception as exc:  # pragma: no cover - learning is best-effort
-        note_suppressed("dist", "read learned shuffle fan-out", exc)
-        return workers
-
-
 def cluster_topology() -> dict:
     """Live cluster shape: alive node count + total CPUs/GPUs. Ray must be up.
 
@@ -300,15 +262,22 @@ def worker_node_memory_bytes() -> int:
 
 def node_classes() -> list[dict]:
     """Per-alive-node resource class:
-    ``{"cpus", "gpus", "memory", "accelerators", "accelerator_type"}``.
+    ``{"node_id", "cpus", "free_cpus", "gpus", "memory", "accelerators", "accelerator_type"}``.
 
     The explicit cluster-heterogeneity model the scheduler lacked: a node is a "GPU
     node" when it exposes a `GPU` resource, a "CPU-only node" otherwise. The accelerator
     type comes from Ray's default `ray.io/accelerator-type` node label when present.
     Read on demand (Ray must be up) so it tracks autoscaler growth/shrink; empty when the
     topology is unreadable (the caller then keeps its homogeneous defaults).
+
+    `cpus` is the nameplate; `free_cpus` is what is unreserved now (`capacity.free_cpus_by_node`,
+    falling back to `cpus`). Conflating "how big is this node" with "what will fit on it" is
+    what made a fleet ask for a shape only a completely idle cluster could host.
     """
     try:
+        from batcher.dist.executors.ray_runtime.capacity import free_cpus_by_node
+
+        free = free_cpus_by_node()
         out: list[dict] = []
         for n in _alive_nodes():
             if not n.get("Alive", True):
@@ -318,9 +287,12 @@ def node_classes() -> list[dict]:
             if cpus <= 0:
                 continue
             labels = n.get("Labels", {}) or {}
+            node_id = n.get("NodeID", "")
             out.append(
                 {
+                    "node_id": node_id,
                     "cpus": cpus,
+                    "free_cpus": cpus if free is None else min(cpus, free.get(node_id, cpus)),
                     "gpus": float(res.get("GPU", 0.0)),
                     # Per-node RAM, so a placement check can bound by the resource a
                     # bundle reserves alongside cores. `0.0` when the node advertises no

@@ -17,9 +17,9 @@ Every page embeds a complete, self-contained script from the [`examples/operatio
 ## See also
 
 - {doc}`../../configuration/index`: the configuration guide and the field-by-field reference.
-- {doc}`/user-guide/operate/explain-plans`: reading a plan and its measured profile in depth.
-- {doc}`/user-guide/operate/observability`: progress, structured logs, and the web dashboard.
-- {doc}`/user-guide/operate/troubleshooting`: the symptom-to-cause table when one of these goes wrong.
+- {doc}`/user-guide/operate/tuning/explain-plans`: reading a plan and its measured profile in depth.
+- {doc}`/user-guide/operate/running/observability`: progress, structured logs, and the web dashboard.
+- {doc}`/user-guide/operate/running/troubleshooting`: the symptom-to-cause table when one of these goes wrong.
 
 ```{toctree}
 :hidden:

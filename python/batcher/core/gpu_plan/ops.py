@@ -27,7 +27,14 @@ from batcher.core.gpu_plan.windows import supported_window, window
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
 
-__all__ = ["SUPPORTED_OPS", "apply_op", "distinct_rows", "fold_zero", "supported_op"]
+__all__ = [
+    "DECLINED_OPS",
+    "SUPPORTED_OPS",
+    "apply_op",
+    "distinct_rows",
+    "fold_zero",
+    "supported_op",
+]
 
 SUPPORTED_OPS = (
     "filter",
@@ -41,6 +48,27 @@ SUPPORTED_OPS = (
     "unpivot",
     "row_id",
 )
+
+#: Every other `bc_ir::RelOp` tag, and why this tier does not apply it as a chain operator.
+#:
+#: Exhaustive against `plan.ir_tags.Op` by test, which is the point: the device tier is a
+#: *translator* of the same IR rather than a second consumer of the same Rust `Expr`, so a new
+#: operator added to the engine is otherwise declined here forever, silently and with no
+#: record that anyone considered it. Listing the decline makes it a decision. A tag that is
+#: neither supported nor listed fails `tests/unit/test_gpu_vocabulary_contract.py`.
+DECLINED_OPS: dict[str, str] = {
+    # Matched structurally by `eligibility`, which recognizes a chain over a scan, a join of
+    # two chains, or a union of chains — so these are plan *shapes* here, never chain steps.
+    "scan": "the chain's root; matched by `eligibility`, not applied as an operator",
+    "hash_join": "matched by `eligibility.gpu_join_spec`, not applied as an operator",
+    "union": "matched by `eligibility.gpu_union_spec`, not applied as an operator",
+    # Not translated. Each would need its semantics restated against the dataframe libraries,
+    # which is the work this tier's contract says must be proven against the CPU engine before
+    # it ships — not approximated.
+    "asof_join": "not translated",
+    "range_join": "not translated",
+    "sample": "not translated",
+}
 
 
 def supported_op(ir: dict) -> bool:

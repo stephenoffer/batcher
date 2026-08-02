@@ -98,7 +98,11 @@ def test_exceeds_all_gpus_but_shards_small_enough_still_uses_them(restore_config
     """
     plan, sources = _plan(5000)
     ws = _working_set_gb(plan, sources)
-    _set_gpu(gpu_min_rows=10, gpu_memory_gb=ws / 8)  # 2 GPUs hold only a quarter of the set
+    # 2 GPUs hold under half the set, and 8 oversubscribed shards of it each fit one device's
+    # *usable* budget with room to spare. Sized off `ws / 6` rather than `ws / 8` so the shard
+    # clears the VRAM headroom instead of landing exactly on the un-derated device size, which
+    # is a boundary no real device has.
+    _set_gpu(gpu_min_rows=10, gpu_memory_gb=ws / 6)
     d = decide_gpu_backend(plan, sources, gpu_count=2, force=True)
     assert d.use_gpu is True and d.distributed is True
 
@@ -135,11 +139,13 @@ def test_gpu_memory_budget_is_detected_not_assumed(monkeypatch):
     dc = active_config().distributed
     assert dc.gpu_memory_gb == 0.0, "the default must be 'detect', not a device guess"
 
-    # An 80 GB A100: usable budget scales with the real device.
+    # A *capacity*, in decimal GB, matching the unit Kyber measures a working set in
+    # (`rows x width / 1e9`). Dividing by `1 << 30` here reported an 80 GiB board as "80"
+    # against a GB-denominated working set, over-stating the device by 7.4%.
     monkeypatch.setattr(
         hw, "gpu_inventory", lambda: [{"index": 0, "name": "A100", "memory_bytes": 80 << 30}]
     )
-    assert dc.resolved_gpu_memory_gb() == 80 * 0.75
+    assert dc.resolved_gpu_memory_gb() == (80 << 30) / 1e9
 
     # A heterogeneous cluster plans for the SMALLEST device — sizing to the largest would
     # dispatch a working set that OOMs every other card.
@@ -151,13 +157,46 @@ def test_gpu_memory_budget_is_detected_not_assumed(monkeypatch):
             {"index": 1, "name": "T4", "memory_bytes": 16 << 30},
         ],
     )
-    assert dc.resolved_gpu_memory_gb() == 16 * 0.75
+    assert dc.resolved_gpu_memory_gb() == (16 << 30) / 1e9
 
-    # No visible device → the historical default, so a CPU-only driver planning for a remote
-    # GPU worker behaves exactly as it did before.
+    # No visible device → a T4-shaped nameplate, so a CPU-only driver planning for a remote
+    # GPU worker keeps a budget within a gigabyte of the one it always had.
     monkeypatch.setattr(hw, "gpu_inventory", lambda: [])
-    assert dc.resolved_gpu_memory_gb() == 12.0
+    assert dc.resolved_gpu_memory_gb() == 16.0
 
     # An explicit setting always wins over detection.
     pinned = dataclasses.replace(dc, gpu_memory_gb=40.0)
     assert pinned.resolved_gpu_memory_gb() == 40.0
+
+
+def test_the_vram_headroom_knob_moves_the_routing_budget():
+    """`accelerator.vram_headroom` must reach Kyber's routing, not only Carbonite's pool.
+
+    It was one knob with five private copies: `0.15` in the packing math, `0.15` in the VRAM
+    pool, `0.85` usable in the device recommender, `0.75` usable in the distributed config, and
+    no headroom at all in `cluster_gpu_memory_gb` — which is the figure Kyber routes against on
+    a live cluster. So a working set was dispatched to a single device at 100% of its VRAM,
+    leaving nothing for the CUDA context or the hash table the kernel builds, and raising the
+    knob for a fleet with a resident co-tenant moved neither.
+    """
+    from batcher.config import active_config, config_context
+
+    plan, sources = _plan(5000)
+    ws = _working_set_gb(plan, sources)
+
+    def single_device(headroom: float) -> bool:
+        base = active_config()
+        cfg = base.replace(
+            accelerator=dataclasses.replace(base.accelerator, vram_headroom=headroom)
+        )
+        with config_context(cfg):
+            decision = decide_gpu_backend(
+                plan, sources, gpu_count=4, force=True, gpu_memory_gb=ws * 1.25
+            )
+        return decision.use_gpu and not decision.distributed
+
+    # A device 1.25x the working set holds it with 10% of the board reserved, and does not
+    # once half the board is. Before, no headroom reached this decision at all and both
+    # answered "fits one GPU" — including the one that leaves the kernel no room to build in.
+    assert single_device(0.1)
+    assert not single_device(0.5)

@@ -196,10 +196,10 @@ affected windows in a batch job, which is a reconciliation pipeline, not a strea
 - {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: landing the raw events you measure the lag distribution
   on.
 - {doc}`Streaming </user-guide/moving-data/streaming>`: watermarks, triggers, and output modes in full.
-- {doc}`Late-arriving data </cookbook/data-engineering/late-arriving-data>`: the batch reconciliation
+- {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation
   pipeline this page keeps pointing at.
-- {doc}`Deduplication </cookbook/data-engineering/deduplication>`: dedup without a watermark to bound it.
+- {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: dedup without a watermark to bound it.
 - {doc}`Data quality </user-guide/trust/data-quality>`: catching the clock-from-the-future row at
   the edge.
-- {doc}`Spilling </deep-dives/memory/spilling>`: what bounded state buys you, and where it goes when
+- {doc}`Spilling </architecture/deep-dives/memory/spilling>`: what bounded state buys you, and where it goes when
   it does not fit.

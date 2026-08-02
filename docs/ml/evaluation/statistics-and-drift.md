@@ -380,4 +380,4 @@ Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed
 - {doc}`/ml/evaluation/evaluation`: score a model once you have a trustworthy split.
 - {doc}`/ml/preparing/preprocessors/index`: the transforms these statistics tell you a column needs.
 - {doc}`/user-guide/trust/data-quality`: assert contracts rather than measure them.
-- {doc}`/cookbook/statistics/index`: short runnable recipes for the functions on this page.
+- {doc}`/cookbook/metrics/statistics/index`: short runnable recipes for the functions on this page.

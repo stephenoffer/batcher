@@ -9,7 +9,7 @@
 //! DuckDB streams the same queries in a few GB. Projection pushdown already works there, so
 //! this is intermediate blow-up, not a wide scan.
 //!
-//! This module implements the pipeline/breaker model `docs/internals/execution.md` has
+//! This module implements the pipeline/breaker model `docs/architecture/internals/execution.md` has
 //! documented all along: *"A pipeline is a maximal chain of operators that can run a batch
 //! straight through without materializing. A breaker is an operator that has to collect its
 //! input."*

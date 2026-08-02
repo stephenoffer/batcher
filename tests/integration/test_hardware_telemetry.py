@@ -24,7 +24,6 @@ from batcher._internal import hardware
 from batcher.plan.feedback import (
     CONTENDED_PREEMPTIONS_PER_CORE_SECOND,
     OperatorFeedback,
-    faulted_bytes,
     preemption_rate,
 )
 from batcher.plan.profile.types import OpProfile
@@ -138,14 +137,6 @@ def test_preemption_rate_normalizes_per_core_second():
     assert preemption_rate(0, elapsed_ms=1_000, threads=4) == 0.0
     assert preemption_rate(1_000, elapsed_ms=0, threads=4) == 0.0
     assert preemption_rate(1_000, elapsed_ms=1_000, threads=0) == 0.0
-
-
-def test_faulted_bytes_uses_the_real_page_size():
-    # 16 KiB pages on Apple silicon and configurable 64 KiB on ARM servers mean an assumed
-    # 4 KiB under-counts the measured working set by up to 16x.
-    assert faulted_bytes(minor_faults=10, major_faults=2, page_bytes=4096) == 12 * 4096
-    assert faulted_bytes(minor_faults=10, major_faults=2, page_bytes=16384) == 12 * 16384
-    assert faulted_bytes(minor_faults=0, major_faults=0, page_bytes=4096) == 0
 
 
 def test_a_contended_operator_is_flagged_in_the_rendered_plan():

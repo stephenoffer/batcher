@@ -19,5 +19,5 @@ python examples/operations/environment.py
 
 - {doc}`configuration`: options, scoped overrides, and profiles.
 - {doc}`error_handling`: catching the failure you meant to catch.
-- {doc}`/user-guide/operate/performance`: measuring and tuning a query that is correct but slow.
-- {doc}`/user-guide/operate/observability`: what the engine records about a run, and where.
+- {doc}`/user-guide/operate/tuning/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`/user-guide/operate/running/observability`: what the engine records about a run, and where.

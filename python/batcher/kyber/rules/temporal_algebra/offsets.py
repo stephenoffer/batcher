@@ -35,12 +35,12 @@ from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.exprs.guards import is_date, is_timestamp, schema_rule
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import DateOffset
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Filter, Project
 from batcher.plan.schema import SchemaRef
 
 __all__ = ["OFFSET_DATE_SHIFT_RULES", "OFFSET_SHIFT_RULES"]
 
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 _COMPARISONS = ("lt", "le", "gt", "ge", "eq", "ne")
 _MICROS_PER_DAY = 86_400_000_000
 
@@ -58,11 +58,11 @@ def _instant_literal(expr: Expr) -> dt.datetime | None:
 
 def _offset_comparison(expr: Expr) -> tuple[str, DateOffset, dt.datetime] | None:
     """`(op, offset_call, instant)` for an `offset_by(ts, …) OP <timestamp literal>`."""
-    if not isinstance(expr, Binary) or expr.op not in _FLIP:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_FLIP:
         return None
     for computed, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, _FLIP[expr.op]),
+        (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         if isinstance(computed, DateOffset):
             instant = _instant_literal(other)
@@ -111,7 +111,7 @@ def _register(op: str):
             expr_matches=(Binary,),
             # Both `op` and its mirror: the comparison is normalized with the computed side
             # on the left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
-            expr_ops=(op, _FLIP[op]),
+            expr_ops=(op, COMPARISON_FLIP[op]),
         )
     )
 
@@ -138,11 +138,11 @@ def _date_literal(expr: Expr) -> dt.date | None:
 
 
 def _date_offset_comparison(expr: Expr) -> tuple[str, DateOffset, dt.date] | None:
-    if not isinstance(expr, Binary) or expr.op not in _FLIP:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_FLIP:
         return None
     for computed, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, _FLIP[expr.op]),
+        (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         if isinstance(computed, DateOffset):
             day = _date_literal(other)
@@ -184,7 +184,7 @@ def _register_date(op: str):
             expr_matches=(Binary,),
             # Both `op` and its mirror: the comparison is normalized with the computed side
             # on the left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
-            expr_ops=(op, _FLIP[op]),
+            expr_ops=(op, COMPARISON_FLIP[op]),
         )
     )
 

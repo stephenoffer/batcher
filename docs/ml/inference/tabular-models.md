@@ -99,7 +99,7 @@ scored = ds.ml.predict(
     concurrency=16,
     model_memory_gb=0.5,
 )
-scored.write_parquet("s3://bucket/scored/", distributed=True)
+scored.write.parquet("s3://bucket/scored/", distributed=True)
 ```
 
 `batch_size` matters more here than for a GPU model: a tabular model's per-call overhead is fixed and small, so larger batches amortize it, and 100,000 rows of 50 float32 features is only 20 MB.

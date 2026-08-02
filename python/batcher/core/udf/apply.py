@@ -258,7 +258,7 @@ def _apply_udf_async(
     if op.batch_format == "pyarrow":
         call = fn
     else:
-        from batcher.ml.batch_format import result_to_arrowable, to_format
+        from batcher.interop.formats import result_to_arrowable, to_format
 
         async def call(batch: pa.RecordBatch) -> object:  # type: ignore[misc]
             return result_to_arrowable(await fn(to_format(batch, op.batch_format)), op.batch_format)

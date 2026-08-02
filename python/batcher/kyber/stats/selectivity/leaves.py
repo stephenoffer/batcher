@@ -21,7 +21,6 @@ from batcher.kyber.stats.selectivity.patterns import (
     regex_selectivity,
 )
 from batcher.kyber.stats.selectivity.scalars import (
-    _FLIP_OP,
     _column_of_comparison,
     _dedup,
     _fraction_below_bounds,
@@ -45,6 +44,7 @@ from batcher.plan.expr_ir import (
     Lit,
     StrFunc,
 )
+from batcher.plan.ir_tags import COMPARISON_OPS, ORDERING_FLIP
 
 # Boolean-valued string predicates whose match fraction is a fixed prior — the pattern is
 # implicit in the function (`contains` is always a substring, `starts_with` always anchored).
@@ -156,7 +156,6 @@ _TWO_VALUED = (IsNull, IsNotNull)
 
 # Comparisons propagate NULL: `NULL OP x` is NULL, so the predicate is neither TRUE nor
 # FALSE. `and`/`or` do not (Kleene: `FALSE AND NULL` is FALSE), so they are excluded.
-_NULL_PROPAGATING = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 
 
 def _null_mass(expr: Expr, nulls: dict[str, float]) -> float:
@@ -178,7 +177,7 @@ def _null_mass(expr: Expr, nulls: dict[str, float]) -> float:
     """
     if isinstance(expr, _TWO_VALUED):
         return 0.0
-    if isinstance(expr, Binary) and expr.op in _NULL_PROPAGATING:
+    if isinstance(expr, Binary) and expr.op in COMPARISON_OPS:
         return _measured_null_fraction(expr, nulls) or 0.0
     # `col IN (...)` and `col LIKE p` are NULL when the column is NULL, so `NOT IN` / `NOT
     # LIKE` drop those rows too — the same 3-valued complement as a comparison. Without this
@@ -305,7 +304,7 @@ def _date_part_range_selectivity(expr: Binary, op: str) -> float | None:
         frac_le = 1.0
     else:
         frac_le = (xf - lo + 1) / n
-    eff = op if col_on_left else _FLIP_OP[op]
+    eff = op if col_on_left else ORDERING_FLIP[op]
     return _from_cdf(eff, frac_le, 1.0 / n)
 
 
@@ -382,7 +381,7 @@ def _range_selectivity(
         frac_le = _fraction_below_bounds(x, bounds.get(col))
     if frac_le is None:
         return cfg.range_selectivity
-    eff = op if col_on_left else _FLIP_OP[op]
+    eff = op if col_on_left else ORDERING_FLIP[op]
     bound = bounds.get(col)
     eq = _point_mass(col, value, ndv or {}, mcv or {})
     if eq == 0.0 and not _outside_bounds(value, bound):

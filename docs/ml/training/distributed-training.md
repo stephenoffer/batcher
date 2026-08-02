@@ -257,12 +257,12 @@ improves, and the improvement is not real.
 - {doc}`PyTorch </ml/inference/pytorch>`: DDP and FSDP wiring on the training side.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: the fit and transform contract.
 - {doc}`Streaming for training </ml/inference/streaming>`: the bounded-memory ingest path in depth.
-- {doc}`Distributed training pipeline </tutorials/distributed-training-pipeline>`: the
+- {doc}`Distributed training pipeline </tutorials/ml/distributed-training-pipeline>`: the
   tutorial, from raw files to a multi-rank loop.
-- {doc}`Distributed scheduling </deep-dives/distribution/distributed-scheduling>`: what the engine is
+- {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>`: what the engine is
   doing while the ranks are reading.
-- {doc}`Train/test split recipe </cookbook/ml/pipelines/train-test-split>`: the leak-free split, on
+- {doc}`Train/test split recipe </cookbook/ml/pipelines/features/train-test-split>`: the leak-free split, on
   its own.
-- {doc}`Scaling benchmarks </benchmarks/scaling>`: what the ingest path holds up to.
+- {doc}`Scaling benchmarks </benchmarks/results/scaling>`: what the ingest path holds up to.
 - {doc}`ML API </api/models/ml>`: the `stream_loader`, `ResumableSampler`, and `epoch_order`
   reference.

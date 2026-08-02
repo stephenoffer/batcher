@@ -2,7 +2,7 @@
 """Draw `adaptive_loop.svg` — the two feedback loops, and where each one stops.
 
 This diagram carries a claim the project is careful about, so it is drawn to the
-wording `docs/internals/competitive_architecture.md` sanctions rather than the older
+wording `docs/architecture/internals/competitive_architecture.md` sanctions rather than the older
 marketing line. The inner loop is stage-boundary re-optimization at the same
 granularity as Spark AQE, gated off below `_ADAPTIVE_MIN_INPUT_ROWS`
 (`python/batcher/api/adaptive/gating.py`, 20,000,000 rows). The outer loop is the

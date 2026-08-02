@@ -132,7 +132,7 @@ Report, with file:line evidence:
 3. Modules whose docstring no longer matches what they contain, or that claim a
    responsibility living elsewhere (this has happened: a crate doc advertised sorting that
    lives in a different crate).
-4. Guidance in CLAUDE.md / .claude/rules / docs/internals that is no longer true.
+4. Guidance in CLAUDE.md / .claude/rules / docs/architecture/internals that is no longer true.
 5. Dead code: unreferenced functions, files not declared in their module tree, orphaned
    allowlist entries in tools/lint_structure.py.
 
@@ -147,7 +147,7 @@ REVIEW_BENCH = _p(
     "Find the most promising performance work from benchmark evidence",
     """Identify Batcher's best available performance wins, from evidence rather than intuition.
 
-Read `.claude/rules/performance.md`, `docs/internals/competitive_architecture.md`, and the
+Read `.claude/rules/performance.md`, `docs/architecture/internals/competitive_architecture.md`, and the
 benchmark results in `benchmarks/BENCHMARK_RESULTS.md` / `TPCH_FINDINGS.md`.
 
 Report the shapes where Batcher currently loses to DuckDB or Polars, worst ratio first. For

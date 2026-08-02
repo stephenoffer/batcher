@@ -58,7 +58,7 @@ SIMD resize, fanned out per row across every core. The result crosses into a sha
 tensor column with no per-batch re-type step. On a 96-core node that decodes and resizes
 **5,693 images per second**, which is **2.4x Daft**, and streams LiDAR point clouds at
 **21,467 frames per second**. See
-{doc}`Multimodal ingest benchmarks </benchmarks/multimodal-ingest>` and the reproducible
+{doc}`Multimodal ingest benchmarks </benchmarks/results/multimodal-ingest>` and the reproducible
 head-to-heads under `benchmarks/scenarios/`.
 
 You can also decode inside a pipeline with the `.image` expression after a download:

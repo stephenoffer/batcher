@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher.plan.ir_tags import RUNNING_AGGREGATES
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -28,8 +30,6 @@ from batcher.api.terminal.gpu_backend.fanout import (
 )
 from batcher.dist.gpu import gpu_task_options
 from batcher.dist.gpu.groupby import dispatch_gpu_aggregate, distributed_gpu_aggregate
-
-_GPU_AGGS = ("sum", "count", "mean", "min", "max")
 
 
 def _gpu_agg_spec(plan: LogicalPlan):
@@ -48,7 +48,7 @@ def _gpu_agg_spec(plan: LogicalPlan):
     aggs: dict[str, tuple[str, str]] = {}
     for spec in plan.aggregates:
         ae = spec.agg
-        if getattr(ae, "func", None) not in _GPU_AGGS or not isinstance(ae.input, Col):
+        if getattr(ae, "func", None) not in RUNNING_AGGREGATES or not isinstance(ae.input, Col):
             return None
         aggs[spec.alias] = (ae.input.name, ae.func)
     return gk.alias, gk.expr.name, aggs, plan.input

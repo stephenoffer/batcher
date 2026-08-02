@@ -348,3 +348,104 @@ def test_bandit_arm_invalidates_on_its_mean_not_its_accumulator():
     doubled = {"hash": {"n": 51, "sum": 1020.0, "sumsq": 24000.0}}  # mean ~20ms
     assert not _materially_differs(prior, stable)
     assert _materially_differs(prior, doubled)
+
+
+# --- the property no key test can see: does the memo actually hit? ------------
+#
+# Every test above builds a key, or stores and looks one up, without ever *running* a query
+# in between. None of them can see the failure that shipped: execution itself moved the key.
+# `record_column_stats` advanced the learned generation on every run and the generation is in
+# the key, so three identical queries recorded 0 hits and 3 misses while the whole file above
+# stayed green (`benchmarks/BENCHMARK_RESULTS.md`, "the plan cache never hit once"). A second
+# defect of the same shape followed in `_calibration_epoch`, which advanced whenever a refit
+# *ran* rather than when it changed anything.
+#
+# The gate is end-to-end on purpose. A cache that never hits is not a wrong answer, it is only
+# a slower one, so nothing else in the suite is looking.
+
+
+#: Executions a query is allowed before the memo must start hitting. Two, and both are real:
+#: the first run learns the column sketches the plan had no statistics for, and the second is
+#: the first one whose key reflects that learning. From the third on, nothing new is being
+#: learned about an unchanged query over unchanged data, so every run must hit.
+_WARMUP_RUNS = 2
+
+
+def _lookup_trace(query, times: int) -> list[str]:
+    """`"HIT"`/`"miss"` per execution of `query`, in order."""
+    trace: list[str] = []
+    real_lookup = plan_cache.lookup
+
+    def counting_lookup(key):
+        result = real_lookup(key)
+        trace.append("HIT" if result is not None else "miss")
+        return result
+
+    plan_cache.lookup = counting_lookup
+    try:
+        for _ in range(times):
+            query.collect()
+    finally:
+        plan_cache.lookup = real_lookup
+    return trace
+
+
+def _grouped_query():
+    """One Dataset, collected repeatedly — the re-issued-identical-query shape.
+
+    Rebuilding the Dataset each pass would allocate a new in-memory source, whose identity is
+    part of the key, and would legitimately miss.
+    """
+    table = pa.table(
+        {
+            "g": pa.array([i % 5 for i in range(200)], type=pa.int64()),
+            "v": pa.array([float(i) for i in range(200)], type=pa.float64()),
+        }
+    )
+    return bt.from_arrow(table.to_batches()).group_by("g").agg(s=bt.col("v").sum())
+
+
+def test_the_memo_stops_missing_once_there_is_nothing_left_to_learn():
+    """After warmup, an unchanged query over unchanged data must hit every single time.
+
+    This is the shape the shipped defect broke and no key test could see: the memo missed on
+    *every* run, forever, because execution advanced a counter that was part of the key. The
+    assertion is on the steady state rather than on a hit count, because the two cold runs are
+    legitimate — the first genuinely learns the column statistics the cold plan lacked.
+    """
+    pytest.importorskip("batcher._native", reason="native engine not built")
+    runs = _WARMUP_RUNS + 4
+
+    trace = _lookup_trace(_grouped_query(), runs)
+
+    steady = trace[_WARMUP_RUNS:]
+    assert steady and set(steady) == {"HIT"}, (
+        f"the memo never settled: {trace}. Every run after the {_WARMUP_RUNS}-run warmup must "
+        "hit — a miss here means something in the cache key advances on execution even when "
+        "nothing was learned, which is the '0 hits, 3 misses' defect."
+    )
+
+
+def test_a_warm_query_does_not_move_its_own_cache_key():
+    """The narrower statement, with no counting: once warm, executing must not move the key.
+
+    Whatever execution records — column stats, operator timings, a bandit arm — must stop
+    changing the key of the query that recorded it. If it never stops, the memo can never hit,
+    and it does so silently.
+    """
+    pytest.importorskip("batcher._native", reason="native engine not built")
+    from batcher import core
+
+    query = _grouped_query()
+    for _ in range(_WARMUP_RUNS):
+        query.collect()
+
+    hub = core.default_hub()
+    plan_key = query._plan.content_key()
+    source = _source(list(range(100)))
+    before = _key(plan_key, [source], hub)
+    query.collect()
+
+    assert _key(plan_key, [source], hub) == before, (
+        "a warm execution still moved its own plan cache key"
+    )

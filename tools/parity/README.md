@@ -14,7 +14,7 @@ immediately; a mismatch is a wrong answer nobody has noticed. Reading a competit
 tells you what it *has*; only running it tells you what Batcher *answers*.
 
 The findings and the build log against them live in
-`docs/internals/competitor_parity_census.md`.
+`docs/architecture/internals/competitor_parity_census.md`.
 
 ## Running them
 

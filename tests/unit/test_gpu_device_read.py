@@ -152,16 +152,32 @@ def test_an_in_memory_descriptor_has_nothing_to_read_from_storage(host_backend):
     assert read_descriptor_on_device({"batches": []}, host_backend) is None
 
 
-def test_a_pushed_predicate_keeps_the_reader_that_can_use_it():
-    """The device read cannot skip row groups, so it would move more bytes, not fewer."""
+_A_PREDICATE = {"e": "binary", "op": "gt"}
+
+
+def test_a_pushed_predicate_still_reads_row_groups_on_the_device():
+    """A `RowGroupSplit` was cut from a footer this same predicate already pruned, so both
+    readers would open the same bytes and the device may as well do the decoding.
+
+    Declining here instead cost the device path exactly the queries it exists for: every
+    scan-heavy TPC-H and ClickBench shape is a filtered one, so the CPU decode this replaces
+    was never actually replaced on any of them."""
     from batcher.dist.gpu.device_read import _specs
 
-    descriptor = {
-        "splits": [_row_group()],
-        "projection": None,
-        "predicate": {"e": "binary", "op": "gt"},
-    }
-    assert _specs(descriptor) is None
+    descriptor = {"splits": [_row_group("a.parquet", (0, 2))], "projection": None}
+    assert _specs({**descriptor, "predicate": _A_PREDICATE}) == [
+        DeviceReadSpec("a.parquet", (0, 2))
+    ]
+    assert _specs({**descriptor, "predicate": None}) is not None
+
+
+def test_a_pushed_predicate_keeps_the_reader_that_can_prune_a_whole_file():
+    """A `FileSplit` names an unpruned file, so here the host reader really would skip row
+    groups the device read would decode. That is the case the refusal is for."""
+    from batcher.dist.gpu.device_read import _specs
+
+    descriptor = {"splits": [_file("b.parquet")], "projection": None}
+    assert _specs({**descriptor, "predicate": _A_PREDICATE}) is None
     assert _specs({**descriptor, "predicate": None}) is not None
 
 

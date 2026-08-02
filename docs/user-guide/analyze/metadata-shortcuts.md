@@ -366,23 +366,23 @@ lets you ask it directly. Crucially, it also lets you ask things no SQL terminal
 spelling for, such as "would this join match anything?" or "how many files am I about to
 open?".
 
-Two deep dives explain the machinery underneath. {doc}`/deep-dives/adaptive/learned-metadata`
+Two deep dives explain the machinery underneath. {doc}`/architecture/deep-dives/adaptive/learned-metadata`
 covers the sketches a finished query records for the next one, and
-{doc}`/deep-dives/adaptive/cardinality-estimation` covers how the optimizer turns them into row
-estimates. The measured payoff is on {doc}`/benchmarks/analytics`, where a `count()`
+{doc}`/architecture/deep-dives/adaptive/cardinality-estimation` covers how the optimizer turns them into row
+estimates. The measured payoff is on {doc}`/benchmarks/results/analytics`, where a `count()`
 after a transform chain returns in 0.05 ms because nothing is scanned.
 
 ## See also
 
-- {doc}`/user-guide/operate/explain-plans`: confirm that a predicate reached the scan, and that pruning
+- {doc}`/user-guide/operate/tuning/explain-plans`: confirm that a predicate reached the scan, and that pruning
   actually happened.
 - {doc}`/user-guide/trust/data-quality`: turn the `ds.meta.col(...).check` probes here into enforced
   contracts with `ds.dq`.
-- {doc}`/user-guide/operate/performance`: the other levers when a query is slower than its metadata suggests
+- {doc}`/user-guide/operate/tuning/performance`: the other levers when a query is slower than its metadata suggests
   it should be.
 - {doc}`/user-guide/moving-data/reading-data`: where footer statistics come from, per format.
 - {doc}`/user-guide/moving-data/lakehouse`: manifest-level statistics on Delta, Iceberg, and Hudi tables.
 - {doc}`/api/relational/dataset`: the `ds.meta` reference, namespace by namespace.
-- {doc}`/internals/execution`: the exact-or-fall-back rule that decides when a
+- {doc}`/architecture/internals/execution`: the exact-or-fall-back rule that decides when a
   statistic is allowed to answer a terminal.
 - {doc}`/cookbook/dataset/inspecting/meta_schema`: the `meta` accessor as a runnable script.

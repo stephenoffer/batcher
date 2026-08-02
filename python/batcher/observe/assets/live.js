@@ -79,7 +79,7 @@ const LIVE = (() => {
               'here within a second.',
         code: 'import batcher as bt\n\n' +
               'ds = bt.read_parquet("images/*.parquet")\n' +
-              'ds.ml.infer(model, batch_size=64).write_parquet("out/")',
+              'ds.ml.infer(model, batch_size=64).write.parquet("out/")',
         hint: 'Partition progress, GPU load, and dropped rows only appear for work that ' +
               'reports them — a single-node scan has none of those, and nothing is invented.',
       });

@@ -26,9 +26,9 @@ import threading
 
 __all__ = [
     "adopt_plan_id",
+    "mint_query_plan_id",
     "next_result_stage",
     "next_stage_base",
-    "mint_query_plan_id",
     "query_plan_id",
     "query_shuffle_scope",
     "reset_query_plan_id",

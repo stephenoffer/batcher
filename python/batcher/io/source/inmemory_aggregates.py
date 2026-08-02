@@ -161,7 +161,7 @@ def _float_order_differs(col: pa.ChunkedArray | pa.Array) -> bool:
 
     (The engine's total-order comparison also disagrees with DuckDB — `WHERE f = 0.0` misses
     `-0.0`, `WHERE f > 1` matches NaN — which is the underlying bug, recorded in
-    `docs/internals/bug_hunt_ledger.md`. When it is fixed, this guard can go.)
+    `docs/architecture/internals/bug_hunt_ledger.md`. When it is fixed, this guard can go.)
     """
     if not pa.types.is_floating(col.type):
         return False

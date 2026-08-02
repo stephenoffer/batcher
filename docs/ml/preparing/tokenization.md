@@ -247,10 +247,10 @@ running it every epoch is pure waste.
 - {doc}`Data loaders </ml/training/data-loaders>`: getting the token column into a training loop.
 - {doc}`Distributed training </ml/training/distributed-training>`: the loader that reads the tokens you
   wrote out.
-- {doc}`UDFs </user-guide/transform/udfs>`: the class-per-worker contract the tokenizer stage rests
+- {doc}`UDFs </user-guide/transform/columns/udfs>`: the class-per-worker contract the tokenizer stage rests
   on.
-- {doc}`Arrow memory </deep-dives/memory/arrow-memory>`: what a `List<Int64>` column costs, and
+- {doc}`Arrow memory </architecture/deep-dives/memory/arrow-memory>`: what a `List<Int64>` column costs, and
   why the boundary stays zero-copy.
-- {doc}`Feature pipeline </cookbook/ml/pipelines/feature-pipeline>`: tokenization inside a larger
+- {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: tokenization inside a larger
   preprocessing job.
 - {doc}`ML API </api/models/ml>`: the `Tokenizer`, `pack_sequences`, and `LabelEncoder` reference.

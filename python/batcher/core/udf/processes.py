@@ -120,7 +120,7 @@ def _apply_fn(fn: object, batch: pa.RecordBatch, fmt: str) -> object:
     """Apply `fn` to `batch`, converting to/from `fmt` when it is not ``pyarrow``."""
     if fmt == "pyarrow":
         return fn(batch)
-    from batcher.ml.batch_format import result_to_arrowable, to_format
+    from batcher.interop.formats import result_to_arrowable, to_format
 
     return result_to_arrowable(fn(to_format(batch, fmt)), fmt)
 

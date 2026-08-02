@@ -199,6 +199,14 @@ class EnergyLedger:
         accounting and useless for reading: the report wants the stage, not its invocations.
         Durations and energy sum; utilization is averaged *weighted by duration*, because a
         plain mean would let a thousand idle microseconds outvote a second of real work.
+
+        Both provenance flags survive the roll-up, and both are conjunctions: a stage is only
+        `measured` if every one of its invocations was, and only `integrated` if every one came
+        from the driver's hardware counter. `integrated` was dropped here entirely, so every
+        rolled-up record reported `False` — including the one `hottest_stage` returns, which is
+        the record a reader is most likely to quote. The flag exists precisely so a chargeback
+        or a carbon figure can say whether its total was exact or sampled, and a roll-up that
+        silently answers "sampled" for an exact stage is worse than not carrying the flag.
         """
         order: list[str] = []
         acc: dict[str, dict] = {}
@@ -214,6 +222,7 @@ class EnergyLedger:
                     "rows": 0,
                     "tokens": 0,
                     "measured": True,
+                    "integrated": True,
                 }
             entry = acc[s.stage]
             entry["seconds"] += s.seconds
@@ -223,6 +232,7 @@ class EnergyLedger:
             entry["tokens"] += s.tokens
             entry["devices"] = max(entry["devices"], s.device_count)
             entry["measured"] = entry["measured"] and s.measured
+            entry["integrated"] = entry["integrated"] and s.integrated
         out: list[StageEnergy] = []
         for name in order:
             e = acc[name]
@@ -238,6 +248,7 @@ class EnergyLedger:
                     rows=e["rows"],
                     tokens=e["tokens"],
                     measured=e["measured"],
+                    integrated=e["integrated"],
                 )
             )
         return out
@@ -280,9 +291,10 @@ class EnergyLedger:
         """A flat, JSON-safe roll-up for logs, metrics sinks, and the dashboard.
 
         Returns:
-            Total energy, idle energy and fraction, the share of it that was measured
-            rather than modelled, row and token counts, and the two efficiency ratios
-            (omitted when undefined rather than reported as zero).
+            Total energy, idle energy and fraction, the share of it that was measured rather
+            than modelled and the share that came from a hardware counter rather than from
+            samples, row and token counts, and the two efficiency ratios (omitted when
+            undefined rather than reported as zero).
         """
         out: dict[str, float] = {
             "joules": self.total_joules,
@@ -294,6 +306,13 @@ class EnergyLedger:
         }
         if self.total_joules > 0:
             out["measured_fraction"] = self.measured_joules / self.total_joules
+            # The qualifier the total needs before anyone quotes it. `integrated_fraction`
+            # existed and reached nothing: this is the record logs, metrics sinks and the
+            # dashboard read, so a figure assembled from power samples and one read off a
+            # hardware counter arrived indistinguishable. Sampling assumes the draw between
+            # two samples was their mean, which a stage alternating a 60 W staged transfer
+            # with a 700 W kernel violates by an order of magnitude.
+            out["integrated_fraction"] = self.integrated_fraction
         tpj, rpj = self.tokens_per_joule(), self.rows_per_joule()
         if tpj is not None:
             out["tokens_per_joule"] = tpj

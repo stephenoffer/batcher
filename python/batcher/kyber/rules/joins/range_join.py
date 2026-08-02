@@ -37,6 +37,7 @@ from batcher.kyber.rule import Phase
 from batcher.kyber.rules.joins.projection import _is_push_safe
 from batcher.plan.expr_ir import Binary, Col, Expr, referenced_columns
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts, substitute_columns
+from batcher.plan.ir_tags import ORDERING_COMPARISONS, ORDERING_FLIP
 from batcher.plan.logical import (
     Filter,
     Join,
@@ -54,8 +55,6 @@ __all__ = ["derive_range_join"]
 
 # The four inequalities the engine's range join understands, and the same comparison read
 # from the other side (`b.y > a.x` is `a.x < b.y`).
-_RANGE_OPS = ("lt", "le", "gt", "ge")
-_FLIPPED = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}
 
 # IEJoin sorts on two axes, so two inequalities is the ceiling. A third stays in the
 # filter above, where it is a cheap post-check on the surviving pairs rather than a
@@ -153,7 +152,7 @@ def _crossing_pair(
     if lhs.name in left_src and rhs.name in right_src:
         return (left_src[lhs.name], right_src[rhs.name], conj.op)
     if lhs.name in right_src and rhs.name in left_src:
-        return (left_src[rhs.name], right_src[lhs.name], _FLIPPED.get(conj.op, conj.op))
+        return (left_src[rhs.name], right_src[lhs.name], ORDERING_FLIP.get(conj.op, conj.op))
     return None
 
 
@@ -299,7 +298,7 @@ def _candidate(
     right_schema: SchemaRef | None,
 ) -> _Candidate | None:
     """The `_Candidate` for `conj`, or `None` when it must stay in the filter."""
-    pair = _crossing_pair(conj, left_src, right_src, _RANGE_OPS)
+    pair = _crossing_pair(conj, left_src, right_src, ORDERING_COMPARISONS)
     if pair is not None:
         # The engine encodes both sides of a condition with one row converter, so a pair
         # whose keys do not share a type cannot be joined this way.
@@ -326,11 +325,11 @@ def _computed_candidate(
     row converter — so the computed operand's inferred type is checked against the plain
     column's before the candidate is offered.
     """
-    if not isinstance(conj, Binary) or conj.op not in _RANGE_OPS:
+    if not isinstance(conj, Binary) or conj.op not in ORDERING_COMPARISONS:
         return None
     orientations = (
         (conj.left, conj.right, conj.op),
-        (conj.right, conj.left, _FLIPPED[conj.op]),
+        (conj.right, conj.left, ORDERING_FLIP[conj.op]),
     )
     for expr, other, op in orientations:
         # `other` is the plain key column; `expr` is the candidate computation, and `op` is
@@ -362,5 +361,5 @@ def _computed_candidate(
             # the right-hand input.
             if expr_side == "left":
                 return _Candidate(None, other_name, op, left_expr=rewritten)
-            return _Candidate(other_name, None, _FLIPPED[op], right_expr=rewritten)
+            return _Candidate(other_name, None, ORDERING_FLIP[op], right_expr=rewritten)
     return None

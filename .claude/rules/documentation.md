@@ -18,7 +18,7 @@ architecture you didn't check. This matters more here than in most projects, bec
 
 **When in doubt, leave it out.** Incomplete but accurate beats complete but partly invented.
 
-Competitive claims have a second gate: `docs/internals/competitive_architecture.md` is the
+Competitive claims have a second gate: `docs/architecture/internals/competitive_architecture.md` is the
 code-checked scorecard. Read it before writing that Batcher beats anything, and never
 restore a claim it retires.
 
@@ -129,8 +129,9 @@ Code in `docs/` is executed, so it is a contract, not an illustration.
 - In the user-facing sections every `python` block runs by default. `# docs: skip` as the
   first line shows a block without executing it. Use it for examples needing a cloud store, a
   cluster, a GPU, or a real model.
-- Under `docs/architecture/` and `docs/internals/` blocks are illustrative and don't run
-  unless the first line is `# docs: run`.
+- Under the `docs/architecture/` overview pages and `docs/architecture/internals/`, blocks are
+  illustrative and don't run unless the first line is `# docs: run`.
+  `docs/architecture/deep-dives/` is *not* one of those: its blocks run by default.
 - Examples must be self-contained per page and use in-memory data (`bt.from_pydict`), so
   no fixture files are needed.
 

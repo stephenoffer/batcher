@@ -44,6 +44,11 @@ from batcher.plan.logical import Aggregate, LogicalPlan
 
 __all__ = ["execute_aggregate_flight"]
 
+#: Ticket stages one aggregate reserves: its map buckets plus room for the combiner tree's
+#: interior levels. The tree halves (fan_in-ways) its frontier each round, so 16 levels covers
+#: `fan_in ** 16` leaves — far past any real fleet — while costing nothing but stage numbers.
+_TREE_STAGE_BLOCK = 17
+
 
 def _shuffle_credits(requested: int = 0) -> int:
     """The credit window Carbonite grants for this shuffle's reducer<-mapper channels.
@@ -107,7 +112,7 @@ def execute_aggregate_flight(
     """
     import ray
 
-    from batcher.dist.fleet import acquire_fleet
+    from batcher.dist.fleet import acquire_fleet, release_session_lease
 
     _ensure_ray(workers)
 
@@ -126,6 +131,15 @@ def execute_aggregate_flight(
     # Borrow the query-lifetime fleet if the adaptive loop installed one (pins the
     # worker count to the fleet's, so every stage shuffles over the same actors);
     # otherwise spawn one we tear down. `owns` gates teardown.
+    # Which of `acquire_fleet`'s three branches ran, decided **here** rather than re-derived at
+    # teardown. `owns` distinguishes a self-spawned fleet, but not the two borrowed ones — and
+    # they need opposite teardowns: borrowing the *session* fleet takes a lease that must be
+    # handed back, borrowing the adaptive loop's *query* fleet takes none. `current_fleet()`
+    # tells them apart only before the acquire; asking again afterwards is how a lease meant
+    # for one path gets released on the other.
+    from batcher.dist.fleet import current_fleet
+
+    borrows_session = current_fleet() is None
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
     n_reducers = 1 if n_keys == 0 else aggregate_reducer_count(agg, shuffle_partitions(workers))
 
@@ -167,11 +181,19 @@ def execute_aggregate_flight(
         # fail the whole query on a bare `ray.get`; instead the lost worker's source is
         # republished on a survivor under the same `src`, so the reducers' tickets still
         # resolve, and `dead` keeps the reduce off a worker that is gone.
-        # One ticket stage for THIS aggregate's map buckets. Every aggregate published under
-        # the fixed stage 0, so a query with two of them (a decorrelated subquery beside its
-        # outer aggregate) had two sets of map buckets at identical coordinates on the same
-        # worker — see `fleet.plan_id.next_stage_base`.
-        stage_base = next_stage_base(1)
+        # Ticket stages for THIS aggregate: one for its map buckets, plus one per level the
+        # combiner tree may add. Every aggregate published under the fixed stage 0, so a query
+        # with two of them (a decorrelated subquery beside its outer aggregate) had two sets of
+        # map buckets at identical coordinates on the same worker — see
+        # `fleet.plan_id.next_stage_base`.
+        #
+        # The block has to cover the tree's *interior* levels too. When the aggregate moved off
+        # stage 0, `_tree_reduce` was left addressing its leaves at the literal stage 0 and
+        # numbering its interior levels 1, 2, 3 — so past `shuffle_fan_in` reducers it fetched
+        # tickets nobody had published and every bucket came back empty. That is a silent wrong
+        # answer, not an error: TPC-H q1 returned **zero rows** at 12 workers and the correct
+        # four at 8, on the same data.
+        stage_base = next_stage_base(_TREE_STAGE_BLOCK)
         addrs, dead = map_barrier(
             workers,
             lambda host, src: actors[host].map_publish.remote(
@@ -250,14 +272,31 @@ def execute_aggregate_flight(
                 return FlightMaterializedSource(handles, schema, src_actors, src_pg)
             batches = out
     finally:
-        # Only tear down a fleet we spawned; a borrowed one is the query's, freed once
-        # by the adaptive loop. `keep_actors` further defers a self-spawned fleet to
-        # the FlightMaterializedSource that took ownership of it.
-        if owns and not keep_actors:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
+        # The teardown `acquire_fleet` deserves, on the branch it actually took.
+        #
+        # Hand-rolling it covered only the fleet this call *spawned*, so the lease it took on
+        # the warm session fleet was never given back: the counter never reached zero, the idle
+        # timer was never armed, and the fleet held every core in the cluster for the life of
+        # the process — after which any query running plain Ray tasks pended forever (ClickBench
+        # stalling on q19 with `CPU 32/32 in use`).
+        #
+        # Calling `release_fleet` for *every* borrowed fleet is the opposite error and a worse
+        # one. `release_fleet` infers the branch from `current_fleet()` at teardown, which is
+        # not necessarily what it was at acquire — and when the buckets stay on the fleet as a
+        # `FlightMaterializedSource`, dropping the last lease arms the idle timer against an
+        # intermediate the next stage has not read yet. Measured: TPC-H q1 returned **zero
+        # rows** at `num_workers >= 12` and the right four below it.
+        #
+        # So: kill what we spawned (unless a source took it over), hand back a lease only if we
+        # took one, and hold it while our output still lives on those actors.
+        if owns:
+            if not keep_actors:
+                for a in actors:
+                    with contextlib.suppress(Exception):
+                        ray.kill(a)
+                release_placement(pg)
+        elif borrows_session and not keep_actors:
+            release_session_lease()
 
     table = pa.Table.from_batches(batches) if batches else _empty_agg_table(agg)
     record_aggregate_cardinality(agg, table.num_rows)
@@ -349,6 +388,7 @@ def _reduce_with_recovery(
         gather_with_backups,
     )
     from batcher.dist.executors.ray_runtime import (
+        blame_host_for_reduce_failure,
         draining_workers,
         recovery_policy,
         speculation_policy,
@@ -428,8 +468,11 @@ def _reduce_with_recovery(
             except ResourceError:
                 return _launch(pending[idx], set())
 
-        def _on_failure(_idx: int, ref: object, _exc: Exception):
-            return ("__dead__", ref_host.get(ref))  # the host of the last-failed copy
+        def _on_failure(_idx: int, ref: object, exc: Exception):
+            # The host of the last-failed copy — but only when the failure means lost data.
+            # A deterministic one re-raises rather than condemning a healthy worker; see
+            # `blame_host_for_reduce_failure`.
+            return ("__dead__", blame_host_for_reduce_failure(exc, ref_host.get(ref)))
 
         results = gather_with_backups(refs, _relaunch, speculation_policy(), on_failure=_on_failure)
         for r, (status, payload) in zip(pending, results, strict=True):
@@ -494,7 +537,9 @@ def _reduce_with_recovery(
     return [b for b in finals if b is not None and b.num_rows > 0]
 
 
-def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=None, replicas=None):
+def _tree_reduce(
+    actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=None, replicas=None, stage_base=0
+):
     """Combine each bucket's `workers` leaf partials into one via a combiner tree.
 
     Each round groups a bucket's current partials into chunks of `fan_in`, and a
@@ -514,7 +559,7 @@ def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=N
 
     # frontier[r]: the (addr, ticket) sources currently holding bucket r's partials.
     frontier = {
-        r: [(leaf_addrs[src], _ticket(0, src, r)) for src in range(workers)]
+        r: [(leaf_addrs[src], _ticket(stage_base, src, r)) for src in range(workers)]
         for r in range(n_reducers)
     }
     # fallbacks[r][i]: replica addresses for frontier[r][i], carried POSITIONALLY alongside
@@ -529,7 +574,8 @@ def _tree_reduce(actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=N
         ]
         for r in range(n_reducers)
     }
-    stage = 1
+    # Interior levels live *inside* this aggregate's reserved block, above its map stage.
+    stage = stage_base + 1
     while any(len(srcs) > fan_in for srcs in frontier.values()):
         tasks, next_frontier, assign = [], {r: [] for r in range(n_reducers)}, 0
         next_fallbacks: dict[int, list[list[str]]] = {r: [] for r in range(n_reducers)}
@@ -617,7 +663,7 @@ def _tree_reduce_with_recovery(
     def attempt():
         try:
             return _tree_reduce(
-                actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead, replicas
+                actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead, replicas, stage_base
             ), set()
         except ray.exceptions.RayTaskError as exc:
             # A combine fetches inside its task, so a lost peer arrives here as a

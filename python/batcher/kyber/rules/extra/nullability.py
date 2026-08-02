@@ -38,10 +38,10 @@ from batcher.kyber.rule import Phase
 
 # The sibling families' helpers, imported rather than re-implemented (copy-paste is the one
 # wrong way to share): `_key` (structural identity), `_rewrite_node` (leaf Expr rule → rebuilt
-# node, or None), `_SAFE_BINARY_OPS` (the null-propagating, non-erroring binaries), `_pure`
+# node, or None), `SAFE_BINARY_OPS` (the null-propagating, non-erroring binaries), `_pure`
 # (deterministic and non-erroring, so deleting it changes neither value nor errors), and
 # `_non_nullable_cols` (the columns a scan's source schema declares NOT NULL).
-from batcher.kyber.rules.extra.boolean_algebra import _SAFE_BINARY_OPS, _key, _rewrite_node
+from batcher.kyber.rules.extra.boolean_algebra import _key, _rewrite_node
 from batcher.kyber.rules.extra.conditional import _pure
 from batcher.kyber.rules.extra.projection_scan import _non_nullable_cols
 from batcher.plan.expr_ir import (
@@ -56,6 +56,7 @@ from batcher.plan.expr_ir import (
     Not,
 )
 from batcher.plan.expr_ir.core import IsInf, IsNan
+from batcher.plan.ir_tags import SAFE_BINARY_OPS
 from batcher.plan.logical import (
     Distinct,
     Filter,
@@ -117,7 +118,7 @@ def _never_null(expr: Expr, non_null: frozenset[str]) -> bool:
     `IS NOT NULL` (total by construction); `NOT` / `IS NAN` / `IS INF` over a never-null input;
     a **strict** `Cast` of one (an unconvertible value *errors* rather than becoming NULL —
     `try_cast`, which does manufacture one, is excluded); a null-propagating binary from
-    `_SAFE_BINARY_OPS` with both operands never-null (`div`/`mod` and the bit/shift ops are
+    `SAFE_BINARY_OPS` with both operands never-null (`div`/`mod` and the bit/shift ops are
     not in it); and a `COALESCE` with a never-null argument. Everything else answers False —
     erring that way prevents a rewrite, never licenses one.
     """
@@ -133,7 +134,7 @@ def _never_null(expr: Expr, non_null: frozenset[str]) -> bool:
         return not expr.try_cast and _never_null(expr.input, non_null)
     if isinstance(expr, Binary):
         return (
-            expr.op in _SAFE_BINARY_OPS
+            expr.op in SAFE_BINARY_OPS
             and _never_null(expr.left, non_null)
             and _never_null(expr.right, non_null)
         )

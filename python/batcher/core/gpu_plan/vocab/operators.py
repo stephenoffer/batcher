@@ -24,6 +24,7 @@ import operator
 from typing import TYPE_CHECKING
 
 from batcher.core.gpu_plan.backend import Unsupported
+from batcher.plan.ir_tags import COMPARISON_OPS
 
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
@@ -78,7 +79,7 @@ def eval_binary(ir, df, be, eval_expr):
         return _boolean_bitwise(op, be.column(left, df), be.column(right, df), be)
     if op in _SHIFTS:
         return _shift(op, be.column(left, df), right, be)
-    if op in _COMPARISONS and (be.is_float(left) or be.is_float(right)):
+    if op in COMPARISON_OPS and (be.is_float(left) or be.is_float(right)):
         return compare(op, be.column(left, df), be.column(right, df))
     if op in ("and", "or"):
         return _kleene(op, be.column(left, df), be.column(right, df))
@@ -105,8 +106,6 @@ def date_difference(left, right, be):
         raise Unsupported("date difference")
     return days.astype(be.dtype(pa.int64()))
 
-
-_COMPARISONS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 
 #: The bit operators, whose result over a BOOLEAN operand is an **integer** in the engine (and
 #: in DuckDB) and a boolean in both dataframe libraries, which route them to logical `and`/`or`.

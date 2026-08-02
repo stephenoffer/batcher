@@ -38,7 +38,7 @@ sees it. That is how `get_bit` was caught being answered with Spark's bit order 
 DuckDB's bit-string function.
 
 The running record of what these censuses found and what closed it lives in
-``docs/internals/competitor_parity_census.md``.
+``docs/architecture/internals/competitor_parity_census.md``.
 """
 
 from __future__ import annotations

@@ -36,6 +36,7 @@ from batcher.plan.ir_tags import WINDOW_AGGREGATES, WINDOW_FUNCS, WINDOW_RANKING
 
 __all__ = [
     "DATE_FNS",
+    "GEO_FNS",
     "KEYED_STR_FNS",
     "LIST_FNS",
     "MAKE_TEMPORAL_FNS",
@@ -172,6 +173,55 @@ LIST_FNS: Final[frozenset[str]] = frozenset(
         "reverse", "softmax", "sort", "std", "sum", "unique", "var",
     }
 )  # fmt: skip
+
+GEO_FNS: Final[frozenset[str]] = frozenset(
+    {
+        # Constructors and codecs.
+        "st_point", "st_point_z", "st_make_line", "st_make_polygon", "st_make_envelope",
+        "st_geom_from_text", "st_geom_from_wkb", "st_geom_from_geojson",
+        "st_geom_from_geohash", "st_as_text", "st_as_ewkt", "st_as_binary", "st_as_ewkb",
+        "st_as_hex_wkb", "st_as_geojson",
+        # Accessors.
+        "st_x", "st_y", "st_z", "st_xmin", "st_ymin", "st_xmax", "st_ymax",
+        "st_geometry_type", "st_dimension", "st_srid", "st_set_srid", "st_num_points",
+        "st_num_geometries", "st_num_interior_rings", "st_geometry_n", "st_point_n",
+        "st_start_point", "st_end_point", "st_exterior_ring", "st_interior_ring_n",
+        "st_is_empty", "st_is_valid", "st_is_valid_reason", "st_is_closed", "st_is_ring",
+        "st_is_simple", "st_is_collection", "st_has_z", "st_coord_dim",
+        # Measures — planar in coordinate units, then geodesic in metres.
+        "st_area", "st_length", "st_perimeter", "st_distance", "st_max_distance",
+        "st_hausdorff_distance", "st_azimuth", "st_distance_sphere",
+        "st_distance_spheroid", "st_area_spheroid", "st_length_spheroid",
+        "st_perimeter_spheroid",
+        # Predicates.
+        "st_intersects", "st_disjoint", "st_contains", "st_within", "st_covers",
+        "st_covered_by", "st_touches", "st_crosses", "st_overlaps", "st_equals",
+        "st_dwithin", "st_dwithin_sphere", "st_intersects_extent", "st_contains_extent",
+        # Constructions and transforms.
+        "st_centroid", "st_envelope", "st_boundary", "st_convex_hull",
+        "st_point_on_surface", "st_buffer", "st_simplify", "st_reverse", "st_force2d",
+        "st_force3d", "st_force_polygon_ccw", "st_force_polygon_cw",
+        "st_flip_coordinates", "st_translate", "st_scale", "st_rotate", "st_affine",
+        "st_snap_to_grid", "st_segmentize", "st_expand", "st_collect",
+        "st_remove_repeated_points", "st_line_interpolate_point", "st_line_locate_point",
+        "st_line_substring", "st_closest_point", "st_shortest_line", "st_project",
+        "st_transform",
+        # Grids and reference systems.
+        "st_geohash", "geohash_encode", "geohash_decode_lon", "geohash_decode_lat",
+        "st_tile_x", "st_tile_y", "st_quadkey", "st_s2_cell", "st_s2_cell_parent",
+        "st_hex_bin", "st_hex_center_x", "st_hex_center_y", "st_utm_zone", "st_utm_epsg",
+    }
+)  # fmt: skip
+"""The geospatial vocabulary, mirroring `bc_expr::GeoFunc`'s serde tags exactly.
+
+Names follow PostGIS so a ported query reads the same, with one deliberate exception:
+`st_force2d` and `st_force3d` carry no underscore before the digit, because that is what
+Rust's `snake_case` rename produces for `StForce2d` and the wire contract is what the
+engine actually deserializes. PostGIS spells them the same way.
+
+The argument *count* is not stated here — it lives in `bc_expr::GeoFunc::arity`, which is
+the one place that can check it, and the Python constructors in `plan/functions/geo/`
+each build a fixed argument list so a mismatch is impossible to write."""
 
 MATH_FNS: Final[frozenset[str]] = frozenset(
     {

@@ -16,13 +16,12 @@ from __future__ import annotations
 
 __all__ = [
     "cluster_accelerator_type",
+    "cluster_gpu_memory_bytes",
     "cluster_gpu_memory_gb",
     "recommend_accelerator_type",
 ]
 
-#: Usable fraction of a device's nameplate VRAM when deciding whether a model fits — the same
-#: headroom (~15%) the packing math leaves for the CUDA context, activations, and fragmentation.
-_USABLE_VRAM = 0.85
+from batcher._internal.device_share import device_headroom
 
 
 def recommend_accelerator_type(model_memory_gb: float) -> str | None:
@@ -68,8 +67,13 @@ def recommend_accelerator_type(model_memory_gb: float) -> str | None:
 
     return select_device_class(
         [c for c in candidates if c],
-        model_memory_gb,
-        headroom=1.0 - _USABLE_VRAM,
+        # GiB, which is the unit the device table's `memory_gib` is written in and the unit
+        # `select_device_class` compares against. `model_memory_gb` is a decimal-GB figure the
+        # user declared, and handing it over unconverted under-states the model by 7.4% —
+        # enough to pin a stage to the device one size down and out-of-memory it at load,
+        # which is the exact failure this pinning exists to prevent.
+        model_memory_gb * 1e9 / (1 << 30),
+        headroom=device_headroom(),
         hub=_learned_hub(),
     )
 
@@ -121,15 +125,22 @@ def cluster_accelerator_type() -> str | None:
     return only if only else None
 
 
-def cluster_gpu_memory_gb() -> float | None:
-    """VRAM of the cluster's **smallest** GPU in GB, or `None` when it can't be determined.
+def cluster_gpu_memory_bytes() -> int | None:
+    """Total VRAM of the cluster's **smallest** GPU in bytes, or `None` when undeterminable.
 
     The minimum is the binding figure: a model packed against the largest device in a mixed
     fleet OOMs every smaller one it lands on, which is the failure this exists to prevent.
 
+    **Nameplate, and in bytes.** One meaning for "how big is one device", stated in the unit
+    the driver reports it in, because the two figures this replaces were neither. The GB
+    spelling below divides by `1 << 30` — a *gibibyte* — while every consumer compared it
+    against a working set built as `rows x width / 1e9`, a decimal gigabyte, so an 80 GiB
+    board was routed as though it were 80 GB and the device was over-stated by 7%. Callers
+    that want a budget rather than a capacity subtract `device_headroom()` themselves, once.
+
     Returns:
-        Usable VRAM in GB of the binding device, or `None` when Ray is down, the topology is
-        unreadable, or any GPU node's device model is unrecognized.
+        Bytes of the binding device, or `None` when Ray is down, the topology is unreadable,
+        or any GPU node's device model is unrecognized.
     """
     try:
         import ray
@@ -143,4 +154,21 @@ def cluster_gpu_memory_gb() -> float | None:
         return None
     if hw is None or hw.gpu_memory_bytes <= 0:
         return None
-    return hw.gpu_memory_bytes / (1 << 30)
+    return int(hw.gpu_memory_bytes)
+
+
+def cluster_gpu_memory_gb() -> float | None:
+    """Total VRAM of the cluster's smallest GPU in **decimal** GB, or `None` when unknown.
+
+    The unit matters and used to be wrong. Kyber sizes a working set as `rows x width / 1e9`
+    — decimal gigabytes — and compared it against this, which divided by `1 << 30`. An 80 GiB
+    A100 therefore presented as "80" against a working set measured in GB, over-stating the
+    device by 7.4% in the direction that dispatches a query the board cannot hold.
+
+    Returns:
+        Decimal GB of the binding device's total memory, or `None` when undeterminable. This
+        is a *capacity*, not a budget: subtract `device_headroom()` to get what a claimant may
+        actually plan against.
+    """
+    total = cluster_gpu_memory_bytes()
+    return None if total is None else total / 1e9

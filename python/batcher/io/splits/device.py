@@ -17,10 +17,15 @@ Two rules keep it from becoming a source of wrong answers rather than a source o
   Parquet, and a second implementation is a second set of edge cases. A split whose schema
   carries anything outside the numeric/boolean/string/temporal core reports no locator, so it
   reads through the host path that the engine's own tests cover.
-* **Only when nothing was pushed into the read.** A predicate the host reader would have used
-  to skip row groups is not expressible here, and a device read that ignores it would move far
-  more bytes than the path it replaced. Declining is the honest answer: a selective query keeps
-  the reader that can be selective.
+* **Only when a pushed predicate has already done its skipping.** A predicate is not
+  expressible in a locator, so a device read cannot perform the row-group skipping the host
+  reader would — but for a `RowGroupSplit` it does not have to, because
+  `parquet.parquet_row_group_splits` already applied that predicate to the footer at *plan*
+  time and the split names only the row groups that survived it. Both readers would open the
+  same bytes. What is left of the predicate is row-level filtering, and the engine's `Filter`
+  re-checks every row on the device regardless, so nothing is lost by letting the device
+  decode them. A `FileSplit` carries no such pruning, so a predicate still disqualifies it:
+  there the host reader really would open less.
 * **Only when the device can undo the compression.** Parquet pages are compressed, and a codec
   the device reader has no kernel for is decompressed on the host — so the pages cross to the
   host, come back, and the "device read" has crossed PCIe twice while using the CPU anyway.
@@ -50,7 +55,9 @@ class DeviceReadSpec:
     row_groups: tuple[int, ...] | None = None
 
 
-def device_read_specs(splits: list, projection: list[str] | None) -> list[DeviceReadSpec] | None:
+def device_read_specs(
+    splits: list, projection: list[str] | None, predicate: dict | None = None
+) -> list[DeviceReadSpec] | None:
     """Locators for reading `splits` directly on a device, or `None` when one cannot.
 
     All-or-nothing by design. A descriptor read half on the device and half on the host would
@@ -62,11 +69,16 @@ def device_read_specs(splits: list, projection: list[str] | None) -> list[Device
         projection: The columns to be read, or `None` for all of them. Used to narrow the
             type check to the columns that will actually cross, so a table with one
             unsupported column can still be read on the device when nobody selected it.
+        predicate: The predicate pushed into this read, or `None` when none was. A locator
+            cannot express one, so it matters only for whether the *skipping* it would have
+            caused has already happened: a `RowGroupSplit` was cut from a footer that this
+            same predicate pruned, so it has, and a `FileSplit` names a whole file, so it
+            has not.
 
     Returns:
         One spec per split, or `None` when any split is not a plain Parquet locator, reads a
-        type the two readers may not agree on, or is compressed with a codec the device cannot
-        decompress.
+        type the two readers may not agree on, is compressed with a codec the device cannot
+        decompress, or would skip row groups on the host that the device would read.
 
     Examples:
         .. doctest::
@@ -85,6 +97,10 @@ def device_read_specs(splits: list, projection: list[str] | None) -> list[Device
         if isinstance(split, RowGroupSplit):
             specs.append(DeviceReadSpec(split.path, tuple(split.row_groups)))
         elif isinstance(split, FileSplit) and split.format_name == "parquet" and not split.kwargs:
+            # A whole-file locator was never pruned, so a pushed predicate is skipping this
+            # read would not do. Leave it to the reader that can do it.
+            if predicate is not None:
+                return None
             specs.append(DeviceReadSpec(split.path))
         else:
             return None

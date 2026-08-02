@@ -128,13 +128,28 @@ def test_the_map_and_the_devices_agree() -> None:
 
 
 def test_summary_carries_the_imbalance_and_the_layout() -> None:
+    # Both devices on one of two rails, which is the fault this metric exists to catch. It
+    # used to report `0.0` for it: the imbalance was computed over *loaded* rails only, so a
+    # node with one loaded rail had a single-entry load list and took the "cannot be unbalanced
+    # against itself" branch. The empty rail is the evidence, and `rails()` keeps a record for
+    # it precisely so this figure can see it.
     records = [Rail("a", rate_gbps=400.0, devices=(0, 1)), Rail("b", rate_gbps=400.0)]
     summary = rail_summary(records)
     assert summary == {
         "rails": 2,
         "loaded_rails": 1,
         "devices": 2,
-        "imbalance": 0.0,
+        "imbalance": 0.5,
         "total_gbps": 400.0,
         "assignment": {"a": [0, 1]},
     }
+
+
+def test_every_device_on_one_rail_of_eight_is_the_worst_answer_not_the_best() -> None:
+    """The headline failure, which the metric used to score as perfectly balanced."""
+    from batcher._internal.hardware.fabric.rails import rail_imbalance
+
+    one_rail = [Rail("a", devices=tuple(range(8)))] + [Rail(f"r{i}") for i in range(7)]
+    assert rail_imbalance(one_rail) == pytest.approx(0.875)
+    balanced = [Rail(f"r{i}", devices=(i,)) for i in range(8)]
+    assert rail_imbalance(balanced) == 0.0

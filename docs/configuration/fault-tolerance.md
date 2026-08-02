@@ -7,7 +7,7 @@ cluster that mostly works; this one tunes what happens when it doesn't.
 Every default is chosen so that turning nothing on changes nothing. The quarantine thresholds
 are permissive enough that a healthy fleet never trips them, and the retry budget is generous
 enough that only a systematically broken run exhausts it.
-{doc}`/user-guide/operate/unstable-nodes` is the task-oriented walkthrough; this page is the
+{doc}`/user-guide/operate/running/unstable-nodes` is the task-oriented walkthrough; this page is the
 field reference.
 
 ```python
@@ -76,7 +76,7 @@ workload's own behavior would take out the next node the retry lands on too.
 
 ## See also
 
-- {doc}`/user-guide/operate/unstable-nodes` for the task-oriented walkthrough.
-- {doc}`/user-guide/operate/gpu-fleets` for power budgets, placement, and device health.
+- {doc}`/user-guide/operate/running/unstable-nodes` for the task-oriented walkthrough.
+- {doc}`/user-guide/operate/running/gpu-fleets` for power budgets, placement, and device health.
 - {doc}`accelerator` for the device-health thresholds these build on.
 - {doc}`/architecture/fault-tolerance` for how recovery works underneath.

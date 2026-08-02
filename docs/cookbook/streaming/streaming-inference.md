@@ -191,9 +191,9 @@ distributed *batch* job over the landed bronze table instead.
 - {doc}`GPU pipelines </ml/inference/gpu>`: actor pools, `concurrency`, and accelerator placement.
 - {doc}`Kafka to the lake </cookbook/streaming/kafka-etl>`: landing the raw events this job scores.
 - {doc}`Exactly-once sinks </cookbook/streaming/exactly-once-sink>`: what the Delta write above actually guarantees.
-- {doc}`LLM batch scoring </cookbook/ml/pipelines/llm-batch-scoring>`: the same stage, run over the landed table
+- {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same stage, run over the landed table
   as a distributed batch.
 - {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, checkpoints, and `recent_progress()`.
 - {doc}`ML API reference </api/models/ml>`: `ds.ml.infer`, `map_batches`, `max_errored_rows`.
-- {doc}`AI and GPU benchmarks </benchmarks/ai-and-gpu>`: what a warm, resident model is worth.
-- {doc}`GPU execution </deep-dives/distribution/gpu-execution>`: the pool the model lives in.
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what a warm, resident model is worth.
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: the pool the model lives in.

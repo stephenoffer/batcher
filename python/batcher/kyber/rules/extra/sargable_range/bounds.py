@@ -33,9 +33,10 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.rules.exprs.guards import is_integer, node_schema
-from batcher.kyber.rules.extra.sargable_range.shared import ORDERED, decompose, transpose
+from batcher.kyber.rules.extra.sargable_range.shared import decompose, transpose
 from batcher.plan.expr_ir import Binary, Expr
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
+from batcher.plan.ir_tags import ORDERING_COMPARISONS
 from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
 from batcher.plan.stats import ColumnStat
 
@@ -64,7 +65,7 @@ def _int_bounds(stat: ColumnStat) -> tuple[int, int] | None:
     # Every ordered comparison, in both spellings: a predicate written `500 < x + 1` arrives
     # as a `lt` and `decompose` normalizes it to `gt`. The set is closed under mirroring, so
     # naming the four covers both directions.
-    expr_ops=ORDERED,
+    expr_ops=ORDERING_COMPARISONS,
 )
 def sarg_bounded_ordered(node: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan | None:
     """Transpose constant arithmetic out of an ordered comparison, where the column's recorded

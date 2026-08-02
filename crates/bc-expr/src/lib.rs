@@ -412,6 +412,407 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+
+    /// A geospatial function over zero or more sub-expressions.
+    ///
+    /// One variadic variant covers the whole `ST_*` surface rather than a node per
+    /// arity, because every one of these functions has the same shape at the wire
+    /// level — a name and an argument list — and the arities range from one to six.
+    /// Splitting them would multiply the wire contract by nothing gained: the arity is
+    /// checked against `GeoFunc::arity` at evaluation, which is where a mismatch has to
+    /// be reported anyway.
+    ///
+    /// Geometry arguments and geometry results are **WKB in a `Binary` array**, which
+    /// is what makes geospatial work fit the Arrow-only columnar contract without a new
+    /// physical type. See `bc_geo` for the encoding and the algorithms.
+    Geo {
+        #[serde(rename = "fn")]
+        func: GeoFunc,
+        args: Vec<Expr>,
+    },
+}
+
+/// The geospatial function vocabulary. Names mirror PostGIS so a ported query reads the
+/// same, and the Python `fn` strings in `plan/expr_ir/fn_names.py::GEO_FNS` are these
+/// serde tags exactly.
+///
+/// Grouped by what they take and return, because that is what a caller needs to know:
+/// constructors take numbers or text and return a geometry, accessors take a geometry
+/// and return a scalar, predicates take two geometries and return a boolean, and the
+/// grid functions take plain numbers and return a cell id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeoFunc {
+    // --- Constructors and codecs (→ geometry, unless noted) -----------------
+    /// `st_point(x, y)`.
+    StPoint,
+    /// `st_point_z(x, y, z)`.
+    StPointZ,
+    /// `st_make_line(a, b)` — the two-position chain joining two points.
+    StMakeLine,
+    /// `st_make_polygon(ring)` — a polygon from a closed chain.
+    StMakePolygon,
+    /// `st_make_envelope(xmin, ymin, xmax, ymax)`.
+    StMakeEnvelope,
+    /// `st_geom_from_text(wkt)` — WKT, EWKT, GeoJSON or hex WKB, detected by content.
+    StGeomFromText,
+    /// `st_geom_from_wkb(bytes)` — re-validate a `Binary` column as geometry.
+    StGeomFromWkb,
+    /// `st_geom_from_geojson(json)`.
+    StGeomFromGeojson,
+    /// `st_geom_from_geohash(hash)` — the cell the hash names, as a rectangle.
+    StGeomFromGeohash,
+    /// `st_as_text(g)` → Utf8 WKT.
+    StAsText,
+    /// `st_as_ewkt(g)` → Utf8 WKT with an `SRID=` prefix.
+    StAsEwkt,
+    /// `st_as_binary(g)` → Binary WKB, without an SRID.
+    StAsBinary,
+    /// `st_as_ewkb(g)` → Binary EWKB, carrying the SRID.
+    StAsEwkb,
+    /// `st_as_hex_wkb(g)` → Utf8 hex EWKB.
+    StAsHexWkb,
+    /// `st_as_geojson(g)` → Utf8 RFC 7946 geometry object.
+    StAsGeojson,
+
+    // --- Accessors (geometry in, scalar out) --------------------------------
+    /// `st_x(g)` → Float64; null unless `g` is a point.
+    StX,
+    /// `st_y(g)` → Float64; null unless `g` is a point.
+    StY,
+    /// `st_z(g)` → Float64; null unless `g` is a 3D point.
+    StZ,
+    /// `st_xmin(g)` → Float64.
+    StXmin,
+    /// `st_ymin(g)` → Float64.
+    StYmin,
+    /// `st_xmax(g)` → Float64.
+    StXmax,
+    /// `st_ymax(g)` → Float64.
+    StYmax,
+    /// `st_geometry_type(g)` → Utf8, the uppercase OGC name.
+    StGeometryType,
+    /// `st_dimension(g)` → Int64: 0 points, 1 lines, 2 areas.
+    StDimension,
+    /// `st_srid(g)` → Int64; 0 when unknown.
+    StSrid,
+    /// `st_set_srid(g, srid)` — relabel without moving a coordinate.
+    StSetSrid,
+    /// `st_num_points(g)` → Int64.
+    StNumPoints,
+    /// `st_num_geometries(g)` → Int64.
+    StNumGeometries,
+    /// `st_num_interior_rings(g)` → Int64.
+    StNumInteriorRings,
+    /// `st_geometry_n(g, n)` — the 1-based `n`-th member.
+    StGeometryN,
+    /// `st_point_n(g, n)` — the 1-based `n`-th position of a chain.
+    StPointN,
+    /// `st_start_point(g)`.
+    StStartPoint,
+    /// `st_end_point(g)`.
+    StEndPoint,
+    /// `st_exterior_ring(g)`.
+    StExteriorRing,
+    /// `st_interior_ring_n(g, n)`.
+    StInteriorRingN,
+    /// `st_is_empty(g)` → Boolean.
+    StIsEmpty,
+    /// `st_is_valid(g)` → Boolean.
+    StIsValid,
+    /// `st_is_valid_reason(g)` → Utf8; null when valid.
+    StIsValidReason,
+    /// `st_is_closed(g)` → Boolean.
+    StIsClosed,
+    /// `st_is_ring(g)` → Boolean.
+    StIsRing,
+    /// `st_is_simple(g)` → Boolean.
+    StIsSimple,
+    /// `st_is_collection(g)` → Boolean.
+    StIsCollection,
+    /// `st_has_z(g)` → Boolean.
+    StHasZ,
+    /// `st_coord_dim(g)` → Int64: 2 or 3.
+    StCoordDim,
+
+    // --- Planar measures (→ Float64, in coordinate units) -------------------
+    /// `st_area(g)`.
+    StArea,
+    /// `st_length(g)` — chains only; a polygon reports 0.
+    StLength,
+    /// `st_perimeter(g)` — polygon boundaries only.
+    StPerimeter,
+    /// `st_distance(a, b)`.
+    StDistance,
+    /// `st_max_distance(a, b)`.
+    StMaxDistance,
+    /// `st_hausdorff_distance(a, b)`.
+    StHausdorffDistance,
+    /// `st_azimuth(a, b)` → radians clockwise from north.
+    StAzimuth,
+
+    // --- Geodesic measures (→ metres / square metres) -----------------------
+    /// `st_distance_sphere(a, b)` — haversine metres between the nearest positions.
+    StDistanceSphere,
+    /// `st_distance_spheroid(a, b)` — Vincenty metres on WGS 84.
+    StDistanceSpheroid,
+    /// `st_area_spheroid(g)` — geodesic square metres.
+    StAreaSpheroid,
+    /// `st_length_spheroid(g)` — geodesic metres along chains.
+    StLengthSpheroid,
+    /// `st_perimeter_spheroid(g)` — geodesic metres around polygons.
+    StPerimeterSpheroid,
+
+    // --- Predicates (→ Boolean) ---------------------------------------------
+    /// `st_intersects(a, b)`.
+    StIntersects,
+    /// `st_disjoint(a, b)`.
+    StDisjoint,
+    /// `st_contains(a, b)`.
+    StContains,
+    /// `st_within(a, b)`.
+    StWithin,
+    /// `st_covers(a, b)`.
+    StCovers,
+    /// `st_covered_by(a, b)`.
+    StCoveredBy,
+    /// `st_touches(a, b)`.
+    StTouches,
+    /// `st_crosses(a, b)`.
+    StCrosses,
+    /// `st_overlaps(a, b)`.
+    StOverlaps,
+    /// `st_equals(a, b)` — topological, not structural.
+    StEquals,
+    /// `st_dwithin(a, b, radius)`.
+    StDwithin,
+    /// `st_dwithin_sphere(a, b, metres)` — the geodesic radius test.
+    StDwithinSphere,
+    /// `st_intersects_extent(a, b)` — bounding boxes only. The cheap prefilter.
+    StIntersectsExtent,
+    /// `st_contains_extent(a, b)` — bounding boxes only.
+    StContainsExtent,
+
+    // --- Constructions (→ geometry) ------------------------------------------
+    /// `st_centroid(g)`.
+    StCentroid,
+    /// `st_envelope(g)`.
+    StEnvelope,
+    /// `st_boundary(g)`.
+    StBoundary,
+    /// `st_convex_hull(g)`.
+    StConvexHull,
+    /// `st_point_on_surface(g)` — a position guaranteed to lie on the geometry.
+    StPointOnSurface,
+    /// `st_buffer(g, radius, quad_segs)` — an approximation; see `bc_geo::algo::construct`.
+    StBuffer,
+    /// `st_simplify(g, tolerance)`.
+    StSimplify,
+    /// `st_reverse(g)`.
+    StReverse,
+    /// `st_force_2d(g)`.
+    StForce2d,
+    /// `st_force_3d(g, z)`.
+    StForce3d,
+    /// `st_force_polygon_ccw(g)`.
+    StForcePolygonCcw,
+    /// `st_force_polygon_cw(g)`.
+    StForcePolygonCw,
+    /// `st_flip_coordinates(g)` — swap x and y.
+    StFlipCoordinates,
+    /// `st_translate(g, dx, dy)`.
+    StTranslate,
+    /// `st_scale(g, sx, sy)`.
+    StScale,
+    /// `st_rotate(g, radians)`.
+    StRotate,
+    /// `st_affine(g, a, b, d, e, xoff, yoff)`.
+    StAffine,
+    /// `st_snap_to_grid(g, size)`.
+    StSnapToGrid,
+    /// `st_segmentize(g, max_segment_length)`.
+    StSegmentize,
+    /// `st_expand(g, dx, dy)` — the bounding box grown on every side.
+    StExpand,
+    /// `st_collect(a, b)` — concatenate without an overlay.
+    StCollect,
+    /// `st_remove_repeated_points(g, tolerance)`.
+    StRemoveRepeatedPoints,
+    /// `st_line_interpolate_point(g, fraction)`.
+    StLineInterpolatePoint,
+    /// `st_line_locate_point(g, point)` → Float64 fraction.
+    StLineLocatePoint,
+    /// `st_line_substring(g, from, to)`.
+    StLineSubstring,
+    /// `st_closest_point(a, b)` — a position on `a`.
+    StClosestPoint,
+    /// `st_shortest_line(a, b)`.
+    StShortestLine,
+    /// `st_project(point, distance_m, azimuth_deg)` — the geodesic destination.
+    StProject,
+    /// `st_transform(g, from_srid, to_srid)`.
+    StTransform,
+
+    // --- Grid indexing (numbers in, cell id out) -----------------------------
+    /// `st_geohash(g, precision)` → Utf8, from the geometry's centroid.
+    StGeohash,
+    /// `geohash_encode(lon, lat, precision)` → Utf8.
+    GeohashEncode,
+    /// `geohash_decode_lon(hash)` → Float64.
+    GeohashDecodeLon,
+    /// `geohash_decode_lat(hash)` → Float64.
+    GeohashDecodeLat,
+    /// `st_tile_x(lon, lat, zoom)` → Int64.
+    StTileX,
+    /// `st_tile_y(lon, lat, zoom)` → Int64.
+    StTileY,
+    /// `st_quadkey(lon, lat, zoom)` → Utf8.
+    StQuadkey,
+    /// `st_s2_cell(lon, lat, level)` → Int64.
+    StS2Cell,
+    /// `st_s2_cell_parent(cell, level)` → Int64.
+    StS2CellParent,
+    /// `st_hex_bin(x, y, size)` → Int64 packed axial key.
+    StHexBin,
+    /// `st_hex_center_x(key, size)` → Float64.
+    StHexCenterX,
+    /// `st_hex_center_y(key, size)` → Float64.
+    StHexCenterY,
+    /// `st_utm_zone(lon)` → Int64.
+    StUtmZone,
+    /// `st_utm_epsg(lon, lat)` → Int64.
+    StUtmEpsg,
+}
+
+impl GeoFunc {
+    /// The number of arguments this function takes.
+    ///
+    /// Checked at evaluation rather than at deserialization because the JSON IR carries
+    /// an argument *list*: serde can prove it is a list of expressions, and only this
+    /// table knows how long it should be.
+    pub fn arity(self) -> usize {
+        use GeoFunc::*;
+        match self {
+            // One geometry, or one text/number.
+            StMakePolygon | StGeomFromText | StGeomFromWkb | StGeomFromGeojson
+            | StGeomFromGeohash | StAsText | StAsEwkt | StAsBinary | StAsEwkb | StAsHexWkb
+            | StAsGeojson | StX | StY | StZ | StXmin | StYmin | StXmax | StYmax
+            | StGeometryType | StDimension | StSrid | StNumPoints | StNumGeometries
+            | StNumInteriorRings | StStartPoint | StEndPoint | StExteriorRing | StIsEmpty
+            | StIsValid | StIsValidReason | StIsClosed | StIsRing | StIsSimple | StIsCollection
+            | StHasZ | StCoordDim | StArea | StLength | StPerimeter | StAreaSpheroid
+            | StLengthSpheroid | StPerimeterSpheroid | StCentroid | StEnvelope | StBoundary
+            | StConvexHull | StPointOnSurface | StReverse | StForce2d | StForcePolygonCcw
+            | StForcePolygonCw | StFlipCoordinates | GeohashDecodeLon | GeohashDecodeLat
+            | StUtmZone => 1,
+
+            // Two: a pair of geometries, or a geometry and one parameter.
+            StPoint
+            | StMakeLine
+            | StSetSrid
+            | StGeometryN
+            | StPointN
+            | StInteriorRingN
+            | StDistance
+            | StMaxDistance
+            | StHausdorffDistance
+            | StAzimuth
+            | StDistanceSphere
+            | StDistanceSpheroid
+            | StIntersects
+            | StDisjoint
+            | StContains
+            | StWithin
+            | StCovers
+            | StCoveredBy
+            | StTouches
+            | StCrosses
+            | StOverlaps
+            | StEquals
+            | StIntersectsExtent
+            | StContainsExtent
+            | StSimplify
+            | StForce3d
+            | StRotate
+            | StSnapToGrid
+            | StSegmentize
+            | StCollect
+            | StRemoveRepeatedPoints
+            | StLineInterpolatePoint
+            | StLineLocatePoint
+            | StClosestPoint
+            | StShortestLine
+            | StGeohash
+            | StHexCenterX
+            | StHexCenterY
+            | StS2CellParent
+            | StUtmEpsg => 2,
+
+            // Three.
+            StPointZ | StDwithin | StDwithinSphere | StBuffer | StTranslate | StScale
+            | StExpand | StLineSubstring | StProject | StTransform | GeohashEncode | StTileX
+            | StTileY | StQuadkey | StS2Cell | StHexBin => 3,
+
+            // Four and up.
+            StMakeEnvelope => 4,
+            StAffine => 7,
+        }
+    }
+
+    /// True when the function's result is a geometry (a WKB `Binary` column).
+    ///
+    /// The one property callers outside the evaluator need: it decides the output
+    /// Arrow type, and it is what lets the schema be known before a row is read.
+    pub fn returns_geometry(self) -> bool {
+        use GeoFunc::*;
+        matches!(
+            self,
+            StPoint
+                | StPointZ
+                | StMakeLine
+                | StMakePolygon
+                | StMakeEnvelope
+                | StGeomFromText
+                | StGeomFromWkb
+                | StGeomFromGeojson
+                | StGeomFromGeohash
+                | StSetSrid
+                | StGeometryN
+                | StPointN
+                | StStartPoint
+                | StEndPoint
+                | StExteriorRing
+                | StInteriorRingN
+                | StCentroid
+                | StEnvelope
+                | StBoundary
+                | StConvexHull
+                | StPointOnSurface
+                | StBuffer
+                | StSimplify
+                | StReverse
+                | StForce2d
+                | StForce3d
+                | StForcePolygonCcw
+                | StForcePolygonCw
+                | StFlipCoordinates
+                | StTranslate
+                | StScale
+                | StRotate
+                | StAffine
+                | StSnapToGrid
+                | StSegmentize
+                | StExpand
+                | StCollect
+                | StRemoveRepeatedPoints
+                | StLineInterpolatePoint
+                | StLineSubstring
+                | StClosestPoint
+                | StShortestLine
+                | StProject
+                | StTransform
+        )
+    }
 }
 
 /// Pairwise list reductions over two equal-length numeric `List` columns (→ Float64).

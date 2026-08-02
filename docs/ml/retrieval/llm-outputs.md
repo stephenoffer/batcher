@@ -242,4 +242,4 @@ print(
 
 - {doc}`/ml/retrieval/llm/index`: running the generation these outputs come from.
 - {doc}`/ml/retrieval/llm-evaluation`: scoring the parsed results.
-- {doc}`/user-guide/transform/expression-accessors`: the `.json` accessor these methods build on.
+- {doc}`/user-guide/transform/columns/expression-accessors`: the `.json` accessor these methods build on.

@@ -184,6 +184,54 @@
     },
     "unit": "month"
   },
+  "geo_binary": {
+    "args": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "lit",
+        "value": {
+          "str": "POINT(1 2)"
+        }
+      }
+    ],
+    "e": "geo",
+    "fn": "st_intersects"
+  },
+  "geo_ternary": {
+    "args": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "lit",
+        "value": {
+          "str": "POINT(1 2)"
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 5.0
+        }
+      }
+    ],
+    "e": "geo",
+    "fn": "st_dwithin"
+  },
+  "geo_unary": {
+    "args": [
+      {
+        "e": "col",
+        "name": "x"
+      }
+    ],
+    "e": "geo",
+    "fn": "st_area"
+  },
   "greatest": {
     "e": "greatest",
     "inputs": [

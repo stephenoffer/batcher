@@ -62,7 +62,12 @@ class TaskPacking:
             one every unknown resolves to.
         per_device: Claimants one device holds concurrently.
         devices: Devices the requested concurrency occupies.
-        share_bytes_: Device memory one claimant may use, `0` when the device size was unknown.
+        share_bytes_: Device memory one claimant may actually use — its share of what is
+            *left* on the device, not of the device. The distinction is the whole reason
+            `used_bytes` is an input: a claimant granted `0.25` of an 80 GiB board that
+            already holds a 40 GiB co-tenant has about 7 GiB, and reporting the 17 GiB that a
+            quarter of the nameplate device works out to hands it a budget it will
+            out-of-memory against. `0` when the device size was unknown.
         isolated: Whether the share is a hardware partition (MIG) rather than a co-tenancy. An
             isolated share has its own memory and its own fault domain; a co-tenancy does not,
             and a caller that reports one as the other is claiming a guarantee it lacks.
@@ -167,7 +172,7 @@ def shard_fraction(
     shard_bytes: float,
     device_bytes: float,
     *,
-    headroom: float = 0.15,
+    headroom: float | None = None,
     max_per_device: int = MAX_COTENANTS,
 ) -> float:
     """The `num_gpus` one relational shard task should request.
@@ -183,7 +188,10 @@ def shard_fraction(
             mean: the fraction is one number for the whole fan-out, and sizing it to the mean
             guarantees the biggest shard does not fit the share it was granted.
         device_bytes: One device's total memory, the smallest on a mixed fleet.
-        headroom: Fraction of the device held back.
+        headroom: Fraction of the device held back, or `None` for the configured
+            `accelerator.vram_headroom`. A literal default here was one of the five private
+            copies of that knob, so a fleet that raised it packed shards against memory
+            Carbonite's admission pool had already reserved.
         max_per_device: Ceiling on co-tenants, which floors the fraction. A caller that knows
             the device is derated or already occupied passes a lower number here rather than
             adjusting the byte figure, so the reason survives into the decision log.
@@ -268,13 +276,28 @@ def plan_task_packing(
     # exactly the case a fraction chosen from the device's total size gets wrong.
     raw = quantize_fraction(need_bytes / available)
     if raw <= 0.0 or raw > 1.0:
-        devices = max(1, int(raw)) * want if raw > 1.0 else want
+        # How many *whole* devices this needs is a different question, and `available` is the
+        # wrong denominator for it. A claimant that gets a device to itself does not inherit
+        # the co-tenant that was measured on the one representative board this figure came
+        # from, so dividing by the occupied remainder inflates the request: 100 GB against an
+        # 80 GB board holding 40 GB asked for four devices where two suffice, and a fleet then
+        # grew to twice the size its own arithmetic said it needed. The first device is still
+        # charged the co-tenant, which is why the ceiling is taken over the remainder plus
+        # whole devices for the rest.
+        clean = usable_bytes(device_bytes, room)
+        whole = quantize_fraction(need_bytes / clean) if clean > 0 else raw
+        if need_bytes > available and clean > 0:
+            whole = max(whole, 1.0 + -(-(need_bytes - available) // clean))
+        devices = int(max(1.0, whole)) * want
         return TaskPacking(
-            fraction=max(1.0, raw),
+            fraction=max(1.0, whole),
             per_device=1,
             devices=devices,
-            share_bytes_=share_bytes(device_bytes, max(1.0, raw), room),
-            reason=f"{need_bytes / 1e9:.1f}GB exceeds one device; whole devices",
+            share_bytes_=share_bytes(device_bytes, max(1.0, whole), room),
+            reason=(
+                f"{need_bytes / 1e9:.1f}GB exceeds one device "
+                f"({available / 1e9:.1f}GB free of {clean / 1e9:.1f}GB usable); whole devices"
+            ),
         )
 
     per_device = derated_cotenants(min(cotenants_per_device(raw), want), derate)
@@ -289,7 +312,11 @@ def plan_task_packing(
         fraction=fraction,
         per_device=per_device,
         devices=devices_for(fraction, want),
-        share_bytes_=share_bytes(device_bytes, fraction, room),
+        # A share of what is *available*, not of the nameplate device. The fraction was chosen
+        # against `available` two lines up, so reporting the byte figure against the device's
+        # full usable size contradicts the very decision that produced it: on a board holding a
+        # 40 GiB co-tenant, `share_bytes(80GiB, 0.25)` claims 17 GiB where 7 GiB is free.
+        share_bytes_=int(available * fraction),
         reason=(
             f"{need_bytes / 1e9:.1f}GB of {available / 1e9:.1f}GB available → "
             f"{fraction} x {per_device} per device"

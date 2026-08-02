@@ -180,7 +180,7 @@ the job's metrics says so. Late data is covered in
 - {doc}`Window functions </user-guide/analyze/window-functions>`: the other kind of window, over a
   bounded frame.
 - {doc}`Delta Lake integration </integrations/lakehouse/delta-lake>`: the sink in the query above.
-- {doc}`Mergeable algebra </deep-dives/operators/mergeable-algebra>`: why one running partial per open
+- {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why one running partial per open
   window is all the state there is.
-- {doc}`Time-series rollups </cookbook/analytics/time-series-rollups>`: the same windows, computed as a
+- {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: the same windows, computed as a
   batch.

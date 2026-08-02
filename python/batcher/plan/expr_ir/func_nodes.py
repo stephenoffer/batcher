@@ -16,6 +16,7 @@ from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 from batcher.plan.expr_ir.fn_names import (
     DATE_FNS,
+    GEO_FNS,
     KEYED_STR_FNS,
     LIST_FNS,
     MAKE_TEMPORAL_FNS,
@@ -101,6 +102,31 @@ class StrFunc(IRNode):
             if extra is not None:
                 args.append(repr(extra))
         return f"{self.input!r}.str.{self.fn}({', '.join(args)})"
+
+
+@expr_node
+class GeoFunc(IRNode):
+    """A geospatial function over an argument list. Built by `plan.functions.geo`.
+
+    One node for the whole `ST_*` surface rather than one per shape, because at the wire
+    level every geospatial function *is* the same shape — a name and an ordered argument
+    list — and the arities run from one to seven. The engine checks the count against
+    `bc_expr::GeoFunc::arity`, which is the only place that knows it; the Python
+    constructors each build a fixed list, so a mismatch cannot be written by a user.
+
+    Geometry arguments and geometry results travel as WKB in a Binary column, which is
+    what lets a geometry column move through every operator, spill path and shuffle the
+    engine already has without a new physical type.
+    """
+
+    tag = ExprTag.GEO
+    vocab = GEO_FNS
+    fn: str = scalar()
+    args: list[Expr] = children()
+
+    def __repr__(self) -> str:
+        """Render as the call the user wrote: ``st_area(col('g'))``."""
+        return f"{self.fn}({', '.join(repr(a) for a in self.args)})"
 
 
 @expr_node

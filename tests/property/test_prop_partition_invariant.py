@@ -2,7 +2,7 @@
 
 Partition-independence is the load-bearing invariant for distribution — if a query
 gives the same answer over one morsel and over many, splitting the input across
-partitions/actors is safe. ``tests/integration/test_partition_independence.py`` pins
+partitions/actors is safe. ``tests/integration/test_chunk_independence.py`` pins
 this with hand-picked cases; here Hypothesis searches the space, generating random
 tables, group counts, null densities, and chunk counts and asserting the answer is
 chunk-invariant. A counterexample is a distribution-correctness bug.

@@ -127,4 +127,4 @@ print(prepared_val.collect().column_names)
 
 - {doc}`/ml/preparing/preprocessors/index`: the fit/transform contract each step in a chain obeys.
 - {doc}`/ml/preparing/preprocessors/feature-generation`: the steps a chain usually ends with.
-- {doc}`/tutorials/feature-engineering`: the same workflow end to end.
+- {doc}`/tutorials/ml/feature-engineering`: the same workflow end to end.

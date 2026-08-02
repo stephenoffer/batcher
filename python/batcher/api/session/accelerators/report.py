@@ -43,7 +43,7 @@ def accelerators() -> dict:
 
             >>> import batcher as bt
             >>> report = bt.accelerators()
-            >>> sorted(report)
+            >>> sorted({"backend", "devices", "power"} & set(report))  # always present
             ['backend', 'devices', 'power']
             >>> isinstance(report["devices"], list)
             True

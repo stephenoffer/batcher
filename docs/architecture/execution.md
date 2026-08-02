@@ -16,7 +16,7 @@ out, metrics = _native.execute_plan_metered(plan.to_json(), sources, cfg.engine_
 
 For the contributor's view, which crate runs which scale, the thresholds with their
 config names, and the metadata layer that answers some terminals without a scan, see
-{doc}`Execution engine <../internals/execution>`.
+{doc}`Execution engine </architecture/internals/execution>`.
 
 ## Lazy evaluation
 
@@ -133,7 +133,7 @@ disk and network are two sinks for one mechanism.
 
 ## See also
 
-- {doc}`Execution engine <../internals/execution>`: the tiers, the crate map, and the exact thresholds.
+- {doc}`Execution engine </architecture/internals/execution>`: the tiers, the crate map, and the exact thresholds.
 - {doc}`Architecture overview <overview>`: the two planes and the control-plane subsystems.
 - {doc}`Fault tolerance <fault-tolerance>`: what happens when a worker or a task fails.
 - {doc}`Configuration options <../configuration/options>`: every execution knob.

@@ -48,6 +48,7 @@ from batcher.plan.expr_ir.func_nodes import (
     DateFunc,
     DateOffset,
     DateTrunc,
+    GeoFunc,
     ListBinary,
     ListContains,
     ListFilter,
@@ -117,6 +118,12 @@ def _representatives() -> dict[str, Any]:
         "is_inf": IsInf(_X),
         "aliased": Aliased(_X, "y"),  # transparent: delegates to inner
         "math": MathExpr("abs", _X),
+        # One variadic `geo` node per arity band, because the whole `ST_*` surface rides
+        # one wire shape and the argument *list* is the only thing that varies: a change
+        # to how it is emitted would move all 113 functions at once.
+        "geo_unary": GeoFunc("st_area", [_X]),
+        "geo_binary": GeoFunc("st_intersects", [_X, Lit("POINT(1 2)")]),
+        "geo_ternary": GeoFunc("st_dwithin", [_X, Lit("POINT(1 2)"), Lit(5.0)]),
         "math2": Math2Expr("pow", _X, Lit(2)),
         "coalesce": Coalesce([_X, Lit(0)]),
         # --- nodes.py leaves ----------------------------------------------------

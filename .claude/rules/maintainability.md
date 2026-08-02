@@ -17,7 +17,16 @@ a reason instead.
 
 Hard (fail the commit):
 
-- **Python module ≤ 500 lines** (soft target 400, warns).
+- **Python module ≤ 500 code lines, EXCLUDING docstrings** (soft target 400, warns). The
+  docstring exclusion mirrors the Rust one below and exists for the same reason: another gate
+  *mandates* those lines. `lint-docstrings` requires a Google-style docstring on every public
+  name, with typed `Args:`/`Returns:` and a runnable `.. doctest::` — and this gate used to
+  charge the file for having them. The two were in direct opposition, and it was not close:
+  `api/dataset/frame.py` is 5,720 lines of which **623 are code and 3,863 are docstrings**;
+  `plan/expr_ir/core.py` is 5,172 of which **316 are code**. Eleven allowlist exemptions
+  existed for that reason and no other; counting code lines retired all eleven and halved the
+  warning count, without moving a line of product code. Comments stay counted — they
+  interleave with the logic, and a file needing a thousand of them is genuinely dense.
 - **Rust file ≤ 800 lines, EXCLUDING the trailing `#[cfg(test)]` module.** Rust
   co-locates unit tests; counting them would punish good test density. The checker cuts
   at the first column-0 `#[cfg(test)]`.

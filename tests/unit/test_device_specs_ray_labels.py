@@ -38,12 +38,19 @@ _KNOWN_ABSENT = frozenset(
 
 
 def _ray_label_values() -> dict[str, str]:
-    """Every `ray.util.accelerators` constant, as `{identifier: label value}`."""
+    """Every `ray.util.accelerators` constant, as `{identifier: label value}`.
+
+    Selected by "module-level, not private, string-valued" rather than by `name.isupper()`.
+    Ray does not spell every constant in strict upper case — `AMD_INSTINCT_MI300x` carries a
+    lowercase tail — and an `isupper()` filter silently dropped exactly those from the sweep.
+    That is how `AMD-Instinct-MI300X-OAM`, the only spelling a real MI300X node is labelled
+    with, went unresolved past a green test: the part this file exists to catch.
+    """
     accelerators = pytest.importorskip("ray.util.accelerators")
     return {
         name: value
         for name, value in vars(accelerators).items()
-        if name.isupper() and isinstance(value, str)
+        if not name.startswith("_") and isinstance(value, str) and not name.startswith("__")
     }
 
 

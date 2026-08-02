@@ -940,7 +940,7 @@ class DatasetML:
                 >>> ds.ml.map_batches(add_ten).to_pydict()
                 {'x': [11, 12, 13]}
         """
-        from batcher.ml.batch_format import FORMATS
+        from batcher.interop.formats import FORMATS
         from batcher.ml.devices import validate_batch_size, validate_num_gpus
         from batcher.ml.gpu import resolve_num_workers
 

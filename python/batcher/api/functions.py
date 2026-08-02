@@ -179,6 +179,11 @@ from batcher.plan.functions.analysis import (
     welch_df,
     welch_t_statistic,
 )
+
+# The geospatial family, re-exported through its own curated `__all__`. See the note in
+# `plan/functions/__init__.py` for why these 113 names are spliced rather than listed.
+from batcher.plan.functions.geo import *  # noqa: F403
+from batcher.plan.functions.geo import __all__ as _GEO_ALL
 from batcher.plan.functions.metrics import (
     accuracy,
     all_caps_rate,
@@ -783,3 +788,10 @@ __all__ = [
     "wrap_tag",
     "zero_vector_rate",
 ]
+
+# Merged rather than appended: the façade's contract is one *sorted*, duplicate-free list
+# (`tests/unit/test_public_function_surface.py`), and `+=` left the 113 spliced geospatial
+# names in a sorted block after the curated one — globally unsorted, so the gate went red the
+# moment they landed. Sorting here keeps the splice a one-liner without the curated list
+# having to restate names it deliberately does not spell out.
+__all__ = sorted(__all__ + _GEO_ALL)

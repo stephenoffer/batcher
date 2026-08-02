@@ -13,8 +13,8 @@ Every one runs in Rust over whole columns rather than row by row. Each page embe
 
 ## See also
 
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
-- {doc}`/user-guide/transform/expression-accessors`: the guide to `.str`, `.dt`, `.list`, `.struct`, and `.json`.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expression-accessors`: the guide to `.str`, `.dt`, `.list`, `.struct`, and `.json`.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.
 - {doc}`/cookbook/dataset/index`: the same recipe treatment for the `Dataset` verbs.
 

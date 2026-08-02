@@ -14,7 +14,7 @@ generation, so a concrete format is a small subclass.
 
 Read `.claude/rules/architecture.md` (the layer rule below is load-bearing) and
 `docs/user-guide/moving-data/custom-connectors.md` (the worked end-to-end example this skill is the
-procedure for) first. `docs/internals/extending.md` §"Add an IO format" is the short form.
+procedure for) first. `docs/architecture/internals/extending.md` §"Add an IO format" is the short form.
 
 ## The layer rule — `io/` is NEUTRAL
 
@@ -233,7 +233,7 @@ added public surface. See `/run-quality-gate`.
 ## See also
 
 - `docs/user-guide/moving-data/custom-connectors.md` (worked example, sources that aren't files,
-  fetching bytes late), `docs/internals/extending.md`, `docs/user-guide/moving-data/reading-data.md`,
+  fetching bytes late), `docs/architecture/internals/extending.md`, `docs/user-guide/moving-data/reading-data.md`,
   `docs/user-guide/moving-data/writing-data.md`.
 - Rules: `.claude/rules/architecture.md` (the import matrix),
   `.claude/rules/maintainability.md` (registry + family modules),

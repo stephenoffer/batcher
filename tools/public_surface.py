@@ -47,6 +47,7 @@ PUBLIC_DUNDERS = frozenset(
 # public and owes the same documentation as a root export.
 _SUBPACKAGES = (
     "batcher.ml",
+    "batcher.graph",
     "batcher.io",
     "batcher.config",
     "batcher.governance",

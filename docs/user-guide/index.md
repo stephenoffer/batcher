@@ -20,7 +20,7 @@ Every example on every page runs as written, and the test suite executes them on
 - {doc}`../cookbook/index`: the same operations as runnable recipes and complete pipelines.
 - {doc}`../ml/index`: the model half of the pipeline, once the relational half is in place.
 - {doc}`../configuration/index`: the tunables the performance and memory guides refer to.
-- {doc}`../deep-dives/index`: why an operator behaves the way these pages describe.
+- {doc}`/architecture/deep-dives/index`: why an operator behaves the way these pages describe.
 - {doc}`../integrations/index`: connecting a specific source or sink.
 
 ```{toctree}

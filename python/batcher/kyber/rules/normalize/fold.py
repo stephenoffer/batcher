@@ -14,6 +14,8 @@ disagree on (see `_cast_is_exact`).
 from __future__ import annotations
 
 import datetime as _dt
+import operator as _operator
+from typing import Final
 
 import pyarrow as pa
 
@@ -22,6 +24,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit, Not
 from batcher.plan.expr_ir.func_nodes import DateOffset
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
+from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.types import DTYPE_REGISTRY
 from batcher.plan.visitor import transform_up
@@ -29,10 +32,19 @@ from batcher.plan.visitor import transform_up
 __all__ = ["ConstantFolding", "fold_constants", "fold_expression"]
 
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
-_COMPARISONS = {"gt": ">", "ge": ">=", "lt": "<", "le": "<=", "eq": "==", "ne": "!="}
 
-
-_COMPARISONS = {"gt": ">", "ge": ">=", "lt": "<", "le": "<=", "eq": "==", "ne": "!="}
+#: Python's operator for each comparison tag. A mapping rather than a chain of `if`s so the
+#: folded value comes from the *one* operator asked for: the previous form built a dict of all
+#: six results and indexed one out, which evaluated five comparisons it discarded and could
+#: raise on an operand pair the requested comparison would have accepted.
+_COMPARE: Final = {
+    "gt": _operator.gt,
+    "ge": _operator.ge,
+    "lt": _operator.lt,
+    "le": _operator.le,
+    "eq": _operator.eq,
+    "ne": _operator.ne,
+}
 
 
 # --- Constant folding -------------------------------------------------------
@@ -182,7 +194,7 @@ def _fold_cast(value: object, dtype: str) -> Lit | None:
 
 
 def _fold_binary(op: str, a: object, b: object) -> Lit | None:
-    if op in _COMPARISONS:
+    if op in COMPARISON_OPS:
         if not _comparable(a, b):
             return None
         return Lit(_compare(op, a, b))
@@ -217,14 +229,7 @@ def _fold_arith(op: str, a: object, b: object) -> Lit | None:
 
 
 def _compare(op: str, a: object, b: object) -> bool:
-    return {
-        "gt": a > b,
-        "ge": a >= b,
-        "lt": a < b,
-        "le": a <= b,
-        "eq": a == b,
-        "ne": a != b,
-    }[op]
+    return bool(_COMPARE[op](a, b))
 
 
 def _comparable(a: object, b: object) -> bool:

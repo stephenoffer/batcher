@@ -1,5 +1,550 @@
 # Batcher CPU benchmark results
 
+## GPU matrix: ClickBench against the CPU engine, and a wrong answer it found (2026-08-01)
+
+All 43 ClickBench queries on an 8M-row `hits` subset, GPU against the CPU engine, warm.
+**41 of 43 agree.** The two that did not:
+
+- `cb-q23` — `CPU_ERROR: no distributed worker became available within 60s`. That is my own
+  concurrent probe contending for the cluster, not a result.
+- `cb-q03` — **a genuinely wrong answer, since fixed.** `SELECT AVG(UserID) FROM hits` returned
+  `1.2646880332207402e+11` on the device against `2.5307619803302287e+18` on the CPU engine.
+
+`cb-q03` is worth the space because the decomposition that produced it is *exactly correct in
+exact arithmetic*. `mean` is not mergeable, so it is split into a summed total and a count and
+divided once at the end. The total was summed in the input's own type, and a mean is asked for
+over precisely the columns whose totals do not fit one: ~1e8 identifiers around 1e18 sum to
+~1e26 against int64's 9.2e18 ceiling. The total wrapped, the finalize divided a wrapped number
+by an honest count, and the answer was arbitrary rather than rounded.
+
+Measured on a device, the libraries are not the culprit and cannot be the fix: **cuDF's `mean`
+is correct** (2.530761980330729e+18 against an exact 2.5307619803307284e+18), and **cuDF and
+pandas both wrap identically on `sum`** (-2179373705815353888). So the cast belongs in the
+decomposition, which is where it now is — `plan/distribution/mergeable.py` sums a mean's running
+total in `float64`. After the fix the device returns 2.5307619803302323e+18, a relative
+difference of **1.4e-15** from the CPU engine: reassociation, which the contract allows.
+
+**Where the device wins, warm** (four `1xT4`, against Batcher's own CPU engine, 9 of 43):
+
+| query | shape | CPU | GPU | speedup |
+|---|---|--:|--:|--:|
+| `cb-q34` | `GROUP BY URL`, high cardinality | 187.2 s | **13.02 s** | **14.4x** |
+| `cb-q29` | 90 summed projections | 2.07 s | **0.24 s** | 8.6x |
+| `cb-q35` | group by four derived integer keys | 29.59 s | **4.83 s** | 6.1x |
+| `cb-q26` | filter, sort, limit on strings | 3.73 s | **0.75 s** | 5.0x |
+| `cb-q05` | `COUNT(DISTINCT SearchPhrase)` | 5.49 s | **1.30 s** | 4.2x |
+
+`cb-q34` is the one to notice: high-cardinality `GROUP BY URL` is the shape this engine is
+weakest on against DuckDB, and it is the shape the device helps most.
+
+## GPU matrix: every TPC-H query at sf1 against the CPU engine (2026-08-01)
+
+Every query run on both engines in the same process, GPU warmed once before timing, and compared
+on names and types exactly with floats allowed to differ by reassociation. The CPU engine is the
+oracle here rather than DuckDB, because it is already differentially tested against DuckDB and
+the device tier's contract is defined against *it*: same rows, same names, same types.
+
+**21 of 22 agree. One does not, and it is a defect:**
+
+| query | rows | CPU type | GPU type |
+|---|--:|---|---|
+| `tpch-q15` | 0 | `s_name: string` | `s_name: **null**` |
+
+The ClickBench arm of the same sweep found two more, of the same kind:
+
+| query | CPU type | GPU type |
+|---|---|---|
+| `cb-q08`, `cb-q09` — `COUNT(DISTINCT UserID)` | `u: int64` | `u: **int32**` |
+
+**All three are fixed and verified on the devices.** Both causes were library behaviours that
+pandas does not share, which is why the translator's own suite could not see either:
+
+- **cuDF converts an *empty* string column to Arrow `null`.** Measured directly on a device:
+  `cudf.DataFrame({"s": ["a"]})` filtered to empty, and an explicitly empty string column, both
+  convert as `s: null`, while an `int64` beside them keeps `int64`. Repaired in
+  `backend.py::_restore_empty_strings`, at the same boundary and for the same reason as the DATE
+  repair next to it. Scoped to the empty case and to the device backend, where `object` means
+  `string` and nothing else.
+- **cuDF answers `nunique` in `int32`; pandas answers it in `int64`.** Repaired in
+  `aggs.py::_as_int64`, applied to the counting reductions only, since their result type is fixed
+  by the engine rather than carried from their input.
+
+After both: `tpch-q15`, `cb-q08`, `cb-q09` all report `TYPE DIFFS: none` against the CPU engine
+on a real cluster, and `gpu_shadow_verify=True` is clean. Regression tests in
+`tests/unit/test_gpu_result_types.py`.
+
+The empty-result case had a second suspect that turned out not to be involved: all three fan-outs
+end with `[t for t in results if t is not None and t.num_rows]`, which does discard the only
+schema-bearing tables, but that path returns `None` and falls back to the CPU engine, so it was
+never the source of the wrong type.
+
+**Speed, warm:** the GPU beats the CPU engine on 3 of 22 — q1 by **14.4x** (0.43 s against
+6.20 s), q22 by 1.3x, q16 by 1.2x. The other 14 that exceed 20 s are not doing 20 s of work: they
+are the runs that lost their workers and re-paid the 22 s cuDF runtime_env, per the section
+below. Until cuDF is in the image, this table measures Ray's environment setup for most of its
+rows, and no ranking should be read off it.
+
+## The GPU relational tier is fast, and the earlier entry below measured Ray, not the device (2026-08-01)
+
+**Correction.** The section that follows records the GPU tier as "correct and slower" on TPC-H.
+The correctness half stands. The performance half was measuring Ray's runtime-environment setup,
+and the conclusion inverts once that is separated out:
+
+```
+tpch-q1 at sf1, five consecutive GPU runs:  31.2s  0.3s  0.3s  0.2s  0.2s   | cpu 2.93s
+```
+
+Warm, **q1 on the GPU is 0.2 s against the CPU engine's 2.93 s — 14x faster**, not 1.5x slower.
+Every number in the older section is a first run.
+
+**Where the 30 s goes.** `gpu_task_runtime_env` attaches `pip: [cudf-cu13, numpy]` to every GPU
+task unless `cluster_has_cudf()`, and on this image it is `False` — a plain Ray worker cannot
+`import cudf`. Timing a task that does nothing at all, with and without that runtime_env:
+
+| GPU task | first call | reused worker |
+|---|--:|--:|
+| no runtime_env | 1.06 s | 0.23 s |
+| with the cuDF runtime_env | **22.18 s** | 1.06 s |
+
+So the fix that matters is a deployment one: **bake cuDF into the cluster image.** That makes
+`cluster_has_cudf()` true, drops the runtime_env entirely, and removes the 22 s from every path
+at once. Nothing in the engine can make a pip resolve cheap.
+
+**A real defect sits underneath it, though: worker reuse holds for one path and not another.**
+`gpu_task_options` sets `max_calls=0` precisely so a GPU worker survives between tasks. Tracking
+worker PIDs across three consecutive runs of each shape:
+
+| query | path | run 1 | run 2 | run 3 |
+|---|---|--:|--:|--:|
+| q1 | `gpu_shard_partial` | 31.0 s, 4 new workers | 0.3 s, **0 new** | 0.3 s, **0 new** |
+| q3 | `gpu_tree_task` | 4.8 s (reused q1's) | 29.9 s, **4 new** | 29.4 s, **4 new** |
+
+The aggregate fan-out keeps its workers; the tree/join fan-out gets four fresh ones every run and
+re-pays the environment each time. It is not the device share — q3 never calls `shard_task_share`
+at all, and q1's share is a stable `1.0`. Both paths build their options from the same
+`gpu_task_options`, and `max_calls=0` is confirmed present in the dict Ray actually receives
+(`gpu_worker_reuse` is `True`, `num_gpus=1.0`, `num_cpus=0`). Ray is being asked to keep the
+worker and is not doing so.
+
+**It is churn rather than a per-shape property**, which the sweep makes clearer than the
+three-run probe did. Each query there is timed twice in a row; q12 ran its *first* GPU pass in
+0.65 s (inheriting the previous query's live workers) and its *second* in 25.68 s, with nothing
+between them. A worker died between two consecutive runs of the same query. So the shapes that
+look permanently slow are the ones that happen to lose the race, not ones doing more work — q11
+warms to 3.97 s from 28.74 s, q13 to 1.27 s from 4.60 s.
+
+Ruled out so far: the device share, straggler speculation (all three fan-outs use the same
+`speculation_policy`), the admission gate (`gpu_admission_wait_s` is 30 s and matches the
+symptom, but q3 runs with three to four devices *free* throughout, so it never blocks), and
+runtime_env hash instability (byte-identical across calls). Unresolved, and the highest-value
+GPU lead open.
+
+**The deployment fix makes the churn harmless either way.** With cuDF in the image there is no
+runtime_env to re-resolve, so a lost worker costs ~1 s instead of ~22 s, and the reuse bug stops
+being a performance cliff whether or not it is ever fixed.
+
+Until cuDF is in the image, a fair benchmark of this tier has to warm each query first; a
+first-run number is a measurement of `pip`.
+
+## What the GPUs do on the relational suites, and why `auto` declines them (2026-08-01)
+
+Four `1xT4` workers. 40 `lineitem` files (11.6 GB) staged identically to NFS and to local NVMe,
+so a filesystem comparison changes only the filesystem. Every GPU result below was checked
+against the CPU engine's: column names and types exact, non-floats exact, floats within
+reassociation tolerance. `gpu_shadow_verify=True` on real devices is **clean** for both shapes.
+
+| query | shape | CPU | GPU | GPU busy | `auto` picks |
+|---|---|--:|--:|--:|---|
+| q1 | filter → group-by → sort | 3.0 s | 4.6-6.6 s | 9-32 % | CPU (3.4 s) |
+| q6 | filter → aggregate | **0.3 s** | **23-27 s** | 1-5 % | CPU (0.3 s) |
+
+**The device tier is correct and slower, and the engine already knows.** `backend="auto"` routes
+both to the CPU engine, which is the whole point of the cost policy — the tier is opt-in, and
+the opt-in is what a user gets wrong, not the default. Forcing `backend="gpu"` on q6 costs 80x.
+Nothing here argues for using the GPUs on these suites; it argues that the routing is honest.
+
+Two hypotheses for the low busy% were tested and **both are wrong**, which is worth recording
+because both are plausible enough to be tried again:
+
+- **GPUDirect Storage.** cuFile is installed, and the eligibility split is real: `/mnt/cluster_storage`
+  (NFS) reports `eligible: 0` for every path, `/mnt/local_storage` (ext4 on NVMe) reports
+  `eligible: 1`, `/tmp` (overlay) `0`. So every byte of a GPU scan was crossing the host. Staging
+  the same files to the eligible filesystem and re-running moved **nothing**: q1 3.0 s → 4.6 s,
+  q6 24.1 s → 23.6 s. The filesystem is not the constraint.
+- **A pushed predicate the device scan never received.** True, and now fixed for symmetry with
+  the CPU scan path (`chain_predicate`, the row counterpart of `chain_projection`). It buys
+  **nothing on TPC-H**: `lineitem` is written in `l_orderkey` order, so no row-group's bounds
+  rule it out — 1961 splits before, 1961 after. It pays on a table clustered on the column it
+  filters, which is the common warehouse layout and not this one.
+
+Where the GPUs *are* worth their place is inference, not SQL: **2444 img/s at 50 % device busy,
+4.04x faster than Ray Data** on the same cluster. That is the workload this fleet earns its
+keep on, and the relational tier's job is to decline gracefully — which it does.
+
+
+## Where the cluster's cores actually go, and what happens past RAM (2026-08-01)
+
+Same four `1xT4` workers (8 CPU / 32 GB each). Utilization here is whole-node CPU busy%,
+sampled per node by an actor pinned to it, over the query's own wall clock.
+
+All warm, all on the default fleet unless the row says otherwise:
+
+| TPC-H sf100 | shape | wall | fleet CPU mean | peak |
+|---|---|--:|--:|--:|
+| q1 | filter → group-by → sort | 7.4 s | **91.5 %** | 100 % |
+| q1 at 16 workers instead of 4 | | 7.4 s | 91.9 % | 100 % |
+| q3 | 3-table join → group-by → top-N | 23.0 s ± 0.5 | 39 % | ~96 % |
+| q3 at 16 workers instead of 4 | | 12.7 s | 56.6 % | 100 % |
+| q6 | scan → filter → aggregate | 0.6 s | *unmeasurable* | — |
+
+**The aggregate shapes meet the target on the default fleet and need no tuning** — 91.5%
+(reproduced: 91.3%), and doubling the fleet width changes nothing (91.9%). **The join shapes do
+not**, and width does not move them either.
+
+Where the join's time goes, from a per-node timeline at 0.25 s and Ray's own task records: two
+saturated bursts at 97–99% either side of a **four-to-ten-second plateau at roughly one core per
+node**, entirely inside `reduce_join_publish`. The plateau is not the map barrier and not
+bandwidth — during it the cluster's inbound network carries **2 MB/s**, against a 1663 MB/s peak
+elsewhere in the same query. It is waiting on local disk.
+
+The reason is that the bounded join reduce grace-partitioned *every* bucket: fetch to disk, read
+back, re-partition to disk, read back, join — three disk passes for a bucket that may fit
+memory. The aggregate's equivalent has always checked, and folds in memory when its partials
+fit; the join had no such branch. It does now.
+
+**That fix is not shown to move q3.** Three consecutive warm runs give 22.8 / 23.8 / 23.0 s,
+tight enough to trust, and indistinguishable from before it. q3's buckets at sf100 plausibly
+exceed the ~660 MB per-worker envelope, in which case it still spills and the new branch never
+fires; an earlier 13.0 s reading of the same query in the same configuration is unexplained and
+did not reproduce. The change is justified by the aggregate's precedent and pinned by the
+spilling tests, not by a number in this table.
+
+**Joining the sub-bucket pairs concurrently was tried and is worse — it is not the fix.** A
+thread pool over the pairs inside `reduce_join_paths_spilling`, sized to the worker's grant,
+took q3 from 23.0 s to 31.7 s (three runs each, 31.2 / 31.8 / 32.0) and *lowered* fleet CPU from
+39% to 32%. `execute_plan` already spreads one pair across the worker's whole core grant, so
+eight concurrent pairs oversubscribe those cores eightfold — the same thread-thrash that
+`engine_config_json` sizes `parallelism` to avoid, reintroduced a layer up. The pairs stayed
+serial, with the measurement recorded at the loop so the next reader does not repeat it.
+
+**What the plateau is, measured rather than inferred.** During it the block layer runs at
+**100% busy, ~650 MB/s of writes, and exactly 0 MB/s of reads** — the reads are free because
+the page cache still holds what was just written. Over the query that is **8.44 GB written
+cluster-wide**, and a before/after diff of every scratch tree shows **zero net growth**: the
+traffic is entirely transient shuffle scratch, written and deleted inside the query.
+
+Four candidate causes are ruled out by measurement, not by argument:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Network bandwidth | per-node NIC sampling | 2 MB/s during the plateau, against a 1663 MB/s peak elsewhere in the same query |
+| Read I/O | block-layer read counters | 0 MB/s, sustained |
+| Bulk data through the Ray object store | `ray memory` during the query | **0 objects, 0 MiB** — the data plane does bypass it, as the contract requires |
+| Scratch on NFS rather than local NVMe | `spill_dir` pointed at `/mnt/local_storage`, 3 runs each | 23.6 s NFS against 24.0 s local, results identical — **no difference** |
+
+The third row is worth stating plainly because an earlier pass of this investigation got it
+wrong: a directory scan found 27.8 GB of `ray_spilled_objects` and it looked like bulk data was
+being routed through Ray. It was not. Those files were *present* on a shared cluster, not
+*written* by this query, and plasma holds 0 objects throughout. A presence scan is not a
+measurement of traffic.
+
+So the write volume is the cost, and its location is not. **Reducing the bytes is the only
+lever left** — overlapping the map and the reduce so staging stops being a phase of its own.
+That is a shuffle redesign, not a tuning knob, and it is not started.
+
+q6 cannot be read from this table at all: warm it finishes in 0.6 s, close to the sampler's own
+interval, so what it reports is start-up rather than the engine.
+
+Every node saturates and the load is even, so the shortfall on the shuffle-bearing queries is
+neither skew nor a parallelism cap.
+
+**It is mostly not a shortfall at all — it is cold page cache.** The first read of a 40 GB
+relation off shared storage dominates the query, and the cluster is idle waiting for it. Warm
+the cache and the same query on the same default fleet looks completely different:
+
+| TPC-H sf100 q1, 4 workers (the default) | wall | fleet CPU mean | peak |
+|---|--:|--:|--:|
+| first touch, cold | 27.0 s | 33.6 % | 79 % |
+| a later run, still unwarmed in-process | 12.0 s | 61.3 % | 99 % |
+| warmed first, then measured | **7.4 s** | **91.5 %** | 100 % |
+
+So the default fleet already clears the target comfortably; the low numbers were measuring the
+filesystem, not the scheduler. This is recorded rather than quietly corrected because an
+earlier revision of this section drew the opposite conclusion from the unwarmed figures — that
+the fleet was "too coarse" and wanted more, narrower workers — and cited a 4-vs-16-vs-32 table
+in support. That comparison ran each width once, so the second width was warmed by the first
+and the effect attributed to fleet width was largely the cache. **Any utilization number here
+that does not say whether the cache was warm is not a measurement of Batcher.**
+
+None of those numbers could be measured at all before the bug below was fixed — every wide-fleet
+run returned an empty result.
+
+### A wide aggregate silently returned nothing
+
+`shuffle_fan_in` (8) is where the aggregate stops reducing its buckets flat and starts folding
+them through a combiner tree. Any reducer count is result-correct under the mergeable algebra,
+so crossing that line should change nothing. It changed the answer to *nothing*: when the
+aggregate moved off the fixed ticket stage 0 onto a reserved stage block, `_tree_reduce` kept
+addressing its leaves at the literal stage 0 and numbering its interior levels 1, 2, 3. Past
+eight reducers it fetched tickets nobody had published, and an unregistered ticket reads back
+as an **empty bucket rather than an error** — the epoch invariant in `shuffle_replication`.
+
+TPC-H q1 at sf10, same data, on a fresh fleet: **four rows at 8 workers, zero at 12.** No error,
+no warning. The aggregate now reserves a block wide enough for the tree and every level
+addresses inside it. Pinned by `tests/integration/test_aggregate_tree_reduce.py`, which runs the
+same aggregate either side of the threshold — at both low and high cardinality, because the
+failure was independent of it.
+
+One related fault is **found and not fixed**: with the tree forced off (`shuffle_fan_in` raised)
+so a wide fan-out reduces flat, a low-cardinality aggregate leaves most buckets empty and the
+bounded reduce panics in Rust — `range start index 18446744073520397944 out of range for slice
+of length 0`, an unsigned underflow. It is loud rather than silent, and it needs a data-plane
+change rather than a scheduling one.
+
+### A co-tenant holding one core per node made every distributed query fail
+
+`cluster_topology` reports each node's *nameplate* CPU, and the fleet gives every worker a
+whole node's cores — so the gang it asks for is one only a completely idle cluster can host.
+With another job holding a single core per node, `4 bundles x 8 CPU` is unsatisfiable while
+`28 x 1 CPU` places instantly; the placement group pended, and after three sixty-second waits
+the query died with `no distributed worker became available`. Measured: 181 s to fail, at every
+partition count.
+
+`_fill_grant` now thins the per-worker grant until the gang tiles *free* capacity, preserving
+the worker count. The first attempt derived the cluster's whole shape from free capacity
+instead, and that is much worse: a node whose cores are momentarily all held drops out of the
+topology, a busy four-node cluster reads as a one-node one, and the fan-out collapses to a
+single worker silently. On an idle cluster — every single-tenant run — the thinning is a no-op.
+
+### Past RAM: the join's map side held the whole partition
+
+The aggregate map side streams its partition; the join map side did not. It read the partition
+whole, ran the prefix over all of it, and then held a second complete copy, because
+`partition_batches` gathers into fresh buffers rather than aliasing. `memory_budget_bytes` does
+not cover any of that — it bounds allocations *inside* `execute_plan`, not what the worker holds
+around it, and the code comment said so. At sf100 that is a quarter of a 600M-row `lineitem` on
+a 30 GB node: **q9 OOM-killed two workers**. `streaming_map_buckets` now walks it in
+byte-bounded chunks, which is safe for exactly the reason partitioning already is — a join side
+carrying a breaker never reaches this path (`_join_sides_are_map_only` refuses it).
+
+The contract stated as something testable: the same query, unconstrained and under a memory cap
+far below its working set, must return the same rows. Every query of both suites, run twice:
+
+| suite | cap per worker | agree |
+|---|---|--:|
+| TPC-H sf10, all 22 | 256 MB | **22 / 22**, 0 mismatched, 0 errored |
+| ClickBench, all 43 | 256 MB | **43 / 43**, 0 mismatched, 0 errored |
+| TPC-H sf100 q1, q6 | 1.07 GB (a fortieth of the data) | 2 / 2 |
+
+That closes the chain rather than asserting it. The harness separately proves the
+*unconstrained* distributed run matches DuckDB on all 22 and all 43, so capped == unconstrained
+means capped == DuckDB.
+
+Floats are compared with a relative tolerance and integers exactly, which matters here: the
+worst float difference seen anywhere was **3.8e-16**, one to two ULP, because a different memory
+budget changes *when* partials combine and float addition is not associative. Calling those
+results "identical" would be wrong, and comparing them loosely would let a real spill bug hide —
+the tolerance is the only thing separating the two, so it is stated rather than assumed.
+
+## The whole suite on a 4-GPU cluster: 22/22 and 43/43, and where the devices actually go (2026-08-01)
+
+Measured on four `1xT4` workers (8 CPU / 32 GB each) plus a CPU head node, release engine,
+every query correctness-gated against DuckDB. The distributed suites are run over the
+normalized parquet mirrors on shared storage, which is the only configuration that reaches
+the distributed dispatcher at all.
+
+| suite | before | after |
+|---|--:|--:|
+| TPC-H sf1, distributed | 17 / 22 | **22 / 22** |
+| ClickBench, distributed | deadlocked at q19 | **43 / 43** |
+
+Three defects, and none of them presented as what it was.
+
+**Five TPC-H queries reported four dead workers on a healthy cluster.** The bucket-reduce
+barrier charged *every* exception to the worker that ran it, so a deterministic bug was blamed
+on a host, recomputed onto the next host, blamed again, and after three rounds surfaced as
+`shuffle did not recover after 3 attempts (still unreachable: {0, 1, 2, 3})` with the real
+traceback discarded. The actual fault was a type confusion: the driver sends each join side a
+0-row *`RecordBatch`* to null-extend from, and the spilling reducer handed it to a parameter
+typed `pa.Schema`. `blame_host_for_reduce_failure` now applies the classification the map
+stage already used, so a bug propagates and a lost worker still recomputes.
+
+**ClickBench hung on the first scan after a shuffle query.** `execute_aggregate_flight` was
+the one Flight operator that hand-rolled its teardown instead of calling `release_fleet`, so
+it never returned its lease on the warm session fleet. The lease count never reached zero, the
+idle timer was never armed, and the fleet held all 32 cores for the life of the process — after
+which any query running plain Ray tasks pended forever. Returning the lease fixes the hang;
+`reclaim_session_fleet_if_starving`, called from the plain-task path, removes the 30-second
+idle-timer wait that remained (that query: hang → 31.8 s → 5.9 s).
+
+**The GPU aggregate read every column of the fact table.** `shard_descriptors` has taken a
+`projection` all along and the tree fan-out passes one, but the sharded aggregate and join —
+the commonest accelerated shapes — passed `None`, so a three-column group-by moved all sixteen
+`lineitem` columns off storage, across the host link, and into device memory it was then priced
+against. On TPC-H sf100 (600 M rows):
+
+| query | GPU before | GPU after | CPU engine |
+|---|--:|--:|--:|
+| filter + 2-key aggregate | 59.3 s | **7.9 s** | 7.4 s |
+| scan + 1-key aggregate | 86.3 s | **28.7 s** | 12.8 s (cold) |
+
+A second change earns its keep on the same path: the device Parquet reader used to decline any
+shard with a pushed predicate, which is every scan-heavy query it was built for. The pruning a
+predicate would have done is *already* in the split — `parquet_row_group_splits` applies it to
+the footer at plan time — so both readers open the same bytes. Measured on one sf10 shard
+(15.1 M rows), read on the device against read on the host and copied over: **0.15 s vs 1.70 s**,
+same row count.
+
+### What the GPUs are actually doing, and what they are not
+
+Reported honestly, because the interesting result is a ceiling rather than a win.
+
+| workload | wall | GPU mean | GPU peak | devices busy |
+|---|--:|--:|--:|--:|
+| batch inference, ResNet-50, 16 384 images | 6.70 s | **50 %** | 100 % | 4 / 4 |
+| the same through Ray Data | 27.08 s | 39 % | 100 % | 4 / 4 |
+| TPC-H sf10, filter + aggregate (warm) | 0.58 s | 49 % | 94 % | 4 / 4 |
+| TPC-H sf100, scan + aggregate | 19–29 s | 5–7 % | 100 % | 3–4 / 4 |
+
+Batcher is **4.04x** faster than Ray Data on the inference workload and holds a higher mean
+utilization while doing it. Every device is engaged on every shape; the peaks reach 100 %.
+
+The means do not, and the reason is not the engine. A sf100 scan moves ~14 GB of projected
+columns off shared storage in ~20 s — about 0.7 GB/s — which is what the filesystem gives, and
+no scheduling change makes a T4 busy on that feed. Forcing 8, 16 and 32 shards instead of the
+planned 4 moves the number from 22.1 s to 18.8 s and the utilization from 5.1 % to 6.8 %, which
+is worth having and is not the missing 70 points. **For an I/O-bound relational scan on network
+storage, GPU utilization is bounded by storage bandwidth**; the shapes where a device can be
+saturated are the compute-bound ones, which is where the inference figure sits.
+
+### What this does not fix
+
+**The inference mean is 50%, not 80%, and the mechanism is identified but its cost is not
+measured.** `split_at_first_pool_boundary` declines the CPU/GPU overlap when nothing but a
+`Scan` precedes the model stage — "a bare scan prefix isn't worth a Flight hand-off for an
+in-memory partition". Confirmed by plan inspection on this cluster's own pipeline:
+
+| pipeline | overlap taken |
+|---|---|
+| `read.parquet(...).map_batches(Model, num_gpus=1)` | **no** |
+| `read.parquet(...).map_batches(noop).map_batches(Model, num_gpus=1)` | yes |
+
+The reasoning holds for `from_arrow` and not for a parquet source on shared storage, where the
+scan is real I/O and the device waits out every partition's read — and the first row is what
+every straightforward batch-inference script writes. What is *not* measured is how much of the
+50% that accounts for: the A/B (the same pipeline with a no-op CPU stage inserted, which changes
+no work and does change whether the overlap is taken) did not finish here. The gate for the
+change is that number, so the change is not made.
+
+**The GPU fan-out's barrier has no deadline**, so shard tasks that cannot be placed stop the
+query rather than failing it. This was invisible until now: the `host_tasks` double in
+`tests/integration/test_gpu_fanout.py` had drifted out of step with `gpu_task_options`, so every
+case in that file died on a `TypeError` before reaching the barrier. Fixing the double exposed
+the hang; the cases are now bounded with `@pytest.mark.timeout` so it reports as a failure, and
+the barrier itself is untouched.
+
+**`tests/differential/test_diff_distributed_map_stage.py` hangs against a local Ray cluster**,
+and does so identically on the tree without any of these changes, so it is the same
+barrier-without-a-deadline shape rather than a regression. On the shared cluster it fails
+differently — `FileNotFoundError` on the driver's own `/tmp` tmpdir, which no worker can read —
+so the file has not run green in either configuration since it was added.
+
+**Nine unit tests fail only in a full-suite run** and pass individually or in pairs, which is
+test-order pollution rather than a defect in what they cover. They are pre-existing — the same
+suite showed fourteen before any of the changes here — and the polluter has not been bisected.
+
+A note on why so much of this was invisible: the Rust half of the preceding changeset had never
+been compiled, because the toolchain was not installed in this environment. Everything above
+was found by installing it, building release, and running the suites for the first time.
+
+Both suites were run through the **distributed** path over splittable parquet on shared
+storage, which is the configuration the single-node numbers above never exercise: an
+in-memory `from_arrow` source is not splittable, so the dispatcher's fallback runs it on one
+node and the distributed dispatcher is never asked anything. TPC-H sf1 across four workers
+at 16 partitions, ClickBench (8 M rows, the `hits_compatible` mirror normalized on disk)
+across two.
+
+| suite | before | after |
+|---|--:|--:|
+| TPC-H, 22 queries | 13 | **19**, measured end to end |
+| ClickBench, 43 queries | 37 | 37 measured; the 6 failures' cause is fixed and verified at the scanner, the full re-run is not yet in |
+
+Every TPC-H result was compared against DuckDB **row by row, in order**. That matters here
+more than usual: `assert_same` is order-independent by design, so it cannot see a sort bug,
+and one of the two fixes is a change to how the distributed sort routes rows.
+
+The ClickBench line is deliberately split. The six failures all raise from one call, and the
+fix is verified by driving that exact call with each query's own pushed predicate against a
+real shard (the table below); a full 43-query distributed re-run has not completed, because
+a Batcher fleet reserves one 8-CPU bundle per node — the whole cluster — and this one was
+shared with other work throughout. Do not quote 43/43 until that run exists.
+
+### A distributed `ORDER BY` on a string column had no path at all
+
+The distributed sort routes rows against sampled quantile boundaries, comparing the leading
+key as `f64`. A string key cannot be compared that way — arrow reads `"12"` as `12.0`, which
+disagrees with the single-node lexical sort — so the dispatcher refused the shape.
+
+Refusing is harmless only while the refusal can fall back. `_unsupported` runs a plan on one
+node when no source is splittable, but once an earlier stage leaves its result on the
+workers every source *is* splittable, the fallback is withdrawn, and the query fails. Four
+TPC-H queries end in a string `ORDER BY` over a materialized aggregate — q4, q9, q12, q22 —
+and did exactly that.
+
+`bc_runtime::shuffle` already routed a string key; the single-node parallel sample sort uses
+it. What was missing was the sampling half, because the quantile grid comes from a KLL
+sketch and KLL is numeric-only. `string_quantiles` samples the column directly, strided so a
+sorted input is not described by its prefix, and `range_partition_batches_str` routes on the
+result. Fixing it also cleared q5, q7 and q8, which had been reporting a phantom unreachable
+worker.
+
+The three sort paths were sampling through three near-copies of the same two lines, which is
+how one of them would have kept refusing string keys after the others learned to route them.
+They now share `sample_key_grid`, beside the `bucketize` they already shared.
+
+### Arrow has no `greater_equal(date32, string)`, and ClickBench writes one 6 times
+
+`WHERE EventDate >= '2013-07-01'` against a `date32` column is how ClickBench spells a date
+range. The pyarrow dataset scanner does not decline that filter — it raises
+`ArrowNotImplementedError` — so q36-q39, q41 and q42 died inside the map task while running
+fine single-node, where the filter is the engine's and the engine coerces.
+
+The distributed scan now types each literal against the fragment schema it already holds and
+declines a comparison arrow cannot make. An unpushable **conjunct** drops only itself: an
+`AND` term only ever widens what is read and the engine's `Filter` re-checks every row, so
+the other five predicates still prune. Measured on one 1 M-row shard, per query, before and
+after:
+
+| | q36 | q37 | q38 | q39 | q41 | q42 |
+|---|--:|--:|--:|--:|--:|--:|
+| before | error | error | error | error | error | error |
+| after, rows scanned | 376,899 | 370,550 | 26,918 | 406,063 | 56,737 | 376,905 |
+
+An `OR` is still all-or-nothing, because dropping a disjunct *narrows* the filter and would
+lose rows.
+
+Coercing the string to the column's type instead would keep the date pruning too, but only
+if this module's parse agreed with the engine's cast on every input — and a pushdown that
+disagrees returns the wrong rows with nothing said. The typed-literal path is the better fix
+and belongs in the SQL front-end, where the comparison is first seen against a typed column.
+
+### What this does not fix
+
+**TPC-H q15** still fails, with `no surviving worker to recover the join shuffle on` — the
+map barrier marking every worker dead. Its CTE is referenced twice, once by a join and once
+by a scalar subquery, so the suspicion is a materialized intermediate outliving the fleet
+that holds it; that is not yet proven.
+
+**A retryable shuffle fault reached the driver as a bare source index**, which is how a
+deterministic bug arrives as "worker N unreachable" and, three recomputes later, fails a
+query on a cluster where every worker is alive. The transport's own words for *why* now
+reach the log on the worker that saw them. The driver's protocol is unchanged.
+
+**The sort and window shuffles addressed their buckets at the literal stage 0**, so two
+sorts of one query on one fleet published byte-identical tickets and the second overwrote
+the first. Each now takes its own stage block, as the join and aggregate shuffles already
+do. No query here was hitting it; it is the same latent collision, closed.
+
 ## A learned date grid and a date literal were on different number lines (2026-07-31)
 
 TPC-H sf1, 16-core c5-class head node, release build, correctness-gated (all 22 `OK`): the
@@ -1041,7 +1586,7 @@ at 1,000 files are the dominant cost rather than a fraction of it; an earlier pr
 listing data was recorded).
 
 **Not attempted here, deliberately.** The fix is the generation-stamped listing cache
-prescribed in `docs/internals/ray_pitfall_parity.md` G5 — entries valid only for a fresh
+prescribed in `docs/architecture/internals/ray_pitfall_parity.md` G5 — entries valid only for a fresh
 listing, invalidated when a cached path list is served — and it spans `io/_backend.py` and the
 path-list cache in `io/base/source.py`. Doing it requires an object-store target to prove the
 win on, since locally the effect is single-digit milliseconds and the *risk* is a stale
@@ -2881,7 +3426,7 @@ all 16 cores), so a loaded box does not merely add noise, it changes the ratio.
 ---
 
 > **Single-node baseline vs DuckDB / Polars (2026-07-13, 16-core / 30 GB node).** The
-> numbers published in `docs/benchmarks/analytics.md` come from this run. It is a smaller
+> numbers published in `docs/benchmarks/results/analytics.md` come from this run. It is a smaller
 > box than the 96-core node and 9-node cluster the sections below use, so do not compare
 > its absolute times against theirs — only the ratios within it.
 >

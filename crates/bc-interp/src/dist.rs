@@ -432,6 +432,50 @@ pub fn range_partition_batches(
     Ok(parts.into_iter().map(|b| vec![b]).collect())
 }
 
+/// As [`range_partition_batches`], but for a **string** leading key compared
+/// lexicographically by bytes — the ordering arrow's sort gives a `Utf8`/`LargeUtf8`
+/// column, so the per-range sorts concatenate into the same relation a single global
+/// string sort produces. The numeric path compares as `f64` and would read `"12"` as
+/// `12.0`, disagreeing with that lexical order, which is why it refuses a string rather
+/// than casting one.
+pub fn range_partition_batches_str(
+    batches: &[RecordBatch],
+    key_index: usize,
+    boundaries: &[String],
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> Result<Vec<Vec<RecordBatch>>, InterpError> {
+    let combined = ops::materialize(batches)?;
+    let key = combined.column(key_index).clone();
+    let parts = in_worker_pool(|| {
+        shuffle::range_partition_by_str_key(
+            &combined,
+            &key,
+            boundaries,
+            n_buckets,
+            nulls_first,
+            descending,
+        )
+    })??;
+    Ok(parts.into_iter().map(|b| vec![b]).collect())
+}
+
+/// Sample a string sort key's distribution as ascending values at `probs`, the string
+/// counterpart of the KLL quantile grid the numeric distributed sort samples with.
+/// Returns an empty grid when the column is absent, empty, or entirely null.
+pub fn string_key_quantiles(
+    batches: &[RecordBatch],
+    key_name: &str,
+    probs: &[f64],
+) -> Result<Vec<String>, InterpError> {
+    let combined = ops::materialize(batches)?;
+    match combined.column_by_name(key_name) {
+        None => Ok(Vec::new()),
+        Some(col) => Ok(shuffle::string_quantiles(col, probs)?),
+    }
+}
+
 /// Skew-aware shuffle for a single-key distributed join: like [`partition_batches`],
 /// but a *hot* key's rows are salted across reducers instead of overloading one.
 /// `replicate=false` (probe side) fans each hot row to one salted bucket;

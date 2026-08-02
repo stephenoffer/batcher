@@ -29,6 +29,18 @@ Ranking, running totals, lag and lead.
 Long to wide and back.
 :::
 
+:::{grid-item-card} {octicon}`globe;1.1em` Geospatial
+:link: /user-guide/analyze/geospatial
+:link-type: doc
+Geometry, spatial joins, projections, and grid keys.
+:::
+
+:::{grid-item-card} {octicon}`share-android;1.1em` Graphs
+:link: /user-guide/analyze/graphs
+:link-type: doc
+PageRank, components, communities, and graph-ML features.
+:::
+
 :::{grid-item-card} {octicon}`database;1.1em` SQL
 :link: /user-guide/analyze/sql
 :link-type: doc
@@ -49,6 +61,8 @@ aggregations
 joins
 window-functions
 pivoting
+geospatial
+graphs
 sql
 metadata-shortcuts
 ```

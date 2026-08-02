@@ -39,6 +39,7 @@ from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.exprs.guards import is_integer, schema_rule
 from batcher.plan.expr_ir import Cast, Expr, Lit
 from batcher.plan.expr_ir.core import Binary
+from batcher.plan.ir_tags import COMPARISON_FLIP, ORDERING_COMPARISONS
 from batcher.plan.logical import Filter, LogicalPlan, Project
 from batcher.plan.schema import SchemaRef
 
@@ -49,10 +50,8 @@ __all__ = [
 
 #: The comparison operators this module unwraps, and their mirror when the cast is on
 #: the right-hand side (`3.5 < cast(i)` reads as `cast(i) > 3.5`).
-_MIRROR = {"eq": "eq", "ne": "ne", "lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}
 
 #: Ordered comparisons -- the ones a fractional literal can still be shifted through.
-_ORDERED = frozenset({"lt", "le", "gt", "ge"})
 
 #: Beyond 2**53 a float64 cannot represent every integer, so a literal above this could
 #: stand for a range of integers rather than one. Outside the window both rules decline.
@@ -95,7 +94,7 @@ def _oriented(expr: Binary, schema: SchemaRef | None):
     if inner is not None:
         value = _float_literal(expr.left)
         if value is not None:
-            return inner, _MIRROR[expr.op], value
+            return inner, COMPARISON_FLIP[expr.op], value
     return None
 
 
@@ -175,7 +174,7 @@ def _register_unwrap(name: str, leaf, op: str):
 # the truncated literal are the same predicate, every operator, every sign.
 UNWRAP_INTEGRAL_CAST_RULES = [
     _register_unwrap(f"unwrap_float_cast_{op}_integral_literal", _integral(op), op)
-    for op in sorted(_MIRROR)
+    for op in sorted(COMPARISON_FLIP)
 ]
 
 # **Fractional literal**, ordered operators only: `cast(i AS DOUBLE) > 3.5 -> i > 3`, and
@@ -189,5 +188,5 @@ UNWRAP_INTEGRAL_CAST_RULES = [
 # the mirror-image reason.
 UNWRAP_FRACTIONAL_CAST_RULES = [
     _register_unwrap(f"unwrap_float_cast_{op}_fractional_literal", _fractional(op), op)
-    for op in sorted(_ORDERED)
+    for op in sorted(ORDERING_COMPARISONS)
 ]

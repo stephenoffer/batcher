@@ -59,10 +59,10 @@ Sharding that stays balanced, and resumes where it stopped.
 ## See also
 
 - {doc}`../user-guide/index`: the relational half of the pipeline that feeds all of this.
-- {doc}`/user-guide/transform/udfs`: batch UDFs generally, of which model inference is one case.
+- {doc}`/user-guide/transform/columns/udfs`: batch UDFs generally, of which model inference is one case.
 - {doc}`/api/models/ml`: the reference for the `.ml` accessor and the `batcher.ml` package.
 - {doc}`/cookbook/ml/pipelines/index`: runnable recipes for the workloads above.
-- {doc}`/deep-dives/distribution/gpu-execution`: how device work is actually scheduled.
+- {doc}`/architecture/deep-dives/distribution/gpu-execution`: how device work is actually scheduled.
 - {doc}`../benchmarks/index`: the measured throughput behind the claims here.
 
 ```{toctree}

@@ -39,12 +39,12 @@ from batcher.plan.expr_ir import (
     referenced_columns,
 )
 from batcher.plan.expr_rewrite import substitute_columns
+from batcher.plan.ir_tags import SAFE_BINARY_OPS
 from batcher.plan.logical import Join, JoinOutputCol, LogicalPlan, Project, Projection
 
 __all__ = ["push_projection_through_join"]
 
 # Binary operators that cannot raise on an unmatched row (no integer div/mod-by-zero).
-_SAFE_BINARY_OPS = frozenset({"add", "sub", "mul", "eq", "ne", "lt", "le", "gt", "ge", "and", "or"})
 # Expression node types that cannot raise, so evaluating them on the extra (later-dropped)
 # unmatched rows of an inner join is harmless. Anything else keeps the projection above.
 _SAFE_LEAF_TYPES = (
@@ -66,9 +66,7 @@ def _is_push_safe(expr: Expr) -> bool:
     """Whether `expr` is built entirely from non-raising operations (so it may run on the
     inner join's unmatched rows without introducing a spurious error)."""
     if isinstance(expr, Binary):
-        return (
-            expr.op in _SAFE_BINARY_OPS and _is_push_safe(expr.left) and _is_push_safe(expr.right)
-        )
+        return expr.op in SAFE_BINARY_OPS and _is_push_safe(expr.left) and _is_push_safe(expr.right)
     if isinstance(expr, _SAFE_LEAF_TYPES):
         return all(_is_push_safe(c) for c in _child_exprs(expr))
     return False

@@ -22,6 +22,7 @@ import pyarrow as pa
 from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.io.source import Source
+from batcher.plan.ir_tags import RUNNING_AGGREGATES
 
 if TYPE_CHECKING:
     from batcher.metadata.hub import MetadataHub
@@ -46,7 +47,6 @@ __all__ = [
 #: Kept to that list on purpose rather than "every aggregate" — see `column_bounds_needed`, where
 #: fetching a column for one aggregate was found to change what an `approx_*` terminal on the *same*
 #: column returns.
-_STAT_READING_AGGREGATES = frozenset({"min", "max", "sum", "mean", "count"})
 
 # Session cache of per-source statistics, keyed by source identity (see collect_source_stats).
 _SOURCE_STATS_CACHE: dict[str, object] = {}
@@ -182,7 +182,7 @@ def column_bounds_needed(plan: LogicalPlan) -> set[str]:
       group key is droppable when the column is constant (`drop_constant_group_key`), and whose
       `count(x)` becomes `count(*)` once the column has a known-zero null count
       (`count_of_non_null_column`). Only the inputs of the aggregates that read them
-      (`_STAT_READING_AGGREGATES`), deliberately: see the caveat below;
+      (`RUNNING_AGGREGATES`), deliberately: see the caveat below;
     * a **`Sort`**, whose key is droppable when the column is constant
       (`prune_constant_sort_keys`), when an earlier key is already unique
       (`prune_sort_keys_after_unique_key`), or when the relation holds one row
@@ -233,7 +233,7 @@ def column_bounds_needed(plan: LogicalPlan) -> set[str]:
             for key in node.group_keys:
                 needed |= referenced_columns(key.expr)
             for spec in node.aggregates:
-                if spec.agg.func in _STAT_READING_AGGREGATES and spec.agg.input is not None:
+                if spec.agg.func in RUNNING_AGGREGATES and spec.agg.input is not None:
                     needed |= referenced_columns(spec.agg.input)
         elif isinstance(node, Sort):
             needed |= {k.expr.name for k in node.keys if isinstance(k.expr, Col)}

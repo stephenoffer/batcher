@@ -50,5 +50,5 @@ actually happened.
 ## See also
 
 - {doc}`lazy`: why nothing runs until a terminal call, which is what makes re-planning possible.
-- {doc}`/user-guide/operate/explain-plans`: reading the plan and the measured numbers behind it.
-- {doc}`/deep-dives/adaptive/adaptive-reoptimization`: the re-planning loop, breaker by breaker.
+- {doc}`/user-guide/operate/tuning/explain-plans`: reading the plan and the measured numbers behind it.
+- {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization`: the re-planning loop, breaker by breaker.

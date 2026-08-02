@@ -178,9 +178,9 @@ print(evolved.to_pydict())
 
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: ingest files, and reconcile the schemas that
   drifted between them.
-- {doc}`Transformations </user-guide/transform/transformations>`: cleanse and reshape what survived the checks.
+- {doc}`Transformations </user-guide/transform/rows/transformations>`: cleanse and reshape what survived the checks.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: summarize it.
 - {doc}`Dataset API </api/relational/dataset>`: the full reference for `ds.dq` and `distinct`.
-- {doc}`Agent skills </agents/index>`: `validate-data-quality`, on choosing between
+- {doc}`Agent skills </agents>`: `validate-data-quality`, on choosing between
   fail, drop, and quarantine, and profiling before you write the checks.
 - {doc}`/cookbook/dataset/cleaning/dq_contracts`: validate, fail, drop, or quarantine, as a runnable script.

@@ -241,12 +241,12 @@ split, not placed.
 
 - {doc}`Governance guide </user-guide/trust/governance>`: the worked introduction, with a runnable
   catalog, principal, and rewritten plan.
-- {doc}`GPU fleets </user-guide/operate/gpu-fleets>`: residency as a placement constraint, beside the
+- {doc}`GPU fleets </user-guide/operate/running/gpu-fleets>`: residency as a placement constraint, beside the
   power and device-health controls a GPU datacenter runs on.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validation, which composes with this.
-- {doc}`Explain plans </user-guide/operate/explain-plans>`: reading the rewrite `enforce` produced.
-- {doc}`Quality gates </cookbook/data-engineering/quality-gates>`: failing the pipeline
+- {doc}`Explain plans </user-guide/operate/tuning/explain-plans>`: reading the rewrite `enforce` produced.
+- {doc}`Quality gates </cookbook/data-engineering/maintenance/quality-gates>`: failing the pipeline
   rather than the dashboard.
-- {doc}`The plan IR </deep-dives/query/plan-ir>`: the tree governance rewrites.
+- {doc}`The plan IR </architecture/deep-dives/query/plan-ir>`: the tree governance rewrites.
 - {doc}`Dataset API </api/relational/dataset>` and {doc}`expressions </api/relational/expressions>`: what a mask lowers to.
 - {doc}`/cookbook/governance/index`: masking, PII transforms, and lineage as runnable scripts.

@@ -166,9 +166,9 @@ neither `query=` nor `table=`.
 ## See also
 
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: the guided tour of the reader surface.
-- {doc}`Multi-source join </cookbook/data-engineering/multi-source-join>`: a BigQuery table
+- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: a BigQuery table
   joined against the lake without staging either side.
-- {doc}`Incremental ingest </cookbook/data-engineering/incremental-ingest>`: reading only the
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: reading only the
   new partitions, which is the cheapest read there is.
 - {doc}`Reading and writing </api/relational/io>`: the full reader/writer surface.
 - {doc}`Snowflake </integrations/warehouses/snowflake>`: the other big warehouse, and the only one Batcher writes.

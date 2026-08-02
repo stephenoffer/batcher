@@ -33,7 +33,7 @@ from batcher.core.gpu_plan.vocab.strings import eval_str
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
 
-__all__ = ["eval_expr", "literal_value"]
+__all__ = ["DECLINED_EXPRS", "eval_expr", "literal_value"]
 
 
 def literal_value(tagged: dict) -> Any:
@@ -349,4 +349,37 @@ _HANDLERS = {
     "window_start": _window_start,
     "make_temporal": _make_temporal,
     "strftime": _named(eval_strftime),
+}
+
+
+#: Every `bc_expr::Expr` tag this tier does not translate, and why.
+#:
+#: Exhaustive against `plan.ir_tags.ExprTag` by test. `_HANDLERS` is keyed by those tag
+#: strings, so a tag renamed on the Rust and Python sides leaves its handler keyed on a dead
+#: string — the expression stops being translated, the plan silently falls back to the CPU
+#: engine, and nothing fails. Pinning both directions turns that into a red test.
+DECLINED_EXPRS: dict[str, str] = {
+    # Rust-only kernels. Decoding an image, resampling audio or running a geometry predicate
+    # happens in `bc-expr::eval::{media,geo}`; there is no dataframe-library equivalent to
+    # translate onto, and approximating one is exactly what this package refuses to do.
+    "image": "media decode is a Rust kernel (`bc-expr::eval::media::image`)",
+    "audio": "media decode is a Rust kernel (`bc-expr::eval::media::audio`)",
+    "video": "media decode is a Rust kernel (`bc-expr::eval::media`)",
+    "geo": "geometry is a Rust kernel (`bc-geo` + `bc-expr::eval::geo`)",
+    # Not translated. Listed rather than absent so adding one is a decision with a date on it.
+    "array": "not translated",
+    "convert_timezone": "not translated",
+    "hash": "not translated",
+    "list_filter": "not translated",
+    "list_join": "not translated",
+    "list_set": "not translated",
+    "list_simhash": "not translated",
+    "list_slice": "not translated",
+    "list_transform": "not translated",
+    "list_zip": "not translated",
+    "make_struct": "not translated",
+    "map": "not translated",
+    "sequence": "not translated",
+    "strptime": "not translated",
+    "window_buckets": "not translated",
 }

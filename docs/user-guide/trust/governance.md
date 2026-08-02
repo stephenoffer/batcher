@@ -425,6 +425,6 @@ own store and check into review.
   consumer.
 - {doc}`Complete API reference </api/complete>`: `SecurityCatalog`, `Principal`,
   `GovernanceEvent`, and `security`.
-- {doc}`Agent skills </agents/index>`: `apply-governance-and-security`, the same
+- {doc}`Agent skills </agents>`: `apply-governance-and-security`, the same
   surface as a procedure, with what to verify before trusting an enforced plan.
 - {doc}`/cookbook/governance/index`: masking, PII transforms, and lineage as runnable scripts.
