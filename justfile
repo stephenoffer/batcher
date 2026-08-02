@@ -75,6 +75,11 @@ lint-layers:
 lint-structure:
     python tools/lint_structure.py
 
+# The JSON IR wire contract: every Python tag is one Rust serde will accept, and back.
+# Invariant #8 was previously reconciled only by tests that happened to name a tag.
+lint-ir-contract:
+    python tools/lint_ir_contract.py
+
 # The daily agentic self-improvement loop: agents review the codebase, make narrow verified
 # improvements in isolated worktrees, and leave branches + a report for review. Nothing is
 # merged automatically and your working tree is never touched. See tools/agentic/README.md.

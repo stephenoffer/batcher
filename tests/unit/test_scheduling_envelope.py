@@ -22,6 +22,27 @@ from batcher.plan.resource import ResourceBounds, SchedulingEnvelope
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _job_ships_batcher():
+    """Pin the package-shipping decision, which is a process global this file must not read.
+
+    `task_options` appends a `runtime_env` when the Ray *job* does not already ship batcher
+    to its workers. That decision is a module global set by `_ensure_ray`, so whether it is
+    set depends on whether some *earlier test in the session* brought Ray up — and these
+    tests are documented as covering the envelope derivation "without a cluster". Left
+    ambient, the five `task_options` assertions below pass alone and fail in the full suite,
+    which is an order dependence rather than a behaviour anyone intended to assert.
+    """
+    from batcher.dist.executors.ray_runtime import scheduling
+
+    before = scheduling._JOB_SHIPS_BATCHER
+    scheduling.set_job_ships_batcher(True)
+    try:
+        yield
+    finally:
+        scheduling.set_job_ships_batcher(before)
+
+
 def _plan(ops: list[PhysicalOp]) -> PhysicalPlan:
     return PhysicalPlan(ir={}, output_schema=None, ops=tuple(ops))
 

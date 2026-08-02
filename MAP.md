@@ -762,13 +762,13 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `autoscale_request.py` | 196 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 183 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `hardware_probe.py` | 500 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
-| `lifecycle.py` | 471 | Ray lifecycle + single-node fallback for the distributed executor. |
+| `lifecycle.py` | 484 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 268 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 56 | How many reducers a shuffle fans out to. |
 | `scaling.py` | 472 | What the live cluster is, and what of it a query may use. |
-| `scheduling.py` | 454 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scheduling.py` | 488 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 127 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend

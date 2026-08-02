@@ -31,7 +31,12 @@ from batcher.plan.logical import LogicalPlan
 
 from .policies import actor_fault_options, fault_options
 from .scaling import cluster_topology
-from .scheduling import current_envelope, set_job_ships_batcher, task_options
+from .scheduling import (
+    current_envelope,
+    ray_session_key,
+    set_job_ships_batcher,
+    task_options,
+)
 
 
 def engine_config_json(num_cpus: float | None = None) -> str:
@@ -278,14 +283,21 @@ def _platform_env_hook_disabled():
 
 
 # Once we've decided whether the job ships batcher (on the first `_ensure_ray`), the
-# answer is fixed for the process — a later `_ensure_ray` must not flip it just because
-# Ray now reports initialized.
-_ship_decided = False
+# answer is fixed **for that Ray session** — a later `_ensure_ray` must not flip it just
+# because Ray now reports initialized.
+#
+# It was previously fixed for the *process*, which is wrong across a session change. If the
+# cluster restarts, or a driver calls `ray.shutdown()` and reconnects, the next `_ensure_ray`
+# sees Ray initialized and keeps the previous session's answer — so a foreign re-init is
+# treated as "the job already ships batcher" and the workers never receive the package.
+# Storing the session the decision belongs to makes the re-decision automatic; `None` means
+# no decision has been made yet.
+_ship_session: str | None = None
 # Serializes Ray bring-up. `_ensure_ray` is check-then-act on `ray.is_initialized()`, and
 # concurrent pipelines both reach it cold: each sees "not initialized" and calls `ray.init`,
 # and the loser dies on Ray's own `AssertionError("Perhaps you called ray.init twice by
 # accident?")`. Observed directly — two pipelines started together, one returned the right
-# answer and the other crashed before it began. The lock also covers `_ship_decided` and
+# answer and the other crashed before it began. The lock also covers `_ship_session` and
 # `_wrap_tasks`, which rebind module-level names in place.
 _RAY_INIT_LOCK = threading.Lock()
 
@@ -311,7 +323,6 @@ def _import_ray():
 
 
 def _ensure_ray(workers: int) -> None:
-    global _ship_decided
     ray = _import_ray()
 
     with _RAY_INIT_LOCK:
@@ -320,7 +331,7 @@ def _ensure_ray(workers: int) -> None:
 
 def _ensure_ray_locked(ray, workers: int) -> None:
     """The bring-up decision, serialized by `_RAY_INIT_LOCK` against other pipelines."""
-    global _ship_decided
+    global _ship_session
 
     if not ray.is_initialized():
         with _platform_env_hook_disabled():
@@ -346,13 +357,15 @@ def _ensure_ray_locked(ray, workers: int) -> None:
         # remote one carries the self-shipped runtime_env, so the job makes batcher
         # importable — no per-remote shipping needed.
         set_job_ships_batcher(True)
-        _ship_decided = True
-    elif not _ship_decided:
+        _ship_session = ray_session_key()
+    elif _ship_session is None or _ship_session != ray_session_key():
         # A foreign `ray.init` ran before batcher (e.g. the user attached to the
         # cluster themselves): batcher couldn't set the job runtime_env, so it must
         # ship its package on each remote instead. A no-op when trust_cluster_image.
+        # Re-evaluated per session, so a reconnect to a cluster batcher did not start
+        # is recognized rather than inheriting the previous session's answer.
         set_job_ships_batcher(False)
-        _ship_decided = True
+        _ship_session = ray_session_key()
     from .capacity import warn_once_if_allocation_is_wider_than_ray
 
     warn_once_if_allocation_is_wider_than_ray()

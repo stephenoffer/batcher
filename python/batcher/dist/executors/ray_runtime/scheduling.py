@@ -120,10 +120,40 @@ def set_job_ships_batcher(value: bool) -> None:
     _JOB_SHIPS_BATCHER = value
 
 
-# Cache the uploaded-package runtime_env for the process (one GCS upload, reused by
-# every task/actor). Keyed by nothing — the driver's batcher package is fixed per run.
+# Cache the uploaded-package runtime_env (one GCS upload, reused by every task/actor),
+# keyed by the **Ray session** it was uploaded into.
+#
+# It used to be keyed by nothing, on the reasoning that "the driver's batcher package is
+# fixed per run". The package is; the *cluster it was uploaded to* is not. The cached value
+# is a content-addressed `gcs://_ray_pkg_<hash>.zip` URI, which is meaningful only inside
+# the GCS that stored it. A driver that outlives one Ray session — a cluster restart, a
+# `ray.shutdown()` and reconnect, a notebook switching between a local and a remote address —
+# then attaches a URI pointing into a GCS that no longer holds the package, and every task
+# and actor fails in runtime_env setup rather than in anything the user wrote.
 _WORKER_RT_ENV: dict | None = None
-_WORKER_RT_ENV_DONE = False
+_WORKER_RT_ENV_SESSION: str | None = None
+
+
+def ray_session_key() -> str | None:
+    """An identifier that changes when the Ray session does, or `None` if Ray is down.
+
+    Used to scope process-global caches that are only valid within one Ray session. The
+    job id serves: `ray.init` mints a new one per session, so an equality test against a
+    stored key detects a reconnect without reaching into Ray's private node state.
+    """
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return None
+        return ray.get_runtime_context().get_job_id()
+    except Exception as e:
+        # Ray's runtime-context API is the only way to ask, and it is not a stable public
+        # contract across versions. Losing the key must not break scheduling: `None` means
+        # "unknown session", which makes the caches below re-derive rather than serve a
+        # value that may belong to a different cluster.
+        note_suppressed("dist", "read ray session key", e)
+        return None
 
 
 def worker_runtime_env() -> dict | None:
@@ -139,11 +169,15 @@ def worker_runtime_env() -> dict | None:
     `import batcher` on every worker independent of Ray init order (the gap that made
     a user's own `ray.init()` silently break distributed runs). Returns `None` for the
     common case where batcher initialized Ray itself.
+
+    The upload is cached per Ray session, so a reconnect re-uploads into the new cluster's
+    GCS instead of handing every remote a URI the new cluster cannot resolve.
     """
-    global _WORKER_RT_ENV, _WORKER_RT_ENV_DONE
+    global _WORKER_RT_ENV, _WORKER_RT_ENV_SESSION
     if _JOB_SHIPS_BATCHER or active_config().distributed.trust_cluster_image:
         return None
-    if _WORKER_RT_ENV_DONE:
+    session = ray_session_key()
+    if _WORKER_RT_ENV is not None and session == _WORKER_RT_ENV_SESSION:
         return _WORKER_RT_ENV
     from ray._private.runtime_env.py_modules import upload_py_modules_if_needed
 
@@ -154,7 +188,7 @@ def worker_runtime_env() -> dict | None:
     # `.so` may be gitignored; it must reach the worker for `import batcher` to work).
     rt = upload_py_modules_if_needed({"py_modules": [pkg]}, include_gitignore=False)
     _WORKER_RT_ENV = rt
-    _WORKER_RT_ENV_DONE = True
+    _WORKER_RT_ENV_SESSION = session
     return _WORKER_RT_ENV
 
 
