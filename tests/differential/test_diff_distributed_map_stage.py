@@ -34,7 +34,7 @@ _N = 200
 
 
 @pytest.fixture(scope="module")
-def parquet_path(tmp_path_factory):
+def parquet_path(cluster_tmp_dir):
     """A multi-row-group Parquet file, so the source really splits."""
     import pyarrow.parquet as pq
 
@@ -46,7 +46,7 @@ def parquet_path(tmp_path_factory):
             "w": pa.array([(i * 37) % 101 for i in range(_N)], pa.int64()),
         }
     )
-    path = tmp_path_factory.mktemp("mapstage") / "t.parquet"
+    path = cluster_tmp_dir / "mapstage_t.parquet"
     pq.write_table(table, path, row_group_size=32)
     return str(path)
 
