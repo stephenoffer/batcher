@@ -188,7 +188,7 @@ The `Dataset` builder package.
 | module | lines | what it is |
 |---|---|---|
 | `_build.py` | 491 | Plan-construction helpers behind the thinner `Dataset` methods. |
-| `_dedup.py` | 321 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
+| `_dedup.py` | 339 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 213 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
 | `_export.py` | 96 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` / `to_torch_dataloader`. |
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
@@ -2246,7 +2246,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 | module | lines | what it is |
 |---|---|---|
 | `hierarchy.py` | 642 | The Batcher exception hierarchy. |
-| `suggest.py` | 299 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
+| `suggest.py` | 304 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 80 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
 ### `batcher/_internal/hardware/` — 0 · utility
@@ -2441,7 +2441,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 589 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 255 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1141 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1183 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 108 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -2454,11 +2454,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `par.rs` | 2864 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
-| `stream/breaker.rs` | 494 | The breakers: operators that must see all of their input before they can emit any output. |
+| `stream/breaker.rs` | 499 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 199 | Preparing a hash join's build side once, for every worker that will probe it. |
-| `stream/meter.rs` | 279 | Per-operator metrics for the streaming executor. |
+| `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 780 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
-| `stream/parallel.rs` | 1026 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 1032 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 152 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 158 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 421 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |

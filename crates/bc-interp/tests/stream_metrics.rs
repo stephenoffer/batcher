@@ -195,3 +195,56 @@ fn the_streaming_aggregates_peak_is_smaller_than_the_materializing_ones() {
         peak(&oracle)
     );
 }
+
+/// The `backend` tag must say whether Tier-1 actually ran, on the tier that is the default.
+///
+/// This tier reported a hardcoded `"interp"` for every operator. That was right for filter and
+/// project — they stay on the interpreter here on purpose — and wrong for the aggregate, which
+/// compiles its computed group keys and inputs. TPC-H q1's
+/// `sum(l_extendedprice * (1 - l_discount))` is compiled and was reported as `interp`, so the
+/// one column a user profiling a query reads to see whether the JIT fired could never say yes.
+#[test]
+fn a_computed_aggregate_reports_the_jit_and_a_bare_one_does_not() {
+    // `sum(v * 2)` — a computed input, so a JIT candidate.
+    let computed = plan(
+        r#"{"op":"aggregate","input":{"op":"scan","source_id":0},
+            "group_keys":[{"expr":{"e":"col","name":"k"},"alias":"k"}],
+            "aggregates":[{"func":"sum","alias":"s","input":
+              {"e":"binary","op":"mul","left":{"e":"col","name":"v"},
+               "right":{"e":"lit","value":{"int":2}}}}]}"#,
+    );
+    for (path, m) in [
+        (
+            "serial",
+            execute_streaming_metered(&computed, &[facts()], 0)
+                .unwrap()
+                .1,
+        ),
+        (
+            // The sharded fold is the arm the engine default reaches, and it has its own
+            // aggregate implementation — a tag recorded only on the serial breaker would
+            // still read `interp` for every real query.
+            "sharded",
+            execute_streaming_parallel_metered(&computed, &[facts()], 4, 0)
+                .unwrap()
+                .1,
+        ),
+    ] {
+        let agg = m.ops.iter().find(|o| o.kind == "aggregate").unwrap();
+        assert_eq!(
+            agg.backend, "jit",
+            "{path}: a compiled aggregate input must not report the interpreter"
+        );
+    }
+
+    // `sum(v)` — a bare column, which the JIT declines on purpose (the interpreter evaluates it
+    // as a zero-copy Arc clone). That is not a fallback, and must still read as `interp`.
+    let bare = plan(
+        r#"{"op":"aggregate","input":{"op":"scan","source_id":0},
+            "group_keys":[{"expr":{"e":"col","name":"k"},"alias":"k"}],
+            "aggregates":[{"func":"sum","alias":"s","input":{"e":"col","name":"v"}}]}"#,
+    );
+    let (_, m) = execute_streaming_metered(&bare, &[facts()], 0).unwrap();
+    let agg = m.ops.iter().find(|o| o.kind == "aggregate").unwrap();
+    assert_eq!(agg.backend, "interp");
+}

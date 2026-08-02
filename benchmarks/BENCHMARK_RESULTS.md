@@ -1,5 +1,89 @@
 # Batcher CPU benchmark results
 
+## TPC-H sf1 re-measured: the geomean is parity, and the suite total is one query (2026-08-02)
+
+Re-run on a quiet 16-core box, release engine, `python benchmarks/run.py --benchmark tpch
+--tier single --scale 1` (best-of-5, correctness-gated). Engines: batcher, duckdb, polars,
+pyarrow, daft. Nothing else was running; the earlier attempt in this session was discarded
+because a test suite was sharing the box.
+
+Against DuckDB on its **native** store, the two summary statistics disagree, so both belong
+in any statement of where the engine stands:
+
+| Statistic | Value |
+|---|---|
+| Per-query geometric mean `b/duckdb` | **0.991x** — parity |
+| Suite total | batcher **785.8 ms** vs duckdb **657.7 ms** = **1.19x behind** |
+| Queries won | **12 of 22** |
+
+**The divergence is a single query.** q21 is **189.4 ms against 69.4 ms**, and its 120 ms
+excess is almost exactly the suite's 128 ms deficit — drop it and the totals agree to within
+1%. So "1.19x behind on the total" and "parity on the typical query" are both true, and
+quoting either alone misleads: the first reads as a broad deficit that the per-query numbers
+do not show, the second hides that one shape costs 2.7x.
+
+Against Polars: suite total **1.35x faster** (786 ms vs 1,062 ms), geomean 0.841x, 12 of 22.
+
+Per-query `b/duckdb`, worst first: q21 2.73x, q5 1.69x, q4 1.66x, q17 1.52x, q20 1.34x,
+q13 1.25x, q3 1.22x, q22 1.20x, q7 1.17x, q18 1.07x. Wins: q15 0.20x, q16 0.62x, q10 0.68x,
+q2 0.76x, q6 0.80x, q14 0.81x, q9 0.82x, q11 0.87x, q1 0.92x, q12 0.92x, q8 0.95x, q19 0.95x.
+
+**Where q21's time goes**, from `ds.stats()` on the same shape (total 209 ms of operator time):
+
+| op | kind | rows in | rows out | ms |
+|---|---|--:|--:|--:|
+| 22 | aggregate | 6,001,215 | 1,500,000 | **99.1** |
+| 9 | hash_join | 3,793,296 | 156,739 | 53.7 |
+| 11 | filter | 6,001,215 | 3,793,296 | 46.6 |
+| 8 | hash_join | 156,739 | 75,871 | 33.3 |
+
+The aggregate is the decorrelation of the `EXISTS`/`NOT EXISTS` pair: it groups the whole
+`lineitem` by `l_orderkey` into **1.5M groups, of which only 75,871 are ever probed** — the
+outer side is reduced to that by the two joins above it before it reaches the join with this
+aggregate (op 5, which is itself only 3.6 ms). So ~95% of the most expensive operator in the
+suite's worst query is building groups nothing asks for.
+
+The fix is a semi-join reduction: restrict the aggregate's input to the order keys the outer
+side actually carries. `bc-interp::stream::runtime_filter` already sinks a join's build-side
+keys down its probe pipeline and explicitly names this query, but it cannot help here — the
+aggregate is the *build* side, so its 1.5M keys are what get sunk, and the 75,871-key side is
+the probe. Making this pay needs the build/probe roles swapped for that join **and** the
+filter traced down through the `Aggregate` into its input scan, which is sound when the
+aggregate groups by exactly the join key (each group is independent, so dropping whole groups
+cannot change the surviving ones). Both halves are open.
+
+**The learned loop is what makes q21 survivable, and it is measurable.** Five consecutive runs
+of the same shape in one session, with the estimates Kyber used printed each time:
+
+| run | wall | join-estimate provenance |
+|---|--:|---|
+| 0 | 935.2 ms | 4 default, 0 learned — `right≈1` for the nation filter (true 1), `left≈399` (true 411) |
+| 1 | 224.8 ms | 3 default, 1 learned — the filtered `lineitem` is now exact at 3,793,296 |
+| 2 | 213.5 ms | 3 default, 1 learned |
+| 3 | 208.7 ms | 3 default, 1 learned |
+| 4 | **146.9 ms** | 3 default, 1 learned |
+
+**6.4x from cold to warm, on measurement rather than tuning.** The base relations are
+`bt.from_arrow` tables, so there is no footer or manifest to seed statistics from: every join
+on run 0 falls to `_inner_join_rows`' no-distinct-counts branch, `max(|L|, |R|)`, which is
+where `left≈3,040,569` for a join whose true output is 156,739 comes from. What replaces it is
+`Core` measuring and `Kyber` consuming on the next run — the cross-query loop, doing exactly
+what it claims. Worth stating precisely because the headline benchmark number is best-of-5 and
+therefore *warm*: the cold number for this shape is 6.4x worse, and an in-memory workload run
+once has no statistics at all.
+
+The remaining `default` estimates are the three joins above the base scans, and the last of
+them (`left≈155,289 right≈1,500,000 → keep`) is **not** a build-side mistake: the decorrelation
+join preserves its outer side, so the build side is fixed by the join type rather than chosen.
+
+**Not a defect, checked and left alone:** every operator reports `backend: interp`. On the
+streaming executor filter and project genuinely do not JIT, and that is a measured decision
+(`stream/mod.rs`: wiring Tier-1 in measured 1.01x over TPC-H with five queries slower, because
+Arrow's compare/boolean kernels are already SIMD). The aggregate on that path *does* JIT via
+`compile_agg`, so the constant `"interp"` in `stream/meter.rs` under-reports it — a metrics
+accuracy bug, not an execution one.
+
+
 ## GPU matrix: ClickBench against the CPU engine, and a wrong answer it found (2026-08-01)
 
 All 43 ClickBench queries on an 8M-row `hits` subset, GPU against the CPU engine, warm.

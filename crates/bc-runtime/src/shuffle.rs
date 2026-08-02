@@ -1790,7 +1790,11 @@ mod tests {
 
         let q = string_quantiles(&key, &[0.0, 0.5, 1.0]).unwrap();
 
-        assert_eq!(q.len(), 3, "a half-null column still describes a distribution");
+        assert_eq!(
+            q.len(),
+            3,
+            "a half-null column still describes a distribution"
+        );
         assert!(q[0] < q[1] && q[1] < q[2], "degenerate grid: {q:?}");
         assert!(q[0].as_str() <= "k00000001", "low end was {}", q[0]);
         assert!(

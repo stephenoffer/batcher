@@ -188,6 +188,41 @@ pub(crate) struct AggJit {
     group: Vec<Jit>,
     input: Vec<Jit>,
     input2: Vec<Jit>,
+    /// How many of the expressions above were JIT *candidates* — everything except a bare
+    /// `Col`, which [`try_compile_computed`] declines on purpose because the interpreter
+    /// evaluates it as a zero-copy `Arc` clone.
+    ///
+    /// Kept because a `None` in the vectors above is ambiguous: it means both "the JIT
+    /// declined this expression" and "there was nothing here to compile". Reporting a
+    /// backend from the `None`s alone would tag an aggregate over bare columns — which is
+    /// most of TPC-H — as having fallen back, when in fact it never had a candidate.
+    candidates: usize,
+}
+
+impl AggJit {
+    /// The expression backend this aggregate ran on, by the same rule `par::backend_tag`
+    /// applies to filter and project: `"jit"` when every candidate compiled, `"interp"`
+    /// when none did (including the common case of having no candidates at all), and
+    /// `"interp+jit"` for a mix.
+    pub(crate) fn backend_tag(&self) -> &'static str {
+        let compiled = self
+            .group
+            .iter()
+            .chain(self.input.iter())
+            .chain(self.input2.iter())
+            .filter(|j| j.is_some())
+            .count();
+        match (compiled, self.candidates) {
+            (0, _) => "interp",
+            (c, n) if c >= n => "jit",
+            _ => "interp+jit",
+        }
+    }
+}
+
+/// Whether `expr` is an expression the JIT would even be offered — i.e. not a bare `Col`.
+fn is_jit_candidate(expr: &bc_expr::Expr) -> bool {
+    !matches!(expr, bc_expr::Expr::Col { .. })
 }
 
 /// Compile the group-key and aggregate-input expressions once, using `sample` as a
@@ -220,6 +255,13 @@ pub(crate) fn compile_agg(
                     .and_then(|e| try_compile_computed(e, sample))
             })
             .collect(),
+        candidates: group_keys
+            .iter()
+            .map(|k| &k.expr)
+            .chain(aggregates.iter().filter_map(|a| a.input.as_ref()))
+            .chain(aggregates.iter().filter_map(|a| a.input2.as_ref()))
+            .filter(|e| is_jit_candidate(e))
+            .count(),
     }
 }
 

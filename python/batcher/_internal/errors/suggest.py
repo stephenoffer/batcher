@@ -247,7 +247,12 @@ def unknown_message(
             parts.append(phrase)
     listed = candidate_list(pool, limit=limit, label=label or f"Available {kind}s", sort=sort)
     if listed:
-        parts.append(listed)
+        # Terminate the list when a hint follows it, because the hint is a new sentence and
+        # the parts are joined with a bare space. Without this the two run together —
+        # "Available columns: 'id', 'text' Pass an existing column to column." — which is
+        # what all 34 hint-passing call sites produced. Unterminated when it is last, so the
+        # common no-hint message is unchanged.
+        parts.append(f"{listed}." if hint else listed)
     if hint:
         parts.append(hint)
     return " ".join(parts)
