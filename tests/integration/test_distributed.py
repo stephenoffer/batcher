@@ -1562,3 +1562,63 @@ def test_distributed_sample_matches_single_node(tmp_path, transport):
         bt.read.parquet(path).sample(n=5, seed=3).collect(
             distributed=True, num_workers=4, transport=transport
         )
+
+
+def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(tmp_path):
+    """`union -> group_by` runs, but its result cannot feed a join or a second aggregate.
+
+    The controls matter more than the assertions here, because three plausible readings of
+    this gap are all wrong and each one is ruled out below:
+
+    * it is not about the join being outer -- a `distinct` over the same union feeds a LEFT
+      join fine, and the refused join below is INNER;
+    * it is not about a breaker over a union -- `distinct` over a union feeds a `group_by`;
+    * it is not about two-level aggregation -- `group_by -> group_by` over a plain scan runs.
+
+    What all the refused shapes share is an aggregate whose input contains a `union`, feeding
+    another pipeline breaker. Feeding a filter, a sort or a `distinct` is fine, and
+    materializing the aggregate first (`bt.from_arrow(...collect())`) clears it, which is the
+    workaround where the intermediate is small enough to pass through the driver.
+
+    `batcher.graph` hits this in `degree_distribution` and in the link-prediction scores,
+    which is why they raise under `distributed=True`. The degree functions used to hit it too
+    and no longer do.
+    """
+    import pyarrow.parquet as pq
+
+    n = 2_000
+    t = pa.table(
+        {"a": (np.arange(n) % 40).astype("int64"), "b": (np.arange(n) % 31).astype("int64")}
+    )
+    path = str(tmp_path / "au.parquet")
+    pq.write_table(t, path, row_group_size=500)
+    e = bt.read.parquet(path)
+
+    def run(ds):
+        return ds.collect(distributed=True, num_workers=4, transport="disk")
+
+    unioned = e.select(k=col("a")).union(e.select(k=col("b")))
+    scan_side = e.select(k=col("a"), z=col("b"))
+
+    # Controls: each is one ingredient of the refused shape, and each one runs.
+    run(unioned.group_by("k").agg(m=count()))
+    run(e.group_by("a").agg(m=count()).group_by("m").agg(c=count()))
+    run(unioned.distinct().group_by("k").agg(c=count()))
+    run(
+        unioned.distinct().join(
+            e.group_by("a").agg(m=count()).select(k=col("a")), on="k", how="left"
+        )
+    )
+    run(unioned.group_by("k").agg(m=count()).filter(col("m") > 0).sort("k"))
+
+    # The aggregate over the union cannot feed a join, even against a plain scan.
+    with pytest.raises(PlanError, match="no path for this plan shape"):
+        run(unioned.group_by("k").agg(m=count()).join(scan_side, on="k"))
+
+    # ...nor a second aggregate.
+    with pytest.raises(PlanError, match="no path for this plan shape"):
+        run(unioned.group_by("k").agg(m=count()).group_by("m").agg(c=count()))
+
+    # Materializing between the two clears it, which is the documented workaround.
+    staged = bt.from_arrow(unioned.group_by("k").agg(m=count()).collect())
+    run(staged.group_by("m").agg(c=count()))

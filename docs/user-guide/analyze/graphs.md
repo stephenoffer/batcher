@@ -389,8 +389,37 @@ an optimization to add later.
   each round's state is collected and re-wrapped. The edge-side joins still distribute --
   the state is one row per *node*, not per edge -- but the driver round-trip is the real
   ceiling on an iterative algorithm here: a graph with more nodes than the driver can hold
-  will not finish, however many workers you add. Degree, triangles and the link-prediction
-  scores are single-pass and have no such limit.
+  will not finish, however many workers you add. The degree functions are single-pass and
+  have no such limit.
+- **Eleven algorithms cannot run under an explicit `distributed=True`.** They build a plan
+  shape the distributed executor has no path for, so `collect(distributed=True)` on a
+  file-backed graph raises `PlanError` rather than running. They still compute the right
+  answer single-node, and the default `distributed="auto"` still returns it, so this is a
+  scaling ceiling rather than a wrong result. The affected functions are `triangles`,
+  `triangle_count`, `clustering_coefficient`, `structural_features`, `candidate_pairs`,
+  `degree_distribution`, and the five link-prediction scores `adamic_adar`,
+  `common_neighbors`, `jaccard_similarity`, `preferential_attachment` and
+  `resource_allocation`.
+
+  One engine limit accounts for all eleven, and it is reproducible in plain Batcher with no
+  graph code (`tests/integration/test_distributed.py` pins it with its controls). An
+  aggregate whose input contains a `union` cannot feed a join or a second aggregate. On its
+  own it distributes, and it can feed a filter, a sort or a `distinct`, but a `group_by` or
+  a join above it has no distributed path. Every one of these algorithms counts something
+  per node, which means aggregating over the edge table read from both directions, and then
+  joins or re-aggregates that count.
+
+  Three natural readings of that limit are wrong, so do not plan around them: it is not
+  about outer joins, since a `distinct` over the same union feeds a left join fine; it is
+  not about a pipeline breaker over a `union`, since a `distinct` there is fine; and it is
+  not about two-level aggregation, since `group_by` over `group_by` distributes over a plain
+  scan.
+
+  There are two ways around it. Where the join only restored zero rows for nodes that
+  contributed none, emit those rows as another `union` arm feeding the same `group_by`
+  instead; that is what the degree functions do and why they distribute. Otherwise
+  materialize the aggregate with `bt.from_arrow(ds.collect())` before the next step, which
+  clears the limit at the cost of passing that intermediate through the driver.
 - **An in-memory edge table never distributes, by design.** `distributed="auto"` routes a
   plan whose sources are all resident in the driver to single-node at any size, because
   shipping resident data out and gathering it back costs more than the compute it
