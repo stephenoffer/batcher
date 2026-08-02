@@ -19,5 +19,5 @@ python examples/dataset/sql_interface.py
 
 - {doc}`/cookbook/dataset/cleaning/sampling_and_splits`: reproducible subsets that do not leak.
 - {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, unnest, and set operations.
-- {doc}`/user-guide/transform/transformations`: the full transformation surface these recipes draw on.
+- {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.

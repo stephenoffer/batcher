@@ -7,9 +7,9 @@ description: Port a Daft workload to Batcher's public Python API — the relatio
 
 Daft and Batcher target the same shape of work: multimodal and ML-first pipelines
 over a native columnar engine, distributed with Ray. The port is mostly mechanical.
-Read `docs/migration/transforming.md` and `docs/migration/reading-and-writing.md`
+Read `docs/getting-started/migration/transforming.md` and `docs/getting-started/migration/reading-and-writing.md`
 (the mapping tables and the `from_*`/`to_*` adapters)
-and `docs/benchmarks/vs-daft.md` (the scorecard) before promising a user a speedup.
+and `docs/benchmarks/comparisons/vs-daft.md` (the scorecard) before promising a user a speedup.
 Batcher wins multimodal ingest and top-N and ties aggregation. The join-heavy TPC-H
 result is **hardware-dependent and has moved**: that page measures Daft ahead on a
 16-core node, while a 96-core re-run at sf1 has Batcher ahead on 18 of the 19 queries
@@ -229,7 +229,7 @@ Daft is the one that departs from SQL, both found by running it against DuckDB:
   legitimately produce different numbers, and the new ones are the correct ones. Tell the
   user; do not "fix" the port to reproduce the old output.
 - **TPC-H q6's float folding.** Daft folds `0.06 + 0.01` to `0.06999999999999999` and
-  drops every `l_discount = 0.07` row (see `docs/benchmarks/vs-daft.md`).
+  drops every `l_discount = 0.07` row (see `docs/benchmarks/comparisons/vs-daft.md`).
 
 The general move: when a ported result differs, run the same query through DuckDB before
 assuming the port is wrong.
@@ -250,7 +250,7 @@ assuming the port is wrong.
   expression touches? Leave it `None` (the default) — every column stays alive.
 - **Do not promise a blanket speedup**, in either direction. The join-heavy TPC-H
   comparison depends on core count and has reversed between the two machines measured;
-  per-batch Python UDFs are still Daft's by ~2×. Quote `docs/benchmarks/vs-daft.md`
+  per-batch Python UDFs are still Daft's by ~2×. Quote `docs/benchmarks/comparisons/vs-daft.md`
   *with its conditions*, never a bare multiplier.
 - **Do expect a ported SQL workload to change answers where Daft was wrong.** On TPC-H
   at sf1 the harness's DuckDB gate fails Daft on q6, q15 and q18 and Daft errors on q21
@@ -259,12 +259,12 @@ assuming the port is wrong.
 
 ## See also
 
-- `docs/migration/transforming.md`, `docs/migration/reading-and-writing.md` — the full
+- `docs/getting-started/migration/transforming.md`, `docs/getting-started/migration/reading-and-writing.md` — the full
   mapping tables and `from_*`/`to_*` adapters.
-- `docs/benchmarks/vs-daft.md`, `docs/benchmarks/multimodal-ingest.md` — the measured
+- `docs/benchmarks/comparisons/vs-daft.md`, `docs/benchmarks/results/multimodal-ingest.md` — the measured
   comparison and the image/point-cloud pipelines.
 - `docs/api/models/ml.md`, `docs/ml/` — the inference, embedding, and training-feed surface.
-- `docs/user-guide/transform/udfs.md` — when a UDF is justified and what it costs.
-- `docs/deep-dives/distribution/shuffle-flight.md`, `docs/deep-dives/operators/mergeable-algebra.md` — why the
+- `docs/user-guide/transform/columns/udfs.md` — when a UDF is justified and what it costs.
+- `docs/architecture/deep-dives/distribution/shuffle-flight.md`, `docs/architecture/deep-dives/operators/mergeable-algebra.md` — why the
   distributed result equals the single-node one, without the object store.
 - `/migrate-from-polars-or-pandas`, `/migrate-from-spark` — the sibling migration skills.

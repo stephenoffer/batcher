@@ -146,7 +146,7 @@ python benchmarks/scenarios/audio_decode.py       # native audio decode vs a sou
 On a 96-core node these show batcher **2.4× faster than Daft** on image decode+resize,
 and they exercise the physical-AI (camera / LiDAR / audio) ingest path. Findings and the
 fix chain are in
-`BENCHMARK_RESULTS.md`; the mechanism is documented in `docs/user-guide/operate/performance.md`
+`BENCHMARK_RESULTS.md`; the mechanism is documented in `docs/user-guide/operate/tuning/performance.md`
 ("Multimodal & physical-AI ingest").
 
 ### Structured streaming (Batcher vs Spark Structured Streaming)

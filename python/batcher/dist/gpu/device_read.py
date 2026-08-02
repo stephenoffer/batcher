@@ -12,9 +12,12 @@ and every one of them is checked before the read rather than hoped for afterward
 
 * the shard's splits must be plain Parquet locators of types both readers agree on, which is
   `io.splits.device`'s question, not this module's;
-* **nothing may have been pushed into the read.** A predicate the host reader would have used
-  to skip row groups is not carried here, so a device read that ignored it would move far more
-  bytes than the read it replaced. A selective query keeps the selective reader;
+* **a pushed predicate must already have done its skipping.** The concern is bytes, not rows:
+  a device read that ignored a predicate the host reader would have used to skip row groups
+  would move far more of them than the read it replaced. A row-group locator was produced by
+  applying that predicate to the footer at *plan* time, so the skipping has happened and both
+  readers move the same bytes; a whole-file locator was never pruned, so a predicate still
+  disqualifies it. `io.splits.device` draws that line;
 * the frame that comes back must present the schema the host path would have. It is compared,
   not assumed — a device Parquet reader is a second implementation, and the one failure this
   cannot tolerate is a shard whose schema differs from its neighbours' in a concatenation.
@@ -48,8 +51,8 @@ def read_descriptor_on_device(descriptor: dict, be: DfBackend):
 
     Returns:
         A device dataframe holding the shard's rows, or `None` when the shard is not
-        device-readable, when a predicate was pushed into its read, or when the device reader
-        produced a schema the host reader would not have.
+        device-readable, when a pushed predicate would still have skipped bytes this read
+        cannot, or when the device reader produced a schema the host reader would not have.
 
     Examples:
         .. doctest::
@@ -103,13 +106,21 @@ def _widen(frame, descriptor: dict, projection: list[str] | None, be: DfBackend)
 
 
 def _specs(descriptor: dict):
-    """The device locators for this descriptor, or `None` when it must go through the host."""
+    """The device locators for this descriptor, or `None` when it must go through the host.
+
+    The predicate goes to `device_read_specs` rather than disqualifying the read here. It once
+    did disqualify it, which cost the device path exactly the queries it was built for: a
+    scan-heavy query is a filtered one, so the decode this exists to move onto the device stayed
+    on a CPU core for every TPC-H and ClickBench shape. What the predicate would have skipped,
+    a `RowGroupSplit` has already skipped at plan time — see that module for which splits carry
+    the pruning and which do not.
+    """
     from batcher.io.splits.device import device_read_specs
 
     splits = descriptor.get("splits")
-    if not splits or descriptor.get("predicate") is not None:
+    if not splits:
         return None
-    return device_read_specs(splits, descriptor.get("projection"))
+    return device_read_specs(splits, descriptor.get("projection"), descriptor.get("predicate"))
 
 
 def _publish_transfer_path(specs: list) -> None:

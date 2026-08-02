@@ -1,12 +1,19 @@
 name: CI
 
-# Runs the project quality gate (the `just test` sequence plus the lint gates) on
-# every push and pull request. Mirrors the local gate documented in CLAUDE.md:
-# `just check` → `just test-rust` → `just build` → `just test-py`, with the ruff,
-# layer-independence, and structure linters. Heavy optional backends
-# (ray/torch/tensorflow/gpu) are not installed, so tests that require them skip via
-# `importorskip`; the deterministic core suite (unit/differential/property/io/docs)
-# is what gates here, the same subset as `just cov-gate`.
+# Runs the project quality gate on every push and pull request: `just check` →
+# `just test-rust` → `just build` → `just cov-gate` → `pytest tests/integration`, with the
+# ruff, layer-independence, structure, duplication, guardrail, skip-budget and docstring
+# linters.
+#
+# This used to claim it mirrored `just test-py`, and it did not — the only Python test step
+# was `just cov-gate`, whose COV_PATHS deliberately excludes tests/integration. The result was
+# that 167 integration files were never *collected* here, which is how a test module that
+# failed to import survived five days with every gate green. The integration step below closes
+# that; keep this comment honest against the steps if you change them.
+#
+# Heavy optional backends (ray/torch/tensorflow/gpu) are not installed, so tests needing them
+# skip via `importorskip`. That hole is real and intentional — `just lint-skips` ratchets its
+# size so it cannot grow unnoticed.
 
 on:
   push:
@@ -70,6 +77,15 @@ jobs:
       - name: Guardrail docs are true
         run: just lint-guardrails
 
+      - name: Unreachable-suite budget
+        run: just lint-skips
+
+      - name: Layering exemption ratchet
+        run: just lint-layer-debt
+
+      - name: Gate-suppression ratchet
+        run: just lint-suppressions
+
       - name: Public-API docstrings
         run: just lint-docstrings
 
@@ -78,3 +94,21 @@ jobs:
 
       - name: Python tests + coverage gate
         run: just cov-gate
+
+      # `cov-gate` runs the deterministic subset only (COV_PATHS), which excludes
+      # tests/integration because those flake under coverage instrumentation's timing. That
+      # exclusion was silently load-bearing: CI ran *only* cov-gate, so 167 integration files
+      # were never collected at all — not skipped, never looked at. A deleted helper
+      # (`plan.feedback.faulted_bytes`, removed in b2fe98ee as "nothing calls it") left
+      # test_hardware_telemetry.py failing to import for five days with every gate green.
+      # Run them here without coverage: the flake reason does not apply, and the ~1,000 tests
+      # that need no Ray actually execute.
+      # `--timeout` is not optional here. Run locally against a Ray cluster this suite can
+      # block indefinitely — a hung distributed test looks identical to a slow one, and
+      # without a per-test limit it wedges the job until the runner's own timeout kills it
+      # with no indication of which test was at fault. CI installs no Ray, so those tests skip
+      # and this mainly guards the ~1,000 that do run; keep it anyway, because the failure it
+      # prevents is the one that wastes the most time to diagnose.
+      - name: Integration tests (no coverage instrumentation)
+        run: pytest tests/integration -q --timeout=300
+        timeout-minutes: 30

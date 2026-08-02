@@ -226,10 +226,10 @@ In order of frequency:
 - {doc}`Distributed training </ml/training/distributed-training>`: the multi-rank sharding contract.
 - {doc}`Streaming for training </ml/inference/streaming>`: the bounded-memory ingest path.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: the fit-on-train, transform-the-stream contract.
-- {doc}`Tensor columns </deep-dives/memory/tensor-columns>`: how a fixed-shape tensor reaches the
+- {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how a fixed-shape tensor reaches the
   loop with its shape intact.
-- {doc}`GPU execution </deep-dives/distribution/gpu-execution>`: what the device is waiting on when it
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: what the device is waiting on when it
   is waiting.
-- {doc}`Distributed training pipeline </tutorials/distributed-training-pipeline>`: the
+- {doc}`Distributed training pipeline </tutorials/ml/distributed-training-pipeline>`: the
   whole path, from files to a loop.
 - {doc}`ML API </api/models/ml>`: the loader and converter reference.

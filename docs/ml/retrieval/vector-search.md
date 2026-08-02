@@ -209,11 +209,11 @@ corpus size and query pattern to a row:
 - {doc}`Embeddings </ml/retrieval/embeddings>`: producing and normalizing the vectors.
 - {doc}`RAG </ml/retrieval/rag>`: retrieval feeding a generation step.
 - {doc}`Expressions API </api/relational/expressions>`: the full `.list` vector method set.
-- {doc}`Expression evaluation </deep-dives/query/expression-evaluation>`: why a vector distance
+- {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: why a vector distance
   is one more vectorized expression, and what that buys.
-- {doc}`Sort internals </deep-dives/operators/sort-internals>`: the bounded heap behind `top_k`.
-- {doc}`RAG index recipe </cookbook/ml/pipelines/rag-index>`: building and querying the index.
-- {doc}`Distinct and dedup </user-guide/transform/distinct-and-dedup>`: the exact and near-duplicate
+- {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: the bounded heap behind `top_k`.
+- {doc}`RAG index recipe </cookbook/ml/pipelines/text/rag-index>`: building and querying the index.
+- {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: the exact and near-duplicate
   tools the last row of that table points at.
 - {doc}`ML API </api/models/ml>`: the `build_vector_index`, `vector_search`, and
   `similarity_join` reference.

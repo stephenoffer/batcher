@@ -133,6 +133,11 @@ _DATE_ATTRS = frozenset({"day", "day_of_year", "days_in_month", "hour",
 #: (`days_in_year` lowers to exactly that, and raised rather than returning a number).
 _DATE_BOOL_ATTRS = frozenset({"is_leap_year"})
 
+#: Date functions that are a `.dt` *method* returning the English name of a calendar unit. Both
+#: libraries spell them the same way and both produce the engine's full names ("Thursday",
+#: "February") rather than abbreviations, which is the only thing that could have differed.
+_DATE_NAME_METHODS = {"dayname": "day_name", "monthname": "month_name"}
+
 
 def eval_math(ir, df, be, eval_expr):
     x = be.column(eval_expr(ir["input"], df, be), df)
@@ -316,6 +321,10 @@ def eval_date(ir, df, be, eval_expr):
     x = be.column(eval_expr(ir["input"], df, be), df)
     if fn in _DATE_ATTRS:
         return getattr(x.dt, fn).astype(be.dtype(_int64()))
+    if fn in _DATE_NAME_METHODS:
+        from batcher.core.gpu_plan.backend import call_or_decline
+
+        return call_or_decline(x.dt, _DATE_NAME_METHODS[fn])
     if fn in _DATE_BOOL_ATTRS:
         import pyarrow as pa
 

@@ -122,7 +122,7 @@ The whole ingest chain of scan, strip, chunk, explode, dedupe, and embed is row-
 apart from the dedup, so it streams and distributes with no breaker before the GPU stage.
 The one thing no static estimate can know is how many chunks a document yields. The
 engine measures the real fan-out on the first run and sizes the downstream GPU stage for
-it on the next. See {doc}`adaptive re-optimization </internals/kyber>`.
+it on the next. See {doc}`adaptive re-optimization </architecture/internals/kyber>`.
 
 ## Retrieval
 
@@ -356,10 +356,10 @@ retrieves nonsense with confident-looking distances.
 - {doc}`LLM inference </ml/retrieval/llm/index>`: engines, chat templates, structured output.
 - {doc}`Governance </user-guide/trust/governance>`: row filters and column masks, if the corpus
   is not all one tenant's.
-- {doc}`RAG from scratch </tutorials/rag-from-scratch>`: the tutorial, built up step by
+- {doc}`RAG from scratch </tutorials/ml/rag-from-scratch>`: the tutorial, built up step by
   step.
-- {doc}`RAG index recipe </cookbook/ml/pipelines/rag-index>`: the ingest half as a runnable job.
-- {doc}`Adaptive re-optimization </deep-dives/adaptive/adaptive-reoptimization>`: how the engine
+- {doc}`RAG index recipe </cookbook/ml/pipelines/text/rag-index>`: the ingest half as a runnable job.
+- {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: how the engine
   learns the chunk fan-out no static estimate could know.
-- {doc}`AI and GPU benchmarks </benchmarks/ai-and-gpu>`: what the embed and generate
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what the embed and generate
   stages cost.

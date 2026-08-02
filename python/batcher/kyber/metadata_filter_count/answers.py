@@ -26,6 +26,7 @@ from batcher.kyber.stats import StatsEstimator
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.bloom_index import BloomIndex
 from batcher.plan.expr_ir import Binary, Col, IsNotNull, IsNull, Lit, Not
+from batcher.plan.ir_tags import COMPARISON_FLIP, COMPARISON_OPS
 from batcher.plan.logical import Filter, LogicalPlan, Project, Scan
 from batcher.plan.stats import ColumnStat, Provenance, RelStats, mismatched_exactness
 
@@ -36,9 +37,7 @@ __all__ = [
 ]
 
 # Comparison operators whose provably-empty side is exact from footer min/max bounds.
-_COMPARE_OPS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
 # Flip a comparison when the literal is on the left (`lit < col` == `col > lit`).
-_FLIP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def answer_filter_count(
@@ -249,13 +248,13 @@ def _is_null_tautology(pred) -> str | None:
 
 def _parse_comparison(expr) -> tuple[str, str, object] | None:
     """Recognise `col OP lit` / `lit OP col` as `(op, column, value)` (flipped), else None."""
-    if not isinstance(expr, Binary) or expr.op not in _COMPARE_OPS:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_OPS:
         return None
     left, right = expr.left, expr.right
     if isinstance(left, Col) and isinstance(right, Lit):
         return expr.op, left.name, right.value
     if isinstance(left, Lit) and isinstance(right, Col):
-        return _FLIP[expr.op], right.name, left.value
+        return COMPARISON_FLIP[expr.op], right.name, left.value
     return None
 
 

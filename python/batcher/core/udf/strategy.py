@@ -57,7 +57,7 @@ PROC_MIN_BATCH_ROWS = 65_536
 # 1 M is the measured bottom of that curve, and is optimal at 6 M and 12 M input rows too,
 # so it is a per-call row count rather than a function of the total. A previous revision set
 # 131,072 as "flat from here up"; it is not — that is 2.7x off the optimum. Full curve in
-# `docs/internals/daft_parity_ledger.md`.
+# `docs/architecture/internals/daft_parity_ledger.md`.
 _THREAD_LIGHT_COARSE_ROWS = 1_048_576
 # The coarsening ceiling for a *heavy* `fn`, which keeps the per-worker split so every core
 # stays busy. Left where it was: the measurement above concerns per-call overhead on the light

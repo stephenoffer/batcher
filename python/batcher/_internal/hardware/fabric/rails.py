@@ -220,23 +220,29 @@ def rail_aligned(ordinal: int, nic: str, assignment: Mapping[int, str] | None = 
 def rail_imbalance(rail_records: Sequence[Rail] | None = None) -> float:
     """How unevenly the node's devices are spread over its rails, `0.0` being perfect.
 
-    Defined as `1 - (mean devices per loaded rail / max devices on any rail)`, over rails that
-    carry at least one device, and `0.0` for a node with one rail or none — a single rail
-    cannot be unbalanced against itself.
+    Defined as `1 - (mean devices per rail / max devices on any rail)` over **every** active
+    rail, and `0.0` for a node with one rail or none — a single rail cannot be unbalanced
+    against itself.
 
-    The figure is worth an alert rather than a log line. A node whose eight devices all chose
-    one NIC reports `0.0` on every port counter, `ACTIVE` on every port, and full nameplate
-    fabric bandwidth, while carrying an eighth of it.
+    **Every rail, including the empty ones.** Measuring only the loaded rails made the metric
+    blind to the exact fault it is documented to catch: a node whose eight devices all chose
+    one NIC has a single loaded rail, so the load list has one entry, the `<= 1` guard fires,
+    and the answer is `0.0` — perfectly balanced. That is the worst wiring a dense node can
+    have, and it is also the one it reported as healthy, alongside `ACTIVE` on every port,
+    zero errors, and the full summed port rate while carrying an eighth of it. `rails()`
+    deliberately keeps a record for every active NIC so this evidence exists; filtering it out
+    here threw it away one line later.
 
     Args:
         rail_records: Rails to measure, or `None` to take them live.
 
     Returns:
         `0.0` (balanced or undecidable) through just under `1.0` (everything on one rail of
-        many).
+        many). `0.0` when no device is placed at all, which is an absent topology rather than
+        an imbalanced one.
     """
     records = rails() if rail_records is None else rail_records
-    loads = [len(r.devices) for r in records if r.devices]
+    loads = [len(r.devices) for r in records]
     if len(loads) <= 1:
         return 0.0
     peak = max(loads)

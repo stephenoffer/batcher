@@ -27,6 +27,7 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, IsNotNull, Lit
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts
+from batcher.plan.ir_tags import COMPARISON_FLIP, ORDERING_COMPARISONS
 from batcher.plan.logical import Filter, LogicalPlan
 
 __all__ = [
@@ -44,12 +45,10 @@ __all__ = [
     "tighten_comparison_bounds",
 ]
 
-_ORDER = frozenset({"lt", "le", "gt", "ge"})
 _LOWER = frozenset({"gt", "ge"})
 _UPPER = frozenset({"lt", "le"})
-_ALL_CMP = _ORDER | {"eq", "ne"}
+_ALL_CMP = ORDERING_COMPARISONS | {"eq", "ne"}
 # Flip a comparison when the column is written on the right (`lit < col` ≡ `col > lit`).
-_FLIP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le", "eq": "eq", "ne": "ne"}
 _OPS = {"lt": operator.lt, "le": operator.le, "gt": operator.gt, "ge": operator.ge}
 
 
@@ -75,7 +74,7 @@ def _col_op_lit(conj: Expr) -> tuple[str, str, object] | None:
     if isinstance(left, Col) and isinstance(right, Lit) and not _bad_literal(right.value):
         return left.name, conj.op, right.value
     if isinstance(right, Col) and isinstance(left, Lit) and not _bad_literal(left.value):
-        return right.name, _FLIP[conj.op], left.value
+        return right.name, COMPARISON_FLIP[conj.op], left.value
     return None
 
 
@@ -311,7 +310,7 @@ def refine_in_list_by_comparison(node: Filter, _ctx: OptimizerContext) -> Logica
         name, values = found
         for j, other in enumerate(conjuncts):
             parsed = _col_op_lit(other)
-            if parsed is None or parsed[0] != name or parsed[1] not in _ORDER:
+            if parsed is None or parsed[0] != name or parsed[1] not in ORDERING_COMPARISONS:
                 continue
             op, lit = parsed[1], parsed[2]
             try:
@@ -476,7 +475,7 @@ def _order_edges(conjuncts: list[Expr]) -> tuple[dict[tuple[str, str], bool], se
     edges: dict[tuple[str, str], bool] = {}
     pairs: set = set()
     for conj in conjuncts:
-        if not (isinstance(conj, Binary) and conj.op in _ORDER):
+        if not (isinstance(conj, Binary) and conj.op in ORDERING_COMPARISONS):
             continue
         left, right = conj.left, conj.right
         if not (isinstance(left, Col) and isinstance(right, Col)):

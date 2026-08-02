@@ -16,8 +16,13 @@ three implement identically and rejects everything else, which keeps the guarant
   Unicode by default, Python's are Unicode on `str`, and cuDF's are not, so they agree on ASCII
   and diverge on the first accented letter. That is the worst possible failure shape: correct in
   every test and wrong on real text;
-* **rejected — `$`**. Python's matches before a trailing newline and Rust's does not, so
-  `^[0-9]+$` disagrees about `"12\\n"`;
+* **accepted as the final character, then gated on the data — `$`**. Python's matches before a
+  trailing newline and Rust's does not, so `^[0-9]+$` disagrees about `"12\\n"` — and about
+  nothing else. That makes it a property of the *column* rather than of the pattern, so the
+  scanner takes a trailing `$` and `_check_end_anchor` declines at execution time when a row
+  actually ends in a newline. Refusing it outright, which this used to do, gave up every
+  anchored pattern there is to avoid a string most text does not contain. A `$` anywhere else
+  is a literal inside a class or an anchor that can never match, and is still rejected;
 * **rejected — lookaround, backreferences, inline flags, POSIX and Unicode classes**, none of
   which all three even implement;
 * **accepted** — literals, escaped metacharacters, `\\xNN`, explicit character classes and
@@ -38,7 +43,7 @@ from batcher.core.gpu_plan.backend import Unsupported, call_or_decline
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
 
-__all__ = ["REGEX_FNS", "eval_regex", "portable"]
+__all__ = ["REGEX_FNS", "eval_regex", "portable", "shorthand_classes"]
 
 #: The regex functions translated here. Three are absent and stay that way. `regexp_extract_all`
 #: and `regexp_split` return a *list* column, and the only spelling pandas has for either
@@ -55,6 +60,21 @@ _LITERAL_ESCAPES = frozenset(".^$*+?()[]{}|\\/-tnrfv \"'#&~=<>,:;!@%_`")
 #: Hexadecimal digits, for the `\xNN` escape — the one non-literal escape that is portable,
 #: and the one `[^\x00-\x7F]` (the non-ASCII test) is built from.
 _HEX = frozenset("0123456789abcdefABCDEF")
+
+#: The shorthand character classes and the word boundary built on them. Portable **only over a
+#: restricted alphabet** — see `RESTRICTED_ALPHABET`.
+_SHORTHAND = frozenset("wWsSdDbB")
+
+#: The characters over which the shorthand classes provably mean the same thing in all three
+#: engines: printable ASCII, tab, newline and carriage return.
+#:
+#: Everything outside it was measured to disagree. `\w` is Unicode in the engine's Rust and in
+#: cuDF it is not, so they part company on the first accented letter. And the divergence is not
+#: only about non-ASCII: `\s` matches a vertical tab in the engine and **not** in the host
+#: backend's RE2, so `\x0b` alone is enough to make the same pattern count differently on the
+#: same data. Restricting to this alphabet removes both, because within it the Unicode and
+#: ASCII definitions of `\w`, `\s` and `\d` are the same set.
+RESTRICTED_ALPHABET = r"[^\t\n\r\x20-\x7e]"
 
 
 def portable(pattern: str) -> bool:
@@ -81,13 +101,24 @@ def portable(pattern: str) -> bool:
             if nxt == "x" and i + 3 < n and pattern[i + 2] in _HEX and pattern[i + 3] in _HEX:
                 i += 4
                 continue
+            if nxt in _SHORTHAND:
+                # Portable only over the restricted alphabet, which the caller then checks the
+                # *data* against. Accepted here so the pattern is not rejected outright.
+                i += 2
+                continue
             if nxt not in _LITERAL_ESCAPES:
-                # `\w`, `\s`, `\d`, `\b`, `\p{...}`, `\1` — every one of them dialect-sensitive.
+                # `\p{...}`, `\1`, `\A` — dialect-sensitive with no alphabet that rescues them.
                 return False
             i += 2
             continue
         if char == "$":
-            return False
+            # Only as the final character, where it is the end anchor and the caller checks the
+            # data for a trailing newline. Anywhere else it is either a literal inside a class
+            # or an anchor that can never match, and neither is worth classifying.
+            if i != n - 1:
+                return False
+            i += 1
+            continue
         if pattern.startswith("[:", i):
             # A POSIX class (`[[:alpha:]]`). Rust implements it, Python does not, and cuDF has
             # its own list — three different answers to the same bracket.
@@ -99,10 +130,67 @@ def portable(pattern: str) -> bool:
     return True
 
 
+def shorthand_classes(pattern: str) -> bool:
+    """Whether `pattern` uses a shorthand class, so its data must be checked against the
+    restricted alphabet.
+
+    Args:
+        pattern: The regular expression from the plan.
+
+    Returns:
+        True when `\\w`, `\\s`, `\\d`, `\\b` or a negation of one appears unescaped.
+    """
+    i, n = 0, len(pattern)
+    while i < n:
+        if pattern[i] == "\\" and i + 1 < n:
+            if pattern[i + 1] in _SHORTHAND:
+                return True
+            i += 2
+            continue
+        i += 1
+    return False
+
+
 def _checked(pattern: str) -> str:
     if not portable(pattern):
         raise Unsupported(f"regex pattern {pattern!r} is not portable across the backends")
     return pattern
+
+
+def _check_end_anchor(x, pattern: str) -> None:
+    """Decline a `$`-anchored pattern over data whose rows end in a newline.
+
+    The one string where the engine's end-of-text anchor and cuDF's "end, or just before a
+    trailing newline" part company. `endswith` answers it without a regex, so the check cannot
+    itself be a source of dialect difference.
+    """
+    if not pattern.endswith("$"):
+        return
+    trailing = call_or_decline(x.str, "endswith", "\n")
+    if bool(trailing.fillna(False).any()):
+        raise Unsupported(
+            f"regex pattern {pattern!r} anchors at the end over text with a trailing newline, "
+            "where the three regex engines disagree"
+        )
+
+
+def _check_alphabet(x, pattern: str) -> None:
+    """Decline a shorthand-class pattern over data the three engines would read differently.
+
+    One scan of the column, which is the same shape of data-dependent decline the aggregates
+    already take over a `NaN`. It buys back roughly thirty-five text functions — `word_count`,
+    `punctuation_ratio`, `has_email`, `normalize_whitespace` and their neighbours are every one
+    of them a `\\w` or a `\\s` underneath — on the ASCII text that is almost all of what they
+    are ever pointed at, without claiming anything about the text where they would differ.
+    """
+    if not shorthand_classes(pattern):
+        return
+    outside = call_or_decline(x.str, "contains", RESTRICTED_ALPHABET, regex=True)
+    if bool(outside.fillna(False).any()):
+        raise Unsupported(
+            f"regex pattern {pattern!r} uses a shorthand class over non-ASCII text, "
+            "where the three regex engines disagree"
+        )
 
 
 def _checked_replacement(replacement: str) -> str:
@@ -132,6 +220,8 @@ def eval_regex(fn: str, x, ir: dict, be: DfBackend):
     import pyarrow as pa
 
     pattern = _checked(str(ir["pattern"]))
+    _check_alphabet(x, pattern)
+    _check_end_anchor(x, pattern)
     if fn == "regexp_count":
         # Both libraries spell a regex count `.str.count`, and both count non-overlapping
         # matches, which is what the engine reports.

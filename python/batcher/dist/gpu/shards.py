@@ -28,6 +28,7 @@ __all__ = [
     "device_peak_marker",
     "is_memory_failure",
     "measured_parts",
+    "narrowed_schema",
     "peak_from_error",
     "plan_shard_count",
     "source_bytes",
@@ -37,6 +38,35 @@ __all__ = [
 #: Bytes per row assumed for a relation whose schema cannot be measured. Deliberately generous:
 #: an under-estimate makes shards too large, and the recovery for that is a failed device.
 _FALLBACK_ROW_BYTES = 128
+
+
+def narrowed_schema(schema, projection: list[str] | None):
+    """`schema` restricted to `projection` — the width a shard read through it actually holds.
+
+    Packing prices a shard from its schema, so a projected read priced at the relation's full
+    width looks several times larger than it is and the fan-out packs fewer tasks onto each
+    board than fit. Both the aggregate and the join fan-outs narrow the same way, from here,
+    rather than each keeping its own copy of a two-line rule.
+
+    Args:
+        schema: The source's Arrow schema, or `None` when it could not be read.
+        projection: The columns the read returns, or `None` for all of them.
+
+    Returns:
+        The narrowed schema, or `schema` unchanged when there is nothing to narrow or a name
+        is absent. A name the schema does not carry leaves it alone rather than raising:
+        mispricing costs a slower fan-out, and this is not where a bad projection should
+        surface.
+    """
+    if schema is None or projection is None:
+        return schema
+    try:
+        import pyarrow as pa
+
+        return pa.schema([schema.field(name) for name in projection])
+    except Exception as exc:
+        note_suppressed("dist", "narrow the shard packing schema to the projection", exc)
+        return schema
 
 
 def source_bytes(source, projection: list[str] | None = None) -> float:

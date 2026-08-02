@@ -148,7 +148,7 @@ for one (`| STATS COUNT(*)`) and let the cluster compute it.
 ## See also
 
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: sources, splits, pushdown.
-- {doc}`Anomaly detection </cookbook/analytics/anomaly-detection>`: the analysis a log index is
+- {doc}`Anomaly detection </cookbook/analytics/inference/anomaly-detection>`: the analysis a log index is
   usually pulled into.
 - {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the `Source`/`Split` protocol, if you
   need the sink this connector does not have.

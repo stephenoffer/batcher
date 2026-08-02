@@ -19,5 +19,5 @@ python examples/expressions/strings_search.py
 
 - {doc}`/cookbook/expressions/strings/matching/strings_regex`: extract, replace, and count.
 - {doc}`/cookbook/expressions/strings/matching/strings_similarity`: fuzzy string matching against a reference value.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

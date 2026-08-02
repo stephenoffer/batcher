@@ -1,7 +1,8 @@
 """The parity census's own classification, pinned.
 
 `tools/parity/duckdb_census.py` produces the numbers in
-`docs/internals/competitor_parity_census.md`. Nothing else checks it, and two bugs in it
+`docs/architecture/internals/competitor_parity_census.md`. Nothing else checks it, and two bugs in
+it
 each moved the headline figure by more than any real change to the engine has:
 
 * counting DuckDB's 135 `icu_collate_*` entries — one per locale, one capability — as 135

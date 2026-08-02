@@ -82,7 +82,7 @@ def cancel_query(query_id: str) -> bool:
 def running_queries() -> list[str]:
     """List the ids of the queries executing in this process right now.
 
-    Each terminal operation (`collect`, `to_pydict`, `write_parquet`, ...) registers one id
+    Each terminal operation (`collect`, `to_pydict`, `write.parquet`, ...) registers one id
     for its duration. Pass one to `cancel_query` to stop it.
 
     Examples:

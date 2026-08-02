@@ -1367,6 +1367,18 @@ class DistributedConfig:
     # cluster and makes a spot-preempted shard's retry cheap (1/N the work). The mergeable
     # combine is correct for any shard count. 1 = one shard per GPU (the old behavior).
     gpu_shard_oversubscribe: int = 4
+    # Re-run every GPU result on the CPU engine and report where they disagree
+    # (`api/terminal/gpu_backend/verify.py`). Off by default: it doubles the work and walks the
+    # result in Python, so it is a diagnostic, not a production setting.
+    #
+    # It exists because the device tier is the one tier that cannot share the Rust `Expr` —
+    # cuDF has no maintained Rust binding, so it is a *translator*, and translators drift. Its
+    # test suite runs on pandas rather than cuDF (CI has no GPU) and is therefore structurally
+    # unable to see a device-only divergence; two have already shipped, both column-type bugs
+    # with correct values. Until there is a GPU CI lane this is the only thing that observes
+    # the device. Turn it on for benchmark and staging runs, and for any change to
+    # `core/gpu_plan/`.
+    gpu_shadow_verify: bool = False
     # The most devices a single query may ask the autoscaler to grow to. The request is sized
     # from the working set (how many devices would hold it in one wave), so a badly-estimated
     # query would otherwise be able to ask a cluster to grow without bound. Reaching the cap is
@@ -1616,11 +1628,19 @@ class DistributedConfig:
         seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
         failure this is supposed to prevent.
 
-        Detection reports *total* VRAM, so it is scaled by `_GPU_USABLE_FRACTION` to leave the
-        driver context, allocator fragmentation, and activation headroom — the same relationship
-        the old default encoded (12 usable of a 16 GB T4). Falls back to that historical default
-        when no device is visible, which keeps a CPU-only driver planning for a remote GPU
-        worker exactly as it did before.
+        Reports the device's **total** memory in decimal GB. It is a *capacity*, and every
+        caller subtracts `accelerator.vram_headroom` from it once, itself — which is the
+        contract that had drifted. Detection used to fold in a private `0.75`, so a stage
+        packed against it applied its own `0.85` on top and budgeted 64% of the board, while
+        the same stage on a Ray cluster took `cluster_gpu_memory_gb()`, which folded in
+        nothing, and budgeted 85%. One decision, two answers, chosen by whether Ray was up.
+
+        The unit is decimal GB rather than GiB for the same single-meaning reason: Kyber sizes
+        a working set as `rows x width / 1e9`, and dividing a device by `1 << 30` to compare
+        against that over-stated an 80 GiB board by 7.4%.
+
+        Falls back to a T4-shaped constant when no device is visible, which keeps a CPU-only
+        driver planning for a remote GPU worker as it did before.
 
         Examples:
             .. doctest::
@@ -1630,7 +1650,7 @@ class DistributedConfig:
                 40.0
 
         Returns:
-            Usable GPU memory in GB for a single device.
+            Total GPU memory in decimal GB for a single device.
         """
         if self.gpu_memory_gb > 0.0:
             return self.gpu_memory_gb
@@ -1640,16 +1660,14 @@ class DistributedConfig:
         smallest = min((b for b in devices if b > 0), default=0)
         if smallest <= 0:
             return _GPU_MEMORY_GB_FALLBACK
-        return smallest / (1 << 30) * _GPU_USABLE_FRACTION
+        return smallest / 1e9
 
 
-#: Fraction of a device's total VRAM treated as usable — the rest is driver context,
-#: allocator fragmentation, and activation headroom. 12/16 is the ratio the previous
-#: hardcoded T4 default encoded, kept so detection reproduces it on that device.
-_GPU_USABLE_FRACTION = 0.75
-#: Usable GB assumed when no device is visible: the historical T4-shaped default, so a
-#: CPU-only driver planning for a remote GPU worker behaves exactly as it used to.
-_GPU_MEMORY_GB_FALLBACK = 12.0
+#: Total GB assumed when no device is visible: a T4's nameplate, which is the device the
+#: historical default described. Stated as a capacity like every other value this resolves to,
+#: so the caller's own headroom subtraction lands on it once and the CPU-only driver planning
+#: for a remote GPU worker keeps a budget within a gigabyte of the one it always had.
+_GPU_MEMORY_GB_FALLBACK = 16.0
 
 
 @dataclass(frozen=True, slots=True)

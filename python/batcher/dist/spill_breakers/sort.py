@@ -33,9 +33,10 @@ def supports_spilling_sort(sort: Sort, sources: list[Source] | None = None) -> b
 
     The leading key must be a plain column (the range partition splits on it — equal
     values share a bucket — and each bucket is then sorted by the full key list) *and*
-    it must be numeric: the boundaries come from the KLL sketch (`column_quantiles`),
-    which only sketches numeric columns, and `range_partition_batches` rejects anything
-    else. Returning `False` is a graceful fallback — the caller runs the ordinary
+    it must be a type the shared sampler and range partitioner both handle: a numeric
+    key sampled from the KLL sketch, or a string one sampled lexically (`sample_key_grid`
+    picks the order and `bucketize` routes on the matching one). Returning `False` is a
+    graceful fallback — the caller runs the ordinary
     (non-spilling) sort — so a key we cannot range-partition costs memory, never
     correctness. Without `sources` the type cannot be checked, so only the shape is.
 
@@ -57,7 +58,12 @@ def supports_spilling_sort(sort: Sort, sources: list[Source] | None = None) -> b
     if idx < 0:
         return False
     dt = schema.field(idx).type
-    return pa.types.is_integer(dt) or pa.types.is_floating(dt)
+    return (
+        pa.types.is_integer(dt)
+        or pa.types.is_floating(dt)
+        or pa.types.is_string(dt)
+        or pa.types.is_large_string(dt)
+    )
 
 
 def execute_spilling_sort(
@@ -125,12 +131,17 @@ def stage_and_partition(
 
     Shared by the streaming sort and the streaming global window: both need equal keys to land
     in one bucket, which is what makes per-bucket processing + key-order concatenation globally
-    correct. Sampling (`column_quantiles`) and bucketing (`bucketize`) are the *same* primitives
+    correct. Sampling (`sample_key_grid`) and bucketing (`bucketize`) are the *same* primitives
     the distributed range-sort uses, so the two sorts cannot drift apart, and the per-row work
     stays in Rust. `descending` is load-bearing: the caller emits buckets high→low for a
     descending sort, so which end the nulls belong at depends on it, not on `nulls_first` alone.
     """
-    from batcher.dist.executors.partition_io import SAMPLE_PROBS, bucketize, merge_boundaries
+    from batcher.dist.executors.partition_io import (
+        SAMPLE_PROBS,
+        bucketize,
+        merge_boundaries,
+        sample_key_grid,
+    )
 
     nat = engine()
 
@@ -143,7 +154,7 @@ def stage_and_partition(
             if not rb.num_rows:
                 continue
             stage.write(rb)
-            grid = nat.column_quantiles([key_name], [rb], list(SAMPLE_PROBS)).get(key_name, [])
+            grid = sample_key_grid([rb], key_name, list(SAMPLE_PROBS))
             if grid:
                 grids.append((grid, rb.num_rows))
     stage_handle = stage.close()

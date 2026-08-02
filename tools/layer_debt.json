@@ -1,0 +1,10 @@
+{
+  "exemptions": [
+    "batcher.core.udf.apply -> batcher.ml.gpu",
+    "batcher.core.udf.apply -> batcher.ml.inference",
+    "batcher.core.udf.call -> batcher.ml.inference",
+    "batcher.core.udf.stream -> batcher.ml.gpu",
+    "batcher.dist.executors.map -> batcher.ml.gpu",
+    "batcher.dist.streaming.consumers -> batcher.ml.gpu"
+  ]
+}

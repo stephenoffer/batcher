@@ -7,14 +7,14 @@ boundary, which is also why a result is identical on one core or a hundred.
 
 ![Batcher's two planes: a Python control plane hands a JSON IR plus zero-copy Arrow batches to the Rust data plane.](/_static/diagrams/two_planes.svg)
 
-Three sections describe the engine at three zoom levels, and they are meant to be read in
-this order:
+The engine is described at three zoom levels, nested inside this section and meant to be
+read in this order:
 
-| Section | Zoom level | Read it when |
+| Level | Zoom | Read it when |
 |---|---|---|
-| Architecture (this section) | The shape of the system | You want to know how the pieces fit |
-| {doc}`Deep dives <../deep-dives/index>` | One mechanism at a time | You want to know why a query behaved that way |
-| {doc}`Internals <../internals/index>` | One subsystem's design | You are about to change the engine |
+| The pages below | The shape of the system | You want to know how the pieces fit |
+| {doc}`Deep dives </architecture/deep-dives/index>` | One mechanism at a time | You want to know why a query behaved that way |
+| {doc}`Internals </architecture/internals/index>` | One subsystem's design | You are about to change the engine |
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -48,6 +48,18 @@ Retries, shuffle recompute, epoch fencing, and backpressure.
 :link-type: doc
 The six design decisions that separate it from DuckDB, Spark, and Ray Data, and where each one stops.
 :::
+
+:::{grid-item-card} {octicon}`telescope;1.1em` Deep dives
+:link: /architecture/deep-dives/index
+:link-type: doc
+Twenty-two pages, one mechanism each: the query lifecycle, the operators, memory, distribution, and the adaptive loop.
+:::
+
+:::{grid-item-card} {octicon}`tools;1.1em` Internals
+:link: /architecture/internals/index
+:link-type: doc
+The design-level record of Kyber, Carbonite, and the execution engine, plus how to extend and test them.
+:::
 ::::
 
 ```{toctree}
@@ -58,4 +70,6 @@ execution
 optimization
 fault-tolerance
 differentiators
+deep-dives/index
+internals/index
 ```

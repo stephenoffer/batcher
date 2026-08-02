@@ -212,9 +212,9 @@ parallel, in Rust, before it becomes a tensor.
 
 - {doc}`PyTorch (ML guide) </ml/inference/pytorch>`: converters, DataLoader wrapping, the full loop.
 - {doc}`Streaming for training </ml/inference/streaming>`: the sample-order contract and resumption.
-- {doc}`Feature pipeline </cookbook/ml/pipelines/feature-pipeline>`: the engineering that happens before
+- {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: the engineering that happens before
   a row becomes a tensor.
-- {doc}`Train/test split </cookbook/ml/pipelines/train-test-split>`: a deterministic split that survives
+- {doc}`Train/test split </cookbook/ml/pipelines/features/train-test-split>`: a deterministic split that survives
   a re-run.
 - {doc}`ML API </api/models/ml>`: `iter_torch_batches`, `streaming_split`, `stream_loader`.
 - {doc}`Ray </integrations/compute/ray>`: what a distributed run actually schedules.

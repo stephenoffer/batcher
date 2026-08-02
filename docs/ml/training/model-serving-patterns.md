@@ -199,12 +199,12 @@ it is. Find your situation below:
 - {doc}`Batch scoring </ml/inference/batch-scoring>`: the offline job end to end.
 - {doc}`Inference </ml/inference/inference>`: the load-once-per-worker contract.
 - {doc}`GPU scheduling </ml/inference/gpu>`: sizing actors and packing models onto devices.
-- {doc}`Credit flow control </deep-dives/distribution/credit-flow-control>`: the credits `Stage` hands
+- {doc}`Credit flow control </architecture/deep-dives/distribution/credit-flow-control>`: the credits `Stage` hands
   out, and the same mechanism in the engine's shuffle.
-- {doc}`GPU execution </deep-dives/distribution/gpu-execution>`: why a CPU stage starves a GPU stage,
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: why a CPU stage starves a GPU stage,
   and what overlapping them buys.
 - {doc}`Streaming inference </cookbook/streaming/streaming-inference>`: the online half,
   as a runnable recipe.
-- {doc}`AI and GPU benchmarks </benchmarks/ai-and-gpu>`: in-process against the served
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: in-process against the served
   path, measured.
 - {doc}`ML API </api/models/ml>`: the `InferencePool`, `Stage`, and `run_pipeline` reference.

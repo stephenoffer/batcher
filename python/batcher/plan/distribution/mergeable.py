@@ -36,10 +36,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from batcher.plan.ir_tags import Op
+from batcher.plan.ir_tags import LEFT_DRIVEN_JOINS, Op
+
+#: Historical name for `LEFT_DRIVEN_JOINS` (`plan.ir_tags`), kept because it is re-exported
+#: from `plan.distribution` and named in prose elsewhere. One definition, two names.
+#:
+#: The set is the join types whose output is driven by LEFT rows, so broadcasting the right
+#: (build) side to every worker and splitting the left (probe) side is correct: unioning the
+#: per-shard outputs never duplicates a right row. `right` and `full` must emit an unmatched
+#: *right* row exactly once, and every shard sees the whole right side, so each would emit it —
+#: those need a co-partitioning exchange instead.
+BROADCAST_SAFE_JOINS = LEFT_DRIVEN_JOINS
 
 __all__ = [
-    "BROADCAST_SAFE_JOINS",
+    "LEFT_DRIVEN_JOINS",
     "ROW_LOCAL_OPS",
     "ShardSplit",
     "decompose",
@@ -110,13 +120,6 @@ class ShardSplit:
 #: Operators whose output for a row depends only on that row, so a shard can run them over the
 #: rows it holds and get the same answer it would have as part of the whole.
 ROW_LOCAL_OPS = frozenset({Op.FILTER, Op.PROJECT})
-
-#: Join types whose output is driven by LEFT rows, so broadcasting the right (build) side to
-#: every worker and splitting the left (probe) side is correct: unioning the per-shard outputs
-#: never duplicates a right row. `right` and `full` must emit an unmatched *right* row exactly
-#: once, and every shard sees the whole right side, so each would emit it — those need a
-#: co-partitioning exchange instead.
-BROADCAST_SAFE_JOINS = frozenset({"inner", "left", "semi", "anti"})
 
 # Reductions that combine with *themselves*: applying them to the partials gives the answer.
 _SELF_COMBINING = {"min": "min", "max": "max", "product": "product",
@@ -325,10 +328,25 @@ def _plan_one(spec: dict, slot: int):
         # A mean is not mergeable, but the pair it is a ratio of is: sum the sums, sum the
         # counts, divide once at the end. Averaging the shards' averages would weight each
         # shard equally regardless of how many rows it held.
+        #
+        # The running total is summed in **double**, not in the input's own type, and that cast
+        # is load-bearing rather than tidy. An integer column's sum stays an integer, and a mean
+        # is asked for over exactly the columns whose totals do not fit one: ClickBench q03 is
+        # `AVG(UserID)` over ~1e8 identifiers around 1e18, whose exact sum is ~1e26 against
+        # int64's 9.2e18 ceiling. It wrapped, and the division then returned 1.26e11 where the
+        # CPU engine returns 2.53e18 — not a rounding difference but an arbitrary number, from a
+        # decomposition that is exactly correct in exact arithmetic. Both libraries wrap here
+        # (measured: cuDF and pandas agree on the wrapped value), so this cannot be left to the
+        # backend. The mean itself is a double whatever the input was, so nothing is lost that
+        # the final division would have kept.
         total, n = f"{_PREFIX}{slot}s", f"{_PREFIX}{slot}n"
         return (
             [
-                {"func": "sum", "alias": total, "input": spec["input"]},
+                {
+                    "func": "sum",
+                    "alias": total,
+                    "input": {"e": "cast", "input": spec["input"], "dtype": "float64"},
+                },
                 {"func": "count", "alias": n, "input": spec["input"]},
             ],
             [

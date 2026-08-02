@@ -20,7 +20,45 @@ from __future__ import annotations
 
 from batcher._internal.logging import get_logger, note_suppressed
 
-__all__ = ["placeable_workers", "warn_once_if_allocation_is_wider_than_ray"]
+__all__ = [
+    "free_cpus_by_node",
+    "placeable_workers",
+    "warn_once_if_allocation_is_wider_than_ray",
+]
+
+
+def free_cpus_by_node() -> dict[str, float] | None:
+    """Cores each node has *unreserved* right now, or `None` when Ray will not say.
+
+    `node_classes` reports nameplate capacity, which is the right figure for classifying a
+    node and the wrong one for deciding what can be *placed* on it. A fleet reserves one
+    worker per node holding that node's cores, so a single core held by anything else — a
+    co-tenant job, another pipeline, a placement group the last query has not finished
+    releasing — makes that whole bundle unplaceable. The gang then pends until the placement
+    timeout and the query fails with `no distributed worker became available`, on a cluster
+    that is almost entirely idle.
+
+    Measured on this four-node fleet with one core busy per node: `4 bundles x 8 CPU` is
+    unsatisfiable while `28 bundles x 1 CPU` places immediately, and every distributed query
+    failed after three sixty-second waits until the grant was sized from these numbers
+    instead of the nameplate.
+
+    Returns:
+        Node id -> free CPU count, or `None` when the per-node figures cannot be read. `None`
+        means "assume nameplate", which is the behaviour every caller had before.
+    """
+    try:
+        from ray._private.state import available_resources_per_node
+
+        return {
+            node_id: float(res.get("CPU", 0.0))
+            for node_id, res in available_resources_per_node().items()
+        }
+    except Exception as exc:
+        # A private Ray API, so a version that moves it must degrade rather than fail: the
+        # caller falls back to nameplate sizing, which is what it did before this existed.
+        note_suppressed("dist", "read per-node free CPU", exc)
+        return None
 
 
 def placeable_workers(
@@ -103,8 +141,9 @@ def warn_once_if_allocation_is_wider_than_ray() -> None:
 
     The silent failure this exists for: `srun -N 4 python job.py` — or the PBS and LSF
     equivalents — gives the job four nodes, and a bare `ray.init()` starts a *local*
-    single-node Ray on whichever one the script happens to be on. The job runs, returns the right answer, and uses a quarter of the
-    hardware it was billed for — with nothing anywhere to say so, because from Batcher's side
+    single-node Ray on whichever one the script happens to be on. The job runs, returns the
+    right answer, and uses a quarter of the hardware it was billed for — with nothing anywhere
+    to say so, because from Batcher's side
     a one-node cluster is a perfectly ordinary cluster.
 
     Batcher cannot fix it from here: bringing up Ray across a batch allocation is the

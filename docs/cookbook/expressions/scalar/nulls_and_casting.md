@@ -19,5 +19,5 @@ python examples/expressions/nulls_and_casting.py
 
 - {doc}`/cookbook/expressions/nested/lists_vectors`: similarity, distance, and normalization.
 - {doc}`/cookbook/expressions/scalar/numeric_math`: arithmetic and math functions on numeric columns.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

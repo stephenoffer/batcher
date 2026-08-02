@@ -94,7 +94,7 @@ DuckDB optimizes once before it runs. Batcher's loop is stage-boundary re-optimi
 the same granularity as Spark AQE, but it's available single-node as well as
 distributed. On top of it sits a sketch-backed cross-query learned-stats and bandit
 loop, so a plan improves the more a query runs. Both mechanisms are described in
-{doc}`/deep-dives/adaptive/adaptive-reoptimization`.
+{doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization`.
 
 ## One algebra, single node to cluster
 
@@ -125,6 +125,6 @@ for one mechanism.
 - {doc}`Execution model <execution>`: pipelines, breakers, and the execution tiers.
 - {doc}`Query optimization <optimization>`: Kyber's passes and cost model.
 - {doc}`Fault tolerance <fault-tolerance>`: retries, recompute, and backpressure.
-- {doc}`Execution engine <../internals/execution>`: morsels and the tiers in detail.
-- {doc}`Kyber optimizer <../internals/kyber>`: the passes and the re-optimization loop.
-- {doc}`Carbonite <../internals/carbonite>`: the memory envelope and flow control.
+- {doc}`Execution engine </architecture/internals/execution>`: morsels and the tiers in detail.
+- {doc}`Kyber optimizer </architecture/internals/kyber>`: the passes and the re-optimization loop.
+- {doc}`Carbonite </architecture/internals/carbonite>`: the memory envelope and flow control.

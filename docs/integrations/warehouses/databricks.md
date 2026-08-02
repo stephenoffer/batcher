@@ -175,7 +175,7 @@ wrapped exception carries the real reason.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>`: the format underneath, and the writer.
 - {doc}`Lakehouse </user-guide/moving-data/lakehouse>`: time travel, merges, maintenance.
 - {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: credentials and object-store paths.
-- {doc}`Incremental ingest </cookbook/data-engineering/incremental-ingest>`: reading a Unity
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: reading a Unity
   table's new partitions on a schedule.
 - {doc}`Reading and writing </api/relational/io>`: the full reader/writer surface.
 - {doc}`Iceberg </integrations/lakehouse/iceberg>`: for the Unity tables the direct path will not open.

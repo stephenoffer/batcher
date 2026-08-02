@@ -56,7 +56,7 @@ def mig_plan(
     accelerator_type: str | None,
     concurrency: int = 1,
     *,
-    headroom: float = 0.15,
+    headroom: float | None = None,
 ) -> MigPlan:
     """Lay a stage's requested concurrency out across whole or partitioned devices.
 
@@ -69,13 +69,20 @@ def mig_plan(
         model_gib: The model's resident footprint per worker.
         accelerator_type: A Ray accelerator-type name.
         concurrency: Concurrent workers the stage wants.
-        headroom: Fraction of an instance's memory left free.
+        headroom: Fraction of an instance's memory left free, or `None` for the configured
+            `accelerator.vram_headroom`. A literal default here was one of the private copies
+            of that knob, so a fleet that raised it still chose partition profiles against the
+            memory the knob had just reserved — and a MIG instance sized that way is the one
+            share on a device that cannot borrow from its neighbour when it turns out short.
 
     Returns:
         The plan; `profile` is `None` when whole devices are the right answer.
     """
+    from batcher._internal.device_share import device_headroom
+
     want = max(1, concurrency)
-    profile = smallest_profile_for(model_gib, accelerator_type, headroom=headroom)
+    room = device_headroom() if headroom is None else headroom
+    profile = smallest_profile_for(model_gib, accelerator_type, headroom=room)
     if profile is None:
         return MigPlan(
             profile=None,

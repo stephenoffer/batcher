@@ -1,0 +1,10 @@
+{
+  "bare-untyped-raise": 44,
+  "dir-allow": 7,
+  "noqa": 226,
+  "noqa-ARG002": 84,
+  "pragma-no-cover": 243,
+  "production-assert": 13,
+  "structure-allow": 32,
+  "type-ignore": 141
+}

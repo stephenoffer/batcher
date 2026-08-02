@@ -98,7 +98,7 @@ batches may sit between one stage and the next.
 ![An inference pipeline with each stage on its own thread. Arrow batches flow from the source through a CPU stage that decodes and tokenizes, then through a GPU stage running the model, then out. A bounded credit window sits between each pair of stages, so a stage blocks once its window to the next stage is full. That bound keeps a fast stage from running ahead into memory, lets stages overlap so the GPU is fed while the CPU decodes, and preserves output order while the run streams.](/_static/diagrams/inference_stages.svg)
 
 That bound is what keeps a fast decoder from filling memory ahead of a slow model, and
-it's why the run streams rather than materializing. See {doc}`/deep-dives/distribution/credit-flow-control`
+it's why the run streams rather than materializing. See {doc}`/architecture/deep-dives/distribution/credit-flow-control`
 for the same mechanism applied to the distributed shuffle.
 
 ## Batch formats and tensor columns

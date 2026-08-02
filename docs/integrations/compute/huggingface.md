@@ -188,7 +188,7 @@ reload per batch. Pass a class, or a model id, which becomes one. Batcher warns;
 
 - {doc}`Inference </ml/inference/inference>`: the actor pool, batching, GPU placement.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: the readers and how they split.
-- {doc}`Text embeddings </cookbook/ml/pipelines/text-embeddings>`: `ds.ml.embed` over a real corpus.
-- {doc}`LLM batch scoring </cookbook/ml/pipelines/llm-batch-scoring>`: the same actor pool, a bigger model.
+- {doc}`Text embeddings </cookbook/ml/pipelines/text/text-embeddings>`: `ds.ml.embed` over a real corpus.
+- {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same actor pool, a bigger model.
 - {doc}`ML API </api/models/ml>`: `infer`, `embed`, `map_batches`, the preprocessors.
 - {doc}`PyTorch </integrations/compute/pytorch>`: tensors, DDP ingest, model-once-per-worker.

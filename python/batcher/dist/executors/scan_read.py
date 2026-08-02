@@ -461,7 +461,14 @@ def _dataset_scan_batches(splits, projection, predicate):
         if predicate is not None:
             from batcher.io.predicate import to_pyarrow_expression
 
-            expr = to_pyarrow_expression(predicate)
+            # Type each literal to its own column. Without the schema a temporal literal
+            # stays whatever the IR carried — a string for `EventDate >= '2013-07-01'` —
+            # and arrow has no `date32 >= string` kernel, so the scanner raises
+            # `ArrowNotImplementedError` from inside the map task instead of pruning. The
+            # same query runs single-node, where the filter is the engine's rather than the
+            # scanner's, which is what made it look like a distributed-only failure: it was.
+            # (Six ClickBench queries, q36-q39/q41/q42.)
+            expr = to_pyarrow_expression(predicate, frags[0].physical_schema)
         return dset.scanner(
             columns=projection,
             filter=expr,

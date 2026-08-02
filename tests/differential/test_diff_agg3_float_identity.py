@@ -4,7 +4,7 @@
 pattern as one value. `mode`/`histogram` encoded the raw child through Arrow's row
 format, which is NOT canonical for floats, so they split `-0.0` from `0.0` and split
 NaN payloads — disagreeing with DuckDB and with the engine's own COUNT(DISTINCT).
-See docs/internals/bug_hunt_ledger.md.
+See docs/architecture/internals/bug_hunt_ledger.md.
 """
 
 from __future__ import annotations

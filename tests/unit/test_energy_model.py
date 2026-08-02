@@ -240,3 +240,50 @@ def test_a_stage_is_modelled_if_any_of_its_calls_was() -> None:
     ledger.record(StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=1.0, measured=True))
     ledger.record(StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=1.0, measured=False))
     assert not ledger.by_stage()[0].measured, "a roll-up is only as measured as its weakest call"
+
+
+def test_the_exactness_flag_survives_the_roll_up() -> None:
+    """`integrated` distinguishes a hardware energy counter from sampled power.
+
+    The roll-up dropped it, so every record `by_stage` produced — including the one
+    `hottest_stage` returns, which is the record a reader is most likely to quote — reported
+    `False` however the energy was obtained. Sampling assumes the draw between two samples was
+    their mean, which a stage alternating a 60 W staged transfer with a 700 W kernel violates
+    by an order of magnitude, so the difference decides whether a total may be billed.
+    """
+    exact = EnergyLedger()
+    for _ in range(3):
+        exact.record(
+            StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=1.0, measured=True, integrated=True)
+        )
+    assert exact.by_stage()[0].integrated
+    assert exact.hottest_stage().integrated
+
+    # ...and it is a conjunction, exactly as `measured` is: one sampled call makes the
+    # rolled-up stage sampled.
+    mixed = EnergyLedger()
+    mixed.record(
+        StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=1.0, measured=True, integrated=True)
+    )
+    mixed.record(
+        StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=1.0, measured=True, integrated=False)
+    )
+    assert not mixed.by_stage()[0].integrated
+
+
+def test_the_summary_carries_the_exactness_qualifier() -> None:
+    """`integrated_fraction` existed and reached nothing a reader sees.
+
+    `summary()` is what logs, metrics sinks and the dashboard read, so a total assembled from
+    power samples and one read off a hardware counter arrived indistinguishable.
+    """
+    ledger = EnergyLedger()
+    ledger.record(
+        StageEnergy("A", "NVIDIA_H100", 1, 1.0, 1.0, joules=75.0, measured=True, integrated=True)
+    )
+    ledger.record(
+        StageEnergy("B", "NVIDIA_H100", 1, 1.0, 1.0, joules=25.0, measured=True, integrated=False)
+    )
+    summary = ledger.summary()
+    assert summary["integrated_fraction"] == pytest.approx(0.75)
+    assert all(isinstance(v, float) for v in summary.values())

@@ -19,5 +19,5 @@ python examples/dataset/profiling.py
 
 - {doc}`/cookbook/dataset/cleaning/null_handling`: dropping, filling, and counting missing values.
 - {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, unnest, and set operations.
-- {doc}`/user-guide/transform/transformations`: the full transformation surface these recipes draw on.
+- {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.

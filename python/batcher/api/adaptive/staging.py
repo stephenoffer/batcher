@@ -209,7 +209,7 @@ def _execute_adaptive(
     from batcher.config import active_config
 
     reopt_error = active_config().optimizer.reoptimize_error
-    from batcher.dist import requires_staging  # lazy: ray is optional
+    from batcher.dist import fused_union_ids, requires_staging  # lazy: ray is optional
 
     try:
         while True:
@@ -224,7 +224,13 @@ def _execute_adaptive(
             # all, where staging is the only execution path rather than an optimization.
             # There every breaker qualifies, exact or not.
             structural = distributed and requires_staging(plan)
-            target = lowest_breaker(plan, None if structural else _worth_staging(srcs, hub))
+            # A union the aggregate above it maps into one shuffle must not be staged, at
+            # either setting: staging it concatenates every branch on the driver — the exact
+            # materialization the fused path exists to avoid — and leaves the aggregate
+            # reading one already-merged source, so the fusion never happens.
+            fused = fused_union_ids(plan) if distributed else set()
+            accept = _stage_filter(fused, None if structural else _worth_staging(srcs, hub))
+            target = lowest_breaker(plan, accept)
             if target is None:
                 break
             final = target is plan
@@ -406,6 +412,22 @@ def _table(batches, node) -> pa.Table:
     # non-adaptive path would have typed `int64`. Share the one neutral spelling.
     names = node.available_columns()
     return pa.Table.from_batches([], schema=empty_result_schema(node, names))
+
+
+def _stage_filter(fused: set[int], worth):
+    """`lowest_breaker`'s accept predicate: never stage a `fused` node, else defer to `worth`.
+
+    `worth` is `None` when the plan structurally *must* stage (the dispatcher has no one-shot
+    route), where every breaker qualifies. Even there a fused union is excluded — staging it
+    is not an execution path the plan needs, it is the driver concatenation the fusion
+    replaces. Returns `None` when there is nothing to exclude and no `worth`, so
+    `lowest_breaker` keeps its own "accept everything" fast path.
+    """
+    if not fused:
+        return worth
+    if worth is None:
+        return lambda node: id(node) not in fused
+    return lambda node: id(node) not in fused and worth(node)
 
 
 def _worth_staging(srcs: list[Source], hub):

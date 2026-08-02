@@ -201,8 +201,8 @@ one-sided stream is a broken pipeline, and a bigger budget only delays the diagn
 - {doc}`Joins </user-guide/analyze/joins>`: the bounded join surface, including the outer joins
   the streaming path does not have.
 - {doc}`Streaming </user-guide/moving-data/streaming>`: sources, sinks, watermarks, and the query handle.
-- {doc}`Join algorithms </deep-dives/operators/join-algorithms>`: what the bounded join does with the
+- {doc}`Join algorithms </architecture/deep-dives/operators/join-algorithms>`: what the bounded join does with the
   build side that the streaming one cannot.
 - {doc}`Kafka integration </integrations/streams/kafka>`: the two topics above.
-- {doc}`Multi-source join </cookbook/data-engineering/multi-source-join>`: the batch recipe for the same
+- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: the batch recipe for the same
   attribution question.

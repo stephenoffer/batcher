@@ -269,10 +269,9 @@ destroys time travel past the window — irreversibly.
 
 ## See also
 
-- Docs: `docs/user-guide/moving-data/lakehouse.md`; `docs/tutorials/building-a-lakehouse.md`;
-  `docs/integrations/{delta-lake,iceberg,hudi,databricks,snowflake}.md`;
-  `docs/examples/data-engineering/{cdc-pipeline,slowly-changing-dimensions,
-  partition-backfill,late-arriving-data,file-compaction,deduplication}.md`.
+- Docs: `docs/user-guide/moving-data/lakehouse.md`; `docs/tutorials/pipelines/building-a-lakehouse.md`;
+  `docs/integrations/lakehouse/delta-lake.md`, `docs/integrations/lakehouse/iceberg.md`, `docs/integrations/lakehouse/hudi.md`, `docs/integrations/warehouses/databricks.md`, `docs/integrations/warehouses/snowflake.md`;
+  `docs/cookbook/data-engineering/ingest/cdc-pipeline.md`, `docs/cookbook/data-engineering/modeling/slowly-changing-dimensions.md`, `docs/cookbook/data-engineering/maintenance/partition-backfill.md`, `docs/cookbook/data-engineering/ingest/late-arriving-data.md`, `docs/cookbook/data-engineering/maintenance/file-compaction.md`, `docs/cookbook/dataset/cleaning/deduplication.md`.
 - Code: `api/merge/{builder,clauses,cdc,execute}.py`; `api/dataset/scd.py`;
   `api/io_namespace/writer.py`; `io/formats/lakehouse/`; `io/catalog.py`.
 - Skills: `read-and-write-data` (formats, paths, credentials, schema at the file layer);

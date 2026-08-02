@@ -26,7 +26,8 @@ __all__ = ["sort_elimination_from_ordering"]
 
 # NOTE: a `Sort(Sort(x, k1), k2) → Sort(x, k2)` "drop the redundant inner sort" rule looks
 # safe but is NOT: Batcher's single-key sort over common types takes a **stable** specialized
-# path (docs/deep-dives/operators/sort-internals.md; test_diff_exec_sort_stability.py), so `k1` is a
+# path (docs/architecture/deep-dives/operators/sort-internals.md; test_diff_exec_sort_stability.py),
+# so `k1` is a
 # real tiebreaker within `k2`'s ties. Dropping the inner sort changes that tie order — a wrong
 # result on the payload columns. The "arrow lexsort is unstable" note only describes the
 # multi-key/uncommon-type *fallback*, not the common path. Do not add that rule.

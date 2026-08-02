@@ -39,6 +39,7 @@ from batcher.kyber.rules.exprs.guards import is_integer, schema_rule
 from batcher.kyber.rules.leaf_rewrite import rewrite_node
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.core import MathExpr
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 from batcher.plan.schema import SchemaRef
 
@@ -49,7 +50,6 @@ _INT64_MAX = 2**63 - 1
 
 #: Comparisons whose operands may be swapped by flipping the operator, so each rule below
 #: matches `abs(x) OP c` and `c OP' abs(x)` alike without a second table.
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 
 
 def _number(expr: Expr) -> float | int | None:
@@ -68,11 +68,11 @@ def _call_against_literal(expr: Expr, fn: str) -> tuple[str, Expr, float | int] 
     flipping the operator. Returns ``None`` when `expr` is not a comparison between a call
     to `fn` and a numeric literal.
     """
-    if not isinstance(expr, Binary) or expr.op not in _FLIP:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_FLIP:
         return None
     for call, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, _FLIP[expr.op]),
+        (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         if isinstance(call, MathExpr) and call.fn == fn:
             value = _number(other)
@@ -117,9 +117,8 @@ def _abs_leaf(op_wanted: str) -> Callable[[Expr], Expr]:
 
 
 #: The mirror of each comparison, for the operator index. A leaf built for `op` is also
-#: reached by a node carrying `_FLIP[op]`, because the comparison is normalized with the
+#: reached by a node carrying `COMPARISON_FLIP[op]`, because the comparison is normalized with the
 #: computed side on the left: `5 > abs(x)` arrives as a `gt` node and matches the `lt` leaf.
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], op: str):
@@ -131,7 +130,7 @@ def _register(name: str, leaf: Callable[[Expr], Expr], op: str):
             matches=_NODES,
             expr_fn=leaf,
             expr_matches=(Binary,),
-            expr_ops=(op, _FLIP[op]),
+            expr_ops=(op, COMPARISON_FLIP[op]),
         )
     )
 
@@ -226,7 +225,7 @@ def _register_sign_integer(key: tuple[str, int]):
             matches=(Filter, Project),
             expr_schema_fn=leaf,
             expr_matches=(Binary,),
-            expr_ops=(key[0], _FLIP[key[0]]),
+            expr_ops=(key[0], COMPARISON_FLIP[key[0]]),
         )
     )
 

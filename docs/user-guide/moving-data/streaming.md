@@ -428,6 +428,6 @@ bt.read.kafka(topic="events").write(
 - {doc}`/architecture/execution`: the pipelines-and-breakers execution model that
   makes batch and streaming one engine.
 - {doc}`/ml/inference/streaming`: streaming a query as bounded-memory training data.
-- {doc}`/agents/index`: the `write-a-streaming-pipeline` agent skill covers this
+- {doc}`/agents`: the `write-a-streaming-pipeline` agent skill covers this
   surface as a procedure, including the batch-vs-stream return-type trap.
 - {doc}`/cookbook/operations/streaming_basics`: the same operators run incrementally, as a script.

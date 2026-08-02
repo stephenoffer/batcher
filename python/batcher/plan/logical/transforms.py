@@ -158,7 +158,7 @@ def empty_result_schema(plan: LogicalPlan, names: list[str]) -> pa.Schema:
     few — notably `filter(<no match>).limit(k)`, where the limit stops before any batch is
     produced — emit none at all, and the null-typed fallback then handed the caller
     `i: null, v: null` for what a single matching row would have typed `int64`. That breaks
-    `concat`, `write_parquet`, and any typed projection downstream.
+    `concat`, `write.parquet`, and any typed projection downstream.
 
     This lives in neutral `plan` rather than `api` because every executor must agree on it.
     `api` (relational), `dist` (spill), and `core` (streaming) each reached for an empty

@@ -5,7 +5,7 @@ and run vectorized over Arrow batches. This page is the reference for the
 constructors, operators, and methods callable on an `Expr`. The accessor namespaces
 (`.str`, `.dt`, `.list`, `.struct`, `.json`, `.map`, `.image`, `.audio`, `.video`) are
 enumerated on {doc}`/api/relational/expression-accessors`. For a guided tour with runnable examples, see
-the {doc}`expressions user guide </user-guide/transform/expressions>`.
+the {doc}`expressions user guide </user-guide/transform/columns/expressions>`.
 
 Blocks on this page share one namespace and run in order.
 
@@ -493,5 +493,5 @@ expressions. See {doc}`/ml/evaluation/evaluation`.
 - {doc}`/api/relational/expression-accessors`: every method on every accessor namespace.
 - {doc}`/api/relational/functions`: the top-level scalar, horizontal, aggregate, and window functions.
 - {doc}`/api/models/metrics`: the scoring and statistical aggregates used inside `agg()`.
-- {doc}`/user-guide/transform/expressions`: the same language taught rather than tabulated.
+- {doc}`/user-guide/transform/columns/expressions`: the same language taught rather than tabulated.
 - {doc}`/cookbook/expressions/index`: 34 runnable recipes for the methods on this page.

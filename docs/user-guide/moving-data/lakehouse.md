@@ -360,6 +360,6 @@ version per logical write, not one per worker.
 - {doc}`Data quality </user-guide/trust/data-quality>`: validate and quarantine before you commit.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: save modes, partitioning, atomic writes.
 - {doc}`I/O API </api/relational/io>`: the full `read`/`write` reference.
-- {doc}`Agent skills </agents/index>`: `manage-a-lakehouse-table` is this page as a
+- {doc}`Agent skills </agents>`: `manage-a-lakehouse-table` is this page as a
   procedure for a coding agent, covering merge, SCD, CDC, backfill, and compaction.
 - {doc}`/cookbook/io/save_modes`: what happens when the target already exists, as a script.

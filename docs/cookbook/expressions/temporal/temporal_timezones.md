@@ -19,5 +19,5 @@ python examples/expressions/temporal_timezones.py
 
 - {doc}`/cookbook/expressions/temporal/temporal_parts`: pulling calendar parts out of a timestamp column.
 - {doc}`/cookbook/expressions/temporal/temporal_truncation`: truncate to a period, or snap to a period boundary.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

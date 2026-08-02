@@ -10,7 +10,7 @@ engine's string kernels (which accept only `Utf8`) crashed on it:
 - ``join`` a LargeUtf8 key against a Utf8 key → "join key type mismatch"
 
 The boundary now normalizes ``LargeUtf8 → Utf8`` (value-preserving; offsets only), so the
-identical column succeeds. See docs/internals/bug_hunt_ledger.md.
+identical column succeeds. See docs/architecture/internals/bug_hunt_ledger.md.
 """
 
 from __future__ import annotations

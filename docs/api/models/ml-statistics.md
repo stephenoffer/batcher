@@ -159,4 +159,4 @@ sample, because both techniques re-score through the engine.
 - {doc}`/api/models/ml-models`: the estimators and metrics these statistics are computed around.
 - {doc}`/ml/evaluation/statistics-and-drift`: the guide, with the monitoring workflow.
 - {doc}`/ml/evaluation/evaluation`: per-segment scoring and the diagnostic tables.
-- {doc}`/cookbook/statistics/index`: 6 runnable recipes for these statistics in the engine.
+- {doc}`/cookbook/metrics/statistics/index`: 6 runnable recipes for these statistics in the engine.

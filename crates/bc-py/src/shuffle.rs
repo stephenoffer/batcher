@@ -136,6 +136,50 @@ pub(crate) fn range_partition_batches(
     Ok(wrap_buckets(parts))
 }
 
+/// As [`range_partition_batches`], but the leading key is a **string** compared
+/// lexicographically by bytes and `boundaries` are ascending string quantiles (from
+/// [`column_string_quantiles`]). The numeric path compares as `f64`, which would order
+/// `"12"` before `"9"`, so a string key needs its own routing rather than a cast — this
+/// is what gives a distributed `ORDER BY <string column>` a path at all.
+#[pyfunction]
+pub(crate) fn range_partition_batches_str(
+    batches: Vec<PyArrowType<RecordBatch>>,
+    key_index: usize,
+    boundaries: Vec<String>,
+    n_buckets: usize,
+    nulls_first: bool,
+    descending: bool,
+) -> PyResult<Vec<Vec<PyArrowType<RecordBatch>>>> {
+    let batches = unwrap_batches(batches)?;
+    validate_partition_args(&batches, std::slice::from_ref(&key_index), n_buckets)?;
+    let parts = bc_interp::dist::range_partition_batches_str(
+        &batches,
+        key_index,
+        &boundaries,
+        n_buckets,
+        nulls_first,
+        descending,
+    )
+    .map_err(to_pyerr)?;
+    Ok(wrap_buckets(parts))
+}
+
+/// Sample a string column's distribution as ascending values at `probs` — the string
+/// counterpart of `column_quantiles`, whose KLL sketch is numeric-only.
+///
+/// Each worker samples its own split and the driver merges the grids into the boundaries
+/// `range_partition_batches_str` routes on. An absent, empty, or all-null column yields an
+/// empty grid, which the merge reads as "this split says nothing about the distribution".
+#[pyfunction]
+pub(crate) fn column_string_quantiles(
+    column: String,
+    batches: Vec<PyArrowType<RecordBatch>>,
+    probs: Vec<f64>,
+) -> PyResult<Vec<String>> {
+    let batches = unwrap_batches(batches)?;
+    bc_interp::dist::string_key_quantiles(&batches, &column, &probs).map_err(to_pyerr)
+}
+
 /// Skew-aware shuffle for a single-key distributed join: a hot key's rows are
 /// salted across reducers instead of overloading one. `hot_keys` are the hot values
 /// rendered as strings (matching `heavy_hitters`); `replicate=false` is the probe
@@ -201,7 +245,15 @@ fn host_of(addr: &str) -> &str {
 }
 
 /// Fetch every source concurrently, invoking `on_batches` for each non-empty result
-/// as it arrives; returns the indices of sources that hit a *retryable* fault.
+/// as it arrives; returns the sources that hit a *retryable* fault, each with the
+/// message of the fault that made it retryable.
+///
+/// The message travels because the index alone is a lie by omission. A reducer that
+/// cannot reach a mapper reports "unreachable worker", the driver recomputes, and after
+/// `recovery_max_attempts` the query fails with a worker-loss error — on a cluster where
+/// every worker is alive. The cause is then three frames and one wrong noun away from
+/// whatever actually broke, which is how a ticket collision here spent hours looking like
+/// a fleet problem.
 ///
 /// Co-located sources (`addr == own_addr`) read the local store with no socket. Remote
 /// fetches run on the shared runtime, bounded by a `fan_in` semaphore so no more than
@@ -226,8 +278,8 @@ async fn drive(
     token: Option<String>,
     shm: bool,
     mut on_batches: impl FnMut(Vec<RecordBatch>) -> Result<(), InterpError>,
-) -> Result<Vec<usize>, GatherErr> {
-    let mut unreachable = Vec::new();
+) -> Result<Vec<(usize, String)>, GatherErr> {
+    let mut unreachable: Vec<(usize, String)> = Vec::new();
 
     // Co-located buckets first — a cheap in-process read, no network, no permit.
     let own_addr = own.exchange.advertised_addr();
@@ -331,7 +383,7 @@ async fn drive(
             Ok(batches) if batches.is_empty() => {}
             Ok(batches) => on_batches(batches).map_err(GatherErr::Combine)?,
             Err(e) => match classify(&e) {
-                FetchFault::Retryable => unreachable.push(idx),
+                FetchFault::Retryable => unreachable.push((idx, e.to_string())),
                 FetchFault::Fatal => return Err(GatherErr::Fatal(e)),
             },
         }
@@ -343,7 +395,8 @@ async fn drive(
 /// Concurrently gather aggregate partials from every `(addr, ticket)` source and fold
 /// them into one merged partial (or, when `finalize`, the finalized output rows).
 ///
-/// Returns `(payload, unreachable)`. If `unreachable` is non-empty the payload is
+/// Returns `(payload, unreachable)`, where each `unreachable` entry is the source's index
+/// paired with the fault that made it retryable. If `unreachable` is non-empty the payload is
 /// `None` (the state is incomplete — the driver recomputes those sources and retries);
 /// otherwise the payload is the single combined/finalized batch, or `None` when every
 /// bucket was empty. This is the concurrent replacement for the serial per-mapper
@@ -368,40 +421,41 @@ pub(crate) fn gather_combine(
     token: Option<String>,
     shm: bool,
     replicas: Vec<Vec<String>>,
-) -> PyResult<(Option<PyArrowType<RecordBatch>>, Vec<usize>)> {
+) -> PyResult<(Option<PyArrowType<RecordBatch>>, Vec<(usize, String)>)> {
     let group_keys = parse_group_keys(group_keys_json)?;
     let aggregates = parse_aggregates(aggregates_json)?;
     let sources = parse_sources(sources)?;
     let pool = client.pool.clone();
 
-    let out: Result<(Option<RecordBatch>, Vec<usize>), GatherErr> = py.allow_threads(|| {
-        shared_runtime().block_on(async {
-            let mut running: Option<RecordBatch> = None;
-            let fold = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
-                let merged: Vec<RecordBatch> = match running.take() {
-                    Some(r) => std::iter::once(r).chain(batches).collect(),
-                    None => batches,
+    let out: Result<(Option<RecordBatch>, Vec<(usize, String)>), GatherErr> =
+        py.allow_threads(|| {
+            shared_runtime().block_on(async {
+                let mut running: Option<RecordBatch> = None;
+                let fold = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
+                    let merged: Vec<RecordBatch> = match running.take() {
+                        Some(r) => std::iter::once(r).chain(batches).collect(),
+                        None => batches,
+                    };
+                    running = Some(bc_interp::dist::combine(&group_keys, &aggregates, &merged)?);
+                    Ok(())
                 };
-                running = Some(bc_interp::dist::combine(&group_keys, &aggregates, &merged)?);
-                Ok(())
-            };
-            let unreachable = drive(
-                server, pool, &sources, &replicas, credits, fan_in, token, shm, fold,
-            )
-            .await?;
-            if !unreachable.is_empty() {
-                return Ok((None, unreachable)); // incomplete → driver recomputes + retries
-            }
-            let payload = match running {
-                Some(state) if finalize => Some(
-                    bc_interp::dist::combine_finalize(&group_keys, &aggregates, &[state])
-                        .map_err(GatherErr::Combine)?,
-                ),
-                other => other,
-            };
-            Ok((payload, Vec::new()))
-        })
-    });
+                let unreachable = drive(
+                    server, pool, &sources, &replicas, credits, fan_in, token, shm, fold,
+                )
+                .await?;
+                if !unreachable.is_empty() {
+                    return Ok((None, unreachable)); // incomplete → driver recomputes + retries
+                }
+                let payload = match running {
+                    Some(state) if finalize => Some(
+                        bc_interp::dist::combine_finalize(&group_keys, &aggregates, &[state])
+                            .map_err(GatherErr::Combine)?,
+                    ),
+                    other => other,
+                };
+                Ok((payload, Vec::new()))
+            })
+        });
 
     let (payload, unreachable) = out.map_err(GatherErr::into_pyerr)?;
     Ok((payload.map(PyArrowType), unreachable))
@@ -427,11 +481,11 @@ pub(crate) fn gather_concat(
     token: Option<String>,
     shm: bool,
     replicas: Vec<Vec<String>>,
-) -> PyResult<(Vec<PyArrowType<RecordBatch>>, Vec<usize>)> {
+) -> PyResult<(Vec<PyArrowType<RecordBatch>>, Vec<(usize, String)>)> {
     let sources = parse_sources(sources)?;
     let pool = client.pool.clone();
 
-    let out: Result<(Vec<RecordBatch>, Vec<usize>), GatherErr> = py.allow_threads(|| {
+    let out: Result<(Vec<RecordBatch>, Vec<(usize, String)>), GatherErr> = py.allow_threads(|| {
         shared_runtime().block_on(async {
             let mut rows: Vec<RecordBatch> = Vec::new();
             let collect = |batches: Vec<RecordBatch>| -> Result<(), InterpError> {
@@ -533,12 +587,12 @@ pub(crate) fn gather_to_files(
     token: Option<String>,
     shm: bool,
     replicas: Vec<Vec<String>>,
-) -> PyResult<(Vec<String>, Vec<usize>)> {
+) -> PyResult<(Vec<String>, Vec<(usize, String)>)> {
     let sources = parse_sources(sources)?;
     let pool = client.pool.clone();
     let dir = PathBuf::from(dir);
 
-    let out: Result<(Vec<String>, Vec<usize>), GatherErr> = py.allow_threads(|| {
+    let out: Result<(Vec<String>, Vec<(usize, String)>), GatherErr> = py.allow_threads(|| {
         shared_runtime().block_on(async {
             let mut paths: Vec<String> = Vec::new();
             let mut seq: usize = 0;

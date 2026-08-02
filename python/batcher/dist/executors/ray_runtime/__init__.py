@@ -25,6 +25,7 @@ from .metering import (
 )
 from .policies import (
     actor_fault_options,
+    blame_host_for_reduce_failure,
     draining_workers,
     fault_options,
     gather_map_results,
@@ -37,12 +38,12 @@ from .policies import (
 )
 from .readiness import await_autoscale
 from .reduce import run_bucket_reduce
+from .reducers import shuffle_partitions
 from .scaling import (
     alive_node_count,
     clamp_workers,
     cluster_topology,
     node_class_selector,
-    shuffle_partitions,
     topology_scope,
     worker_node_memory_bytes,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "actor_fault_options",
     "alive_node_count",
     "await_autoscale",
+    "blame_host_for_reduce_failure",
     "clamp_workers",
     "cluster_topology",
     "create_worker_placement",

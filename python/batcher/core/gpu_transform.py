@@ -23,6 +23,7 @@ from batcher._internal.hardware import accelerator_backend, gpu_devices_absent
 from batcher._internal.instrument import operator_range
 from batcher._internal.logging import note_suppressed
 from batcher.core.energy import measure_stage
+from batcher.plan.ir_tags import RUNNING_AGGREGATES
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -34,8 +35,6 @@ __all__ = ["gpu_available", "gpu_groupby_agg"]
 # ``cuda`` string; a backend with no torch device (or an unknown one) falls back to CPU
 # rather than raising — the accelerated path is an optimization, never a requirement.
 _TORCH_DEVICE = {"cuda": "cuda", "rocm": "cuda", "xpu": "xpu", "mps": "mps"}
-
-_SUPPORTED_AGGS = ("sum", "count", "mean", "min", "max")
 
 
 @functools.lru_cache(maxsize=1)
@@ -87,7 +86,7 @@ def _validate_aggs(aggs: dict[str, tuple[str, str]]) -> None:
     from batcher._internal.errors import BackendError
 
     for name, (_col, red) in aggs.items():
-        if red not in _SUPPORTED_AGGS:
+        if red not in RUNNING_AGGREGATES:
             raise BackendError(f"unsupported GPU reduction {red!r} for {name!r}")
 
 

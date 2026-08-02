@@ -1,6 +1,6 @@
 """Scalar functions DuckDB has and the engine did not — vs DuckDB.
 
-The differential function census (`docs/internals/competitor_parity_census.md`) sorted
+The differential function census (`docs/architecture/internals/competitor_parity_census.md`) sorted
 DuckDB's 478 scalar and aggregate builtins into supported, absent, and *wrong*. These are
 the absent ones this wave implemented: five math functions, one two-argument math
 function, and eleven string functions whose definition comes from an external

@@ -41,7 +41,7 @@ print(filtered.to_pydict())
 # {'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'category': ['a', 'b', 'a'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
 ```
 
-Null handling, `is_in`, and sampling are in {doc}`/user-guide/transform/filtering`.
+Null handling, `is_in`, and sampling are in {doc}`/user-guide/transform/rows/filtering`.
 
 ## Select and transform columns
 
@@ -59,8 +59,8 @@ print(enriched.columns)
 ```
 
 Column work is expressed rather than looped, and the expression language has typed
-accessors for strings, dates, lists, and structs. See {doc}`/user-guide/transform/transformations`
-and {doc}`/user-guide/transform/expressions`.
+accessors for strings, dates, lists, and structs. See {doc}`/user-guide/transform/rows/transformations`
+and {doc}`/user-guide/transform/columns/expressions`.
 
 ## Aggregate
 
@@ -108,7 +108,7 @@ print(revenue.sort("category").to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
 ```
 
-{doc}`/user-guide/analyze/sql` lists the supported surface, and {doc}`../tutorials/sql-to-dataframe`
+{doc}`/user-guide/analyze/sql` lists the supported surface, and {doc}`/tutorials/foundations/sql-to-dataframe`
 translates a SQL query into DataFrame verbs step by step.
 
 ## Execute and inspect
@@ -133,7 +133,7 @@ filter reached the scan instead of running after it:
 print(ds.filter(bt.col("price") > 25.0).explain())
 ```
 
-Reading a plan is a skill worth ten minutes: {doc}`/user-guide/operate/explain-plans`.
+Reading a plan is a skill worth ten minutes: {doc}`/user-guide/operate/tuning/explain-plans`.
 
 Some questions never need a scan at all. A `count()` on a Parquet source is answered from
 file metadata, and {doc}`/user-guide/analyze/metadata-shortcuts` lists the rest.
@@ -171,9 +171,9 @@ source and the machine, not the code.
 
 ## See also
 
-- {doc}`../tutorials/first-pipeline`: the same shape again, on a realistic dataset.
+- {doc}`/tutorials/foundations/first-pipeline`: the same shape again, on a realistic dataset.
 - {doc}`concepts/index`: lazy evaluation, expressions, scaling, and the adaptive loop, one short page each.
 - {doc}`../user-guide/index`: every operator, with runnable examples.
-- {doc}`../migration/index`: the verb-by-verb table if you already know pandas, Polars, Spark, or SQL.
+- {doc}`/getting-started/migration/index`: the verb-by-verb table if you already know pandas, Polars, Spark, or SQL.
 - {doc}`../api/reference`: a cheat sheet to keep open while you work.
-- {doc}`/user-guide/operate/troubleshooting`: what to read when the first query misbehaves.
+- {doc}`/user-guide/operate/running/troubleshooting`: what to read when the first query misbehaves.

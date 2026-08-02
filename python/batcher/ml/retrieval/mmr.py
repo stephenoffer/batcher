@@ -163,6 +163,50 @@ def _require(batch: pa.RecordBatch, name: str) -> None:
         )
 
 
+def _require_grouped_candidates(batch: pa.RecordBatch, embedding_column: str) -> None:
+    """Fail here if `embedding_column` holds one vector per row rather than a candidate list.
+
+    MMR reranks *within* a query, so its input is one row per query whose embedding column
+    holds that query's whole candidate set — a ``list<list<double>>``. The natural mistake is
+    to hand it the retrieval output before grouping, one candidate per row, which is a
+    ``list<double>``: the same column name, the same element type, one nesting level short.
+
+    NumPy's answer to that was ``AxisError: axis 1 is out of bounds for array of dimension
+    1``, raised from `_unit_rows` three frames inside the UDF — a message about an array the
+    caller never built, naming neither the column nor the shape it needed. Checked once per
+    batch off the schema, not per row, so it costs nothing.
+    """
+    import pyarrow as pa
+
+    field = batch.schema.field(batch.schema.get_field_index(embedding_column))
+    dtype = field.type
+    if not pa.types.is_list(dtype) and not pa.types.is_large_list(dtype):
+        raise PlanError(
+            f"mmr_rerank expects {embedding_column!r} to hold each query's candidate vectors "
+            f"as a list, but it is {dtype}."
+        )
+    inner = dtype.value_type
+    if (
+        pa.types.is_list(inner)
+        or pa.types.is_large_list(inner)
+        or pa.types.is_fixed_size_list(inner)
+        # An all-empty candidate column infers `list<null>`: with no elements there is nothing
+        # to type, so the nesting cannot be read off the schema. That is unresolved, not
+        # wrong, and a batch of empty candidate sets is a legitimate (if degenerate) input the
+        # row loop already handles. Only a type positively recognizable as a single vector per
+        # row is rejected.
+        or pa.types.is_null(inner)
+    ):
+        return
+    raise PlanError(
+        f"mmr_rerank expects {embedding_column!r} to hold one *candidate set* per row — a "
+        f"list of vectors, so `list<list<...>>` — but it is {dtype}, which is a single vector "
+        "per row. Reranking happens within a query, so group the retrieved candidates by the "
+        "query first (for example `.group_by(query_key).agg(...)` collecting the embeddings "
+        "and scores into lists), then rerank the grouped rows."
+    )
+
+
 def _rerank_batch(
     batch: pa.RecordBatch,
     *,
@@ -178,6 +222,7 @@ def _rerank_batch(
 
     for name in (embedding_column, *rerank_columns, *([score_column] if score_column else [])):
         _require(batch, name)
+    _require_grouped_candidates(batch, embedding_column)
 
     embeddings = batch.column(batch.schema.get_field_index(embedding_column)).to_pylist()
     scores = (

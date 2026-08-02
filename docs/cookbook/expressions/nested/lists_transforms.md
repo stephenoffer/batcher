@@ -19,5 +19,5 @@ python examples/expressions/lists_transforms.py
 
 - {doc}`/cookbook/expressions/nested/lists_set_operations`: union, intersection, difference, overlap.
 - {doc}`/cookbook/expressions/nested/lists_vectors`: similarity, distance, and normalization.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

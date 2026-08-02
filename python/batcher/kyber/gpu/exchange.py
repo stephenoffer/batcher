@@ -56,8 +56,12 @@ class DeviceFabric:
             when there is no rail map — no RDMA fabric, or an unreadable PCI tree.
         host_link_gbps: The negotiated device-to-host link, in gigabytes per second. `0.0`
             when the board's link cannot be read.
-        island: How many devices are in the largest coherent group this node has. `0` when the
-            topology is unreadable; `1` on a board with no fabric at all.
+        island: How many devices are in **this device's own** coherent group. `0` when the
+            topology is unreadable; `1` on a board with no fabric at all. Not the node's widest
+            group: a node with one eight-device island and one pair reports 8 for a device that
+            is in the pair, and `device_exchange_gbps` then priced an eight-way exchange at
+            NVLink rate for a device that reaches only one peer that way. Ask
+            `widest_fabric_island` when the node's best group is what is wanted.
         fabric_share: Fraction of the group's pairs that exchange on the fabric, `0.0` through
             `1.0`.
     """
@@ -88,33 +92,57 @@ class DeviceFabric:
         }
 
 
-def device_fabric(ordinal: int = 0) -> DeviceFabric:
+def device_fabric(ordinal: int | None = None) -> DeviceFabric:
     """Read what one device's wires can carry, and how coherent its neighbours are.
 
+    **Two index spaces, and this function has to hold both.** The rail map is keyed by CUDA
+    *ordinal* — it is built from `visible_device_indices`, so a worker pinned to board 6 finds
+    its rail under key 0 — while the PCI link table and the peer matrix are positional on the
+    **NVML index**, board 6 under key 6. Passing one number to all three was wrong for two of
+    them whichever number was chosen, and it is invisible on the node everyone develops on,
+    where the pinning is absent and the two spaces coincide. What it produced on a real worker
+    was a shuffle priced against another board's rail share and another board's neighbours.
+
     Args:
-        ordinal: The device's index as this process sees it (CUDA's numbering).
+        ordinal: The device's CUDA ordinal — the numbering a worker's own framework uses.
+            `None` resolves the device this process is currently computing on. A literal `0`
+            was the previous default, which is right only for an unpinned single-device host.
 
     Returns:
         A `DeviceFabric`. Every field is zero on a host with no accelerators, no fabric, or no
         readable PCI tree, which `readable` reports and every consumer here treats as "keep
         what you had".
     """
+    from batcher._internal.hardware.devices import current_ordinal, visible_device_indices
     from batcher._internal.hardware.fabric.device_links import device_pcie_links
+    from batcher._internal.hardware.fabric.p2p import island_of
     from batcher._internal.hardware.fabric.rails import device_rail_bandwidth_gbps
 
-    rail = device_rail_bandwidth_gbps(ordinal)
+    index_of_ordinal = visible_device_indices()
+    slot = current_ordinal() if ordinal is None else ordinal
+    if slot is None:
+        slot = 0
+    if not (0 <= slot < len(index_of_ordinal)):
+        return DeviceFabric()
+    physical = index_of_ordinal[slot]
+
+    # Rails: ordinal space.
+    rail = device_rail_bandwidth_gbps(slot)
+    # PCI links and peer islands: NVML index space.
     islands = peer_islands()
-    widest = max((len(i) for i in islands), default=0)
     # The *negotiated* link, not the model's nameplate: a card that renegotiated to half width
     # still enumerates and still returns correct results, and this is the term a device
     # decision is most sensitive to. Published in gigabits, consumed here in gigabytes.
     links = device_pcie_links()
-    host_link = links[ordinal].bandwidth_gbps / 8.0 if 0 <= ordinal < len(links) else 0.0
-    group = max((i for i in islands if ordinal in i), key=len, default=())
+    host_link = links[physical].bandwidth_gbps / 8.0 if 0 <= physical < len(links) else 0.0
+    # This device's own group, not the node's widest. `peer_islands` guarantees every device
+    # appears in exactly one island, so `island_of` is the whole answer; the `widest` figure
+    # this replaced belonged to whichever group happened to be biggest on the node.
+    group = island_of(physical, islands)
     return DeviceFabric(
         rail_gbps=rail,
         host_link_gbps=host_link,
-        island=widest,
+        island=len(group),
         fabric_share=fabric_fraction(group) if len(group) > 1 else 0.0,
     )
 

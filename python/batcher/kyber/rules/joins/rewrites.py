@@ -38,6 +38,7 @@ from batcher.plan.expr_ir import (
     referenced_columns,
     remap_columns,
 )
+from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -166,7 +167,6 @@ def join_to_semijoin(node: Distinct, _ctx: OptimizerContext) -> LogicalPlan | No
 _NULL_PROPAGATING_BINARY = frozenset(
     {"lt", "le", "gt", "ge", "eq", "ne", "add", "sub", "mul", "div", "mod", "floor_div"}
 )
-_COMPARISONS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
 
 
 @rule(name="outer_to_inner_join", phase=Phase.REWRITE, matches=(Filter,))
@@ -266,7 +266,7 @@ def _null_rejecting_cols(expr: Expr) -> set[str]:
             return _null_rejecting_cols(expr.left) | _null_rejecting_cols(expr.right)
         if expr.op == "or":  # both disjuncts must reject for the disjunction to
             return _null_rejecting_cols(expr.left) & _null_rejecting_cols(expr.right)
-        if expr.op in _COMPARISONS:  # a null operand makes the comparison null
+        if expr.op in COMPARISON_OPS:  # a null operand makes the comparison null
             return _null_propagating_cols(expr.left) | _null_propagating_cols(expr.right)
         return set()
     if isinstance(expr, IsNotNull):  # false when its argument is null

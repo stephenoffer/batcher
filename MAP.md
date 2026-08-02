@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1173 Python modules across 178 packages and 218 Rust files across 14 crates.
+Covering 1177 Python modules across 179 packages and 218 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -187,7 +187,7 @@ The `Dataset` builder package.
 
 | module | lines | what it is |
 |---|---|---|
-| `_build.py` | 492 | Plan-construction helpers behind the thinner `Dataset` methods. |
+| `_build.py` | 491 | Plan-construction helpers behind the thinner `Dataset` methods. |
 | `_dedup.py` | 321 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 213 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
 | `_export.py` | 96 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` / `to_torch_dataloader`. |
@@ -411,9 +411,9 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `_embed_dedup.py` | 45 | In-batch embedding deduplication — encode each distinct text once, gather back. |
 | `_estimator.py` | 129 | The scaffolding every fitted estimator in `batcher.ml` shares. |
 | `autobatch.py` | 262 | Adaptive batch-size control for inference — what Ray Data makes you hand-tune. |
-| `batch_format.py` | 181 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
+| `batch_format.py` | 13 | Re-export of the `batch_format` conversion, which now lives in `interop`. |
 | `cluster.py` | 346 | Unsupervised clustering — grouping rows by similarity, with no labels. |
-| `converters.py` | 399 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
+| `converters.py` | 271 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
 | `devices.py` | 446 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
 | `discriminant.py` | 324 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 208 | Baseline predictors — the "does my model beat doing nothing" reference. |
@@ -578,7 +578,7 @@ Features derived from time — calendar parts, and history as columns.
 | module | lines | what it is |
 |---|---|---|
 | `calendar.py` | 257 | Turning a timestamp into features a model can use. |
-| `history.py` | 229 | Lag and rolling features — history as columns, without leaking the future. |
+| `history.py` | 232 | Lag and rolling features — history as columns, without leaking the future. |
 
 ### `batcher/ml/retrieval/` — 6 · front-end
 
@@ -710,7 +710,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 378 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 196 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1314 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1304 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 174 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 113 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -810,9 +810,9 @@ Multi-GPU *scheduling* for the translated GPU backend.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 392 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
+| `aggregate.py` | 413 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
 | `cudf_probe.py` | 144 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
-| `device_read.py` | 191 | Read a shard onto the device, instead of onto the host and then across the bus. |
+| `device_read.py` | 194 | Read a shard onto the device, instead of onto the host and then across the bus. |
 | `dispatch.py` | 294 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
 | `join.py` | 218 | Run a translated join across every GPU, by splitting the probe side and broadcasting the build. |
@@ -940,7 +940,7 @@ EXACT-gated *filtered-count* metadata shortcuts (façade).
 
 | module | lines | what it is |
 |---|---|---|
-| `answers.py` | 339 | Answer *filtered* counts from metadata — Kyber's EXACT-gated filter-count layer. |
+| `answers.py` | 338 | Answer *filtered* counts from metadata — Kyber's EXACT-gated filter-count layer. |
 
 ### `batcher/kyber/metadata_summary/` — 3 · subsystem
 
@@ -968,13 +968,13 @@ Kyber rule modules.
 |---|---|---|
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `agg_pushdown.py` | 508 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
-| `fusion.py` | 343 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
+| `fusion.py` | 342 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
 | `leaf_rewrite.py` | 139 | The shared machinery every leaf-level expression rule is built from. |
 | `ordering.py` | 59 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 724 | Projection rewrites — collapse stacked projections and prune unread columns. |
 | `pushdown.py` | 486 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 452 | SELECTION-phase rules — cost-based physical algorithm choice. |
-| `zonemap_pruning.py` | 384 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
+| `zonemap_pruning.py` | 382 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
 
@@ -1018,7 +1018,7 @@ Expression-level Kyber rule families.
 | module | lines | what it is |
 |---|---|---|
 | `boolean_normalize.py` | 141 | Driving `NOT` down to the leaves: De Morgan and double negation. |
-| `cast_unwrap.py` | 193 | Unwrapping a widening cast out of a comparison against a literal. |
+| `cast_unwrap.py` | 192 | Unwrapping a widening cast out of a comparison against a literal. |
 | `comparisons.py` | 169 | Self-comparison collapses: `x = x`, `x < x`, and the rest of the reflexive six. |
 | `complex_types.py` | 498 | Struct, list, and array algebra -- the extract-over-construct family. |
 | `conditionals.py` | 335 | Conditional algebra: moving work across a `CASE`, and pruning `GREATEST`/`LEAST`. |
@@ -1061,9 +1061,9 @@ Extended Kyber rule families.
 | `membership_simplify.py` | 118 | `IN`-list and `coalesce` simplifications. |
 | `metadata_adaptive.py` | 291 | Metadata-adaptive rewrites — skip or simplify work a proven-EXACT stat makes dead. |
 | `null_shapes.py` | 190 | Null-check rewrites driven by an expression's *shape* rather than by column nullability. |
-| `nullability.py` | 364 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
+| `nullability.py` | 365 | Schema-driven NULL reasoning — rewrites proved by *declared* nullability. |
 | `predicate_impossible.py` | 391 | Unsatisfiable predicates — empty out a filter no value can satisfy, from one conjunct alone. |
-| `predicate_infer.py` | 490 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
+| `predicate_infer.py` | 489 | Syntactic predicate inference — simplify a Filter's conjunction from its literals alone. |
 | `projection_scan.py` | 350 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 458 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
 | `sargable.py` | 351 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
@@ -1072,9 +1072,9 @@ Extended Kyber rule families.
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 487 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
 | `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
-| `temporal_extra.py` | 455 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
+| `temporal_extra.py` | 460 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
 | `temporal_folds.py` | 142 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
-| `temporal_sargable.py` | 280 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
+| `temporal_sargable.py` | 279 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
 | `topn_limit.py` | 127 | LIMIT / OFFSET rewrites that the base limit rules don't already cover. |
 | `window_extra.py` | 360 | Window rewrites — prune keys, frames and functions a window does not actually need. |
 | `window_rules.py` | 150 | Window-operator rewrites — canonicalize a `Window`'s keys and prune dead output. |
@@ -1114,8 +1114,8 @@ Ordered-comparison sargable transposition, proved rather than assumed.
 
 | module | lines | what it is |
 |---|---|---|
-| `bounds.py` | 106 | Ordered sargable transposition proved by a column's **measured min/max**. |
-| `shared.py` | 185 | The decomposition and the overflow proof shared by the ordered sargable rules. |
+| `bounds.py` | 107 | Ordered sargable transposition proved by a column's **measured min/max**. |
+| `shared.py` | 184 | The decomposition and the overflow proof shared by the ordered sargable rules. |
 
 ### `batcher/kyber/rules/joins/` — 3 · subsystem
 
@@ -1125,8 +1125,8 @@ The join rule family — every rewrite that reshapes a join, in one package.
 |---|---|---|
 | `agg_semijoin.py` | 226 | Sideways information passing into a decorrelated aggregate's input. |
 | `order.py` | 578 | Cost-based join reordering — the JOIN_REORDER phase. |
-| `projection.py` | 193 | Push a derived projection through a join onto the side it reads, so the join |
-| `range_join.py` | 366 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
+| `projection.py` | 191 | Push a derived projection through a join onto the side it reads, so the join |
+| `range_join.py` | 365 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
 | `rewrites.py` | 492 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
 
 ### `batcher/kyber/rules/math_algebra/` — 3 · subsystem
@@ -1135,7 +1135,7 @@ Numeric rule families that turn a computed comparison back into a sargable one.
 
 | module | lines | what it is |
 |---|---|---|
-| `absolute.py` | 243 | `abs` and `sign` inside a comparison, restated over the bare column. |
+| `absolute.py` | 242 | `abs` and `sign` inside a comparison, restated over the bare column. |
 | `float_predicates.py` | 75 | `isnan` / `isinf` see through the rounding functions. |
 | `rounding.py` | 498 | Comparisons against a rounded, bucketed, or popcounted value, restated as a range. |
 
@@ -1204,7 +1204,7 @@ String rule families: predicate absorption, predicate normalization, and lengths
 |---|---|---|
 | `absorption.py` | 182 | Two string predicates on one column where one implies the other. |
 | `lengths.py` | 158 | A comparison against a string's length is almost always an emptiness test. |
-| `predicates.py` | 207 | A string call whose *comparison* is the real predicate, restated as that predicate. |
+| `predicates.py` | 206 | A string call whose *comparison* is the real predicate, restated as that predicate. |
 
 ### `batcher/kyber/rules/window_algebra/` — 3 · subsystem
 
@@ -1253,10 +1253,10 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 
 | module | lines | what it is |
 |---|---|---|
-| `combine.py` | 423 | Composing leaf selectivities into a whole-predicate estimate. |
-| `leaves.py` | 480 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `combine.py` | 422 | Composing leaf selectivities into a whole-predicate estimate. |
+| `leaves.py` | 479 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 188 | What a text pattern says about how many rows it matches. |
-| `scalars.py` | 330 | Scalar and column-statistic primitives shared by every selectivity estimator. |
+| `scalars.py` | 329 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 
 ### `batcher/carbonite/` — 3 · subsystem
 
@@ -1377,7 +1377,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `base.py` | 83 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 328 | Measuring what a stage drew — Core's half of the energy loop. |
 | `executor.py` | 245 | The Core local executor. |
-| `gpu_transform.py` | 314 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
+| `gpu_transform.py` | 313 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 169 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
@@ -1390,13 +1390,13 @@ Translate a Batcher plan to a GPU dataframe execution (cuDF) — many operators,
 
 | module | lines | what it is |
 |---|---|---|
-| `aggs.py` | 362 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
-| `backend.py` | 457 | The dataframe-library adapter the GPU translator runs against. |
+| `aggs.py` | 382 | Group-by aggregation on a dataframe backend, matching the CPU engine's null semantics. |
+| `backend.py` | 493 | The dataframe-library adapter the GPU translator runs against. |
 | `eligibility.py` | 142 | Which plans the GPU translator can run — the matcher in front of the kernels. |
 | `execute.py` | 346 | Replay a matched plan on a dataframe backend — the executor behind the GPU entry points. |
 | `exprs.py` | 385 | Scalar `Expr` IR → dataframe column, for the GPU (cuDF) and verification (pandas) backends. |
 | `ops.py` | 371 | Relational `RelOp` IR → dataframe operations, for the GPU (cuDF) and pandas backends. |
-| `pruning.py` | 240 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
+| `pruning.py` | 382 | Narrow a plan tree to the columns it actually reads, at every level rather than at the leaves. |
 | `scalar_fns.py` | 395 | The named scalar-function families: math, two-argument math, and dates. |
 | `temporal.py` | 413 | The calendar half of the date vocabulary: `date_trunc`, `offset_by`, the year-derived |
 | `tree.py` | 212 | The whole-plan form of the translator: any tree of scans, joins and unions on the device. |
@@ -1491,7 +1491,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `filesystem.py` | 412 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 342 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
-| `predicate.py` | 428 | Predicate translation for source-side pushdown. |
+| `predicate.py` | 433 | Predicate translation for source-side pushdown. |
 | `sink.py` | 104 | Data sinks — persisting query results. |
 
 ### `batcher/io/base/` — 2 · neutral IO
@@ -1535,7 +1535,7 @@ Template-Method base classes for file-backed sources and sinks.
 | module | lines | what it is |
 |---|---|---|
 | `_commit.py` | 430 | The metadata-only Delta commit: register worker-written files, move no data. |
-| `_predicate.py` | 174 | Rendering an expression for delta-rs: as partition filters, or as SQL. |
+| `_predicate.py` | 175 | Rendering an expression for delta-rs: as partition filters, or as SQL. |
 | `_snapshot.py` | 481 | One cached read of a Delta table's `_delta_log`, shared by every metadata question. |
 | `maintenance.py` | 172 | Delta table maintenance: OPTIMIZE, ZORDER, VACUUM, and log checkpointing. |
 | `sink.py` | 403 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
@@ -1788,7 +1788,7 @@ Splits — independently-readable, picklable slices of a source.
 |---|---|---|
 | `columnar_footer.py` | 386 | Footer-derived statistics for columnar formats (Parquet, ORC, Arrow IPC). |
 | `file_identity.py` | 142 | A cheap identity token for a file, so a metadata cache cannot serve a stale answer. |
-| `file_skipping.py` | 285 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
+| `file_skipping.py` | 284 | Manifest-driven file skipping — turn a pushed predicate into a surviving-file set. |
 | `free_counts.py` | 75 | Free row counts from file headers — metadata that costs one header read. |
 | `key_pruning.py` | 265 | Key-driven file pruning — the copy-on-write MERGE's "which files must I rewrite?". |
 | `lakehouse_manifest.py` | 190 | Manifest-derived statistics for lakehouse tables (Delta, Iceberg). |
@@ -1900,7 +1900,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `feedback.py` | 273 | Execution feedback contract: Core → Kyber. |
 | `ids.py` | 10 | Stable identifiers used across plans and feedback. |
 | `ir_specs.py` | 102 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
-| `ir_tags.py` | 164 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
+| `ir_tags.py` | 205 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 232 | `plan.source_stats` — what a connector declares about a source, cheaply. |
@@ -1913,8 +1913,8 @@ How a plan splits across workers — the neutral algebra both the optimizer and 
 
 | module | lines | what it is |
 |---|---|---|
-| `mergeable.py` | 388 | Split a chain of operators into a per-shard stage and a merge stage, in the plan IR. |
-| `tree_shard.py` | 83 | Which leaf of a multi-way plan tree may be split across workers, and which must be replicated. |
+| `mergeable.py` | 406 | Split a chain of operators into a per-shard stage and a merge stage, in the plan IR. |
+| `tree_shard.py` | 84 | Which leaf of a multi-way plan tree may be split across workers, and which must be replicated. |
 
 ### `batcher/plan/energy/` — 1 · contract
 
@@ -2110,7 +2110,7 @@ String free functions, in two halves: building text and reading structure out of
 |---|---|---|
 | `aggregate.py` | 169 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 255 | `LogicalPlan` — the base class for declarative plan nodes. |
-| `join.py` | 335 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
+| `join.py` | 336 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 431 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
 | `transforms.py` | 320 | Plan transforms and predicates over `LogicalPlan` trees. |
@@ -2195,6 +2195,7 @@ Configuration: one frozen, typed `Config` object.
 | `accelerator.py` | 334 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
 | `config.py` | 2560 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 200 | The wall-clock deadline this process will be killed at, so it drains before that. |
+| `env.py` | 78 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
@@ -2388,6 +2389,15 @@ Centrality: which nodes matter, by five different definitions of "matter".
 | `betweenness.py` | 185 | Betweenness: how much of the graph's shortest-path traffic flows through each node. |
 | `rank.py` | 283 | PageRank and the degree-based centralities. |
 | `spectral.py` | 243 | The eigen-family centralities: eigenvector, Katz, and HITS. |
+
+### `batcher/interop/` — ?
+
+Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
+
+| module | lines | what it is |
+|---|---|---|
+| `arrays.py` | 176 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
+| `formats.py` | 186 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 
 ## Rust data plane — `crates/`
 

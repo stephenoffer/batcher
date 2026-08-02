@@ -632,6 +632,89 @@ pub fn range_partition_by_str_key(
     scatter_into_buckets(batch, &part_of, n_buckets)
 }
 
+/// Cap on the values a single [`string_quantiles`] call sorts. Boundaries only need to
+/// describe the *shape* of the key distribution, and a strided sample of this many values
+/// pins the quantiles of any realistic column to well under a bucket's width — while
+/// keeping the sample sort off the critical path of a wide split.
+const MAX_BOUNDARY_SAMPLE: usize = 1 << 16;
+
+/// Sample a string column's distribution as ascending values at `probs` — the sampling
+/// counterpart of [`range_partition_by_str_key`]'s `boundaries`.
+///
+/// The numeric sort key gets its grid from the KLL sketch in `bc-sketches`, which is
+/// numeric-only, so a string key had no grid at all and the distributed sort refused it.
+/// A sketch is not needed here: the merge on the driver re-quantiles the union of every
+/// worker's sample anyway, so each worker only has to describe its own split. Strided
+/// sampling followed by a sort of the sample does that in bounded memory and time.
+///
+/// Nulls are skipped — they route to a dedicated end bucket rather than by comparison —
+/// and an all-null or empty column yields no boundaries, which the caller reads as "this
+/// split says nothing about the distribution".
+pub fn string_quantiles(key_col: &ArrayRef, probs: &[f64]) -> Result<Vec<String>, RuntimeError> {
+    let mut sample = sample_strings(key_col)?;
+    if sample.is_empty() || probs.is_empty() {
+        return Ok(Vec::new());
+    }
+    sample.sort_unstable();
+    let last = (sample.len() - 1) as f64;
+    Ok(probs
+        .iter()
+        .map(|p| sample[(p.clamp(0.0, 1.0) * last).round() as usize].clone())
+        .collect())
+}
+
+/// Collect up to [`MAX_BOUNDARY_SAMPLE`] non-null values of a `Utf8`/`LargeUtf8` column,
+/// strided so the sample spans the whole column rather than its prefix. A prefix sample
+/// would describe a *sorted* input as a single narrow range and route every row to one
+/// bucket — the exact skew the boundaries exist to prevent.
+///
+/// The stride walks the **non-null** positions, not every position. Striding the raw index
+/// range and discarding the nulls it happened to land on makes the sample size a function of
+/// where the nulls fall: a column whose nulls are periodic with the stride yields a sample
+/// far below the cap, and one whose nulls align with it exactly yields nothing at all — no
+/// boundaries, so every row routes to a single bucket. Counting only what survives keeps the
+/// sample the size the cap intends whatever the null pattern is, in one pass and without
+/// materializing the surviving index list.
+fn sample_strings(key_col: &ArrayRef) -> Result<Vec<String>, RuntimeError> {
+    fn collect<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) -> Vec<String> {
+        let present = arr.len() - arr.null_count();
+        if present == 0 {
+            return Vec::new();
+        }
+        let stride = present.div_ceil(MAX_BOUNDARY_SAMPLE).max(1);
+        let mut sample = Vec::with_capacity(present.div_ceil(stride));
+        let mut seen = 0usize;
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+            if seen % stride == 0 {
+                sample.push(arr.value(i).to_string());
+            }
+            seen += 1;
+        }
+        sample
+    }
+    let bad = || RuntimeError::NonNumericRangeKey {
+        dtype: key_col.data_type().to_string(),
+    };
+    match key_col.data_type() {
+        DataType::Utf8 => Ok(collect(
+            key_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(bad)?,
+        )),
+        DataType::LargeUtf8 => Ok(collect(
+            key_col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(bad)?,
+        )),
+        _ => Err(bad()),
+    }
+}
+
 /// The per-row bucket id [`range_partition_by_str_key`] would scatter by — the routing
 /// without the gather.
 pub fn range_part_of_str(
@@ -1618,5 +1701,121 @@ mod tests {
                 "key {k} landed in different sub-buckets on the two sides under one salt"
             );
         }
+    }
+
+    /// The invariant the whole distributed string sort rests on: routing every row by
+    /// sampled boundaries and concatenating the buckets in order reproduces the single
+    /// global lexical sort. If it did not, the sort would return the right rows in the
+    /// wrong order — the failure `assert_same` is order-independent about and cannot see.
+    #[test]
+    fn string_boundaries_route_into_a_globally_ordered_concatenation() {
+        let words: Vec<String> = (0..500)
+            .map(|i| format!("k{:03}", (i * 37) % 500))
+            .collect();
+        let key: ArrayRef = Arc::new(StringArray::from(words.clone()));
+        for buckets in [1usize, 2, 4, 7, 16] {
+            let probs: Vec<f64> = (1..buckets).map(|i| i as f64 / buckets as f64).collect();
+            let mut bounds = string_quantiles(&key, &probs).unwrap();
+            bounds.dedup();
+            let part_of = range_part_of_str(&key, &bounds, buckets, false, false).unwrap();
+            // Concatenate the buckets in order, sorting within each, and compare against
+            // one global sort of the whole column.
+            let mut concat: Vec<&String> = Vec::new();
+            for b in 0..buckets {
+                let mut in_bucket: Vec<&String> = words
+                    .iter()
+                    .zip(&part_of)
+                    .filter(|(_, &p)| p as usize == b.min(bounds.len()))
+                    .map(|(w, _)| w)
+                    .collect();
+                in_bucket.sort();
+                concat.extend(in_bucket);
+            }
+            let mut global: Vec<&String> = words.iter().collect();
+            global.sort();
+            assert_eq!(concat, global, "buckets={buckets}");
+        }
+    }
+
+    /// Equal keys must never straddle a boundary, or a bucket-local sort could not stand
+    /// in for the global one.
+    #[test]
+    fn equal_string_keys_land_in_one_bucket() {
+        let words: Vec<String> = (0..300).map(|i| format!("v{}", i % 5)).collect();
+        let key: ArrayRef = Arc::new(StringArray::from(words.clone()));
+        let bounds = string_quantiles(&key, &[0.25, 0.5, 0.75]).unwrap();
+        let part_of = range_part_of_str(&key, &bounds, 4, false, false).unwrap();
+        let mut of_word = std::collections::HashMap::new();
+        for (w, b) in words.iter().zip(&part_of) {
+            assert_eq!(
+                *of_word.entry(w.clone()).or_insert(*b),
+                *b,
+                "{w} split across buckets"
+            );
+        }
+    }
+
+    /// A sorted input must still sample its whole range: a prefix sample would describe it
+    /// as one narrow range and route every row to a single bucket.
+    #[test]
+    fn a_sorted_column_still_samples_its_whole_range() {
+        let words: Vec<String> = (0..200_000).map(|i| format!("k{i:06}")).collect();
+        let key: ArrayRef = Arc::new(StringArray::from(words));
+        let q = string_quantiles(&key, &[0.0, 0.5, 1.0]).unwrap();
+        // Endpoints are approximate — a strided sample need not land on the last row — but
+        // they must bracket the column rather than describe its prefix.
+        assert_eq!(q[0], "k000000");
+        assert!(
+            q[1].as_str() > "k090000" && q[1].as_str() < "k110000",
+            "median was {}",
+            q[1]
+        );
+        assert!(q[2].as_str() > "k199000", "top of the range was {}", q[2]);
+    }
+
+    /// Nulls periodic with the stride must not collapse the sample.
+    ///
+    /// The stride walks non-null positions precisely so the null *pattern* cannot decide the
+    /// sample size. Striding raw indices and discarding the nulls landed on made the worst
+    /// case total: at twice the cap the stride is 2, so a column null at every even index was
+    /// sampled entirely on nulls and described no distribution at all — no boundaries, and
+    /// every row routed to one bucket while the sort stayed correct and silent.
+    #[test]
+    fn nulls_periodic_with_the_stride_do_not_collapse_the_sample() {
+        let rows = MAX_BOUNDARY_SAMPLE * 2;
+        let words: Vec<Option<String>> = (0..rows)
+            .map(|i| (i % 2 == 1).then(|| format!("k{i:08}")))
+            .collect();
+        let key: ArrayRef = Arc::new(StringArray::from(words));
+
+        let q = string_quantiles(&key, &[0.0, 0.5, 1.0]).unwrap();
+
+        assert_eq!(q.len(), 3, "a half-null column still describes a distribution");
+        assert!(q[0] < q[1] && q[1] < q[2], "degenerate grid: {q:?}");
+        assert!(q[0].as_str() <= "k00000001", "low end was {}", q[0]);
+        assert!(
+            q[2].as_str() >= "k00131000",
+            "high end was {} — sample did not span the column",
+            q[2]
+        );
+    }
+
+    /// Nulls route by `nulls_first`/`descending`, never by comparison, and an all-null
+    /// column describes no distribution at all.
+    #[test]
+    fn nulls_are_excluded_from_the_sample_and_routed_to_an_end_bucket() {
+        let key: ArrayRef = Arc::new(StringArray::from(vec![Some("b"), None, Some("a")]));
+        assert_eq!(string_quantiles(&key, &[0.0, 1.0]).unwrap(), vec!["a", "b"]);
+        let all_null: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None]));
+        assert!(string_quantiles(&all_null, &[0.5]).unwrap().is_empty());
+        let bounds = vec!["b".to_string()];
+        assert_eq!(
+            range_part_of_str(&key, &bounds, 4, true, false).unwrap()[1],
+            0
+        );
+        assert_eq!(
+            range_part_of_str(&key, &bounds, 4, false, false).unwrap()[1],
+            3
+        );
     }
 }

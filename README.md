@@ -154,7 +154,7 @@ Arrow input, so these compare *execution*, not storage formats:
 | suite | result vs DuckDB on the same Arrow |
 |---|---|
 | **TPC-H sf10** — all 22 queries, 96 cores | **won 21 of 22**, **1.89×** on the suite total |
-| **TPC-H sf1** — all 22 queries, 16 cores | **won 22 of 22**, 1.1×–6.9× faster |
+| **TPC-H sf1** — all 22 queries, 16 cores | **won 22 of 22**, **2.37×** on the suite total (re-measured 2026-07-31) |
 | **ClickBench** — 43 queries | **won 43 of 43**, 43/43 correct |
 | **Semi-structured JSON** — 5 queries | **won 5 of 5**, 3.5×–12.7× faster (**12×–81×** vs Polars) |
 
@@ -176,7 +176,7 @@ scale we measured. Against DuckDB the story is scale-dependent, and we report it
 
 | scale (single node) | Batcher vs DuckDB (same-input execution) |
 |---------------------|-------------------------------------------|
-| **sf1** — 6M rows, in memory   | wins **all 22** TPC-H queries (1.1–6.9×) |
+| **sf1** — 6M rows, in memory   | wins **all 22** TPC-H queries, **2.37×** on the suite total (re-measured 2026-07-31, 16 cores) |
 | **sf10** — 60M rows, in memory | wins **21 of 22** and the suite total by **1.89×** (re-measured 2026-07-27, 96 cores) |
 | **sf100** — 600M rows, scanned | DuckDB leads 2–11×; Batcher OOMs on the deepest join trees (q3/q4/q5) |
 

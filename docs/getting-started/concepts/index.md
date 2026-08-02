@@ -36,14 +36,14 @@ The optimizer re-plans mid-query on measured row counts, not static guesses.
 ## See also
 
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: every way to get a dataset.
-- {doc}`Transformations </user-guide/transform/transformations>`,
+- {doc}`Transformations </user-guide/transform/rows/transformations>`,
   {doc}`Aggregations </user-guide/analyze/aggregations>`,
   {doc}`Joins </user-guide/analyze/joins>`, and
   {doc}`Window functions </user-guide/analyze/window-functions>`: the verbs, once a dataset exists.
 - {doc}`../../architecture/index`: the same split, at the level of the whole system.
-- {doc}`/deep-dives/query/query-lifecycle`: what actually happens between `collect()` and
+- {doc}`/architecture/deep-dives/query/query-lifecycle`: what actually happens between `collect()` and
   the Arrow batches coming back.
-- {doc}`/user-guide/operate/explain-plans`: reading the plan these concepts describe.
+- {doc}`/user-guide/operate/tuning/explain-plans`: reading the plan these concepts describe.
 
 ```{toctree}
 :hidden:

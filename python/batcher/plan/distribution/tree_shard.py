@@ -30,12 +30,13 @@ is — it is, but only when *every* input is split together, which a single-leaf
 
 from __future__ import annotations
 
+from batcher.plan.ir_tags import LEFT_DRIVEN_JOINS
+
 __all__ = ["LEFT_DRIVEN_JOINS", "RIGHT_DRIVEN_JOINS", "shardable_leaves"]
 
 #: Join types whose output is driven by the LEFT input, so splitting it is safe: each left row
 #: is seen by exactly one worker and contributes to the answer exactly as many times as the
 #: matches in the (whole) right side it sees.
-LEFT_DRIVEN_JOINS = frozenset({"inner", "left", "semi", "anti"})
 
 #: The mirror. `inner` is in both because it is driven by neither side alone.
 RIGHT_DRIVEN_JOINS = frozenset({"inner", "right"})

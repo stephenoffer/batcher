@@ -54,7 +54,7 @@ than spelling out `agg`. The set is `sum`, `mean`, `min`, `max`, `median`,
 `quantile(q)`, `n_unique`, `std`, `var`, `count` (non-null values per column), and
 `len` (the per-group row count). With no arguments they reduce every non-key
 column, keeping its name. Pass column names or a
-{doc}`selector </user-guide/transform/transformations>` to reduce a subset. The arithmetic reductions
+{doc}`selector </user-guide/transform/rows/transformations>` to reduce a subset. The arithmetic reductions
 (`sum`, `mean`, `median`, `quantile`, `std`, `var`) default to numeric columns
 only, matching pandas' `numeric_only`.
 
@@ -324,7 +324,7 @@ print(buckets.to_pydict())
 
 - {doc}`Joins </user-guide/analyze/joins>`: combine grouped results with other datasets.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: per-row aggregates that keep the rows.
-- {doc}`Performance and memory </user-guide/operate/performance>`: cache a rollup you reuse, and spill the
+- {doc}`Performance and memory </user-guide/operate/tuning/performance>`: cache a rollup you reuse, and spill the
   aggregations too big for memory.
 - {doc}`Expressions API </api/relational/expressions>`: every aggregate and approximate-aggregate
   method in one place.

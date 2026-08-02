@@ -16,7 +16,7 @@ scalar `Expr` type. There are three things you might add, in increasing cost:
 
 Read `.claude/rules/python-control-plane.md` (the IR wire contract),
 `.claude/rules/maintainability.md` (group by family, keep `Expr`/`Dataset` thin), and
-`docs/internals/extending.md` (the cookbook this skill automates) first.
+`docs/architecture/internals/extending.md` (the cookbook this skill automates) first.
 
 - **Node base:** `plan/expr_ir/node_base.py` — `IRNode`, `@expr_node`, and the field
   factories `child` / `children` / `scalar` / `literal`.

@@ -201,7 +201,7 @@ same object can be reused freely and combined by chaining `replace` calls. See
 - {doc}`options`: every configurable field, with its default and its unit.
 - {doc}`environment`: the same settings as `BATCHER_*` variables, and the precedence order
   when both are present.
-- {doc}`/user-guide/operate/performance`: which of these knobs actually moves a slow query, and
+- {doc}`/user-guide/operate/tuning/performance`: which of these knobs actually moves a slow query, and
   in what order to try them.
 - {doc}`/integrations/compute/ray`: attaching to a cluster, and what the `distributed.*` fields
   above control once you are on one.

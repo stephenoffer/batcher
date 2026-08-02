@@ -120,7 +120,15 @@ def _add_measured_link(row: dict, index: int) -> None:
     came up at, and only when the two disagree — a link at full capability adds nothing a
     reader needs, while one at half width is the whole explanation for a transfer-bound stage
     that used to be fast.
+
+    `index` is the driver's own index, which is what this report enumerates. The PCI link table
+    is positional on it, but `nearest_rdma_device` is keyed by CUDA *ordinal*, so the two need
+    translating between: on a pinned process the ordinal and the index are different numbers,
+    and passing the index straight through silently dropped the NIC column for every device
+    (`nearest_rdma_device(6)` on a one-device visible set is out of range) — or named the wrong
+    NIC on a process pinned to several.
     """
+    from batcher._internal.hardware.devices import visible_device_indices
     from batcher._internal.hardware.fabric.device_links import (
         device_pcie_links,
         nearest_rdma_device,
@@ -130,7 +138,9 @@ def _add_measured_link(row: dict, index: int) -> None:
     if index >= len(links):
         return
     link = links[index]
-    nic = nearest_rdma_device(index)
+    visible = visible_device_indices()
+    ordinal = visible.index(index) if index in visible else -1
+    nic = nearest_rdma_device(ordinal) if ordinal >= 0 else ""
     if nic:
         # Which NIC this device should reach the fabric through. A transfer routed via a NIC
         # on the other root complex crosses the inter-socket link twice on its way off the

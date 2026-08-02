@@ -50,18 +50,41 @@ def sharded_gpu_aggregate(
         no shardable split, an unreadable cluster — so the caller can use the single-device
         dispatch or the CPU engine instead.
     """
+    from batcher.core.gpu_plan.pruning import chain_predicate, chain_projection
     from batcher.plan.distribution import shard_plan
 
     split = shard_plan(ops)
     if split is None:
         return None
 
+    # Narrow the read to the columns the chain names. `shard_descriptors` has taken a
+    # projection all along and the *tree* fan-out passes one; this one did not, so the
+    # commonest accelerated shape there is read every column of the fact table to answer a
+    # three-column query. Derived from the whole `ops` chain rather than `split.shard_ops`:
+    # what runs above the reducer sees only the reducer's output aliases, so the full chain is
+    # both the correct question and the narrower answer.
+    projection = chain_projection(ops)
+    # ...and narrow it to the *rows* the chain keeps, from the same chain, because the CPU scan
+    # path has taken a pushed predicate all along and this one passed `None`. It prunes nothing
+    # on TPC-H — `lineitem` is written in orderkey order, so no row-group's bounds rule it out
+    # (q6: 1961 splits either way) — and pays on a table clustered on what it filters.
+    predicate = chain_predicate(ops)
     descriptors = shard_descriptors(
-        source, gpu_count, sharded=sharded, preserve_order=split.ordered
+        source,
+        gpu_count,
+        sharded=sharded,
+        preserve_order=split.ordered,
+        projection=projection,
+        predicate=predicate,
     )
     if descriptors is None:
         return None
-    partials = _run_shards(descriptors, split.shard_ops, _source_schema(source), gpu_count)
+    # The same projection prices the shards. Packing asks how much of a device one shard holds,
+    # and a shard that reads three of sixteen columns holds three of them — pricing it at the
+    # relation's full width packs fewer tasks onto each board than fit.
+    partials = _run_shards(
+        descriptors, split.shard_ops, _source_schema(source, projection), gpu_count
+    )
     if not partials:
         return None
     return fold_shards(partials, split)
@@ -96,6 +119,7 @@ def shard_descriptors(
     sharded: bool,
     preserve_order: bool,
     projection: list[str] | None = None,
+    predicate: dict | None = None,
 ):
     """One partition descriptor per shard, or `None` when the source cannot be fanned out.
 
@@ -112,6 +136,12 @@ def shard_descriptors(
     difference between moving a fact table's sixteen columns onto a device and moving the four
     the query names — off storage, across the host link, and as resident device memory the shard
     is then sized against. `None` reads the relation as it is.
+
+    `predicate` narrows the same read to the *rows* that can match, from the footer bounds a
+    Parquet file already carries: a row-group ruled out never becomes a shard, so it is never
+    opened, balanced or shipped. It prunes only — the chain's own `filter` re-checks every
+    surviving row — so `None`, or a predicate a source cannot use, costs rows nobody wanted
+    rather than rows somebody did.
     """
     # Only Ray is optional here, so only Ray's import is tolerated. The batcher imports are
     # deliberately NOT in the `try`: they were, and when `_scan_splits` stopped being re-exported
@@ -129,7 +159,7 @@ def shard_descriptors(
         return None
     if not ray.is_initialized() or gpu_count < 1:
         return None
-    splits = _scan_splits(source, gpu_count)
+    splits = _scan_splits(source, gpu_count, predicate)
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
         return None
     if sharded:
@@ -160,7 +190,11 @@ def shard_descriptors(
         n_shards = 1
     _ensure_ray(gpu_count)
     return partition_descriptors(
-        source, n_shards, projection=projection, preserve_order=preserve_order
+        source,
+        n_shards,
+        projection=projection,
+        predicate=predicate,
+        preserve_order=preserve_order,
     )
 
 
@@ -181,18 +215,25 @@ def _device_bytes() -> float:
     return float(gb) * 1e9 if gb else 0.0
 
 
-def _source_schema(source: Source):
-    """The source's schema, or `None` when it cannot be read.
+def _source_schema(source: Source, projection: list[str] | None = None):
+    """The schema the shards are actually read with, or `None` when it cannot be read.
 
     Only ever used to price the shards for packing, so a source that will not describe itself
     costs the fan-out its fractional share and nothing else — the tasks then ask for whole
     devices, which is what they always did.
+
+    `projection` narrows it to the columns the read will return, because that is the width a
+    shard occupies on the device — see `shards.narrowed_schema`, which the join fan-out prices
+    through as well.
     """
     try:
-        return source.schema()
+        schema = source.schema()
     except Exception as exc:
         note_suppressed("dist", "read the source schema for gpu shard packing", exc)
         return None
+    from batcher.dist.gpu.shards import narrowed_schema
+
+    return narrowed_schema(schema, projection)
 
 
 def _run_shards(descriptors: list, shard_ops: list[dict], schema=None, gpu_count: int = 0) -> list:
@@ -241,9 +282,7 @@ def _run_shards(descriptors: list, shard_ops: list[dict], schema=None, gpu_count
     # costs the co-tenancy for one shard's recovery and makes that recovery far more likely to
     # be the last one. Identical to `gpu_task` when nothing was packed, so an unpacked fan-out
     # builds no second handle.
-    retry_task = (
-        ray.remote(**gpu_task_options())(gpu_shard_partial) if packing.packed else gpu_task
-    )
+    retry_task = ray.remote(**gpu_task_options())(gpu_shard_partial) if packing.packed else gpu_task
     cpu_task = ray.remote(max_retries=int(dc.task_max_retries))(cpu_shard_partial)
 
     report = ShardReport("gpu-chain", len(descriptors), packing=packing)

@@ -46,6 +46,7 @@ from batcher.plan.expr_ir import (
 )
 from batcher.plan.expr_ir.core import IsInf, IsNan
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
+from batcher.plan.ir_tags import SAFE_BINARY_OPS
 from batcher.plan.logical import Filter, LogicalPlan, Project
 
 __all__ = [
@@ -63,7 +64,6 @@ __all__ = [
 # Binary ops that are deterministic and cannot raise (no div/mod, whose zero divisor
 # aborts; no cast, whose strict form errors on a bad value). Wrapping add/sub/mul and
 # the comparison / boolean ops are total.
-_SAFE_BINARY_OPS = frozenset({"and", "or", "eq", "ne", "lt", "le", "gt", "ge", "add", "sub", "mul"})
 # Exact Kleene/total-order negation of each comparison: null-in-null-out on both
 # sides, and trichotomy holds under the engine's total float order (NaN included).
 _NEGATED_COMPARISON = {"eq": "ne", "ne": "eq", "lt": "ge", "le": "gt", "gt": "le", "ge": "lt"}
@@ -89,7 +89,7 @@ def _safe(expr: Expr) -> bool:
     if isinstance(expr, (Lit, Col)):
         return True
     if isinstance(expr, Binary):
-        return expr.op in _SAFE_BINARY_OPS and _safe(expr.left) and _safe(expr.right)
+        return expr.op in SAFE_BINARY_OPS and _safe(expr.left) and _safe(expr.right)
     if isinstance(expr, (Not, IsNull, IsNotNull, IsNan, IsInf)):
         return _safe(expr.input)
     if isinstance(expr, InList):

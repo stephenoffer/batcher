@@ -96,7 +96,7 @@ Reference and derive columns, build literals, and branch.
 
 ## Column selectors
 
-A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the {doc}`transformations guide </user-guide/transform/transformations>` for how they compose.
+A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the {doc}`transformations guide </user-guide/transform/rows/transformations>` for how they compose.
 
 ```{eval-rst}
 .. autosummary::
@@ -168,7 +168,7 @@ Address any tunable by its dotted path, in the style of `pandas.set_option` and
 ### Logging and verbosity
 
 One-line switches over `ObservabilityConfig`. See
-{doc}`observability </user-guide/operate/observability>`.
+{doc}`observability </user-guide/operate/running/observability>`.
 
 ```{eval-rst}
 .. autofunction:: batcher.config.set_log_level

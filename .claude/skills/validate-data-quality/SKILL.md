@@ -191,8 +191,8 @@ approximate stats, what is provable from footers) is its own topic; see
 ## See also
 
 - `docs/user-guide/trust/data-quality.md`; `docs/user-guide/analyze/metadata-shortcuts.md`;
-  `docs/cookbook/data-engineering/quality-gates.md`;
-  `docs/examples/data-engineering/{deduplication,schema-evolution,cdc-pipeline}.md`.
+  `docs/cookbook/data-engineering/maintenance/quality-gates.md`;
+  `docs/cookbook/dataset/cleaning/deduplication.md`, `docs/cookbook/data-engineering/modeling/schema-evolution.md`, `docs/cookbook/data-engineering/ingest/cdc-pipeline.md`.
 - Skills: `write-a-batcher-pipeline` (relational basics, `map_batches`);
   `write-a-streaming-pipeline` (gating micro-batches with `for_each_batch`);
   `optimize-a-slow-query` (`stats()`/`explain(analyze=True)` — the *performance* tools);

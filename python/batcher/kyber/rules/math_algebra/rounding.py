@@ -36,6 +36,7 @@ from batcher.kyber.rules.exprs.guards import is_integer, schema_rule
 from batcher.kyber.rules.leaf_rewrite import rewrite_node
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.core import MathExpr
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 from batcher.plan.schema import SchemaRef
 
@@ -52,7 +53,6 @@ __all__ = [
 
 _NODES = (Filter, Project, Aggregate, Sort, Window)
 _INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 _COMPARISONS = ("lt", "le", "gt", "ge", "eq", "ne")
 
 
@@ -80,11 +80,11 @@ def _in_int64(value: int) -> bool:
 def _comparison_parts(expr: Expr) -> tuple[str, Expr, int] | None:
     """`(op, left_operand, integral_literal)` for a comparison against an integral literal,
     normalized so the computed side is on the left."""
-    if not isinstance(expr, Binary) or expr.op not in _FLIP:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_FLIP:
         return None
     for computed, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, _FLIP[expr.op]),
+        (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         value = _integral(other)
         if value is not None:
@@ -104,7 +104,7 @@ def _register(name: str, leaf: Callable[[Expr], Expr], op: str):
             matches=_NODES,
             expr_fn=leaf,
             expr_matches=(Binary,),
-            expr_ops=(op, _FLIP[op]),
+            expr_ops=(op, COMPARISON_FLIP[op]),
         )
     )
 
@@ -424,7 +424,7 @@ def _register_schema(name: str, leaf, op: str) -> object:
             Phase.NORMALIZE,
             lambda node, _ctx, _leaf=leaf: schema_rule(node, _leaf, carries=(Binary,)),
             matches=(Filter, Project),
-            expr_ops=(op, _FLIP[op]),
+            expr_ops=(op, COMPARISON_FLIP[op]),
             expr_schema_fn=leaf,
             expr_matches=(Binary,),
         )

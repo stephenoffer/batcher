@@ -1,7 +1,7 @@
 """Differential tests: list min/max type-generality + precision, and float membership.
 
 Each test pins a bug-hunt defect. Before the fix the engine diverged from DuckDB;
-after it they agree. See docs/internals/bug_hunt_ledger.md.
+after it they agree. See docs/architecture/internals/bug_hunt_ledger.md.
 
 - ``list_min``/``list_max`` cast the child to Float64, which nulled non-numeric
   elements (strings/bools/dates) and lost integer precision above 2^53 — returning a

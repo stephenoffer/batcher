@@ -178,7 +178,7 @@ Fuzzy dedup with MinHash, and `similarity_join` on embeddings.
 
 ## See also
 
-- {doc}`Feature engineering tutorial </tutorials/feature-engineering>`: the full workflow
+- {doc}`Feature engineering tutorial </tutorials/ml/feature-engineering>`: the full workflow
   from raw table to model-ready matrix, end to end, with `Chain`.
 - {doc}`PyTorch integration </ml/inference/pytorch>`: hand the assembled features to a training loop.
 - {doc}`ML API reference </api/models/ml>`: the complete `Preprocessor` surface.

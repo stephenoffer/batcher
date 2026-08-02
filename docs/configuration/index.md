@@ -171,9 +171,9 @@ The environment and file layers are read once when `batcher` is imported.
 
 ## See also
 
-- {doc}`/user-guide/operate/performance`: which of these options matter when a query is slow.
-- {doc}`/user-guide/operate/caching`: the result cache and the options that bound it.
-- {doc}`/deep-dives/memory/buffer-pool`: what the memory options actually govern.
+- {doc}`/user-guide/operate/tuning/performance`: which of these options matter when a query is slow.
+- {doc}`/user-guide/operate/tuning/caching`: the result cache and the options that bound it.
+- {doc}`/architecture/deep-dives/memory/buffer-pool`: what the memory options actually govern.
 - {doc}`/api/operations/configuration`: the configuration objects as an API surface.
 
 ```{toctree}

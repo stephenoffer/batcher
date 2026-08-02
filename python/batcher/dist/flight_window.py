@@ -24,6 +24,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.fleet import acquire_fleet, release_fleet
+from batcher.dist.fleet.plan_id import next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
@@ -45,7 +46,7 @@ def execute_window_flight(
     """Hash-shuffle rows by the window's partition keys over Flight, window per bucket.
 
     Mappers publish their key-hashed row buckets on their own Flight servers
-    (shuffle stage 0); reducer r fetches bucket r from every mapper and runs the
+    (one stage per shuffle); reducer r fetches bucket r from every mapper and runs the
     window operator over the whole partition. Worker loss is survived in both phases:
     `map_barrier` relocates a source whose worker dies while mapping, `ShuffleRecovery`
     recomputes one whose worker dies before the reduce fetches it. `_fault_inject` /
@@ -92,10 +93,15 @@ def execute_window_flight(
         # source republished on a survivor under the same `src`, so the reducers' tickets
         # still resolve. A bare `ray.get` here failed the whole query on one preemption —
         # in the map phase, which reads the source and dominates the query's runtime.
+        # One ticket stage for THIS window's shuffle. It used to be the literal 0, so a
+        # window sharing a fleet with another shuffle of the same query published
+        # byte-identical tickets and one overwrote the other — the collision that made a
+        # join read another join's buckets. See `fleet.plan_id.next_stage_base`.
+        stage = next_stage_base(1)
         addrs, dead = map_barrier(
             workers,
             lambda host, src: actors[host].map_publish_raw.remote(
-                map_ir, key_names, parts[src], n_buckets, 0, src, 0, current_plan_id()
+                map_ir, key_names, parts[src], n_buckets, stage, src, 0, current_plan_id()
             ),
         )
 
@@ -119,6 +125,7 @@ def execute_window_flight(
             workers,
             dead=dead,
             replicas=replicas,
+            stage=stage,
         )
     finally:
         release_fleet(actors, pg, owns)
@@ -132,7 +139,17 @@ def execute_window_flight(
 
 
 def _window_reduce_with_recovery(
-    actors, addrs, parts, map_ir, key_names, win_json, n_buckets, workers, dead=None, replicas=None
+    actors,
+    addrs,
+    parts,
+    map_ir,
+    key_names,
+    win_json,
+    n_buckets,
+    workers,
+    dead=None,
+    replicas=None,
+    stage=0,
 ):
     """Run the window reduce under recompute-on-worker-loss recovery.
 
@@ -148,7 +165,7 @@ def _window_reduce_with_recovery(
 
     def remote_reduce(host: int, bucket: int):
         return actors[host].reduce_window.remote(
-            win_json, addrs, bucket, None, replicas, current_plan_id()
+            win_json, addrs, bucket, None, replicas, current_plan_id(), stage
         )
 
     def republish(target: int, src: int) -> None:
@@ -157,7 +174,7 @@ def _window_reduce_with_recovery(
         retire_replicas(replicas, src, target, "window")
         addrs[src] = ray.get(
             actors[target].map_publish_raw.remote(
-                map_ir, key_names, parts[src], n_buckets, 0, src, 0, current_plan_id()
+                map_ir, key_names, parts[src], n_buckets, stage, src, 0, current_plan_id()
             )
         )
 

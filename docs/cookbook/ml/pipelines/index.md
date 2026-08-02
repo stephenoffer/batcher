@@ -15,79 +15,85 @@ once per worker, so the weights load in the constructor and stay loaded. A funct
 on every batch, and on a GPU stage that is usually the whole performance story.
 :::
 
-## Inference
+## Images, audio, and video
+
+Media pipelines, where the decode in front of the model is the bottleneck rather than the model. See {doc}`multimodal/index`.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
-:::{grid-item-card} {octicon}`zap;1.1em` Batch scoring an LLM
-:link: llm-batch-scoring
-:link-type: doc
-Structured output, and why the engine you pick barely matters.
-:::
-
 :::{grid-item-card} {octicon}`image;1.1em` Image classification
-:link: image-classification
+:link: /cookbook/ml/pipelines/multimodal/image-classification
 :link-type: doc
 Decode on the CPU, forward pass on the GPU, and never in lockstep.
 :::
 
 :::{grid-item-card} {octicon}`pencil;1.1em` Image captioning
-:link: image-captioning
+:link: /cookbook/ml/pipelines/multimodal/image-captioning
 :link-type: doc
 A vision-language model over a URL column, with the dead links survived.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Audio transcription
-:link: audio-transcription
+:link: /cookbook/ml/pipelines/multimodal/audio-transcription
 :link-type: doc
 Decode and resample in the engine, not in a `librosa` loop.
 :::
 ::::
 
-## Embeddings and retrieval
+## Text and language models
+
+Labelling, embedding, and indexing a corpus, with the model inside the pipeline. See {doc}`text/index`.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
+:::{grid-item-card} {octicon}`zap;1.1em` Batch scoring an LLM
+:link: /cookbook/ml/pipelines/text/llm-batch-scoring
+:link-type: doc
+Structured output, and why the engine you pick barely matters.
+:::
+
 :::{grid-item-card} {octicon}`search;1.1em` Text embeddings
-:link: text-embeddings
+:link: /cookbook/ml/pipelines/text/text-embeddings
 :link-type: doc
 Clean the text, embed once, normalize at write time.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.1em` Building a RAG index
-:link: rag-index
+:link: /cookbook/ml/pipelines/text/rag-index
 :link-type: doc
 Chunk, embed, index, retrieve.
 :::
 ::::
 
-## Training data
+## Training data and features
+
+Producing the table a model trains on, without leaking the answer into it. See {doc}`features/index`.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
 :::{grid-item-card} {octicon}`beaker;1.1em` Feature pipeline
-:link: feature-pipeline
+:link: /cookbook/ml/pipelines/features/feature-pipeline
 :link-type: doc
 Fit on train, transform everywhere.
 :::
 
 :::{grid-item-card} {octicon}`git-branch;1.1em` Train/test split
-:link: train-test-split
+:link: /cookbook/ml/pipelines/features/train-test-split
 :link-type: doc
 The leak you get for free from a naive random split.
 :::
 
 :::{grid-item-card} {octicon}`filter;1.1em` Deduplicating training data
-:link: training-data-dedup
+:link: /cookbook/ml/pipelines/features/training-data-dedup
 :link-type: doc
 Including the test-set contamination nobody checks for.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.1em` Recommender features
-:link: recommender-features
+:link: /cookbook/ml/pipelines/features/recommender-features
 :link-type: doc
 Aggregates and windows over an event log, without the future in them.
 :::
@@ -97,7 +103,7 @@ Aggregates and windows over an event log, without the future in them.
 
 Measured on 8xT4 with a prediction-agreement gate on every run. These are the workloads the
 recipes above are built on, and the full table lives in
-{doc}`/benchmarks/ai-and-gpu`.
+{doc}`/benchmarks/results/ai-and-gpu`.
 
 | Workload | Model | Throughput |
 | --- | --- | ---: |
@@ -116,35 +122,15 @@ stage overlapping the GPU stage, and the decode running in the data plane.
 - {doc}`Inference </ml/inference/inference>` and {doc}`GPU scheduling </ml/inference/gpu>`: pools, stage
   overlap, adaptive batch sizing, fractional packing.
 - {doc}`ML API reference </api/models/ml>`: the `ds.ml` namespace and the `batcher.ml` functions.
-- {doc}`GPU execution </deep-dives/distribution/gpu-execution>` and
-  {doc}`tensor columns </deep-dives/memory/tensor-columns>`: the mechanisms underneath.
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>` and
+  {doc}`tensor columns </architecture/deep-dives/memory/tensor-columns>`: the mechanisms underneath.
 - {doc}`Streaming recipes </cookbook/streaming/index>`: the same model stages, over a source that
   never ends.
 
 ```{toctree}
 :hidden:
-:caption: Inference
 
-llm-batch-scoring
-image-classification
-image-captioning
-audio-transcription
-```
-
-```{toctree}
-:hidden:
-:caption: Embeddings and retrieval
-
-text-embeddings
-rag-index
-```
-
-```{toctree}
-:hidden:
-:caption: Training data
-
-feature-pipeline
-train-test-split
-training-data-dedup
-recommender-features
+multimodal/index
+text/index
+features/index
 ```

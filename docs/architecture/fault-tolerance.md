@@ -287,7 +287,7 @@ overhead.
 
 ## See also
 
-- {doc}`Carbonite <../internals/carbonite>`: the resource manager, memory envelope,
+- {doc}`Carbonite </architecture/internals/carbonite>`: the resource manager, memory envelope,
   and the credit model in detail.
 - {doc}`Execution model <execution>`: pipelines, breakers, and the mergeable algebra
   that makes recovery sound.
@@ -295,5 +295,5 @@ overhead.
   memory, and flow-control field with its default.
 - {doc}`Fault-tolerance options <../configuration/fault-tolerance>`: the quarantine
   thresholds and the job-wide retry budget.
-- {doc}`Unstable nodes <../user-guide/operate/unstable-nodes>`: the operator's walkthrough
+- {doc}`Unstable nodes </user-guide/operate/running/unstable-nodes>`: the operator's walkthrough
   for a GPU fleet whose nodes and devices fail underneath a running job.

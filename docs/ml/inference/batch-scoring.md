@@ -208,12 +208,12 @@ thousand rows, not on a billion.
 - {doc}`Model serving patterns </ml/training/model-serving-patterns>`: calling a model that lives in
   another process.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: scoring images, audio, and video.
-- {doc}`GPU execution </deep-dives/distribution/gpu-execution>`: what an actor pool actually is, and
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: what an actor pool actually is, and
   what keeps the device fed.
-- {doc}`Batch inference tutorial </tutorials/batch-inference>`: this job, built up from
+- {doc}`Batch inference tutorial </tutorials/ml/batch-inference>`: this job, built up from
   nothing.
-- {doc}`Image classification </cookbook/ml/pipelines/image-classification>` and
-  {doc}`LLM batch scoring </cookbook/ml/pipelines/llm-batch-scoring>`: the same shape, two models.
-- {doc}`AI and GPU benchmarks </benchmarks/ai-and-gpu>`: the throughput this path reaches.
-- {doc}`UDFs </user-guide/transform/udfs>`: `max_errored_rows`, `output_columns`, and the rest of
+- {doc}`Image classification </cookbook/ml/pipelines/multimodal/image-classification>` and
+  {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same shape, two models.
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the throughput this path reaches.
+- {doc}`UDFs </user-guide/transform/columns/udfs>`: `max_errored_rows`, `output_columns`, and the rest of
   the batch-function contract.

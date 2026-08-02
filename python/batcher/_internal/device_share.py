@@ -33,11 +33,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 __all__ = [
+    "DEVICE_HEADROOM",
     "MAX_COTENANTS",
     "PACK_QUANTA",
     "DeviceShare",
     "balanced_fraction",
     "cotenants_per_device",
+    "device_headroom",
     "devices_for",
     "fits_one_device",
     "pack_fraction",
@@ -45,6 +47,20 @@ __all__ = [
     "share_bytes",
     "usable_bytes",
 ]
+
+#: Fraction of a device never planned against: the CUDA context (~0.5-1 GiB), allocator
+#: fragmentation, and the activation peaks no declared footprint includes.
+#:
+#: This is the *fallback*, used when the configuration cannot be read. The live figure is
+#: `accelerator.vram_headroom`, and `device_headroom()` is how every caller should reach it.
+#: Both exist here, at layer 0, because five different files had each written their own
+#: answer — `0.15` in the packing math, `0.15` in the VRAM pool, `0.85` usable in the device
+#: recommender, `0.75` usable in the distributed config, and a configured `vram_headroom`
+#: that only three of the five actually honored. An operator who raised the knob for a fleet
+#: with a co-tenant moved Carbonite's admission and PyTorch's cap and moved neither Kyber's
+#: packing fraction nor the routing budget, so the optimizer kept sizing against memory the
+#: resource manager had already promised away.
+DEVICE_HEADROOM = 0.15
 
 #: The fractions of a device a claimant may be granted, ascending, ending at the whole device.
 #: A ladder rather than a continuous value because Ray packs by *summing* the requests on a
@@ -99,6 +115,36 @@ class DeviceShare:
         return self.fraction > 0.0
 
 
+def device_headroom() -> float:
+    """The configured fraction of a device held back from every plan and every reservation.
+
+    One accessor rather than a constant read in five places, so `accelerator.vram_headroom` is
+    a knob that actually moves the whole engine: Kyber's packing fraction, Carbonite's
+    admission pool, the PyTorch per-process cap, the device-class recommendation, and the
+    routing budget that decides whether a working set fits one device.
+
+    Returns:
+        The headroom fraction in `[0, 1)`, falling back to `DEVICE_HEADROOM` when the
+        configuration cannot be read — which happens early in process start-up and inside a
+        worker that has not received a config yet, and must never be an exception on a path
+        every allocation goes through.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher._internal.device_share import device_headroom
+            >>> 0.0 <= device_headroom() < 1.0
+            True
+    """
+    try:
+        from batcher.config import active_config
+
+        configured = float(active_config().accelerator.vram_headroom)
+    except Exception:
+        return DEVICE_HEADROOM
+    return configured if 0.0 <= configured < 1.0 else DEVICE_HEADROOM
+
+
 def usable_bytes(device_bytes: float, headroom: float) -> int:
     """Device memory a claimant may plan against, after the untouchable part.
 
@@ -146,7 +192,7 @@ def pack_fraction(
     need_bytes: float,
     device_bytes: float,
     *,
-    headroom: float = 0.15,
+    headroom: float | None = None,
     quanta: Sequence[float] = PACK_QUANTA,
 ) -> float:
     """The `num_gpus` a claimant needing `need_bytes` should request.
@@ -159,7 +205,8 @@ def pack_fraction(
         need_bytes: Device memory the claimant will hold.
         device_bytes: One device's total memory — the *smallest* device on a mixed fleet, since
             a fraction chosen against the largest is an over-commitment on every other one.
-        headroom: Fraction of the device held back from the calculation.
+        headroom: Fraction of the device held back from the calculation, or `None` for the
+            configured `accelerator.vram_headroom`.
         quanta: The packing ladder.
 
     Returns:
@@ -179,13 +226,13 @@ def pack_fraction(
             >>> pack_fraction(3 * gib, 0)  # nothing known about the device
             0.0
     """
-    usable = usable_bytes(device_bytes, headroom)
+    usable = usable_bytes(device_bytes, device_headroom() if headroom is None else headroom)
     if need_bytes <= 0 or usable <= 0:
         return 0.0
     return quantize_fraction(need_bytes / usable, quanta)
 
 
-def share_bytes(device_bytes: float, fraction: float, headroom: float = 0.15) -> int:
+def share_bytes(device_bytes: float, fraction: float, headroom: float | None = None) -> int:
     """The memory one share of `fraction` may actually use.
 
     The inverse of `pack_fraction`, and the figure a claimant must size its *own* buffers
@@ -197,12 +244,13 @@ def share_bytes(device_bytes: float, fraction: float, headroom: float = 0.15) ->
     Args:
         device_bytes: One device's total memory.
         fraction: The granted share; values above `1.0` are whole devices and multiply.
-        headroom: Fraction of the device held back.
+        headroom: Fraction of the device held back, or `None` for the configured
+            `accelerator.vram_headroom`.
 
     Returns:
         Bytes, `0` when the device's capacity or the fraction is unknown.
     """
-    usable = usable_bytes(device_bytes, headroom)
+    usable = usable_bytes(device_bytes, device_headroom() if headroom is None else headroom)
     return int(usable * fraction) if usable > 0 and fraction > 0 else 0
 
 
@@ -269,7 +317,7 @@ def balanced_fraction(claimants: int, quanta: Sequence[float] = PACK_QUANTA) -> 
     return max(fitting) if fitting else min(quanta)
 
 
-def fits_one_device(need_bytes: float, device_bytes: float, headroom: float = 0.15) -> bool:
+def fits_one_device(need_bytes: float, device_bytes: float, headroom: float | None = None) -> bool:
     """Whether a claimant fits a single device, headroom included.
 
     The routing question one step above the fraction: a need that fits is *packed*, one that
@@ -279,11 +327,12 @@ def fits_one_device(need_bytes: float, device_bytes: float, headroom: float = 0.
     Args:
         need_bytes: Device memory the claimant will hold.
         device_bytes: One device's total memory.
-        headroom: Fraction of the device held back.
+        headroom: Fraction of the device held back, or `None` for the configured
+            `accelerator.vram_headroom`.
 
     Returns:
         True when it fits. An unknown device reports `False`, which routes to the sharded path
         — the one that is correct at any size, merely slower when it was not needed.
     """
-    usable = usable_bytes(device_bytes, headroom)
+    usable = usable_bytes(device_bytes, device_headroom() if headroom is None else headroom)
     return usable > 0 and 0 < need_bytes <= usable

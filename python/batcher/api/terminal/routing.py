@@ -44,6 +44,65 @@ def resolve_distributed(
     plan: LogicalPlan | None = None,
     sources: list[Source] | None = None,
 ) -> bool:
+    """Resolve ``distributed="auto"`` (see `_resolve_distributed`), and say so when a stage
+    that asked for an accelerator is about to run on a process that has none.
+
+    The routing answer is unchanged; only the silence is. A stage carrying ``num_gpus`` (or a
+    custom accelerator resource) that stays local on a GPU-less driver runs its model on the
+    CPU and returns the right answer slowly, with nothing said — and on the ordinary cluster
+    shape, a CPU head node with GPU workers, that is the *default* outcome of forgetting
+    `distributed=True`, because ``auto`` will not force a Ray init to find out. The user asked
+    for a device by name; not getting one is worth a sentence.
+    """
+    decision = _resolve_distributed(distributed, plan, sources)
+    if not decision:
+        _warn_accelerator_stage_stays_local(plan)
+    return decision
+
+
+def _warn_accelerator_stage_stays_local(plan: LogicalPlan | None) -> None:
+    """Warn when `plan` wants an accelerator and this process demonstrably has none.
+
+    Gated on the plan first, so the detection below only runs for a query that already
+    intends to load a model — where importing torch costs nothing the UDF was not about to
+    pay anyway. Silent unless the absence is *positively* established: a host whose devices
+    cannot be read is not a host without devices, and a false warning on every GPU query
+    would be worse than the silence this replaces.
+    """
+    if plan is None or not _plan_has_gpu_stage(plan):
+        return
+    if _local_accelerator_present() is not False:
+        return
+    import warnings
+
+    from batcher._internal.errors import PerformanceWarning
+
+    warnings.warn(
+        "this query has a stage that requested an accelerator, but it is running on this "
+        "process, which has none — the model will run on CPU. Pass distributed=True to run "
+        "it on the cluster's accelerator nodes (`auto` will not start Ray on its own, so it "
+        "cannot route there for you).",
+        PerformanceWarning,
+        stacklevel=4,
+    )
+
+
+def _local_accelerator_present() -> bool | None:
+    """Whether this process can see an accelerator: `True`, `False`, or `None` for unknown.
+
+    The probe lives in `_internal.hardware.devices.presence`, shared with the `dist`
+    dispatcher, which asks the same question before falling back to single-node.
+    """
+    from batcher._internal.hardware.devices.presence import local_accelerator_present
+
+    return local_accelerator_present()
+
+
+def _resolve_distributed(
+    distributed: bool | str,
+    plan: LogicalPlan | None = None,
+    sources: list[Source] | None = None,
+) -> bool:
     """Resolve ``distributed="auto"``: distribute only when it PAYS.
 
     On a multi-node cluster the Ray fan-out is a ~2 s fixed cost, so a small query is far
@@ -142,23 +201,18 @@ def _plan_has_gpu_stage(plan: LogicalPlan) -> bool:
     """Whether any `map_batches` stage requests an accelerator (so the query must distribute
     to reach the cluster's accelerators, whatever its input size).
 
-    Both request forms count. Ray reports NVIDIA/AMD/Intel/MetaX as the `GPU` resource, which
-    is `num_gpus`; every other accelerator — `TPU`, `neuron_cores` (Trainium/Inferentia),
-    `HPU` (Gaudi), `NPU` — is a *custom* resource and carries `num_gpus == 0`. Checking only
-    `num_gpus` therefore made exactly the non-CUDA accelerators invisible here, so a TPU or
-    Trainium stage was routed by input size alone and ran locally on the CPU-only driver,
-    never reaching the accelerator nodes it asked for.
-    """
-    from batcher.plan.logical import MapBatches
+    The predicate itself is `plan.accelerator.plan_requests_accelerator`, in the neutral
+    layer, because the `dist` dispatcher asks the same question before it falls back to
+    single-node and the two answers must not drift.
 
-    node: LogicalPlan | None = plan
-    while node is not None:
-        if isinstance(node, MapBatches) and (
-            getattr(node, "num_gpus", 0) > 0 or getattr(node, "resources", ())
-        ):
-            return True
-        node = getattr(node, "input", None)
-    return False
+    Delegating also fixed a blind spot this had on its own: it followed the single `input`
+    chain, so a GPU stage on the **build side of a join** was invisible and the query was
+    routed by input size alone — landing the inference on the CPU-only driver, which is the
+    exact outcome this check exists to prevent.
+    """
+    from batcher.plan.accelerator import plan_requests_accelerator
+
+    return plan_requests_accelerator(plan)
 
 
 def _estimated_input_rows(sources: list[Source]) -> int | None:

@@ -20,6 +20,8 @@ from typing import Any
 
 import pyarrow as pa
 
+from batcher.plan.ir_tags import COMPARISON_FLIP, COMPARISON_OPS
+
 __all__ = [
     "to_iceberg_expression",
     "to_mongo_filter",
@@ -28,9 +30,7 @@ __all__ = [
     "to_sql_where",
 ]
 
-_CMP = {"eq", "ne", "lt", "le", "gt", "ge"}
 _SQL_OP = {"eq": "=", "ne": "<>", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
-_FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def _literal(ir: dict[str, Any]) -> Any:
@@ -108,13 +108,60 @@ def _col_and_pa_literal(
     """Like :func:`_col_and_literal`, but the value is a typed pyarrow scalar.
 
     `schema` (when known) types a temporal literal to its column's own type, so a filter
-    on a timezone-aware timestamp column type-checks instead of raising.
+    on a timezone-aware timestamp column type-checks instead of raising, and lets a
+    literal the scanner could not compare at all be declined instead of pushed.
     """
     if left.get("e") == "col" and right.get("e") == "lit":
-        return left["name"], _pa_literal(right, _field_type(schema, left["name"])), False
-    if left.get("e") == "lit" and right.get("e") == "col":
-        return right["name"], _pa_literal(left, _field_type(schema, right["name"])), True
-    return None
+        col, lit = left["name"], right
+    elif left.get("e") == "lit" and right.get("e") == "col":
+        col, lit = right["name"], left
+    else:
+        return None
+    col_type = _field_type(schema, col)
+    if not _comparable(col_type, lit):
+        return None
+    return col, _pa_literal(lit, col_type), left.get("e") == "lit"
+
+
+def _comparable(col_type: Any | None, lit: dict[str, Any]) -> bool:
+    """Whether arrow has a comparison kernel for this column type against this literal.
+
+    Arrow compares within a type family and promotes between numeric widths, but it has no
+    ``greater_equal(date32, string)`` — and the scanner raises `ArrowNotImplementedError`
+    rather than declining, from inside whatever task built it. SQL routinely writes exactly
+    that: ``WHERE EventDate >= '2013-07-01'`` against a `date32` column is the ClickBench
+    spelling, and it failed six of the 43 queries on the distributed path while running
+    single-node, where the filter is the engine's and the engine coerces.
+
+    So the mismatch is declined here instead. Pushdown is an optimization and the engine's
+    own `Filter` re-checks every row, so dropping this term costs pruning and never a row.
+    Coercing the string to the column's type would keep the pruning, but only if this
+    module's parse agreed with the engine's cast on every input — and a pushdown that
+    disagrees silently returns the wrong rows, which is the one outcome worth ruling out.
+
+    An unknown column type (no schema) keeps the previous behavior: push and hope, which is
+    what every caller without a schema has always done.
+    """
+    if col_type is None:
+        return True
+    ((kind, _),) = lit["value"].items()
+    if pa.types.is_dictionary(col_type):
+        col_type = col_type.value_type
+    if pa.types.is_temporal(col_type):
+        return kind in ("date", "timestamp", "time")
+    if pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
+        return kind == "str"
+    if pa.types.is_binary(col_type) or pa.types.is_large_binary(col_type):
+        return kind in ("str", "bytes")
+    if pa.types.is_boolean(col_type):
+        return kind in ("bool", "int")
+    if (
+        pa.types.is_integer(col_type)
+        or pa.types.is_floating(col_type)
+        or pa.types.is_decimal(col_type)
+    ):
+        return kind in ("int", "float", "bool")
+    return True  # a type this does not model: unchanged, push it
 
 
 def _field_type(schema: Any | None, name: str) -> Any | None:
@@ -171,15 +218,22 @@ def _to_pa(ir: dict[str, Any], ds: Any, schema: Any | None = None) -> Any | None
     if op in ("and", "or"):
         left = _to_pa(ir["left"], ds, schema)
         right = _to_pa(ir["right"], ds, schema)
-        if left is None or right is None:
-            return None
-        return (left & right) if op == "and" else (left | right)
-    if op in _CMP:
+        if op == "or":
+            # Dropping a disjunct narrows the filter and would lose rows. All or nothing.
+            return None if left is None or right is None else (left | right)
+        # An AND may keep whichever side is pushable: a conjunct only ever *widens* the
+        # rows read, and the engine's `Filter` re-checks all of them. Dropping the whole
+        # filter because one term was not pushable is what turned an unpushable date
+        # comparison into a full scan of an eight-column, six-predicate ClickBench query.
+        if left is None:
+            return right
+        return left if right is None else (left & right)
+    if op in COMPARISON_OPS:
         parsed = _col_and_pa_literal(ir["left"], ir["right"], schema)
         if parsed is None:
             return None
         col, value, flipped = parsed
-        effective = _FLIP[op] if flipped else op
+        effective = COMPARISON_FLIP[op] if flipped else op
         field = ds.field(col)
         return {
             "eq": field == value,
@@ -230,7 +284,7 @@ def to_sql_where(ir: dict[str, Any]) -> str | None:
         if left is None or right is None:
             return None
         return f"({left} {op.upper()} {right})"
-    if op in _CMP:
+    if op in COMPARISON_OPS:
         parsed = _col_and_literal(ir["left"], ir["right"])
         if parsed is None:
             return None
@@ -241,7 +295,7 @@ def to_sql_where(ir: dict[str, Any]) -> str | None:
         # re-checks every row, so a non-pushed predicate is always correct.
         if isinstance(value, float) and not math.isfinite(value):
             return None
-        effective = _FLIP[op] if flipped else op
+        effective = COMPARISON_FLIP[op] if flipped else op
         return f"{col} {_SQL_OP[effective]} {_sql_literal(value)}"
     return None
 
@@ -274,12 +328,12 @@ def to_iceberg_expression(ir: dict[str, Any]) -> Any | None:
             if left is None or right is None:
                 return None
             return ie.And(left, right) if op == "and" else ie.Or(left, right)
-        if op in _CMP:
+        if op in COMPARISON_OPS:
             parsed = _col_and_literal(node["left"], node["right"])
             if parsed is None:
                 return None
             col, value, flipped = parsed
-            effective = _FLIP[op] if flipped else op
+            effective = COMPARISON_FLIP[op] if flipped else op
             return cmp_ctor[effective](col, value)
         return None
 
@@ -330,7 +384,7 @@ def to_native_predicate(ir: dict[str, Any]) -> dict[str, Any] | None:
         if left is None or right is None:
             return None
         return {"node": op, "left": left, "right": right}
-    if op in _CMP:
+    if op in COMPARISON_OPS:
         left, right = ir["left"], ir["right"]
         if left.get("e") == "col" and right.get("e") == "lit":
             col, lit_ir, flipped = left["name"], right, False
@@ -341,7 +395,12 @@ def to_native_predicate(ir: dict[str, Any]) -> dict[str, Any] | None:
         value, ok = _native_scalar(lit_ir)
         if not ok:
             return None
-        return {"node": "cmp", "col": col, "op": _FLIP[op] if flipped else op, "lit": value}
+        return {
+            "node": "cmp",
+            "col": col,
+            "op": COMPARISON_FLIP[op] if flipped else op,
+            "lit": value,
+        }
     return None
 
 
@@ -364,11 +423,11 @@ def to_mongo_filter(ir: dict[str, Any]) -> dict[str, Any] | None:
         if left is None or right is None:
             return None
         return {f"${op}": [left, right]}
-    if op in _CMP:
+    if op in COMPARISON_OPS:
         parsed = _col_and_literal(ir["left"], ir["right"])
         if parsed is None:
             return None
         col, value, flipped = parsed
-        effective = _FLIP[op] if flipped else op
+        effective = COMPARISON_FLIP[op] if flipped else op
         return {col: {_MONGO_OP[effective]: value}}
     return None

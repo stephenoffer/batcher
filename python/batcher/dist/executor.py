@@ -40,6 +40,7 @@ from batcher.dist.executors.plan_analysis import (
     _single_source,
     _split_at,
     empty_result_table,
+    shuffle_branches,
 )
 from batcher.dist.executors.plan_analysis import _relabel_single_source as _relabel_single_source
 from batcher.dist.executors.ray_runtime import _ensure_ray as _ensure_ray
@@ -73,6 +74,7 @@ from batcher.plan.logical import (
     RangeJoin,
     RowId,
     Sample,
+    Scan,
     Sort,
     Union,
     Window,
@@ -325,6 +327,12 @@ def _worker_node_cpus() -> list[float]:
     missed the `topology_scope()` snapshot and paid its own `ray.nodes()` round trip on
     every call. Sharing the definition is also what the layering asks for: two copies of a
     rule is the one way to get them out of step.
+
+    Nameplate capacity, deliberately: this is the cluster's *shape*, and a node whose cores
+    are momentarily all held is still a node the fleet will run on. Sizing the shape from what
+    is free at this instant makes a busy 4-node cluster look like a 1-node one and collapses
+    the fan-out. What free capacity legitimately bounds is the per-worker *grant*, which
+    `_fill_grant` caps so the bundle is placeable.
     """
     from batcher.dist.executors.ray_runtime.scaling import node_classes
 
@@ -451,13 +459,60 @@ def _fill_grant(node_cpus: list[float]) -> float:
         return sum(int(c // grant) * grant for c in node_cpus)
 
     best = max(occupied(g) for g in candidates)
-    if best <= 0:
-        return candidates[-1]
-    # `candidates` is descending, so the first acceptable one is the largest.
-    for grant in candidates:
-        if occupied(grant) >= _FILL_STRAND_TOLERANCE * best:
-            return grant
-    return candidates[-1]
+    chosen = candidates[-1]
+    if best > 0:
+        # `candidates` is descending, so the first acceptable one is the largest.
+        for grant in candidates:
+            if occupied(grant) >= _FILL_STRAND_TOLERANCE * best:
+                chosen = grant
+                break
+    return _placeable_grant(chosen, node_cpus)
+
+
+def _placeable_grant(grant: float, node_cpus: list[float]) -> float:
+    """`grant`, thinned until the gang it implies can actually be placed on free cores.
+
+    The grant above is chosen from nameplate capacity, which is right for the cluster's
+    *shape* and wrong for whether Ray can place the fleet. A gang is all-or-nothing: it needs
+    one free block of `grant` cores per worker, so a grant the free capacity cannot tile
+    leaves the placement group pending until the timeout and the query fails with `no
+    distributed worker became available` on a cluster that is almost entirely idle. Measured
+    here with a co-tenant holding a core or two per node: `4 bundles x 8 CPU` is unsatisfiable
+    while the same four workers at 5 cores each place immediately.
+
+    Thinning **preserves the worker count** — it returns the largest grant whose free-capacity
+    tiling still yields as many workers as the nameplate tiling does. That is the whole
+    difference between this and reading the cluster's shape from free capacity, which was
+    tried first and is much worse: a node whose cores are momentarily all held drops out
+    entirely, a busy four-node cluster looks like a one-node one, and the fan-out collapses
+    silently to a single worker.
+
+    Returns `grant` unchanged when the per-node figures cannot be read, when they do not line
+    up with the node set, or when nothing is holding cores — the idle-cluster case, which is
+    every single-tenant run and therefore the common one.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import node_classes
+
+    try:
+        rows = node_classes()
+        free = [float(n["free_cpus"]) for n in rows]
+        nameplate = [float(n["cpus"]) for n in rows]
+    except Exception as exc:
+        note_suppressed("dist", "read free capacity for the worker grant", exc)
+        return grant
+    if len(free) != len(node_cpus) or not free:
+        return grant
+
+    def tiles(sizes: list[float], g: float) -> int:
+        return sum(int(c // g) for c in sizes)
+
+    wanted = tiles(nameplate, grant)
+    if wanted <= 0 or tiles(free, grant) >= wanted:
+        return grant  # already placeable — the idle-cluster path, and no-op
+    for candidate in range(int(grant) - 1, 0, -1):
+        if tiles(free, float(candidate)) >= wanted:
+            return float(candidate)
+    return grant  # nothing thin enough tiles it; the cluster is genuinely full
 
 
 def _even_cpu_share(workers: int) -> float:
@@ -755,25 +810,24 @@ def _distributed_global_window(
 def _range_partitionable_sort_key(sort: Sort) -> bool:
     """Whether the leading sort key is a type the range partitioner accepts.
 
-    The distributed sort routes rows by comparing the leading key as `f64` against `f64`
-    quantile boundaries, so `bc_runtime::shuffle` takes a numeric key directly and a temporal
-    one through its order-preserving integer backing. It **refuses a string** on purpose, and
-    the reason is a correctness one rather than a missing cast: arrow would read `"12"` as
-    `12.0` and order the buckets numerically, disagreeing with the single-node *lexical* sort.
+    The distributed sort routes rows against sampled quantile boundaries, in one of two
+    orders. A numeric key is compared as `f64` (`bc_runtime::shuffle::range_partition_by_key`),
+    and a temporal one through its order-preserving integer backing. A **string** key is
+    compared byte-lexically (`range_partition_by_str_key`) — never as `f64`, because arrow
+    would read `"12"` as `12.0` and order the buckets numerically, disagreeing with the
+    single-node lexical sort.
 
-    Without this check that refusal surfaced as a `RuntimeError` from inside a Ray task —
-    `ORDER BY <string column>` under `distributed=True` crashed rather than ran. Declining to
-    distribute is the honest answer: the query still returns the right rows from the
-    single-node sort, which is a performance limit instead of a failure.
+    The string case used to be refused here, which was the honest answer while it had no
+    routing: the alternative was a `RuntimeError` from inside a Ray task. But refusing is
+    only harmless when the fallback can *run*. Once an earlier stage leaves its result on
+    the workers, every source is splittable and `_unsupported` raises rather than falling
+    back — so `ORDER BY <string column>` after any shuffle failed outright. That is four of
+    the 22 TPC-H queries (q4, q9, q12, q22), each ending in a string `ORDER BY` over a
+    materialized aggregate.
 
     `None` from either the schema or the inference means "not certain", and the sound answer
     there is to leave routing exactly as it was — this may only ever *withhold* distribution
     on a key it is sure about.
-
-    Lifting the limit means giving the FFI a string-boundary entry point:
-    `bc_runtime::shuffle::range_part_of_str` already exists and is what the single-node
-    parallel sample sort (`bc_interp::ops::sample_sort`) uses for exactly this case. The
-    sampling side would need string quantiles too, since `merge_boundaries` is numpy-numeric.
     """
     schema = sort.input.available_schema()
     if schema is None:
@@ -788,6 +842,8 @@ def _range_partitionable_sort_key(sort: Sort) -> bool:
         or pa.types.is_floating(dtype)
         or pa.types.is_decimal(dtype)
         or pa.types.is_temporal(dtype)
+        or pa.types.is_string(dtype)
+        or pa.types.is_large_string(dtype)
     )
 
 
@@ -951,6 +1007,12 @@ def _dispatch(
                 from batcher.dist.executors.map import _distributed_map_aggregate
 
                 return _distributed_map_aggregate(above, agg, sources, workers)
+        # Any other breaker over a map/UDF pipeline — `map_batches(...).sort(...)`,
+        # `.distinct()`, `.limit()`, a partitioned window: run the pipeline as its own
+        # distributed stage, land it on shared scratch, and dispatch the breaker over that.
+        staged = _stage_map_prefix(plan, sources, workers, transport, hub)
+        if staged is not None:
+            return staged
         # Any other map+breaker shape has no distributed path yet.
         return _unsupported(plan, sources, "a map_batches/UDF pipeline feeding this operator")
 
@@ -1106,6 +1168,20 @@ def _dispatch(
                 return execute_aggregate_flight(
                     above, agg, sources, workers, materialize=materialize
                 )
+            from batcher.dist.executors.aggregate import _distributed_aggregate
+
+            return _distributed_aggregate(
+                above, agg, sources, workers, hub, materialize=materialize, metrics_out=metrics_out
+            )
+        # An aggregate over a UNION ALL of map-only branches: every branch maps into the SAME
+        # shuffle, so nothing is concatenated on the driver first. `union(...).group_by(...)`
+        # and both set operators (`intersect`/`except_` lower to an aggregate over a union of
+        # tagged branches) reach this. Without it they took `_distributed_union`, which runs
+        # each branch to a driver table — the whole of both inputs through one node to answer
+        # a query that reduces them. Disk shuffle only, as the ASOF join is, so it needs the
+        # same cross-node scratch the disk transport always does.
+        if shuffle_branches(agg.input) is not None and isinstance(agg.input, Union):
+            _require_shared_scratch("aggregate over union")
             from batcher.dist.executors.aggregate import _distributed_aggregate
 
             return _distributed_aggregate(
@@ -1272,6 +1348,90 @@ def _dispatch(
     return _unsupported(plan, sources, "an unsupported operator combination")
 
 
+def _stage_map_prefix(
+    plan: LogicalPlan, sources: list[Source], workers: int, transport: str, hub=None
+):
+    """Run a `map_batches` prefix as its own stage so the breaker above it can distribute.
+
+    Returns the result table, or `None` when the shape does not qualify (the caller then
+    reports the gap as before).
+
+    A UDF pipeline distributes, and every relational breaker distributes, but nothing composed
+    them: the map executors ship a *whole* sub-plan to each worker, which is only sound for a
+    map-only one, so a `sort` / `distinct` / `limit` / partitioned `window` above a
+    `map_batches` matched no branch and raised on splittable data. That is the shape of most
+    batch-inference work once the model has run — read, infer, then order or deduplicate the
+    output — and `_distributed_map_aggregate` covered only the aggregate case of it.
+
+    The fix is a stage boundary, which is what a shuffle is anyway. Each worker writes its own
+    partition of the UDF output to shared scratch and only file locators come back, so the
+    post-inference rows never pass through the driver — the same two-phase shape as the
+    distributed write, and the reason this is bounded in memory rather than a driver
+    materialization. The breaker then sees an ordinary splittable Parquet source and takes the
+    route it always had, so it needs no map-awareness of its own.
+
+    Restricted to a **linear** prefix under a single-input breaker: a join has two operands and
+    replacing one of them is a different rewrite, so it stays unrouted. Order is preserved
+    where it is observable, because the scratch is read back as a source and the breaker above
+    imposes its own order; a bare `limit` over a UDF is the one shape that would depend on the
+    write order, and it is handled by the ordinary `Limit` path only when there is no UDF.
+    """
+    import dataclasses
+
+    from batcher.core.udf import has_map_batches
+
+    # Walk down single-input nodes to the map pipeline. A `Join`/`Union` has no `.input`, so
+    # the walk stops there and the shape is declined.
+    chain: list[LogicalPlan] = []
+    node = plan
+    while not _is_linear_map_pipeline(node):
+        if not hasattr(node, "input"):
+            return None
+        chain.append(node)
+        node = node.input
+    if not chain or not has_map_batches(node) or not _single_source(node):
+        return None
+    sid = next(iter(scanned_source_ids(node)))
+    if sid >= len(sources) or not _is_splittable_source(sources[sid]):
+        return None  # nothing to fan out; the single-node fallback is the right plan
+    _require_shared_scratch("a map_batches pipeline feeding this operator")
+
+    from batcher.dist.executors.map import _distributed_map
+    from batcher.dist.shuffle_io import distributed_work_dir
+    from batcher.io.formats.structured.parquet import ParquetSource
+    from batcher.plan.schema import SchemaRef
+
+    work_dir = distributed_work_dir("batcher_mapstage_")
+    try:
+        _distributed_map(
+            node,
+            sources,
+            workers,
+            hub,
+            write_spec={
+                "fmt": "parquet",
+                "sink_kwargs": None,
+                "path": work_dir,
+                "partition_by": None,
+            },
+        )
+        staged = ParquetSource(work_dir)
+        try:
+            schema = SchemaRef.from_arrow(staged.schema())
+        except Exception:
+            # Every partition was empty, so no file carries a schema. The result is empty
+            # whatever the breaker is, and the plan's own schema is the honest one to return.
+            return empty_result_table(plan, plan.available_columns())
+        # Re-root the chain on a scan of the staged output. `materialize=True`: the scratch is
+        # removed below, so a partitioned intermediate pointing into it must not escape.
+        rebuilt: LogicalPlan = Scan(len(sources), schema)
+        for above in reversed(chain):
+            rebuilt = dataclasses.replace(above, input=rebuilt)
+        return _dispatch(rebuilt, [*sources, staged], workers, transport, hub, materialize=True)
+    finally:
+        _rmtree(work_dir)
+
+
 def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
     """Either fail loudly (the silent-single-node antipattern) or run a legitimately
     single-node-only plan on one node.
@@ -1313,7 +1473,50 @@ def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
             f"({reason}); refusing to silently fall back to single-node on distributed "
             f"data. {hint}"
         )
+    _warn_accelerator_stage_falls_back(plan, reason)
     return _single_node(plan, sources)
+
+
+def _warn_accelerator_stage_falls_back(plan: LogicalPlan, reason: str) -> None:
+    """Say so when the single-node fallback is about to run a device stage on the driver.
+
+    The fallback above is correct for CPU work: with no splittable source there is no
+    distributed data, so one node is the right plan rather than a perf cliff. That reasoning
+    does not carry to a stage holding a device. The driver of a GPU cluster is routinely the
+    one node *without* one — a CPU head node with GPU workers is the ordinary shape — so the
+    same fallback silently runs the model on CPU, returning the right answer arbitrarily
+    slower with nothing said, after the user asked for `distributed=True` and named a device.
+
+    Measured on the 4xT4 cluster: `group_by(...).agg(...)` feeding
+    `ds.ml.map_batches(Model, num_gpus=1)` under `collect(distributed=True)` ran every batch
+    on the driver's CPU, while all four devices sat idle — because a shuffle beneath a
+    `map_batches` is a shape the dispatcher has no one-shot path for and the intermediate is
+    in-memory, so it landed here.
+
+    A warning rather than a raise: the query is correct, and failing a pipeline that works
+    today would be a worse trade than telling its author what it is costing them.
+    """
+    from batcher.plan.accelerator import plan_requests_accelerator
+
+    if not plan_requests_accelerator(plan):
+        return
+    from batcher._internal.hardware.devices.presence import local_accelerator_present
+
+    if local_accelerator_present() is not False:
+        return
+    import warnings
+
+    from batcher._internal.errors import PerformanceWarning
+
+    warnings.warn(
+        "a stage of this query requested an accelerator, but the distributed executor has "
+        f"no path for this plan shape ({reason}) and fell back to running it in this "
+        "process, which has no accelerator — the model will run on CPU. Materializing the "
+        "stage before the accelerator stage (for example `.collect()` then re-reading, or "
+        "writing the intermediate out) lets the inference stage distribute on its own.",
+        PerformanceWarning,
+        stacklevel=3,
+    )
 
 
 # --- ASOF join (co-partition by the `by` keys) --------------------------------

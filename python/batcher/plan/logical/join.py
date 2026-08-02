@@ -12,7 +12,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher.plan.ir_tags import Op
+from batcher.plan.ir_tags import ORDERING_COMPARISONS, Op
 from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases
 from batcher.plan.schema import SchemaRef
 
@@ -258,7 +258,6 @@ class AsofJoin(LogicalPlan):
 # The inequalities a `RangeJoin` condition may carry. `eq` is a hash join and `ne`
 # admits no ordering structure, so neither appears here — both are left to the paths
 # that already handle them.
-RANGE_OPS = frozenset({"lt", "le", "gt", "ge"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,7 +266,7 @@ class RangeCondition:
 
     left_key: str
     right_key: str
-    op: str  # one of RANGE_OPS
+    op: str  # one of ORDERING_COMPARISONS
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,8 +298,10 @@ class RangeJoin(LogicalPlan):
         left_cols = set(self.left.available_columns())
         right_cols = set(self.right.available_columns())
         for c in self.conditions:
-            if c.op not in RANGE_OPS:
-                raise PlanError(f"unknown range op {c.op!r}; expected {sorted(RANGE_OPS)}")
+            if c.op not in ORDERING_COMPARISONS:
+                raise PlanError(
+                    f"unknown range op {c.op!r}; expected {sorted(ORDERING_COMPARISONS)}"
+                )
             if c.left_key not in left_cols:
                 raise PlanError(f"range join left key {c.left_key!r} not in left columns")
             if c.right_key not in right_cols:

@@ -13,7 +13,7 @@ answer must be identical anyway. `docs/integrations/compute/ray.md` is the canon
 ## Decide whether to distribute at all
 
 Distribution buys scale-out and larger-than-memory. It costs a shuffle, actor startup, and
-a Ray dispatch. Below the crossover it is a **pessimization**, and `docs/benchmarks/scaling.md`
+a Ray dispatch. Below the crossover it is a **pessimization**, and `docs/benchmarks/results/scaling.md`
 says so plainly: TPC-H sf1 (6M rows) on a 9-node / 128-CPU cluster runs in **86 ms
 single-node vs 92 ms distributed**, and an 80k-row filter cost ~2,150 ms of pure Ray fan-out
 before `"auto"` learned to stay home (now ~67 ms).
@@ -168,7 +168,7 @@ advertises the Ray node IP, so open the node-to-node range rather than hunting a
 Seven controls exist for a cluster whose scarce resource is accelerators rather than cores, all
 of them off or unbounded by default so a fleet that configures nothing behaves as before.
 `config.accelerator` is where they live (`docs/configuration/accelerator.md`), and
-`docs/user-guide/operate/gpu-fleets.md` is the walkthrough.
+`docs/user-guide/operate/running/gpu-fleets.md` is the walkthrough.
 
 - **Power binds before slots.** `accelerator.energy.power_budget_watts` clamps GPU fan-out to
   what a rack can actually power — ten 700 W devices on a 10 kW circuit, not the sixteen its
@@ -264,12 +264,12 @@ distributed one.
 
 ## See also
 
-- `docs/integrations/compute/ray.md`; `docs/architecture/{execution,fault-tolerance}.md`;
+- `docs/integrations/compute/ray.md`; `docs/architecture/execution.md`, `docs/architecture/fault-tolerance.md`;
   `docs/configuration/options.md` (every knob named above).
-- `docs/deep-dives/{shuffle-flight,distributed-scheduling,credit-flow-control,spilling,mergeable-algebra}.md`.
-- `docs/user-guide/operate/gpu-fleets.md` and `docs/configuration/accelerator.md` for a GPU fleet's
+- `docs/architecture/deep-dives/distribution/shuffle-flight.md`, `docs/architecture/deep-dives/distribution/distributed-scheduling.md`, `docs/architecture/deep-dives/distribution/credit-flow-control.md`, `docs/architecture/deep-dives/memory/spilling.md`, `docs/architecture/deep-dives/operators/mergeable-algebra.md`.
+- `docs/user-guide/operate/running/gpu-fleets.md` and `docs/configuration/accelerator.md` for a GPU fleet's
   power budget, fabric-aware placement, device health, and data residency.
-- `docs/benchmarks/{scaling,vs-spark}.md` — the Spark page is an architectural argument and
+- `docs/benchmarks/results/scaling.md`, `docs/benchmarks/comparisons/vs-spark.md` — the Spark page is an architectural argument and
   publishes **no** head-to-head timings; do not quote it as a measurement.
 - Skills: `write-a-batcher-pipeline`, `optimize-a-slow-query`, `debug-a-batcher-query`,
   `build-an-ml-pipeline`, `migrate-from-spark`, and

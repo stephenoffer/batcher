@@ -150,15 +150,15 @@ print(back.drop_nulls().sort("region", "quarter").to_pydict())
 ## See also
 
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the aggregate a pivot cell is built from.
-- {doc}`Transformations </user-guide/transform/transformations>`: `explode` and `unnest`, the other two reshapers.
+- {doc}`Transformations </user-guide/transform/rows/transformations>`: `explode` and `unnest`, the other two reshapers.
 - {doc}`SQL </user-guide/analyze/sql>`: the SQL surface. SQL `PIVOT` and `UNPIVOT` are *not* supported and raise
   `NotImplementedError`. Reshaping goes through `ds.pivot(...)` and `ds.unpivot(...)`,
   which you can call on the result of a `bt.sql(...)` query.
-- {doc}`Aggregation internals </deep-dives/operators/aggregation-internals>`: the grouped hash
+- {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: the grouped hash
   aggregate a pivot cell is computed by.
-- {doc}`Time-series rollups </cookbook/analytics/time-series-rollups>`: a wide report
+- {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: a wide report
   built from a long fact table.
-- {doc}`Cohort analysis </cookbook/analytics/cohort-analysis>`: the other classic pivot,
+- {doc}`Cohort analysis </cookbook/analytics/behavior/cohort-analysis>`: the other classic pivot,
   with a declared column vocabulary.
 - {doc}`Dataset API </api/relational/dataset>`: the `pivot` and `unpivot` reference.
 - {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, and unnest, as a runnable script.

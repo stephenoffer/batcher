@@ -33,6 +33,7 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.rules.zonemap_pruning import _float_order_is_ambiguous
 from batcher.plan.expr_ir import Binary, Col
+from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import Distinct, Filter, Limit, LogicalPlan, Sort
 from batcher.plan.stats import ColumnStat, Provenance
 
@@ -45,7 +46,6 @@ __all__ = [
 
 # Comparison operators (the `Binary.op` tags) this module reasons about — the same set
 # `zonemap_prune_filter` decides for `col OP literal`, reused here for `col OP col`.
-_COMPARISONS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
 
 
 def _is_constant_column(stat: ColumnStat) -> bool:
@@ -228,7 +228,7 @@ def prune_filter_col_comparison(node: Filter, ctx: OptimizerContext) -> LogicalP
     if ctx is None:
         return None
     pred = node.predicate
-    if not (isinstance(pred, Binary) and pred.op in _COMPARISONS):
+    if not (isinstance(pred, Binary) and pred.op in COMPARISON_OPS):
         return None
     if not (isinstance(pred.left, Col) and isinstance(pred.right, Col)):
         return None

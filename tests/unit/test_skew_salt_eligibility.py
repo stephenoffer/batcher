@@ -14,7 +14,8 @@ defaults to 0, but a measured hot key engages salting anyway
 These are unit tests over the pure predicate rather than an end-to-end distributed run,
 and that is deliberate. Reaching the hazard end-to-end needs the disk transport AND a
 fusable join-aggregate AND a detected hot key to line up; `resolve_transport` picks Flight
-on any multi-node cluster, and `docs/internals/databricks_parity.md` records that Flight
+on any multi-node cluster, and `docs/architecture/internals/databricks_parity.md` records that
+Flight
 join behaviour "cannot be validated in a single-node dev environment." An integration test
 written here passes whether or not the guard exists, which is worse than no test — so the
 invariant is pinned where it can actually be checked.

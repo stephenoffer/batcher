@@ -29,6 +29,7 @@ from batcher.plan.expr_rewrite import (
     split_conjuncts,
     substitute_columns,
 )
+from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -58,7 +59,6 @@ __all__ = [
 
 # Comparisons whose `col OP literal` form is a constant constraint worth mirroring
 # across an equi-join's key correspondence.
-_INFERABLE_COMPARISONS = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
 
 
 def rewrite_predicate(plan: LogicalPlan) -> LogicalPlan:
@@ -377,7 +377,7 @@ def _column_constraints(side: LogicalPlan, col: str) -> list[Expr]:
 def _sole_constrained_column(conj: Expr) -> str | None:
     """The column name of a `col OP literal` conjunct that references only that one
     column (an inferable constant constraint), else None."""
-    if not isinstance(conj, Binary) or conj.op not in _INFERABLE_COMPARISONS:
+    if not isinstance(conj, Binary) or conj.op not in COMPARISON_OPS:
         return None
     cs = comparison_col_side(conj)
     if cs is not None and referenced_columns(conj) == {cs[0]}:

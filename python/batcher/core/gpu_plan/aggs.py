@@ -92,16 +92,21 @@ def supported_aggregate(ir: dict) -> bool:
     return all(a.get("func") in _SUPPORTED for a in ir["aggregates"])
 
 
-def _key_columns(df, ir: dict, be: DfBackend) -> tuple[list[str], list[str]]:
-    """Materialize the group keys into `df`, returning their column names and output aliases.
+def _key_columns(df, ir: dict, be: DfBackend) -> tuple[list[str], list[str], dict[str, str]]:
+    """Materialize the group keys into `df`, returning their names, output aliases, and the
+    source column of every key that had to be normalized.
 
     A key that is already a plain column is used in place; a computed key (``group_by(x2=col
     ("x") + 1)``) is evaluated into a private column first. Supporting the computed form here
     is what keeps a `GROUP BY <expression>` on the device instead of dropping the whole chain
     to the CPU engine.
+
+    The third return value is what lets the caller *label* a normalized group with the value
+    the engine would show rather than with the normalized one — see `_normalized_key`.
     """
     names: list[str] = []
     aliases: list[str] = []
+    sources: dict[str, str] = {}
     for i, gk in enumerate(ir["group_keys"]):
         expr = gk["expr"]
         if expr.get("e") == "col":
@@ -109,9 +114,12 @@ def _key_columns(df, ir: dict, be: DfBackend) -> tuple[list[str], list[str]]:
         else:
             name = f"__bt_gk{i}"
             df[name] = be.column(eval_expr(expr, df, be), df)
-        names.append(_normalized_key(df, name, be, slot=i))
+        key = _normalized_key(df, name, be, slot=i)
+        if key != name:
+            sources[key] = name
+        names.append(key)
         aliases.append(gk["alias"])
-    return names, aliases
+    return names, aliases, sources
 
 
 def _normalized_key(df, name: str, be: DfBackend, *, slot: int) -> str:
@@ -126,6 +134,14 @@ def _normalized_key(df, name: str, be: DfBackend, *, slot: int) -> str:
 
     Adding zero is the fold: `-0.0 + 0.0` is `+0.0`, and `x + 0.0` is `x` for every other
     value, including the infinities and `NaN`. Only float keys pay for it.
+
+    The fold decides *identity* only, never the label. Emitting the normalized value would
+    make a group of `{-0.0, 0.0}` come back as `0.0` where the engine returns the first one it
+    saw, `-0.0` — the same group under a different name. That reads as harmless until a
+    sharded fan-out concatenates a device shard's `0.0` with a CPU-recovered shard's `-0.0`
+    and gets two groups where the engine has one, which is the float-key split this fold
+    exists to prevent, reintroduced one level up. `aggregate` therefore re-labels the group
+    from `sources` with the first value it actually contained.
     """
     if not be.is_float(df[name]):
         return name
@@ -155,14 +171,34 @@ def _null_if_empty(series, reduced):
     return reduced.where(_call(series, "count") > 0)
 
 
+def _as_int64(reduced, be: DfBackend):
+    """A counting reduction in the engine's `int64`, whatever width the library chose for it.
+
+    **cuDF answers `nunique` in `int32` and pandas answers it in `int64`.** So
+    `COUNT(DISTINCT ...)` came back a different *column* on a device than on the host with every
+    value agreeing — the one difference this package's pandas-backed tests are structurally
+    unable to see, and the third defect of exactly that shape here. Found by comparing the
+    device against the CPU engine on ClickBench q08 and q09, where `COUNT(DISTINCT UserID)`
+    returned `int32`.
+
+    Applied to the counting reductions only. They are the ones whose result type is fixed by the
+    engine rather than carried from their input, so restating it here cannot drift from what the
+    input said; a `sum` or a `min` keeps its column's own type and is left alone.
+    """
+    import pyarrow as pa
+
+    return reduced.astype(be.dtype(pa.int64()))
+
+
 def _reduce(grouped, spec: dict, column: str | None, be: DfBackend):
     """One reduction over the shared `GroupBy`, as a Series indexed by the group key."""
     func = spec["func"]
     if func == "count_star":
-        return grouped.size()
+        return _as_int64(grouped.size(), be)
     series = grouped[column]
     if func in _PLAIN:
-        return _call(series, _PLAIN[func])
+        reduced = _call(series, _PLAIN[func])
+        return _as_int64(reduced, be) if func in _COUNTING else reduced
     if func == "product":
         # The engine (and DuckDB) answer `product` in **double** whatever the input's type,
         # because the running product of a bigint column leaves its range almost immediately.
@@ -273,7 +309,7 @@ def aggregate(df, ir: dict, be: DfBackend):
     # Shallow: the private key and input columns below are added to this frame, and the caller's
     # frame must not grow them. Sharing every existing column's buffer makes that free.
     df = df.copy(deep=False)
-    keys, aliases = _key_columns(df, ir, be)
+    keys, aliases, sources = _key_columns(df, ir, be)
     inputs = _materialize_inputs(df, ir, be)
     # `dropna=False`: a null key is a group, exactly as it is in the engine and in SQL.
     # The libraries drop it by default, which silently deletes rows from the answer.
@@ -281,8 +317,16 @@ def aggregate(df, ir: dict, be: DfBackend):
     columns = {}
     for spec, column in zip(ir["aggregates"], inputs, strict=True):
         columns[spec["alias"]] = _reduce(grouped, spec, column, be)
-    out = be.lib.DataFrame(columns) if columns else be.lib.DataFrame(index=grouped.size().index)
+    # The un-normalized value each normalized group is labelled by. `sort=False` keeps the
+    # groups in first-seen order, and `first()` picks each group's first row, so the label is
+    # the one the engine's own first-seen representative would be.
+    labels = {f"__bt_lbl{i}": grouped[src].first() for i, src in enumerate(sources.values())}
+    out = be.lib.DataFrame(columns | labels)
+    if not (columns or labels):
+        out = be.lib.DataFrame(index=grouped.size().index)
     out = out.reset_index()
+    for (key, _), label in zip(sources.items(), labels, strict=True):
+        out[key] = out[label]
     # `reset_index` restores the key columns under their *source* names; rename to the
     # aliases the plan asked for, then order as the plan does (keys first).
     renames = {src: alias for src, alias in zip(keys, aliases, strict=True) if src != alias}

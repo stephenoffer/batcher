@@ -188,50 +188,25 @@ def visible_device_indices() -> tuple[int, ...]:
     that asks NVML about "device 0" gets the wrong board's PCI address, NUMA node, and link —
     on a node where every device is identical, the answer even looks plausible.
 
+    A thin alias for `hardware.devices.visible_device_indices`, which is the module that owns
+    this question. There were two implementations, and they disagreed in three ways that all
+    resolve against the fabric probes here — so one worker's affinity binding, rail choice and
+    PCIe link were read off a different device set from the one its memory pool and OOM guard
+    were reading:
+
+    * **ROCm.** This one consulted `CUDA_VISIBLE_DEVICES` alone, so an Instinct node pinned by
+      ``HIP_VISIBLE_DEVICES`` reported *every* device on the host to the affinity path.
+    * **An empty value.** ``CUDA_VISIBLE_DEVICES=""`` is how a scheduler says "no devices at
+      all", and this returned the whole node for it.
+    * **MIG handles.** ``MIG-GPU-.../1/0`` resolved to nothing here and to the parent board
+      there, so a partitioned worker bound its host threads to whatever the fallback gave it.
+
     Returns:
-        NVML indices in visible order. Every device when the variable is unset or empty (the
-        CUDA default). An entry naming a UUID is resolved against NVML; one naming neither an
-        index nor a known UUID is dropped, because a device this process cannot identify is one
-        it must not make a placement decision about.
+        NVML indices in visible order, empty when no accelerator is detectable.
     """
-    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
-    nv = _nvml()
-    count = _device_count(nv) if nv is not None else 0
-    if raw is None or not raw.strip():
-        return tuple(range(count))
-    by_uuid = _uuid_indices(nv, count)
-    out: list[int] = []
-    for token in raw.split(","):
-        entry = token.strip()
-        if not entry:
-            continue
-        if entry.isdigit():
-            index = int(entry)
-            # CUDA stops at the first invalid entry rather than skipping it, and so does this:
-            # the devices after an unresolvable one are not visible either.
-            if index >= count:
-                break
-            out.append(index)
-        elif entry in by_uuid:
-            out.append(by_uuid[entry])
-        else:
-            break
-    return tuple(out)
+    from batcher._internal.hardware.devices import visible_device_indices as _resolved
 
-
-def _uuid_indices(nv, count: int) -> dict[str, int]:
-    """Device UUID to NVML index, empty without a driver."""
-    if nv is None:
-        return {}
-    out: dict[str, int] = {}
-    for index in range(count):
-        handle = _read(lambda i=index: nv.nvmlDeviceGetHandleByIndex(i), None)
-        if handle is None:
-            continue
-        uuid = _decode(_read(lambda h=handle: nv.nvmlDeviceGetUUID(h), ""))
-        if uuid:
-            out[uuid] = index
-    return out
+    return _resolved()
 
 
 def nearest_rdma_device(ordinal: int = 0) -> str:

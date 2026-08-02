@@ -70,7 +70,7 @@ Two figures state something the project has deliberately narrowed, and both name
 source so the picture cannot drift away from the audit:
 
 - `adaptive_loop` and `adaptive_positioning` are drawn to the wording
-  `docs/internals/competitive_architecture.md` sanctions, **not** to the retired claim that
+  `docs/architecture/internals/competitive_architecture.md` sanctions, **not** to the retired claim that
   Batcher re-optimizes more finely than Spark AQE. It does not: the within-query loop is
   stage-boundary adaptation at the same granularity, gated off below the thresholds in
   `python/batcher/api/adaptive/gating.py`. The differentiator those diagrams draw is that

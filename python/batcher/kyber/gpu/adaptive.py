@@ -132,7 +132,11 @@ def record_backend_timing(
 
 
 def record_device_throughput(
-    hub: MetadataHub | None, accelerator_type: str | None, rows: int, seconds: float
+    hub: MetadataHub | None,
+    accelerator_type: str | None,
+    rows: int,
+    seconds: float,
+    devices: int = 1,
 ) -> None:
     """Fold one device's measured rows-per-second into its model's throughput bucket.
 
@@ -144,11 +148,20 @@ def record_device_throughput(
     Args:
         hub: The metadata hub, or `None` to record nothing.
         accelerator_type: The device model, `None` for an unlabelled device (pooled).
-        rows: Rows the device processed.
+        rows: Rows the observation processed.
         seconds: How long it took.
+        devices: How many devices shared that work. The caller on the fan-out path has a
+            whole-*query* row count and a whole-query wall time, so what it observed is the
+            fleet's throughput and not a device's — an eight-device run recorded a figure
+            eight times any single board's. That is harmless while every model is measured at
+            the same fan-out width and wrong the moment they are not, which is exactly the
+            mixed fleet the figure exists to deal shards across. Dividing here keeps the
+            stored statistic per device, which is what its name and its consumer both assume.
+            `1` — the default — is the single-device observation this always claimed to take.
     """
     if hub is None or rows <= 0 or seconds <= 0.0:
         return
+    seconds = seconds * max(1, int(devices))
     try:
         key = accelerator_type or "unknown"
         s = hub.get_keyed_param(scoped(_TP_NS), key) or {}

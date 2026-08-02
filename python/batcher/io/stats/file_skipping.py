@@ -39,6 +39,7 @@ from __future__ import annotations
 from typing import Any
 
 from batcher._internal.logging import note_suppressed
+from batcher.plan.ir_tags import COMPARISON_FLIP, COMPARISON_OPS
 
 __all__ = [
     "MAX_PREFIX",
@@ -56,9 +57,7 @@ MIN_PREFIX = "min."
 MAX_PREFIX = "max."
 NULL_PREFIX = "null_count."
 
-_CMP = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 # `lit OP col` is normalized to `col OP' lit` by flipping the operator.
-_FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def surviving_files(predicate: dict[str, Any] | None, manifest: Any) -> list[str] | None:
@@ -125,7 +124,7 @@ def _eval(ir: dict[str, Any], manifest: Any, pc: Any) -> Any | None:
             return _conjunction(ir, manifest, pc)
         if op == "or":
             return _disjunction(ir, manifest, pc)
-        if op in _CMP:
+        if op in COMPARISON_OPS:
             return _comparison(op, ir.get("left"), ir.get("right"), manifest, pc)
         return None
     if kind in ("is_null", "is_not_null"):
@@ -193,7 +192,7 @@ def _comparison(
         literal, is_lit = _literal_of(left)
         if column is None or not is_lit:
             return None
-        value, op = literal, _FLIP[op]
+        value, op = literal, COMPARISON_FLIP[op]
 
     lo, hi = _bounds(column, manifest)
     if lo is None or hi is None:

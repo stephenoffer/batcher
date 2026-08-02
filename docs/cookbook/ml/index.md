@@ -17,7 +17,7 @@ Every page embeds a complete, self-contained script that builds its own in-memor
 - {doc}`/ml/index`: the ML guide these pages are the short form of.
 - {doc}`/api/models/ml`: the `ds.ml` accessor and the `batcher.ml` package reference.
 - {doc}`/cookbook/metrics/index`: scoring the models fitted here.
-- {doc}`/deep-dives/distribution/gpu-execution`: how the device work underneath is scheduled.
+- {doc}`/architecture/deep-dives/distribution/gpu-execution`: how the device work underneath is scheduled.
 
 ```{toctree}
 :hidden:

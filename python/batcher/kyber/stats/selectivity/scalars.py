@@ -19,9 +19,7 @@ from batcher.kyber.stats.distribution import residual_eq_frequency
 from batcher.plan.expr_ir import Binary, Col, Lit
 from batcher.plan.stats import AXIS_NUMERIC, ordinal_with_axis
 
-_COMPARISONS = {"lt", "le", "gt", "ge"}
 # Comparison operators flip when the column is on the right (`literal < col` ≡ `col > literal`).
-_FLIP_OP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 
 
 def comparison_col_side(expr: Binary) -> tuple[str, Any, bool] | None:

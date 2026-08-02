@@ -313,14 +313,14 @@ The same trick applies to a custom source over an object store: yield handles fr
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: partitioned, compacted, and distributed writes.
 - {doc}`Cloud storage </user-guide/moving-data/cloud-storage>`: the filesystem layer your source resolves through.
 - {doc}`IO API </api/relational/io>`: the full `batcher.io` reference.
-- {doc}`Morsel parallelism </deep-dives/operators/morsel-parallelism>`: what a worker does with the
+- {doc}`Morsel parallelism </architecture/deep-dives/operators/morsel-parallelism>`: what a worker does with the
   split you handed it.
-- {doc}`Distributed scheduling </deep-dives/distribution/distributed-scheduling>`: how splits become
+- {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>`: how splits become
   tasks, and why they carry locators rather than data.
-- {doc}`Incremental ingest </cookbook/data-engineering/incremental-ingest>`: a source read
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: a source read
   repeatedly, without re-reading what it already saw.
-- {doc}`Multimodal ingest benchmark </benchmarks/multimodal-ingest>`: the reference-row
+- {doc}`Multimodal ingest benchmark </benchmarks/results/multimodal-ingest>`: the reference-row
   pattern measured against the alternatives.
-- {doc}`Agent skills </agents/index>`: `add-an-io-format-or-connector`, the ordered
+- {doc}`Agent skills </agents>`: `add-an-io-format-or-connector`, the ordered
   procedure and the tests a new connector must carry.
 - {doc}`/cookbook/io/sources_and_sinks`: the registries a new format registers into, as a script.

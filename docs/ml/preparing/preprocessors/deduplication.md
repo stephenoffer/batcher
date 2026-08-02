@@ -79,6 +79,6 @@ candidate set up quadratically.
 
 ## See also
 
-- {doc}`/user-guide/transform/distinct-and-dedup`: exact and keyed deduplication.
+- {doc}`/user-guide/transform/rows/distinct-and-dedup`: exact and keyed deduplication.
 - {doc}`/ml/retrieval/embeddings`: producing the vectors `similarity_join` matches on.
 - {doc}`/ml/preparing/preprocessors/index`: the rest of the preprocessor family.

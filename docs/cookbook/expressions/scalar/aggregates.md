@@ -19,5 +19,5 @@ python examples/expressions/aggregates.py
 
 - {doc}`/cookbook/expressions/scalar/column_selectors`: naming columns by type or pattern instead of one at a time.
 - {doc}`/cookbook/expressions/scalar/conditionals`: when/then/otherwise, and the SQL null helpers.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

@@ -284,10 +284,9 @@ output; `image_column=` handles VLM prompts.
 
 ## See also
 
-- `docs/ml/{index,inference,batch-scoring,embeddings,multimodal,gpu,llm,vector-search,rag,
-  data-loaders,distributed-training,preprocessors,streaming,tokenization,serving}.md`;
-  `docs/user-guide/{udfs,cloud-storage,writing-data,explain-plans}.md`.
-- `docs/tutorials/{batch-inference,distributed-training-pipeline,feature-engineering}.md`;
+- `docs/ml/index.md`, `docs/ml/inference/inference.md`, `docs/ml/inference/batch-scoring.md`, `docs/ml/retrieval/embeddings.md`, `docs/ml/preparing/multimodal/index.md`, `docs/ml/inference/gpu.md`, `docs/ml/retrieval/llm/index.md`, `docs/ml/retrieval/vector-search.md`, `docs/ml/retrieval/rag.md`, `docs/ml/training/data-loaders.md`, `docs/ml/training/distributed-training.md`, `docs/api/models/preprocessors.md`, `docs/ml/inference/streaming.md`, `docs/ml/preparing/tokenization.md`, `docs/ml/training/serving.md`;
+  `docs/user-guide/transform/columns/udfs.md`, `docs/user-guide/moving-data/cloud-storage.md`, `docs/user-guide/moving-data/writing-data.md`, `docs/user-guide/operate/tuning/explain-plans.md`.
+- `docs/tutorials/ml/batch-inference.md`, `docs/tutorials/ml/distributed-training-pipeline.md`, `docs/tutorials/ml/feature-engineering.md`;
   `examples/ml_inference.py`, `examples/preprocessors.py`.
 - Skills: `run-a-distributed-job` (taking this to a cluster — GPU stages force distribution),
   `write-a-batcher-pipeline`, `debug-a-batcher-query`, `migrate-from-daft`.

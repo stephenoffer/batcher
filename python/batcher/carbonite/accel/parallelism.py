@@ -402,7 +402,23 @@ def plan_parallelism(
         # Reaching here means a positive footprint did not fit a positive device, so both
         # figures are known to be usable and the division below is safe.
         tensor = max(valid_tensor_degrees(attention_heads, kv_heads, max_tensor_degree))
-        pipeline = -(-shard_weight_bytes(weight_bytes, tensor) // usable_bytes)
+        # Sized against the weights *and* one sequence's cache, exactly as
+        # `minimum_tensor_degree` does. Weights alone was the mistake that function's whole
+        # docstring warns about, reintroduced here on the fallback path: a pipeline stage
+        # holds its own layers' cache for every sequence in flight, so a degree chosen so the
+        # weights just fit leaves nothing for it. The engine then does not fail — it admits
+        # one sequence, preempts it, recomputes it, and serves at a fraction of the rate with
+        # nothing in any log to say why.
+        #
+        # Tensor parallelism has already divided the per-token cost `tensor` ways; the
+        # pipeline divides the *layers*, so each stage carries `1/pipeline` of what is left.
+        # Solving that exactly would be circular, so the cache is charged undivided, which
+        # over-states the need and therefore only ever asks for more devices than the minimum
+        # — the safe direction for a figure whose other error mode is a stage that cannot run.
+        per_device = shard_weight_bytes(weight_bytes, tensor) + shard_bytes_per_token(
+            max(0, bytes_per_token) * max(0, context_tokens), tensor
+        )
+        pipeline = max(1, -(-per_device // usable_bytes))
         if budget and tensor * pipeline > budget:
             raise ResourceError(
                 f"model needs {tensor * pipeline} devices "

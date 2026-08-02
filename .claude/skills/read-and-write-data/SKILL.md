@@ -242,9 +242,8 @@ correctly.
 
 ## See also
 
-- Docs: `docs/user-guide/{reading-data,writing-data,cloud-storage,type-system,streaming,
-  custom-connectors,data-quality}.md`; `docs/integrations/` (per-connector setup);
-  `docs/examples/data-engineering/{schema-evolution,incremental-ingest,file-compaction}.md`.
+- Docs: `docs/user-guide/moving-data/reading-data.md`, `docs/user-guide/moving-data/writing-data.md`, `docs/user-guide/moving-data/cloud-storage.md`, `docs/user-guide/transform/columns/type-system.md`, `docs/user-guide/moving-data/streaming.md`, `docs/user-guide/moving-data/custom-connectors.md`, `docs/user-guide/trust/data-quality.md`; `docs/integrations/` (per-connector setup);
+  `docs/cookbook/data-engineering/modeling/schema-evolution.md`, `docs/cookbook/data-engineering/ingest/incremental-ingest.md`, `docs/cookbook/data-engineering/maintenance/file-compaction.md`.
 - Code: `python/batcher/api/io_namespace/{reader,writer}.py`; `io/{detect,filesystem,
   credentials,manifest}.py`; `io/schema/evolution.py`; `io/base/_tolerance.py`.
 - Skills: `write-a-batcher-pipeline` (the relational core); `manage-a-lakehouse-table`

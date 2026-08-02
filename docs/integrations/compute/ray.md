@@ -188,9 +188,9 @@ to avoid. Batches move over Flight; Ray moves the paths.
 ## See also
 
 - {doc}`Execution architecture </architecture/execution>`: morsels, breakers, the shuffle.
-- {doc}`Shuffle over Arrow Flight </deep-dives/distribution/shuffle-flight>`: the transport that replaces the
+- {doc}`Shuffle over Arrow Flight </architecture/deep-dives/distribution/shuffle-flight>`: the transport that replaces the
   object store, and its credits.
-- {doc}`Distributed scheduling </deep-dives/distribution/distributed-scheduling>`: how a plan becomes Ray tasks.
+- {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>`: how a plan becomes Ray tasks.
 - {doc}`Configuration options </configuration/options>`: every distributed knob.
 - {doc}`Fault tolerance </architecture/fault-tolerance>`: retries, recovery, speculation.
 - {doc}`PyTorch </integrations/compute/pytorch>`: distributed training ingest.

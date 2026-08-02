@@ -117,7 +117,7 @@ The whole chain of scan, chunk, explode, and embed is a linear row-wise pipeline
 distributes across workers and streams over an unbounded source with no breaker. The
 one thing no static rule can know is how many chunks a document yields. Kyber estimates
 a fan-out of 1 on the first run, Core measures the real fan-out, and the next plan sizes
-the downstream GPU stage for it. See {doc}`adaptive re-optimization </internals/kyber>`.
+the downstream GPU stage for it. See {doc}`adaptive re-optimization </architecture/internals/kyber>`.
 
 ## Vector search over the embeddings
 

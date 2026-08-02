@@ -21,7 +21,11 @@ from batcher import col
 from batcher.core.gpu_plan import DfBackend, gpu_plan_ops
 from batcher.core.gpu_plan.backend import Unsupported
 from batcher.core.gpu_plan.execute import run_chain
-from batcher.core.gpu_plan.vocab.regex import portable
+from batcher.core.gpu_plan.vocab.regex import (
+    RESTRICTED_ALPHABET,
+    portable,
+    shorthand_classes,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -92,10 +96,8 @@ def test_a_portable_pattern_is_accepted(pattern):
 @pytest.mark.parametrize(
     "pattern",
     [
-        # The shorthand classes: Unicode in Rust and Python, ASCII on the device.
-        r"\w+", r"\s", r"\S+", r"\d", r"\W", r"\D", r"\b\w+\b",
-        # `$` matches before a trailing newline in Python and at end of text in Rust.
-        "^[0-9]+$", "abc$",
+        # A `$` anywhere but the end is a literal in a class or an anchor that cannot match.
+        "a$b", "^$x",
         # Nobody implements all three of these the same way, and cuDF implements none.
         r"(?=foo)", r"(?i)abc", r"(a)\1", r"\p{Alpha}", "[[:alpha:]]",
     ],
@@ -104,6 +106,39 @@ def test_a_dialect_sensitive_pattern_is_rejected(pattern):
     """A classifier that lets one of these through is worse than no classifier: it would agree
     with the engine on every ASCII test and disagree on the first accented letter."""
     assert not portable(pattern)
+
+
+@pytest.mark.parametrize("pattern", ["^[0-9]+$", "abc$"])
+def test_a_trailing_end_anchor_is_accepted_but_gated_on_the_data(pattern):
+    """`$` is the one construct handled in two halves rather than refused outright.
+
+    The engines disagree about it only over text that *ends in a newline* — Python's matches
+    before it, Rust's does not — and that is a property of the data, not of the pattern. So the
+    scanner accepts a trailing `$` and `_check_end_anchor` declines at execution time when the
+    column actually contains one, which keeps `^[0-9]+$` on the device for the overwhelming
+    majority of real text instead of refusing every anchored pattern there is.
+    """
+    assert portable(pattern)
+
+
+@pytest.mark.parametrize("pattern", [r"\w+", r"\s", r"\S+", r"\d", r"\W", r"\D", r"\b\w+\b"])
+def test_a_shorthand_class_is_accepted_but_gated_on_the_data(pattern):
+    """The shorthand classes are portable over a *restricted alphabet* and not in general, so
+    they are accepted here and the column is checked against that alphabet before they run."""
+    assert portable(pattern)
+    assert shorthand_classes(pattern)
+
+
+@pytest.mark.parametrize("pattern", ["[0-9]", r"a\.b", "(?:ab)+", r"[^\x00-\x7F]"])
+def test_a_pattern_without_a_shorthand_class_needs_no_data_check(pattern):
+    assert not shorthand_classes(pattern)
+
+
+def test_the_alphabet_probe_is_itself_a_portable_pattern():
+    """The gate is applied with a regex, so it has to be one both backends read the same way —
+    otherwise the check would need a check."""
+    assert portable(RESTRICTED_ALPHABET)
+    assert not shorthand_classes(RESTRICTED_ALPHABET)
 
 
 def test_an_unfinished_escape_is_rejected():
@@ -168,12 +203,58 @@ def test_a_text_function_built_on_a_portable_pattern_reaches_the_device(be, fn):
     _assert_matches_engine(ds, TEXT, be)
 
 
+# --- the shorthand classes, over the alphabet they are portable on ----------------------------
+
+#: The same text as `TEXT`, without the non-ASCII row — which is the whole difference between
+#: a shorthand-class pattern the three engines agree on and one they do not.
+ASCII_TEXT = pa.table(
+    {
+        "s": pa.array(
+            [
+                "Hello World! foo@bar.com",
+                "a  b\tc",
+                "",
+                None,
+                "one two three four five",
+                "https://x.io/p?q=1",
+                "#tag @who 123-456-7890",
+            ],
+            pa.string(),
+        )
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    ["word_count", "whitespace_ratio", "punctuation_ratio", "email_count", "url_count",
+     "hashtag_count", "mention_count", "phone_count", "long_word_count",
+     "uppercase_word_count", "paragraph_count", "remove_punctuation", "normalize_whitespace",
+     "remove_emails", "remove_urls", "has_email", "has_url", "symbol_to_word_ratio",
+     "digit_to_word_ratio", "avg_word_length", "avg_sentence_length", "mean_line_length",
+     "estimate_tokens", "word_char_ratio"],
+)  # fmt: skip
+def test_a_shorthand_class_text_function_over_ascii_matches_the_engine(be, fn):
+    """Every one of these is a `\\w` or a `\\s` underneath, and every one of them ran on the
+    host because the family was declined by its spelling rather than by its data."""
+    ds = bt.from_arrow(ASCII_TEXT).select(out=getattr(col("s").str, fn)())
+    _assert_matches_engine(ds, ASCII_TEXT, be)
+
+
 @pytest.mark.parametrize("fn", ["word_count", "whitespace_ratio", "punctuation_ratio"])
-def test_a_text_function_built_on_a_shorthand_class_still_declines(be, fn):
-    """`\\S+` and `\\s` are Unicode in the engine and not on the device, so these run on the CPU
-    engine on purpose — and the non-ASCII row above is exactly where they would disagree."""
+def test_the_same_function_declines_over_non_ascii(be, fn):
+    """`\\w` is Unicode in the engine and ASCII on the device, so the accented row is exactly
+    where they part company — and it is the *data* that decides, not the spelling."""
     ds = bt.from_arrow(TEXT).select(out=getattr(col("s").str, fn)())
     _declines(ds, TEXT, be)
+
+
+def test_a_vertical_tab_is_enough_to_decline(be):
+    """Not only about non-ASCII: `\\s` matches a vertical tab in the engine and not in the host
+    backend's RE2, so one control character makes the same pattern count differently."""
+    table = pa.table({"s": pa.array(["a\x0bb"], pa.string())})
+    ds = bt.from_arrow(table).select(out=col("s").str.word_count())
+    _declines(ds, table, be)
 
 
 def test_a_replacement_carrying_a_group_reference_declines(be):

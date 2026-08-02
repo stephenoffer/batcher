@@ -19,5 +19,5 @@ python examples/expressions/strings_slicing.py
 
 - {doc}`/cookbook/expressions/strings/matching/strings_similarity`: fuzzy string matching against a reference value.
 - {doc}`/cookbook/expressions/nested/structs_and_maps`: nested records without flattening the table.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

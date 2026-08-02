@@ -5,7 +5,7 @@ description: Port an existing pandas or Polars script to Batcher's public Python
 
 # Migrate from Polars or pandas
 
-`docs/migration/transforming.md` is the user-facing mapping table and the source of truth.
+`docs/getting-started/migration/transforming.md` is the user-facing mapping table and the source of truth.
 Read it first; this skill is the agent-side procedure around it, and must never
 contradict it. Everything below is verified against the live surface — if you need a
 name this skill doesn't list, check it with
@@ -37,7 +37,7 @@ Work happens only at a terminal op: `collect()`, `to_arrow()`, `to_pydict()`,
 
 ## Translation table
 
-Extends the tables in `docs/migration/transforming.md`; consult that page for the full
+Extends the tables in `docs/getting-started/migration/transforming.md`; consult that page for the full
 pandas/Polars/PySpark grid, including IO, terminal ops, and the `from_*`/`to_*`
 round-trips.
 
@@ -96,7 +96,7 @@ canonical spelling above — one obvious way per operation.
 Worth saying out loud when a user asks "why port at all":
 
 - **Adaptive re-optimization** — the plan is re-optimized at pipeline breakers on
-  *measured* cardinalities, not just estimates (`docs/deep-dives/adaptive/adaptive-reoptimization.md`).
+  *measured* cardinalities, not just estimates (`docs/architecture/deep-dives/adaptive/adaptive-reoptimization.md`).
 - **The same code runs distributed** — `ds.collect(distributed=True)` uses the same
   mergeable `partial → combine → finalize` operators, so single-node and multi-node
   results are identical by construction.
@@ -116,7 +116,7 @@ Worth saying out loud when a user asks "why port at all":
    not insert `.collect()` between stages — that defeats the optimizer.
 4. **Move per-row Python into expressions.** `df.apply(...)` / a Python loop becomes an
    `Expr`. Only if the expression language genuinely has no answer, fall back to
-   `ds.map_batches(fn)` over Arrow batches (see `docs/user-guide/transform/udfs.md`), declaring
+   `ds.map_batches(fn)` over Arrow batches (see `docs/user-guide/transform/columns/udfs.md`), declaring
    `input_columns` and `output_columns`.
 5. **Fix the tail.** `ds.write.parquet(path)` / `ds.to_pandas()` at the boundary where
    downstream code still expects a DataFrame.
@@ -173,11 +173,11 @@ For a sorted query, compare `new.to_pylist()` against the oracle **in order**.
 
 ## See also
 
-- `docs/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
-- `docs/user-guide/transform/expressions.md`, `docs/user-guide/transform/expression-accessors.md`,
+- `docs/getting-started/migration/transforming.md` — the full pandas/Polars/PySpark mapping tables.
+- `docs/user-guide/transform/columns/expressions.md`, `docs/user-guide/transform/columns/expression-accessors.md`,
   `docs/api/relational/expressions.md` — the expression surface
   and every accessor namespace.
-- `docs/user-guide/transform/udfs.md` — when a UDF is justified and what it costs.
-- `docs/user-guide/analyze/window-functions.md`, `docs/user-guide/transform/transformations.md`.
-- `docs/benchmarks/vs-polars.md` — where Batcher wins and where it does not.
+- `docs/user-guide/transform/columns/udfs.md` — when a UDF is justified and what it costs.
+- `docs/user-guide/analyze/window-functions.md`, `docs/user-guide/transform/rows/transformations.md`.
+- `docs/benchmarks/comparisons/vs-polars.md` — where Batcher wins and where it does not.
 - `/migrate-from-daft` — the multimodal/ML-first sibling of this skill.

@@ -33,10 +33,18 @@ from batcher.api.terminal.gpu_backend.translate import (
 
 
 def try_gpu_collect(
-    plan: LogicalPlan, sources: list[Source], hub=None, *, force: bool = True
+    plan: LogicalPlan,
+    sources: list[Source],
+    hub=None,
+    *,
+    force: bool = True,
+    columns: list[str] | None = None,
 ) -> pa.Table | None:
     """Execute `plan` on the GPU if Kyber's cost policy says it pays and the shape is supported,
     else `None`.
+
+    `columns` is the terminal op's requested output columns, needed only to build the CPU
+    engine's context under `distributed.gpu_shadow_verify`; it is otherwise unused.
 
     `None` signals the caller to use the CPU engine — the safe fallback for any unsupported
     shape, a GPU-less cluster, or a plan Kyber routes to the CPU (too small to amortize the GPU
@@ -102,15 +110,23 @@ def try_gpu_collect(
         return None
     if result is None:
         return None
+    # Stopped before shadow-verify, which doubles the work by design: the recorded figure has
+    # to be what the device path costs, not what verifying it costs, or the learned GPU/CPU
+    # crossover moves the moment an operator switches the diagnostic on.
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    from batcher.config import active_config
+
+    if active_config().distributed.gpu_shadow_verify:
+        from batcher.api.terminal.gpu_backend.verify import shadow_verify
+
+        result = shadow_verify(plan, sources, columns or [], result)
     # Record this GPU run so Kyber can learn the GPU/CPU crossover (Core measures, Kyber
     # consumes). Keyed on the source's ACTUAL input rows — the same exact x the CPU side records
     # against — so the two fitted lines are directly comparable. Against the *raw* plan for
     # exactly that reason: the CPU recorder is handed the raw one, and an optimized plan can
     # match `_gpu_agg_spec` where the raw one does not (or the reverse), which would put the two
     # backends' timings on two different x-axes.
-    _record_gpu_timing(
-        hub, raw_plan, sources, decision.est_rows, (time.perf_counter() - t0) * 1000.0
-    )
+    _record_gpu_timing(hub, raw_plan, sources, decision.est_rows, elapsed_ms)
     return result
 
 

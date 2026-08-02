@@ -18,7 +18,7 @@ from batcher._internal.errors import PlanError
 from batcher.api._join_helpers import _as_key_expr
 from batcher.plan.expr_ir import Col, nullif, when
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors
-from batcher.plan.ir_tags import WINDOW_FRAMEABLE
+from batcher.plan.ir_tags import RUNNING_AGGREGATES, WINDOW_FRAMEABLE
 from batcher.plan.logical import (
     Sample,
     SortKeySpec,
@@ -416,9 +416,6 @@ def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:
     return ds.with_columns(**derived).select(*final)
 
 
-_PIVOT_AGGS = ("sum", "mean", "min", "max", "count")
-
-
 def build_pivot(
     ds: Dataset,
     index: list[str],
@@ -437,8 +434,10 @@ def build_pivot(
     by the aggregate. With `columns` omitted, the distinct pivot values are discovered
     by an eager pre-pass over `on` (like DuckDB's auto-`PIVOT`).
     """
-    if aggregate not in _PIVOT_AGGS:
-        raise PlanError(f"pivot(): aggregate must be one of {_PIVOT_AGGS}, got {aggregate!r}")
+    if aggregate not in RUNNING_AGGREGATES:
+        raise PlanError(
+            f"pivot(): aggregate must be one of {RUNNING_AGGREGATES}, got {aggregate!r}"
+        )
     for c in (*index, on, values):
         if c not in ds.columns:
             raise PlanError(f"pivot(): unknown column {c!r}")

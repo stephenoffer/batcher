@@ -19,5 +19,5 @@ python examples/expressions/strings_similarity.py
 
 - {doc}`/cookbook/expressions/strings/matching/strings_search`: substring tests, multi-pattern tests, and match counting.
 - {doc}`/cookbook/expressions/strings/shaping/strings_slicing`: taking a fixed piece of every value.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

@@ -82,11 +82,29 @@ def _host_shard(descriptor, ops):
 
 @pytest.fixture
 def host_tasks(monkeypatch):
-    """Point the fan-out's device task at the host backend, and ask for no GPU."""
-    import batcher.dist.gpu.tasks as tasks
+    """Point the fan-out's device task at the host backend, and ask for no GPU.
 
+    The stub takes `num_gpus` because the real `gpu_task_options` does: a packed fan-out asks
+    for a fraction of a device rather than a whole one. A stub that accepts only the old
+    no-argument call fails every case here with a `TypeError` from inside the fixture, which
+    reads as the fan-out being broken rather than the double being stale.
+    """
+    import batcher.dist.gpu.resources as resources
+    import batcher.dist.gpu.tasks as tasks
+    from batcher.carbonite.accel.fractional import whole_device_packing
+
+    host_opts = {"num_gpus": 0, "max_retries": 0}
     monkeypatch.setattr(tasks, "gpu_shard_partial", _host_shard)
-    monkeypatch.setattr(tasks, "gpu_task_options", lambda: {"num_gpus": 0, "max_retries": 0})
+    monkeypatch.setattr(tasks, "gpu_task_options", lambda num_gpus=0.0, **_: dict(host_opts))
+    # `gpu_shard_options` is where the fan-out gets the options it launches *shards* with;
+    # `gpu_task_options` only covers the un-packed retry handle. Patching one and not the other
+    # leaves every shard asking Ray for a real device, and this suite runs on a local cluster
+    # that has none — so the tasks pend forever and the case hangs instead of failing.
+    monkeypatch.setattr(
+        resources,
+        "gpu_shard_options",
+        lambda descriptors, schema=None, **_: (dict(host_opts), whole_device_packing(1, "test")),
+    )
 
 
 def _rows(table: pa.Table, *, ordered: bool) -> list[tuple]:
@@ -107,12 +125,22 @@ CASES = {
 }
 
 
+@pytest.mark.timeout(90)
 @pytest.mark.parametrize("case", sorted(CASES))
 @pytest.mark.parametrize("sharded", [False, True])
 def test_the_fan_out_reproduces_the_single_node_answer(
     case, sharded, cluster, source_dir, host_tasks
 ):
-    """The wiring end to end: descriptors, tasks, the barrier, and the merge."""
+    """The wiring end to end: descriptors, tasks, the barrier, and the merge.
+
+    Bounded explicitly because the failure mode here is a *hang*, not an error: the fan-out's
+    barrier waits on shard tasks with no deadline, so when they cannot be placed the case stops
+    rather than fails. That was hidden until recently — the `host_tasks` double had drifted out
+    of step with `gpu_task_options`, so every case died on a `TypeError` before reaching the
+    barrier and the wait was never entered. Fixing the double is what exposed it. The timeout
+    turns the hang back into a reported failure; the barrier itself wanting a deadline is a
+    separate finding and is not fixed here.
+    """
     from batcher.core.gpu_plan import gpu_plan_ops
     from batcher.dist.gpu.aggregate import sharded_gpu_aggregate
 
@@ -134,12 +162,28 @@ def test_a_splittable_source_can_be_described_to_a_worker(cluster, source_dir):
     legitimate "not splittable" — indistinguishable, from the outside, from an import that
     moved.
     """
+    import dataclasses
+
+    from batcher.config import active_config, config_context
     from batcher.dist.gpu.aggregate import shard_descriptors
     from batcher.dist.gpu.dispatch import whole_source_descriptor
 
     source = bt.read.parquet(source_dir)._sources[0]
     assert whole_source_descriptor(source) is not None
-    fanned = shard_descriptors(source, 2, sharded=True, preserve_order=False)
+    # This fixture's source is a few hundred kilobytes, and `plan_shard_count` will not cut a
+    # shard below `gpu_min_shard_bytes` (128 MB by default) because the Ray dispatch would cost
+    # more than the shard's own compute. That floor is right and separately tested; it just
+    # means a test-sized relation is *correctly* one shard. Lower it so this case can still
+    # exercise the thing it is about, which is the descriptor wiring, not the sizing policy.
+    # Only the one field: a fresh `DistributedConfig()` would also reset the autoscale wait and
+    # the placement timeout this suite's local cluster depends on, and the case would hang
+    # rather than fail.
+    cfg = active_config()
+    tiny_floor = cfg.replace(
+        distributed=dataclasses.replace(cfg.distributed, gpu_min_shard_bytes=1)
+    )
+    with config_context(tiny_floor):
+        fanned = shard_descriptors(source, 2, sharded=True, preserve_order=False)
     assert fanned is not None and len(fanned) > 1
 
 

@@ -19,5 +19,5 @@ python examples/expressions/lists_aggregate.py
 
 - {doc}`/cookbook/expressions/nested/json_columns`: reading JSON held in a string column, without parsing it in Python.
 - {doc}`/cookbook/expressions/nested/lists_basics`: indexing, slicing, joining, and flattening.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

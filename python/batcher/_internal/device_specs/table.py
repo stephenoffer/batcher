@@ -211,9 +211,9 @@ _HOST_LINK: dict[str, tuple[str, float]] = {
 #: where the facts were in fact known, so VRAM sizing fell back to a default, the fabric width
 #: read as one device, MIG read as unpartitionable, and every energy figure read as zero.
 #:
-#: Only the parts whose label differs from the row key need an entry. The AMD and Intel rows
-#: are already spelled the way Ray spells them (`AMD-Instinct-MI300X` normalizes onto
-#: `AMD_INSTINCT_MI300X`), and the TPU rows are labelled with their row key verbatim.
+#: Only the parts whose label differs from the row key need an entry. Most AMD and Intel rows
+#: are already spelled the way Ray spells them (`AMD-Instinct-MI250X` normalizes onto
+#: `AMD_INSTINCT_MI250X`), and the TPU rows are labelled with their row key verbatim.
 #:
 #: `tests/unit/test_device_specs_ray_labels.py` checks this map against the live
 #: `ray.util.accelerators` module, so a part Ray adds later fails a test rather than silently
@@ -247,6 +247,13 @@ RAY_LABEL_ALIASES: dict[str, str] = {
     # Ray labels the MI250 and MI250X with one shared string. The X is the larger part, and
     # the row it points at is the one this table carries.
     "AMD_INSTINCT_MI250X_MI250": "AMD_INSTINCT_MI250X",
+    # Ray labels an MI300X node with the OAM form factor in the string — the bare
+    # `AMD-Instinct-MI300X` this table's row key matches is a spelling no node carries. Without
+    # this the largest part in the table (192 GiB) read as unknown on every real MI300X fleet,
+    # which `binding_gpu_memory_bytes` reports as `0` and every VRAM-sized decision then takes
+    # its default for. Missed because Ray spells the constant `AMD_INSTINCT_MI300x`, whose
+    # lowercase tail dropped it from the label sweep in `test_device_specs_ray_labels`.
+    "AMD_INSTINCT_MI300X_OAM": "AMD_INSTINCT_MI300X",
     # Ray spells the Intel parts with the `GPU` segment the row keys leave out.
     "INTEL_GPU_MAX_1550": "INTEL_MAX_1550",
     "INTEL_GPU_MAX_1100": "INTEL_MAX_1100",

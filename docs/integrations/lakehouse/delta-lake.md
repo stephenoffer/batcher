@@ -228,9 +228,9 @@ columns in the plan (`select`, `cast`) rather than hoping the writer coerces.
 
 - {doc}`Lakehouse </user-guide/moving-data/lakehouse>`: merge clauses, SCD, CDC, file skipping in depth.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: modes, partitioning, the commit path.
-- {doc}`Partition backfill </cookbook/data-engineering/partition-backfill>`: `replace_where=`
+- {doc}`Partition backfill </cookbook/data-engineering/maintenance/partition-backfill>`: `replace_where=`
   as a re-runnable job.
-- {doc}`File compaction </cookbook/data-engineering/file-compaction>`: `bt.compact` and
+- {doc}`File compaction </cookbook/data-engineering/maintenance/file-compaction>`: `bt.compact` and
   Z-ordering on a schedule.
 - {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>`: `app_id` and `txn_version`
   in a streaming pipeline.

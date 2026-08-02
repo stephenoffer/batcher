@@ -19,5 +19,5 @@ python examples/expressions/column_selectors.py
 
 - {doc}`/cookbook/expressions/scalar/aggregates`: counts, positions, quantiles, and approximations.
 - {doc}`/cookbook/expressions/scalar/conditionals`: when/then/otherwise, and the SQL null helpers.
-- {doc}`/user-guide/transform/expressions`: what an expression is, and how it is evaluated.
+- {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
 - {doc}`/api/relational/expressions`: the complete `Expr` reference.

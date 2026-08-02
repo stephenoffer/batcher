@@ -214,6 +214,6 @@ cover the train-set preparation steps.
 ## See also
 
 - {doc}`/api/relational/expressions`: the core `Expr` surface these namespaces extend.
-- {doc}`/user-guide/transform/expression-accessors`: the same namespaces taught with examples.
-- {doc}`/user-guide/transform/expression-recipes`: text-corpus and feature recipes built on them.
+- {doc}`/user-guide/transform/columns/expression-accessors`: the same namespaces taught with examples.
+- {doc}`/user-guide/transform/columns/expression-recipes`: text-corpus and feature recipes built on them.
 - {doc}`/cookbook/expressions/index`: runnable recipes for the namespaces on this page.

@@ -92,9 +92,9 @@ marketing document, not a measurement.
 
 ## See also
 
-- {doc}`tpch`: the suite where the gate has the most to say about other engines.
-- {doc}`analytics` and {doc}`ai-and-gpu`: the two halves of the
+- {doc}`/benchmarks/results/tpch`: the suite where the gate has the most to say about other engines.
+- {doc}`/benchmarks/results/analytics` and {doc}`/benchmarks/results/ai-and-gpu`: the two halves of the
   measurement.
-- {doc}`../internals/testing-strategy`: the same discipline applied to the
+- {doc}`/architecture/internals/testing-strategy`: the same discipline applied to the
   engine itself, where DuckDB is the differential oracle.
-- {doc}`/user-guide/operate/performance`: the levers you have on your own query.
+- {doc}`/user-guide/operate/tuning/performance`: the levers you have on your own query.

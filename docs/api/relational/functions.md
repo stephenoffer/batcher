@@ -242,5 +242,5 @@ value functions are window-only: bind them with `.over(partition_by=…, order_b
 
 - {doc}`/api/relational/expressions`: the `Expr` methods and accessor namespaces.
 - {doc}`/api/models/metrics`: the scoring and statistical aggregates.
-- {doc}`/user-guide/transform/expressions`: the same language taught rather than tabulated.
+- {doc}`/user-guide/transform/columns/expressions`: the same language taught rather than tabulated.
 - {doc}`/cookbook/expressions/index`: runnable recipes for these functions in context.

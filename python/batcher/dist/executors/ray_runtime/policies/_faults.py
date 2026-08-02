@@ -63,6 +63,58 @@ def is_recoverable_task_failure(exc: BaseException) -> bool:
     return isinstance(exc, recoverable) or isinstance(getattr(exc, "cause", None), recoverable)
 
 
+def blame_host_for_reduce_failure(exc: BaseException, host: int | None) -> int | None:
+    """The worker to blame for a failed bucket reduce, or re-raise if nothing is to blame.
+
+    A bucket reduce is gathered through `gather_with_backups`, whose `on_failure` hook turns a
+    failed slot into a result instead of raising — that is what lets the recovery loop treat a
+    preempted host as a recompute rather than a dead query. The hook sees an exception, though,
+    and only *some* exceptions mean a host was lost. A reducer fetches from its upstreams
+    inside the task, so a genuinely-lost peer arrives as a `RetryableShuffleError`; a schema
+    mismatch, a bad cast, or any other deterministic bug arrives as the very same
+    `RayTaskError` wrapper.
+
+    Absorbing the second kind is how a bug becomes a fleet outage. Each round blames the host
+    that ran it, recomputes, hits the identical error on the next host, and blames that one
+    too — until every worker is marked lost and the query fails as
+    `shuffle did not recover after 3 attempts (still unreachable: {0, 1, 2, 3})` on a cluster
+    where all four workers are healthy, with the real traceback discarded three frames down.
+    Five of the twenty-two TPC-H queries failed exactly that way, all of them multi-way joins.
+
+    The taxonomy is `gather_map_results`': a `RayError` that is *not* a `RayTaskError` is the
+    death of an actor, a worker, or a node — the loss this whole path exists to survive — while
+    a `RayTaskError` carries whatever the task itself raised and has to be classified. The two
+    are kept in step deliberately: the map stage and the reduce stage disagreeing about what a
+    failure means is how a fleet ends up half-recovering.
+
+    Args:
+        exc: The failure that finished off every live copy of the slot.
+        host: The worker the last-failed copy ran on, or `None` when it is unknown.
+
+    Returns:
+        `host`, unchanged, when the failure means lost data and a recompute can fix it.
+
+    Raises:
+        BaseException: `exc` itself, when it is deterministic and a retry would only re-run it.
+    """
+    if not _reduce_failure_is_worker_loss(exc):
+        raise exc
+    return host
+
+
+def _reduce_failure_is_worker_loss(exc: BaseException) -> bool:
+    """Whether a failed bucket reduce lost a host, rather than hitting a deterministic bug."""
+    if _is_fatal_ray_error(exc):
+        return False  # a broken environment, a cancellation, a caller's deadline — not a death
+    try:
+        from ray.exceptions import RayError, RayTaskError
+    except Exception:  # pragma: no cover - ray optional
+        return is_recoverable_task_failure(exc)
+    if isinstance(exc, RayError) and not isinstance(exc, RayTaskError):
+        return True  # actor / worker / node death: exactly what a recompute is for
+    return is_recoverable_task_failure(exc)
+
+
 def _is_fatal_ray_error(exc: BaseException) -> bool:
     """Whether `exc` is a Ray error that a worker-loss retry must NOT absorb."""
     try:

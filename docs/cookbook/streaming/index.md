@@ -69,7 +69,7 @@ than discover. None of them is a bug you can configure away.
   reference.
 - {doc}`Kafka integration </integrations/streams/kafka>`: brokers, consumer groups, and splits.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: the batch write surface and Delta commits.
-- {doc}`Late-arriving data </cookbook/data-engineering/late-arriving-data>`: the batch reconciliation
+- {doc}`Late-arriving data </cookbook/data-engineering/ingest/late-arriving-data>`: the batch reconciliation
   half of the same problem.
 - {doc}`ML recipes </cookbook/ml/pipelines/index>`: the model stages that these queries run per micro-batch.
 

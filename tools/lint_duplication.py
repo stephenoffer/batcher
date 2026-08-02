@@ -119,6 +119,129 @@ def _collect() -> dict[str, list[tuple[str, int, str]]]:
     return buckets
 
 
+#: Vocabularies already restated across modules when this detector was written, keyed by their
+#: canonical contents. Each entry is debt with a destination, not an exemption: the gate exists
+#: so the list shrinks, and a NEW restatement is a failure rather than a line to add here.
+#:
+#: They were invisible because `ruff` cannot see them — `F811` does not fire on a module-level
+#: reassignment, so even two adjacent identical `_COMPARISONS` dicts in one file passed — and
+#: because the function-body detector above normalizes constants away by design.
+VOCABULARY_ALLOW: dict[str, str] = {
+    # The comparison set appears once more as an ORDERED TUPLE in three rule families
+    # (`math_algebra/rounding`, `temporal_algebra/{epoch,offsets}`), each spelling
+    # `("lt", "le", "gt", "ge", "eq", "ne")`. That is not a restated vocabulary: registration
+    # order is *run* order, and the order a family registers its per-operator rules in is a
+    # decision belonging to that family, not to the vocabulary. Two of the sites here use a
+    # different order from `plan.ir_tags.COMPARISON_ORDER`, so folding them onto it would
+    # silently reorder 12 rules — which `just lint-rule-order` catches, and which is exactly
+    # the class of change this repo has been bitten by (283 of 302 rules once moved). The
+    # *content* is what must not drift, and a rule-order snapshot pins that too.
+    "eq,ge,gt,le,lt,ne": (
+        "three families' own registration ORDER; content pinned by lint-rule-order"
+    ),
+}
+
+#: A constant literal repeated in at least this many modules is a shared vocabulary that has no
+#: home, not a coincidence. Two is too low — a pair of modules naming the same small set is
+#: ordinary — and this catches the shape that actually went wrong: the comparison-operator set
+#: was spelled out in *twelve* Kyber modules as a dict, a frozenset, a tuple and a dict of
+#: callables, one of them silently missing `eq`/`ne`, and `ruff` reports none of it (F811 does
+#: not fire on a module-level reassignment, so even the two adjacent identical copies in one
+#: file passed).
+CONSTANT_MIN_MODULES = 3
+
+#: Below this many elements a repeated literal is not worth a shared home.
+CONSTANT_MIN_ELEMENTS = 4
+
+
+def _constant_literals() -> dict[str, list[tuple[str, int, str]]]:
+    """Module-level constant collections, keyed by their canonical contents."""
+    found: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    for root in TARGETS:
+        for path in sorted(root.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            for node in tree.body:
+                if not isinstance(node, ast.Assign | ast.AnnAssign):
+                    continue
+                target = node.targets[0] if isinstance(node, ast.Assign) else node.target
+                value = node.value
+                if not isinstance(target, ast.Name) or value is None:
+                    continue
+                elements = _literal_elements(value)
+                if elements is None or len(elements) < CONSTANT_MIN_ELEMENTS:
+                    continue
+                key = ",".join(sorted(elements))
+                rel = path.relative_to(ROOT).as_posix()
+                found[key].append((rel, node.lineno, target.id))
+    return found
+
+
+def _literal_elements(value: ast.expr) -> list[str] | None:
+    """The canonical elements of a string set/tuple/list/dict literal, or `None`.
+
+    A dict contributes `key=value` pairs, not bare keys. Sharing *keys* is not duplication:
+    `{"lt": "gt", ...}` (flip a comparison) and `{"lt": operator.lt, ...}` (evaluate one) are
+    different mappings over one vocabulary, and collapsing them would buy indirection rather
+    than a single source of truth. Sharing keys *and* values is — that is the same fact
+    written twice.
+    """
+    if isinstance(value, ast.Call):  # frozenset({...}) / set([...])
+        name = getattr(value.func, "id", "")
+        if name not in ("frozenset", "set") or not value.args:
+            return None
+        value = value.args[0]
+    if isinstance(value, ast.Dict):
+        out = []
+        for key, val in zip(value.keys, value.values, strict=True):
+            if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                return None
+            if not isinstance(val, ast.Constant):
+                return None  # a computed value is not a restated literal
+            out.append(f"{key.value}={val.value!r}")
+        return out
+    if not isinstance(value, ast.Set | ast.Tuple | ast.List):
+        return None
+    out = []
+    for item in value.elts:
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+            return None
+        out.append(item.value)
+    return out
+
+
+def _report_constants() -> int:
+    """Report vocabularies restated in several modules. Returns the failure count."""
+    failures = 0
+    for key, sites in sorted(_constant_literals().items()):
+        modules = {file for file, _, _ in sites}
+        if len(modules) < CONSTANT_MIN_MODULES:
+            continue
+        if key in VOCABULARY_ALLOW:
+            print(
+                f"allow: {len(modules)} modules restate [{key[:40]}...] — {VOCABULARY_ALLOW[key]}"
+            )
+            continue
+        failures += 1
+        names = " / ".join(sorted({name for _, _, name in sites}))
+        print(
+            f"\nFAIL: the same {len(key.split(','))}-element vocabulary is restated in "
+            f"{len(modules)} modules [{names}]"
+        )
+        for file, line, name in sorted(sites):
+            print(f"    {file}:{line}  {name}")
+        print(
+            "    → give it ONE home (plan/ir_tags.py for IR vocabulary, else a neutral layer) "
+            "and import it.\n      Restating it is how the copies drift: one of them ends up "
+            "meaning something narrower\n      while still answering to the same name."
+        )
+    return failures
+
+
 def main() -> int:
     groups = [sites for sites in _collect().values() if len(sites) > 1]
     # Only cross-file copies. Two identical bodies in one module are usually a deliberate
@@ -145,8 +268,13 @@ def main() -> int:
             ".claude/rules/architecture.md."
         )
 
-    if failures:
-        print(f"\nlint-duplication: {len(failures)} duplicated block(s)")
+    constant_failures = _report_constants()
+
+    if failures or constant_failures:
+        print(
+            f"\nlint-duplication: {len(failures)} duplicated block(s), "
+            f"{constant_failures} restated vocabular(ies)"
+        )
         return 1
     print("lint-duplication: clean")
     return 0

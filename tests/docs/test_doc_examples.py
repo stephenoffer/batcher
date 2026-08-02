@@ -14,9 +14,11 @@ Contract for doc authors:
   whose first line is ``# docs: skip`` is shown in the docs but not executed; use
   it for examples that need external resources (cloud object stores, a Ray
   cluster, a GPU, or a real model).
-- The design sections (``architecture/`` and ``internals/``) carry illustrative
-  pseudo-code, so their blocks are not executed unless the first line is
-  ``# docs: run``.
+- The design sections carry illustrative pseudo-code, so their blocks are not
+  executed unless the first line is ``# docs: run``. Those are the
+  ``docs/architecture/*.md`` overview pages and ``docs/architecture/internals/``.
+  ``docs/architecture/deep-dives/`` is *not* one of them: its examples are real and
+  run by default.
 - Examples should be self-contained within a page and use in-memory data
   (``bt.from_pydict``), so the suite needs no fixtures on disk.
 - A page is executed in its own empty temporary directory, so a block that *does*
@@ -42,8 +44,20 @@ _BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
 _SKIP = "# docs: skip"
 _RUN = "# docs: run"
 
-# Sections of illustrative design docs: blocks are opt-in via ``# docs: run``.
-_DESIGN_SECTIONS = {"architecture", "internals"}
+
+def _is_design_page(rel: Path) -> bool:
+    """True for the illustrative design pages, whose blocks are opt-in via ``# docs: run``.
+
+    Matched on the path shape rather than the top-level directory name, because
+    ``architecture/`` now nests two sub-sections and they do not share this behavior:
+    ``architecture/internals/`` is design prose, while ``architecture/deep-dives/`` carries
+    real, executed examples. Keying on ``rel.parts[0]`` alone silently stopped running all
+    22 deep-dive pages when that section moved under ``architecture/``.
+    """
+    parts = rel.parts
+    if not parts or parts[0] != "architecture":
+        return False
+    return len(parts) == 2 or parts[1] == "internals"
 
 
 def _doc_files() -> list[Path]:
@@ -69,8 +83,7 @@ def _runnable_blocks(text: str, *, opt_in: bool) -> list[str]:
 def test_doc_examples(path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Run every non-skipped python block in one doc page, in order."""
     rel = path.relative_to(DOCS_ROOT)
-    opt_in = bool(rel.parts) and rel.parts[0] in _DESIGN_SECTIONS
-    blocks = _runnable_blocks(path.read_text(), opt_in=opt_in)
+    blocks = _runnable_blocks(path.read_text(), opt_in=_is_design_page(rel))
     if not blocks:
         pytest.skip("no runnable python blocks")
     # Each page gets its own empty directory as cwd. Examples are documented as

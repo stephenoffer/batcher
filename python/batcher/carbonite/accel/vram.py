@@ -30,15 +30,18 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from batcher._internal.device_share import DEVICE_HEADROOM
 from batcher._internal.errors import ResourceError
 
 __all__ = ["VramPool", "VramReservation"]
 
 #: Fraction of a device held back from reservation by default: CUDA context (~0.5-1 GiB),
 #: allocator fragmentation, and activation peaks a declared model footprint never includes.
-#: The same 15% the packing math in `ml.gpu` leaves, kept in agreement deliberately — two
-#: different headroom constants would make "fits" mean two different things in one pipeline.
-DEFAULT_HEADROOM = 0.15
+#: Re-exported from `_internal.device_share` rather than restated, so the packing math, the
+#: routing budget and this pool cannot disagree about what "fits" means in one pipeline. A
+#: deployment moves it through `accelerator.vram_headroom`, which every caller that builds a
+#: pool from live config already passes explicitly.
+DEFAULT_HEADROOM = DEVICE_HEADROOM
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +126,19 @@ class VramPool:
             capacities=dict(capacities),
         )
 
+    def governed_devices(self) -> tuple[int, ...]:
+        """The device indices this pool accounts for, ascending.
+
+        The per-device map's own keys where it has any, and `0..device_count-1` otherwise.
+        Deriving them from a `range` unconditionally assumed the indices are contiguous and
+        zero-based, which is true of the node and false of the process: a worker pinned by
+        ``CUDA_VISIBLE_DEVICES=4,5`` builds a pool keyed by physical index, and a `range(2)`
+        then walked devices 0 and 1 — boards this process cannot touch. Every reservation
+        fell through `capacity_of`'s scalar fallback, so `best_device` placed onto a stranger's
+        device and `summary` reported a fleet nobody was using.
+        """
+        return tuple(sorted(self.capacities)) or tuple(range(max(1, self.device_count)))
+
     def capacity_of(self, device: int = 0) -> int:
         """Total memory of one governed device.
 
@@ -189,7 +205,7 @@ class VramPool:
             answer than placing it on the least-bad option and letting the reservation fail
             with a reason.
         """
-        devices = range(max(1, self.device_count))
+        devices = self.governed_devices()
         skip = set(exclude or ())
         eligible = [d for d in devices if d not in skip] or list(devices)
         return min(eligible, key=lambda d: (-self.available_bytes(d), d))
@@ -278,7 +294,7 @@ class VramPool:
             Capacity, held, available, and peak bytes summed across devices, plus the
             maximum per-device pressure.
         """
-        devices = range(max(1, self.device_count))
+        devices = self.governed_devices()
         return {
             # Summed per device rather than `capacity_bytes * device_count`, which silently
             # reports a mixed node as though every board were the smallest one.

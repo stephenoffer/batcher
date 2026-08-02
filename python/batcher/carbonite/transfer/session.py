@@ -257,15 +257,19 @@ class ShuffleSession:
         finalize: bool,
         fan_in: int = _DEFAULT_FAN_IN,
         replicas: list[list[str]] | None = None,
-    ) -> tuple[pa.RecordBatch | None, list[int]]:
+    ) -> tuple[pa.RecordBatch | None, list[tuple[int, str]]]:
         """Concurrently fetch + `combine` aggregate partials from every mapper.
 
         The reducer's bounded-memory merge, but fetching all mappers at once (bounded by
         `fan_in`) instead of one blocking round-trip each — the dominant shuffle-reduce
         cost at scale. The combine spec (`group_keys_json`/`aggregates_json`) is supplied
         by the relational layer; the session stays operator-agnostic. Returns
-        `(payload, unreachable)` — a non-empty `unreachable` is the `("retry", srcs)`
-        signal. When same-node shared memory is enabled, same-node sources are read
+        `(payload, unreachable)`, where each `unreachable` entry pairs a lost source's
+        index with the transport fault that made it retryable — a non-empty list is the
+        `("retry", srcs)` signal. The fault text travels with the index because the index
+        alone is a lie by omission: the driver turns it into "worker lost", recomputes,
+        and eventually fails a query on a cluster where every worker is alive. When
+        same-node shared memory is enabled, same-node sources are read
         zero-copy from shared memory *inside* the concurrent gather (Flight fallback on a
         miss), so cross-node fetches still fan out in parallel.
 
@@ -297,9 +301,10 @@ class ShuffleSession:
         *,
         fan_in: int | None = None,
         replicas: list[list[str]] | None = None,
-    ) -> tuple[list[str], list[int]]:
+    ) -> tuple[list[str], list[tuple[int, str]]]:
         """Concurrently fetch every mapper's bucket and spill each to an IPC file under
-        `spill_dir`, returning `(paths, unreachable)`.
+        `spill_dir`, returning `(paths, unreachable)` — each `unreachable` entry pairing
+        a lost source's index with the fault that made it retryable.
 
         The out-of-core sibling of `gather_combine`: it never holds the assembled bucket
         in RAM (only `fan_in` in-flight fetches), landing each on disk so the reducer can
@@ -332,12 +337,13 @@ class ShuffleSession:
         *,
         fan_in: int | None = None,
         replicas: list[list[str]] | None = None,
-    ) -> tuple[list[pa.RecordBatch], list[int]]:
+    ) -> tuple[list[pa.RecordBatch], list[tuple[int, str]]]:
         """Concurrently fetch every mapper's raw bucket into one list (window/sort/join).
 
         Like `gather`, but fetches concurrently (bounded by `fan_in`) and returns the
-        lost-source indices instead of raising, so the reducer can report `("retry",
-        srcs)`. When shared memory is enabled, same-node sources are read zero-copy from
+        lost sources — each an `(index, fault)` pair — instead of raising, so the reducer
+        can report `("retry", srcs)` and the fault is not lost on the way. When shared
+        memory is enabled, same-node sources are read zero-copy from
         shared memory within the concurrent gather (Flight fallback on a miss).
 
         `fan_in` defaults to `flow_control.shuffle_fetch_fan_in` — the *flat*-gather bound,

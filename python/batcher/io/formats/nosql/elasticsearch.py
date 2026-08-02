@@ -28,6 +28,7 @@ from batcher.io.formats.nosql.base import (
     rows_to_batches,
 )
 from batcher.io.formats.sql._common import probe_is_typed
+from batcher.plan.ir_tags import COMPARISON_FLIP
 
 __all__ = ["ElasticsearchSource"]
 
@@ -217,7 +218,6 @@ class ElasticsearchSource(ScanSource):
 # IR comparison op → Elasticsearch ``range`` query operator (``eq`` uses ``term``).
 _ES_RANGE = {"lt": "lt", "le": "lte", "gt": "gt", "ge": "gte"}
 # When a literal sits on the left, flip the comparison direction.
-_ES_FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
 def _to_es_query(ir: dict[str, Any]) -> dict[str, Any] | None:
@@ -249,7 +249,7 @@ def _to_es_query(ir: dict[str, Any]) -> dict[str, Any] | None:
     if parsed is None:
         return None
     col, value, flipped = parsed
-    effective = _ES_FLIP[op] if flipped else op
+    effective = COMPARISON_FLIP[op] if flipped else op
     if effective == "eq":
         return {"term": {col: value}}
     if effective == "ne":

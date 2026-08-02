@@ -263,9 +263,8 @@ StreamingQueryProgress(batch_id=3, num_input_rows=5, num_output_rows=2, ...) 10
 ## See also
 
 - `docs/user-guide/moving-data/streaming.md` (exactly-once at :297, cluster at :331, medallion at :374);
-  `docs/examples/streaming/{kafka-etl,exactly-once-sink,late-data-watermarks,stream-join,
-  windowed-aggregation,streaming-inference}.md`; `docs/ml/inference/streaming.md`;
-  `docs/examples/data-engineering/{incremental-ingest,cdc-pipeline,late-arriving-data}.md`.
+  `docs/cookbook/streaming/kafka-etl.md`, `docs/cookbook/streaming/exactly-once-sink.md`, `docs/cookbook/streaming/late-data-watermarks.md`, `docs/cookbook/streaming/stream-join.md`, `docs/cookbook/streaming/windowed-aggregation.md`, `docs/cookbook/streaming/streaming-inference.md`; `docs/ml/inference/streaming.md`;
+  `docs/cookbook/data-engineering/ingest/incremental-ingest.md`, `docs/cookbook/data-engineering/ingest/cdc-pipeline.md`, `docs/cookbook/data-engineering/ingest/late-arriving-data.md`.
 - Skills: `write-a-batcher-pipeline` (relational core); `read-and-write-data` (sources/sinks);
   `manage-a-lakehouse-table` (Delta/Iceberg upserts — the idempotent sink);
   `validate-data-quality` (gating micro-batches); `run-a-distributed-job`;

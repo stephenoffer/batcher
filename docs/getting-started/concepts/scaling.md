@@ -41,6 +41,6 @@ counts.collect(distributed=True)   # same plan, many machines, identical result
 
 ## See also
 
-- {doc}`/user-guide/operate/performance`: measuring and tuning before reaching for more machines.
-- {doc}`/deep-dives/operators/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
+- {doc}`/user-guide/operate/tuning/performance`: measuring and tuning before reaching for more machines.
+- {doc}`/architecture/deep-dives/operators/mergeable-algebra`: the `partial`, `combine`, `finalize` contract in full.
 - {doc}`/integrations/compute/ray`: running the distributed path on a real cluster.

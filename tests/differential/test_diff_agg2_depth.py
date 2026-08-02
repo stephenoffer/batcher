@@ -2,7 +2,7 @@
 
 Each test pins a specific bug: the query returned the wrong answer (or raised) before
 the fix and matches DuckDB — and the in-memory path — after it. See
-docs/internals/bug_hunt_ledger.md.
+docs/architecture/internals/bug_hunt_ledger.md.
 """
 
 from __future__ import annotations

@@ -17,12 +17,15 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from batcher.io.source import Source
+    from batcher.metadata import MetadataHub
     from batcher.plan.logical import LogicalPlan
 
 __all__ = ["broadcast_join", "is_shardable"]
 
 
-def broadcast_join(plan: LogicalPlan, sources: list[Source]) -> bool:
+def broadcast_join(
+    plan: LogicalPlan, sources: list[Source], hub: MetadataHub | None = None
+) -> bool:
     """Whether Kyber would run this plan's join by replicating its build side.
 
     The GPU backend splits a join's probe side across devices and gives every device the whole
@@ -39,6 +42,14 @@ def broadcast_join(plan: LogicalPlan, sources: list[Source]) -> bool:
     fan-out could honor it, but the probe side would then be the plan's right input, and a
     fan-out that split the wrong side would be wrong rather than slow.
 
+    `hub` supplies the learned statistics the estimator sizes the two sides with, and it is
+    the *same* hub the routing decision next door estimates against. Passing `None` here while
+    the router passed a hub is how the two came to disagree: the router sized the build side
+    from measured cardinalities and this sized it from footer estimates, so on any fleet that
+    had learned anything the router could route a join to the fan-out that this had refused to
+    call a broadcast — or, worse, the reverse, which puts a build side nobody measured onto
+    every device at once. `None` is still accepted, and still means "no learned statistics".
+
     Never raises: an unanswerable *question* is answered "no", and the join runs on one device.
     That tolerance covers an estimator that cannot size the inputs — not a moved symbol, which
     is why the imports sit outside it. Swallowing one of those is how this fan-out was
@@ -54,7 +65,7 @@ def broadcast_join(plan: LogicalPlan, sources: list[Source]) -> bool:
         joins = [n for n in _walk(plan) if isinstance(n, Join)]
         if len(joins) != 1:
             return False
-        est = CardinalityEstimator(sources=sources, learned=load_learned_stats(None))
+        est = CardinalityEstimator(sources=sources, learned=load_learned_stats(hub))
         _rewritten, decisions = adaptive_build_side(joins[0], est)
         return len(decisions) == 1 and decisions[0].broadcast and not decisions[0].swapped
     except Exception as exc:  # pragma: no cover - routing must never break a plan
@@ -62,15 +73,26 @@ def broadcast_join(plan: LogicalPlan, sources: list[Source]) -> bool:
         return False
 
 
-def _walk(node):
-    """Every node of a plan, parents before children."""
+def _walk(node, seen: set[int] | None = None):
+    """Every *distinct* node of a plan, parents before children.
+
+    Distinct by identity, because a logical plan is a DAG rather than a tree: a subtree bound
+    to a variable and used twice (`d = ...; d.join(d, ...)`) is one object reachable by two
+    paths. Yielding it twice made a single self-join look like two joins, so `len(joins) != 1`
+    refused the fan-out for the one plan shape most obviously worth fanning out — and on a
+    deep shared subtree the duplicate traversal is exponential rather than merely wrong.
+    """
+    seen = set() if seen is None else seen
+    if id(node) in seen:
+        return
+    seen.add(id(node))
     yield node
     for attr in ("input", "left", "right"):
         child = getattr(node, attr, None)
         if child is not None:
-            yield from _walk(child)
+            yield from _walk(child, seen)
     for child in getattr(node, "inputs", ()) or ():
-        yield from _walk(child)
+        yield from _walk(child, seen)
 
 
 def is_shardable(plan: LogicalPlan) -> bool:

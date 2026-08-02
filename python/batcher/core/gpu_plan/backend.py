@@ -20,7 +20,15 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import pyarrow as pa
 
-__all__ = ["DfBackend", "Unsupported", "call_or_decline", "widen_narrow", "widened_type"]
+__all__ = [
+    "DfBackend",
+    "Unsupported",
+    "call_or_decline",
+    "conform_empty_dtype",
+    "sortable_key",
+    "widen_narrow",
+    "widened_type",
+]
 
 
 def widened_type(dtype: pa.DataType):
@@ -213,11 +221,47 @@ class DfBackend:
     def to_arrow(self, df) -> pa.Table:
         """A dataframe back as an Arrow table, dropping the index (never part of the result)."""
         if self._arrow_native:
-            return self._restore_dates(df.to_arrow())
+            return self._restore_dates(self._restore_empty_strings(df, df.to_arrow()))
         import pyarrow as pa
 
         table = pa.Table.from_pandas(df, preserve_index=False).replace_schema_metadata(None)
         return self._restore_dates(table)
+
+    def _restore_empty_strings(self, df, table: pa.Table) -> pa.Table:
+        """An **empty** cuDF string column converts to Arrow `null`; give it back its type.
+
+        Measured on the device: both `cudf.DataFrame({"s": ["a"]})[...filtered to empty...]` and
+        an explicitly empty string column convert as `s: null`, while an `int64` column beside
+        them keeps `int64`. So a query whose result is empty came back with every string column
+        untyped, and TPC-H q15 — which is empty on this data — returned `s_name`, `s_address` and
+        `s_phone` as `null` where the CPU engine returns `string`. Every value agreed, because
+        there were none. That is the whole danger of it: the device tier's contract fixes column
+        *types* as exactly as it fixes rows, and a value comparison can never see this.
+
+        Safe because in cuDF `object` means `string` and nothing else — it has no arbitrary
+        Python object column — so the dtype is a reliable statement of what the column held. The
+        repair is confined to the empty case, where there is provably no data to misread, and to
+        this backend, where that equivalence holds; a pandas frame's `object` column could be
+        anything, and the host backend exists to mirror the engine's tests rather than to answer
+        queries.
+        """
+        if table.num_rows:
+            return table
+        import pyarrow as pa
+
+        columns = set(df.columns)
+        fields, changed = [], False
+        for field in table.schema:
+            if (
+                field.name in columns
+                and pa.types.is_null(field.type)
+                and str(df[field.name].dtype) == "object"
+            ):
+                fields.append(pa.field(field.name, pa.string(), nullable=True))
+                changed = True
+            else:
+                fields.append(field)
+        return table.cast(pa.schema(fields)) if changed else table
 
     def _restore_dates(self, table: pa.Table) -> pa.Table:
         """`table` with any column that arrived as a DATE cast back from the library's timestamp.
@@ -388,3 +432,62 @@ class DfBackend:
     def column(self, value: Any, df):
         """`value` as a column of `df`'s length, whether it arrived as a column or a scalar."""
         return value if self.is_series(value) else self.broadcast(value, df)
+
+
+# --- conforming a dataframe column to what the engine would return ------------------
+#
+# Both libraries disagree with the engine in ways that produce a right *value* in a wrong
+# *column*, which is the failure this package is most exposed to: a sharded fan-out
+# concatenates its shards' partials, and a shard that fell back to the CPU engine contributes
+# the engine's type beside a device shard's. These two are the window operator's share of that,
+# and `aggs._normalized_key` is the aggregate's — same fold, same reason.
+
+#: Window functions whose result type is *not* their input's. Everything else — `sum`, `min`,
+#: `max`, `product`, the bit/bool folds, and every value function — returns the input's own
+#: type, which is what `_fix_empty_dtype` restores.
+_WIDENS_TO_DOUBLE = frozenset({"avg", "var", "stddev", "percent_rank", "cume_dist"})
+_COUNTS = frozenset({"count", "count_distinct", "row_number", "rank", "dense_rank", "ntile"})
+
+
+def conform_empty_dtype(out, f: dict, name: str | None) -> None:
+    """Give a window column computed over an *empty* frame the type a non-empty one would have.
+
+    Both dataframe libraries type an empty reduction as `float64` regardless of what went in,
+    so `SUM(v)` over an empty partition came back `double` where the engine returns `int64`.
+    The values agree — there are none — and the *column* does not, which is the failure this
+    package is most exposed to: a sharded fan-out cannot concatenate a device shard that
+    contributed `double` with a CPU-recovered shard that contributed `int64`, and an empty
+    shard is the single most likely one to fall back.
+
+    Only the empty case is adjusted. A non-empty frame already carries the input's type
+    through, and re-casting it would be a second, drifting statement of the engine's type
+    rules rather than a repair of a library default.
+    """
+    if len(out) != 0:
+        return
+    alias, fn = f["alias"], f["func"]
+    if fn in _WIDENS_TO_DOUBLE or fn in _COUNTS or name is None:
+        return  # already double / already cast to int64 by the rank path
+    out[alias] = out[alias].astype(out[name].dtype)
+
+
+def sortable_key(out, name: str, be: DfBackend, computed: list[str], *, slot: int) -> str:
+    """`name`, or a private copy of it safe to multi-key sort on.
+
+    A float column holding both `-0.0` and `0.0` cannot go through pandas' multi-key sort:
+    `lexsort_indexer` builds a `Categorical` per key and infers its categories from the unique
+    values, and the two zeros are distinct bit patterns that compare equal — so the inferred
+    categories are not unique and pandas raises a bare `ValueError`. That escaped the
+    translator entirely, so an ordinary `PARTITION BY g ORDER BY k, f` dropped to the CPU
+    engine, and did so as an unclassified exception rather than a decline.
+
+    Folding the two zeros together is exactly what `aggs._normalized_key` does for a group
+    key, and it is order-preserving for the same reason: IEEE says they are equal, so no sort
+    can distinguish them anyway. Only float keys pay for the copy.
+    """
+    if not be.is_float(out[name]):
+        return name
+    normalized = f"__bt_wsk{slot}"
+    out[normalized] = out[name] + 0.0
+    computed.append(normalized)
+    return normalized

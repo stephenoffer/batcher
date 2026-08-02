@@ -1,7 +1,7 @@
 """Mechanical anti-drift gate: every agent skill is catalogued in the docs.
 
 The skills under ``.claude/skills/`` are how a coding agent learns to drive this
-engine, and a skill nobody can find is a skill nobody uses. ``docs/agents/index.md``
+engine, and a skill nobody can find is a skill nobody uses. ``docs/agents.md``
 is the catalog, and this module keeps it honest in both directions: a skill added to
 the tree must be listed, and a skill listed must exist.
 
@@ -21,7 +21,7 @@ pytestmark = pytest.mark.unit
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SKILLS = _ROOT / ".claude" / "skills"
-_CATALOG = _ROOT / "docs" / "agents" / "index.md"
+_CATALOG = _ROOT / "docs" / "agents.md"
 
 _NAME = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
 _DESCRIPTION = re.compile(r"^description:\s*(.+)$", re.MULTILINE)
@@ -63,7 +63,7 @@ def test_skill_has_frontmatter(path: Path) -> None:
 def test_skill_is_catalogued(path: Path) -> None:
     """Every skill is listed in the docs catalog, so it is discoverable."""
     assert path.parent.name in _catalog_text(), (
-        f"skill `{path.parent.name}` is not listed in docs/agents/index.md — add it to "
+        f"skill `{path.parent.name}` is not listed in docs/agents.md — add it to "
         "the relevant table so readers and agents can find it"
     )
 
@@ -81,6 +81,5 @@ def test_catalog_lists_no_missing_skills() -> None:
     }
     missing = sorted(cited - known)
     assert not missing, (
-        f"docs/agents/index.md cites skills that do not exist: {missing}. "
-        "Fix the name or add the skill."
+        f"docs/agents.md cites skills that do not exist: {missing}. Fix the name or add the skill."
     )

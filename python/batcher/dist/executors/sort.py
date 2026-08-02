@@ -5,7 +5,7 @@ deterministically land in the same bucket, so no value spans a boundary), sort e
 range by *all* sort keys in parallel, then concatenate the ranges in leading-key
 order — globally sorted, with no final merge. The range boundaries come from a
 **sample pass**: each worker sketches its OWN partition's leading-key quantile grid
-via the mergeable KLL sketch (`column_quantiles`), so the input is never read on the
+via the shared sampler (`sample_key_grid`), so the input is never read on the
 driver — only the small grids cross back, which the driver merges into `workers-1`
 boundaries. This mirrors `flight_sort`, but shuffles through driver-local IPC files
 instead of Arrow Flight. Single- and multi-key sorts both go through this path (the
@@ -153,14 +153,13 @@ def _distributed_sort(
 
 def _sample_task(map_ir, key_name, probs, part_path, engine_config):
     nat = engine()
-    from batcher.dist.executors.partition_io import read_partition
+    from batcher.dist.executors.partition_io import read_partition, sample_key_grid
 
     rows = nat.execute_plan(map_ir, [read_partition(part_path)], engine_config)
     n = sum(b.num_rows for b in rows)
     if n == 0:
         return ([], 0)
-    grid = nat.column_quantiles([key_name], rows, list(probs)).get(key_name, [])
-    return (grid, n)
+    return (sample_key_grid(rows, key_name, list(probs)), n)
 
 
 def _range_task(

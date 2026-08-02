@@ -26,6 +26,12 @@ from batcher._internal.logging import note_suppressed
 #: keyword arguments — and both looked, from the outside, like a query that was simply slow.
 _BACKEND_DEFECTS = (ImportError, AttributeError, NameError, TypeError)
 
+#: `verify.DeviceDivergence` is a defect too, and is matched by name rather than by import: it
+#: lives in `verify`, which imports this module, so naming the class here would close a cycle.
+#: A divergence is the one failure on this path that is never a decline — the tier's contract
+#: is that the device changes where a plan runs, never what it computes.
+_DEFECT_NAMES = frozenset({"DeviceDivergence"})
+
 
 def note_gpu_failure(step: str, exc: BaseException) -> None:
     """Record a GPU-path failure, loudly when it reads as a defect rather than a decline.
@@ -39,7 +45,7 @@ def note_gpu_failure(step: str, exc: BaseException) -> None:
         step: A short, stable name for what was attempted.
         exc: The exception being suppressed.
     """
-    if not isinstance(exc, _BACKEND_DEFECTS):
+    if not isinstance(exc, _BACKEND_DEFECTS) and type(exc).__name__ not in _DEFECT_NAMES:
         note_suppressed("api", step, exc)
         return
     import logging

@@ -140,3 +140,27 @@ def test_a_missing_column_names_the_ones_that_exist():
     udf = mmr_rerank_udf(embedding_column="absent", k=2)
     with pytest.raises(ColumnNotFoundError):
         bt.from_pydict({"vecs": [[[1.0]]]}).ml.map_batches(udf).to_pydict()
+
+
+def test_ungrouped_candidates_are_rejected_by_name():
+    """The natural mistake, and the message it used to produce.
+
+    MMR reranks *within* a query, so its input is one row per query holding that query's whole
+    candidate set (`list<list<double>>`). Handing it the retrieval output before grouping — one
+    candidate per row, `list<double>` — is the same column name and element type, one nesting
+    level short. NumPy answered with `AxisError: axis 1 is out of bounds for array of dimension
+    1` from three frames inside the UDF, naming neither the column nor the shape it wanted.
+    """
+    flat = bt.from_pydict(
+        {"emb": [[1.0, 0.0], [0.0, 1.0]], "score": [1.0, 2.0]},
+    )
+    udf = mmr_rerank_udf(embedding_column="emb", score_column="score", k=2)
+    with pytest.raises(PlanError, match="candidate set"):
+        flat.ml.map_batches(udf).collect()
+
+
+def test_a_non_list_embedding_column_is_rejected():
+    scalar = bt.from_pydict({"emb": [1.0, 2.0], "score": [1.0, 2.0]})
+    udf = mmr_rerank_udf(embedding_column="emb", score_column="score", k=2)
+    with pytest.raises(PlanError, match="as a list"):
+        scalar.ml.map_batches(udf).collect()

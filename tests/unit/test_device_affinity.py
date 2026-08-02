@@ -15,6 +15,8 @@ import os
 
 import pytest
 
+from batcher._internal.hardware import nvml
+from batcher._internal.hardware.devices import scope
 from batcher._internal.hardware.fabric import device_links
 from batcher.carbonite.accel import affinity
 
@@ -40,8 +42,18 @@ class _FakeNvml:
 
 @pytest.fixture
 def eight_devices(monkeypatch):
-    """A host with eight devices, four on each NUMA node — the dense two-socket shape."""
+    """A host with eight devices, four on each NUMA node — the dense two-socket shape.
+
+    The driver is faked at `hardware.devices.scope`, which is the single place that resolves
+    the visibility environment. `device_links.visible_device_indices` is an alias for it: there
+    used to be two implementations, and they disagreed about ROCm, about an empty value, and
+    about MIG handles — so a worker's affinity binding was read off a different device set from
+    its own memory pool. Faking the canonical source is what keeps these tests exercising the
+    resolution the engine actually performs rather than a second copy of it.
+    """
     uuids = [f"GPU-{i}" for i in range(8)]
+    telemetry = tuple(nvml.DeviceTelemetry(index=i, uuid=uuid) for i, uuid in enumerate(uuids))
+    monkeypatch.setattr(scope, "device_telemetry", lambda: telemetry)
     monkeypatch.setattr(device_links, "_nvml", lambda: _FakeNvml(uuids))
     monkeypatch.setattr(device_links, "_device_count", lambda nv: nv.nvmlDeviceGetCount())
     cpus = {i: tuple(range(0, 48)) if i < 4 else tuple(range(48, 96)) for i in range(8)}
@@ -51,9 +63,30 @@ def eight_devices(monkeypatch):
         lambda address: cpus[int(address.split(":")[1], 16)],
     )
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
     monkeypatch.delenv("CUDA_MPS_PIPE_DIRECTORY", raising=False)
     monkeypatch.delenv("BATCHER_MPS_CLIENTS", raising=False)
     return uuids
+
+
+def test_the_two_visibility_resolvers_are_one(monkeypatch, eight_devices):
+    """`device_links` and `hardware.devices` must never answer this differently.
+
+    They did, in three ways that all landed on the fabric probes: `device_links` consulted
+    `CUDA_VISIBLE_DEVICES` alone (so a ROCm node reported every device to the affinity path),
+    read an empty value as "the whole node" rather than "no devices", and resolved no MIG
+    handle. A worker therefore bound its host threads, chose its rail and read its PCIe link
+    against one device set while its VRAM pool and OOM guard used another.
+    """
+    from batcher._internal.hardware.devices import visible_device_indices
+
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "6")
+    assert device_links.visible_device_indices() == visible_device_indices() == (6,)
+
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    assert device_links.visible_device_indices() == visible_device_indices() == ()
 
 
 # --- Visible-device translation -----------------------------------------------------------
@@ -219,6 +252,13 @@ def test_one_unreadable_address_does_not_renumber_the_other_devices(monkeypatch)
     assert addresses[1] == ""
     assert addresses[2] == "0000:02:00.0"
     # And the device with no address binds nothing rather than borrowing a neighbour's cores.
+    # The visible set comes from `hardware.devices`, the one resolver, so the driver has to be
+    # faked there as well as at the PCI probe this test's first half exercises.
+    monkeypatch.setattr(
+        scope,
+        "device_telemetry",
+        lambda: tuple(nvml.DeviceTelemetry(index=i, uuid=f"GPU-{i}") for i in range(4)),
+    )
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr(device_links, "device_cpu_affinity", lambda a: tuple(range(16)))
     assert affinity.feeder_cpus_for_device(1) == ()

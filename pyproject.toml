@@ -209,6 +209,70 @@ features = ["pyo3/extension-module"]
 [tool.importlinter]
 root_package = "batcher"
 
+# The import matrix from `.claude/rules/architecture.md`, as a contract rather than as prose.
+#
+# Until this existed the matrix was enforced in five narrow spots — one `independence` contract
+# and four `forbidden` ones — which left most of it unchecked. Nothing forbade a subsystem
+# importing `dist`, and nothing forbade `core` or `dist` reaching up into `ml`: eighteen such
+# edges had accumulated with every gate green, all of them function-local imports, and only one
+# of the eighteen was recorded anywhere as debt.
+#
+# Higher layers may import lower ones, never the reverse. Within a layer, `|` marks siblings
+# that are *independent* (may not import each other) and `:` marks siblings that may — so the
+# four layer-3 subsystems and the two neutral sinks are `|`, and `plan`/`metadata` and
+# `config`/`_internal`, which the matrix lets depend on each other, are `:`.
+[[tool.importlinter.contracts]]
+name = "the import matrix is a layered stack"
+type = "layers"
+containers = ["batcher"]
+layers = [
+    # `api` and the front-end libraries are ONE layer, and mutually dependent by design.
+    # `api/dataset/ml.py` is the `ds.ml` façade and calls down into `ml/`; `ml/` is written
+    # against `Dataset` and calls back up. Stating them as separate layers made 17 ordinary
+    # façade-to-implementation calls look like violations while describing the coupling as
+    # one-way, which it is not (`ml` imports `api` 77 times, `api` imports `ml` 17). `:` is
+    # import-linter's "these siblings may import each other" — the accurate statement.
+    # Everything BELOW still may not reach up into any of them, which is the part that matters.
+    "api : ml : graph : _sql",
+    "dist",
+    "kyber | carbonite | core | governance",
+    "interop",
+    "io | observe",
+    "plan : metadata",
+    "config : _internal",
+]
+# The upward edges left after the layered contract landed. Started at 28; these six remain.
+# `tools/lint_layer_debt.py` fails if the list grows, so the contract blocks new violations
+# while these are paid down. Do not add an entry to make a new import pass.
+#
+# **What was paid off.** Five `ml.batch_format` edges went when the Arrow-to-framework
+# conversion moved down into the new `interop` layer, where the executor can reach it
+# (`batcher/interop/`). Seventeen `api -> ml`/`_sql` edges went when the layer spec above was
+# corrected: `api` and its front-end libraries are mutually dependent by design, not stacked,
+# so stating them as one layer describes the code instead of contradicting it.
+#
+# **What is left, and why it is still here.** All six are `core`/`dist` reaching into
+# `ml.gpu` and `ml.inference` for execution concerns — autocast, the inference actor pool,
+# device sizing — that grew in the user-facing package instead of in the executor. They belong
+# in `interop` beside the conversion helpers.
+#
+# The move was measured rather than deferred on a hunch: the transitive closure of the eight
+# symbols `core` and `dist` import is **28 definitions, ~785 lines** — half of `ml/gpu.py` —
+# and it drags in NVML handle management, the autocast speed probe, visible-device ordinal
+# mapping and backend detection. That is not a seam, it is a bisection, and it is a bisection
+# of the one surface in this repo with no automated verification at all: the device tier is
+# tested on a pandas stand-in and CI has no GPU (`.claude/rules/device-tier.md`). Trading six
+# documented, ratcheted exemptions for an untestable 785-line split of the inference path is
+# the wrong way round. Do it with a GPU and a recorded `gpu_shadow_verify` run.
+ignore_imports = [
+    "batcher.core.udf.apply -> batcher.ml.gpu",
+    "batcher.core.udf.apply -> batcher.ml.inference",
+    "batcher.core.udf.call -> batcher.ml.inference",
+    "batcher.core.udf.stream -> batcher.ml.gpu",
+    "batcher.dist.executors.map -> batcher.ml.gpu",
+    "batcher.dist.streaming.consumers -> batcher.ml.gpu",
+]
+
 [[tool.importlinter.contracts]]
 name = "Kyber, Carbonite, Core, and Governance are independent"
 type = "independence"

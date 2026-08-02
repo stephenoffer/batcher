@@ -51,11 +51,11 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.rules.exprs.guards import schema_rule
 
-# `_MIRROR`/`_OPS` (the operator vocabulary), `_kind_from_schema`/`_column_kind` (the naive
+# `COMPARISON_FLIP`/`_OPS` (the operator vocabulary), `_kind_from_schema`/`_column_kind` (the naive
 # date-vs-timestamp guard) and `_range_expr` (the per-operator band predicate) are the sibling
 # family's helpers, imported rather than re-implemented.
 from batcher.kyber.rules.extra.temporal_sargable import (
-    _MIRROR,
+    COMPARISON_FLIP,
     _column_kind,
     _kind_from_schema,
     _range_expr,
@@ -80,11 +80,11 @@ def _match_date_cast(expr: Binary) -> tuple[str, _dt.date, str] | None:
     `date`: a `datetime` compared against a date-typed cast is a different comparison (the
     engine coerces one side), and this rule claims nothing about it.
     """
-    if expr.op not in _MIRROR:
+    if expr.op not in COMPARISON_FLIP:
         return None
     for cast, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, _MIRROR[expr.op]),
+        (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         if not (isinstance(cast, Cast) and cast.dtype in _DATE_DTYPES):
             continue

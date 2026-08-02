@@ -42,12 +42,12 @@ from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.leaf_rewrite import rewrite_node
 from batcher.plan.expr_ir import Binary, Expr, InList, Lit
 from batcher.plan.expr_rewrite import expr_key
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["PREDICATE_BOUND_RULES"]
 
 _NODES = (Filter, Project, Aggregate, Sort, Window)
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 #: Which side of the number line each ordered operator bounds, and whether it includes the
 #: endpoint. The inclusive flag is the tie-break when two bounds share a literal.
 _UPPER = {"lt": False, "le": True}
@@ -67,11 +67,11 @@ def _scalar(expr: Expr) -> object | None:
 
 def _comparison(expr: Expr) -> tuple[str, Expr, object] | None:
     """`(op, operand, literal)` for a comparison against a literal, operand-first."""
-    if not isinstance(expr, Binary) or expr.op not in _FLIP:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_FLIP:
         return None
     for operand, other, op in (
         (expr.left, expr.right, expr.op),
-        (expr.right, expr.left, _FLIP[expr.op]),
+        (expr.right, expr.left, COMPARISON_FLIP[expr.op]),
     ):
         value = _scalar(other)
         if value is not None:
@@ -154,7 +154,7 @@ def _equality_absorbs_bound(expr: Expr) -> Expr:
     if left is None or right is None:
         return expr
     for equality, bound, equality_side in ((left, right, expr.left), (right, left, expr.right)):
-        if equality[0] != "eq" or bound[0] not in _FLIP or bound[0] == "eq":
+        if equality[0] != "eq" or bound[0] not in COMPARISON_FLIP or bound[0] == "eq":
             continue
         if not _same_operand(equality[1], bound[1]):
             continue

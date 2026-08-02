@@ -46,6 +46,7 @@ from batcher.dist.executors.partition_io.assignment import (
     has_affinity,
 )
 from batcher.dist.executors.partition_io.folds import (
+    streaming_map_buckets,
     streaming_partial_aggregate,
     streaming_topn,
 )
@@ -53,6 +54,7 @@ from batcher.dist.executors.partition_io.ranges import (
     SAMPLE_PROBS,
     bucketize,
     merge_boundaries,
+    sample_key_grid,
 )
 
 __all__ = [
@@ -70,7 +72,9 @@ __all__ = [
     "partition_descriptors",
     "read_partition",
     "read_partition_descriptor",
+    "sample_key_grid",
     "source_pushdown",
+    "streaming_map_buckets",
     "streaming_partial_aggregate",
     "streaming_topn",
 ]

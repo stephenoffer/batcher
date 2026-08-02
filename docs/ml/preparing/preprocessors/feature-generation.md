@@ -230,4 +230,4 @@ tokenized = Tokenizer("text", hf, output_column="input_ids").fit_transform(ds)
 
 - {doc}`/ml/preparing/preprocessors/pipelines`: sequencing these steps and saving the fitted result.
 - {doc}`/ml/preparing/preprocessors/encoding`: making a categorical column numeric before it feeds these.
-- {doc}`/user-guide/transform/expression-recipes`: the same feature work written by hand as expressions.
+- {doc}`/user-guide/transform/columns/expression-recipes`: the same feature work written by hand as expressions.

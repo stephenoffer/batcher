@@ -113,3 +113,69 @@ def test_annotation_still_packs_a_small_breaker_end_to_end():
     estimator = CardinalityEstimator(frame._sources)
     ops = annotate_ops(plan, estimator, active_config(), CostModel(estimator))
     assert any(op.bounds.prefers_locality for op in ops)
+
+
+def _mixed_fleet() -> ClusterShape:
+    """Two fat accelerator nodes beside four thin CPU workers — the ordinary shape.
+
+    The density ordering alone puts the GPU nodes first, because an eight-device box carries
+    far more cores than the CPU workers beside it.
+    """
+    gpu = tuple(
+        NodeShape(
+            node_id=f"g{i}",
+            cpu_cores=96,
+            memory_bytes=1 << 40,
+            gpus=8,
+            accelerator_type="NVIDIA_H100",
+            rack="r1",
+            fabric_gbps=25.0,
+        )
+        for i in range(2)
+    )
+    cpu = tuple(
+        NodeShape(
+            node_id=f"c{i}",
+            cpu_cores=32,
+            memory_bytes=1 << 40,
+            rack="r1",
+            fabric_gbps=25.0,
+        )
+        for i in range(4)
+    )
+    return ClusterShape(nodes=gpu + cpu)
+
+
+def test_a_relational_gang_packs_onto_the_cpu_nodes_of_a_mixed_fleet():
+    """A host-side breaker must not be aimed at the nodes whose cores feed the devices.
+
+    Ranking by density alone sent it exactly there: the accelerator nodes are the densest on
+    every real fleet, and a device's host half reads files, decodes and stages buffers on those
+    same cores. So the one placement rule that deliberately *concentrates* a gang concentrated
+    it onto the hardware the GPU stages need, invisibly, as a plan that is merely slower.
+    """
+    from batcher.kyber.cost.placement import _packed_view, _packing_order
+
+    fleet = _mixed_fleet()
+    order = [n.node_id for n in _packing_order(fleet)]
+    assert order[:4] == ["c0", "c1", "c2", "c3"], "CPU-only nodes first"
+    assert order[4:] == ["g0", "g1"], "the accelerator nodes are the last resort"
+
+    # ...and the view a saving is priced against is the same set the count proposed. Two
+    # orderings would price a placement the count never suggested.
+    hardware = _profile(fleet, 6)
+    view = _packed_view(hardware, 2)
+    assert [n.node_id for n in view.cluster.nodes] == ["c0", "c1"]
+
+
+def test_a_gpu_only_fleet_is_still_ordered_by_density():
+    """With nothing else to pack onto, the rule is density alone — what it always was."""
+    from batcher.kyber.cost.placement import _packing_order
+
+    fleet = ClusterShape(
+        nodes=(
+            NodeShape(node_id="g0", cpu_cores=32, memory_bytes=1 << 40, gpus=8),
+            NodeShape(node_id="g1", cpu_cores=96, memory_bytes=1 << 40, gpus=8),
+        )
+    )
+    assert [n.node_id for n in _packing_order(fleet)] == ["g1", "g0"]

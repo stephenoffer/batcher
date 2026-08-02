@@ -123,9 +123,13 @@ def wire_problems(fabric: dict) -> list[str]:
     out: list[str] = []
     rails = fabric.get("rails") or {}
     imbalance = float(rails.get("imbalance", 0.0))
-    if imbalance >= _IMBALANCE_ALERT and rails.get("loaded_rails", 0) > 1:
+    # Gated on the rails the node *has*, not on the ones that got a device. The worst case —
+    # every device on one NIC of eight — has exactly one loaded rail, so a `loaded_rails > 1`
+    # gate suppressed the alert precisely when it mattered most, and the imbalance figure
+    # itself was computed the same way and reported `0.0` for it.
+    if imbalance >= _IMBALANCE_ALERT and rails.get("rails", 0) > 1:
         out.append(
-            f"fabric: devices are unevenly spread over {rails['loaded_rails']} rails "
+            f"fabric: devices are unevenly spread over {rails['rails']} rails "
             f"({imbalance:.0%} imbalance), so a cross-node stage uses part of the port rate"
         )
     peers = fabric.get("peers") or {}

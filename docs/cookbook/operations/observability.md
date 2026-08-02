@@ -19,5 +19,5 @@ python examples/operations/observability.py
 
 - {doc}`memory_and_caching`: caching a reused branch and spilling under a tight budget.
 - {doc}`streaming_basics`: the same operators, incrementally.
-- {doc}`/user-guide/operate/performance`: measuring and tuning a query that is correct but slow.
-- {doc}`/user-guide/operate/observability`: what the engine records about a run, and where.
+- {doc}`/user-guide/operate/tuning/performance`: measuring and tuning a query that is correct but slow.
+- {doc}`/user-guide/operate/running/observability`: what the engine records about a run, and where.

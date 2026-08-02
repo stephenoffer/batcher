@@ -84,7 +84,17 @@ def sharded_gpu_join(
     build = whole_source_descriptor(right)
     if build is None:
         return None
-    probes = shard_descriptors(left, gpu_count, sharded=sharded, preserve_order=False)
+    # The probe side reads only what its own pre-join chain names. Unnarrowed — which is how
+    # this read — the fact table's every column crosses onto each device to be joined on two of
+    # them. `left_ops` is the chain below the join, so it is exactly the leaf's want-set; what
+    # the join and the chain above it need of the probe side is already inside those ops.
+    from batcher.core.gpu_plan.pruning import chain_projection
+    from batcher.dist.gpu.shards import narrowed_schema
+
+    probe_projection = chain_projection(left_ops)
+    probes = shard_descriptors(
+        left, gpu_count, sharded=sharded, preserve_order=False, projection=probe_projection
+    )
     if probes is None:
         return None
 
@@ -96,7 +106,10 @@ def sharded_gpu_join(
         join_ir,
         above.shard_ops,
         gpu_count=gpu_count,
-        probe_schema=_schema_of(left),
+        # Priced at the width the probe shards are actually read with, for the same reason the
+        # aggregate fan-out is: packing asks how much of a device one shard holds, and a shard
+        # read through a projection holds the projection.
+        probe_schema=narrowed_schema(_schema_of(left), probe_projection),
         build_bytes=_build_side_bytes(build, right),
     )
     if not shards:

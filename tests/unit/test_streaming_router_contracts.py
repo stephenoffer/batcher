@@ -130,11 +130,18 @@ def test_a_numeric_leading_key_is_range_partitionable():
     assert supports_spilling_sort(plan, src._sources) is True
 
 
-def test_a_string_leading_key_is_not():
-    """The boundaries come from the KLL sketch, which only sketches numeric columns."""
+def test_a_string_leading_key_is_range_partitionable_too():
+    """A string key is sampled lexically rather than by the KLL sketch, and routes the same.
+
+    This asserted `False` until `sample_key_grid`/`string_quantiles` gave a string key its own
+    sampler: the KLL sketch is numeric-only, so before that there was no grid to cut and the
+    out-of-core sort declined the shape. The refusal was not harmless — four TPC-H queries end
+    in a string `ORDER BY` over a materialized aggregate, where no fallback is left to take
+    (`benchmarks/BENCHMARK_RESULTS.md`).
+    """
     src = bt.from_pydict({"n": [3, 1, 2], "s": ["c", "a", "b"]})
     plan = src.sort("s")._plan
-    assert supports_spilling_sort(plan, src._sources) is False
+    assert supports_spilling_sort(plan, src._sources) is True
 
 
 def test_a_derived_key_is_not():

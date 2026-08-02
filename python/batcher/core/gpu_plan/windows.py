@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher.core.gpu_plan.backend import Unsupported
+from batcher.core.gpu_plan.backend import Unsupported, conform_empty_dtype, sortable_key
 
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
@@ -151,9 +151,23 @@ def window(df, ir: dict, be: DfBackend):
     part = _key_names(out, ir["partition_keys"], be, computed, kind="p")
     order = _key_names(out, [k["expr"] for k in ir["order_keys"]], be, computed, kind="o")
     if part or order:
+        # A column may be both a partition key and an order key — `PARTITION BY g ORDER BY k,
+        # g` is ordinary SQL — and sorting by it a second time cannot change the result, since
+        # every row in a partition already shares that value. pandas does not merely ignore
+        # the repeat: `lexsort_indexer` builds a `Categorical` over the key list and raises
+        # "Categorical categories must be unique", which escaped as a bare `ValueError` and
+        # took the whole chain to the CPU engine. Dropping the later mention keeps the sort
+        # identical and the shape on the device.
+        keys, ascend, seen = [], [], set()
+        for key, asc in zip(part + order, [True] * len(part) + ascending, strict=True):
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(sortable_key(out, key, be, computed, slot=len(keys)))
+            ascend.append(asc)
         out = out.sort_values(
-            part + order,
-            ascending=[True] * len(part) + ascending,
+            keys,
+            ascending=ascend,
             na_position="first" if nulls_first else "last",
             kind="stable",
         ).reset_index(drop=True)
@@ -166,6 +180,7 @@ def window(df, ir: dict, be: DfBackend):
     names = _function_inputs(out, ir, be, computed)
     for f, name in zip(ir["functions"], names, strict=True):
         out[f["alias"]] = _evaluate(out, f, be, order=order, size=size, name=name)
+        conform_empty_dtype(out, f, name)
 
     # Restore the arrival order, then drop the private columns: the engine's Window keeps the
     # input's row order, and a sorted result would differ from it row-for-row.

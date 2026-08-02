@@ -4,7 +4,7 @@ A SQL filter keeps a row only when the predicate is TRUE; a NULL predicate drops
 the row (three-valued logic). These guard a fixed zone-map pruning defect: over a
 column whose min/max prove an inner predicate empty, ``NOT (that predicate)`` was
 folded to *always-true* and the whole filter dropped — which wrongly KEPT the NULL-
-predicate rows the filter must drop. See docs/internals/bug_hunt_ledger.md.
+predicate rows the filter must drop. See docs/architecture/internals/bug_hunt_ledger.md.
 
 Root cause: `kyber/rules/zonemap_pruning.py::_predicate_status` negated its tri-state
 with a plain `not inner`, turning an "always-empty" (`_FALSE`, which conflates FALSE

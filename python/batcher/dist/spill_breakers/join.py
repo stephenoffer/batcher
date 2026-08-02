@@ -206,6 +206,13 @@ def reduce_join_paths_spilling(
             continue
         # A missing side becomes a 0-row, schema-bearing input so an outer join still
         # null-extends the present side (matching the non-spilling reducer's behavior).
+        #
+        # One pair at a time, and measurably so: joining several concurrently in a thread pool
+        # was tried and is 35% *slower* (TPC-H sf100 q3, three runs each: 23.0s serial against
+        # 31.7s at eight-way, and utilization fell from 39% to 32%). `execute_plan` already
+        # spreads a pair across this worker's whole core grant, so Python-level concurrency
+        # only oversubscribes them — the same thread-thrash `engine_config_json` sizes
+        # `parallelism` to avoid.
         left_b = read_ipc(left_sub[i]) if left_sub[i] else _maybe_empty(left_schema)
         right_b = read_ipc(right_sub[i]) if right_sub[i] else _maybe_empty(right_schema)
         out.extend(

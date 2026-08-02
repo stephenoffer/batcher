@@ -32,12 +32,12 @@ from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.leaf_rewrite import rewrite_node
 from batcher.plan.expr_ir import Binary, Expr, Lit, Not
 from batcher.plan.expr_ir.func_nodes import StrFunc
+from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["COUNTING_PREDICATE_RULES", "REVERSE_EQUALITY_RULES", "SLICE_PREDICATE_RULES"]
 
 _NODES = (Filter, Project, Aggregate, Sort, Window)
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
 
 
 def _int_literal(expr: Expr) -> int | None:
@@ -48,12 +48,12 @@ def _int_literal(expr: Expr) -> int | None:
 
 def _comparison(expr: Expr) -> tuple[str, Expr, Expr] | None:
     """`(op, computed_side, literal_side)` with the operator normalized to the left."""
-    if not isinstance(expr, Binary) or expr.op not in _FLIP:
+    if not isinstance(expr, Binary) or expr.op not in COMPARISON_FLIP:
         return None
     if isinstance(expr.right, Lit):
         return expr.op, expr.left, expr.right
     if isinstance(expr.left, Lit):
-        return _FLIP[expr.op], expr.right, expr.left
+        return COMPARISON_FLIP[expr.op], expr.right, expr.left
     return None
 
 
@@ -87,9 +87,8 @@ def _counting_leaf(fn: str, key: tuple[str, int]) -> Callable[[Expr], Expr]:
     return leaf
 
 
-#: The mirror of each comparison, for the operator index: `_comparison` normalizes the
-#: computed side to the left, so a leaf built for `op` is also reached by `_FLIP[op]` nodes.
-_FLIP = {"eq": "eq", "ne": "ne", "lt": "gt", "gt": "lt", "le": "ge", "ge": "le"}
+#: The mirror of each comparison, for the operator index: `_comparison` normalizes the computed
+#: side to the left, so a leaf built for `op` is also reached by `COMPARISON_FLIP[op]` nodes.
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], op: str):
@@ -101,7 +100,7 @@ def _register(name: str, leaf: Callable[[Expr], Expr], op: str):
             matches=_NODES,
             expr_fn=leaf,
             expr_matches=(Binary,),
-            expr_ops=(op, _FLIP[op]),
+            expr_ops=(op, COMPARISON_FLIP[op]),
         )
     )
 

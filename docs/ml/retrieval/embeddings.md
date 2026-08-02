@@ -388,11 +388,11 @@ aggregate.
 - {doc}`Vector search </ml/retrieval/vector-search>`: retrieving against the vectors you built.
 - {doc}`RAG </ml/retrieval/rag>`: the full chunk → embed → retrieve → generate pipeline.
 - {doc}`GPU scheduling </ml/inference/gpu>`: sizing the actor pool that runs the encoder.
-- {doc}`GPU execution </deep-dives/distribution/gpu-execution>`: how a GPU stage is scheduled, and what
+- {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how a GPU stage is scheduled, and what
   "once per worker" means underneath.
-- {doc}`Text embeddings recipe </cookbook/ml/pipelines/text-embeddings>`: the job, end to end, on a
+- {doc}`Text embeddings recipe </cookbook/ml/pipelines/text/text-embeddings>`: the job, end to end, on a
   real corpus.
-- {doc}`RAG index recipe </cookbook/ml/pipelines/rag-index>`: the same vectors, written and indexed.
-- {doc}`AI and GPU benchmarks </benchmarks/ai-and-gpu>`: what an embed job costs against
+- {doc}`RAG index recipe </cookbook/ml/pipelines/text/rag-index>`: the same vectors, written and indexed.
+- {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what an embed job costs against
   the alternatives.
 - {doc}`ML API </api/models/ml>`: the `ml.embed` and `EncoderFactory` reference.

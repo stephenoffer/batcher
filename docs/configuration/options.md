@@ -65,11 +65,11 @@ Buffer-pool envelope and the out-of-core spill story. Setting `max_memory_bytes`
 | `spill_compression` | `"auto"` | Arrow-IPC codec for spilled batches. `"auto"` lets the engine choose. `"lz4"`, `"zstd"`, or `None` force it. |
 | `spill_bucket_max_bytes` | `134217728` (128 MiB) | A spilled aggregate bucket larger than this is re-partitioned (grace recursion) so a skewed key set degrades gracefully instead of OOMing the reduce. |
 | `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path, with no out-of-core spilling. Set it when you'd rather a query fail fast than spill to disk. |
-| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing `Dataset.cache()`, described in {doc}`/user-guide/operate/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
+| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing `Dataset.cache()`, described in {doc}`/user-guide/operate/tuning/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
 | `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear `ResourceError` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
 | `respect_cgroup_high` | `True` | Budget against the cgroup v2 `memory.high` throttle threshold, not just the `memory.max` kill threshold. Inert wherever `memory.high` is unset. |
 | `stall_aware_pressure` | `True` | Let the kernel's memory PSI raise the pressure level, so the engine spills while reclaim is still coping. It can only raise a level, never lower one. |
-| `oom_kill_backoff` | `0.8` | Fraction of the auto-sensed envelope kept when this container's `memory.events` shows it has already been OOM-killed. `1.0` disables the backoff. An explicit `max_memory_bytes` is never scaled. See {doc}`/deep-dives/memory/buffer-pool` for what these three kernel signals measure. |
+| `oom_kill_backoff` | `0.8` | Fraction of the auto-sensed envelope kept when this container's `memory.events` shows it has already been OOM-killed. `1.0` disables the backoff. An explicit `max_memory_bytes` is never scaled. See {doc}`/architecture/deep-dives/memory/buffer-pool` for what these three kernel signals measure. |
 
 ## flow_control
 
@@ -419,7 +419,7 @@ What the engine tells you about what it did: the `batcher.*` logger hierarchy an
 | `otel_traces` | `False` | Emit an OpenTelemetry span per query, with a child span per operator, into the tracer your app already configured. It needs `opentelemetry` installed and a provider, because Batcher owns no exporter. It reuses the profile the event log already measures, so turning it on adds the emit, not the measurement. |
 | `event_log_dir` | `""` | Directory for event-log documents. Empty resolves to `$BATCHER_HOME/logs` (or `~/.batcher/logs`) at write time. |
 | `event_log_max_files` | `200` | Keep at most this many event-log files; the oldest are pruned on write. `0` is unbounded. |
-| `progress` | `None` | Explicit progress-bar mode: `"auto"` renders only into a real TTY that has not set `NO_COLOR`/`TERM=dumb`, `"on"` forces it, `"off"` disables it. `None` derives it from `verbosity`. Read the effective value from `resolved_progress`. See {doc}`/user-guide/operate/observability`. |
+| `progress` | `None` | Explicit progress-bar mode: `"auto"` renders only into a real TTY that has not set `NO_COLOR`/`TERM=dumb`, `"on"` forces it, `"off"` disables it. `None` derives it from `verbosity`. Read the effective value from `resolved_progress`. See {doc}`/user-guide/operate/running/observability`. |
 | `ui` | `False` | Start the web dashboard automatically on the first query. It's off by default, because binding a port should be asked for. `bt.start_ui()` is the explicit spelling. Use this field for a long-running service that always wants the dashboard. |
 | `ui_host` | `"127.0.0.1"` | Interface the dashboard binds. Loopback by default: it exposes query text, plans, and logs, and Batcher ships no authentication. Set it to a routable address only deliberately. |
 | `ui_port` | `4040` | Dashboard port. `0` asks the OS for any free port. |

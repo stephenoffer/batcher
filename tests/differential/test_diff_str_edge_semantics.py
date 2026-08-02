@@ -2,7 +2,8 @@
 
 Each test here pins a defect found by the string-function bug hunt: negative/empty
 arguments and integer extremes that produced a wrong result or a process-aborting panic
-(see docs/internals/bug_hunt_ledger.md). Kept separate from the happy-path `.str` suites
+(see docs/architecture/internals/bug_hunt_ledger.md). Kept separate from the happy-path `.str`
+suites
 so the edge contract is legible.
 """
 

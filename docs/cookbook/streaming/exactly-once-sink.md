@@ -211,5 +211,5 @@ you were counting on cannot happen. Put the checkpoint on object storage.
   strongest sink strong.
 - {doc}`Fault tolerance </architecture/fault-tolerance>`: the recovery model the offset and
   commit logs implement.
-- {doc}`Deduplication </cookbook/data-engineering/deduplication>`: what to do when the sink you are
+- {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: what to do when the sink you are
   stuck with cannot dedup at all.

@@ -180,9 +180,9 @@ of a service account.
 ## See also
 
 - {doc}`Reading data </user-guide/moving-data/reading-data>` and {doc}`Writing data </user-guide/moving-data/writing-data>`.
-- {doc}`Incremental ingest </cookbook/data-engineering/incremental-ingest>`: pulling only the
+- {doc}`Incremental ingest </cookbook/data-engineering/ingest/incremental-ingest>`: pulling only the
   new rows, which is how you keep the query cost above under control.
-- {doc}`Multi-source join </cookbook/data-engineering/multi-source-join>`: a warehouse table
+- {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: a warehouse table
   joined against the lake, in one plan.
 - {doc}`Reading and writing </api/relational/io>`: the full reader/writer surface.
 - {doc}`BigQuery </integrations/warehouses/bigquery>`: the other big warehouse. Read-only, with a genuinely parallel

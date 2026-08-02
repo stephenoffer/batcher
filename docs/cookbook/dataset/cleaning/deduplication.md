@@ -19,5 +19,5 @@ python examples/dataset/deduplication.py
 
 - {doc}`/cookbook/dataset/cleaning/dq_contracts`: validate, fail, drop, or quarantine.
 - {doc}`/cookbook/dataset/verbs/grouping`: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
-- {doc}`/user-guide/transform/transformations`: the full transformation surface these recipes draw on.
+- {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
 - {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.

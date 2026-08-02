@@ -14,7 +14,7 @@ deliberately small. Keep it that way.
 - **Lazy + immutable.** A `Dataset` is a handle to a `LogicalPlan` plus bound
   inputs. Every operation returns a *new* `Dataset`; nothing mutates. No work
   happens until a terminal op (`collect`, `to_pydict`, `iter_batches`,
-  `write_parquet`, ...). At that point `api` orchestrates Kyber → Carbonite → Core.
+  `write.parquet`, ...). At that point `api` orchestrates Kyber → Carbonite → Core.
 - **Expressions everywhere, no lambdas in the hot path.** Column work is expressed
   via `Expr` (`col("x") * col("y")`, `.sum()`, `.cast(...)`, `.str.contains(...)`),
   which lowers to `bc_expr::Expr` and runs in Rust. User Python callbacks
@@ -58,8 +58,16 @@ a serialized protocol.
   batches move via `bc-transport` (Arrow Flight), never as Ray objects.
 - The distributed executor (`dist/`) composes the *same* mergeable primitives
   (`partial_aggregate` / `partition_batches` / `combine_finalize`) the single-node
-  path uses. Distributed is a scheduling concern, not a second semantics. A result
-  MUST be identical whether produced on one node or many.
+  path uses. Distributed is a scheduling concern, not a second semantics.
+- **A result MUST be identical whether produced on one node or many — with one stated
+  exception.** The multiset of rows, every column name, and every column *type* are exact.
+  Floating-point reductions are identical *up to reassociation*: `combine` is associative in
+  exact arithmetic, IEEE addition is not, and partition count changes the summation order.
+  `bc-runtime`'s Neumaier compensation and Chan's parallel Welford formula bound that error to
+  near the last bits; they do not remove it, and nothing can while the partition count is free.
+  Write the claim this way. Stating it as bit-identity was worse than useless: it is not what
+  the code does, `assert_same` tolerates float rounding so nothing ever checked it, and an
+  invariant nobody can fail is one nobody reads.
 
 ## Streaming and batch
 

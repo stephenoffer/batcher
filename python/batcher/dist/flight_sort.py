@@ -37,6 +37,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.fleet import acquire_fleet, release_fleet
+from batcher.dist.fleet.plan_id import next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
@@ -214,6 +215,12 @@ def execute_sort_flight(
         # buckets keep the ticket the reducers dial.
         dead: set[int] = set()
 
+        # One ticket stage for THIS sort's shuffle. The stage used to be the literal 0, so
+        # two sorts in one query (or a sort beside a window) published byte-identical
+        # tickets on the same worker and the second overwrote the first — the collision
+        # that made a join read another join's buckets. See `fleet.plan_id.next_stage_base`.
+        stage_base = next_stage_base(1)
+
         # SAMPLE: each worker samples its own split's leading-key distribution.
         _s = _t.perf_counter()
         grids, dead = map_barrier(
@@ -246,6 +253,7 @@ def execute_sort_flight(
                 src,
                 0,
                 current_plan_id(),
+                stage_base,
             ),
             dead=dead,
         )
@@ -278,6 +286,7 @@ def execute_sort_flight(
             workers,
             dead=dead,
             replicas=replicas,
+            stage_base=stage_base,
         )
         _phase("reduce_gather_sort", _t.perf_counter() - _s)
     finally:
@@ -314,6 +323,7 @@ def _sort_reduce_with_recovery(
     workers,
     dead=None,
     replicas=None,
+    stage_base=0,
 ):
     """Run the sort reduce under recompute-on-worker-loss recovery.
 
@@ -329,7 +339,7 @@ def _sort_reduce_with_recovery(
 
     def remote_reduce(host: int, bucket: int):
         return actors[host].sort_reduce.remote(
-            sort_ir, addrs, bucket, None, replicas, current_plan_id()
+            sort_ir, addrs, bucket, None, replicas, current_plan_id(), stage_base
         )
 
     def republish(target: int, src: int) -> None:
@@ -348,6 +358,7 @@ def _sort_reduce_with_recovery(
                 src,
                 0,
                 current_plan_id(),
+                stage_base,
             )
         )
 
