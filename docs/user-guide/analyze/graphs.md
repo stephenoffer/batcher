@@ -420,6 +420,14 @@ an optimization to add later.
   instead; that is what the degree functions do and why they distribute. Otherwise
   materialize the aggregate with `bt.from_arrow(ds.collect())` before the next step, which
   clears the limit at the cost of passing that intermediate through the driver.
+- **`betweenness_centrality` and `co_occurrence_graph` hang under `distributed=True`.**
+  Unlike the eleven above they raise nothing: the query reserves the cluster and then waits
+  on a task that can never be scheduled, and Carbonite reports `distributed barrier has
+  waited 240s with 0/1 tasks finished, cluster CPU 32/32 in use` until you kill it. Both
+  return in under a second single-node on the same input, and passing `num_workers` does
+  not avoid it. Use the default `distributed="auto"`, which runs them single-node and
+  returns the right answer. A hang is worse than a refusal, so this is the one limitation
+  here worth checking before you script an unattended job against a file-backed graph.
 - **An in-memory edge table never distributes, by design.** `distributed="auto"` routes a
   plan whose sources are all resident in the driver to single-node at any size, because
   shipping resident data out and gathering it back costs more than the compute it
