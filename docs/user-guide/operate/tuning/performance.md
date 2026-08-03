@@ -162,6 +162,38 @@ print(joined.collect(adaptive=True).to_pydict())
 # {'tier': ['gold', 'silver'], 'total': [112.0, 20.0]}
 ```
 
+## A repeated top-N gets faster on its second run
+
+`ORDER BY x DESC LIMIT 10` over a wide table decodes every projected column of every row and
+then throws all but ten away. What would make it cheap is a value separating the ten from the
+rest, and before the scan nothing knows one.
+
+After the scan, Batcher does. It remembers the tenth-best value and uses it on the next run of
+the same query as a filter, which the reader answers by skipping row groups whose bounds
+exclude it and by decoding the remaining columns only for the rows that survive. On a 2.5 GB
+20-column Parquet table this took `ORDER BY x DESC LIMIT 10` from 2,353 ms to 240 ms.
+
+```python
+top = events.sort("amount", descending=True).limit(3)
+
+print(top.collect().to_pydict()["amount"])  # first run: learns where the cut falls
+# [99.0, 10.0, 8.0]
+print(top.collect().to_pydict()["amount"])  # second run: starts from it
+# [99.0, 10.0, 8.0]
+```
+
+Nothing is needed to turn this on and the answer never depends on it. The filter removes only
+rows strictly worse than the remembered value, so whenever the requested number of rows
+survives, those rows *are* the true top-N no matter how stale the value was. If too few
+survive, which is what happens after the data moves, the engine notices the short result and
+re-runs the query as written. A stale value therefore costs one extra cheap scan, never a
+wrong row.
+
+Two shapes opt out. A `nulls_first` ordering is never seeded, because it wants nulls at the
+top and a bound predicate would drop them. Very large limits are skipped too: a bound far out
+in the distribution's tail excludes almost nothing, so the added filter would be evaluated
+over the whole relation to no purpose.
+
 ## What the engine learns is per machine
 
 Adaptive re-optimization improves one query while it runs. A second loop improves the *next*

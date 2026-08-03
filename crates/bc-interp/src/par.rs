@@ -29,8 +29,9 @@ use rayon::prelude::*;
 use crate::agg_par;
 use crate::error::InterpError;
 use crate::join_par::{
-    broadcast_join, broadcast_join_streaming, is_skewed_bucket, is_skewed_bucket_bytes,
-    skew_salting_eligible, spilling_asof_join, spilling_hash_join_streaming,
+    broadcast_join, broadcast_join_streaming, build_side_swap_pays, flip_output, is_skewed_bucket,
+    is_skewed_bucket_bytes, skew_salting_eligible, spilling_asof_join,
+    spilling_hash_join_streaming,
 };
 use crate::metrics::{ExecMetrics, IdGen, OpMetric, Stopwatch};
 use crate::ops;
@@ -1347,8 +1348,42 @@ fn exec(
         } => {
             let left_batches = exec(left, sources, opts, m, ids)?;
             let right_batches = exec(right, sources, opts, m, ids)?;
+
+            // ── Runtime build-side correction ────────────────────────────────────────
+            // The planner chose which side to build from *estimated* cardinalities. Both
+            // relations are now materialized, so their sizes are facts, and every decision
+            // below this line — spill vs in-memory, streaming probe vs shuffle, hash-table
+            // cache residency — is made against the build side. Correcting the orientation
+            // here costs two slice rebindings and an output re-label; leaving it wrong
+            // costs a grace hash join that did not need to happen. See
+            // `join_par::build_side_swap_pays` for why this is restricted to `Inner`.
+            let swap = build_side_swap_pays(
+                *join_type,
+                count_rows(&left_batches) as usize,
+                count_rows(&right_batches) as usize,
+            );
+            let (left_batches, right_batches) = if swap {
+                (right_batches, left_batches)
+            } else {
+                (left_batches, right_batches)
+            };
+            let (left_keys, right_keys) = if swap {
+                (right_keys, left_keys)
+            } else {
+                (left_keys, right_keys)
+            };
+            let flipped_output: Vec<bc_ir::JoinOutputCol>;
+            let output: &[bc_ir::JoinOutputCol] = if swap {
+                flipped_output = flip_output(output);
+                &flipped_output
+            } else {
+                output
+            };
+
             // The probe side (left) drives the per-row probe cost; the build side (right)
-            // drives the hash table's memory. Their sum made both meaningless.
+            // drives the hash table's memory. Their sum made both meaningless. Both are
+            // read *after* the correction above, so what Carbonite learns as `n_build` is
+            // the table the join actually built, not the one the planner nominated.
             let rows_in = count_rows(&left_batches);
             let rows_build = count_rows(&right_batches);
             // The hash table / chain / null mask built over the build side is the join's
@@ -2889,6 +2924,85 @@ mod tests {
     /// A plan with no media decode — the common case for the `auto_width` cap tests.
     fn no_media_plan() -> RelOp {
         RelOp::Scan { source_id: 0 }
+    }
+
+    /// A join whose planner-nominated build side turns out to be the *larger* relation is
+    /// re-oriented at execution, and the re-oriented join is the same relation.
+    ///
+    /// Both halves matter. The multiset equality against the sequential oracle is the
+    /// correctness proof: the oracle never swaps (`lib.rs` ignores the orientation
+    /// entirely), so agreeing with it is exactly the statement that a swap changes nothing
+    /// observable but the row order. The `rows_build` assertion is what stops the test from
+    /// being true by construction — without it a rule that never fired would pass, and
+    /// `rows_build` is reported *after* the correction, so it names the table the join
+    /// actually built. 40 k build against 5 k probe clears both the 2× ratio and the
+    /// one-morsel floor; after the swap the engine must report having built the 5 k side.
+    #[test]
+    fn oversized_build_side_is_re_oriented_and_still_matches_the_oracle() {
+        let probe_keys: Vec<i64> = (0..5_000).collect();
+        let probe_vals: Vec<i64> = (0..5_000).map(|k| k * 10).collect();
+        let build_keys: Vec<i64> = (0..40_000).collect();
+        let build_vals: Vec<i64> = (0..40_000).map(|k| k * 100).collect();
+
+        let plan = RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: bc_ir::JoinType::Inner,
+            output: vec![
+                bc_ir::JoinOutputCol {
+                    side: bc_ir::JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                bc_ir::JoinOutputCol {
+                    side: bc_ir::JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        let sources = vec![
+            vec![batch(&probe_keys, &probe_vals)],
+            vec![batch(&build_keys, &build_vals)],
+        ];
+
+        // Sorted so the comparison is a multiset one: the swap deliberately changes the
+        // emitted order (output follows the probe), which is the one thing it may change.
+        let rows = |bs: &[RecordBatch]| -> Vec<(i64, i64)> {
+            let mut out = Vec::new();
+            for b in bs {
+                let lv = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let rv = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    out.push((lv.value(i), rv.value(i)));
+                }
+            }
+            out.sort();
+            out
+        };
+
+        let (par, metrics) =
+            execute_parallel_with_metrics(&plan, &sources, &ExecOptions::default()).unwrap();
+        let oracle = execute(&plan, &sources).unwrap();
+
+        // Column identity survives the re-label: `lv` still comes from the left input.
+        assert_eq!(rows(&par), rows(&oracle));
+        assert_eq!(rows(&par).len(), 5_000);
+        assert!(rows(&par).iter().all(|(lv, rv)| *rv == *lv * 10));
+
+        let join = metrics
+            .ops
+            .iter()
+            .find(|o| o.kind == "hash_join")
+            .expect("the plan has a hash join");
+        assert_eq!(
+            join.rows_build, 5_000,
+            "the executor built the planner's oversized side instead of correcting it"
+        );
+        assert_eq!(join.rows_in, 40_000, "the larger side should be the probe");
     }
 
     /// The fused join→aggregate must produce exactly what the sequential oracle produces —

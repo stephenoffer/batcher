@@ -1,5 +1,173 @@
 # Batcher CPU benchmark results
 
+## A remembered top-N bound beats DuckDB by 1.2-1.4x and Polars by 12-19x on `ORDER BY … LIMIT` (2026-08-02)
+
+Box: GenuineIntel, 15 cores, 30 GiB, L3 35 MiB, NVMe. Table: 20M rows x 21 `int64` columns,
+2,544 MB Parquet, 200k-row row groups, snappy. Query: `SELECT * FROM t ORDER BY x DESC LIMIT 10`
+over a uniformly random `x` — so no clustering helps and no zone map prunes anything on its own.
+
+Every engine is run repeatedly in one process and reported at the median after a warm-up, so
+all three are measured in the same warm regime a served query lives in:
+
+Two independent process runs are reported rather than one, because the second found a warmer
+page cache and moved every engine. The *ratio* is the durable figure; the absolute numbers are
+not:
+
+| engine | run A | run B | Batcher's edge |
+|---|--:|--:|--:|
+| **Batcher** | **140.8 ms** | **96.4 ms** | — |
+| DuckDB | 197.9 ms | 114.5 ms | **1.19x – 1.41x** |
+| Polars | 2,707.3 ms | 1,141.8 ms | **11.9x – 19.2x** |
+
+Both competitors returned identical top-10 rows. Against DuckDB the win is real and repeated
+but modest — call it ~1.2–1.4x, not a rout; DuckDB's own top-N is strong and it is reading the
+same file. Against Polars, which materializes the sort, it is an order of magnitude.
+
+The mechanism is `kyber/learned_tuning/topn_bound.py`. A top-N's k-th best value is one of the
+most stable things about a query — a leaderboard's tenth score, a log's slowest request — so it
+is remembered and used on the next run of the shape as a predicate. That turns the query into a
+highly selective filter, which predicate pushdown, row-group zone maps and `bc-io`'s late
+materialization already know how to make cheap: the scan decodes `x`, discards ~all of it, and
+decodes the other 20 columns only for what survives.
+
+Against Batcher's own prior behavior, end to end, same file and query:
+
+| | wall | 
+|---|--:|
+| run 1 (cold — learns the bound, no seeding) | 2,353.2 ms |
+| run 2+ (seeded) | 240.3 ms |
+| **speedup** | **9.79x** |
+
+and the hand-fed ceiling (bound supplied directly, no learning) was 1,645 ms → 86 ms, **19.1x**.
+
+**State the cold run honestly: it is not faster.** The first execution of a shape pays full
+freight and is what teaches the bound; the gain is entirely on the repeat. The competitive table
+above is warm for every engine, which is the fair comparison, but a one-shot query gets nothing.
+
+**Why a stale bound cannot return a wrong answer.** The seeded plan removes only rows strictly
+beyond the bound, so if `k` rows survive they *are* the true global top-k — regardless of what
+the bound was learned from. The bound is a guess about *how many* rows survive, never about
+which. That leaves one failure mode, too few survivors, which is visible in the row count; the
+conductor re-runs the plan as written and the cost is one wasted (cheap) scan. `nulls_first` is
+refused outright at the shape test, because there the loss *would* be invisible to a row count.
+
+Verified by `tests/differential/test_diff_topn_learned_bound.py` (37 cases: nulls, dense ties,
+negatives, single row, empty relation, `k` > relation, both directions, multi-key — each run
+**twice** so the seeded path is the one under test, and compared to DuckDB both order-independently
+and **ordered**, since `assert_same` cannot see a sort bug) and
+`tests/unit/test_topn_learned_bound.py` (the stale-bound fallback and the shape refusals).
+
+Reproduce: `benchmarks/` has no harness for this shape yet; the scripts used are recorded in the
+session scratchpad and the table above is a single-box measurement, not a suite entry.
+
+
+## A repeat distributed sort was reading its input twice, and a learned grid removes one pass — 1.39x (2026-08-02)
+
+Cluster: 17 nodes, **256 CPUs**, Ray 2.56, release engine. 4M-row in-memory table, `ORDER BY`
+a random `int64` key over a 10^9 domain, `collect(distributed=True)`.
+
+A distributed full sort runs its mapped prefix — scan, pushed predicate, projection — **twice**.
+Once in `sample_quantiles`, which executes the whole prefix over every split purely to return
+~33 floats per worker, and once in `range_publish`, which executes the identical prefix again
+to bucketize the rows it just measured and discarded. The second pass is the work; the first
+buys only the boundaries.
+
+`dist/sort_boundaries.py` persists the merged per-worker grids under the sort's shape, so a
+later run of that shape range-partitions straight from them. Runs alternate sampled/learned
+after a two-run warm-up, so cluster drift cannot be attributed to the change:
+
+| run pair | sampled (SAMPLE barrier runs) | learned (barrier skipped) |
+|---|--:|--:|
+| 1 | 14,258 ms | 10,478 ms |
+| 2 | 20,828 ms | 14,130 ms |
+| 3 | 14,560 ms | 8,557 ms |
+| 4 | 14,146 ms | 8,682 ms |
+| **median** | **14,560 ms** | **10,478 ms** |
+
+**1.39x, and every one of the four pairs favors the learned grid.** Correctness was asserted on
+every run, not at the end: the key column compared positionally against the single-node result
+(the sort's actual contract) and the whole relation compared as a multiset. The payload column
+is deliberately *not* compared positionally — duplicate keys may order their payloads
+differently across partitions, and asserting otherwise would assert something the sort never
+promised.
+
+**Why a stale grid is safe, and why that is structural rather than lucky.** Boundaries decide
+only which reducer a row lands on. The buckets are globally ordered for *any* monotone boundary
+list, because `bucketize` places rows by `searchsorted(side="right")` against deduplicated
+boundaries and the reducers concatenate in bucket order. A grid that no longer describes the
+data therefore costs balance and can never cost a row, a duplicate, or an ordering — the same
+failure mode sampling error already has, which is why the pass is allowed to sample at all.
+The grid is additionally keyed on the serialized mapped prefix, so a different predicate, a
+different projection, or a different set of files is a different key and re-samples.
+
+**What this does not do.** It does not help the first run of a shape, which still samples; the
+gain is on the repeat, which is the case a served workload is made of. Nothing here changes the
+single-node sort.
+
+## Tried and reverted: making the map-side `combine` adaptive (2026-08-02)
+
+Cluster: 17 nodes, 256 CPUs. 8M rows, `GROUP BY` a **unique** `int64` key — the shape where
+map-side pre-aggregation reduces nothing. `BATCHER_FOLD_CHUNK_BYTES=2 MiB`, passed through
+`ray.init(runtime_env={"env_vars": ...})` because nothing else propagates it to workers, so
+each partition spans many chunks.
+
+`folds.streaming_partial_aggregate` folds each chunk into a single running partial, which
+re-hashes everything accumulated so far on *every* chunk — `O(C^2)` row-hashes over `C` chunks
+when grouping does not reduce. `bc_interp::agg_par` documents the single-node twin of this at
+5.2x (2.25 s against 429 ms), so the map side looked like the same win waiting to happen.
+
+Two shapes were implemented and measured against the shipped behavior:
+
+| variant | median | vs shipped |
+|---|--:|--:|
+| shipped: merge every chunk | 7,906 ms | — |
+| stop merging, shuffle the chunk partials un-merged | 8,486 ms | **0.93x (7% slower)** |
+| stop merging, one deferred merge at the end | 7,972 / 9,205 ms | no effect |
+
+**Both were reverted.** Shipping the un-merged partials is a real regression: the transfer and
+the reduce both pay for the fragmentation, and that costs more than the merge being avoided.
+The deferred-merge variant is sound on paper — `O(C)` instead of `O(C^2)`, same single output
+partial, and no extra memory (in the case where it engages, the running partial was *already*
+the size of the whole partition) — but repeated arms straddled each other (A: 8,376/7,979,
+B: 7,972/9,205), so the effect is below this cluster's run-to-run variance. An unproven branch
+plus a tuning constant on the map-side hot path is not worth carrying.
+
+**What would settle it**: a partition large enough that `C` is in the tens at the *default*
+256 MiB chunk size, i.e. a multi-GB partition — roughly the 1B-row scale the module header is
+written against. At 8M rows the shuffle and scheduling dominate and the merge is not visible.
+Three separate benchmark attempts here were invalid before this one (a driver-side monkeypatch
+that never reached the workers; an env var that never reached the workers; a dataset whose
+partitions fit in a single chunk, so zero merges ran at all) — check `C > 1` on a worker before
+trusting any measurement of this code path.
+
+## The runtime can now correct a mis-chosen join build side, and it is worth ~2% (2026-08-02)
+
+Same box, 15 cores. `bc-interp`'s parallel hash join re-orients an `Inner` join when the
+planner's nominated build side turns out, at execution, to be materially larger than the probe
+(`join_par::build_side_swap_pays`). Both relations are materialized at that point, so their
+sizes are facts rather than estimates.
+
+Shape: an 8M-row side behind `(k.abs() >= 0) & ((k+1).abs() >= 0)` — a predicate the estimator
+scores at ~19% and which keeps every row — joined against 2M rows drawn from the same key
+domain, so Kyber's sideways key filter cannot shrink the build. The planner nominates the 8M
+side as the build (`join build side: left≈2,000,000 right≈1,539,601 [default] → keep`). One
+cold execution per process, since from the second run onward the learning loop has the real
+cardinalities and the *planner* fixes itself.
+
+| memory envelope | build side as planned | build side corrected |
+|---|--:|--:|
+| unbounded | 507 ms | 506 ms |
+| 256 MiB | 497 ms | 491 ms |
+| 128 MiB | 606 ms | 593 ms |
+
+**~2% at best, inside the run-to-run noise.** Recorded as a negative result rather than a win:
+the hypothesis was that the orientation decides whether the join spills, and at these sizes it
+does not — total work is `build N + probe M` either way and the output gather dominates both.
+The change is kept because it is free at runtime (two slice rebindings and an output re-label),
+because it makes `n_build` report the table the join actually built rather than the one the
+planner nominated, and because the failure it prevents is unbounded on paper even though it is
+2% here. It should not be described as a speedup.
+
 ## Distributed == single-node on a live 16-node cluster, and the two test failures it explains (2026-08-02)
 
 Cluster: 16 x `16cpu-32gb` workers plus a head, **256 CPUs / 544 GiB**, Ray 2.56, release engine.
