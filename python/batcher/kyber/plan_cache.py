@@ -49,6 +49,7 @@ import math
 from collections import OrderedDict
 from typing import Any
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import safe_div
 from batcher.config import Config
 from batcher.kyber import learning
@@ -164,7 +165,13 @@ def _read_cost_key(hub: Any, sources: list | None) -> str:
         from batcher.plan.source_stats import source_identity
 
         factors = relative_read_cost(hub, [source_identity(s) for s in sources])
-    except Exception:  # pragma: no cover - a learned read must never break the memo
+    except Exception as exc:
+        # A learned read must never break the memo, but it must not fail *invisibly* either.
+        # Degrading to "-" is the all-1.0 vector: every source looks equally cheap, so plans
+        # silently stop specializing on read cost and simply get a little worse. That is the
+        # failure mode `note_suppressed` exists for — "the difference between 'this
+        # optimization did not apply' and 'this optimization has been broken since March'".
+        note_suppressed("kyber", "read learned relative read cost", exc)
         return "-"
     return ",".join(
         str(round(math.log2(f) * _READ_COST_BUCKETS)) if f > 0.0 else "0" for f in factors
