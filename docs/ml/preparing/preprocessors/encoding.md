@@ -215,6 +215,41 @@ The learned fill value in `imputer.statistics_` is reused on every split, so tra
 validation get the *same* fill. The standard impute-then-scale ordering composes by
 sequencing the objects, as **Composing a pipeline** below shows.
 
+## Imputing from the other columns
+
+{py:class}`SimpleImputer <batcher.ml.preprocessors.SimpleImputer>` fills a column with one
+number, which discards everything the row's *other* columns say about it. A missing income
+in a row with a known job title and postcode is not well described by the global mean.
+
+{py:class}`IterativeImputer <batcher.ml.preprocessors.IterativeImputer>` is the MICE-style
+alternative, matching scikit-learn's: model each incomplete column from the remaining ones,
+fill the gaps with the model's prediction, and repeat so later rounds see better fills than
+earlier ones did.
+
+```python
+from batcher.ml.preprocessors import IterativeImputer, SimpleImputer
+
+related = bt.from_pydict(
+    {"a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "b": [2.0, 4.0, None, 8.0, 10.0, 12.0]}
+)
+print(round(IterativeImputer(["a", "b"]).fit_transform(related).to_pydict()["b"][2], 3))
+# 6.0
+print(round(SimpleImputer(["b"]).fit_transform(related).to_pydict()["b"][2], 3))
+# 7.2
+```
+
+`b` is exactly twice `a`, so 6.0 is the right answer and 7.2 is the column mean. That gap is
+the whole reason to pay for this.
+
+`fit` records the entire schedule — the initial per-column fill, then one model per
+incomplete column per round, in order — and `transform` replays it. A serving row is
+therefore imputed by the same models in the same sequence as a training row, which is the
+part a hand-rolled loop usually gets wrong.
+
+The cost is real. A fit is up to `max_iter * len(incomplete columns)` model fits, each a
+pass over the data, so reach for `SimpleImputer` when the columns are unrelated. Rounds stop
+early once nothing moves by more than `tol`, and `n_iter_` reports how many actually ran.
+
 ## Binning continuous values
 
 `KBinsDiscretizer` turns a continuous column into an integer bin index `0..n_bins-1`.

@@ -13,14 +13,14 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, columns_arg, fit_aggregate
-from batcher.plan.expr_ir import coalesce, col, count, lit
+from batcher.plan.expr_ir import coalesce, col, count, lit, when
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from batcher.api.dataset import Dataset
 
-__all__ = ["SimpleImputer"]
+__all__ = ["IterativeImputer", "SimpleImputer"]
 
 _STRATEGIES = ("mean", "median", "most_frequent", "constant")
 
@@ -144,3 +144,218 @@ class SimpleImputer(Preprocessor):
             base = col(c).cast("float64") if cast_float else col(c)
             new[c] = coalesce(base, lit(self.statistics_[c]))
         return ds.with_columns(**new)
+
+
+class IterativeImputer(Preprocessor):
+    """Impute each column by regressing it on the others, repeatedly.
+
+    `SimpleImputer` fills a column with one number, which throws away everything the row's
+    *other* columns say about it: a missing income in a row with a known job title and
+    postcode is not well described by the global mean. This is scikit-learn's
+    ``IterativeImputer``, the MICE-style alternative — model each incomplete column from the
+    remaining ones, fill the gaps with the model's prediction, and repeat so that later
+    rounds see better fills than earlier ones did.
+
+    `fit` records the whole schedule: the initial per-column fill, then one linear model per
+    incomplete column per round, in order. `transform` replays exactly that schedule, so a
+    serving row is imputed by the same models in the same sequence as a training row — which
+    is the part a hand-rolled loop usually gets wrong.
+
+    The cost is real: a fit is up to ``max_iter * len(incomplete columns)`` model fits, each
+    a pass over the data. Reach for `SimpleImputer` when the columns are unrelated, and for
+    this when they are not.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import IterativeImputer
+            >>> ds = bt.from_pydict(
+            ...     {"a": [1.0, 2.0, 3.0, 4.0], "b": [2.0, 4.0, None, 8.0]}
+            ... )
+            >>> out = IterativeImputer(["a", "b"], max_iter=3).fit_transform(ds)
+            >>> round(out.to_pydict()["b"][2], 6)
+            6.0
+
+    Args:
+        columns: The numeric columns to impute and to regress on each other.
+        max_iter: The maximum number of rounds over the incomplete columns.
+        initial_strategy: How to fill before the first round — ``"mean"`` or ``"median"``.
+        tol: Stop early once a round moves no imputed value by more than this.
+        ridge: The ridge penalty on each round's regression. A small positive value is the
+            default because the columns are correlated by assumption, which is exactly when
+            an unpenalized least-squares fit is unstable.
+    """
+
+    __slots__ = (
+        "columns",
+        "imputations_",
+        "initial_",
+        "initial_strategy",
+        "max_iter",
+        "n_iter_",
+        "ridge",
+        "tol",
+    )
+
+    def __init__(
+        self,
+        columns: str | Sequence[str],
+        *,
+        max_iter: int = 10,
+        initial_strategy: str = "mean",
+        tol: float = 1e-3,
+        ridge: float = 1e-6,
+    ) -> None:
+        self.columns = columns_arg(columns, what="IterativeImputer")
+        if len(self.columns) < 2:
+            raise PlanError(
+                "IterativeImputer needs at least two columns: it imputes each one *from the "
+                "others*, so a single column has nothing to regress on. Use SimpleImputer."
+            )
+        if max_iter < 1:
+            raise PlanError(f"IterativeImputer: max_iter must be at least 1, got {max_iter}")
+        if initial_strategy not in ("mean", "median"):
+            raise PlanError(
+                f"IterativeImputer: initial_strategy must be 'mean' or 'median', "
+                f"got {initial_strategy!r}"
+            )
+        if tol < 0:
+            raise PlanError(f"IterativeImputer: tol must be non-negative, got {tol!r}")
+        self.max_iter = max_iter
+        self.initial_strategy = initial_strategy
+        self.tol = tol
+        self.ridge = ridge
+        self.initial_: dict[str, float] = {}
+        self.imputations_: list[dict[str, Any]] = []
+        self.n_iter_: int = 0
+
+    def _missing_flag(self, column: str) -> str:
+        """The helper column name carrying `column`'s original missingness."""
+        return f"__bt_missing_{column}"
+
+    def _staged(self, ds: Dataset) -> Dataset:
+        """`ds` with the missingness flags captured and the initial fills applied.
+
+        The flags have to be taken before any filling, and carried alongside: once a column
+        has been filled it no longer knows which of its values were imputed, and every later
+        round must only overwrite the ones that were.
+        """
+        flags = {self._missing_flag(c): col(c).is_null() for c in self.columns}
+        filled = {c: coalesce(col(c).cast("float64"), lit(self.initial_[c])) for c in self.columns}
+        return ds.with_columns(**flags).with_columns(**filled)
+
+    def _apply(self, ds: Dataset, step: dict[str, Any]) -> Dataset:
+        """Overwrite one column's originally-missing entries with a fitted model's output."""
+        from batcher.ml._estimator import linear_score
+
+        target = step["column"]
+        predicted = linear_score(step["features"], step["coef"], step["intercept"])
+        return ds.with_columns(
+            **{target: when(col(self._missing_flag(target))).then(predicted).otherwise(col(target))}
+        )
+
+    def fit(self, ds: Dataset) -> IterativeImputer:
+        """Learn the initial fills and the per-round regression schedule.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import IterativeImputer
+                >>> ds = bt.from_pydict({"a": [1.0, 2.0, 3.0], "b": [2.0, None, 6.0]})
+                >>> fitted = IterativeImputer(["a", "b"], max_iter=2).fit(ds)
+                >>> fitted.imputations_[0]["column"]
+                'b'
+
+        Args:
+            ds: The training dataset.
+
+        Returns:
+            ``self``, fitted.
+
+        Raises:
+            PlanError: If a column is entirely null, leaving nothing to learn a fill from.
+            ColumnNotFoundError: If a named column is missing.
+        """
+        from batcher.ml.linear import Ridge
+
+        aggregates = {}
+        for name in self.columns:
+            expression = col(name).cast("float64")
+            aggregates[name] = (
+                expression.mean() if self.initial_strategy == "mean" else expression.median()
+            )
+        learned = fit_aggregate(ds, aggregates)
+        empty = [name for name, value in learned.items() if value is None]
+        if empty:
+            raise PlanError(
+                f"IterativeImputer: column {empty[0]!r} has no non-null values, so there is "
+                "nothing to learn an initial fill from. Drop it, or supply a constant with "
+                "SimpleImputer first."
+            )
+        self.initial_ = {name: float(value) for name, value in learned.items()}
+        incomplete = [
+            name for name in self.columns if ds.filter(col(name).is_null()).limit(1).count() > 0
+        ]
+        self.imputations_ = []
+        self.n_iter_ = 0
+        if not incomplete:
+            self._fitted = True
+            return self
+
+        working = self._staged(ds)
+        for _round in range(self.max_iter):
+            self.n_iter_ += 1
+            largest_move = 0.0
+            for target in incomplete:
+                features = [c for c in self.columns if c != target]
+                observed = working.filter(~col(self._missing_flag(target)))
+                model = Ridge(features, target, alpha=self.ridge).fit(observed)
+                step = {
+                    "column": target,
+                    "features": features,
+                    "coef": [float(v) for v in model.coef_],
+                    "intercept": float(model.intercept_),
+                }
+                # Keep the pre-update value beside the column so the round's movement is a
+                # per-row difference inside one frame, not a comparison across two datasets
+                # whose rows nothing lines up.
+                previous = f"__bt_previous_{target}"
+                staged = working.with_columns(**{previous: col(target)})
+                updated = self._apply(staged, step)
+                moved = updated.agg(__bt_move=(col(target) - col(previous)).abs().max()).collect()
+                movement = moved.column("__bt_move")[0].as_py()
+                largest_move = max(largest_move, abs(float(movement)) if movement else 0.0)
+                working = updated.drop(previous)
+                self.imputations_.append(step)
+            if largest_move <= self.tol:
+                break
+        self._fitted = True
+        return self
+
+    def transform(self, ds: Dataset) -> Dataset:
+        """Replay the fitted schedule: initial fills, then each round's model in order.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import IterativeImputer
+                >>> train = bt.from_pydict({"a": [1.0, 2.0, 3.0], "b": [2.0, None, 6.0]})
+                >>> fitted = IterativeImputer(["a", "b"], max_iter=2).fit(train)
+                >>> out = fitted.transform(bt.from_pydict({"a": [4.0], "b": [None]}))
+                >>> out.to_pydict()["b"][0] is not None
+                True
+
+        Args:
+            ds: The dataset to impute.
+
+        Returns:
+            A new lazy `Dataset` with the imputed columns and no helper columns left behind.
+        """
+        self._require_fitted()
+        working = self._staged(ds)
+        for step in self.imputations_:
+            working = self._apply(working, step)
+        return working.drop(*(self._missing_flag(c) for c in self.columns))

@@ -130,6 +130,9 @@ The rest of the estimators cover discretization, missing values, text splitting,
 .. autoclass:: SimpleImputer
    :members:
 
+.. autoclass:: IterativeImputer
+   :members:
+
 .. autoclass:: Tokenizer
    :members:
 

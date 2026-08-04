@@ -47,7 +47,7 @@ from batcher.ml.preprocessors.encoders import (
     TargetEncoder,
     WOEEncoder,
 )
-from batcher.ml.preprocessors.imputers import SimpleImputer
+from batcher.ml.preprocessors.imputers import IterativeImputer, SimpleImputer
 from batcher.ml.preprocessors.persistence import from_dict, load, save, to_dict
 from batcher.ml.preprocessors.polynomial import PolynomialFeatures, SplineTransformer
 from batcher.ml.preprocessors.power import BoxCoxTransformer, PowerTransformer
@@ -114,6 +114,7 @@ __all__ = [
     "HashingVectorizer",
     "InteractionFeatures",
     "IsotonicCalibrator",
+    "IterativeImputer",
     "JamesSteinEncoder",
     "KBinsDiscretizer",
     "LabelBinarizer",
