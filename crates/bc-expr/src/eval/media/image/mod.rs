@@ -60,6 +60,10 @@ pub(crate) fn eval_image(
     args: ImageArgs<'_>,
 ) -> Result<ArrayRef, ExprError> {
     let norm = Normalization::resolve(func, args.mean, args.std, args.channels_first)?;
+    // An all-null column is typed `Null`, not `Binary`; see `widen_null_column`.
+    if let Some(nulls) = super::widen_null_column(arr) {
+        return eval_image_sized::<i32>(func, &nulls, args, norm);
+    }
     match arr.data_type() {
         DataType::Binary => eval_image_sized::<i32>(func, arr, args, norm),
         DataType::LargeBinary => eval_image_sized::<i64>(func, arr, args, norm),

@@ -187,3 +187,62 @@ def test_the_detection_preprocessing_this_exists_for():
     boxed = ds.select(x=col("i").image.auto_orient().image.letterbox(64, 64)).to_pydict()["x"]
     # Both orientations land on the same canvas, which is what makes them batchable.
     assert [len(row) for row in boxed] == [64 * 64 * 3, 64 * 64 * 3]
+
+
+# The cross-product the contract calls out: an operator combined with a non-default path.
+# Each of these ops is new, and none of them had been run against an empty batch, a
+# single-row batch, or a streamed one — which is exactly where a per-row kernel that
+# pre-allocates by `len` or indexes by `i` goes wrong without failing loudly.
+_NEW_OPS = [
+    ("thumbnail", lambda c: c.image.thumbnail(16)),
+    ("letterbox", lambda c: c.image.letterbox(8, 6)),
+    ("auto_orient", lambda c: c.image.auto_orient()),
+    ("exif_orientation", lambda c: c.image.exif_orientation()),
+]
+
+
+@pytest.mark.parametrize(("label", "build"), _NEW_OPS, ids=[o[0] for o in _NEW_OPS])
+def test_an_empty_batch_yields_an_empty_column(label, build):
+    """A zero-row input must produce a zero-row column, not an error or a stray row."""
+    pytest.importorskip("PIL")
+    ds = bt.from_pydict({"i": [_png(4, 4)]}).filter(col("i").is_null())
+    assert ds.select(x=build(col("i"))).collect().num_rows == 0
+
+
+@pytest.mark.parametrize(("label", "build"), _NEW_OPS, ids=[o[0] for o in _NEW_OPS])
+def test_an_all_null_batch_stays_all_null(label, build):
+    """Below the parallel-fan-out threshold and above it, so both loops are exercised."""
+    pytest.importorskip("PIL")
+    for n in (1, 32):
+        out = bt.from_pydict({"i": [None] * n}).select(x=build(col("i"))).to_pydict()["x"]
+        assert out == [None] * n, f"{label} with {n} null rows"
+
+
+@pytest.mark.parametrize(("label", "build"), _NEW_OPS, ids=[o[0] for o in _NEW_OPS])
+def test_streaming_agrees_with_collecting(label, build):
+    """Batching must not change a per-row result.
+
+    The kernels fan out across rows once a batch clears a threshold, so a small streamed
+    batch and a large collected one take *different* code paths inside the same operator.
+    """
+    pytest.importorskip("PIL")
+    rows = [_png(40, 10), None, _png(10, 40), b"not an image", _png(20, 20)] * 3
+    ds = bt.from_pydict({"i": rows})
+    whole = ds.select(x=build(col("i"))).to_pydict()["x"]
+    streamed = [
+        row
+        for batch in ds.select(x=build(col("i"))).iter_batches(batch_size=2)
+        for row in batch.column("x").to_pylist()
+    ]
+    assert whole == streamed, f"{label} disagreed between collect and iter_batches"
+
+
+@pytest.mark.parametrize(("label", "build"), _NEW_OPS, ids=[o[0] for o in _NEW_OPS])
+def test_mixed_orientations_and_sizes_in_one_batch(label, build):
+    """A real corpus is heterogeneous, and every one of these ops sizes per row."""
+    pytest.importorskip("PIL")
+    rows = [_png(1, 1), _png(4, 100), _png(100, 4), _png(64, 64), None]
+    out = bt.from_pydict({"i": rows}).select(x=build(col("i"))).to_pydict()["x"]
+    assert len(out) == len(rows)
+    assert out[-1] is None
+    assert all(v is not None for v in out[:-1]), f"{label} nulled a decodable row"

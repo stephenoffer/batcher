@@ -179,3 +179,46 @@ def test_the_oriented_bytes_feed_the_tensor_path():
     ds = bt.from_pydict({"i": [_tagged_jpeg(6)]})
     tensor = col("i").image.auto_orient().image.to_tensor(8, 8)
     assert len(ds.select(t=tensor).to_pydict()["t"][0]) == 8 * 8 * 3
+
+
+def test_a_column_of_nothing_but_nulls_is_not_a_type_error():
+    """Arrow types an all-null column as `Null`, not as `Binary` with the nulls set.
+
+    That shape arrives constantly in a media pipeline — a download stage where every fetch
+    failed, an outer join that matched nothing, a partition filtered empty upstream — and
+    every `.image` and `.audio` op used to *fail the batch* on it with `expected a Binary
+    argument, got Null`. A type error about a column the caller never typed, on the one
+    input whose answer was never in doubt.
+
+    Parametrized across the namespace rather than the two ops that surfaced it, because
+    the bug was in the shared entry point and a test of one op would let it back in
+    through another.
+    """
+    import batcher as bt
+
+    ops = {
+        "decode": lambda c: c.image.decode(),
+        "to_tensor": lambda c: c.image.to_tensor(4, 4),
+        "to_tensor_f32": lambda c: c.image.to_tensor_f32(4, 4),
+        "to_grayscale": lambda c: c.image.to_grayscale(4, 4),
+        "center_crop": lambda c: c.image.center_crop(4, 4),
+        "resize": lambda c: c.image.resize(4, 4),
+        "crop": lambda c: c.image.crop(0, 0, 2, 2),
+        "encode": lambda c: c.image.encode("png"),
+        "convert": lambda c: c.image.convert("L"),
+        "dhash": lambda c: c.image.dhash(),
+        "brightness": lambda c: c.image.brightness(),
+        "sharpness": lambda c: c.image.sharpness(),
+        "thumbnail": lambda c: c.image.thumbnail(8),
+        "letterbox": lambda c: c.image.letterbox(4, 4),
+        "auto_orient": lambda c: c.image.auto_orient(),
+        "exif_orientation": lambda c: c.image.exif_orientation(),
+        "audio.decode": lambda c: c.audio.decode(),
+        "audio.to_waveform": lambda c: c.audio.to_waveform(),
+    }
+    ds = bt.from_pydict({"i": [None, None]})
+    assert ds.collect().schema.field("i").type == __import__("pyarrow").null()
+
+    for label, build in ops.items():
+        out = ds.select(x=build(col("i"))).to_pydict()["x"]
+        assert out == [None, None], f"{label} did not answer null for an all-null column"

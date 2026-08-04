@@ -47,7 +47,9 @@ pub(crate) fn eval_video(
     arr: &ArrayRef,
     args: VideoArgs,
 ) -> Result<ArrayRef, ExprError> {
-    let clips = Clips::new(func, arr)?;
+    // An all-null column is typed `Null`, not `Binary`; see `widen_null_column`.
+    let widened = crate::eval::media::widen_null_column(arr);
+    let clips = Clips::new(func, widened.as_ref().unwrap_or(arr))?;
     match func {
         VideoFunc::Decode => decode_meta(&clips),
         VideoFunc::Frames => sample::frames(&clips, args),
@@ -80,7 +82,7 @@ impl<'a> Clips<'a> {
             DataType::LargeBinary => (None, arr.as_any().downcast_ref::<GenericBinaryArray<i64>>()),
             other => {
                 return Err(ExprError::ExpectedBinary {
-                    func: format!("{func:?}"),
+                    func: format!("video.{func:?}"),
                     got: other.to_string(),
                 })
             }

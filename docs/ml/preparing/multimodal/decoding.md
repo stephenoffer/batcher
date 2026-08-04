@@ -173,6 +173,29 @@ print(decoded_audio.schema.field("mono").type, len(decoded_audio.column("mono")[
 # list<item: float> 16
 ```
 
+### What a bad row does
+
+Every decode operation answers **null** for a row it cannot read: null input bytes,
+truncated files, a codec the build does not have. The batch is never failed, because one
+corrupt file in a scrape of millions is normal and losing the other millions to it is not.
+
+That extends to a column of nothing but nulls, which is a shape a media pipeline produces
+constantly — a download stage where every fetch failed, an outer join that matched nothing,
+a partition filtered empty upstream. Such a column is typed `null` rather than `binary`,
+and the decode operations read it as "all rows are null" rather than as a type mismatch.
+
+Null is deliberate rather than a zero-filled tensor. Zeros are indistinguishable from a
+legitimately black image or a silent clip, so they put blank samples into a training set
+with nothing to detect them by. Count them instead:
+
+```python
+import batcher as bt
+from batcher import col
+
+photos = bt.from_pydict({"bytes": [b"", b""]})
+undecodable = photos.filter(col("bytes").image.decode().is_null())
+```
+
 ### Choosing how an image is resized
 
 Three operations resize, and picking the wrong one is a mistake the output's shape cannot

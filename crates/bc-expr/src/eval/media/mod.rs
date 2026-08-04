@@ -5,6 +5,7 @@
 //! library-backed decode, so it falls back here (one implementation, no tier
 //! divergence). Grouped under `media/` to keep `eval/` within its file-count limit.
 
+use arrow::array::ArrayRef;
 use rayon::prelude::*;
 
 pub(crate) mod audio;
@@ -39,4 +40,23 @@ where
     } else {
         (0..len).map(f).collect()
     }
+}
+
+/// Read an all-null column as an all-null **Binary** column of the same length.
+///
+/// An Arrow batch types a column of nothing but nulls as `Null`, not as `Binary` with the
+/// null bits set — and that shape arrives constantly in a media pipeline: a download stage
+/// where every fetch failed, an outer join that matched nothing, a partition whose rows
+/// were all filtered out upstream. Every kernel here already answers null for a null row,
+/// so the entire fix is to hand them a `Binary` array that is null everywhere; the output
+/// type and the null bits then come out exactly right with no per-op special case.
+///
+/// Without it, each of these ops *failed the batch* with `expected a Binary argument, got
+/// Null` — a type error about a column the caller never typed, on the one input where the
+/// answer was never in doubt.
+pub(crate) fn widen_null_column(arr: &ArrayRef) -> Option<ArrayRef> {
+    use arrow::datatypes::DataType;
+
+    matches!(arr.data_type(), DataType::Null)
+        .then(|| arrow::array::new_null_array(&DataType::Binary, arr.len()))
 }
