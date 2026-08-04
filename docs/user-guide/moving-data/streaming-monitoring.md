@@ -21,9 +21,16 @@ q.is_active            # True while running
 q.status               # a point-in-time StreamingQueryStatus
 q.recent_progress    # per-micro-batch metrics
 q.exception()          # the failure that stopped it, or None (does not re-raise)
+q.explain()            # the plan this query is running
+q.process_all_available()  # block until the current backlog is done
 q.stop()               # halt at the next micro-batch boundary
 bt.streams()           # all active streaming queries
 ```
+
+{py:meth}`explain <batcher.StreamingQuery.explain>` shows the *planned* tree only. `Dataset.explain(analyze=True)` runs the
+query to measure it, which a stream cannot do twice: the source has moved on, and running
+it again would double-consume the topic. Per-micro-batch measurements live in
+`recent_progress` instead.
 
 With several queries running, {py:func}`bt.await_any_termination(timeout=None) <batcher.await_any_termination>` blocks until
 the first of them stops, re-raising its exception if it failed. This is the Spark

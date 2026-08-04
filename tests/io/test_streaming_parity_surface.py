@@ -226,3 +226,34 @@ def test_a_real_query_reports_where_its_time_went():
     breakdown = query.recent_progress[-1].duration_ms_map
     assert set(breakdown) == {"latestOffset", "addBatch", "walCommit"}
     assert all(v >= 0 for v in breakdown.values())
+
+
+# --- the plan a running query is running -----------------------------------------------
+
+
+@pytest.mark.integration
+def test_a_query_can_explain_the_plan_it_is_running():
+    """A stream is the case where you most want the plan and least want to re-derive it:
+    the Dataset that started it is often long out of scope, and `explain(analyze=True)`
+    is not available because measuring would mean consuming the source a second time."""
+    query = bt.read.rate_micro_batch(10, num_rows=20).write.noop(trigger=bt.Trigger.available_now())
+    plan = query.explain()
+    assert "scan" in plan
+    assert query.await_termination(timeout=60) is True
+
+
+@pytest.mark.integration
+def test_explain_also_renders_json():
+    query = bt.read.rate_micro_batch(10, num_rows=20).write.noop(trigger=bt.Trigger.available_now())
+    assert json.loads(query.explain(format="json"))
+    assert query.await_termination(timeout=60) is True
+
+
+@pytest.mark.integration
+def test_process_all_available_has_the_snake_case_spelling_too():
+    """Every other Spark name on this handle aliases a snake_case primary. This one was
+    only reachable in camelCase, so a pipeline written in Batcher's own idiom had to
+    switch spelling for one call."""
+    query = bt.read.rate_micro_batch(5, num_rows=10).write.noop(trigger=bt.Trigger.available_now())
+    assert query.process_all_available() is True
+    assert query.processAllAvailable() is True

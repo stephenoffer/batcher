@@ -143,7 +143,7 @@ def start_streaming_query(
         projection=projection,
         predicate=predicate,
     )
-    query = StreamingQuery(query_name, engine)
+    query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)
     try:
         engine.start()
@@ -239,7 +239,7 @@ def _start_driver_stream(
         checkpoint=None,
         runner_factory=make_runner,
     )
-    query = StreamingQuery(query_name, engine)
+    query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)
     try:
         engine.start()

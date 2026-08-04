@@ -117,7 +117,7 @@ def start_distributed_stream(
         checkpoint=store,
         runner_factory=make_runner,
     )
-    query = StreamingQuery(query_name, engine)
+    query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)
     try:
         engine.start()
