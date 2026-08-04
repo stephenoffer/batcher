@@ -60,19 +60,34 @@ class StatelessProcessor:
 class AggregateProcessor:
     """Fold each micro-batch into a running aggregate and emit the current result.
 
-    `complete` and `update` both emit the full running result here (a keyed sink
-    upserts it idempotently); a later step narrows `update` to only the changed
-    groups via a Rust delta path. `append` on an unwindowed aggregate is rejected
-    upstream — it needs a watermark to know a group is final.
+    `complete` emits the whole running result every micro-batch. `update` emits **only
+    the rows that changed since the last trigger**, which is what the mode means in Spark
+    and the whole reason to pick it over `complete`: on a wide key space, re-sending every
+    group every trigger is the traffic the mode exists to avoid. `append` on an unwindowed
+    aggregate is rejected upstream — it needs a watermark to know a group is final.
+
+    The changed rows are found by anti-joining this result against the previous one over
+    every column, so a row is "changed" exactly when it is not present unaltered in what
+    was last emitted. That is deliberately *value*-based rather than key-based: the group
+    keys of an `Aggregate` can be expressions (`window(ts, "1h")`) that the input batch
+    does not carry, so "which keys did this batch touch" is not answerable from the batch
+    alone, while "which output rows differ" always is. It costs one extra copy of the
+    result and one vectorized Arrow join per micro-batch, and it never *omits* a changed
+    row — a null or NaN in an output column makes a row compare unequal to itself, so such
+    a row is re-emitted every trigger, which an upsert sink absorbs and a missed update
+    would not be.
     """
 
-    __slots__ = ("_agg", "_cap", "_emitted", "_fold", "_keyed")
+    __slots__ = ("_agg", "_cap", "_emitted", "_fold", "_keyed", "_previous", "_update_only")
 
-    def __init__(self, agg: Aggregate) -> None:
+    def __init__(self, agg: Aggregate, *, update_only: bool = False) -> None:
         from batcher.core.streaming import streaming_state_budget
 
         self._fold = _AggFold(agg)
         self._agg = agg
+        self._update_only = update_only
+        #: The last result emitted, for the `update` diff. None until the first one.
+        self._previous: pa.Table | None = None
         # Whether any micro-batch produced a result. See `finalize`.
         self._emitted = False
         # A *grouped* aggregate over a stream with no watermark holds one entry per group
@@ -101,7 +116,27 @@ class AggregateProcessor:
         if result is None:
             return []
         self._emitted = True
-        return [result]
+        if not self._update_only:
+            return [result]
+        return self._changed_rows(result)
+
+    def _changed_rows(self, result: pa.RecordBatch) -> list[pa.RecordBatch]:
+        """The rows of `result` that differ from the last emitted result.
+
+        Falls back to the whole result when a column's type cannot be a join key (a list,
+        struct or map aggregate). Emitting more than changed is `complete`'s behavior,
+        which is correct if wasteful; emitting less would lose an update.
+        """
+        current = pa.Table.from_batches([result])
+        previous, self._previous = self._previous, current
+        if previous is None:
+            return [result]
+        if not _joinable(current.schema):
+            return [result]
+        changed = current.join(previous, keys=current.schema.names, join_type="left anti")
+        if changed.num_rows == 0:
+            return []
+        return changed.combine_chunks().to_batches()
 
     def finalize(self) -> list[pa.RecordBatch]:
         """The one row a *keyless* aggregate owes a stream that carried none.
@@ -258,7 +293,7 @@ def make_processor(
                 "'complete'/'update')"
             )
         agg = plan if isinstance(plan, Aggregate) else _distinct_as_aggregate(plan)
-        return AggregateProcessor(agg)
+        return AggregateProcessor(agg, update_only=output_mode == OutputMode.UPDATE)
     if is_streamable(plan):
         if output_mode != OutputMode.APPEND:
             raise PlanError(
@@ -277,3 +312,10 @@ def make_processor(
 def _distinct_as_aggregate(distinct) -> Aggregate:
     """A `Distinct` is a group-by over all columns — reuse the aggregate fold."""
     return distinct.as_aggregate()
+
+
+def _joinable(schema: pa.Schema) -> bool:
+    """Whether every column can be an Arrow join key (nested types cannot)."""
+    return not any(
+        pa.types.is_nested(field.type) or pa.types.is_dictionary(field.type) for field in schema
+    )

@@ -112,27 +112,45 @@ def test_processing_time_trigger_drains_bounded_stream():
     assert bt.read_memory("life_pt").count() == 5
 
 
-@pytest.mark.integration
-def test_update_output_mode_emits_running_result():
+def _batches_of(mode: str) -> list[dict]:
+    """Run the same two-micro-batch aggregation under `mode` and record what each emitted."""
     seen: list[pa.Table] = []
-
-    def sink(table: pa.Table, _batch_id: int) -> None:
-        seen.append(table)
 
     def feed():
         yield pa.record_batch({"k": ["a", "b"], "v": [1, 2]}, schema=_SCHEMA)
         yield pa.record_batch({"k": ["a"], "v": [3]}, schema=_SCHEMA)
 
-    q = (
+    query = (
         bt.from_batches(feed, _SCHEMA, bounded=False)
         .group_by("k")
         .agg(total=bt.col("v").sum())
-        .write.for_each_batch(sink, trigger=bt.Trigger.available_now(), output_mode="update")
+        .write.for_each_batch(
+            lambda table, _id: seen.append(table),
+            trigger=bt.Trigger.available_now(),
+            output_mode=mode,
+        )
     )
-    q.await_termination()
-    last = seen[-1].to_pydict()
-    final = dict(zip(last["k"], last["total"], strict=True))
-    assert final == {"a": 4, "b": 2}
+    query.await_termination()
+    return [
+        dict(zip(t.to_pydict()["k"], t.to_pydict()["total"], strict=True))
+        for t in seen
+        if t.num_rows
+    ]
+
+
+@pytest.mark.integration
+def test_update_output_mode_emits_only_the_groups_that_changed():
+    """Spark's rule, and the only thing that distinguishes `update` from `complete`: `b`
+    got no row in the second micro-batch, so its unchanged total is not re-sent. Emitting
+    it anyway is `complete` wearing `update`'s name, and on a wide key space it is exactly
+    the traffic the mode exists to avoid."""
+    assert _batches_of("update") == [{"a": 1, "b": 2}, {"a": 4}]
+
+
+@pytest.mark.integration
+def test_complete_output_mode_still_emits_the_whole_result():
+    """The contrast that gives the test above its meaning."""
+    assert _batches_of("complete") == [{"a": 1, "b": 2}, {"a": 4, "b": 2}]
 
 
 @pytest.mark.integration
@@ -165,3 +183,60 @@ def test_for_each_row_sink():
 def test_read_memory_missing_raises():
     with pytest.raises(PlanError, match="no in-memory streaming sink"):
         bt.read_memory("never_written_sink")
+
+
+@pytest.mark.integration
+def test_a_group_whose_value_is_unchanged_is_not_re_sent_even_when_it_gets_rows():
+    """ "Changed" is about the value, not about whether a row arrived. Adding zero to a
+    sum touches the group and changes nothing, so nothing should go downstream."""
+    seen: list[pa.Table] = []
+
+    def feed():
+        yield pa.record_batch({"k": ["a"], "v": [5]}, schema=_SCHEMA)
+        yield pa.record_batch({"k": ["a"], "v": [0]}, schema=_SCHEMA)
+
+    query = (
+        bt.from_batches(feed, _SCHEMA, bounded=False)
+        .group_by("k")
+        .agg(total=bt.col("v").sum())
+        .write.for_each_batch(
+            lambda table, _id: seen.append(table),
+            trigger=bt.Trigger.available_now(),
+            output_mode="update",
+        )
+    )
+    query.await_termination()
+    # One call, not two: the second micro-batch produced no changed row, so the sink is
+    # not invoked at all rather than handed an empty table.
+    assert [t.num_rows for t in seen] == [1]
+
+
+@pytest.mark.integration
+def test_update_mode_on_a_windowed_aggregate_emits_only_the_window_that_moved():
+    """The group key is an expression here, which is why the diff is over output *values*
+    rather than over "which keys did this batch carry" -- the batch carries `ts`, not the
+    window the row lands in."""
+    import datetime as dt
+
+    base = dt.datetime(2024, 1, 1)
+    schema = pa.schema([("ts", pa.timestamp("us")), ("v", pa.int64())])
+    seen: list[pa.Table] = []
+
+    def feed():
+        yield pa.record_batch({"ts": [base], "v": [1]}, schema=schema)
+        yield pa.record_batch({"ts": [base + dt.timedelta(hours=3)], "v": [2]}, schema=schema)
+
+    query = (
+        bt.from_batches(feed, schema, bounded=False)
+        .with_watermark("ts", "10m")
+        .group_by(w=bt.window(bt.col("ts"), "1h"))
+        .agg(total=bt.col("v").sum())
+        .write.for_each_batch(
+            lambda table, _id: seen.append(table),
+            trigger=bt.Trigger.available_now(),
+            output_mode="update",
+        )
+    )
+    query.await_termination()
+    emitted = [t.to_pydict()["total"] for t in seen if t.num_rows]
+    assert emitted == [[1], [2]]
