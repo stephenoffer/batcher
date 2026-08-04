@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from batcher.ml.preprocessors.base import Preprocessor
 from batcher.ml.preprocessors.binning import KBinsDiscretizer
+from batcher.ml.preprocessors.calibration import IsotonicCalibrator, PlattCalibrator
 from batcher.ml.preprocessors.chain import Chain
 from batcher.ml.preprocessors.derived import (
     PCA,
@@ -102,6 +103,7 @@ __all__ = [
     "HashingEncoder",
     "HashingVectorizer",
     "InteractionFeatures",
+    "IsotonicCalibrator",
     "KBinsDiscretizer",
     "LabelBinarizer",
     "LabelEncoder",
@@ -115,6 +117,7 @@ __all__ = [
     "Normalizer",
     "OneHotEncoder",
     "OrdinalEncoder",
+    "PlattCalibrator",
     "PolynomialFeatures",
     "PowerTransformer",
     "Preprocessor",

@@ -260,6 +260,43 @@ region of the score range drives a high-stakes call. `brier_skill_score` rescale
 score against the base rate so it reads like R²: 1 is perfect, 0 is no better than predicting
 the base rate, negative is worse.
 
+## Fixing a miscalibrated score
+
+Measuring the gap is half the job. {py:class}`PlattCalibrator <batcher.ml.preprocessors.PlattCalibrator>`
+and {py:class}`IsotonicCalibrator <batcher.ml.preprocessors.IsotonicCalibrator>` close it, by
+fitting the map from raw score to observed rate and applying it to every future score.
+
+Fit them on a split the model did **not** train on. Calibrating on the training split
+measures the model's confidence on rows it memorized, which produces a calibration curve
+that looks perfect in development and is wrong in use.
+
+```python
+from batcher.ml.preprocessors import IsotonicCalibrator
+
+scored = bt.from_pydict(
+    {"score": [0.02, 0.05, 0.3, 0.5, 0.7, 0.95, 0.97, 0.99],
+     "label": [0, 0, 0, 1, 0, 1, 1, 1]}
+)
+calibrator = IsotonicCalibrator("score", "label", n_bins=4).fit(scored)
+print(calibrator.transform(scored).to_pydict()["calibrated"])
+# [0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0]
+```
+
+Which to use depends on how much calibration data you have and what shape the distortion is:
+
+| Calibrator | Parameters | Use it when |
+|---|---|---|
+| `PlattCalibrator` | Two | The calibration split is small, and the distortion is roughly sigmoid. |
+| `IsotonicCalibrator` | One per bin | You have a few thousand rows, and the distortion is not sigmoid. |
+
+Platt scaling fits `sigmoid(a * score + b)`, so it cannot overfit much and cannot represent
+an asymmetric distortion. Isotonic regression assumes only that a higher score should never
+mean a lower probability, which fits a boosted tree's asymmetric overconfidence far better,
+at the cost of needing more data before its steps are trustworthy.
+
+Neither reorders the model's ranking — both are monotone in the score — so AUC is unchanged
+and only the calibration metrics above move.
+
 ## Count and rate models
 
 RMSE assumes symmetric, constant-variance error. A count (claims, clicks, defects) or a rate

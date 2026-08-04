@@ -182,6 +182,20 @@ the validation split is pruned by the training split's decision:
 .. autofunction:: feature_importances
 ```
 
+## Probability calibration
+
+`batcher.ml.metrics` measures calibration; these two correct it. Both are fitted on a split
+the model did not train on, and both are monotone in the score, so neither changes the
+model's ranking:
+
+```{eval-rst}
+.. autoclass:: PlattCalibrator
+   :members:
+
+.. autoclass:: IsotonicCalibrator
+   :members:
+```
+
 ## Text vectorizers
 
 These turn a text column into the bag-of-words features a classical text model trains on.

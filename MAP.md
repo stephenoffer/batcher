@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1199 Python modules across 182 packages and 219 Rust files across 14 crates.
+Covering 1202 Python modules across 183 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -557,6 +557,15 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 | `text.py` | 252 | Feature assembly and text tokenization. |
 | `text_features.py` | 160 | Surface features from a text column — the numbers a model can use before an embedding. |
 | `transforms.py` | 494 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
+
+### `batcher/ml/preprocessors/calibration/` — 6 · front-end
+
+Probability calibration — turning a model's scores into numbers that mean what they say.
+
+| module | lines | what it is |
+|---|---|---|
+| `isotonic.py` | 249 | Isotonic calibration — a monotone step function fitted to the observed rates. |
+| `platt.py` | 196 | Platt scaling — a one-dimensional logistic fit turning scores into probabilities. |
 
 ### `batcher/ml/preprocessors/derived/` — 6 · front-end
 
