@@ -59,6 +59,13 @@ class IncrementalFileSource:
         state_dir: Directory holding the durable seen-file store. Created if
             missing; the store file lives at ``<state_dir>/<format>_seen.sqlite``.
         suffix: File suffix to list (default derived from ``format``).
+        max_files_per_trigger: Cap on the new files one discovery pass admits, so a
+            large backlog drains across many bounded micro-batches (Spark
+            ``maxFilesPerTrigger``). ``None`` admits every new file.
+        max_bytes_per_trigger: Cap on the total *size* one pass admits (Spark
+            ``maxBytesPerTrigger``). Composes with `max_files_per_trigger`; whichever
+            bound trips first wins. A single file larger than the budget is still
+            admitted alone.
 
     Laziness: ``iter_batches`` runs one discovery pass per call (a streaming
     driver loops). ``row_count`` is ``None`` — the directory is unbounded over
@@ -69,12 +76,17 @@ class IncrementalFileSource:
     #: A pass's new files are independent work units, so a micro-batch can be fanned
     #: across the cluster one file per worker (see `dist.streaming.microbatch`).
     partitionable = True
+    #: A pass ends when the directory holds nothing new, and the durable seen-store means
+    #: the next one returns only what arrived since. Asking again is how the stream keeps
+    #: flowing — never a replay. See `io.source.continues_across_passes`.
+    continues_across_passes = True
 
     __slots__ = (
         "_completed",
         "_completed_set",
         "_format",
         "_fs",
+        "_max_bytes",
         "_max_files",
         "_path",
         "_pending",
@@ -92,6 +104,7 @@ class IncrementalFileSource:
         state_dir: str,
         suffix: str | None = None,
         max_files_per_trigger: int | None = None,
+        max_bytes_per_trigger: int | None = None,
     ) -> None:
         self._path = path
         self._format = format
@@ -106,6 +119,18 @@ class IncrementalFileSource:
 
             raise PlanError(f"max_files_per_trigger must be >= 1, got {max_files_per_trigger}")
         self._max_files = max_files_per_trigger
+        # The same backpressure by *size* (Spark `maxBytesPerTrigger` / Auto Loader
+        # `cloudFiles.maxBytesPerTrigger`). A file count is a poor proxy for the memory a
+        # micro-batch will need: ten thousand 4 KiB JSON files and three 8 GiB Parquet files
+        # are both "a backlog", and only one of them fits. Capping both means a pass admits
+        # at most `max_files_per_trigger` files *and* at most `max_bytes_per_trigger` of
+        # them, whichever bound trips first. A single file over the budget is still admitted
+        # alone — refusing it would stall the stream permanently on one large arrival.
+        if max_bytes_per_trigger is not None and max_bytes_per_trigger < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(f"max_bytes_per_trigger must be >= 1, got {max_bytes_per_trigger}")
+        self._max_bytes = max_bytes_per_trigger
         self._fs = resolve_filesystem(path)
         self._schema_cache: pa.Schema | None = None
         # Files handed out by `discover()` whose epoch has not been published yet. They
@@ -178,8 +203,27 @@ class IncrementalFileSource:
             # `candidates` comes back sorted, so capping the head drains the backlog in a
             # stable, oldest-name-first order; the tail is left undiscovered for a later pass.
             new_files = new_files[: self._max_files]
+        if self._max_bytes is not None:
+            new_files = self._within_byte_budget(new_files)
         self._pending.extend(new_files)
         return new_files
+
+    def _within_byte_budget(self, files: list[str]) -> list[str]:
+        """The head of `files` whose total size fits `max_bytes_per_trigger`.
+
+        The first file is always admitted, even when it alone exceeds the budget: a stream
+        that refuses to make progress on a large arrival is stalled rather than throttled,
+        and the next pass would refuse it again forever.
+        """
+        admitted: list[str] = []
+        used = 0
+        for path in files:
+            size = _safe_size(self._fs, path)
+            if admitted and used + size > self._max_bytes:
+                break
+            admitted.append(path)
+            used += size
+        return admitted
 
     def complete(self, files: list[str]) -> None:
         """Mark `files` fully read — eligible to be confirmed once their epoch publishes.

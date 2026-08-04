@@ -41,10 +41,6 @@ if TYPE_CHECKING:
 
 __all__ = ["DistributedRunner"]
 
-#: How long to wait before re-listing an unbounded source that had nothing new. Only the
-#: *empty* path pays it: an epoch with data is staged immediately.
-_IDLE_POLL_SECONDS = 0.2
-
 #: How long a source's work units stay cached before they are enumerated again.
 #:
 #: `splits()` costs a round trip for most unbounded sources — a Kafka `list_topics`, a Kinesis
@@ -148,8 +144,12 @@ class DistributedRunner:
         """
         import time
 
+        from batcher.config import active_config
         from batcher.io.source import is_bounded
 
+        # One knob, both runners: an idle stream must wait the same amount on one machine
+        # and on a cluster, or the two disagree about how a quiet source behaves.
+        idle_poll_seconds = active_config().streaming.idle_poll_seconds
         while not self._spent:
             splits = self._splits()
             epoch = self._fan_out(batch_id, splits) if splits else _StagedEpoch()
@@ -160,7 +160,7 @@ class DistributedRunner:
                 return epoch
             if self._drain or self._should_stop() or is_bounded(self._source):
                 return None
-            time.sleep(_IDLE_POLL_SECONDS)
+            time.sleep(idle_poll_seconds)
         return None
 
     def _splits(self) -> list[Any]:
@@ -312,10 +312,12 @@ class DistributedRunner:
         result = self._fold.finalize()
         if result is None or not result.num_rows:
             return 0
-        from batcher.io.formats.streaming.sinks import DeltaStreamSink, FileStreamSink
+        from batcher.io.formats.streaming.sinks import FileStreamSink, TransactionalStreamSink
 
         sink: Any = (
-            DeltaStreamSink(self._path, query_name=self._query_name, **self._sink_kwargs)
+            TransactionalStreamSink(
+                self._path, self._fmt, query_name=self._query_name, **self._sink_kwargs
+            )
             if self._sink_writer == "transactional"
             else FileStreamSink(self._path, self._fmt, **self._sink_kwargs)
         )

@@ -401,3 +401,74 @@ def test_measuring_a_poll_does_not_copy_its_payloads():
     src._poll()
     # One copy, in `_decode`, which has to keep the bytes. None for the measurement.
     assert recs[0].value_calls == 1
+
+
+# --- startingOffsets / failOnDataLoss (Spark option parity) --------------------------
+
+
+def test_starting_offsets_earliest_and_latest_map_to_the_reset_policy():
+    from batcher.io.formats.streaming.kafka import _parse_starting_offsets
+
+    assert _parse_starting_offsets("earliest", "t") == ("earliest", {})
+    assert _parse_starting_offsets("latest", "t") == ("latest", {})
+    assert _parse_starting_offsets(None, "t") == ("earliest", {})
+
+
+def test_a_partition_map_becomes_explicit_seeks():
+    from batcher.io.formats.streaming.kafka import _parse_starting_offsets
+
+    assert _parse_starting_offsets({0: 10, 1: 20}, "t") == ("earliest", {0: 10, 1: 20})
+
+
+def test_sparks_nested_topic_form_is_unwrapped():
+    from batcher.io.formats.streaming.kafka import _parse_starting_offsets
+
+    assert _parse_starting_offsets({"t": {"0": 5}}, "t") == ("earliest", {0: 5})
+
+
+def test_a_json_string_is_accepted_because_spark_writes_one():
+    from batcher.io.formats.streaming.kafka import _parse_starting_offsets
+
+    assert _parse_starting_offsets('{"t": {"0": 7}}', "t") == ("earliest", {0: 7})
+
+
+def test_sparks_negative_sentinels_mean_earliest_and_latest():
+    from batcher.io.formats.streaming.kafka import _parse_starting_offsets
+
+    assert _parse_starting_offsets({0: -2}, "t") == ("earliest", {})
+    assert _parse_starting_offsets({0: -1}, "t") == ("latest", {})
+
+
+def test_an_unknown_starting_position_is_refused_with_a_suggestion():
+    from batcher._internal.errors import PlanError
+    from batcher.io.formats.streaming.kafka import _parse_starting_offsets
+
+    with pytest.raises(PlanError, match="unknown starting_offsets"):
+        _parse_starting_offsets("earlist", "t")
+
+
+def test_the_spark_options_never_reach_the_client_config():
+    src = KafkaSource("t", starting_offsets="latest", fail_on_data_loss=False)
+    assert "starting_offsets" not in src._options
+    assert "fail_on_data_loss" not in src._options
+    assert src._offset_reset == "latest"
+
+
+def test_an_offset_that_aged_out_of_the_log_fails_by_default():
+    """`failOnDataLoss=True` is Spark's default and the safe one: rows were skipped."""
+    src = KafkaSource("t")
+    with pytest.raises(BackendError, match="Kafka read failed"):
+        src._decode([_Rec(0, error=_Err(1))])  # OFFSET_OUT_OF_RANGE
+
+
+def test_data_loss_can_be_tolerated_explicitly_but_is_logged(caplog):
+    src = KafkaSource("t", fail_on_data_loss=False)
+    with caplog.at_level("WARNING"):
+        assert src._decode([_Rec(0, error=_Err(1))]) == []
+    assert any("no longer available" in r.getMessage() for r in caplog.records)
+
+
+def test_tolerating_data_loss_does_not_tolerate_any_other_error():
+    src = KafkaSource("t", fail_on_data_loss=False)
+    with pytest.raises(BackendError, match="Kafka read failed"):
+        src._decode([_Rec(0, error=_Err(-193, text="sasl handshake failed"))])

@@ -52,6 +52,79 @@ _PARTITION_EOF = -191
 #: librdkafka's "this consumer has no stored offset to commit" code (``KafkaError._NO_OFFSET``).
 _NO_OFFSET = -168
 
+#: The two errors that mean "the offset you asked for is gone from the log" — the broker's
+#: retention deleted it, or the partition was truncated. This is the *data loss* condition
+#: Spark's ``failOnDataLoss`` is about, and the only one it is about: every other error
+#: stays fatal whatever that option says.
+#: ``_AUTO_OFFSET_RESET`` (-140) is librdkafka's local report; ``OFFSET_OUT_OF_RANGE`` (1)
+#: is the broker's.
+_DATA_LOSS_CODES = (-140, 1)
+
+#: What ``starting_offsets`` accepts as a whole-topic position, and the
+#: ``auto.offset.reset`` value each maps to.
+_STARTING_POSITIONS = {"earliest": "earliest", "latest": "latest"}
+
+
+def _is_data_loss(err: Any) -> bool:
+    """Whether a record error means the requested offset is no longer in the log."""
+    try:
+        return err.code() in _DATA_LOSS_CODES
+    except Exception:  # pragma: no cover - a client without `code()`
+        return False
+
+
+def _parse_starting_offsets(value: Any, topic: str) -> tuple[str, dict[int, int]]:
+    """Split ``starting_offsets`` into an ``auto.offset.reset`` and per-partition seeks.
+
+    Spark's ``startingOffsets`` is one option carrying two different things: a whole-topic
+    position (``"earliest"`` / ``"latest"``) or an explicit per-partition map. Both are
+    accepted here, because a job ported from Spark passes whichever it already used and a
+    resume-from-a-recorded-position workflow needs the map.
+
+    The map may be Spark's nested ``{"topic": {"0": 123}}`` or the flat ``{0: 123}`` that
+    is more natural when there is only one topic. A partition offset of ``-2`` means
+    earliest and ``-1`` latest, as in Spark.
+
+    Args:
+        value: The option as given.
+        topic: The topic being read, used to unwrap the nested form.
+
+    Returns:
+        ``(auto_offset_reset, {partition: offset})``.
+
+    Raises:
+        PlanError: If the option is neither a recognized position nor a mapping.
+    """
+    from batcher._internal.errors import PlanError, suggestion
+
+    if value is None:
+        return "earliest", {}
+    if isinstance(value, str):
+        if value in _STARTING_POSITIONS:
+            return _STARTING_POSITIONS[value], {}
+        try:
+            import json
+
+            value = json.loads(value)
+        except ValueError:
+            hint = suggestion(value, tuple(_STARTING_POSITIONS))
+            raise PlanError(
+                f"unknown starting_offsets {value!r}; use 'earliest', 'latest', or a "
+                "{partition: offset} mapping." + (f" {hint}" if hint else "")
+            ) from None
+    if not isinstance(value, dict):
+        raise PlanError(
+            f"starting_offsets must be 'earliest', 'latest', or a mapping, not "
+            f"{type(value).__name__}"
+        )
+    inner = value.get(topic, value)
+    if not isinstance(inner, dict):
+        raise PlanError(f"starting_offsets for topic {topic!r} must be a mapping of partition")
+    seeks = {int(p): int(o) for p, o in inner.items()}
+    # Spark's sentinels, so a map copied out of a Spark job keeps meaning what it meant.
+    reset = "latest" if any(o == -1 for o in seeks.values()) else "earliest"
+    return reset, {p: o for p, o in seeks.items() if o >= 0}
+
 
 def _is_no_offset(exc: BaseException) -> bool:
     """Whether a commit failure is the benign "nothing stored to commit" condition."""
@@ -129,7 +202,15 @@ class KafkaSource(BrokerSource):
 
     format_name = "kafka"
 
-    __slots__ = ("_consumer", "_metadata_timeout", "_partitions", "_poll_timeout")
+    __slots__ = (
+        "_consumer",
+        "_fail_on_data_loss",
+        "_metadata_timeout",
+        "_offset_reset",
+        "_partitions",
+        "_poll_timeout",
+        "_start_at",
+    )
 
     def __init__(
         self,
@@ -142,6 +223,8 @@ class KafkaSource(BrokerSource):
         group: str = "batcher",
         poll_timeout: float = 1.0,
         metadata_timeout: float = 10.0,
+        starting_offsets: Any = None,
+        fail_on_data_loss: bool = True,
         **options: Any,
     ) -> None:
         super().__init__(
@@ -154,6 +237,11 @@ class KafkaSource(BrokerSource):
         )
         self._partitions = partitions
         self._consumer: Any = None
+        # Spark's `startingOffsets` and `failOnDataLoss`, kept out of `options` so they
+        # never reach the confluent-kafka config as bogus keys. See `_parse_starting_offsets`
+        # and `_is_data_loss`.
+        self._offset_reset, self._start_at = _parse_starting_offsets(starting_offsets, topic)
+        self._fail_on_data_loss = fail_on_data_loss
         # How long the *first* record of a poll is waited for. It bounds the micro-batch
         # loop's stop latency (a `stop()` is observed only between polls); the records that
         # follow are drained without blocking, so this is no longer a floor on batch latency.
@@ -175,7 +263,9 @@ class KafkaSource(BrokerSource):
             "bootstrap.servers": opts.pop("bootstrap_servers"),
             "group.id": opts.pop("group"),
             "enable.auto.commit": False,  # we commit per batch for exactly-once.
-            "auto.offset.reset": opts.pop("auto_offset_reset", "earliest"),
+            # `starting_offsets` is the Spark spelling and wins; `auto_offset_reset` stays
+            # for a caller reaching for the librdkafka name directly.
+            "auto.offset.reset": opts.pop("auto_offset_reset", self._offset_reset),
             **{k.replace("_", "."): v for k, v in opts.items()},
         }
         self._consumer = consumer_cls(config)
@@ -206,6 +296,11 @@ class KafkaSource(BrokerSource):
             token = self._resume_from.get(tp.partition)
             if token is not None:
                 tp.offset = int(token) + 1  # resume strictly *after* the last published row
+            elif tp.partition in self._start_at:
+                # A first run with an explicit `starting_offsets` map. Only when there is no
+                # checkpointed position: the checkpoint is the source of truth once a query
+                # has run, or a restart would rewind to the configured start every time.
+                tp.offset = self._start_at[tp.partition]
         consumer.assign(partitions)
 
     def _apply_seek(self, partition: int, token: Any) -> None:
@@ -309,6 +404,22 @@ class KafkaSource(BrokerSource):
             err = rec.error()
             if err is not None:
                 if _is_benign_record_error(err):
+                    continue
+                if _is_data_loss(err) and not self._fail_on_data_loss:
+                    # `fail_on_data_loss=False` is an explicit "I would rather keep running
+                    # than stop on a gap". It must still be *loud*: rows were skipped, and a
+                    # stream that logs nothing here is indistinguishable from one that lost
+                    # nothing at all.
+                    from batcher._internal.logging import get_logger
+
+                    get_logger("io").warning(
+                        "Kafka topic %r: requested offsets are no longer available (%s). "
+                        "fail_on_data_loss=False, so the consumer resets to %r and rows "
+                        "between the two positions are skipped.",
+                        self.topic,
+                        err,
+                        self._offset_reset,
+                    )
                     continue
                 raise BackendError(f"Kafka read failed on topic {self.topic!r}: {err}")
             messages.append(

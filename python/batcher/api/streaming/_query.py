@@ -203,8 +203,16 @@ class StreamingQuery:
         """A point-in-time snapshot of the query's state."""
         return self._engine.status()
 
+    @property
     def recent_progress(self) -> list[StreamingQueryProgress]:
-        """Per-micro-batch metrics for the most recent batches (rolling window)."""
+        """Per-micro-batch metrics for the most recent batches (rolling window).
+
+        A *property*, matching `status` and `last_progress` beside it and Spark's
+        `recentProgress`. It was the one accessor on this handle that had to be called,
+        so a ported `query.recentProgress` read back as a bound method — truthy, with a
+        `len()` that raises — rather than as the list of batches it names. The window is
+        bounded by `streaming.progress_history`.
+        """
         return self._engine.recent_progress()
 
     @property
@@ -274,6 +282,7 @@ class StreamingQuery:
         """Spark spelling of `last_progress` — the most recent micro-batch's metrics."""
         return self.last_progress
 
+    @property
     def recentProgress(self) -> list[StreamingQueryProgress]:
         """Spark spelling of `recent_progress` — metrics for the most recent batches."""
-        return self.recent_progress()
+        return self.recent_progress

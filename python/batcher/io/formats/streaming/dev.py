@@ -42,6 +42,10 @@ class RateSource:
     """
 
     bounded = False
+    #: Deliberately *not* `continues_across_passes`: `iter_batches` restarts at
+    #: `_start`, so a fresh generator replays the same values. The stream is expressed
+    #: as one never-ending generator instead (or a `num_rows` cap that ends it), which is
+    #: why re-opening it is never the right move. See `io.source.continues_across_passes`.
 
     def __init__(
         self,

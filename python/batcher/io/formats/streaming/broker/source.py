@@ -43,6 +43,9 @@ class BrokerSource(ABC):
     #: Partitions are independent, offset-addressable work units, so a micro-batch can be
     #: read partition-per-worker across the cluster (see `BrokerSplit.read_epoch`).
     partitionable = True
+    #: Per-partition offsets carry forward, so a fresh poll loop resumes where the last one
+    #: stopped rather than replaying the topic. See `io.source.continues_across_passes`.
+    continues_across_passes = True
 
     #: Payload bytes one poll may accumulate before it stops early, whatever `poll_size` says.
     #:
@@ -75,6 +78,8 @@ class BrokerSource(ABC):
         *,
         poll_size: int = 16_384,
         poll_bytes: int | None = None,
+        max_offsets_per_trigger: int | None = None,
+        max_bytes_per_trigger: int | None = None,
         **options: Any,
     ) -> None:
         """Create a broker source for ``topic`` polling ``poll_size`` per batch.
@@ -82,7 +87,31 @@ class BrokerSource(ABC):
         ``poll_bytes`` additionally bounds a poll by payload size (see `DEFAULT_POLL_BYTES`);
         ``options`` are passed through to the concrete client (broker addresses,
         credentials, consumer group, …); subclasses document what they accept.
+
+        ``max_offsets_per_trigger`` and ``max_bytes_per_trigger`` are the Spark spellings of
+        the same two bounds, accepted so a ported job's options carry over verbatim. One
+        poll *is* one micro-batch here, so they are exact synonyms rather than an
+        approximation — but a reader who knows the Spark names should not have to discover
+        that, and a job that passed `maxOffsetsPerTrigger` as an unknown option used to have
+        it forwarded silently into the client config, where librdkafka rejected it or, worse,
+        ignored it.
         """
+        if max_offsets_per_trigger is not None:
+            poll_size = max_offsets_per_trigger
+        if max_bytes_per_trigger is not None:
+            poll_bytes = max_bytes_per_trigger
+        if poll_size < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"broker poll_size / max_offsets_per_trigger must be >= 1, got {poll_size}"
+            )
+        if poll_bytes is not None and poll_bytes < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"broker poll_bytes / max_bytes_per_trigger must be >= 1, got {poll_bytes}"
+            )
         self.topic = topic
         self.poll_size = poll_size
         self.poll_bytes = self.DEFAULT_POLL_BYTES if poll_bytes is None else poll_bytes

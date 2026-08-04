@@ -66,11 +66,29 @@ class LocalRunner:
     processor and writes the result to the sink. The processor and sink are exactly the
     ones the conductor built, so this is the same code the engine ran before the seam
     existed; it is the reference the distributed runner has to agree with.
+
+    **An idle unbounded source is not a finished one.** `iter_batches` on a source that
+    discovers its work per pass — the incremental file source, whose pass ends when the
+    directory holds nothing new — returns a generator that *ends*, and this runner read
+    that as end-of-stream and stopped the query. An Auto Loader stream therefore ran its
+    first discovery pass, silently terminated, and never ingested another file: no error,
+    no log line, a `StreamingQuery` that simply reported `is_active == False` seconds
+    after it started. The distributed runner never had the bug, because it asks the
+    source for work each epoch instead of holding one iterator — so single-node and
+    distributed streaming disagreed about when a stream is over, which is precisely the
+    divergence the one-runner-protocol exists to prevent.
+
+    An exhausted pass now re-opens the source and waits `streaming.idle_poll_seconds`
+    before looking again, exactly as `dist.streaming.microbatch` does. Only a *drain*
+    trigger (`once` / `available_now`) reads an empty pass as the end — which is what
+    makes it a drain — along with a stop signal or a genuinely bounded source.
     """
 
     __slots__ = (
+        "_drain",
         "_iterator",
         "_last_token",
+        "_pass_yielded",
         "_predicate",
         "_processor",
         "_projection",
@@ -88,8 +106,12 @@ class LocalRunner:
         projection: list[str] | None = None,
         predicate: dict | None = None,
         should_stop: Callable[[], bool] | None = None,
+        drain: bool = False,
     ) -> None:
         self._source = source
+        # True under `Trigger.once()` / `Trigger.available_now()`: process what is
+        # available and stop, rather than waiting for more. See the class docstring.
+        self._drain = drain
         self._processor = processor
         self._sink = sink
         # Handed to a source that knows how to end its own poll loop. Without it, stopping a
@@ -106,10 +128,64 @@ class LocalRunner:
         self._projection = projection
         self._predicate = predicate
         self._iterator: Iterator[pa.RecordBatch] | None = None
+        # Whether the *current* pass has produced a batch. An exhausted pass that produced
+        # rows may have more waiting behind it; one that produced none is the idle (or,
+        # under a drain, the terminal) condition. See `stage`.
+        self._pass_yielded = False
         # What the sink said it wrote for the last published epoch. See `last_sink_token`.
         self._last_token: str | None = None
 
     def stage(self, batch_id: int) -> pa.RecordBatch | None:  # noqa: ARG002
+        """Pull this epoch's batch; None only when the stream is genuinely over.
+
+        An exhausted iterator is the end of a *pass*. Whether it is also the end of the
+        stream depends on the source:
+
+        * a bounded source has one pass, so its first exhaustion is the end;
+        * so does an unbounded source that does **not** declare
+          `continues_across_passes` — re-opening one of those replays its rows from the
+          beginning, which would write the whole stream to the sink again, forever;
+        * a source that continues (an incremental directory listing, a broker) is
+          re-opened. A drain trigger (`once` / `available_now`) then ends on the first
+          *empty* pass, which is why `available_now` still drains a whole backlog the
+          source hands over a few files at a time (`max_files_per_trigger`) instead of
+          stopping after the first. Anything else waits `streaming.idle_poll_seconds`
+          and looks again, so a directory-watching stream keeps ingesting for the life
+          of the query.
+
+        A pass that *did* produce rows is re-opened immediately with no wait, so a
+        backlog drains at full speed and only genuine idleness costs latency.
+        """
+        import time
+
+        from batcher.config import active_config
+        from batcher.io.source import continues_across_passes, is_bounded
+
+        nap = active_config().streaming.idle_poll_seconds
+        resumable = not is_bounded(self._source) and continues_across_passes(self._source)
+        while True:
+            batch = self._next_batch()
+            if batch is not None:
+                self._pass_yielded = True
+                return batch
+            # Exhausted: every batch the source yielded has already been published (each
+            # publish precedes the next stage), so the last file's rows are durable and
+            # its `confirm` — which would otherwise never come — is safe here.
+            _confirm(self._source)
+            if not resumable:
+                return None
+            # Drop the spent iterator so the next one re-runs the source's discovery.
+            productive, self._iterator, self._pass_yielded = self._pass_yielded, None, False
+            if productive:
+                continue  # more may already be waiting — look again without a wait
+            if self._drain:
+                return None
+            if self._should_stop is not None and self._should_stop():
+                return None
+            time.sleep(nap)
+
+    def _next_batch(self) -> pa.RecordBatch | None:
+        """One batch from the current pass, opening the source's iterator if needed."""
         if self._iterator is None:
             # Read *through* the pushdown, exactly as `_iter_streaming` does. This was
             # `iter_batches(None)`, which decoded every column regardless of the plan's
@@ -121,13 +197,7 @@ class LocalRunner:
             from batcher.io.source import iter_source
 
             self._iterator = iter_source(self._source, self._projection, self._predicate)
-        batch = next(self._iterator, None)
-        if batch is None:
-            # Exhausted: every batch the source yielded has already been published (each
-            # publish precedes the next stage), so the last file's rows are durable and
-            # its `confirm` — which would otherwise never come — is safe here.
-            _confirm(self._source)
-        return batch
+        return next(self._iterator, None)
 
     def positions(self) -> dict[int, dict]:
         from batcher.io.source import is_checkpointable

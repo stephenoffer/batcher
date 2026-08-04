@@ -1,8 +1,8 @@
 # Kafka
 
-`bt.read.kafka(topic)` consumes a Kafka topic as an unbounded `Dataset`. It is a read path
+{py:meth}`bt.read.kafka(topic) <batcher.api.io_namespace.reader.Reader.kafka>` consumes a Kafka topic as an unbounded {py:class}`Dataset <batcher.Dataset>`. It is a read path
 only. Batcher has no Kafka sink, so producing back to Kafka goes through
-`ds.write.for_each_batch` with your own producer, covered at the end of this page.
+{py:meth}`ds.write.for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>` with your own producer, covered at the end of this page.
 
 | | |
 | --- | --- |
@@ -17,7 +17,7 @@ only. Batcher has no Kafka sink, so producing back to Kafka goes through
 pip install 'batcher-engine[kafka]'
 ```
 
-That pulls `confluent-kafka`. Without it, construction raises a `BackendError` saying so.
+That pulls `confluent-kafka`. Without it, construction raises a {py:exc}`BackendError <batcher.BackendError>` saying so.
 
 ## The read
 
@@ -86,6 +86,51 @@ Avro and Protobuf payloads have no built-in decoder, and there is no Schema Regi
 Reach for `map_batches` and decode the whole Arrow `value` column at once, per batch, never
 per row.
 
+## Where a query starts, and what happens when offsets age out
+
+`starting_offsets` is Spark's `startingOffsets`: `"earliest"` (the default), `"latest"`, or
+an explicit `{partition: offset}` map. Spark's nested `{"topic": {"0": 123}}` form and its
+`-2`/`-1` sentinels are accepted too, so a map copied out of a Spark job keeps meaning what
+it meant.
+
+```python
+# docs: skip
+bt.read.kafka("clicks", bootstrap_servers="broker-1:9092", starting_offsets="latest")
+bt.read.kafka("clicks", bootstrap_servers="broker-1:9092", starting_offsets={0: 4096})
+```
+
+It applies only to a **first** run. Once a query has a checkpoint, the recorded position
+always wins, or every restart would rewind to the configured start and reprocess.
+
+`fail_on_data_loss` is Spark's `failOnDataLoss` and defaults to `True`: if the offsets the
+query wants have aged out of the log, the read fails rather than skipping to whatever is
+left. Set it `False` to keep running through the gap. The skip is logged at warning level,
+because a stream that says nothing here cannot be told apart from one that lost nothing.
+
+:::{warning}
+`fail_on_data_loss=False` is a decision to accept missing rows. Reach for it when the
+alternative is a dead pipeline, not to quiet a recurring alert: a query that keeps hitting
+it is falling behind retention, and the fix is more throughput or a longer retention.
+:::
+
+## Rate-limiting a micro-batch
+
+A backlogged topic hands over as much as one poll allows, and the two bounds that matter
+ask different questions. `max_offsets_per_trigger` caps the message count;
+`max_bytes_per_trigger` caps the payload size, which is the one that decides whether a
+micro-batch fits in memory when a message can be a megabyte. Both are Spark's spellings and
+both compose:
+
+```python
+# docs: skip
+bt.read.kafka(
+    "clicks",
+    bootstrap_servers="broker-1:9092",
+    max_offsets_per_trigger=50_000,
+    max_bytes_per_trigger=64 << 20,
+)
+```
+
 ## Consumer groups, and what happens on restart
 
 Read this part before you deploy.
@@ -120,7 +165,7 @@ replay the week. Pass `auto_offset_reset="latest"` if that is not what you meant
 
 ## How it parallelizes
 
-A `Source` divides into `Split`s, and a split is the unit of read parallelism. Kafka's split
+A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>`s, and a split is the unit of read parallelism. Kafka's split
 is the topic-partition. `splits()` asks the broker for the topic's partition list and returns
 one split per partition, each of which rebuilds a consumer on its worker with an explicit
 assignment for that one partition.
@@ -164,8 +209,7 @@ secure = bt.read.kafka(
 
 ## Writing
 
-The stream is a `Dataset`, so it goes to any sink. There is no Kafka sink, so publishing back
-to a topic is a `for_each_batch` over a producer you own.
+The stream is a `Dataset`, so it goes to any sink, including back to Kafka.
 
 ::::{tab-set}
 
@@ -196,32 +240,43 @@ replayed batch a no-op instead of a duplicate.
 
 :::{tab-item} Back to Kafka
 
-If a pipeline has to publish results, hand each micro-batch to a producer you own:
+`write.kafka` publishes one message per row. The column contract is Spark's: `value` is
+required, `key`, `topic`, `partition`, and `headers` are optional, and both binary and
+string are accepted for the payload columns.
 
 ```python
 # docs: skip
-from confluent_kafka import Producer
-
-producer = Producer({"bootstrap.servers": "broker-1:9092"})
-
-def publish(table, batch_id):
-    for payload in table.column("value").to_pylist():
-        producer.produce("enriched", value=payload)
-    producer.flush()
-
-enriched.write.for_each_batch(publish, trigger=bt.Trigger.processing_time("5 seconds"))
+q = enriched.select(
+    key=col("user_id").cast("string"),
+    value=col("payload"),
+).write.kafka(
+    "enriched",
+    bootstrap_servers="broker-1:9092",
+    trigger=bt.Trigger.processing_time("5 seconds"),
+    compression_type="zstd",
+)
 ```
 
-`for_each_batch` gets the whole Arrow table, so the per-message loop is at the edge, in your
-producer call, not in the engine.
+Any further option is passed to `confluent-kafka` with underscores turned into dots, so
+`compression_type="zstd"` sets `compression.type`.
+
+Each micro-batch is flushed and acknowledged before the sink reports it written, so a
+broker rejection fails the query instead of silently dropping records. Delivery is
+**at-least-once**: a replayed micro-batch republishes its rows, so the consumer must be
+idempotent or dedup on the key. Kafka's transactional produce is the only way to do better,
+and it requires the consumer to read committed-only; Spark's Kafka sink makes the same
+tradeoff.
+
+A pipeline that needs to publish through a producer it configures itself can still use
+{py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>`, which gets the whole Arrow table so the per-message loop stays at the edge.
 :::
 
 ::::
 
 :::{note}
-`collect()` on a Kafka dataset raises `PlanError`. The source is unbounded; there is nothing
-to materialize. Use `iter_batches()`, a write with a trigger, or bound it with
-`Trigger.available_now()`.
+{py:meth}`collect() <batcher.Dataset.collect>` on a Kafka dataset raises {py:exc}`PlanError <batcher.PlanError>`. The source is unbounded; there is nothing
+to materialize. Use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a write with a trigger, or bound it with
+{py:meth}`Trigger.available_now() <batcher.Trigger.available_now>`.
 :::
 
 ## See also

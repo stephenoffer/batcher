@@ -58,7 +58,7 @@ def test_status_and_progress_while_running():
     status = q.status
     assert status.is_active is True
     assert status.batches_processed >= 1
-    progress = q.recent_progress()
+    progress = q.recent_progress
     assert progress and progress[-1].num_input_rows == 1
     q.stop()
 

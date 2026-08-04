@@ -103,7 +103,7 @@ def test_trigger_once_processes_one_microbatch():
     q = _stream().write.memory("m_once", trigger=bt.Trigger.once())
     q.await_termination()
     assert bt.read_memory("m_once").count() == 2  # only the first micro-batch
-    assert q.recent_progress()[-1].batch_id == 0
+    assert q.recent_progress[-1].batch_id == 0
 
 
 @pytest.mark.integration

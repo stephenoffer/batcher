@@ -100,7 +100,10 @@ def test_a_query_that_keeps_up_reports_zero():
         def process(self, batch):
             return [batch]
 
-    progress = _run(Trigger.processing_time("30 seconds"), _Fast())
+    # A cadence far longer than an instant processor needs, but short enough that the
+    # loop's post-batch sleep does not outlast `await_termination`. At 30 seconds the
+    # two were the same number and the test failed roughly half the time.
+    progress = _run(Trigger.processing_time("1 second"), _Fast())
     assert progress and all(p.behind_by_ms == 0.0 for p in progress)
 
 
@@ -118,12 +121,12 @@ def test_the_field_defaults_so_an_old_construction_still_works():
 
 
 def test_the_signal_is_reachable_the_way_a_user_gets_it():
-    """Users never construct a progress record — they read one off `recent_progress()`."""
+    """Users never construct a progress record — they read one off `recent_progress`."""
 
     class _Fast:
         def process(self, batch):
             return [batch]
 
-    progress = _run(Trigger.processing_time("30 seconds"), _Fast())
+    progress = _run(Trigger.processing_time("1 second"), _Fast())
     assert hasattr(progress[0], "behind_by_ms")
     assert hasattr(progress[0], "is_behind")

@@ -46,8 +46,21 @@ from batcher.api.session import *  # noqa: F403  (governed by session.__all__)
 from batcher.api.sql_session import Session
 from batcher.core.runtime import cancel_query, running_queries
 from batcher.governance import GovernanceEvent, Principal, SecurityCatalog
+from batcher.io.formats.streaming import ForeachWriter
 from batcher.observe import start_ui, stop_ui, ui_url
-from batcher.plan.streaming import OutputMode, Trigger
+from batcher.plan.streaming import (
+    OutputMode,
+    QueryProgressEvent,
+    QueryStartedEvent,
+    QueryTerminatedEvent,
+    SinkProgress,
+    SourceProgress,
+    StateOperatorProgress,
+    StreamingQueryListener,
+    StreamingQueryProgress,
+    StreamingQueryStatus,
+    Trigger,
+)
 
 # `bt.read` is the accessor namespace (`bt.read.csv(...)`), which is also callable as
 # `bt.read(path)`. It shadows the plain `read` function `session` exports; the two have
@@ -80,7 +93,17 @@ __all__ = [
     "Dataset",
     "GovernanceEvent",
     "GroupBy",
+    "ForeachWriter",
     "OutputMode",
+    "QueryProgressEvent",
+    "QueryStartedEvent",
+    "QueryTerminatedEvent",
+    "SinkProgress",
+    "SourceProgress",
+    "StateOperatorProgress",
+    "StreamingQueryListener",
+    "StreamingQueryProgress",
+    "StreamingQueryStatus",
     "Principal",
     "SecurityCatalog",
     "Session",

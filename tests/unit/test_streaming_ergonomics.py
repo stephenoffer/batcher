@@ -13,13 +13,13 @@ import pytest
 
 from batcher._internal.errors import PlanError
 from batcher.api.streaming import StreamingQuery
-from batcher.plan.streaming import parse_interval_seconds
-from batcher.plan.streaming.spec import (
+from batcher.plan.streaming import (
     OutputMode,
     StreamingQueryProgress,
     StreamingQueryStatus,
     Trigger,
     Watermark,
+    parse_interval_seconds,
 )
 
 pytestmark = pytest.mark.unit
@@ -238,7 +238,7 @@ def test_query_core_accessors():
     assert q.id == "q-test"
     assert q.is_active is True
     assert q.last_progress.batch_id == 1
-    assert len(q.recent_progress()) == 2
+    assert len(q.recent_progress) == 2
     assert q.status.batches_processed == 2
 
 
@@ -246,7 +246,7 @@ def test_query_spark_aliases_delegate():
     q = _query(active=False)
     assert q.isActive is False
     assert q.lastProgress.batch_id == 1
-    assert len(q.recentProgress()) == 2
+    assert len(q.recentProgress) == 2
     assert q.awaitTermination(0.0) is True
     assert q.processAllAvailable() is True
 

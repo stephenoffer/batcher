@@ -8,7 +8,6 @@ that forward their state (`self._plan`, `self._sources`, `self.columns`) here.
 from __future__ import annotations
 
 import time
-import uuid
 from typing import Any
 
 import pyarrow as pa
@@ -550,7 +549,7 @@ def _write(
     default to `False`, so on a cluster every write — the one terminal whose output size
     is the whole result — ran the read, the transform, and the write on the driver alone.
     """
-    from batcher.io.sink import SINKS
+    from batcher.io.sink import SINKS, table_sink_kwargs
     from batcher.plan.logical import is_streamable
 
     distributed = _resolve_distributed(distributed, plan, sources)
@@ -571,14 +570,14 @@ def _write(
     sink_kwargs = dict(sink_kwargs or {})
     if fmt == "delta" and partition_by is not None:
         sink_kwargs.setdefault("partition_by", partition_by)
-    if fmt == "iceberg":
-        # For Iceberg the write `path` IS the table identifier (the sink needs it at
-        # construction for staging + commit, on the driver and every worker).
-        sink_kwargs.setdefault("identifier", path)
-        # One write token shared by every worker's sink so all shards of this write name
-        # their staged files under the same token (and a later write uses a different one,
-        # so `add_files` never lets it clobber a file a prior snapshot still references).
-        sink_kwargs.setdefault("write_token", uuid.uuid4().hex[:12])
+    # A table format may need its destination at construction rather than per call — for
+    # Iceberg the write `path` IS the table identifier, and one write token is shared by
+    # every worker's sink so all shards of this write name their staged files under the
+    # same token (a later write uses a different one, so `add_files` never lets it clobber
+    # a file a prior snapshot still references). Shared with the streaming table sink,
+    # which needs the identical treatment.
+    for key, value in table_sink_kwargs(fmt, path).items():
+        sink_kwargs.setdefault(key, value)
     # `sink` lets a caller supply the writer instead of taking the registry's default. The
     # copy-on-write MERGE needs it: its output files land *beside* files it deliberately did
     # not read, so they must carry a unique token (`TokenizedParquetSink`) rather than the

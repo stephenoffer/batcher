@@ -489,3 +489,76 @@ def build_unpivot(
     idx = list(index) if index is not None else [c for c in cols if c not in set(on or ())]
     vals = list(on) if on is not None else [c for c in cols if c not in set(idx)]
     return ds._derive(Unpivot(ds._plan, tuple(idx), tuple(vals), variable_name, value_name))
+
+
+def _bounded_interval_join(
+    left: Dataset,
+    right: Dataset,
+    left_keys: list[str],
+    right_keys: list[str],
+    left_time: str,
+    right_time: str,
+    within_us: int,
+    how: str,
+) -> Dataset:
+    """`join_stream` over two *bounded* inputs — the same answer, with no watermark.
+
+    The interval is part of the join *condition*, not a filter above it. That distinction
+    is invisible for an inner join and decides the answer for an outer one: a left row
+    whose key matches but whose event time is outside the interval has not matched, so a
+    left outer join must emit it null-padded. Filtering above the join deleted it instead,
+    while the streaming driver — which never counts such a pair as a match — emitted it.
+    The same query over bounded and unbounded inputs returned two different answers.
+
+    Expressed with the relational surface rather than a non-equi join: the matched pairs
+    are an inner join plus the interval filter, and each preserved side's unmatched rows
+    are what an anti-join against those pairs leaves behind. A synthetic row index gives
+    the anti-join a row identity, so duplicates on either side are handled exactly. The
+    unmatched rows are then joined against an *empty* copy of the opposite side, which is
+    what types their null columns — cheaper to reason about than constructing typed null
+    literals, and it cannot drift from the matched rows' column order.
+
+    Args:
+        left: The left input.
+        right: The right input.
+        left_keys: The left equality keys.
+        right_keys: The right equality keys.
+        left_time: The left event-time column.
+        right_time: The right event-time column.
+        within_us: The interval half-width, in microseconds.
+        how: ``"inner"``, ``"left"``, ``"right"``, or ``"full"``.
+
+    Returns:
+        A `Dataset` of the interval-joined rows in the join's output shape.
+    """
+    diff = Col(left_time).cast("int64") - Col(right_time).cast("int64")
+    matched = (diff <= within_us) & (diff >= -within_us)
+    if how == "inner":
+        return left.join(right, left_on=left_keys, right_on=right_keys, how="inner").filter(matched)
+
+    lid, rid = "__ij_left_id", "__ij_right_id"
+    tagged_left = left.with_row_index(lid)
+    tagged_right = right.with_row_index(rid)
+    pairs = tagged_left.join(
+        tagged_right, left_on=left_keys, right_on=right_keys, how="inner"
+    ).filter(matched)
+
+    parts = [pairs]
+    if how in ("left", "full"):
+        unmatched = tagged_left.join(pairs.select(lid), on=[lid], how="anti")
+        parts.append(
+            unmatched.join(
+                tagged_right.limit(0), left_on=left_keys, right_on=right_keys, how="left"
+            )
+        )
+    if how in ("right", "full"):
+        unmatched = tagged_right.join(pairs.select(rid), on=[rid], how="anti")
+        parts.append(
+            tagged_left.limit(0).join(
+                unmatched, left_on=left_keys, right_on=right_keys, how="right"
+            )
+        )
+    combined = parts[0]
+    for part in parts[1:]:
+        combined = combined.union(part)
+    return combined.select(*[c for c in pairs.columns if c not in (lid, rid)])

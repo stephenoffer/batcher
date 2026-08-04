@@ -17,6 +17,7 @@ from batcher.io.source.inmemory import InMemorySource
 from batcher.io.source.iterator import IteratorSource
 from batcher.io.source.materialized import MaterializedSource
 from batcher.io.source.read import (
+    continues_across_passes,
     is_bounded,
     iter_source,
     plan_splits,
@@ -36,6 +37,7 @@ __all__ = [
     "ParquetSource",
     "Source",
     "Split",
+    "continues_across_passes",
     "is_bounded",
     "is_checkpointable",
     "iter_source",

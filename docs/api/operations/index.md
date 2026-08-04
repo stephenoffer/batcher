@@ -5,6 +5,7 @@ The knobs, the guardrails, and what raises when something breaks.
 | Page | Covers |
 |---|---|
 | {doc}`/api/operations/configuration` | The tunables, and how they are set |
+| {doc}`/api/operations/streaming` | Triggers, output modes, query progress, and listeners |
 | {doc}`/api/operations/governance` | Row filters, column masks, grants, and lineage |
 | {doc}`/api/operations/exceptions` | The typed exceptions, and what raises them |
 
@@ -12,6 +13,7 @@ The knobs, the guardrails, and what raises when something breaks.
 :hidden:
 
 configuration
+streaming
 governance
 exceptions
 ```

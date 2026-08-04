@@ -40,6 +40,12 @@ Delta, Iceberg, and Hudi tables.
 :link-type: doc
 Windows, watermarks, exactly-once.
 :::
+
+:::{grid-item-card} {octicon}`pulse;1.1em` Monitoring a stream
+:link: /user-guide/moving-data/streaming-monitoring
+:link-type: doc
+Progress, state, late rows, listeners.
+:::
 ::::
 
 ```{toctree}
@@ -51,4 +57,5 @@ custom-connectors
 cloud-storage
 lakehouse
 streaming
+streaming-monitoring
 ```

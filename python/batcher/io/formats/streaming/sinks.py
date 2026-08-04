@@ -8,10 +8,10 @@ here.
 Where a batch sink writes durable files it **reuses the existing batch machinery**
 — `FileStreamSink` wraps any `SINKS` file format and writes one atomic
 ``part-batch<NNNNN>`` file per micro-batch (exactly-once by position, the same
-property `resume=` relies on), and `DeltaStreamSink` reuses the transactional Delta
-append. Only the genuinely-new targets (console, memory, foreach-batch, foreach)
-are implemented here from scratch. The `write_batch` return value is an opaque
-*sink token* the checkpoint commit-log records (Workstream D).
+property `resume=` relies on), and `TransactionalStreamSink` reuses the destination
+table format's own transactional append. Only the genuinely-new targets (console,
+memory, foreach-batch, foreach) are implemented here from scratch. The `write_batch`
+return value is an opaque *sink token* the checkpoint commit-log records.
 """
 
 from __future__ import annotations
@@ -30,8 +30,10 @@ __all__ = [
     "FileStreamSink",
     "ForeachBatchStreamSink",
     "ForeachStreamSink",
+    "ForeachWriter",
     "MemoryStreamSink",
     "StreamSink",
+    "TransactionalStreamSink",
     "memory_table",
 ]
 
@@ -56,23 +58,55 @@ class StreamSink(Protocol):
 STREAM_SINKS: Registry[type] = Registry("stream_sink")
 
 
+#: Characters a truncated console cell keeps, matching Spark's ``truncate=True`` default.
+_TRUNCATE_WIDTH = 20
+
+
 @STREAM_SINKS.register("console")
 class ConsoleStreamSink:
-    """Print each micro-batch to stdout (the `console` sink — for development)."""
+    """Print each micro-batch to stdout (the `console` sink — for development).
 
-    def __init__(self, *, num_rows: int = 20, **_: Any) -> None:
+    `num_rows` and `truncate` are Spark's two console options. Truncation is on by
+    default there and was absent here, which is the difference between a readable
+    development stream and a terminal filled by one column of JSON blobs — the exact
+    shape a Kafka stream carries. Only *display* is truncated; nothing downstream sees it.
+    """
+
+    def __init__(self, *, num_rows: int = 20, truncate: bool | int = True, **_: Any) -> None:
         self._num_rows = num_rows
+        # Spark accepts `truncate=True` (20 chars) or an explicit width; both are useful,
+        # and an int is what a reader reaches for the moment 20 turns out to be too narrow.
+        self._truncate = _TRUNCATE_WIDTH if truncate is True else (truncate or 0)
 
     def open(self) -> None:
         pass
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
         print(f"-------- Batch: {batch_id} --------")
-        print(table.slice(0, self._num_rows))
+        shown = table.slice(0, self._num_rows)
+        print(_truncate_strings(shown, self._truncate) if self._truncate else shown)
         return None
 
     def close(self) -> None:
         pass
+
+
+def _truncate_strings(table: pa.Table, width: int) -> pa.Table:
+    """Shorten every string column to `width` characters, for display only.
+
+    Vectorized per column rather than per cell: this is a development sink, but it runs on
+    every micro-batch of a stream someone left running, and a per-row Python loop over a
+    wide table is the kind of cost that turns "print the output" into the slowest operator
+    in the query.
+    """
+    import pyarrow.compute as pc
+
+    columns = []
+    for column in table.columns:
+        if pa.types.is_string(column.type) or pa.types.is_large_string(column.type):
+            column = pc.utf8_slice_codeunits(column, 0, width)
+        columns.append(column)
+    return pa.Table.from_arrays(columns, schema=table.schema)
 
 
 # Process-global store for in-memory sinks, read back by `bt.read_memory(name)`.
@@ -240,23 +274,139 @@ class ForeachStreamSink:
     fits comfortably in Arrow can be an order of magnitude larger as Python objects, and the
     peak lands on top of the Arrow table it was built from. Per-record-batch conversion caps
     that transient at one morsel and lets each chunk's dicts be collected as it goes.
+
+    **A `ForeachWriter` object works too**, which is how Spark's `foreach` is usually
+    written for a real destination: `open(partition_id, epoch_id)` acquires the connection
+    and returns whether to proceed, `process(row)` writes one row, and `close(error)`
+    releases it — including when the epoch failed, which is the whole reason the shape
+    exists. A plain function has nowhere to put a connection, so every call either reopens
+    one or leans on a module-level global.
     """
 
-    def __init__(self, fn: Callable[[dict[str, Any]], Any], **_: Any) -> None:
-        self._fn = fn
+    def __init__(self, fn: Callable[[dict[str, Any]], Any] | Any, **_: Any) -> None:
+        # A writer object is duck-typed on `process`, so any of the three Spark shapes
+        # works: a bare function, a class instance with `process`, or one with all three.
+        self._writer = fn if hasattr(fn, "process") else None
+        self._fn = fn if self._writer is None else fn.process
 
     def open(self) -> None:
         pass
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
-        fn = self._fn
+        if self._writer is None:
+            self._consume(self._fn, table)
+            return f"foreach:{batch_id}"
+        return self._write_through_writer(batch_id, table)
+
+    def _write_through_writer(self, batch_id: int, table: pa.Table) -> str | None:
+        """Run one epoch through a `ForeachWriter`'s open / process / close lifecycle.
+
+        `close` runs in a `finally` and receives the failure, so a destination connection
+        is released whether the epoch succeeded or not — the property a bare function
+        cannot offer, and the reason Spark's own docs steer real sinks to this shape.
+        Partition id is 0: a single-node micro-batch is one partition, and inventing a
+        number would make a user's per-partition bookkeeping quietly wrong.
+        """
+        opener = getattr(self._writer, "open", None)
+        if opener is not None and opener(0, batch_id) is False:
+            return f"foreach:{batch_id}:skipped"
+        error: BaseException | None = None
+        try:
+            self._consume(self._fn, table)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            closer = getattr(self._writer, "close", None)
+            if closer is not None:
+                closer(error)
+        return f"foreach:{batch_id}"
+
+    @staticmethod
+    def _consume(fn: Callable[[dict[str, Any]], Any], table: pa.Table) -> None:
+        """Hand every row to `fn`, one record batch's worth of dicts at a time."""
         for record_batch in table.to_batches():
             for row in record_batch.to_pylist():
                 fn(row)
-        return f"foreach:{batch_id}"
 
     def close(self) -> None:
         pass
+
+
+class ForeachWriter:
+    """The open / process / close shape `write.for_each` accepts (Spark `ForeachWriter`).
+
+    Subclass it for a destination that needs a connection: `open` acquires one and returns
+    whether to proceed with the epoch, `process` writes a row, `close` releases it — with
+    the exception when the epoch failed, so cleanup is not conditional on success.
+
+    Nothing requires the base class; the sink duck-types on `process`. It exists so the
+    contract is written down once and so `isinstance` works for a caller that wants it.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> class ToApi(bt.ForeachWriter):
+            ...     def open(self, partition_id, epoch_id):
+            ...         self.sent = []
+            ...         return True
+            ...     def process(self, row):
+            ...         self.sent.append(row)
+            ...     def close(self, error):
+            ...         pass
+            >>> writer = ToApi()
+            >>> stream = bt.read.kafka("events")  # doctest: +SKIP
+            >>> query = stream.write.for_each(writer)  # doctest: +SKIP
+    """
+
+    def open(self, partition_id: int, epoch_id: int) -> bool:  # noqa: ARG002 - override point
+        """Acquire whatever this epoch needs; return False to skip it entirely.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.ForeachWriter().open(0, 3)
+                True
+
+        Args:
+            partition_id: The partition being written. ``0`` on the single-node path,
+                where one micro-batch is one partition.
+            epoch_id: The micro-batch id, stable across a replay of the same epoch.
+
+        Returns:
+            True to process the epoch, False to skip it.
+        """
+        return True
+
+    def process(self, row: dict[str, Any]) -> None:
+        """Write one row to the destination.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.ForeachWriter().process({"x": 1}) is None
+                True
+
+        Args:
+            row: One output row, as a dict of column name to value.
+        """
+
+    def close(self, error: BaseException | None) -> None:
+        """Release the epoch's resources, whether or not it succeeded.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.ForeachWriter().close(None) is None
+                True
+
+        Args:
+            error: The exception that ended the epoch, or None when it completed.
+        """
 
 
 class FileStreamSink:
@@ -288,66 +438,120 @@ class FileStreamSink:
         pass
 
 
-class DeltaStreamSink:
-    """Append each micro-batch to a Delta table as exactly one idempotent transaction.
+class TransactionalStreamSink:
+    """Append each micro-batch to a *table* format as one transaction.
 
-    Two properties the log must have, and how they are obtained:
+    Two properties the log should have, and how they are obtained:
 
-    **Exactly one transaction per micro-batch.** Each batch gets a fresh `delta` sink
-    that writes its data file and commits it, so the version history is a one-to-one
-    record of the micro-batches — never one commit per worker, and never a commit per
-    file.
+    **Exactly one transaction per micro-batch.** Each batch gets a fresh sink for the
+    destination format that writes its data file and commits it, so the version history
+    is a one-to-one record of the micro-batches — never one commit per worker, and never
+    a commit per file.
 
-    **Exactly-once under replay.** The engine records a micro-batch's source offset
-    *before* processing it, so a crash between processing and committing leaves a batch
-    the next run replays. A plain append would then write those rows a second time.
-    Instead every commit carries a Delta ``txn`` action — ``(app_id, batch_id)`` — and
-    the sink checks the log for it first: a replayed batch finds its own transaction
-    already recorded, writes nothing, and commits nothing. That check is what turns the
-    engine's at-least-once replay into end-to-end exactly-once, and it is why the log
-    ends up with exactly one transaction per micro-batch no matter how often one was
-    retried.
+    **Exactly-once under replay, where the format can do it.** The engine records a
+    micro-batch's source offset *before* processing it, so a crash between processing and
+    committing leaves a batch the next run replays. A plain append would then write those
+    rows a second time. A format with an application-transaction log — Delta, via its
+    ``txn`` action carrying ``(app_id, batch_id)`` — is asked first whether it has already
+    recorded this batch: a replayed one finds its own transaction, writes nothing, and
+    commits nothing. That check is what turns the engine's at-least-once replay into
+    end-to-end exactly-once.
 
     `app_id` must be *stable across restarts* or the idempotency check would never find
     the previous run's transactions. It is the query name when one was given, and
     otherwise derived from the destination table — stable either way.
+
+    **A format without that log gets an ordinary append, and says so.** Iceberg and Hudi
+    have no ``(app_id, batch_id)`` marker here, so a replayed epoch appends its rows
+    again. That is at-least-once, and the sink warns once at `open()` rather than letting
+    a reader assume the exactly-once story above applies to every table format. What it
+    must never do is what this class replaced: `DeltaStreamSink` hard-coded
+    ``SINKS.get("delta")`` while the conductor routed *every* mode-aware format to it, so
+    ``write(path, format="iceberg", trigger=...)`` silently produced a Delta table — right
+    rows, right path, wrong format, no error anywhere.
     """
 
-    def __init__(self, uri: str, *, query_name: str | None = None, **opts: Any) -> None:
+    def __init__(
+        self, uri: str, fmt: str = "delta", *, query_name: str | None = None, **opts: Any
+    ) -> None:
         self._uri = uri
+        self._fmt = fmt
         self._app_id = query_name or f"batcher-stream:{uri.rstrip('/')}"
         opts.setdefault("mode", "append")
         self._opts = opts
 
+    def _idempotent(self) -> bool:
+        """Whether this format can recognize a replayed micro-batch by its transaction id."""
+        from batcher.io.formats import SINKS
+
+        return hasattr(SINKS.get(self._fmt), "is_committed")
+
+    def _new_sink(self, batch_id: int) -> Any:
+        """A fresh sink for one micro-batch, carrying its transaction id where supported."""
+        from batcher.io.formats import SINKS
+        from batcher.io.sink import table_sink_kwargs
+
+        cls = SINKS.get(self._fmt)
+        # A table format may need its destination at *construction* — Iceberg's identifier
+        # and per-write token. The batch write path knew that; this one did not, and failed
+        # on the first micro-batch with a TypeError out of the constructor.
+        extra = table_sink_kwargs(self._fmt, self._uri)
+        if self._idempotent():
+            return cls(app_id=self._app_id, txn_version=batch_id, **extra, **self._opts)
+        return cls(**extra, **self._opts)
+
     def open(self) -> None:
-        pass
+        """Warn once when the destination format cannot absorb a replayed micro-batch."""
+        if self._idempotent():
+            return
+        import warnings
+
+        warnings.warn(
+            f"the {self._fmt!r} streaming sink has no per-batch transaction marker, so a "
+            "micro-batch replayed after a failure appends its rows a second time "
+            "(at-least-once). Use format='delta' for exactly-once, or dedup downstream.",
+            stacklevel=2,
+        )
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
         from batcher._internal.errors import CommitError
-        from batcher.io.formats import SINKS
         from batcher.io.manifest import WriteManifest
 
-        sink = SINKS.get("delta")(app_id=self._app_id, txn_version=batch_id, **self._opts)
+        sink = self._new_sink(batch_id)
+        idempotent = self._idempotent()
         # Check *before* writing: a replayed batch must not even leave an orphan data
         # file behind, let alone commit one.
-        if sink.is_committed(self._uri):
-            return f"delta:{batch_id}:already-committed"
+        if idempotent and sink.is_committed(self._uri):
+            return f"{self._fmt}:{batch_id}:already-committed"
         written = sink.write(table, self._uri)
         try:
             sink.commit(WriteManifest((written,), schema=table.schema), self._uri)
         except CommitError:
             # The pre-check is not atomic with the commit. A second writer sharing this
             # `app_id` — a concurrent driver, or this query racing its own restart —
-            # can pass the same check, and the Delta log's optimistic concurrency
-            # rejects the loser's transaction at commit time. Re-read the log: if this
+            # can pass the same check, and the log's optimistic concurrency rejects the
+            # loser's transaction at commit time. Re-read the log: if this
             # `(app_id, batch_id)` transaction is now recorded, the batch is durably
             # committed and the conflict is benign (the loser's data file is an
             # uncommitted orphan the log ignores and vacuum reclaims). Re-raise only
-            # when the transaction still is not there — a genuine commit failure.
-            if not sink.is_committed(self._uri):
+            # when the transaction still is not there — a genuine commit failure, and
+            # always for a format that cannot answer the question.
+            if not idempotent or not sink.is_committed(self._uri):
                 raise
-            return f"delta:{batch_id}:already-committed"
-        return f"delta:{batch_id}:{written.rows}"
+            return f"{self._fmt}:{batch_id}:already-committed"
+        return f"{self._fmt}:{batch_id}:{written.rows}"
 
     def close(self) -> None:
         pass
+
+
+class DeltaStreamSink(TransactionalStreamSink):
+    """`TransactionalStreamSink` pinned to Delta — the exactly-once streaming table sink.
+
+    Kept as its own name because Delta is the one format that carries the
+    ``(app_id, batch_id)`` transaction the engine's replay story depends on, and because
+    callers that mean Delta specifically should say so.
+    """
+
+    def __init__(self, uri: str, *, query_name: str | None = None, **opts: Any) -> None:
+        super().__init__(uri, "delta", query_name=query_name, **opts)

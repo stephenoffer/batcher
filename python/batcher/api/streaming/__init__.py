@@ -18,9 +18,6 @@ when that terminal runs in streaming mode (a `Trigger` was set, or a source is u
 from __future__ import annotations
 
 from batcher.api.streaming._distributed import (
-    _DRAIN_TRIGGER_KINDS as _DRAIN_TRIGGER_KINDS,
-)
-from batcher.api.streaming._distributed import (
     start_distributed_stream,
     start_distributed_stream_drain,
 )

@@ -4283,15 +4283,21 @@ class Dataset:
         right_time: str,
         within: str,
         lateness: str | None = None,
+        how: str = "inner",
     ) -> Dataset:
-        """Watermark-bounded stream-stream interval inner join (Spark stream-stream join).
+        """Watermark-bounded stream-stream interval join (Spark stream-stream join).
 
         Joins two streams on equality keys (`on` / `left_on`+`right_on`) **and** an
         event-time interval — a row pair matches only if
         ``|left_time - right_time| <= within``. That time bound is what lets buffered
         state be evicted once the watermark passes, keeping memory bounded over two
-        unbounded streams. Over bounded sources it is a plain inner join plus the
-        interval filter. Consume the streaming result with `iter_batches()`.
+        unbounded streams. Over bounded sources it is a plain join plus the interval
+        filter. Consume the streaming result with `iter_batches()`.
+
+        An outer `how` emits a row that never matched, padded with nulls, at the moment
+        the watermark guarantees no partner can still arrive — which is the only moment
+        such a statement is decidable about an unbounded stream, and why the interval is
+        required rather than optional.
 
         Args:
             other: The right-hand stream.
@@ -4302,6 +4308,7 @@ class Dataset:
             right_time: The right event-time column.
             within: The maximum time difference for a pair to match (e.g. ``"1h"``).
             lateness: Extra grace before evicting buffered state; ``None`` for none.
+            how: ``"inner"`` (default), ``"left"``, ``"right"``, or ``"full"``.
 
         Returns:
             A new `Dataset` of the interval-joined rows.
@@ -4320,10 +4327,15 @@ class Dataset:
                 >>> joined.count()
                 2
         """
+        from batcher._internal.errors import PlanError
         from batcher.io.source import is_bounded
         from batcher.plan.functions.temporal import _duration_micros
         from batcher.plan.logical import WatermarkStreamJoin
 
+        if how not in ("inner", "left", "right", "full"):
+            raise PlanError(
+                f"join_stream(): unknown how={how!r}; use 'inner', 'left', 'right', or 'full'"
+            )
         left_keys, right_keys = _resolve_join_keys(on, left_on, right_on)
         within_us = _duration_micros(within, arg="join within")
         lateness_us = _duration_micros(lateness, arg="join lateness") if lateness else 0
@@ -4331,9 +4343,11 @@ class Dataset:
         combined = self._sources + other._sources
 
         if all(is_bounded(s) for s in combined):
-            joined = self.join(other, left_on=left_keys, right_on=right_keys, how="inner")
-            diff = Col(left_time).cast("int64") - Col(right_time).cast("int64")
-            return joined.filter((diff <= within_us) & (diff >= -within_us))
+            from batcher.api.dataset._build import _bounded_interval_join
+
+            return _bounded_interval_join(
+                self, other, left_keys, right_keys, left_time, right_time, within_us, how
+            )
 
         output = _join_output(self.columns, other.columns, left_keys, right_keys, "inner", "_right")
         node = WatermarkStreamJoin(
@@ -4346,6 +4360,7 @@ class Dataset:
             right_time,
             within_us,
             lateness_us,
+            how,
         )
         return Dataset(node, combined)
 

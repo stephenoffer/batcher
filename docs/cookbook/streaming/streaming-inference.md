@@ -72,7 +72,7 @@ predicates before the model when you can, and the expensive ones after it.
 
 :::{tab-item} A real model, on a topic
 
-Same shape, different `__call__`. `ds.ml.infer` takes a HuggingFace model id and does the
+Same shape, different `__call__`. {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` takes a HuggingFace model id and does the
 class-per-worker construction for you; `num_gpus` and `concurrency` place it:
 
 ```python
@@ -161,7 +161,7 @@ The query handle is how you know whether the model is keeping up:
 :::{dropdown} Per-batch progress, straight off the query handle
 
 ```python
-progress = q.recent_progress()
+progress = q.recent_progress
 print([(p.batch_id, p.num_input_rows, p.num_output_rows) for p in progress])
 # [(0, 1, 1), (1, 1, 0), (2, 1, 1)]
 print(q.is_active)
@@ -193,7 +193,7 @@ distributed *batch* job over the landed bronze table instead.
 - {doc}`Exactly-once sinks </cookbook/streaming/exactly-once-sink>`: what the Delta write above actually guarantees.
 - {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same stage, run over the landed table
   as a distributed batch.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, checkpoints, and `recent_progress()`.
+- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, checkpoints, and `recent_progress`.
 - {doc}`ML API reference </api/models/ml>`: `ds.ml.infer`, `map_batches`, `max_errored_rows`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what a warm, resident model is worth.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: the pool the model lives in.

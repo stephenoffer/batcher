@@ -35,6 +35,7 @@ from batcher.config import ObservabilityConfig as ObservabilityConfig
 from batcher.config import OptimizerConfig as OptimizerConfig
 from batcher.config import PIDConfig as PIDConfig
 from batcher.config import ShuffleTlsConfig as ShuffleTlsConfig
+from batcher.config import StreamingConfig as StreamingConfig
 from batcher.config import TenantConfig as TenantConfig
 from batcher.config import active_config as active_config
 from batcher.config import config_context as config_context
@@ -61,6 +62,7 @@ _CONFIG_EXPORTS = [
     "ObservabilityConfig",
     "OptimizerConfig",
     "PIDConfig",
+    "StreamingConfig",
     "ShuffleTlsConfig",
     "TenantConfig",
     "tenant",

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import pyarrow as pa
 
 from batcher.core.streaming import _AggFold
-from batcher.plan.streaming import OutputMode
+from batcher.plan.streaming import OutputMode, StateOperatorProgress
 
 if TYPE_CHECKING:
     from batcher.plan.logical import Aggregate
@@ -129,6 +129,10 @@ class AggregateProcessor:
         result = empty_global_aggregate(self._agg, schema.arrow)
         return [result] if result is not None else []
 
+    def state_metrics(self) -> tuple[StateOperatorProgress, ...]:
+        """This operator's retained state after the last micro-batch."""
+        return (self._fold.metrics(),)
+
     def snapshot_state(self) -> pa.RecordBatch | None:
         """The running partial state for a checkpoint snapshot."""
         return self._fold.state()
@@ -159,6 +163,10 @@ class WindowedAggregateProcessor:
     def finalize(self) -> list[pa.RecordBatch]:
         result = self._fold.flush()
         return [result] if result is not None else []
+
+    def state_metrics(self) -> tuple[StateOperatorProgress, ...]:
+        """This operator's open windows, watermark, and anything dropped as late."""
+        return (self._fold.metrics(),)
 
     def snapshot_state(self) -> pa.RecordBatch | None:
         """The open windows and the watermark, for a checkpoint snapshot.

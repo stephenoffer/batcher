@@ -1,6 +1,6 @@
 # Configuration options
 
-This page is the field-by-field reference for `Config`. Each section below corresponds to one attribute of `Config`, such as `config.execution` or `config.memory`. Defaults are the engine's tuned constants. To change a field, derive a new section with `dataclasses.replace`.
+This page is the field-by-field reference for {py:class}`Config <batcher.Config>`. Each section below corresponds to one attribute of {py:class}`Config <batcher.Config>`, such as `config.execution` or `config.memory`. Defaults are the engine's tuned constants. To change a field, derive a new section with `dataclasses.replace`.
 
 Sections appear in the order they're declared on `Config`. Within a section, the fields you're most likely to reach for come first, then the power-user thresholds.
 
@@ -34,7 +34,7 @@ How work is sized and parallelized.
 | `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`/user-guide/trust/hardening`. |
 | `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
 | `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
-| `shrink_output_dtypes` | `False` | Re-narrow a pass-through output column back to its source numeric width, such as `Int32` ids widened on input, halving its footprint. It's lossless but data-dependent, so it's off by default. With it off, output types match `Dataset.schema` exactly. |
+| `shrink_output_dtypes` | `False` | Re-narrow a pass-through output column back to its source numeric width, such as `Int32` ids widened on input, halving its footprint. It's lossless but data-dependent, so it's off by default. With it off, output types match {py:obj}`Dataset.schema <batcher.Dataset.schema>` exactly. |
 
 The remaining execution fields are **power-user performance thresholds**: they tune *how* the parallel executor runs an operator and are result-invariant (a query produces the identical result at any setting). Each default equals the Rust constant it replaced, so leaving them untouched is bit-identical to the engine's tuned baseline. Reach for them only to tune a known hot path.
 
@@ -65,8 +65,8 @@ Buffer-pool envelope and the out-of-core spill story. Setting `max_memory_bytes`
 | `spill_compression` | `"auto"` | Arrow-IPC codec for spilled batches. `"auto"` lets the engine choose. `"lz4"`, `"zstd"`, or `None` force it. |
 | `spill_bucket_max_bytes` | `134217728` (128 MiB) | A spilled aggregate bucket larger than this is re-partitioned (grace recursion) so a skewed key set degrades gracefully instead of OOMing the reduce. |
 | `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path, with no out-of-core spilling. Set it when you'd rather a query fail fast than spill to disk. |
-| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing `Dataset.cache()`, described in {doc}`/user-guide/operate/tuning/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
-| `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear `ResourceError` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
+| `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing {py:meth}`Dataset.cache() <batcher.Dataset.cache>`, described in {doc}`/user-guide/operate/tuning/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
+| `streaming_state_max_bytes` | `0` | Cap on one streaming operator's in-memory state (window partials, dedup keys, join buffers). Exceeding it raises a clear {py:exc}`ResourceError <batcher.ResourceError>` (a stalled-watermark signal) instead of OOMing. `0` derives the cap from the hard memory budget. |
 | `respect_cgroup_high` | `True` | Budget against the cgroup v2 `memory.high` throttle threshold, not just the `memory.max` kill threshold. Inert wherever `memory.high` is unset. |
 | `stall_aware_pressure` | `True` | Let the kernel's memory PSI raise the pressure level, so the engine spills while reclaim is still coping. It can only raise a level, never lower one. |
 | `oom_kill_backoff` | `0.8` | Fraction of the auto-sensed envelope kept when this container's `memory.events` shows it has already been OOM-killed. `1.0` disables the backoff. An explicit `max_memory_bytes` is never scaled. See {doc}`/architecture/deep-dives/memory/buffer-pool` for what these three kernel signals measure. |
@@ -98,6 +98,31 @@ print(cfg.flow_control.default_credits)
 # 8
 ```
 
+## streaming
+
+The micro-batch loop's cadence and bookkeeping. These govern how a long-running
+streaming query behaves between batches, not what it computes. The memory a streaming
+operator's state may hold is `memory.streaming_state_max_bytes`, in the `memory` section.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `idle_poll_seconds` | `0.2` | How long a runner waits before asking an idle unbounded source for data again. Only an empty pass pays it. |
+| `progress_history` | `100` | Micro-batch progress records a query handle keeps for `recent_progress`. |
+
+Lower `idle_poll_seconds` when first-row latency after a quiet stretch matters more than
+the cost of re-listing a directory or re-asking a broker for its partitions. Raise it when
+a stream is idle most of the time and the listing is expensive, such as a large cloud
+prefix. The single-node and distributed runners read the same value, so an idle stream
+behaves the same on one machine and on a cluster.
+
+```python
+from batcher import Config, StreamingConfig
+
+cfg = Config().replace(streaming=StreamingConfig(idle_poll_seconds=0.05))
+print(cfg.streaming.idle_poll_seconds)
+# 0.05
+```
+
 ## optimizer
 
 Kyber's planning thresholds, cost model, and learned-stats behavior. This section
@@ -118,9 +143,9 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 | `build_bloom_index` | `False` | On write, build a per-column membership bloom index so a later read can data-skip an equality / `IN` predicate whose value is absent. Opt-in (~1.2 MB per million rows per column). |
 | `target_bytes_per_task` | `268435456` (256 MiB) | Target bytes per distributed task; partition counts take the max of the row- and byte-derived fan-out, so a few wide rows (videos, embeddings) still shard finely enough to fit memory. |
 | `broadcast_max_bytes` | `0` (auto) | Build-side byte threshold below which a join is broadcast, meaning replicated to every worker, rather than shuffled. This is the analog of Spark's `autoBroadcastJoinThreshold`, but it's sized to cache rather than to memory, because a broadcast join wins only while its one hash table stays cache-resident. `0` detects the threshold from the last-level cache. A positive value pins it. Read the effective value from `resolved_broadcast_max_bytes`. The runtime guard falls back to a shuffle if the materialized build side exceeds the threshold. |
-| `cardinality` | `CardinalityConfig()` | Selinger-style fallback selectivities (sub-section below). |
-| `cost_coeffs` | `CostCoefficients()` | Per-unit operator costs (sub-section below). |
-| `cost_weights` | `CostWeights()` | Relative weight of CPU, IO, and network when collapsing cost to a scalar (sub-section below). |
+| `cardinality` | {py:class}`CardinalityConfig() <batcher.config.config.CardinalityConfig>` | Selinger-style fallback selectivities (sub-section below). |
+| `cost_coeffs` | {py:class}`CostCoefficients() <batcher.config.config.CostCoefficients>` | Per-unit operator costs (sub-section below). |
+| `cost_weights` | {py:class}`CostWeights() <batcher.config.config.CostWeights>` | Relative weight of CPU, IO, and network when collapsing cost to a scalar (sub-section below). |
 
 This section is the {py:class}`OptimizerConfig <batcher.OptimizerConfig>` dataclass
 (its full field list, including the three nested sub-sections, is in the API
@@ -224,7 +249,7 @@ print(cfg.metadata.backend)
 
 ## governance
 
-Whether the row filters and column masks in a `SecurityCatalog` are advisory or mandatory.
+Whether the row filters and column masks in a {py:class}`SecurityCatalog <batcher.SecurityCatalog>` are advisory or mandatory.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -265,142 +290,8 @@ space. See {doc}`/user-guide/trust/hardening`.
 
 ## distributed
 
-How the engine attaches to a Ray cluster, shuffles across it, and stays correct
-through node and task failures. Ray is used for scheduling only; bulk shuffle data
-moves over Arrow Flight, bypassing the Ray object store. See the **fault-tolerant
-cluster recipe in {doc}`profiles`.
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `ray_address` | `None` | Ray cluster address. `None` attaches to a running cluster when `RAY_ADDRESS` is set, or when Batcher detects a managed control plane such as Anyscale. A distributed query on a managed workspace therefore fans out across the cluster with no configuration instead of stranding on a local single-node Ray. It falls back to a local start only when no cluster is reachable. Set an explicit address to override. |
-| `namespace` | `"batcher"` | Ray namespace for batcher's shuffle actors, so they are isolatable. |
-| `runtime_env` | `None` | `runtime_env` dict shipped to workers so `batcher` + its native extension are present cluster-wide. |
-| `transport` | `"auto"` | Shuffle transport. `"auto"` picks Flight on a multi-node cluster, disk on a single node / shared filesystem; `"flight"`/`"disk"` force it. |
-| `shared_filesystem` | `False` | True when every worker shares a filesystem at the same path, so the disk shuffle is safe cluster-wide. |
-| `dashboard` | `False` | Show the Ray dashboard. |
-| `tls` | `ShuffleTlsConfig()` (off) | TLS/mTLS for the inter-node Arrow Flight shuffle. Sub-section below. |
-| `adaptive_credits` | `True` | AIMD shuffle credits: the window grows and shrinks per remote fetch from observed memory backpressure instead of holding the static grant. Flow control only, so the merged output is unchanged. `False` pins the static `default_credits` window. |
-| `runtime_bloom_join` | `"auto"` | Build a bloom from the join build side and push it to the probe side to drop non-matching rows before they shuffle, cutting network volume for a selective fact-to-dimension join. `"auto"` engages only when Kyber estimates the probe is much larger than the build. `True` always engages it and `False` never does. Inner and semi joins only. |
-| `shared_memory_transfer` | `True` | Same-node shared-memory shuffle: a mapper mirrors each bucket to a memory-mapped Arrow-IPC file, using Linux `/dev/shm` when available, that a same-node reducer reads via mmap with no gRPC. It's pressure-gated, so it's skipped when the node is tight on memory, and best-effort. A miss falls back to Flight, which is bit-identical. |
-| `locality_aware_scheduling` | `True` | Host a reducer whose bucket concentrates on one node on that node, turning the bulk of its fetches into same-node hits. Result-preserving; pays off on a multi-node cluster with a skewed / co-partitioned shuffle. A single-node fleet resolves to "nothing to place" from the worker addresses alone, with no remote call. |
-| `persistent_fleet` | `False` | Reserve one placement group and worker fleet for a whole adaptive multi-stage query, keeping each stage's intermediate partitioned on the workers instead of collecting to the driver. Removes per-stage placement churn and the driver funnel. |
-| `resilience` | `"default"` | Named fault-tolerance profile. `"default"` keeps the conservative budgets below; `"spot"` hardens them as a bundle (more restarts / recompute, keepalive on, one speculative backup) for a churning spot-node cluster. Explicit knobs override the profile. See {doc}`../architecture/fault-tolerance`. |
-
-This section is the {py:class}`DistributedConfig <batcher.config.config.DistributedConfig>`
-dataclass (the API reference lists every field). Construct one and swap it onto `Config`. For example, to isolate a job's shuffle actors in their own Ray namespace:
-
-```python
-from batcher import Config
-from batcher.config import DistributedConfig
-
-cfg = Config().replace(distributed=DistributedConfig(namespace="nightly-etl"))
-print(cfg.distributed.namespace)
-# nightly-etl
-```
-
-### Fault tolerance
-
-The first line of defense is Ray-level retries; beneath it, a lost shuffle worker's
-output is recomputed from its (durable) source partition and re-fetched.
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `task_max_retries` | `2` | Ray reruns a failed shuffle task this many times. Shuffle tasks are deterministic and recomputed from a durable source, so a rerun is safe. |
-| `retry_on_transient` | `True` | Extend task retries to application exceptions (not just worker death). |
-| `actor_max_restarts` | `1` | Respawn a crashed compute actor (the map/inference pool) this many times. |
-| `actor_max_task_retries` | `1` | Rerun an in-flight actor call on the respawned actor this many times. |
-| `recovery_max_attempts` | `3` | Recompute→retry rounds before a still-broken shuffle fails loudly. A larger/flakier cluster may want more. |
-| `recovery_backoff_base_s` | `0.5` | Base of the exponential backoff slept between recovery rounds (`0` disables the sleep). |
-| `flight_idle_timeout_s` | `60.0` | Max gap between batches in a shuffle fetch before the peer is treated as dead. Generous so a long GC pause is not misread as death; bounded so a truly dead peer is detected and recomputed. |
-| `flight_keepalive_s` | `None` | HTTP/2 keepalive ping interval. `None`/`0` disables it; set it to detect a silently-dropped connection faster than the idle timeout. |
-| `placement_timeout_s` | `60.0` | How long gang-scheduling waits for a worker placement group before falling back to default scheduling (a real cluster may need to autoscale up). |
-| `speculation_max_backups` | `1` | Max concurrent speculative backup tasks at a shuffle barrier. One backup catches the single worst straggler without letting a uniformly slow stage spawn a backup per task. `0` disables straggler speculation, making the barrier a plain wait. |
-| `speculation_straggler_factor` | `1.5` | Back up a task whose elapsed time exceeds this multiple of the median finished task's time. Batcher also learns this factor per operator family from measured task-time variance, so a stage that finishes uniformly raises its own bar. |
-| `speculation_min_finished_frac` | `0.75` | Fraction of tasks that must finish before speculation starts. |
-| `skew_join_salt` | `0` | Spread a hot join key's rows across this many reducers (`0` disables skew-aware salting). |
-| `skew_join_fraction` | `0.10` | A value is "hot" when it exceeds this fraction of a side's rows. |
-| `shuffle_token` | `None` | Shared secret authenticating Flight shuffle fetches. Also read from `BATCHER_SHUFFLE_TOKEN`. |
-| `shuffle_port_range` | `None` | `(min, max)` the Flight shuffle listener may bind, instead of an OS-ephemeral port. Also read from `BATCHER_SHUFFLE_PORT_RANGE` (`"40000-40100"`). |
-
-### Restricted networks
-
-The defaults assume nodes can reach each other freely, which is true on a normal cloud VPC and often false on-premises. Two knobs cover firewalls, multi-homed hosts, and NAT.
-
-`shuffle_port_range` confines the Flight listener to a range you can open in a firewall rule. By default each worker takes an ephemeral port, which never collides but obliges you to open the entire ephemeral range node-to-node. Make the range at least as wide as the number of workers that share a node. A worker that can't find a free port fails with an error naming the range rather than binding somewhere unreachable.
-
-```bash
-export BATCHER_SHUFFLE_PORT_RANGE=40000-40100
-```
-
-`BATCHER_ADVERTISE_HOST` overrides the address a worker advertises to its peers. Batcher uses the node IP Ray reports, which is correct almost everywhere. Set this when the address peers must dial differs, such as on a multi-homed host whose shuffle belongs on a second network interface, or on a NAT'd or VPC-peered network. Set it per node, in the pod spec or the node environment, because the right value differs on each one.
-
-### Cluster saturation and autoscaling
-
-Out of the box the distributed engine fills the whole cluster with no tuning. It attaches to the running cluster, even on a managed workspace that exports no `RAY_ADDRESS`. It fans out to one worker per node, gives each worker an even share of that node's cores so morsel parallelism saturates every core, and scales the shuffle reducer count with the worker count. On an autoscaling-capable cluster it also asks the autoscaler for the cores a query wants, then waits a bounded time for the new nodes to arrive before sizing the fan-out. A big query therefore runs on the grown cluster instead of clamping to the pre-scale size and leaving the new capacity for the next job.
-
-The autoscale wait auto-enables when Batcher detects an autoscaling cluster, meaning Anyscale, a spot node, or `BATCHER_AUTOSCALE=1`. It stays off on a fixed or single-node cluster, so the default needs no configuration. Override any of it explicitly with the fields below.
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `autoscale_wait_s` | `-1.0` (auto) | Seconds to wait for autoscaler-launched nodes before sizing the fan-out. `-1` resolves to a bounded wait on an autoscaling cluster and to `0`, meaning off, on a fixed one. `0` disables it even on an autoscaling cluster. A positive value caps the budget. |
-| `autoscale_poll_s` | `5.0` | Poll interval while waiting for capacity to arrive. |
-| `autoscale_stall_s` | `90.0` | Grace window. Give up the wait once capacity has been flat this long, which happens on a fixed cluster or when spot capacity can't be had, so the wait never blocks the whole budget on nodes that won't arrive. Any capacity gain resets it. Sized longer than a node's boot time. |
-| `max_shuffle_partitions` | `2048` | Cap on shuffle reducers, so the reducer count scales with the cluster but an all-to-all exchange stays bounded (not O(nodes²)) at thousands of nodes. `0` disables the cap. |
-
-The worker fan-out itself isn't a `Config` field. Pass `num_workers=` to the terminal call, such as `ds.collect(num_workers=16)`, to pin it and skip the wait. Leave it unset and Batcher auto-sizes to one worker per node on a multi-node cluster, or to all cores on a single node.
-
-The `BATCHER_AUTOSCALE` environment variable is authoritative in both directions. `1` forces the wait on and `0` forces it off, even on a managed cluster. The wait is pure scheduling, so the result is identical whether it waits or not.
-
-### distributed.tls
-
-The shuffle carries query data straight between worker processes, including columns a governance policy has already decrypted or masked. On a network you don't fully control, encrypt it. `config.distributed.tls` is a
-{py:class}`ShuffleTlsConfig <batcher.config.config.ShuffleTlsConfig>`: the fields are **paths**
-to PEM material your platform already mounts on every worker (a Kubernetes secret volume,
-cert-manager, a cloud private CA). Batcher reads them at worker start and issues no
-certificates itself.
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `enabled` | `False` | Turn on TLS for the Flight shuffle. Off means a plaintext shuffle, which is the right default only on a trusted network. |
-| `ca_cert_path` | `""` | The CA a peer's certificate must chain to. It's the trust root in both directions, because one cluster CA usually signs both server and client certificates. |
-| `server_cert_path` | `""` | This node's server certificate, presented on its Flight port. |
-| `server_key_path` | `""` | The private key for `server_cert_path`. |
-| `client_cert_path` | `""` | This node's client certificate, presented under mTLS when fetching from a peer. Empty means outbound connections are server-auth only. |
-| `client_key_path` | `""` | The private key for `client_cert_path`. Set together with the certificate or not at all. |
-| `require_client_auth` | `False` | mTLS: verify a client certificate on every incoming fetch, so a process that can merely reach the port cannot pull shuffle data. |
-| `server_name` | `"batcher-shuffle"` | The name checked against a peer certificate's SAN. Peers are dialed by address, so the certificate rarely matches the literal host. Set this to the name your certificates actually carry. |
-
-A half-configured TLS setup fails at config time, not at the first fetch: enabling TLS
-without `ca_cert_path`, without the server certificate/key pair, or with only one half of
-the client pair raises `ConfigError`. Each field also has a
-`BATCHER_DISTRIBUTED_TLS_<FIELD>` env override, which is how a deployment injects paths
-without shipping a config file.
-
-```python
-# docs: skip
-from batcher import Config, set_config
-from batcher.config import DistributedConfig, ShuffleTlsConfig
-
-set_config(
-    Config().replace(
-        distributed=DistributedConfig(
-            transport="flight",
-            tls=ShuffleTlsConfig(
-                enabled=True,
-                ca_cert_path="/etc/batcher/ca.pem",
-                server_cert_path="/etc/batcher/server.pem",
-                server_key_path="/etc/batcher/server.key",
-                client_cert_path="/etc/batcher/client.pem",
-                client_key_path="/etc/batcher/client.key",
-                require_client_auth=True,
-            ),
-        )
-    )
-)
-```
-
-Pair it with `shuffle_token` above: TLS proves *who* the peer is, the token proves it is
-allowed to fetch this partition.
+Ray attachment, the shuffle transport, fault tolerance, restricted networks, autoscaling,
+and TLS. Large enough to be its own page: see {doc}`distributed-options`.
 
 ## observability
 
@@ -420,7 +311,7 @@ What the engine tells you about what it did: the `batcher.*` logger hierarchy an
 | `event_log_dir` | `""` | Directory for event-log documents. Empty resolves to `$BATCHER_HOME/logs` (or `~/.batcher/logs`) at write time. |
 | `event_log_max_files` | `200` | Keep at most this many event-log files; the oldest are pruned on write. `0` is unbounded. |
 | `progress` | `None` | Explicit progress-bar mode: `"auto"` renders only into a real TTY that has not set `NO_COLOR`/`TERM=dumb`, `"on"` forces it, `"off"` disables it. `None` derives it from `verbosity`. Read the effective value from `resolved_progress`. See {doc}`/user-guide/operate/running/observability`. |
-| `ui` | `False` | Start the web dashboard automatically on the first query. It's off by default, because binding a port should be asked for. `bt.start_ui()` is the explicit spelling. Use this field for a long-running service that always wants the dashboard. |
+| `ui` | `False` | Start the web dashboard automatically on the first query. It's off by default, because binding a port should be asked for. {py:func}`bt.start_ui() <batcher.start_ui>` is the explicit spelling. Use this field for a long-running service that always wants the dashboard. |
 | `ui_host` | `"127.0.0.1"` | Interface the dashboard binds. Loopback by default: it exposes query text, plans, and logs, and Batcher ships no authentication. Set it to a routable address only deliberately. |
 | `ui_port` | `4040` | Dashboard port. `0` asks the OS for any free port. |
 
@@ -443,7 +334,7 @@ Every field takes a `BATCHER_OBSERVABILITY_*` environment override, so a deploym
 
 ## Inspecting and editing
 
-`Config()` is the defaults. To read the config a query would actually run under, call `active_config()`. It resolves to the innermost of the layered sources: the config file, the `BATCHER_*` environment variables, `set_config`, and any enclosing `config_context` block. That makes it what you check when a tunable doesn't seem to be taking effect.
+`Config()` is the defaults. To read the config a query would actually run under, call `active_config()`. It resolves to the innermost of the layered sources: the config file, the `BATCHER_*` environment variables, {py:func}`set_config <batcher.set_config>`, and any enclosing {py:func}`config_context <batcher.config_context>` block. That makes it what you check when a tunable doesn't seem to be taking effect.
 
 ```python
 from batcher.config import Config, ExecutionConfig, active_config, config_context
@@ -484,11 +375,11 @@ print(cfg.optimizer.cardinality.eq_selectivity)
 
 ## Requirements and limitations
 
-Batcher validates a config where you install it, not where it's used. Invalid values raise `ConfigError` at the config entry point, meaning `set_config`, `config_context`, `from_env`, or `from_file`, rather than failing confusingly at runtime. That covers a negative retry count, a `soft_limit` above `hard_limit`, and a non-positive timeout. A half-configured TLS block fails the same way.
+Batcher validates a config where you install it, not where it's used. Invalid values raise {py:exc}`ConfigError <batcher.ConfigError>` at the config entry point, meaning `set_config`, `config_context`, `from_env`, or `from_file`, rather than failing confusingly at runtime. That covers a negative retry count, a `soft_limit` above `hard_limit`, and a non-positive timeout. A half-configured TLS block fails the same way.
 
-`Config` and every section are frozen. Derive a new one with `Config.replace` or `dataclasses.replace` rather than assigning to a field.
+`Config` and every section are frozen. Derive a new one with {py:meth}`Config.replace <batcher.Config.replace>` or `dataclasses.replace` rather than assigning to a field.
 
-The worker fan-out is a terminal-call parameter, `ds.collect(num_workers=...)`, not a `Config` field. The `distributed` section tunes how the fan-out behaves once chosen, not how wide it is.
+The worker fan-out is a terminal-call parameter, {py:meth}`ds.collect(num_workers=...) <batcher.Dataset.collect>`, not a `Config` field. The `distributed` section tunes how the fan-out behaves once chosen, not how wide it is.
 
 This page documents the fields most deployments reach for. The dataclasses carry further power-user thresholds that the API reference enumerates in full.
 

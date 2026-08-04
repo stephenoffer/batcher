@@ -93,11 +93,18 @@ def push_filter_into_stream_join_sides(node: Filter, _ctx: OptimizerContext) -> 
     buffer. Under a stream that is the difference between bounded and unbounded memory,
     not a constant factor of CPU.
 
-    The join is an inner join, so a row filtered from one side can only remove output
-    rows — never add or alter one — which makes pushing a side-pure predicate down
-    equivalent to applying it above. The predicate must reference columns from exactly
-    one side: a cross-side predicate is a join condition, not a pushable filter, and a
-    constant predicate has nothing to gain from moving.
+    For an **inner** join a row filtered from one side can only remove output rows —
+    never add or alter one — which makes pushing a side-pure predicate down equivalent to
+    applying it above. The predicate must reference columns from exactly one side: a
+    cross-side predicate is a join condition, not a pushable filter, and a constant
+    predicate has nothing to gain from moving.
+
+    For an **outer** join that equivalence holds only on the *preserved* side. Filtering
+    the null-supplying side before the join turns a row that would have matched into one
+    that is emitted null-padded — a row the filter above the join would then have
+    dropped. Pushing there does not remove output rows, it *replaces* them with different
+    ones, so the rewrite is refused for that side (and entirely for a full outer join,
+    where both sides supply nulls).
 
     Column identity comes from the join's own `output` mapping, which records each
     output column's `side` and pre-rename `name`; a predicate is attributed to a side
@@ -131,10 +138,18 @@ def push_filter_into_stream_join_sides(node: Filter, _ctx: OptimizerContext) -> 
     if len(sides) != 1:
         return None  # a cross-side predicate is a join condition, not a filter
 
+    side = sides.pop()
+    # An outer join only preserves one side; filtering the other changes which rows are
+    # null-padded rather than merely removing some. See the docstring.
+    if (side == "left" and join.emits_unmatched_right) or (
+        side == "right" and join.emits_unmatched_left
+    ):
+        return None
+
     # The predicate is phrased in the join's output aliases; rewrite it into the side's
     # own column names before attaching it below the rename.
     predicate = remap_columns(node.predicate, renames)
-    if sides.pop() == "left":
+    if side == "left":
         return WatermarkStreamJoin(
             left=Filter(join.left, predicate),
             right=join.right,
@@ -145,6 +160,7 @@ def push_filter_into_stream_join_sides(node: Filter, _ctx: OptimizerContext) -> 
             right_time=join.right_time,
             within_micros=join.within_micros,
             lateness_micros=join.lateness_micros,
+            how=join.how,
         )
     return WatermarkStreamJoin(
         left=join.left,
@@ -156,4 +172,5 @@ def push_filter_into_stream_join_sides(node: Filter, _ctx: OptimizerContext) -> 
         right_time=join.right_time,
         within_micros=join.within_micros,
         lateness_micros=join.lateness_micros,
+        how=join.how,
     )

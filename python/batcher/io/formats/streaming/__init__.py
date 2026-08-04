@@ -21,6 +21,7 @@ from batcher.io.formats.streaming.broker import (
 from batcher.io.formats.streaming.dev import RateSource, SocketSource
 from batcher.io.formats.streaming.eventhubs import EventHubsSource
 from batcher.io.formats.streaming.kafka import KafkaSource
+from batcher.io.formats.streaming.kafka_sink import KafkaStreamSink
 from batcher.io.formats.streaming.kinesis import KinesisSource
 from batcher.io.formats.streaming.pubsub import PubSubSource
 from batcher.io.formats.streaming.pulsar import PulsarSource
@@ -28,7 +29,9 @@ from batcher.io.formats.streaming.sinks import (
     STREAM_SINKS,
     DeltaStreamSink,
     FileStreamSink,
+    ForeachWriter,
     StreamSink,
+    TransactionalStreamSink,
     memory_table,
 )
 
@@ -40,14 +43,17 @@ __all__ = [
     "DeltaStreamSink",
     "EventHubsSource",
     "FileStreamSink",
+    "ForeachWriter",
     "IncrementalFileSource",
     "KafkaSource",
+    "KafkaStreamSink",
     "KinesisSource",
     "PubSubSource",
     "PulsarSource",
     "RateSource",
     "SocketSource",
     "StreamSink",
+    "TransactionalStreamSink",
     "broker_schema",
     "memory_table",
 ]
