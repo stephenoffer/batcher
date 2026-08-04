@@ -244,6 +244,7 @@ meta-model never sees a base model scoring a row it was fitted on.
 .. currentmodule:: batcher.ml.ensemble
 
 .. autofunction:: blend_predictions
+.. autofunction:: majority_vote
 .. autofunction:: out_of_fold_features
 
 .. autoclass:: StackingEnsemble

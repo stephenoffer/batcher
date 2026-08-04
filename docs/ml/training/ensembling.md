@@ -35,6 +35,27 @@ print(weighted.to_pydict()["prediction"])
 Blend *probabilities*, not hard class labels. The mean of labels 0 and 2 is 1, which may be
 a class neither model predicted. Blend the probability columns and threshold afterwards.
 
+## Voting, when the models emit labels
+
+Averaging class *labels* is meaningless: the mean of labels 0 and 2 is 1, which may be a
+class nobody predicted. {py:func}`majority_vote <batcher.ml.majority_vote>` counts votes
+instead:
+
+```python
+from batcher.ml.ensemble import majority_vote
+
+labelled = bt.from_pydict({"m1": ["a", "b"], "m2": ["a", "b"], "m3": ["b", "a"]})
+print(majority_vote(labelled, ["m1", "m2", "m3"]).to_pydict()["prediction"])
+# ['a', 'b']
+```
+
+`weights` lets a model you trust more count for more, and ties resolve to whichever label
+comes first in `labels` so the result is reproducible rather than dependent on evaluation
+order.
+
+Where the models expose probabilities, prefer `blend_predictions` on those and threshold
+afterwards. Soft voting uses more of what each model knows than a hard label does.
+
 ## Stacking, when a fixed average isn't enough
 
 A blend applies the same weights everywhere. A meta-model can learn that one base model is

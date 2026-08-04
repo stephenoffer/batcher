@@ -13,7 +13,12 @@ import pytest
 import batcher as bt
 from batcher._internal.errors import ColumnNotFoundError, PlanError
 from batcher.ml import LinearRegression, Ridge
-from batcher.ml.ensemble import StackingEnsemble, blend_predictions, out_of_fold_features
+from batcher.ml.ensemble import (
+    StackingEnsemble,
+    blend_predictions,
+    majority_vote,
+    out_of_fold_features,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -208,3 +213,55 @@ def test_stacking_is_reproducible() -> None:
         return stack.predict(ds).sort("x").to_pydict()["prediction"]
 
     assert run() == run()
+
+
+def test_majority_vote_picks_the_label_most_models_chose() -> None:
+    ds = bt.from_pydict({"m1": ["a", "b"], "m2": ["a", "b"], "m3": ["b", "a"]})
+    assert majority_vote(ds, ["m1", "m2", "m3"]).to_pydict()["prediction"] == ["a", "b"]
+
+
+def test_majority_vote_weights_a_better_model_higher() -> None:
+    ds = bt.from_pydict({"strong": ["a"], "weak1": ["b"], "weak2": ["b"]})
+    equal = majority_vote(ds, ["strong", "weak1", "weak2"]).to_pydict()["prediction"]
+    weighted = majority_vote(ds, ["strong", "weak1", "weak2"], weights=[5.0, 1.0, 1.0]).to_pydict()[
+        "prediction"
+    ]
+    assert equal == ["b"]
+    assert weighted == ["a"]
+
+
+def test_majority_vote_breaks_ties_by_label_order() -> None:
+    """A tie must resolve the same way every run, not by evaluation order."""
+    ds = bt.from_pydict({"m1": ["a"], "m2": ["b"]})
+    assert majority_vote(ds, ["m1", "m2"], labels=["a", "b"]).to_pydict()["prediction"] == ["a"]
+    assert majority_vote(ds, ["m1", "m2"], labels=["b", "a"]).to_pydict()["prediction"] == ["b"]
+
+
+def test_majority_vote_accepts_explicit_labels_and_stays_lazy() -> None:
+    ds = bt.from_pydict({"m1": ["a", "c"], "m2": ["a", "c"]})
+    out = majority_vote(ds, ["m1", "m2"], labels=["a", "b", "c"])
+    assert out.to_pydict()["prediction"] == ["a", "c"]
+
+
+def test_majority_vote_works_on_integer_labels() -> None:
+    ds = bt.from_pydict({"m1": [0, 2], "m2": [0, 2], "m3": [2, 0]})
+    assert majority_vote(ds, ["m1", "m2", "m3"]).to_pydict()["prediction"] == [0, 2]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"columns": []}, "at least one prediction column"),
+        ({"columns": ["m1", "m2"], "weights": [1.0]}, "weight"),
+        ({"columns": ["m1", "m2"], "weights": [-1.0, 1.0]}, "non-negative"),
+    ],
+)
+def test_majority_vote_configuration_is_validated(kwargs: dict, message: str) -> None:
+    ds = bt.from_pydict({"m1": ["a"], "m2": ["b"]})
+    with pytest.raises(PlanError, match=message):
+        majority_vote(ds, **kwargs)
+
+
+def test_majority_vote_names_a_missing_column() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        majority_vote(bt.from_pydict({"m1": ["a"]}), ["m1", "nope"])

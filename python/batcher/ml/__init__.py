@@ -32,6 +32,7 @@ from batcher.ml.embed_api import openai_embedding_encoder, tei_encoder
 from batcher.ml.ensemble import (
     StackingEnsemble,
     blend_predictions,
+    majority_vote,
     out_of_fold_features,
 )
 from batcher.ml.feature_spec import FeatureSpec
@@ -317,6 +318,7 @@ __all__ = [
     "llm_verify_udf",
     "load",
     "mahalanobis_distance",
+    "majority_vote",
     "mix_corpora",
     "mmr_rerank_udf",
     "openai_embedding_encoder",

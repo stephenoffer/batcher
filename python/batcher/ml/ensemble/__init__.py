@@ -20,7 +20,12 @@ describe the same row without a join and without needing a row key.
 
 from __future__ import annotations
 
-from batcher.ml.ensemble.blending import blend_predictions
+from batcher.ml.ensemble.blending import blend_predictions, majority_vote
 from batcher.ml.ensemble.stacking import StackingEnsemble, out_of_fold_features
 
-__all__ = ["StackingEnsemble", "blend_predictions", "out_of_fold_features"]
+__all__ = [
+    "StackingEnsemble",
+    "blend_predictions",
+    "majority_vote",
+    "out_of_fold_features",
+]
