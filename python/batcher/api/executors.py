@@ -98,6 +98,56 @@ class UdfExecutor:
         return table
 
 
+class DriverExecutor:
+    """Materialize a plan whose top node the *driver* executes, not the engine.
+
+    A few operators are defined by a Python callback rather than by relational algebra —
+    `transform_with_state` today — so they have no IR to lower and the native executor
+    cannot run them. They already have a driver in `api.terminal.stream`, which is what
+    `iter_batches()` uses; this makes `collect()` reach the same driver instead of failing
+    at `to_ir()` with a `NotImplementedError` a user cannot act on.
+
+    One driver, two terminals: the rows `collect()` returns are by construction the rows
+    `iter_batches()` yields, because there is only one implementation.
+    """
+
+    def execute(self, plan: LogicalPlan, sources: list[Source], ctx: ExecutionContext) -> pa.Table:
+        from batcher.api.terminal.stream import _iter_batches
+
+        batches = list(_iter_batches(plan, sources, ctx.columns))
+        if batches:
+            return pa.Table.from_batches(batches)
+        return pa.Table.from_batches([], schema=_driver_schema(plan, ctx))
+
+
+def _driver_schema(plan: LogicalPlan, ctx: ExecutionContext) -> pa.Schema:
+    """The output schema for a driver-executed plan that produced no rows.
+
+    A zero-row result still has to carry a schema — every pipeline breaker above it needs
+    the column names. The plan's own schema is `None` for these nodes by construction (the
+    callback's types are not knowable statically), so the declared output columns are typed
+    null, which is what an empty relation of unknown type is.
+    """
+    declared = plan.available_schema()
+    if declared is not None:
+        return declared.arrow
+    columns = ctx.columns or plan.available_columns()
+    return pa.schema([pa.field(name, pa.null()) for name in columns])
+
+
+def driver_executed(plan: LogicalPlan) -> bool:
+    """Whether `plan`'s top node is one only the driver can run.
+
+    Only the *top* node: a driver-executed operator lower in the plan would have relational
+    operators above it that the engine must run, and that composition is not supported —
+    `is_streamable` already declines it, so such a plan takes the materializing path and
+    fails there with the shape error rather than silently running half of itself.
+    """
+    from batcher.plan.logical import TransformWithState
+
+    return isinstance(plan, TransformWithState)
+
+
 class LocalNativeExecutor:
     """Single-node native execution: Kyber → Carbonite → Core, with feedback."""
 
@@ -408,6 +458,7 @@ def _map_scheduling_envelope(plan: LogicalPlan, num_workers: int | None, hub):
 
 _REGISTRY: Registry[Executor] = Registry("executor")
 _REGISTRY.add("local", LocalNativeExecutor())
+_REGISTRY.add("driver", DriverExecutor())
 _REGISTRY.add("udf", UdfExecutor())
 _REGISTRY.add("distributed", DistributedExecutor())
 
@@ -420,6 +471,22 @@ def select(plan: LogicalPlan, *, distributed: bool) -> Executor:
     """
     from batcher import core
 
+    if driver_executed(plan):
+        # Checked before `distributed`, because these operators have no IR at all and so
+        # nothing a worker could run. Silently falling back to the single-node driver would
+        # be the exact divergence invariant #7 forbids — a `distributed=True` that quietly
+        # is not — so it is refused by name, with the shuffle it would need spelled out.
+        if distributed:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                "transform_with_state has no distributed implementation yet: its mergeable "
+                "form is a shuffle by the group keys (each key's state on exactly one "
+                "worker, so the partitions' key sets are disjoint), and the distributed "
+                "runner does not do that shuffle. Run it with distributed=False rather "
+                "than have the cluster compute something else."
+            )
+        return _REGISTRY.get("driver")
     if distributed:
         return _REGISTRY.get("distributed")
     if core.has_map_batches(plan):

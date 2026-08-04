@@ -46,6 +46,12 @@ Windows, watermarks, exactly-once.
 :link-type: doc
 Progress, state, late rows, listeners.
 :::
+
+:::{grid-item-card} {octicon}`database;1.1em` Stateful streaming
+:link: /user-guide/moving-data/streaming-stateful
+:link-type: doc
+Dedup, interval joins, keyed state, union.
+:::
 ::::
 
 ```{toctree}
@@ -57,5 +63,6 @@ custom-connectors
 cloud-storage
 lakehouse
 streaming
+streaming-stateful
 streaming-monitoring
 ```

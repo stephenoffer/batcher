@@ -258,100 +258,11 @@ sessions = clicks.session_window("ts", "45m", hits=col("n").sum())
 print(sessions.select("session_start", "session_end", "hits").to_pydict())
 ```
 
-## Deduplication within a watermark
+## Operators that remember
 
-{py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row per key seen inside the
-watermark window, forgetting keys the watermark has passed so memory stays bounded.
-Over a bounded source it is exact deduplication:
-
-```python
-records = bt.from_pydict({
-    "id": ["x", "y", "x", "z"],
-    "ts": [base, base, base + dt.timedelta(minutes=1), base],
-    "v": [1, 2, 3, 4],
-})
-deduped = records.drop_duplicates_within_watermark(["id"], event_time="ts",
-                                                   lateness="1h")
-print(sorted(deduped.to_pydict()["id"]))  # ['x', 'y', 'z'] — the second 'x' dropped
-```
-
-## Stream-to-stream joins
-
-{py:meth}`join_stream <batcher.Dataset.join_stream>` joins two streams on keys **and** an event-time interval
-(`|left_time - right_time| <= within`). The time bound is what lets buffered state be
-evicted by the watermark, keeping a two-stream join in bounded memory. Bounded
-sources run it as a plain join plus the interval filter:
-
-```python
-impressions = bt.from_pydict({"ad": ["a", "b"], "shown": [base, base]})
-clicks2 = bt.from_pydict({"ad": ["a"], "clicked": [base + dt.timedelta(minutes=2)]})
-
-attributed = impressions.join_stream(
-    clicks2, on="ad", left_time="shown", right_time="clicked", within="5m"
-)
-print(attributed.to_pydict()["ad"])  # ['a'] — clicked within 5 minutes of shown
-```
-
-`how=` takes `"inner"` (the default), `"left"`, `"right"`, and `"full"`. An unmatched row
-is emitted null-padded at the moment the watermark guarantees no partner can still arrive
-for it — which is the only moment that statement is decidable about an unbounded stream,
-and why the interval is required rather than optional:
-
-```python
-unclicked = impressions.join_stream(
-    clicks2, on="ad", left_time="shown", right_time="clicked", within="5m", how="left"
-)
-print(sorted(unclicked.to_pydict()["ad"]))  # ['a', 'b'] — 'b' with null click columns
-```
-
-A joined stream writes to a sink like any other streaming query:
-
-```python
-# docs: skip
-attributed.write.delta("lake/attribution", trigger=bt.Trigger.processing_time("30 seconds"))
-```
-
-`checkpoint=` is the one thing it refuses. A join's state is two buffered sides and two
-watermarks, none of it addressable by a source offset, so there is nothing to resume from
-— and accepting the argument would restart from an empty join on every restart while
-looking exactly like exactly-once recovery. The sink's own idempotency still applies, so a
-replayed micro-batch does not duplicate rows.
-
-## Unioning streams
-
-`union` works over streams. Because a UNION ALL is a multiset union and makes no ordering
-claim, the branches are **interleaved** rather than concatenated: one batch from each in
-turn, so an unbounded first branch cannot shut the second one out.
-
-```python
-import pyarrow as pa
-
-feed_schema = pa.schema([("v", pa.int64())])
-
-def eu():
-    for i in (0, 1):
-        yield pa.record_batch({"v": [i]}, schema=feed_schema)
-
-def us():
-    for i in (10, 11):
-        yield pa.record_batch({"v": [i]}, schema=feed_schema)
-
-both = bt.from_batches(eu, feed_schema, bounded=False).union(
-    bt.from_batches(us, feed_schema, bounded=False)
-)
-print(sorted(x for b in both.iter_batches() for x in b.to_pydict()["v"]))
-# [0, 1, 10, 11]
-```
-
-A union of *bounded* inputs still concatenates in order, because order is free there. A
-`distinct=True` union over streams is refused: a global dedup is exactly the
-whole-relation state a stream does not have.
-
-:::{note}
-A branch parked on an idle source delays the others, because pulling from it is a blocking
-read. That is the same property {py:meth}`join_stream <batcher.Dataset.join_stream>` has,
-and for the same reason: one driver thread, and the source decides when its read returns.
-:::
+Deduplication within a watermark, the stream-stream interval join, arbitrary keyed state,
+and the union of two streams all keep something between micro-batches, and each is bounded
+by a limit you choose rather than by the data. See {doc}`streaming-stateful`.
 
 ## Exactly-once and checkpointing
 

@@ -73,6 +73,7 @@ def _iter_batches(
         Distinct,
         Limit,
         Sort,
+        TransformWithState,
         Union,
         WatermarkDedup,
         WatermarkStreamJoin,
@@ -194,6 +195,13 @@ def _iter_batches(
         # Watermark-bounded streaming deduplication (bounded seen-key state).
         if isinstance(plan, WatermarkDedup) and is_streamable(plan.input):
             yield from stream_watermark_dedup(plan, sources[0], batch_size)
+            return
+        # Arbitrary keyed state: the user function owns one key's state, the engine owns
+        # when it is called and expired. State is bounded by the key space and the TTL.
+        if isinstance(plan, TransformWithState) and is_streamable(plan.input):
+            from batcher.core.streaming import stream_keyed_state
+
+            yield from stream_keyed_state(plan, sources[0], batch_size)
             return
         # A top-level aggregate/distinct over a breaker-free relational input streams
         # with bounded memory: fold each micro-batch's partial into one running state.

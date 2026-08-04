@@ -1981,6 +1981,78 @@ class Dataset:
         """
         return build_with_random(self, name, seed=seed, normal=normal)
 
+    def transform_with_state(
+        self,
+        fn: Callable[[tuple, Any, dict | None], tuple[Any, dict | None]],
+        *,
+        group_by: str | list[str],
+        output_columns: list[str],
+        state_ttl: str | None = None,
+    ) -> Dataset:
+        """Arbitrary keyed stateful processing over a stream (Spark ``transformWithState``).
+
+        The escape hatch for the shapes the relational operators cannot express:
+        sessionization with custom rules, a running fraud score, a per-device state
+        machine, "alert when this key has been silent for ten minutes". `fn` owns one
+        key's state; the engine owns when it is called, checkpointed, and expired.
+
+        `fn(key, rows, state)` returns ``(rows_out, state_out)``, where `key` is the group
+        key's values as a tuple, `rows` is that key's rows in this micro-batch as an Arrow
+        `RecordBatch`, `state` is what the previous call returned for the key (None the
+        first time), `rows_out` is what to emit (a `RecordBatch`, a column dict, or None),
+        and `state_out` is the state to keep (None forgets the key).
+
+        State must be a flat mapping of scalars, because the whole key space is
+        checkpointed as one Arrow batch. Keep a large payload elsewhere and hold a
+        reference to it.
+
+        Args:
+            fn: The per-key callback described above.
+            group_by: The key column name(s) that partition the state.
+            output_columns: The column names `fn` emits. Types come from what it returns.
+            state_ttl: How long a key's state survives without new rows (``"10 minutes"``).
+                ``None`` never expires, which is bounded only if the key space is — and is
+                what the streaming state budget will eventually refuse.
+
+        Returns:
+            A new `Dataset` of whatever `fn` emitted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> def running_total(key, rows, state):
+                ...     total = (state or {"total": 0})["total"] + sum(rows.column("v").to_pylist())
+                ...     return {"user": [key[0]], "total": [total]}, {"total": total}
+                >>> events = bt.from_pydict({"user": ["a", "b", "a"], "v": [1, 2, 3]})
+                >>> out = events.transform_with_state(
+                ...     running_total,
+                ...     group_by="user",
+                ...     output_columns=["user", "total"],
+                ...     state_ttl="1 hour",
+                ... )
+                >>> sorted(zip(*[out.to_pydict()[c] for c in ("user", "total")], strict=True))
+                [('a', 4), ('b', 2)]
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.functions.temporal import _duration_micros
+        from batcher.plan.logical import TransformWithState
+
+        keys = [group_by] if isinstance(group_by, str) else list(group_by)
+        if not keys:
+            raise PlanError("transform_with_state(): group_by must name at least one column")
+        missing = [k for k in keys if k not in self.columns]
+        if missing:
+            raise PlanError(f"transform_with_state(): unknown group_by column(s) {missing}")
+        if not output_columns:
+            raise PlanError(
+                "transform_with_state(): output_columns must name the columns fn emits — "
+                "the engine cannot infer them from an opaque callback"
+            )
+        ttl = _duration_micros(state_ttl, arg="state_ttl") if state_ttl else 0
+        node = TransformWithState(self._plan, fn, tuple(keys), tuple(output_columns), ttl)
+        return Dataset(node, self._sources)
+
     def drop_duplicates_within_watermark(
         self, subset: list[str], *, event_time: str, lateness: str
     ) -> Dataset:

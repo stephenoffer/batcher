@@ -33,6 +33,7 @@ from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
 __all__ = [
     "stream_aggregate",
     "stream_distinct",
+    "stream_keyed_state",
     "stream_limit",
     "stream_topn",
     "stream_windowed_aggregate",
@@ -210,3 +211,33 @@ def stream_topn(
         yield from result.to_batches()
     else:
         yield from result.to_batches(max_chunksize=batch_size)
+
+
+def stream_keyed_state(
+    node,
+    source: Source,
+    batch_size: int | None = None,
+    *,
+    projection: list[str] | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """Drive a `TransformWithState` over `source`, one micro-batch at a time.
+
+    Memory is bounded by the *key space* rather than by the input, and by the node's
+    `state_ttl` rather than by the query's lifetime — which is the whole reason the TTL is
+    part of the operator instead of advice in a docstring.
+
+    Args:
+        node: The `TransformWithState` to drive.
+        source: Its single source.
+        batch_size: Optional output rebatching.
+        projection: The source projection Kyber decided for this plan.
+
+    Yields:
+        Whatever the user function emitted, rebatched if asked.
+    """
+    from batcher.core.streaming.keyed_state import KeyedStateFold
+
+    fold = KeyedStateFold(node)
+    for batch in _read(source, projection):
+        for produced in fold.push(batch):
+            yield from _rebatch(produced, batch_size)

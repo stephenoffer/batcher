@@ -36,6 +36,7 @@ from batcher.plan.logical.relational import (
     Projection,
     Sample,
     Scan,
+    TransformWithState,
     Union,
     WatermarkDedup,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "Scan",
     "Sort",
     "SortKeySpec",
+    "TransformWithState",
     "Union",
     "Unnest",
     "Unpivot",

@@ -227,6 +227,68 @@ class WatermarkDedup(LogicalPlan):
 
 
 @dataclass(frozen=True, slots=True)
+class TransformWithState(LogicalPlan):
+    """Arbitrary keyed stateful processing over a stream (Spark ``transformWithState``).
+
+    The escape hatch for the shapes the relational operators cannot express: sessionization
+    with custom rules, a running fraud score, a state machine per device, "alert when this
+    key has been silent for ten minutes". Spark calls the family ``mapGroupsWithState`` /
+    ``transformWithState``; the shared idea is that a *user function* owns the state for a
+    key, and the engine owns when it is called, checkpointed, and expired.
+
+    `fn` is called once per key per micro-batch with ``(key, rows, state)`` and returns
+    ``(rows_out, state_out)``:
+
+    * `key` is the group key's values as a tuple, in `group_keys` order;
+    * `rows` is that key's rows *in this micro-batch*, as one Arrow `RecordBatch`;
+    * `state` is whatever the previous call returned for this key, or None the first time;
+    * `rows_out` is what to emit (a `RecordBatch`, a column dict, or None for nothing);
+    * `state_out` is the state to keep, or None to forget the key entirely.
+
+    Per-key, per-micro-batch Python — not per row. That is the same bargain `map_batches`
+    strikes: the iteration granularity *is* the user's chosen semantics, and everything
+    around it (the scan, the shuffle into groups, the emit) stays in the engine.
+
+    **State must be a flat mapping of scalars**, because it is checkpointed as one Arrow
+    `RecordBatch` alongside the keys. Spark requires a state schema for the same reason. A
+    state that cannot be expressed that way is a signal to keep the payload elsewhere and
+    hold a reference in state.
+
+    `ttl_micros` is what keeps the operator's memory bounded on an unbounded stream: a key
+    whose state has not been touched for that long is dropped. ``0`` means never, which is
+    correct only for a bounded key space — and is the shape `kyber.streaming
+    .retains_unbounded_state` is entitled to complain about.
+
+    A *streaming* node executed by the driver, never lowered to the Rust IR. Its mergeable
+    form is a shuffle by `group_keys`: each key's state lives on exactly one worker, so the
+    partitions' key sets are disjoint and `combine` is their union. The distributed runner
+    does not implement that yet and the conductor refuses `distributed=True` rather than
+    running different semantics (the same refusal a watermarked distributed aggregate gets).
+    """
+
+    input: LogicalPlan
+    #: ``(key, rows, state) -> (rows_out, state_out)``. See the class docstring.
+    fn: object
+    group_keys: tuple[str, ...]
+    #: The output column names. Types come from what `fn` actually returns, exactly as
+    #: they do for `MapBatches` — declaring them here would be a second source of truth.
+    output_columns: tuple[str, ...]
+    #: Microseconds of inactivity after which a key's state is dropped; 0 = never.
+    ttl_micros: int = 0
+
+    def to_ir(self) -> dict[str, Any]:
+        raise NotImplementedError(
+            "transform_with_state is executed by the streaming driver, not lowered to the IR"
+        )
+
+    def available_columns(self) -> list[str]:
+        return list(self.output_columns)
+
+    def available_schema(self) -> SchemaRef | None:
+        return None  # opaque: the types are whatever `fn` returns
+
+
+@dataclass(frozen=True, slots=True)
 class Union(LogicalPlan):
     """Concatenate relations with identical schemas (UNION ALL, or UNION if distinct)."""
 

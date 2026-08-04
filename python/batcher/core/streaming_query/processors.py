@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AggregateProcessor",
+    "KeyedStateProcessor",
     "MicroBatchProcessor",
     "StatelessProcessor",
     "WindowedAggregateProcessor",
@@ -186,6 +187,38 @@ class WindowedAggregateProcessor:
         self._fold.restore(state)
 
 
+class KeyedStateProcessor:
+    """`transform_with_state` as a micro-batch processor: the user function owns the state.
+
+    A thin wrapper over `KeyedStateFold` — the same fold `iter_batches()` drives — so a
+    query written against the sink and one consumed batch by batch cannot disagree about
+    what the operator means. `snapshot_state`/`restore_state` are the fold's, so the key
+    space rides through a restart in the checkpoint like any other streaming state.
+    """
+
+    __slots__ = ("_fold",)
+
+    def __init__(self, node) -> None:
+        from batcher.core.streaming import KeyedStateFold
+
+        self._fold = KeyedStateFold(node)
+
+    def process(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
+        return [b for b in self._fold.push(batch) if b.num_rows]
+
+    def state_metrics(self) -> tuple[StateOperatorProgress, ...]:
+        """The key count, what the TTL expired, and the footprint."""
+        return (self._fold.metrics(),)
+
+    def snapshot_state(self) -> pa.RecordBatch | None:
+        """The whole key space, for a checkpoint snapshot."""
+        return self._fold.state()
+
+    def restore_state(self, state: pa.RecordBatch) -> None:
+        """Rebuild the key space from a checkpoint snapshot."""
+        self._fold.restore(state)
+
+
 def make_processor(
     plan,
     output_mode: str,
@@ -198,8 +231,20 @@ def make_processor(
     rule, so an impossible query fails at `start()`, not mid-stream.
     """
     from batcher._internal.errors import PlanError
-    from batcher.plan.logical import Aggregate, Distinct, is_streamable
+    from batcher.plan.logical import Aggregate, Distinct, TransformWithState, is_streamable
 
+    if isinstance(plan, TransformWithState):
+        if output_mode != OutputMode.APPEND:
+            raise PlanError(
+                f"output_mode={output_mode!r} needs an aggregation; transform_with_state "
+                "emits whatever its function returns, once per call, which is 'append'"
+            )
+        if not is_streamable(plan.input):
+            raise PlanError(
+                "transform_with_state needs a breaker-free input (filter / select / "
+                "map_batches over one source); this plan has a pipeline breaker beneath it"
+            )
+        return KeyedStateProcessor(plan)
     if isinstance(plan, (Aggregate, Distinct)):
         if output_mode == OutputMode.APPEND:
             from batcher.core.streaming import _window_key

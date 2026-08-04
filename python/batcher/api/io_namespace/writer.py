@@ -107,8 +107,20 @@ def _undistributable_stream_reason(plan: Any) -> str | None:
     (single-node == distributed), and is not a slogan: the one shape that slipped through this
     gate silently returned a different answer on a cluster than on one box.
     """
-    from batcher.plan.logical import Aggregate, is_streamable
+    from batcher.plan.logical import Aggregate, TransformWithState, is_streamable
 
+    if isinstance(plan, TransformWithState):
+        # Named rather than folded into "another pipeline breaker": this one *has* a
+        # mergeable form (a shuffle by the group keys, so each key's state lives on exactly
+        # one worker and the partitions' key sets are disjoint) and the runner simply does
+        # not implement it yet. A reader who is told "sort / join / window" will restructure
+        # a plan that did not need restructuring.
+        return (
+            "transform_with_state has no distributed implementation yet: its mergeable "
+            "form is a shuffle by the group keys, which the distributed runner does not "
+            "do. Run it with distributed=False rather than have the cluster compute "
+            "something else."
+        )
     if not isinstance(plan, Aggregate) or not is_streamable(plan.input):
         return (
             "distributed streaming supports a stateless pipeline or a top-level "
