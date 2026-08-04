@@ -29,6 +29,11 @@ from batcher.ml.discriminant import (
 from batcher.ml.dummy import DummyClassifier, DummyRegressor
 from batcher.ml.embed import EncoderFactory, build_vector_index, embed, vector_search
 from batcher.ml.embed_api import openai_embedding_encoder, tei_encoder
+from batcher.ml.ensemble import (
+    StackingEnsemble,
+    blend_predictions,
+    out_of_fold_features,
+)
 from batcher.ml.feature_spec import FeatureSpec
 from batcher.ml.glm import GammaRegressor, PoissonRegressor, TweedieRegressor
 from batcher.ml.inference import InferencePool, Worker, WorkerFactory
@@ -245,6 +250,7 @@ __all__ = [
     "ServingClient",
     "SimpleImputer",
     "SplineTransformer",
+    "StackingEnsemble",
     "Stage",
     "StandardScaler",
     "TargetEncoder",
@@ -259,6 +265,7 @@ __all__ = [
     "WorkerFactory",
     "anthropic_engine",
     "balanced_sample",
+    "blend_predictions",
     "build_vector_index",
     "class_counts",
     "class_weights",
@@ -289,6 +296,7 @@ __all__ = [
     "mix_corpora",
     "mmr_rerank_udf",
     "openai_embedding_encoder",
+    "out_of_fold_features",
     "outlier_bounds",
     "oversample",
     "pack_sequences",

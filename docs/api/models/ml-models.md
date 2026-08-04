@@ -234,6 +234,22 @@ Score a clustering against a reference labeling with `batcher.ml.metrics`, each 
 .. autofunction:: davies_bouldin_score
 ```
 
+## Ensembling
+
+Combining several models into one prediction. `blend_predictions` is a weighted average and
+needs no fit; `StackingEnsemble` fits a meta-model on out-of-fold predictions, so the
+meta-model never sees a base model scoring a row it was fitted on.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.ensemble
+
+.. autofunction:: blend_predictions
+.. autofunction:: out_of_fold_features
+
+.. autoclass:: StackingEnsemble
+   :members:
+```
+
 ## Feature selection
 
 `batcher.ml.selection` decides which columns are worth keeping without fitting a model,
