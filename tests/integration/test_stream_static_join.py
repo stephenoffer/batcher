@@ -214,3 +214,39 @@ def test_distributed_true_yields_the_same_rows():
     for batch in _stream().join(_dim(), on="k", how="left").iter_batches(distributed=True):
         fanned.extend(batch.to_pylist())
     assert sorted(map(_key, single)) == sorted(map(_key, fanned))
+
+
+_NASTY = [[("a", 1), (None, 2)], [("a", 3), ("z", 4)]]
+
+
+def _nasty_stream():
+    """Duplicate keys, a null key, and a key the dimension does not have."""
+
+    def feed():
+        for rows in _NASTY:
+            yield pa.record_batch(
+                {"k": [k for k, _ in rows], "v": [v for _, v in rows]}, schema=_SCHEMA
+            )
+
+    return bt.from_batches(feed, _SCHEMA, bounded=False)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("how", ["inner", "left", "semi", "anti"])
+def test_null_and_duplicate_keys_agree_with_the_bounded_join(how):
+    """The key cross-product `CLAUDE.md` asks for, against the operator this one claims to
+    be: a dimension with a duplicate key and a null key, a stream with a null key and an
+    unmatched key. A null never matches a null in a join, and a duplicate multiplies the
+    stream row -- both easy to get wrong once the join is rebuilt per micro-batch."""
+    dimension = bt.from_pydict({"k": ["a", "a", None], "lab": ["A1", "A2", "N"]})
+    flat = [pair for batch in _NASTY for pair in batch]
+    bounded = bt.from_pydict({"k": [k for k, _ in flat], "v": [v for _, v in flat]})
+
+    streamed = _rows(_nasty_stream().join(dimension, on="k", how=how))
+    expected = bounded.join(dimension, on="k", how=how).to_pylist()
+    assert _printable(streamed) == _printable(expected)
+
+
+def _printable(rows: list[dict]) -> list[tuple]:
+    """Rows as sorted (name, rendered value) tuples -- a null sorts against a string."""
+    return sorted(tuple(sorted((name, str(value)) for name, value in row.items())) for row in rows)
