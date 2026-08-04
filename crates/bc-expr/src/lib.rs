@@ -1112,6 +1112,13 @@ pub enum MapFunc {
     MapKeys,
     /// `map_values(m)` → `List<V>` of each row's values (DuckDB `map_values`).
     MapValues,
+    /// `map_entries(m)` → `List<Struct<key, value>>`, the row's entries as a list of
+    /// pairs (DuckDB and Spark both spell it `map_entries`).
+    ///
+    /// This is the one accessor that keeps a key beside its value. `map_keys` and
+    /// `map_values` each return a list, and pairing them back up relies on the two
+    /// sharing an order — true here, but not a guarantee a caller should have to know.
+    MapEntries,
     /// `element_at(m, key)` → the value for the literal `key` (null if absent).
     ElementAt,
 }

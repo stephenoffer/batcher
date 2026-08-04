@@ -61,6 +61,7 @@ class MapFn(StrEnum):
 
     MAP_KEYS = "map_keys"
     MAP_VALUES = "map_values"
+    MAP_ENTRIES = "map_entries"
     ELEMENT_AT = "element_at"
 
 

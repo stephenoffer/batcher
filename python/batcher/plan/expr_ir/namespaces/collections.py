@@ -491,6 +491,30 @@ class _MapNamespace:
         """
         return MapFunc("map_values", self._e)
 
+    def entries(self) -> MapFunc:
+        """Return each row's map as a ``List`` of ``{key, value}`` structs (DuckDB ``map_entries``).
+
+        Use this rather than zipping :meth:`keys` against :meth:`values` when a key has to
+        travel with its value, such as before an ``explode`` that turns one map row into one
+        row per entry. The pairing is structural here, so it survives any later filter or
+        sort that reorders the list.
+
+        Returns:
+            A new List<Struct<key, value>> expression of each row's entries.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> col = pa.array([[("a", 1), ("b", 2)]],
+                ...                type=pa.map_(pa.string(), pa.int64()))
+                >>> ds = bt.from_arrow(pa.table({"m": col}))
+                >>> ds.select(bt.col("m").map.entries().alias("e")).to_pydict()
+                {'e': [[{'key': 'a', 'value': 1}, {'key': 'b', 'value': 2}]]}
+        """
+        return MapFunc("map_entries", self._e)
+
     def len(self) -> Expr:
         """Count each row's entries (DuckDB ``cardinality``; → Int64).
 

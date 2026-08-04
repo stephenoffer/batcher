@@ -327,6 +327,19 @@ def _mapfunc_type(fn: str, map_t: pa.DataType | None) -> pa.DataType | None:
         return pa.list_(map_t.key_type)
     if fn == "map_values":
         return pa.list_(map_t.item_type)
+    if fn == "map_entries":
+        # The entries child of an Arrow Map is `Struct<key, value>`, and the field names
+        # are part of the type a caller then subscripts (`e.struct.get("key")`), so they
+        # are spelled here rather than left to the engine. `key` is non-nullable because
+        # a map entry cannot have one; `value` can be null.
+        return pa.list_(
+            pa.struct(
+                [
+                    pa.field("key", map_t.key_type, nullable=False),
+                    pa.field("value", map_t.item_type),
+                ]
+            )
+        )
     if fn == "element_at":
         return map_t.item_type
     return None
