@@ -169,7 +169,6 @@ def population_stability_index(
     return _psi_from_pairs(_aligned_shares(reference, current, column, buckets))
 
 
-
 def _psi_from_pairs(pairs: list[tuple[float, float]]) -> float:
     """The population stability index of already-aligned ``(reference, current)`` shares."""
     return sum(

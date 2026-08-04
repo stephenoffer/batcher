@@ -300,9 +300,7 @@ def _anova_scores(ds: Dataset, target: str, names: list[str]) -> dict[str, float
         aggregates[f"__bt_n{i}"] = col(name).count()
         aggregates[f"__bt_s{i}"] = sum_(value)
         aggregates[f"__bt_q{i}"] = sum_(value * value)
-    grouped = (
-        ds.filter(col(target).is_not_null()).group_by(target).agg(**aggregates).collect()
-    )
+    grouped = ds.filter(col(target).is_not_null()).group_by(target).agg(**aggregates).collect()
     out: dict[str, float] = {}
     for i, name in enumerate(names):
         counts = [v or 0 for v in grouped.column(f"__bt_n{i}").to_pylist()]

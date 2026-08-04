@@ -161,9 +161,9 @@ class PlattCalibrator(Preprocessor):
                 f"positive={self.positive!r}, so there is nothing to calibrate against. "
                 "Check the split and the positive-class value."
             )
-        model = LogisticRegression(
-            ["__bt_score"], "__bt_label", max_iter=self.max_iter
-        ).fit(prepared)
+        model = LogisticRegression(["__bt_score"], "__bt_label", max_iter=self.max_iter).fit(
+            prepared
+        )
         self.coef_ = float(model.coef_[0])
         self.intercept_ = float(model.intercept_)
         self._fitted = True
