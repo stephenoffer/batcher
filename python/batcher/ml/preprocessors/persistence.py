@@ -252,4 +252,10 @@ def load(path: str) -> Preprocessor:
             >>> load(target).is_fitted
             True
     """
-    return from_dict(read_document(path))
+    try:
+        document = read_document(path)
+    except PlanError as exc:
+        # The shared reader says "not a saved Batcher object"; this entry point knows which
+        # kind was expected, and the narrower message is what the caller can act on.
+        raise PlanError(f"{path!r} is not a saved preprocessor: {exc}") from exc
+    return from_dict(document)

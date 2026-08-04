@@ -194,6 +194,21 @@ print(sorted(json.loads(open(target).read())))
 ```
 
 `state` holds what `fit` learned, under scikit-learn's trailing-underscore names, and
+{py:func}`model_to_dict <batcher.ml.model_to_dict>` and
+{py:func}`model_from_dict <batcher.ml.model_from_dict>` are the same conversion without the
+file, for when the model travels inside something else — a config blob, a registry row, a
+message payload:
+
+```python
+from batcher.ml import model_from_dict, model_to_dict
+
+document = model_to_dict(model)
+print(document["class"], sorted(document["state"]))
+# LinearRegression ['coef_', 'intercept_']
+print(model_from_dict(document).coef_)
+# [2.0]
+```
+
 `params` holds the constructor arguments — read from the constructor's own signature, so a
 parameter an estimator keeps privately (`Ridge` takes `alpha` and stores `_alpha`) is still
 recorded under the name that rebuilds it.

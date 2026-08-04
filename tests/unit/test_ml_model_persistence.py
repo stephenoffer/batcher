@@ -91,7 +91,13 @@ def test_the_registry_finds_the_estimators() -> None:
     assert len(names) >= 10
 
 
-@pytest.mark.parametrize("name", _estimator_names())
+#: An ensemble closes over the caller's own `fit`/`predict` functions, so it has no JSON
+#: representation at all. That is a property of the object, not a gap in the writer, and it
+#: is asserted explicitly below rather than skipped silently.
+UNSAVEABLE = {"StackingEnsemble"}
+
+
+@pytest.mark.parametrize("name", [n for n in _estimator_names() if n not in UNSAVEABLE])
 def test_every_estimator_round_trips_and_predicts_identically(name: str, tmp_path) -> None:
     klass = _registry()[name]
     fitted, ds = _build(name, klass)
@@ -183,3 +189,25 @@ def test_preprocessor_persistence_still_works() -> None:
 
     fitted = StandardScaler("x").fit(_regression())
     assert from_dict(to_dict(fitted)).mean_ == fitted.mean_
+
+
+def test_an_ensemble_of_callables_says_why_it_cannot_be_saved() -> None:
+    """The bare encoder could only name the *type*; the caller needs the field and the fix."""
+    from batcher.ml import LinearRegression, StackingEnsemble
+
+    ds = bt.from_pydict({"x": [float(i) for i in range(20)], "y": [2.0 * i for i in range(20)]})
+    bases = {"m": (lambda d: LinearRegression(["x"], "y").fit(d), lambda m, d: m.predict(d))}
+    meta = (lambda d: LinearRegression(["m"], "y").fit(d), lambda m, d: m.predict(d))
+    stack = StackingEnsemble(bases, meta, k=4, key="x").fit(ds)
+    with pytest.raises(PlanError, match=r"StackingEnsemble\.bases holds a callable"):
+        model_to_dict(stack)
+
+
+def test_an_unserializable_field_is_named() -> None:
+    """A non-callable that JSON cannot hold should still say which attribute it was."""
+    from batcher.ml import LinearRegression
+
+    fitted = LinearRegression(["x"], "y").fit(_regression())
+    fitted.coef_ = object()
+    with pytest.raises(PlanError, match=r"LinearRegression\.coef_ cannot be saved"):
+        model_to_dict(fitted)

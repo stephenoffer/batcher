@@ -112,12 +112,43 @@ def model_to_dict(model: object) -> dict[str, Any]:
             >>> model_to_dict(LinearRegression(["x"], "y").fit(ds))["class"]
             'LinearRegression'
     """
+    name = type(model).__name__
     return {
         "version": SCHEMA_VERSION,
-        "class": type(model).__name__,
-        "params": {k: encode_value(v) for k, v in _parameters(model).items()},
-        "state": {n: encode_value(getattr(model, n)) for n in state_names(model)},
+        "class": name,
+        "params": {k: _encode_field(v, name, k) for k, v in _parameters(model).items()},
+        "state": {n: _encode_field(getattr(model, n), name, n) for n in state_names(model)},
     }
+
+
+def _encode_field(value: Any, model: str, field: str) -> Any:
+    """Encode one field, saying which one failed and what to do instead.
+
+    The bare encoder can only report the offending *type*, and "cannot serialize fitted
+    state of type function" tells a caller nothing about which attribute or which way out.
+    A callable is the case worth naming: an ensemble that closes over user `fit`/`predict`
+    pairs cannot be written as JSON at all, and no amount of retrying will change that.
+    """
+    try:
+        return encode_value(value)
+    except PlanError as exc:
+        if callable(value) or _holds_callable(value):
+            raise PlanError(
+                f"{model}.{field} holds a callable, so this model cannot be saved as JSON. "
+                "An ensemble that closes over your own fit/predict functions has no portable "
+                "representation — save each base model with save_model() and rebuild the "
+                "ensemble in code."
+            ) from exc
+        raise PlanError(f"{model}.{field} cannot be saved: {exc}") from exc
+
+
+def _holds_callable(value: Any) -> bool:
+    """Whether `value` is a container with a callable somewhere inside it."""
+    if isinstance(value, dict):
+        return any(_holds_callable(v) or callable(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_holds_callable(v) or callable(v) for v in value)
+    return False
 
 
 def model_from_dict(document: dict[str, Any]) -> Any:
