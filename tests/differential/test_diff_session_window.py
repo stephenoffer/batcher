@@ -149,3 +149,74 @@ def test_the_session_bounds_keep_the_event_time_columns_own_type(arrow_type, exp
     result = out.collect()
     assert str(result.schema.field("session_start").type) == expected
     assert str(result.schema.field("session_end").type) == expected
+
+
+def test_a_null_event_time_lands_where_duckdb_puts_it(duck):
+    """A row with no event time has no place in a gap-based session, so where it goes is
+    decided by how nulls sort in the ordering both engines use. They agree -- the null row
+    joins the session that follows it -- and this pins that rather than leaving the one
+    input a session window has no answer for untested."""
+    base = _BASE
+    tbl = pa.table(
+        {
+            "k": pa.array(["a", "a", "a"], pa.string()),
+            "ts": pa.array([base, None, base + dt.timedelta(hours=4)], pa.timestamp("us")),
+            "v": pa.array([1, 7, 2], pa.int64()),
+        }
+    )
+    got = (
+        bt.from_arrow(tbl)
+        .session_window("ts", "30m", partition_by=["k"], total=col("v").sum())
+        .collect()
+    )
+    duck.register("t", tbl)
+    rel = duck.sql(
+        """
+        WITH marked AS (
+            SELECT *,
+                CASE WHEN epoch_us(ts) - lag(epoch_us(ts)) OVER w > 1800 * 1000000
+                          OR lag(epoch_us(ts)) OVER w IS NULL
+                     THEN 1 ELSE 0 END AS new_session
+            FROM t WINDOW w AS (PARTITION BY k ORDER BY ts)
+        ),
+        sessioned AS (
+            SELECT *, sum(new_session) OVER (PARTITION BY k ORDER BY ts) AS sid FROM marked
+        )
+        SELECT k, min(ts) AS session_start, max(ts) AS session_end, sum(v) AS total
+        FROM sessioned GROUP BY k, sid
+        """
+    )
+    assert_same(got, rel)
+
+
+def test_the_streaming_operator_puts_the_null_row_in_the_same_place():
+    """Whatever the answer is, both paths must give it. A null event time cannot advance a
+    watermark either, which is the part only the streaming path has to get right."""
+    base = _BASE
+    schema = pa.schema([("k", pa.string()), ("ts", pa.timestamp("us")), ("v", pa.int64())])
+
+    def feed():
+        yield pa.record_batch({"k": ["a", "a"], "ts": [base, None], "v": [1, 7]}, schema=schema)
+        yield pa.record_batch(
+            {"k": ["a"], "ts": [base + dt.timedelta(hours=4)], "v": [2]}, schema=schema
+        )
+
+    streamed = []
+    plan = bt.from_batches(feed, schema, bounded=False).session_window(
+        "ts", "30m", partition_by=["k"], total=col("v").sum()
+    )
+    for batch in plan.iter_batches():
+        streamed.extend(batch.to_pylist())
+    bounded = (
+        bt.from_pydict(
+            {"k": ["a", "a", "a"], "ts": [base, None, base + dt.timedelta(hours=4)], "v": [1, 7, 2]}
+        )
+        .session_window("ts", "30m", partition_by=["k"], total=col("v").sum())
+        .to_pylist()
+    )
+    assert _by_start(streamed) == _by_start(bounded)
+
+
+def _by_start(rows: list[dict]) -> list[tuple]:
+    """Sessions keyed by start, so the comparison does not depend on emission order."""
+    return sorted((str(row["session_start"]), row["total"]) for row in rows)
