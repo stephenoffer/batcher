@@ -280,3 +280,31 @@ def test_register_allows_reusing_a_stopped_name():
     finally:
         _deregister(name)
     assert name not in _ACTIVE
+
+
+def test_the_active_registry_does_not_grow_with_finished_queries():
+    """A driver that neither stops nor awaits its query is ordinary — a scheduler firing
+    an `available_now` backfill takes its rows and moves on. Those entries stayed forever,
+    each holding a handle, an engine, a processor, a sink and a progress deque: invisible
+    in `bt.streams()`, which filters on liveness, and unbounded in the dict behind it."""
+    from batcher.api.streaming._query import _ACTIVE, _register, active_streams
+
+    before = len(_ACTIVE)
+    for i in range(5):
+        _register(f"swept-{i}", StreamingQuery(f"swept-{i}", _FakeEngine(active=False)))
+    assert len(_ACTIVE) > before
+
+    assert active_streams() == []
+    assert len(_ACTIVE) == before, "finished queries were never swept out"
+
+
+def test_a_running_query_is_never_swept():
+    from batcher.api.streaming._query import _ACTIVE, _register, active_streams
+
+    live = StreamingQuery("kept", _FakeEngine(active=True))
+    _register("kept", live)
+    try:
+        assert live in active_streams()
+        assert "kept" in _ACTIVE
+    finally:
+        _ACTIVE.pop("kept", None)

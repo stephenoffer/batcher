@@ -33,6 +33,19 @@ def _next_name() -> str:
         return f"query-{_COUNTER}"
 
 
+def _sweep_stopped() -> None:
+    """Drop queries that have finished. **Caller must hold `_LOCK`.**
+
+    A query is removed on `stop()` or a completed `await_termination()`, and a driver
+    that does neither is ordinary: a scheduler firing an `available_now` backfill every
+    few minutes gets its rows and moves on. Those entries stayed forever, each holding a
+    handle, an engine, a processor, a sink and a bounded progress deque — invisible in
+    `bt.streams()`, which filters on liveness, and unbounded in the dict behind it.
+    """
+    for name in [n for n, q in _ACTIVE.items() if not q.is_active]:
+        _ACTIVE.pop(name, None)
+
+
 def _register(name: str, query: StreamingQuery) -> None:
     """Add `query` to the active registry, rejecting a duplicate *active* name.
 
@@ -50,6 +63,7 @@ def _register(name: str, query: StreamingQuery) -> None:
                 f"a streaming query named {name!r} is already active; stop it first or "
                 "pass a distinct name= to write(...)"
             )
+        _sweep_stopped()
         _ACTIVE[name] = query
 
 
@@ -88,9 +102,14 @@ def _warn_if_checkpoint_not_durable(location: str) -> None:
 
 
 def active_streams() -> list[StreamingQuery]:
-    """All currently-active streaming queries (the `bt.streams` accessor)."""
+    """All currently-active streaming queries (the `bt.streams` accessor).
+
+    Sweeps the finished ones out on the way past, so the registry is bounded by the
+    queries actually running rather than by every query the process ever started.
+    """
     with _LOCK:
-        return [q for q in _ACTIVE.values() if q.is_active]
+        _sweep_stopped()
+        return list(_ACTIVE.values())
 
 
 def await_any_termination(timeout: float | None = None) -> bool:

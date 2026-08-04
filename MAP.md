@@ -343,7 +343,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
 | `_launch.py` | 244 | The single-node streaming launcher: optimize once, then drive micro-batches. |
-| `_query.py` | 288 | The `StreamingQuery` handle users hold, and the registry of running queries. |
+| `_query.py` | 307 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
 
