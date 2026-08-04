@@ -60,7 +60,11 @@ from batcher.ml.loader import (
     streaming_split,
 )
 from batcher.ml.mixture import GaussianMixture
-from batcher.ml.model_selection import cross_val_predict, cross_val_score, learning_curve
+from batcher.ml.model_selection import (
+    cross_val_predict,
+    cross_val_score,
+    learning_curve,
+)
 from batcher.ml.naive_bayes import BernoulliNB, GaussianNB, MultinomialNB
 from batcher.ml.outliers import (
     OutlierClipper,
@@ -83,14 +87,16 @@ from batcher.ml.preprocessors import (
     Concatenator,
     CountVectorizer,
     CyclicalEncoder,
-    DropCorrelated,
     DateTimeFeaturizer,
+    DropCorrelated,
     FrequencyEncoder,
+    FunctionTransformer,
     GroupImputer,
     GroupStatEncoder,
     HashingEncoder,
     HashingVectorizer,
     InteractionFeatures,
+    IsotonicCalibrator,
     KBinsDiscretizer,
     LabelBinarizer,
     LabelEncoder,
@@ -104,6 +110,7 @@ from batcher.ml.preprocessors import (
     Normalizer,
     OneHotEncoder,
     OrdinalEncoder,
+    PlattCalibrator,
     PolynomialFeatures,
     PowerTransformer,
     Preprocessor,
@@ -117,6 +124,7 @@ from batcher.ml.preprocessors import (
     SelectKBest,
     SelectPercentile,
     SimpleImputer,
+    SplineTransformer,
     StandardScaler,
     TargetEncoder,
     TextStatFeaturizer,
@@ -159,6 +167,8 @@ from batcher.ml.streaming_sampler import (
 )
 
 __all__ = [
+    "PCA",
+    "RFE",
     "BernoulliNB",
     "Binarizer",
     "BinaryEncoder",
@@ -180,6 +190,7 @@ __all__ = [
     "EngineFactory",
     "FeatureSpec",
     "FrequencyEncoder",
+    "FunctionTransformer",
     "GammaRegressor",
     "GaussianMixture",
     "GaussianNB",
@@ -189,6 +200,7 @@ __all__ = [
     "HashingVectorizer",
     "InferencePool",
     "InteractionFeatures",
+    "IsotonicCalibrator",
     "KBinsDiscretizer",
     "KMeans",
     "LabelBinarizer",
@@ -211,7 +223,7 @@ __all__ = [
     "OneHotEncoder",
     "OrdinalEncoder",
     "OutlierClipper",
-    "PCA",
+    "PlattCalibrator",
     "PoissonRegressor",
     "PolynomialFeatures",
     "PowerTransformer",
@@ -219,7 +231,6 @@ __all__ = [
     "QuadraticDiscriminantAnalysis",
     "QualityThresholds",
     "QuantileTransformer",
-    "RFE",
     "RankTransformer",
     "RareCategoryEncoder",
     "RatioFeatures",
@@ -233,6 +244,7 @@ __all__ = [
     "SelectPercentile",
     "ServingClient",
     "SimpleImputer",
+    "SplineTransformer",
     "Stage",
     "StandardScaler",
     "TargetEncoder",
