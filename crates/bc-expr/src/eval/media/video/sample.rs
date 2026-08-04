@@ -51,13 +51,6 @@ enum Size {
 }
 
 impl Size {
-    fn exact(func: &str, args: super::VideoArgs) -> Result<Self, ExprError> {
-        Ok(Self::Exact {
-            width: dim(func, "width", args.width)?,
-            height: dim(func, "height", args.height)?,
-        })
-    }
-
     fn fit(func: &str, args: super::VideoArgs) -> Result<Self, ExprError> {
         Ok(Self::Fit {
             max: dim(func, "max_size", args.width)?,
@@ -80,13 +73,15 @@ impl Size {
         }
     }
 
-    /// Bytes of RGB8 in one frame, for the fixed-size case only.
-    fn frame_bytes(&self) -> u64 {
+    /// Bytes of RGB8 in one frame, when that is knowable before the clip is opened.
+    ///
+    /// `None` for `Fit`, whose size follows the frame it is scaling — which is exactly why
+    /// only the tensor op can pre-allocate a per-row buffer, and why only it has a
+    /// per-row element count to guard.
+    fn frame_bytes(&self) -> Option<u64> {
         match *self {
-            Self::Exact { width, height } => (width as u64) * (height as u64) * 3,
-            // `Fit` is only used by the still-producing ops, which never pre-allocate a
-            // per-row buffer — the size is not known until the clip's own is.
-            Self::Fit { .. } => 0,
+            Self::Exact { width, height } => Some((width as u64) * (height as u64) * 3),
+            Self::Fit { .. } => None,
         }
     }
 }
@@ -113,24 +108,27 @@ fn dim(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprErr
 /// video model's input: every row has the same `(n, h, w, 3)` shape whatever the source
 /// clip's resolution or length was.
 pub(super) fn frames(clips: &Clips<'_>, args: super::VideoArgs) -> Result<ArrayRef, ExprError> {
-    let size = Size::exact("frames", args)?;
+    let width = dim("frames", "width", args.width)?;
+    let height = dim("frames", "height", args.height)?;
+    let size = Size::Exact { width, height };
     let n = args.num_frames.ok_or(ExprError::MissingImageArg {
         func: "frames".to_string(),
         arg: "num_frames",
     })?;
-    let n = usize::try_from(n)
-        .ok()
-        .filter(|&v| v > 0)
-        .ok_or_else(|| ExprError::InvalidArgument {
-            func: "frames".to_string(),
-            reason: format!("num_frames must be a positive integer, got {n}"),
-        })?;
+    let n =
+        usize::try_from(n)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| ExprError::InvalidArgument {
+                func: "frames".to_string(),
+                reason: format!("num_frames must be a positive integer, got {n}"),
+            })?;
     // The per-row element count is also the `FixedSizeList` element length, an Arrow
     // `i32`, and it is driven by three query parameters that multiply. Computed in `u64`
     // so the multiply cannot itself overflow, then rejected above `i32::MAX` — where the
     // later `as i32` would wrap negative and the `len * per_row` allocation would become
     // a multi-gigabyte OOM bomb.
-    let per_frame = size.frame_bytes();
+    let per_frame = (width as u64) * (height as u64) * 3;
     let per_row = per_frame * (n as u64);
     if per_row > i32::MAX as u64 {
         return Err(ExprError::InvalidArgument {
@@ -192,7 +190,9 @@ pub(super) fn frame_at(clips: &Clips<'_>, args: super::VideoArgs) -> Result<Arra
     if !second.is_finite() || second < 0.0 {
         return Err(ExprError::InvalidArgument {
             func: "frame_at".to_string(),
-            reason: format!("second must be a finite, non-negative number of seconds, got {second}"),
+            reason: format!(
+                "second must be a finite, non-negative number of seconds, got {second}"
+            ),
         });
     }
     let out: Vec<Option<Vec<u8>>> = map_rows(clips.len(), |i| {
@@ -278,7 +278,7 @@ impl Decoding {
     /// The pack is not optional: FFmpeg pads each row out to a `stride(0)` that is `>=`
     /// `width * 3`, so handing `data(0)` straight to Arrow would ship the padding as
     /// pixels and shear the image progressively down the frame.
-    fn to_rgb(&mut self, frame: &ff::frame::Video) -> Option<Vec<u8>> {
+    fn scale_to_rgb(&mut self, frame: &ff::frame::Video) -> Option<Vec<u8>> {
         let (w, h) = self.out;
         let mut rgb = ff::frame::Video::empty();
         self.scaler.run(frame, &mut rgb).ok()?;
@@ -312,7 +312,7 @@ fn sample_uniform(data: &[u8], n: usize, size: &Size) -> Option<Vec<u8>> {
 
     let mut ictx = open_input(clip.path())?;
     let mut dec = Decoding::open(&ictx, size)?;
-    let frame_bytes = size.frame_bytes() as usize;
+    let frame_bytes = size.frame_bytes()? as usize;
     let mut out = vec![0u8; frame_bytes * n];
     // Which output slots each wanted source index fills. A clip shorter than `n` frames
     // repeats frames rather than failing, so one source index can fill several slots.
@@ -321,7 +321,7 @@ fn sample_uniform(data: &[u8], n: usize, size: &Size) -> Option<Vec<u8>> {
     let mut decoded = ff::frame::Video::empty();
 
     let mut place = |dec: &mut Decoding, frame: &ff::frame::Video, pos: usize| -> Option<()> {
-        let rgb = dec.to_rgb(frame)?;
+        let rgb = dec.scale_to_rgb(frame)?;
         if rgb.len() != frame_bytes {
             return None;
         }
@@ -513,18 +513,18 @@ fn seek_frame(data: &[u8], second: Option<f64>, size: &Size) -> Option<(Vec<u8>,
             // No timestamp to compare against (a raw stream with no pts). The first
             // frame after the seek is the best available answer.
             None => {
-                *best = dec.to_rgb(frame);
+                *best = dec.scale_to_rgb(frame);
                 true
             }
             Some(t) if t <= target_secs + TS_EPSILON => {
-                *best = dec.to_rgb(frame);
+                *best = dec.scale_to_rgb(frame);
                 false
             }
             // Past the target. Keep the earlier frame if there is one; otherwise the seek
             // overshot (or the target precedes the first frame) and this is the closest.
             Some(_) => {
                 if best.is_none() {
-                    *best = dec.to_rgb(frame);
+                    *best = dec.scale_to_rgb(frame);
                 }
                 true
             }

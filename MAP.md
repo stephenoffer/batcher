@@ -2472,7 +2472,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/radix_sort.rs` | 176 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 256 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
-| `ops/sample_sort.rs` | 358 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort.rs` | 343 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 168 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 3001 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
@@ -2606,7 +2606,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 42 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/speech.rs` | 126 | Waveform conditioning for speech pipelines: silence trimming, peak normalization, and the zero-crossing rate. |
-| `eval/media/video/mod.rs` | 286 | Video evaluation for `Expr::Video` (the `.video` namespace). |
+| `eval/media/video/mod.rs` | 296 | Video evaluation for `Expr::Video` (the `.video` namespace). |
 | `eval/media/video/sample.rs` | 568 | Turning a clip into pixels: `frames`, `thumbnail`, and `frame_at`. |
 | `eval/mod.rs` | 39 | Evaluation bodies for the scalar `Expr` variants. |
 | `eval/security/crypto.rs` | 101 | Keyed cryptographic primitives: HMAC-SHA-256 pseudonymization and AES-256-GCM-SIV column encryption. |

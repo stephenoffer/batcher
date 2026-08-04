@@ -229,11 +229,11 @@ fn resize_rgb(img: &image::RgbImage, w: u32, h: u32) -> Option<image::RgbImage> 
     use fast_image_resize as fir;
 
     let (sw, sh) = img.dimensions();
-    let src = fir::images::Image::from_vec_u8(sw, sh, img.as_raw().clone(), fir::PixelType::U8x3)
-        .ok()?;
+    let src =
+        fir::images::Image::from_vec_u8(sw, sh, img.as_raw().clone(), fir::PixelType::U8x3).ok()?;
     let mut dst = fir::images::Image::new(w, h, fir::PixelType::U8x3);
-    let opts =
-        fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
+    let opts = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
     fir::Resizer::new().resize(&src, &mut dst, &opts).ok()?;
     image::RgbImage::from_raw(w, h, dst.into_vec())
 }

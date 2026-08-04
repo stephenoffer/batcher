@@ -27,7 +27,13 @@ use crate::{ExprError, VideoFunc};
 /// Passed to every op even though only the sampling three read it, for the same reason
 /// `image::ImageArgs` exists: four positional `Option`s at a call site is a place where
 /// swapping `width` and `height` is a silent bug the compiler cannot see.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Without the `video` feature nothing reads the fields — the stub `eval_video` below
+/// returns `FeatureDisabled` before looking at them — but the struct itself must still
+/// exist, because `eval::dispatch` builds one unconditionally. That is what the
+/// feature-gated `allow` is for; an unconditional one would hide a real dead field.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "video"), allow(dead_code))]
 pub(crate) struct VideoArgs {
     pub num_frames: Option<i64>,
     pub width: Option<i64>,
@@ -71,10 +77,7 @@ impl<'a> Clips<'a> {
 
         let (narrow, wide) = match arr.data_type() {
             DataType::Binary => (arr.as_any().downcast_ref::<GenericBinaryArray<i32>>(), None),
-            DataType::LargeBinary => (
-                None,
-                arr.as_any().downcast_ref::<GenericBinaryArray<i64>>(),
-            ),
+            DataType::LargeBinary => (None, arr.as_any().downcast_ref::<GenericBinaryArray<i64>>()),
             other => {
                 return Err(ExprError::ExpectedBinary {
                     func: format!("{func:?}"),
@@ -104,6 +107,13 @@ impl<'a> Clips<'a> {
     }
 }
 
+/// One clip's header facts: `(width, height, num_frames, duration_secs, fps)`.
+///
+/// Named because it crosses two function signatures, and a bare five-tuple at both
+/// ends is a place where two `f64`s can be swapped with nothing to notice.
+#[cfg(feature = "video")]
+type ClipMeta = (i32, i32, i64, f64, f64);
+
 /// `decode()` → struct `{width, height, num_frames, duration_secs, fps}`.
 #[cfg(feature = "video")]
 fn decode_meta(clips: &Clips<'_>) -> Result<ArrayRef, ExprError> {
@@ -116,7 +126,7 @@ fn decode_meta(clips: &Clips<'_>) -> Result<ArrayRef, ExprError> {
     // Probe every clip in parallel (each opens its own temp file, so the rows are
     // independent), then fold into the column buffers serially. See `super::map_rows` —
     // without it a sub-morsel batch would probe on a single core.
-    let metas: Vec<Option<(i32, i32, i64, f64, f64)>> =
+    let metas: Vec<Option<ClipMeta>> =
         super::map_rows(clips.len(), |i| clips.get(i).and_then(probe_meta));
     let (mut w, mut h) = (Vec::new(), Vec::new());
     let (mut frames, mut dur, mut fps) = (Vec::new(), Vec::new(), Vec::new());
@@ -166,7 +176,7 @@ fn decode_meta(clips: &Clips<'_>) -> Result<ArrayRef, ExprError> {
 
 /// Probe `(width, height, num_frames, duration_secs, fps)` from a clip's header.
 #[cfg(feature = "video")]
-fn probe_meta(data: &[u8]) -> Option<(i32, i32, i64, f64, f64)> {
+fn probe_meta(data: &[u8]) -> Option<ClipMeta> {
     let clip = ClipFile::write(data)?;
     let ictx = open_input(clip.path())?;
     let stream = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
