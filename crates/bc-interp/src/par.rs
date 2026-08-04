@@ -771,7 +771,7 @@ fn exec(
             // once. When grouping does reduce, the sample's partials are the first slice of
             // the work below, and are reused rather than recomputed.
             let partition_keys = agg_par::partitionable(group_keys, &parts);
-            let partials = match agg_par::decide(
+            let (partials, est_groups) = match agg_par::decide(
                 &parts,
                 group_keys,
                 aggregates,
@@ -780,7 +780,11 @@ fn exec(
             )? {
                 // The partition path holds the gathered relation where the reducing path can
                 // spill its partials, so the pool decides. Declining costs the sample only.
-                agg_par::AggPlan::Partition { keys, width } => {
+                agg_par::AggPlan::Partition {
+                    keys,
+                    width,
+                    groups,
+                } => {
                     match admit(opts, op_id, agg_par::partition_footprint(in_bytes)) {
                         Admit::InMemory(_reservation) => {
                             let out = agg_par::partitioned_aggregate(
@@ -803,12 +807,16 @@ fn exec(
                             );
                             return Ok(out);
                         }
-                        Admit::Spill => {
-                            agg_par::partials(&parts, group_keys, aggregates, &agg_jit)?
-                        }
+                        // The pool declined the gathered relation, so the bounded reducing
+                        // path runs instead — over a group-by the sample says does NOT
+                        // reduce, which is exactly where the merge wants a wide regroup.
+                        Admit::Spill => (
+                            agg_par::partials(&parts, group_keys, aggregates, &agg_jit)?,
+                            groups,
+                        ),
                     }
                 }
-                agg_par::AggPlan::Partials(partials) => partials,
+                agg_par::AggPlan::Partials { partials, groups } => (partials, groups),
             };
 
             // Spill once the partial state exceeds the per-operator budget *or* the
@@ -889,8 +897,12 @@ fn exec(
                     }
                 }
                 Admit::InMemory(_reservation) => {
-                    let merged =
-                        agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+                    let merged = agg::combine_sized(
+                        &partials,
+                        &funcs,
+                        opts.tuning.radix_parallel_threshold,
+                        est_groups,
+                    )?;
                     let agg_cols = agg::finalize(&funcs, &merged)?;
                     (merged.group_columns, agg_cols)
                 }
@@ -2669,6 +2681,10 @@ fn exec_agg_fused(
         }
     }
 
+    // The merge below cannot measure its own output size; the sample already taken can.
+    let est_groups =
+        agg_par::groups_from_sample(&sample_partials, sample_rows, sample_n, base_rows as usize);
+
     // Reducing (or the pool declined the partitioned shape): fold every remaining morsel
     // straight into a partial, dropping its chained batch as the fusion always has. The
     // sample's partials are the first slice of that work and are reused, not recomputed.
@@ -2720,8 +2736,12 @@ fn exec_agg_fused(
             (res.group_columns, res.agg_columns)
         }
         Admit::InMemory(_reservation) => {
-            let merged =
-                agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+            let merged = agg::combine_sized(
+                &partials,
+                &funcs,
+                opts.tuning.radix_parallel_threshold,
+                est_groups,
+            )?;
             let agg_cols = agg::finalize(&funcs, &merged)?;
             (merged.group_columns, agg_cols)
         }
