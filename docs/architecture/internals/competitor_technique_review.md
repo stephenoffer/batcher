@@ -17,9 +17,16 @@ already built or unreachable.
 inventories rather than following the scorecard, and found the one gap in this document that
 is *asymptotic* rather than a constant factor: `DISTINCT`/`GROUP BY` under a `LIMIT` never
 stops early (10a, 0.15x at 16M rows and widening). It also found a query every competitor
-accepts and Batcher raises on (10b), and **ruled two candidates out** — DuckDB's perfect-hash
-aggregate and perfect-hash join are both already built here (10e). Note what that ratio says:
-of five operator-level candidates examined, two were already done. Check before building.
+accepts and Batcher raises on (10b), and **ruled four candidates out** — DuckDB's perfect-hash
+aggregate and perfect-hash join, time-bucketed grouping, and expression CSE are all already
+built here (10e). Note what that ratio says: of nine operator-level candidates examined, four
+were already done. Check before building.
+
+The sweep then extended to Polars' streaming-node inventory, which contributed 10f (sortedness
+is tracked and propagated, and no operator specializes on it) and 10g — a methodological
+finding worth as much as any gap: **two attempts to time a plan-level optimization measured
+Kyber's shortcut machinery instead of the mechanism**, because it answered both probe shapes
+from metadata 15-22x faster than DuckDB executed them.
 
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
 This document is the *parts list* behind it. It answers a narrower question: given the
@@ -731,6 +738,50 @@ previous run's, so a first-seen shape gets a prior rather than a measurement, an
 data volume changed run-to-run gets a stale one. Spark, with no learning at all, uses the
 fresher number for this one decision.
 
+### 10f. Sortedness is tracked, and no operator specializes on it
+
+Polars' streaming engine carries a sortedness flag and has **operators that consume it**:
+`nodes/sorted_group_by.rs`, `nodes/sorted_unique.rs`, `nodes/is_first_distinct.rs`,
+`nodes/merge_sorted.rs`. On sorted input a group-by is a linear scan over adjacent runs — no
+hash table, `O(1)` state, and it cannot spill.
+
+Batcher has the *property* and propagates it well. `RelStats.sorted_by` carries a canonical
+ascending/nulls-last ordering, `kyber/properties.py` defines `PhysicalProperties` with a
+`satisfies` relation that knows a `(a, b)` ordering satisfies a request for `(a)`, and
+`project_ordering` threads it through projections. Two things consume it: `kyber/rules/ordering.py`
+**eliminates a redundant sort** when the wanted columns are a prefix of the delivered ordering
+(`:41-55`), and `kyber/cost/shuffle.py` plus `dist/executor.py` use it to cost and avoid
+shuffles.
+
+What consumes it nowhere is aggregation. A grep for a sorted-aggregate or adjacent-dedup
+operator across `crates/` returns nothing, and no rule rewrites `Distinct`/`Aggregate` on the
+strength of a sorted input. So a lakehouse table with a declared sort key — the case
+`shortcuts/ordering.py` exists to describe — still pays a full hash aggregate to group by its
+own sort key.
+
+**Unmeasured**, and honestly stated as such: it needs a source that declares `sorted_by`, which
+is more setup than the other items here. The reason to rank it anyway is that the win is
+*memory* before speed. A sorted group-by has bounded state, so it is the one shape that
+converts a spilling aggregate into a streaming one.
+
+### 10g. A caution about probing this optimizer with a stopwatch
+
+Two attempts to measure whether Batcher reuses a repeated *subplan* (as Polars' `multiplexer`
+node and Spark's `ReuseExchange` do) failed, in an instructive way. A CTE self-joined on its own
+group key answered in **7 ms** against 122 ms for the aggregate alone, and a regex-extraction
+subplan `UNION ALL`-ed with itself answered in **22 ms** against 359 ms for one copy. Both times
+Kyber *solved* the query from metadata rather than executing it, so the probe measured the
+shortcut and not the thing it was aimed at.
+
+Recorded because it changes how the next person should measure. A timing probe of a plan-level
+optimization has to use a shape the shortcut machinery cannot answer, or it reports a number
+about the wrong mechanism entirely. Note also what the two figures say on their own account:
+on both shapes Batcher beat DuckDB by 15x and 22x, because DuckDB executed what it was asked.
+
+Expression-level CSE is present and is a different thing —
+`kyber/rules/extra/cse.py` binds a subexpression repeated across a `Project`'s outputs to one
+synthetic column. Plan-level reuse remains **unestablished in either direction**.
+
 ### 10e. Ruled out — already built, do not re-implement
 
 Both were on the shortlist of DuckDB operators worth taking, and both already exist:
@@ -743,6 +794,14 @@ Both were on the shortlist of DuckDB operators worth taking, and both already ex
   `bc-runtime/src/join/dense.rs`, "a perfect hash for a small-range integer build key",
   explicitly written as the join-side counterpart of the group-key one, with a measurement of
   the build cost it removes.
+- **Time-bucketed grouping.** DuckDB's `time_bucket`, Polars' `group_by_dynamic` /
+  `group_by_rolling`, Spark's `window()`. Batcher: `plan/functions/temporal.py` and
+  `expr_ir/func_nodes.py:274` give `window_start(ts, width, origin)` for tumbling buckets and a
+  list of overlapping buckets for sliding ones, and `group_by_dynamic` is already mapped to the
+  Batcher spelling in `api/dataset/compat/guidance/`.
+- **Expression CSE.** `kyber/rules/extra/cse.py`, which binds a subexpression repeated across a
+  `Project`'s outputs to one synthetic column. (Plan-level *subplan* reuse is a different
+  question, and 10g explains why it is still open.)
 
 ## Things Batcher already has, so do not "add" them
 
