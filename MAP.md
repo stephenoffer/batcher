@@ -342,7 +342,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | module | lines | what it is |
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
-| `_launch.py` | 240 | The single-node streaming launcher: optimize once, then drive micro-batches. |
+| `_launch.py` | 244 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 288 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
@@ -389,9 +389,9 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `dispatch.py` | 477 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
+| `dispatch.py` | 500 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
 | `rebatch.py` | 59 | The exact output-granularity contract for `iter_batches(batch_size=N)`. |
-| `union.py` | 83 | When a UNION streams branch by branch, and how its branches are addressed. |
+| `union.py` | 158 | When a UNION streams branch by branch, and how its branches are addressed. |
 
 ### `batcher/api/terminal/stream/watermark/` — 5 · conductor
 

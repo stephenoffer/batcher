@@ -173,6 +173,48 @@ print(decoded_audio.schema.field("mono").type, len(decoded_audio.column("mono")[
 # list<item: float> 16
 ```
 
+### Choosing how an image is resized
+
+Three operations resize, and picking the wrong one is a mistake the output's shape cannot
+show you:
+
+| Call | Aspect ratio | Output | Use it for |
+| --- | --- | --- | --- |
+| `.image.to_tensor(w, h)` | stretched to fit | uint8 tensor | a classifier fed square crops |
+| `.image.letterbox(w, h, fill=114)` | preserved, padded | uint8 tensor | object detection |
+| `.image.thumbnail(max_size)` | preserved, never upscaled | PNG bytes | anything a person looks at |
+
+`to_tensor` and `resize` take both dimensions, so they squash whatever is not already at
+the target ratio. That is right for a classifier and wrong for a detector, because a
+stretched image moves every box the model predicts off its object. `center_crop` is not the
+answer either: it discards the border, which is where the missed detections are.
+
+`letterbox` is the standard detection preprocessing. It scales the whole image to fit,
+centres it on the canvas, and fills the remainder with a constant the model learns to
+ignore. The default fill of `114` is the YOLO family's grey, so a model trained against
+that preprocessing sees the padding it expects.
+
+```python
+# docs: skip
+from batcher import col
+
+# Two orientations, one canvas, so the rows batch together.
+frames = photos.with_columns(x=col("bytes").image.letterbox(640, 640))
+```
+
+`thumbnail` scales so the longest side is `max_size` and hands back encoded bytes rather
+than pixels, because its output is for review rather than for a model. It never upscales.
+That split is the rule across the whole media surface: an operation returning an **encoded
+still** takes a longest side and keeps the shape, one returning a **tensor** takes exact
+dimensions.
+
+```python
+# docs: skip
+from batcher import col
+
+sheet = photos.select(uri=col("uri"), small=col("bytes").image.thumbnail(256))
+```
+
 ## Tensor columns
 
 A column where every row is a same-shape `N`-dimensional tensor is stored as Arrow's
