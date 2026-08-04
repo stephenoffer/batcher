@@ -166,7 +166,7 @@ def _start_driver_stream(
     name: str | None,
     checkpoint: str | None,
 ) -> StreamingQuery:
-    """Drive a multi-source streaming plan (a stream-stream join) into a sink.
+    """Drive a multi-source streaming plan into a sink — a join, or a union of streams.
 
     The driver is the same `_iter_batches` router `iter_batches()` uses, so the rows
     written are the rows that terminal would have yielded — one implementation, two
@@ -180,26 +180,30 @@ def _start_driver_stream(
     from batcher import core
     from batcher._internal.errors import PlanError
     from batcher.api.terminal.stream import _iter_batches
-    from batcher.plan.logical import WatermarkStreamJoin
+    from batcher.api.terminal.stream.union import union_streams_interleaved
+    from batcher.plan.logical import Union, WatermarkStreamJoin
 
-    if not isinstance(plan, WatermarkStreamJoin):
+    joins = isinstance(plan, WatermarkStreamJoin)
+    unions = isinstance(plan, Union) and union_streams_interleaved(plan, sources)
+    if not (joins or unions):
         raise PlanError(
-            "streaming a sink from more than one source is supported for a "
-            "stream-stream interval join (join_stream); this plan reads "
+            "streaming a sink from more than one source is supported for a stream-stream "
+            "interval join (join_stream) and a UNION ALL of streams; this plan reads "
             f"{len(sources)} sources some other way. Write each input separately, or "
             "materialize one side to a bounded source first."
         )
     output_mode = OutputMode.validate(output_mode)
     if output_mode != OutputMode.APPEND:
         raise PlanError(
-            f"output_mode={output_mode!r} needs an aggregation; a stream-stream join "
-            "emits each matched (or watermark-closed) row once, which is 'append'"
+            f"output_mode={output_mode!r} needs an aggregation; a stream-stream join and "
+            "a stream union each emit every row once, which is 'append'"
         )
     if checkpoint is not None:
         raise PlanError(
-            "a stream-stream join has no checkpointable position: its state is two "
-            "buffered sides and two watermarks, not a source offset. Drop checkpoint= "
-            "(the sink's own idempotency still applies), or join against a bounded side."
+            "a multi-source streaming plan has no checkpointable position: a join's state "
+            "is two buffered sides and two watermarks, and a union's is one cursor per "
+            "branch — neither is a source offset the engine records. Drop checkpoint= "
+            "(the sink's own idempotency still applies), or reduce to a single source."
         )
 
     query_name = name or _next_name()

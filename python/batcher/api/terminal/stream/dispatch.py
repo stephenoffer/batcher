@@ -32,7 +32,12 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher.api.terminal.stream.rebatch import _rebatch_exact
-from batcher.api.terminal.stream.union import union_branch_sources, union_streams_branchwise
+from batcher.api.terminal.stream.union import (
+    interleave,
+    union_branch_sources,
+    union_streams_branchwise,
+    union_streams_interleaved,
+)
 from batcher.api.terminal.stream.watermark import stream_stream_join, stream_watermark_dedup
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -119,6 +124,24 @@ def _iter_batches(
                 num_workers=num_workers,
                 transport=transport,
             )
+        return
+
+    # A union over *streams* interleaves instead of concatenating: an unbounded branch
+    # never ends, so concatenation would emit branch 0 forever and branch 1 never. UNION
+    # ALL is a multiset union and makes no ordering claim, so a row from whichever branch
+    # has one next is as correct as any other order — which is what makes this sound.
+    if isinstance(plan, Union) and union_streams_interleaved(plan, sources):
+        yield from interleave(
+            [
+                _iter_batches(
+                    remap_sources(branch, -sid),
+                    [sources[sid]],
+                    branch.available_columns(),
+                    batch_size,
+                )
+                for branch, sid in union_branch_sources(plan)
+            ]
+        )
         return
 
     # A distributed breaker streams its result off the workers one bucket at a time,

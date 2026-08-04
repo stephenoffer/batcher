@@ -314,6 +314,42 @@ watermarks, none of it addressable by a source offset, so there is nothing to re
 looking exactly like exactly-once recovery. The sink's own idempotency still applies, so a
 replayed micro-batch does not duplicate rows.
 
+## Unioning streams
+
+`union` works over streams. Because a UNION ALL is a multiset union and makes no ordering
+claim, the branches are **interleaved** rather than concatenated: one batch from each in
+turn, so an unbounded first branch cannot shut the second one out.
+
+```python
+import pyarrow as pa
+
+feed_schema = pa.schema([("v", pa.int64())])
+
+def eu():
+    for i in (0, 1):
+        yield pa.record_batch({"v": [i]}, schema=feed_schema)
+
+def us():
+    for i in (10, 11):
+        yield pa.record_batch({"v": [i]}, schema=feed_schema)
+
+both = bt.from_batches(eu, feed_schema, bounded=False).union(
+    bt.from_batches(us, feed_schema, bounded=False)
+)
+print(sorted(x for b in both.iter_batches() for x in b.to_pydict()["v"]))
+# [0, 1, 10, 11]
+```
+
+A union of *bounded* inputs still concatenates in order, because order is free there. A
+`distinct=True` union over streams is refused: a global dedup is exactly the
+whole-relation state a stream does not have.
+
+:::{note}
+A branch parked on an idle source delays the others, because pulling from it is a blocking
+read. That is the same property {py:meth}`join_stream <batcher.Dataset.join_stream>` has,
+and for the same reason: one driver thread, and the source decides when its read returns.
+:::
+
 ## Exactly-once and checkpointing
 
 Pass `checkpoint=<dir>` to a streaming write to record source offsets and sink

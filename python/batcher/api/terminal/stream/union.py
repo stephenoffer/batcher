@@ -16,7 +16,11 @@ from __future__ import annotations
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
-__all__ = ["union_branch_sources", "union_streams_branchwise"]
+__all__ = [
+    "union_branch_sources",
+    "union_streams_branchwise",
+    "union_streams_interleaved",
+]
 
 
 def union_branch_sources(plan) -> list[tuple[LogicalPlan, int]]:
@@ -81,3 +85,74 @@ def union_streams_branchwise(plan, sources: list[Source]) -> bool:
     if any(s is None for s in schemas):
         return False  # an opaque branch (a UDF) — cannot prove the types already agree
     return all(s.arrow.types == schemas[0].arrow.types for s in schemas[1:])
+
+
+def union_streams_interleaved(plan, sources: list[Source]) -> bool:
+    """Whether this UNION's branches may be *interleaved* rather than concatenated.
+
+    Concatenation needs every branch to end, which an unbounded one never does — so a
+    union over streams could not stream at all: branch 0 would emit forever and branch 1
+    never, and the router refused it with a `PlanError` rather than return that. Spark
+    unions streaming DataFrames, and a union of two topics is an ordinary shape (two
+    regions, two versions of a producer, a backfill beside a live feed).
+
+    Interleaving is sound where concatenation is, minus the ordering claim — and UNION ALL
+    never made one: it is a multiset union, so a row from whichever branch has one next is
+    as correct as any other order. The remaining preconditions are `union_streams_branchwise`'s
+    and hold for the same reasons: ALL rather than distinct (a global dedup is exactly the
+    whole-relation state this path lacks), one source per branch so each can be relabelled,
+    and types that already agree across branches so no promotion is due.
+
+    Args:
+        plan: The `Union` node being routed.
+        sources: The bound sources for the whole plan.
+
+    Returns:
+        True when at least one branch is unbounded and interleaving is provably equivalent
+        to the materialized multiset.
+    """
+    from batcher.io.source import is_bounded
+
+    if plan.distinct or all(is_bounded(s) for s in sources):
+        return False  # all-bounded unions concatenate, which also preserves order
+    if not union_branch_sources(plan):
+        return False
+    schemas = [branch.available_schema() for branch in plan.inputs]
+    if any(s is None for s in schemas):
+        return False  # an opaque branch (a UDF) — cannot prove the types already agree
+    return all(s.arrow.types == schemas[0].arrow.types for s in schemas[1:])
+
+
+def interleave(streams: list) -> object:
+    """Yield from `streams` round-robin until every one is exhausted.
+
+    One batch from each in turn, so a busy branch cannot starve a quiet one of its place
+    in the output and the driver never holds more than one branch's one batch.
+
+    **A branch parked on an idle source delays the others**, because pulling from it is a
+    blocking read — the same property the stream-stream join has, and for the same reason:
+    there is one driver thread and a source's `iter_batches` decides when it returns. A
+    stop signal reaches the sources themselves, so a query still stops promptly; what it
+    does not do is skip ahead past a quiet branch mid-poll.
+
+    Args:
+        streams: The per-branch iterators, already relabelled onto their own source.
+
+    Returns:
+        A generator over every branch's batches, round-robin.
+    """
+
+    def gen():
+        live = list(streams)
+        while live:
+            still: list = []
+            for stream in live:
+                batch = next(stream, None)
+                if batch is None:
+                    continue  # this branch has ended; drop it from the rotation
+                still.append(stream)
+                if batch.num_rows:
+                    yield batch
+            live = still
+
+    return gen()

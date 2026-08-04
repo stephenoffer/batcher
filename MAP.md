@@ -254,7 +254,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 188 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 155 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1463 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `reader.py` | 1469 | The `bt.read` namespace — typed, per-format dataset readers. |
 | `writer.py` | 1329 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
@@ -1761,7 +1761,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | module | lines | what it is |
 |---|---|---|
 | `binary.py` | 175 | Binary-blob source — whole files as ``{uri, bytes, size, mime}`` rows. |
-| `documents.py` | 152 | Document format — PDF text extraction via `pypdf`, to Arrow. |
+| `documents.py` | 192 | Document format — PDF text extraction via `pypdf`, to Arrow. |
 | `text.py` | 230 | Plain-text source — one row per line or one row per whole file. |
 | `warc.py` | 245 | WARC source — web-archive records (ISO 28500) as Arrow rows. |
 
@@ -2472,7 +2472,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/radix_sort.rs` | 176 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 256 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
-| `ops/sample_sort.rs` | 343 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort.rs` | 341 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 168 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 3001 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
