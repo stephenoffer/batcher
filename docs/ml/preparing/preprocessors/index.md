@@ -6,9 +6,8 @@ is distributed and spillable for free. `transform` is a lazy column rewrite. Fit
 on the training set, then `transform` the training **and** validation sets with the
 same learned state.
 
-Every preprocessor is importable from `batcher.ml.preprocessors`. Most are also
-re-exported from `batcher.ml`, with the exceptions of `TargetEncoder` and
-`PolynomialFeatures`, which you import from `batcher.ml.preprocessors`.
+Every preprocessor is importable from both `batcher.ml.preprocessors` and `batcher.ml`.
+`tests/unit/test_ml_preprocessing_workflow.py` pins that, so the two paths cannot drift.
 
 ## Splitting first
 
