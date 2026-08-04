@@ -671,7 +671,7 @@ Statistical analysis and drift monitoring over a `Dataset`.
 | `_special.py` | 140 | Distribution tail probabilities for hypothesis testing, in dependency-free Python. |
 | `association.py` | 401 | Association between two columns — contingency tables, chi-squared, and ANOVA. |
 | `descriptive.py` | 255 | Statistics that need two passes or a grouping — ranks, entropy, and category association. |
-| `drift.py` | 451 | Distribution drift between a reference dataset and a current one. |
+| `drift.py` | 477 | Distribution drift between a reference dataset and a current one. |
 | `homogeneity.py` | 150 | Tests of equal variance across groups — the assumption ANOVA and the t-test quietly rely on. |
 | `hypothesis.py` | 470 | Hypothesis tests — a statistic plus the p-value that makes it a decision. |
 | `multivariate.py` | 222 | Multivariate association — correlation and covariance across many columns at once. |
