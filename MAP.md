@@ -1584,7 +1584,7 @@ ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
 | `_ndarray.py` | 47 | NumPy-slice → Arrow conversion shared by the HDF5 and Zarr array readers. |
 | `hdf5.py` | 128 | HDF5 format — array-dataset read via `h5py`, sliced to Arrow. |
 | `numpy.py` | 130 | NumPy ``.npy`` / ``.npz`` source — arrays as Arrow columns. |
-| `point_cloud.py` | 297 | Point-cloud sources — LiDAR / depth sensor frames as Arrow columns. |
+| `point_cloud.py` | 412 | Point-cloud sources — LiDAR / depth sensor frames as Arrow columns. |
 | `shards.py` | 197 | Sharded training dataset — fixed-size Arrow-IPC shards + a JSON index. |
 | `tensor.py` | 98 | Fixed-shape tensor columns — multi-dimensional arrays as one Arrow column. |
 | `tfrecord.py` | 130 | TFRecord format — TensorFlow record stream → Arrow via manual framing. |
@@ -1689,7 +1689,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `autoloader.py` | 339 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 239 | Development streaming sources — `rate` and `socket` (Spark parity). |
 | `eventhubs.py` | 230 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
-| `kafka.py` | 476 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
+| `kafka.py` | 477 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kafka_sink.py` | 268 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
 | `kinesis.py` | 408 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 181 | Google Cloud Pub/Sub broker source — subscription pull batches. |
@@ -1703,9 +1703,9 @@ Shared base for row/message-based streaming brokers (Kafka, Kinesis, ...).
 
 | module | lines | what it is |
 |---|---|---|
-| `schema.py` | 124 | The fixed broker message schema, the message record, and option redaction. |
-| `source.py` | 378 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
-| `split.py` | 188 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
+| `schema.py` | 145 | The fixed broker message schema, the message record, and option redaction. |
+| `source.py` | 401 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
+| `split.py` | 193 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
 
 ### `batcher/io/formats/streaming/checkpoint/` — 2 · neutral IO
 
@@ -2455,7 +2455,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `agg_par.rs` | 372 | The high-cardinality parallel aggregate: partition first, aggregate once. |
-| `dist.rs` | 552 | Distributed-execution primitives. |
+| `dist.rs` | 553 | Distributed-execution primitives. |
 | `error.rs` | 140 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par.rs` | 653 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `lib.rs` | 783 | `bc-interp` — the Tier-0 interpreter. |
@@ -2472,9 +2472,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/radix_sort.rs` | 176 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 256 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
-| `ops/sample_sort.rs` | 347 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort.rs` | 358 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 168 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
-| `par.rs` | 3000 | The multi-core executor. |
+| `par.rs` | 3001 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 499 | The breakers: operators that must see all of their input before they can emit any output. |

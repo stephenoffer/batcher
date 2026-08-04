@@ -417,6 +417,7 @@ mod tests {
             x: None,
             y: None,
             format: None,
+            fill: None,
         };
         assert!(bare.contains_media_decode());
 

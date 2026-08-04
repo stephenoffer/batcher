@@ -780,17 +780,11 @@ fn exec(
             )? {
                 // The partition path holds the gathered relation where the reducing path can
                 // spill its partials, so the pool decides. Declining costs the sample only.
-                agg_par::AggPlan::Partition(keys) => {
+                agg_par::AggPlan::Partition { keys, width } => {
                     match admit(opts, op_id, agg_par::partition_footprint(in_bytes)) {
                         Admit::InMemory(_reservation) => {
                             let out = agg_par::partitioned_aggregate(
-                                &parts,
-                                &keys,
-                                group_keys,
-                                aggregates,
-                                &agg_jit,
-                                &funcs,
-                                rayon::current_num_threads().max(1),
+                                &parts, &keys, group_keys, aggregates, &agg_jit, &funcs, width,
                             )?;
                             // The partition path holds the gathered relation *and* the source
                             // morsels at once (~2×), the same footprint it was admitted on —
@@ -2481,6 +2475,66 @@ fn try_fused_join_aggregate(
     Ok(Some(out))
 }
 
+/// Run the fused linear chain over one morsel, returning the chained batch and the row count
+/// after each stage (which is what gives the fused ops exact selectivity metrics).
+fn run_chain(
+    stages: &[FusedStage],
+    b: &RecordBatch,
+    opts: &ExecOptions,
+) -> Result<(RecordBatch, Vec<u64>), InterpError> {
+    opts.check_cancelled()?;
+    let mut cur = b.clone();
+    let mut stage_rows = Vec::with_capacity(stages.len());
+    for stage in stages {
+        cur = stage.apply(&cur)?;
+        stage_rows.push(cur.num_rows() as u64);
+    }
+    Ok((cur, stage_rows))
+}
+
+/// Emit one metric per fused linear op (children before parents), as `exec_fused` does.
+///
+/// The chain's wall/CPU time is split evenly across its stages: they ran interleaved inside
+/// one parallel map, so there is no per-stage measurement to report and an even split is the
+/// only honest attribution.
+fn emit_stage_metrics(
+    m: &mut ExecMetrics,
+    stages: &[FusedStage],
+    totals: &[u64],
+    base_rows: u64,
+    stage_t0: Stopwatch,
+) {
+    let n = stages.len().max(1) as u64;
+    let stage_elapsed = stage_t0.elapsed_ns().max(1) / n;
+    let (fused_cpu, _fused_rss, fused_hw) = stage_t0.measure();
+    let stage_cpu = fused_cpu / n;
+    let stage_hw = fused_hw.split(n);
+    let threads = rayon::current_num_threads().max(1) as u32;
+    for (i, stage) in stages.iter().enumerate() {
+        let rows_in = if i == 0 { base_rows } else { totals[i - 1] };
+        m.record(OpMetric {
+            op_id: stage.op_id(),
+            kind: stage.kind(),
+            rows_in,
+            rows_out: totals[i],
+            elapsed_ns: stage_elapsed,
+            wall_span_ns: 0,
+            cpu_ns: stage_cpu,
+            threads,
+            peak_bytes: 0,
+            result_bytes: 0,
+            rows_build: 0,
+            spilled: false,
+            spill_bytes: 0,
+            // These linear stages hold no relation of their own (the aggregate downstream
+            // does), so there is no working set to attribute a high-water mark to.
+            peak_rss_bytes: 0,
+            backend: stage.backend(),
+            hw: stage_hw,
+        });
+    }
+}
+
 /// Fused Filter/Project → Aggregate: build each morsel's partial state directly from the
 /// linear chain's per-morsel output, without ever collecting the transformed relation.
 /// The chain is numbered and metered exactly as the recursive `exec` would (so adaptive
@@ -2535,59 +2589,107 @@ fn exec_agg_fused(
 
     // Per morsel: run the chain, then fold the result straight into a partial. Track the
     // row count after each stage so the fused ops keep exact selectivity metrics.
+    //
+    // A *sample* of the morsels goes first, and its chained batches are kept rather than
+    // dropped. Fusing pre-aggregates every morsel, which is the wrong shape for exactly the
+    // same reason it is wrong unfused: when the group-by does not reduce, the per-morsel
+    // hash build is thrown away and the merge inherits the whole relation. The sample says
+    // which regime this is, and keeping its chained batches means choosing "partition" costs
+    // no re-run of the chain over the rows already filtered.
     let n = stages.len();
-    let results: Vec<(agg::Partial, Vec<u64>)> = base_morsels
+    let threads = rayon::current_num_threads().max(1);
+    let sample_n = agg_par::sample_size(threads, base_morsels.len());
+    let sample_chained: Vec<(RecordBatch, Vec<u64>)> = base_morsels[..sample_n]
+        .par_iter()
+        .map(|b| run_chain(&stages, b, opts))
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    let sample_partials: Vec<agg::Partial> = sample_chained
+        .par_iter()
+        .map(|(b, _)| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    let sample_rows: usize = sample_chained.iter().map(|(b, _)| b.num_rows()).sum();
+
+    let mut totals = vec![0u64; n];
+    let add_rows = |rows: &[u64], totals: &mut Vec<u64>| {
+        for (i, r) in rows.iter().enumerate() {
+            totals[i] += r;
+        }
+    };
+
+    // The chain has only run over the sample, so the size of the post-chain relation is not
+    // yet known and `base_rows` — the chain's *input* — stands in for it. It is exact when
+    // nothing filters, and an over-estimate when something does; both only widen the
+    // partitioning slightly, which the flat region of `agg_par::GROUPS_PER_PARTITION`
+    // absorbs. Running the chain over everything first to get the true figure would cost the
+    // whole materialization this branch may then decline.
+    let partition_width = match agg_par::plain_key_columns(group_keys) {
+        Some(keys) if base_morsels.len() >= 2 => {
+            agg_par::width_from_sample(&sample_partials, sample_rows, sample_n, base_rows as usize)
+                .map(|w| (keys, w))
+        }
+        _ => None,
+    };
+    if let Some((keys, width)) = partition_width {
+        if let Admit::InMemory(_reservation) =
+            admit(opts, op_id, agg_par::partition_footprint(base_bytes))
+        {
+            let mut chained: Vec<RecordBatch> = Vec::with_capacity(base_morsels.len());
+            for (b, rows) in sample_chained {
+                add_rows(&rows, &mut totals);
+                chained.push(b);
+            }
+            let rest: Vec<(RecordBatch, Vec<u64>)> = base_morsels[sample_n..]
+                .par_iter()
+                .map(|b| run_chain(&stages, b, opts))
+                .collect::<Result<Vec<_>, InterpError>>()?;
+            for (b, rows) in rest {
+                add_rows(&rows, &mut totals);
+                chained.push(b);
+            }
+            emit_stage_metrics(m, &stages, &totals, base_rows, stage_t0);
+            let agg_t0 = Stopwatch::start();
+            let funcs = ops::agg_funcs(aggregates);
+            let chained_bytes = batch_bytes(&chained);
+            let out = agg_par::partitioned_aggregate(
+                &chained, &keys, group_keys, aggregates, &agg_jit, &funcs, width,
+            )?;
+            push_breaker(
+                m,
+                op_id,
+                "aggregate",
+                *totals.last().unwrap_or(&base_rows),
+                0,
+                agg_par::partition_footprint(chained_bytes) as u64,
+                &out,
+                agg_t0,
+                false,
+                "par-agg-partitioned",
+            );
+            return Ok(out);
+        }
+    }
+
+    // Reducing (or the pool declined the partitioned shape): fold every remaining morsel
+    // straight into a partial, dropping its chained batch as the fusion always has. The
+    // sample's partials are the first slice of that work and are reused, not recomputed.
+    let mut partials = Vec::with_capacity(base_morsels.len());
+    for ((_, rows), partial) in sample_chained.into_iter().zip(sample_partials) {
+        add_rows(&rows, &mut totals);
+        partials.push(partial);
+    }
+    let rest: Vec<(agg::Partial, Vec<u64>)> = base_morsels[sample_n..]
         .par_iter()
         .map(|b| {
-            opts.check_cancelled()?;
-            let mut cur = b.clone();
-            let mut stage_rows = Vec::with_capacity(n);
-            for stage in &stages {
-                cur = stage.apply(&cur)?;
-                stage_rows.push(cur.num_rows() as u64);
-            }
+            let (cur, stage_rows) = run_chain(&stages, b, opts)?;
             let partial = ops::eval_partial_jit(&cur, group_keys, aggregates, &agg_jit)?;
             Ok((partial, stage_rows))
         })
         .collect::<Result<Vec<_>, InterpError>>()?;
-
-    let mut totals = vec![0u64; n];
-    let mut partials = Vec::with_capacity(results.len());
-    for (partial, rows) in results {
-        for (i, r) in rows.iter().enumerate() {
-            totals[i] += r;
-        }
+    for (partial, rows) in rest {
+        add_rows(&rows, &mut totals);
         partials.push(partial);
     }
-    // Emit one metric per fused linear op (children before parents), as `exec_fused` does.
-    let stage_elapsed = stage_t0.elapsed_ns().max(1) / n as u64;
-    let (fused_cpu, _fused_rss, fused_hw) = stage_t0.measure();
-    let stage_cpu = fused_cpu / n as u64;
-    let stage_hw = fused_hw.split(n as u64);
-    let threads = rayon::current_num_threads().max(1) as u32;
-    for (i, stage) in stages.iter().enumerate() {
-        let rows_in = if i == 0 { base_rows } else { totals[i - 1] };
-        m.record(OpMetric {
-            op_id: stage.op_id(),
-            kind: stage.kind(),
-            rows_in,
-            rows_out: totals[i],
-            elapsed_ns: stage_elapsed,
-            wall_span_ns: 0,
-            cpu_ns: stage_cpu,
-            threads,
-            peak_bytes: 0,
-            result_bytes: 0,
-            rows_build: 0,
-            spilled: false,
-            spill_bytes: 0,
-            // These linear stages hold no relation of their own (the aggregate downstream
-            // does), so there is no working set to attribute a high-water mark to.
-            peak_rss_bytes: 0,
-            backend: stage.backend(),
-            hw: stage_hw,
-        });
-    }
+    emit_stage_metrics(m, &stages, &totals, base_rows, stage_t0);
 
     // Combine the partials — the same in-memory / grace-spill path as the unfused
     // aggregate (no value-list aggregate reaches here, so no raw-morsel spill is needed).
@@ -3586,6 +3688,7 @@ mod tests {
                     x: None,
                     y: None,
                     format: None,
+                    fill: None,
                 },
                 alias: "img".into(),
             }],

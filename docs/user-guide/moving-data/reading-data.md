@@ -1,6 +1,6 @@
 # Reading data
 
-A pipeline starts by building a `Dataset` from a source. Sources come in two groups:
+A pipeline starts by building a {py:class}`Dataset <batcher.Dataset>` from a source. Sources come in two groups:
 in-memory constructors, which wrap data already in the process, and path readers,
 which load from disk or object storage. Both are lazy.
 
@@ -11,7 +11,7 @@ are what the rest of the documentation uses for its runnable examples.
 
 ### From a column dict
 
-`from_pydict` takes a column-oriented dictionary. This is the constructor used
+{py:func}`from_pydict <batcher.from_pydict>` takes a column-oriented dictionary. This is the constructor used
 throughout the docs because it needs no files.
 
 ```python
@@ -30,7 +30,7 @@ print(ds.to_pydict())
 
 ### From arrow
 
-`from_arrow` wraps a `pyarrow.Table`, a `RecordBatch`, or a list of batches with
+{py:func}`from_arrow <batcher.from_arrow>` wraps a `pyarrow.Table`, a `RecordBatch`, or a list of batches with
 no copy of the underlying buffers.
 
 ```python
@@ -44,7 +44,7 @@ print(ds.to_pydict())
 
 ### From a streaming factory
 
-`from_batches` builds a streaming source from a callable that returns a fresh
+{py:func}`from_batches <batcher.from_batches>` builds a streaming source from a callable that returns a fresh
 iterator of Arrow batches each time it is called, plus the schema those batches
 follow.
 
@@ -64,7 +64,7 @@ print(ds.to_pydict())
 
 ### From items and generators
 
-`from_items` builds a `Dataset` from a Python list, one row per item.
+{py:func}`from_items <batcher.from_items>` builds a `Dataset` from a Python list, one row per item.
 A dict item expands to columns, and a scalar becomes a single `item` column. `date_range`
 generates a calendar dimension, the date-typed sibling of `range`.
 
@@ -78,8 +78,8 @@ print(bt.date_range("2024-01-01", "2024-01-03").count())
 ### From other frameworks
 
 Adapters convert a frame from another library into a `Dataset`:
-`from_pandas`, `from_polars`, `from_numpy`, `from_spark`, `from_dask`,
-`from_huggingface`, `from_torch`, and `from_tf`. They require the corresponding
+{py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_numpy <batcher.from_numpy>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_dask <batcher.from_dask>`,
+{py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>`. They require the corresponding
 library to be installed.
 
 ```python
@@ -169,7 +169,7 @@ grids = bt.read.zarr("s3://bucket/array.zarr")
 
 ### Web crawls (WARC)
 
-`bt.read.warc(path)` reads the format every web-scale crawler ships, Common Crawl
+{py:meth}`bt.read.warc(path) <batcher.api.io_namespace.reader.Reader.warc>` reads the format every web-scale crawler ships, Common Crawl
 included. Each record becomes a row: the named WARC headers as typed columns, every other
 header as JSON in `warc_headers`, and the payload as `warc_content`. `.warc.gz` is read
 transparently, including the per-record gzip members a crawler normally writes.
@@ -248,8 +248,14 @@ Each file is one frame, and every point becomes a row with a column per field, s
 `x`, `y`, `z`, and `intensity`, plus a `frame` column naming the source file. The cloud is
 columnar, so the usual robotics preprocessing is a native engine operator: crop a region,
 remove the ground plane, bin into voxels. A directory of sweeps stays separable with
-`group_by("frame")`. A raw `.bin` buffer carries no schema, so pass its `columns=` layout.
+{py:meth}`group_by("frame") <batcher.Dataset.group_by>`. A raw `.bin` buffer carries no schema, so pass its `columns=` layout.
 That defaults to `x, y, z, intensity`.
+
+Reading the schema does not read the points. PCD and PLY declare their fields in an ASCII
+header, and a raw `.bin` has no header at all because you supplied the layout, so
+`ds.schema` costs a few hundred bytes per file rather than a parse of every sweep in the
+directory. That matters at corpus scale: an autonomous-driving dataset is thousands of
+files, and each one is millions of points.
 
 ```python
 import os
@@ -381,7 +387,7 @@ data. That is the discovery step before a query names the handful of channels it
 
 ### Hive-partitioned Parquet directories
 
-Partitioned Parquet needs only local files, so it runs end to end. `parquet_dataset`
+Partitioned Parquet needs only local files, so it runs end to end. {py:meth}`parquet_dataset <batcher.api.io_namespace.reader.Reader.parquet_dataset>`
 recovers the partition columns from the Hive directory layout and prunes whole
 partitions when a filter matches the partition key:
 
@@ -412,7 +418,7 @@ print(people.columns)
 # ['id', 'name']
 ```
 
-The reads above run on the compiled Rust data plane. `engine_version` reports which
+The reads above run on the compiled Rust data plane. {py:func}`engine_version <batcher.engine_version>` reports which
 engine build is loaded, distinct from the Python package version:
 
 ```python
