@@ -45,7 +45,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 |---|---|---|---|---|
 | 1 | Short-circuiting conjunctive filter, conjuncts ordered by cost | DuckDB | **Landed** | 1.3x to 5.7x on multi-predicate filters |
 | 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued 2026-08-04**: the win is `take`/`filter` (3-13x), *not* comparison (parity) or sort (0.75-0.81x). Only pays scan-native; a boundary conversion loses at morsel size |
-| 9 | A faster string `ORDER BY` | DuckDB | **Largest measured gap**: 3.22x on a low-cardinality key, 1.18x on a high-cardinality one | Now tracked by `benchmarks/.../ordering.py`; three candidate fixes measured and rejected, two leads left |
+| 9 | A faster string `ORDER BY` | DuckDB | Loses; **magnitude unmeasured** — this machine's noise is 5.3x | Now tracked by `benchmarks/.../ordering.py`; three candidate fixes measured and rejected, two leads left |
 | 3 | Online adaptive reordering of filter conjuncts | DuckDB | **Landed** (`ConjunctOrder`) | Fixes the case a static cost model gets wrong |
 | 4 | Top-K heap threshold pushed down as a filter | DataFusion | **Half landed** (`TopNBound` skips morsels; nothing reaches the scan) | Large on `ORDER BY ... LIMIT k` over big inputs |
 | 5 | Skew detected from measured partition sizes, split automatically | Spark AQE | Machinery exists, off by default | Removes a config the user cannot be expected to set |
@@ -544,13 +544,17 @@ DuckDB look slow for reasons that have nothing to do with the operator, and quot
 how the retracted 15-643x range-join number happened), 10M rows, 27-char values, 200k
 distinct:
 
+Each row below is one run, and **every absolute number in this table carries the caveat at the
+end of this section**: on this machine the same case re-run four times spanned 5.3x. Treat the
+*direction* of each row as the finding and the milliseconds as indicative only.
+
 | shape | Batcher | DuckDB | Batcher is |
 |---|---|---|---|
-| full `ORDER BY <string>` | 620-655 ms | 188-216 ms | **0.30-0.33x** |
+| full `ORDER BY <string>` | 620-655 ms | 188-216 ms | 0.30-0.33x |
 | `DISTINCT <string>` | 544 ms | 196 ms | 0.36x |
 | `GROUP BY <string>` | 570 ms | 274 ms | 0.48x |
 | `ORDER BY <string> LIMIT 10` | 14-17 ms | 6-7 ms | 0.41x |
-| `ORDER BY <string> LIMIT 10000` | 17-19 ms | 53-55 ms | **2.81-3.22x** |
+| `ORDER BY <string> LIMIT 10000` | 17-19 ms | 53-55 ms | 2.81-3.22x |
 | filter on a string + `sum` | 30 ms | 22 ms | 0.72x |
 
 **Now tracked by a committed benchmark.** The table above came from a scratch script, which is
@@ -571,12 +575,20 @@ passed on all three):
 | `op-sort-string-lowcard` (`l_shipmode`, 7 distinct) | 411 ms | 128 ms | 205 ms | **3.22x slower** |
 | `op-sort-string-limit` (top-100, tie-broken) | 47 ms | 24 ms | 1311 ms | 1.97x slower |
 
-Note that this **relocates the gap**. In-memory at 10M rows the high-cardinality sort was the
-worst shape; from parquet at 6M rows it is nearly at parity (1.18x) and the **low-cardinality**
-sort is the outlier at 3.22x — the shape where seven distinct values give the sampled quantile
-boundaries nothing to cut on, so the sample-sort's ranges come out lopsided and most cores idle.
-Batcher also beats Polars on two of the three. Anyone optimizing here should start from this
-table rather than the in-memory one below, and should fix the low-cardinality case first.
+**Retracted 2026-08-04, same day: the 3.22x in that table is not reliable and neither is any
+other single-run figure taken on this machine.** Re-running the identical case four times
+across two builds gave `op-sort-string-lowcard` at 580 ms, 110 ms, 115 ms and 397 ms — a 5.3x
+spread with no relation to which build was running. The box carries two other sessions' cargo
+builds and test suites, and at 16 cores under a load average of 20-35 a benchmark measures the
+scheduler. The *ratios within one run* are still fair (both engines see the same load), which
+is why the correctness gate and the relative shape of the table survive; the absolute
+milliseconds and any cross-run comparison do not.
+
+What can be said without a quiet box: the low-cardinality string sort is **structurally**
+disadvantaged, because seven distinct values give the sampled quantile boundaries nothing to
+cut on, so the sample-sort's ranges come out lopsided however many are asked for. That is a
+property of the code, not of a timing. Whether it costs 1.1x or 3.9x is exactly what needs
+re-measuring somewhere quiet.
 
 The full sort is the big one, and it is the *ordering* rather than the materialization:
 holding the sort key fixed and changing only the payload moves nothing (sorting by a string
@@ -661,14 +673,19 @@ is done; what remains is ordered by value against the mandate.
    tested. It is one decode, in `normalize_to`, standing between them and every real query.
    Decode on egress instead of ingress; `plan/types/lattice.py::widen` needs no change. The
    audit is every operator that builds an output batch from its input's schema.
-3. **The low-cardinality string sort (item 9).** Promoted above `StringView` because it is the
-   largest gap the committed benchmark shows — **3.22x DuckDB** on `op-sort-string-lowcard` —
-   and because the cause is structural rather than a kernel: seven distinct values give the
-   sampled quantile boundaries nothing to cut on, so the sample-sort's ranges come out
-   lopsided and most cores idle. `sample_sort.rs` already solves exactly this on the
-   *multi-key* path — `composite_part_of` re-routes by the full composite key when
-   `max_bucket > 3 * fair_share` — and the single-key path has no equivalent fallback, which
-   is precisely the case that needs one.
+3. **The low-cardinality string sort (item 9).** The cause is structural rather than a
+   kernel, which is why it is here despite the magnitude being unmeasured: seven distinct
+   values give the sampled quantile boundaries nothing to cut on, so the sample-sort's ranges
+   come out lopsided however many are asked for. `sample_sort.rs` already solves exactly this
+   on the *multi-key* path — `composite_part_of` re-routes by the full composite key when
+   `max_bucket > 3 * fair_share` — and the single-key path has no equivalent fallback.
+
+   **The fix is written and was not landed, deliberately.** Extending that gate to one key
+   needs the composite to carry a trailing ascending row index, or it ties for every row and
+   routes identically; `(keys…, row index)` is exactly the order this sort produces, so
+   splitting a tie group across ranges is sound. It passed the serial oracle on every
+   shape. It is not landed because "no performance regressions" is a gate and this machine
+   could not measure it either way. Land it from a quiet box, with the benchmark above.
 4. **An adaptive-width sort key for the per-range sort (item 9).** Proven
    permutation-identical and worth 1.69x on high-cardinality 27-char keys, but a *fixed*
    4-byte head loses 0.78-0.87x on two other shapes, so the width has to come from the sample

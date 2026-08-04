@@ -55,10 +55,21 @@ pub(crate) fn parallel_sort_batch(
     }
     // Evaluate every sort key once over the whole batch: the per-range sorts reuse these
     // arrays, so a computed `ORDER BY` expression is evaluated once, not once per range.
+    //
+    // Canonicalize here rather than leaving it to `sort_indices_of`, so the *routing* and the
+    // per-range *sort* rank a float the same way. `canon_float_array` rewrites `-0.0` to `0.0`
+    // and canonicalizes NaN; without it the row encoding below orders `-0.0` strictly below
+    // `0.0` (arrow's row format is a total order) while the per-range sort, seeing them
+    // canonicalized, calls them equal and falls back to input order. Rows would then be routed
+    // to different ranges than the order they belong in, and the concatenation would put a
+    // later `-0.0` row ahead of an earlier `0.0` one — a wrong answer that appears only with a
+    // signed zero or a NaN in a key that is skewed enough to take the composite path. The call
+    // is free on the common case: it returns the same `Arc` when there is nothing to rewrite,
+    // and `sort_indices_of` re-applying it is then idempotent.
     let key_arrays: Vec<ArrayRef> = keys
         .iter()
-        .map(|k| k.expr.eval(batch))
-        .collect::<Result<_, _>>()?;
+        .map(|k| Ok(super::normalize_sort_key(k.expr.eval(batch)?)))
+        .collect::<Result<_, InterpError>>()?;
     let key = &key_arrays[0];
     // 64 ranges saturate the gather: measured 32/64/96/128/192 ranges on 96 cores at
     // 157/123/124/120/116 ms — past 64 the sort is memory-bandwidth bound, not
@@ -147,6 +158,15 @@ pub(crate) fn parallel_sort_batch(
     // ASC/DESC and nulls placement are baked into the encoding), so the ranges stay globally
     // ordered, every core gets an even share, and no final reverse is needed (the encoding
     // already carries the leading key's direction).
+    //
+    // A **single** low-cardinality key has the same problem and no fallback: seven distinct
+    // values cut at most seven ranges however many are asked for. Extending this to one key
+    // needs the composite to carry a trailing row index (otherwise it ties for every row and
+    // routes identically), which is sound — `(keys…, row index)` is exactly the order this
+    // sort produces — but it is a *performance* change, and it is not landed here because it
+    // could not be measured: on this machine the same benchmark case swung 110 ms to 580 ms
+    // run to run under other sessions' load, on both the old and the new code. See
+    // `competitor_technique_review.md` item 9.
     let fair_share = batch.num_rows() / parts;
     let max_bucket = buckets.iter().map(Vec::len).max().unwrap_or(0);
     if keys.len() > 1 && max_bucket > fair_share.saturating_mul(3).max(1) {
@@ -188,7 +208,7 @@ pub(crate) fn parallel_sort_batch(
 /// `SortOptions`, so a byte-lexicographic compare of the encoding reproduces the multi-key
 /// ordering exactly — descending keys and nulls placement included. Boundaries are sampled from
 /// that encoding and each row is routed by how many boundaries it sorts after, so buckets come
-/// out in ascending composite order (the final sorted order — the caller must NOT reverse) and
+/// out in ascending composite order (the final sorted order — the caller must NOT reverse).
 /// rows equal on the whole key always land together. `None` when there is too little data to
 /// sample, leaving the caller on its leading-key routing.
 fn composite_part_of(
@@ -558,6 +578,52 @@ mod tests {
         assert!(parallel_sort_batch(&b, &key(false, false), None)
             .unwrap()
             .is_none());
+    }
+
+    /// A skewed **float** key carrying `-0.0` and NaN must still match the serial oracle.
+    ///
+    /// This is the case the composite routing gets wrong if it encodes the raw key: arrow's row
+    /// format is a total order and puts `-0.0` strictly below `0.0`, while the per-range sort
+    /// sees them canonicalized and calls them equal. Route by one ranking and sort by another
+    /// and the concatenation surfaces a later row ahead of an earlier one — with the *values*
+    /// still looking correct, which is why the payload column is what this checks.
+    ///
+    /// The key is deliberately low-cardinality so the composite fallback actually fires; on a
+    /// well-spread key this path is never taken and the test would prove nothing.
+    #[test]
+    fn a_skewed_float_key_with_signed_zero_and_nan_matches_serial() {
+        let n = 1 << 18;
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let vals: Vec<Option<f64>> = (0..n)
+                    .map(|i| match i % 5 {
+                        0 => Some(-0.0),
+                        1 => Some(0.0),
+                        2 => Some(f64::NAN),
+                        3 => None,
+                        _ => Some(1.0),
+                    })
+                    .collect();
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("s", DataType::Float64, true),
+                    Field::new("p", DataType::Int64, false),
+                ]));
+                let sa: ArrayRef = Arc::new(arrow::array::Float64Array::from(vals));
+                let pa: ArrayRef = Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>()));
+                let b = RecordBatch::try_new(schema, vec![sa, pa]).unwrap();
+                let keys = key(descending, nulls_first);
+
+                let want = sort_batch(&b, &keys, None).unwrap();
+                let Some(ranges) = parallel_sort_batch(&b, &keys, None).unwrap() else {
+                    continue; // declined; the serial path is the oracle and already correct
+                };
+                assert_eq!(
+                    want,
+                    concat_ranges(&b.schema(), ranges),
+                    "desc={descending} nulls_first={nulls_first}"
+                );
+            }
+        }
     }
 
     #[test]
