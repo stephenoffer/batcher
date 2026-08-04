@@ -342,7 +342,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | module | lines | what it is |
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
-| `_launch.py` | 159 | The single-node streaming launcher: optimize once, then drive micro-batches. |
+| `_launch.py` | 240 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 288 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
@@ -1402,7 +1402,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
 | `stats.py` | 189 | Column-statistics measurement — Core's lane. |
-| `streaming_runner.py` | 285 | How one micro-batch gets run — the seam between the loop and where the work happens. |
+| `streaming_runner.py` | 345 | How one micro-batch gets run — the seam between the loop and where the work happens. |
 
 ### `batcher/core/gpu_plan/` — 3 · subsystem
 
@@ -2472,7 +2472,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/radix_sort.rs` | 176 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 256 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
-| `ops/sample_sort.rs` | 321 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort.rs` | 347 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 168 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 3000 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
