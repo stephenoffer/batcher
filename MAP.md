@@ -728,7 +728,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `flight_join.py` | 505 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 396 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 196 | Distributed window functions over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1442 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1460 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 202 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 174 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 318 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -1449,7 +1449,7 @@ The streaming-query engine — the micro-batch loop behind a unified `ds.write`.
 
 | module | lines | what it is |
 |---|---|---|
-| `engine.py` | 518 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
+| `engine.py` | 532 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
 | `processors.py` | 234 | What a micro-batch *becomes* — the per-batch processors and the routing that picks one. |
 
 ### `batcher/core/udf/` — 3 · subsystem
@@ -2167,7 +2167,7 @@ Resource contracts between Kyber (optimizer), Carbonite (resource manager), and 
 | `_duration.py` | 144 | Duration parsing for streaming intervals — the one gate every trigger/lateness flows through. |
 | `listener.py` | 357 | `StreamingQueryListener` — a callback that sees every query start, batch, and stop. |
 | `progress.py` | 312 | What a micro-batch reported — the progress records a streaming query publishes. |
-| `spec.py` | 364 | Neutral streaming-query specification types — triggers, output modes, progress. |
+| `spec.py` | 372 | Neutral streaming-query specification types — triggers, output modes, progress. |
 
 ### `batcher/plan/types/` — 1 · contract
 

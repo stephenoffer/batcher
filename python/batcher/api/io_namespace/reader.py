@@ -488,13 +488,19 @@ class Reader:
         """
         return _read(path, format="binary", **opts)
 
-    def documents(self, path: PathLike, **opts: Any) -> Dataset:
+    def documents(self, path: PathLike, *, password: str | None = None, **opts: Any) -> Dataset:
         """Read PDF document(s) — a file, directory, or glob — as extracted text rows.
 
         Needs the optional extra: ``pip install 'batcher-engine[pdf]'``.
 
+        Extracting the text is skipped entirely when the ``text`` column is not projected,
+        so ``select("path", "page")`` and ``count()`` read the page tree and stop. Laying a
+        page out into reading order is most of the cost of this reader.
+
         Args:
             path: A PDF file, directory, or glob to read.
+            password: The user password for an encrypted corpus. A PDF encrypted for
+                *permissions* only opens without it.
             opts: Format-specific reader options forwarded to the source.
 
         Returns:
@@ -506,7 +512,7 @@ class Reader:
                 >>> import batcher as bt
                 >>> ds = bt.read.documents("docs/*.pdf")  # doctest: +SKIP
         """
-        return _read(path, format="documents", **opts)
+        return _read(path, format="documents", password=password, **opts)
 
     def numpy(self, path: PathLike, **opts: Any) -> Dataset:
         """Read NumPy ``.npy``/``.npz`` file(s) — file, directory, or glob — as tensor rows.

@@ -19,7 +19,7 @@ import pytest
 pypdf = pytest.importorskip("pypdf")
 
 import batcher.io.formats.unstructured.documents as doc_mod  # noqa: E402
-from batcher._internal.errors import FormatError  # noqa: E402
+from batcher._internal.errors import BackendError, FormatError  # noqa: E402
 from batcher.io.formats.unstructured.documents import DocumentSource  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -166,3 +166,63 @@ def test_the_batch_size_is_what_splits_the_pages(tmp_path, monkeypatch) -> None:
     batches = list(DocumentSource(str(tmp_path)).iter_batches())
 
     assert [b.num_rows for b in batches] == [10, 10, 5]
+
+
+def _encrypted_pdf(path, *, user_password: str, owner_password: str = "owner") -> None:
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_blank_page(width=200, height=200)
+    writer.encrypt(user_password=user_password, owner_password=owner_password)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+
+
+def test_a_password_protected_corpus_can_be_read(tmp_path) -> None:
+    """There was nowhere to put the password, so these documents could not be read at all.
+
+    An enterprise or scanned corpus routinely carries them, and the failure was
+    `FileNotDecryptedError: File has not been decrypted` — which says what happened and
+    not one thing about what to do about it.
+    """
+    _encrypted_pdf(tmp_path / "locked.pdf", user_password="s3cret")
+    table = pa.Table.from_batches(
+        list(DocumentSource(str(tmp_path), password="s3cret").iter_batches())
+    )
+
+    assert table.num_rows == 2
+
+
+def test_a_permissions_only_pdf_needs_no_password(tmp_path) -> None:
+    """Encrypting a PDF to restrict printing leaves the *user* password empty.
+
+    Every other reader opens those silently, so requiring a password for them would
+    reject a large part of a real corpus for no reason.
+    """
+    _encrypted_pdf(tmp_path / "restricted.pdf", user_password="")
+    table = pa.Table.from_batches(list(DocumentSource(str(tmp_path)).iter_batches()))
+
+    assert table.num_rows == 2
+
+
+def test_a_wrong_password_names_the_parameter_that_would_fix_it(tmp_path) -> None:
+    """The error a caller can act on, rather than the backend's own."""
+    from batcher._internal.errors import FormatError
+
+    _encrypted_pdf(tmp_path / "locked.pdf", user_password="s3cret")
+    source = DocumentSource(str(tmp_path), password="wrong")
+
+    with pytest.raises((FormatError, BackendError), match="password"):
+        list(source.iter_batches())
+
+
+def test_the_password_travels_to_a_distributed_worker(tmp_path) -> None:
+    """A worker rebuilds the reader from `_reader_kwargs`.
+
+    Without the password there, every encrypted file would fail on the cluster while
+    succeeding locally — a distributed result that differs from the single-node one,
+    which is the failure mode the mergeable contract exists to prevent.
+    """
+    _encrypted_pdf(tmp_path / "locked.pdf", user_password="s3cret")
+    source = DocumentSource(str(tmp_path), password="s3cret")
+
+    assert source._reader_kwargs()["password"] == "s3cret"

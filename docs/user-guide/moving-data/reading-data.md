@@ -142,6 +142,7 @@ take their connection as keyword options rather than a path.
 | `read.hdf5(path)` | HDF5 files, datasets as columns | `[hdf5]` |
 | `read.zarr(path)` | A Zarr store of chunked n-dimensional arrays | `[zarr]` |
 | `read.numpy(path)` | NumPy `.npy` and `.npz` files as tensor rows | nothing extra |
+| `read.documents(path)` | PDF documents, one row per page as `{path, page, text}` | `[pdf]` |
 | `read.point_cloud(path)` | LiDAR point-cloud files in `.pcd`, `.ply`, or raw `.bin`, one row per point | nothing extra |
 | `read.mcap(path)` | MCAP robot and vehicle logs from ROS 2 or ADAS, one row per message | `[robotics]` |
 | `read.mdf(path)` | ASAM MDF4 vehicle measurements over CAN/LIN and sensors, one row per sample | `[robotics]` |
@@ -239,6 +240,44 @@ print(events.schema.field("v").type)
 
 Pick a branch out with the usual struct accessor, so `col("v").struct.field("member1")` is
 the string arm. Or `coalesce` the arms together once you know they are compatible.
+
+### PDF documents
+
+`read.documents` extracts a PDF corpus into `{path, page, text}`, one row per page. That
+shape is what makes the rest of a document pipeline relational: chunking, embedding, and
+retrieval all run as expressions over the `text` column, and `path` keeps a page attached
+to the document it came from.
+
+```python
+# docs: skip
+import batcher as bt
+from batcher import col
+
+pages = bt.read.documents("s3://bucket/reports/")
+chunks = pages.with_columns(chunk=col("text").str.chunk(512, overlap=64, boundary="sentence"))
+```
+
+Two properties are worth knowing before you point it at a large corpus.
+
+**Extraction is skipped when you do not ask for the text.** Laying a page out into reading
+order is most of the cost of reading a PDF, so `select("path", "page")` and `count()` walk
+the page tree and stop. Surveying a corpus is therefore cheap, and it is the right first
+step: `group_by("path").agg(pages=col("page").count())` tells you the shape of what you
+have without extracting a word.
+
+**Encrypted documents need their password.** A PDF encrypted for *permissions* only, to
+restrict printing or copying, carries an empty user password and opens without anything
+extra. One with a real password takes `password=`:
+
+```python
+# docs: skip
+locked = bt.read.documents("s3://bucket/contracts/", password="s3cret")
+```
+
+A page that will not extract is a page-level failure rather than a document-level one:
+under `on_error="skip"` its text is null, distinguishable from a genuinely empty page, and
+one bad page in a 900-page report does not cost the other 899. The document is recorded in
+`corrupt_files()`.
 
 ### Point clouds and sensor arrays for robotics
 
