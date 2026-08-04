@@ -46,7 +46,7 @@ from batcher.ml.preprocessors.encoders import (
 )
 from batcher.ml.preprocessors.imputers import SimpleImputer
 from batcher.ml.preprocessors.persistence import from_dict, load, save, to_dict
-from batcher.ml.preprocessors.polynomial import PolynomialFeatures
+from batcher.ml.preprocessors.polynomial import PolynomialFeatures, SplineTransformer
 from batcher.ml.preprocessors.power import BoxCoxTransformer, PowerTransformer
 from batcher.ml.preprocessors.scalers import (
     MaxAbsScaler,
@@ -73,6 +73,7 @@ from batcher.ml.preprocessors.timeseries import (
 )
 from batcher.ml.preprocessors.transforms import (
     Clipper,
+    FunctionTransformer,
     LogTransformer,
     MissingIndicator,
     QuantileTransformer,
@@ -95,6 +96,7 @@ __all__ = [
     "DateTimeFeaturizer",
     "DropCorrelated",
     "FrequencyEncoder",
+    "FunctionTransformer",
     "GroupImputer",
     "GroupStatEncoder",
     "HashingEncoder",
@@ -126,6 +128,7 @@ __all__ = [
     "SelectKBest",
     "SelectPercentile",
     "SimpleImputer",
+    "SplineTransformer",
     "StandardScaler",
     "TargetEncoder",
     "TextStatFeaturizer",

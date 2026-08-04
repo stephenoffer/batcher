@@ -96,6 +96,81 @@ print(out.to_pydict()["units_rolling_mean_2"])
 Rows near the start of a series have no history and get null, which is the honest answer:
 drop them, or let a booster use the null as the signal it is.
 
+## Fitting a curve with a linear model
+
+A linear model can only fit a straight line through a feature, so a relationship that bends
+has to be given the bend as extra columns. There are two ways to do that, and they behave
+very differently.
+
+{py:class}`PolynomialFeatures <batcher.ml.preprocessors.PolynomialFeatures>` adds powers and
+products. It is the right tool for interactions, where the point is that two features act
+together:
+
+```python
+from batcher.ml.preprocessors import PolynomialFeatures
+
+ds = bt.from_pydict({"a": [1.0, 2.0, 3.0], "b": [4.0, 5.0, 6.0]})
+print(PolynomialFeatures(["a", "b"], degree=2).fit_transform(ds).columns)
+# ['a', 'b', 'a^2', 'a*b', 'b^2']
+```
+
+For curvature in a single feature it is usually the wrong tool. A degree-3 polynomial makes
+the whole column's shape one cubic, so it oscillates near the edges of the range, and a
+point at one end can move the fit at the other.
+
+{py:class}`SplineTransformer <batcher.ml.preprocessors.SplineTransformer>` expands a column
+into a B-spline basis instead. Each basis function is non-zero over a few knots only, so the
+fit is *local*: a wiggle in one region stays in that region. This is how a generalized
+additive model gets its smooth terms.
+
+```python
+from batcher.ml.preprocessors import SplineTransformer
+
+curved = bt.from_pydict({"x": [float(i) for i in range(20)]})
+spline = SplineTransformer("x", n_knots=5, degree=3).fit(curved)
+print([c for c in spline.transform(curved).columns if c.startswith("x_sp")])
+# ['x_sp0', 'x_sp1', 'x_sp2', 'x_sp3', 'x_sp4', 'x_sp5', 'x_sp6']
+```
+
+The basis has `n_knots + degree - 1` columns, and every row's values sum to one, so the
+expansion adds shape without adding scale.
+
+Knots go at the column's quantiles by default, following the data's density rather than its
+range, which is what keeps the basis well-behaved on a skewed column. Pass
+`knots="uniform"` to space them evenly across the observed range instead:
+
+```python
+print(SplineTransformer("x", n_knots=3, knots="uniform").fit(curved).knots_["x"])
+# [0.0, 9.5, 19.0]
+```
+
+A column with a heavy point mass returns the same quantile several times over. Repeated
+knots would make consecutive basis functions identical, and a linear fit over perfectly
+collinear columns is singular, so the duplicates are collapsed and the basis comes out
+narrower than `n_knots` would suggest.
+
+## Applying an expression as a pipeline step
+
+{py:class}`FunctionTransformer <batcher.ml.preprocessors.FunctionTransformer>` wraps an
+arbitrary expression so it becomes part of the fitted object rather than a loose
+`with_columns` call. That matters because a chain is applied to the validation split as a
+unit, and the loose call is the step that gets forgotten.
+
+`func` receives the column's expression and returns a new one, so the work still runs in
+Rust:
+
+```python
+from batcher.ml.preprocessors import FunctionTransformer
+
+amounts = bt.from_pydict({"amount": [1.0, 4.0, 9.0]})
+print(FunctionTransformer("amount", lambda c: c.sqrt()).fit_transform(amounts).to_pydict())
+# {'amount': [1.0, 2.0, 3.0]}
+```
+
+Pass `suffix=` to add a column instead of replacing one. A function written against a
+*value* rather than an expression is rejected with that explanation, because it is the
+obvious mistake to make here.
+
 ## Reducing dimensionality
 
 `PCA` projects a block of correlated numeric columns onto their top principal components, replacing them with a few uncorrelated `pc1`, `pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a wide table for a downstream model, and its `explained_variance_ratio_` tells you how many components to keep. The fit is a single scan, because the mean and covariance are aggregates, and only the small eigendecomposition runs on the driver.

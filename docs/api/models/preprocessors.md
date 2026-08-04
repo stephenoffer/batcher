@@ -133,6 +133,12 @@ The rest of the estimators cover discretization, missing values, text splitting,
 .. autoclass:: PolynomialFeatures
    :members:
 
+.. autoclass:: SplineTransformer
+   :members:
+
+.. autoclass:: FunctionTransformer
+   :members:
+
 .. autoclass:: Clipper
    :members:
 

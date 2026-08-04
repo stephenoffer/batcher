@@ -28,12 +28,18 @@ from batcher.plan.expr_ir.constructors import col, lit, nullif, when
 from batcher.plan.functions.analysis._normal import normal_ppf
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir import Expr
 
-__all__ = ["Clipper", "LogTransformer", "MissingIndicator", "QuantileTransformer"]
+__all__ = [
+    "Clipper",
+    "FunctionTransformer",
+    "LogTransformer",
+    "MissingIndicator",
+    "QuantileTransformer",
+]
 
 
 class QuantileTransformer(Preprocessor):
@@ -399,3 +405,90 @@ class MissingIndicator(Preprocessor):
         return ds.with_columns(
             **{f"{name}{self.suffix}": col(name).is_null() for name in self.columns}
         )
+
+
+class FunctionTransformer(Preprocessor):
+    """Apply an arbitrary expression to each column, as a `Preprocessor`.
+
+    The escape hatch for a transform this package does not have a name for. `func` takes the
+    column's `Expr` and returns a new one, so the result is an ordinary projection the engine
+    evaluates in Rust — this is *not* a way to run Python per row, and passing a plain
+    ``lambda v: v + 1`` written against a scalar will not work.
+
+    Its reason to exist is composition: a `Chain` is fitted and saved as a unit, and a
+    one-off ``with_columns`` in the middle of a pipeline is the step that gets forgotten
+    when the pipeline is applied to the validation split. Wrapping it here makes it part of
+    the object that gets carried around.
+
+    A `FunctionTransformer` is stateless, so it survives `save`/`load` only when `func` is
+    named at module scope — the saved document records the reference, not the code. A lambda
+    raises on save rather than writing a file that cannot be read back.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.preprocessors import FunctionTransformer
+            >>> ds = bt.from_pydict({"x": [1.0, 4.0, 9.0]})
+            >>> FunctionTransformer("x", lambda c: c.sqrt()).fit_transform(ds).to_pydict()
+            {'x': [1.0, 2.0, 3.0]}
+
+    Args:
+        columns: The columns to rewrite.
+        func: ``(Expr) -> Expr``, applied to each column in turn.
+        suffix: Write the result to ``<column><suffix>`` instead of replacing the column.
+    """
+
+    __slots__ = ("columns", "func", "suffix")
+
+    def __init__(
+        self,
+        columns: str | Sequence[str],
+        func: Callable[[Expr], Expr],
+        *,
+        suffix: str = "",
+    ) -> None:
+        self.columns = columns_arg(columns, what="FunctionTransformer")
+        if not callable(func):
+            raise PlanError(
+                "FunctionTransformer needs a callable taking an Expr and returning an Expr, "
+                f"got {type(func).__name__}. It builds a projection, so it receives the "
+                "column expression, not a value."
+            )
+        self.func = func
+        self.suffix = suffix
+
+    def transform(self, ds: Dataset) -> Dataset:
+        """Apply `func` to each configured column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import FunctionTransformer
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0]})
+                >>> pre = FunctionTransformer("x", lambda c: c * 10, suffix="_scaled")
+                >>> pre.fit_transform(ds).to_pydict()
+                {'x': [1.0, 2.0], 'x_scaled': [10.0, 20.0]}
+
+        Args:
+            ds: The dataset to rewrite.
+
+        Returns:
+            A new lazy `Dataset` with the rewritten (or added) columns.
+
+        Raises:
+            PlanError: If `func` returns something that is not an expression.
+        """
+        self._require_fitted()
+        projections: dict[str, Expr] = {}
+        for name in self.columns:
+            produced = self.func(col(name))
+            if not hasattr(produced, "to_ir"):
+                raise PlanError(
+                    f"FunctionTransformer: func returned {type(produced).__name__} for column "
+                    f"{name!r}, not an expression. It is handed the column's Expr and must "
+                    "return an Expr — for example lambda c: c.log1p(), not lambda v: log(v)."
+                )
+            projections[f"{name}{self.suffix}"] = produced
+        return ds.with_columns(**projections)
