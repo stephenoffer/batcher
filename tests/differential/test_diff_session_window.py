@@ -121,3 +121,31 @@ def test_a_streaming_session_window_matches_duckdb_too(duck, chunks):
         """
     )
     assert_same(result, rel)
+
+
+@pytest.mark.parametrize(
+    ("arrow_type", "expected"),
+    [
+        (pa.timestamp("us", tz="UTC"), "timestamp[us, tz=UTC]"),
+        (pa.timestamp("ms"), "timestamp[ms]"),
+        (pa.timestamp("us"), "timestamp[us]"),
+    ],
+)
+def test_the_session_bounds_keep_the_event_time_columns_own_type(arrow_type, expected):
+    """The bounds used to be computed from an epoch-micros copy and cast back, which
+    produced a naive `timestamp[us]` whatever went in. A UTC-aware column came back with
+    the right instant and no timezone, and a millisecond column came back in microseconds
+    -- right values, wrong type, which is the shape of bug an order-independent value
+    comparison cannot see and anything rendering a local time downstream reads as wrong."""
+    base = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc if arrow_type.tz else None)
+    table = pa.table(
+        {
+            "k": pa.array(["a", "a"], pa.string()),
+            "ts": pa.array([base, base + dt.timedelta(minutes=1)], arrow_type),
+            "v": pa.array([1, 2], pa.int64()),
+        }
+    )
+    out = bt.from_arrow(table).session_window("ts", "30m", partition_by=["k"], total=col("v").sum())
+    result = out.collect()
+    assert str(result.schema.field("session_start").type) == expected
+    assert str(result.schema.field("session_end").type) == expected

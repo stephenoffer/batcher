@@ -437,11 +437,16 @@ def sessionize(
     from batcher.plan.expr_ir import col
 
     s = mark_sessions(ds, time_col, gap_us, pk)
-    grouped = s.group_by(*pk, "_sid").agg(_ss=col("_t").min(), _se=col("_t").max(), **aggs)
-    out = grouped.with_columns(
-        session_start=col("_ss").cast("timestamp"), session_end=col("_se").cast("timestamp")
+    # The bounds are min/max of the event-time column *itself*, not of the epoch-micros
+    # copy the gap arithmetic needs. Going through the copy and casting back produced a
+    # naive `timestamp[us]` whatever the input was, so a `timestamp[us, tz=UTC]` column
+    # came back with the right instant and no timezone, and a `timestamp[ms]` column came
+    # back in microseconds. Right values, wrong type — which anything rendering a local
+    # time downstream reads as a wrong answer.
+    grouped = s.group_by(*pk, "_sid").agg(
+        session_start=col(time_col).min(), session_end=col(time_col).max(), **aggs
     )
-    return out.select(*pk, "session_start", "session_end", *aggs.keys())
+    return grouped.select(*pk, "session_start", "session_end", *aggs.keys())
 
 
 def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:
