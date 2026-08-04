@@ -42,6 +42,18 @@ deduped = records.drop_duplicates_within_watermark(["id"], event_time="ts",
 print(sorted(deduped.to_pydict()["id"]))  # ['x', 'y', 'z'] — the second 'x' dropped
 ```
 
+A deduplicated stream writes to a sink like any other streaming query, which is usually
+the point of deduplicating one:
+
+```python
+# docs: skip
+deduped.write.delta("lake/silver/events", trigger=bt.Trigger.processing_time("30 seconds"))
+```
+
+`checkpoint=` is refused here. The seen-key set is not a source offset, so a restart would
+resume with an empty one while the offset log said otherwise, which looks exactly like
+exactly-once recovery and is not. The sink's own idempotency still applies.
+
 ## Stream-to-stream joins
 
 {py:meth}`join_stream <batcher.Dataset.join_stream>` joins two streams on keys **and** an event-time interval
