@@ -166,6 +166,34 @@ Apply it for one query with {py:func}`bt.config_context(cfg) <batcher.config_con
 {py:func}`bt.set_config(cfg) <batcher.set_config>`.
 
 
+## Shipping progress somewhere else
+
+A progress record's destination is usually a log line or a metrics system, and both want
+data rather than a dataclass. `to_dict()` and `json()` produce Spark's shape, keyed in its
+camelCase, so a dashboard written against `StreamingQueryProgress` reads these unchanged:
+
+```python
+# docs: skip
+for p in q.recent_progress:
+    metrics.emit(p.to_dict())          # or p.json() straight into a log line
+```
+
+`durationMs` in that payload is where the micro-batch's time went: `latestOffset` (asking
+the source what is available), `addBatch` (running the plan and writing the sink),
+`walCommit` (the offset and commit log fsyncs), and `triggerExecution` for the whole batch.
+A total alone cannot tell a slow query from a slow *checkpoint*, and those have opposite
+remedies.
+
+## Identifying a query across restarts
+
+`q.id` is stable across restarts of the same query; `q.run_id` is fresh on every start.
+Keying a dashboard only on `id` cannot tell a query that has been up for a week from one
+that has crash-looped every ten minutes. Both have Spark's camelCase spellings too.
+
+A supervisor that loops on `bt.await_any_termination()` should call `bt.reset_terminated()`
+after handling one, exactly as in Spark: the call returns immediately once any query has
+terminated and keeps doing so until the record is cleared, so a loop that forgets spins.
+
 ## See also
 
 - {doc}`streaming`: sources, sinks, triggers, output modes, and checkpoints.

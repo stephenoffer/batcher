@@ -1446,6 +1446,34 @@ class Reader:
         """
         return _read_table("rate", rows_per_second, **opts)
 
+    def rate_micro_batch(self, rows_per_batch: int = 1, **opts: Any) -> Dataset:
+        """Generate exactly `rows_per_batch` rows per micro-batch (Spark ``rate-micro-batch``).
+
+        The difference from `rate` is the unit, and it is the whole point. `rate` promises
+        rows per *second*, so how many land in a micro-batch depends on how long the
+        previous one took — which makes it useless as a benchmark input, because the thing
+        being measured changes the input. This promises rows per *batch*, so a run is
+        reproducible and a comparison between two builds is a comparison.
+
+        Args:
+            rows_per_batch: Rows in every micro-batch.
+            opts: ``num_rows=`` to bound it, ``start_timestamp=`` and
+                ``advance_ms_per_batch=`` to shape the event-time column so a windowed
+                query over it is deterministic too.
+
+        Returns:
+            A lazy `Dataset` of generated ``(timestamp, value)`` rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> demo = bt.read.rate_micro_batch(3, num_rows=9)
+                >>> [b.num_rows for b in demo.iter_batches()]
+                [3, 3, 3]
+        """
+        return _read_table("rate_micro_batch", rows_per_batch, **opts)
+
     def socket(self, host: str = "localhost", port: int = 9999, **opts: Any) -> Dataset:
         """Read newline-delimited text from a TCP socket (Spark `socket`; dev only).
 

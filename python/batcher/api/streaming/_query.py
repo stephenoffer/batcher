@@ -17,7 +17,12 @@ from batcher.plan.streaming import StreamingQueryProgress, StreamingQueryStatus
 if TYPE_CHECKING:
     from batcher.core.streaming_query import StreamingQueryEngine
 
-__all__ = ["StreamingQuery", "active_streams", "await_any_termination"]
+__all__ = [
+    "StreamingQuery",
+    "active_streams",
+    "await_any_termination",
+    "reset_terminated",
+]
 
 
 # Process-wide registry of running queries, surfaced as `bt.streams`.
@@ -112,6 +117,23 @@ def active_streams() -> list[StreamingQuery]:
         return list(_ACTIVE.values())
 
 
+#: Queries that have terminated since the last `reset_terminated()`. Spark's
+#: `awaitAnyTermination` returns immediately once *any* query has ever terminated, until
+#: `resetTerminated()` clears the flag — so a supervisor loop that forgets to reset spins.
+_TERMINATED: list[str] = []
+
+
+def reset_terminated() -> None:
+    """Forget the terminations `await_any_termination` has already reported (Spark parity).
+
+    Spark's `awaitAnyTermination` returns immediately once *any* query has terminated, and
+    keeps doing so until `resetTerminated()` clears the record. A supervisor that restarts
+    a failed query and loops back into `awaitAnyTermination` without resetting therefore
+    spins at full speed on a termination it has already handled. This is that reset.
+    """
+    _TERMINATED.clear()
+
+
 def await_any_termination(timeout: float | None = None) -> bool:
     """Block until any active streaming query stops (Spark ``awaitAnyTermination``).
 
@@ -133,6 +155,8 @@ def await_any_termination(timeout: float | None = None) -> bool:
     """
     import time
 
+    if _TERMINATED:
+        return True  # a termination already reported and not yet reset — Spark's semantics
     watching = active_streams()
     if not watching:
         return True
@@ -140,6 +164,7 @@ def await_any_termination(timeout: float | None = None) -> bool:
     while True:
         for q in watching:
             if not q.is_active:
+                _TERMINATED.append(q.name)
                 q.await_termination(0.0)  # re-raise if it failed; deregister
                 return True
         if deadline is not None and time.monotonic() >= deadline:
@@ -157,11 +182,18 @@ class StreamingQuery:
     `await_termination(timeout)`, `status`, `recent_progress`, `is_active`.
     """
 
-    __slots__ = ("_engine", "_name")
+    __slots__ = ("_engine", "_name", "_run_id")
 
     def __init__(self, name: str, engine: StreamingQueryEngine) -> None:
+        import uuid
+
         self._name = name
         self._engine = engine
+        # Spark distinguishes `id` (stable across restarts of the same checkpoint) from
+        # `runId` (fresh per start). Conflating them is what makes a restart indistinguishable
+        # from a still-running query in a metrics system keyed on the identifier, so the two
+        # exist here for the same reason.
+        self._run_id = str(uuid.uuid4())
 
     def __repr__(self) -> str:
         """Show the query name, liveness, and the most recent micro-batch's progress."""
@@ -191,8 +223,28 @@ class StreamingQuery:
 
     @property
     def id(self) -> str:
-        """A stable identifier for the query (its name); Spark `StreamingQuery.id` parity."""
+        """A stable identifier for the query (its name); Spark `StreamingQuery.id` parity.
+
+        Stable across restarts of the same query, which is what makes it the right key for
+        a dashboard or an alert: two runs of the same pipeline are the same `id`.
+        """
         return self._name
+
+    @property
+    def run_id(self) -> str:
+        """A fresh identifier for *this* run (Spark `StreamingQuery.runId` parity).
+
+        New on every start, so a restart is visibly a restart. `id` answers "which query is
+        this"; `run_id` answers "which attempt" — and a metrics system keyed only on `id`
+        cannot tell a query that has been up for a week from one that has crash-looped
+        every ten minutes.
+        """
+        return self._run_id
+
+    @property
+    def runId(self) -> str:
+        """Spark spelling of `run_id` — a fresh identifier for this run."""
+        return self._run_id
 
     @property
     def is_active(self) -> bool:

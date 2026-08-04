@@ -388,13 +388,25 @@ class StreamingQueryEngine:
         if staged is None:
             self._checkpoint_drain()
             return False
+        staged_at = perf_counter()
         start_offset = self._runner.positions()
         if self._checkpoint is not None:
             self._checkpoint.record_offsets(self._batches, start_offset)
+        wal_at = perf_counter()
         consumed, emitted = self._runner.publish(self._batches, staged)
+        published_at = perf_counter()
         if self._checkpoint is not None:
             self._commit_microbatch()
-        duration_ms = (perf_counter() - t0) * 1000.0
+        end = perf_counter()
+        duration_ms = (end - t0) * 1000.0
+        # Keyed as Spark keys `durationMs`, because a total alone cannot distinguish a slow
+        # query from a slow *checkpoint* — and those have opposite remedies. `walCommit`
+        # covers both log writes (the write-ahead before publish and the commit after).
+        breakdown = (
+            ("latestOffset", (staged_at - t0) * 1000.0),
+            ("addBatch", (published_at - wal_at) * 1000.0),
+            ("walCommit", ((wal_at - staged_at) + (end - published_at)) * 1000.0),
+        )
         progress = StreamingQueryProgress(
             batch_id=self._batches,
             num_input_rows=consumed,
@@ -406,6 +418,7 @@ class StreamingQueryEngine:
             state_operators=self._state_metrics(),
             sources=self._source_progress(consumed, start_offset),
             sink=self._sink_progress(emitted),
+            duration_breakdown_ms=breakdown,
         )
         self._progress.append(progress)
         notify_query_progress(self._name, progress)

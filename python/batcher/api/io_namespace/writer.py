@@ -780,6 +780,49 @@ class Writer:
             ForeachBatchStreamSink(fn), trigger, output_mode, query_name, checkpoint
         )
 
+    def noop(
+        self,
+        *,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+    ) -> StreamingQuery:
+        """Run the pipeline and discard its output (Spark ``format("noop")``).
+
+        The benchmark sink. Measuring a pipeline through a real sink measures the sink too
+        — a Parquet write is compression and fsyncs, the console sink is a terminal, the
+        memory sink grows until the box dies. Discarding the rows leaves the read, the
+        transform and the engine, which is the thing under test.
+
+        The rows are still counted, so `recent_progress` reports what the query processed.
+        A benchmark sink that swallowed the count would make "this is fast" and "this
+        produced nothing" look identical.
+
+        Args:
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+
+        Returns:
+            A `StreamingQuery` handle for the running (output-discarding) stream.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> demo = bt.read.rate_micro_batch(100, num_rows=1000)
+                >>> query = demo.write.noop(trigger=bt.Trigger.available_now())
+                >>> query.await_termination()
+                True
+                >>> sum(p.num_input_rows for p in query.recent_progress)
+                1000
+        """
+        from batcher.io.formats.streaming.sinks import NoopStreamSink
+
+        return self._start_stream(NoopStreamSink(), trigger, output_mode, query_name, checkpoint)
+
     def kafka(
         self,
         topic: str | None = None,

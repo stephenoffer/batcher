@@ -63,6 +63,11 @@ files and tables:
 | Rate generator (dev) | {py:meth}`bt.read.rate(rows_per_second) <batcher.api.io_namespace.reader.Reader.rate>` |
 | TCP socket (dev) | {py:meth}`bt.read.socket(host, port) <batcher.api.io_namespace.reader.Reader.socket>` |
 
+Every broker takes the same `starting_position=` — `"earliest"` or `"latest"` — whatever it
+calls the idea itself (Kafka's `auto.offset.reset`, Kinesis's `ShardIteratorType`, Event
+Hubs' offset sentinel, Pulsar's `InitialPosition`). Each connector's native spelling still
+works, so an existing reader keeps reading.
+
 The `rate` source generates rows and is handy for trying the API without external
 infrastructure (`num_rows` bounds it, `pace=False` removes the one-second cadence):
 
@@ -70,6 +75,17 @@ infrastructure (`num_rows` bounds it, `pace=False` removes the one-second cadenc
 demo = bt.read.rate(5, num_rows=10, pace=False)
 rows = [b.num_rows for b in demo.iter_batches()]
 print(sum(rows))  # 10 generated (value, timestamp) rows
+```
+
+`rate` promises rows per *second*, so how many land in a micro-batch depends on how long the
+previous one took — which makes it a poor benchmark input, because the thing being measured
+changes the input. `rate_micro_batch` promises rows per *batch* instead, so a run is
+reproducible:
+
+```python
+bench = bt.read.rate_micro_batch(4, num_rows=8)
+print([b.num_rows for b in bench.iter_batches()])
+# [4, 4]
 ```
 
 Kafka, Kinesis, and Delta need their optional dependency and a running service:
@@ -118,6 +134,9 @@ Sinks available on the write namespace:
 - {py:meth}`ds.write.for_each_batch(fn, trigger=...) <batcher.api.io_namespace.writer.Writer.for_each_batch>` calls `fn(table, batch_id)` on each
   micro-batch. The whole Arrow table is passed, never a row, so this is the hook for
   custom upserts (`MERGE`/SCD), multi-sink fan-out, or any per-batch commit logic.
+- {py:meth}`ds.write.noop(trigger=...) <batcher.api.io_namespace.writer.Writer.noop>` runs the pipeline and discards
+  its output. The benchmark sink: measuring through a real sink measures the sink too. Rows
+  are still counted, so `recent_progress` reports what the query processed.
 - {py:meth}`ds.write.for_each(fn, trigger=...) <batcher.api.io_namespace.writer.Writer.for_each>` calls `fn(row)` per row. Pass a
   {py:class}`ForeachWriter <batcher.ForeachWriter>` instead of a function when the
   destination needs a connection: its `open(partition_id, epoch_id)` acquires one and

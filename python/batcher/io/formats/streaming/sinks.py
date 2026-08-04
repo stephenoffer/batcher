@@ -32,6 +32,7 @@ __all__ = [
     "ForeachStreamSink",
     "ForeachWriter",
     "MemoryStreamSink",
+    "NoopStreamSink",
     "StreamSink",
     "TransactionalStreamSink",
     "memory_table",
@@ -107,6 +108,38 @@ def _truncate_strings(table: pa.Table, width: int) -> pa.Table:
             column = pc.utf8_slice_codeunits(column, 0, width)
         columns.append(column)
     return pa.Table.from_arrays(columns, schema=table.schema)
+
+
+@STREAM_SINKS.register("noop")
+class NoopStreamSink:
+    """Accept every micro-batch and write nothing (Spark ``format("noop")``).
+
+    The benchmark sink. Measuring a pipeline through a real sink measures the sink too — a
+    Parquet write is compression and fsyncs, the console sink is a terminal, the memory sink
+    grows until the box dies. Discarding the rows leaves the read, the transform and the
+    engine, which is the thing under test.
+
+    It is not a no-op: `write_batch` counts what it was handed, so a run reports the rows it
+    processed rather than a silent zero. A sink that swallowed the count would make "the
+    pipeline is fast" and "the pipeline produced nothing" look identical, which is the one
+    way a benchmark sink can actively mislead.
+    """
+
+    def __init__(self, **_: Any) -> None:
+        self.rows_written = 0
+        self.batches_written = 0
+
+    def open(self) -> None:
+        self.rows_written = 0
+        self.batches_written = 0
+
+    def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
+        self.rows_written += table.num_rows
+        self.batches_written += 1
+        return f"noop:{batch_id}:{table.num_rows}"
+
+    def close(self) -> None:
+        pass
 
 
 # Process-global store for in-memory sinks, read back by `bt.read_memory(name)`.

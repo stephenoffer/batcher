@@ -65,6 +65,23 @@ class StateOperatorProgress:
     #: before any row has set one.
     watermark_micros: int | None = None
 
+    @property
+    def num_rows_dropped_by_watermark(self) -> int:
+        """Spark's name for `num_late_inputs_dropped`.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.plan.streaming import StateOperatorProgress
+                >>> s = StateOperatorProgress("windowed_aggregate", num_late_inputs_dropped=3)
+                >>> s.num_rows_dropped_by_watermark
+                3
+
+        Returns:
+            Input rows this operator dropped for arriving below the watermark.
+        """
+        return self.num_late_inputs_dropped
+
     def __str__(self) -> str:
         """A one-line summary: retained rows, eviction, and anything dropped as late."""
         late = (
@@ -159,6 +176,128 @@ class StreamingQueryProgress:
     sources: tuple[SourceProgress, ...] = ()
     #: What the sink accepted, when the runner reports a single sink.
     sink: SinkProgress | None = None
+    #: Where the micro-batch's time went, in milliseconds, keyed as Spark keys it:
+    #: ``latestOffset`` (asking the source what is available), ``addBatch`` (running the
+    #: plan and writing the sink), ``walCommit`` (the offset/commit log fsyncs), and
+    #: ``triggerExecution`` (the whole batch). A total alone cannot distinguish a slow
+    #: query from a slow *checkpoint*, which is the first thing to rule out when a stream
+    #: falls behind — and the two have opposite remedies.
+    duration_breakdown_ms: tuple[tuple[str, float], ...] = ()
+
+    @property
+    def duration_ms_map(self) -> dict[str, float]:
+        """The `duration_breakdown_ms` pairs as a dict (Spark's ``durationMs``).
+
+        A tuple of pairs on the record because the dataclass is frozen and hashable; a dict
+        here because that is what a caller wants to index.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.plan.streaming import StreamingQueryProgress
+                >>> p = StreamingQueryProgress(
+                ...     0, 1, 1, 5.0, 0.0, duration_breakdown_ms=(("addBatch", 4.0),)
+                ... )
+                >>> p.duration_ms_map["addBatch"]
+                4.0
+
+        Returns:
+            The phase-to-milliseconds mapping for this micro-batch.
+        """
+        return dict(self.duration_breakdown_ms)
+
+    @property
+    def processed_rows_per_second(self) -> float:
+        """Spark's name for `output_rows_per_second`.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.plan.streaming import StreamingQueryProgress
+                >>> StreamingQueryProgress(0, 500, 50, 250.0, 0.0).processed_rows_per_second
+                200.0
+
+        Returns:
+            Output rows per second for this micro-batch.
+        """
+        return self.output_rows_per_second
+
+    def to_dict(self) -> dict:
+        """This record as plain JSON-encodable data (Spark's ``progress.json``).
+
+        A progress record's destination is usually a log line or a metrics system, and both
+        want data rather than a dataclass. Keyed in Spark's camelCase so a dashboard written
+        against `StreamingQueryProgress` reads this one unchanged.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.plan.streaming import StreamingQueryProgress
+                >>> StreamingQueryProgress(3, 10, 8, 5.0, 0.0).to_dict()["batchId"]
+                3
+
+        Returns:
+            A JSON-encodable dict of the micro-batch's metrics.
+        """
+        return {
+            "name": self.name,
+            "batchId": self.batch_id,
+            "timestamp": self.timestamp,
+            "numInputRows": self.num_input_rows,
+            "numOutputRows": self.num_output_rows,
+            "numLateRows": self.num_late_rows,
+            "inputRowsPerSecond": self.input_rows_per_second,
+            "processedRowsPerSecond": self.processed_rows_per_second,
+            "durationMs": {"triggerExecution": self.duration_ms, **self.duration_ms_map},
+            "behindByMs": self.behind_by_ms,
+            "eventTimeWatermarkMicros": self.event_time_watermark_micros,
+            "stateOperators": [
+                {
+                    "operatorName": s.operator_name,
+                    "numRowsTotal": s.num_rows_total,
+                    "numRowsUpdated": s.num_rows_updated,
+                    "numRowsRemoved": s.num_rows_removed,
+                    "memoryUsedBytes": s.memory_used_bytes,
+                    "numRowsDroppedByWatermark": s.num_late_inputs_dropped,
+                    "watermarkMicros": s.watermark_micros,
+                }
+                for s in self.state_operators
+            ],
+            "sources": [
+                {
+                    "description": s.description,
+                    "numInputRows": s.num_input_rows,
+                    "startOffset": s.start_offset,
+                    "endOffset": s.end_offset,
+                }
+                for s in self.sources
+            ],
+            "sink": None
+            if self.sink is None
+            else {
+                "description": self.sink.description,
+                "numOutputRows": self.sink.num_output_rows,
+                "token": self.sink.token,
+            },
+        }
+
+    def json(self) -> str:
+        """This record as a JSON string (Spark ``StreamingQueryProgress.json``).
+
+        Examples:
+            .. doctest::
+
+                >>> import json
+                >>> from batcher.plan.streaming import StreamingQueryProgress
+                >>> json.loads(StreamingQueryProgress(2, 1, 1, 1.0, 0.0).json())["batchId"]
+                2
+
+        Returns:
+            The record encoded as JSON.
+        """
+        import json as _json
+
+        return _json.dumps(self.to_dict())
 
     @property
     def input_rows_per_second(self) -> float:

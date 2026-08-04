@@ -16,7 +16,60 @@ import pyarrow as pa
 
 from batcher.io.formats.sql._common import connection_fingerprint
 
-__all__ = ["HEADERS_TYPE", "BrokerMessage", "broker_schema", "redact_broker_options"]
+__all__ = [
+    "HEADERS_TYPE",
+    "BrokerMessage",
+    "broker_schema",
+    "normalize_starting_position",
+    "redact_broker_options",
+]
+
+#: The two whole-stream starting positions every broker understands, under the names Spark
+#: uses. Each concrete broker maps them onto its own vocabulary (Kafka's
+#: ``auto.offset.reset``, Kinesis's ``ShardIteratorType``, Event Hubs' offset sentinel).
+STARTING_POSITIONS = ("earliest", "latest")
+
+
+def normalize_starting_position(value: object, *, aliases: dict[str, str]) -> str:
+    """Map a `starting_position` onto one concrete broker's own vocabulary.
+
+    Five brokers, five spellings of the same two ideas: Kafka says
+    ``auto.offset.reset=earliest``, Kinesis says ``ShardIteratorType=TRIM_HORIZON``, Event
+    Hubs says offset ``-1``, Pulsar says ``MessageId.earliest``. A reader who knows one has
+    to look up the other four, and a job ported from Spark knows none of them — it knows
+    ``startingOffsets`` / ``startingPosition``, which is ``"earliest"`` or ``"latest"``.
+
+    So the *option* is the same everywhere and the mapping lives with the broker that needs
+    it. A broker's native spelling still works, because refusing it would break the readers
+    that already pass one.
+
+    Args:
+        value: What the user asked for — a shared name, or this broker's native spelling.
+        aliases: This broker's ``{shared_name: native_value}`` mapping.
+
+    Returns:
+        The native value to hand the client.
+
+    Raises:
+        PlanError: If `value` is neither a shared name nor a recognized native one.
+    """
+    from batcher._internal.errors import PlanError, suggestion
+
+    if not isinstance(value, str):
+        raise PlanError(
+            f"starting_position must be a string, not {type(value).__name__} ({value!r}); "
+            f"use one of {list(STARTING_POSITIONS)}"
+        )
+    if value in aliases:
+        return aliases[value]
+    native = set(aliases.values())
+    if value in native:
+        return value  # this broker's own spelling, passed through unchanged
+    known = [*STARTING_POSITIONS, *sorted(native)]
+    hint = suggestion(value, known)
+    raise PlanError(
+        f"unknown starting_position {value!r}; use one of {known}." + (f" {hint}" if hint else "")
+    )
 
 
 #: Two forces pull on this list. Too narrow and a credential reaches a log line and the

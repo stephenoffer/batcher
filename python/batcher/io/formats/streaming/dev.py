@@ -1,10 +1,11 @@
-"""Development streaming sources — `rate` and `socket` (Spark parity).
+"""Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity).
 
-These are the test/dev sources Spark ships: `rate` generates a steady stream of
-``(timestamp, value)`` rows for benchmarking and demos, and `socket` reads
-newline-delimited text from a TCP connection. Both are unbounded (``bounded =
-False``); `rate` accepts an optional `num_rows` cap so it can also drive a bounded
-``available_now`` run or a test.
+The test/dev sources Spark ships. `rate` generates a steady stream of
+``(timestamp, value)`` rows for benchmarking and demos; `rate_micro_batch` generates a
+*fixed number of rows per micro-batch* rather than per second, which is what makes a
+benchmark reproducible; `socket` reads newline-delimited text from a TCP connection. All
+are unbounded (``bounded = False``); `rate` and `rate_micro_batch` accept a `num_rows` cap
+so they can also drive a bounded ``available_now`` run or a test.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import pyarrow as pa
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
 
-__all__ = ["RateSource", "SocketSource"]
+__all__ = ["RateMicroBatchSource", "RateSource", "SocketSource"]
 
 #: Naive UTC epoch, for turning a wall-clock read into microseconds without a per-row object.
 _EPOCH = datetime.datetime(1970, 1, 1)
@@ -180,14 +181,28 @@ class SocketSource:
     bounded = False
 
     def __init__(
-        self, host: str = "localhost", port: int = 9999, *, batch_size: int = 1024, **_: Any
+        self,
+        host: str = "localhost",
+        port: int = 9999,
+        *,
+        batch_size: int = 1024,
+        include_timestamp: bool = True,
+        **_: Any,
     ) -> None:
         self._host = host
         self._port = port
         self._batch_size = batch_size
+        # Spark's `includeTimestamp`, whose default is the opposite of this one. Ours stays
+        # True because the column has always been here and dropping it silently would break
+        # every existing reader; the option exists so a ported job can ask for Spark's
+        # one-column shape rather than discovering an extra column at runtime.
+        self._include_timestamp = include_timestamp
 
     def schema(self) -> pa.Schema:
-        return pa.schema([("value", pa.string()), ("timestamp", pa.timestamp("us"))])
+        fields = [("value", pa.string())]
+        if self._include_timestamp:
+            fields.append(("timestamp", pa.timestamp("us")))
+        return pa.schema(fields)
 
     def row_count(self) -> int | None:
         return None
@@ -231,9 +246,96 @@ class SocketSource:
         # row: `[now] * len(lines)` is O(rows) Python object handling in the data plane, the
         # same shape `RateSource._make_batch` was vectorized out of.
         stamps = pa.array(np.full(len(lines), micros, dtype=np.int64)).cast(pa.timestamp("us"))
-        batch = pa.record_batch({"value": pa.array(lines, type=pa.string()), "timestamp": stamps})
+        columns: dict[str, Any] = {"value": pa.array(lines, type=pa.string())}
+        if self._include_timestamp:
+            columns["timestamp"] = stamps
+        batch = pa.record_batch(columns)
         return batch.select(projection) if projection is not None else batch
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         """Read until the connection closes (the bounded-test convenience)."""
+        return list(self.iter_batches(projection))
+
+
+@SOURCES.register("rate_micro_batch")
+class RateMicroBatchSource(RateSource):
+    """Generate exactly `rows_per_batch` rows per micro-batch (Spark ``rate-micro-batch``).
+
+    The difference from `rate` is the unit, and it is the whole point. `rate` promises rows
+    per *second*, so how many land in a micro-batch depends on how long the previous one
+    took — which makes it useless as a benchmark input, because the thing being measured
+    changes the input. `rate_micro_batch` promises rows per *batch*, so a run is
+    reproducible and a comparison between two engine builds is a comparison.
+
+    Spark added it in 3.5 for exactly that reason. `start_timestamp` and
+    `advance_ms_per_batch` shape the event-time column so a windowed query over it is
+    deterministic too: batch *k*'s rows are stamped ``start_timestamp + k *
+    advance_ms_per_batch``, so a fixed number of batches always closes the same windows.
+
+    Args:
+        rows_per_batch: Rows in every micro-batch.
+        num_rows: Total rows before the stream ends; None is unbounded.
+        start_timestamp: Milliseconds since the epoch for the first batch.
+        advance_ms_per_batch: How far event time moves between batches.
+        pace: Sleep a second between batches, as `rate` does. Off by default here —
+            a source whose point is a reproducible batch size is usually being read as
+            fast as possible.
+    """
+
+    def __init__(
+        self,
+        rows_per_batch: int = 1,
+        *,
+        num_rows: int | None = None,
+        start_value: int = 0,
+        start_timestamp: int = 0,
+        advance_ms_per_batch: int = 1000,
+        pace: bool = False,
+        **options: Any,
+    ) -> None:
+        if rows_per_batch < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(f"rate_micro_batch rows_per_batch must be >= 1, got {rows_per_batch}")
+        if advance_ms_per_batch < 0:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"rate_micro_batch advance_ms_per_batch must be >= 0, got "
+                f"{advance_ms_per_batch}: event time does not run backwards"
+            )
+        # `rows_per_second` is the parent's batch size, which is exactly the rows-per-batch
+        # promise under a different name — so the generation loop is inherited unchanged and
+        # only the timestamp derivation differs.
+        super().__init__(
+            rows_per_batch,
+            num_rows=num_rows,
+            start_value=start_value,
+            pace=pace,
+            **options,
+        )
+        self._start_timestamp = start_timestamp
+        self._advance = advance_ms_per_batch
+
+    def identity(self) -> str:
+        return f"rate_micro_batch:{self._rps}:{self._num_rows}:{self._advance}"
+
+    def _make_batch(self, first_value: int, n: int) -> pa.RecordBatch:
+        """Rows stamped by *batch index*, so a fixed batch count closes fixed windows."""
+        import numpy as np
+
+        batch_index = first_value // self._rps
+        stamp_us = (self._start_timestamp + batch_index * self._advance) * 1000
+        values = pa.array(np.arange(first_value, first_value + n, dtype=np.int64))
+        timestamps = pa.array(np.full(n, stamp_us, dtype=np.int64)).cast(pa.timestamp("us"))
+        return pa.record_batch({"timestamp": timestamps, "value": values})
+
+    def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
+        """Materialize — only valid when `num_rows` bounds the stream."""
+        if self._num_rows is None:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                "rate_micro_batch is unbounded; set num_rows to read(), or use iter_batches"
+            )
         return list(self.iter_batches(projection))

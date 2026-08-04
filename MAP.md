@@ -254,8 +254,8 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 188 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 155 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1469 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 1341 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `reader.py` | 1497 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `writer.py` | 1384 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -302,7 +302,7 @@ Session entry points that create `Dataset`s.
 | module | lines | what it is |
 |---|---|---|
 | `_scan.py` | 33 | The one place a `Source` becomes a `Dataset`. |
-| `admin.py` | 295 | Session-level administration: table maintenance and streaming-query control. |
+| `admin.py` | 317 | Session-level administration: table maintenance and streaming-query control. |
 | `combine.py` | 194 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 388 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
 | `frameworks.py` | 406 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
@@ -343,7 +343,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
 | `_launch.py` | 244 | The single-node streaming launcher: optimize once, then drive micro-batches. |
-| `_query.py` | 307 | The `StreamingQuery` handle users hold, and the registry of running queries. |
+| `_query.py` | 359 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
 
@@ -1450,7 +1450,7 @@ The streaming-query engine — the micro-batch loop behind a unified `ds.write`.
 
 | module | lines | what it is |
 |---|---|---|
-| `engine.py` | 532 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
+| `engine.py` | 545 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
 | `processors.py` | 279 | What a micro-batch *becomes* — the per-batch processors and the routing that picks one. |
 
 ### `batcher/core/udf/` — 3 · subsystem
@@ -1688,15 +1688,15 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | module | lines | what it is |
 |---|---|---|
 | `autoloader.py` | 339 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
-| `dev.py` | 239 | Development streaming sources — `rate` and `socket` (Spark parity). |
-| `eventhubs.py` | 230 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
+| `dev.py` | 341 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
+| `eventhubs.py` | 245 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
 | `kafka.py` | 477 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kafka_sink.py` | 268 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
-| `kinesis.py` | 408 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
+| `kinesis.py` | 418 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 181 | Google Cloud Pub/Sub broker source — subscription pull batches. |
-| `pulsar.py` | 374 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
+| `pulsar.py` | 391 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
 | `seen_store.py` | 183 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
-| `sinks.py` | 557 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
+| `sinks.py` | 590 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
 ### `batcher/io/formats/streaming/broker/` — 2 · neutral IO
 
@@ -1704,7 +1704,7 @@ Shared base for row/message-based streaming brokers (Kafka, Kinesis, ...).
 
 | module | lines | what it is |
 |---|---|---|
-| `schema.py` | 145 | The fixed broker message schema, the message record, and option redaction. |
+| `schema.py` | 198 | The fixed broker message schema, the message record, and option redaction. |
 | `source.py` | 401 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
 | `split.py` | 193 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
 
@@ -1922,7 +1922,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `feedback.py` | 273 | Execution feedback contract: Core → Kyber. |
 | `ids.py` | 10 | Stable identifiers used across plans and feedback. |
 | `ir_specs.py` | 102 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
-| `ir_tags.py` | 231 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
+| `ir_tags.py` | 232 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 232 | `plan.source_stats` — what a connector declares about a source, cheaply. |
@@ -1959,7 +1959,7 @@ The scalar expression algebra.
 | `core.py` | 5171 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 266 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 392 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
-| `image.py` | 641 | The `.image` expression namespace — lazy, batch-level image decode. |
+| `image.py` | 685 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 265 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 492 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 257 | A readable ``repr`` for the scalar `Expr` tree. |
@@ -2167,7 +2167,7 @@ Resource contracts between Kyber (optimizer), Carbonite (resource manager), and 
 |---|---|---|
 | `_duration.py` | 144 | Duration parsing for streaming intervals — the one gate every trigger/lateness flows through. |
 | `listener.py` | 357 | `StreamingQueryListener` — a callback that sees every query start, batch, and stop. |
-| `progress.py` | 312 | What a micro-batch reported — the progress records a streaming query publishes. |
+| `progress.py` | 451 | What a micro-batch reported — the progress records a streaming query publishes. |
 | `spec.py` | 372 | Neutral streaming-query specification types — triggers, output modes, progress. |
 
 ### `batcher/plan/types/` — 1 · contract
@@ -2179,7 +2179,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `footprint.py` | 86 | How much memory live Arrow data actually keeps resident. |
 | `infer.py` | 508 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 103 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
-| `media.py` | 125 | Output types for the multimodal expressions, where the shape is in the arguments. |
+| `media.py` | 123 | Output types for the multimodal expressions, where the shape is in the arguments. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
 | `widths.py` | 220 | Static per-column byte widths derived from a column's Arrow type. |
 
@@ -2544,7 +2544,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `analyze.rs` | 428 | Validate a [`bc_expr::Expr`] against the JIT's supported subset and infer the scalar type each sub-expression evaluates to, recording referenced columns. |
+| `analyze.rs` | 429 | Validate a [`bc_expr::Expr`] against the JIT's supported subset and infer the scalar type each sub-expression evaluates to, recording referenced columns. |
 | `cache.rs` | 97 | A process-wide memo for compiled expressions. |
 | `compile.rs` | 485 | Build and JIT-compile a Cranelift function that evaluates an `Expr` element-wise over the row index, returning the finalized function pointer. |
 | `emit.rs` | 617 | Per-element IR emitter: recurses over a validated `Expr` building Cranelift values at the current loop index, producing one output element per row. |
@@ -2573,11 +2573,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `analyze.rs` | 398 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
+| `analyze.rs` | 422 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 99 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 776 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 446 | `cast` evaluation with DuckDB float→int rounding semantics. |
-| `eval/dispatch.rs` | 423 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 438 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 374 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/grid.rs` | 232 | The grid and reference-system functions, which take plain numbers rather than geometry. |
@@ -2603,7 +2603,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/media/audio.rs` | 406 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/mod.rs` | 633 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/image/quality.rs` | 130 | Image-curation measures: how bright an image is, and how sharp. |
-| `eval/media/image/reencode.rs` | 454 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
+| `eval/media/image/reencode.rs` | 556 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 62 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/speech.rs` | 126 | Waveform conditioning for speech pipelines: silence trimming, peak normalization, and the zero-crossing rate. |
@@ -2630,7 +2630,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1774 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1790 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 412 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`

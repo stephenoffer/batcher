@@ -14,6 +14,7 @@ __all__ = [
     "await_any_termination",
     "compact",
     "remove_streaming_listener",
+    "reset_terminated",
     "streaming_listeners",
     "streams",
     "vacuum",
@@ -127,6 +128,27 @@ def await_any_termination(timeout: float | None = None) -> bool:
     from batcher.api.streaming import await_any_termination as _await_any
 
     return _await_any(timeout)
+
+
+def reset_terminated() -> None:
+    """Forget terminations already reported by `await_any_termination` (Spark parity).
+
+    Spark's `awaitAnyTermination` returns immediately once any query has terminated, and
+    keeps doing so until `resetTerminated()` clears the record — so a supervisor that
+    restarts a failed query and loops back in without resetting spins at full speed on a
+    termination it has already handled.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.reset_terminated()
+            >>> bt.await_any_termination(timeout=0.0)
+            True
+    """
+    from batcher.api.streaming._query import reset_terminated as _reset
+
+    _reset()
 
 
 def compact(

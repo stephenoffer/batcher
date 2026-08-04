@@ -79,6 +79,7 @@ class PulsarSource(BrokerSource):
         "_num_partitions",
         "_partitions",
         "_receive_timeout_millis",
+        "_starting_position",
         "_unacked",
     )
 
@@ -93,8 +94,15 @@ class PulsarSource(BrokerSource):
         subscription: str = "batcher",
         num_partitions: int = 1,
         receive_timeout_millis: int = 1000,
+        starting_position: str = "earliest",
         **options: Any,
     ) -> None:
+        from batcher.io.formats.streaming.broker.schema import normalize_starting_position
+
+        # One option name across every broker, mapped here onto Pulsar's `InitialPosition`.
+        self._starting_position = normalize_starting_position(
+            starting_position, aliases={"earliest": "Earliest", "latest": "Latest"}
+        )
         super().__init__(
             topic,
             poll_size=poll_size,
@@ -156,6 +164,15 @@ class PulsarSource(BrokerSource):
             kwargs["batch_receive_policy"] = policy(
                 self.poll_size, self.poll_bytes, _DRAIN_TIMEOUT_MILLIS
             )
+        # Where a *new* subscription starts. Pulsar remembers a subscription's cursor
+        # server-side, so this only bites the first time — which is exactly when a reader
+        # who wanted `latest` discovers they replayed the whole topic instead.
+        # Doubly defensive: an older client may not expose `InitialPosition` at all, and a
+        # client that does may not know a position name. Either way the subscription simply
+        # takes the broker's default rather than the read failing on an option.
+        initial = getattr(getattr(pulsar, "InitialPosition", None), self._starting_position, None)
+        if initial is not None:
+            kwargs["initial_position"] = initial
         self._consumer = self._client_obj.subscribe(
             self._topic_names(),
             subscription_name=self._options["subscription"],

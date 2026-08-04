@@ -59,6 +59,7 @@ register SQL functions or sessions.
    sql
    streams
    await_any_termination
+   reset_terminated
    register_function
    udf
    compact

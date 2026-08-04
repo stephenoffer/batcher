@@ -18,7 +18,11 @@ from batcher.io.formats.streaming.broker import (
     BrokerSplit,
     broker_schema,
 )
-from batcher.io.formats.streaming.dev import RateSource, SocketSource
+from batcher.io.formats.streaming.dev import (
+    RateMicroBatchSource,
+    RateSource,
+    SocketSource,
+)
 from batcher.io.formats.streaming.eventhubs import EventHubsSource
 from batcher.io.formats.streaming.kafka import KafkaSource
 from batcher.io.formats.streaming.kafka_sink import KafkaStreamSink
@@ -30,6 +34,7 @@ from batcher.io.formats.streaming.sinks import (
     DeltaStreamSink,
     FileStreamSink,
     ForeachWriter,
+    NoopStreamSink,
     StreamSink,
     TransactionalStreamSink,
     memory_table,
@@ -48,8 +53,10 @@ __all__ = [
     "KafkaSource",
     "KafkaStreamSink",
     "KinesisSource",
+    "NoopStreamSink",
     "PubSubSource",
     "PulsarSource",
+    "RateMicroBatchSource",
     "RateSource",
     "SocketSource",
     "StreamSink",
