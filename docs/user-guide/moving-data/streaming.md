@@ -134,7 +134,10 @@ A {py:class}`Trigger <batcher.Trigger>` sets the cadence (Spark parity):
 
 - {py:meth}`bt.Trigger.processing_time("5 seconds") <batcher.Trigger.processing_time>` fires a micro-batch on a wall-clock
   interval. This is the default streaming cadence.
-- {py:meth}`bt.Trigger.once() <batcher.Trigger.once>` processes one micro-batch of available data, then stops.
+- {py:meth}`bt.Trigger.once() <batcher.Trigger.once>` processes all currently-available data, then stops.
+  Spark's `Once` puts it in a single micro-batch and was deprecated for exactly that reason;
+  here it drains across as many micro-batches as the data needs. Prefer `available_now()` in
+  new code: it is the same execution under the name Spark now recommends.
 - {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>` drains every record available when it starts, then stops.
   It is the incremental-batch and backfill trigger.
 - {py:meth}`bt.Trigger.continuous("1 second") <batcher.Trigger.continuous>` is the lowest-latency option: micro-batches run

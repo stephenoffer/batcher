@@ -337,15 +337,29 @@ class StreamingQueryEngine:
         self._batches += 1
 
     def _loop(self) -> None:
+        """Drive micro-batches at the trigger's cadence until the query is over.
+
+        `once` drains with `available_now` rather than running a single `_process_next`.
+        Staging one epoch reads **one source batch**, which is an internal artifact — it
+        varies with file size, poll size and morsel size — so `Trigger.once()` processed
+        whatever fraction of the available data happened to land in the first batch and
+        reported success. A one-shot backfill over five batches wrote one of them, with
+        nothing raised and nothing in the progress record to say so.
+
+        Spark's `Trigger.Once` processes *all* available data, which is what this
+        trigger's own docstring has always promised. Spark deprecated it in favour of
+        `AvailableNow` because doing that in a single micro-batch is an unbounded memory
+        risk; draining across as many micro-batches as the data needs keeps the promise
+        and the memory bound, so the two triggers are now the same execution under two
+        names — the name kept working for a ported job, executed the safer way.
+        """
         kind = self._trigger.kind
-        if kind == "once":
-            self._process_next()
-            return
-        if kind in ("available_now", "continuous"):
+        if kind in ("once", "available_now", "continuous"):
             # Continuous: process micro-batches back-to-back with no inter-batch
             # delay (lowest latency), committing a checkpoint epoch per batch, until
-            # the query is stopped or the source is exhausted. (`available_now` shares
-            # the loop; it is simply expected to drain a finite source and end.)
+            # the query is stopped or the source is exhausted. (`available_now` and
+            # `once` share the loop; they are simply expected to drain what is
+            # available and end — see the docstring for why `once` is one of them.)
             while not self._stop.is_set() and self._process_next():
                 pass
             return

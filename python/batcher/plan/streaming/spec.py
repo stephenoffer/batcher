@@ -47,8 +47,12 @@ class Trigger:
 
     * ``Trigger.processing_time("5 seconds")`` — fire a micro-batch on a fixed wall
       clock interval (the default streaming cadence).
-    * ``Trigger.once()`` — process one micro-batch of all currently-available data,
-      then stop.
+    * ``Trigger.once()`` — process all currently-available data, then stop. Spark's
+      ``Once`` puts it in a *single* micro-batch and was deprecated for exactly that
+      reason (an unbounded backlog is an unbounded batch); here it drains across as
+      many micro-batches as the data needs, which keeps the promise and the memory
+      bound. Prefer ``available_now()`` in new code — it is the same execution under
+      the name Spark now recommends.
     * ``Trigger.available_now()`` — drain all currently-available data across as many
       micro-batches as needed, then stop (the incremental-batch / backfill trigger).
     * ``Trigger.continuous("1 second")`` — lowest-latency processing: micro-batches
@@ -124,7 +128,11 @@ class Trigger:
 
     @classmethod
     def once(cls) -> Trigger:
-        """Process one micro-batch of available data, then stop.
+        """Process all currently-available data, then stop (Spark ``Once``).
+
+        Drains across as many micro-batches as the data needs rather than forcing it
+        into one, which is why Spark deprecated its own `Once`. `available_now` is the
+        same execution under the name Spark now recommends.
 
         Examples:
             .. doctest::
@@ -199,7 +207,7 @@ class Trigger:
 
     @classmethod
     def Once(cls) -> Trigger:
-        """Spark spelling of `once` — process one micro-batch of available data, then stop.
+        """Spark spelling of `once` — process all currently-available data, then stop.
 
         Examples:
             .. doctest::

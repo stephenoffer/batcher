@@ -99,11 +99,15 @@ def test_foreach_batch_receives_whole_tables():
 
 
 @pytest.mark.integration
-def test_trigger_once_processes_one_microbatch():
+def test_trigger_once_processes_all_available_data():
+    """It used to stop after one *source batch* — an internal artifact that varies with
+    file size, poll size and morsel size — so a one-shot backfill silently wrote whatever
+    fraction landed in the first batch. Spark's `Once` processes all available data, which
+    is what this trigger's docstring has always promised."""
     q = _stream().write.memory("m_once", trigger=bt.Trigger.once())
     q.await_termination()
-    assert bt.read_memory("m_once").count() == 2  # only the first micro-batch
-    assert q.recent_progress[-1].batch_id == 0
+    assert bt.read_memory("m_once").count() == sum(b.num_rows for b in _batches())
+    assert len(q.recent_progress) > 1, "the drain collapsed back to a single micro-batch"
 
 
 @pytest.mark.integration

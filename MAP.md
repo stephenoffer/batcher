@@ -2500,8 +2500,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct.rs` | 422 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/fused.rs` | 418 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1292 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 779 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
-| `agg/group/mod.rs` | 28 | Group-key assignment and the parallel `combine` regroup. |
+| `agg/group/combine.rs` | 743 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/mod.rs` | 27 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/hll.rs` | 115 | APPROX_COUNT_DISTINCT — bounded-memory distinct count via per-group HyperLogLog. |
 | `agg/median.rs` | 528 | MEDIAN / continuous-quantile — exact, mergeable via a per-group value list (no dedup, unlike COUNT(DISTINCT)). |
 | `agg/mod.rs` | 771 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
