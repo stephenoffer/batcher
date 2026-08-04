@@ -32,6 +32,13 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher.api.terminal.stream.rebatch import _rebatch_exact
+from batcher.api.terminal.stream.static_join import (
+    refuse_reason as static_join_refusal,
+)
+from batcher.api.terminal.stream.static_join import (
+    stream_static_join,
+    stream_static_sides,
+)
 from batcher.api.terminal.stream.union import (
     interleave,
     union_branch_sources,
@@ -168,6 +175,20 @@ def _iter_batches(
         if distributable_scan_source(plan, sources) is not None:
             yield from iter_distributed_scan(plan, sources, num_workers, batch_size)
             return
+
+    # Stream-static join: one side is a table that does not move, so it is read once and
+    # every micro-batch joins against the whole of it. A `Join` is a pipeline breaker, so
+    # without this the router saw an unbounded input beneath a breaker and refused the most
+    # common thing anyone does to a stream.
+    static_sides = stream_static_sides(plan, sources)
+    if static_sides is not None:
+        from batcher._internal.errors import PlanError
+
+        reason = static_join_refusal(plan.join_type, static_sides[0])
+        if reason is not None:
+            raise PlanError(reason)
+        yield from stream_static_join(plan, sources, static_sides[0], batch_size)
+        return
 
     # Stream-stream interval join: two streams, buffered + watermark-evicted.
     if isinstance(plan, WatermarkStreamJoin) and len(sources) == 2:

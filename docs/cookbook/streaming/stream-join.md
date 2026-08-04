@@ -151,39 +151,66 @@ and it is why an outer stream-stream join needs a time bound rather than merely 
 one.
 :::
 
-:::{important}
-**A stream cannot be joined to a static dimension table with `join`.** That plan has to
-materialize, and the engine refuses on an unbounded source rather than hanging:
+## Joining a stream to a table that does not move
+
+The other join anyone writes: clicks against a product catalogue, events against a device
+registry, impressions against a campaign dimension. Only one side streams, so no interval
+is needed. Write it as an ordinary {py:meth}`join <batcher.Dataset.join>`:
 
 ```python
-# docs: skip
-stream.join(dim_table, on="ad")   # PlanError: plan must materialize
-```
-:::
+campaigns = bt.from_pydict({
+    "ad": ["a1", "a2", "a3"],
+    "campaign": ["spring", "fall", "spring"],
+})
 
-Do the enrichment inside the batch instead. `map_batches` receives a whole Arrow batch, so
-the lookup is one vectorized Arrow join per micro-batch, against a table you hold in
-memory:
-
-```python
-dim = pa.table({"ad": ["a1", "a2", "a3"], "campaign": ["spring", "fall", "spring"]})
-
-
-def enrich(batch):
-    table = pa.Table.from_batches([batch]).join(dim, keys="ad").combine_chunks()
-    return table.to_batches()[0]
-
-
-enriched = left.map_batches(enrich, output_columns=["ad", "shown", "campaign"])
+enriched = left.join(campaigns, on="ad", how="left")
 for batch in enriched.iter_batches():
     print(sorted(batch.to_pydict()["campaign"]))
-# ['fall', 'spring', 'spring']
+# ['fall', 'spring']
+# ['spring']
 ```
 
+The static side is read once, before the first micro-batch, and every micro-batch joins
+against the whole of it. That is exact rather than approximate: an equi-join is per-row on
+the stream side, so no stream row's result depends on another's, and joining batch by batch
+gives the same rows as joining the whole stream at once.
+
+Its memory bound is the dimension table itself. A table small enough to enrich a stream
+against is small enough to hold, and one that is not wants a different design.
+
 :::{warning}
-Refresh `dim` yourself if it changes. The engine will not reload it for you, and a
-long-running query will happily serve a stale dimension forever.
+**The dimension is a snapshot, not a subscription.** A query serves the table as it stood
+when the query started, for as long as the query runs. That is deliberate and it matches
+Spark: a dimension that changed mid-stream would otherwise let two rows of the same
+micro-batch disagree about the same key. Restart the query to pick up a new one.
 :::
+
+### Which join types work
+
+A side is *preserved* by an outer join when its unmatched rows must be emitted, and a
+preserved row is only known to be unmatched once the **opposite** side is complete. The
+static side is complete before the first micro-batch; the stream never is. So a join that
+preserves the stream side works, and one that preserves the static side is refused with a
+message saying so:
+
+| Join type | Stream on the left | Stream on the right |
+|---|---|---|
+| `inner` | Works | Works |
+| `left` | Works | Refused |
+| `right` | Refused | Works |
+| `full` | Refused | Refused |
+| `semi`, `anti` | Works | Refused |
+
+```python
+try:
+    list(left.join(campaigns, on="ad", how="full").iter_batches())
+except Exception as exc:
+    print(type(exc).__name__)
+# PlanError
+```
+
+Batcher draws this line in exactly the place Spark does, so a ported job either runs or
+fails on the same shapes it already failed on.
 
 ## When the buffer grows anyway
 

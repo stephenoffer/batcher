@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1189 Python modules across 181 packages and 220 Rust files across 14 crates.
+Covering 1190 Python modules across 181 packages and 220 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -342,7 +342,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | module | lines | what it is |
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
-| `_launch.py` | 244 | The single-node streaming launcher: optimize once, then drive micro-batches. |
+| `_launch.py` | 248 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 359 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
@@ -389,8 +389,9 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `dispatch.py` | 508 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
+| `dispatch.py` | 529 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
 | `rebatch.py` | 59 | The exact output-granularity contract for `iter_batches(batch_size=N)`. |
+| `static_join.py` | 209 | The stream-static join — enrich a stream from a table that does not move. |
 | `union.py` | 158 | When a UNION streams branch by branch, and how its branches are addressed. |
 
 ### `batcher/api/terminal/stream/watermark/` — 5 · conductor
@@ -1959,11 +1960,11 @@ The scalar expression algebra.
 | `core.py` | 5171 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 266 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 392 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
-| `image.py` | 685 | The `.image` expression namespace — lazy, batch-level image decode. |
+| `image.py` | 682 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 265 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
 | `nodes.py` | 492 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 257 | A readable ``repr`` for the scalar `Expr` tree. |
-| `video.py` | 217 | The `.video` expression namespace — lazy, batch-level video decode. |
+| `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 379 | Structural traversals over the expression tree. |
 
 ### `batcher/plan/expr_ir/compat/` — 1 · contract
@@ -2177,7 +2178,7 @@ The neutral type vocabulary and inference for the plan layer.
 | module | lines | what it is |
 |---|---|---|
 | `footprint.py` | 86 | How much memory live Arrow data actually keeps resident. |
-| `infer.py` | 508 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
+| `infer.py` | 512 | Per-expression output-type inference — a column's Arrow type before the engine runs. |
 | `lattice.py` | 103 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `media.py` | 123 | Output types for the multimodal expressions, where the shape is in the arguments. |
 | `registry.py` | 42 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name table. |
@@ -2573,11 +2574,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `analyze.rs` | 422 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
+| `analyze.rs` | 427 | Cheap static analyses over `Expr` trees, consulted *before* execution. |
 | `error.rs` | 99 | The crate's error type: every way scalar expression evaluation can fail. |
 | `eval/binary.rs` | 776 | Binary-operator evaluation for `Expr::Binary` plus the shared numeric/boolean coercion helpers (split out of `lib.rs`). |
 | `eval/cast.rs` | 446 | `cast` evaluation with DuckDB float→int rounding semantics. |
-| `eval/dispatch.rs` | 438 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 437 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 374 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/grid.rs` | 232 | The grid and reference-system functions, which take plain numbers rather than geometry. |
@@ -2601,14 +2602,14 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/map.rs` | 211 | Map-column evaluation for `Expr::Map` (`map_keys`/`map_values`/`element_at`). |
 | `eval/math.rs` | 475 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 406 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
-| `eval/media/image/mod.rs` | 633 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
+| `eval/media/image/mod.rs` | 666 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/image/quality.rs` | 130 | Image-curation measures: how bright an image is, and how sharp. |
-| `eval/media/image/reencode.rs` | 556 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
+| `eval/media/image/reencode.rs` | 493 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 62 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/speech.rs` | 126 | Waveform conditioning for speech pipelines: silence trimming, peak normalization, and the zero-crossing rate. |
-| `eval/media/video/mod.rs` | 298 | Video evaluation for `Expr::Video` (the `.video` namespace). |
-| `eval/media/video/sample.rs` | 568 | Turning a clip into pixels: `frames`, `thumbnail`, and `frame_at`. |
+| `eval/media/video/mod.rs` | 299 | Video evaluation for `Expr::Video` (the `.video` namespace). |
+| `eval/media/video/sample.rs` | 602 | Turning a clip into pixels: `frames`, `thumbnail`, and `frame_at`. |
 | `eval/mod.rs` | 39 | Evaluation bodies for the scalar `Expr` variants. |
 | `eval/security/crypto.rs` | 101 | Keyed cryptographic primitives: HMAC-SHA-256 pseudonymization and AES-256-GCM-SIV column encryption. |
 | `eval/security/keyref.rs` | 50 | Resolving a crypto key *reference* to the key material, at evaluation time. |
@@ -2630,7 +2631,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/temporal/make.rs` | 139 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 15 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 1790 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 1789 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 412 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 
 ### `bc-arrow`
