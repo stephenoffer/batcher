@@ -5,6 +5,14 @@
 the live path". Every competitor claim below cites a file that was read in the original pass.
 Every claim about Batcher was checked against Batcher's code, not its docs.
 
+**Measured pass, 2026-08-04.** Item 2 (`StringView`) was benchmarked rather than assumed, which
+re-valued it and narrowed where it can pay; item 4 gained the record of a top-N change that was
+built, proven correct, measured a regression and reverted; and a new item 9 records the largest
+gap `ORDER BY` has, together with three fixes for it that were measured and lost. The bias of
+this pass is deliberate: **prefer a number that closes off a direction to a plausible technique
+that opens one**, because the previous two passes both lost time to work that turned out to be
+already built or unreachable.
+
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
 This document is the *parts list* behind it. It answers a narrower question: given the
 competitors' source, which specific mechanisms does Batcher not have, and which of them are
@@ -36,7 +44,8 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | # | Technique | Best source | Batcher today | Value |
 |---|---|---|---|---|
 | 1 | Short-circuiting conjunctive filter, conjuncts ordered by cost | DuckDB | **Landed** | 1.3x to 5.7x on multi-predicate filters |
-| 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | The other half of the single-node gap |
+| 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued 2026-08-04**: the win is `take`/`filter` (3-13x), *not* comparison (parity) or sort (0.75-0.81x). Only pays scan-native; a boundary conversion loses at morsel size |
+| 9 | A faster string `ORDER BY` | DuckDB | **Largest measured gap**: 3.22x on a low-cardinality key, 1.18x on a high-cardinality one | Now tracked by `benchmarks/.../ordering.py`; three candidate fixes measured and rejected, two leads left |
 | 3 | Online adaptive reordering of filter conjuncts | DuckDB | **Landed** (`ConjunctOrder`) | Fixes the case a static cost model gets wrong |
 | 4 | Top-K heap threshold pushed down as a filter | DataFusion | **Half landed** (`TopNBound` skips morsels; nothing reaches the scan) | Large on `ORDER BY ... LIMIT k` over big inputs |
 | 5 | Skew detected from measured partition sizes, split automatically | Spark AQE | Machinery exists, off by default | Removes a config the user cannot be expected to set |
@@ -171,11 +180,66 @@ across `crates/` and `python/batcher/` returns zero hits. This is not a missing
 dependency: arrow-rs 56 is already pinned in `crates/bc-arrow` and ships
 `StringViewArray` with comparison, `take` and `filter` kernels.
 
-This remains the largest single-node item, exactly as `competitive_architecture.md` roadmap
-step 2 says. It is also the most invasive, because the representation has to survive scan,
-project, join key construction and sort to be worth having, and a half-adoption that
-converts at every boundary would be slower than what exists now. It was not attempted in
-this pass for that reason, not because it is lower value than what was.
+### What the arrow-rs 56 view kernels actually win, measured 2026-08-04
+
+The paragraph above described the *representation*. Before adopting it, the kernels Batcher
+would actually run were benchmarked against their `Utf8` equivalents: 4M rows, single
+thread, best of five, `arrow` 56.2.1. **The result does not match the shape of the claim,
+and it should change what gets built.**
+
+| operation | 1 char | 7 chars | 27 chars | 60 chars |
+|---|---|---|---|---|
+| `filter`, 1% kept | **3.01x** | **3.84x** | **9.44x** | **7.58x** |
+| `filter`, 50% kept | **6.23x** | **3.52x** | **7.39x** | **13.74x** |
+| `take`, random permutation | **4.82x** | **7.02x** | **8.19x** | **9.63x** |
+| `sort_to_indices` | 1.12x | 1.51x | *0.81x* | *0.75x* |
+| `RowConverter` encode | 0.99x | *0.81x* | 0.93x | 0.93x |
+| `eq` vs a literal | *0.88x* | 0.99x | 0.98x | *0.74x* |
+| `lt` vs a literal | 1.70x | 1.03x | 1.07x | *0.87x* |
+
+Read the columns, not the average. **The entire win is `take` and `filter`; comparison is
+parity and sorting is a small loss on long strings.** That is the opposite of the usual
+German-strings story, which sells the inline 4-byte prefix as a comparison optimization —
+arrow-rs's `eq`/`lt` against a literal do not exploit it, so the prefix buys nothing here.
+What views *do* buy is that `take` and `filter` move 16-byte descriptors instead of chasing
+and copying bytes, which is why `take` is flat at ~114 ms across every string length while
+`Utf8` climbs from 658 ms to 1,107 ms.
+
+Two further facts bound any adoption. Views are **larger in memory**, not smaller, for every
+shape measured (27 chars: 150 MB against 198 MB), because the 16-byte descriptor is paid per
+row on top of the bytes. And conversion is not free: `cast(Utf8 -> Utf8View)` costs 60-88 ms
+per 4M rows and the reverse 44-187 ms.
+
+### Converting at an operator boundary does not pay, and the crossover says why
+
+The cheap version of this — leave the schema alone, convert to a view inside one operator,
+convert back — was measured directly as `cast -> take -> cast` against a plain `take`, over
+input sizes, output/input ratios, and both index orders:
+
+| input rows | out/in | index order | round trip is |
+|---|---|---|---|
+| 4,000,000 | 1.0 | random | **2.22x** |
+| 4,000,000 | 1.0 | sorted | 0.43x |
+| 4,000,000 | 0.1 | random | 1.08x |
+| 1,000,000 | 1.0 | random | **1.87x** |
+| 100,000 | 1.0 | random | 0.53x |
+| **16,384** (one morsel) | 1.0 | random | **0.45x** |
+
+The round trip wins only on a *large* input, gathered *whole*, in *random* order. Batcher is
+morsel-driven at 16,384 rows, where it is 0.45x at best — so an operator-local conversion is
+a pessimization on the default path, and no gate on selectivity rescues it. Note also the
+`sorted` column: `take(Utf8)` with ascending indices is already 6-11x cheaper than with a
+random permutation (92 ms against 984 ms at 4M x 27 chars), because the value buffer is then
+read sequentially. A filter's gather is ascending by construction, which is exactly why the
+filter path has nothing to gain here.
+
+**What that leaves.** `StringView` is still worth having, but as a representation the *scan*
+produces and the engine never converts — not as a boundary trick, and not for the reason
+usually given. Its value is `take`/`filter`, its cost is memory and a conversion at every
+edge that is not view-native, and the honest expected win should be argued from the `take`
+and `filter` rows above rather than from the comparison story. This remains the most invasive
+single-node item; what the measurement changes is that a *partial* adoption is now known to
+lose rather than merely suspected to.
 
 ## 3. Online adaptive conjunct reordering
 
@@ -256,6 +320,28 @@ column. The bound only ever tightens, so a stale read costs a missed skip and ne
 answer, and an `is_off()` gauge retires a bound that is not earning its cost. The key
 expressions are evaluated once per morsel and reused for the selection, the bound check and the
 candidate gather. `report_the_top_n_skip_saving` measures the trade it makes.
+
+**A related change was tried on the string key and reverted, 2026-08-04.** For a *single*
+sort key `top_k_indices_of` answers a top-N by running the specialized full sort over each
+morsel and slicing it to `k`. For the integer radix that is sound because the radix is linear.
+For a **string** key it is not: `stable_sort_indices_str` is a comparison sort, so the branch
+pays `O(n log n)` to keep `k` rows, and the code comment asserting both were linear was simply
+wrong. Replacing it with an `O(n)` quickselect under the identical total order was built,
+proven result-identical (16 differential cases against DuckDB plus a Rust oracle test), and
+**measured a regression**: at 10M rows `LIMIT 10` was a wash (15 ms either way), `LIMIT 100000`
+went 893 -> 1139 ms (0.78x) and `LIMIT 1000000` went 1434 -> 4267 ms (**0.34x**).
+
+The reason is downstream of the selection. `parallel_top_n` concatenates every morsel's
+candidates and re-sorts them with a limited `lexsort`; once `k` exceeds the 16,384-row morsel
+every row becomes a candidate, and handing that merge 610 **sorted runs** is worth far more
+than the per-morsel ordering costs. At a morsel of 16,384 rows the ordering was never the
+bottleneck in the first place. The engine code is unchanged; the comment now records the real
+reason the branch exists, and the tests were kept because the string key was the one key type
+with no top-N oracle test of its own.
+
+The lesson generalizes past this operator: **asymptotics measured per morsel can invert once
+the merge is included**, and Batcher's morsel is small enough that `O(n log n)` inside one is
+often free.
 
 What is **not** there is the edge to the scan. The bound skips morsels the engine has already
 read; nothing derived from it reaches a Parquet reader, so no row group is pruned and no I/O is
@@ -448,6 +534,98 @@ boundary rather than guessing at plan time — but that is the part that needs d
 rule that fires with a badly chosen `W` would be a pessimization rather than a win. It was
 therefore recorded rather than half-built.
 
+## 9. String sorting — the largest measured single-node gap, and three fixes that lost
+
+Added 2026-08-04. This was not on the shortlist because the earlier passes measured the
+string *filter* and *group-by* paths and not `ORDER BY`.
+
+**The gap.** Against DuckDB's own storage (not a registered Arrow table — an Arrow scan makes
+DuckDB look slow for reasons that have nothing to do with the operator, and quoting that is
+how the retracted 15-643x range-join number happened), 10M rows, 27-char values, 200k
+distinct:
+
+| shape | Batcher | DuckDB | Batcher is |
+|---|---|---|---|
+| full `ORDER BY <string>` | 620-655 ms | 188-216 ms | **0.30-0.33x** |
+| `DISTINCT <string>` | 544 ms | 196 ms | 0.36x |
+| `GROUP BY <string>` | 570 ms | 274 ms | 0.48x |
+| `ORDER BY <string> LIMIT 10` | 14-17 ms | 6-7 ms | 0.41x |
+| `ORDER BY <string> LIMIT 10000` | 17-19 ms | 53-55 ms | **2.81-3.22x** |
+| filter on a string + `sum` | 30 ms | 22 ms | 0.72x |
+
+**Now tracked by a committed benchmark.** The table above came from a scratch script, which is
+how the gap stayed invisible: `benchmarks/suites/operators/ordering.py` had exactly one case and
+it sorted a *float* on *three* keys, so nothing in the suite touched the single string key path
+at all. Three cases now do. Reproduce with:
+
+```bash
+python benchmarks/run.py --benchmark operators --only sort-string --engines batcher,duckdb,polars --scale 1
+```
+
+At scale 1 (6M `lineitem` rows, read from parquet, best of five, 16 cores, correctness gate
+passed on all three):
+
+| case | batcher | duckdb | polars | vs DuckDB |
+|---|---|---|---|---|
+| `op-sort-string` (high-card `l_comment`) | 1068 ms | 908 ms | 1239 ms | 1.18x slower |
+| `op-sort-string-lowcard` (`l_shipmode`, 7 distinct) | 411 ms | 128 ms | 205 ms | **3.22x slower** |
+| `op-sort-string-limit` (top-100, tie-broken) | 47 ms | 24 ms | 1311 ms | 1.97x slower |
+
+Note that this **relocates the gap**. In-memory at 10M rows the high-cardinality sort was the
+worst shape; from parquet at 6M rows it is nearly at parity (1.18x) and the **low-cardinality**
+sort is the outlier at 3.22x — the shape where seven distinct values give the sampled quantile
+boundaries nothing to cut on, so the sample-sort's ranges come out lopsided and most cores idle.
+Batcher also beats Polars on two of the three. Anyone optimizing here should start from this
+table rather than the in-memory one below, and should fix the low-cardinality case first.
+
+The full sort is the big one, and it is the *ordering* rather than the materialization:
+holding the sort key fixed and changing only the payload moves nothing (sorting by a string
+and returning an `int` costs 973 ms; returning the string costs 941 ms), while holding the
+payload fixed and changing the key moves everything (sorting by an `int` and returning that
+same `int` costs 220 ms). So ~750 ms of a ~950 ms sort is attributable to the string key.
+
+**Where that 750 ms sits.** The sample-sort's phases, replicated at 10M rows over 64 ranges
+on 16 threads:
+
+| phase | high-card 27 ch | low-card 7 ch | shared 20-char prefix |
+|---|---|---|---|
+| sample boundaries | 5 ms | 4 ms | 3 ms |
+| route (binary search per row) | 82-139 ms | 120 ms | 110-113 ms |
+| bucket | 75-103 ms | 51-56 ms | 76-87 ms |
+| gather each range's key column | 154-157 ms | 35-49 ms | 152-195 ms |
+| **per-range sort** | **288-537 ms** | 35-65 ms | 47-63 ms |
+
+The per-range comparison sort is ~53% of the total on the shape that loses, and routing plus
+bucketing is another ~23%.
+
+**Three fixes were measured and all three lost.** Recording them because each is the obvious
+next idea, and each costs a day to re-derive:
+
+1. **LSD radix over the packed prefix** — DuckDB's own shape (fixed-width radix key, tie-break
+   only where the key ties). Measured *slower* than the existing comparison sort on the
+   high-card shape. `sort_live`'s packed prefix already removes the pointer chase that a radix
+   is meant to avoid, and pdqsort over a 12-byte key beats eight scatter passes plus a
+   run-repair pass. This also explains why `radix_sort.rs` declines above 2^18 rows for
+   floats: same cause, already known, and it applies here too.
+2. **Skipping the per-range key gather** — build the packed prefix once over the whole column
+   and let each range sort in place through global row indices. This looks like it removes
+   154 ms of pure copying. It costs **2,655-2,735 ms**: the gather is not overhead, it is what
+   makes every subsequent read of that range sequential. Do not remove it.
+3. **A narrower sort key** — one `u64` per row holding the first *four* bytes above the row
+   index, so the key array halves and sorts with no comparator at all, with runs sharing four
+   leading bytes repaired afterwards. Verified to produce the **identical permutation** on
+   every shape. Interleaved medians over seven repetitions: **1.69x** on high-card 27-char
+   (361 -> 214 ms), but **0.87x** on low-card 7-char and **0.78x** on 10M-distinct 12-char,
+   where four bytes collide often enough that the repair pass dominates. A fixed width is
+   therefore wrong; an *adaptive* one chosen from the sample `prefix_discriminates` already
+   takes is the version worth building, and it is the one open lead this section leaves.
+
+**A caveat on all of the above.** These were measured on a 16-core box carrying another
+session's build and test load; single-pass numbers swung as much as 2.3x on the same code, so
+every figure here is a median of interleaved repetitions and the equivalence checks (not the
+timings) are what the conclusions rest on. Re-measure on a quiet box before acting on a
+margin under ~1.3x.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
@@ -483,13 +661,28 @@ is done; what remains is ordered by value against the mandate.
    tested. It is one decode, in `normalize_to`, standing between them and every real query.
    Decode on egress instead of ingress; `plan/types/lattice.py::widen` needs no change. The
    audit is every operator that builds an output batch from its input's schema.
-3. `StringView` adoption (item 2), alongside 2, since both are about not destroying a compact
-   string representation. Still the largest and most invasive single-node item.
-4. **The scan half of the top-K dynamic filter (item 4).** The morsel-skip half is landed; what
+3. **The low-cardinality string sort (item 9).** Promoted above `StringView` because it is the
+   largest gap the committed benchmark shows — **3.22x DuckDB** on `op-sort-string-lowcard` —
+   and because the cause is structural rather than a kernel: seven distinct values give the
+   sampled quantile boundaries nothing to cut on, so the sample-sort's ranges come out
+   lopsided and most cores idle. `sample_sort.rs` already solves exactly this on the
+   *multi-key* path — `composite_part_of` re-routes by the full composite key when
+   `max_bucket > 3 * fair_share` — and the single-key path has no equivalent fallback, which
+   is precisely the case that needs one.
+4. **An adaptive-width sort key for the per-range sort (item 9).** Proven
+   permutation-identical and worth 1.69x on high-cardinality 27-char keys, but a *fixed*
+   4-byte head loses 0.78-0.87x on two other shapes, so the width has to come from the sample
+   `prefix_discriminates` already draws. Needs a quiet box: the margin is inside this
+   machine's noise band.
+5. `StringView` adoption (item 2), alongside 2, since both are about not destroying a compact
+   string representation. Still the largest and most invasive single-node item — but now
+   argued from `take`/`filter` only, and known to lose if adopted anywhere short of
+   scan-native.
+6. **The scan half of the top-K dynamic filter (item 4).** The morsel-skip half is landed; what
    is missing is republishing the bound so a Parquet reader can prune row groups, which is where
    the I/O saving is.
-5. Skew salt derived from measured partition sizes (item 5).
-6. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
+7. Skew salt derived from measured partition sizes (item 5).
+8. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
 
 **A process note, since this document exists to direct work.** Three of the six items in the
 previous version of this list described work that already existed, and one described a win the
