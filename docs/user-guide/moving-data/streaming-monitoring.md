@@ -103,6 +103,20 @@ print(p.sources[0].description, p.sources[0].num_input_rows, p.sources[0].end_of
 print(p.sink.description, p.sink.num_output_rows, p.sink.token)
 ```
 
+### What a multi-source or row-retaining query reports
+
+A query whose plan is a stream-stream join, a stream-static join, a session window, a
+watermark dedup, a limit, or a union of streams runs through a driver that produces
+finished rows and hands them to the sink. The engine sees what the driver hands it, not
+what the driver read, so for these queries:
+
+- `num_input_rows` counts the rows the driver emitted, not the rows it consumed from the
+  source.
+- `state_operators` is empty, even though these operators do retain state.
+
+The state is still bounded, and still raises a {py:exc}`ResourceError <batcher.ResourceError>` naming the stall when a
+watermark stops advancing. What is missing is the per-batch reporting, not the guard.
+
 ## Reacting to batches as they happen
 
 Polling `recent_progress` on a timer misses batches, because the window is bounded, and

@@ -257,3 +257,28 @@ def test_process_all_available_has_the_snake_case_spelling_too():
     query = bt.read.rate_micro_batch(5, num_rows=10).write.noop(trigger=bt.Trigger.available_now())
     assert query.process_all_available() is True
     assert query.processAllAvailable() is True
+
+
+# --- what a driver-path query reports -------------------------------------------------
+
+
+@pytest.mark.integration
+def test_a_driver_path_query_reports_no_state_metrics_and_counts_its_own_rows():
+    """Pinned because the monitoring guide now says so. A stream-stream join, a session
+    window, a dedup, a limit and a stream union all run through a driver that hands the
+    engine finished rows, so the engine cannot see what the driver read or what it
+    retained. The guard on that state still fires; only the per-batch reporting is
+    missing, and a test is the difference between a documented limit and a drifting one."""
+    schema = pa.schema([("k", pa.string()), ("v", pa.int64())])
+
+    def feed():
+        yield pa.record_batch({"k": ["a", "b", "c"], "v": [1, 2, 3]}, schema=schema)
+
+    query = (
+        bt.from_batches(feed, schema, bounded=False)
+        .head(2)
+        .write.memory("driver_metrics", trigger=bt.Trigger.available_now())
+    )
+    assert query.await_termination(timeout=60) is True
+    assert all(progress.state_operators == () for progress in query.recent_progress)
+    assert sum(p.num_input_rows for p in query.recent_progress) == 2

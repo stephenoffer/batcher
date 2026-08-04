@@ -476,7 +476,7 @@ Ensembling — combining several models into one prediction.
 
 | module | lines | what it is |
 |---|---|---|
-| `blending.py` | 99 | `blend_predictions` — combine several models' prediction columns into one. |
+| `blending.py` | 203 | `blend_predictions` — combine several models' prediction columns into one. |
 | `stacking.py` | 284 | `StackingEnsemble` — let a second model learn how to combine the first ones. |
 
 ### `batcher/ml/inference/` — 6 · front-end
