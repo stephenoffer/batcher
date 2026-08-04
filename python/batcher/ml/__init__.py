@@ -66,9 +66,15 @@ from batcher.ml.loader import (
 )
 from batcher.ml.mixture import GaussianMixture
 from batcher.ml.model_selection import (
+    SearchResult,
     cross_val_predict,
     cross_val_score,
+    grid_search,
     learning_curve,
+    param_grid,
+    param_samples,
+    random_search,
+    validation_curve,
 )
 from batcher.ml.naive_bayes import BernoulliNB, GaussianNB, MultinomialNB
 from batcher.ml.outliers import (
@@ -244,6 +250,7 @@ __all__ = [
     "RidgeClassifier",
     "RobustScaler",
     "RollingFeaturizer",
+    "SearchResult",
     "SelectFromModel",
     "SelectKBest",
     "SelectPercentile",
@@ -280,6 +287,7 @@ __all__ = [
     "feature_importances",
     "flag_outliers",
     "from_dict",
+    "grid_search",
     "http_client",
     "http_engine",
     "iter_torch_batches",
@@ -301,11 +309,14 @@ __all__ = [
     "oversample",
     "pack_sequences",
     "padding_waste",
+    "param_grid",
+    "param_samples",
     "partial_dependence",
     "permutation_importance",
     "quality_filter",
     "quality_flags",
     "quality_report",
+    "random_search",
     "rank_index_batches",
     "run_pipeline",
     "sample_weights",
@@ -325,6 +336,7 @@ __all__ = [
     "triton_client",
     "undersample",
     "usable_length",
+    "validation_curve",
     "vector_search",
     "vllm_engine",
 ]
