@@ -21,7 +21,7 @@ import pytest
 
 import batcher as bt
 from batcher import col
-from batcher._internal.errors import ResourceError
+from batcher._internal.errors import PlanError, ResourceError
 from batcher.config import Config, MemoryConfig, config_context
 
 _BASE = dt.datetime(2024, 1, 1)
@@ -228,3 +228,24 @@ def test_distributed_true_yields_the_same_sessions():
         for row in batch.to_pylist():
             fanned.append((row["k"], row["session_start"], row["session_end"], row["total"]))
     assert single == sorted(fanned)
+
+
+@pytest.mark.integration
+def test_an_unknown_partition_key_is_named_without_the_engines_own_columns():
+    """Left to the window node underneath, the message listed `_t` -- the internal epoch
+    copy the gap arithmetic needs -- among the "available" columns, offering the caller a
+    column they never wrote and cannot use."""
+    bounded = bt.from_pydict({"k": ["a"], "ts": [_at(0)], "v": [1]})
+    with pytest.raises(PlanError, match=r"partition_by column\(s\) \['nope'\]") as raised:
+        bounded.session_window("ts", "5m", partition_by=["nope"], total=col("v").sum())
+    assert "_t" not in str(raised.value)
+
+
+@pytest.mark.integration
+def test_the_same_check_fires_before_a_stream_starts_reading():
+    """An unbounded source would otherwise have to produce a batch before the query could
+    discover it was impossible."""
+    with pytest.raises(PlanError, match="partition_by"):
+        _stream([[("a", 0, 1)]]).session_window(
+            "ts", "5m", partition_by=["nope"], total=col("v").sum()
+        )

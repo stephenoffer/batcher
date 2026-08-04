@@ -355,6 +355,15 @@ def build_session_window(
 
     if time_col not in ds.columns:
         raise PlanError(f"session_window(): unknown time column {time_col!r}")
+    # Checked here rather than left to the window node underneath: by then the plan
+    # carries the internal `_t` epoch copy, so the "available columns" the error listed
+    # included a column the caller never wrote and cannot use.
+    unknown = [name for name in partition_by if name not in ds.columns]
+    if unknown:
+        raise PlanError(
+            f"session_window(): unknown partition_by column(s) {unknown}; "
+            f"available: {sorted(ds.columns)}"
+        )
     if not aggs:
         raise PlanError("session_window() requires at least one named aggregate")
     gap_us = _duration_micros(gap, arg="session gap")
