@@ -126,7 +126,14 @@ pub(crate) fn assign_groups(
         // so the group ids and representative columns are identical to `assign_groups_multi_raw`
         // — a pure short-circuit. Anything wider keeps the general raw path.
         if let Some(layout) = packed_layout(group_keys) {
-            return assign_groups_packed(group_keys, &layout, num_rows);
+            let total: usize = layout.iter().sum();
+            if total <= 16 {
+                return assign_groups_packed(group_keys, &layout, num_rows);
+            }
+            // Wider than a `u128` but still bounded: pack into a fixed-stride byte row and
+            // group on that. Same injectivity argument as the `u128` path, same result — it
+            // is only the key's storage that differs (a slice rather than a register).
+            return assign_groups_packed_wide(group_keys, &layout, total, num_rows);
         }
         return assign_groups_multi_raw(group_keys, num_rows);
     }
@@ -153,6 +160,7 @@ pub(crate) fn assign_groups(
     let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
     let mut group_ids = Vec::with_capacity(num_rows);
+    let mut probe = GroupGrowth::new(num_rows);
 
     for i in 0..num_rows {
         let row_i = rows.row(i);
@@ -171,6 +179,12 @@ pub(crate) fn assign_groups(
             }
         };
         group_ids.push(gid);
+        if let Some(extra) = probe.extra_capacity(i, reps.len()) {
+            reps.reserve(extra);
+            table.reserve(extra, |&g| {
+                state.hash_one(rows.row(reps[g as usize] as usize))
+            });
+        }
     }
 
     let num_groups = reps.len();
@@ -205,6 +219,80 @@ pub(crate) const DENSE_SPAN_MAX: usize = 1 << 20;
 pub(crate) fn dense_budget(n: usize) -> usize {
     n.saturating_mul(DENSE_SPAN_ROW_FACTOR)
         .clamp(1024, DENSE_SPAN_MAX)
+}
+
+/// One-shot capacity extrapolation for a whole-relation group table.
+///
+/// [`group_table_capacity`] deliberately starts the table small, because an analytical
+/// `GROUP BY` is usually low-cardinality and sizing at `num_rows` wastes an allocation
+/// orders of magnitude too large. That is the right call for the common shape and the
+/// wrong one for the opposite extreme: a near-unique key reaches the cap and then pays a
+/// *doubling cascade*, rehashing every entry each time. Pre-sizing removes that cascade and
+/// measured **about 5%** on the H2O db-benchmark's `GROUP BY id1..id6` (10 M groups over
+/// 10 M rows).
+///
+/// That figure is deliberately modest, and the way it was arrived at is the point. The
+/// first measurement of this change read **-34%** (1,725 ms against 1,145 ms), taken by
+/// comparing two whole benchmark runs. It was wrong: this box runs several agent sessions
+/// concurrently, and a controlled A/B that interleaved the two binaries run-by-run put the
+/// real effect near 5%. Do not restore the larger number, and do not measure a change here
+/// by comparing separate runs — on this hardware that method cannot resolve anything below
+/// roughly 30%.
+///
+/// Rather than pick a constant that has to be wrong at one end, this *measures the input*.
+/// Once the table has filled its initial capacity, the groups-per-row density seen so far
+/// is a sound estimator of the density of the rest, so the final group count extrapolates
+/// to `groups_so_far / rows_so_far * num_rows`. One `reserve` to that figure replaces the
+/// whole cascade.
+///
+/// Why this is safe at both ends:
+///
+/// * A low-cardinality key never reaches the initial capacity, so `extra_capacity` never
+///   fires and the tuned behaviour above is untouched — including the per-morsel calls,
+///   whose `num_rows` is already an exact bound.
+/// * The estimate is only a hint. Capacity changes no group id, no first-seen order, and
+///   no output column, which is what lets it be chosen by measurement.
+/// * It fires **once**. A pathological key whose density collapses later falls back to the
+///   ordinary doubling it would have had anyway, and never re-extrapolates from a stale
+///   ratio.
+///
+/// This is deliberately a runtime measurement rather than a planner hint. It needs no
+/// cardinality estimate, so it works identically for a streaming morsel, a distributed
+/// partition, and a source the optimizer has never seen — the shapes where an estimate is
+/// least likely to exist.
+struct GroupGrowth {
+    num_rows: usize,
+    trigger: usize,
+    fired: bool,
+}
+
+impl GroupGrowth {
+    fn new(num_rows: usize) -> Self {
+        Self {
+            num_rows,
+            // The point the initial allocation runs out; below it there is nothing to fix.
+            trigger: group_table_capacity(num_rows),
+            fired: false,
+        }
+    }
+
+    /// Extra slots to reserve now, or `None` while the initial capacity still suffices.
+    ///
+    /// Args:
+    ///     row: Index of the row just assigned.
+    ///     groups: Distinct groups seen so far.
+    fn extra_capacity(&mut self, row: usize, groups: usize) -> Option<usize> {
+        if self.fired || groups < self.trigger {
+            return None;
+        }
+        self.fired = true;
+        let rows_seen = row + 1;
+        // Density is groups/row over the prefix; project it across the whole relation and
+        // reserve the shortfall. Bounded by `num_rows`, which no key can exceed.
+        let projected =
+            (groups as u128 * self.num_rows as u128 / rows_seen.max(1) as u128) as usize;
+        projected.min(self.num_rows).checked_sub(groups)
+    }
 }
 
 /// Ceiling on a group table's *initial* capacity. See [`group_table_capacity`].
@@ -940,6 +1028,16 @@ fn assign_groups_multi_raw(
 /// (so the general raw path handles it). `Int64` occupies 8 bytes; a string/binary column
 /// occupies `1 + max_value_len` (a length tag plus its longest value). The per-column max
 /// length is one cheap pass over the offsets — far less than the grouping it accelerates.
+/// The widest composite key the packed paths will build, in bytes.
+///
+/// Past this the pack itself starts to cost what it saves — each row writes `PACKED_MAX_BYTES`
+/// bytes whether or not the values fill them, and the group table holds one such row per
+/// group — so a very wide key is better served by `assign_groups_multi_raw`, which touches
+/// only the bytes that exist. 64 covers the shapes that actually appear: H2O's six-column
+/// `GROUP BY id1..id6` (three 5-char strings + three `Int64` = 42 bytes) and the TPC-DS
+/// multi-key aggregates, while the two-column TPC-H keys stay well inside the `u128` path.
+const PACKED_MAX_BYTES: usize = 64;
+
 fn packed_layout(cols: &[ArrayRef]) -> Option<Vec<usize>> {
     use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
     let mut widths = Vec::with_capacity(cols.len());
@@ -974,7 +1072,7 @@ fn packed_layout(cols: &[ArrayRef]) -> Option<Vec<usize>> {
             _ => return None,
         };
         total += w;
-        if total > 16 {
+        if total > PACKED_MAX_BYTES {
             return None;
         }
         widths.push(w);
@@ -1077,6 +1175,121 @@ fn write_bytes(buf: &mut [u8; 16], off: usize, v: &[u8]) {
     buf[off + 1..off + 1 + v.len()].copy_from_slice(v);
 }
 
+/// [`write_bytes`] over a plain slice, for the wide packed path's fixed-stride rows.
+fn write_bytes_at(buf: &mut [u8], off: usize, v: &[u8]) {
+    buf[off] = v.len() as u8;
+    buf[off + 1..off + 1 + v.len()].copy_from_slice(v);
+}
+
+/// Multi-column `assign_groups` for a composite key wider than a `u128` but no wider than
+/// [`PACKED_MAX_BYTES`].
+///
+/// The `u128` path's argument for why packing is *identical* to comparing the columns
+/// one at a time carries over unchanged: fixed per-column slots stop one column bleeding
+/// into the next, and a length tag stops a short string aliasing a padded longer one, so
+/// distinct composite keys pack to distinct rows and equal ones to equal rows. Only the
+/// key's storage differs — a `stride`-byte slice instead of a register — so this is a pure
+/// short-circuit for [`assign_groups_multi_raw`] and returns the same group ids and the
+/// same first-seen representatives.
+///
+/// What it buys is the same thing the `u128` path buys, at a width that path cannot reach:
+/// one hash over one contiguous row and one `memcmp` on probe, in place of a per-row hasher
+/// plus a per-column `hash_into` and `eq_at` that re-read the representative row's values
+/// through their offset buffers. H2O `groupby` q10 (`GROUP BY id1..id6`, a 42-byte key) is
+/// the shape this exists for; it is also the one the benchmark's own notes expect Batcher to
+/// win and where it was losing worst.
+///
+/// Memory is bounded by the *answer*, not the input: the packed key is built in a stack
+/// buffer per row and only each group's key is retained, so the table costs
+/// `num_groups * stride` — the same shape as the `u128` path's `Vec<u128>`.
+fn assign_groups_packed_wide(
+    group_keys: &[ArrayRef],
+    widths: &[usize],
+    stride: usize,
+    num_rows: usize,
+) -> Result<(Vec<u32>, usize, Vec<ArrayRef>), RuntimeError> {
+    let cols: Vec<RawKeyCol> = group_keys
+        .iter()
+        .map(|a| {
+            use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
+            match a.data_type() {
+                Int64 => RawKeyCol::Int(a.as_primitive::<Int64Type>()),
+                Utf8 => RawKeyCol::Str32(a.as_string::<i32>()),
+                LargeUtf8 => RawKeyCol::Str64(a.as_string::<i64>()),
+                Binary => RawKeyCol::Bin32(a.as_binary::<i32>()),
+                LargeBinary => RawKeyCol::Bin64(a.as_binary::<i64>()),
+                _ => unreachable!("packed_layout gates the types"),
+            }
+        })
+        .collect();
+    let mut offs = Vec::with_capacity(widths.len());
+    let mut acc = 0usize;
+    for &w in widths {
+        offs.push(acc);
+        acc += w;
+    }
+
+    // One row packs into a stack buffer; only the *groups*' keys are retained, exactly as the
+    // `u128` path retains `keys: Vec<u128>`. Packing every row up front would read better but
+    // costs `num_rows * stride` bytes, and `assign_groups` is called on a whole shuffle
+    // partition (~645,000 rows measured), not only on a 16,384-row morsel — an O(rows) buffer
+    // the path this generalizes never had. Keyed by group, the table is bounded by the answer's
+    // own size.
+    let pack_into = |buf: &mut [u8; PACKED_MAX_BYTES], i: usize| {
+        buf[..stride].fill(0);
+        for (c, &o) in cols.iter().zip(&offs) {
+            match c {
+                RawKeyCol::Int(a) => buf[o..o + 8].copy_from_slice(&a.value(i).to_le_bytes()),
+                RawKeyCol::Float(_) => unreachable!("packed_layout excludes Float64"),
+                RawKeyCol::Str32(a) => write_bytes_at(buf, o, a.value(i).as_bytes()),
+                RawKeyCol::Str64(a) => write_bytes_at(buf, o, a.value(i).as_bytes()),
+                RawKeyCol::Bin32(a) => write_bytes_at(buf, o, a.value(i)),
+                RawKeyCol::Bin64(a) => write_bytes_at(buf, o, a.value(i)),
+            }
+        }
+    };
+
+    let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
+    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
+    let mut reps: Vec<u32> = Vec::new();
+    let mut keys: Vec<u8> = Vec::new(); // group_id -> its packed key, `stride` bytes each
+    let mut group_ids = Vec::with_capacity(num_rows);
+    let mut probe = GroupGrowth::new(num_rows);
+    let mut buf = [0u8; PACKED_MAX_BYTES];
+    for i in 0..num_rows {
+        pack_into(&mut buf, i);
+        let key = &buf[..stride];
+        let hash = state.hash_one(key);
+        let gid = match table.entry(
+            hash,
+            |&g| &keys[g as usize * stride..(g as usize + 1) * stride] == key,
+            |&g| state.hash_one(&keys[g as usize * stride..(g as usize + 1) * stride]),
+        ) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let gid = reps.len() as u32;
+                reps.push(i as u32);
+                keys.extend_from_slice(key);
+                e.insert(gid);
+                gid
+            }
+        };
+        group_ids.push(gid);
+        if let Some(extra) = probe.extra_capacity(i, reps.len()) {
+            table.reserve(extra, |&g| {
+                state.hash_one(&keys[g as usize * stride..(g as usize + 1) * stride])
+            });
+        }
+    }
+    let num_groups = reps.len();
+    let reps_arr = UInt32Array::from(reps);
+    let group_columns = group_keys
+        .iter()
+        .map(|a| arrow::compute::take(a, &reps_arr, None))
+        .collect::<Result<_, _>>()?;
+    Ok((group_ids, num_groups, group_columns))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1133,20 +1346,142 @@ mod tests {
         assert_eq!(pcols, rcols, "packed rep columns diverge from raw");
     }
 
-    /// A key wider than 16 bytes falls back to the raw path (still correct), not the packer.
+    /// A key past `PACKED_MAX_BYTES` falls back to the raw path and is still correct.
+    ///
+    /// The fallback boundary moved (16 bytes -> [`PACKED_MAX_BYTES`]) when the wide packed
+    /// path landed, so the key here is sized past the *new* cap. The assertion it carries is
+    /// the one that has always mattered: a key too wide to pack still groups exactly.
     #[test]
-    fn wide_multikey_falls_back_and_is_correct() {
+    fn over_wide_multikey_falls_back_and_is_correct() {
         let long: ArrayRef = Arc::new(StringArray::from(vec![
-            "this-is-a-very-long-category-value-past-sixteen-bytes",
+            "this-is-a-very-long-category-value-that-runs-well-past-the-packing-cap-of-64",
             "another-long-one",
-            "this-is-a-very-long-category-value-past-sixteen-bytes",
+            "this-is-a-very-long-category-value-that-runs-well-past-the-packing-cap-of-64",
         ]));
         let k2: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 1]));
         let keys = vec![long, k2];
-        assert!(packed_layout(&keys).is_none(), "wide key must not pack");
+        assert!(
+            packed_layout(&keys).is_none(),
+            "key past the cap must not pack"
+        );
         let (ids, n, _cols) = assign_groups(&keys, 3).unwrap();
         assert_eq!(ids, vec![0, 1, 0]);
         assert_eq!(n, 2);
+    }
+
+    /// A key between 17 and [`PACKED_MAX_BYTES`] bytes takes the wide packed path and agrees
+    /// with the raw path it short-circuits — ids, group count, and representative columns.
+    ///
+    /// Comparing against `assign_groups_multi_raw` directly, rather than against hand-written
+    /// expectations, is what makes this an *identity* test: the packed path's whole claim is
+    /// that it computes what the raw path computes, only faster.
+    #[test]
+    fn wide_packed_matches_the_raw_path_it_replaces() {
+        let a: ArrayRef = Arc::new(StringArray::from(vec![
+            "category-alpha",
+            "category-beta",
+            "category-alpha",
+            "category-beta",
+            "category-alpha",
+        ]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec![
+            "region-north",
+            "region-south",
+            "region-north",
+            "region-north",
+            "region-south",
+        ]));
+        let c: ArrayRef = Arc::new(Int64Array::from(vec![7i64, 8, 7, 8, 7]));
+        let keys = vec![a, b, c];
+        let widths = packed_layout(&keys).expect("must pack under the cap");
+        let total: usize = widths.iter().sum();
+        assert!(
+            (17..=PACKED_MAX_BYTES).contains(&total),
+            "want the wide path, got {total} bytes"
+        );
+
+        let (want_ids, want_n, want_cols) = assign_groups_multi_raw(&keys, 5).unwrap();
+        let (got_ids, got_n, got_cols) = assign_groups(&keys, 5).unwrap();
+        assert_eq!(
+            got_ids, want_ids,
+            "wide packed group ids diverge from the raw path"
+        );
+        assert_eq!(
+            got_n, want_n,
+            "wide packed group count diverges from the raw path"
+        );
+        assert_eq!(
+            got_cols, want_cols,
+            "wide packed representatives diverge from the raw path"
+        );
+    }
+
+    /// The H2O `groupby` q10 shape: six columns, three short strings and three `Int64`s.
+    ///
+    /// This is the key the wide path was written for (42 bytes — past the `u128` cap, inside
+    /// [`PACKED_MAX_BYTES`]), so it is pinned explicitly rather than left to the generic case
+    /// above. Values repeat so that grouping actually collapses rows.
+    #[test]
+    fn h2o_six_column_key_packs_and_matches_the_raw_path() {
+        let n = 64usize;
+        let mk_str = |m: usize| -> ArrayRef {
+            Arc::new(StringArray::from(
+                (0..n)
+                    .map(|i| format!("id{:03}", i % m))
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        let mk_int = |m: usize| -> ArrayRef {
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| (i % m) as i64).collect::<Vec<_>>(),
+            ))
+        };
+        let keys = vec![
+            mk_str(3),
+            mk_str(4),
+            mk_str(5),
+            mk_int(3),
+            mk_int(4),
+            mk_int(5),
+        ];
+        let widths = packed_layout(&keys).expect("the q10 key must pack");
+        let total: usize = widths.iter().sum();
+        assert!(
+            total > 16 && total <= PACKED_MAX_BYTES,
+            "want the wide path, got {total}"
+        );
+
+        let (want_ids, want_n, want_cols) = assign_groups_multi_raw(&keys, n).unwrap();
+        let (got_ids, got_n, got_cols) = assign_groups(&keys, n).unwrap();
+        assert_eq!(got_ids, want_ids);
+        assert_eq!(got_n, want_n);
+        assert_eq!(got_cols, want_cols);
+    }
+
+    /// A short value must not alias a padded longer one in the same slot.
+    ///
+    /// This is the property the length tag exists for, and the one a fixed-stride pack would
+    /// silently break without it: `("ab", "c")` and `("a", "bc")` occupy the same bytes if the
+    /// lengths are not written. Both rows are distinct groups.
+    #[test]
+    fn wide_packed_does_not_alias_across_slot_boundaries() {
+        let pad = "-".repeat(20); // push the key past 16 bytes so the wide path is taken
+        let a: ArrayRef = Arc::new(StringArray::from(vec![
+            format!("ab{pad}"),
+            format!("a{pad}"),
+            format!("ab{pad}"),
+        ]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec![
+            "c".to_string(),
+            "bc".to_string(),
+            "c".to_string(),
+        ]));
+        let keys = vec![a, b];
+        let total: usize = packed_layout(&keys).expect("must pack").iter().sum();
+        assert!(total > 16, "want the wide path, got {total}");
+        let (ids, n, _) = assign_groups(&keys, 3).unwrap();
+        assert_eq!(n, 2, "distinct string splits must stay distinct groups");
+        assert_eq!(ids, vec![0, 1, 0]);
     }
 
     /// A dictionary key must group identically to the same column decoded to plain values —
@@ -1509,6 +1844,121 @@ mod tests {
                 *id as usize,
                 row / 2,
                 "first-seen order must survive growth"
+            );
+        }
+    }
+    /// The same guarantee for every **composite-key** grouper.
+    ///
+    /// The test above uses one `Int64` column, which routes to `assign_groups_int` and so
+    /// leaves the three multi-key paths — `assign_groups_int64_multi`,
+    /// `assign_groups_packed` and `assign_groups_multi_raw` — completely unexercised at a
+    /// cardinality high enough to make `GroupGrowth` fire. Those are exactly the paths a
+    /// mis-applied `reserve` would corrupt, and a wrong one shows up as a wrong group
+    /// count or a broken first-seen order rather than as a crash.
+    ///
+    /// Each shape below is built so every key appears exactly twice past the cap, which
+    /// pins the group count at `n / 2` and the id of row `r` at `r / 2`.
+    #[test]
+    fn high_cardinality_composite_keys_still_group_exactly() {
+        let n = GROUP_TABLE_INITIAL_CAP * 2 + 3;
+        let half: Vec<i64> = (0..n as i64).map(|i| i / 2).collect();
+
+        // Two null-free Int64 columns -> assign_groups_int64_multi.
+        let int_multi: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(half.clone())),
+            Arc::new(Int64Array::from(
+                half.iter().map(|v| v * 7 + 1).collect::<Vec<_>>(),
+            )),
+        ];
+        // Int64 + a short string, which packs into the 16-byte key -> assign_groups_packed.
+        let packed: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(half.clone())),
+            Arc::new(StringArray::from(
+                half.iter()
+                    .map(|v| format!("k{}", v % 97))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        // Int64 + a string too long to pack -> assign_groups_multi_raw.
+        let raw: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(half.clone())),
+            Arc::new(StringArray::from(
+                half.iter()
+                    .map(|v| format!("a-considerably-longer-key-value-{v:012}"))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+
+        for (name, cols) in [
+            ("int64_multi", int_multi),
+            ("packed", packed),
+            ("raw_multi", raw),
+        ] {
+            let (ids, groups, out) = assign_groups(&cols, n).unwrap();
+            assert_eq!(groups, n.div_ceil(2), "{name}: group count");
+            assert_eq!(out[0].len(), groups, "{name}: output length");
+            for (row, id) in ids.iter().enumerate() {
+                assert_eq!(
+                    *id as usize,
+                    row / 2,
+                    "{name}: first-seen order must survive growth"
+                );
+            }
+        }
+    }
+
+    /// `GroupGrowth` must stay inert for the low-cardinality shape `group_table_capacity`
+    /// is tuned for, and fire exactly once for the near-unique shape it exists to rescue.
+    /// This is asserted on the policy rather than on wall-clock, because the cascade it
+    /// removes is worth only a few percent — small enough that a timing test on a shared
+    /// box would assert noise.
+    #[test]
+    fn group_growth_fires_once_and_only_for_high_cardinality() {
+        let rows = 4_000_000;
+
+        // Low cardinality: the group count never reaches the initial capacity, so no
+        // reserve is ever requested and the tuned sizing is untouched.
+        let mut low = GroupGrowth::new(rows);
+        for i in 0..1000 {
+            assert_eq!(low.extra_capacity(i, i / 100), None);
+        }
+
+        // Near-unique: once the table fills, one reserve projects the observed density
+        // (here 1 group per row) across the whole relation.
+        let mut high = GroupGrowth::new(rows);
+        let trigger = group_table_capacity(rows);
+        assert_eq!(
+            high.extra_capacity(trigger - 2, trigger - 1),
+            None,
+            "not yet full"
+        );
+        let extra = high
+            .extra_capacity(trigger - 1, trigger)
+            .expect("must fire when full");
+        assert_eq!(extra, rows - trigger, "density 1.0 projects to every row");
+
+        // And never again: a later call cannot re-extrapolate from a stale ratio.
+        assert_eq!(
+            high.extra_capacity(rows - 1, rows),
+            None,
+            "fires at most once"
+        );
+    }
+
+    /// The projection is bounded by the row count: no key can produce more groups than
+    /// rows, so a noisy prefix can never reserve a table larger than the input.
+    #[test]
+    fn group_growth_never_projects_past_the_row_count() {
+        let rows = 100_000;
+        let mut g = GroupGrowth::new(rows);
+        let trigger = group_table_capacity(rows);
+        if trigger < rows {
+            let extra = g
+                .extra_capacity(trigger - 1, trigger)
+                .expect("fires when full");
+            assert!(
+                trigger + extra <= rows,
+                "projected capacity must not exceed the input"
             );
         }
     }

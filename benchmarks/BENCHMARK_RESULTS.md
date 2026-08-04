@@ -7022,6 +7022,62 @@ Grouped by what they need, which is the useful form for whoever takes them next:
 * **Correct but pathological** (1): q72, above.
 
 
+## Composite group keys wider than 16 bytes now pack (implemented, measurement pending)
+
+The H2O `groupby` suite's own module note says Batcher's advantage "should show on the
+high-cardinality ones (q3, q6, q10), where the group-by state is what dominates; a regression
+there is a regression in `bc-runtime`'s mergeable aggregate, not in the query." It loses every
+one of them, and the loss tracks the key width:
+
+| Query | Key | Ratio |
+|---|---|---|
+| q1 | 1 key, 100 groups | **0.73x (win)** |
+| q3 / q7 | 1 key, high cardinality | 1.78x / 2.04x |
+| q2 / q9 | 2 keys | 2.02x / 2.53x |
+| q10 | **6 keys**, near-unique | **3.44x** |
+
+`assign_groups` has a ladder of fast paths ending in one that folds a whole composite key into
+a single `u128` — capped at **16 bytes**. H2O q10's key is three 5-char strings plus three
+`Int64`s, **42 bytes**, so it misses the cap and lands in `assign_groups_multi_raw`: a per-row
+hasher plus a per-column `hash_into` and `eq_at` that re-read the representative row through
+its offset buffers. That is exactly what the composite-key entry above concluded and left for
+whoever came next — *"the cost is in the per-row hash and equality work itself"*.
+
+`assign_groups_packed_wide` applies the same technique at a width `u128` cannot hold: the key
+packs into a fixed-stride byte row, and grouping is then one hash over one contiguous key and
+one `memcmp` on probe. The injectivity argument is unchanged from the `u128` path — fixed
+per-column slots stop columns bleeding into each other, a length tag stops a short string
+aliasing a padded longer one — so it is a pure short-circuit returning identical group ids,
+counts and representatives. `PACKED_MAX_BYTES = 64` covers q10 and the TPC-DS multi-key
+aggregates; past it the pack costs more than it saves and the raw path still runs.
+
+It needed no change to `partial`/`combine`/`finalize`, so batch, streaming, single-node and
+distributed inherit it together. The shuffle side already has parallel raw-hash fast paths for
+composite keys, so the reducer's `assign_groups` is where the distributed win lands.
+
+### The first version had an O(rows) memory term, and that is the part worth recording
+
+It originally packed **every row up front** into a `num_rows * stride` buffer — one clean
+columnar pass per column. The `u128` path it generalizes retains only each *group's* key, so
+that version quietly added an allocation proportional to the **input** where the original was
+proportional to the **answer**. `assign_groups` is not only called on a 16,384-row morsel: the
+composite-key entry above measured it running per shuffle partition at ~645,000 rows, which is
+41 MB at stride 64 and grows linearly from there.
+
+It compiled, and all 35 assign tests passed. A performance change that regresses memory on the
+distributed path, while every gate stays green, is precisely the failure `CLAUDE.md` describes
+— so the packed key is now built in a stack buffer per row with only group keys retained, and
+the table costs `num_groups * stride`.
+
+**Gate:** 1,749 Rust tests, clippy and `cargo fmt` clean. The existing test asserting a
+>16-byte key never packs was *retargeted, not deleted*: its subject is now a key past the new
+cap, and three tests were added — an identity check against `assign_groups_multi_raw`, the
+exact six-column q10 shape, and an aliasing test pinning that `("ab","c")` and `("a","bc")`
+stay distinct groups.
+
+**No speedup is claimed yet.** A controlled A/B (rebuild with the cap at 64, measure
+h2o-groupby + ClickBench + TPC-H, restore the cap to 16, rebuild, measure again) is queued.
+
 # In-flight work list
 
 Everything above is measured and settled. This section is the opposite: it is the live
