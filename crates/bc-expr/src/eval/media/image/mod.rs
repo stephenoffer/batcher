@@ -24,8 +24,9 @@ use crate::{ExprError, ImageFunc};
 
 mod reencode;
 
+pub(crate) use reencode::Bounds;
 use reencode::{
-    auto_orient, convert, crop, encode, exif_orientation, letterbox, resize, thumbnail,
+    auto_orient, convert, crop_dynamic, encode, exif_orientation, letterbox, resize, thumbnail,
 };
 
 /// Evaluate an image function over a Binary or LargeBinary array of encoded image bytes.
@@ -37,9 +38,9 @@ use reencode::{
 /// The scalar arguments an image function may carry, gathered into one struct.
 ///
 /// They arrived as seven positional parameters, which had already earned an
-/// `#[allow(clippy::too_many_arguments)]`; `crop` and `encode` would have made it ten, at
-/// which point a caller swapping `x` and `y` is a silent bug the compiler cannot see.
-/// Named fields make each call site read as what it is.
+/// `#[allow(clippy::too_many_arguments)]`; `encode` and `letterbox` pushed it further, at
+/// which point a caller swapping `width` and `height` is a silent bug the compiler cannot
+/// see. Named fields make each call site read as what it is.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ImageArgs<'a> {
     pub width: Option<i64>,
@@ -47,8 +48,6 @@ pub(crate) struct ImageArgs<'a> {
     pub mean: Option<&'a [f64]>,
     pub std: Option<&'a [f64]>,
     pub channels_first: bool,
-    pub x: Option<i64>,
-    pub y: Option<i64>,
     pub format: Option<&'a str>,
     /// `letterbox` only: the byte the leftover canvas is filled with.
     pub fill: Option<i64>,
@@ -156,7 +155,6 @@ fn eval_image_sized<O: OffsetSizeTrait>(
         ImageFunc::CenterCrop => center_crop(bytes, width, height),
         ImageFunc::ToGrayscale => to_grayscale(bytes, width, height),
         ImageFunc::Resize => resize(bytes, width, height),
-        ImageFunc::Crop => crop(bytes, args),
         ImageFunc::Encode => encode(bytes, args.format),
         ImageFunc::Convert => convert(bytes, args.format),
         ImageFunc::Dhash => dhash(bytes),
@@ -631,6 +629,41 @@ fn decode_jpeg_scaled(data: &[u8], w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)
     Some((pixels, out_w, out_h))
 }
 
+/// Evaluate `ImageCrop` — a crop whose window is four columns rather than four constants.
+///
+/// Split from [`eval_image`] rather than folded into it because the shapes genuinely
+/// differ: every `ImageFunc` reads scalar arguments validated once for the batch, while
+/// this one reads four arrays validated per row. Sharing an entry point would mean an
+/// `ImageArgs` carrying four `ArrayRef`s that fifteen of the sixteen functions ignore.
+pub(crate) fn eval_image_crop(arr: &ArrayRef, bounds: &Bounds<'_>) -> Result<ArrayRef, ExprError> {
+    // An all-null column is typed `Null`, not `Binary`; see `media::widen_null_column`.
+    if let Some(nulls) = super::widen_null_column(arr) {
+        let bytes = nulls
+            .as_any()
+            .downcast_ref::<GenericBinaryArray<i32>>()
+            .expect("widen_null_column builds a Binary array");
+        return crop_dynamic(bytes, bounds);
+    }
+    match arr.data_type() {
+        DataType::Binary => crop_dynamic(
+            arr.as_any()
+                .downcast_ref::<GenericBinaryArray<i32>>()
+                .expect("matched Binary"),
+            bounds,
+        ),
+        DataType::LargeBinary => crop_dynamic(
+            arr.as_any()
+                .downcast_ref::<GenericBinaryArray<i64>>()
+                .expect("matched LargeBinary"),
+            bounds,
+        ),
+        other => Err(ExprError::ExpectedBinary {
+            func: "image.crop".to_string(),
+            got: other.to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // The `reencode` tests live here rather than beside their functions because they share
@@ -660,8 +693,6 @@ mod tests {
             mean: None,
             std: None,
             channels_first: false,
-            x: None,
-            y: None,
             format: None,
             fill: None,
         }
@@ -887,22 +918,24 @@ mod tests {
         let src = src.into_inner();
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(src.as_slice())]));
 
-        for (x, want) in [(0u32, [255u8, 0, 0]), (4, [0, 255, 0])] {
-            let out = eval_image(
-                ImageFunc::Crop,
-                &arr,
-                ImageArgs {
-                    x: Some(i64::from(x)),
-                    y: Some(0),
-                    ..args(Some(4), Some(8))
-                },
-            )
-            .unwrap();
+        for (x, want) in [(0i64, [255u8, 0, 0]), (4, [0, 255, 0])] {
+            let out = crop_at(&arr, &[x], &[0], &[4], &[8]);
             let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
             let got = image::load_from_memory(b.value(0)).unwrap().into_rgb8();
             assert_eq!((got.width(), got.height()), (4, 8), "x={x}");
             assert_eq!(got.get_pixel(0, 0).0, want, "x={x}");
         }
+    }
+
+    /// Run `ImageCrop` with the four bound columns given as slices — the shape the
+    /// dispatcher builds after evaluating each bound expression against the batch.
+    fn crop_at(arr: &ArrayRef, x: &[i64], y: &[i64], w: &[i64], h: &[i64]) -> ArrayRef {
+        let cols: Vec<ArrayRef> = [x, y, w, h]
+            .iter()
+            .map(|v| Arc::new(Int64Array::from(v.to_vec())) as ArrayRef)
+            .collect();
+        let bounds = Bounds::new([&cols[0], &cols[1], &cols[2], &cols[3]]).unwrap();
+        eval_image_crop(arr, &bounds).unwrap()
     }
 
     #[test]
@@ -914,16 +947,7 @@ mod tests {
             None,
             Some(b"not an image".as_slice()),
         ]));
-        let out = eval_image(
-            ImageFunc::Crop,
-            &arr,
-            ImageArgs {
-                x: Some(6),
-                y: Some(6),
-                ..args(Some(100), Some(100))
-            },
-        )
-        .unwrap();
+        let out = crop_at(&arr, &[6; 3], &[6; 3], &[100; 3], &[100; 3]);
         let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
         let got = image::load_from_memory(b.value(0)).unwrap();
         assert_eq!(
@@ -937,16 +961,7 @@ mod tests {
     #[test]
     fn a_crop_window_entirely_outside_the_image_is_null() {
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(8, 8).as_slice())]));
-        let out = eval_image(
-            ImageFunc::Crop,
-            &arr,
-            ImageArgs {
-                x: Some(8),
-                y: Some(0),
-                ..args(Some(4), Some(4))
-            },
-        )
-        .unwrap();
+        let out = crop_at(&arr, &[8], &[0], &[4], &[4]);
         assert!(out
             .as_any()
             .downcast_ref::<BinaryArray>()
@@ -954,21 +969,72 @@ mod tests {
             .is_null(0));
     }
 
+    /// A per-row window is the reason this variant exists: one image, four different
+    /// boxes, four different crops. A kernel that read its bounds once for the batch
+    /// would return four identical patches and pass every other test in this file.
     #[test]
-    fn a_negative_crop_offset_is_rejected_not_wrapped() {
-        // `as u32` would turn -1 into ~4 billion, i.e. a window past every image, and
-        // every row would silently become null instead of the query failing.
-        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(8, 8).as_slice())]));
-        assert!(eval_image(
-            ImageFunc::Crop,
+    fn each_row_gets_its_own_window() {
+        use image::{Rgb, RgbImage};
+
+        // A 8x8 image whose four quadrants are four distinct colors.
+        let quadrants = [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+        let mut img = RgbImage::new(8, 8);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let q = usize::from(x >= 4) + 2 * usize::from(y >= 4);
+            *px = Rgb(quadrants[q]);
+        }
+        let src = png_of(img);
+        let rows = vec![Some(src.as_slice()); 4];
+        let arr: ArrayRef = Arc::new(BinaryArray::from(rows));
+
+        let out = crop_at(&arr, &[0, 4, 0, 4], &[0, 0, 4, 4], &[4; 4], &[4; 4]);
+        let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        for (i, want) in quadrants.iter().enumerate() {
+            let got = image::load_from_memory(b.value(i)).unwrap().into_rgb8();
+            assert_eq!((got.width(), got.height()), (4, 4), "row {i}");
+            assert_eq!(
+                &got.get_pixel(0, 0).0,
+                want,
+                "row {i} took the wrong quadrant"
+            );
+        }
+    }
+
+    /// A window the caller could not supply is a row with no answer, not a failed batch.
+    ///
+    /// This is the semantic that had to change when the bounds became data. As constants
+    /// a negative offset was a *query* error and rightly raised; per row it is one bad
+    /// box among thousands — from a detector that declined to predict, or a join that
+    /// matched nothing — and failing the batch for it would lose every good row with it.
+    #[test]
+    fn an_unusable_window_nulls_its_row_and_leaves_the_others() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(8, 8).as_slice()); 5]));
+        let out = crop_at(
             &arr,
-            ImageArgs {
-                x: Some(-1),
-                y: Some(0),
-                ..args(Some(4), Some(4))
-            }
-        )
-        .is_err());
+            &[0, -1, 0, 0, 0],
+            &[0, 0, 0, 0, 0],
+            &[4, 4, 0, -4, 4],
+            &[4, 4, 4, 4, 4],
+        );
+        let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(b.is_valid(0), "a usable window must still produce a crop");
+        assert!(b.is_null(1), "a negative offset");
+        assert!(b.is_null(2), "a zero extent");
+        assert!(b.is_null(3), "a negative extent");
+        assert!(b.is_valid(4), "the good row after the bad ones survives");
+    }
+
+    /// A null bound nulls its row rather than being read as zero.
+    #[test]
+    fn a_null_bound_nulls_its_row() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(red_png(8, 8).as_slice()); 2]));
+        let xs: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), None]));
+        let ys: ArrayRef = Arc::new(Int64Array::from(vec![0, 0]));
+        let ws: ArrayRef = Arc::new(Int64Array::from(vec![4, 4]));
+        let hs: ArrayRef = Arc::new(Int64Array::from(vec![4, 4]));
+        let out = eval_image_crop(&arr, &Bounds::new([&xs, &ys, &ws, &hs]).unwrap()).unwrap();
+        let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(b.is_valid(0) && b.is_null(1));
     }
 
     #[test]

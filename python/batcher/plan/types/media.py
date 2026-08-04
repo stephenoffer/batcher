@@ -35,9 +35,7 @@ _IMAGE_TENSOR_CHANNELS = {
 }
 
 # The image ops that hand back a still-encoded image, so the payload stays compressed.
-_IMAGE_BINARY_FNS = frozenset(
-    {"resize", "crop", "encode", "convert", "auto_orient", "thumbnail"}
-)
+_IMAGE_BINARY_FNS = frozenset({"resize", "encode", "convert", "auto_orient", "thumbnail"})
 
 
 def imagefunc_type(expr: ImageFunc) -> pa.DataType | None:

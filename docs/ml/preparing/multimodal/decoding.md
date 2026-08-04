@@ -184,6 +184,23 @@ constantly — a download stage where every fetch failed, an outer join that mat
 a partition filtered empty upstream. Such a column is typed `null` rather than `binary`,
 and the decode operations read it as "all rows are null" rather than as a type mismatch.
 
+An image too large to decode is a bad row too. The decoders carry a 512 MiB ceiling on the
+pixel data one image may produce, so a "decompression bomb" — a small file declaring
+enormous dimensions, such as the gigapixel scans and panoramas a real corpus contains
+without malice — nulls its row rather than allocating. `.image.decode()` still reads its
+header, so a corpus can be surveyed for oversized images before it is decoded:
+
+```python
+# docs: skip
+from batcher import col
+
+too_big = photos.filter(
+    col("bytes").image.decode().struct.field("width")
+    * col("bytes").image.decode().struct.field("height")
+    > 100_000_000
+)
+```
+
 Null is deliberate rather than a zero-filled tensor. Zeros are indistinguishable from a
 legitimately black image or a silent clip, so they put blank samples into a training set
 with nothing to detect them by. Count them instead:
@@ -195,6 +212,40 @@ from batcher import col
 photos = bt.from_pydict({"bytes": [b"", b""]})
 undecodable = photos.filter(col("bytes").image.decode().is_null())
 ```
+
+### Cutting out a detection's bounding box
+
+`.image.crop(x, y, width, height)` takes its window from **columns**, not just constants,
+which is what makes the central operation of a detection pipeline an engine operation: cut
+the box a model predicted out of the frame it was predicted in. The boxes are data, one per
+row, so a fixed window could never express it.
+
+```python
+# docs: skip
+from batcher import col
+
+patches = detections.with_columns(
+    patch=col("frame").image.crop(col("box_x"), col("box_y"), col("box_w"), col("box_h"))
+)
+```
+
+Constants and columns mix, so a fixed-size patch at a per-row position is
+`crop(col("cx"), col("cy"), 64, 64)`.
+
+The result is encoded bytes rather than a tensor, because rows genuinely differ in size.
+Follow it with `letterbox` or `to_tensor` to get back to one shape a model can batch:
+
+```python
+# docs: skip
+ready = patches.with_columns(x=col("patch").image.letterbox(224, 224))
+```
+
+A window that runs past an edge is clipped to what exists, rather than padded — a crop is
+something you look at, and inventing black pixels there invents data. A window that is
+null, negative, empty, or entirely outside the image nulls **that row only**. That last
+part matters at corpus scale: boxes come from a model that sometimes declines to predict,
+or from a join that sometimes matches nothing, and one unusable box should not cost the
+batch it travelled in.
 
 ### Choosing how an image is resized
 

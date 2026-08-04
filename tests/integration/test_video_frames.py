@@ -267,3 +267,41 @@ def test_bad_arguments_are_rejected_at_plan_build(build):
     """A bad frame count or size is a caller bug, so it fails before any decode runs."""
     with pytest.raises(PlanError):
         build(col("v"))
+
+
+def test_frame_at_takes_its_timestamp_from_a_column():
+    """The usual case, not the exotic one: the row that wants a still knows when.
+
+    A detection, a caption, a scene boundary — each already carries the moment it refers
+    to, so a constant timestamp made the common case the one this could not express.
+    """
+    ds = bt.from_pydict({"v": [_clip(n_frames=30, fps=10)] * 4, "t": [0.0, 1.0, 2.0, 2.9]})
+    out = _sample(ds, s=col("v").video.frame_at(col("t"), 16))["s"]
+
+    got = [_frame_index(p) for p in out]
+    assert got == [pytest.approx(w, abs=1) for w in (0, 10, 20, 29)]
+
+
+def test_a_constant_timestamp_still_works():
+    """The literal form is the same operation with a constant column, not a second one."""
+    ds = bt.from_pydict({"v": [_clip(n_frames=30, fps=10)] * 3})
+    out = _sample(ds, s=col("v").video.frame_at(1.0, 16))["s"]
+
+    assert [_frame_index(p) for p in out] == [pytest.approx(10, abs=1)] * 3
+
+
+def test_an_unusable_timestamp_nulls_only_its_own_row():
+    """A moment the caller could not supply is a row with no answer, not a failed batch.
+
+    Same call `crop` makes about a bad bounding box, for the same reason: the timestamps
+    come from something that does not answer for every row, and failing the batch would
+    lose the rows that did.
+    """
+    clip = _clip(n_frames=30, fps=10)  # 3.0 seconds long
+    ds = bt.from_pydict({"v": [clip] * 4, "t": [0.5, None, -1.0, 99.0]})
+    out = _sample(ds, s=col("v").video.frame_at(col("t"), 16))["s"]
+
+    assert out[0] is not None, "a usable timestamp must still produce a still"
+    assert out[1] is None, "null"
+    assert out[2] is None, "negative"
+    assert out[3] is None, "past the end of a clip whose duration is known"

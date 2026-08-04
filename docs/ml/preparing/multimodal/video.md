@@ -94,8 +94,8 @@ sheet = bt.read.video("s3://bucket/clips/").select(
     path=col("path"), thumb=col("bytes").video.thumbnail(320)
 )
 
-# The picture at a timestamp a detection already gave you.
-stills = detections.with_columns(still=col("clip").video.frame_at(3.5, 640))
+# The picture at the timestamp each row already carries.
+stills = detections.with_columns(still=col("clip").video.frame_at(col("t"), 640))
 ```
 
 Both scale the frame so its longest side is `max_size`, keeping the clip's aspect ratio
@@ -112,6 +112,12 @@ first-frame thumbnails useless for the review work thumbnails exist for.
 
 Both seek to the keyframe before the target and decode forward from there, so the cost is
 bounded by the keyframe interval rather than by how far into the clip the target is.
+`frame_at` takes its timestamp from a **column** as readily as from a constant, which is
+the usual case rather than the exotic one: a detection, a caption, or a scene boundary
+already carries the moment it refers to. A row whose timestamp is null or negative is
+null, and only that row — the timestamps come from something that does not answer for
+every row, and one missing moment should not cost the batch it travelled in.
+
 `frame_at` returns the frame a player displays at that instant. A `second` past the end of
 a clip whose duration is known yields null rather than the last frame, because handing back
 a frame under a timestamp that does not exist invents data.

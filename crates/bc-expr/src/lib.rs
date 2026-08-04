@@ -136,12 +136,6 @@ pub enum Expr {
         std: Option<Vec<f64>>,
         #[serde(default)]
         channels_first: bool,
-        /// `Crop` only: the top-left corner of the window. `#[serde(default)]`, so every
-        /// other image op's IR round-trips unchanged.
-        #[serde(default)]
-        x: Option<i64>,
-        #[serde(default)]
-        y: Option<i64>,
         /// `Encode` only: the target container format.
         #[serde(default)]
         format: Option<String>,
@@ -177,6 +171,29 @@ pub enum Expr {
         threshold_db: Option<i64>,
     },
 
+    /// A crop over an image column whose window is **four sub-expressions rather than
+    /// four constants**.
+    ///
+    /// Its own variant rather than four more `Option<i64>` on `Image`, because the
+    /// distinction is real: every other image op's dimensions are part of its output
+    /// *type* (a `to_tensor(224, 224)` column is `fixed_shape_tensor(uint8, [224,224,3])`
+    /// and cannot be per-row), while a crop window is *data*. Cropping the bounding box a
+    /// detector predicted is the operation a vision pipeline is built around, and with
+    /// literal-only arguments it was the one thing this namespace could not express —
+    /// leaving a per-row Python loop as the only way to cut objects out of frames.
+    ///
+    /// The bounds are evaluated to arrays once per batch and read per row, so a literal
+    /// costs one broadcast array and needs no separate path. Output is PNG `Binary`; a
+    /// window clipped by an edge yields the part that exists, one starting past the image
+    /// yields null, and so does a null, negative, or empty window.
+    ImageCrop {
+        input: Box<Expr>,
+        x: Box<Expr>,
+        y: Box<Expr>,
+        width: Box<Expr>,
+        height: Box<Expr>,
+    },
+
     /// A video decode op over a binary (video-bytes) sub-expression. Backed by the
     /// system FFmpeg behind the `video` feature; without it, evaluation errors. The
     /// JIT falls back to this interpreter path.
@@ -196,9 +213,14 @@ pub enum Expr {
         width: Option<i64>,
         #[serde(default)]
         height: Option<i64>,
-        /// `FrameAt` only: the timestamp to seek to, in seconds from the clip start.
+        /// `FrameAt` only: the timestamp to seek to, in seconds from the clip start —
+        /// an **expression**, because a timestamp is data. The row that wants a still
+        /// usually already carries the moment it wants (a detection, a caption, a scene
+        /// boundary), so a constant here would make the one common case the one this
+        /// cannot express. The other three arguments stay constants: they describe the
+        /// output, not the row.
         #[serde(default)]
-        second: Option<f64>,
+        second: Option<Box<Expr>>,
     },
 
     /// First non-null among the sub-expressions, per row (SQL COALESCE).
@@ -941,13 +963,6 @@ pub enum ImageFunc {
     /// `resize(width, height)` → re-encoded PNG bytes at the new size (Daft
     /// `image.resize`). Null/undecodable input → null. → Binary.
     Resize,
-    /// `crop(x, y, width, height)` → the requested region, re-encoded as PNG bytes. The
-    /// arbitrary-offset counterpart of `CenterCrop`, for pulling a detection's bounding box
-    /// out of a frame and keeping it as an image rather than as a tensor. A window that
-    /// runs past an edge is clipped to the image, so the output can be smaller than
-    /// requested; a window entirely outside it is null. Null/undecodable input → null.
-    /// → Binary.
-    Crop,
     /// `encode(format)` → the image re-encoded in `format` (`png`, `jpeg`, `bmp`, `gif`),
     /// pixels unchanged. Normalizes a mixed-format corpus to one codec, or trades a PNG
     /// for a smaller JPEG. Null/undecodable input → null. → Binary.

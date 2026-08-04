@@ -94,6 +94,7 @@ class ExprTag:
     MAP: Final = "map"
     GEO: Final = "geo"
     IMAGE: Final = "image"
+    IMAGE_CROP: Final = "image_crop"
     AUDIO: Final = "audio"
     VIDEO: Final = "video"
 
@@ -169,7 +170,7 @@ WINDOW_AGGREGATES: Final = frozenset(
         # ones whose *running* form costs O(1) per row, which is what lets them share the
         # existing whole-partition and running machinery. Order statistics
         # (`median`/`quantile`/`mode`) need a sorted structure and are deliberately
-        # absent — see `bc_runtime::window_agg`.
+        # absent — see `bc_runtime::window::agg`.
         "var", "stddev", "product",
         "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor", "count_distinct",
     }
@@ -188,7 +189,7 @@ WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE
 # Functions that honour an explicit `ROWS`/`GROUPS` frame.
 #
 # The six folds joined the original five once the framed path's two-stack slide was
-# generalized from `+` to any associative, commutative operator (`bc_runtime::window_agg`).
+# generalized from `+` to any associative, commutative operator (`bc_runtime::window::agg`).
 # That structure exists because the naive O(1) slide needs an *inverse* to un-apply the
 # leaving value, and `product` cannot divide out a zero while `bit_and`/`bool_and` cannot
 # un-AND at all.
@@ -203,3 +204,29 @@ WINDOW_FRAMEABLE: Final = frozenset(
         "product", "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor",
     }
 )  # fmt: skip
+
+# The GROUP BY aggregate vocabulary, mirroring the Rust `AggFunc` enum (serde snake_case).
+#
+# This is *not* `WINDOW_FUNCS`, and the difference is not cosmetic: a grouped average is
+# `mean` while a windowed one is `avg`, so one `AggExpr` carries two vocabularies depending
+# on whether `.over()` is called. `Aggregate` validates against this set, which is why
+# `AggExpr` itself cannot — `AggExpr("avg", x).over(...)` is correct and must stay legal.
+AGG_FNS: Final = frozenset(
+    {
+        "any_value", "approx_count_distinct", "approx_quantile", "approx_top_k",
+        "arg_max", "arg_min", "bit_and", "bit_or", "bit_xor", "bool_and", "bool_or",
+        "corr", "count", "count_distinct", "count_star", "covar_pop", "covar_samp",
+        "entropy", "histogram", "kahan_sum", "kurtosis", "kurtosis_pop", "list_agg",
+        "mad", "max", "mean", "median", "min", "mode", "product", "quantile",
+        "quantile_disc", "skewness", "stddev", "sum", "var",
+    }
+)  # fmt: skip
+
+#: How a window frame counts its offsets, mirroring the Rust `FrameUnits` enum.
+FRAME_UNITS: Final = frozenset({"rows", "range", "groups"})
+
+#: The `kind` discriminator of one frame edge, mirroring the Rust `FrameBound` enum, which
+#: is `#[serde(tag = "kind")]`. `preceding`/`following` additionally carry `n`.
+FRAME_BOUND_KINDS: Final = frozenset(
+    {"unbounded_preceding", "preceding", "current_row", "following", "unbounded_following"}
+)

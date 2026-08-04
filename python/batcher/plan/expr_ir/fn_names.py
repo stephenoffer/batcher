@@ -248,7 +248,7 @@ MATH_FNS: Final[frozenset[str]] = frozenset(
 IMAGE_FNS: Final[frozenset[str]] = frozenset(
     {
         "decode", "to_tensor", "to_tensor_f32", "to_grayscale", "center_crop",
-        "resize", "crop", "encode", "convert", "dhash", "brightness", "sharpness",
+        "resize", "encode", "convert", "dhash", "brightness", "sharpness",
         "auto_orient", "exif_orientation", "thumbnail", "letterbox",
     }
 )  # fmt: skip

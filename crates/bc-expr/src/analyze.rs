@@ -173,6 +173,7 @@ impl Expr {
             // fallible keeps it on the far side of that reordering.
             | Expr::Geo { .. }
             | Expr::Image { .. }
+            | Expr::ImageCrop { .. }
             | Expr::Audio { .. }
             | Expr::Video { .. }
             | Expr::Coalesce { .. }
@@ -262,7 +263,10 @@ impl Expr {
             // of magnitude past that. Both are "run me last" and the exact number
             // only has to preserve that ordering.
             Expr::Str { input, .. } => 40u32.saturating_add(input.eval_cost()),
-            Expr::Image { .. } | Expr::Audio { .. } | Expr::Video { .. } => 100_000,
+            Expr::Image { .. }
+            | Expr::ImageCrop { .. }
+            | Expr::Audio { .. }
+            | Expr::Video { .. } => 100_000,
             _ => 50,
         }
     }
@@ -296,6 +300,32 @@ impl Expr {
             // Leaves.
             Expr::Col { .. } | Expr::Lit { .. } => {}
 
+            // `frame_at`'s timestamp is an expression too, and optional — so `Video`
+            // cannot ride the single-child list without its bound going unvisited.
+            Expr::Video { input, second, .. } => {
+                visit(input);
+                if let Some(at) = second {
+                    visit(at);
+                }
+            }
+
+            // The one media op whose *arguments* are expressions too: a crop window
+            // is data, so all five children have to be visited or every analysis below
+            // goes blind to the columns the bounds read.
+            Expr::ImageCrop {
+                input,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                visit(input);
+                visit(x);
+                visit(y);
+                visit(width);
+                visit(height);
+            }
+
             // Single-child wrappers.
             Expr::Not { input }
             | Expr::Cast { input, .. }
@@ -307,7 +337,6 @@ impl Expr {
             | Expr::Date { input, .. }
             | Expr::Image { input, .. }
             | Expr::Audio { input, .. }
-            | Expr::Video { input, .. }
             | Expr::InList { input, .. }
             | Expr::Math { input, .. }
             | Expr::List { input, .. }
@@ -386,7 +415,7 @@ impl Expr {
     pub fn contains_media_decode(&self) -> bool {
         if matches!(
             self,
-            Expr::Image { .. } | Expr::Audio { .. } | Expr::Video { .. }
+            Expr::Image { .. } | Expr::ImageCrop { .. } | Expr::Audio { .. } | Expr::Video { .. }
         ) {
             return true;
         }
@@ -414,8 +443,6 @@ mod tests {
             mean: None,
             std: None,
             channels_first: false,
-            x: None,
-            y: None,
             format: None,
             fill: None,
         };

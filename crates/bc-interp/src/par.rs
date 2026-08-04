@@ -3705,8 +3705,6 @@ mod tests {
                     mean: None,
                     std: None,
                     channels_first: false,
-                    x: None,
-                    y: None,
                     format: None,
                     fill: None,
                 },

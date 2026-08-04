@@ -15,7 +15,7 @@ from batcher.plan.expr_ir.fn_names import IMAGE_FNS
 from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
-__all__ = ["ImageFunc", "_ImageNamespace"]
+__all__ = ["ImageCrop", "ImageFunc", "_ImageNamespace"]
 
 # Container formats `.image.encode` can write; mirrors `bc-expr`'s `ENCODE_FORMATS`.
 # WebP is readable but not writable by the underlying decoder, so it is deliberately
@@ -27,6 +27,24 @@ _IMAGE_FORMATS = frozenset({"png", "jpeg", "bmp", "gif"})
 # same vocabulary `.image.decode()` reports — so a mode read off `decode` can be handed
 # straight back to `convert`.
 _IMAGE_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
+
+
+@expr_node
+class ImageCrop(IRNode):
+    """A crop whose window is four sub-expressions rather than four constants.
+
+    Its own node rather than four more scalars on `ImageFunc`, because the distinction is
+    real: every other image op's dimensions are part of its output *type* and so cannot
+    vary per row, while a crop window is data. Cropping the box a detector predicted is
+    what a vision pipeline is built around.
+    """
+
+    tag = ExprTag.IMAGE_CROP
+    input: Expr = child()
+    x: Expr = child()
+    y: Expr = child()
+    width: Expr = child()
+    height: Expr = child()
 
 
 @expr_node
@@ -51,11 +69,8 @@ class ImageFunc(IRNode):
     mean: list[float] | None = scalar(omit_none=True, default=None)
     std: list[float] | None = scalar(omit_none=True, default=None)
     channels_first: bool = scalar(omit_falsy=True, default=False)
-    # `crop` only: the window's top-left corner. `encode` only: the target container.
-    # All three are omitted from the IR unless set, so every other image op's wire shape
-    # is byte-identical to what it was.
-    x: int | None = scalar(omit_none=True, default=None)
-    y: int | None = scalar(omit_none=True, default=None)
+    # `encode` only: the target container; `convert` reuses the slot for its color mode.
+    # Omitted from the IR unless set, so every other image op's wire shape is unchanged.
     format: str | None = scalar(omit_none=True, default=None)
     # `letterbox` only: the byte the leftover canvas is filled with.
     fill: int | None = scalar(omit_none=True, default=None)
@@ -126,19 +141,37 @@ class _ImageNamespace:
         """
         return ImageFunc("decode", self._e)
 
-    def crop(self, x: int, y: int, width: int, height: int) -> ImageFunc:
+    def crop(
+        self,
+        x: int | Expr,
+        y: int | Expr,
+        width: int | Expr,
+        height: int | Expr,
+    ) -> ImageCrop:
         """Cut the window at ``(x, y)`` out of each image, as PNG bytes.
 
         The arbitrary-offset counterpart of :meth:`center_crop`, and the shape a detection
         pipeline needs: pull a bounding box out of a frame and keep it as an *image* rather
         than as a tensor.
 
+        **Each bound may be a column.** That is what makes this the operation a vision
+        pipeline is built around rather than a fixed-window utility: the boxes a detector
+        predicts are data, one per row, so cutting them out of their frames needs the
+        window to vary per row. Mixing constants and columns is fine — a fixed-size patch
+        at a per-row position is ``crop(col("cx"), col("cy"), 64, 64)``.
+
         A window that runs past an edge is **clipped**, so the result can be smaller than
         requested. That is the opposite of :meth:`center_crop`, which zero-pads, and the
         difference is deliberate: `center_crop` feeds a model that needs a fixed input
         size, while a cropped image is something a person or another tool will look at,
         and inventing black pixels there would be inventing data. A window that starts
-        past the image entirely is null.
+        past the image entirely is null, as is one whose bounds are null, negative, or
+        non-positive in extent — a box the caller could not supply is a row with no
+        answer, not a reason to fail the batch.
+
+        Because the window varies per row, the result is encoded bytes rather than a
+        fixed-shape tensor: rows genuinely differ in size. Feed a model by following it
+        with :meth:`to_tensor` or :meth:`letterbox`.
 
         Args:
             x: Left edge of the window, in pixels from the left of the image.
@@ -148,7 +181,7 @@ class _ImageNamespace:
 
         Returns:
             An expression evaluating to PNG bytes of the cropped region; null for null,
-            undecodable, or entirely-out-of-bounds input.
+            undecodable, or entirely-out-of-bounds input, and for an unusable window.
 
         Examples:
             .. doctest::
@@ -159,8 +192,16 @@ class _ImageNamespace:
                 >>> region = bt.col("img").image.crop(0, 0, 1, 1)
                 >>> ds.select(d=region.image.decode().struct.field("width")).to_pydict()
                 {'d': [1]}
+
+                >>> # A detector's boxes, cut out of the frames they were found in.
+                >>> patch = bt.col("frame").image.crop(
+                ...     bt.col("box_x"), bt.col("box_y"), bt.col("box_w"), bt.col("box_h")
+                ... )
         """
-        return ImageFunc("crop", self._e, width=width, height=height, x=x, y=y)
+        from batcher.plan.expr_ir.constructors import lit
+
+        bounds = [b if isinstance(b, Expr) else lit(int(b)) for b in (x, y, width, height)]
+        return ImageCrop(self._e, *bounds)
 
     def encode(self, format: str) -> ImageFunc:
         """Re-encode each image in `format`, pixels unchanged.

@@ -113,14 +113,24 @@ def test_the_inferred_type_matches_what_the_engine_emits(frame):
 
 
 def test_a_still_encoded_result_is_binary_not_a_tensor(frame):
-    """`resize`/`crop`/`encode` hand back an encoded image, whose size is the image's
-    content and so is genuinely not knowable from the arguments."""
+    """`resize`/`encode` hand back an encoded image, whose size is the image's content
+    and so is genuinely not knowable from the arguments."""
     for build in (
         lambda e: e.image.resize(_W, _H),
-        lambda e: e.image.crop(0, 0, _W, _H),
         lambda e: e.image.encode("png"),
     ):
         assert imagefunc_type(build(col("b"))) == pa.binary()
+
+
+def test_a_cropped_region_is_binary_too(frame):
+    """`crop` is a node of its own rather than an `ImageFunc`, because its window is four
+    expressions — so it is typed through `infer_type` rather than `imagefunc_type`. Same
+    answer for the same reason: rows genuinely differ in size."""
+    from batcher.plan.types import infer_type
+
+    schema = frame._plan.available_schema()
+    assert infer_type(col("b").image.crop(0, 0, _W, _H), schema) == pa.binary()
+    assert infer_type(col("b").image.crop(col("id"), 0, _W, _H), schema) == pa.binary()
 
 
 def test_an_unrecognised_image_op_stays_unknown():

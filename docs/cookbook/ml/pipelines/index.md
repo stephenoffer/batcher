@@ -34,6 +34,12 @@ Decode on the CPU, forward pass on the GPU, and never in lockstep.
 A vision-language model over a URL column, with the dead links survived.
 :::
 
+:::{grid-item-card} {octicon}`screen-full;1.1em` Object detection
+:link: /cookbook/ml/pipelines/multimodal/object-detection
+:link-type: doc
+Boxes cut out of the frames they were found in, as expressions rather than a loop.
+:::
+
 :::{grid-item-card} {octicon}`broadcast;1.1em` Audio transcription
 :link: /cookbook/ml/pipelines/multimodal/audio-transcription
 :link-type: doc
@@ -121,7 +127,7 @@ stage overlapping the GPU stage, and the decode running in the data plane.
 - {doc}`ML guide </ml/index>`: the reference for every surface these recipes call.
 - {doc}`Inference </ml/inference/inference>` and {doc}`GPU scheduling </ml/inference/gpu>`: pools, stage
   overlap, adaptive batch sizing, fractional packing.
-- {doc}`ML API reference </api/models/ml>`: the `ds.ml` namespace and the `batcher.ml` functions.
+- {doc}`ML API reference </api/models/ml>`: the {py:obj}`ds.ml <batcher.Dataset.ml>` namespace and the `batcher.ml` functions.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>` and
   {doc}`tensor columns </architecture/deep-dives/memory/tensor-columns>`: the mechanisms underneath.
 - {doc}`Streaming recipes </cookbook/streaming/index>`: the same model stages, over a source that

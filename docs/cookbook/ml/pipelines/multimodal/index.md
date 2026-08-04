@@ -8,6 +8,7 @@ CPU turns files into tensors.
 |---|---|
 | {doc}`Image classification <image-classification>` | A labelled corpus, with the JPEG decode overlapped against the forward pass |
 | {doc}`Image captioning <image-captioning>` | A vision-language model over a URL column |
+| {doc}`Object detection <object-detection>` | Boxes cut out of the frames they were found in, without leaving the engine |
 | {doc}`Audio transcription <audio-transcription>` | Mixed-format audio resampled to what the model wants, then transcribed |
 
 ## See also
@@ -20,5 +21,6 @@ CPU turns files into tensors.
 
 image-classification
 image-captioning
+object-detection
 audio-transcription
 ```

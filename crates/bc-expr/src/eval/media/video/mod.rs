@@ -34,18 +34,19 @@ use crate::{ExprError, VideoFunc};
 /// feature-gated `allow` is for; an unconditional one would hide a real dead field.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(feature = "video"), allow(dead_code))]
-pub(crate) struct VideoArgs {
+pub(crate) struct VideoArgs<'a> {
     pub num_frames: Option<i64>,
     pub width: Option<i64>,
     pub height: Option<i64>,
-    pub second: Option<f64>,
+    /// `FrameAt` only: the evaluated timestamp column, one second value per row.
+    pub second: Option<&'a ArrayRef>,
 }
 
 #[cfg(feature = "video")]
 pub(crate) fn eval_video(
     func: VideoFunc,
     arr: &ArrayRef,
-    args: VideoArgs,
+    args: VideoArgs<'_>,
 ) -> Result<ArrayRef, ExprError> {
     // An all-null column is typed `Null`, not `Binary`; see `widen_null_column`.
     let widened = crate::eval::media::widen_null_column(arr);
@@ -289,7 +290,7 @@ impl Drop for ClipFile {
 pub(crate) fn eval_video(
     func: VideoFunc,
     _arr: &ArrayRef,
-    _args: VideoArgs,
+    _args: VideoArgs<'_>,
 ) -> Result<ArrayRef, ExprError> {
     Err(ExprError::FeatureDisabled {
         func: format!("video.{func:?}").to_lowercase(),

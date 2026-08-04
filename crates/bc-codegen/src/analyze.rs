@@ -277,6 +277,7 @@ pub(crate) fn analyze(
         Expr::Str { .. } => Err(CodegenError::Unsupported("string function".into())),
         Expr::Date { .. } => Err(CodegenError::Unsupported("date function".into())),
         Expr::Image { .. } => Err(CodegenError::Unsupported("image function".into())),
+        Expr::ImageCrop { .. } => Err(CodegenError::Unsupported("image crop".into())),
         Expr::Audio { .. } => Err(CodegenError::Unsupported("audio function".into())),
         Expr::Video { .. } => Err(CodegenError::Unsupported("video function".into())),
         // Geospatial work decodes WKB and walks variable-length geometry per row, which

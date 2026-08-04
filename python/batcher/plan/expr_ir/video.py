@@ -35,7 +35,9 @@ class VideoFunc(IRNode):
     num_frames: int | None = scalar(omit_none=True, default=None)
     width: int | None = scalar(omit_none=True, default=None)
     height: int | None = scalar(omit_none=True, default=None)
-    second: float | None = scalar(omit_none=True, default=None)
+    # `frame_at` only, and a *child* rather than a scalar: a timestamp is data, so the
+    # row that wants a still can name the moment it wants.
+    second: Expr | None = child(omit_none=True, default=None)
 
 
 class _VideoNamespace:
@@ -174,7 +176,7 @@ class _VideoNamespace:
             raise PlanError(f"video.thumbnail(): max_size must be positive, got {max_size}")
         return VideoFunc("thumbnail", self._e, width=max_size)
 
-    def frame_at(self, second: float, max_size: int) -> VideoFunc:
+    def frame_at(self, second: float | Expr, max_size: int) -> VideoFunc:
         """Take the frame shown at `second`, as PNG bytes.
 
         The random-access counterpart of :meth:`frames`, for when a row already carries a
@@ -182,6 +184,11 @@ class _VideoNamespace:
         picture at it. The clip is seeked to the keyframe before `second` and decoded
         forward from there, so reading a frame ten minutes in costs about what reading one
         ten seconds in does.
+
+        **`second` may be a column.** That is the usual case rather than the exotic one:
+        the row that wants a still normally already knows the moment it wants, so a
+        constant would leave the common case as the one this could not express. The size
+        stays a constant, because it describes the output rather than the row.
 
         The frame returned is the one a player displays at `second`: the last frame whose
         presentation time is at or before it. Address a frame by *index* rather than by
@@ -191,15 +198,17 @@ class _VideoNamespace:
         never upscaling, as :meth:`thumbnail` does.
 
         Args:
-            second: Offset from the start of the clip, in seconds.
+            second: Offset from the start of the clip, in seconds. May be a column.
             max_size: Length of the longest side of the still, in pixels.
 
         Returns:
-            An expression evaluating to PNG bytes; null for null or undecodable input, and
-            for a `second` past the end of a clip whose duration is known.
+            An expression evaluating to PNG bytes; null for null or undecodable input, for
+            a `second` past the end of a clip whose duration is known, and for a row whose
+            timestamp is null or negative — a moment the caller could not supply is a row
+            with no answer, not a reason to fail the batch.
 
         Raises:
-            PlanError: If `second` is negative or `max_size` is not positive.
+            PlanError: If a constant `second` is negative, or `max_size` is not positive.
 
         Examples:
             .. doctest::
@@ -207,11 +216,17 @@ class _VideoNamespace:
                 >>> import batcher as bt
                 >>> hits = bt.read.video("s3://bucket/clips/")  # doctest: +SKIP
                 >>> stills = hits.select(  # doctest: +SKIP
-                ...     still=bt.col("bytes").video.frame_at(3.5, 640)
+                ...     still=bt.col("bytes").video.frame_at(bt.col("t"), 640)
                 ... )
         """
-        if second < 0:
-            raise PlanError(f"video.frame_at(): second must be non-negative, got {second}")
+        from batcher.plan.expr_ir.constructors import lit
+
         if max_size <= 0:
             raise PlanError(f"video.frame_at(): max_size must be positive, got {max_size}")
-        return VideoFunc("frame_at", self._e, second=float(second), width=max_size)
+        if isinstance(second, Expr):
+            at = second
+        else:
+            if second < 0:
+                raise PlanError(f"video.frame_at(): second must be non-negative, got {second}")
+            at = lit(float(second))
+        return VideoFunc("frame_at", self._e, second=at, width=max_size)

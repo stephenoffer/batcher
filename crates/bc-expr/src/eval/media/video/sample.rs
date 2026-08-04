@@ -181,26 +181,60 @@ pub(super) fn thumbnail(clips: &Clips<'_>, args: super::VideoArgs) -> Result<Arr
 }
 
 /// `frame_at(second, w, h)` → PNG bytes of the frame at `second`.
-pub(super) fn frame_at(clips: &Clips<'_>, args: super::VideoArgs) -> Result<ArrayRef, ExprError> {
+pub(super) fn frame_at(
+    clips: &Clips<'_>,
+    args: super::VideoArgs<'_>,
+) -> Result<ArrayRef, ExprError> {
     let size = Size::fit("frame_at", args)?;
-    let second = args.second.ok_or(ExprError::MissingImageArg {
+    let column = args.second.ok_or(ExprError::MissingImageArg {
         func: "frame_at".to_string(),
         arg: "second",
     })?;
-    if !second.is_finite() || second < 0.0 {
-        return Err(ExprError::InvalidArgument {
-            func: "frame_at".to_string(),
-            reason: format!(
-                "second must be a finite, non-negative number of seconds, got {second}"
-            ),
-        });
-    }
+    let seconds = Seconds::new(column)?;
+
     let out: Vec<Option<Vec<u8>>> = map_rows(clips.len(), |i| {
         let data = clips.get(i)?;
-        let (rgb, w, h) = seek_frame(data, Some(second), &size)?;
+        let (rgb, w, h) = seek_frame(data, Some(seconds.at(i)?), &size)?;
         encode_png(&rgb, w, h)
     });
     Ok(Arc::new(BinaryArray::from_iter(out)))
+}
+
+/// The per-row timestamp column `frame_at` seeks to.
+///
+/// A timestamp is data — the row that wants a still usually already carries the moment it
+/// wants — so this is a column rather than a constant, and a row whose timestamp is
+/// unusable is null rather than a failed batch. That is the same call `crop` makes about a
+/// bad bounding box, for the same reason: the timestamps come from a detector or a join
+/// that does not answer for every row, and failing the batch would lose the rows that did.
+struct Seconds<'a> {
+    values: &'a arrow::array::Float64Array,
+}
+
+impl<'a> Seconds<'a> {
+    fn new(column: &'a ArrayRef) -> Result<Self, ExprError> {
+        column
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .map(|values| Self { values })
+            .ok_or_else(|| ExprError::InvalidArgument {
+                func: "frame_at".to_string(),
+                reason: format!(
+                    "second must be a floating-point number of seconds, got {}; cast the \
+                     column first",
+                    column.data_type()
+                ),
+            })
+    }
+
+    /// Row `i`'s timestamp, or `None` when it is null, negative, or not finite.
+    fn at(&self, i: usize) -> Option<f64> {
+        use arrow::array::Array;
+
+        (!self.values.is_null(i))
+            .then(|| self.values.value(i))
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    }
 }
 
 /// Encode one `w*h*3` RGB8 buffer as PNG.

@@ -156,7 +156,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
-    from batcher.plan.expr_ir.image import ImageFunc
+    from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
     from batcher.plan.expr_ir.namespaces import (
         ConvertTimezone,
         DateFunc,
@@ -219,6 +219,10 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return _fold_promote([*branch_thens, infer_type(expr.otherwise, schema)])
     if isinstance(expr, ImageFunc):
         return imagefunc_type(expr)
+    if isinstance(expr, ImageCrop):
+        # A per-row window means rows genuinely differ in size, so the result is an
+        # encoded still rather than a fixed-shape tensor.
+        return pa.binary()
     if isinstance(expr, VideoFunc):
         return videofunc_type(expr)
     if isinstance(expr, ListSimhash):
