@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.core import Expr
+from batcher.plan.expr_ir.fn_names import AUDIO_FNS
 from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
@@ -28,6 +29,7 @@ class AudioFunc(IRNode):
     """
 
     tag = ExprTag.AUDIO
+    vocab = AUDIO_FNS
     fn: str = scalar()
     input: Expr = child()
     rate: int | None = scalar(omit_none=True, default=None)

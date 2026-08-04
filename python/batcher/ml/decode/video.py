@@ -1,9 +1,15 @@
-"""Video decode — sampling a fixed number of resized frames per clip, via PyAV.
+"""Video decode — sampling a fixed number of resized frames per clip.
 
-The only decoder here that has no native kernel behind it. A clip is an independent
-container with its own codec state, so the work is a bounded-concurrency loop over rows
-rather than a vectorized pass; see `video_dataset` for why that is inherent to the
-codec API rather than a gap waiting to be closed.
+Two decoders, and which one runs is a property of the *engine build* rather than of the
+pipeline. An engine built with the ``video`` cargo feature carries an FFmpeg-backed
+`.video.frames` kernel, and this stage lowers to it: the decode then happens in the data
+plane, row-parallel, with no Python in the loop at all. An engine built without it has no
+video codec to reach, so the stage falls back to the PyAV loop below.
+
+The fallback is a per-row Python loop, which the architecture otherwise forbids. It earns
+its exception the way `core/gpu_plan` does — there is nothing else to call — and it is
+kept honest by being *only* a fallback: `engine_features()` decides, so a build that can
+do this natively never takes it.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher._internal.native import engine_features
 from batcher.ml.decode.stage import (
     _bounded_map,
     _require_frames,
@@ -37,29 +44,34 @@ def video_dataset(
 ) -> Dataset:
     """Decode a video-bytes column into a ``(num_frames, H, W, 3)`` uint8 tensor column.
 
-    Samples `num_frames` evenly-spaced frames and resizes each to `size` via `PyAV`
-    (``batcher-engine[video]``). Fixed frame count and size make the result a fixed-shape
-    uint8 tensor, ready for a video model; undecodable rows become all-zero frames.
+    Samples `num_frames` evenly-spaced frames and resizes each to `size`. Fixed frame
+    count and size make the result a fixed-shape uint8 tensor, ready for a video model.
 
-    A clip that fails to decode is indistinguishable from a legitimately black one — both
-    are all-zero frames — which silently injects black samples into a training set. Set
-    `error_column` to append a boolean column that is ``True`` exactly for the rows whose
-    bytes were present but would not decode, so those rows can be counted and filtered out.
+    **Where the decode runs depends on the engine build.** When the engine carries the
+    ``video`` feature this lowers to the native ``col(...).video.frames(...)`` kernel and
+    stays a pure `with_columns`, so the clips are decoded row-parallel in the data plane
+    with no Python in the loop — the same shape the image path has. There, an undecodable
+    clip is *null*, which is what `error_column` exists to reconstruct on the fallback.
 
-    **A clip is decoded in Python, one clip at a time.** That is a loop in the control
-    plane, and it is unavoidable rather than fixed: PyAV exposes no batch API, and each
-    row is an independent container with its own codec state, so there is nothing to
-    vectorize across. What is avoidable is doing it serially — `decode_concurrency` clips
-    decode at once and PyAV releases the GIL inside the codec, so the work genuinely
-    overlaps. The cost is memory: peak residency is `decode_concurrency` clips rather
-    than one, so lower it to ``1`` for GB-sized clips.
+    Otherwise the engine has no video codec to reach and a clip is decoded in Python via
+    PyAV (``batcher-engine[video]``), one clip at a time. What is avoidable there is doing
+    it serially — `decode_concurrency` clips decode at once and PyAV releases the GIL
+    inside the codec, so the work genuinely overlaps. The cost is memory: peak residency is
+    `decode_concurrency` clips rather than one, so lower it to ``1`` for GB-sized clips.
 
-    `seek` changes how frames are found. By default every frame is decoded in order and
-    the wanted ones kept, which is exact but linear in clip length — sampling 8 frames
-    out of a 100k-frame video decodes ~100k to keep 8. With ``seek=True`` the decoder
-    jumps to the keyframe before each target timestamp, far faster for sparse sampling
-    but landing on *approximately* the requested frames. Use it when the sample is a
-    summary of the clip, not when exact frame indices matter.
+    **Both paths give the same answer**, which is the point of choosing between them: an
+    undecodable clip is *null* either way, never all-zero frames. Zeros would be
+    indistinguishable from a legitimately black clip, so they put blank samples into a
+    training set with nothing to detect them by. Set `error_column` to append a boolean
+    column that is ``True`` exactly for the rows whose bytes were present but would not
+    decode, which separates a decode failure from an input that was null to begin with.
+
+    `seek` and `decode_concurrency` apply to the Python fallback only; the native kernel
+    always samples exact frame indices and parallelizes across rows on its own. By default
+    the fallback decodes every frame in order and keeps the wanted ones, which is exact but
+    linear in clip length — sampling 8 frames out of a 100k-frame video decodes ~100k to
+    keep 8. With ``seek=True`` it jumps to the keyframe before each target timestamp, far
+    faster for sparse sampling but landing on *approximately* the requested frames.
     """
     from batcher.io.formats.ml.tensor import as_tensor_column
 
@@ -68,6 +80,17 @@ def video_dataset(
     height, width = _require_size(size, "read.video(decode=True)")
     shape = (num_frames, height, width, 3)
     per_row = num_frames * height * width * 3
+
+    if "video" in engine_features():
+        return _native_frames(
+            ds,
+            num_frames=num_frames,
+            width=width,
+            height=height,
+            source_column=source_column,
+            output_column=output_column,
+            error_column=error_column,
+        )
 
     def _one(data: bytes | None) -> Any:
         if data is None:
@@ -84,15 +107,24 @@ def video_dataset(
         # a null-input row is not a failure. The validity bits are cheap (no bytes copied).
         valid = src.is_valid().to_numpy(zero_copy_only=False) if error_column else None
         failed = np.zeros(batch.num_rows, dtype=bool) if error_column else None
+        # A row that produced no frames is *null*, not zeros. Zeros are indistinguishable
+        # from a legitimately black clip, so they put blank samples into a training set
+        # with nothing to detect them by — and they would make this path disagree with the
+        # native kernel, which nulls, about what the same call means.
+        missing = np.zeros(batch.num_rows, dtype=bool)
         # Materialize clip bytes lazily per row rather than via `.to_pylist()`, so at most
         # `decode_concurrency` clips are resident instead of the whole batch.
         clips = (s.as_py() if s.is_valid else None for s in src)
         for i, frames in enumerate(_bounded_map(_one, clips, max(decode_concurrency, 1))):
             if frames is not None:
                 flat[i] = frames.reshape(-1)
-            elif error_column and valid[i]:
-                failed[i] = True
-        storage = pa.FixedSizeListArray.from_arrays(pa.array(flat.reshape(-1)), per_row)
+            else:
+                missing[i] = True
+                if error_column and valid[i]:
+                    failed[i] = True
+        storage = pa.FixedSizeListArray.from_arrays(
+            pa.array(flat.reshape(-1)), per_row, mask=pa.array(missing)
+        )
         out = batch.append_column(output_column, as_tensor_column(storage, shape))
         if error_column:
             out = out.append_column(error_column, pa.array(failed))
@@ -100,6 +132,36 @@ def video_dataset(
 
     appended = [output_column, *([error_column] if error_column else [])]
     return ds.map_batches(_decode, output_columns=[*list(ds.columns), *appended])
+
+
+def _native_frames(
+    ds: Dataset,
+    *,
+    num_frames: int,
+    width: int,
+    height: int,
+    source_column: str,
+    output_column: str,
+    error_column: str | None,
+) -> Dataset:
+    """Lower the stage onto the engine's `.video.frames` kernel.
+
+    Staying a pure `with_columns` — no `map_batches` — is what keeps the decode on the
+    fully-parallel native path rather than the opaque-UDF one, the same distinction that
+    made image ingest fast. It is also why `error_column` is derived from the *result*
+    here rather than recorded during a loop: a row failed exactly when its bytes were
+    present and its frames came back null, which is a two-column predicate the engine can
+    evaluate itself.
+    """
+    from batcher.plan.expr_ir import col
+
+    frames = col(source_column).video.frames(num_frames, width, height)
+    out = ds.with_columns(**{output_column: frames})
+    if error_column:
+        out = out.with_columns(
+            **{error_column: col(source_column).is_not_null() & col(output_column).is_null()}
+        )
+    return out
 
 
 def _decode_video_bytes(

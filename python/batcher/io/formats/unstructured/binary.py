@@ -8,13 +8,13 @@ downstream Rust expression, never done at read time.
 
 from __future__ import annotations
 
-import mimetypes
 from collections.abc import Iterator
 
 import pyarrow as pa
 
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SOURCES
+from batcher.io.formats.mime import sniff_mime
 from batcher.io.formats.multimodal._batching import (
     pack_by_count_and_bytes,
     probe_sizes,
@@ -110,7 +110,12 @@ class BinarySource:
             uris.append(f)
             blobs.append(data)
             sizes.append(len(data))
-            mimes.append(mimetypes.guess_type(f)[0] or "application/octet-stream")
+            # Sniff the payload rather than trusting the name. This source exists for
+            # exactly the corpora where the name is least reliable — object keys with no
+            # extension, content-addressed blobs, WARC extractions — and the bytes are
+            # already in hand, so reading them costs nothing. The extension remains the
+            # fallback inside `sniff_mime` for anything the magic table cannot place.
+            mimes.append(sniff_mime(f, data))
         return pa.RecordBatch.from_arrays(
             [
                 pa.array(uris, pa.string()),

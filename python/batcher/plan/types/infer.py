@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher.plan.types.lattice import promote, widen
-from batcher.plan.types.media import imagefunc_type
+from batcher.plan.types.media import imagefunc_type, videofunc_type
 from batcher.plan.types.registry import DTYPE_REGISTRY
 
 if TYPE_CHECKING:
@@ -186,6 +186,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         NullIf,
         Sequence,
     )
+    from batcher.plan.expr_ir.video import VideoFunc
 
     if isinstance(expr, Col):
         return schema.field(expr.name).type if schema.has(expr.name) else None
@@ -218,6 +219,8 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return _fold_promote([*branch_thens, infer_type(expr.otherwise, schema)])
     if isinstance(expr, ImageFunc):
         return imagefunc_type(expr)
+    if isinstance(expr, VideoFunc):
+        return videofunc_type(expr)
     if isinstance(expr, ListSimhash):
         return pa.list_(pa.int64())  # one Int64 bit per hyperplane
     if isinstance(expr, StrFunc):

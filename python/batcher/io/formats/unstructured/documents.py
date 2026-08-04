@@ -100,12 +100,20 @@ class DocumentSource(FileSource):
         extracted text is resident at once — and a document corpus is exactly where that
         bites, since page counts are unbounded and vary by orders of magnitude.
 
+        **Extraction is skipped entirely when `text` is not projected.** Laying out a page
+        into reading order is essentially the whole cost of this reader — measured at ~90%
+        of a 300-page document's read time — and it was being paid unconditionally, so
+        `select("path", "page")` cost the same as reading the prose and a bare `count()`
+        cost it too. The other two columns come from enumerating `reader.pages`, which
+        only walks the page tree.
+
         A page that will not extract is a *page*-level failure, not a document-level one:
         under ``on_error="skip"`` its text is null (distinguishable from a genuinely empty
         page) and the document is recorded in `corrupt_files()`, rather than one bad page
         in a 900-page report costing the other 899.
         """
         pypdf = _require_pypdf()
+        wants_text = projection is None or "text" in projection
         with self._fs.open(path) as fh:
             try:
                 reader = pypdf.PdfReader(fh)
@@ -115,11 +123,13 @@ class DocumentSource(FileSource):
             pages: list[int] = []
             texts: list[str | None] = []
             for number, page in enumerate(reader.pages):
-                try:
-                    text: str | None = page.extract_text() or ""
-                except Exception as exc:
-                    self._errors.tolerate(path, exc, format_name=self.format_name)
-                    text = None
+                text: str | None = None
+                if wants_text:
+                    try:
+                        text = page.extract_text() or ""
+                    except Exception as exc:
+                        self._errors.tolerate(path, exc, format_name=self.format_name)
+                        text = None
                 paths.append(path)
                 pages.append(number)
                 texts.append(text)

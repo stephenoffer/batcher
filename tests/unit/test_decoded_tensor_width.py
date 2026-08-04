@@ -142,6 +142,47 @@ def test_the_width_reaches_the_morsel_cap(frame):
     assert rows * 224 * 224 * 3 <= budget
 
 
+def test_a_sampled_clip_is_priced_and_capped_like_the_tensor_it_is(frame):
+    """The same blind spot as the image ops, on the widest column the engine produces.
+
+    `frames(8, 224, 224)` is 1,204,224 bytes per row — eight decoded images stacked, and
+    about nineteen thousand times the 64-byte varlen prior a `None` type falls back to. At
+    the default 16,384-row morsel that is a **19.7 GB** batch sized as though it were a
+    megabyte, which is not an optimistic estimate so much as no estimate at all.
+
+    A single row here is already wider than the whole byte budget, so the cap bottoms out
+    at one row rather than satisfying the budget — that is `row_floor`'s stated behavior
+    and the correct answer for a frame stack larger than a morsel. What matters is that
+    the width is *seen*: one row against the sixteen thousand a missing type would leave.
+    """
+    from batcher.plan.types import schema_row_bytes
+    from batcher.plan.types.media import videofunc_type
+
+    clip = col("b").video.frames(8, 224, 224)
+    assert videofunc_type(clip) == pa.fixed_shape_tensor(pa.uint8(), (8, 224, 224, 3))
+
+    plan = frame.with_columns(f=clip).select("f")._plan
+    schema = plan.available_schema()
+    assert schema_row_bytes(schema.arrow) == 8 * 224 * 224 * 3
+
+    config = active_config()
+    target = morsel_target(config, PressureLevel.NORMAL, plan=plan)
+    assert target is not None, "the widest column the engine holds must bind the morsel"
+    rows, _budget = target
+    assert rows == 1
+    assert rows < config.execution.morsel_rows / 1000
+
+
+def test_a_still_from_a_clip_is_binary_not_a_tensor(frame):
+    """`thumbnail`/`frame_at` hand back an encoded still, so they must not be priced as
+    pixels — over-sizing a compressed column shrinks a morsel for no reason."""
+    from batcher.plan.types.media import videofunc_type
+
+    assert videofunc_type(col("b").video.thumbnail(320)) == pa.binary()
+    assert videofunc_type(col("b").video.frame_at(1.5, 320)) == pa.binary()
+    assert videofunc_type(col("b").video.decode()) is None
+
+
 def test_a_narrow_plan_is_unchanged(frame):
     """The safety property: nothing about a plan with no media column may move."""
     assert morsel_target(active_config(), PressureLevel.NORMAL, plan=frame.select("id")._plan) is (

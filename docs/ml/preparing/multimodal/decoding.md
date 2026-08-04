@@ -4,7 +4,7 @@ Getting the bytes, and turning them into tensors.
 
 ## Fetch remote bytes
 
-`ds.ml.download(url_column)` fetches the bytes at each URL or path into a binary
+{py:meth}`ds.ml.download(url_column) <batcher.api.dataset.ml.DatasetML.download>` fetches the bytes at each URL or path into a binary
 column, reading `s3://` / `gs://` / `az://` / `http(s)://` / local paths through the
 shared filesystem resolver. Each batch's rows are fetched concurrently, and the stage
 parallelizes across workers the way any operator does. `on_error="null"` turns a failed
@@ -18,7 +18,7 @@ ds = bt.read.parquet("s3://bucket/catalog.parquet")  # has a "url" column
 with_bytes = ds.ml.download("url", output_column="bytes", max_concurrency=32)
 ```
 
-`ds.ml.upload(data_column, directory)` is the counterpart. It writes a bytes column such
+{py:meth}`ds.ml.upload(data_column, directory) <batcher.api.dataset.ml.DatasetML.upload>` is the counterpart. It writes a bytes column such
 as decoded thumbnails or re-encoded media back to object storage, and appends the written
 paths. Names come from a `name_column` or a content hash, and writes are concurrent and
 atomic.
@@ -48,9 +48,13 @@ video = bt.read.video("data/videos/", decode=True, size=(112, 112), num_frames=8
 Image and audio decode run natively in the engine. Audio goes through the pure-Rust
 `symphonia` decoder, and an explicit `sample_rate` resamples natively too, with a sinc
 resampler in the data plane. Only multi-channel output falls back to Python. Always
-pass a `size`, or a batch of full-resolution frames can exhaust memory. Video decode uses
-`PyAV` behind the `batcher-engine[video]` extra, one clip at a time, so a batch of large
-clips never all co-resides. Keep `batch_size` small for multi-GB clips.
+pass a `size`, or a batch of full-resolution frames can exhaust memory.
+
+Video decodes natively too, on an engine built with the `video` cargo feature, which links
+the system FFmpeg. A build without it has no video codec to reach, so the same call falls
+back to `PyAV` behind the `batcher-engine[video]` extra, one clip at a time. Both give the
+same answer. {doc}`/ml/preparing/multimodal/video` covers which one you are running and
+what changes. Keep `batch_size` small for multi-GB clips either way.
 
 Decode is fast because it runs in the data plane, not a Python loop. Image decode uses
 SIMD JPEG, including a DCT-scaled path for large frames feeding small model inputs, and
@@ -61,7 +65,7 @@ tensor column with no per-batch re-type step. On a 96-core node that decodes and
 {doc}`Multimodal ingest benchmarks </benchmarks/results/multimodal-ingest>` and the reproducible
 head-to-heads under `benchmarks/scenarios/`.
 
-You can also decode inside a pipeline with the `.image` expression after a download:
+You can also decode inside a pipeline with the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>` expression after a download:
 
 ```python
 # docs: skip
@@ -75,7 +79,7 @@ tensors = (
 )
 ```
 
-The `.image.to_tensor(width, height)` expression decodes and resizes natively in the
+The {py:meth}`.image.to_tensor(width, height) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` expression decodes and resizes natively in the
 engine, with no per-row Python and no model needed, so it runs here on a handful of
 in-memory PNG bytes:
 
@@ -106,10 +110,10 @@ tensor column so the shape travels with the data, as the tensor-column section b
 describes. The bare expression leaves it flat for when you reshape it yourself in a
 downstream `map_batches`.
 
-`.image.resize(width, height)` is the other half of the pair. It decodes, resizes, then
+{py:meth}`.image.resize(width, height) <batcher.plan.expr_ir.image._ImageNamespace.resize>` is the other half of the pair. It decodes, resizes, then
 **re-encodes to PNG bytes**, so the column stays a compact `binary` blob instead of
 becoming a tensor. Reach for `resize` when you want to shrink payloads before a
-shuffle, a spill, or a write. Use `to_tensor` when the next stage is a model.
+shuffle, a spill, or a write. Use {py:meth}`to_tensor <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` when the next stage is a model.
 
 ```python
 resized = ds.with_columns(small=col("bytes").image.resize(4, 4)).collect()
@@ -118,9 +122,9 @@ print(resized.schema.field("small").type, thumbnail[:4] == b"\x89PNG")
 # binary True
 ```
 
-Two more expressions stay in the bytes-to-bytes lane. `.image.crop(x, y, width, height)`
+Two more expressions stay in the bytes-to-bytes lane. {py:meth}`.image.crop(x, y, width, height) <batcher.plan.expr_ir.image._ImageNamespace.crop>`
 cuts a named window out of each image, which is what a detection pipeline does with a
-bounding box. `.image.encode(format)` rewrites the container without touching the pixels,
+bounding box. {py:meth}`.image.encode(format) <batcher.plan.expr_ir.image._ImageNamespace.encode>` rewrites the container without touching the pixels,
 for normalizing a mixed-format corpus onto one codec or trading a PNG for a smaller JPEG.
 
 ```python
@@ -132,7 +136,7 @@ print(cut.select(d=col("region").image.decode()).to_pydict())
 # {'d': [{'width': 4, 'height': 4, 'channels': 4, 'mode': 'RGBA'}]}
 ```
 
-`.image.convert(mode)` completes the set: it changes only the channels, which is what
+{py:meth}`.image.convert(mode) <batcher.plan.expr_ir.image._ImageNamespace.convert>` completes the set: it changes only the channels, which is what
 normalizing a corpus that mixes RGB and RGBA needs before a model that wants one of them.
 The mode names are the ones `decode` reports, so a mode read off one goes straight into
 the other, and grayscale uses the same Rec. 601 luma as `to_grayscale` and `dhash`.
@@ -142,11 +146,11 @@ that needs a fixed input size; a cropped image is something a person or another 
 look at, and inventing black pixels there would be inventing data. A window starting past
 the image entirely yields null.
 
-The audio counterpart is `.audio.to_waveform()`, which decodes an encoded clip and
+The audio counterpart is {py:meth}`.audio.to_waveform() <batcher.plan.expr_ir.audio._AudioNamespace.to_waveform>`, which decodes an encoded clip and
 averages its channels down to a single mono PCM signal. That is a `list<float>` per row,
 the shape most audio models take as input. To feed a model that expects a fixed rate,
-such as the 16 kHz Whisper and wav2vec want, `.audio.resample(16000)` decodes and
-band-limit-resamples in the same native pass. `.video.decode()` is the video equivalent.
+such as the 16 kHz Whisper and wav2vec want, {py:meth}`.audio.resample(16000) <batcher.plan.expr_ir.audio._AudioNamespace.resample>` decodes and
+band-limit-resamples in the same native pass. {py:meth}`.video.decode() <batcher.plan.expr_ir.video._VideoNamespace.decode>` is the video equivalent.
 
 ```python
 import math
@@ -173,7 +177,7 @@ print(decoded_audio.schema.field("mono").type, len(decoded_audio.column("mono")[
 
 A column where every row is a same-shape `N`-dimensional tensor is stored as Arrow's
 canonical fixed-shape-tensor type, so the shape travels with the data across the
-engine boundary and converts to a correctly-shaped training tensor. `from_numpy` and
+engine boundary and converts to a correctly-shaped training tensor. {py:func}`from_numpy <batcher.from_numpy>` and
 the NumPy reader build them for rows of rank 2 or higher:
 
 ```python
@@ -195,7 +199,7 @@ or `"torch"`, the per-row tensors arrive **stacked** into one leading-batch arra
 wants. No manual stacking or reshaping in the UDF.
 
 A nested list column holds several small vectors per row, such as per-frame features or a
-ragged batch of patches. `.list.flatten()` collapses it into one flat list per row,
+ragged batch of patches. {py:meth}`.list.flatten() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.flatten>` collapses it into one flat list per row,
 removing a single level of nesting and keeping element order. Use it before a
 downstream stage that wants one contiguous vector rather than a list of lists:
 

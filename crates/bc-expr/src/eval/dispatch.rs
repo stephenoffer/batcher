@@ -182,6 +182,7 @@ impl Expr {
                 x,
                 y,
                 format,
+                fill,
             } => {
                 let arr = input.eval(batch)?;
                 eval_image(
@@ -196,6 +197,7 @@ impl Expr {
                         x: *x,
                         y: *y,
                         format: format.as_deref(),
+                        fill: *fill,
                     },
                 )
             }
@@ -221,9 +223,25 @@ impl Expr {
                     *threshold_db,
                 )
             }
-            Expr::Video { func, input } => {
+            Expr::Video {
+                func,
+                input,
+                num_frames,
+                width,
+                height,
+                second,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_video(*func, &arr)
+                eval_video(
+                    *func,
+                    &arr,
+                    crate::eval::media::VideoArgs {
+                        num_frames: *num_frames,
+                        width: *width,
+                        height: *height,
+                        second: *second,
+                    },
+                )
             }
             Expr::Coalesce { inputs } => eval_coalesce(inputs, batch),
             Expr::InList { input, set } => {

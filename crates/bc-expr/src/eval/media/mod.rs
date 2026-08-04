@@ -16,7 +16,7 @@ mod speech;
 
 pub(crate) use audio::eval_audio;
 pub(crate) use image::eval_image;
-pub(crate) use video::eval_video;
+pub(crate) use video::{eval_video, VideoArgs};
 
 /// Below this row count, decode serially: a handful of clips isn't worth rayon's
 /// fan-out/join overhead, and it keeps the sub-second small-batch path allocation-free.

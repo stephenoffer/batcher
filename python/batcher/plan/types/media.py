@@ -18,8 +18,9 @@ import pyarrow as pa
 
 if TYPE_CHECKING:
     from batcher.plan.expr_ir.image import ImageFunc
+    from batcher.plan.expr_ir.video import VideoFunc
 
-__all__ = ["imagefunc_type"]
+__all__ = ["imagefunc_type", "videofunc_type"]
 
 
 # The image ops whose output is a decoded pixel tensor, and how many channels each
@@ -27,13 +28,16 @@ __all__ = ["imagefunc_type"]
 # width of a decoded image column is knowable before a single byte is read.
 _IMAGE_TENSOR_CHANNELS = {
     "to_tensor": 3,
+    "letterbox": 3,
     "to_tensor_f32": 3,
     "center_crop": 3,
     "to_grayscale": 1,
 }
 
 # The image ops that hand back a still-encoded image, so the payload stays compressed.
-_IMAGE_BINARY_FNS = frozenset({"resize", "crop", "encode", "convert"})
+_IMAGE_BINARY_FNS = frozenset(
+    {"resize", "crop", "encode", "convert", "auto_orient", "thumbnail"}
+)
 
 
 def imagefunc_type(expr: ImageFunc) -> pa.DataType | None:
@@ -56,8 +60,9 @@ def imagefunc_type(expr: ImageFunc) -> pa.DataType | None:
     Nothing here is inferred from a name. Each mapping was read off the engine's actual
     output: `to_tensor(w, h)` yields `fixed_shape_tensor(uint8, [h, w, 3])`, `to_tensor_f32`
     the `float32` form (`[3, h, w]` under `channels_first`), `to_grayscale` a single luma
-    channel, `center_crop` the cropped RGB region, `dhash` an `int64` digest, and
-    `resize`/`crop`/`encode`/`convert` a still-encoded `binary`. `decode` returns a struct of
+    channel, `center_crop` the cropped RGB region, `dhash` an `int64` digest,
+    `exif_orientation` an `int32` code, and `resize`/`crop`/`encode`/`convert`/`auto_orient`
+    a still-encoded `binary`. `decode` returns a struct of
     header facts and is deliberately left `None`: its exact field nullability is not worth
     asserting for a column that is a handful of bytes either way.
 
@@ -69,6 +74,8 @@ def imagefunc_type(expr: ImageFunc) -> pa.DataType | None:
     """
     if expr.fn == "dhash":
         return pa.int64()
+    if expr.fn == "exif_orientation":
+        return pa.int32()
     if expr.fn in _IMAGE_BINARY_FNS:
         return pa.binary()
     channels = _IMAGE_TENSOR_CHANNELS.get(expr.fn)
@@ -81,3 +88,38 @@ def imagefunc_type(expr: ImageFunc) -> pa.DataType | None:
         else (expr.height, expr.width, channels)
     )
     return pa.fixed_shape_tensor(value, shape)
+
+
+# The video ops that hand back a still-encoded still, so the payload stays compressed.
+_VIDEO_BINARY_FNS = frozenset({"thumbnail", "frame_at"})
+
+
+def videofunc_type(expr: VideoFunc) -> pa.DataType | None:
+    """The Arrow type a `.video.*` expression produces, or `None` when not certain.
+
+    The same sizing question :func:`imagefunc_type` answers, for the columns where getting
+    it wrong costs the most. A sampled clip is the widest thing the engine ever holds: a
+    modest ``frames(8, 224, 224)`` is **1,204,224 bytes per row**, eight times a decoded
+    image and roughly nineteen thousand times the 64-byte fallback prior. A memory envelope
+    built on that prior is not merely optimistic, it is off by four orders of magnitude in
+    the direction that makes a build side look broadcastable and a morsel look cheap.
+
+    As with the image ops, nothing here is inferred from a name: `frames` yields
+    ``fixed_shape_tensor(uint8, [num_frames, height, width, 3])`` and
+    `thumbnail`/`frame_at` still-encoded PNG ``binary``. `decode` returns a struct of
+    header facts and is left `None`, for the same reason it is there — a handful of bytes
+    either way.
+
+    Args:
+        expr: The `VideoFunc` node to type.
+
+    Returns:
+        The output Arrow type, or `None` when it is not statically known.
+    """
+    if expr.fn in _VIDEO_BINARY_FNS:
+        return pa.binary()
+    if expr.fn != "frames":
+        return None
+    if expr.num_frames is None or expr.width is None or expr.height is None:
+        return None
+    return pa.fixed_shape_tensor(pa.uint8(), (expr.num_frames, expr.height, expr.width, 3))

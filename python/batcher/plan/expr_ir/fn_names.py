@@ -35,13 +35,16 @@ from typing import Final
 from batcher.plan.ir_tags import WINDOW_AGGREGATES, WINDOW_FUNCS, WINDOW_RANKING, WINDOW_VALUE
 
 __all__ = [
+    "AUDIO_FNS",
     "DATE_FNS",
     "GEO_FNS",
+    "IMAGE_FNS",
     "KEYED_STR_FNS",
     "LIST_FNS",
     "MAKE_TEMPORAL_FNS",
     "MATH_FNS",
     "STR_FNS",
+    "VIDEO_FNS",
     "WINDOW_AGGREGATES",
     "WINDOW_FUNCS",
     "WINDOW_RANKING",
@@ -231,3 +234,32 @@ MATH_FNS: Final[frozenset[str]] = frozenset(
         "csc", "even", "gamma", "lgamma", "rint", "sec",
     }
 )  # fmt: skip
+
+# --- Multimodal decode families ------------------------------------------------------
+#
+# These three were the vocabularies with no named home, and the omission had a cost:
+# `IRNode.vocab` validates a node's `fn` at construction, so a family without a set here
+# is a family where a typo becomes an opaque engine error at execution rather than a
+# `PlanError` at plan build — and, because `tools/lint_ir_contract.py` derives its checks
+# from these same sets, a family the engine and the control plane could drift apart on
+# with nothing to notice.
+
+IMAGE_FNS: Final[frozenset[str]] = frozenset(
+    {
+        "decode", "to_tensor", "to_tensor_f32", "to_grayscale", "center_crop",
+        "resize", "crop", "encode", "convert", "dhash", "brightness", "sharpness",
+        "auto_orient", "exif_orientation", "thumbnail", "letterbox",
+    }
+)  # fmt: skip
+"""The `.image` vocabulary, mirroring `bc_expr::ImageFunc`'s serde tags exactly."""
+
+AUDIO_FNS: Final[frozenset[str]] = frozenset(
+    {
+        "decode", "to_waveform", "resample", "trim_silence", "peak_normalize",
+        "zero_crossing_rate", "mel_spectrogram", "mfcc",
+    }
+)  # fmt: skip
+"""The `.audio` vocabulary, mirroring `bc_expr::AudioFunc`'s serde tags exactly."""
+
+VIDEO_FNS: Final[frozenset[str]] = frozenset({"decode", "frames", "thumbnail", "frame_at"})
+"""The `.video` vocabulary, mirroring `bc_expr::VideoFunc`'s serde tags exactly."""

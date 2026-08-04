@@ -1,21 +1,25 @@
-"""Decode media columns into tensors — native image decode, Python audio/video.
+"""Decode media columns into tensors — natively wherever the engine has the codec.
 
 Multimodal sources read references + header metadata only (no pixels/samples at read
 time). These helpers turn the raw ``bytes`` column into model-ready tensors at the
 point a pipeline asks for it:
 
-* **images** decode in the **Rust data plane** — the existing ``col.image.to_tensor``
-  kernel resizes and flattens to RGB8 in the engine; here we only re-type the result
-  (zero-copy) into a fixed-shape ``(H, W, 3)`` tensor column.
-* **audio / video** decode in **Python UDFs** (soundfile / PyAV behind optional
-  extras), because their codecs live in those libraries.
+* **images** decode in the **Rust data plane** — the ``col.image.to_tensor`` kernel
+  resizes and flattens to RGB8 in the engine, which tags the result as a fixed-shape
+  ``(H, W, 3)`` tensor column so it crosses the FFI already shaped.
+* **video** decodes in the data plane too (``col.video.frames``) on an engine built with
+  the ``video`` cargo feature, which links the system FFmpeg. A build without it has no
+  video codec to reach, so the stage falls back to a per-row PyAV loop.
+* **audio** decodes natively for every mono case (``col.audio.to_waveform`` /
+  ``.resample``); only multi-channel output falls back to `soundfile`.
 
 Pixels stay ``uint8`` and samples ``float32`` all the way through: the float32 a model
 wants is four times the bytes, and that conversion belongs at the GPU, not here.
 
-Each returns a new lazy `Dataset`, so decode composes with the rest of a pipeline.
-A row whose bytes are null or fail to decode yields a null (image) or zero (video)
-result rather than failing the batch — the multimodal convention.
+Each returns a new lazy `Dataset`, so decode composes with the rest of a pipeline. A row
+whose bytes are null or fail to decode yields **null** rather than failing the batch — the
+multimodal convention, and the same answer whichever decoder ran. Zeros would be
+indistinguishable from a legitimately black or silent input.
 
 `transfer` moves bytes in and out (download/upload), `media` decodes images and audio,
 `video` samples frames from clips, and `stage` holds the scaffolding all three share.

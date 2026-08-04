@@ -63,19 +63,30 @@ def test_video_decode_metadata_or_graceful_error(tmp_path):
     assert out[1] is None  # null bytes → null struct
 
 
-def test_video_dataset_decodes_per_row_without_whole_batch_materialization():
-    # The Python `video_dataset` path decodes one clip at a time (no `.to_pylist()`).
-    # Null rows skip the PyAV decode and become all-zero frames, so this exercises the
-    # per-row iteration + fixed-shape tensor output without needing PyAV installed.
-    import numpy as np
-
+def test_video_dataset_decodes_per_row_without_whole_batch_materialization(monkeypatch):
+    # The Python `video_dataset` fallback decodes one clip at a time (no `.to_pylist()`).
+    # Null rows skip the PyAV decode entirely, so this exercises the per-row iteration and
+    # the fixed-shape tensor output without needing PyAV installed. The fallback is pinned
+    # because the decoder is chosen from the engine's compiled features, and a
+    # `video`-enabled build would otherwise take the native kernel instead.
+    import batcher.ml.decode.video as video_mod
     from batcher.ml.decode import video_dataset
 
+    monkeypatch.setattr(video_mod, "engine_features", frozenset)
     ds = bt.from_pydict({"bytes": [None, None]})
     out = video_dataset(ds, size=(8, 8), num_frames=2).collect()
-    frames = out.column("frames")
     assert out.num_rows == 2
-    # Fixed-shape tensor: each row is (num_frames, H, W, 3) = (2, 8, 8, 3) of zeros.
-    arr = np.asarray(frames.to_pylist())
-    assert arr.shape == (2, 2 * 8 * 8 * 3)
-    assert not arr.any()  # undecodable/null clips → all-zero frames
+    # A clip that produced no frames is null, never zeros — zeros are indistinguishable
+    # from a legitimately black clip, and the native kernel nulls too.
+    assert out.column("frames").to_pylist() == [None, None]
+
+
+def test_the_engine_reports_whether_it_can_decode_video():
+    # `video_dataset` picks its decoder from this, so it has to be answerable without
+    # running a query and without guessing from the Python environment: PyAV being
+    # installed says nothing about whether the *engine* links FFmpeg.
+    from batcher._internal.native import engine_features
+
+    features = engine_features()
+    assert isinstance(features, frozenset)
+    assert all(isinstance(name, str) for name in features)

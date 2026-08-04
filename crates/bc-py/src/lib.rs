@@ -650,6 +650,21 @@ fn read_avro(
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
+/// The optional cargo features compiled into this engine, sorted.
+///
+/// Kept as an explicit list rather than derived, because a feature only belongs here once
+/// it changes what the *control plane* may plan: `video` does (it decides whether
+/// `.video.frames` is a native kernel or a Python fallback), and a feature that only
+/// changes how something is done internally does not.
+fn engine_features() -> Vec<&'static str> {
+    let mut features: Vec<&'static str> = Vec::new();
+    if cfg!(feature = "video") {
+        features.push("video");
+    }
+    features.sort_unstable();
+    features
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
@@ -666,6 +681,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "release"
         },
     )?;
+    // The optional cargo features this engine was compiled with. Optional decoders link
+    // system C libraries, so whether one is present is a property of the *binary*, not of
+    // the Python environment — and nothing on the Python side can otherwise see it. The
+    // control plane needs it at plan-build time to choose between a native kernel and a
+    // Python fallback: guessing wrong means either a run-time failure on a path the plan
+    // promised, or a slow per-row fallback on a build that never needed one.
+    m.add("__engine_features__", engine_features())?;
     m.add_function(wrap_pyfunction!(tracing_init::init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;

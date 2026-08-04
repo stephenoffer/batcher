@@ -24,7 +24,9 @@ use crate::{ExprError, ImageFunc};
 
 mod reencode;
 
-use reencode::{convert, crop, encode, resize};
+use reencode::{
+    auto_orient, convert, crop, encode, exif_orientation, letterbox, resize, thumbnail,
+};
 
 /// Evaluate an image function over a Binary or LargeBinary array of encoded image bytes.
 ///
@@ -48,6 +50,8 @@ pub(crate) struct ImageArgs<'a> {
     pub x: Option<i64>,
     pub y: Option<i64>,
     pub format: Option<&'a str>,
+    /// `letterbox` only: the byte the leftover canvas is filled with.
+    pub fill: Option<i64>,
 }
 
 pub(crate) fn eval_image(
@@ -154,6 +158,10 @@ fn eval_image_sized<O: OffsetSizeTrait>(
         ImageFunc::Dhash => dhash(bytes),
         ImageFunc::Brightness => quality::brightness(bytes),
         ImageFunc::Sharpness => quality::sharpness(bytes),
+        ImageFunc::AutoOrient => auto_orient(bytes),
+        ImageFunc::ExifOrientation => exif_orientation(bytes),
+        ImageFunc::Thumbnail => thumbnail(bytes, width),
+        ImageFunc::Letterbox => letterbox(bytes, args),
     }
 }
 
@@ -164,7 +172,7 @@ fn eval_image_sized<O: OffsetSizeTrait>(
 /// `u32::MAX` wraps to a small one (a silently wrong output size). Both are rejected with a
 /// clear error instead — the dimension is a query parameter, so a bad one is a caller bug to
 /// surface, not a crash to suffer or a wrong answer to return.
-fn dim(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprError> {
+pub(super) fn dim(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprError> {
     let value = value.ok_or(ExprError::MissingImageArg {
         func: func.to_string(),
         arg,
@@ -190,7 +198,7 @@ fn dim(func: &str, arg: &'static str, value: Option<i64>) -> Result<u32, ExprErr
 /// `per_row` computed in `u64` so the multiply cannot itself overflow, is the guard all of
 /// them need — so it lives once. `unit` names what a row counts (``"bytes"`` / ``"floats"``
 /// / ``"pixels"``) for the error message.
-fn element_len_guard(func: &str, per_row: u64, unit: &str) -> Result<usize, ExprError> {
+pub(super) fn element_len_guard(func: &str, per_row: u64, unit: &str) -> Result<usize, ExprError> {
     if per_row > i32::MAX as u64 {
         return Err(ExprError::InvalidArgument {
             func: func.to_string(),
@@ -209,7 +217,7 @@ fn element_len_guard(func: &str, per_row: u64, unit: &str) -> Result<usize, Expr
 /// into one contiguous child buffer (an undecodable row — `None` — leaves its slot zeroed
 /// and is marked null), then the `FixedSizeListArray`. Serial on purpose: it is a memcpy,
 /// cheap next to the parallel decode that produced `rows`.
-fn assemble_u8_tensor(n: usize, per_row: usize, rows: Vec<Option<Vec<u8>>>) -> ArrayRef {
+pub(super) fn assemble_u8_tensor(n: usize, per_row: usize, rows: Vec<Option<Vec<u8>>>) -> ArrayRef {
     let mut values: Vec<u8> = vec![0u8; n * per_row];
     let mut valid: Vec<bool> = Vec::with_capacity(n);
     for (i, row) in rows.into_iter().enumerate() {
@@ -651,6 +659,7 @@ mod tests {
             x: None,
             y: None,
             format: None,
+            fill: None,
         }
     }
 
@@ -1112,6 +1121,45 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// A format that cannot carry orientation reports "upright" rather than an error or a
+    /// null. `1` is what the Exif code *means* — not "absent", but "no transform needed" —
+    /// and null would push every caller into a coalesce for no information.
+    ///
+    /// The eight transforms themselves are proved against `PIL.ImageOps.exif_transpose` in
+    /// `tests/integration/test_image_orientation.py`. They need a JPEG carrying a real Exif
+    /// chunk, and the `image` crate reads Exif but does not write it, so the reference
+    /// implementation has to supply the fixture.
+    #[test]
+    fn an_image_without_exif_reports_upright() {
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(red_png(4, 6).as_slice()),
+            None,
+            Some(b"not an image".as_slice()),
+        ]));
+        let out = ei(ImageFunc::ExifOrientation, &arr, None, None).unwrap();
+        let codes = out.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(codes.value(0), 1);
+        assert!(codes.is_null(1) && codes.is_null(2));
+    }
+
+    /// Orienting an image that needs no orienting must not change it, since a corpus is
+    /// oriented wholesale and most of it is already upright.
+    #[test]
+    fn auto_orient_leaves_an_upright_image_alone() {
+        let src = red_png(4, 6);
+        let arr: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(src.as_slice()),
+            None,
+            Some(b"not an image".as_slice()),
+        ]));
+        let out = ei(ImageFunc::AutoOrient, &arr, None, None).unwrap();
+        let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let got = image::load_from_memory(b.value(0)).unwrap();
+        assert_eq!((got.width(), got.height()), (4, 6));
+        assert_eq!(got.into_rgb8().get_pixel(0, 0).0, [255, 0, 0]);
+        assert!(b.is_null(1) && b.is_null(2));
     }
 
     #[test]

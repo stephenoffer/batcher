@@ -1694,7 +1694,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `kinesis.py` | 408 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 181 | Google Cloud Pub/Sub broker source — subscription pull batches. |
 | `pulsar.py` | 374 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
-| `seen_store.py` | 168 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
+| `seen_store.py` | 183 | A durable "seen-file" key-value store, backed by stdlib ``sqlite3``. |
 | `sinks.py` | 557 | Streaming sinks — per-micro-batch writers for the streaming-query engine. |
 
 ### `batcher/io/formats/streaming/broker/` — 2 · neutral IO

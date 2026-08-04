@@ -110,6 +110,210 @@ pub(super) fn encode<O: OffsetSizeTrait>(
     Ok(assemble_binary(rows))
 }
 
+/// `thumbnail(max_size)` → the image scaled so its **longest side** is `max_size`, as PNG.
+///
+/// The difference from `resize` is the whole point: `resize` takes both dimensions and
+/// therefore stretches anything that is not already the target aspect ratio. A corpus of
+/// mixed-orientation photographs run through `resize(256, 256)` comes out squashed, which
+/// is invisible in a shape assertion and obvious to anyone who looks at it.
+///
+/// Never *up*scales. Enlarging a thumbnail to reach `max_size` invents detail and costs
+/// bytes, and `Image.thumbnail` in Pillow — the operation this is named for — has always
+/// behaved this way, so a corpus already normalized against it stays byte-comparable.
+pub(super) fn thumbnail<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    max_size: Option<i64>,
+) -> Result<ArrayRef, ExprError> {
+    let max = dim("thumbnail", "max_size", max_size)?;
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let img = image::load_from_memory(bytes.value(i)).ok()?;
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (tw, th) = fit_within(w, h, max, max);
+        // Already inside the box: re-encode without resampling rather than round-tripping
+        // the pixels through a filter that can only lose information.
+        let scaled = if tw == w && th == h {
+            img
+        } else {
+            image::DynamicImage::ImageRgb8(resize_rgb(&img.into_rgb8(), tw, th)?)
+        };
+        let mut buf = Vec::new();
+        scaled
+            .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+            .ok()?;
+        Some(buf)
+    });
+    Ok(assemble_binary(rows))
+}
+
+/// `letterbox(width, height, fill)` → aspect-preserving fit onto a `(width, height)`
+/// canvas, the remainder filled, flattened to RGB8.
+///
+/// The standard object-detection preprocessing, and the reason neither `to_tensor` nor
+/// `center_crop` covers it. `to_tensor` stretches, which moves every bounding box a model
+/// predicts off its object; `center_crop` discards the border, which is where the missed
+/// detections live. Letterboxing does neither: the whole image survives at its true aspect
+/// ratio, and the leftover canvas is a constant the model learns to ignore.
+///
+/// The default fill is 114, the YOLO family's grey, so a model trained against that
+/// preprocessing sees the padding it expects.
+pub(super) fn letterbox<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+    args: ImageArgs<'_>,
+) -> Result<ArrayRef, ExprError> {
+    let w = dim("letterbox", "width", args.width)?;
+    let h = dim("letterbox", "height", args.height)?;
+    let per_row = super::element_len_guard("letterbox", (w as u64) * (h as u64) * 3, "bytes")?;
+    let fill = match args.fill {
+        None => 114u8,
+        Some(v) => u8::try_from(v).map_err(|_| ExprError::InvalidArgument {
+            func: "letterbox".to_string(),
+            reason: format!("fill must be a byte value in 0..=255, got {v}"),
+        })?,
+    };
+
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let img = image::load_from_memory(bytes.value(i)).ok()?.into_rgb8();
+        let (sw, sh) = img.dimensions();
+        if sw == 0 || sh == 0 {
+            return None;
+        }
+        let (tw, th) = fit_within(sw, sh, w, h);
+        let scaled = resize_rgb(&img, tw, th)?;
+        let mut out = vec![fill; per_row];
+        // Centre the scaled image on the canvas, so the padding is split evenly between
+        // the two sides. An off-centre paste would bias every coordinate a model predicts.
+        let x0 = ((w - tw) / 2) as usize;
+        let y0 = ((h - th) / 2) as usize;
+        let src = scaled.as_raw();
+        let row_bytes = tw as usize * 3;
+        for y in 0..th as usize {
+            let s = y * row_bytes;
+            let d = ((y0 + y) * w as usize + x0) * 3;
+            out[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+        }
+        Some(out)
+    });
+    Ok(super::assemble_u8_tensor(bytes.len(), per_row, rows))
+}
+
+/// The largest `(w, h)` with the source's aspect ratio that fits inside `(max_w, max_h)`.
+///
+/// Rounded rather than truncated, and floored at one pixel: truncation drops a very wide
+/// image's short side to zero, and a zero-dimension resize is an error rather than a
+/// degenerate image, so a panorama would fail the row instead of thumbnailing.
+fn fit_within(sw: u32, sh: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if sw <= max_w && sh <= max_h {
+        return (sw, sh);
+    }
+    let scale = f64::from(max_w) / f64::from(sw);
+    let scale = scale.min(f64::from(max_h) / f64::from(sh));
+    let w = ((f64::from(sw) * scale).round() as u32).max(1);
+    let h = ((f64::from(sh) * scale).round() as u32).max(1);
+    (w.min(max_w), h.min(max_h))
+}
+
+/// SIMD bilinear resize of an RGB8 image, matching `decode_rgb_resized`'s filter.
+///
+/// Shared so a thumbnail and a `to_tensor` of the same image downscale identically —
+/// two resamplers in one namespace disagreeing is a difference a caller finds by accident.
+fn resize_rgb(img: &image::RgbImage, w: u32, h: u32) -> Option<image::RgbImage> {
+    use fast_image_resize as fir;
+
+    let (sw, sh) = img.dimensions();
+    let src = fir::images::Image::from_vec_u8(sw, sh, img.as_raw().clone(), fir::PixelType::U8x3)
+        .ok()?;
+    let mut dst = fir::images::Image::new(w, h, fir::PixelType::U8x3);
+    let opts =
+        fir::ResizeOptions::new().resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
+    fir::Resizer::new().resize(&src, &mut dst, &opts).ok()?;
+    image::RgbImage::from_raw(w, h, dst.into_vec())
+}
+
+/// `auto_orient()` → the image rotated/flipped per its Exif orientation, as PNG bytes.
+///
+/// A camera almost never rotates its sensor data. It records which way up the camera was
+/// held, in the Exif `Orientation` tag, and leaves the pixels as the sensor read them —
+/// so a portrait phone photo is stored landscape with a "rotate 90" note attached. Every
+/// viewer, phone gallery, and browser honours that note, and so does `OpenCV::imread` and
+/// anything built on `PIL.ImageOps.exif_transpose`.
+///
+/// The decoder underneath this namespace does not, and neither did anything above it. So
+/// a corpus of phone photographs decoded here came out rotated a quarter turn from what
+/// every other tool in the pipeline saw, silently: the tensor is the right shape, the
+/// pixels are real, and only a human looking at a sample would notice. This is the
+/// operation that fixes it, and it is a separate op rather than a changed default because
+/// flipping a default would rotate the output of pipelines that are already compensating.
+///
+/// The result is PNG, which carries no Exif, so the orientation cannot be applied twice.
+pub(super) fn auto_orient<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+) -> Result<ArrayRef, ExprError> {
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        oriented_png(bytes.value(i))
+    });
+    Ok(assemble_binary(rows))
+}
+
+fn oriented_png(data: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    // A format that cannot carry orientation reports `NoTransforms`, so this is a no-op
+    // re-encode for a PNG rather than a failure.
+    let orientation = image::ImageDecoder::orientation(&mut decoder).ok()?;
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    let mut buf = Vec::new();
+    img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+        .ok()?;
+    Some(buf)
+}
+
+/// `exif_orientation()` → the Exif orientation code, 1 through 8.
+///
+/// The diagnostic half of [`auto_orient`]: it says whether a corpus needs orienting at
+/// all, which is otherwise invisible. `1` (no transform) is reported for an image that
+/// carries no orientation and for a format that cannot carry one, because that is what
+/// the tag means — not "absent", but "already upright".
+pub(super) fn exif_orientation<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::Int32Array;
+
+    let codes: Vec<Option<i32>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        orientation_code(bytes.value(i))
+    });
+    Ok(Arc::new(Int32Array::from(codes)))
+}
+
+fn orientation_code(data: &[u8]) -> Option<i32> {
+    let mut decoder = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    image::ImageDecoder::orientation(&mut decoder)
+        .ok()
+        .map(|o| i32::from(o.to_exif()))
+}
+
 /// The color modes `convert` can produce. Mirrors `_IMAGE_MODES` in
 /// `plan/expr_ir/image.py` and the names `decode` reports, so a caller can read a mode off
 /// `decode` and hand it straight back to `convert`.

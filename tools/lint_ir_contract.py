@@ -55,6 +55,21 @@ PAIRS: list[tuple[str, str, str]] = [
         "MakeTemporalFunc",
         "batcher.plan.expr_ir.fn_names:MAKE_TEMPORAL_FNS",
     ),
+    # The multimodal decode vocabularies. Adding them closed the same hole the window
+    # ones did, on the surface where it was widest: an `.image`/`.audio`/`.video` fn is a
+    # name only its own accessor method ever writes, so nothing in a differential test
+    # spells it independently, and a rename on either side would have gone unnoticed.
+    ("bc-expr/src/lib.rs", "ImageFunc", "batcher.plan.expr_ir.fn_names:IMAGE_FNS"),
+    ("bc-expr/src/lib.rs", "AudioFunc", "batcher.plan.expr_ir.fn_names:AUDIO_FNS"),
+    ("bc-expr/src/lib.rs", "VideoFunc", "batcher.plan.expr_ir.fn_names:VIDEO_FNS"),
+    # The window/aggregate vocabularies. These were the four enums this checker did not
+    # cover, which mattered more than the omission looks: a `WindowFn` or `AggFunc` tag is
+    # exactly the kind that no differential test names individually, so it could drift in
+    # either direction silently — the failure mode this whole module exists to close.
+    ("bc-ir/src/lib.rs", "WindowFn", "batcher.plan.ir_tags:WINDOW_FUNCS"),
+    ("bc-ir/src/lib.rs", "AggFunc", "batcher.plan.ir_tags:AGG_FNS"),
+    ("bc-ir/src/lib.rs", "FrameUnits", "batcher.plan.ir_tags:FRAME_UNITS"),
+    ("bc-ir/src/lib.rs", "FrameBound", "batcher.plan.ir_tags:FRAME_BOUND_KINDS"),
 ]
 
 

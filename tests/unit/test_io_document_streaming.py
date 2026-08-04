@@ -86,6 +86,42 @@ def test_projection_is_honored(corpus) -> None:
     assert batch.schema.names == ["page"]
 
 
+def test_a_projection_without_text_never_extracts_any(corpus, monkeypatch) -> None:
+    """Projecting `text` away must skip the extraction, not just drop the column.
+
+    Laying a page out into reading order is essentially the entire cost of this reader —
+    around 90% of a 300-page document's read time — and it was paid unconditionally. So
+    `select("path", "page")` cost the same as reading the prose, and a bare `count()` cost
+    it too. Nothing about that shows up in a row count or a schema, which is why it needs
+    an assertion on the *call*: an explosive `extract_text` is the only way to state
+    "this was never reached".
+    """
+
+    def explode(self):
+        raise AssertionError("extract_text ran for a projection that excluded `text`")
+
+    monkeypatch.setattr(pypdf._page.PageObject, "extract_text", explode)
+    for projection in (["page"], ["path"], ["path", "page"], []):
+        rows = sum(b.num_rows for b in DocumentSource(corpus).iter_batches(projection))
+        assert rows == 1200, f"{projection} lost rows"
+
+
+def test_text_is_still_extracted_when_it_is_projected(corpus, monkeypatch) -> None:
+    """The other half of the pushdown: skipping must not become skipping always."""
+    calls = {"n": 0}
+    original = pypdf._page.PageObject.extract_text
+
+    def counted(self, *args, **kwargs):
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pypdf._page.PageObject, "extract_text", counted)
+    for projection in (None, ["text"], ["path", "text"]):
+        calls["n"] = 0
+        list(DocumentSource(corpus).iter_batches(projection))
+        assert calls["n"] == 1200, f"{projection} did not extract every page"
+
+
 def test_a_page_that_will_not_extract_is_null_under_skip(corpus, monkeypatch) -> None:
     """One bad page in a 900-page report must not cost the other 899."""
 

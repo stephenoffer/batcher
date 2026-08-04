@@ -32,8 +32,8 @@ from batcher._internal.errors import IOError as BatcherIOError
 from batcher._internal.hardware import available_cpu_count
 from batcher.io.base._tolerance import ErrorPolicy
 from batcher.io.filesystem import resolve_filesystem
+from batcher.io.formats.mime import sniff_mime
 from batcher.io.formats.multimodal._batching import pack_by_count_and_bytes, probe_sizes
-from batcher.io.formats.multimodal._mime import sniff_mime
 from batcher.io.formats.multimodal._pruning import prune_files
 from batcher.io.formats.multimodal._split import MediaSplit
 from batcher.plan.source_stats import SourceStatistics
