@@ -182,6 +182,15 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # more names than 120. Collapsing the imports would hide them from editors and from
     # `just lint-docstrings`, which introspects this list.
     "python/batcher/ml/__init__.py": "ML re-export facade; one name per line over 8 subpackages",
+    # The same case one level down: a pure re-export façade over the preprocessor family,
+    # now covering vectorizers and feature selection alongside scalers, encoders, imputers
+    # and the rest. `from batcher.ml.preprocessors import X` is the documented import path
+    # for every one of them, so the list cannot shrink without breaking it, and
+    # `persistence._registry` reads this `__all__` to know what `load()` can reconstruct.
+    "python/batcher/ml/preprocessors/__init__.py": (
+        "preprocessor re-export facade; one name per line, and persistence._registry reads "
+        "this __all__ to know what load() can reconstruct"
+    ),
     "python/batcher/ml/metrics/__init__.py": (
         "the ml.metrics re-export facade curates ~80 scoring functions across nine submodules "
         "(evaluate, ranking, clustering, regression, calibration, fairness, comparison, "

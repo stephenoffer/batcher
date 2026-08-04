@@ -55,6 +55,14 @@ from batcher.ml.preprocessors.scalers import (
     RobustScaler,
     StandardScaler,
 )
+from batcher.ml.preprocessors.selection import (
+    RFE,
+    DropCorrelated,
+    SelectFromModel,
+    SelectKBest,
+    SelectPercentile,
+    feature_importances,
+)
 from batcher.ml.preprocessors.text import Concatenator, Tokenizer
 from batcher.ml.preprocessors.text_features import TextStatFeaturizer
 from batcher.ml.preprocessors.timeseries import (
@@ -69,9 +77,11 @@ from batcher.ml.preprocessors.transforms import (
     MissingIndicator,
     QuantileTransformer,
 )
+from batcher.ml.preprocessors.vectorizers import CountVectorizer, HashingVectorizer, TfidfVectorizer
 
 __all__ = [
     "PCA",
+    "RFE",
     "Binarizer",
     "BinaryEncoder",
     "BoxCoxTransformer",
@@ -80,12 +90,15 @@ __all__ = [
     "ColumnDropper",
     "ColumnSelector",
     "Concatenator",
+    "CountVectorizer",
     "CyclicalEncoder",
     "DateTimeFeaturizer",
+    "DropCorrelated",
     "FrequencyEncoder",
     "GroupImputer",
     "GroupStatEncoder",
     "HashingEncoder",
+    "HashingVectorizer",
     "InteractionFeatures",
     "KBinsDiscretizer",
     "LabelBinarizer",
@@ -109,14 +122,19 @@ __all__ = [
     "RatioFeatures",
     "RobustScaler",
     "RollingFeaturizer",
+    "SelectFromModel",
+    "SelectKBest",
+    "SelectPercentile",
     "SimpleImputer",
     "StandardScaler",
     "TargetEncoder",
     "TextStatFeaturizer",
+    "TfidfVectorizer",
     "Tokenizer",
     "TruncatedSVD",
     "VarianceThreshold",
     "WOEEncoder",
+    "feature_importances",
     "from_dict",
     "load",
     "save",

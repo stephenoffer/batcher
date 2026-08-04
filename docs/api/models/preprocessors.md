@@ -152,6 +152,47 @@ The rest of the estimators cover discretization, missing values, text splitting,
    :members:
 ```
 
+## Feature selection
+
+These prune columns rather than transform them, and they hold the choice as fitted state so
+the validation split is pruned by the training split's decision:
+
+```{eval-rst}
+.. autoclass:: SelectKBest
+   :members:
+
+.. autoclass:: SelectPercentile
+   :members:
+
+.. autoclass:: DropCorrelated
+   :members:
+
+.. autoclass:: SelectFromModel
+   :members:
+
+.. autoclass:: RFE
+   :members:
+
+.. autofunction:: feature_importances
+```
+
+## Text vectorizers
+
+These turn a text column into the bag-of-words features a classical text model trains on.
+`CountVectorizer` and `TfidfVectorizer` learn a vocabulary; `HashingVectorizer` decides a
+term's feature index arithmetically and so needs no fit pass at all:
+
+```{eval-rst}
+.. autoclass:: CountVectorizer
+   :members:
+
+.. autoclass:: TfidfVectorizer
+   :members:
+
+.. autoclass:: HashingVectorizer
+   :members:
+```
+
 ## Derived and grouped features
 
 These build new columns out of existing ones: products and ratios that a linear model

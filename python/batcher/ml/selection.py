@@ -36,6 +36,8 @@ from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from batcher.api.dataset import Dataset
 
 __all__ = ["constant_columns", "correlated_columns", "feature_profile", "feature_report"]
@@ -109,7 +111,11 @@ def constant_columns(
 
 
 def correlated_columns(
-    ds: Dataset, columns: list[str] | None = None, *, threshold: float = 0.95
+    ds: Dataset,
+    columns: list[str] | None = None,
+    *,
+    threshold: float = 0.95,
+    keep: Sequence[str] = (),
 ) -> list[str]:
     """The columns to drop so that no surviving pair correlates above `threshold`.
 
@@ -119,10 +125,17 @@ def correlated_columns(
     two pipelines that disagree about which of two identical columns survived are impossible
     to compare.
 
+    `keep` is expressed through that same rule rather than as a filter over the result: a
+    protected name is moved to the front of the ordering, so it wins every pair it is in and
+    its partner is the one dropped. Removing protected names from the answer afterwards
+    would instead leave *both* columns of the pair standing, which is the opposite of what
+    the caller asked for.
+
     Args:
         ds: The dataset to screen.
         columns: The columns to consider; every numeric column when omitted.
         threshold: The absolute correlation above which a pair is redundant.
+        keep: Columns that must survive; their correlated partners are dropped instead.
 
     Returns:
         The names to drop, so that the remaining columns are pairwise below `threshold`.
@@ -141,12 +154,17 @@ def correlated_columns(
             ... )
             >>> correlated_columns(ds)
             ['copy']
+            >>> correlated_columns(ds, keep=["copy"])
+            ['a']
     """
     if not 0.0 < threshold <= 1.0:
         raise PlanError(f"threshold must be in (0, 1], got {threshold}")
     import batcher as bt
 
     names = _numeric_columns(ds, columns)
+    if keep:
+        protected = [n for n in keep if n in names]
+        names = protected + [n for n in names if n not in set(protected)]
     if len(names) < 2:
         return []
     pairs = {

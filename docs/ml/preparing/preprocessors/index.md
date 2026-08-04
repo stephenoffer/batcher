@@ -188,7 +188,9 @@ Fuzzy dedup with MinHash, and `similarity_join` on embeddings.
 
 scaling
 encoding
+text-vectorization
 feature-generation
+feature-selection
 pipelines
 deduplication
 ```
