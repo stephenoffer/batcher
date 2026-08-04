@@ -160,6 +160,16 @@ different kinds of signal, so a feature strong on any of them survives.
 
 `batcher.ml.feature_scores` is the univariate filter that scikit-learn's `SelectKBest` runs, one score per feature against the target: `f_classif_scores` (ANOVA F for a categorical target), `f_regression_scores` (regression F for a continuous one), `chi2_scores` (categorical against categorical), and `mutual_info_scores` (bits shared, which catches a non-monotone link the F scores miss). `select_k_best` turns any of those score dicts into the columns to keep.
 
+`f_classif_scores` and `f_regression_scores` score every feature in **one pass** over the
+data, however wide the table is. Both statistics are recoverable from mergeable moments, so
+a hundred features ride a single `group_by` rather than costing a hundred scans, which is
+what makes them usable as a first screen on a wide frame and on the distributed path where
+each scan is a pass across the cluster.
+
+`chi2_scores` and `mutual_info_scores` still cost a pass per feature: each needs its own
+contingency grid over a different pair of category sets, and those do not share a scan.
+Screen with the F scores first if the table is wide.
+
 ```python
 from batcher.ml.feature_scores import f_classif_scores, select_k_best
 
