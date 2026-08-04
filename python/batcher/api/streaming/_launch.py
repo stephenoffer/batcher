@@ -101,13 +101,16 @@ def start_streaming_query(
     """
     from batcher import core
     from batcher._internal.errors import PlanError
-    from batcher.plan.logical import StreamingSessionWindow, WatermarkDedup
+    from batcher.plan.logical import Limit, StreamingSessionWindow, WatermarkDedup
 
-    # A session window and a watermark dedup go down the driver path for the same reason a
-    # join does: their state is retained *rows* rather than a fold, and the operators that
-    # turn them into output are relational ones living above `core`, which `core` may not
-    # import. One definition of each, reached from both terminals.
-    if len(sources) > 1 or isinstance(plan, (StreamingSessionWindow, WatermarkDedup)):
+    # These go down the driver path for the same reason a join does: their state is
+    # retained *rows* or a cursor rather than a fold, and the operators that turn them into
+    # output are relational ones living above `core`, which `core` may not import. One
+    # definition of each, reached from both terminals. A `Limit` is here because a limited
+    # stream *ends*, and the driver runner is the thing that already knows what to do when
+    # its iterator stops.
+    driver_shapes = (Limit, StreamingSessionWindow, WatermarkDedup)
+    if len(sources) > 1 or isinstance(plan, driver_shapes):
         return _start_driver_stream(plan, sources, sink, trigger, output_mode, name, checkpoint)
     output_mode = OutputMode.validate(output_mode)
     trigger = trigger or Trigger.processing_time(0)
@@ -188,6 +191,7 @@ def _start_driver_stream(
     from batcher.api.terminal.stream.static_join import stream_static_sides
     from batcher.api.terminal.stream.union import union_streams_interleaved
     from batcher.plan.logical import (
+        Limit,
         StreamingSessionWindow,
         Union,
         WatermarkDedup,
@@ -197,7 +201,7 @@ def _start_driver_stream(
     joins = isinstance(plan, WatermarkStreamJoin)
     unions = isinstance(plan, Union) and union_streams_interleaved(plan, sources)
     enriches = stream_static_sides(plan, sources) is not None
-    retains_rows = isinstance(plan, (StreamingSessionWindow, WatermarkDedup))
+    retains_rows = isinstance(plan, (Limit, StreamingSessionWindow, WatermarkDedup))
     if not (joins or unions or enriches or retains_rows):
         raise PlanError(
             "streaming a sink from more than one source is supported for a stream-stream "
@@ -209,15 +213,16 @@ def _start_driver_stream(
     if output_mode != OutputMode.APPEND:
         raise PlanError(
             f"output_mode={output_mode!r} needs an aggregation; a stream-stream join, a "
-            "stream-static join, a session window, a watermark dedup and a stream union "
-            "each emit every row once, which is 'append'"
+            "stream-static join, a session window, a watermark dedup, a limit and a "
+            "stream union each emit every row once, which is 'append'"
         )
     if checkpoint is not None:
         raise PlanError(
             "this streaming plan has no checkpointable position: a join's state is two "
             "buffered sides and two watermarks, a stream-static join's is a dimension "
             "snapshot, a session window's is the rows of every session still open, a "
-            "watermark dedup's is the seen-key set, and a union's is one cursor per branch "
+            "watermark dedup's is the seen-key set, a limit's is how many rows have gone "
+            "out, and a union's is one cursor per branch "
             "— none of them is a source offset the engine records. Drop checkpoint= (the "
             "sink's own idempotency still applies), or reduce to a plan the offset log can "
             "address."

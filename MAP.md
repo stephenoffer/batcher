@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1210 Python modules across 186 packages and 220 Rust files across 14 crates.
+Covering 1211 Python modules across 186 packages and 220 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -194,7 +194,7 @@ The `Dataset` builder package.
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_window.py` | 135 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 403 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 5815 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 5826 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 3245 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -342,7 +342,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | module | lines | what it is |
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
-| `_launch.py` | 261 | The single-node streaming launcher: optimize once, then drive micro-batches. |
+| `_launch.py` | 266 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 422 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
@@ -596,6 +596,7 @@ Categorical encoders — ordinal codes, 0/1 indicators, and target encoding.
 | `frequency.py` | 339 | Cardinality-tolerant categorical encoders — frequency, count, rare-bucketing, hashing. |
 | `onehot.py` | 233 | Indicator encoders — one 0/1 output column per learned category. |
 | `ordinal.py` | 226 | Ordinal encoders — fit the category set, transform with a CASE projection. |
+| `shrinkage.py` | 340 | Target encoders that shrink differently — leave-one-out, and James-Stein. |
 | `target.py` | 262 | Mean (likelihood) target encoding, plain and cross-fitted. |
 | `woe.py` | 190 | Weight-of-evidence encoding — the credit-scorecard categorical transform. |
 
@@ -2184,7 +2185,7 @@ String free functions, in two halves: building text and reading structure out of
 | `aggregate.py` | 175 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 255 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 353 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
-| `relational.py` | 542 | Row-wise and set relational logical nodes. |
+| `relational.py` | 550 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
 | `transforms.py` | 320 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 258 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
