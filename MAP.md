@@ -443,7 +443,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `permutation.py` | 187 | The keyed epoch permutation — a shuffled sample order that is computed, not stored. |
 | `pipeline.py` | 217 | Multi-stage streaming pipeline with credit-based backpressure (the GPU-feeding moat). |
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
-| `selection.py` | 390 | Deciding which features to keep, before a model ever sees them. |
+| `selection.py` | 400 | Deciding which features to keep, before a model ever sees them. |
 | `sparse_linear.py` | 259 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
 | `splitting.py` | 319 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 | `timeseries.py` | 323 | Time-series diagnostics — autocorrelation and the tests built on it. |

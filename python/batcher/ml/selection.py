@@ -218,6 +218,10 @@ def feature_report(
         buckets: Quantile bins for the information value.
         positive: The label value that counts as the positive class.
 
+    Cost is one aggregate carrying every feature's correlation, signal ratio and null rate,
+    plus one quantile-binned pass per feature for the information value, which needs the
+    feature's own bin edges and so cannot ride the shared aggregate.
+
     Returns:
         A lazy `Dataset` of ``feature``, ``information_value``, ``point_biserial``,
         ``signal_ratio``, ``null_rate``, ordered by descending information value.
@@ -300,9 +304,15 @@ def feature_profile(ds: Dataset, columns: list[str] | None = None) -> Dataset:
     """What each numeric column looks like as a *feature*, and what it is asking for.
 
     `Dataset.profile` answers the data-quality question — how much is present, how many
-    distinct values. This answers the modelling one, in the same single pass: how
-    concentrated the column is, how skewed, how heavy its tails are, and therefore which
-    transform it wants before a model sees it.
+    distinct values. This answers the modelling one: how concentrated the column is, how
+    skewed, how heavy its tails are, and therefore which transform it wants before a model
+    sees it.
+
+    Cost is one aggregate carrying every column's null rate, skew, kurtosis and robust
+    spread, plus **one grouped query per column** for the mode share. That last one cannot
+    join the others: a mode is a `group_by` on the column itself, and two columns cannot
+    share a grouping. Profile the columns you are actually considering rather than the whole
+    frame when it is wide.
 
     The ``suggestion`` column is a convention rather than a rule, and deliberately blunt:
 
