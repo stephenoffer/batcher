@@ -37,6 +37,20 @@ agent's work here:
   and ignores the rest of the index. If you use plain `git commit`, read
   `git diff --cached --stat` immediately before it and confirm every line is yours.
 
+- **`--only` bounds the *paths*, not the *hunks inside them*.** This is the trap on the far
+  side of the fix above, and it is easy to walk into precisely because `--only` feels safe.
+  A path you own one line of carries **every** uncommitted change in that file, including
+  another agent's. It has happened: a commit adding a one-line `fill: None` to a test fixture
+  in `bc-interp/src/par.rs` swept up 203 lines of a neighbouring session's half-finished
+  aggregation work — without the `agg_par.rs` those lines call into — and **the Rust
+  workspace stopped compiling at HEAD** until someone else committed the missing half.
+
+  So the check is per *file*, not per commit: `git diff <path>` every entry on your list and
+  confirm you wrote all of it. The trap is the file you add **last**, to fix some small thing
+  the gate complained about — that is the one you inspect a single hunk of rather than the
+  whole diff. A cheap tell after the fact is `git show --numstat`: a file you touched once
+  showing `+153 -50` is not a file you touched once.
+
   To back a path out of a commit you already made, without touching the working tree:
   `git restore --source=HEAD~1 --staged <path>` then `git commit --amend --no-edit`. Their
   content stays in the tree and goes back to being unstaged. Guard any `--amend` with
