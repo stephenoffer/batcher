@@ -21,6 +21,10 @@ from batcher.ml.preprocessors.encoders.frequency import (
 )
 from batcher.ml.preprocessors.encoders.onehot import MultiHotEncoder, OneHotEncoder
 from batcher.ml.preprocessors.encoders.ordinal import LabelEncoder, OrdinalEncoder
+from batcher.ml.preprocessors.encoders.shrinkage import (
+    JamesSteinEncoder,
+    LeaveOneOutEncoder,
+)
 from batcher.ml.preprocessors.encoders.target import TargetEncoder
 from batcher.ml.preprocessors.encoders.woe import WOEEncoder
 
@@ -28,7 +32,9 @@ __all__ = [
     "BinaryEncoder",
     "FrequencyEncoder",
     "HashingEncoder",
+    "JamesSteinEncoder",
     "LabelEncoder",
+    "LeaveOneOutEncoder",
     "MultiHotEncoder",
     "OneHotEncoder",
     "OrdinalEncoder",

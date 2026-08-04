@@ -109,6 +109,12 @@ These turn categorical columns into numeric ones:
 .. autoclass:: RareCategoryEncoder
    :members:
 
+.. autoclass:: LeaveOneOutEncoder
+   :members:
+
+.. autoclass:: JamesSteinEncoder
+   :members:
+
 .. autoclass:: WOEEncoder
    :members:
 ```

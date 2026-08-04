@@ -123,6 +123,55 @@ rather than Python's `hash()`, which varies per process and would be a silent sk
 
 `BinaryEncoder` is the middle ground between `OneHotEncoder` and `HashingEncoder` when a column has many categories but not unboundedly many: it assigns each category an integer and writes it in base 2, so 100 categories cost 7 bit columns rather than 100 one-hot columns, with no collisions. An unseen category encodes as all-zero bits.
 
+## Choosing how much to trust a category
+
+`TargetEncoder` shrinks every category toward the global mean by the same fixed weight. Two
+other encoders answer the same question differently, and the difference shows on a
+long-tailed column where categories differ wildly in size.
+
+{py:class}`LeaveOneOutEncoder <batcher.ml.preprocessors.LeaveOneOutEncoder>` doesn't shrink
+at all. It removes the row's own contribution instead, so a row's encoding is the mean of
+the *other* rows in its category and the target cannot leak into its own feature:
+
+```python
+from batcher.ml.preprocessors import LeaveOneOutEncoder
+
+spend = bt.from_pydict({"city": ["a", "a", "a"], "amount": [0.0, 3.0, 6.0]})
+print(LeaveOneOutEncoder(["city"], "amount").fit_transform(spend).to_pydict()["city"])
+# [4.5, 3.0, 1.5]
+```
+
+`fit_transform` applies that leave-one-out form because those are the training rows;
+`transform` applies the plain category mean, because a held-out row contributed nothing to
+subtract.
+
+The exactness has a cost worth knowing. On a binary target in a category of two rows, the
+encoding *is* the other row's label, so a model can learn to read the feature backwards.
+Prefer it where categories have a reasonable number of rows each, and prefer
+`TargetEncoder(cv=...)` when the tail is thin.
+
+{py:class}`JamesSteinEncoder <batcher.ml.preprocessors.JamesSteinEncoder>` derives the
+shrinkage from the data rather than taking it as a hyperparameter. A category whose own
+target scatters widely relative to the spread between categories is trusted less; one that
+is both large and consistent keeps almost all of its own mean:
+
+```python
+from batcher.ml.preprocessors import JamesSteinEncoder
+
+mixed = bt.from_pydict(
+    {"city": ["big"] * 20 + ["tiny"] * 2, "churn": [1.0] * 20 + [1.0, 1.0]}
+)
+fitted = JamesSteinEncoder(["city"], "churn").fit(mixed)
+print(round(fitted.mapping_["city"]["big"], 4) >= round(fitted.mapping_["city"]["tiny"], 4))
+# True
+```
+
+That removes the one number `TargetEncoder` asks you to guess, which matters when a single
+`smoothing` that suits a category with ten rows over-shrinks one with ten thousand.
+
+Both learn from one mergeable `group_by` per column and encode with a lazy CASE expression,
+like every other encoder here. An unseen category, and a null, take the global mean.
+
 ## Weight-of-evidence encoding
 
 `TargetEncoder` replaces a category with the target's mean; `WOEEncoder` replaces it with the
