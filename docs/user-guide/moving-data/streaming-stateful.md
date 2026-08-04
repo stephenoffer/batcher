@@ -1,8 +1,8 @@
 # Stateful streaming operators
 
 This page describes the streaming operators that **remember something between
-micro-batches**: watermark deduplication, the stream-stream interval join, arbitrary keyed
-state, and the union that interleaves two streams. Windows and watermarks are on
+micro-batches**: watermark deduplication, the stream-stream interval join, the stream-static
+join, session windows, arbitrary keyed state, and the union that interleaves two streams. Windows and watermarks are on
 {doc}`streaming`, because they are the mechanism these lean on rather than an operator.
 
 They share one problem and one answer. The problem is that state over an unbounded input is
@@ -83,6 +83,84 @@ watermarks, none of it addressable by a source offset, so there is nothing to re
 — and accepting the argument would restart from an empty join on every restart while
 looking exactly like exactly-once recovery. The sink's own idempotency still applies, so a
 replayed micro-batch does not duplicate rows.
+
+## Stream-to-static joins
+
+Enriching a stream from a table that does not move is an ordinary
+{py:meth}`join <batcher.Dataset.join>`. The static side is read once, before the first micro-batch, and every
+micro-batch joins against the whole of it:
+
+```python
+catalogue = bt.from_pydict({"ad": ["a", "b"], "campaign": ["spring", "fall"]})
+
+ad_schema = pa.schema([("ad", pa.string()), ("shown", pa.timestamp("us"))])
+
+
+def ad_feed():
+    yield pa.record_batch({"ad": ["a", "c"], "shown": [base, base]}, schema=ad_schema)
+
+
+live_ads = bt.from_batches(ad_feed, ad_schema, bounded=False)
+
+for batch in live_ads.join(catalogue, on="ad", how="left").iter_batches():
+    print(sorted(str(c) for c in batch.to_pydict()["campaign"]))
+# ['None', 'spring']
+```
+
+The state it holds is the dimension table, and it is a snapshot rather than a
+subscription: a long-running query serves the table as it stood when it started. That is
+deliberate, because a dimension that changed mid-stream would let two rows of the same
+micro-batch disagree about the same key. Restart the query to pick up a new one.
+
+A join type that would need the *static* side to be complete is refused rather than run,
+since an unmatched static row could only be emitted once the stream ended. Inner works
+either way round, left outer with the stream on the left, right outer with the stream on
+the right, and semi/anti with the stream on the left. The full outer and the two mirrored
+outers raise, with a message naming the combinations that do work.
+
+## Session windows
+
+{py:meth}`session_window <batcher.Dataset.session_window>` groups events per key into runs with no gap longer than the
+timeout. Over a stream it is stateful for a reason no fixed window is: a session's end is
+not knowable in advance, because every event extends the session it lands in and an event
+between two sessions merges them. So its rows are held until the watermark passes its last
+event plus the gap, and only then aggregated:
+
+```python
+visit_schema = pa.schema([("user", pa.string()), ("ts", pa.timestamp("us")),
+                          ("pages", pa.int64())])
+
+
+def visit_feed():
+    yield pa.record_batch(
+        {"user": ["u1", "u1"], "ts": [base, base + dt.timedelta(minutes=2)],
+         "pages": [1, 1]},
+        schema=visit_schema,
+    )
+    yield pa.record_batch(
+        {"user": ["u1"], "ts": [base + dt.timedelta(hours=4)], "pages": [1]},
+        schema=visit_schema,
+    )
+
+
+visits = bt.from_batches(visit_feed, visit_schema, bounded=False)
+
+for batch in visits.session_window(
+    "ts", "30m", partition_by=["user"], pages=col("pages").sum()
+).iter_batches():
+    print(batch.to_pydict()["pages"])
+# [2]
+# [1]
+```
+
+The buffer holds rows for sessions still open, which is the live key space times the gap
+rather than the length of the stream. A source whose event time stalls never closes a
+session, so the retained rows are checked against `memory.streaming_state_max_bytes` and a
+{py:exc}`ResourceError <batcher.ResourceError>` names the stall instead of the process dying on memory.
+
+A late event cannot reopen a session already emitted; it is dropped, exactly as a late row
+is dropped from a closed window. Use `with_watermark` to buy a straggler room, and expect
+every session to close that much later in exchange.
 
 ## Arbitrary keyed state
 

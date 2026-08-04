@@ -279,9 +279,23 @@ print(sessions.select("session_start", "session_end", "hits").to_pydict())
 
 ## Operators that remember
 
-Deduplication within a watermark, the stream-stream interval join, arbitrary keyed state,
-and the union of two streams all keep something between micro-batches, and each is bounded
-by a limit you choose rather than by the data. See {doc}`streaming-stateful`.
+Deduplication within a watermark, the stream-stream interval join, the session window,
+arbitrary keyed state, and the union of two streams all keep something between
+micro-batches, and each is bounded by a limit you choose rather than by the data. See
+{doc}`streaming-stateful`.
+
+Two of them are worth knowing about before you reach for a workaround, because both used
+to be refusals:
+
+- **Joining a stream to a static table.** Write it as an ordinary
+  {py:meth}`join <batcher.Dataset.join>`. The table is read once when the query starts and every
+  micro-batch joins against the whole of it. The join types that would need the *static*
+  side to be complete are refused, which is where Spark draws the line too. See
+  {doc}`/cookbook/streaming/stream-join`.
+- **Session windows.** {py:meth}`session_window <batcher.Dataset.session_window>` works over a stream. A session has no
+  end until the gap has passed with nothing arriving, so its rows are held until the
+  watermark says so and then aggregated by the same code the bounded path runs. See
+  {doc}`/cookbook/streaming/windowed-aggregation`.
 
 ## Exactly-once and checkpointing
 
