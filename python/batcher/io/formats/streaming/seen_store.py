@@ -84,8 +84,23 @@ class SeenStore:
 
         ``path`` may be ``":memory:"`` for an ephemeral in-process store (useful
         for tests). The parent directory of an on-disk path must already exist.
+
+        ``check_same_thread=False``, for the same reason the checkpoint logs disable it
+        (`streaming/checkpoint/logs.py`): a streaming query's loop runs on a background
+        thread, but **recovery runs on the main one** before that thread starts. Recovery
+        calls `seek` → `confirm`, which opens this connection — so a restore carrying
+        pending files opens the store on the main thread and the first discovery pass then
+        raises ``SQLite objects created in a thread can only be used in that same thread``.
+
+        That sequence is reachable directly through the `Checkpointable` surface and is
+        pinned by a test. It is **not** currently reached by the engine's own recovery,
+        because the last committed offset happens to be the drain marker, recorded after
+        `confirm()` has cleared the pending list. That is an accident of ordering rather
+        than a property anything enforces, which is exactly why the store should not
+        depend on it. Access is serialized either way — recovery completes before the loop
+        begins, then only the loop touches it — so the check is redundant, not protective.
         """
-        self._conn = sqlite3.connect(path)
+        self._conn = sqlite3.connect(path, check_same_thread=False)
         _tune(self._conn)
         self._conn.execute(_SCHEMA)
         self._conn.commit()
