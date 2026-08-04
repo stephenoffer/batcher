@@ -391,8 +391,8 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 |---|---|---|
 | `dispatch.py` | 537 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
 | `rebatch.py` | 59 | The exact output-granularity contract for `iter_batches(batch_size=N)`. |
-| `session.py` | 219 | The streaming session window — sessions whose end you only learn by waiting. |
-| `static_join.py` | 209 | The stream-static join — enrich a stream from a table that does not move. |
+| `session.py` | 226 | The streaming session window — sessions whose end you only learn by waiting. |
+| `static_join.py` | 215 | The stream-static join — enrich a stream from a table that does not move. |
 | `union.py` | 158 | When a UNION streams branch by branch, and how its branches are addressed. |
 
 ### `batcher/api/terminal/stream/watermark/` — 5 · conductor

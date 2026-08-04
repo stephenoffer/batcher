@@ -44,6 +44,13 @@ def stream_session_window(
 ) -> Iterator[pa.RecordBatch]:
     """Emit each session once the watermark guarantees no event can still extend it.
 
+    Driver-executed today, including under `distributed=True`: the result is identical
+    (the same rows through the same code), it simply does not fan out. Its mergeable form
+    is a shuffle by `partition_by`, because a session belongs to exactly one key -- so each
+    worker would own a disjoint set of keys, and `combine` is their union. Without
+    `partition_by` there is one global session chain and no shuffle key, which is the shape
+    that genuinely cannot distribute.
+
     Args:
         plan: The `StreamingSessionWindow` node.
         source: The single unbounded source beneath it.

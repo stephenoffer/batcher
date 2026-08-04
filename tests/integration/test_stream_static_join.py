@@ -203,3 +203,14 @@ def test_two_streams_still_route_to_the_interval_join_not_this():
     left, right = _stream(), _stream()
     plan = left.join(right, on="k", how="inner")._plan
     assert stream_static_sides(plan, left._sources + right._sources) is None
+
+
+@pytest.mark.integration
+def test_distributed_true_yields_the_same_rows():
+    """It is driver-executed, so asking for the cluster changes nothing about the answer.
+    Pinned so that teaching it to fan out later has to keep producing this."""
+    single = _rows(_stream().join(_dim(), on="k", how="left"))
+    fanned = []
+    for batch in _stream().join(_dim(), on="k", how="left").iter_batches(distributed=True):
+        fanned.extend(batch.to_pylist())
+    assert sorted(map(_key, single)) == sorted(map(_key, fanned))

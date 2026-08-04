@@ -211,3 +211,20 @@ def test_the_streaming_node_refuses_to_be_lowered_to_the_ir():
     assert isinstance(plan, StreamingSessionWindow)
     with pytest.raises(NotImplementedError, match="streaming driver"):
         plan.to_ir()
+
+
+@pytest.mark.integration
+def test_distributed_true_yields_the_same_sessions():
+    """Driver-executed, so asking for the cluster changes nothing about the answer. Its
+    mergeable form is a shuffle by the partition key; pinning the equality now means
+    building that later cannot quietly change what a session is."""
+    batches = [[("a", 0, 1), ("b", 0, 2)], [("a", 2, 1)], [("a", 60, 1), ("b", 60, 2)]]
+    single = _sessions(
+        _stream(batches).session_window("ts", "5m", partition_by=["k"], total=col("v").sum())
+    )
+    fanned = []
+    plan = _stream(batches).session_window("ts", "5m", partition_by=["k"], total=col("v").sum())
+    for batch in plan.iter_batches(distributed=True):
+        for row in batch.to_pylist():
+            fanned.append((row["k"], row["session_start"], row["session_end"], row["total"]))
+    assert single == sorted(fanned)

@@ -120,6 +120,12 @@ def stream_static_join(
     dimension that changed mid-stream would otherwise make two rows of the same micro-batch
     disagree about the same key.
 
+    Driver-executed today, including under `distributed=True`: the result is identical
+    (the same rows through the same code), it simply does not fan out. Its mergeable form
+    is the ordinary broadcast join — the static side is small by assumption, so shipping a
+    copy to each worker and joining that worker's stream shard against it is exact for
+    every join type in `_SAFE`, with no cross-worker state at all.
+
     Args:
         plan: The `Join` node.
         sources: The bound sources for the whole plan.
