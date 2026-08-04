@@ -182,6 +182,27 @@ the validation split is pruned by the training split's decision:
 .. autofunction:: feature_importances
 ```
 
+## Random projection and kernel approximation
+
+Dimensionality reduction and kernel feature maps that need no covariance matrix. All four
+lower to plain arithmetic over the source columns, so the transform runs column-wise:
+
+```{eval-rst}
+.. autoclass:: GaussianRandomProjection
+   :members:
+
+.. autoclass:: SparseRandomProjection
+   :members:
+
+.. autoclass:: RBFSampler
+   :members:
+
+.. autoclass:: Nystroem
+   :members:
+
+.. autofunction:: johnson_lindenstrauss_min_dim
+```
+
 ## Probability calibration
 
 `batcher.ml.metrics` measures calibration; these two correct it. Both are fitted on a split

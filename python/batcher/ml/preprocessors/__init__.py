@@ -49,6 +49,13 @@ from batcher.ml.preprocessors.imputers import SimpleImputer
 from batcher.ml.preprocessors.persistence import from_dict, load, save, to_dict
 from batcher.ml.preprocessors.polynomial import PolynomialFeatures, SplineTransformer
 from batcher.ml.preprocessors.power import BoxCoxTransformer, PowerTransformer
+from batcher.ml.preprocessors.projection import (
+    GaussianRandomProjection,
+    Nystroem,
+    RBFSampler,
+    SparseRandomProjection,
+    johnson_lindenstrauss_min_dim,
+)
 from batcher.ml.preprocessors.scalers import (
     MaxAbsScaler,
     MinMaxScaler,
@@ -98,6 +105,7 @@ __all__ = [
     "DropCorrelated",
     "FrequencyEncoder",
     "FunctionTransformer",
+    "GaussianRandomProjection",
     "GroupImputer",
     "GroupStatEncoder",
     "HashingEncoder",
@@ -115,6 +123,7 @@ __all__ = [
     "MultiHotEncoder",
     "MultiLabelBinarizer",
     "Normalizer",
+    "Nystroem",
     "OneHotEncoder",
     "OrdinalEncoder",
     "PlattCalibrator",
@@ -122,6 +131,7 @@ __all__ = [
     "PowerTransformer",
     "Preprocessor",
     "QuantileTransformer",
+    "RBFSampler",
     "RankTransformer",
     "RareCategoryEncoder",
     "RatioFeatures",
@@ -131,6 +141,7 @@ __all__ = [
     "SelectKBest",
     "SelectPercentile",
     "SimpleImputer",
+    "SparseRandomProjection",
     "SplineTransformer",
     "StandardScaler",
     "TargetEncoder",
@@ -142,6 +153,7 @@ __all__ = [
     "WOEEncoder",
     "feature_importances",
     "from_dict",
+    "johnson_lindenstrauss_min_dim",
     "load",
     "save",
     "to_dict",

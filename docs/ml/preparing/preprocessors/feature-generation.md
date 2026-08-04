@@ -186,6 +186,72 @@ print(reducer.transform(ds).columns)
 
 `TruncatedSVD` is the same idea without centering the columns first, which is what you want on a non-negative or sparse feature block (a bag-of-words count matrix) where centering would destroy the structure. On centered data it coincides with `PCA`.
 
+## Reducing dimensionality without a covariance pass
+
+`PCA` finds the directions carrying the most variance, which costs a covariance pass and an
+eigendecomposition over the full width. Sometimes you cannot afford that, and often you do
+not need it.
+
+{py:class}`GaussianRandomProjection <batcher.ml.preprocessors.GaussianRandomProjection>` and
+{py:class}`SparseRandomProjection <batcher.ml.preprocessors.SparseRandomProjection>` multiply
+the block through a random matrix instead. The Johnson-Lindenstrauss lemma says that
+preserves every pairwise distance to within a small factor, with a bound that depends on the
+*target* width and the row count only, not on the input width and not on the data:
+
+```python
+from batcher.ml.preprocessors import SparseRandomProjection, johnson_lindenstrauss_min_dim
+
+wide = bt.from_pydict({f"f{i}": [float(i + j) for j in range(50)] for i in range(200)})
+projected = SparseRandomProjection(list(wide.columns), n_components=64, seed=0)
+print(len([c for c in projected.fit_transform(wide).columns if c.startswith("rp")]))
+# 64
+```
+
+Nothing is read from the data, so these fit on a stream, and the matrix depends only on the
+seed and the input width, so training and serving cannot disagree.
+
+Use `johnson_lindenstrauss_min_dim` to size the target rather than guessing:
+
+```python
+print(johnson_lindenstrauss_min_dim(10_000, eps=0.2))
+# 2125
+```
+
+Prefer the sparse variant on a wide block. Most of its matrix is zero, and zeroed entries
+are skipped when the projection is lowered, so the expression the engine evaluates per row
+is much smaller for the same distance guarantee.
+
+## Kernel features for a linear model
+
+A kernel SVM is often the best model on a medium tabular problem and the worst thing to put
+in a pipeline: it needs the full pairwise kernel matrix, so it is quadratic in rows and does
+not distribute.
+
+{py:class}`RBFSampler <batcher.ml.preprocessors.RBFSampler>` and
+{py:class}`Nystroem <batcher.ml.preprocessors.Nystroem>` map each row into a space where an
+ordinary dot product approximates the RBF kernel. Fit a plain linear model on those columns
+and you get most of the kernel's accuracy from something that streams and distributes:
+
+```python
+from batcher.ml.preprocessors import Chain, RBFSampler, StandardScaler
+
+points = bt.from_pydict({"a": [0.0, 1.0, 2.0, 3.0], "b": [3.0, 2.0, 1.0, 0.0]})
+mapped = Chain(
+    StandardScaler(["a", "b"]),
+    RBFSampler(["a", "b"], n_components=64, gamma=0.5, seed=0),
+).fit_transform(points)
+print(len([c for c in mapped.columns if c.startswith("rbf")]))
+# 64
+```
+
+Scale first, as above. `gamma` is a distance in the feature space, so a column measured in
+millions and one measured in fractions cannot share a sensible value.
+
+`RBFSampler` draws its map from a seed and reads no data, so it works on a stream.
+`Nystroem` samples actual rows as landmarks and measures similarity to them, which is
+data-dependent and therefore usually needs fewer components for the same accuracy, at the
+cost of a fit pass.
+
 ## Assembling features
 
 `Concatenator` stacks several numeric columns into one list column. It is the "make a
