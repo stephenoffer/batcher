@@ -101,8 +101,13 @@ def start_streaming_query(
     """
     from batcher import core
     from batcher._internal.errors import PlanError
+    from batcher.plan.logical import StreamingSessionWindow
 
-    if len(sources) > 1:
+    # A session window goes down the driver path for the same reason a join does: its
+    # state is buffered rows rather than a fold, and the operator that turns them into
+    # sessions is the relational one, which lives above `core` and which `core` may not
+    # import. One definition of a session, reached from both terminals.
+    if len(sources) > 1 or isinstance(plan, StreamingSessionWindow):
         return _start_driver_stream(plan, sources, sink, trigger, output_mode, name, checkpoint)
     output_mode = OutputMode.validate(output_mode)
     trigger = trigger or Trigger.processing_time(0)
@@ -182,12 +187,13 @@ def _start_driver_stream(
     from batcher.api.terminal.stream import _iter_batches
     from batcher.api.terminal.stream.static_join import stream_static_sides
     from batcher.api.terminal.stream.union import union_streams_interleaved
-    from batcher.plan.logical import Union, WatermarkStreamJoin
+    from batcher.plan.logical import StreamingSessionWindow, Union, WatermarkStreamJoin
 
     joins = isinstance(plan, WatermarkStreamJoin)
     unions = isinstance(plan, Union) and union_streams_interleaved(plan, sources)
     enriches = stream_static_sides(plan, sources) is not None
-    if not (joins or unions or enriches):
+    sessionizes = isinstance(plan, StreamingSessionWindow)
+    if not (joins or unions or enriches or sessionizes):
         raise PlanError(
             "streaming a sink from more than one source is supported for a stream-stream "
             "interval join (join_stream), a stream-static join, and a UNION ALL of streams; "
@@ -198,16 +204,17 @@ def _start_driver_stream(
     if output_mode != OutputMode.APPEND:
         raise PlanError(
             f"output_mode={output_mode!r} needs an aggregation; a stream-stream join, a "
-            "stream-static join and a stream union each emit every row once, which is "
-            "'append'"
+            "stream-static join, a session window and a stream union each emit every row "
+            "once, which is 'append'"
         )
     if checkpoint is not None:
         raise PlanError(
-            "a multi-source streaming plan has no checkpointable position: a join's state "
-            "is two buffered sides and two watermarks, a stream-static join's is a "
-            "dimension snapshot, and a union's is one cursor per branch — none of them is a "
-            "source offset the engine records. Drop checkpoint= (the sink's own idempotency "
-            "still applies), or reduce to a single source."
+            "this streaming plan has no checkpointable position: a join's state is two "
+            "buffered sides and two watermarks, a stream-static join's is a dimension "
+            "snapshot, a session window's is the rows of every session still open, and a "
+            "union's is one cursor per branch — none of them is a source offset the engine "
+            "records. Drop checkpoint= (the sink's own idempotency still applies), or "
+            "reduce to a plan the offset log can address."
         )
 
     query_name = name or _next_name()

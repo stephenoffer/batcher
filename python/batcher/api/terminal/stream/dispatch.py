@@ -80,6 +80,7 @@ def _iter_batches(
         Distinct,
         Limit,
         Sort,
+        StreamingSessionWindow,
         TransformWithState,
         Union,
         WatermarkDedup,
@@ -219,6 +220,13 @@ def _iter_batches(
             return
         # Arbitrary keyed state: the user function owns one key's state, the engine owns
         # when it is called and expired. State is bounded by the key space and the TTL.
+        # Gap-based sessions: a session's end is only knowable once the gap has passed
+        # with nothing arriving, so rows are held until the watermark says so.
+        if isinstance(plan, StreamingSessionWindow) and is_streamable(plan.input):
+            from batcher.api.terminal.stream.session import stream_session_window
+
+            yield from stream_session_window(plan, sources[0], batch_size)
+            return
         if isinstance(plan, TransformWithState) and is_streamable(plan.input):
             from batcher.core.streaming import stream_keyed_state
 

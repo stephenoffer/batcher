@@ -351,7 +351,6 @@ def build_session_window(
     ``partition_by + session_id`` — emitting ``session_start``/``session_end`` and the
     requested aggregates. All row work is the existing window + group-by engine.
     """
-    from batcher.plan.expr_ir import col
     from batcher.plan.functions.temporal import _duration_micros
 
     if time_col not in ds.columns:
@@ -360,17 +359,84 @@ def build_session_window(
         raise PlanError("session_window() requires at least one named aggregate")
     gap_us = _duration_micros(gap, arg="session gap")
     pk = list(partition_by)
+
+    # Over an unbounded source the composition below cannot run: a session's end is not
+    # known until the gap has elapsed with nothing arriving, so the operator has to hold
+    # rows until the watermark says so. That is a driver-side stateful node, and it
+    # re-applies these same aggregates to each closed batch.
+    if not _all_bounded(ds):
+        from batcher.plan.logical import StreamingSessionWindow
+
+        lateness = ds._watermark.lateness_micros if ds._watermark is not None else 0
+        return ds._derive(
+            StreamingSessionWindow(
+                ds._plan, time_col, gap_us, tuple(pk), tuple(aggs.items()), lateness
+            )
+        )
+    return sessionize(ds, time_col, gap_us, pk, aggs)
+
+
+def _all_bounded(ds: Dataset) -> bool:
+    """Whether every source behind `ds` is bounded."""
+    from batcher.io.source import is_bounded
+
+    return all(is_bounded(s) for s in ds._sources)
+
+
+def mark_sessions(ds: Dataset, time_col: str, gap_us: int, pk: list[str]) -> Dataset:
+    """Tag every row with the session it belongs to, as `_t`/`_sid`.
+
+    Ordered by event time within each `pk` group, a row starts a new session when the gap
+    to the row before it exceeds `gap_us` (or there is no row before it); the session id
+    is the running count of those starts. `_t` is the event time in epoch microseconds,
+    which the gap arithmetic and the session bounds both need — the engine has no
+    Timestamp min/max.
+
+    Args:
+        ds: The rows to tag.
+        time_col: The event-time column.
+        gap_us: The gap that separates two sessions, in microseconds.
+        pk: The partition-key columns; empty for one global session chain.
+
+    Returns:
+        `ds` with `_t` and `_sid` added.
+    """
+    from batcher.plan.expr_ir import col
+
     order = [(time_col, False)]
-    # Epoch micros for gap arithmetic and min/max (the engine has no Timestamp min/max).
     s = ds.with_columns(_t=col(time_col).cast("int64"))
     s = build_window(
         s, partition_by=pk, order_by=order, functions={"_prev": ("lag", "_t", 1)}, frame=None
     )
     new_session = ((col("_t") - col("_prev") > gap_us) | col("_prev").is_null()).cast("int64")
     s = s.with_columns(_new=new_session)
-    s = build_window(
+    return build_window(
         s, partition_by=pk, order_by=order, functions={"_sid": ("sum", "_new")}, frame=None
     )
+
+
+def sessionize(
+    ds: Dataset, time_col: str, gap_us: int, pk: list[str], aggs: dict[str, Any]
+) -> Dataset:
+    """Aggregate `ds` by gap-based session, emitting `session_start`/`session_end`.
+
+    The bounded computation, and the one the streaming operator runs over each batch of
+    rows whose sessions the watermark has closed — so the two paths agree by construction
+    rather than by a second implementation agreeing with the first.
+
+    Args:
+        ds: The rows to sessionize.
+        time_col: The event-time column.
+        gap_us: The gap that separates two sessions, in microseconds.
+        pk: The partition-key columns.
+        aggs: The named aggregates to compute per session.
+
+    Returns:
+        One row per session: the partition keys, its bounds, and the aggregates.
+    """
+    from batcher.plan.expr_ir import col
+
+    s = mark_sessions(ds, time_col, gap_us, pk)
     grouped = s.group_by(*pk, "_sid").agg(_ss=col("_t").min(), _se=col("_t").max(), **aggs)
     out = grouped.with_columns(
         session_start=col("_ss").cast("timestamp"), session_end=col("_se").cast("timestamp")

@@ -73,3 +73,51 @@ def test_session_window_matches_duckdb(duck, gap):
         """
     )
     assert_same(got, rel)
+
+
+def _feed(tbl: pa.Table, chunks: int):
+    """The same rows as an unbounded source, delivered `chunks` micro-batches at a time."""
+
+    def source():
+        rows = tbl.num_rows
+        size = max(1, -(-rows // chunks))
+        for start in range(0, rows, size):
+            yield tbl.slice(start, size).to_batches()[0]
+
+    return bt.from_batches(source, tbl.schema, bounded=False)
+
+
+@pytest.mark.parametrize("chunks", [1, 3, 8])
+def test_a_streaming_session_window_matches_duckdb_too(duck, chunks):
+    """The streaming operator holds rows until the watermark says a session cannot grow.
+    Whether it held the right ones is only visible against an oracle that saw them all at
+    once -- and `chunks` varies where the micro-batch boundaries fall, because a boundary
+    inside a session is exactly what the operator exists to survive."""
+    tbl = _data().sort_by([("ts", "ascending")])  # a stream arrives in event-time order
+    got = []
+    stream = _feed(tbl, chunks).session_window(
+        "ts", "10m", partition_by=["k"], total=col("v").sum(), n=col("v").count()
+    )
+    for batch in stream.iter_batches():
+        got.append(batch)
+    result = pa.Table.from_batches(got)
+
+    duck.register("t", tbl)
+    rel = duck.sql(
+        """
+        WITH marked AS (
+            SELECT *,
+                CASE WHEN epoch_us(ts) - lag(epoch_us(ts)) OVER w > 600 * 1000000
+                          OR lag(epoch_us(ts)) OVER w IS NULL
+                     THEN 1 ELSE 0 END AS new_session
+            FROM t WINDOW w AS (PARTITION BY k ORDER BY ts)
+        ),
+        sessioned AS (
+            SELECT *, sum(new_session) OVER (PARTITION BY k ORDER BY ts) AS sid FROM marked
+        )
+        SELECT k, min(ts) AS session_start, max(ts) AS session_end,
+               sum(v) AS total, count(v) AS n
+        FROM sessioned GROUP BY k, sid
+        """
+    )
+    assert_same(result, rel)

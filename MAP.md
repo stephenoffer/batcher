@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1190 Python modules across 181 packages and 220 Rust files across 14 crates.
+Covering 1201 Python modules across 183 packages and 220 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -187,14 +187,14 @@ The `Dataset` builder package.
 
 | module | lines | what it is |
 |---|---|---|
-| `_build.py` | 564 | Plan-construction helpers behind the thinner `Dataset` methods. |
+| `_build.py` | 630 | Plan-construction helpers behind the thinner `Dataset` methods. |
 | `_dedup.py` | 339 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 213 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
 | `_export.py` | 96 | Framework-export helpers behind `Dataset.to_torch` / `to_tf` / `to_torch_dataloader`. |
 | `_nulls.py` | 196 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_window.py` | 135 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 403 | Row-callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 5806 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 5815 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 3245 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -342,7 +342,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | module | lines | what it is |
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
-| `_launch.py` | 248 | The single-node streaming launcher: optimize once, then drive micro-batches. |
+| `_launch.py` | 255 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 359 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
@@ -389,8 +389,9 @@ Streaming terminal path for `Dataset.iter_batches` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `dispatch.py` | 529 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
+| `dispatch.py` | 537 | Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`). |
 | `rebatch.py` | 59 | The exact output-granularity contract for `iter_batches(batch_size=N)`. |
+| `session.py` | 219 | The streaming session window — sessions whose end you only learn by waiting. |
 | `static_join.py` | 209 | The stream-static join — enrich a stream from a table that does not move. |
 | `union.py` | 158 | When a UNION streams branch by branch, and how its branches are addressed. |
 
@@ -436,13 +437,13 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `interpret.py` | 234 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 500 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 374 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
-| `model_selection.py` | 373 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
+| `model_selection.py` | 724 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `naive_bayes.py` | 490 | Naive Bayes — a probabilistic classifier whose whole fit is a grouped aggregate. |
 | `outliers.py` | 364 | Outlier detection — finding the rows a model should not be trained on, at scale. |
 | `permutation.py` | 187 | The keyed epoch permutation — a shuffled sample order that is computed, not stored. |
 | `pipeline.py` | 217 | Multi-stage streaming pipeline with credit-based backpressure (the GPU-feeding moat). |
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
-| `selection.py` | 372 | Deciding which features to keep, before a model ever sees them. |
+| `selection.py` | 390 | Deciding which features to keep, before a model ever sees them. |
 | `sparse_linear.py` | 259 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
 | `splitting.py` | 319 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 
@@ -549,7 +550,7 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 | `chain.py` | 232 | `Chain` — a sequence of preprocessors fitted and applied as one (sklearn ``Pipeline``). |
 | `imputers.py` | 146 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
 | `persistence.py` | 313 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
-| `polynomial.py` | 142 | Polynomial and interaction feature expansion (stateless). |
+| `polynomial.py` | 356 | Basis expansion — polynomial/interaction terms, and B-splines. |
 | `power.py` | 379 | The Yeo-Johnson power transform and its one-pass maximum-likelihood fit. |
 | `scalers.py` | 496 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
 | `text.py` | 252 | Feature assembly and text tokenization. |
@@ -580,6 +581,16 @@ Categorical encoders — ordinal codes, 0/1 indicators, and target encoding.
 | `target.py` | 262 | Mean (likelihood) target encoding, plain and cross-fitted. |
 | `woe.py` | 190 | Weight-of-evidence encoding — the credit-scorecard categorical transform. |
 
+### `batcher/ml/preprocessors/selection/` — 6 · front-end
+
+Feature selection as fit/transform preprocessors.
+
+| module | lines | what it is |
+|---|---|---|
+| `model_based.py` | 353 | `SelectFromModel` and `RFE` — feature selection that reads a fitted model. |
+| `redundancy.py` | 117 | `DropCorrelated` — remove one of every pair of columns that say the same thing. |
+| `univariate.py` | 256 | `SelectKBest` and `SelectPercentile` — keep the features that score against the target. |
+
 ### `batcher/ml/preprocessors/timeseries/` — 6 · front-end
 
 Features derived from time — calendar parts, and history as columns.
@@ -588,6 +599,18 @@ Features derived from time — calendar parts, and history as columns.
 |---|---|---|
 | `calendar.py` | 257 | Turning a timestamp into features a model can use. |
 | `history.py` | 232 | Lag and rolling features — history as columns, without leaking the future. |
+
+### `batcher/ml/preprocessors/vectorizers/` — 6 · front-end
+
+Bag-of-words text vectorizers — counts, TF-IDF, and the hashing trick.
+
+| module | lines | what it is |
+|---|---|---|
+| `assemble.py` | 165 | Turning a per-row list of term codes into a bag-of-words row, without a Python loop. |
+| `counts.py` | 341 | `CountVectorizer` — a learned vocabulary and the term counts of each document. |
+| `hashing.py` | 215 | `HashingVectorizer` — a bag of words with no vocabulary and therefore no fit. |
+| `tokens.py` | 195 | The tokenization step every text vectorizer shares, as one native expression. |
+| `weighting.py` | 162 | `TfidfVectorizer` — counts reweighted by how rare each term is across the corpus. |
 
 ### `batcher/ml/retrieval/` — 6 · front-end
 
@@ -892,9 +915,9 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 189 | The learned per-column statistics tables — their schema, their keys, and their bound. |
 | `correction.py` | 164 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
-| `cpu_shares.py` | 204 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
+| `cpu_shares.py` | 193 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 459 | Cross-execution learning — the metadata feedback loop. |
-| `measured_selectivity.py` | 133 | Filter selectivity derived from what Core measured, per plan signature. |
+| `measured_selectivity.py` | 153 | Filter selectivity derived from what Core measured, per plan signature. |
 | `metadata_answer.py` | 427 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 66 | The optimizer context — shared analysis threaded through every rule. |
@@ -2134,7 +2157,7 @@ String free functions, in two halves: building text and reading structure out of
 | `aggregate.py` | 175 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 255 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 353 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
-| `relational.py` | 493 | Row-wise and set relational logical nodes. |
+| `relational.py` | 542 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
 | `transforms.py` | 320 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 258 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
@@ -2247,7 +2270,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `device_share.py` | 338 | How much of one accelerator a claimant gets — the fractional-scheduling vocabulary. |
 | `events.py` | 312 | The engine's one observability event bus — every subsystem publishes here. |
 | `logging.py` | 274 | Centralized logging for the whole engine — one configured `batcher.*` hierarchy. |
-| `mathx.py` | 101 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
+| `mathx.py` | 131 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
 | `native.py` | 101 | The single accessor for the compiled Rust data plane (``batcher._native``). |
 | `optional.py` | 82 | The one optional-dependency import guard. |
 | `paths.py` | 107 | Filesystem locations of the installed package, and how to create things there safely. |
@@ -2604,7 +2627,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/media/audio.rs` | 406 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/mod.rs` | 666 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |
 | `eval/media/image/quality.rs` | 130 | Image-curation measures: how bright an image is, and how sharp. |
-| `eval/media/image/reencode.rs` | 493 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
+| `eval/media/image/reencode.rs` | 517 | Bytes-to-bytes image ops: `resize`, `crop`, `encode`, `convert`. |
 | `eval/media/mel.rs` | 237 | Mel power-spectrogram kernel for `AudioFunc::MelSpectrogram`. |
 | `eval/media/mod.rs` | 62 | Library-backed multimodal decoders (image / audio / video) for the `.image`/`.audio`/`.video` expression namespaces. |
 | `eval/media/speech.rs` | 126 | Waveform conditioning for speech pipelines: silence trimming, peak normalization, and the zero-crossing rate. |

@@ -150,6 +150,55 @@ print(sessions.select("user", "session_start", "total").to_pydict()["total"])
 User `a` clicked at 00:00 and again at 01:30, a 90-minute gap, so two sessions (3 and 7),
 not one of 10.
 
+### A session over a stream has to wait
+
+A fixed window knows its end before a single row arrives, so the engine can close one the
+instant the watermark passes it. A session knows nothing in advance: every event extends
+the session it lands in, and an event arriving between two sessions merges them into one.
+So the operator holds a session's rows until the watermark passes its last event plus the
+gap, and only then aggregates and emits it.
+
+The call is unchanged. Only the source is:
+
+```python
+session_schema = pa.schema([("user", pa.string()), ("ts", pa.timestamp("us")),
+                            ("amount", pa.int64())])
+
+
+def click_feed():
+    yield pa.record_batch(
+        {"user": ["a", "a"], "ts": [base, base + 2 * minute], "amount": [3, 4]},
+        schema=session_schema,
+    )
+    yield pa.record_batch(
+        {"user": ["a"], "ts": [base + 300 * minute], "amount": [9]}, schema=session_schema
+    )
+
+
+clicks = bt.from_batches(click_feed, session_schema, bounded=False)
+
+for batch in clicks.session_window(
+    "ts", "45m", partition_by=["user"], total=col("amount").sum()
+).iter_batches():
+    print(batch.to_pydict()["total"])
+# [7]
+# [9]
+```
+
+The first session emitted while the stream was still running, because the 05:00 event
+pushed the watermark past 00:02 plus the 45-minute gap. The second was still open when
+the feed ended, so it came out in the end-of-stream flush.
+
+That gives the operator its memory bound: it buffers rows for sessions that are still
+open, which is the live key space times the gap rather than the length of the stream.
+
+:::{warning}
+**A late event cannot reopen a session that was already emitted.** It is dropped, the
+same way a late row is dropped from a closed window, and for the same reason: the row
+downstream has already been written. `with_watermark("ts", "10m")` is how you buy a
+straggler room, and it costs exactly that much more buffering before any session closes.
+:::
+
 ## What bounds the state
 
 Memory for a windowed streaming aggregate is proportional to the number of *open*

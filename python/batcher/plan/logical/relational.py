@@ -34,6 +34,7 @@ __all__ = [
     "Projection",
     "Sample",
     "Scan",
+    "StreamingSessionWindow",
     "Union",
     "WatermarkDedup",
 ]
@@ -224,6 +225,54 @@ class WatermarkDedup(LogicalPlan):
 
     def available_schema(self) -> SchemaRef | None:
         return self.input.available_schema()
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingSessionWindow(LogicalPlan):
+    """Gap-based session windows over a stream (Spark ``session_window``).
+
+    A session is a run of events for one key with no gap longer than `gap_micros`
+    between consecutive events. Unlike a tumbling or sliding window, its bounds are not
+    known in advance: every new event can extend the session it lands in, and two
+    sessions can merge when an event arrives between them. That is why a bounded
+    `session_window` composes cleanly out of a window function and a group-by, and a
+    streaming one cannot — it has to wait.
+
+    What it waits for is the watermark. A session whose last event is at ``t`` can still
+    be extended by any event in ``(t, t + gap]``, so it is complete exactly when the
+    watermark passes ``t + gap``: the watermark is the engine's promise that no event
+    older than it will arrive, and a row that arrives older is dropped as late. Complete
+    sessions are aggregated and emitted; the rest stay buffered. **That is the operator's
+    memory bound**: rows for open sessions only, which is bounded by the key space times
+    the gap rather than by the length of the stream.
+
+    A *streaming-only* node — over a bounded source `session_window` builds the composed
+    window + group-by plan instead, because there is nothing to wait for. Executed by the
+    streaming driver and never lowered to the Rust IR; `aggs` are re-applied per closed
+    batch through the ordinary engine, so the aggregation itself is the same code the
+    bounded path runs.
+    """
+
+    input: LogicalPlan
+    time_col: str
+    #: The gap that separates two sessions, in microseconds.
+    gap_micros: int
+    partition_by: tuple[str, ...]
+    #: ``(output_name, aggregate expression)`` pairs, in output order.
+    aggs: tuple[tuple[str, Expr], ...]
+    #: Allowed lateness from the watermark, in microseconds.
+    lateness_micros: int = 0
+
+    def to_ir(self) -> dict[str, Any]:
+        raise NotImplementedError(
+            "a streaming session window is executed by the streaming driver, not lowered to the IR"
+        )
+
+    def available_columns(self) -> list[str]:
+        return [*self.partition_by, "session_start", "session_end", *(a for a, _ in self.aggs)]
+
+    def available_schema(self) -> SchemaRef | None:
+        return None  # the aggregate output types come from the engine, not from here
 
 
 @dataclass(frozen=True, slots=True)

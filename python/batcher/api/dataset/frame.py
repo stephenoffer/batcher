@@ -2115,8 +2115,17 @@ class Dataset:
 
             ds.session_window("ts", "5m", partition_by=["user"], hits=col("v").sum())
 
-        Composed from the window + group-by engine (no new operator), so it is
-        differential-tested against DuckDB and runs single-node or distributed.
+        Over a bounded source this composes from the window + group-by engine with no
+        new operator, so it is differential-tested against DuckDB and runs single-node
+        or distributed.
+
+        Over a **stream** it has to wait, because a session's end is not knowable in
+        advance: every event extends the session it lands in, and an event between two
+        sessions merges them. So a session's rows are held until the watermark passes
+        its last event plus `gap`, and only then aggregated and emitted — by the same
+        code the bounded path runs. That bounds the state to sessions still open, and it
+        means a late event cannot reopen a session already emitted; it is dropped, as it
+        would be from a closed window. Use `with_watermark` to buy a straggler room.
 
         Args:
             time_col: The event-time column that orders events into sessions.
