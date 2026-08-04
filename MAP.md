@@ -568,7 +568,7 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 | `binning.py` | 160 | Binning / discretization preprocessors. |
 | `chain.py` | 232 | `Chain` — a sequence of preprocessors fitted and applied as one (sklearn ``Pipeline``). |
 | `imputers.py` | 361 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
-| `persistence.py` | 313 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
+| `persistence.py` | 255 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
 | `polynomial.py` | 356 | Basis expansion — polynomial/interaction terms, and B-splines. |
 | `power.py` | 379 | The Yeo-Johnson power transform and its one-pass maximum-likelihood fit. |
 | `scalers.py` | 496 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
