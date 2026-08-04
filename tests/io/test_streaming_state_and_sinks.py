@@ -189,7 +189,10 @@ def test_complete_mode_replaces_and_does_not_accumulate():
     for i in range(3):
         sink.write_batch(i, pa.table({"a": [i]}))
     assert memory_table("complete-mode").to_pydict() == {"a": [2]}
-    assert sink._held == 0
+    # The retained size is the *current* table's, not zero and not a running total: complete
+    # mode replaces what it holds each micro-batch, and the size guard has to measure what is
+    # actually held or a high-cardinality running result grows past the budget unnoticed.
+    assert sink._held == pa.table({"a": [2]}).nbytes
     _MEMORY.pop("complete-mode", None)
 
 

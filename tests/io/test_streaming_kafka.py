@@ -472,3 +472,64 @@ def test_tolerating_data_loss_does_not_tolerate_any_other_error():
     src = KafkaSource("t", fail_on_data_loss=False)
     with pytest.raises(BackendError, match="Kafka read failed"):
         src._decode([_Rec(0, error=_Err(-193, text="sasl handshake failed"))])
+
+
+# --- includeHeaders (Spark option parity) --------------------------------------------
+
+
+class _RecWithHeaders(_Rec):
+    """A record whose client exposes headers, as confluent-kafka's does."""
+
+    def __init__(self, offset: int, headers) -> None:
+        super().__init__(offset)
+        self._headers = headers
+
+    def headers(self):
+        return self._headers
+
+
+def test_the_headers_column_is_absent_unless_asked_for():
+    from batcher.io.formats.streaming.broker import broker_schema
+
+    assert "headers" not in broker_schema().names
+    assert KafkaSource("t").schema().names == list(broker_schema().names)
+
+
+def test_asking_for_headers_adds_a_spark_shaped_column():
+    """Spark's Kafka source types it `array<struct<key:string,value:binary>>`, so a ported
+    job's accessors keep working."""
+    source = KafkaSource("t", include_headers=True)
+    field = source.schema().field("headers")
+    assert str(field.type) == "list<item: struct<key: string, value: binary>>"
+
+
+def test_headers_reach_the_batch_when_the_reader_opted_in():
+    source = KafkaSource("t", include_headers=True)
+    batch = source._make_batch(source._decode([_RecWithHeaders(0, [("trace", b"abc")])]))
+    assert batch.column("headers").to_pylist() == [[{"key": "trace", "value": b"abc"}]]
+
+
+def test_a_message_with_no_headers_is_null_not_an_empty_list():
+    """ "This broker carries no headers" and "this message had none" stay distinguishable,
+    the same distinction Spark's null-vs-empty-array draws."""
+    source = KafkaSource("t", include_headers=True)
+    batch = source._make_batch(source._decode([_RecWithHeaders(0, None)]))
+    assert batch.column("headers").to_pylist() == [None]
+
+
+def test_headers_are_not_decoded_when_the_reader_did_not_ask():
+    source = KafkaSource("t")
+    decoded = source._decode([_RecWithHeaders(0, [("trace", b"abc")])])
+    assert decoded[0].headers is None
+
+
+def test_the_split_carries_the_choice_to_the_worker():
+    """A worker that rebuilt the source without it would return a batch one column
+    narrower than its siblings, and the epoch's concat would fail on the schema."""
+    split = KafkaSource("t", include_headers=True, partitions=[0]).splits()[0]
+    assert split.include_headers is True
+    assert "headers" in split.schema().names
+
+
+def test_include_headers_never_reaches_the_client_config():
+    assert "include_headers" not in KafkaSource("t", include_headers=True)._options

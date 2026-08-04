@@ -218,14 +218,29 @@ def test_broker_schema_is_fixed():
     assert schema.field("topic").type == pa.string()
 
 
-def test_broker_make_batch_assembles_fixed_schema():
+def _assemble(messages, *, include_headers: bool = False):
+    """Build a batch through a concrete broker — `_make_batch` is per-source now, because
+    whether it produces a `headers` column depends on how the reader was configured."""
     from batcher.io.formats.streaming.broker import BrokerSource
 
+    class _Assembler(BrokerSource):
+        format_name = "assembler"
+
+        def _discover_partitions(self):
+            return [0]
+
+        def _poll(self):
+            return None
+
+    return _Assembler("t", include_headers=include_headers)._make_batch(messages)
+
+
+def test_broker_make_batch_assembles_fixed_schema():
     messages = [
         BrokerMessage(value=b"a", partition=0, offset=10, timestamp=100, topic="t", key=b"k"),
         BrokerMessage(value=b"b", partition=0, offset=11, timestamp=101, topic="t"),
     ]
-    batch = BrokerSource._make_batch(messages)
+    batch = _assemble(messages)
     assert batch.schema == broker_schema()
     assert batch.num_rows == 2
     assert batch.column("value").to_pylist() == [b"a", b"b"]
@@ -413,9 +428,7 @@ def test_eventhubs_event_preserves_binary_body_and_coerces_key():
     assert msg.key == b"tenant-9"
     assert msg.partition == 2 and msg.offset == 7 and msg.timestamp == 123
     # And the message assembles cleanly into the binary broker schema (would raise before).
-    from batcher.io.formats.streaming.broker import BrokerSource
-
-    batch = BrokerSource._make_batch([msg])
+    batch = _assemble([msg])
     assert batch.schema.equals(broker_schema())
     assert batch.column("value")[0].as_py() == raw
 

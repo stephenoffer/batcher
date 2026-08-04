@@ -430,6 +430,7 @@ class KafkaSource(BrokerSource):
                     timestamp=rec.timestamp()[1],
                     topic=rec.topic(),
                     key=rec.key(),
+                    headers=rec.headers() if self._include_headers else None,
                 )
             )
         return messages

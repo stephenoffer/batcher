@@ -131,6 +131,23 @@ bt.read.kafka(
 )
 ```
 
+## Message headers
+
+Headers carry the metadata that is not the payload: a trace id, a schema-registry id, a
+routing hint. `include_headers=True` adds a `headers` column typed exactly as Spark's
+Kafka source types it, `array<struct<key:string,value:binary>>`:
+
+```python
+# docs: skip
+events = bt.read.kafka("clicks", bootstrap_servers="broker-1:9092", include_headers=True)
+traced = events.with_columns(trace=col("headers").list.get(0).struct.field("value"))
+```
+
+It is off by default for the same reason it is in Spark: most pipelines never read headers,
+and the nested column costs on every message of every poll. A message that carried none
+reads as `null` rather than as an empty list, so "this broker has no headers" and "this
+message had none" stay distinguishable.
+
 ## Consumer groups, and what happens on restart
 
 Read this part before you deploy.

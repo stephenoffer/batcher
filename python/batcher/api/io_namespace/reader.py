@@ -1266,8 +1266,10 @@ class Reader:
                 ``poll_bytes``) to bound one micro-batch by message count and by payload
                 size, ``starting_offsets=`` (``"earliest"``, ``"latest"``, or a
                 ``{partition: offset}`` map) for where a first run begins,
-                ``fail_on_data_loss=`` for whether aged-out offsets stop the query, and
-                anything else the ``confluent-kafka`` consumer accepts.
+                ``fail_on_data_loss=`` for whether aged-out offsets stop the query,
+                ``include_headers=True`` to add a ``headers`` column of
+                ``array<struct<key:string,value:binary>>``, and anything else the
+                ``confluent-kafka`` consumer accepts.
 
         Returns:
             A lazy `Dataset` streaming from the Kafka topic.
