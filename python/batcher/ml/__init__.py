@@ -85,6 +85,12 @@ from batcher.ml.outliers import (
     mahalanobis_distance,
     outlier_bounds,
 )
+from batcher.ml.persistence import (
+    load_model,
+    model_from_dict,
+    model_to_dict,
+    save_model,
+)
 from batcher.ml.pipeline import Stage, run_pipeline
 from batcher.ml.preprocessors import (
     PCA,
@@ -317,10 +323,13 @@ __all__ = [
     "llm_udf",
     "llm_verify_udf",
     "load",
+    "load_model",
     "mahalanobis_distance",
     "majority_vote",
     "mix_corpora",
     "mmr_rerank_udf",
+    "model_from_dict",
+    "model_to_dict",
     "openai_embedding_encoder",
     "out_of_fold_features",
     "outlier_bounds",
@@ -339,6 +348,7 @@ __all__ = [
     "run_pipeline",
     "sample_weights",
     "save",
+    "save_model",
     "serve_deployment",
     "serving_udf",
     "shard_stream_loader",

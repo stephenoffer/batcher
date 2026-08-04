@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1209 Python modules across 185 packages and 219 Rust files across 14 crates.
+Covering 1212 Python modules across 186 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -548,6 +548,15 @@ Model evaluation over a `Dataset` — rank metrics, diagnostic tables, and `eval
 | `regression.py` | 376 | Regression-specific diagnostics — the residual, the interval, and the top-k label. |
 | `tables.py` | 411 | Diagnostic tables — confusion matrix, threshold sweep, lift, calibration. |
 | `thresholds.py` | 292 | Choosing an operating point — the step between a good AUC and a deployed model. |
+
+### `batcher/ml/persistence/` — 6 · front-end
+
+Persisting fitted state — the document format, and estimator save/load.
+
+| module | lines | what it is |
+|---|---|---|
+| `document.py` | 214 | The JSON document format fitted objects are written in, and how it is read back. |
+| `models.py` | 222 | Saving and loading a fitted estimator — the half of train/serve parity that was missing. |
 
 ### `batcher/ml/preprocessors/` — 6 · front-end
 

@@ -234,6 +234,21 @@ Score a clustering against a reference labeling with `batcher.ml.metrics`, each 
 .. autofunction:: davies_bouldin_score
 ```
 
+## Model persistence
+
+A fitted estimator has to outlive the process that fitted it, or a model trained across a
+cluster cannot be moved anywhere. These write it as readable JSON, the same format the
+preprocessors use:
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.persistence
+
+.. autofunction:: save_model
+.. autofunction:: load_model
+.. autofunction:: model_to_dict
+.. autofunction:: model_from_dict
+```
+
 ## Ensembling
 
 Combining several models into one prediction. `blend_predictions` is a weighted average and

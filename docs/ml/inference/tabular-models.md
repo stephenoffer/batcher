@@ -153,6 +153,51 @@ When clusters overlap or the goal is a density rather than a partition, `batcher
 
 When the groups *are* the labels, `batcher.ml.cluster.NearestCentroid` is the supervised counterpart: it fits one centroid per class and labels a row by the nearest, reproducing scikit-learn's `NearestCentroid`.
 
+## Save a model Batcher fitted
+
+The estimators in `batcher.ml` fit *on* the engine, so a model can be trained across a
+cluster. {py:func}`save_model <batcher.ml.save_model>` and
+{py:func}`load_model <batcher.ml.load_model>` are what move it afterwards — without them the
+only route from a fitted model to a prediction is to fit again, which is not a serving
+story.
+
+```python
+import os
+import tempfile
+
+import batcher as bt
+from batcher.ml import LinearRegression, load_model, save_model
+
+train = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
+model = LinearRegression(["x"], "y").fit(train)
+
+target = os.path.join(tempfile.mkdtemp(), "model.json")
+save_model(model, target)
+
+served = load_model(target)
+print(served.predict(bt.from_pydict({"x": [10.0]})).to_pydict()["prediction"])
+# [20.0]
+```
+
+The path may be a cloud URI, because a fitted model belongs next to the data it scores
+rather than on the machine that fitted it.
+
+What is written is JSON, not a pickle, and for the same reasons the preprocessors use JSON:
+you can read what the model will do, a reviewer can diff it, it survives a class moving or a
+slot being renamed, and it is safe to load from a store you do not fully control.
+
+```python
+import json
+
+print(sorted(json.loads(open(target).read())))
+# ['class', 'params', 'state', 'version']
+```
+
+`state` holds what `fit` learned, under scikit-learn's trailing-underscore names, and
+`params` holds the constructor arguments — read from the constructor's own signature, so a
+parameter an estimator keeps privately (`Ridge` takes `alpha` and stores `_alpha`) is still
+recorded under the name that rebuilds it.
+
 ## Requirements and limitations
 
 Each framework is an optional extra: `pip install 'batcher-engine[xgboost]'`, `[lightgbm]`, `[catboost]`, `[onnx]`, or `[sklearn]`. `[tabular]` installs all of them.
