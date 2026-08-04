@@ -430,7 +430,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `dummy.py` | 208 | Baseline predictors — the "does my model beat doing nothing" reference. |
 | `embed.py` | 500 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
 | `embed_api.py` | 325 | Embedding encoders backed by a *served* endpoint, not a local model. |
-| `feature_scores.py` | 268 | Univariate feature scoring — rank every feature against the target in one pass each. |
+| `feature_scores.py` | 333 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 331 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
 | `glm.py` | 344 | Generalized linear models fitted by iteratively reweighted least squares. |
 | `gpu.py` | 1573 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |

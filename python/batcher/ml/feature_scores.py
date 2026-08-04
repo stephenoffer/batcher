@@ -18,9 +18,11 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from batcher.ml.stats.association import anova_f, chi_square, mutual_information
+from batcher.ml.stats.association import chi_square, mutual_information
+from batcher.plan.expr_ir import count
 from batcher.plan.expr_ir.constructors import col
 from batcher.plan.functions.aggregate import corr
+from batcher.plan.functions.aggregate import sum as sum_
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -119,8 +121,10 @@ def f_classif_scores(
             >>> scores["signal"] > scores["noise"]
             True
     """
-    features = _feature_list(ds, features, target)
-    return {f: anova_f(ds, f, target) for f in features}
+    names = _feature_list(ds, features, target)
+    if not names:
+        return {}
+    return _anova_scores(ds, target, names)
 
 
 def f_regression_scores(
@@ -153,11 +157,20 @@ def f_regression_scores(
             >>> scores["linear"] > scores["flat"]
             True
     """
-    features = _feature_list(ds, features, target)
-    n = ds.count()
+    names = _feature_list(ds, features, target)
+    if not names:
+        return {}
+    # One aggregate carrying every feature's correlation, rather than one scan per feature.
+    # A correlation is a mergeable reduction, so a hundred of them ride the same pass; the
+    # loop this replaces made a wide-table screen cost a hundred scans of the same data.
+    row = ds.agg(
+        __bt_rows=count(),
+        **{f"__bt_r{i}": corr(col(f), col(target)) for i, f in enumerate(names)},
+    ).collect()
+    n = row.column("__bt_rows")[0].as_py() or 0
     out: dict[str, float] = {}
-    for f in features:
-        r = ds.agg(r=corr(col(f), col(target))).collect().column("r")[0].as_py()
+    for i, f in enumerate(names):
+        r = row.column(f"__bt_r{i}")[0].as_py()
         if r is None or abs(r) >= 1.0:
             out[f] = math.inf if r is not None else math.nan
             continue
@@ -266,3 +279,55 @@ def select_k_best(scores: dict[str, float], k: int) -> list[str]:
         reverse=True,
     )
     return [name for name, _ in ranked[:k]]
+
+
+def _anova_scores(ds: Dataset, target: str, names: list[str]) -> dict[str, float]:
+    """Every feature's one-way ANOVA F against `target`, from a single grouped pass.
+
+    `stats.anova_f` computes one feature at a time with window functions, which is the
+    clearest way to say it and costs a scan per feature. The same statistic is recoverable
+    from per-group ``(count, sum, sum of squares)``, and those are ordinary mergeable
+    aggregates — so every feature's three moments ride one ``group_by(target)`` and the
+    arithmetic happens on the driver over one row per class.
+
+    Nulls are handled per feature rather than per frame: a feature's count, sum and sum of
+    squares all skip its own nulls, which reproduces `anova_f`'s row filter without forcing
+    every feature to share one filtered relation.
+    """
+    aggregates: dict[str, object] = {}
+    for i, name in enumerate(names):
+        value = col(name).cast("float64")
+        aggregates[f"__bt_n{i}"] = col(name).count()
+        aggregates[f"__bt_s{i}"] = sum_(value)
+        aggregates[f"__bt_q{i}"] = sum_(value * value)
+    grouped = (
+        ds.filter(col(target).is_not_null()).group_by(target).agg(**aggregates).collect()
+    )
+    out: dict[str, float] = {}
+    for i, name in enumerate(names):
+        counts = [v or 0 for v in grouped.column(f"__bt_n{i}").to_pylist()]
+        sums = [v or 0.0 for v in grouped.column(f"__bt_s{i}").to_pylist()]
+        squares = [v or 0.0 for v in grouped.column(f"__bt_q{i}").to_pylist()]
+        out[name] = _anova_from_moments(counts, sums, squares)
+    return out
+
+
+def _anova_from_moments(counts: list[int], sums: list[float], squares: list[float]) -> float:
+    """The F statistic implied by one feature's per-group moments.
+
+    ``SSW`` is accumulated as ``sum_of_squares - sum^2 / count`` per group, which is the
+    textbook shortcut and the reason the three moments are enough. Groups the feature has no
+    non-null value in contribute nothing and do not count toward ``k``, matching what
+    filtering those rows out would have done.
+    """
+    groups = [(n, s, q) for n, s, q in zip(counts, sums, squares, strict=True) if n]
+    k = len(groups)
+    n = sum(n for n, _, _ in groups)
+    if k < 2 or n <= k:
+        return float("nan")
+    grand_mean = sum(s for _, s, _ in groups) / n
+    ss_between = sum(count * (s / count - grand_mean) ** 2 for count, s, _ in groups)
+    ss_within = sum(q - s * s / count for count, s, q in groups)
+    if ss_within <= 0:
+        return float("nan")
+    return (ss_between / (k - 1)) / (ss_within / (n - k))
