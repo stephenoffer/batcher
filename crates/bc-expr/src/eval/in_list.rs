@@ -97,16 +97,43 @@ impl<T: Hash + Eq + Ord + Copy> Ranged<T> {
 }
 
 /// Evaluate `array IN set` to a `BooleanArray` (null where `array` is null).
+/// Every literal converted under one arm's extractor, or `None` if *any* of them does not.
+///
+/// The typed arms below are accelerations of the `=` chain, not a second semantics, so an
+/// arm may only be taken when it can represent the whole set. Dropping the members it
+/// cannot represent is what made `date_col IN ('2000-06-30', '2000-09-27')` return **no
+/// rows**: `literal_date` accepts only `Literal::Date`, both string literals were filtered
+/// away, and the set was empty. The single-literal spelling was correct the whole time,
+/// because one equality is never folded into an `InList` — so `d = '…'` matched and
+/// `d IN ('…', '…')` did not. `Expr.is_in` on the public API had it too, including
+/// `is_in([1.0, 2.0])` against an `Int64` column.
+///
+/// Returning `None` sends the call to `membership_generic`, which is the OR-of-equality the
+/// fold collapsed from and therefore carries `eval_binary`'s coercions — the property the
+/// fallback arm below already relies on, applied to the typed arms as well.
+fn all_converted<'a, T>(
+    set: &'a [Literal],
+    f: impl Fn(&'a Literal) -> Option<T>,
+) -> Option<Vec<T>> {
+    set.iter().map(f).collect()
+}
+
 pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef, ExprError> {
     let out: BooleanArray = match array.data_type() {
         DataType::Int64 => {
             let a = array.as_primitive::<Int64Type>();
-            let members = Ranged::new(set.iter().filter_map(literal_i64).collect());
+            let Some(items) = all_converted(set, literal_i64) else {
+                return membership_generic(array, set);
+            };
+            let members = Ranged::new(items);
             membership(a.nulls(), a.len(), |i| members.contains(a.value(i)))
         }
         DataType::Date32 => {
             let a = array.as_primitive::<Date32Type>();
-            let members = Ranged::new(set.iter().filter_map(literal_date).collect());
+            let Some(items) = all_converted(set, literal_date) else {
+                return membership_generic(array, set);
+            };
+            let members = Ranged::new(items);
             membership(a.nulls(), a.len(), |i| members.contains(a.value(i)))
         }
         // A float column can reach `InList`: the fold rule collapses a chain of
@@ -119,19 +146,20 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
         // `-0.0`/`NaN` correctly never lands in the set.
         DataType::Float64 => {
             let a = array.as_primitive::<Float64Type>();
-            let members = Members::new(
-                set.iter()
-                    .filter_map(literal_f64)
-                    .map(f64::to_bits)
-                    .collect(),
-            );
+            let Some(items) = all_converted(set, |l| literal_f64(l).map(f64::to_bits)) else {
+                return membership_generic(array, set);
+            };
+            let members = Members::new(items);
             membership(a.nulls(), a.len(), |i| {
                 members.contains(&a.value(i).to_bits())
             })
         }
         DataType::Utf8 => {
             let a = array.as_string::<i32>();
-            let members = Members::new(set.iter().filter_map(literal_str).collect());
+            let Some(items) = all_converted(set, literal_str) else {
+                return membership_generic(array, set);
+            };
+            let members = Members::new(items);
             membership(a.nulls(), a.len(), |i| members.contains(&a.value(i)))
         }
         // A dictionary-encoded column: evaluate membership on the *dictionary values* (a
@@ -444,5 +472,52 @@ mod tests {
             vec![Some(true), Some(false), None]
         );
         assert_eq!(run(arr, &large), vec![Some(true), Some(false), None]);
+    }
+
+    /// A set the typed arm cannot represent must fall back, not silently shrink.
+    ///
+    /// `literal_date` accepts only `Literal::Date`, so string members were filtered away
+    /// and `date_col IN ('2000-06-30', '2000-09-27')` matched nothing at all. The fallback
+    /// is the OR-of-equality this kernel folds from, which coerces the string exactly as
+    /// `col = '2000-06-30'` does — and that spelling was always correct, which is what made
+    /// the bug so quiet.
+    #[test]
+    fn a_string_literal_against_a_date_column_still_matches() {
+        use arrow::array::Date32Array;
+        // 11138 = 2000-06-30, 11227 = 2000-09-27 (days since epoch).
+        let arr: ArrayRef = Arc::new(Date32Array::from(vec![Some(11138), Some(11227), None]));
+        let set = [
+            Literal::Str("2000-06-30".into()),
+            Literal::Str("2000-09-27".into()),
+        ];
+        assert_eq!(run(arr, &set), vec![Some(true), Some(true), None]);
+    }
+
+    /// The same defect on the numeric arms: a float literal against an `Int64` column.
+    #[test]
+    fn a_float_literal_against_an_int_column_still_matches() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)]));
+        let set = [Literal::Float(1.0), Literal::Float(2.0)];
+        assert_eq!(run(arr, &set), vec![Some(true), Some(true), Some(false)]);
+    }
+
+    /// A mixed set must not lose the members the typed arm *can* hold either.
+    #[test]
+    fn a_mixed_set_keeps_every_member() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(7)]));
+        let set = [Literal::Int(1), Literal::Float(2.0)];
+        assert_eq!(run(arr, &set), vec![Some(true), Some(true), Some(false)]);
+    }
+
+    /// The typed fast path is still taken for a homogeneous set — the fallback is only for
+    /// sets it cannot represent, so this must stay bit-identical to the pre-existing arms.
+    #[test]
+    fn a_homogeneous_set_is_unchanged() {
+        let arr: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(5), Some(9), None]));
+        let set = [Literal::Int(1), Literal::Int(5)];
+        assert_eq!(
+            run(arr, &set),
+            vec![Some(true), Some(true), Some(false), None]
+        );
     }
 }

@@ -142,6 +142,69 @@ def _has_aggregate(node) -> bool:
     return False
 
 
+_MAX_DERIVED_DEPTH = 8
+
+
+def _source_columns(tr, node, depth: int = 0) -> list[str] | None:
+    """The output column names of one FROM source, or None if they can't be determined.
+
+    Read from the AST rather than by planning the source. Planning it would be exact, but
+    `_disambiguate_columns` runs *before* the FROM clause is built and translating a
+    subquery twice would advance the translator's alias counters and clobber its
+    per-select state — so the names are derived structurally instead.
+
+    Returning None is always safe: the caller then leaves that source alone, which is the
+    behavior every derived table had before it was considered at all.
+
+    Args:
+        tr: The translator, for its table registry.
+        node: A FROM/JOIN source — a base table, a derived table, or a set operation.
+        depth: Recursion guard for nested derived tables.
+
+    Returns:
+        The source's output column names in order, or None if any part is unresolvable.
+    """
+    if depth > _MAX_DERIVED_DEPTH:
+        return None
+    if isinstance(node, exp.Table):
+        rel = tr._registry.get(node.name)
+        return list(rel.columns) if rel is not None else None
+    if isinstance(node, exp.Subquery):
+        return _source_columns(tr, node.this, depth + 1)
+    if isinstance(node, exp.Union):
+        # A set operation takes its column names from its left branch, as SQL specifies.
+        return _source_columns(tr, node.this, depth + 1)
+    if not isinstance(node, exp.Select):
+        return None
+
+    inner_from = node.args.get("from") or node.args.get("from_")
+    inner_sources = ([inner_from.this] if inner_from is not None else []) + [
+        j.this for j in node.args.get("joins", []) or []
+    ]
+    out: list[str] = []
+    for p in node.expressions:
+        # `SELECT *` / `SELECT x.*` — expand from the inner FROM. TPC-DS q44 needs this:
+        # its ranked relations are `(SELECT * FROM (SELECT item_sk, ... rnk FROM …) V11 …)`,
+        # so the colliding `rnk` is two levels down and invisible to the projection list.
+        star = isinstance(p, exp.Star)
+        qualified_star = isinstance(p, exp.Column) and isinstance(p.this, exp.Star)
+        if star or qualified_star:
+            want = p.table if qualified_star else None
+            for s in inner_sources:
+                if want and (s.alias or getattr(s, "name", None)) != want:
+                    continue
+                cols = _source_columns(tr, s, depth + 1)
+                if cols is None:
+                    return None
+                out.extend(cols)
+            continue
+        name = p.alias_or_name
+        if not name:
+            return None
+        out.append(name)
+    return out or None
+
+
 def _disambiguate_columns(tr, node) -> None:
     """Rename colliding columns so the alias-blind resolver sees distinct names.
 
@@ -162,14 +225,28 @@ def _disambiguate_columns(tr, node) -> None:
     (`_key_shadows`), and only the qualified references are redirected onto it. The bare
     name still resolves to the coalesced column, which is what USING/NATURAL specify and
     what the ``ON`` form is leniently allowed here (DuckDB calls that one ambiguous).
+
+    It also records, per select node, which joined-relation column each source contributed
+    (``tr._star_sources``). That is what lets ``SELECT x.*`` project x's columns and only
+    x's, under their bare names — see :func:`grouping._projection_map`.
     """
     from_ = node.args.get("from") or node.args.get("from_")
     if from_ is None:
         return
     joins = node.args.get("joins", []) or []
-    tables = [t for t in [from_.this, *(j.this for j in joins)] if isinstance(t, exp.Table)]
-    if len(tables) < 2:
+    # A *derived* table collides exactly the way a base table does, and is included for
+    # that reason: `FROM (SELECT k AS r FROM t) a, (SELECT k AS r FROM t) b WHERE a.r = b.r`
+    # otherwise collapsed both `r`s onto one column, so the predicate became `r = r` — true
+    # for every pair — and the query silently returned the cartesian product. TPC-DS q44 is
+    # that shape (two ranked subqueries joined on `rnk`) and returned 100 rows for 10.
+    sources = [
+        t
+        for t in [from_.this, *(j.this for j in joins)]
+        if isinstance(t, (exp.Table, exp.Subquery))
+    ]
+    if len(sources) < 2:
         return
+    tables = [t for t in sources if isinstance(t, exp.Table)]
 
     # Columns a USING / same-name-ON-equi join merges must keep their bare name (the
     # join unifies them; flattening would make it drop the right key). Comma joins
@@ -186,18 +263,25 @@ def _disambiguate_columns(tr, node) -> None:
                 protected.add(a.name)
 
     names = [t.name for t in tables]
-    per_source: list[tuple] = []  # (table_node, alias, columns)
+    per_source: list[tuple] = []  # (source_node, alias, columns)
     counts: dict[str, int] = {}
-    for t in tables:
-        if t.name not in tr._registry:
-            if names.count(t.name) > 1:
+    for t in sources:
+        cols = _source_columns(tr, t)
+        if cols is None:
+            # A source whose columns cannot be enumerated cannot be disambiguated. For a
+            # base table that is only safe when its name is unique (a self-join would
+            # silently collapse); a derived table is always uniquely aliased, so an
+            # unresolvable one is simply left alone, exactly as before this change.
+            if isinstance(t, exp.Table) and names.count(t.name) > 1:
                 raise NotImplementedError(
                     f"self-join on {t.name!r} is not supported (its columns can't be "
                     f"enumerated to disambiguate the aliases)"
                 )
             continue
-        cols = list(tr._registry[t.name].columns)
-        per_source.append((t, t.alias or t.name, cols))
+        alias = t.alias or (t.name if isinstance(t, exp.Table) else None)
+        if alias is None:
+            continue  # an unaliased derived table cannot be referenced by qualifier
+        per_source.append((t, alias, cols))
         for c in set(cols):
             counts[c] = counts.get(c, 0) + 1
 
@@ -206,6 +290,15 @@ def _disambiguate_columns(tr, node) -> None:
         protected |= shared
     flatten = shared - protected
     shadow_keys = _key_shadows(node, joins, shared & protected)
+
+    # Record where every source's columns end up in the joined relation, so a *qualified*
+    # star (`SELECT x.*`) can project exactly that source's columns under their bare names.
+    # This has to be recorded even when nothing is renamed below: `x.*` needs to know which
+    # columns are x's whether or not any of them collided.
+    tr._star_sources[id(node)] = {
+        alias: {c: f"{alias}__{c}" if c in flatten or c in shadow_keys else c for c in cols}
+        for _, alias, cols in per_source
+    }
     if not flatten and not shadow_keys:
         return
 
@@ -226,7 +319,9 @@ def _disambiguate_columns(tr, node) -> None:
                 exp.alias_(exp.column(c), flat[c]) if c in flat else exp.column(c) for c in cols
             ]
             + [exp.alias_(exp.column(c), s) for c, s in shadow.items()]
-        ).from_(exp.table_(t.name))
+            # A base table is re-selected by name; a derived table is wrapped around
+            # itself, since its rows exist only as its own subquery.
+        ).from_(exp.table_(t.name) if isinstance(t, exp.Table) else t.copy())
         t.replace(exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias))))
 
     # A bare `alias.col` projected directly keeps its output name (`col`).
@@ -257,6 +352,13 @@ def _key_shadows(node, joins, merged_keys: set[str]) -> set[str]:
     * **Semi/anti.** They emit the left relation's columns alone, so there is no second
       side to tell apart and nothing was coalesced away to begin with.
 
+    A **qualified star** counts as naming every merged key, and has to be handled
+    separately: `x.*` asks x for all of its own columns, its share of the key included, but
+    the node sqlglot produces for it is a `Column` whose `name` is `"*"` — so matching on
+    the key name alone silently misses it. Under a FULL join that showed up as
+    `SELECT x.* FROM x FULL JOIN y USING (k)` reporting y's key on a y-only row, where SQL
+    requires NULL.
+
     Args:
         node: The `Select` node being translated.
         joins: Its `Join` nodes.
@@ -269,11 +371,9 @@ def _key_shadows(node, joins, merged_keys: set[str]) -> set[str]:
         return set()
     if not any((j.side or "").upper() in {"LEFT", "RIGHT", "FULL"} for j in joins):
         return set()
-    return {
+    qualified = {
         c.name
         for c in node.find_all(exp.Column)
-        if c.name in merged_keys
-        and c.table
-        and c.find_ancestor(exp.Select) is node
-        and c.find_ancestor(exp.Join) is None
+        if c.table and c.find_ancestor(exp.Select) is node and c.find_ancestor(exp.Join) is None
     }
+    return set(merged_keys) if "*" in qualified else merged_keys & qualified

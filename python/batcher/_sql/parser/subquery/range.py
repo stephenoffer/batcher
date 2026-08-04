@@ -97,7 +97,7 @@ def decorrelate_inequality_exists(tr, ds, inner, local_preds, local, local_cols,
     """
 
     from batcher._sql.parser.core_utils import _join_and
-    from batcher._sql.parser.subquery.core import _reject_correlated
+    from batcher._sql.parser.subquery.correlation import _reject_correlated
 
     found = _inequality_correlation(local_preds, local, local_cols)
     if found is None:

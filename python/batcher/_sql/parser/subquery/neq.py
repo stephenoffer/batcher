@@ -26,7 +26,7 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher._sql.parser.core_utils import _join_and, _split_and
-from batcher._sql.parser.subquery.core import (
+from batcher._sql.parser.subquery.correlation import (
     _correlation_pair,
     _local_columns,
     _local_tables,

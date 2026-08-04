@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1180 Python modules across 180 packages and 219 Rust files across 14 crates.
+Covering 1181 Python modules across 180 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -661,10 +661,10 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 |---|---|---|
 | `agg_rewrites.py` | 139 | Aggregate pre-pass rewrites for the SQL translator. |
 | `clauses.py` | 294 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
-| `core_utils.py` | 297 | Small stateless AST helpers shared across translator theme modules. |
-| `from_clause.py` | 428 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
+| `core_utils.py` | 379 | Small stateless AST helpers shared across translator theme modules. |
+| `from_clause.py` | 454 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 432 | Grouping, aggregation, and projection mapping for the SQL translator. |
-| `grouping_sets.py` | 126 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
+| `grouping_sets.py` | 187 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `translator.py` | 401 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 199 | Registered-Python-function support for the SQL translator. |
 | `windowing.py` | 443 | Window-function handling for the SQL translator. |
@@ -702,7 +702,8 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `core.py` | 593 | Subquery handling and decorrelation for the SQL translator. |
+| `core.py` | 512 | Subquery handling and decorrelation for the SQL translator. |
+| `correlation.py` | 166 | Correlation analysis for SQL subqueries: which references reach out of a subquery. |
 | `neq.py` | 224 | Correlated ``<>``-residual EXISTS/NOT EXISTS decorrelation (TPC-H q21 shape). |
 | `range.py` | 118 | Correlated **inequality** EXISTS/NOT EXISTS decorrelation — a range semi/anti join. |
 
@@ -712,7 +713,7 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 1719 | The distributed executor — the dispatcher. |
+| `executor.py` | 1774 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 721 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_join.py` | 398 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 396 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
@@ -769,7 +770,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `accelerators.py` | 174 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 196 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
 | `capacity.py` | 183 | How many workers a cluster can actually *place*, as opposed to afford. |
-| `hardware_probe.py` | 500 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
+| `hardware_probe.py` | 529 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 484 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 132 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `readiness.py` | 271 | Bounded waits for a Ray cluster that is not ready yet. |
@@ -806,7 +807,7 @@ The query-lifetime shuffle fleet and the partitioned intermediate it produces.
 
 | module | lines | what it is |
 |---|---|---|
-| `_fleet.py` | 421 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
+| `_fleet.py` | 491 | A query-lifetime shuffle-actor fleet for the adaptive Flight path. |
 | `eviction.py` | 107 | Free a finished query's shuffle buckets, so a reused fleet does not grow without bound. |
 | `plan_id.py` | 204 | The per-query shuffle plan id — the fence that keeps concurrent pipelines apart. |
 | `query.py` | 83 | The query-lifetime fleet: one placement group held for the whole adaptive query. |
@@ -1082,7 +1083,7 @@ Extended Kyber rule families.
 | `strings.py` | 487 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
 | `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
 | `temporal_extra.py` | 460 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
-| `temporal_folds.py` | 142 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
+| `temporal_folds.py` | 185 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
 | `temporal_sargable.py` | 279 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
 | `topn_limit.py` | 127 | LIMIT / OFFSET rewrites that the base limit rules don't already cover. |
 | `window_extra.py` | 360 | Window rewrites — prune keys, frames and functions a window does not actually need. |
@@ -2502,7 +2503,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_filter.rs` | 168 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 1396 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 1652 | Hash join — produces match index-pairs, built to distribute. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 299 | The band join: two inequalities that bound **one** right key from both sides. |
 | `join/range/keys.rs` | 537 | Sortable key forms for a range join's axes, and the dense ranking built on them. |
@@ -2569,7 +2570,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/geo/mod.rs` | 320 | Evaluation of the `Expr::Geo` variant — the array-level half of geospatial support. |
 | `eval/geo/scalar.rs` | 347 | The scalar-returning geospatial functions: accessors, measures, predicates, codecs. |
 | `eval/hash.rs` | 223 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
-| `eval/in_list.rs` | 243 | `x IN (lit, lit, …)` — hash-set membership. |
+| `eval/in_list.rs` | 271 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 796 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
 | `eval/list_ops/coerce.rs` | 150 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
 | `eval/list_ops/gather.rs` | 79 | `list.gather` — reorder or select from a list by a second list of indices. |

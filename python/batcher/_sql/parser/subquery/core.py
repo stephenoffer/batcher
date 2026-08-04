@@ -10,8 +10,23 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher._sql.parser.core_utils import _has_aggregate, _join_and, _split_and
+from batcher._sql.parser.subquery.correlation import (
+    _correlation_pair,
+    _is_plain_column,
+    _local_columns,
+    _local_tables,
+    _outer_key_reducer,
+    _reject_correlated,
+)
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import col, lit
+
+#: Prefix of the synthetic boolean an `EXISTS` under `OR` is rewritten to. Leading dunders
+#: make it un-typeable as a user column, the same convention `__bt_cse_` and `__jk_l` use.
+#: `clauses.py` drops these once the residual predicate that reads them has been applied —
+#: keying the cleanup on the prefix rather than threading a list keeps it correct for a
+#: nested SELECT, whose own markers are cleared by its own pass.
+EXISTS_MARKER_PREFIX = "__exists_"
 
 
 def _apply_subquery_predicates(tr, ds: Dataset, pred):
@@ -42,6 +57,35 @@ def _apply_subquery_predicates(tr, ds: Dataset, pred):
     if len(leaves) >= 2:
         ds, handled = _fuse_correlated_neq(tr, ds, leaves)
 
+    # An `EXISTS` under `OR` becomes a marker column, and `_exists_marker` attaches it with a
+    # LEFT JOIN *immediately* — against whatever `ds` is at that moment. Every other leaf here
+    # only contributes to `residual`, which the caller filters with **after** this returns, so
+    # for `FROM a, b, c WHERE a.k = b.k AND c.k = a.k AND (EXISTS … OR …)` that moment is the
+    # bare comma-join **cross product**: the marker is joined to `a x b x c` and the equalities
+    # that would have made it three ordinary joins are applied afterwards.
+    #
+    # It is quadratic in the FROM width and it is not theoretical. TPC-DS q10 is exactly this
+    # shape, and on sf1 (371 MB) it is OOM-killed where DuckDB answers in 31.7 ms. Bisected on
+    # the same data, holding the subquery fixed and adding one comma-joined table: **425 ms
+    # with one table, 23,858 ms with two** (48x, same answer), dead at three.
+    #
+    # So apply the column-to-column equalities first, which is what turns that cross product
+    # back into joins. Deliberately only `col = col`: they are the comma-join conditions, they
+    # carry no subquery, no UDF and no scalar-subquery decorrelation that the caller's residual
+    # path handles (`_hoist_udfs`, `_decorrelate_scalar_subqueries`), so moving them earlier
+    # cannot change what any of that sees. `AND` commutes, so applying a subset sooner is the
+    # same relation — this is predicate pushdown done at build time because the optimizer
+    # cannot reorder past a LEFT JOIN that has already been built.
+    #
+    # Gated on a marker actually being needed, so every query that does not hit the pathology
+    # keeps its previous plan exactly.
+    if any(i not in handled and _will_markerize(leaf) for i, leaf in enumerate(leaves)):
+        for i, leaf in enumerate(leaves):
+            if i in handled or not _is_column_equality(leaf):
+                continue
+            ds = ds.filter(tr._scalar(leaf))
+            handled = handled | {i}
+
     residual = None
     for i, leaf in enumerate(leaves):
         if i in handled:
@@ -50,6 +94,35 @@ def _apply_subquery_predicates(tr, ds: Dataset, pred):
         if r is not None:
             residual = r if residual is None else exp.And(this=residual, expression=r)
     return ds, residual
+
+
+def _is_column_equality(pred) -> bool:
+    """Whether `pred` is `<column> = <column>` — a comma-join condition and nothing else.
+
+    Narrow on purpose. This is the only shape `_apply_subquery_predicates` promotes ahead of
+    the marker joins, and the promotion is safe precisely because such a predicate holds no
+    subquery, no registered UDF and no aggregate, so none of the residual path's later
+    rewrites can be looking for it.
+    """
+    return (
+        isinstance(pred, exp.EQ)
+        and isinstance(pred.this, exp.Column)
+        and isinstance(pred.expression, exp.Column)
+    )
+
+
+def _will_markerize(pred) -> bool:
+    """Whether folding `pred` will build an existence marker (and so a LEFT JOIN on `ds`).
+
+    True for a predicate that *contains* an `EXISTS` without *being* one — the shape
+    `_apply_single_predicate` sends to `_exists_marker`. A bare `EXISTS`/`NOT EXISTS` becomes
+    a semi/anti join instead and needs no reordering, which is why it is excluded here.
+    """
+    if isinstance(pred, exp.Exists):
+        return False
+    if isinstance(pred, exp.Not) and isinstance(pred.this, exp.Exists):
+        return False
+    return any(True for _ in pred.find_all(exp.Exists))
 
 
 def _apply_single_predicate(tr, ds: Dataset, pred):
@@ -64,6 +137,26 @@ def _apply_single_predicate(tr, ds: Dataset, pred):
         return _apply_exists(tr, ds, pred, negate=False), None
     if isinstance(pred, exp.Not) and isinstance(pred.this, exp.Exists):
         return _apply_exists(tr, ds, pred.this, negate=True), None
+
+    # An `EXISTS` buried under OR cannot become a join — the join would drop rows the OR
+    # should keep — but it *can* become a boolean column and be evaluated in place. That is
+    # Spark's ExistenceJoin; see `_exists_marker`. Done before the refusal below so the
+    # shapes it handles stop being refusals.
+    if any(True for _ in pred.find_all(exp.Exists)):
+        rewritten = pred.copy()
+        ok = True
+        for found in list(rewritten.find_all(exp.Exists)):
+            parent, negated = found.parent, False
+            if isinstance(parent, exp.Not):
+                found, negated = parent, True
+            marked = _exists_marker(tr, ds, found.this if negated else found, negate=negated)
+            if marked is None:
+                ok = False
+                break
+            ds, replacement = marked
+            found.replace(replacement)
+        if ok:
+            return ds, rewritten
 
     # Guard: a subquery buried under OR / arbitrary boolean structure cannot
     # be folded into a join. (Scalar subqueries are fine — those resolve to a
@@ -182,15 +275,16 @@ def _not_in_antijoin(ds: Dataset, left_key: str, inner_ds: Dataset, right_key: s
     return ds.join(key_only.distinct(), left_on=[left_key], right_on=[right_key], how="anti")
 
 
-def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
-    """EXISTS / NOT EXISTS, correlated or not.
+def _exists_shape(tr, node):
+    """Split an `EXISTS (SELECT …)` into its inner SELECT, correlation equalities and locals.
 
-    A correlated `EXISTS (SELECT … FROM b WHERE b.k = a.k AND <local>)`
-    decorrelates to a SEMI join (anti for NOT EXISTS) of the outer rows with
-    `b` filtered by `<local>`, keyed on the correlation equalities.
+    Shared by the join rewrite (`_apply_exists`) and the marker-column rewrite
+    (`_exists_marker`) so the two cannot disagree about what correlates.
 
-    An uncorrelated EXISTS is a whole-table keep-or-drop: collect the subquery
-    eagerly to test emptiness, then keep or drop every row.
+    Returns:
+        `(inner, local, local_cols, corr, local_preds)` — the detached inner SELECT, the
+        table names it introduces, the columns those tables offer, the `(outer, inner)`
+        equality pairs that correlate it, and the predicates local to the inner relation.
     """
     inner = node.this
     if isinstance(inner, exp.Subquery):
@@ -205,6 +299,96 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
         for leaf in _split_and(where.this):
             pair = _correlation_pair(leaf, local, local_cols)
             (corr if pair is not None else local_preds).append(pair or leaf)
+    return inner, local, local_cols, corr, local_preds
+
+
+def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
+    """`EXISTS (…)` as a boolean *column* on `ds`, for a predicate that cannot become a join.
+
+    A bare `EXISTS` under `AND` folds into a semi/anti join, which is strictly better. But
+    `EXISTS (…) OR <anything>` cannot: the join would drop rows the `OR` should keep. Spark
+    solves this with an **ExistenceJoin** — a left join that emits, per outer row, a boolean
+    saying whether the subquery matched — and then evaluates the original boolean over that
+    column. This is that rewrite, spelled with the primitives already here.
+
+    It is exact rather than approximate, and for one specific reason: the inner relation is
+    reduced to its *distinct* correlation keys before the join, so a left join against it
+    matches each outer row at most once and cannot multiply rows. `EXISTS` is also the one
+    subquery form with no three-valued subtlety — it is TRUE or FALSE, never NULL — so the
+    marker needs no null reasoning. `IN` under `OR` is deliberately *not* handled here for
+    exactly that reason: `x IN (…)` is NULL when `x` is NULL or the list holds a NULL, and a
+    boolean marker cannot carry that.
+
+    Args:
+        tr: The translator, used to plan the inner SELECT.
+        ds: The outer relation the marker is attached to.
+        node: The `EXISTS` AST node.
+        negate: True for `NOT EXISTS`.
+
+    Returns:
+        `(ds, ast)` — the relation carrying the marker, and the boolean AST to substitute
+        for the `EXISTS` node — or `None` when the shape is not markerizable, in which case
+        the caller reports the original refusal.
+    """
+    inner, _local, _local_cols, corr, local_preds = _exists_shape(tr, node)
+
+    # A counter on the translator, read defensively: `_sql/parser/translator.py` owns the
+    # other `_*_n` counters, and this avoids editing that file to add one more.
+    n = getattr(tr, "_exists_n", 0)
+    tr._exists_n = n + 1
+
+    if not corr:
+        # Uncorrelated: a whole-relation emptiness test, so the answer is the same constant
+        # for every outer row. Anything still referencing the outer query here is a range or
+        # `<>` correlation, which reshapes the relation rather than yielding a column.
+        try:
+            _reject_correlated(inner)
+        except NotImplementedError:
+            return None
+        non_empty = tr.statement(inner).limit(1).collect().num_rows > 0
+        return ds, exp.true() if non_empty != negate else exp.false()
+
+    # Correlated on equalities: reduce the inner relation to its distinct keys, tag it, and
+    # left join. The keys are aliased to generated names first so an inner key that shares an
+    # outer column's name cannot collide in the joined schema.
+    keys = [f"__ex{n}_k{i}" for i in range(len(corr))]
+    marker = f"{EXISTS_MARKER_PREFIX}{n}"
+    inner.set("where", exp.Where(this=_join_and(local_preds)) if local_preds else None)
+    inner.set("group", None)
+    inner.set(
+        "expressions",
+        [exp.alias_(exp.column(ic), k) for k, (_oc, ic) in zip(keys, corr, strict=True)],
+    )
+    try:
+        _reject_correlated(inner)
+    except NotImplementedError:
+        return None
+
+    tagged = tr.statement(inner).distinct().with_columns(**{marker: lit(True)})
+    ds = ds.join(tagged, left_on=[oc for (oc, _ic) in corr], right_on=keys, how="left")
+    # Matched ⇒ the tag survives; unmatched ⇒ the left join null-extends it. That is exactly
+    # the existence bit, with no coalesce needed.
+    ds = ds.with_columns(**{marker: col(marker).is_not_null()})
+    # The equi-join consumes the right-hand key columns, so usually there is nothing left to
+    # drop; guard on what is actually present rather than assuming either behaviour.
+    leftover = [k for k in keys if k in ds.columns]
+    if leftover:
+        ds = ds.drop(*leftover)
+    ast = exp.column(marker)
+    return ds, (exp.Not(this=ast) if negate else ast)
+
+
+def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
+    """EXISTS / NOT EXISTS, correlated or not.
+
+    A correlated `EXISTS (SELECT … FROM b WHERE b.k = a.k AND <local>)`
+    decorrelates to a SEMI join (anti for NOT EXISTS) of the outer rows with
+    `b` filtered by `<local>`, keyed on the correlation equalities.
+
+    An uncorrelated EXISTS is a whole-table keep-or-drop: collect the subquery
+    eagerly to test emptiness, then keep or drop every row.
+    """
+    inner, local, local_cols, corr, local_preds = _exists_shape(tr, node)
 
     # A single *inequality* correlation (`a.x < b.y`) is a range semi/anti join: not an
     # equi-key, so it never reaches `corr`, and before this it raised. See `subquery.range`.
@@ -250,126 +434,6 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
         right_on=[ic for (_oc, ic) in corr],
         how=how,
     )
-
-
-def _local_tables(select_node) -> set[str]:
-    """Table names + aliases introduced by this SELECT's own FROM/JOINs."""
-    local: set[str] = set()
-    from_ = select_node.args.get("from") or select_node.args.get("from_")
-    sources = []
-    if from_ is not None:
-        sources.append(from_.this)
-    sources += [j.this for j in select_node.args.get("joins", []) or []]
-    for t in sources:
-        if isinstance(t, exp.Table):
-            # An aliased table is referenceable only by its alias — SQL scoping
-            # shadows the base name. Adding the base name of an *inner* aliased
-            # table (`FROM emp e2`) would misclassify an outer reference that
-            # happens to use that base name (`emp.dept`, an unaliased outer `emp`)
-            # as local, so the correlation is missed and every group counts all rows.
-            if t.alias:
-                local.add(t.alias)
-            else:
-                local.add(t.name)
-    return local
-
-
-def _local_columns(tr, select_node):
-    """Column names available from this SELECT's own FROM/JOIN tables.
-
-    Returns ``None`` when any source can't be resolved to a known relation (a derived
-    table or unknown name): then unqualified references can't be classified by
-    membership and correlation detection falls back to table-qualifier-only.
-    """
-    from_ = select_node.args.get("from") or select_node.args.get("from_")
-    sources = ([from_.this] if from_ is not None else []) + [
-        j.this for j in select_node.args.get("joins", []) or []
-    ]
-    cols: set[str] = set()
-    for t in sources:
-        if isinstance(t, exp.Table) and t.name in tr._registry:
-            cols |= set(tr._registry[t.name].columns)
-        else:
-            return None
-    return cols
-
-
-def _correlation_pair(leaf, local: set[str], local_cols: set[str] | None = None, *, op=None):
-    """If `leaf` is `outer.col <op> inner.col`, return `(outer_col, inner_col)`.
-
-    Exactly one side must be an outer reference; the other is local. A side is outer
-    when it is qualified by a table outside `local`, or — for an unqualified column
-    when `local_cols` is known — when its name is not among the local tables' columns
-    (TPC-H references outer columns unqualified, e.g. ``l_orderkey = o_orderkey``).
-    Otherwise return None (a local predicate).
-
-    `op` is the sqlglot comparison class the leaf must be, defaulting to `exp.EQ`. The
-    `<>` decorrelation in `subquery_neq` passes `exp.NEQ`: the outer-reference analysis is
-    identical for both, and it was a verbatim copy until it was parameterized here.
-    """
-    if not isinstance(leaf, op or exp.EQ):
-        return None
-    lhs, rhs = leaf.this, leaf.expression
-    if not (isinstance(lhs, exp.Column) and isinstance(rhs, exp.Column)):
-        return None
-
-    def _is_outer(c) -> bool:
-        if c.table:
-            return c.table not in local
-        return local_cols is not None and c.name not in local_cols
-
-    lhs_outer, rhs_outer = _is_outer(lhs), _is_outer(rhs)
-    if lhs_outer and not rhs_outer:
-        return (lhs.name, rhs.name)
-    if rhs_outer and not lhs_outer:
-        return (rhs.name, lhs.name)
-    return None
-
-
-def _outer_key_reducer(tr, outer_node, sub, corr):
-    """A cheap `SELECT k… FROM T WHERE <T's predicates>` to pre-filter a correlated aggregate
-    subquery by (`(ic…) IN (…)`), or None. A per-key aggregate otherwise scans the whole fact
-    table for every key, but the enclosing query only produces the keys of its own (often
-    filtered) dimension `T` (the base table owning every correlation column). `T` filtered by
-    the enclosing conjuncts whose *top-level* columns (not those in a nested subquery, so
-    `ps_partkey IN (SELECT …)` counts) all belong to `T` — minus the conjunct carrying the sub
-    (circular) — is a superset of the LEFT JOIN's keys, so it changes no surviving group."""
-    if outer_node is None or not corr:
-        return None
-    ocs = [oc for (oc, _ic) in corr]
-    from_ = outer_node.args.get("from") or outer_node.args.get("from_")
-    sources = ([from_.this] if from_ is not None else []) + [
-        j.this for j in outer_node.args.get("joins", []) or []
-    ]
-    owning = None
-    for t in sources:
-        if not (isinstance(t, exp.Table) and t.name in tr._registry):
-            continue
-        tcols = set(tr._registry[t.name].columns)
-        if all(oc in tcols for oc in ocs):
-            if owning is not None:
-                return None  # ambiguous
-            owning = t.name
-    if owning is None:
-        return None
-    tcols = set(tr._registry[owning].columns)
-    where = outer_node.args.get("where")
-    if where is None:
-        return None
-    tpreds = []
-    for leaf in _split_and(where.this):
-        nested = set(leaf.find_all(exp.Subquery))
-        if sub in nested:
-            continue
-        top_cols = {
-            c.name for c in leaf.find_all(exp.Column) if c.find_ancestor(exp.Subquery) not in nested
-        }
-        if top_cols and top_cols <= tcols:
-            tpreds.append(leaf.copy())
-    if not tpreds:
-        return None
-    cols = [exp.column(o) for o in ocs]
-    return exp.select(*cols).from_(exp.table_(owning)).where(_join_and(tpreds))
 
 
 def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> Dataset:
@@ -446,30 +510,3 @@ def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> D
             else:
                 sub.replace(exp.column(alias))
     return ds
-
-
-def _is_plain_column(node) -> bool:
-    return isinstance(node, exp.Column)
-
-
-def _reject_correlated(select_node) -> None:
-    """Raise if `select_node` references a table outside its own FROM/JOINs.
-
-    A correlated subquery refers to a column qualified by an *outer* table.
-    We approximate correlation by collecting the table names and aliases the
-    subquery introduces and flagging any qualified column outside that set.
-    Unqualified columns are assumed local (we cannot resolve them otherwise).
-    """
-    local: set[str] = set()
-    for t in select_node.find_all(exp.Table):
-        local.add(t.name)
-        if t.alias:
-            local.add(t.alias)
-    for sub in select_node.find_all(exp.Subquery):
-        if sub.alias:
-            local.add(sub.alias)
-
-    for c in select_node.find_all(exp.Column):
-        tbl = c.table
-        if tbl and tbl not in local:
-            raise NotImplementedError("correlated subqueries not supported")

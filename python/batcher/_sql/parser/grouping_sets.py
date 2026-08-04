@@ -10,9 +10,12 @@ the levels are combined with UNION ALL. That keeps the aggregate path in
 
 from __future__ import annotations
 
+import sys
+
 from sqlglot import expressions as exp
 
 from batcher.api.dataset import Dataset
+from batcher.plan.expr_ir import col
 
 
 def _grouping_key(e) -> str:
@@ -69,8 +72,22 @@ def _grouping_sets_union(tr, node, group) -> Dataset:
 
     Each level groups by its active expressions; the inactive grouping expressions
     are projected as NULL. (Matches DuckDB's row output for non-null group keys.)
+
+    ``ORDER BY`` / ``LIMIT`` / ``OFFSET`` sit *above* the union and are applied here,
+    once, to the combined result. They are stripped from the per-level nodes first:
+    each level is a copy of the whole SELECT, so leaving them in place ran the sort and
+    the limit inside every branch. That is wrong twice over — the limit became
+    per-level (``ROLLUP(a, b) ... LIMIT 7`` returned 7 + 5 + 1 = 13 rows), and the
+    ordering was per-level, so the union's output was not sorted at all. TPC-DS q18/q22
+    returned 401 rows against DuckDB's 100.
     """
     import itertools
+
+    # The ORDER BY/LIMIT/OFFSET belong to the union, not to any one level.
+    node = node.copy()
+    order = node.args.pop("order", None)
+    limit = node.args.pop("limit", None)
+    offset = node.args.pop("offset", None)
 
     factors = _grouping_factors(group)
     levels = [[e for part in combo for e in part] for combo in itertools.product(*factors)]
@@ -88,7 +105,51 @@ def _grouping_sets_union(tr, node, group) -> Dataset:
     out = datasets[0]
     for d in datasets[1:]:
         out = out.union(d, distinct=False)
+
+    if order is not None:
+        out = _order_union(out, order, node.expressions)
+    if limit is not None or offset is not None:
+        skip = int(offset.expression.this) if offset is not None else 0
+        n = int(limit.expression.this) if limit is not None else sys.maxsize
+        out = out.limit(n, offset=skip)
     return out
+
+
+def _order_union(out: Dataset, order, projections) -> Dataset:
+    """Sort the unioned levels by the query's ORDER BY.
+
+    The union carries the *projected* output columns, so an ORDER BY item is resolved
+    against the SELECT list by name (its alias, or the SQL text of the item it repeats)
+    rather than re-resolved against the source relation, which the union no longer has.
+    The 1-based positional form is resolved the same way. An item that names neither an
+    output column nor a position is rejected rather than silently ignored: SQL allows
+    ordering a grouped query by an expression outside the SELECT list, and this path
+    cannot see one.
+    """
+    by_text = {}
+    for i, p in enumerate(projections):
+        name = p.alias_or_name
+        if name:
+            by_text.setdefault(p.this.sql() if isinstance(p, exp.Alias) else p.sql(), name)
+            by_text.setdefault(name, name)
+        by_text.setdefault(str(i + 1), name)
+
+    keys, desc, nulls_first = [], [], []
+    for o in order.expressions:
+        target = o.this
+        text = target.sql()
+        name = by_text.get(text) or by_text.get(target.name)
+        if name is None and isinstance(target, exp.Literal) and not target.is_string:
+            name = by_text.get(target.this)
+        if name is None or name not in out.columns:
+            raise NotImplementedError(
+                f"ORDER BY {text} on a ROLLUP/CUBE/GROUPING SETS query must name a column "
+                "of the SELECT list; order in an enclosing query instead"
+            )
+        keys.append(col(name))
+        desc.append(bool(o.args.get("desc")))
+        nulls_first.append(bool(o.args.get("nulls_first")))
+    return out.sort(*keys, descending=desc, nulls_first=nulls_first)
 
 
 def _grouping_level_node(node, active: dict, every: dict):
