@@ -122,11 +122,12 @@ for a straggler; it costs you exactly that much more buffer.
 ## The limits, before you build on this operator
 
 :::{important}
-**You cannot write a stream-stream join to a sink.** A streaming write takes a single
-source today. `joined.write.delta(...)` raises a {py:exc}`PlanError <batcher.PlanError>` that says so. The only way to
-consume it is {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, and whatever you do with those batches (including a
-transactional write) is your code, on your restart semantics. This is the sharpest edge in
-Batcher's streaming story and it is worth knowing before you build a topology around it.
+**A stream-stream join has no checkpoint.** It writes to a sink like any other streaming
+query — `joined.write.delta(..., trigger=...)` runs — but passing `checkpoint=` is refused
+rather than accepted, because the join's state is two buffered sides and two watermarks,
+none of it addressable by a source offset. A restart therefore begins with an empty join
+and re-reads from wherever the sources start. The sink's own idempotency still applies, so
+a replayed micro-batch does not duplicate rows; what you do not get is resumption.
 :::
 
 `how=` takes `"inner"` (the default), `"left"`, `"right"`, and `"full"`. An outer join is

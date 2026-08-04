@@ -90,16 +90,20 @@ def start_streaming_query(
     `sink` is a constructed `StreamSink`. `trigger` defaults to as-soon-as-possible
     micro-batches. `checkpoint` is a directory enabling exactly-once recovery
     (offset/commit logs + state snapshots). Raises `PlanError` for an unsupported
-    shape (multi-source, or an output-mode/plan mismatch).
+    shape (an output-mode/plan mismatch, or a multi-source plan no driver can produce).
+
+    A **two-source** plan is a stream-stream join, whose driver reads both sides itself
+    and yields finished output rows. It reaches the engine through `DriverRunner` instead
+    of the one-source `LocalRunner` — the trigger, the progress record, the sink's
+    exactly-once check and the listener events are all unchanged. Until this existed the
+    only way to consume a stream-stream join was `iter_batches()`, which the cookbook
+    called the sharpest edge in the streaming story.
     """
     from batcher import core
     from batcher._internal.errors import PlanError
 
-    if len(sources) != 1:
-        raise PlanError(
-            "streaming a sink currently supports a single source (stream-stream join "
-            "is not yet available); collect or write each input separately"
-        )
+    if len(sources) > 1:
+        return _start_driver_stream(plan, sources, sink, trigger, output_mode, name, checkpoint)
     output_mode = OutputMode.validate(output_mode)
     trigger = trigger or Trigger.processing_time(0)
 
@@ -149,6 +153,83 @@ def start_streaming_query(
 
             with contextlib.suppress(Exception):
                 store.close()
+        raise
+    return query
+
+
+def _start_driver_stream(
+    plan: LogicalPlan,
+    sources: list[Source],
+    sink,
+    trigger: Trigger | None,
+    output_mode: str,
+    name: str | None,
+    checkpoint: str | None,
+) -> StreamingQuery:
+    """Drive a multi-source streaming plan (a stream-stream join) into a sink.
+
+    The driver is the same `_iter_batches` router `iter_batches()` uses, so the rows
+    written are the rows that terminal would have yielded — one implementation, two
+    consumers, rather than a second definition of what a stream-stream join means.
+
+    `checkpoint=` is refused rather than accepted-and-ignored. The join's state is two
+    buffers plus two watermarks, none of it offset-addressable, so there is nothing to
+    resume from: a checkpoint here would restart the query from an empty join on every
+    restart while looking exactly like exactly-once recovery.
+    """
+    from batcher import core
+    from batcher._internal.errors import PlanError
+    from batcher.api.terminal.stream import _iter_batches
+    from batcher.plan.logical import WatermarkStreamJoin
+
+    if not isinstance(plan, WatermarkStreamJoin):
+        raise PlanError(
+            "streaming a sink from more than one source is supported for a "
+            "stream-stream interval join (join_stream); this plan reads "
+            f"{len(sources)} sources some other way. Write each input separately, or "
+            "materialize one side to a bounded source first."
+        )
+    output_mode = OutputMode.validate(output_mode)
+    if output_mode != OutputMode.APPEND:
+        raise PlanError(
+            f"output_mode={output_mode!r} needs an aggregation; a stream-stream join "
+            "emits each matched (or watermark-closed) row once, which is 'append'"
+        )
+    if checkpoint is not None:
+        raise PlanError(
+            "a stream-stream join has no checkpointable position: its state is two "
+            "buffered sides and two watermarks, not a source offset. Drop checkpoint= "
+            "(the sink's own idempotency still applies), or join against a bounded side."
+        )
+
+    query_name = name or _next_name()
+    trigger = trigger or Trigger.processing_time(0)
+
+    def make_runner(should_stop):
+        from batcher.core.streaming_runner import DriverRunner
+
+        for source in sources:
+            attach = getattr(source, "set_stop_signal", None)
+            if attach is not None:
+                attach(should_stop)
+        return DriverRunner(_iter_batches(plan, sources, plan.available_columns()), sink)
+
+    engine = core.StreamingQueryEngine(
+        name=query_name,
+        source=sources[0],
+        sink=sink,
+        processor=None,  # the driver produces finished output rows
+        trigger=trigger,
+        output_mode=output_mode,
+        checkpoint=None,
+        runner_factory=make_runner,
+    )
+    query = StreamingQuery(query_name, engine)
+    _register(query_name, query)
+    try:
+        engine.start()
+    except BaseException:
+        _deregister(query_name)
         raise
     return query
 

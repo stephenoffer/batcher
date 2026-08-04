@@ -301,6 +301,19 @@ unclicked = impressions.join_stream(
 print(sorted(unclicked.to_pydict()["ad"]))  # ['a', 'b'] — 'b' with null click columns
 ```
 
+A joined stream writes to a sink like any other streaming query:
+
+```python
+# docs: skip
+attributed.write.delta("lake/attribution", trigger=bt.Trigger.processing_time("30 seconds"))
+```
+
+`checkpoint=` is the one thing it refuses. A join's state is two buffered sides and two
+watermarks, none of it addressable by a source offset, so there is nothing to resume from
+— and accepting the argument would restart from an empty join on every restart while
+looking exactly like exactly-once recovery. The sink's own idempotency still applies, so a
+replayed micro-batch does not duplicate rows.
+
 ## Exactly-once and checkpointing
 
 Pass `checkpoint=<dir>` to a streaming write to record source offsets and sink

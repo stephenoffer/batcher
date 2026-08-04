@@ -57,7 +57,7 @@ than discover. None of them is a bug you can configure away.
 
 | The edge | What actually happens | Where it is covered |
 | --- | --- | --- |
-| A stream-stream join has no sink | A streaming write takes a single source; `write.delta(...)` on a joined stream raises {py:exc}`PlanError <batcher.PlanError>`. The only consumer is {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`. | {doc}`Stream join </cookbook/streaming/stream-join>` |
+| A stream-stream join has no checkpoint | It writes to a sink like any other streaming query, but `checkpoint=` is refused: the join's state is two buffers and two watermarks, not a source offset, so a restart begins with an empty join. | {doc}`Stream join </cookbook/streaming/stream-join>` |
 | A stream cannot join a static dimension table | The plan has to materialize, so the engine refuses it with a `PlanError` rather than hanging. Enrich inside `map_batches`. | {doc}`Stream join </cookbook/streaming/stream-join>` |
 | The file sink dedups by *position* | A different batch 0 written into a directory that already holds `part-batch00000.parquet` is skipped, silently. One query, one output directory. | {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>` |
 | A non-replayable source ignores `checkpoint=` | No offsets are recorded, so a restart re-reads from the beginning. Nothing warns you. | {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>` |

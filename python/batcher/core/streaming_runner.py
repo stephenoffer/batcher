@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from batcher.core.streaming_query import MicroBatchProcessor
     from batcher.io.source import Source
 
-__all__ = ["LocalRunner", "MicroBatchRunner"]
+__all__ = ["DriverRunner", "LocalRunner", "MicroBatchRunner"]
 
 
 @runtime_checkable
@@ -270,6 +270,66 @@ class LocalRunner:
 
     def has_state(self) -> bool:
         return getattr(self._processor, "snapshot_state", None) is not None
+
+
+class DriverRunner:
+    """Run a micro-batch produced by a *driver*, not staged from one source.
+
+    Some streaming operators are not "read a batch, transform it, write it": the
+    stream-stream interval join reads from **two** sources, buffers both, and decides on
+    its own when a pair (or an unmatched row) may be emitted. Its output is already the
+    query's output, so there is nothing for a processor to do — but there was also no way
+    to send it to a sink, because the only runner in existence staged from exactly one
+    source. A stream-stream join could therefore only ever be consumed by
+    `iter_batches()`, which the cookbook called the sharpest edge in the streaming story.
+
+    This runner closes that gap: the conductor hands it the driver's iterator, and each
+    batch the driver yields becomes one micro-batch. Everything else — the trigger, the
+    progress record, the sink's exactly-once check, the listener events — is the engine's,
+    unchanged.
+
+    **It reports no source position, and that is a real limitation rather than an
+    oversight.** A stream-stream join's state is two buffers plus two watermarks, none of
+    which is offset-addressable; snapshotting them is a separate piece of work. So a query
+    on this runner has no checkpoint to resume from, and the conductor refuses a
+    `checkpoint=` rather than accepting one that would silently restart from scratch.
+    """
+
+    __slots__ = ("_batches", "_last_token", "_sink")
+
+    def __init__(self, batches: Iterator[pa.RecordBatch], sink: Any) -> None:
+        self._batches = batches
+        self._sink = sink
+        self._last_token: str | None = None
+
+    def stage(self, batch_id: int) -> pa.RecordBatch | None:  # noqa: ARG002
+        """The driver's next output batch, or None once it has finished.
+
+        The driver observes the stop signal through its own sources, so an exhausted
+        iterator here means "the driver is done" for either reason.
+        """
+        return next(self._batches, None)
+
+    def positions(self) -> dict[int, dict]:
+        """No checkpointable position — see the class docstring."""
+        return {}
+
+    def publish(self, batch_id: int, staged: pa.RecordBatch) -> tuple[int, int]:
+        """Write the driver's batch to the sink.
+
+        Input and output rows are the same number: the driver consumed its inputs
+        internally, so the count the runner can honestly report is what it emitted.
+        """
+        self._last_token = self._sink.write_batch(batch_id, pa.Table.from_batches([staged]))
+        return staged.num_rows, staged.num_rows
+
+    def last_sink_token(self) -> str | None:
+        """What the sink reported writing for the epoch just published."""
+        return self._last_token
+
+    def seek(self, position: dict) -> None:  # noqa: ARG002 - protocol signature
+        """Unreachable: a query on this runner has no checkpoint to recover from."""
+        raise AssertionError("a driver-produced stream has no checkpointable position")
 
 
 def _confirm(source: Source) -> None:
