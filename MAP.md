@@ -440,7 +440,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `model_selection.py` | 725 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `multiclass.py` | 224 | `OneVsRestClassifier` — multiclass classification built from a binary estimator. |
 | `naive_bayes.py` | 512 | Naive Bayes — a probabilistic classifier whose whole fit is a grouped aggregate. |
-| `outliers.py` | 367 | Outlier detection — finding the rows a model should not be trained on, at scale. |
+| `outliers.py` | 547 | Outlier detection — finding the rows a model should not be trained on, at scale. |
 | `permutation.py` | 187 | The keyed epoch permutation — a shuffled sample order that is computed, not stored. |
 | `pipeline.py` | 217 | Multi-stage streaming pipeline with credit-based backpressure (the GPU-feeding moat). |
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |

@@ -92,6 +92,11 @@ def _build(name: str, klass: type):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
     if name in ("LinearDiscriminantAnalysis", "QuadraticDiscriminantAnalysis"):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
+    if name == "EllipticEnvelope":
+        from batcher.ml import EllipticEnvelope
+
+        ds = _classification()
+        return EllipticEnvelope(["x", "z"]).fit(ds), ds
     if name == "OneVsRestClassifier":
         from batcher.ml import LogisticRegression, OneVsRestClassifier
 

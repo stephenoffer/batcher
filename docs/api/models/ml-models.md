@@ -208,6 +208,9 @@ the three standard rules (IQR, z-score, MAD), each a per-column bound learned in
 .. autofunction:: mahalanobis_distance
 .. autoclass:: OutlierClipper
    :members:
+
+.. autoclass:: EllipticEnvelope
+   :members:
 ```
 
 ## Clustering

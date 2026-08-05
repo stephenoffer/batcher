@@ -231,6 +231,29 @@ scored = mahalanobis_distance(ds, ["height", "weight"])
 print(scored.to_pydict()["mahalanobis"][3] == max(scored.to_pydict()["mahalanobis"]))  # the light-but-average-height row
 ```
 
+`mahalanobis_distance` relearns the centre and the covariance from whatever dataset you hand it. That is what you want for a one-off audit and the wrong thing for scoring new data: a batch made entirely of outliers relearns itself as normal and comes back clean. {py:class}`EllipticEnvelope <batcher.ml.outliers.EllipticEnvelope>` splits the two steps, so the envelope is learned once on the training data and applied unchanged to whatever arrives:
+
+```python
+from batcher.ml import EllipticEnvelope
+
+train = bt.from_pydict(
+    {
+        "height": [1.70, 1.75, 1.80, 1.85, 1.65, 1.78, 1.72, 1.82],
+        "weight": [64.0, 70.0, 76.0, 82.0, 58.0, 73.0, 66.0, 79.0],
+    }
+)
+
+envelope = EllipticEnvelope(["height", "weight"], contamination=0.05).fit(train)
+
+incoming = bt.from_pydict({"height": [1.76, 1.79], "weight": [71.0, 55.0]})
+print(envelope.predict(incoming).to_pydict()["is_outlier"])
+# [False, True]
+```
+
+The second row is the case the univariate rules miss: 1.79m and 55kg are each unremarkable, and the pair is not. `contamination` is the share of training rows expected to fall outside, which sets the chi-squared cutoff, and `score_samples` returns the distance itself when you would rather rank rows than threshold them.
+
+The fit is a mean and a covariance, both mergeable aggregates, so it is one pass and gives the same envelope on a cluster as on one machine. Scoring adds no pass at all, because it lowers to a single expression.
+
 ## Drift monitoring
 
 When a model has been deployed and the labels have not arrived yet, the only observable thing is whether the *inputs* still look like the training data.

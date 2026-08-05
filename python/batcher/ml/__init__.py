@@ -88,6 +88,7 @@ from batcher.ml.neighbors import (
     smote,
 )
 from batcher.ml.outliers import (
+    EllipticEnvelope,
     OutlierClipper,
     count_outliers,
     flag_outliers,
@@ -221,6 +222,7 @@ __all__ = [
     "DummyRegressor",
     "ElasticNet",
     "ElasticNetCV",
+    "EllipticEnvelope",
     "EncoderFactory",
     "Engine",
     "EngineFactory",
