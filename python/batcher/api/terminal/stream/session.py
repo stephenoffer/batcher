@@ -28,6 +28,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher.api.terminal.stream.watermark._state import _event_micros
 from batcher.io.source import Source
 from batcher.plan.logical import StreamingSessionWindow
 
@@ -117,18 +118,22 @@ class _SessionBuffer:
         # micro-batch for exactly this reason.
         before = self.watermark
         if before is not None:
-            keep = pc.greater_equal(pc.cast(table.column(self._plan.time_col), pa.int64()), before)
+            keep = pc.greater_equal(_event_micros(table.column(self._plan.time_col)), before)
             table = table.filter(pc.fill_null(keep, True))
         arrived = _to_micros(column)
         if arrived is not None:
             self._max_seen = arrived if self._max_seen is None else max(self._max_seen, arrived)
 
         self._buffer = table if self._buffer is None else pa.concat_tables([self._buffer, table])
-        self._check_bounded()
         watermark = self.watermark
-        if watermark is None or self._buffer.num_rows == 0:
-            return
-        yield from self._close(watermark)
+        if watermark is not None and self._buffer.num_rows:
+            yield from self._close(watermark)
+        # Checked on what *remains* after closing, not on what arrived. The batch that
+        # pushes the buffer over the budget is very often the same batch whose event time
+        # closes most of it -- a burst after a quiet period is the ordinary case -- and
+        # checking first turned that into a spurious failure on a query whose state was
+        # about to shrink.
+        self._check_bounded()
 
     def drain(self) -> Iterator[pa.Table]:
         """Close every remaining session, because the stream has ended."""
@@ -197,13 +202,19 @@ class _SessionBuffer:
         """
         from batcher._internal.errors import ResourceError
         from batcher.config import active_config
+        from batcher.plan.types import retained_bytes
 
         if self._buffer is None:
             return
         budget = active_config().memory.streaming_state_budget_bytes()
-        if budget and self._buffer.nbytes > budget:
+        # Retained, not logical. The buffer shrinks by `filter`, which in Arrow leaves a
+        # window pinning the pre-eviction parent -- so `nbytes` measures the wrong table and
+        # would read as shrinking on every eviction while the process held everything it
+        # ever buffered. `_state.py` documents the same trap for the other two operators.
+        held = retained_bytes(self._buffer)
+        if budget and held > budget:
             raise ResourceError(
-                f"session_window(): {self._buffer.nbytes / 1e6:.0f} MB of rows are buffered "
+                f"session_window(): {held / 1e6:.0f} MB of rows are buffered "
                 f"for sessions that never close, over the {budget / 1e6:.0f} MB streaming "
                 "state budget. A session closes when the watermark passes its last event "
                 f"plus the {self._plan.gap_micros / 1e6:.0f}s gap, so this means event time "
@@ -219,8 +230,7 @@ def _strip(table: pa.Table) -> pa.Table:
 
 
 def _to_micros(column: pa.ChunkedArray | pa.Array) -> int | None:
-    """The largest value of a timestamp column, in epoch microseconds."""
+    """The largest value of an event-time column, in epoch microseconds."""
     import pyarrow.compute as pc
 
-    largest = pc.max(pc.cast(column, pa.int64()))
-    return largest.as_py()
+    return pc.max(_event_micros(column)).as_py()

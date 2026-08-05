@@ -1,8 +1,8 @@
 """State shared by the event-time streaming operators: eviction, units, and the cap.
 
-Watermark dedup and the stream-stream interval join both retain rows between
-micro-batches and release them as event time advances, so they share three things and
-nothing else: how a state table is kept from fragmenting, how an event-time column is
+Watermark dedup, the stream-stream interval join, and the session window all retain rows
+between micro-batches and release them as event time advances, so they share three things
+and nothing else: how a state table is kept from fragmenting, how an event-time column is
 normalized to the microseconds every bound is expressed in, and what happens when a
 watermark stops advancing and the retained state stops shrinking.
 """

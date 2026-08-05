@@ -249,3 +249,21 @@ def test_the_same_check_fires_before_a_stream_starts_reading():
         _stream([[("a", 0, 1)]]).session_window(
             "ts", "5m", partition_by=["nope"], total=col("v").sum()
         )
+
+
+@pytest.mark.integration
+def test_a_burst_that_also_closes_its_sessions_does_not_trip_the_budget():
+    """The batch that pushes the buffer past the budget is very often the same batch whose
+    event time closes most of it -- a burst after a quiet period is the ordinary case.
+    Checking the cap before closing turned that into a failure on a query whose state was
+    about to shrink to almost nothing."""
+    quiet = [[(f"k{i}", 0, 1) for i in range(4000)]]
+    burst = [[("k0", 10_000, 1)]]  # far past every session's last event plus the gap
+    tight = Config().replace(memory=MemoryConfig(streaming_state_max_bytes=256 << 10))
+    with config_context(tight):
+        got = _sessions(
+            _stream(quiet + burst).session_window(
+                "ts", "5m", partition_by=["k"], total=col("v").sum()
+            )
+        )
+    assert len(got) == 4001

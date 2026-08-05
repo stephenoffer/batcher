@@ -220,3 +220,102 @@ def test_the_streaming_operator_puts_the_null_row_in_the_same_place():
 def _by_start(rows: list[dict]) -> list[tuple]:
     """Sessions keyed by start, so the comparison does not depend on emission order."""
     return sorted((str(row["session_start"]), row["total"]) for row in rows)
+
+
+def test_a_date_event_time_column_sessionizes_by_the_gap_it_was_given(duck):
+    """A `date32` column cast straight to int64 counts *days*, and the gap is expressed in
+    microseconds -- so every gap looked smaller than every threshold and a key's whole
+    history collapsed into one session. Silently: the answer was one plausible row per key.
+    Sessionizing an order or visit date by "3 days" is an ordinary analytic query, so the
+    column type had to stop deciding the answer."""
+    tbl = pa.table(
+        {
+            "k": pa.array(["a", "a", "a", "b"], pa.string()),
+            "d": pa.array(
+                [
+                    dt.date(2024, 1, 1),
+                    dt.date(2024, 1, 2),
+                    dt.date(2024, 6, 1),
+                    dt.date(2024, 1, 1),
+                ],
+                pa.date32(),
+            ),
+            "v": pa.array([1, 2, 3, 4], pa.int64()),
+        }
+    )
+    got = (
+        bt.from_arrow(tbl)
+        .session_window("d", "2d", partition_by=["k"], total=col("v").sum())
+        .collect()
+    )
+    assert str(got.schema.field("session_start").type) == "date32[day]"
+
+    duck.register("t", tbl)
+    rel = duck.sql(
+        """
+        WITH marked AS (
+            SELECT *,
+                CASE WHEN epoch_us(d::TIMESTAMP) - lag(epoch_us(d::TIMESTAMP)) OVER w > 172800000000
+                          OR lag(epoch_us(d::TIMESTAMP)) OVER w IS NULL
+                     THEN 1 ELSE 0 END AS new_session
+            FROM t WINDOW w AS (PARTITION BY k ORDER BY d)
+        ),
+        sessioned AS (
+            SELECT *, sum(new_session) OVER (PARTITION BY k ORDER BY d) AS sid FROM marked
+        )
+        SELECT k, min(d) AS session_start, max(d) AS session_end, sum(v) AS total
+        FROM sessioned GROUP BY k, sid
+        """
+    )
+    assert_same(got, rel)
+
+
+def test_the_streaming_operator_takes_a_date_event_time_column_too():
+    """It raised `ArrowNotImplementedError: Unsupported cast from date32[day] to int64` --
+    the same mistake as the bounded path's, arriving as a crash instead of a wrong
+    answer."""
+    schema = pa.schema([("k", pa.string()), ("d", pa.date32()), ("v", pa.int64())])
+
+    def feed():
+        yield pa.record_batch(
+            {"k": ["a", "a"], "d": [dt.date(2024, 1, 1), dt.date(2024, 1, 2)], "v": [1, 2]},
+            schema=schema,
+        )
+        yield pa.record_batch({"k": ["a"], "d": [dt.date(2024, 6, 1)], "v": [3]}, schema=schema)
+
+    streamed = []
+    plan = bt.from_batches(feed, schema, bounded=False).session_window(
+        "d", "2d", partition_by=["k"], total=col("v").sum()
+    )
+    for batch in plan.iter_batches():
+        streamed.extend(batch.to_pylist())
+    assert sorted((str(r["session_start"]), r["total"]) for r in streamed) == [
+        ("2024-01-01", 3),
+        ("2024-06-01", 3),
+    ]
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_the_gap_means_the_same_thing_at_every_timestamp_resolution(unit):
+    """The gap is microseconds and the column's raw ticks are not, so a resolution other
+    than `us` would scale every comparison by up to a thousand in either direction -- the
+    same failure the `date32` case makes obvious, in a form that stays plausible. A
+    four-hour gap has to break a thirty-minute session at every resolution."""
+    base = _BASE
+    tbl = pa.table(
+        {
+            "k": pa.array(["a", "a", "a"], pa.string()),
+            "ts": pa.array(
+                [base, base + dt.timedelta(minutes=1), base + dt.timedelta(hours=4)],
+                pa.timestamp(unit),
+            ),
+            "v": pa.array([1, 2, 3], pa.int64()),
+        }
+    )
+    got = (
+        bt.from_arrow(tbl)
+        .session_window("ts", "30m", partition_by=["k"], total=col("v").sum())
+        .collect()
+    )
+    assert str(got.schema.field("session_start").type) == f"timestamp[{unit}]"
+    assert sorted(got.to_pydict()["total"]) == [3, 3]

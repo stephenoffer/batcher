@@ -86,3 +86,27 @@ def test_a_non_append_output_mode_is_refused():
         _deduped(_stream()).write.memory(
             "dedup_mode", trigger=bt.Trigger.available_now(), output_mode="complete"
         )
+
+
+@pytest.mark.integration
+def test_distinct_with_a_subset_is_refused_by_name_over_a_stream():
+    """A subset makes `distinct` a window over rows that have not arrived, so it cannot
+    stream. The generic breaker message advised "restructure to ... a single top-level
+    aggregate / distinct", which is the thing the caller just wrote."""
+    with pytest.raises(PlanError, match="drop_duplicates_within_watermark"):
+        _stream().distinct(subset=["k"])
+
+
+@pytest.mark.integration
+def test_distinct_over_the_whole_row_still_streams():
+    """The refusal is about the subset, not about `distinct`, and the message says so."""
+    rows = [row for batch in _stream().distinct().iter_batches() for row in batch.to_pylist()]
+    assert len(rows) == 5
+
+
+@pytest.mark.integration
+def test_a_bounded_source_keeps_the_subset_form():
+    """Nothing about the bounded behavior changes; there the ordering is over rows that
+    have all arrived."""
+    bounded = bt.from_pydict({"k": ["a", "a", "b"], "v": [1, 2, 3]})
+    assert bounded.distinct(subset=["k"]).to_pydict()["k"] == ["a", "b"]

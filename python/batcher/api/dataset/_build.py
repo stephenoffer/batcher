@@ -308,6 +308,19 @@ def build_distinct(
         raise PlanError(f"distinct(): unknown subset column(s) {sorted(unknown)}")
     if keep not in ("first", "last", "any"):
         raise PlanError(f"distinct(): keep must be 'first'/'last'/'any', got {keep!r}")
+    # Refused here, by name, rather than at execution as a generic breaker. The generic
+    # message advises "restructure to ... a single top-level aggregate / distinct", which
+    # is the thing the caller just wrote -- a subset makes this a window, not a distinct,
+    # and no restructuring of it streams.
+    if not _all_bounded(ds):
+        raise PlanError(
+            "distinct(subset=...) cannot stream: keeping one row per key across an "
+            "unbounded input needs the key set held for the life of the query, and which "
+            "row wins is decided by an ordering over rows that have not arrived. Use "
+            "drop_duplicates_within_watermark(subset, event_time=..., lateness=...), whose "
+            "state the watermark bounds, or distinct() with no subset when the whole row "
+            "is the key."
+        )
 
     if keep == "any":
         order: list[tuple[str, bool]] = [(c, False) for c in subset]
@@ -413,7 +426,11 @@ def mark_sessions(ds: Dataset, time_col: str, gap_us: int, pk: list[str]) -> Dat
     from batcher.plan.expr_ir import col
 
     order = [(time_col, False)]
-    s = ds.with_columns(_t=col(time_col).cast("int64"))
+    # Through `timestamp` first, not straight to int64. A `date32` column casts to int64 as
+    # a count of *days*, which was then compared against a gap expressed in microseconds --
+    # so every gap looked smaller than every threshold and a whole key collapsed into one
+    # session. Silently: the answer was one plausible row per key.
+    s = ds.with_columns(_t=col(time_col).cast("timestamp").cast("int64"))
     s = build_window(
         s, partition_by=pk, order_by=order, functions={"_prev": ("lag", "_t", 1)}, frame=None
     )
