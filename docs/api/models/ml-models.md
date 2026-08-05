@@ -234,6 +234,18 @@ Score a clustering against a reference labeling with `batcher.ml.metrics`, each 
 .. autofunction:: davies_bouldin_score
 ```
 
+## Pipelines
+
+Preprocessing and a model as one fitted object, so the sequence `predict` replays is by
+construction the one `fit` used:
+
+```{eval-rst}
+.. currentmodule:: batcher.ml
+
+.. autoclass:: Pipeline
+   :members:
+```
+
 ## Nearest neighbours
 
 Prediction and imputation by local similarity. All three fold a bounded reference set into

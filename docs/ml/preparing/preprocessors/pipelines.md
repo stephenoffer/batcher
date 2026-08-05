@@ -123,6 +123,52 @@ print(prepared_val.collect().column_names)
 # ['age', 'income', 'city_oslo', 'city_paris', 'city_rome']
 ```
 
+## Taking the model with it
+
+{py:class}`Chain <batcher.ml.preprocessors.Chain>` composes preprocessors and stops there,
+which leaves you responsible for remembering which transforms a model was trained behind and
+applying exactly those at serving time. That is where train/serve skew comes from, and it
+fails silently: a model scored behind one fewer transform returns numbers, not an error.
+
+{py:class}`Pipeline <batcher.ml.Pipeline>` owns both halves. `fit` fits each step on the
+previous one's output and then the model on the fully transformed frame; `predict` replays
+the identical sequence:
+
+```python
+import batcher as bt
+from batcher.ml import LinearRegression, Pipeline, SimpleImputer, StandardScaler
+
+train = bt.from_pydict({"x": [1.0, None, 3.0, 5.0], "y": [2.0, 4.0, 6.0, 10.0]})
+pipe = Pipeline(
+    SimpleImputer(["x"]),
+    StandardScaler(["x"]),
+    model=LinearRegression(["x"], "y"),
+).fit(train)
+print("prediction" in pipe.predict(train).columns)
+# True
+```
+
+Because it is one object it saves as one file, so what ships to serving is the whole recipe
+rather than a model plus a memo about what preceded it:
+
+```python
+import os
+import tempfile
+
+target = os.path.join(tempfile.mkdtemp(), "pipeline.json")
+pipe.save(target)
+served = Pipeline.load(target)
+print([type(step).__name__ for step in served.steps])
+# ['SimpleImputer', 'StandardScaler']
+```
+
+`transform` applies the steps without scoring, which is how you inspect what the model
+actually sees. And because a `Pipeline` exposes `fit`/`predict`, it drops straight into
+{py:func}`cross_val_score <batcher.ml.cross_val_score>` and
+{py:func}`grid_search <batcher.ml.grid_search>` — which is the point of putting the
+preprocessing inside it, since cross-validating a model whose scaler was fitted on the whole
+frame measures nothing.
+
 ## See also
 
 - {doc}`/ml/preparing/preprocessors/index`: the fit/transform contract each step in a chain obeys.

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1216 Python modules across 187 packages and 219 Rust files across 14 crates.
+Covering 1218 Python modules across 188 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -447,6 +447,14 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `sparse_linear.py` | 259 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
 | `splitting.py` | 319 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 | `timeseries.py` | 323 | Time-series diagnostics — autocorrelation and the tests built on it. |
+
+### `batcher/ml/compose/` — 6 · front-end
+
+Composing preprocessing and a model into one fitted object.
+
+| module | lines | what it is |
+|---|---|---|
+| `pipeline.py` | 220 | `Pipeline` — the preprocessing and the model as one fitted object. |
 
 ### `batcher/ml/corpus/` — 6 · front-end
 
