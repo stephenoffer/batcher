@@ -426,7 +426,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `cluster.py` | 346 | Unsupervised clustering — grouping rows by similarity, with no labels. |
 | `converters.py` | 271 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
 | `devices.py` | 446 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
-| `discriminant.py` | 324 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
+| `discriminant.py` | 370 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 208 | Baseline predictors — the "does my model beat doing nothing" reference. |
 | `embed.py` | 500 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
 | `embed_api.py` | 325 | Embedding encoders backed by a *served* endpoint, not a local model. |
