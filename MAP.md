@@ -624,7 +624,7 @@ Categorical encoders — ordinal codes, 0/1 indicators, and target encoding.
 | module | lines | what it is |
 |---|---|---|
 | `binary.py` | 118 | Binary encoding — a compact base-2 code for a categorical column. |
-| `frequency.py` | 339 | Cardinality-tolerant categorical encoders — frequency, count, rare-bucketing, hashing. |
+| `frequency.py` | 359 | Cardinality-tolerant categorical encoders — frequency, count, rare-bucketing, hashing. |
 | `onehot.py` | 233 | Indicator encoders — one 0/1 output column per learned category. |
 | `ordinal.py` | 226 | Ordinal encoders — fit the category set, transform with a CASE projection. |
 | `shrinkage.py` | 340 | Target encoders that shrink differently — leave-one-out, and James-Stein. |

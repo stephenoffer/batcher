@@ -342,3 +342,27 @@ def test_a_baseline_still_takes_a_target_name(name: str) -> None:
 
     ds = bt.from_pydict({"y": [1.0, 2.0, 3.0, 4.0]})
     assert getattr(ml, name)("y").fit(ds).predict(ds).count() == 4
+
+
+def test_the_rare_category_encoder_names_a_numeric_column() -> None:
+    """The mirror image: its replacement is a string, so it is *numbers* it cannot rewrite.
+
+    The engine's message for this was `arguments need to have the same data type`, from a
+    `case` whose branches disagreed. It named neither column nor either type.
+    """
+    from batcher.ml import RareCategoryEncoder
+
+    ds = bt.from_pydict({"x": ["a", "a", "a", "b"], "z": [1.0, 2.0, 3.0, 4.0]})
+    with pytest.raises(PlanError) as caught:
+        RareCategoryEncoder(["x", "z"]).fit(ds)
+    message = str(caught.value)
+    assert "'z'" in message, "it must name the numeric column, not the string one"
+    assert "KBinsDiscretizer" in message, "it must offer a way to use a numeric column"
+
+
+def test_the_rare_category_encoder_still_takes_strings() -> None:
+    from batcher.ml import RareCategoryEncoder
+
+    ds = bt.from_pydict({"x": ["a", "a", "a", "b"]})
+    out = RareCategoryEncoder(["x"], min_frequency=0.5).fit(ds).transform(ds).to_pydict()
+    assert out["x"] == ["a", "a", "a", "__rare__"]

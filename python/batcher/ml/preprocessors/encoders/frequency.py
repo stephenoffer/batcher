@@ -233,6 +233,26 @@ class RareCategoryEncoder(Preprocessor):
             ``self``, fitted.
         """
         total = ds.count()
+        import pyarrow.types as arrow_types
+
+        schema = ds.schema
+        for name in self.columns:
+            index = schema.get_field_index(name)
+            if index < 0:
+                continue
+            dtype = schema.field(index).type
+            if arrow_types.is_floating(dtype) or arrow_types.is_integer(dtype):
+                # This is the mirror image of every other check here: the replacement is a
+                # *string* sentinel, so it is the numeric column that cannot work, not the
+                # string one. Left alone, `transform` reached a `case` whose branches had
+                # different types and the engine said "arguments need to have the same data
+                # type", which names neither the column nor which two types it meant.
+                raise PlanError(
+                    f"RareCategoryEncoder replaces a rare category with the string "
+                    f"{self.other_value!r}, so it cannot rewrite the numeric column "
+                    f"{name!r}. Cast it to a string first, or bucket it with "
+                    "KBinsDiscretizer."
+                )
         threshold = self.min_frequency * total
         for name in self.columns:
             pairs = _category_counts(ds, name, self.max_categories)
