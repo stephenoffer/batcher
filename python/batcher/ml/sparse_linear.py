@@ -16,7 +16,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import linear_score, require_fitted, require_rows
+from batcher.ml._estimator import (
+    linear_score,
+    require_fitted,
+    require_numeric,
+    require_rows,
+)
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
@@ -144,6 +149,7 @@ class ElasticNet:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
         d = len(self.features)
         require_rows(self, ds.count(), 2, because="its moments divide by n - 1")
         aggregates: dict[str, object] = {

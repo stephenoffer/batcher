@@ -80,3 +80,42 @@ def test_predict_before_fit_raises() -> None:
     ds = bt.from_pydict({"x": [1], "y": [0]})
     with pytest.raises(PlanError, match="must be fitted"):
         BernoulliNB(["x"], "y").predict(ds)
+
+
+def test_a_negative_feature_is_named_instead_of_a_math_domain_error() -> None:
+    """`math.log` on a negative count raised a bare ValueError naming nothing at all.
+
+    sklearn rejects this input too, so the fix is the message rather than the outcome: the
+    caller needs to know which column is wrong and what to do about it.
+    """
+    ds = bt.from_pydict({"x": [-2.0, -1.0, 1.0, 2.0], "z": [1.0, 2.0, 3.0, 4.0], "y": [0, 0, 1, 1]})
+    with pytest.raises(PlanError, match="cannot be negative"):
+        MultinomialNB(["x", "z"], "y").fit(ds)
+
+
+def test_the_rejection_names_the_column_and_the_value() -> None:
+    ds = bt.from_pydict({"x": [-2.0, -1.0, 1.0, 2.0], "z": [1.0, 2.0, 3.0, 4.0], "y": [0, 0, 1, 1]})
+    with pytest.raises(PlanError) as caught:
+        MultinomialNB(["x", "z"], "y").fit(ds)
+    message = str(caught.value)
+    assert "'x'" in message and "-2" in message
+    assert "GaussianNB" in message, "the message must name the estimator that takes real values"
+
+
+def test_negatives_that_cancel_in_the_sum_are_still_caught() -> None:
+    """A sum-based check is free and wrong: -5 and +5 sum to zero and log(0+alpha) succeeds."""
+    ds = bt.from_pydict({"x": [-5.0, 5.0, -5.0, 5.0], "z": [1.0, 2.0, 3.0, 4.0], "y": [0, 0, 1, 1]})
+    with pytest.raises(PlanError, match="cannot be negative"):
+        MultinomialNB(["x", "z"], "y").fit(ds)
+
+
+def test_nulls_do_not_trip_the_negativity_check() -> None:
+    ds = bt.from_pydict({"x": [1.0, None, 5.0, 6.0], "z": [1.0, 2.0, 3.0, 4.0], "y": [0, 0, 1, 1]})
+    assert MultinomialNB(["x", "z"], "y").fit(ds).classes_ == [0, 1]
+
+
+def test_a_non_negative_fit_is_unaffected(counts) -> None:
+    _, _, features, ds = counts
+    model = MultinomialNB(features, "y").fit(ds)
+    assert sorted(model.classes_) == [0, 1, 2]
+    assert model.predict(ds).count() == ds.count()

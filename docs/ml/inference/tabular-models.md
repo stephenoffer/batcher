@@ -132,6 +132,49 @@ For classification, `RidgeClassifier` casts it as regression on one-vs-rest targ
 
 When the features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance instead of assuming independence: `LinearDiscriminantAnalysis` shares one covariance across classes for a stable linear boundary, and `QuadraticDiscriminantAnalysis` gives each class its own for a quadratic one. Both reproduce scikit-learn exactly.
 
+## More than two classes
+
+{py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits one weight vector, so it can only answer one yes-or-no question. Given a target with three labels it rejects the fit and names the column, rather than returning a model that predicts a single class for every row.
+
+{py:class}`OneVsRestClassifier <batcher.ml.multiclass.OneVsRestClassifier>` is the way to fit that target. It trains one binary model per class, each asking whether a row belongs to that class, and predicts whichever scores highest. Pass the estimator as a class rather than an instance, because each sub-model needs its own target column:
+
+```python
+import batcher as bt
+from batcher.ml import LogisticRegression, OneVsRestClassifier
+
+ds = bt.from_pydict(
+    {
+        "weight": [0.2, 0.3, 0.4, 5.0, 5.2, 5.4, 20.0, 21.0, 22.0],
+        "grade": ["small", "small", "small", "medium", "medium", "medium",
+                  "large", "large", "large"],
+    }
+)
+
+model = OneVsRestClassifier(LogisticRegression, ["weight"], "grade").fit(ds)
+print(model.classes_)
+# ['large', 'medium', 'small']
+print(model.predict(ds).to_pydict()["prediction"])
+# ['small', 'small', 'small', 'medium', 'medium', 'medium', 'large', 'large', 'large']
+```
+
+The labels can be of any type, and `classes_` is sorted so that the sub-model order does not depend on the order the scan returned the labels in. That is what lets a model fitted across a cluster be saved and loaded against one fitted on a laptop.
+
+Prediction stays a single pass however many classes there are. Each sub-model's score is staged as a column and the choice between them is folded into one `argmax` expression, so classifying against a hundred classes reads the data once rather than a hundred times.
+
+Pass hyperparameters for every sub-model through `params`:
+
+```python
+model = OneVsRestClassifier(
+    LogisticRegression, ["weight"], "grade", params={"max_iter": 50}
+).fit(ds)
+print(len(model.estimators_))
+# 3
+```
+
+The base estimator must expose `predict_proba`. Ranking classes means comparing their scores, which a hard 0/1 label cannot support, so an estimator without it is rejected when you construct the wrapper rather than when you predict.
+
+{py:class}`RidgeClassifier <batcher.ml.linear.RidgeClassifier>` already does this decomposition internally and takes a multiclass target directly. It is the cheaper option when a closed-form fit is enough, since it needs one scan rather than one per Newton step.
+
 ## Clustering without labels
 
 Not every tabular job has a target. `batcher.ml.cluster.KMeans` segments rows by similarity, learning its centroids in the engine: each Lloyd iteration is one nearest-centroid assignment expression and one grouped mean, so the fit is a handful of scans and labeling any dataset is a single streaming pass. The `inertia_` it learns is the total squared distance to the centroids, which is the number an elbow plot uses to choose the cluster count.
@@ -320,6 +363,22 @@ agree wherever the neighbourhood is unambiguous.
 Each framework is an optional extra: `pip install 'batcher-engine[xgboost]'`, `[lightgbm]`, `[catboost]`, `[onnx]`, or `[sklearn]`. `[tabular]` installs all of them.
 
 Feature columns must be numeric, boolean, or decimal. Encode a categorical column first, with `OrdinalEncoder`, `TargetEncoder`, or one of the cardinality-tolerant encoders on {doc}`/ml/preparing/preprocessors/index`. A string column raises an error naming the column rather than failing deep inside the model.
+
+The estimators Batcher fits itself are stricter than `ds.ml.predict` on one point: a feature column must be an integer, a float, or a decimal. They fit through engine aggregates, which are not defined on a boolean, so a flag column has to be cast before it can be used as a feature:
+
+```python
+import batcher as bt
+from batcher.ml import LinearRegression
+
+ds = bt.from_pydict(
+    {"flag": [True, False, True, False], "z": [1.0, 4.0, 2.0, 9.0], "y": [0.0, 1.0, 2.0, 3.0]}
+)
+numeric = ds.with_columns(flag=bt.col("flag").cast("int64"))
+print(len(LinearRegression(["flag", "z"], "y").fit(numeric).coef_))
+# 2
+```
+
+A string, boolean, date, or all-null feature raises an error naming the column, the type, and the fix, rather than surfacing as an aggregate or cast failure from inside the engine.
 
 The feature-name guard only fires where the model recorded its training feature names. A booster fitted from a bare NumPy matrix records generic `f0…fN`, which match no real column, so nothing can be checked. Fit from a DataFrame, or keep the feature list beside the model.
 

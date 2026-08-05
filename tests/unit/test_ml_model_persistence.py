@@ -58,6 +58,16 @@ def _positive() -> bt.Dataset:
     )
 
 
+def _multiclass() -> bt.Dataset:
+    """Three well-separated classes, for the estimators that need more than two."""
+    return bt.from_pydict(
+        {
+            "x": [0.0, 1.0, 2.0, 8.0, 9.0, 10.0, 20.0, 21.0, 22.0],
+            "label": [0, 0, 0, 1, 1, 1, 2, 2, 2],
+        }
+    )
+
+
 def _build(name: str, klass: type):
     """Fit one instance of `klass`, with the arguments that estimator actually takes."""
     from batcher.ml import (
@@ -82,6 +92,11 @@ def _build(name: str, klass: type):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
     if name in ("LinearDiscriminantAnalysis", "QuadraticDiscriminantAnalysis"):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
+    if name == "OneVsRestClassifier":
+        from batcher.ml import LogisticRegression, OneVsRestClassifier
+
+        ds = _multiclass()
+        return OneVsRestClassifier(LogisticRegression, ["x"], "label").fit(ds), ds
     if name == "TransformedTargetRegressor":
         from batcher.ml import LinearRegression, TransformedTargetRegressor
 

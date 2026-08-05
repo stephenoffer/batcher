@@ -117,6 +117,19 @@ its own (quadratic boundaries).
    :members:
 ```
 
+`batcher.ml.multiclass` extends a two-class estimator to any number of classes.
+{py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits a single weight
+vector, so it answers one yes-or-no question and rejects a target with more than two labels.
+{py:class}`OneVsRestClassifier <batcher.ml.multiclass.OneVsRestClassifier>` fits one such
+model per class and predicts whichever scores highest.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.multiclass
+
+.. autoclass:: OneVsRestClassifier
+   :members:
+```
+
 ## Evaluation
 
 `batcher.ml.metrics` holds the metrics that need a global ordering or return a table. The

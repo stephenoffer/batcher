@@ -20,6 +20,7 @@ from batcher.ml._estimator import (
     argmax_prediction,
     linear_score,
     require_fitted,
+    require_numeric,
     require_rows,
 )
 from batcher.plan.expr_ir.constructors import col, lit, when
@@ -49,6 +50,7 @@ def _solve(
             raise ColumnNotFoundError(
                 unknown_message("column", name, ds.columns, hint="Pass an existing column.")
             )
+    require_numeric(estimator, ds, features)
     d = len(features)
     n = ds.count()
     require_rows(estimator, n, 2, because="the covariance it is built from divides by n - 1")
@@ -300,6 +302,24 @@ class LogisticRegression:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
+        # A non-binary target is the one input this fit cannot detect from its own arithmetic.
+        # IRLS treats `target - probability` as a residual, so labels of 0/1/2 converge to a
+        # model that predicts one class for nearly every row: fitted, plausible, and wrong,
+        # with nothing raised. Three distinct values are enough to prove it, so the check is
+        # bounded rather than a full scan of the column.
+        seen = [
+            v.as_py()
+            for v in ds.select(self.target).distinct().limit(3).collect().column(self.target)
+        ]
+        extra = sorted((repr(v) for v in seen if v is not None and v not in (0, 1)), key=str)
+        if extra:
+            raise PlanError(
+                f"LogisticRegression fits a binary target, but {self.target!r} contains "
+                f"{extra[0]}. Encode it as 0/1 for a two-class problem, or use "
+                "OneVsRestClassifier(LogisticRegression, features, target) to fit one binary "
+                "model per class."
+            )
         terms = [lit(1.0), *[col(name) for name in self.features]]
         m = len(terms)
         require_rows(self, ds.count(), m, because="IRLS needs one row per fitted term")
@@ -307,7 +327,11 @@ class LogisticRegression:
         for iteration in range(self.max_iter):
             eta = self._linear_predictor(list(beta[1:]), float(beta[0]))
             probability = lit(1.0) / (lit(1.0) + (-eta).exp())
-            residual = col(self.target) - probability
+            # Cast because a boolean label column is one of the commonest ways to spell a
+            # binary target, and Arrow will not subtract a float from a boolean: the IRLS
+            # residual raised ``Invalid arithmetic operation: Boolean - Float64`` from inside
+            # the engine, naming neither the column nor the fix.
+            residual = col(self.target).cast("float64") - probability
             weight = probability * (lit(1.0) - probability)
             aggregates = {}
             for j in range(m):

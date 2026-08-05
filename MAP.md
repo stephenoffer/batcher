@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1220 Python modules across 188 packages and 219 Rust files across 14 crates.
+Covering 1221 Python modules across 188 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -420,31 +420,32 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | module | lines | what it is |
 |---|---|---|
 | `_embed_dedup.py` | 45 | In-batch embedding deduplication — encode each distinct text once, gather back. |
-| `_estimator.py` | 129 | The scaffolding every fitted estimator in `batcher.ml` shares. |
+| `_estimator.py` | 190 | The scaffolding every fitted estimator in `batcher.ml` shares. |
 | `autobatch.py` | 262 | Adaptive batch-size control for inference — what Ray Data makes you hand-tune. |
 | `batch_format.py` | 13 | Re-export of the `batch_format` conversion, which now lives in `interop`. |
-| `cluster.py` | 346 | Unsupervised clustering — grouping rows by similarity, with no labels. |
+| `cluster.py` | 351 | Unsupervised clustering — grouping rows by similarity, with no labels. |
 | `converters.py` | 271 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
 | `devices.py` | 446 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
-| `discriminant.py` | 370 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
+| `discriminant.py` | 377 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 208 | Baseline predictors — the "does my model beat doing nothing" reference. |
 | `embed.py` | 500 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
 | `embed_api.py` | 325 | Embedding encoders backed by a *served* endpoint, not a local model. |
 | `feature_scores.py` | 331 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 331 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
-| `glm.py` | 344 | Generalized linear models fitted by iteratively reweighted least squares. |
+| `glm.py` | 350 | Generalized linear models fitted by iteratively reweighted least squares. |
 | `gpu.py` | 1573 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
-| `linear.py` | 500 | Native linear models — ordinary and ridge regression trained inside the engine. |
-| `mixture.py` | 374 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
+| `linear.py` | 524 | Native linear models — ordinary and ridge regression trained inside the engine. |
+| `mixture.py` | 375 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
 | `model_selection.py` | 725 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
-| `naive_bayes.py` | 490 | Naive Bayes — a probabilistic classifier whose whole fit is a grouped aggregate. |
+| `multiclass.py` | 224 | `OneVsRestClassifier` — multiclass classification built from a binary estimator. |
+| `naive_bayes.py` | 512 | Naive Bayes — a probabilistic classifier whose whole fit is a grouped aggregate. |
 | `outliers.py` | 364 | Outlier detection — finding the rows a model should not be trained on, at scale. |
 | `permutation.py` | 187 | The keyed epoch permutation — a shuffled sample order that is computed, not stored. |
 | `pipeline.py` | 217 | Multi-stage streaming pipeline with credit-based backpressure (the GPU-feeding moat). |
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
 | `selection.py` | 400 | Deciding which features to keep, before a model ever sees them. |
-| `sparse_linear.py` | 259 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
+| `sparse_linear.py` | 265 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
 | `splitting.py` | 319 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 | `timeseries.py` | 323 | Time-series diagnostics — autocorrelation and the tests built on it. |
 
@@ -576,7 +577,7 @@ Persisting fitted state — the document format, and estimator save/load.
 | module | lines | what it is |
 |---|---|---|
 | `document.py` | 214 | The JSON document format fitted objects are written in, and how it is read back. |
-| `models.py` | 288 | Saving and loading a fitted estimator — the half of train/serve parity that was missing. |
+| `models.py` | 323 | Saving and loading a fitted estimator — the half of train/serve parity that was missing. |
 
 ### `batcher/ml/preprocessors/` — 6 · front-end
 

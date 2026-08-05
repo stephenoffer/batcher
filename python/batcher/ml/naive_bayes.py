@@ -17,7 +17,7 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import argmax_prediction, require_fitted
+from batcher.ml._estimator import argmax_prediction, require_fitted, require_numeric
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -118,6 +118,7 @@ class GaussianNB:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
         total = ds.count()
         global_variance = ds.agg(
             **{f"v{i}": var_pop(col(name)) for i, name in enumerate(self.features)}
@@ -272,15 +273,33 @@ class MultinomialNB:
         Raises:
             ColumnNotFoundError: If a named column is missing.
         """
+        from batcher.plan.functions.aggregate import min as min_
         from batcher.plan.functions.aggregate import sum as sum_
 
-        _check_columns(ds, self.features, self.target)
+        _check_columns(ds, self.features, self.target, self)
         total = ds.count()
         aggregates: dict[str, object] = {"__bt_n": col(self.target).count()}
         for i, name in enumerate(self.features):
             aggregates[f"s{i}"] = sum_(col(name))
+            # The minimum rides along in the aggregate that was already being computed, so
+            # validating costs no extra pass. Checking the *sums* instead would be free too
+            # and wrong: negative values cancel, and a column of -5 and +5 sums to zero.
+            aggregates[f"m{i}"] = min_(col(name))
         grouped = ds.group_by(self.target).agg(**aggregates).collect()
         d = len(self.features)
+        for i, name in enumerate(self.features):
+            column = grouped.column(f"m{i}")
+            smallest = min(
+                (column[row].as_py() for row in range(grouped.num_rows)),
+                default=0.0,
+                key=lambda v: float("inf") if v is None else v,
+            )
+            if smallest is not None and smallest < 0:
+                raise PlanError(
+                    f"MultinomialNB models counts, so a feature cannot be negative: "
+                    f"{name!r} contains {smallest}. Use GaussianNB for real-valued features, "
+                    "or scale this column to be non-negative with MinMaxScaler first."
+                )
         self.classes_, self.log_prior_, self.log_prob_ = [], {}, {}
         for row in range(grouped.num_rows):
             label = grouped.column(self.target)[row].as_py()
@@ -422,7 +441,7 @@ class BernoulliNB:
         """
         from batcher.plan.functions.aggregate import sum as sum_
 
-        _check_columns(ds, self.features, self.target)
+        _check_columns(ds, self.features, self.target, self)
         total = ds.count()
         aggregates: dict[str, object] = {"__bt_n": col(self.target).count()}
         for i, name in enumerate(self.features):
@@ -479,8 +498,10 @@ class BernoulliNB:
         )
 
 
-def _check_columns(ds: Dataset, features: Sequence[str], target: str) -> None:
-    """Raise a `ColumnNotFoundError` naming the closest match for any missing column."""
+def _check_columns(
+    ds: Dataset, features: Sequence[str], target: str, estimator: object = "naive Bayes"
+) -> None:
+    """Raise naming the closest match for a missing column, or the type of an unusable one."""
     for name in (*features, target):
         if name not in ds.columns:
             from batcher._internal.errors import ColumnNotFoundError, unknown_message
@@ -488,3 +509,4 @@ def _check_columns(ds: Dataset, features: Sequence[str], target: str) -> None:
             raise ColumnNotFoundError(
                 unknown_message("column", name, ds.columns, hint="Pass an existing column.")
             )
+    require_numeric(estimator, ds, features)

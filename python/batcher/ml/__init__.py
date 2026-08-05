@@ -78,6 +78,7 @@ from batcher.ml.model_selection import (
     random_search,
     validation_curve,
 )
+from batcher.ml.multiclass import OneVsRestClassifier
 from batcher.ml.naive_bayes import BernoulliNB, GaussianNB, MultinomialNB
 from batcher.ml.neighbors import (
     KNeighborsClassifier,
@@ -262,6 +263,7 @@ __all__ = [
     "Normalizer",
     "Nystroem",
     "OneHotEncoder",
+    "OneVsRestClassifier",
     "OrdinalEncoder",
     "OutlierClipper",
     "Pipeline",

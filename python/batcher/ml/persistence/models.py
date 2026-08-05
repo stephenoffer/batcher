@@ -39,6 +39,10 @@ __all__ = ["load_model", "model_from_dict", "model_to_dict", "save_model"]
 #: tag so the wrapper saves as one file, the way `Chain` already does for preprocessors.
 _MODEL_TAG = "__model__"
 
+#: tag for a field holding an estimator *class*, recorded by name and resolved through the
+#: registry on load, so a wrapper that builds its own sub-models stays saveable.
+_CLASS_TAG = "__estimator_class__"
+
 
 def _parameters(model: object) -> dict[str, Any]:
     """The constructor hyperparameters of `model`, read from its own signature.
@@ -147,6 +151,23 @@ def _encode_field(value: Any, model: str, field: str) -> Any:
         # A wrapper holding another estimator saves as one document rather than obliging
         # the caller to persist the two halves and remember how they were connected.
         return {_MODEL_TAG: model_to_dict(value)}
+    if isinstance(value, type):
+        # A wrapper parameterized by an estimator *class* rather than an instance, the way
+        # `OneVsRestClassifier` is: it must build one sub-model per class, so it cannot be
+        # handed a single pre-built one. The name is recorded and resolved back through the
+        # same registry, which is why an unregistered class has to fail here - writing a name
+        # nothing can look up would produce a file that saves and never loads.
+        if _registry().get(value.__name__) is not value:
+            raise PlanError(
+                f"{model}.{field} holds the class {value.__name__!r}, which is not exported "
+                "from batcher.ml, so a saved model could not name it well enough to rebuild. "
+                "Parameterize the wrapper with an exported estimator."
+            )
+        return {_CLASS_TAG: value.__name__}
+    if isinstance(value, list) and any(_is_estimator(item) for item in value):
+        # One-vs-rest keeps a list of fitted sub-models. Encoding them individually keeps
+        # the whole ensemble in one document, matching the single-estimator case above.
+        return [_encode_field(item, model, field) for item in value]
     try:
         return encode_value(value)
     except PlanError as exc:
@@ -169,6 +190,20 @@ def _decode_field(value: Any) -> Any:
     """Decode one field, rebuilding a nested estimator."""
     if isinstance(value, dict) and _MODEL_TAG in value:
         return model_from_dict(value[_MODEL_TAG])
+    if isinstance(value, dict) and _CLASS_TAG in value:
+        name = value[_CLASS_TAG]
+        klass = _registry().get(name)
+        if klass is None:
+            raise PlanError(
+                f"this model was parameterized by {name!r}, which batcher.ml no longer "
+                "exports. It was saved by a version that had it; rebuild the model with an "
+                "estimator this version provides."
+            )
+        return klass
+    if isinstance(value, list) and any(
+        isinstance(item, dict) and _MODEL_TAG in item for item in value
+    ):
+        return [_decode_field(item) for item in value]
     return decode_value(value)
 
 

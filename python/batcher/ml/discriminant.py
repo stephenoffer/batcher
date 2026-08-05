@@ -19,7 +19,12 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import argmax_prediction, linear_score, require_fitted
+from batcher.ml._estimator import (
+    argmax_prediction,
+    linear_score,
+    require_fitted,
+    require_numeric,
+)
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -179,6 +184,7 @@ class QuadraticDiscriminantAnalysis:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
         labels, counts, means, covariances = class_moments(ds, self.features, self.target)
         total = sum(counts.values())
         self.classes_, self.means_, self.precision_, self.log_prior_ = [], {}, {}, {}
@@ -319,6 +325,7 @@ class LinearDiscriminantAnalysis:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
         labels, counts, class_means, covariances = class_moments(ds, self.features, self.target)
         total = sum(counts.values())
         d = len(self.features)

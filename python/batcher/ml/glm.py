@@ -17,7 +17,12 @@ import warnings
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import DataWarning, PlanError
-from batcher.ml._estimator import linear_score, require_fitted, require_rows
+from batcher.ml._estimator import (
+    linear_score,
+    require_fitted,
+    require_numeric,
+    require_rows,
+)
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -176,6 +181,7 @@ class TweedieRegressor:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
         self.converged_ = False
         terms = [lit(1.0), *[col(name) for name in self.features]]
         m = len(terms)
