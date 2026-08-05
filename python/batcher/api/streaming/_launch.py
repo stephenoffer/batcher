@@ -101,16 +101,8 @@ def start_streaming_query(
     """
     from batcher import core
     from batcher._internal.errors import PlanError
-    from batcher.plan.logical import Limit, StreamingSessionWindow, WatermarkDedup
 
-    # These go down the driver path for the same reason a join does: their state is
-    # retained *rows* or a cursor rather than a fold, and the operators that turn them into
-    # output are relational ones living above `core`, which `core` may not import. One
-    # definition of each, reached from both terminals. A `Limit` is here because a limited
-    # stream *ends*, and the driver runner is the thing that already knows what to do when
-    # its iterator stops.
-    driver_shapes = (Limit, StreamingSessionWindow, WatermarkDedup)
-    if len(sources) > 1 or isinstance(plan, driver_shapes):
+    if len(sources) > 1 or _is_driver_shape(plan):
         return _start_driver_stream(plan, sources, sink, trigger, output_mode, name, checkpoint)
     output_mode = OutputMode.validate(output_mode)
     trigger = trigger or Trigger.processing_time(0)
@@ -213,12 +205,19 @@ def _start_driver_stream(
         Union,
         WatermarkDedup,
         WatermarkStreamJoin,
+        is_partition_independent,
     )
 
-    joins = isinstance(plan, WatermarkStreamJoin)
-    unions = isinstance(plan, Union) and union_streams_interleaved(plan, sources)
-    enriches = stream_static_sides(plan, sources) is not None
-    retains_rows = isinstance(plan, (Limit, StreamingSessionWindow, WatermarkDedup))
+    # Row-wise operators above the shape are peeled by the router and re-applied per batch,
+    # so recognition has to look under them here too -- otherwise a `filter` on top of a
+    # stream-stream join is a plan `iter_batches` streams and no sink accepts.
+    root = plan
+    while is_partition_independent(root):
+        root = root.input
+    joins = isinstance(root, WatermarkStreamJoin)
+    unions = isinstance(root, Union) and union_streams_interleaved(root, sources)
+    enriches = stream_static_sides(root, sources) is not None
+    retains_rows = isinstance(root, (Limit, StreamingSessionWindow, WatermarkDedup))
     if not (joins or unions or enriches or retains_rows):
         raise PlanError(
             "streaming a sink from more than one source is supported for a stream-stream "
@@ -293,6 +292,34 @@ def _is_stateless(plan: LogicalPlan) -> bool:
     from batcher.plan.logical import Aggregate, Distinct, is_streamable
 
     return is_streamable(plan) and not isinstance(plan, (Aggregate, Distinct))
+
+
+def _is_driver_shape(plan: LogicalPlan) -> bool:
+    """Whether the driver produces this plan's rows, under any stack of row-wise operators.
+
+    These shapes go down the driver path for the same reason a join does: their state is
+    retained *rows* or a cursor rather than a fold, and the operators that turn them into
+    output are relational ones living above `core`, which `core` may not import. One
+    definition of each, reached from both terminals. A `Limit` is here because a limited
+    stream *ends*, and the driver runner already knows what to do when its iterator stops.
+
+    The peeling matters as much as the list. `iter_batches` strips row-wise operators off a
+    breaker and re-applies them per batch, so `join_stream(...).filter(...)` -- the
+    cookbook's own recipe for "impressions with no click" -- streams there. This launcher
+    tested the top node only, so a single `filter` on top made every one of these plans
+    unrecognizable and unwritable. The same `is_partition_independent` predicate the router
+    peels by is used here, so the two cannot drift into disagreeing about which plans exist.
+    """
+    from batcher.plan.logical import (
+        Limit,
+        StreamingSessionWindow,
+        WatermarkDedup,
+        is_partition_independent,
+    )
+
+    while is_partition_independent(plan):
+        plan = plan.input
+    return isinstance(plan, (Limit, StreamingSessionWindow, WatermarkDedup))
 
 
 def _is_mapped_aggregate(plan: LogicalPlan) -> bool:

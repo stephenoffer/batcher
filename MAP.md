@@ -342,7 +342,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | module | lines | what it is |
 |---|---|---|
 | `_distributed.py` | 265 | Streaming with the micro-batch fanned across the cluster. |
-| `_launch.py` | 308 | The single-node streaming launcher: optimize once, then drive micro-batches. |
+| `_launch.py` | 335 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 422 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
@@ -2007,7 +2007,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `ir_tags.py` | 232 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 117 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 232 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 269 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 396 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 

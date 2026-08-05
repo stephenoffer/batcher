@@ -62,6 +62,8 @@ than discover. None of them is a bug you can configure away.
 | The file sink dedups by *position* | A different batch 0 written into a directory that already holds `part-batch00000.parquet` is skipped, silently. One query, one output directory. | {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>` |
 | A non-replayable source ignores `checkpoint=` | No offsets are recorded, so a restart re-reads from the beginning. Nothing warns you. | {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>` |
 | Late rows are dropped, not diverted | No side output and no dead-letter: the rows are gone. `num_late_rows` on each micro-batch counts them, so the shortfall is visible. | {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>` |
+| A session only closes when event time moves past it | The gap is measured in event time, so a source whose clock stalls never closes a session and the buffered rows never leave. A `ResourceError` names the stall rather than letting the process die. | {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>` |
+| A query that retains rows reports no state metrics | The stream-stream join, the stream-static join, the session window, the dedup, a limit and a stream union all run through a driver, so `state_operators` is empty and `num_input_rows` counts what the driver emitted. The memory guard still fires. | {doc}`Monitoring </user-guide/moving-data/streaming-monitoring>` |
 
 ## See also
 
