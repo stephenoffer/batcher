@@ -16,8 +16,9 @@ already built or unreachable.
 **Operator sweep, same day (item 10).** A second pass read the competitors' operator
 inventories rather than following the scorecard, and found the one gap in this document that
 is *asymptotic* rather than a constant factor: `DISTINCT`/`GROUP BY` under a `LIMIT` never
-stops early (10a, 0.15x at 16M rows and widening). It also found a query every competitor
-accepts and Batcher raises on (10b), and **ruled four candidates out** — DuckDB's perfect-hash
+stops early (10a, 0.15x at 16M rows and widening). It also found a SQL-portability item (10b — whose
+first draft wrongly claimed Spark accepts the query; Spark's own test asserts it does not, and
+the entry now carries the correction), and **ruled four candidates out** — DuckDB's perfect-hash
 aggregate and perfect-hash join, time-bucketed grouping, and expression CSE are all already
 built here (10e). Note what that ratio says: of nine operator-level candidates examined, four
 were already done. Check before building.
@@ -31,9 +32,10 @@ from metadata 15-22x faster than DuckDB executed them. DataFusion, Daft and Ray 
 reader, and Ray Data's `train_test_split`/`streaming_split`/shuffle are all already built.
 
 **The honest summary of the whole sweep is that Batcher's operator coverage is broad.** Across
-the five trees, three genuine openings came out of it — 10a (asymptotic, and the one to build),
-10b (cheap), 10f (unmeasured, memory-shaped) — against roughly a dozen candidates that were
-already implemented. An agent reading this document for work should start at the backlog, not
+the five trees, two genuine openings came out of it — 10a (asymptotic, and the one to build)
+and 10f (unmeasured, memory-shaped) — against roughly a dozen candidates that were already
+implemented, plus one item (10b) that shrank to an error message once its competitor claim was
+actually run instead of recalled. An agent reading this document for work should start at the backlog, not
 at a competitor's file listing.
 
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
@@ -72,7 +74,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued 2026-08-04**: the win is `take`/`filter` (3-13x), *not* comparison (parity) or sort (0.75-0.81x). Only pays scan-native; a boundary conversion loses at morsel size |
 | 10a | `DISTINCT`/`GROUP BY` + `LIMIT` stops once `k` groups exist | DuckDB | Absent — `RelOp::Distinct` carries no limit | **0.15x at 16M rows on a high-cardinality key, widening with scale.** The only *asymptotic* gap in this document |
 | 9 | A faster string `ORDER BY` | DuckDB | Loses; **magnitude unmeasured** — this machine's noise is 5.3x | Now tracked by `benchmarks/.../ordering.py`; three candidate fixes measured and rejected, two leads left |
-| 10b | `row_number() OVER ()` with no `ORDER BY` | DuckDB, Spark, Polars | **Raises** on both the DataFrame and SQL surfaces | Cheap; a query every competitor accepts |
+| 10b | `row_number() OVER ()` with no `ORDER BY` | DuckDB, Polars (**Spark rejects it too**) | Raises — matching Spark; the capability exists as `with_row_index` | Small: SQL portability and an error message, not a capability gap |
 | 3 | Online adaptive reordering of filter conjuncts | DuckDB | **Landed** (`ConjunctOrder`) | Fixes the case a static cost model gets wrong |
 | 4 | Top-K heap threshold pushed down as a filter | DataFusion | **Half landed** (`TopNBound` skips morsels; nothing reaches the scan) | Large on `ORDER BY ... LIMIT k` over big inputs |
 | 5 | Skew detected from measured partition sizes, split automatically | Spark AQE | Machinery exists, off by default | Removes a config the user cannot be expected to set |
@@ -702,21 +704,50 @@ direct-map dedups the whole column faster than DuckDB reaches its early exit. So
 a rule that fires on an *estimated-high-cardinality* key, not an unconditional one — and
 Kyber already has the sketch-backed cardinality estimate to decide it.
 
-### 10b. `row_number() OVER ()` is rejected, and every competitor accepts it
+### 10b. `row_number() OVER ()` is rejected — **and this entry was wrong when first written**
 
-`SELECT x, row_number() OVER () FROM t` runs in DuckDB, Spark and Polars. Batcher refuses it
-on both surfaces:
+**Correction, same day.** The first version of this entry said the query "runs in DuckDB, Spark
+and Polars" and called Batcher's refusal indefensible. Only DuckDB and Polars had actually been
+run; **Spark was asserted from memory and is the opposite of the truth.** Spark's own test suite
+pins the failure:
 
-- DataFrame: `PlanError: window ranking function 'row_number' requires order_by keys`
-- SQL: `NotImplementedError: window ranking function 'rownumber' requires ORDER BY`
+```scala
+// sql/core/src/test/scala/org/apache/spark/sql/DataFrameWindowFunctionsSuite.scala:72
+test("window function should fail if order by clause is not specified") {
+  ... intercept[AnalysisException](df.select(row_number().over(Window.partitionBy("value")))),
+  condition = "WINDOW_FUNCTION_FRAME_NOT_ORDERED",
+  parameters = Map("wf_name" -> "row_number", ...)
+```
 
-The refusal looks principled — without an `ORDER BY` the numbering has no defined order, and
-this engine cares about determinism more than most. But the conclusion does not follow.
-Batcher already defines a deterministic order for exactly this situation everywhere else: its
-sorts resolve ties to *input order*, and `str_sort`/`radix_sort` exist to guarantee it. Numbering
-an unordered window in input order is the same rule, is what DuckDB effectively produces, and
-costs a ported query nothing. Refusing is the one option that is neither compatible nor more
-deterministic than the alternative.
+with the message defined at `common/utils/.../error-conditions.json:9426`.
+
+**The verified state**, all four checked rather than recalled:
+
+| engine | `row_number() OVER ()` | |
+|---|---|---|
+| DuckDB | accepts | run |
+| Polars | accepts | run |
+| **Spark** | **rejects** (`WINDOW_FUNCTION_FRAME_NOT_ORDERED`) | its own test |
+| Batcher | rejects | run |
+
+So it is a 2-2 split, and Batcher sides with the *other distributed engine* — for the same
+stated reason. `plan/logical/window.py:211` argues that "without an order there is no 'previous'
+row: the result would depend on arrival order, which a morselized/distributed scan does not
+fix." That is Spark's argument, and it is sound: DuckDB and Polars are single-node and can
+define arrival order cheaply, where an engine whose contract is single-node == distributed
+cannot.
+
+**What survives is much smaller than the original claim.** The *capability* is already present
+under Polars' own spelling — `Dataset.with_row_index(name, offset=)` at
+`api/dataset/frame.py:1933`, plus `with_row_count`. What is missing is only SQL portability: a
+ported DuckDB or Polars-SQL query using `row_number() OVER ()` fails, and the error names the
+missing `ORDER BY` without pointing at `with_row_index` as the deterministic alternative. That
+is an error-message and porting-guidance item, not a capability gap, and it is ranked
+accordingly below.
+
+Recorded at this length because the failure mode matters more than the item: this document's
+whole purpose is to be checkable, and a competitor claim taken from memory rather than run is
+exactly what it must not contain.
 
 ### 10c. No streaming window path
 
@@ -882,9 +913,10 @@ is done; what remains is ordered by value against the mandate.
    count decides it rather than a timing margin. Gate it on Kyber's existing cardinality
    estimate rather than firing unconditionally: on a *low*-cardinality key Batcher's dense
    direct-map already beats DuckDB 4.9x, and an unconditional early exit gives that back.
-4. **`row_number() OVER ()` (item 10b).** A query DuckDB, Spark and Polars all accept and
-   Batcher refuses on both surfaces. Cheap, and the deterministic answer — number in input
-   order — is the rule Batcher's sorts already apply to ties.
+4. **`row_number() OVER ()` porting guidance (item 10b).** Demoted after the entry was
+   corrected: Spark rejects this too, for Batcher's own stated reason, and the capability
+   already exists as `with_row_index`. What is left is that a ported DuckDB/Polars-SQL query
+   fails with an error that does not name the alternative. An error-message change.
 5. **The low-cardinality string sort (item 9).** The cause is structural rather than a
    kernel, which is why it is here despite the magnitude being unmeasured: seven distinct
    values give the sampled quantile boundaries nothing to cut on, so the sample-sort's ranges
