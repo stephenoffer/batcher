@@ -28,6 +28,8 @@ from batcher.plan.expr_ir.constructors import col, lit, when
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from numpy.typing import NDArray
+
     from batcher.api.dataset import Dataset
 
 __all__ = ["LinearRegression", "LogisticRegression", "Ridge", "RidgeClassifier"]
@@ -523,3 +525,285 @@ class RidgeClassifier:
         require_fitted(self, self.classes_)
         prediction = argmax_prediction(self.classes_, self._score)
         return ds.with_columns(**{self.output_column: prediction})
+
+
+#: The ceiling on features for `RidgeCV`, which lowers to one aggregate per pair of terms.
+#:
+#: The whole cross-validation is one grouped aggregate of ``(d + 1)(d + 4) / 2`` sums. That is
+#: 252 at twenty features and grows quadratically, so the bound keeps a mis-specified call
+#: from building a plan with tens of thousands of aggregates instead of appearing to hang.
+MAX_CV_FEATURES = 20
+
+
+def _moment_blocks(row: dict[str, object], terms: int) -> tuple[float, NDArray, NDArray]:
+    """Split one aggregate row into ``(n, sums, cross-products)`` over the fitted terms."""
+    import numpy as np
+
+    count = float(row["__bt_n"])
+    sums = np.array([float(row[f"__bt_s{i}"] or 0.0) for i in range(terms)])
+    products = np.zeros((terms, terms))
+    for i in range(terms):
+        for j in range(i, terms):
+            value = float(row[f"__bt_p{i}_{j}"] or 0.0)
+            products[i, j] = products[j, i] = value
+    return count, sums, products
+
+
+def _ridge_from_moments(count: float, sums, products, alpha: float, features: int):
+    """Solve the ridge normal equations from moments alone, touching no rows.
+
+    This is what makes the search cheap: centering, the penalty, and the solve are all
+    arithmetic on a ``(d + 1) x (d + 1)`` matrix, so a new `alpha` costs a small `solve` and
+    not another pass over the data.
+    """
+    import numpy as np
+
+    centered = products - np.outer(sums, sums) / count
+    system = centered[:features, :features] + alpha * np.eye(features)
+    coefficients = np.linalg.solve(system, centered[:features, features])
+    means = sums / count
+    intercept = means[features] - float(coefficients @ means[:features])
+    return coefficients, intercept
+
+
+def _sse_from_moments(count: float, sums, products, coefficients, intercept: float) -> float:
+    """The held-out sum of squared errors, expanded into the same moments.
+
+    ``sum (y - b.x - c)^2`` multiplies out to ``Syy - 2b'Sxy - 2cSy + b'Sxx b + 2cb'Sx + nc^2``,
+    every term of which is already in the fold's moment block. Scoring a fold therefore reads
+    no rows either, which is the half of the saving that a naive search cannot avoid: it has
+    to score each candidate on each fold, and each of those is a scan.
+    """
+    d = len(coefficients)
+    sxx = products[:d, :d]
+    sxy = products[:d, d]
+    syy = products[d, d]
+    sx = sums[:d]
+    sy = sums[d]
+    return float(
+        syy
+        - 2.0 * coefficients @ sxy
+        - 2.0 * intercept * sy
+        + coefficients @ sxx @ coefficients
+        + 2.0 * intercept * (coefficients @ sx)
+        + count * intercept * intercept
+    )
+
+
+def _cv_error(blocks, total_n: float, total_sums, total_products, alpha: float, d: int) -> float:
+    """The mean held-out squared error for one penalty, over folds already reduced to moments.
+
+    Each fold's *training* moments are the total minus that fold's own, which is the whole
+    reason one aggregate suffices: moments add, so leaving a fold out is a subtraction rather
+    than another pass.
+    """
+    error, held = 0.0, 0.0
+    for count, sums, products in blocks:
+        train_n = total_n - count
+        if train_n <= d + 1 or count <= 0:
+            # A fold holding almost everything, or nothing, cannot score a candidate.
+            # Skipping it beats both a singular solve and a silently optimistic zero.
+            continue
+        coefficients, intercept = _ridge_from_moments(
+            train_n, total_sums - sums, total_products - products, alpha, d
+        )
+        error += _sse_from_moments(count, sums, products, coefficients, intercept)
+        held += count
+    return error / held if held else float("inf")
+
+
+class RidgeCV:
+    """Ridge regression with the penalty chosen by cross-validation, in one pass over the data.
+
+    Searching a penalty normally costs a fit per candidate per fold. Ridge does not need that.
+    Its normal equations are built entirely from the first and second moments of the features
+    and the target, and **those moments do not depend on alpha** — so every candidate can be
+    solved from the same numbers. The held-out error expands into the same moments too, so
+    scoring a candidate on a fold reads no rows either.
+
+    What that leaves is a single grouped aggregate: the moments per fold, computed once. Every
+    fold's training moments are the total minus that fold's, because moments are additive, and
+    every ``(fold, alpha)`` pair is then arithmetic on small matrices. Five folds and twenty
+    candidates cost one pass, not a hundred.
+
+    That additivity is the same property that makes the operator distributable, so the search
+    behaves identically on one node and on a cluster. Folds are assigned by hashing the row's
+    own values, so a row lands in the same fold however the data is partitioned.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml import RidgeCV
+            >>> ds = bt.from_pydict(
+            ...     {"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ...      "y": [2.1, 3.9, 6.2, 7.8, 10.1, 12.0, 13.9, 16.2]}
+            ... )
+            >>> model = RidgeCV(["x"], "y", alphas=(0.01, 1.0, 100.0), cv=4).fit(ds)
+            >>> model.alpha_ in (0.01, 1.0, 100.0)
+            True
+            >>> round(model.predict(ds).to_pydict()["prediction"][0], 1)
+            2.1
+
+    Args:
+        features: The predictor columns.
+        target: The column to predict.
+        alphas: The candidate L2 penalties to choose between.
+        cv: How many cross-validation folds to score each candidate on.
+        seed: Seed for the content-hash fold assignment.
+        output_column: The name of the prediction column `predict` appends.
+
+    Raises:
+        PlanError: If `features` is empty or longer than `MAX_CV_FEATURES`, if `alphas` is
+            empty or holds a negative penalty, or if `cv` is below two.
+    """
+
+    __slots__ = (
+        "alpha_",
+        "alphas",
+        "coef_",
+        "cv",
+        "features",
+        "intercept_",
+        "output_column",
+        "scores_",
+        "seed",
+        "target",
+    )
+
+    def __init__(
+        self,
+        features: Sequence[str],
+        target: str,
+        *,
+        alphas: Sequence[float] = (0.01, 0.1, 1.0, 10.0, 100.0),
+        cv: int = 5,
+        seed: int = 0,
+        output_column: str = "prediction",
+    ) -> None:
+        self.features = list(features)
+        if not self.features:
+            raise PlanError("RidgeCV needs at least one feature column.")
+        if len(self.features) > MAX_CV_FEATURES:
+            raise PlanError(
+                f"RidgeCV lowers to one aggregate per pair of terms, so {len(self.features)} "
+                f"features would build a plan of "
+                f"{(len(self.features) + 1) * (len(self.features) + 4) // 2} aggregates. "
+                f"The ceiling is {MAX_CV_FEATURES}; select features first with "
+                "SelectKBest, or fit Ridge at a fixed alpha."
+            )
+        self.alphas = [float(a) for a in alphas]
+        if not self.alphas:
+            raise PlanError("RidgeCV needs at least one candidate in alphas.")
+        if any(a < 0 for a in self.alphas):
+            raise PlanError(f"RidgeCV: every alpha must be non-negative, got {self.alphas}.")
+        if cv < 2:
+            raise PlanError(f"RidgeCV needs at least two folds to hold one out, got {cv}.")
+        self.target = target
+        self.cv = cv
+        self.seed = seed
+        self.output_column = output_column
+        self.coef_: list[float] = []
+        self.intercept_: float = 0.0
+        self.alpha_: float = 0.0
+        self.scores_: dict[float, float] = {}
+
+    def fit(self, ds: Dataset) -> RidgeCV:
+        """Score every candidate on every fold from a single grouped aggregate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml import RidgeCV
+                >>> ds = bt.from_pydict(
+                ...     {"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ...      "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}
+                ... )
+                >>> model = RidgeCV(["x"], "y", alphas=(0.1, 10.0), cv=3).fit(ds)
+                >>> sorted(model.scores_) == [0.1, 10.0]
+                True
+
+        Args:
+            ds: The training dataset.
+
+        Returns:
+            ``self``, fitted at the best-scoring alpha over all the data.
+
+        Raises:
+            PlanError: If a feature or the target is not numeric, or too few rows remain.
+            ColumnNotFoundError: If a named column is missing.
+        """
+        import numpy as np
+
+        from batcher.api.dataset._build import split_key
+        from batcher.plan.functions.aggregate import sum as sum_
+
+        for name in (*self.features, self.target):
+            if name not in ds.columns:
+                from batcher._internal.errors import ColumnNotFoundError, unknown_message
+
+                raise ColumnNotFoundError(
+                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
+                )
+        require_numeric(self, ds, self.features)
+        require_numeric(self, ds, [self.target], role="target")
+
+        d = len(self.features)
+        names = [*self.features, self.target]
+        columns = [col(n).cast("float64") for n in names]
+        fold = (split_key(ds, names, self.seed) * lit(float(self.cv))).floor().cast("int64")
+        aggregates: dict[str, object] = {"__bt_n": col(self.target).count()}
+        for i, left in enumerate(columns):
+            aggregates[f"__bt_s{i}"] = sum_(left)
+            for j in range(i, len(columns)):
+                aggregates[f"__bt_p{i}_{j}"] = sum_(left * columns[j])
+        grouped = ds.with_columns(__bt_fold=fold).group_by("__bt_fold").agg(**aggregates).collect()
+
+        terms = d + 1
+        blocks = [
+            _moment_blocks({k: grouped.column(k)[r].as_py() for k in aggregates}, terms)
+            for r in range(grouped.num_rows)
+        ]
+        total_n = sum(b[0] for b in blocks)
+        require_rows(self, int(total_n), d + 2, because="ridge needs more rows than terms")
+        total_sums = sum(b[1] for b in blocks)
+        total_products = sum(b[2] for b in blocks)
+
+        self.scores_ = {
+            alpha: _cv_error(blocks, total_n, total_sums, total_products, alpha, d)
+            for alpha in self.alphas
+        }
+
+        self.alpha_ = min(self.alphas, key=lambda a: (self.scores_[a], a))
+        coefficients, intercept = _ridge_from_moments(
+            total_n, total_sums, total_products, self.alpha_, d
+        )
+        self.coef_ = [float(c) for c in np.asarray(coefficients)]
+        self.intercept_ = float(intercept)
+        return self
+
+    def predict(self, ds: Dataset) -> Dataset:
+        """Append the prediction from the fit at the chosen penalty.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml import RidgeCV
+                >>> ds = bt.from_pydict(
+                ...     {"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]}
+                ... )
+                >>> model = RidgeCV(["x"], "y", alphas=(0.001,), cv=2).fit(ds)
+                >>> round(model.predict(ds).to_pydict()["prediction"][1], 3)
+                4.0
+
+        Args:
+            ds: The dataset to score.
+
+        Returns:
+            A new lazy `Dataset` with the prediction column appended.
+        """
+        require_fitted(self, self.coef_)
+        expression = linear_score(self.features, self.coef_, self.intercept_)
+        return ds.with_columns(**{self.output_column: expression})

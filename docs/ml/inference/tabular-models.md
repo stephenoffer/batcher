@@ -132,6 +132,39 @@ For classification, `RidgeClassifier` casts it as regression on one-vs-rest targ
 
 When the features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance instead of assuming independence: `LinearDiscriminantAnalysis` shares one covariance across classes for a stable linear boundary, and `QuadraticDiscriminantAnalysis` gives each class its own for a quadratic one. Both reproduce scikit-learn exactly.
 
+## Choosing a penalty without paying for it
+
+A ridge penalty has to be chosen, and the usual way costs a fit per candidate per fold. {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>` does not need that. Ridge builds its normal equations from the first and second moments of the features and the target, and those moments do not depend on the penalty, so every candidate is solved from the same numbers. The held-out squared error expands into the same moments, so scoring a candidate on a fold reads no rows either.
+
+What remains is one grouped aggregate: the moments per fold. Each fold's training moments are the total minus that fold's, because moments add, and every combination is then arithmetic on small matrices:
+
+```python
+import batcher as bt
+from batcher.ml import RidgeCV
+
+ds = bt.from_pydict(
+    {
+        "size": [750.0, 800.0, 850.0, 900.0, 950.0, 1000.0, 1050.0, 1100.0],
+        "age": [10.0, 8.0, 12.0, 5.0, 7.0, 3.0, 9.0, 2.0],
+        "price": [150.0, 162.0, 168.0, 189.0, 195.0, 214.0, 210.0, 232.0],
+    }
+)
+
+model = RidgeCV(["size", "age"], "price", alphas=(0.01, 1.0, 100.0), cv=4).fit(ds)
+print(model.alpha_)
+# 1.0
+print({a: round(s, 2) for a, s in model.scores_.items()})
+# {0.01: 3.17, 1.0: 2.53, 100.0: 42.71}
+print(round(model.predict(ds).to_pydict()["prediction"][0], 1))
+# 150.4
+```
+
+`scores_` holds the mean held-out squared error per candidate, and the model is refitted over all the data at `alpha_` once the search is done.
+
+Five folds against twenty candidates is one pass rather than a hundred, and adding candidates costs nothing extra: on 200,000 rows with five features, the search runs one terminal operation where refitting each combination runs 125. The additivity that makes this work is the same property that makes the operator distributable, so the search behaves identically on one node and across a cluster, and folds are assigned by hashing each row's own values so a row lands in the same fold however the data is partitioned.
+
+Candidates that are statistically indistinguishable can tie. When two penalties score the same to within floating-point noise, which one wins is arbitrary, and the fix is a wider spread of candidates rather than a closer reading of `scores_`.
+
 ## More than two classes
 
 {py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits one weight vector, so it can only answer one yes-or-no question. Given a target with three labels it rejects the fit and names the column, rather than returning a model that predicts a single class for every row.

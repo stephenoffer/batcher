@@ -45,6 +45,7 @@ from batcher.ml.linear import (
     LogisticRegression,
     Ridge,
     RidgeClassifier,
+    RidgeCV,
 )
 from batcher.ml.llm import (
     Engine,
@@ -281,6 +282,7 @@ __all__ = [
     "RatioFeatures",
     "ResumableSampler",
     "Ridge",
+    "RidgeCV",
     "RidgeClassifier",
     "RobustScaler",
     "RollingFeaturizer",

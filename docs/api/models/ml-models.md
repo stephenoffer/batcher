@@ -44,6 +44,9 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 .. autoclass:: RidgeClassifier
    :members:
 
+.. autoclass:: RidgeCV
+   :members:
+
 .. autoclass:: LogisticRegression
    :members:
 ```

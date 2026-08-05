@@ -435,7 +435,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `glm.py` | 351 | Generalized linear models fitted by iteratively reweighted least squares. |
 | `gpu.py` | 1573 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
-| `linear.py` | 525 | Native linear models — ordinary and ridge regression trained inside the engine. |
+| `linear.py` | 809 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 375 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
 | `model_selection.py` | 725 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `multiclass.py` | 224 | `OneVsRestClassifier` — multiclass classification built from a binary estimator. |
