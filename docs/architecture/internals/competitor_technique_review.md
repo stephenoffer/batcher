@@ -31,11 +31,16 @@ from metadata 15-22x faster than DuckDB executed them. DataFusion, Daft and Ray 
 (10h) and turned up almost nothing: `WITH RECURSIVE`, Daft's whole AI axis including a WARC
 reader, and Ray Data's `train_test_split`/`streaming_split`/shuffle are all already built.
 
-**The honest summary of the whole sweep is that Batcher's operator coverage is broad.** Across
-the five trees, two genuine openings came out of it — 10a (asymptotic, and the one to build)
-and 10f (unmeasured, memory-shaped) — against roughly a dozen candidates that were already
-implemented, plus one item (10b) that shrank to an error message once its competitor claim was
-actually run instead of recalled. An agent reading this document for work should start at the backlog, not
+A final pass compared **optimizer passes** rather than operators (10i), on the reasoning that a
+pass DuckDB has and Kyber does not is worth more than an operator, Kyber being the moat. It
+found one: common *subplan* elimination, which also settles the question 10g had to leave open.
+
+**The honest summary of the whole sweep is that Batcher's coverage is broad.** Across the five
+trees plus DuckDB's optimizer, three genuine openings came out of it — 10a (asymptotic, and the
+one to build), 10i (a pass Kyber lacks), 10f (unmeasured, memory-shaped) — against roughly
+fifteen candidates that were already implemented, one of which (partial aggregate pushdown) is
+argued more carefully here than in the pass it matches. Plus one item (10b) that shrank to an
+error message once its competitor claim was actually run instead of recalled. An agent reading this document for work should start at the backlog, not
 at a competitor's file listing.
 
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
@@ -74,6 +79,7 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 | 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued 2026-08-04**: the win is `take`/`filter` (3-13x), *not* comparison (parity) or sort (0.75-0.81x). Only pays scan-native; a boundary conversion loses at morsel size |
 | 10a | `DISTINCT`/`GROUP BY` + `LIMIT` stops once `k` groups exist | DuckDB | Absent — `RelOp::Distinct` carries no limit | **0.15x at 16M rows on a high-cardinality key, widening with scale.** The only *asymptotic* gap in this document |
 | 9 | A faster string `ORDER BY` | DuckDB | Loses; **magnitude unmeasured** — this machine's noise is 5.3x | Now tracked by `benchmarks/.../ordering.py`; three candidate fixes measured and rejected, two leads left |
+| 10i | Common **subplan** elimination (signature-matched, plan-level) | DuckDB | Absent — `rules/extra/cse.py` is expression-level only | Settles 10g: the technique is real and Kyber lacks it |
 | 10b | `row_number() OVER ()` with no `ORDER BY` | DuckDB, Polars (**Spark rejects it too**) | Raises — matching Spark; the capability exists as `with_row_index` | Small: SQL portability and an error message, not a capability gap |
 | 3 | Online adaptive reordering of filter conjuncts | DuckDB | **Landed** (`ConjunctOrder`) | Fixes the case a static cost model gets wrong |
 | 4 | Top-K heap threshold pushed down as a filter | DataFusion | **Half landed** (`TopNBound` skips morsels; nothing reaches the scan) | Large on `ORDER BY ... LIMIT k` over big inputs |
@@ -851,6 +857,42 @@ Batcher's scorecard positions Ray Data as a primary competitor and claims 50-450
 the porting surface for that specific audience being the unmapped one is a mismatch worth
 closing. It is a table entry, not an engine change.
 
+### 10i. The optimizer pass list — one real gap, and it settles 10g
+
+The sweep above compared *execution operators*. This compares **optimizer passes**, which is
+the more pointed comparison: Kyber is the moat, so a pass DuckDB has and Kyber does not is
+worth more than an operator. `duckdb/src/optimizer/` holds ~40 of them.
+
+**The gap: common subplan elimination.** `common_subplan_optimizer.cpp` computes a *signature*
+per subplan, canonicalizing column indices so that two structurally identical subtrees compare
+equal even when their bindings differ, and rewrites the duplicates to one computation. Kyber has
+no equivalent — `rules/extra/cse.py` is expression-level, within a single `Project`, and the only
+`grep` hit for "subplan" under `kyber/rules/` is an unrelated docstring in `joins/order.py:159`
+about tracing a column to its leaf.
+
+This also **settles the question 10g left open**. Two timing probes there failed to establish
+whether Batcher reuses a repeated subplan, because Kyber answered both shapes from metadata. The
+source answers it directly: it does not, and DuckDB thinks the technique is worth a dedicated
+pass with signature-based matching. 10g's caution about probing this optimizer with a stopwatch
+still stands; it was the method that was wrong, not the question.
+
+**Related, and already on the backlog rather than new.** `late_materialization.cpp` rewrites
+`SELECT * ... ORDER BY x LIMIT k` so the scan fetches only the key plus a row locator, then
+fetches the wide columns for the `k` survivors alone. Batcher already does the *operator*-level
+half — `ops::parallel_top_n` emits "only its top-k **sort-key values** plus a `(morsel, row)`
+locator" and gathers the payload once. What DuckDB's version additionally saves is the *I/O* of
+reading those columns at all, which needs a positional fetch from the scan. That is the same
+family as backlog item 8 (the scan half of the top-K dynamic filter): both are about getting
+information down to the reader so it reads less. Sequence them together.
+
+**Ruled out here, both already present and one of them better than DuckDB's.**
+`partial_aggregate_pushdown.cpp` against `kyber/rules/agg_pushdown.py`, which distinguishes
+`eager_aggregation` (min/max, "idempotent under the join's row duplication, so it is correct for
+*any* fan-out") from `pre_aggregation_through_join` (sum/count, admitted only when the other side
+is "provably unique on the join key") — a fan-out safety argument stated more carefully than the
+pass it matches. And `empty_result_pullup.cpp` against `limit_extra.py`'s empty-marker machinery,
+covered by three differential files (`test_diff_empty{,_propagation,_relation}.py`).
+
 ### 10e. Ruled out — already built, do not re-implement
 
 Both were on the shortlist of DuckDB operators worth taking, and both already exist:
@@ -917,7 +959,11 @@ is done; what remains is ordered by value against the mandate.
    corrected: Spark rejects this too, for Batcher's own stated reason, and the capability
    already exists as `with_row_index`. What is left is that a ported DuckDB/Polars-SQL query
    fails with an error that does not name the alternative. An error-message change.
-5. **The low-cardinality string sort (item 9).** The cause is structural rather than a
+5. **Common subplan elimination (item 10i).** DuckDB gives it a dedicated pass with
+   signature-based matching, which is evidence the technique earns its keep. Kyber has the
+   expression-level version only. Unmeasured in Batcher, and 10g explains why a stopwatch
+   will not measure it without a shape the shortcut machinery cannot answer.
+6. **The low-cardinality string sort (item 9).** The cause is structural rather than a
    kernel, which is why it is here despite the magnitude being unmeasured: seven distinct
    values give the sampled quantile boundaries nothing to cut on, so the sample-sort's ranges
    come out lopsided however many are asked for. `sample_sort.rs` already solves exactly this
@@ -930,22 +976,22 @@ is done; what remains is ordered by value against the mandate.
    splitting a tie group across ranges is sound. It passed the serial oracle on every
    shape. It is not landed because "no performance regressions" is a gate and this machine
    could not measure it either way. Land it from a quiet box, with the benchmark above.
-6. **An adaptive-width sort key for the per-range sort (item 9).** Proven
+7. **An adaptive-width sort key for the per-range sort (item 9).** Proven
    permutation-identical and worth 1.69x on high-cardinality 27-char keys, but a *fixed*
    4-byte head loses 0.78-0.87x on two other shapes, so the width has to come from the sample
    `prefix_discriminates` already draws. Needs a quiet box: the margin is inside this
    machine's noise band.
-7. `StringView` adoption (item 2), alongside 2, since both are about not destroying a compact
+8. `StringView` adoption (item 2), alongside 2, since both are about not destroying a compact
    string representation. Still the largest and most invasive single-node item — but now
    argued from `take`/`filter` only, and known to lose if adopted anywhere short of
    scan-native.
-8. **The scan half of the top-K dynamic filter (item 4).** The morsel-skip half is landed; what
+9. **The scan half of the top-K dynamic filter (item 4).** The morsel-skip half is landed; what
    is missing is republishing the bound so a Parquet reader can prune row groups, which is where
    the I/O saving is.
-9. Skew salt derived from measured partition sizes (item 5).
-10. Post-shuffle partition coalescing from the sizes just written, not the previous run's
+10. Skew salt derived from measured partition sizes (item 5).
+11. Post-shuffle partition coalescing from the sizes just written, not the previous run's
     (item 10d).
-11. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
+12. Adaptive morsel sizing (item 7), if latency ever becomes the complaint.
 
 **A process note, since this document exists to direct work.** Three of the six items in the
 previous version of this list described work that already existed, and one described a win the
