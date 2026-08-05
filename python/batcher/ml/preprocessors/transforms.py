@@ -75,6 +75,8 @@ class QuantileTransformer(Preprocessor):
             standard-normal-shaped output.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "n_quantiles", "output_distribution", "quantiles_")
 
     def __init__(
@@ -115,6 +117,7 @@ class QuantileTransformer(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self.check_numeric(ds)
         fractions = [i / self.n_quantiles for i in range(self.n_quantiles)]
         aggregates = {
             f"{name}__{i}": col(name).quantile(f)
@@ -206,6 +209,8 @@ class LogTransformer(Preprocessor):
         offset: Added before the logarithm; 1.0 gives ``log1p``, which handles zeros.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "offset")
 
     def __init__(self, columns: str | Sequence[str], *, offset: float = 1.0) -> None:
@@ -270,6 +275,8 @@ class Clipper(Preprocessor):
         upper: The upper quantile to clamp at, or None for no upper bound.
     """
 
+    numeric_only = True
+
     __slots__ = ("bounds_", "columns", "lower", "upper")
 
     def __init__(
@@ -309,6 +316,7 @@ class Clipper(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self.check_numeric(ds)
         aggregates = {}
         for name in self.columns:
             if self.lower is not None:

@@ -91,16 +91,21 @@ def test_the_cast_the_boolean_message_recommends_actually_works() -> None:
     assert model.predict(fixed).count() == 4
 
 
-@pytest.mark.parametrize("name", ESTIMATORS)
-def test_an_all_null_feature_is_rejected_by_name(name: str) -> None:
-    ds = bt.from_pydict(
-        {"x": [None, None, None, None], "z": [1.0, 2.0, 3.0, 4.0], "y": [0, 0, 1, 1]}
-    )
-    with pytest.raises(PlanError) as caught:
-        _build(name, ["x", "z"]).fit(ds)
-    message = str(caught.value)
-    assert "'x'" in message and "null" in message
-    assert "SimpleImputer" in message, "the message must name the way to fill it"
+def test_an_untyped_column_is_not_rejected_because_empty_data_looks_the_same() -> None:
+    """An all-null column and an *empty* dataset are the same thing to a schema.
+
+    Rejecting the untyped case broke fitting on a frame filtered down to nothing, which is a
+    legitimate input and, in a distributed job, an ordinary empty partition. The check defers
+    to the row-count guards rather than guessing, so this must reach one of those instead.
+    """
+    from batcher.ml import StandardScaler
+
+    empty = bt.from_pydict({"x": [], "z": []})
+    scaler = StandardScaler(["x"])
+    try:
+        scaler.fit(empty)
+    except PlanError as exc:  # a row-count message is fine; a type message is not
+        assert "null" not in str(exc), f"the type check must not fire on empty data: {exc}"
 
 
 def test_a_date_feature_is_rejected_by_name() -> None:
@@ -150,3 +155,123 @@ def test_the_check_reads_the_schema_without_executing_the_plan() -> None:
     finally:
         type(ds).collect = original
     assert seen == [], "the type check must not execute the plan"
+
+
+#: The estimators that predict a number, and so need a numeric target as well as features.
+REGRESSORS = [
+    "LinearRegression",
+    "Ridge",
+    "Lasso",
+    "ElasticNet",
+    "PoissonRegressor",
+    "GammaRegressor",
+    "TweedieRegressor",
+]
+
+
+@pytest.mark.parametrize("name", REGRESSORS)
+def test_a_string_target_is_rejected_by_name(name: str) -> None:
+    """A regressor cannot average a string any more than it can a string feature."""
+    import batcher.ml as ml
+
+    ds = bt.from_pydict({"x": [1.0, 4.0, 2.0, 9.0], "y": ["a", "b", "c", "d"]})
+    with pytest.raises(PlanError) as caught:
+        getattr(ml, name)(["x"], "y").fit(ds)
+    message = str(caught.value)
+    assert "'y'" in message, "the message must name the target column"
+    assert "target" in message, "the message must say it is the target, not a feature"
+
+
+@pytest.mark.parametrize("name", ["GaussianNB", "RidgeClassifier", "NearestCentroid"])
+def test_a_classifier_still_accepts_a_string_target(name: str) -> None:
+    """A class label is legitimately a string, so the target check must not reach classifiers."""
+    import batcher.ml as ml
+
+    ds = bt.from_pydict({"x": [0.0, 1.0, 9.0, 10.0], "y": ["a", "a", "b", "b"]})
+    assert sorted(getattr(ml, name)(["x"], "y").fit(ds).classes_) == ["a", "b"]
+
+
+def test_a_numeric_target_is_still_accepted() -> None:
+    from batcher.ml import LinearRegression
+
+    ds = bt.from_pydict({"x": [1.0, 4.0, 2.0, 9.0], "y": [1.0, 2.0, 3.0, 4.0]})
+    assert LinearRegression(["x"], "y").fit(ds).coef_ is not None
+
+
+#: Every preprocessor whose transform is arithmetic, so a string column cannot work.
+NUMERIC_PREPROCESSORS = [
+    "Binarizer",
+    "BoxCoxTransformer",
+    "Clipper",
+    "GaussianRandomProjection",
+    "KBinsDiscretizer",
+    "LogTransformer",
+    "MaxAbsScaler",
+    "MinMaxScaler",
+    "Normalizer",
+    "Nystroem",
+    "PolynomialFeatures",
+    "PowerTransformer",
+    "QuantileTransformer",
+    "RBFSampler",
+    "RankTransformer",
+    "RobustScaler",
+    "SparseRandomProjection",
+    "StandardScaler",
+    "VarianceThreshold",
+]
+
+
+@pytest.mark.parametrize("name", NUMERIC_PREPROCESSORS)
+def test_a_numeric_preprocessor_names_a_string_column(name: str) -> None:
+    """Twenty of these failed from inside the engine, in ten different ways."""
+    from batcher.ml import preprocessors as pp
+
+    ds = bt.from_pydict({"x": ["a", "b", "c", "d"], "z": [1.0, 2.0, 3.0, 4.0]})
+    pre = getattr(pp, name)(["x"])
+    with pytest.raises(PlanError) as caught:
+        pre.fit(ds).transform(ds).collect()
+    message = str(caught.value)
+    assert "'x'" in message, f"{name} must name the column"
+    assert name in message, f"{name} must name itself"
+
+
+@pytest.mark.parametrize("name", NUMERIC_PREPROCESSORS)
+def test_a_numeric_preprocessor_still_accepts_numbers(name: str) -> None:
+    """The guard must not fire on the input these are for."""
+    from batcher.ml import preprocessors as pp
+
+    ds = bt.from_pydict({"z": [1.0, 4.0, 2.0, 9.0]})
+    assert getattr(pp, name)(["z"]).fit(ds).transform(ds).count() == 4
+
+
+@pytest.mark.parametrize("strategy", ["most_frequent", "constant"])
+def test_the_imputer_strategies_that_exist_for_strings_still_take_them(strategy: str) -> None:
+    """`numeric_only` is a property of the strategy here, not of the class.
+
+    Filling with the most frequent value is exactly how a categorical column is imputed, so a
+    blanket rule on `SimpleImputer` would have broken the one imputation strings need.
+    """
+    from batcher.ml.preprocessors import SimpleImputer
+
+    ds = bt.from_pydict({"x": ["a", None, "c", "a"]})
+    kwargs = {"fill_value": "z"} if strategy == "constant" else {}
+    filled = SimpleImputer(["x"], strategy=strategy, **kwargs).fit(ds).transform(ds)
+    assert None not in filled.to_pydict()["x"]
+
+
+@pytest.mark.parametrize("strategy", ["mean", "median"])
+def test_the_arithmetic_imputer_strategies_reject_a_string_column(strategy: str) -> None:
+    from batcher.ml.preprocessors import SimpleImputer
+
+    ds = bt.from_pydict({"x": ["a", None, "c", "a"]})
+    with pytest.raises(PlanError, match="'x'"):
+        SimpleImputer(["x"], strategy=strategy).fit(ds)
+
+
+def test_an_encoder_still_takes_a_string_column() -> None:
+    """The encoders are the reason `numeric_only` is opt-in rather than the default."""
+    from batcher.ml.preprocessors import OrdinalEncoder
+
+    ds = bt.from_pydict({"x": ["a", "b", "a", "c"]})
+    assert OrdinalEncoder(["x"]).fit(ds).transform(ds).to_pydict()["x"] == [0, 1, 0, 2]

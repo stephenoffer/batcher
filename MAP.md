@@ -420,7 +420,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | module | lines | what it is |
 |---|---|---|
 | `_embed_dedup.py` | 45 | In-batch embedding deduplication — encode each distinct text once, gather back. |
-| `_estimator.py` | 190 | The scaffolding every fitted estimator in `batcher.ml` shares. |
+| `_estimator.py` | 197 | The scaffolding every fitted estimator in `batcher.ml` shares. |
 | `autobatch.py` | 262 | Adaptive batch-size control for inference — what Ray Data makes you hand-tune. |
 | `batch_format.py` | 13 | Re-export of the `batch_format` conversion, which now lives in `interop`. |
 | `cluster.py` | 351 | Unsupervised clustering — grouping rows by similarity, with no labels. |
@@ -432,10 +432,10 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `embed_api.py` | 325 | Embedding encoders backed by a *served* endpoint, not a local model. |
 | `feature_scores.py` | 331 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 331 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
-| `glm.py` | 350 | Generalized linear models fitted by iteratively reweighted least squares. |
+| `glm.py` | 351 | Generalized linear models fitted by iteratively reweighted least squares. |
 | `gpu.py` | 1573 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
-| `linear.py` | 524 | Native linear models — ordinary and ridge regression trained inside the engine. |
+| `linear.py` | 525 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 375 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
 | `model_selection.py` | 725 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `multiclass.py` | 224 | `OneVsRestClassifier` — multiclass classification built from a binary estimator. |
@@ -445,7 +445,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `pipeline.py` | 217 | Multi-stage streaming pipeline with credit-based backpressure (the GPU-feeding moat). |
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
 | `selection.py` | 400 | Deciding which features to keep, before a model ever sees them. |
-| `sparse_linear.py` | 265 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
+| `sparse_linear.py` | 266 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
 | `splitting.py` | 319 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 | `timeseries.py` | 323 | Time-series diagnostics — autocorrelation and the tests built on it. |
 
@@ -585,17 +585,17 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 
 | module | lines | what it is |
 |---|---|---|
-| `base.py` | 465 | The `Preprocessor` contract — sklearn-style fit/transform on a Dataset. |
-| `binning.py` | 160 | Binning / discretization preprocessors. |
+| `base.py` | 493 | The `Preprocessor` contract — sklearn-style fit/transform on a Dataset. |
+| `binning.py` | 163 | Binning / discretization preprocessors. |
 | `chain.py` | 232 | `Chain` — a sequence of preprocessors fitted and applied as one (sklearn ``Pipeline``). |
-| `imputers.py` | 361 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
+| `imputers.py` | 382 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
 | `persistence.py` | 261 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
-| `polynomial.py` | 356 | Basis expansion — polynomial/interaction terms, and B-splines. |
-| `power.py` | 379 | The Yeo-Johnson power transform and its one-pass maximum-likelihood fit. |
-| `scalers.py` | 496 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
+| `polynomial.py` | 358 | Basis expansion — polynomial/interaction terms, and B-splines. |
+| `power.py` | 385 | The Yeo-Johnson power transform and its one-pass maximum-likelihood fit. |
+| `scalers.py` | 510 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
 | `text.py` | 252 | Feature assembly and text tokenization. |
 | `text_features.py` | 160 | Surface features from a text column — the numbers a model can use before an embedding. |
-| `transforms.py` | 494 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
+| `transforms.py` | 502 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
 
 ### `batcher/ml/preprocessors/calibration/` — 6 · front-end
 
@@ -612,9 +612,9 @@ Derived-feature preprocessors — the columns a model needs that the table doesn
 
 | module | lines | what it is |
 |---|---|---|
-| `construct.py` | 392 | Feature construction — the columns a model needs that the source table doesn't have. |
+| `construct.py` | 397 | Feature construction — the columns a model needs that the source table doesn't have. |
 | `decomposition.py` | 323 | Dimensionality reduction — projecting many correlated columns onto a few components. |
-| `encode.py` | 304 | Rank and label transforms — order-based rescaling and one-vs-rest label expansion. |
+| `encode.py` | 306 | Rank and label transforms — order-based rescaling and one-vs-rest label expansion. |
 | `grouped.py` | 279 | Group-aggregate features — what a row's group looks like, attached to the row. |
 
 ### `batcher/ml/preprocessors/encoders/` — 6 · front-end
@@ -637,8 +637,8 @@ Dimensionality reduction and kernel approximation that need no covariance matrix
 
 | module | lines | what it is |
 |---|---|---|
-| `kernel.py` | 346 | Kernel approximation — the accuracy of an RBF kernel at the cost of a linear model. |
-| `random_projection.py` | 307 | Random projection — cut a wide feature block down without looking at the data. |
+| `kernel.py` | 352 | Kernel approximation — the accuracy of an RBF kernel at the cost of a linear model. |
+| `random_projection.py` | 312 | Random projection — cut a wide feature block down without looking at the data. |
 
 ### `batcher/ml/preprocessors/selection/` — 6 · front-end
 

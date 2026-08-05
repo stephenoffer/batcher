@@ -378,7 +378,7 @@ print(len(LinearRegression(["flag", "z"], "y").fit(numeric).coef_))
 # 2
 ```
 
-A string, boolean, date, or all-null feature raises an error naming the column, the type, and the fix, rather than surfacing as an aggregate or cast failure from inside the engine.
+A string, boolean, date, or all-null feature raises an error naming the column, the type, and the fix, rather than surfacing as an aggregate or cast failure from inside the engine. The same applies to the target of a regressor, which must also be a number. A classifier's target is unrestricted, because a class label is legitimately a string.
 
 The feature-name guard only fires where the model recorded its training feature names. A booster fitted from a bare NumPy matrix records generic `f0…fN`, which match no real column, so nothing can be checked. Fit from a DataFrame, or keep the feature list beside the model.
 

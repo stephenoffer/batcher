@@ -150,6 +150,7 @@ class ElasticNet:
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
         require_numeric(self, ds, self.features)
+        require_numeric(self, ds, [self.target], role="target")
         d = len(self.features)
         require_rows(self, ds.count(), 2, because="its moments divide by n - 1")
         aggregates: dict[str, object] = {

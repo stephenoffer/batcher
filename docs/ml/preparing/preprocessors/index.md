@@ -132,6 +132,26 @@ Reach for `MissingIndicator` before an encoder when the difference between "abse
 "rare" carries signal for your model. It adds a 0/1 column recording where the nulls were,
 so the information survives whatever the next step does with them.
 
+## What a preprocessor accepts
+
+The arithmetic preprocessors, meaning the scalers, the binners, the power and rank transforms, the projections and the kernel approximations, need a number in every column they name. Given a string one they say so, naming the column and the preprocessor:
+
+```python
+import batcher as bt
+from batcher.ml.preprocessors import StandardScaler
+
+ds = bt.from_pydict({"city": ["a", "b", "c"], "amount": [1.0, 4.0, 2.0]})
+try:
+    StandardScaler(["city"]).fit(ds)
+except Exception as error:
+    print(str(error)[:60])
+# StandardScaler: column 'city' has type string, and a fit
+```
+
+The encoders are the opposite case and take strings by design, which is why the requirement is opt-in per preprocessor rather than a rule for all of them. {py:class}`SimpleImputer <batcher.ml.preprocessors.SimpleImputer>` sits between the two: `strategy="mean"` and `strategy="median"` are arithmetic and need numbers, while `most_frequent` and `constant` are how a categorical column gets imputed and keep working on strings.
+
+The check reads the schema rather than the data, so it costs no pass over the dataset and raises before any work is scheduled. An empty dataset is not rejected, because an untyped column is what both an all-null column and an empty partition look like.
+
 ## Where they run
 
 `transform` is a lazy `Dataset`, so it composes with the rest of a pipeline and the

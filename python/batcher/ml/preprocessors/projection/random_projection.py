@@ -144,6 +144,7 @@ class _RandomProjection(Preprocessor):
             PlanError: If the projection would lower to more terms than `max_terms`.
             ColumnNotFoundError: If a named column is missing.
         """
+        self.check_numeric(ds)
         available = ds.columns
         present = set(available)
         for name in self.columns:
@@ -226,6 +227,8 @@ class GaussianRandomProjection(_RandomProjection):
         max_terms: The ceiling on ``n_features * n_components``.
     """
 
+    numeric_only = True
+
     __slots__ = ()
 
     def _draw(self, rows: int, columns: int) -> Any:
@@ -266,6 +269,8 @@ class SparseRandomProjection(_RandomProjection):
         drop_original: Remove the source columns after projecting them.
         max_terms: The ceiling on ``n_features * n_components``.
     """
+
+    numeric_only = True
 
     __slots__ = ("density",)
 

@@ -63,6 +63,26 @@ class SimpleImputer(Preprocessor):
         self.fill_value = fill_value
         self.statistics_: dict[str, Any] = {}
 
+    def check_numeric(self, ds: Dataset) -> None:
+        """Require numeric columns only for the statistics that are arithmetic.
+
+        `numeric_only` is a property of the class everywhere else, but here it is a property of
+        the *strategy*: filling with the most frequent value, or with a constant, is exactly how
+        a categorical column is imputed and must keep working on strings. Only the mean and the
+        median need a number, and those were the two that failed inside the engine.
+
+        Args:
+            ds: The dataset whose schema to read.
+
+        Raises:
+            PlanError: If the strategy is arithmetic and a named column is not a number.
+        """
+        if self.strategy not in ("mean", "median"):
+            return
+        from batcher.ml._estimator import require_numeric
+
+        require_numeric(self, ds, self.columns, role="column")
+
     def fit(self, ds: Dataset) -> SimpleImputer:
         """Learn each column's fill value into `statistics_` per the chosen strategy.
 
@@ -86,6 +106,7 @@ class SimpleImputer(Preprocessor):
         Raises:
             PlanError: If a column has no non-null values to learn a statistic from.
         """
+        self.check_numeric(ds)
         if self.strategy == "constant":
             self.statistics_ = dict.fromkeys(self.columns, self.fill_value)
         elif self.strategy == "most_frequent":

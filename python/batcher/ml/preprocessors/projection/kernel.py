@@ -84,6 +84,8 @@ class RBFSampler(Preprocessor):
         drop_original: Remove the source columns after mapping them.
     """
 
+    numeric_only = True
+
     __slots__ = (
         "columns",
         "drop_original",
@@ -140,6 +142,7 @@ class RBFSampler(Preprocessor):
         Raises:
             ColumnNotFoundError: If a named column is missing.
         """
+        self.check_numeric(ds)
         import numpy as np
 
         _require_columns(ds, self.columns)
@@ -220,6 +223,8 @@ class Nystroem(Preprocessor):
         drop_original: Remove the source columns after mapping them.
     """
 
+    numeric_only = True
+
     __slots__ = (
         "columns",
         "components_",
@@ -277,6 +282,7 @@ class Nystroem(Preprocessor):
             PlanError: If the dataset has no complete rows to use as landmarks.
             ColumnNotFoundError: If a named column is missing.
         """
+        self.check_numeric(ds)
         import numpy as np
 
         _require_columns(ds, self.columns)

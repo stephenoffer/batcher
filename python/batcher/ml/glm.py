@@ -182,6 +182,7 @@ class TweedieRegressor:
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
         require_numeric(self, ds, self.features)
+        require_numeric(self, ds, [self.target], role="target")
         self.converged_ = False
         terms = [lit(1.0), *[col(name) for name in self.features]]
         m = len(terms)

@@ -72,6 +72,8 @@ class PolynomialFeatures(Preprocessor):
             building it.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "degree", "include_bias", "interaction_only", "max_terms")
 
     def __init__(

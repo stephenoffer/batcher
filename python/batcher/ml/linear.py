@@ -51,6 +51,7 @@ def _solve(
                 unknown_message("column", name, ds.columns, hint="Pass an existing column.")
             )
     require_numeric(estimator, ds, features)
+    require_numeric(estimator, ds, [target], role="target")
     d = len(features)
     n = ds.count()
     require_rows(estimator, n, 2, because="the covariance it is built from divides by n - 1")
