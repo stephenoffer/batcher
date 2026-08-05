@@ -244,6 +244,9 @@ construction the one `fit` used:
 
 .. autoclass:: Pipeline
    :members:
+
+.. autoclass:: TransformedTargetRegressor
+   :members:
 ```
 
 ## Nearest neighbours

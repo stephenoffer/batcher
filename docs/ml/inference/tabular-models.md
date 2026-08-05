@@ -213,6 +213,47 @@ print(model_from_dict(document).coef_)
 parameter an estimator keeps privately (`Ridge` takes `alpha` and stores `_alpha`) is still
 recorded under the name that rebuilds it.
 
+## Fitting on a reshaped target
+
+Squared error assumes the target's noise is symmetric and roughly constant. A price, a
+duration, a claim amount and a count all violate that: they are non-negative, right-skewed,
+and their spread grows with their level, so a regression fitted directly on them spends its
+capacity on the long tail and under-predicts the body.
+
+Fitting on `log1p(y)` and exponentiating back is the standard fix, and the third step —
+remembering to invert at serving time — is the one that gets forgotten. Predictions are then
+wrong by a factor of *e*, with the right shape and no error.
+{py:class}`TransformedTargetRegressor <batcher.ml.TransformedTargetRegressor>` wraps the pair
+so the inverse cannot be lost:
+
+```python
+import math
+
+import batcher as bt
+from batcher.ml import LinearRegression, TransformedTargetRegressor
+
+skewed = bt.from_pydict(
+    {"x": [1.0, 2.0, 3.0, 4.0], "y": [math.expm1(v) for v in (1.0, 2.0, 3.0, 4.0)]}
+)
+model = TransformedTargetRegressor(
+    LinearRegression(["x"], "y"), target="y", transform="log1p"
+).fit(skewed)
+print([round(v, 3) for v in model.predict(skewed).to_pydict()["prediction"]])
+# [1.718, 6.389, 19.086, 53.598]
+```
+
+The prediction comes back on the original scale, so a metric computed against the
+untransformed truth means what it says — comparing a model fitted on `log1p(y)` against one
+fitted on `y` is otherwise comparing two different quantities and calling the smaller number
+better.
+
+`log1p` is the default because, unlike a bare `log`, it is defined at zero, which is where a
+count or an amount most often sits. `log` and `sqrt` are also available.
+
+One property worth knowing: inverting a mean in log space gives a median-like estimate on
+the original scale, not a mean. That is the accepted behaviour of the technique and usually
+what you want on a skewed target, but it biases the result low if you need an expectation.
+
 ## Predicting from the nearest training rows
 
 {py:class}`KNeighborsRegressor <batcher.ml.KNeighborsRegressor>` and

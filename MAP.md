@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1218 Python modules across 188 packages and 219 Rust files across 14 crates.
+Covering 1219 Python modules across 188 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -455,6 +455,7 @@ Composing preprocessing and a model into one fitted object.
 | module | lines | what it is |
 |---|---|---|
 | `pipeline.py` | 220 | `Pipeline` — the preprocessing and the model as one fitted object. |
+| `target.py` | 165 | `TransformedTargetRegressor` — fit on a reshaped target, predict on the original scale. |
 
 ### `batcher/ml/corpus/` — 6 · front-end
 
