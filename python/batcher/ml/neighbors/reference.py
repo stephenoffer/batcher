@@ -125,7 +125,12 @@ def squared_distance(features: Sequence[str], point: Sequence[float]) -> Expr:
 
 
 def stage_distances(
-    ds: Dataset, features: Sequence[str], points: Sequence[Sequence[float]], k: int
+    ds: Dataset,
+    features: Sequence[str],
+    points: Sequence[Sequence[float]],
+    k: int,
+    *,
+    tie_break: bool = False,
 ) -> Dataset:
     """Attach each row's distances to every reference point, and its k-th smallest.
 
@@ -143,11 +148,20 @@ def stage_distances(
         features: The feature columns.
         points: The reference rows' feature values.
         k: How many neighbours to use.
+        tie_break: Make equal distances strictly ordered by reference index, for a caller
+            that must select exactly one neighbour rather than weight all the tied ones.
 
     Returns:
         `ds` with the distance-list and threshold helper columns attached.
     """
-    distances = array(*(squared_distance(features, point) for point in points))
+    built = [squared_distance(features, point) for point in points]
+    if tie_break:
+        # Nudge each distance by a relative amount proportional to its reference index, so
+        # equal distances become a strict order broken by index. A caller that needs to pick
+        # *one* nearest neighbour cannot use ties: averaging two symmetric neighbours returns
+        # the point between them, which is the base row itself.
+        built = [d * lit(1.0 + index * 1e-12) for index, d in enumerate(built)]
+    distances = array(*built)
     staged = ds.with_columns(**{DISTANCE_COLUMN: distances})
     # `k` may exceed the reference set, in which case every row is a neighbour and the
     # threshold is simply the largest distance.

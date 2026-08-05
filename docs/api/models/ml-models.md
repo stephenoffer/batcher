@@ -265,6 +265,8 @@ the expression, so scoring is one projection rather than a join:
 
 .. autoclass:: KNNImputer
    :members:
+
+.. autofunction:: smote
 ```
 
 ## Model persistence

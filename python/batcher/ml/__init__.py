@@ -83,6 +83,7 @@ from batcher.ml.neighbors import (
     KNeighborsClassifier,
     KNeighborsRegressor,
     KNNImputer,
+    smote,
 )
 from batcher.ml.outliers import (
     OutlierClipper,
@@ -363,6 +364,7 @@ __all__ = [
     "serve_deployment",
     "serving_udf",
     "shard_stream_loader",
+    "smote",
     "stratified_sample",
     "stream_loader",
     "streaming_split",

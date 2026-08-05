@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1219 Python modules across 188 packages and 219 Rust files across 14 crates.
+Covering 1220 Python modules across 188 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -566,7 +566,8 @@ Nearest-neighbour models — prediction and imputation by local similarity.
 |---|---|---|
 | `estimators.py` | 252 | `KNeighborsClassifier` and `KNeighborsRegressor` — prediction by local averaging. |
 | `imputer.py` | 175 | `KNNImputer` — fill a gap with what similar rows had there. |
-| `reference.py` | 227 | The nearest-neighbour primitive the k-NN estimators and imputer share. |
+| `reference.py` | 241 | The nearest-neighbour primitive the k-NN estimators and imputer share. |
+| `smote.py` | 233 | `smote` — grow a minority class by interpolating between its own neighbours. |
 
 ### `batcher/ml/persistence/` — 6 · front-end
 

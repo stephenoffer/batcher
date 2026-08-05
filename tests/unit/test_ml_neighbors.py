@@ -255,3 +255,152 @@ def test_the_imputer_composes_in_a_chain() -> None:
     ds = bt.from_pydict({"a": [1.0, 2.0, None, 4.0], "b": [1.0, 2.0, 3.0, 4.0]})
     out = Chain(KNNImputer(["a", "b"], k=1), StandardScaler(["a"])).fit_transform(ds)
     assert all(v is not None for v in out.to_pydict()["a"])
+
+
+def _imbalanced(rare: int = 4, common: int = 20) -> bt.Dataset:
+    rng = np.random.default_rng(1)
+    minority = rng.normal(0.0, 1.0, size=(rare, 2))
+    majority = rng.normal(10.0, 1.0, size=(common, 2))
+    points = np.vstack([minority, majority])
+    return bt.from_pydict(
+        {
+            "a": points[:, 0].tolist(),
+            "b": points[:, 1].tolist(),
+            "label": ["rare"] * rare + ["common"] * common,
+        }
+    )
+
+
+def test_smote_balances_the_classes_by_default() -> None:
+    from batcher.ml import smote
+
+    grown = smote(_imbalanced(), "label", minority="rare", features=["a", "b"])
+    counts: dict[str, int] = {}
+    for value in grown.to_pydict()["label"]:
+        counts[value] = counts.get(value, 0) + 1
+    assert counts["rare"] == counts["common"] == 20
+
+
+def test_smote_makes_new_points_rather_than_copies() -> None:
+    """The whole difference from `oversample`: the synthetic rows are not duplicates."""
+    from batcher.ml import smote
+
+    ds = _imbalanced()
+    original = {
+        (round(a, 9), round(b, 9)) for a, b in zip(*(ds.to_pydict()[c] for c in "ab"), strict=True)
+    }
+    grown = smote(ds, "label", minority="rare", features=["a", "b"]).to_pydict()
+    synthetic = [
+        (round(a, 9), round(b, 9))
+        for a, b, lab in zip(grown["a"], grown["b"], grown["label"], strict=True)
+    ][len(original) :]
+    assert synthetic
+    assert not set(synthetic) & original
+
+
+def test_a_synthetic_row_lies_inside_the_minority_hull() -> None:
+    """Interpolation only, never extrapolation: every new point is between two real ones."""
+    from batcher.ml import smote
+
+    ds = _imbalanced()
+    frame = ds.to_pydict()
+    rare = [
+        (a, b)
+        for a, b, lab in zip(frame["a"], frame["b"], frame["label"], strict=True)
+        if lab == "rare"
+    ]
+    low_a, high_a = min(p[0] for p in rare), max(p[0] for p in rare)
+    low_b, high_b = min(p[1] for p in rare), max(p[1] for p in rare)
+    grown = smote(ds, "label", minority="rare", features=["a", "b"]).to_pydict()
+    for a, b, lab in list(zip(grown["a"], grown["b"], grown["label"], strict=True))[
+        len(frame["a"]) :
+    ]:
+        assert lab == "rare"
+        assert low_a - 1e-9 <= a <= high_a + 1e-9
+        assert low_b - 1e-9 <= b <= high_b + 1e-9
+
+
+def test_smote_is_reproducible_and_partition_independent() -> None:
+    from batcher.ml import smote
+
+    ds = _imbalanced()
+    first = smote(ds, "label", minority="rare", features=["a", "b"]).sort("a").to_pydict()
+    second = smote(ds, "label", minority="rare", features=["a", "b"]).sort("a").to_pydict()
+    split = (
+        smote(ds.repartition(3), "label", minority="rare", features=["a", "b"])
+        .sort("a")
+        .to_pydict()
+    )
+    assert first == second == split
+
+
+def test_a_different_seed_makes_different_points() -> None:
+    from batcher.ml import smote
+
+    ds = _imbalanced()
+    one = smote(ds, "label", minority="rare", features=["a", "b"], seed=1).to_pydict()["a"]
+    two = smote(ds, "label", minority="rare", features=["a", "b"], seed=2).to_pydict()["a"]
+    assert one != two
+
+
+def test_n_samples_controls_how_many_rows_are_made() -> None:
+    from batcher.ml import smote
+
+    ds = _imbalanced()
+    grown = smote(ds, "label", minority="rare", features=["a", "b"], n_samples=7)
+    assert grown.count() == ds.count() + 7
+
+
+def test_more_synthetic_rows_than_minority_rows_still_differ() -> None:
+    """Each repeat re-seeds, so asking for more than the class size is not duplication."""
+    from batcher.ml import smote
+
+    ds = _imbalanced(rare=3)
+    grown = smote(ds, "label", minority="rare", features=["a", "b"], n_samples=9).to_pydict()
+    made = list(zip(grown["a"], grown["b"], strict=True))[-9:]
+    assert len({(round(a, 9), round(b, 9)) for a, b in made}) > 3
+
+
+def test_columns_smote_cannot_interpolate_are_left_null() -> None:
+    """Inventing an id or a free-text value would put fabricated data in an unchecked column."""
+    from batcher.ml import smote
+
+    ds = bt.from_pydict(
+        {
+            "a": [0.0, 1.0, 2.0, 9.0, 9.5],
+            "note": ["x", "y", "z", "p", "q"],
+            "label": ["rare", "rare", "rare", "common", "common"],
+        }
+    )
+    grown = smote(ds, "label", minority="rare", features=["a"], n_samples=2).to_pydict()
+    assert grown["note"][-2:] == [None, None]
+    assert all(v is not None for v in grown["a"])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"features": []}, "at least one feature column"),
+        ({"features": ["a"], "k": 0}, "k must be at least 1"),
+    ],
+)
+def test_smote_configuration_is_validated(kwargs: dict, message: str) -> None:
+    from batcher.ml import smote
+
+    with pytest.raises(PlanError, match=message):
+        smote(_imbalanced(), "label", minority="rare", **kwargs)
+
+
+def test_a_minority_class_of_one_says_to_use_oversample() -> None:
+    from batcher.ml import smote
+
+    ds = bt.from_pydict({"a": [0.0, 5.0, 6.0], "label": ["rare", "common", "common"]})
+    with pytest.raises(PlanError, match="Use oversample"):
+        smote(ds, "label", minority="rare", features=["a"])
+
+
+def test_an_already_balanced_class_is_returned_unchanged() -> None:
+    from batcher.ml import smote
+
+    ds = bt.from_pydict({"a": [0.0, 1.0, 5.0, 6.0], "label": ["rare", "rare", "common", "common"]})
+    assert smote(ds, "label", minority="rare", features=["a"]).count() == 4

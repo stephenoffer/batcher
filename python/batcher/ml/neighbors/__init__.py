@@ -21,10 +21,12 @@ from __future__ import annotations
 from batcher.ml.neighbors.estimators import KNeighborsClassifier, KNeighborsRegressor
 from batcher.ml.neighbors.imputer import KNNImputer
 from batcher.ml.neighbors.reference import MAX_REFERENCE_ROWS
+from batcher.ml.neighbors.smote import smote
 
 __all__ = [
     "MAX_REFERENCE_ROWS",
     "KNNImputer",
     "KNeighborsClassifier",
     "KNeighborsRegressor",
+    "smote",
 ]

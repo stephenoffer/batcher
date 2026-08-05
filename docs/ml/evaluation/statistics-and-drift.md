@@ -286,6 +286,32 @@ print(class_counts(oversample(ds, "y"), "y"))     # exactly balanced by duplicat
 (a per-row weight column). Both rebalance the *loss* without discarding or duplicating a
 single row. `class_counts` is the first thing to look at.
 
+{py:func}`smote <batcher.ml.smote>` is the alternative to duplicating. `oversample` repeats
+minority rows, so a model can still memorize the exact points and tighten its boundary around
+them rather than around the region they occupy. SMOTE makes *new* points instead, each on the
+segment between a real minority row and one of its nearest minority neighbours:
+
+```python
+from batcher.ml import smote
+
+rare = bt.from_pydict(
+    {"x": [0.0, 0.1, 0.2, 5.0, 5.1, 5.2, 5.3, 5.4],
+     "label": ["rare"] * 3 + ["common"] * 5}
+)
+print(smote(rare, "label", minority="rare", features=["x"]).count())
+# 10
+```
+
+The synthetic rows are interpolations, never extrapolations, so they stay inside the
+minority region. Both random draws are content hashes of the row, so the same input produces
+the same synthetic rows however the data is partitioned — an imbalanced experiment stays
+repeatable.
+
+Two things to know before using it. Scale the features first, because distance decides which
+neighbours a row is drawn towards and therefore where the new points land. And only the
+`features` and the label are filled: any other column is null on a synthetic row, because
+there is no honest value to interpolate for an identifier or a free-text field.
+
 `stratified_sample` is the different tool for a different job: it keeps the same fraction of *every* stratum rather than equalizing them, so it shrinks a dataset for a quick experiment while preserving its class balance. You get a proportional 10% sample rather than 10% of the whole, which would starve the rare classes.
 
 ```python
