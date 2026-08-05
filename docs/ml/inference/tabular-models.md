@@ -132,6 +132,33 @@ For classification, `RidgeClassifier` casts it as regression on one-vs-rest targ
 
 When the features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance instead of assuming independence: `LinearDiscriminantAnalysis` shares one covariance across classes for a stable linear boundary, and `QuadraticDiscriminantAnalysis` gives each class its own for a quadratic one. Both reproduce scikit-learn exactly.
 
+## When a few rows are wrong
+
+Squared error grows with the square of the residual, so one row that is off by a hundred counts as much as ten thousand rows off by one. A single mistyped price or a stuck sensor visibly tilts an ordinary fit, and nothing reports it. {py:class}`HuberRegressor <batcher.ml.glm.HuberRegressor>` uses a loss that is squared near zero and linear past a threshold, so a far-away row keeps a bounded influence:
+
+```python
+import batcher as bt
+from batcher.ml import HuberRegressor, LinearRegression
+
+readings = bt.from_pydict(
+    {
+        "hours": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        "wear": [2.1, 3.9, 6.2, 7.8, 10.1, 12.2, 13.8, 90.0],
+    }
+)
+
+print(round(LinearRegression(["hours"], "wear").fit(readings).coef_[0], 1))
+# 8.2
+print(round(HuberRegressor(["hours"], "wear").fit(readings).coef_[0], 1))
+# 2.0
+```
+
+Seven readings sit on a slope of about 2 and the eighth is nonsense. Least squares splits the difference at 8.2; the robust fit reports the slope the seven agree on.
+
+The fit is the same iteratively reweighted least squares the GLMs use, so each pass is a handful of aggregates and the whole thing distributes. `epsilon` sets where the loss turns linear, in units of the residual scale: smaller is more robust and less efficient on clean data, and the default of 1.35 keeps about 95% of least squares' efficiency when the errors really are normal. On data with no outliers it returns what least squares returns.
+
+The residual scale is re-estimated on every pass rather than fixed from the starting fit, because those starting residuals are already stretched by the rows being guarded against. That can hit the iteration cap on a degenerate input, where the retained rows fit exactly and the scale chases zero; the fit warns when it stops on the cap rather than presenting the last iterate as an optimum.
+
 ## Choosing a penalty without paying for it
 
 A ridge penalty has to be chosen, and the usual way costs a fit per candidate per fold. {py:class}`RidgeCV <batcher.ml.linear.RidgeCV>` does not need that. Ridge builds its normal equations from the first and second moments of the features and the target, and those moments do not depend on the penalty, so every candidate is solved from the same numbers. The held-out squared error expands into the same moments, so scoring a candidate on a fold reads no rows either.

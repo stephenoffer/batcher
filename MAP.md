@@ -432,7 +432,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `embed_api.py` | 325 | Embedding encoders backed by a *served* endpoint, not a local model. |
 | `feature_scores.py` | 331 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 331 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
-| `glm.py` | 351 | Generalized linear models fitted by iteratively reweighted least squares. |
+| `glm.py` | 638 | Generalized linear models fitted by iteratively reweighted least squares. |
 | `gpu.py` | 1573 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
 | `linear.py` | 843 | Native linear models — ordinary and ridge regression trained inside the engine. |

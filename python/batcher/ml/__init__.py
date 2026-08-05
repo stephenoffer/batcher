@@ -42,7 +42,12 @@ from batcher.ml.ensemble import (
     out_of_fold_features,
 )
 from batcher.ml.feature_spec import FeatureSpec
-from batcher.ml.glm import GammaRegressor, PoissonRegressor, TweedieRegressor
+from batcher.ml.glm import (
+    GammaRegressor,
+    HuberRegressor,
+    PoissonRegressor,
+    TweedieRegressor,
+)
 from batcher.ml.inference import InferencePool, Worker, WorkerFactory
 from batcher.ml.interpret import partial_dependence, permutation_importance
 from batcher.ml.linear import (
@@ -242,6 +247,7 @@ __all__ = [
     "GroupStatEncoder",
     "HashingEncoder",
     "HashingVectorizer",
+    "HuberRegressor",
     "InferencePool",
     "InteractionFeatures",
     "IsotonicCalibrator",

@@ -94,6 +94,9 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 
 .. autoclass:: GammaRegressor
    :members:
+
+.. autoclass:: HuberRegressor
+   :members:
 ```
 
 `batcher.ml.naive_bayes` adds the probabilistic baseline whose entire fit is one grouped
