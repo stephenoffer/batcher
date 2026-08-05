@@ -344,6 +344,30 @@ ds = bt.from_pydict({"y": [0] * 100 + [1] * 20, "x": list(range(120))})
 print(class_counts(stratified_sample(ds, "y", 0.5, seed=1), "y"))  # {0: 50, 1: 10}
 ```
 
+## Holding out a test set that still has the rare class in it
+
+`ds.ml.train_test_split` assigns each row by a content hash, which makes the split proportional in expectation and nothing more. On 200 rows with ten positives and a quarter held out, the test half should get two or three. Across seeds it gets between one and four, and one positive makes precision, recall and AUC meaningless without anything reporting a problem.
+
+`stratify=` names a column whose distribution to hold constant across both halves:
+
+```python
+sales = bt.from_pydict(
+    {
+        "amount": [float(i) for i in range(200)],
+        "fraud": [1 if i % 20 == 0 else 0 for i in range(200)],
+    }
+)
+
+plain = sales.ml.train_test_split(test_size=0.25, seed=3)[1]
+kept = sales.ml.train_test_split(test_size=0.25, seed=3, stratify="fraud")[1]
+print(sum(plain.to_pydict()["fraud"]), sum(kept.to_pydict()["fraud"]))
+# 4 3
+```
+
+The stratified count is the same for every seed, because it is a property of the split rather than of the draw. Every label with at least two rows reaches both halves, and the cut rounds towards putting a rare class in the test half rather than away from it. A label with a single row goes to train, since a model that never saw the class is the worse of the two mistakes.
+
+Reach for {py:func}`stratified_split <batcher.ml.splitting.stratified_split>` directly when you want the same behaviour outside the `ds.ml` surface.
+
 ## Cross-validation splits
 
 A fold here is a **content hash** of each row compared against fold boundaries, never a materialized shuffle. That means a fold is an ordinary row-wise filter, the assignment is identical however the data is partitioned, and the training half of a fold stays lazy until something reads it.

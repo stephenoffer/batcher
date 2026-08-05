@@ -145,6 +145,7 @@ however the data is partitioned.
 
 .. autofunction:: kfold
 .. autofunction:: stratified_kfold
+.. autofunction:: stratified_split
 .. autofunction:: group_kfold
 .. autofunction:: time_series_split
 .. autofunction:: fold_column

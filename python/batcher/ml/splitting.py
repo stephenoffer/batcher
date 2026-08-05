@@ -31,6 +31,7 @@ __all__ = [
     "group_kfold",
     "kfold",
     "stratified_kfold",
+    "stratified_split",
     "time_series_split",
 ]
 
@@ -317,3 +318,85 @@ def time_series_split(
         validate = ds.filter((col(time_column) >= lit(start)) & (col(time_column) < lit(end)))
         splits.append((train, validate))
     return splits
+
+
+def stratified_split(
+    ds: Dataset,
+    label: str,
+    *,
+    test_size: float = 0.25,
+    seed: int = 0,
+    key: str | list[str] | None = None,
+) -> tuple[Dataset, Dataset]:
+    """Split into train and test while holding each label's share of the rows constant.
+
+    A hash split is proportional *in expectation* and nothing more. On 200 rows with ten
+    positives and a quarter held out, the test half should get two or three; across six seeds
+    it gets between one and four. One positive in the test half makes precision, recall and
+    AUC meaningless, and nothing in the pipeline says so - the split succeeded, the model
+    fitted, and a number came back.
+
+    This ranks each label's rows and cuts each one at its own boundary, so the proportion is a
+    property of the split rather than of the seed.
+
+    Every label with at least two rows reaches both halves. The cut is placed with a floor, so
+    a rare class rounds *towards* being represented in the test half rather than away from it,
+    which is the direction that keeps a metric meaningful. A label with a single row goes to
+    train, because a model that never saw the class is the worse of the two mistakes.
+
+    Rows are ordered inside each label by a hash of their own values, so the split is
+    reproducible and partition-independent: a row lands on the same side however the data is
+    laid out, on one node or across a cluster.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.splitting import stratified_split
+            >>> ds = bt.from_pydict(
+            ...     {"x": [float(i) for i in range(100)],
+            ...      "y": [1 if i % 10 == 0 else 0 for i in range(100)]}
+            ... )
+            >>> train, test = stratified_split(ds, "y", test_size=0.25)
+            >>> sum(test.to_pydict()["y"]), sum(train.to_pydict()["y"])
+            (3, 7)
+            >>> test.count(), train.count()
+            (26, 74)
+
+    Args:
+        ds: The dataset to split.
+        label: The column whose distribution must be preserved across both halves.
+        test_size: The fraction of rows to place in the test part, in ``(0, 1)``.
+        seed: Seed for the row ordering; the same seed reproduces the split.
+        key: The column(s) identifying a row. Prefer it on a real corpus, so that adding or
+            recomputing a feature does not reshuffle rows between the halves.
+
+    Returns:
+        The train and test datasets, disjoint and covering every row.
+
+    Raises:
+        PlanError: If `test_size` is not strictly between 0 and 1.
+        ColumnNotFoundError: If `label` or a `key` column is missing.
+    """
+    from batcher.plan.expr_ir.constructors import greatest
+    from batcher.plan.expr_ir.nodes import row_number
+
+    if not 0.0 < test_size < 1.0:
+        raise PlanError(f"stratified_split(): test_size must be in (0, 1), got {test_size}")
+    _check_columns(ds, label)
+    keys = _as_key_columns(ds, key)
+    columns = keys if keys is not None else list(ds.columns)
+
+    ranked = ds.with_columns(__bt_u=split_key(ds, columns, seed)).with_columns(
+        __bt_rank=row_number().over(partition_by=[label], order_by=["__bt_u"]),
+        __bt_size=col(label).count().over(partition_by=[label]),
+    )
+    # The last rows of each label go to test. `greatest(..., 1)` keeps a label of one row on
+    # the train side; without it the floor would be zero and the row would be held out,
+    # leaving the model with no example of that class at all.
+    boundary = greatest((lit(1.0 - test_size) * col("__bt_size")).floor().cast("int64"), lit(1))
+    staged = ranked.with_columns(__bt_cut=boundary)
+    drop = ("__bt_rank", "__bt_size", "__bt_cut", "__bt_u")
+    train = staged.filter(col("__bt_rank") <= col("__bt_cut")).drop(*drop)
+    test = staged.filter(col("__bt_rank") > col("__bt_cut")).drop(*drop)
+    return train, test
