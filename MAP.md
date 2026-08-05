@@ -2145,7 +2145,7 @@ Metrics that score a model's predictions against known labels.
 | module | lines | what it is |
 |---|---|---|
 | `agreement.py` | 134 | Agreement and efficiency scores — how well two series match, beyond a plain correlation. |
-| `classification.py` | 500 | Classification metrics as mergeable aggregate expressions. |
+| `classification.py` | 519 | Classification metrics as mergeable aggregate expressions. |
 | `diagnostic.py` | 399 | Diagnostic-test metrics — the epidemiology and medical-ML vocabulary of the confusion matrix. |
 | `embedding.py` | 340 | Embedding-quality metrics — scoring vector columns for retrieval, similarity, and drift. |
 | `errors.py` | 500 | Regression error metrics as mergeable aggregate expressions. |

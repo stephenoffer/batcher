@@ -117,7 +117,7 @@ class QuantileTransformer(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         fractions = [i / self.n_quantiles for i in range(self.n_quantiles)]
         aggregates = {
             f"{name}__{i}": col(name).quantile(f)
@@ -316,7 +316,7 @@ class Clipper(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         aggregates = {}
         for name in self.columns:
             if self.lower is not None:

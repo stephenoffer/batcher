@@ -144,7 +144,7 @@ class _RandomProjection(Preprocessor):
             PlanError: If the projection would lower to more terms than `max_terms`.
             ColumnNotFoundError: If a named column is missing.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         available = ds.columns
         present = set(available)
         for name in self.columns:

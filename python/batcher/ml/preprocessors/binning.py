@@ -93,7 +93,7 @@ class KBinsDiscretizer(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         inner = self.n_bins - 1
         if self.strategy == "uniform":
             aggs = {}

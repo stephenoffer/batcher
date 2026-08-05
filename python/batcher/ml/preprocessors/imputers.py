@@ -63,7 +63,7 @@ class SimpleImputer(Preprocessor):
         self.fill_value = fill_value
         self.statistics_: dict[str, Any] = {}
 
-    def check_numeric(self, ds: Dataset) -> None:
+    def _check_numeric(self, ds: Dataset) -> None:
         """Require numeric columns only for the statistics that are arithmetic.
 
         `numeric_only` is a property of the class everywhere else, but here it is a property of
@@ -106,7 +106,7 @@ class SimpleImputer(Preprocessor):
         Raises:
             PlanError: If a column has no non-null values to learn a statistic from.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         if self.strategy == "constant":
             self.statistics_ = dict.fromkeys(self.columns, self.fill_value)
         elif self.strategy == "most_frequent":

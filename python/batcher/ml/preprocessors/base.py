@@ -363,11 +363,11 @@ class Preprocessor(abc.ABC):
         Returns:
             ``self``, marked fitted, so `fit` chains straight into `transform`.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         self._fitted = True
         return self
 
-    def check_numeric(self, ds: Dataset) -> None:
+    def _check_numeric(self, ds: Dataset) -> None:
         """Raise naming the column if `numeric_only` and one of them is not a number.
 
         Called by the default `fit`, which is what every stateless transformer uses, so those

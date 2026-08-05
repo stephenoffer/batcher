@@ -132,7 +132,7 @@ class PowerTransformer(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         aggregates = {}
         for name in self.columns:
             value = col(name)
@@ -300,7 +300,7 @@ class BoxCoxTransformer(Preprocessor):
         Raises:
             PlanError: If a fitted column contains a non-positive value.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         from batcher._internal.errors import PlanError
 
         aggregates: dict[str, object] = {}

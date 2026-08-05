@@ -92,7 +92,7 @@ class StandardScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__m"] = col(c).mean()
@@ -209,7 +209,7 @@ class MinMaxScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -302,7 +302,7 @@ class MaxAbsScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -399,7 +399,7 @@ class RobustScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         q_lo, q_hi = self.quantile_range
         aggs = {}
         for c in self.columns:

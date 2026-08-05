@@ -364,7 +364,7 @@ class VarianceThreshold(Preprocessor):
         Returns:
             ``self``, fitted.
         """
-        self.check_numeric(ds)
+        self._check_numeric(ds)
         cell = fit_aggregate(ds, {f"{c}__v": col(c).var() for c in self.columns})
         self.kept_ = [
             c
