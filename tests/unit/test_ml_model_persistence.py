@@ -47,6 +47,17 @@ def _counts() -> bt.Dataset:
     )
 
 
+def _positive() -> bt.Dataset:
+    """A strictly positive target, so a log-family transform is defined on it."""
+    return bt.from_pydict(
+        {
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "z": [2.0, 1.0, 4.0, 3.0, 6.0, 5.0],
+            "y": [2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+        }
+    )
+
+
 def _build(name: str, klass: type):
     """Fit one instance of `klass`, with the arguments that estimator actually takes."""
     from batcher.ml import (
@@ -71,6 +82,11 @@ def _build(name: str, klass: type):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
     if name in ("LinearDiscriminantAnalysis", "QuadraticDiscriminantAnalysis"):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
+    if name == "TransformedTargetRegressor":
+        from batcher.ml import LinearRegression, TransformedTargetRegressor
+
+        wrapped = TransformedTargetRegressor(LinearRegression(["x", "z"], "y"), target="y")
+        return wrapped.fit(_positive()), _positive()
     if name in ("PoissonRegressor", "GammaRegressor", "TweedieRegressor"):
         return klass(["x"], "y").fit(_counts()), _counts()
     return klass(["x", "z"], "y").fit(_regression()), _regression()
@@ -221,3 +237,16 @@ def test_a_class_with_its_own_persistence_is_not_claimed_by_this_writer() -> Non
     pipe = Pipeline(StandardScaler(["x"]), model=LinearRegression(["x"], "y")).fit(_regression())
     with pytest.raises(PlanError, match=r"call its \.save\(path\) instead"):
         save_model(pipe, "/tmp/unused.json")
+
+
+def test_a_wrapper_saves_the_estimator_it_holds(tmp_path) -> None:
+    """`TransformedTargetRegressor` wraps a model; both halves belong in one document."""
+    from batcher.ml import LinearRegression, TransformedTargetRegressor
+
+    ds = _positive()
+    fitted = TransformedTargetRegressor(LinearRegression(["x"], "y"), target="y").fit(ds)
+    target = str(tmp_path / "wrapped.json")
+    save_model(fitted, target)
+    restored = load_model(target)
+    assert type(restored.model).__name__ == "LinearRegression"
+    assert restored.predict(ds).to_pydict() == fitted.predict(ds).to_pydict()

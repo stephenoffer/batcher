@@ -34,6 +34,11 @@ from batcher.ml.persistence.document import (
 
 __all__ = ["load_model", "model_from_dict", "model_to_dict", "save_model"]
 
+#: A nested estimator held inside another one's parameters — `TransformedTargetRegressor`
+#: wraps the regressor it reshapes the target for. Written as its own document under this
+#: tag so the wrapper saves as one file, the way `Chain` already does for preprocessors.
+_MODEL_TAG = "__model__"
+
 
 def _parameters(model: object) -> dict[str, Any]:
     """The constructor hyperparameters of `model`, read from its own signature.
@@ -138,6 +143,10 @@ def _encode_field(value: Any, model: str, field: str) -> Any:
     A callable is the case worth naming: an ensemble that closes over user `fit`/`predict`
     pairs cannot be written as JSON at all, and no amount of retrying will change that.
     """
+    if _is_estimator(value):
+        # A wrapper holding another estimator saves as one document rather than obliging
+        # the caller to persist the two halves and remember how they were connected.
+        return {_MODEL_TAG: model_to_dict(value)}
     try:
         return encode_value(value)
     except PlanError as exc:
@@ -149,6 +158,18 @@ def _encode_field(value: Any, model: str, field: str) -> Any:
                 "ensemble in code."
             ) from exc
         raise PlanError(f"{model}.{field} cannot be saved: {exc}") from exc
+
+
+def _is_estimator(value: Any) -> bool:
+    """Whether `value` is a fitted estimator this module knows how to write."""
+    return type(value).__name__ in _registry() and callable(getattr(value, "predict", None))
+
+
+def _decode_field(value: Any) -> Any:
+    """Decode one field, rebuilding a nested estimator."""
+    if isinstance(value, dict) and _MODEL_TAG in value:
+        return model_from_dict(value[_MODEL_TAG])
+    return decode_value(value)
 
 
 def _holds_callable(value: Any) -> bool:
@@ -193,7 +214,7 @@ def model_from_dict(document: dict[str, Any]) -> Any:
         hint = suggestion(str(name), sorted(classes))
         tail = f" {hint}" if hint else ""
         raise PlanError(f"unknown estimator class {name!r}.{tail}")
-    params = {k: decode_value(v) for k, v in document.get("params", {}).items()}
+    params = {k: _decode_field(v) for k, v in document.get("params", {}).items()}
     try:
         model = classes[name](**params)
     except TypeError as exc:
@@ -202,7 +223,7 @@ def model_from_dict(document: dict[str, Any]) -> Any:
             "a different version of Batcher; re-fit and re-save it."
         ) from exc
     for attribute, value in document.get("state", {}).items():
-        setattr(model, attribute, decode_value(value))
+        setattr(model, attribute, _decode_field(value))
     return model
 
 
