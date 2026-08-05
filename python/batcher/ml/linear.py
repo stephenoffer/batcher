@@ -590,6 +590,70 @@ def _sse_from_moments(count: float, sums, products, coefficients, intercept: flo
     )
 
 
+def _fold_moments(
+    estimator: object,
+    ds: Dataset,
+    features: Sequence[str],
+    target: str,
+    cv: int,
+    seed: int,
+):
+    """The per-fold moment blocks and their total, from one grouped aggregate.
+
+    Shared by every cross-validated linear model here - ridge, the lasso, the elastic net -
+    because they all fit from the same moments and all score from them. Writing it twice
+    would be the copy-paste the contract forbids, so it lives with the model that needed it
+    first and the L1 module imports it.
+
+    Args:
+        estimator: The estimator doing the fitting, named in any error.
+        ds: The training dataset.
+        features: The predictor columns.
+        target: The column being predicted.
+        cv: How many folds to split into.
+        seed: Seed for the content-hash fold assignment.
+
+    Returns:
+        The per-fold ``(count, sums, products)`` blocks, and the same three summed over all
+        of them.
+
+    Raises:
+        PlanError: If a column is not numeric, or too few rows remain to fit.
+        ColumnNotFoundError: If a named column is missing.
+    """
+    from batcher.api.dataset._build import split_key
+    from batcher.plan.functions.aggregate import sum as sum_
+
+    for name in (*features, target):
+        if name not in ds.columns:
+            from batcher._internal.errors import ColumnNotFoundError, unknown_message
+
+            raise ColumnNotFoundError(
+                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
+            )
+    require_numeric(estimator, ds, features)
+    require_numeric(estimator, ds, [target], role="target")
+
+    d = len(features)
+    names = [*features, target]
+    columns = [col(n).cast("float64") for n in names]
+    fold = (split_key(ds, names, seed) * lit(float(cv))).floor().cast("int64")
+    aggregates: dict[str, object] = {"__bt_n": col(target).count()}
+    for i, left in enumerate(columns):
+        aggregates[f"__bt_s{i}"] = sum_(left)
+        for j in range(i, len(columns)):
+            aggregates[f"__bt_p{i}_{j}"] = sum_(left * columns[j])
+    grouped = ds.with_columns(__bt_fold=fold).group_by("__bt_fold").agg(**aggregates).collect()
+
+    blocks = [
+        _moment_blocks({k: grouped.column(k)[r].as_py() for k in aggregates}, d + 1)
+        for r in range(grouped.num_rows)
+    ]
+    total_n = sum(b[0] for b in blocks)
+    require_rows(estimator, int(total_n), d + 2, because="a linear fit needs more rows than terms")
+    return blocks, (total_n, sum(b[1] for b in blocks), sum(b[2] for b in blocks))
+
+
 def _cv_error(blocks, total_n: float, total_sums, total_products, alpha: float, d: int) -> float:
     """The mean held-out squared error for one penalty, over folds already reduced to moments.
 
@@ -736,39 +800,9 @@ class RidgeCV:
         """
         import numpy as np
 
-        from batcher.api.dataset._build import split_key
-        from batcher.plan.functions.aggregate import sum as sum_
-
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
-        require_numeric(self, ds, self.features)
-        require_numeric(self, ds, [self.target], role="target")
-
         d = len(self.features)
-        names = [*self.features, self.target]
-        columns = [col(n).cast("float64") for n in names]
-        fold = (split_key(ds, names, self.seed) * lit(float(self.cv))).floor().cast("int64")
-        aggregates: dict[str, object] = {"__bt_n": col(self.target).count()}
-        for i, left in enumerate(columns):
-            aggregates[f"__bt_s{i}"] = sum_(left)
-            for j in range(i, len(columns)):
-                aggregates[f"__bt_p{i}_{j}"] = sum_(left * columns[j])
-        grouped = ds.with_columns(__bt_fold=fold).group_by("__bt_fold").agg(**aggregates).collect()
-
-        terms = d + 1
-        blocks = [
-            _moment_blocks({k: grouped.column(k)[r].as_py() for k in aggregates}, terms)
-            for r in range(grouped.num_rows)
-        ]
-        total_n = sum(b[0] for b in blocks)
-        require_rows(self, int(total_n), d + 2, because="ridge needs more rows than terms")
-        total_sums = sum(b[1] for b in blocks)
-        total_products = sum(b[2] for b in blocks)
+        blocks, totals = _fold_moments(self, ds, self.features, self.target, self.cv, self.seed)
+        total_n, total_sums, total_products = totals
 
         self.scores_ = {
             alpha: _cv_error(blocks, total_n, total_sums, total_products, alpha, d)

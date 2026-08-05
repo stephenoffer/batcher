@@ -192,7 +192,7 @@ from batcher.ml.serving import (
     torchserve_client,
     triton_client,
 )
-from batcher.ml.sparse_linear import ElasticNet, Lasso
+from batcher.ml.sparse_linear import ElasticNet, ElasticNetCV, Lasso, LassoCV
 from batcher.ml.streaming_sampler import (
     ResumableSampler,
     epoch_order,
@@ -220,6 +220,7 @@ __all__ = [
     "DummyClassifier",
     "DummyRegressor",
     "ElasticNet",
+    "ElasticNetCV",
     "EncoderFactory",
     "Engine",
     "EngineFactory",
@@ -248,6 +249,7 @@ __all__ = [
     "LabelEncoder",
     "LagFeaturizer",
     "Lasso",
+    "LassoCV",
     "LeaveOneOutEncoder",
     "LinearDiscriminantAnalysis",
     "LinearRegression",

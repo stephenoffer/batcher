@@ -159,6 +159,29 @@ print(round(model.predict(ds).to_pydict()["prediction"][0], 1))
 # 150.4
 ```
 
+The same saving applies to the L1 models, for the same reason: coordinate descent works from the centered Gram matrix and the feature-target covariances, which are moments too. {py:class}`LassoCV <batcher.ml.sparse_linear.LassoCV>` and {py:class}`ElasticNetCV <batcher.ml.sparse_linear.ElasticNetCV>` search a penalty path in one pass, and because the penalty is L1 the search selects features as it goes:
+
+```python
+import batcher as bt
+from batcher.ml import LassoCV
+
+ds = bt.from_pydict(
+    {
+        "tenure": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        "noise": [0.3, -0.1, 0.2, -0.4, 0.1, 0.5, -0.2, 0.0],
+        "spend": [12.0, 24.1, 35.9, 48.0, 60.1, 72.0, 83.9, 96.1],
+    }
+)
+
+model = LassoCV(["tenure", "noise"], "spend", alphas=(0.01, 10.0), cv=4).fit(ds)
+print(model.alpha_)
+# 0.01
+print([round(c, 2) for c in model.coef_])
+# [12.0, 0.0]
+```
+
+The uninformative column comes back at exactly zero rather than merely small, which is what separates L1 from a ridge penalty. `ElasticNetCV` takes an `l1_ratio` to blend the two, and `LassoCV` is that class with the ratio fixed at 1.0.
+
 `scores_` holds the mean held-out squared error per candidate, and the model is refitted over all the data at `alpha_` once the search is done.
 
 Five folds against twenty candidates is one pass rather than a hundred, and adding candidates costs nothing extra: on 200,000 rows with five features, the search runs one terminal operation where refitting each combination runs 125. The additivity that makes this work is the same property that makes the operator distributable, so the search behaves identically on one node and across a cluster, and folds are assigned by hashing each row's own values so a row lands in the same fold however the data is partitioned.

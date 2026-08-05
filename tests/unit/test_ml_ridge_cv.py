@@ -231,3 +231,118 @@ def test_too_few_rows_is_rejected(sample) -> None:
     tiny = bt.from_pydict({"a": [1.0, 2.0], "b": [1.0, 3.0], "y": [1.0, 2.0]})
     with pytest.raises(PlanError):
         RidgeCV(features, "y", cv=2).fit(tiny)
+
+
+# --------------------------------------------------------------------------------------
+# The same one-pass search, for the L1 models
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def sparse_sample() -> tuple[bt.Dataset, list[str]]:
+    """One informative feature and two that carry nothing, which is what L1 is for."""
+    rng = np.random.default_rng(3)
+    n = 400
+    a = rng.normal(size=n)
+    b = rng.normal(size=n)
+    noise = rng.normal(size=n)
+    y = 2.5 * a + rng.normal(scale=0.4, size=n)
+    ds = bt.from_pydict({"a": a.tolist(), "b": b.tolist(), "n": noise.tolist(), "y": y.tolist()})
+    return ds, ["a", "b", "n"]
+
+
+def test_lasso_cv_ends_in_exactly_lasso_at_the_chosen_alpha(sparse_sample) -> None:
+    from batcher.ml import Lasso, LassoCV
+
+    ds, features = sparse_sample
+    model = LassoCV(features, "y", alphas=(0.0001, 0.01, 0.1, 1.0), cv=5).fit(ds)
+    plain = Lasso(features, "y", alpha=model.alpha_).fit(ds)
+    assert model.coef_ == pytest.approx(plain.coef_, abs=1e-6)
+    assert model.intercept_ == pytest.approx(plain.intercept_, abs=1e-6)
+
+
+def test_elastic_net_cv_ends_in_exactly_elastic_net_at_the_chosen_alpha(sparse_sample) -> None:
+    from batcher.ml import ElasticNet, ElasticNetCV
+
+    ds, features = sparse_sample
+    model = ElasticNetCV(features, "y", alphas=(0.001, 0.1), l1_ratio=0.5, cv=4).fit(ds)
+    plain = ElasticNet(features, "y", alpha=model.alpha_, l1_ratio=0.5).fit(ds)
+    assert model.coef_ == pytest.approx(plain.coef_, abs=1e-6)
+
+
+def test_lasso_cv_recovers_the_informative_feature(sparse_sample) -> None:
+    from batcher.ml import LassoCV
+
+    ds, features = sparse_sample
+    model = LassoCV(features, "y", alphas=(0.0001, 0.01), cv=5).fit(ds)
+    assert model.coef_[0] == pytest.approx(2.5, abs=0.1)
+    assert abs(model.coef_[1]) < 0.2
+    assert abs(model.coef_[2]) < 0.2
+
+
+def test_a_strong_l1_penalty_zeroes_the_uninformative_features(sparse_sample) -> None:
+    """Exactly zero, not merely small: that is what distinguishes L1 from ridge."""
+    from batcher.ml import LassoCV
+
+    ds, features = sparse_sample
+    model = LassoCV(features, "y", alphas=(1.0,), cv=4).fit(ds)
+    assert model.coef_[1] == 0.0
+    assert model.coef_[2] == 0.0
+
+
+def test_the_l1_search_is_also_one_pass(sparse_sample) -> None:
+    from batcher.ml import LassoCV
+
+    ds, features = sparse_sample
+    frame = type(ds)
+    calls = {"n": 0}
+    originals = {name: getattr(frame, name) for name in ("collect", "to_pydict", "count")}
+
+    def wrap(original):
+        def counted(self, *args, **kwargs):
+            calls["n"] += 1
+            return original(self, *args, **kwargs)
+
+        return counted
+
+    for name, original in originals.items():
+        setattr(frame, name, wrap(original))
+    try:
+        LassoCV(features, "y", alphas=(0.001, 0.01, 0.1, 1.0), cv=5).fit(ds)
+    finally:
+        for name, original in originals.items():
+            setattr(frame, name, original)
+    assert calls["n"] == 1, f"expected one terminal op, got {calls['n']}"
+
+
+def test_lasso_cv_is_the_elastic_net_at_l1_ratio_one(sparse_sample) -> None:
+    from batcher.ml import ElasticNetCV, LassoCV
+
+    ds, features = sparse_sample
+    lasso = LassoCV(features, "y", alphas=(0.01, 0.1), cv=4).fit(ds)
+    net = ElasticNetCV(features, "y", alphas=(0.01, 0.1), l1_ratio=1.0, cv=4).fit(ds)
+    assert lasso.l1_ratio == 1.0
+    assert lasso.alpha_ == net.alpha_
+    assert lasso.coef_ == pytest.approx(net.coef_, abs=1e-9)
+
+
+def test_an_l1_ratio_outside_the_unit_interval_is_rejected() -> None:
+    from batcher.ml import ElasticNetCV
+
+    with pytest.raises(PlanError, match="l1_ratio"):
+        ElasticNetCV(["a"], "y", l1_ratio=1.5)
+
+
+@pytest.mark.parametrize("name", ["ElasticNetCV", "LassoCV"])
+def test_the_l1_searches_reject_the_same_bad_arguments(name: str) -> None:
+    import batcher.ml as ml
+
+    klass = getattr(ml, name)
+    with pytest.raises(PlanError, match="at least one feature"):
+        klass([], "y")
+    with pytest.raises(PlanError, match="at least one candidate"):
+        klass(["a"], "y", alphas=())
+    with pytest.raises(PlanError, match="non-negative"):
+        klass(["a"], "y", alphas=(-1.0,))
+    with pytest.raises(PlanError, match="two folds"):
+        klass(["a"], "y", cv=1)

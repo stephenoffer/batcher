@@ -435,7 +435,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `glm.py` | 351 | Generalized linear models fitted by iteratively reweighted least squares. |
 | `gpu.py` | 1573 | Accelerator detection + utilization feedback — the adaptive half of scheduling. |
 | `interpret.py` | 239 | Model interpretation at scale — why the model predicts what it does, over the whole set. |
-| `linear.py` | 809 | Native linear models — ordinary and ridge regression trained inside the engine. |
+| `linear.py` | 843 | Native linear models — ordinary and ridge regression trained inside the engine. |
 | `mixture.py` | 375 | Gaussian mixture models — soft clustering and density estimation by expectation-maximization. |
 | `model_selection.py` | 725 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `multiclass.py` | 224 | `OneVsRestClassifier` — multiclass classification built from a binary estimator. |
@@ -445,7 +445,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `pipeline.py` | 217 | Multi-stage streaming pipeline with credit-based backpressure (the GPU-feeding moat). |
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
 | `selection.py` | 400 | Deciding which features to keep, before a model ever sees them. |
-| `sparse_linear.py` | 266 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
+| `sparse_linear.py` | 559 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
 | `splitting.py` | 319 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 | `timeseries.py` | 323 | Time-series diagnostics — autocorrelation and the tests built on it. |
 

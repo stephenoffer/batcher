@@ -73,6 +73,12 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 
 .. autoclass:: ElasticNet
    :members:
+
+.. autoclass:: LassoCV
+   :members:
+
+.. autoclass:: ElasticNetCV
+   :members:
 ```
 
 `batcher.ml.glm` fits the Tweedie family of generalized linear models by the same one-scan IRLS steps, covering the general form and its Poisson and gamma special cases.
