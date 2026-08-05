@@ -16,7 +16,13 @@ nothing to indicate it.
 
 from __future__ import annotations
 
+from batcher.ml.compose.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from batcher.ml.compose.pipeline import Pipeline
 from batcher.ml.compose.target import TransformedTargetRegressor
 
-__all__ = ["Pipeline", "TransformedTargetRegressor"]
+__all__ = [
+    "MultiOutputClassifier",
+    "MultiOutputRegressor",
+    "Pipeline",
+    "TransformedTargetRegressor",
+]

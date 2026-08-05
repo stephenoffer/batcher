@@ -272,6 +272,12 @@ construction the one `fit` used:
 
 .. autoclass:: TransformedTargetRegressor
    :members:
+
+.. autoclass:: MultiOutputRegressor
+   :members:
+
+.. autoclass:: MultiOutputClassifier
+   :members:
 ```
 
 ## Nearest neighbours

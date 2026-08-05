@@ -9,7 +9,12 @@ mergeable aggregate and whose `transform` is a lazy `Expr` projection.
 from __future__ import annotations
 
 from batcher.ml.cluster import KMeans, NearestCentroid
-from batcher.ml.compose import Pipeline, TransformedTargetRegressor
+from batcher.ml.compose import (
+    MultiOutputClassifier,
+    MultiOutputRegressor,
+    Pipeline,
+    TransformedTargetRegressor,
+)
 from batcher.ml.converters import to_numpy_batches, to_tf_dataset, to_torch_iterable
 from batcher.ml.corpus import (
     MixtureReport,
@@ -263,6 +268,8 @@ __all__ = [
     "MixtureReport",
     "MultiHotEncoder",
     "MultiLabelBinarizer",
+    "MultiOutputClassifier",
+    "MultiOutputRegressor",
     "MultinomialNB",
     "NearestCentroid",
     "Normalizer",

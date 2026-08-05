@@ -92,6 +92,14 @@ def _build(name: str, klass: type):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
     if name in ("LinearDiscriminantAnalysis", "QuadraticDiscriminantAnalysis"):
         return klass(["x", "z"], "label").fit(_classification()), _classification()
+    if name in ("MultiOutputRegressor", "MultiOutputClassifier"):
+        from batcher.ml import LinearRegression, LogisticRegression
+
+        if name == "MultiOutputRegressor":
+            ds = _regression()
+            return klass(LinearRegression, ["x"], ["y", "z"]).fit(ds), ds
+        ds = _classification()
+        return klass(LogisticRegression, ["x"], ["label"]).fit(ds), ds
     if name == "EllipticEnvelope":
         from batcher.ml import EllipticEnvelope
 
