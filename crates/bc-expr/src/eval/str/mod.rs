@@ -504,6 +504,11 @@ pub(crate) fn eval_str(
                 .map(|o| o.map(|v| crc32fast::hash(v.as_bytes()) as i64))
                 .collect::<Int64Array>(),
         ),
+        StrFunc::MimeType => Arc::new(
+            s.iter()
+                .map(|o| o.and_then(|v| crate::eval::mime::sniff(v.as_bytes())))
+                .collect::<StringArray>(),
+        ),
         StrFunc::XxHash64 => Arc::new(
             s.iter()
                 .map(|o| o.map(|v| xxhash64(v.as_bytes()) as i64))
@@ -1230,6 +1235,12 @@ fn eval_bytes(
                     .collect::<StringArray>(),
             )
         }
+        StrFunc::MimeType => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.and_then(crate::eval::mime::sniff))
+                .collect::<StringArray>(),
+        ),
         StrFunc::Crc32 => Arc::new(
             bytes
                 .iter()

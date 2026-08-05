@@ -32,6 +32,14 @@ mod spill_split;
 pub mod stream;
 mod window_spill;
 
+/// What a payload's leading bytes say it is, or `None` when nothing recognizes them.
+///
+/// Re-exported from `bc-expr` rather than reached directly, so `bc-py` gains no crate edge
+/// for a one-function helper. The IO layer calls this through the FFI so its `mime` column
+/// and the `.str.mime_type()` expression read the *same* magic-number table — a reader with
+/// its own copy would be a second answer to "what is this file", drifting silently the
+/// first time a format was added to one of them.
+pub use bc_expr::sniff_mime;
 pub use error::InterpError;
 pub use metrics::{ExecMetrics, OpMetric};
 pub use par::{

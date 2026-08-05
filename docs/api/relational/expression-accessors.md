@@ -44,6 +44,7 @@ casing, encoding, and the similarity measures:
 | {py:meth}`.unhex() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.unhex>` | decode pairs of hex digits to a UTF-8 string; null if invalid |
 | {py:meth}`.md5() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.md5>` / {py:meth}`.sha1() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.sha1>` / {py:meth}`.sha256() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.sha256>` | cryptographic digest as lowercase hex; null → null |
 | `.crc32()` | CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`, → Int64) |
+| `.mime_type()` | what the leading bytes say the payload is (`image/png`, `video/mp4`, `application/pdf`, …), null when unrecognized — the way to identify bytes that never came from a file read, such as a `ds.ml.download` or a blob column |
 | {py:meth}`.hash64() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.hash64>` | deterministic FNV-1a 64-bit hash, stable across partitions and machines, so it's a surrogate-key building block (→ Int64) |
 | {py:meth}`.xxhash64() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.xxhash64>` | fast non-cryptographic 64-bit xxHash; the standard bucketing/sharding hash (→ Int64) |
 | `.substring_index(delimiter, count)` | substring before the `count`-th `delimiter` (Spark) |

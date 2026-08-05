@@ -1,4 +1,4 @@
-"""What a file is, decided from its bytes rather than its name.
+"""What a payload is, decided from its bytes rather than its name.
 
 The `mime` column is what an unstructured pipeline routes on — send the images to a vision
 model, the audio to a transcriber, the PDFs to a text extractor — so getting it wrong does
@@ -116,3 +116,81 @@ def test_the_binary_source_sniffs_the_bytes_it_already_read(tmp_path):
     (tmp_path / "also_nameless").write_bytes(b"%PDF-1.4\n")
     got = bt.read.binary(str(tmp_path)).sort("uri").to_pydict()["mime"]
     assert got == ["application/pdf", "image/heic"]
+
+
+# --- the same table, reached as an expression -----------------------------------------
+#
+# `sniff_mime` above answers for a *file*, which has a name to fall back on. The
+# expression answers for *bytes*, which do not — a `ds.ml.download`, a blob column in a
+# Parquet table, a payload pulled out of an archive. Those had no way to be identified at
+# all before, so routing a mixed blob corpus meant dropping to a Python UDF.
+#
+# The two must not disagree, which is why the magic table lives in the engine and this
+# module delegates to it. The parity test below is what would notice if that stopped being
+# true — a second table would drift the first time a format was added to one copy.
+
+
+@pytest.mark.parametrize(("label", "head", "expected"), _CASES, ids=[c[0] for c in _CASES])
+def test_the_expression_identifies_the_same_payloads(label, head, expected):
+    import batcher as bt
+
+    got = bt.from_pydict({"b": [head]}).select(m=bt.col("b").str.mime_type()).to_pydict()["m"]
+    assert got == [expected]
+
+
+def test_the_expression_and_the_reader_never_disagree():
+    """One table, reached two ways. A second copy would drift and nothing would say so."""
+    import batcher as bt
+
+    heads = [head for _label, head, _expected in _CASES]
+    from_expression = (
+        bt.from_pydict({"b": heads}).select(m=bt.col("b").str.mime_type()).to_pydict()["m"]
+    )
+    # The reader is given a name with no extension, so only the bytes can answer — which
+    # makes this a comparison of the magic table against itself through two callers.
+    from_reader = [sniff_mime("s3://bucket/blob/anonymous", head) for head in heads]
+
+    assert from_expression == from_reader
+
+
+def test_unrecognized_bytes_are_null_not_octet_stream():
+    """An expression has no filename left to try, so it must not claim to have decided.
+
+    `application/octet-stream` is a conclusion; null is the absence of one. Collapsing them
+    would make `coalesce` impossible and hide the rows a caller could still identify from
+    something else they know.
+    """
+    import batcher as bt
+
+    ds = bt.from_pydict({"b": [b"\x00\x01\x02\x03", None, b""]})
+    assert ds.select(m=bt.col("b").str.mime_type()).to_pydict()["m"] == [None, None, None]
+
+
+def test_it_reads_a_text_column_too():
+    """A `Utf8` column's bytes are bytes: an XML or SVG payload stored as text still has a
+    magic prefix, and refusing to look would be an artificial distinction."""
+    import batcher as bt
+
+    ds = bt.from_pydict({"s": ["%PDF-1.7 not really", "hello"]})
+    assert ds.select(m=bt.col("s").str.mime_type()).to_pydict()["m"] == ["application/pdf", None]
+
+
+def test_routing_a_mixed_blob_corpus_is_a_filter():
+    """The use case, end to end: bytes from nowhere in particular, split by what they are."""
+    import batcher as bt
+    from batcher import col
+
+    ds = bt.from_pydict(
+        {
+            "b": [
+                b"\x89PNG\r\n\x1a\n" + bytes(8),
+                _iso(b"isom"),
+                b"%PDF-1.4\n",
+                b"whatever",
+            ]
+        }
+    )
+    typed = ds.with_columns(m=col("b").str.mime_type())
+    assert typed.filter(col("m").str.starts_with("image/")).count() == 1
+    assert typed.filter(col("m").str.starts_with("video/")).count() == 1
+    assert typed.filter(col("m").is_null()).count() == 1

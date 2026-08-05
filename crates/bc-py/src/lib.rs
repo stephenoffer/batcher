@@ -650,6 +650,22 @@ fn read_avro(
     Ok(batches.into_iter().map(PyArrowType).collect())
 }
 
+/// What a payload's leading bytes say it is, or `None` when nothing recognizes them.
+///
+/// The IO layer's `sniff_mime` calls this so the magic-number table has exactly one home:
+/// the same `bc-expr` function `.str.mime_type()` evaluates. A Python-side copy of the
+/// table would be a second answer to "what is this file", and the two would drift the
+/// first time a format was added to one of them — silently, on a column whose whole job
+/// is to route rows to different branches.
+///
+/// Scalar rather than batched because the caller is already opening a file per row; the
+/// FFI hop is nothing next to that, and a batched form would need the readers restructured
+/// around it for no measurable gain.
+#[pyfunction]
+fn sniff_mime(data: &[u8]) -> Option<&'static str> {
+    bc_interp::sniff_mime(data)
+}
+
 /// The optional cargo features compiled into this engine, sorted.
 ///
 /// Kept as an explicit list rather than derived, because a feature only belongs here once
@@ -688,6 +704,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Python fallback: guessing wrong means either a run-time failure on a path the plan
     // promised, or a slow per-row fallback on a build that never needed one.
     m.add("__engine_features__", engine_features())?;
+    m.add_function(wrap_pyfunction!(sniff_mime, m)?)?;
     m.add_function(wrap_pyfunction!(tracing_init::init_tracing, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;

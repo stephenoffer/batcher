@@ -27,6 +27,16 @@ mod select;
 pub use error::ExprError;
 pub use select::ConjunctOrder;
 
+/// What a payload's leading bytes say it is, or `None` when nothing recognizes them.
+///
+/// Public so the IO layer can reach the *same* magic-number table the `.str.mime_type()`
+/// expression uses, through a `bc-py` helper. A reader that kept its own copy would be a
+/// second answer to "what is this file", and the two would drift the first time a format
+/// was added to one of them.
+pub fn sniff_mime(data: &[u8]) -> Option<&'static str> {
+    eval::mime::sniff(data)
+}
+
 // The per-variant evaluation bodies (and `Expr::eval` itself) live in `eval`; the
 // wire-contract enum definitions stay here in `lib.rs`.
 mod eval;
@@ -1466,6 +1476,17 @@ pub enum StrFunc {
     Sha256,
     /// CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`). → Int64.
     Crc32,
+    /// `mime_type()` → what the value's leading bytes say it is (`image/png`,
+    /// `video/mp4`, `application/pdf`, …), or **null** when nothing recognizes them.
+    ///
+    /// The byte-oriented sibling of the IO layer's `mime` column, for the bytes that never
+    /// came from a file read — a `ds.ml.download`, a blob column in a Parquet table, a
+    /// payload extracted from an archive. Those have no filename to guess from and, until
+    /// this, no way to be identified at all, so routing a mixed blob corpus meant a Python
+    /// UDF. Null rather than `application/octet-stream` because this reader knows only what
+    /// the bytes say: "unrecognized" and "opaque binary" are different claims, and only a
+    /// caller with a filename left to try can collapse them.
+    MimeType,
     /// 64-bit xxHash of the UTF-8 bytes (the u64 digest reinterpreted as i64). The
     /// fast non-cryptographic hash for bucketing/sharding. Null → null. → Int64.
     #[serde(rename = "xxhash64")]

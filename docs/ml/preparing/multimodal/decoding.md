@@ -173,6 +173,36 @@ print(decoded_audio.schema.field("mono").type, len(decoded_audio.column("mono")[
 # list<item: float> 16
 ```
 
+### Identifying bytes that did not come from a file
+
+The media and blob readers give you a `mime` column, sniffed from each file's leading bytes
+rather than its name. Bytes that arrive any other way — a download, a blob column in a
+Parquet table, a payload pulled out of an archive — have no such column and no filename to
+guess from. `.str.mime_type()` reads the same magic-number table as an expression:
+
+```python
+import batcher as bt
+from batcher import col
+
+blobs = bt.from_pydict({"b": [b"\x89PNG\r\n\x1a\n" + bytes(8), b"unknown"]})
+print(blobs.select(m=col("b").str.mime_type()).to_pydict())
+# {'m': ['image/png', None]}
+```
+
+That makes routing a mixed corpus a filter rather than a UDF:
+
+```python
+# docs: skip
+typed = downloaded.with_columns(kind=col("bytes").str.mime_type())
+images = typed.filter(col("kind").str.starts_with("image/"))
+video = typed.filter(col("kind").str.starts_with("video/"))
+```
+
+Unrecognized bytes are **null**, not `application/octet-stream`. An expression sees only
+bytes, so it has nothing left to try; a reader, which still has a filename, turns the same
+null into a guess from the extension before giving up. Keeping them distinct is what lets
+you `coalesce` in whatever you know instead.
+
 ### What a bad row does
 
 Every decode operation answers **null** for a row it cannot read: null input bytes,
