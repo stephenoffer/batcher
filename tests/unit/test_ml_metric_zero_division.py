@@ -104,3 +104,61 @@ def test_a_degenerate_batch_no_longer_poisons_an_average() -> None:
 
 def test_the_false_negative_rate_is_zero_when_there_are_no_positives() -> None:
     assert _value([0, 0, 0, 0], [0, 0, 0, 0], bt.false_negative_rate("y", "p")) == 0.0
+
+
+#: A constant target has no variance, so every variance-ratio score divides by zero.
+CONSTANT_TARGET = [
+    ("perfect prediction", [5.0, 5.0, 5.0, 5.0], [5.0, 5.0, 5.0, 5.0]),
+    ("imperfect prediction", [5.0, 5.0, 5.0, 5.0], [4.0, 6.0, 5.0, 5.0]),
+]
+
+
+@pytest.mark.parametrize(("label", "y", "p"), CONSTANT_TARGET)
+def test_r2_is_finite_on_a_constant_target(label: str, y: list, p: list) -> None:
+    """It answered NaN when the prediction was perfect and -inf when it was not.
+
+    A constant target is not exotic: a filtered group, a degenerate fold, and a
+    single-valued segment in a `group_by` all produce one, and -inf spreads through a mean
+    exactly as NaN does.
+    """
+    got = _value(y, p, bt.r2("y", "p"))
+    assert not math.isnan(got), f"r2 was NaN on {label}"
+    assert math.isfinite(got), f"r2 was {got} on {label}"
+
+
+@pytest.mark.parametrize(("label", "y", "p"), CONSTANT_TARGET)
+def test_r2_and_explained_variance_match_sklearn_on_a_constant_target(
+    label: str, y: list, p: list
+) -> None:
+    assert _value(y, p, bt.r2("y", "p")) == pytest.approx(sk.r2_score(y, p)), label
+    assert _value(y, p, bt.explained_variance("y", "p")) == pytest.approx(
+        sk.explained_variance_score(y, p)
+    ), label
+
+
+@pytest.mark.parametrize(
+    ("y", "p"),
+    [
+        ([1.0, 2.0, 3.0, 4.0], [1.1, 1.9, 3.2, 3.8]),
+        ([1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]),
+        ([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]),
+    ],
+)
+def test_the_ordinary_variance_ratios_are_unchanged(y: list, p: list) -> None:
+    """Including the anti-correlated case, whose r2 is -3: the guard must not clamp."""
+    assert _value(y, p, bt.r2("y", "p")) == pytest.approx(sk.r2_score(y, p))
+    assert _value(y, p, bt.explained_variance("y", "p")) == pytest.approx(
+        sk.explained_variance_score(y, p)
+    )
+
+
+def test_a_constant_group_no_longer_poisons_a_grouped_score() -> None:
+    ds = bt.from_pydict(
+        {
+            "g": ["a", "a", "a", "b", "b", "b"],
+            "y": [7.0, 7.0, 7.0, 1.0, 2.0, 3.0],
+            "p": [7.0, 7.0, 7.0, 1.1, 2.1, 2.9],
+        }
+    )
+    scores = ds.group_by("g").agg(score=bt.r2("y", "p")).to_pydict()["score"]
+    assert all(math.isfinite(v) for v in scores), f"a group went non-finite: {scores}"
