@@ -78,6 +78,11 @@ from batcher.ml.model_selection import (
     validation_curve,
 )
 from batcher.ml.naive_bayes import BernoulliNB, GaussianNB, MultinomialNB
+from batcher.ml.neighbors import (
+    KNeighborsClassifier,
+    KNeighborsRegressor,
+    KNNImputer,
+)
 from batcher.ml.outliers import (
     OutlierClipper,
     count_outliers,
@@ -232,6 +237,9 @@ __all__ = [
     "JamesSteinEncoder",
     "KBinsDiscretizer",
     "KMeans",
+    "KNNImputer",
+    "KNeighborsClassifier",
+    "KNeighborsRegressor",
     "LabelBinarizer",
     "LabelEncoder",
     "LagFeaturizer",

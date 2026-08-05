@@ -234,6 +234,24 @@ Score a clustering against a reference labeling with `batcher.ml.metrics`, each 
 .. autofunction:: davies_bouldin_score
 ```
 
+## Nearest neighbours
+
+Prediction and imputation by local similarity. All three fold a bounded reference set into
+the expression, so scoring is one projection rather than a join:
+
+```{eval-rst}
+.. currentmodule:: batcher.ml
+
+.. autoclass:: KNeighborsRegressor
+   :members:
+
+.. autoclass:: KNeighborsClassifier
+   :members:
+
+.. autoclass:: KNNImputer
+   :members:
+```
+
 ## Model persistence
 
 A fitted estimator has to outlive the process that fitted it, or a model trained across a

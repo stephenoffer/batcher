@@ -213,6 +213,67 @@ print(model_from_dict(document).coef_)
 parameter an estimator keeps privately (`Ridge` takes `alpha` and stores `_alpha`) is still
 recorded under the name that rebuilds it.
 
+## Predicting from the nearest training rows
+
+{py:class}`KNeighborsRegressor <batcher.ml.KNeighborsRegressor>` and
+{py:class}`KNeighborsClassifier <batcher.ml.KNeighborsClassifier>` assume nothing about the
+shape of the relationship: to predict a row, they find the training rows most like it and
+average what happened to them. That makes them the natural first check on whether a problem
+has local structure, and the right tool when a boundary is genuinely irregular.
+
+```python
+import batcher as bt
+from batcher.ml import KNeighborsClassifier
+
+train = bt.from_pydict(
+    {"x": [0.0, 1.0, 10.0, 11.0], "label": ["low", "low", "high", "high"]}
+)
+model = KNeighborsClassifier(["x"], "label", k=2).fit(train)
+print(model.predict(bt.from_pydict({"x": [0.5, 10.5]})).to_pydict()["prediction"])
+# ['low', 'high']
+```
+
+A k-NN model has no parameters — it *is* its training data — so `fit` keeps a reference set
+and `predict` measures against it. Batcher folds that reference set into the prediction as
+literals, exactly the way a fitted linear model folds in its coefficients, so scoring is one
+arithmetic expression over the feature columns with no join and no shuffle.
+
+That is what makes it distribute unchanged, and it is also why the reference set is capped.
+Exact k-NN costs one distance per scored row per reference row, and nothing removes that:
+measured on this engine, scoring the reference set against itself takes about 0.4s at 200
+rows and 4s at 1,000. Past `max_reference` the fit fails and names the ways out rather than
+building a query nobody wants to wait for.
+
+Two habits matter more here than for most models:
+
+- **Scale the features first.** Distance treats every column alike, so a column measured in
+  millions decides every neighbour and one measured in fractions is ignored.
+- **Reach for an index when the corpus is large.**
+  {py:func}`build_vector_index <batcher.ml.build_vector_index>` is the approximate route;
+  a broadcast reference set is not.
+
+Ties at the k-th distance all count as neighbours, so a row can have more than `k` of them.
+The alternative would be to break the tie by reference-set order, which makes a prediction
+depend on the order rows happened to arrive in.
+
+{py:class}`KNNImputer <batcher.ml.KNNImputer>` applies the same idea to missing values: it
+matches a row on the columns that *are* present and fills the gap with what similar rows
+had there.
+
+```python
+from batcher.ml import KNNImputer
+
+homes = bt.from_pydict(
+    {"size": [10.0, 11.0, 50.0, 51.0, 10.5], "price": [1.0, 1.2, 9.0, 9.4, None]}
+)
+print(round(KNNImputer(["size", "price"], k=2).fit_transform(homes).to_pydict()["price"][4], 3))
+# 1.1
+```
+
+The column mean there is about 5.15, so the gap between the two is the whole reason to use
+it. Unlike scikit-learn's, a donor row must be complete across the imputed columns; the two
+agree wherever the neighbourhood is unambiguous.
+
 ## Requirements and limitations
 
 Each framework is an optional extra: `pip install 'batcher-engine[xgboost]'`, `[lightgbm]`, `[catboost]`, `[onnx]`, or `[sklearn]`. `[tabular]` installs all of them.

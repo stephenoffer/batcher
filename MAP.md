@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1212 Python modules across 186 packages and 219 Rust files across 14 crates.
+Covering 1216 Python modules across 187 packages and 219 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -548,6 +548,16 @@ Model evaluation over a `Dataset` — rank metrics, diagnostic tables, and `eval
 | `regression.py` | 376 | Regression-specific diagnostics — the residual, the interval, and the top-k label. |
 | `tables.py` | 411 | Diagnostic tables — confusion matrix, threshold sweep, lift, calibration. |
 | `thresholds.py` | 292 | Choosing an operating point — the step between a good AUC and a deployed model. |
+
+### `batcher/ml/neighbors/` — 6 · front-end
+
+Nearest-neighbour models — prediction and imputation by local similarity.
+
+| module | lines | what it is |
+|---|---|---|
+| `estimators.py` | 252 | `KNeighborsClassifier` and `KNeighborsRegressor` — prediction by local averaging. |
+| `imputer.py` | 175 | `KNNImputer` — fill a gap with what similar rows had there. |
+| `reference.py` | 227 | The nearest-neighbour primitive the k-NN estimators and imputer share. |
 
 ### `batcher/ml/persistence/` — 6 · front-end
 
