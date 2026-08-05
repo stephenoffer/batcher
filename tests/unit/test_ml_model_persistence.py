@@ -211,3 +211,13 @@ def test_an_unserializable_field_is_named() -> None:
     fitted.coef_ = object()
     with pytest.raises(PlanError, match=r"LinearRegression\.coef_ cannot be saved"):
         model_to_dict(fitted)
+
+
+def test_a_class_with_its_own_persistence_is_not_claimed_by_this_writer() -> None:
+    """`Pipeline` stores steps *and* a model, so a one-estimator document cannot hold it."""
+    from batcher.ml import LinearRegression, Pipeline, StandardScaler
+
+    assert "Pipeline" not in _registry()
+    pipe = Pipeline(StandardScaler(["x"]), model=LinearRegression(["x"], "y")).fit(_regression())
+    with pytest.raises(PlanError, match=r"call its \.save\(path\) instead"):
+        save_model(pipe, "/tmp/unused.json")

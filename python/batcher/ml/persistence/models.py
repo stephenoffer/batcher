@@ -81,12 +81,21 @@ def _registry() -> dict[str, type]:
     classes: dict[str, type] = {}
     for name in getattr(ml_package, "__all__", ()):
         candidate = getattr(ml_package, name, None)
-        if (
-            isinstance(candidate, type)
-            and callable(getattr(candidate, "fit", None))
-            and callable(getattr(candidate, "predict", None))
+        if not isinstance(candidate, type):
+            continue
+        if not callable(getattr(candidate, "fit", None)):
+            continue
+        if not callable(getattr(candidate, "predict", None)):
+            continue
+        # A class carrying its own `save`/`load` owns a document shape this one cannot
+        # write: `Pipeline` holds preprocessors *and* a model and stores both, and a
+        # `Preprocessor` has its own registry. Claiming them here would produce a file
+        # neither loader could read back.
+        if callable(getattr(candidate, "save", None)) and callable(
+            getattr(candidate, "load", None)
         ):
-            classes[name] = candidate
+            continue
+        classes[name] = candidate
     return classes
 
 
@@ -222,6 +231,11 @@ def save_model(model: object, path: str) -> None:
             >>> load_model(target).coef_
             [2.0]
     """
+    if callable(getattr(model, "save", None)) and callable(getattr(type(model), "load", None)):
+        raise PlanError(
+            f"{type(model).__name__} writes its own document — call its .save(path) instead. "
+            "This writer records one estimator, and that class holds more than one thing."
+        )
     write_document(model_to_dict(model), path)
 
 
