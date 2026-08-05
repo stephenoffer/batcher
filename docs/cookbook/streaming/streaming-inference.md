@@ -154,6 +154,48 @@ you uptime at the price of silent data loss. If the loss matters, catch the exce
 yourself downstream.
 :::
 
+## Rolling the scores up
+
+Scoring is rarely the last stage. A rollup over the scored stream -- alerts per model
+version, a running mean, a count above threshold -- is an ordinary aggregation over a
+`map_batches` input, and it writes to a sink like any other streaming aggregation:
+
+```python
+rollup_schema = pa.schema([("model", pa.string()), ("text", pa.string())])
+
+
+def rollup_batches():
+    yield pa.record_batch({"model": ["v1", "v2"], "text": ["ok", "no"]},
+                          schema=rollup_schema)
+    yield pa.record_batch({"model": ["v1"], "text": ["fine"]}, schema=rollup_schema)
+
+
+def score_length(batch):
+    return {"model": batch.column("model").to_pylist(),
+            "score": [len(t) for t in batch.column("text").to_pylist()]}
+
+
+rollup = (
+    bt.from_batches(rollup_batches, rollup_schema, bounded=False)
+    .map_batches(score_length, output_columns=["model", "score"])
+    .group_by("model")
+    .agg(total=col("score").sum())
+)
+for batch in rollup.iter_batches():
+    print(sorted(zip(batch.to_pydict()["model"], batch.to_pydict()["total"], strict=True)))
+# [('v1', 6), ('v2', 2)]
+```
+
+The UDF runs in Python once per micro-batch and the fold runs in the engine over what it
+returns, so a long-running rollup never holds the scored output, only the running state.
+
+:::{warning}
+`checkpoint=` is refused on this shape. The running state is folded against whatever schema
+the UDF returns, which is not knowable before the UDF has run, so there is nothing for a
+restart to resume into. Accepting it would advance the offset log while the totals silently
+restarted at zero. Land the scores first and aggregate the table if you need resumption.
+:::
+
 ## Watching it run
 
 The query handle is how you know whether the model is keeping up:

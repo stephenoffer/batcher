@@ -76,14 +76,31 @@ class AggregateProcessor:
     row — a null or NaN in an output column makes a row compare unequal to itself, so such
     a row is re-emitted every trigger, which an upsert sink absorbs and a missed update
     would not be.
+
+    A `map_batches` input is handled by `run_batch`, which runs the map and hands back the
+    mapped batches for the fold to consume. The fold is then built lazily against the
+    *mapped* schema, because an `Aggregate` sitting on a `MapBatches` cannot be lowered at
+    all: `MapBatches.to_ir()` raises, the UDF being Python is the whole point of it. Until
+    this existed, `map → agg` -- inference followed by a rollup, the single most common
+    shape an ML streaming job has -- streamed correctly through `iter_batches` and answered
+    a streaming write with a bare `NotImplementedError` about the IR.
     """
 
-    __slots__ = ("_agg", "_cap", "_emitted", "_fold", "_keyed", "_previous", "_update_only")
+    __slots__ = ("_agg", "_cap", "_emitted", "_fold", "_keyed", "_map", "_previous", "_update_only")
 
-    def __init__(self, agg: Aggregate, *, update_only: bool = False) -> None:
+    def __init__(
+        self,
+        agg: Aggregate,
+        *,
+        update_only: bool = False,
+        run_batch: Callable[[pa.RecordBatch], list[pa.RecordBatch]] | None = None,
+    ) -> None:
         from batcher.core.streaming import streaming_state_budget
 
-        self._fold = _AggFold(agg)
+        self._map = run_batch
+        # With a map in front, the fold's input schema is whatever the UDF returns, which
+        # is knowable only once it has returned something. See `_folded`.
+        self._fold = None if run_batch is not None else _AggFold(agg)
         self._agg = agg
         self._update_only = update_only
         #: The last result emitted, for the `update` diff. None until the first one.
@@ -100,7 +117,11 @@ class AggregateProcessor:
         self._cap = streaming_state_budget()
 
     def process(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
-        self._fold.push(batch)
+        for mapped in self._map(batch) if self._map is not None else [batch]:
+            if mapped.num_rows or self._fold is not None:
+                self._folded(mapped).push(mapped)
+        if self._fold is None:  # the map produced nothing at all yet
+            return []
         if self._keyed:
             from batcher.core.streaming import check_agg_state_bounded
 
@@ -119,6 +140,26 @@ class AggregateProcessor:
         if not self._update_only:
             return [result]
         return self._changed_rows(result)
+
+    def _folded(self, mapped: pa.RecordBatch) -> _AggFold:
+        """The fold, built against the mapped schema the first time one is available.
+
+        The map is already applied by then, so the fold's input is a plain scan of that
+        schema — it partial-aggregates and combines, and never re-runs the UDF. This is the
+        same substitution `api.terminal.map_stream` makes for `iter_batches`, which is what
+        keeps the two terminals computing one aggregate rather than two.
+        """
+        import dataclasses
+
+        from batcher.plan.logical import Scan
+        from batcher.plan.schema import SchemaRef
+
+        if self._fold is None:
+            identity = dataclasses.replace(
+                self._agg, input=Scan(0, SchemaRef.from_arrow(mapped.schema))
+            )
+            self._fold = _AggFold(identity)
+        return self._fold
 
     def _changed_rows(self, result: pa.RecordBatch) -> list[pa.RecordBatch]:
         """The rows of `result` that differ from the last emitted result.
@@ -167,14 +208,19 @@ class AggregateProcessor:
 
     def state_metrics(self) -> tuple[StateOperatorProgress, ...]:
         """This operator's retained state after the last micro-batch."""
-        return (self._fold.metrics(),)
+        return () if self._fold is None else (self._fold.metrics(),)
 
     def snapshot_state(self) -> pa.RecordBatch | None:
         """The running partial state for a checkpoint snapshot."""
-        return self._fold.state()
+        return None if self._fold is None else self._fold.state()
 
     def restore_state(self, state: pa.RecordBatch) -> None:
-        """Resume from a checkpointed running partial state."""
+        """Resume from a checkpointed running partial state.
+
+        Never reached for a mapped aggregate: the fold is built against the schema the UDF
+        returns, which is not knowable before the UDF has run, so `checkpoint=` is refused
+        for that shape at `start()` rather than silently resuming from an empty aggregate.
+        """
         self._fold.restore(state)
 
 
@@ -293,7 +339,12 @@ def make_processor(
                 "'complete'/'update')"
             )
         agg = plan if isinstance(plan, Aggregate) else _distinct_as_aggregate(plan)
-        return AggregateProcessor(agg, update_only=output_mode == OutputMode.UPDATE)
+        # `run_batch` is present here only for a `map → agg`: the conductor builds it from
+        # the aggregate's *input* precisely so the UDF runs in Python and the fold sees
+        # mapped batches. Without it the fold would try to lower a `MapBatches` node.
+        return AggregateProcessor(
+            agg, update_only=output_mode == OutputMode.UPDATE, run_batch=run_batch
+        )
     if is_streamable(plan):
         if output_mode != OutputMode.APPEND:
             raise PlanError(

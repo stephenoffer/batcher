@@ -130,9 +130,26 @@ def start_streaming_query(
         _warn_if_checkpoint_not_durable(checkpoint)
         store = CheckpointStore(checkpoint)
 
-    run_batch, projection, predicate = (
-        _build_run_batch(plan, sources) if _is_stateless(plan) else (None, None, None)
-    )
+    # A top-level aggregate over a `map_batches` input is the one non-stateless shape that
+    # still needs a per-batch runner: the UDF runs in Python and the fold consumes what it
+    # returns. `iter_batches` has streamed this since S29 (`map_stream`); the sink path
+    # answered it with a bare `NotImplementedError` from `MapBatches.to_ir()`, which is the
+    # single most common shape an ML streaming job has -- inference, then a rollup.
+    mapped_aggregate = _is_mapped_aggregate(plan)
+    if mapped_aggregate and checkpoint is not None:
+        raise PlanError(
+            "checkpoint= is refused for an aggregate over map_batches: the running state is "
+            "folded against whatever schema the UDF returns, which is not knowable before "
+            "the UDF has run, so a restart would resume from an empty aggregate while the "
+            "offset log said the rows were already counted. Aggregate without the UDF (or "
+            "materialize the mapped output first) if you need resumption."
+        )
+    if mapped_aggregate:
+        run_batch, projection, predicate = _build_run_batch(plan.input, sources)
+    else:
+        run_batch, projection, predicate = (
+            _build_run_batch(plan, sources) if _is_stateless(plan) else (None, None, None)
+        )
     processor = core.make_processor(plan, output_mode, run_batch)
     query_name = name or _next_name()
     engine = core.StreamingQueryEngine(
@@ -230,6 +247,18 @@ def _start_driver_stream(
 
     query_name = name or _next_name()
     trigger = trigger or Trigger.processing_time(0)
+    # Every shape on this path retains something between batches -- buffered sides, a
+    # dimension snapshot, open sessions, a seen-key set, a row count. Continuous processing
+    # has no micro-batch boundary to fold at, which is why Spark restricts it to stateless
+    # pipelines and why the single-source launcher already refused it. This path never
+    # checked, so a continuous trigger was accepted and then quietly run as micro-batches:
+    # the answer was right and the latency the caller asked for was not what they got.
+    if trigger.kind == "continuous":
+        raise PlanError(
+            "continuous trigger supports only stateless pipelines (filter / select / "
+            "map_batches); this plan retains state between micro-batches, which needs a "
+            "boundary to fold at. Use a processing-time trigger."
+        )
 
     def make_runner(should_stop):
         from batcher.core.streaming_runner import DriverRunner
@@ -264,3 +293,16 @@ def _is_stateless(plan: LogicalPlan) -> bool:
     from batcher.plan.logical import Aggregate, Distinct, is_streamable
 
     return is_streamable(plan) and not isinstance(plan, (Aggregate, Distinct))
+
+
+def _is_mapped_aggregate(plan: LogicalPlan) -> bool:
+    """A top-level aggregate whose input is a breaker-free `map_batches` pipeline."""
+    from batcher import core
+    from batcher.plan.logical import Aggregate, is_streamable
+
+    return (
+        isinstance(plan, Aggregate)
+        and plan.watermark is None
+        and is_streamable(plan.input)
+        and core.has_map_batches(plan.input)
+    )
