@@ -26,7 +26,15 @@ The sweep then extended to Polars' streaming-node inventory, which contributed 1
 is tracked and propagated, and no operator specializes on it) and 10g — a methodological
 finding worth as much as any gap: **two attempts to time a plan-level optimization measured
 Kyber's shortcut machinery instead of the mechanism**, because it answered both probe shapes
-from metadata 15-22x faster than DuckDB executed them.
+from metadata 15-22x faster than DuckDB executed them. DataFusion, Daft and Ray Data followed
+(10h) and turned up almost nothing: `WITH RECURSIVE`, Daft's whole AI axis including a WARC
+reader, and Ray Data's `train_test_split`/`streaming_split`/shuffle are all already built.
+
+**The honest summary of the whole sweep is that Batcher's operator coverage is broad.** Across
+the five trees, three genuine openings came out of it — 10a (asymptotic, and the one to build),
+10b (cheap), 10f (unmeasured, memory-shaped) — against roughly a dozen candidates that were
+already implemented. An agent reading this document for work should start at the backlog, not
+at a competitor's file listing.
 
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
 This document is the *parts list* behind it. It answers a narrower question: given the
@@ -781,6 +789,36 @@ on both shapes Batcher beat DuckDB by 15x and 22x, because DuckDB executed what 
 Expression-level CSE is present and is a different thing —
 `kyber/rules/extra/cse.py` binds a subexpression repeated across a `Project`'s outputs to one
 synthetic column. Plan-level reuse remains **unestablished in either direction**.
+
+### 10h. DataFusion, Daft and Ray Data — one small gap, and a lot ruled out
+
+The sweep finished across the remaining three trees. The result is lopsided and worth
+reporting as such: **almost everything checked was already built.**
+
+DataFusion's `physical-plan/src` contributes `recursive_query.rs` + `work_table.rs`, i.e.
+`WITH RECURSIVE`. Batcher has it — `_sql/parser/translator.py:63` even documents the iteration
+cap it applies against a missing stop condition, and
+`WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5) SELECT sum(x) FROM c`
+returns 15.
+
+Daft's crate list is the sharpest test of the AI axis, since that is what Daft is for. Its three
+most distinctive crates all have Batcher counterparts: `daft-ai` against `ml/embed_api.py` and
+`ml/llm/`; `daft-functions-tokenize` against `plan/functions/prompt/` (token budgeting) and the
+`.str` n-gram/normalization family; and `daft-warc` — a WARC reader for web-crawl corpora, which
+is niche enough to be a plausible gap — against `io/formats/unstructured/warc.py`.
+
+Ray Data's `Dataset` surface (93 public methods) is likewise covered where it matters:
+`train_test_split` is `api/dataset/ml.py`, `streaming_split` is `ml/loader/lazy.py`, and
+`random_shuffle` is `Dataset.shuffle(seed=)` — the Feistel permutation the scorecard already
+claims as a strength.
+
+**The one gap, and it is small.** `split_at_indices` and `split_proportionately` have no
+Batcher equivalent. More useful than the two methods: **no Ray Data spelling appears in the
+compat guidance table** (`api/dataset/compat/guidance/_dataset_table.py`), which does carry
+Polars, pandas and Spark names — `group_by_dynamic` is mapped there, `random_shuffle` is not.
+Batcher's scorecard positions Ray Data as a primary competitor and claims 50-450x over it, so
+the porting surface for that specific audience being the unmapped one is a mismatch worth
+closing. It is a table entry, not an engine change.
 
 ### 10e. Ruled out — already built, do not re-implement
 
