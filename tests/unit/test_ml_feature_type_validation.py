@@ -275,3 +275,70 @@ def test_an_encoder_still_takes_a_string_column() -> None:
 
     ds = bt.from_pydict({"x": ["a", "b", "a", "c"]})
     assert OrdinalEncoder(["x"]).fit(ds).transform(ds).to_pydict()["x"] == [0, 1, 0, 2]
+
+
+#: The classes a first pass over this surface missed, found by re-sweeping rather than by
+#: reading: decomposition, the distance-based models, and the two clipping/imputing helpers.
+LATER_ADDITIONS = [
+    "PCA",
+    "TruncatedSVD",
+    "OutlierClipper",
+    "IterativeImputer",
+    "KNNImputer",
+    "InteractionFeatures",
+]
+
+
+@pytest.mark.parametrize("name", LATER_ADDITIONS)
+def test_the_rest_of_the_surface_names_a_string_column(name: str) -> None:
+    """A validation covering most of a surface reads as done and is not.
+
+    These eight were still failing from inside the engine after the first pass, and only a
+    re-sweep over every exported class with a `fit` found them.
+    """
+    import batcher.ml as ml
+
+    ds = bt.from_pydict({"x": ["a", "b", "c", "d"], "z": [1.0, 2.0, 3.0, 4.0]})
+    obj = getattr(ml, name)(["x", "z"])
+    with pytest.raises(PlanError) as caught:
+        obj.fit(ds).transform(ds).collect()
+    assert "'x'" in str(caught.value), f"{name} must name the column"
+
+
+@pytest.mark.parametrize("name", ["KNeighborsClassifier", "KNeighborsRegressor"])
+def test_the_neighbour_models_name_a_string_feature(name: str) -> None:
+    import batcher.ml as ml
+
+    ds = bt.from_pydict({"x": ["a", "b", "c", "d"], "z": [1.0, 2.0, 3.0, 4.0], "y": [0, 0, 1, 1]})
+    with pytest.raises(PlanError) as caught:
+        getattr(ml, name)(["x", "z"], "y").fit(ds)
+    assert "'x'" in str(caught.value)
+
+
+@pytest.mark.parametrize("name", LATER_ADDITIONS)
+def test_the_rest_of_the_surface_still_takes_numbers(name: str) -> None:
+    import batcher.ml as ml
+
+    ds = bt.from_pydict({"a": [1.0, 4.0, 2.0, 9.0], "b": [2.0, 1.0, 5.0, 3.0]})
+    assert getattr(ml, name)(["a", "b"]).fit(ds).transform(ds).count() == 4
+
+
+@pytest.mark.parametrize("name", ["DummyClassifier", "DummyRegressor"])
+def test_a_baseline_rejects_a_feature_list_where_a_target_belongs(name: str) -> None:
+    """It took the list, then raised ``TypeError: unhashable type: 'list'`` from inside fit.
+
+    A baseline has no features, so writing it like every other estimator is the natural
+    mistake; the message it produced named neither the argument nor the shape expected.
+    """
+    import batcher.ml as ml
+
+    with pytest.raises(PlanError, match="one target column"):
+        getattr(ml, name)(["x", "z"])
+
+
+@pytest.mark.parametrize("name", ["DummyClassifier", "DummyRegressor"])
+def test_a_baseline_still_takes_a_target_name(name: str) -> None:
+    import batcher.ml as ml
+
+    ds = bt.from_pydict({"y": [1.0, 2.0, 3.0, 4.0]})
+    assert getattr(ml, name)("y").fit(ds).predict(ds).count() == 4

@@ -216,6 +216,8 @@ class InteractionFeatures(Preprocessor):
         columns: The columns to cross; every distinct pair becomes a product column.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns",)
 
     def __init__(self, columns: Sequence[str]) -> None:

@@ -97,7 +97,10 @@ class _KNeighbors:
             PlanError: If nothing usable remains, or the reference set exceeds
                 `max_reference`.
         """
+        from batcher.ml._estimator import require_numeric
         from batcher.plan.expr_ir import col
+
+        require_numeric(self, ds, self.features)
 
         usable = ds.filter(col(self.target).is_not_null())
         points, carried = read_reference(

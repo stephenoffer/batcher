@@ -50,6 +50,16 @@ class DummyRegressor:
     def __init__(
         self, target: str, *, strategy: str = "mean", output_column: str = "prediction"
     ) -> None:
+        if not isinstance(target, str):
+            # A baseline takes the target column alone - it has no features by definition -
+            # so a list here is the caller writing it like every other estimator. Left
+            # alone it reached a dict lookup and raised ``TypeError: unhashable type:
+            # 'list'`` from inside fit, which names neither the argument nor the shape.
+            raise PlanError(
+                f"DummyRegressor takes the name of one target column, not "
+                f"{target!r}. A baseline has no features, so there is no "
+                "feature list to pass."
+            )
         if strategy not in _REGRESSOR_STRATEGIES:
             raise PlanError(
                 f"strategy must be one of {sorted(_REGRESSOR_STRATEGIES)}, got {strategy!r}."
@@ -133,6 +143,16 @@ class DummyClassifier:
     def __init__(
         self, target: str, *, strategy: str = "most_frequent", output_column: str = "prediction"
     ) -> None:
+        if not isinstance(target, str):
+            # A baseline takes the target column alone - it has no features by definition -
+            # so a list here is the caller writing it like every other estimator. Left
+            # alone it reached a dict lookup and raised ``TypeError: unhashable type:
+            # 'list'`` from inside fit, which names neither the argument nor the shape.
+            raise PlanError(
+                f"DummyClassifier takes the name of one target column, not "
+                f"{target!r}. A baseline has no features, so there is no "
+                "feature list to pass."
+            )
         if strategy not in _CLASSIFIER_STRATEGIES:
             raise PlanError(
                 f"strategy must be one of {sorted(_CLASSIFIER_STRATEGIES)}, got {strategy!r}."

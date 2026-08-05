@@ -208,6 +208,8 @@ class IterativeImputer(Preprocessor):
             an unpenalized least-squares fit is unstable.
     """
 
+    numeric_only = True
+
     __slots__ = (
         "columns",
         "imputations_",
@@ -299,6 +301,7 @@ class IterativeImputer(Preprocessor):
             PlanError: If a column is entirely null, leaving nothing to learn a fill from.
             ColumnNotFoundError: If a named column is missing.
         """
+        self._check_numeric(ds)
         from batcher.ml.linear import Ridge
 
         aggregates = {}

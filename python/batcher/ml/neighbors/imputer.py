@@ -79,6 +79,8 @@ class KNNImputer(Preprocessor):
         max_reference: The ceiling on the reference set.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "k", "max_reference", "points_", "weights")
 
     def __init__(
@@ -126,6 +128,7 @@ class KNNImputer(Preprocessor):
         Raises:
             PlanError: If no row is complete, or the reference set exceeds `max_reference`.
         """
+        self._check_numeric(ds)
         points, _ = read_reference(
             ds, self.columns, [], what="KNNImputer", limit=self.max_reference
         )

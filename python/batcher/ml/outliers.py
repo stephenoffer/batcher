@@ -239,6 +239,8 @@ class OutlierClipper(Preprocessor):
         threshold: The rule's width.
     """
 
+    numeric_only = True
+
     __slots__ = ("bounds_", "columns", "method", "threshold")
 
     def __init__(
@@ -269,6 +271,7 @@ class OutlierClipper(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         for name in self.columns:
             self.bounds_[name] = outlier_bounds(
                 ds, name, method=self.method, threshold=self.threshold

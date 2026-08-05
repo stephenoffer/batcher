@@ -427,7 +427,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `converters.py` | 271 | Framework converters — hand Arrow batches to NumPy / PyTorch training loops. |
 | `devices.py` | 446 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
 | `discriminant.py` | 377 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
-| `dummy.py` | 208 | Baseline predictors — the "does my model beat doing nothing" reference. |
+| `dummy.py` | 228 | Baseline predictors — the "does my model beat doing nothing" reference. |
 | `embed.py` | 500 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
 | `embed_api.py` | 325 | Embedding encoders backed by a *served* endpoint, not a local model. |
 | `feature_scores.py` | 331 | Univariate feature scoring — rank every feature against the target in one pass each. |
@@ -440,7 +440,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `model_selection.py` | 725 | Cross-validated scoring and learning curves — the model-selection loop, tied together. |
 | `multiclass.py` | 224 | `OneVsRestClassifier` — multiclass classification built from a binary estimator. |
 | `naive_bayes.py` | 512 | Naive Bayes — a probabilistic classifier whose whole fit is a grouped aggregate. |
-| `outliers.py` | 364 | Outlier detection — finding the rows a model should not be trained on, at scale. |
+| `outliers.py` | 367 | Outlier detection — finding the rows a model should not be trained on, at scale. |
 | `permutation.py` | 187 | The keyed epoch permutation — a shuffled sample order that is computed, not stored. |
 | `pipeline.py` | 217 | Multi-stage streaming pipeline with credit-based backpressure (the GPU-feeding moat). |
 | `sampling.py` | 378 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
@@ -565,8 +565,8 @@ Nearest-neighbour models — prediction and imputation by local similarity.
 
 | module | lines | what it is |
 |---|---|---|
-| `estimators.py` | 252 | `KNeighborsClassifier` and `KNeighborsRegressor` — prediction by local averaging. |
-| `imputer.py` | 175 | `KNNImputer` — fill a gap with what similar rows had there. |
+| `estimators.py` | 255 | `KNeighborsClassifier` and `KNeighborsRegressor` — prediction by local averaging. |
+| `imputer.py` | 178 | `KNNImputer` — fill a gap with what similar rows had there. |
 | `reference.py` | 241 | The nearest-neighbour primitive the k-NN estimators and imputer share. |
 | `smote.py` | 233 | `smote` — grow a minority class by interpolating between its own neighbours. |
 
@@ -588,7 +588,7 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 | `base.py` | 493 | The `Preprocessor` contract — sklearn-style fit/transform on a Dataset. |
 | `binning.py` | 163 | Binning / discretization preprocessors. |
 | `chain.py` | 232 | `Chain` — a sequence of preprocessors fitted and applied as one (sklearn ``Pipeline``). |
-| `imputers.py` | 382 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
+| `imputers.py` | 385 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
 | `persistence.py` | 261 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
 | `polynomial.py` | 358 | Basis expansion — polynomial/interaction terms, and B-splines. |
 | `power.py` | 385 | The Yeo-Johnson power transform and its one-pass maximum-likelihood fit. |
@@ -612,8 +612,8 @@ Derived-feature preprocessors — the columns a model needs that the table doesn
 
 | module | lines | what it is |
 |---|---|---|
-| `construct.py` | 397 | Feature construction — the columns a model needs that the source table doesn't have. |
-| `decomposition.py` | 323 | Dimensionality reduction — projecting many correlated columns onto a few components. |
+| `construct.py` | 399 | Feature construction — the columns a model needs that the source table doesn't have. |
+| `decomposition.py` | 329 | Dimensionality reduction — projecting many correlated columns onto a few components. |
 | `encode.py` | 306 | Rank and label transforms — order-based rescaling and one-vs-rest label expansion. |
 | `grouped.py` | 279 | Group-aggregate features — what a row's group looks like, attached to the row. |
 
