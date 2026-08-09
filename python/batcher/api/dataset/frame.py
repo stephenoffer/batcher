@@ -1981,6 +1981,78 @@ class Dataset:
         """
         return build_with_random(self, name, seed=seed, normal=normal)
 
+    def transform_with_state(
+        self,
+        fn: Callable[[tuple, Any, dict | None], tuple[Any, dict | None]],
+        *,
+        group_by: str | list[str],
+        output_columns: list[str],
+        state_ttl: str | None = None,
+    ) -> Dataset:
+        """Arbitrary keyed stateful processing over a stream (Spark ``transformWithState``).
+
+        The escape hatch for the shapes the relational operators cannot express:
+        sessionization with custom rules, a running fraud score, a per-device state
+        machine, "alert when this key has been silent for ten minutes". `fn` owns one
+        key's state; the engine owns when it is called, checkpointed, and expired.
+
+        `fn(key, rows, state)` returns ``(rows_out, state_out)``, where `key` is the group
+        key's values as a tuple, `rows` is that key's rows in this micro-batch as an Arrow
+        `RecordBatch`, `state` is what the previous call returned for the key (None the
+        first time), `rows_out` is what to emit (a `RecordBatch`, a column dict, or None),
+        and `state_out` is the state to keep (None forgets the key).
+
+        State must be a flat mapping of scalars, because the whole key space is
+        checkpointed as one Arrow batch. Keep a large payload elsewhere and hold a
+        reference to it.
+
+        Args:
+            fn: The per-key callback described above.
+            group_by: The key column name(s) that partition the state.
+            output_columns: The column names `fn` emits. Types come from what it returns.
+            state_ttl: How long a key's state survives without new rows (``"10 minutes"``).
+                ``None`` never expires, which is bounded only if the key space is — and is
+                what the streaming state budget will eventually refuse.
+
+        Returns:
+            A new `Dataset` of whatever `fn` emitted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> def running_total(key, rows, state):
+                ...     total = (state or {"total": 0})["total"] + sum(rows.column("v").to_pylist())
+                ...     return {"user": [key[0]], "total": [total]}, {"total": total}
+                >>> events = bt.from_pydict({"user": ["a", "b", "a"], "v": [1, 2, 3]})
+                >>> out = events.transform_with_state(
+                ...     running_total,
+                ...     group_by="user",
+                ...     output_columns=["user", "total"],
+                ...     state_ttl="1 hour",
+                ... )
+                >>> sorted(zip(*[out.to_pydict()[c] for c in ("user", "total")], strict=True))
+                [('a', 4), ('b', 2)]
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.plan.functions.temporal import _duration_micros
+        from batcher.plan.logical import TransformWithState
+
+        keys = [group_by] if isinstance(group_by, str) else list(group_by)
+        if not keys:
+            raise PlanError("transform_with_state(): group_by must name at least one column")
+        missing = [k for k in keys if k not in self.columns]
+        if missing:
+            raise PlanError(f"transform_with_state(): unknown group_by column(s) {missing}")
+        if not output_columns:
+            raise PlanError(
+                "transform_with_state(): output_columns must name the columns fn emits — "
+                "the engine cannot infer them from an opaque callback"
+            )
+        ttl = _duration_micros(state_ttl, arg="state_ttl") if state_ttl else 0
+        node = TransformWithState(self._plan, fn, tuple(keys), tuple(output_columns), ttl)
+        return Dataset(node, self._sources)
+
     def drop_duplicates_within_watermark(
         self, subset: list[str], *, event_time: str, lateness: str
     ) -> Dataset:
@@ -2043,8 +2115,17 @@ class Dataset:
 
             ds.session_window("ts", "5m", partition_by=["user"], hits=col("v").sum())
 
-        Composed from the window + group-by engine (no new operator), so it is
-        differential-tested against DuckDB and runs single-node or distributed.
+        Over a bounded source this composes from the window + group-by engine with no
+        new operator, so it is differential-tested against DuckDB and runs single-node
+        or distributed.
+
+        Over a **stream** it has to wait, because a session's end is not knowable in
+        advance: every event extends the session it lands in, and an event between two
+        sessions merges them. So a session's rows are held until the watermark passes
+        its last event plus `gap`, and only then aggregated and emitted — by the same
+        code the bounded path runs. That bounds the state to sessions still open, and it
+        means a late event cannot reopen a session already emitted; it is dropped, as it
+        would be from a closed window. Use `with_watermark` to buy a straggler room.
 
         Args:
             time_col: The event-time column that orders events into sessions.
@@ -4283,15 +4364,21 @@ class Dataset:
         right_time: str,
         within: str,
         lateness: str | None = None,
+        how: str = "inner",
     ) -> Dataset:
-        """Watermark-bounded stream-stream interval inner join (Spark stream-stream join).
+        """Watermark-bounded stream-stream interval join (Spark stream-stream join).
 
         Joins two streams on equality keys (`on` / `left_on`+`right_on`) **and** an
         event-time interval — a row pair matches only if
         ``|left_time - right_time| <= within``. That time bound is what lets buffered
         state be evicted once the watermark passes, keeping memory bounded over two
-        unbounded streams. Over bounded sources it is a plain inner join plus the
-        interval filter. Consume the streaming result with `iter_batches()`.
+        unbounded streams. Over bounded sources it is a plain join plus the interval
+        filter. Consume the streaming result with `iter_batches()`.
+
+        An outer `how` emits a row that never matched, padded with nulls, at the moment
+        the watermark guarantees no partner can still arrive — which is the only moment
+        such a statement is decidable about an unbounded stream, and why the interval is
+        required rather than optional.
 
         Args:
             other: The right-hand stream.
@@ -4302,6 +4389,7 @@ class Dataset:
             right_time: The right event-time column.
             within: The maximum time difference for a pair to match (e.g. ``"1h"``).
             lateness: Extra grace before evicting buffered state; ``None`` for none.
+            how: ``"inner"`` (default), ``"left"``, ``"right"``, or ``"full"``.
 
         Returns:
             A new `Dataset` of the interval-joined rows.
@@ -4320,10 +4408,15 @@ class Dataset:
                 >>> joined.count()
                 2
         """
+        from batcher._internal.errors import PlanError
         from batcher.io.source import is_bounded
         from batcher.plan.functions.temporal import _duration_micros
         from batcher.plan.logical import WatermarkStreamJoin
 
+        if how not in ("inner", "left", "right", "full"):
+            raise PlanError(
+                f"join_stream(): unknown how={how!r}; use 'inner', 'left', 'right', or 'full'"
+            )
         left_keys, right_keys = _resolve_join_keys(on, left_on, right_on)
         within_us = _duration_micros(within, arg="join within")
         lateness_us = _duration_micros(lateness, arg="join lateness") if lateness else 0
@@ -4331,9 +4424,11 @@ class Dataset:
         combined = self._sources + other._sources
 
         if all(is_bounded(s) for s in combined):
-            joined = self.join(other, left_on=left_keys, right_on=right_keys, how="inner")
-            diff = Col(left_time).cast("int64") - Col(right_time).cast("int64")
-            return joined.filter((diff <= within_us) & (diff >= -within_us))
+            from batcher.api.dataset._build import _bounded_interval_join
+
+            return _bounded_interval_join(
+                self, other, left_keys, right_keys, left_time, right_time, within_us, how
+            )
 
         output = _join_output(self.columns, other.columns, left_keys, right_keys, "inner", "_right")
         node = WatermarkStreamJoin(
@@ -4346,6 +4441,7 @@ class Dataset:
             right_time,
             within_us,
             lateness_us,
+            how,
         )
         return Dataset(node, combined)
 

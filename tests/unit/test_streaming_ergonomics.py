@@ -13,13 +13,13 @@ import pytest
 
 from batcher._internal.errors import PlanError
 from batcher.api.streaming import StreamingQuery
-from batcher.plan.streaming import parse_interval_seconds
-from batcher.plan.streaming.spec import (
+from batcher.plan.streaming import (
     OutputMode,
     StreamingQueryProgress,
     StreamingQueryStatus,
     Trigger,
     Watermark,
+    parse_interval_seconds,
 )
 
 pytestmark = pytest.mark.unit
@@ -238,7 +238,7 @@ def test_query_core_accessors():
     assert q.id == "q-test"
     assert q.is_active is True
     assert q.last_progress.batch_id == 1
-    assert len(q.recent_progress()) == 2
+    assert len(q.recent_progress) == 2
     assert q.status.batches_processed == 2
 
 
@@ -246,7 +246,7 @@ def test_query_spark_aliases_delegate():
     q = _query(active=False)
     assert q.isActive is False
     assert q.lastProgress.batch_id == 1
-    assert len(q.recentProgress()) == 2
+    assert len(q.recentProgress) == 2
     assert q.awaitTermination(0.0) is True
     assert q.processAllAvailable() is True
 
@@ -280,3 +280,31 @@ def test_register_allows_reusing_a_stopped_name():
     finally:
         _deregister(name)
     assert name not in _ACTIVE
+
+
+def test_the_active_registry_does_not_grow_with_finished_queries():
+    """A driver that neither stops nor awaits its query is ordinary — a scheduler firing
+    an `available_now` backfill takes its rows and moves on. Those entries stayed forever,
+    each holding a handle, an engine, a processor, a sink and a progress deque: invisible
+    in `bt.streams()`, which filters on liveness, and unbounded in the dict behind it."""
+    from batcher.api.streaming._query import _ACTIVE, _register, active_streams
+
+    before = len(_ACTIVE)
+    for i in range(5):
+        _register(f"swept-{i}", StreamingQuery(f"swept-{i}", _FakeEngine(active=False)))
+    assert len(_ACTIVE) > before
+
+    assert active_streams() == []
+    assert len(_ACTIVE) == before, "finished queries were never swept out"
+
+
+def test_a_running_query_is_never_swept():
+    from batcher.api.streaming._query import _ACTIVE, _register, active_streams
+
+    live = StreamingQuery("kept", _FakeEngine(active=True))
+    _register("kept", live)
+    try:
+        assert live in active_streams()
+        assert "kept" in _ACTIVE
+    finally:
+        _ACTIVE.pop("kept", None)

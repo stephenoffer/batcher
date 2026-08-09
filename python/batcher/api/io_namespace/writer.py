@@ -107,8 +107,20 @@ def _undistributable_stream_reason(plan: Any) -> str | None:
     (single-node == distributed), and is not a slogan: the one shape that slipped through this
     gate silently returned a different answer on a cluster than on one box.
     """
-    from batcher.plan.logical import Aggregate, is_streamable
+    from batcher.plan.logical import Aggregate, TransformWithState, is_streamable
 
+    if isinstance(plan, TransformWithState):
+        # Named rather than folded into "another pipeline breaker": this one *has* a
+        # mergeable form (a shuffle by the group keys, so each key's state lives on exactly
+        # one worker and the partitions' key sets are disjoint) and the runner simply does
+        # not implement it yet. A reader who is told "sort / join / window" will restructure
+        # a plan that did not need restructuring.
+        return (
+            "transform_with_state has no distributed implementation yet: its mergeable "
+            "form is a shuffle by the group keys, which the distributed runner does not "
+            "do. Run it with distributed=False rather than have the cluster compute "
+            "something else."
+        )
     if not isinstance(plan, Aggregate) or not is_streamable(plan.input):
         return (
             "distributed streaming supports a stateless pipeline or a top-level "
@@ -537,7 +549,7 @@ class Writer:
         weaker guarantee than the API implies.
         """
         from batcher._internal.errors import PlanError
-        from batcher.api.streaming import _DRAIN_TRIGGER_KINDS, _is_stateless
+        from batcher.api.streaming import _is_stateless
         from batcher.dist.executor import _is_splittable_source
         from batcher.io.source import is_bounded
 
@@ -558,7 +570,7 @@ class Writer:
         if not splittable:
             return None
 
-        drain = trigger is not None and trigger.kind in _DRAIN_TRIGGER_KINDS
+        drain = trigger is not None and trigger.is_drain
         if drain and checkpoint is None and is_bounded(source):
             from batcher.api.streaming import start_distributed_stream_drain
 
@@ -611,14 +623,18 @@ class Writer:
     ) -> Any:
         """Build the per-micro-batch `StreamSink` for a path/format streaming write.
 
-        `query_name` becomes the transactional sink's Delta ``txn`` application id, which
-        is what makes a restarted query's replayed micro-batch idempotent — so it has to
+        `query_name` becomes the transactional sink's ``txn`` application id, which is
+        what makes a restarted query's replayed micro-batch idempotent — so it has to
         reach the sink, not just the query engine.
+
+        `fmt` reaches the sink too, and used not to: every mode-aware format was handed to
+        a Delta-pinned sink, so a streaming ``format="iceberg"`` write produced a Delta
+        table at the Iceberg path, with the right rows and no error anywhere.
         """
-        from batcher.io.formats.streaming.sinks import DeltaStreamSink, FileStreamSink
+        from batcher.io.formats.streaming.sinks import FileStreamSink, TransactionalStreamSink
 
         if fmt in _MODE_AWARE_SINKS:
-            return DeltaStreamSink(path, query_name=query_name, **opts)
+            return TransactionalStreamSink(path, fmt, query_name=query_name, **opts)
         return FileStreamSink(path, fmt, **opts)
 
     def console(
@@ -627,6 +643,7 @@ class Writer:
         trigger: Trigger | None = None,
         output_mode: str = "append",
         num_rows: int = 20,
+        truncate: bool | int = True,
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -636,6 +653,9 @@ class Writer:
             trigger: Micro-batch cadence; a one-shot batch when omitted.
             output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
             num_rows: Rows to print per micro-batch (default 20).
+            truncate: Shorten string cells for display (Spark's ``truncate``). ``True``
+                keeps 20 characters, an int keeps that many, ``False`` prints them whole.
+                Display only; nothing downstream sees the shortened value.
             query_name: Optional name for the streaming query.
             checkpoint: Optional checkpoint location for offset tracking.
 
@@ -655,7 +675,11 @@ class Writer:
         from batcher.io.formats.streaming.sinks import ConsoleStreamSink
 
         return self._start_stream(
-            ConsoleStreamSink(num_rows=num_rows), trigger, output_mode, query_name, checkpoint
+            ConsoleStreamSink(num_rows=num_rows, truncate=truncate),
+            trigger,
+            output_mode,
+            query_name,
+            checkpoint,
         )
 
     def memory(
@@ -756,6 +780,103 @@ class Writer:
             ForeachBatchStreamSink(fn), trigger, output_mode, query_name, checkpoint
         )
 
+    def noop(
+        self,
+        *,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+    ) -> StreamingQuery:
+        """Run the pipeline and discard its output (Spark ``format("noop")``).
+
+        The benchmark sink. Measuring a pipeline through a real sink measures the sink too
+        — a Parquet write is compression and fsyncs, the console sink is a terminal, the
+        memory sink grows until the box dies. Discarding the rows leaves the read, the
+        transform and the engine, which is the thing under test.
+
+        The rows are still counted, so `recent_progress` reports what the query processed.
+        A benchmark sink that swallowed the count would make "this is fast" and "this
+        produced nothing" look identical.
+
+        Args:
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+
+        Returns:
+            A `StreamingQuery` handle for the running (output-discarding) stream.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> demo = bt.read.rate_micro_batch(100, num_rows=1000)
+                >>> query = demo.write.noop(trigger=bt.Trigger.available_now())
+                >>> query.await_termination()
+                True
+                >>> sum(p.num_input_rows for p in query.recent_progress)
+                1000
+        """
+        from batcher.io.formats.streaming.sinks import NoopStreamSink
+
+        return self._start_stream(NoopStreamSink(), trigger, output_mode, query_name, checkpoint)
+
+    def kafka(
+        self,
+        topic: str | None = None,
+        *,
+        bootstrap_servers: str = "localhost:9092",
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to Kafka (Spark ``format("kafka")``).
+
+        The write side of `bt.read.kafka`, and the column contract is Spark's: a ``value``
+        column is required, ``key`` / ``topic`` / ``partition`` / ``headers`` are optional,
+        and `topic` here is the destination for rows that carry no ``topic`` column.
+        Payload columns may be binary or string.
+
+        Delivery is at-least-once. Each micro-batch is flushed and acknowledged before it
+        is reported written, so a failure replays rather than losing rows — but a replayed
+        epoch republishes, so downstream consumers must be idempotent or dedup on the key.
+
+        Args:
+            topic: Destination topic for rows with no ``topic`` column.
+            bootstrap_servers: The Kafka bootstrap servers.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: Further ``confluent-kafka`` producer configuration; underscores
+                become dots, so ``compression_type="zstd"`` sets ``compression.type``.
+
+        Returns:
+            A `StreamingQuery` handle for the running Kafka write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.kafka("raw", stream=True)  # doctest: +SKIP
+                >>> query = events.select(  # doctest: +SKIP
+                ...     value=bt.col("value")
+                ... ).write.kafka("clean", bootstrap_servers="broker:9092")
+        """
+        from batcher.io.formats.streaming.kafka_sink import KafkaStreamSink
+
+        return self._start_stream(
+            KafkaStreamSink(topic=topic, bootstrap_servers=bootstrap_servers, **options),
+            trigger,
+            output_mode,
+            query_name,
+            checkpoint,
+        )
+
     def for_each(
         self,
         fn: Callable[[dict[str, Any]], Any],
@@ -767,8 +888,14 @@ class Writer:
     ) -> StreamingQuery:
         """Stream each row of each micro-batch into a user callback ``fn(row)``.
 
+        `fn` may also be a `ForeachWriter` — an object with `open(partition_id, epoch_id)`,
+        `process(row)`, and `close(error)` (Spark's shape). That is what a destination
+        needing a connection wants: `open` acquires it, `close` releases it even when the
+        epoch failed. A bare function has nowhere to put one.
+
         Args:
-            fn: Callback ``fn(row)`` invoked once per row, ``row`` a dict.
+            fn: Callback ``fn(row)`` invoked once per row (``row`` a dict), or a
+                `ForeachWriter` whose `process` receives each row.
             trigger: Micro-batch cadence; a one-shot batch when omitted.
             output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
             query_name: Optional name for the streaming query.

@@ -231,6 +231,11 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
                     ctx.check_budget(state_bytes, "the streaming aggregate does not spill")?;
                     let out = finalize_partial(&merged, group_keys, aggregates)?;
                     if let (Some(m), Some(id)) = (ctx.meter, id) {
+                        // Only when something was actually compiled: the cell is empty if no
+                        // morsel carried rows, and the default tag is already `"interp"`.
+                        if let Some(compiled) = jit.get() {
+                            m.note_backend(id, compiled.backend_tag());
+                        }
                         // Peak is the *state* plus the result — not the input, which this
                         // executor never holds. That is a smaller and truer number than the
                         // materializing path's, and Carbonite should reserve against it.

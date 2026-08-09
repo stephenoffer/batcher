@@ -1,8 +1,8 @@
 {
   "gated": {
     "batcher": 152,
-    "batcher._native": 3200,
-    "duckdb": 2782,
+    "batcher._native": 3223,
+    "duckdb": 2805,
     "other": 749,
     "polars": 11,
     "ray": 226,

@@ -19,7 +19,14 @@ from batcher.io.source.base import Source
 from batcher.io.splits import Split
 from batcher.plan.source_stats import SourceStatistics
 
-__all__ = ["is_bounded", "iter_source", "plan_splits", "read_source", "source_statistics"]
+__all__ = [
+    "continues_across_passes",
+    "is_bounded",
+    "iter_source",
+    "plan_splits",
+    "read_source",
+    "source_statistics",
+]
 
 
 def plan_splits(
@@ -104,6 +111,35 @@ def is_bounded(source: Source) -> bool:
     bounded unless it opts out.
     """
     return getattr(source, "bounded", True)
+
+
+def continues_across_passes(source: Source) -> bool:
+    """Whether a fresh `iter_batches()` *continues* the stream rather than replaying it.
+
+    An unbounded source can end an `iter_batches()` generator for two very different
+    reasons, and a streaming driver must not confuse them:
+
+    * **It continues.** The incremental file source ends a pass when the directory holds
+      nothing new, and its durable seen-store means the next pass returns only what has
+      arrived since. A broker is the same: its offsets carry forward. Asking again is how
+      the stream keeps flowing, so a driver that stops here stops the query.
+    * **It replays.** An `IteratorSource` built from a batch factory calls that factory
+      again, from the beginning. Asking again yields the *same rows a second time*, so a
+      driver that re-opens it duplicates the entire stream, forever.
+
+    Nothing in the `Source` protocol distinguished the two, so this is declared: a source
+    opts in with ``continues_across_passes = True``. Default False, because replaying is
+    the answer that is merely wrong rather than catastrophic — a stream that stops early
+    is visible in `is_active`; one that re-reads its input in a loop writes duplicates to
+    the sink until someone notices.
+
+    Args:
+        source: The source to ask.
+
+    Returns:
+        True when re-opening the source continues the stream.
+    """
+    return getattr(source, "continues_across_passes", False)
 
 
 def iter_source(

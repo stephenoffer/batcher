@@ -56,8 +56,13 @@ def st_geom_from_text(text: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'t': ['POINT(1 2)', '{"type":"Point","coordinates":[3,4]}', 'not a
-            ...     geometry']}
+            ...     {
+            ...         't': [
+            ...             'POINT(1 2)',
+            ...             '{"type":"Point","coordinates":[3,4]}',
+            ...             'not a geometry',
+            ...         ],
+            ...     }
             ... )
             >>> got = bt.st_as_text(bt.st_geom_from_text(bt.col("t")))
             >>> ds.select(v=got).to_pydict()

@@ -95,7 +95,8 @@ class KinesisSource(BrokerSource):
     """An unbounded Kinesis stream, consumed via ``boto3``.
 
     The ``topic`` is the Kinesis stream name. Options: ``region`` (AWS region),
-    ``iterator_type`` (``"TRIM_HORIZON"`` by default, or ``"LATEST"``), and
+    ``starting_position`` (``"earliest"`` / ``"latest"``, the name every broker here shares)
+    or its Kinesis spelling ``iterator_type`` (``"TRIM_HORIZON"`` / ``"LATEST"``), and
     ``partitions`` (the specific shards to read — set by :class:`BrokerSplit` on a
     worker; the values are shard *indices* into the discovered shard list).
 
@@ -122,8 +123,17 @@ class KinesisSource(BrokerSource):
         partitions: list[int] | None = None,
         region: str = "us-east-1",
         iterator_type: str = "TRIM_HORIZON",
+        starting_position: str | None = None,
         **options: Any,
     ) -> None:
+        # One option name across every broker (`starting_position`), mapped here onto
+        # Kinesis's own `ShardIteratorType`. The native spelling still works.
+        if starting_position is not None:
+            from batcher.io.formats.streaming.broker.schema import normalize_starting_position
+
+            iterator_type = normalize_starting_position(
+                starting_position, aliases={"earliest": "TRIM_HORIZON", "latest": "LATEST"}
+            )
         super().__init__(
             topic,
             poll_size=poll_size,

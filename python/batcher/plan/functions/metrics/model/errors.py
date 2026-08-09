@@ -276,6 +276,21 @@ def wape(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     return _residual(y_true, y_pred).abs().sum() / paired.sum()
 
 
+def _variance_ratio(unexplained: Expr, total: Expr) -> Expr:
+    """``1 - unexplained / total``, with an answer when the target has no variance at all.
+
+    A constant target makes the denominator zero, and it is not a rare input: a filtered
+    group, a degenerate fold, a single-valued segment in a `group_by` all produce one. Plain
+    division answered NaN when the prediction was also perfect, and **-inf** when it was not,
+    both of which then spread through any mean taken over groups or folds.
+
+    scikit-learn's rule, which this reproduces: with nothing to explain, a model that got it
+    exactly right scores 1.0 and one that did not scores 0.0.
+    """
+    degenerate = when(unexplained == lit(0.0)).then(lit(1.0)).otherwise(lit(0.0))
+    return when(total == lit(0.0)).then(degenerate).otherwise(lit(1.0) - unexplained / total)
+
+
 def r2(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     """Coefficient of determination — ``1 - SS_res / SS_tot``, scikit-learn's ``r2_score``.
 
@@ -303,7 +318,7 @@ def r2(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     paired_true = _as_column(y_true) + _as_column(y_pred) * Lit(0)
     # var() is the sample variance (n-1); (n-1) * var is exactly the total sum of squares.
     total = paired_true.var() * (paired_true.count() - lit(1))
-    return lit(1.0) - (error * error).sum() / total
+    return _variance_ratio((error * error).sum(), total)
 
 
 def explained_variance(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
@@ -329,7 +344,7 @@ def explained_variance(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
             {'m': [1.0]}
     """
     paired_true = _as_column(y_true) + _as_column(y_pred) * Lit(0)
-    return lit(1.0) - _residual(y_true, y_pred).var() / paired_true.var()
+    return _variance_ratio(_residual(y_true, y_pred).var(), paired_true.var())
 
 
 def msle(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:

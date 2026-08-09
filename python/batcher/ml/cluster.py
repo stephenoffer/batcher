@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import argmax_prediction, require_fitted
+from batcher.ml._estimator import argmax_prediction, require_fitted, require_numeric
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -152,9 +152,13 @@ class KMeans:
 
         Returns:
             ``self``, fitted.
+
+        Raises:
+            PlanError: If a feature column is not numeric.
         """
         from batcher.plan.functions.aggregate import mean as mean_
 
+        require_numeric(self, ds, self.columns)
         centroids = self._initial_centroids(ds)
         aggregates = {name: mean_(col(name)) for name in self.columns}
         for iteration in range(self.max_iter):
@@ -305,6 +309,7 @@ class NearestCentroid:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
         grouped = (
             ds.group_by(self.target)
             .agg(**{name: mean_(col(name)) for name in self.features})

@@ -34,6 +34,7 @@ pub(crate) mod list_ops;
 pub(crate) mod map;
 pub(crate) mod math;
 pub(crate) mod media;
+pub(crate) mod mime;
 pub(crate) mod security;
 pub(crate) mod str;
 pub(crate) mod temporal;

@@ -23,14 +23,16 @@ from batcher._sql.parser.subquery.core import (
     _apply_in_subquery,
     _apply_single_predicate,
     _apply_subquery_predicates,
-    _correlation_pair,
     _decorrelate_scalar_subqueries,
     _in_subquery_select,
     _is_in_subquery,
+    _not_in_antijoin,
+)
+from batcher._sql.parser.subquery.correlation import (
+    _correlation_pair,
     _is_plain_column,
     _local_columns,
     _local_tables,
-    _not_in_antijoin,
     _outer_key_reducer,
     _reject_correlated,
 )

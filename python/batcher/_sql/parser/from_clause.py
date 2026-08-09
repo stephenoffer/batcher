@@ -137,7 +137,7 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
     an outer join must null-extend, and preserving them needs a real nested-loop join
     operator in the engine (tracked in `docs/architecture/internals/databricks_parity.md`).
     """
-    eq_pairs, extra = _split_join_on(on)
+    eq_pairs, extra = _split_join_on(on, set(ds.columns), set(right.columns))
     if not eq_pairs:
         _reject_ambiguous_residual(on, ds, right, set())
         if how == "inner":
@@ -257,8 +257,32 @@ def _reject_ambiguous_residual(extra, left: Dataset, right: Dataset, keys: set[s
         )
 
 
-def _split_join_on(on):
-    """Split an ``ON`` predicate into ``(equi key pairs, residual predicate)``."""
+def _orient_key_pair(a: str, b: str, left_cols, right_cols) -> tuple[str, str]:
+    """Order one ``ON`` equality as ``(left key, right key)`` by *membership*.
+
+    SQL attaches no meaning to which side of the ``=`` a key is written on, so the written
+    order is authoritative only when it happens to resolve. Preferring it whenever it does
+    keeps every previously-working join on exactly its old path.
+    """
+    if left_cols is None or right_cols is None:
+        return (a, b)
+    if a in left_cols and b in right_cols:
+        return (a, b)
+    if b in left_cols and a in right_cols:
+        return (b, a)
+    return (a, b)  # ambiguous or unresolvable: keep the written order, as before
+
+
+def _split_join_on(on, left_cols=None, right_cols=None):
+    """Split an ``ON`` predicate into ``(equi key pairs, residual predicate)``.
+
+    Each equality is oriented by which relation actually owns each column, not by the side
+    of the ``=`` it was typed on. Reading position alone made ``ON b.k = a.k`` — the same
+    join as ``ON a.k = b.k`` — bind ``b.k`` to the *left* relation, and the query died with
+    ``projection '__jk_l0' references unknown column(s) ['b.k']``. It affected the plainest
+    possible form (``a JOIN b ON b.bk = a.ak``) and blocked TPC-DS q72, q75, q78 and q93,
+    all of which write the right-hand table first.
+    """
     eq_pairs: list[tuple[str, str]] = []
     residual: list = []
     for conj in _and_conjuncts(on):
@@ -267,7 +291,9 @@ def _split_join_on(on):
             and isinstance(conj.this, exp.Column)
             and isinstance(conj.expression, exp.Column)
         ):
-            eq_pairs.append((conj.this.name, conj.expression.name))
+            eq_pairs.append(
+                _orient_key_pair(conj.this.name, conj.expression.name, left_cols, right_cols)
+            )
         else:
             residual.append(conj)
     extra = None

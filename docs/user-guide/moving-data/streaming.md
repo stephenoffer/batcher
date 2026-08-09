@@ -1,6 +1,6 @@
 # Streaming
 
-Batcher treats **batch as the bounded special case of streaming**. One `Dataset`
+Batcher treats **batch as the bounded special case of streaming**. One {py:class}`Dataset <batcher.Dataset>`
 API (`group_by`, `window`, `join`, `with_columns`, `write`) runs over a finite table
 or an unbounded stream. Moving a pipeline from a one-off job to a continuous one
 means changing the *source*, or adding a `trigger`. There is no second API to learn
@@ -9,7 +9,7 @@ and nothing in the pipeline to rewrite.
 ## One API, batch or streaming
 
 Every operation below works on a bounded dataset (returning a result you can
-`collect()`) and on an unbounded one (consumed with `iter_batches()` or written to a
+{py:meth}`collect() <batcher.Dataset.collect>`) and on an unbounded one (consumed with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` or written to a
 sink). The query is identical:
 
 ```python
@@ -42,26 +42,31 @@ print(sum(seen))
 ```
 
 A bounded source can also `collect()`. An unbounded one cannot, since it would never
-finish, and it raises a clear `PlanError` if a terminal tries to materialize it. Use
-`ds.is_streaming` to check which you have.
+finish, and it raises a clear {py:exc}`PlanError <batcher.PlanError>` if a terminal tries to materialize it. Use
+{py:obj}`ds.is_streaming <batcher.Dataset.is_streaming>` to check which you have.
 
 ## Reading streams
 
-Streaming sources are unbounded relations behind the same `bt.read` namespace as
+Streaming sources are unbounded relations behind the same {py:obj}`bt.read <batcher.read>` namespace as
 files and tables:
 
 | Source | Reader |
 | --- | --- |
-| Apache Kafka | `bt.read.kafka("events", bootstrap_servers=...)` |
-| Amazon Kinesis | `bt.read.kinesis("my-stream", region=...)` |
-| Apache Pulsar | `bt.read.pulsar("events", service_url=...)` |
-| Google Pub/Sub | `bt.read.pubsub("projects/p/subscriptions/s")` |
-| Azure Event Hubs | `bt.read.eventhubs("hub", connection_str=...)` |
-| Incremental files (Auto Loader) | `bt.read.files_incremental(path, "parquet", state_dir=...)` |
-| Delta Lake (new commits) | `bt.read.delta(uri, stream=True)` |
-| Delta Change Data Feed | `bt.read.read_change_feed(uri)` |
-| Rate generator (dev) | `bt.read.rate(rows_per_second)` |
-| TCP socket (dev) | `bt.read.socket(host, port)` |
+| Apache Kafka | {py:meth}`bt.read.kafka("events", bootstrap_servers=...) <batcher.api.io_namespace.reader.Reader.kafka>` |
+| Amazon Kinesis | {py:meth}`bt.read.kinesis("my-stream", region=...) <batcher.api.io_namespace.reader.Reader.kinesis>` |
+| Apache Pulsar | {py:meth}`bt.read.pulsar("events", service_url=...) <batcher.api.io_namespace.reader.Reader.pulsar>` |
+| Google Pub/Sub | {py:meth}`bt.read.pubsub("projects/p/subscriptions/s") <batcher.api.io_namespace.reader.Reader.pubsub>` |
+| Azure Event Hubs | {py:meth}`bt.read.eventhubs("hub", connection_str=...) <batcher.api.io_namespace.reader.Reader.eventhubs>` |
+| Incremental files (Auto Loader) | {py:meth}`bt.read.files_incremental(path, "parquet", state_dir=...) <batcher.api.io_namespace.reader.Reader.files_incremental>` |
+| Delta Lake (new commits) | {py:meth}`bt.read.delta(uri, stream=True) <batcher.api.io_namespace.reader.Reader.delta>` |
+| Delta Change Data Feed | {py:meth}`bt.read.read_change_feed(uri) <batcher.api.io_namespace.reader.Reader.read_change_feed>` |
+| Rate generator (dev) | {py:meth}`bt.read.rate(rows_per_second) <batcher.api.io_namespace.reader.Reader.rate>` |
+| TCP socket (dev) | {py:meth}`bt.read.socket(host, port) <batcher.api.io_namespace.reader.Reader.socket>` |
+
+Every broker takes the same `starting_position=` — `"earliest"` or `"latest"` — whatever it
+calls the idea itself (Kafka's `auto.offset.reset`, Kinesis's `ShardIteratorType`, Event
+Hubs' offset sentinel, Pulsar's `InitialPosition`). Each connector's native spelling still
+works, so an existing reader keeps reading.
 
 The `rate` source generates rows and is handy for trying the API without external
 infrastructure (`num_rows` bounds it, `pace=False` removes the one-second cadence):
@@ -70,6 +75,17 @@ infrastructure (`num_rows` bounds it, `pace=False` removes the one-second cadenc
 demo = bt.read.rate(5, num_rows=10, pace=False)
 rows = [b.num_rows for b in demo.iter_batches()]
 print(sum(rows))  # 10 generated (value, timestamp) rows
+```
+
+`rate` promises rows per *second*, so how many land in a micro-batch depends on how long the
+previous one took — which makes it a poor benchmark input, because the thing being measured
+changes the input. `rate_micro_batch` promises rows per *batch* instead, so a run is
+reproducible:
+
+```python
+bench = bt.read.rate_micro_batch(4, num_rows=8)
+print([b.num_rows for b in bench.iter_batches()])
+# [4, 4]
 ```
 
 Kafka, Kinesis, and Delta need their optional dependency and a running service:
@@ -84,8 +100,8 @@ for batch in recent.iter_batches():
 
 ## Writing streams: the unified `ds.write`
 
-`ds.write(...)` is the one write surface. With a bounded source and no trigger it is
-a single batch write returning a `WriteManifest`, unchanged from a normal job. Add a
+{py:obj}`ds.write(...) <batcher.Dataset.write>` is the one write surface. With a bounded source and no trigger it is
+a single batch write returning a {py:class}`WriteManifest <batcher.io.WriteManifest>`, unchanged from a normal job. Add a
 `trigger=`, or point it at an unbounded source, and it runs as a streaming query:
 each micro-batch is appended, and you get back a `StreamingQuery` handle.
 
@@ -109,25 +125,41 @@ Sinks available on the write namespace:
 
 - `ds.write(path, format=..., trigger=...)` writes files such as Parquet, CSV, or JSON,
   one `part-batch*` file per micro-batch, idempotent on restart.
-- `ds.write.delta(uri, trigger=...)` makes a transactional Delta append per micro-batch.
-- `ds.write.console(trigger=...)` prints each micro-batch. Development only.
-- `ds.write.memory(name, trigger=...)` builds an in-memory table you read back with
-  `bt.read_memory(name)`.
-- `ds.write.for_each_batch(fn, trigger=...)` calls `fn(table, batch_id)` on each
+- {py:meth}`ds.write.delta(uri, trigger=...) <batcher.api.io_namespace.writer.Writer.delta>` makes a transactional Delta append per micro-batch.
+- {py:meth}`ds.write.console(trigger=..., num_rows=..., truncate=...) <batcher.api.io_namespace.writer.Writer.console>` prints each micro-batch.
+  Development only. Strings are shortened to 20 characters for display unless you pass
+  `truncate=False` or an explicit width.
+- {py:meth}`ds.write.memory(name, trigger=...) <batcher.api.io_namespace.writer.Writer.memory>` builds an in-memory table you read back with
+  {py:func}`bt.read_memory(name) <batcher.read_memory>`.
+- {py:meth}`ds.write.for_each_batch(fn, trigger=...) <batcher.api.io_namespace.writer.Writer.for_each_batch>` calls `fn(table, batch_id)` on each
   micro-batch. The whole Arrow table is passed, never a row, so this is the hook for
   custom upserts (`MERGE`/SCD), multi-sink fan-out, or any per-batch commit logic.
-- `ds.write.for_each(fn, trigger=...)` calls `fn(row)` per row.
+- {py:meth}`ds.write.noop(trigger=...) <batcher.api.io_namespace.writer.Writer.noop>` runs the pipeline and discards
+  its output. The benchmark sink: measuring through a real sink measures the sink too. Rows
+  are still counted, so `recent_progress` reports what the query processed.
+- {py:meth}`ds.write.for_each(fn, trigger=...) <batcher.api.io_namespace.writer.Writer.for_each>` calls `fn(row)` per row. Pass a
+  {py:class}`ForeachWriter <batcher.ForeachWriter>` instead of a function when the
+  destination needs a connection: its `open(partition_id, epoch_id)` acquires one and
+  returns whether to proceed, `process(row)` writes a row, and `close(error)` releases it,
+  including when the epoch failed. A bare function has nowhere to put a connection.
+- {py:meth}`ds.write.kafka(topic, bootstrap_servers=..., trigger=...) <batcher.api.io_namespace.writer.Writer.kafka>` publishes each row to Kafka.
+  The column contract is Spark's: `value` is required, and `key`, `topic`, `partition`, and
+  `headers` are optional. Delivery is at-least-once, so make the consumer idempotent or
+  dedup on the key.
 
 ### Triggers
 
-A `Trigger` sets the cadence (Spark parity):
+A {py:class}`Trigger <batcher.Trigger>` sets the cadence (Spark parity):
 
-- `bt.Trigger.processing_time("5 seconds")` fires a micro-batch on a wall-clock
+- {py:meth}`bt.Trigger.processing_time("5 seconds") <batcher.Trigger.processing_time>` fires a micro-batch on a wall-clock
   interval. This is the default streaming cadence.
-- `bt.Trigger.once()` processes one micro-batch of available data, then stops.
-- `bt.Trigger.available_now()` drains every record available when it starts, then stops.
+- {py:meth}`bt.Trigger.once() <batcher.Trigger.once>` processes all currently-available data, then stops.
+  Spark's `Once` puts it in a single micro-batch and was deprecated for exactly that reason;
+  here it drains across as many micro-batches as the data needs. Prefer `available_now()` in
+  new code: it is the same execution under the name Spark now recommends.
+- {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>` drains every record available when it starts, then stops.
   It is the incremental-batch and backfill trigger.
-- `bt.Trigger.continuous("1 second")` is the lowest-latency option: micro-batches run
+- {py:meth}`bt.Trigger.continuous("1 second") <batcher.Trigger.continuous>` is the lowest-latency option: micro-batches run
   back-to-back with no inter-batch delay, committing a checkpoint epoch on the
   interval. Stateless pipelines only.
 
@@ -142,7 +174,7 @@ A `Trigger` sets the cadence (Spark parity):
 - `"update"`: only the result rows whose value changed this micro-batch.
 
 Those literals are the values of the {py:class}`OutputMode <batcher.OutputMode>`
-constants, `bt.OutputMode.APPEND`, `bt.OutputMode.COMPLETE`, `bt.OutputMode.UPDATE`.
+constants, {py:obj}`bt.OutputMode.APPEND <batcher.OutputMode.APPEND>`, {py:obj}`bt.OutputMode.COMPLETE <batcher.OutputMode.COMPLETE>`, {py:obj}`bt.OutputMode.UPDATE <batcher.OutputMode.UPDATE>`.
 Pass a constant in place of the raw string for a typo-proof spelling.
 
 ```python
@@ -161,47 +193,11 @@ print(dict(zip(*[bt.read_memory("running_totals").to_pydict()[c]
                  for c in ("user", "total")], strict=True)))
 ```
 
-### Managing a query
+## Monitoring a running query
 
-`start`-style writes return a `StreamingQuery`:
-
-```python
-# docs: skip
-q = clicks.write("s3://bucket/out", format="parquet",
-                 trigger=bt.Trigger.processing_time("10 seconds"),
-                 checkpoint="s3://bucket/_ckpt")
-q.is_active            # True while running
-q.status               # a point-in-time StreamingQueryStatus
-q.recent_progress()    # per-micro-batch metrics
-q.exception()          # the failure that stopped it, or None (does not re-raise)
-q.stop()               # halt at the next micro-batch boundary
-bt.streams()           # all active streaming queries
-```
-
-With several queries running, `bt.await_any_termination(timeout=None)` blocks until
-the first of them stops, re-raising its exception if it failed. This is the Spark
-`awaitAnyTermination` pattern, for a driver that supervises multiple streams.
-
-### Is the query keeping up?
-
-Throughput tells you how fast a micro-batch ran. It cannot tell you whether that was fast
-enough, because "enough" is the trigger interval. Each `StreamingQueryProgress` carries
-`behind_by_ms`, the milliseconds the batch overran its cadence, and `is_behind` for the
-common check:
-
-```python
-# docs: skip
-late = [p for p in q.recent_progress() if p.is_behind]
-if late:
-    print(f"{len(late)} of the last {len(q.recent_progress())} batches ran long")
-    print(max(p.behind_by_ms for p in late), "ms worst case")
-```
-
-A batch that occasionally runs long is normal. A `behind_by_ms` that grows batch over batch
-means the query is falling behind its source, and the fix is upstream of the metric: a
-larger trigger interval, more workers, or less work per row. Both fields are `0` for a
-trigger with no interval (`once`, `available_now`, `continuous`), where there is no cadence
-to be late for.
+A streaming write hands back a `StreamingQuery`. It carries the query's liveness, the
+per-micro-batch metrics, the state each stateful operator holds, and the count of rows
+dropped as late. See {doc}`streaming-monitoring`.
 
 ## Event-time windows and watermarks
 
@@ -243,7 +239,7 @@ Five windows, from 23:30 the previous day through 01:30, and each click is count
 windows that contain it. The 00:00 window holds the 00:00 and 00:30 clicks, so it sums to 3.
 
 :::{warning}
-Grouping by a sliding window directly, `group_by(w=bt.window(col("ts"), "1h", "30m"))`,
+Grouping by a sliding window directly, {py:meth}`group_by(w=bt.window(col("ts"), "1h", "30m")) <batcher.Dataset.group_by>`,
 would group by the *list* rather than by the windows, counting each row once instead of
 once per window it belongs to. That is a wrong answer, so the engine rejects it and points
 at `explode`. A tumbling window (no slide) is a single start and groups directly.
@@ -258,7 +254,7 @@ a long-running stream.
 :::
 
 On an unbounded stream, declare a **watermark** so windowed state stays bounded:
-`ds.with_watermark(time_col, lateness)` lets the engine emit and evict a window once
+{py:meth}`ds.with_watermark(time_col, lateness) <batcher.Dataset.with_watermark>` lets the engine emit and evict a window once
 the watermark (`max(event_time) - lateness`) passes its end, and drop rows that
 arrive later than that. The query is otherwise identical to the batch one:
 
@@ -281,39 +277,25 @@ sessions = clicks.session_window("ts", "45m", hits=col("n").sum())
 print(sessions.select("session_start", "session_end", "hits").to_pydict())
 ```
 
-## Deduplication within a watermark
+## Operators that remember
 
-`drop_duplicates_within_watermark` keeps the first row per key seen inside the
-watermark window, forgetting keys the watermark has passed so memory stays bounded.
-Over a bounded source it is exact deduplication:
+Deduplication within a watermark, the stream-stream interval join, the session window,
+arbitrary keyed state, and the union of two streams all keep something between
+micro-batches, and each is bounded by a limit you choose rather than by the data. See
+{doc}`streaming-stateful`.
 
-```python
-records = bt.from_pydict({
-    "id": ["x", "y", "x", "z"],
-    "ts": [base, base, base + dt.timedelta(minutes=1), base],
-    "v": [1, 2, 3, 4],
-})
-deduped = records.drop_duplicates_within_watermark(["id"], event_time="ts",
-                                                   lateness="1h")
-print(sorted(deduped.to_pydict()["id"]))  # ['x', 'y', 'z'] — the second 'x' dropped
-```
+Two of them are worth knowing about before you reach for a workaround, because both used
+to be refusals:
 
-## Stream-to-stream joins
-
-`join_stream` joins two streams on keys **and** an event-time interval
-(`|left_time - right_time| <= within`). The time bound is what lets buffered state be
-evicted by the watermark, keeping a two-stream join in bounded memory. Bounded
-sources run it as a plain join plus the interval filter:
-
-```python
-impressions = bt.from_pydict({"ad": ["a", "b"], "shown": [base, base]})
-clicks2 = bt.from_pydict({"ad": ["a"], "clicked": [base + dt.timedelta(minutes=2)]})
-
-attributed = impressions.join_stream(
-    clicks2, on="ad", left_time="shown", right_time="clicked", within="5m"
-)
-print(attributed.to_pydict()["ad"])  # ['a'] — clicked within 5 minutes of shown
-```
+- **Joining a stream to a static table.** Write it as an ordinary
+  {py:meth}`join <batcher.Dataset.join>`. The table is read once when the query starts and every
+  micro-batch joins against the whole of it. The join types that would need the *static*
+  side to be complete are refused, which is where Spark draws the line too. See
+  {doc}`/cookbook/streaming/stream-join`.
+- **Session windows.** {py:meth}`session_window <batcher.Dataset.session_window>` works over a stream. A session has no
+  end until the gap has passed with nothing arriving, so its rows are held until the
+  watermark says so and then aggregated by the same code the bounded path runs. See
+  {doc}`/cookbook/streaming/windowed-aggregation`.
 
 ## Exactly-once and checkpointing
 

@@ -57,17 +57,20 @@ pub(super) fn output_field(item: &ProjectionItem, array: &ArrayRef, batch: &Reco
             Err(_) => Field::new(&item.alias, array.data_type().clone(), true),
         },
         bc_expr::Expr::Image {
-            func: bc_expr::ImageFunc::ToTensor | bc_expr::ImageFunc::CenterCrop,
+            func:
+                bc_expr::ImageFunc::ToTensor
+                | bc_expr::ImageFunc::CenterCrop
+                | bc_expr::ImageFunc::Letterbox,
             width: Some(w),
             height: Some(h),
             ..
-        } => tensor_field(&item.alias, array.data_type().clone(), [*h, *w, 3]),
+        } => tensor_field(&item.alias, array.data_type().clone(), &[*h, *w, 3]),
         bc_expr::Expr::Image {
             func: bc_expr::ImageFunc::ToGrayscale,
             width: Some(w),
             height: Some(h),
             ..
-        } => tensor_field(&item.alias, array.data_type().clone(), [*h, *w, 1]),
+        } => tensor_field(&item.alias, array.data_type().clone(), &[*h, *w, 1]),
         bc_expr::Expr::Image {
             func: bc_expr::ImageFunc::ToTensorF32,
             width: Some(w),
@@ -81,8 +84,18 @@ pub(super) fn output_field(item: &ProjectionItem, array: &ArrayRef, batch: &Reco
             } else {
                 [*h, *w, 3]
             };
-            tensor_field(&item.alias, array.data_type().clone(), shape)
+            tensor_field(&item.alias, array.data_type().clone(), &shape)
         }
+        // Sampled video frames are the widest column the engine produces — a modest
+        // `frames(8, 224, 224)` is 1.2 MB per row — so the shape has to travel with the
+        // data for the same reason an image tensor's does, and more so.
+        bc_expr::Expr::Video {
+            func: bc_expr::VideoFunc::Frames,
+            num_frames: Some(n),
+            width: Some(w),
+            height: Some(h),
+            ..
+        } => tensor_field(&item.alias, array.data_type().clone(), &[*n, *h, *w, 3]),
         _ => Field::new(&item.alias, array.data_type().clone(), true),
     }
 }
@@ -92,8 +105,15 @@ pub(super) fn output_field(item: &ProjectionItem, array: &ArrayRef, batch: &Reco
 /// flat `FixedSizeList` storage reconstructs to a shaped tensor on the pyarrow side of the
 /// FFI, with no per-batch Python re-type pass (which otherwise forces the whole decode
 /// through the slow opaque-UDF path — the physical-AI ingest bottleneck).
-fn tensor_field(alias: &str, dtype: DataType, shape: [i64; 3]) -> Field {
-    let [a, b, c] = shape;
+/// `shape` is a slice rather than a fixed array because a decoded image is 3-D
+/// (`[h, w, c]`) and a sampled clip is 4-D (`[n, h, w, 3]`) — the metadata format is the
+/// same, and duplicating this for each rank is how the two spellings drift apart.
+fn tensor_field(alias: &str, dtype: DataType, shape: &[i64]) -> Field {
+    let dims = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let metadata = HashMap::from([
         (
             "ARROW:extension:name".to_string(),
@@ -101,7 +121,7 @@ fn tensor_field(alias: &str, dtype: DataType, shape: [i64; 3]) -> Field {
         ),
         (
             "ARROW:extension:metadata".to_string(),
-            format!("{{\"shape\":[{a},{b},{c}]}}"),
+            format!("{{\"shape\":[{dims}]}}"),
         ),
     ]);
     Field::new(alias, dtype, true).with_metadata(metadata)

@@ -101,6 +101,8 @@ class PowerTransformer(Preprocessor):
             variance, as scikit-learn does by default.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "lambdas_", "mean_", "scale_", "standardize")
 
     def __init__(self, columns: str | Sequence[str], *, standardize: bool = True) -> None:
@@ -130,6 +132,7 @@ class PowerTransformer(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         aggregates = {}
         for name in self.columns:
             value = col(name)
@@ -263,6 +266,8 @@ class BoxCoxTransformer(Preprocessor):
         standardize: Also center and scale each transformed column to zero mean, unit variance.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "lambdas_", "mean_", "scale_", "standardize")
 
     def __init__(self, columns: str | Sequence[str], *, standardize: bool = True) -> None:
@@ -295,6 +300,7 @@ class BoxCoxTransformer(Preprocessor):
         Raises:
             PlanError: If a fitted column contains a non-positive value.
         """
+        self._check_numeric(ds)
         from batcher._internal.errors import PlanError
 
         aggregates: dict[str, object] = {}

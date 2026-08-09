@@ -27,7 +27,7 @@ use crate::eval::math::{
     eval_coalesce, eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2,
 };
 use crate::eval::media::image::ImageArgs;
-use crate::eval::media::{eval_audio, eval_image, eval_video};
+use crate::eval::media::{eval_audio, eval_image, eval_image_crop, eval_video, Bounds};
 use crate::eval::str::{eval_str, try_dict_str};
 use crate::eval::temporal::date::{
     eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
@@ -179,9 +179,8 @@ impl Expr {
                 mean,
                 std,
                 channels_first,
-                x,
-                y,
                 format,
+                fill,
             } => {
                 let arr = input.eval(batch)?;
                 eval_image(
@@ -193,9 +192,8 @@ impl Expr {
                         mean: mean.as_deref(),
                         std: std.as_deref(),
                         channels_first: *channels_first,
-                        x: *x,
-                        y: *y,
                         format: format.as_deref(),
+                        fill: *fill,
                     },
                 )
             }
@@ -221,9 +219,43 @@ impl Expr {
                     *threshold_db,
                 )
             }
-            Expr::Video { func, input } => {
+            Expr::ImageCrop {
+                input,
+                x,
+                y,
+                width,
+                height,
+            } => {
                 let arr = input.eval(batch)?;
-                eval_video(*func, &arr)
+                // Evaluate the four bounds once for the batch. A literal broadcasts to a
+                // constant array here, which is what lets the kernel read every window the
+                // same way instead of branching on whether it was constant.
+                let (xs, ys) = (x.eval(batch)?, y.eval(batch)?);
+                let (ws, hs) = (width.eval(batch)?, height.eval(batch)?);
+                eval_image_crop(&arr, &Bounds::new([&xs, &ys, &ws, &hs])?)
+            }
+            Expr::Video {
+                func,
+                input,
+                num_frames,
+                width,
+                height,
+                second,
+            } => {
+                let arr = input.eval(batch)?;
+                // The timestamp is a column; evaluate it once for the batch the way the
+                // crop bounds are. A literal broadcasts, so there is no constant path.
+                let at = second.as_ref().map(|e| e.eval(batch)).transpose()?;
+                eval_video(
+                    *func,
+                    &arr,
+                    crate::eval::media::VideoArgs {
+                        num_frames: *num_frames,
+                        width: *width,
+                        height: *height,
+                        second: at.as_ref(),
+                    },
+                )
             }
             Expr::Coalesce { inputs } => eval_coalesce(inputs, batch),
             Expr::InList { input, set } => {

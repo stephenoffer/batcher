@@ -49,6 +49,8 @@ class KBinsDiscretizer(Preprocessor):
         strategy: ``"quantile"`` or ``"uniform"``.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "edges_", "n_bins", "strategy")
 
     def __init__(
@@ -91,6 +93,7 @@ class KBinsDiscretizer(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         inner = self.n_bins - 1
         if self.strategy == "uniform":
             aggs = {}

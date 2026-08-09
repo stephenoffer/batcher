@@ -54,6 +54,10 @@ class BrokerSplit:
     partition: int
     poll_size: int
     poll_bytes: int = BrokerSource.DEFAULT_POLL_BYTES
+    #: Whether this partition's reader produces the `headers` column. It has to travel with
+    #: the split: a worker that rebuilt the source without it would return a batch one
+    #: column narrower than its siblings, and the epoch's concat would fail on the schema.
+    include_headers: bool = False
     #: `repr=False` because these are the *client* options — they carry `sasl.password`,
     #: `sasl_plain_password`, and Event Hubs' `connection_str` (a SAS key). A split is
     #: pickled to every worker and appears verbatim in any traceback that mentions it, so
@@ -68,12 +72,13 @@ class BrokerSplit:
             self.topic,
             poll_size=self.poll_size,
             poll_bytes=self.poll_bytes,
+            include_headers=self.include_headers,
             partitions=[self.partition],
             **self.options,
         )
 
     def schema(self) -> pa.Schema:
-        return broker_schema()
+        return broker_schema(self.include_headers)
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         return self._reader().read(projection)

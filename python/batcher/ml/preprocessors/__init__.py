@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from batcher.ml.preprocessors.base import Preprocessor
 from batcher.ml.preprocessors.binning import KBinsDiscretizer
+from batcher.ml.preprocessors.calibration import IsotonicCalibrator, PlattCalibrator
 from batcher.ml.preprocessors.chain import Chain
 from batcher.ml.preprocessors.derived import (
     PCA,
@@ -36,7 +37,9 @@ from batcher.ml.preprocessors.encoders import (
     BinaryEncoder,
     FrequencyEncoder,
     HashingEncoder,
+    JamesSteinEncoder,
     LabelEncoder,
+    LeaveOneOutEncoder,
     MultiHotEncoder,
     OneHotEncoder,
     OrdinalEncoder,
@@ -44,16 +47,31 @@ from batcher.ml.preprocessors.encoders import (
     TargetEncoder,
     WOEEncoder,
 )
-from batcher.ml.preprocessors.imputers import SimpleImputer
+from batcher.ml.preprocessors.imputers import IterativeImputer, SimpleImputer
 from batcher.ml.preprocessors.persistence import from_dict, load, save, to_dict
-from batcher.ml.preprocessors.polynomial import PolynomialFeatures
+from batcher.ml.preprocessors.polynomial import PolynomialFeatures, SplineTransformer
 from batcher.ml.preprocessors.power import BoxCoxTransformer, PowerTransformer
+from batcher.ml.preprocessors.projection import (
+    GaussianRandomProjection,
+    Nystroem,
+    RBFSampler,
+    SparseRandomProjection,
+    johnson_lindenstrauss_min_dim,
+)
 from batcher.ml.preprocessors.scalers import (
     MaxAbsScaler,
     MinMaxScaler,
     Normalizer,
     RobustScaler,
     StandardScaler,
+)
+from batcher.ml.preprocessors.selection import (
+    RFE,
+    DropCorrelated,
+    SelectFromModel,
+    SelectKBest,
+    SelectPercentile,
+    feature_importances,
 )
 from batcher.ml.preprocessors.text import Concatenator, Tokenizer
 from batcher.ml.preprocessors.text_features import TextStatFeaturizer
@@ -65,13 +83,16 @@ from batcher.ml.preprocessors.timeseries import (
 )
 from batcher.ml.preprocessors.transforms import (
     Clipper,
+    FunctionTransformer,
     LogTransformer,
     MissingIndicator,
     QuantileTransformer,
 )
+from batcher.ml.preprocessors.vectorizers import CountVectorizer, HashingVectorizer, TfidfVectorizer
 
 __all__ = [
     "PCA",
+    "RFE",
     "Binarizer",
     "BinaryEncoder",
     "BoxCoxTransformer",
@@ -80,17 +101,26 @@ __all__ = [
     "ColumnDropper",
     "ColumnSelector",
     "Concatenator",
+    "CountVectorizer",
     "CyclicalEncoder",
     "DateTimeFeaturizer",
+    "DropCorrelated",
     "FrequencyEncoder",
+    "FunctionTransformer",
+    "GaussianRandomProjection",
     "GroupImputer",
     "GroupStatEncoder",
     "HashingEncoder",
+    "HashingVectorizer",
     "InteractionFeatures",
+    "IsotonicCalibrator",
+    "IterativeImputer",
+    "JamesSteinEncoder",
     "KBinsDiscretizer",
     "LabelBinarizer",
     "LabelEncoder",
     "LagFeaturizer",
+    "LeaveOneOutEncoder",
     "LogTransformer",
     "MaxAbsScaler",
     "MinMaxScaler",
@@ -98,26 +128,37 @@ __all__ = [
     "MultiHotEncoder",
     "MultiLabelBinarizer",
     "Normalizer",
+    "Nystroem",
     "OneHotEncoder",
     "OrdinalEncoder",
+    "PlattCalibrator",
     "PolynomialFeatures",
     "PowerTransformer",
     "Preprocessor",
     "QuantileTransformer",
+    "RBFSampler",
     "RankTransformer",
     "RareCategoryEncoder",
     "RatioFeatures",
     "RobustScaler",
     "RollingFeaturizer",
+    "SelectFromModel",
+    "SelectKBest",
+    "SelectPercentile",
     "SimpleImputer",
+    "SparseRandomProjection",
+    "SplineTransformer",
     "StandardScaler",
     "TargetEncoder",
     "TextStatFeaturizer",
+    "TfidfVectorizer",
     "Tokenizer",
     "TruncatedSVD",
     "VarianceThreshold",
     "WOEEncoder",
+    "feature_importances",
     "from_dict",
+    "johnson_lindenstrauss_min_dim",
     "load",
     "save",
     "to_dict",

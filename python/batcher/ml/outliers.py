@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml._estimator import require_fitted
 from batcher.ml.preprocessors.base import Preprocessor, columns_arg
 from batcher.plan.expr_ir.constructors import col, lit
 
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "METHODS",
+    "EllipticEnvelope",
     "OutlierClipper",
     "count_outliers",
     "flag_outliers",
@@ -239,6 +241,8 @@ class OutlierClipper(Preprocessor):
         threshold: The rule's width.
     """
 
+    numeric_only = True
+
     __slots__ = ("bounds_", "columns", "method", "threshold")
 
     def __init__(
@@ -269,6 +273,7 @@ class OutlierClipper(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         for name in self.columns:
             self.bounds_[name] = outlier_bounds(
                 ds, name, method=self.method, threshold=self.threshold
@@ -362,3 +367,181 @@ def mahalanobis_distance(
             if weight != 0.0:
                 quadratic = quadratic + lit(weight) * centered[i] * centered[j]
     return ds.with_columns(**{output_column: quadratic.sqrt()})
+
+
+class EllipticEnvelope:
+    """Flag multivariate outliers by Mahalanobis distance from a fitted Gaussian.
+
+    The rules `flag_outliers` applies look at one column at a time, so a row that is
+    unremarkable in every column separately but implausible in combination goes unnoticed. In a
+    height/weight sample, a person half a standard deviation tall and half a standard deviation
+    light is ordinary on both counts and still well off the line the two follow together. This
+    measures distance from the fitted centre in the metric the covariance defines, which is
+    what sees the combination rather than the values.
+
+    {py:func}`mahalanobis_distance <batcher.ml.outliers.mahalanobis_distance>` computes the
+    same distance but relearns the centre and covariance from whatever dataset it is handed.
+    That is the wrong thing for a train-then-apply pipeline, where the envelope has to come
+    from the training data and be applied unchanged to new rows - relearning it on the new rows
+    is how a batch made entirely of outliers ends up looking clean. `fit` and `predict` split
+    those two steps.
+
+    The whole fit is a mean and a covariance, both mergeable aggregates, so it is one pass and
+    behaves the same on a cluster as on one machine. Scoring is a single expression.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml.outliers import EllipticEnvelope
+            >>> train = bt.from_pydict(
+            ...     {"h": [1.6, 1.7, 1.8, 1.9, 1.65, 1.75],
+            ...      "w": [55.0, 65.0, 75.0, 85.0, 58.0, 70.0]}
+            ... )
+            >>> envelope = EllipticEnvelope(["h", "w"], contamination=0.1).fit(train)
+            >>> test = bt.from_pydict({"h": [1.72, 1.90], "w": [68.0, 40.0]})
+            >>> envelope.predict(test).to_pydict()["is_outlier"]
+            [False, True]
+
+    Args:
+        columns: The numeric columns defining the space to measure distance in.
+        contamination: The share of training rows expected to fall outside the envelope,
+            which sets the chi-squared cutoff.
+        output_column: The name of the boolean column `predict` appends.
+
+    Raises:
+        PlanError: If `columns` is empty or `contamination` is not in ``(0, 1)``.
+    """
+
+    __slots__ = (
+        "columns",
+        "contamination",
+        "location_",
+        "output_column",
+        "precision_",
+        "threshold_",
+    )
+
+    def __init__(
+        self,
+        columns: Sequence[str],
+        *,
+        contamination: float = 0.1,
+        output_column: str = "is_outlier",
+    ) -> None:
+        self.columns = list(columns)
+        if not self.columns:
+            raise PlanError("EllipticEnvelope needs at least one column.")
+        if not 0.0 < contamination < 1.0:
+            raise PlanError(
+                f"contamination is the share of rows expected outside the envelope, so it "
+                f"must be between 0 and 1, got {contamination}."
+            )
+        self.contamination = float(contamination)
+        self.output_column = output_column
+        self.location_: list[float] = []
+        self.precision_: list[list[float]] = []
+        self.threshold_: float = 0.0
+
+    def fit(self, ds: Dataset) -> EllipticEnvelope:
+        """Learn the centre, the inverse covariance, and the distance cutoff.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.outliers import EllipticEnvelope
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [1.0, 2.0, 3.0, 4.5]})
+                >>> len(EllipticEnvelope(["x", "y"]).fit(ds).location_)
+                2
+
+        Args:
+            ds: The training dataset.
+
+        Returns:
+            ``self``, fitted.
+
+        Raises:
+            PlanError: If a column is not numeric.
+            ColumnNotFoundError: If a named column is missing.
+        """
+        import numpy as np
+
+        from batcher.ml._estimator import require_numeric
+        from batcher.ml.stats._special import chi2_ppf
+        from batcher.ml.stats.multivariate import covariance_matrix
+        from batcher.plan.functions.aggregate import mean as mean_
+
+        _require(ds, *self.columns)
+        require_numeric(self, ds, self.columns, role="column")
+        means = ds.agg(**{name: mean_(col(name)) for name in self.columns}).collect()
+        self.location_ = [float(means.column(name)[0].as_py()) for name in self.columns]
+        covariance = covariance_matrix(ds, self.columns).to_pydict()
+        matrix = np.array([covariance[name] for name in self.columns], dtype=float).T
+        # A pseudo-inverse rather than an inverse: perfectly collinear columns make the
+        # covariance singular, which is a shape of data to score rather than to refuse.
+        self.precision_ = [[float(v) for v in row] for row in np.linalg.pinv(matrix)]
+        self.threshold_ = float(chi2_ppf(1.0 - self.contamination, float(len(self.columns))))
+        return self
+
+    def _squared_distance(self):
+        """The squared Mahalanobis distance from the fitted centre, as one expression."""
+        centered = [
+            col(name) - lit(self.location_[index]) for index, name in enumerate(self.columns)
+        ]
+        quadratic = lit(0.0)
+        for i in range(len(self.columns)):
+            for j in range(len(self.columns)):
+                weight = self.precision_[i][j]
+                if weight != 0.0:
+                    quadratic = quadratic + lit(weight) * centered[i] * centered[j]
+        return quadratic
+
+    def predict(self, ds: Dataset) -> Dataset:
+        """Append a boolean column marking the rows outside the fitted envelope.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.outliers import EllipticEnvelope
+                >>> train = bt.from_pydict(
+                ...     {"x": [1.0, 2.0, 3.0, 4.0, 5.0], "y": [1.0, 2.0, 3.0, 4.0, 5.0]}
+                ... )
+                >>> envelope = EllipticEnvelope(["x", "y"], contamination=0.05).fit(train)
+                >>> envelope.predict(train).to_pydict()["is_outlier"]
+                [False, False, False, False, False]
+
+        Args:
+            ds: The dataset to score, which need not be the one `fit` saw.
+
+        Returns:
+            A new lazy `Dataset` with the boolean outlier column appended.
+        """
+        require_fitted(self, self.location_)
+        flag = self._squared_distance() > lit(self.threshold_)
+        return ds.with_columns(**{self.output_column: flag})
+
+    def score_samples(self, ds: Dataset, *, output_column: str = "mahalanobis") -> Dataset:
+        """Append the Mahalanobis distance itself, for ranking rather than thresholding.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.outliers import EllipticEnvelope
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 40.0], "y": [1.0, 2.0, 3.0, 4.0]})
+                >>> envelope = EllipticEnvelope(["x", "y"]).fit(ds)
+                >>> scored = envelope.score_samples(ds).to_pydict()["mahalanobis"]
+                >>> scored[3] == max(scored)
+                True
+
+        Args:
+            ds: The dataset to score.
+            output_column: The name of the distance column to append.
+
+        Returns:
+            A new lazy `Dataset` with the distance column appended.
+        """
+        require_fitted(self, self.location_)
+        return ds.with_columns(**{output_column: self._squared_distance().sqrt()})

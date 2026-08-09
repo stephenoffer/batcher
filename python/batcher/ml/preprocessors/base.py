@@ -276,6 +276,15 @@ class Preprocessor(abc.ABC):
 
     _fitted: bool = False
 
+    #: Whether every column this preprocessor names must hold a number.
+    #:
+    #: Set on the arithmetic transformers - the scalers, the binners, the power and rank
+    #: transforms, the projections. Left false on the encoders and the imputer variants that
+    #: exist precisely to consume a string. When true, `fit` checks the schema and raises
+    #: naming the column, instead of letting the failure surface from inside the engine as
+    #: ``Ln expected a numeric argument, got Utf8`` or ``could not convert string to float``.
+    numeric_only: bool = False
+
     @property
     def is_fitted(self) -> bool:
         """Whether `fit` (or `fit_transform`) has run, so `transform` is ready.
@@ -354,9 +363,28 @@ class Preprocessor(abc.ABC):
         Returns:
             ``self``, marked fitted, so `fit` chains straight into `transform`.
         """
-        _ = ds  # stateless default — no statistics to learn
+        self._check_numeric(ds)
         self._fitted = True
         return self
+
+    def _check_numeric(self, ds: Dataset) -> None:
+        """Raise naming the column if `numeric_only` and one of them is not a number.
+
+        Called by the default `fit`, which is what every stateless transformer uses, so those
+        are covered without a line each. A preprocessor that overrides `fit` to run its own
+        aggregate calls this itself, before that aggregate reaches the engine.
+
+        Args:
+            ds: The dataset whose schema to read.
+
+        Raises:
+            PlanError: If a named column cannot be used as a number.
+        """
+        if not self.numeric_only:
+            return
+        from batcher.ml._estimator import require_numeric
+
+        require_numeric(self, ds, getattr(self, "columns", ()), role="column")
 
     @abc.abstractmethod
     def transform(self, ds: Dataset) -> Dataset:

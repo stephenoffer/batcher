@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher.plan.types.lattice import promote, widen
-from batcher.plan.types.media import imagefunc_type
+from batcher.plan.types.media import imagefunc_type, videofunc_type
 from batcher.plan.types.registry import DTYPE_REGISTRY
 
 if TYPE_CHECKING:
@@ -156,7 +156,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         MathExpr,
         Not,
     )
-    from batcher.plan.expr_ir.image import ImageFunc
+    from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
     from batcher.plan.expr_ir.namespaces import (
         ConvertTimezone,
         DateFunc,
@@ -186,6 +186,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         NullIf,
         Sequence,
     )
+    from batcher.plan.expr_ir.video import VideoFunc
 
     if isinstance(expr, Col):
         return schema.field(expr.name).type if schema.has(expr.name) else None
@@ -218,6 +219,12 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return _fold_promote([*branch_thens, infer_type(expr.otherwise, schema)])
     if isinstance(expr, ImageFunc):
         return imagefunc_type(expr)
+    if isinstance(expr, ImageCrop):
+        # A per-row window means rows genuinely differ in size, so the result is an
+        # encoded still rather than a fixed-shape tensor.
+        return pa.binary()
+    if isinstance(expr, VideoFunc):
+        return videofunc_type(expr)
     if isinstance(expr, ListSimhash):
         return pa.list_(pa.int64())  # one Int64 bit per hyperplane
     if isinstance(expr, StrFunc):
@@ -324,6 +331,19 @@ def _mapfunc_type(fn: str, map_t: pa.DataType | None) -> pa.DataType | None:
         return pa.list_(map_t.key_type)
     if fn == "map_values":
         return pa.list_(map_t.item_type)
+    if fn == "map_entries":
+        # The entries child of an Arrow Map is `Struct<key, value>`, and the field names
+        # are part of the type a caller then subscripts (`e.struct.get("key")`), so they
+        # are spelled here rather than left to the engine. `key` is non-nullable because
+        # a map entry cannot have one; `value` can be null.
+        return pa.list_(
+            pa.struct(
+                [
+                    pa.field("key", map_t.key_type, nullable=False),
+                    pa.field("value", map_t.item_type),
+                ]
+            )
+        )
     if fn == "element_at":
         return map_t.item_type
     return None

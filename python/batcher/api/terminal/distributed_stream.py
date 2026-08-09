@@ -75,9 +75,24 @@ def iter_distributed(
     peak driver memory is a *single* reducer's output, not the whole result. Shapes that
     don't support ``materialize=False`` return a collected table, which is simply
     re-chunked. The partitioned intermediate is freed once iteration finishes.
+
+    The whole generator runs inside one `query_shuffle_scope`, and that is load-bearing
+    rather than tidy. Scope exit evicts the query's shuffle buckets, on the premise —
+    true everywhere else — that leaving the scope means the query is over. It is false
+    here: this terminal *deliberately* returns handles to buckets the driver has not read
+    yet, so the scope `run_relational` opens internally would close, evict them, and leave
+    the reads to find nothing. They would not raise. An unregistered ticket reads back as
+    an **empty bucket, not an error** (the epoch invariant in `dist/shuffle_replication`),
+    so `iter_batches(distributed=True)` silently returned **zero rows** under the Flight
+    transport on a multi-node cluster, while `collect()` on the same plan returned the
+    right answer — the exact wrong-answer bug `dist/fleet/eviction.py`'s own docstring
+    says premature eviction would cause. Holding an enclosing scope makes the inner one
+    reentrant (it detects the ambient plan id and neither re-mints nor evicts), so the
+    buckets are freed when *iteration* finishes, which is when this query is actually over.
     """
     from batcher import core
     from batcher.api.orchestration import run_relational
+    from batcher.dist.fleet.plan_id import query_shuffle_scope
 
     ctx = core.ExecutionContext(
         columns=columns,
@@ -85,21 +100,22 @@ def iter_distributed(
         num_workers=num_workers,
         transport=transport,
     )
-    result, _ = run_relational(plan, sources, ctx, distributed=True, materialize=False)
-    if isinstance(result, pa.Table):
-        batches = (
-            result.to_batches()
-            if batch_size is None
-            else result.to_batches(max_chunksize=batch_size)
-        )
-        yield from batches
-        return
-    try:
-        for b in result.iter_batches():
-            yield from _rechunk(b, batch_size)
-    finally:
-        if callable(getattr(result, "cleanup", None)):
-            result.cleanup()
+    with query_shuffle_scope():
+        result, _ = run_relational(plan, sources, ctx, distributed=True, materialize=False)
+        if isinstance(result, pa.Table):
+            batches = (
+                result.to_batches()
+                if batch_size is None
+                else result.to_batches(max_chunksize=batch_size)
+            )
+            yield from batches
+            return
+        try:
+            for b in result.iter_batches():
+                yield from _rechunk(b, batch_size)
+        finally:
+            if callable(getattr(result, "cleanup", None)):
+                result.cleanup()
 
 
 def iter_distributed_scan(

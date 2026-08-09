@@ -260,15 +260,18 @@ def test_without_explicit_keys_the_vector_is_its_own_key():
 def test_bad_arguments_are_rejected():
     left = bt.from_pydict({"v": [[1.0]]})
     right = bt.from_pydict({"v": [[1.0]]})
-    with pytest.raises(PlanError, match="unknown left column"):
+    # Which *argument* was wrong is the discriminating fact here — all three of these name a
+    # column called "nope" — so the assertion is on the parameter the message points at,
+    # which is what `unknown_message`'s hint carries.
+    with pytest.raises(PlanError, match=r"Unknown column 'nope'.*left_on"):
         left.ml.similarity_join(right, left_on="nope")
-    with pytest.raises(PlanError, match="unknown right column"):
+    with pytest.raises(PlanError, match=r"Unknown column 'nope'.*right_on"):
         left.ml.similarity_join(right, left_on="v", right_on="nope")
     with pytest.raises(PlanError, match="threshold must be in"):
         left.ml.similarity_join(right, left_on="v", threshold=2.0)
     with pytest.raises(PlanError, match="bands must divide num_bits"):
         left.ml.similarity_join(right, left_on="v", num_bits=64, bands=7)
-    with pytest.raises(PlanError, match="unknown left key column"):
+    with pytest.raises(PlanError, match=r"Unknown column 'nope'.*left_key"):
         left.ml.similarity_join(right, left_on="v", left_key="nope")
 
 

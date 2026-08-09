@@ -21,11 +21,18 @@ from batcher.plan.expr_ir.constructors import col, lit, when
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir.core import Expr
 
 T = TypeVar("T")
 
-__all__ = ["argmax_prediction", "linear_score", "require_fitted", "require_rows"]
+__all__ = [
+    "argmax_prediction",
+    "linear_score",
+    "require_fitted",
+    "require_numeric",
+    "require_rows",
+]
 
 
 def require_fitted(estimator: object, state: T | None, method: str = "predict") -> T:
@@ -127,3 +134,64 @@ def require_rows(estimator: object, rows: int, needed: int, *, because: str) -> 
         f"{type(estimator).__name__} cannot fit on {rows} row(s): it needs at least "
         f"{needed} because {because}. Check the filters upstream of fit()."
     )
+
+
+def require_numeric(
+    estimator: object, ds: Dataset, names: Sequence[str], *, role: str = "feature"
+) -> None:
+    """Raise naming the column unless every one of `names` is something a fit can average.
+
+    The estimators here reach the engine through aggregates and arithmetic, neither of which
+    is defined on a string. Without this the failure surfaced from inside the data plane as
+    ``aggregate mean is not supported for column type Utf8``, or a cast error, or - worst -
+    ``Invalid arithmetic operation: Float64`` with no column named in any of them. Eight
+    estimators produced eight different messages for the same mistake, and not one said which
+    column was wrong or what to do about it.
+
+    The check reads the schema, which is known when the plan is built, so it costs no pass
+    over the data and fires before any work is scheduled.
+
+    Args:
+        estimator: The estimator doing the checking, named in the message.
+        ds: The dataset whose schema to read.
+        names: The columns that must be numeric.
+        role: What those columns are to the estimator, named in the message. A regressor
+            passes ``"target"`` for the column it predicts; a classifier does not, because
+            a class label is legitimately a string.
+
+    Raises:
+        PlanError: If a column is present but cannot be used as a numeric feature.
+    """
+    import pyarrow.types as types
+
+    schema = ds.schema
+    for name in names:
+        index = schema.get_field_index(name)
+        if index < 0:  # absent: the caller's own missing-column check owns that message
+            continue
+        dtype = schema.field(index).type
+        if types.is_floating(dtype) or types.is_integer(dtype) or types.is_decimal(dtype):
+            continue
+        what = type(estimator).__name__ if not isinstance(estimator, str) else estimator
+        if types.is_null(dtype):
+            # An untyped column is ambiguous from the schema alone: it is what an all-null
+            # column looks like, and equally what an *empty* dataset looks like. Rejecting it
+            # broke fitting on an empty frame - a filtered-to-nothing training set, an empty
+            # partition - which is a legitimate input, so this defers to the row-count checks
+            # rather than guessing. Only the unambiguous types below are rejected.
+            continue
+        if types.is_boolean(dtype):
+            # A boolean flag is a perfectly good 0/1 feature and every estimator here refuses
+            # it, because the engine defines neither `mean` nor arithmetic on Boolean. The
+            # four messages that produced - a mean failure, two arithmetic failures and a
+            # comparison failure - named the type but never the column or the one-line fix.
+            raise PlanError(
+                f"{what}: {role} {name!r} is boolean, and the engine's aggregates are not "
+                "defined on that type. Cast it first: "
+                f'ds.with_columns({name}=bt.col("{name}").cast("int64")).'
+            )
+        raise PlanError(
+            f"{what}: {role} {name!r} has type {dtype}, and a fit needs a number. Encode a "
+            "categorical column first with OrdinalEncoder, OneHotEncoder or TargetEncoder, "
+            "and parse a date or a string of digits into a numeric column."
+        )

@@ -82,13 +82,28 @@ def _import_consumer() -> Any:
     return EventHubConsumerClient
 
 
+def _event_hubs_position(value: str) -> str:
+    """Map the shared `starting_position` onto Event Hubs' own offset sentinels.
+
+    ``-1`` is the start of a partition and ``@latest`` its tail, which is a vocabulary
+    nobody guesses. An explicit offset string is passed through, because resuming from a
+    recorded position is the other reason to set this at all.
+    """
+    from batcher.io.formats.streaming.broker.schema import normalize_starting_position
+
+    if value not in ("earliest", "latest", "-1", "@latest"):
+        return value  # an explicit offset/sequence number the caller recorded earlier
+    return normalize_starting_position(value, aliases={"earliest": "-1", "latest": "@latest"})
+
+
 @SOURCES.register("eventhubs")
 class EventHubsSource(BrokerSource):
     """An unbounded Event Hub, consumed via ``azure-eventhub``.
 
     The ``topic`` is the Event Hub name. Required option: ``connection_str`` (the
     namespace connection string). Options: ``consumer_group`` (default
-    ``"$Default"``), ``starting_position`` (default ``"-1"`` = start of stream),
+    ``"$Default"``), ``starting_position`` (``"earliest"`` / ``"latest"``, the name every
+    broker here shares, or an explicit Event Hubs offset string),
     and ``partitions`` (the specific partition ids to read — set by
     :class:`BrokerSplit` on a worker).
 
@@ -108,7 +123,7 @@ class EventHubsSource(BrokerSource):
         partitions: list[int] | None = None,
         connection_str: str = "",
         consumer_group: str = "$Default",
-        starting_position: str = "-1",
+        starting_position: str = "earliest",
         **options: Any,
     ) -> None:
         super().__init__(
@@ -116,7 +131,7 @@ class EventHubsSource(BrokerSource):
             poll_size=poll_size,
             connection_str=connection_str,
             consumer_group=consumer_group,
-            starting_position=starting_position,
+            starting_position=_event_hubs_position(starting_position),
             **options,
         )
         self._partitions = partitions

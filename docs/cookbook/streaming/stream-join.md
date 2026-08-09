@@ -14,7 +14,7 @@ is not an attribution, and telling the engine so, in the join itself.
 
 ## The interval is the contract
 
-`join_stream` joins on equality keys **and** an event-time interval:
+{py:meth}`join_stream <batcher.Dataset.join_stream>` joins on equality keys **and** an event-time interval:
 `|left_time - right_time| <= within`. That bound is the whole reason the join can run
 forever. Once the watermark passes `impression_time + within`, no future click can match
 that impression, so it is evicted from the buffer.
@@ -117,57 +117,100 @@ for a straggler; it costs you exactly that much more buffer.
 | --- | --- | --- |
 | `within` | the event-time interval a match must fall inside | it is a business rule first: too wide and a click ten hours later counts as an attribution |
 | `lateness` | grace on top of `within` before buffered rows are evicted | exactly that much more buffer |
-| `memory.streaming_state_max_bytes` | the cap the retained buffers are checked against | nothing, because it turns an OOM into a `ResourceError` that names the stall |
+| `memory.streaming_state_max_bytes` | the cap the retained buffers are checked against | nothing, because it turns an OOM into a {py:exc}`ResourceError <batcher.ResourceError>` that names the stall |
 
 ## The limits, before you build on this operator
 
 :::{important}
-**You cannot write a stream-stream join to a sink.** A streaming write takes a single
-source today. `joined.write.delta(...)` raises a `PlanError` that says so. The only way to
-consume it is `iter_batches()`, and whatever you do with those batches (including a
-transactional write) is your code, on your restart semantics. This is the sharpest edge in
-Batcher's streaming story and it is worth knowing before you build a topology around it.
+**A stream-stream join has no checkpoint.** It writes to a sink like any other streaming
+query — `joined.write.delta(..., trigger=...)` runs — but passing `checkpoint=` is refused
+rather than accepted, because the join's state is two buffered sides and two watermarks,
+none of it addressable by a source offset. A restart therefore begins with an empty join
+and re-reads from wherever the sources start. The sink's own idempotency still applies, so
+a replayed micro-batch does not duplicate rows; what you do not get is resumption.
 :::
 
-:::{note}
-**Inner join only.** No outer/left variants, so an impression that is never clicked never
-appears in the output. If you need "impressions with no click within 30 minutes", the interval
-join will not give it to you.
-:::
-
-:::{important}
-**A stream cannot be joined to a static dimension table with `join`.** That plan has to
-materialize, and the engine refuses on an unbounded source rather than hanging:
+`how=` takes `"inner"` (the default), `"left"`, `"right"`, and `"full"`. An outer join is
+how you answer "impressions with no click within 30 minutes": the unmatched impression is
+emitted with null click columns, once, at the moment the watermark guarantees no click can
+still arrive for it.
 
 ```python
 # docs: skip
-stream.join(dim_table, on="ad")   # PlanError: plan must materialize
+unattributed = impressions.join_stream(
+    clicks, on="ad", left_time="shown", right_time="clicked", within="30m", how="left"
+).filter(col("clicked").is_null())
 ```
+
+:::{note}
+**An outer row is emitted late, by design.** It cannot be emitted when the row arrives,
+because a partner may still be coming; it is emitted when the row leaves the join buffer,
+which is `within` plus the allowed `lateness` after its event time. A wider interval buys
+more matches and delays every unmatched row by the same amount. This is Spark's rule too,
+and it is why an outer stream-stream join needs a time bound rather than merely accepting
+one.
 :::
 
-Do the enrichment inside the batch instead. `map_batches` receives a whole Arrow batch, so
-the lookup is one vectorized Arrow join per micro-batch, against a table you hold in
-memory:
+## Joining a stream to a table that does not move
+
+The other join anyone writes: clicks against a product catalogue, events against a device
+registry, impressions against a campaign dimension. Only one side streams, so no interval
+is needed. Write it as an ordinary {py:meth}`join <batcher.Dataset.join>`:
 
 ```python
-dim = pa.table({"ad": ["a1", "a2", "a3"], "campaign": ["spring", "fall", "spring"]})
+campaigns = bt.from_pydict({
+    "ad": ["a1", "a2", "a3"],
+    "campaign": ["spring", "fall", "spring"],
+})
 
-
-def enrich(batch):
-    table = pa.Table.from_batches([batch]).join(dim, keys="ad").combine_chunks()
-    return table.to_batches()[0]
-
-
-enriched = left.map_batches(enrich, output_columns=["ad", "shown", "campaign"])
+enriched = left.join(campaigns, on="ad", how="left")
 for batch in enriched.iter_batches():
     print(sorted(batch.to_pydict()["campaign"]))
-# ['fall', 'spring', 'spring']
+# ['fall', 'spring']
+# ['spring']
 ```
 
+The static side is read once, before the first micro-batch, and every micro-batch joins
+against the whole of it. That is exact rather than approximate: an equi-join is per-row on
+the stream side, so no stream row's result depends on another's, and joining batch by batch
+gives the same rows as joining the whole stream at once.
+
+Its memory bound is the dimension table itself. A table small enough to enrich a stream
+against is small enough to hold, and one that is not wants a different design.
+
 :::{warning}
-Refresh `dim` yourself if it changes. The engine will not reload it for you, and a
-long-running query will happily serve a stale dimension forever.
+**The dimension is a snapshot, not a subscription.** A query serves the table as it stood
+when the query started, for as long as the query runs. That is deliberate and it matches
+Spark: a dimension that changed mid-stream would otherwise let two rows of the same
+micro-batch disagree about the same key. Restart the query to pick up a new one.
 :::
+
+### Which join types work
+
+A side is *preserved* by an outer join when its unmatched rows must be emitted, and a
+preserved row is only known to be unmatched once the **opposite** side is complete. The
+static side is complete before the first micro-batch; the stream never is. So a join that
+preserves the stream side works, and one that preserves the static side is refused with a
+message saying so:
+
+| Join type | Stream on the left | Stream on the right |
+|---|---|---|
+| `inner` | Works | Works |
+| `left` | Works | Refused |
+| `right` | Refused | Works |
+| `full` | Refused | Refused |
+| `semi`, `anti` | Works | Refused |
+
+```python
+try:
+    list(left.join(campaigns, on="ad", how="full").iter_batches())
+except Exception as exc:
+    print(type(exc).__name__)
+# PlanError
+```
+
+Batcher draws this line in exactly the place Spark does, so a ported job either runs or
+fails on the same shapes it already failed on.
 
 ## When the buffer grows anyway
 

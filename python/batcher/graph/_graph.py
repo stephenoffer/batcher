@@ -156,6 +156,23 @@ class Graph:
 
         Returns:
             A one-column dataset of `node`, or `None` if no node table was attached.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.graph import Graph
+                >>> g = Graph.from_edges(bt.from_pydict({"src": [1], "dst": [2]}))
+                >>> g.extra_nodes() is None
+                True
+
+                >>> # With a node table attached, that table is the extra union arm. It is
+                >>> # the whole declared table, not only the isolated nodes: the arm is
+                >>> # unioned with the endpoints and deduplicated, so overlap is harmless
+                >>> # and finding the isolated ones would cost the anti-join this avoids.
+                >>> g = g.with_nodes(bt.from_pydict({"node": [1, 2, 3]}))
+                >>> sorted(g.extra_nodes().to_pydict()["node"])
+                [1, 2, 3]
         """
         return None
 

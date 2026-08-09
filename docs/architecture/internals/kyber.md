@@ -234,6 +234,27 @@ the next run of that shape plans against them: sketch-backed cardinality, cost
 coefficients calibrated from measured operator times, and a UCB1 bandit over join
 strategies. A query therefore gets a better plan the more often it runs.
 
+Two of those loops do more than tune a number, because what they remember lets a later run
+skip work outright rather than choose between two ways of doing it.
+
+A **top-N remembers its k-th best value** (`kyber/learned_tuning/topn_bound.py`). Before the
+scan nothing knows a value that separates the top ten from the rest, so the query has to read
+everything and then select; afterwards the engine does know one, and the next run of the shape
+starts from it as a predicate. Row-group zone maps and late materialization then answer the
+query without decoding what it excludes. The rewrite is safe under any staleness: the filter
+removes only rows strictly worse than the bound, so if `k` rows survive they are the true
+top-k regardless of where the bound came from. Too few survivors is the one failure mode, it
+is visible in the row count, and the conductor re-runs the plan as written. That verification
+is why the seeding is a Kyber decision but the fallback is `api`'s: a plan → plan pass cannot
+express "run it, look at the answer, run something else".
+
+A **distributed sort remembers its range boundaries** (`dist/sort_boundaries.py`). The sample
+barrier executes the whole mapped prefix over every split to produce a few dozen floats per
+worker, and the map barrier then executes that same prefix again to do the partitioning. The
+remembered grids remove the first of those two passes. Boundaries decide only which reducer a
+row lands on, and the ordered concatenation is correct for any monotone boundary list, so a
+stale grid costs balance and never a row.
+
 ## Using it
 
 You rarely call Kyber directly, because it runs automatically on every terminal

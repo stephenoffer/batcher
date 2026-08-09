@@ -496,6 +496,12 @@ fn run_with_cache(
             }
             let out = combine_and_finalize(&partials, group_keys, aggregates)?;
             if let Some(m) = meter {
+                // This is the arm the engine default actually reaches — the sharded fold — so a
+                // backend tag recorded only on the sequential breaker would still read `interp`
+                // for every real query. Empty when no shard saw a row, where `interp` is right.
+                if let Some(compiled) = jit.get() {
+                    m.note_backend(m.id(plan), compiled.backend_tag());
+                }
                 m.breaker(
                     m.id(plan),
                     rows_in,

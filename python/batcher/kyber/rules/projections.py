@@ -48,6 +48,7 @@ from batcher.plan.logical import (
     Sample,
     Scan,
     Sort,
+    TransformWithState,
     Union,
     Unnest,
     Unpivot,
@@ -530,6 +531,13 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         child = _rewrite(node.input, _map_batches_need(node, need))
         rebuilt = node if child is node.input else dataclasses.replace(node, input=child)
         return _drop_unused_map_output(rebuilt, need)
+    if isinstance(node, TransformWithState):
+        # A black box like `map_batches`, and with no `input_columns` to declare: the `fn`
+        # is handed the key's whole rows and may read any of them. Keeping everything alive
+        # is the safe default and the only sound one — pruning to what the plan above
+        # consumes would starve an `fn` that reads a column it does not re-emit.
+        child = _rewrite(node.input, set(node.input.available_columns()))
+        return node if child is node.input else dataclasses.replace(node, input=child)
     if isinstance(node, WatermarkDedup):
         # The dedup emits whole rows, so everything needed above must survive — plus the
         # two column sets its *state* depends on, which nothing above it references: the
@@ -719,6 +727,9 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
 
     elif isinstance(node, MapBatches):
         _visit(node.input, _map_batches_need(node, need), acc)
+
+    elif isinstance(node, TransformWithState):
+        _visit(node.input, set(node.input.available_columns()), acc)
 
     else:  # pragma: no cover - defensive
         raise TypeError(f"projection pushdown: unhandled node {type(node).__name__}")

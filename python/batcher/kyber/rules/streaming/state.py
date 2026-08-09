@@ -388,6 +388,16 @@ def split_filter_conjuncts_into_stream_join_sides(
             continue
         renames = {c.alias: c.name for c in cols if c is not None}
         per_side[sides.pop()].append(remap_columns(conjunct, renames))
+    # An outer join preserves one side and supplies nulls for the other. Filtering the
+    # null-supplying side before the join replaces matched rows with null-padded ones
+    # rather than merely removing rows, so a conjunct destined for it stays above the
+    # join. (See `push_filter_into_stream_join_side` for the argument in full.)
+    if join.emits_unmatched_right:
+        residual.extend(per_side["left"])
+        per_side["left"] = []
+    if join.emits_unmatched_left:
+        residual.extend(per_side["right"])
+        per_side["right"] = []
     if not (per_side["left"] or per_side["right"]) or not residual:
         return None
     lefts, rights = per_side["left"], per_side["right"]
@@ -448,13 +458,20 @@ def add_stream_join_key_null_rejection(
 ) -> LogicalPlan | None:
     """Reject null-keyed rows before they enter a stream-join buffer.
 
-    An inner equi-join never matches a NULL key against anything, including another NULL.
+    An equi-join never matches a NULL key against anything, including another NULL.
     A row whose join key is null is therefore buffered, compared against every arriving
     row of the opposite side for the whole interval window, and emitted never. Adding
     ``IS NOT NULL`` on each side's keys removes exactly those rows and no others, so the
     output is unchanged by construction while the buffered state drops by the null rate —
     which on a real event stream (an unset ``user_id``, an unparsed device id) is not
     small, and unlike a bounded query is *permanent* occupancy, not a scan cost.
+
+    "Emitted never" is only true on a side the join does not **preserve**. An outer join
+    emits its preserved side's unmatched rows null-padded, and a null-keyed row is exactly
+    an unmatched one — so removing it there deletes output rather than dead weight. The
+    rule therefore skips the preserved side, and a full outer join entirely. This is the
+    same distinction `push_is_not_null_from_join_key` draws for the bounded join with its
+    `FILTERABLE_SIDES` table.
 
     The guard that keeps it from firing forever is idempotence: a conjunct already present
     on that side is not added again, which stops the rule matching its own output through
@@ -470,8 +487,9 @@ def add_stream_join_key_null_rejection(
     Returns:
         The join with null-rejecting filters on its sides, or None when nothing is added.
     """
-    left = _reject_null_keys(node.left, node.left_keys)
-    right = _reject_null_keys(node.right, node.right_keys)
+    # A preserved side's null-keyed rows are its *output*, not its dead weight.
+    left = None if node.emits_unmatched_left else _reject_null_keys(node.left, node.left_keys)
+    right = None if node.emits_unmatched_right else _reject_null_keys(node.right, node.right_keys)
     if left is None and right is None:
         return None
     return dataclasses.replace(

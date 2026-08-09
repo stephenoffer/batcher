@@ -22,7 +22,17 @@ from collections.abc import Callable
 from time import perf_counter, time
 from typing import TYPE_CHECKING
 
-from batcher.plan.streaming import StreamingQueryProgress, StreamingQueryStatus, Trigger
+from batcher.plan.streaming import (
+    SinkProgress,
+    SourceProgress,
+    StateOperatorProgress,
+    StreamingQueryProgress,
+    StreamingQueryStatus,
+    Trigger,
+    notify_query_progress,
+    notify_query_started,
+    notify_query_terminated,
+)
 
 if TYPE_CHECKING:
     from batcher.core.streaming_query.processors import MicroBatchProcessor
@@ -33,6 +43,29 @@ __all__ = ["StreamingQueryEngine"]
 
 #: Seconds between "still stopping" warnings while `stop()` waits for the loop thread.
 _STOP_WARN_SECONDS = 30
+
+
+def _progress_history() -> int:
+    """How many micro-batch progress records a query retains (`streaming.progress_history`)."""
+    from batcher.config import active_config
+
+    return active_config().streaming.progress_history
+
+
+def _describe(obj: object) -> str:
+    """A short human name for a source or sink, for the progress record.
+
+    A source's `identity()` already exists and is exactly this string (``kafka:events:…``);
+    anything else falls back to its class name, which is still more use to an operator
+    reading a progress record than an empty field.
+    """
+    identity = getattr(obj, "identity", None)
+    if identity is not None:
+        try:
+            return str(identity())
+        except Exception:
+            pass
+    return type(obj).__name__
 
 
 class StreamingQueryEngine:
@@ -79,10 +112,14 @@ class StreamingQueryEngine:
                 projection=projection,
                 predicate=predicate,
                 should_stop=self._stop.is_set,
+                # Only a draining trigger reads an idle unbounded source as a finished
+                # one. Without this the runner stopped an Auto Loader stream after its
+                # first discovery pass — see `LocalRunner`.
+                drain=trigger.is_drain,
             )
         )
         self._thread: threading.Thread | None = None
-        self._progress: deque[StreamingQueryProgress] = deque(maxlen=100)
+        self._progress: deque[StreamingQueryProgress] = deque(maxlen=_progress_history())
         self._batches = 0
         self._error: BaseException | None = None
         self._active = False
@@ -98,6 +135,10 @@ class StreamingQueryEngine:
             target=self._run, name=f"batcher-stream-{self._name}", daemon=True
         )
         self._thread.start()
+        # After the thread is running, so a listener that inspects the query sees a live
+        # one. Before this existed the start of a query was the one event nothing could
+        # observe: polling `recent_progress` can only ever see batches that already ran.
+        notify_query_started(self._name, time())
 
     def _recover(self) -> None:
         """Restore source position, batch counter, and running state from a checkpoint."""
@@ -178,6 +219,9 @@ class StreamingQueryEngine:
             is_trigger_active=self._active and not self._stop.is_set(),
             message=message,
             batches_processed=self._batches,
+            # From the last completed micro-batch, not re-measured: a `status()` call must
+            # not touch the running fold from another thread.
+            state_operators=self._progress[-1].state_operators if self._progress else (),
         )
 
     # --- the loop ---------------------------------------------------------
@@ -189,6 +233,7 @@ class StreamingQueryEngine:
             self._error = exc
         finally:
             self._active = False
+            notify_query_terminated(self._name, self._error)
             if self._sink is not None:
                 with contextlib.suppress(Exception):
                     self._sink.close()
@@ -292,15 +337,29 @@ class StreamingQueryEngine:
         self._batches += 1
 
     def _loop(self) -> None:
+        """Drive micro-batches at the trigger's cadence until the query is over.
+
+        `once` drains with `available_now` rather than running a single `_process_next`.
+        Staging one epoch reads **one source batch**, which is an internal artifact — it
+        varies with file size, poll size and morsel size — so `Trigger.once()` processed
+        whatever fraction of the available data happened to land in the first batch and
+        reported success. A one-shot backfill over five batches wrote one of them, with
+        nothing raised and nothing in the progress record to say so.
+
+        Spark's `Trigger.Once` processes *all* available data, which is what this
+        trigger's own docstring has always promised. Spark deprecated it in favour of
+        `AvailableNow` because doing that in a single micro-batch is an unbounded memory
+        risk; draining across as many micro-batches as the data needs keeps the promise
+        and the memory bound, so the two triggers are now the same execution under two
+        names — the name kept working for a ported job, executed the safer way.
+        """
         kind = self._trigger.kind
-        if kind == "once":
-            self._process_next()
-            return
-        if kind in ("available_now", "continuous"):
+        if kind in ("once", "available_now", "continuous"):
             # Continuous: process micro-batches back-to-back with no inter-batch
             # delay (lowest latency), committing a checkpoint epoch per batch, until
-            # the query is stopped or the source is exhausted. (`available_now` shares
-            # the loop; it is simply expected to drain a finite source and end.)
+            # the query is stopped or the source is exhausted. (`available_now` and
+            # `once` share the loop; they are simply expected to drain what is
+            # available and end — see the docstring for why `once` is one of them.)
             while not self._stop.is_set() and self._process_next():
                 pass
             return
@@ -329,24 +388,86 @@ class StreamingQueryEngine:
         if staged is None:
             self._checkpoint_drain()
             return False
+        staged_at = perf_counter()
+        start_offset = self._runner.positions()
         if self._checkpoint is not None:
-            self._checkpoint.record_offsets(self._batches, self._runner.positions())
+            self._checkpoint.record_offsets(self._batches, start_offset)
+        wal_at = perf_counter()
         consumed, emitted = self._runner.publish(self._batches, staged)
+        published_at = perf_counter()
         if self._checkpoint is not None:
             self._commit_microbatch()
-        duration_ms = (perf_counter() - t0) * 1000.0
-        self._progress.append(
-            StreamingQueryProgress(
-                batch_id=self._batches,
-                num_input_rows=consumed,
-                num_output_rows=emitted,
-                duration_ms=duration_ms,
-                timestamp=time(),
-                behind_by_ms=self._behind_by(duration_ms),
-            )
+        end = perf_counter()
+        duration_ms = (end - t0) * 1000.0
+        # Keyed as Spark keys `durationMs`, because a total alone cannot distinguish a slow
+        # query from a slow *checkpoint* — and those have opposite remedies. `walCommit`
+        # covers both log writes (the write-ahead before publish and the commit after).
+        breakdown = (
+            ("latestOffset", (staged_at - t0) * 1000.0),
+            ("addBatch", (published_at - wal_at) * 1000.0),
+            ("walCommit", ((wal_at - staged_at) + (end - published_at)) * 1000.0),
         )
+        progress = StreamingQueryProgress(
+            batch_id=self._batches,
+            num_input_rows=consumed,
+            num_output_rows=emitted,
+            duration_ms=duration_ms,
+            timestamp=time(),
+            behind_by_ms=self._behind_by(duration_ms),
+            name=self._name,
+            state_operators=self._state_metrics(),
+            sources=self._source_progress(consumed, start_offset),
+            sink=self._sink_progress(emitted),
+            duration_breakdown_ms=breakdown,
+        )
+        self._progress.append(progress)
+        notify_query_progress(self._name, progress)
         self._batches += 1
         return True
+
+    def _state_metrics(self) -> tuple[StateOperatorProgress, ...]:
+        """What the runner's stateful operators are holding, if it has any.
+
+        Duck-typed, like `snapshot_state` and `finalize` beside it: a stateless pipeline
+        and the distributed runner simply do not define it, and report no operators.
+        """
+        metrics = getattr(self._runner, "state_metrics", None)
+        if metrics is None:
+            metrics = getattr(self._processor, "state_metrics", None)
+        return tuple(metrics()) if metrics is not None else ()
+
+    def _source_progress(
+        self, consumed: int, offsets: dict[int, dict]
+    ) -> tuple[SourceProgress, ...]:
+        """One `SourceProgress` for the query's source, with the position it reached.
+
+        A single source today — the launcher rejects a multi-source streaming plan — but
+        reported as a tuple because Spark's shape is per-source and a stream-stream join
+        will have two.
+        """
+        return (
+            SourceProgress(
+                description=_describe(self._source),
+                num_input_rows=consumed,
+                start_offset=offsets.get(0),
+                end_offset=self._runner.positions().get(0),
+            ),
+        )
+
+    def _sink_progress(self, emitted: int) -> SinkProgress | None:
+        """What the sink accepted, when there is one on this side of the seam.
+
+        None for the distributed runner, whose sinks live on the workers — reporting a
+        driver-side sink there would name an object that wrote nothing.
+        """
+        if self._sink is None:
+            return None
+        token_of = getattr(self._runner, "last_sink_token", None)
+        return SinkProgress(
+            description=_describe(self._sink),
+            num_output_rows=emitted,
+            token=token_of() if token_of is not None else None,
+        )
 
     def _behind_by(self, duration_ms: float) -> float:
         """How far this micro-batch overran the cadence it fires on, in milliseconds.

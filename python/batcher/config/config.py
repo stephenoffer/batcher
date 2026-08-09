@@ -409,6 +409,49 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamingConfig:
+    """Cadence and bookkeeping for a long-running streaming query.
+
+    These govern the micro-batch *loop*, not what it computes: how long an idle stream
+    waits before looking for data again, and how much progress history a query handle
+    keeps. The memory a streaming operator's state may hold is `MemoryConfig`'s
+    `streaming_state_max_bytes`, not here.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config import StreamingConfig
+            >>> StreamingConfig().idle_poll_seconds
+            0.2
+    """
+
+    # How long a runner waits before asking an *idle* unbounded source for data again.
+    # Only the empty path pays it: an epoch with rows is staged immediately. Too small
+    # burns a core re-listing a directory or re-asking a broker for its partitions; too
+    # large adds latency to the first row after a quiet stretch. The single-node and
+    # distributed runners share this value, so an idle stream behaves the same on one
+    # machine and on a cluster.
+    idle_poll_seconds: float = 0.2
+    # Micro-batch progress records a `StreamingQuery` handle retains for
+    # `recent_progress`. Bounded because a query that runs for a week at a 200ms
+    # cadence produces three million of them; Spark's `recentProgress` is bounded the
+    # same way (`spark.sql.streaming.numRecentProgressUpdates`, default 100).
+    progress_history: int = 100
+
+    def __post_init__(self) -> None:
+        """Reject a cadence or history that cannot mean anything."""
+        if self.idle_poll_seconds <= 0:
+            raise ValueError(
+                f"streaming.idle_poll_seconds must be > 0, got {self.idle_poll_seconds}: "
+                "a zero wait spins a core on every idle stream"
+            )
+        if self.progress_history < 1:
+            raise ValueError(
+                f"streaming.progress_history must be >= 1, got {self.progress_history}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class FlowControlConfig:
     """Credit-based backpressure for the shuffle and data transport.
 
@@ -696,20 +739,38 @@ class OptimizerConfig:
     cost_coeffs: CostCoefficients = CostCoefficients()
     cost_weights: CostWeights = CostWeights()
 
-    def resolved_broadcast_max_bytes(self, l3_cache_bytes: int = 0) -> int:
-        """The build-side broadcast threshold in bytes, sized to the last-level cache.
+    def resolved_broadcast_max_bytes(self, l3_cache_bytes: int = 0, workers: int = 1) -> int:
+        """The build-side broadcast threshold in bytes, sized to the cache or the cluster.
 
-        A broadcast join builds one hash table and probes it from every core, so it wins only
-        while that table stays L3-resident; past that the partitioned (shuffle) join wins. The
-        right threshold is therefore a share of the L3 the probing cores share — not a fixed
-        byte count, which is wrong by the cache ratio across the fleet (≈1 MiB on a small ARM
+        On **one node** (`workers <= 1`) this is a cache question. A broadcast join builds one
+        hash table and probes it from every core, so it wins only while that table stays
+        L3-resident; past that the partitioned (shuffle) join wins. The right threshold is
+        therefore a share of the L3 the probing cores share — not a fixed byte count, which is
+        wrong by the cache ratio across the fleet (≈1 MiB on a small ARM
         core to 32+ MiB per CCX on an EPYC). Given the detected `l3_cache_bytes`, this returns
         `_BROADCAST_L3_FRACTION` of it.
 
-        A pinned `broadcast_max_bytes` (any positive value) always wins. When it is `0` (auto)
-        and the cache is unknown (`l3_cache_bytes <= 0`, e.g. a non-Linux host), it falls back
-        to `_BROADCAST_FALLBACK_BYTES` — the historical 4 MiB — so behavior only ever *improves*
-        where the cache is readable and is unchanged where it is not.
+        Across a **cluster** (`workers > 1`) it is a network question instead, and the answer
+        is a different order of magnitude. Replicating `B` bytes to `W` workers costs `B x W`
+        on the wire; co-partitioning costs the probe side plus the build side, and the probe
+        side is the large one. A dimension table ten times too big for L3 still beats shuffling
+        a fact table fifty times its size, so applying the cache figure to a cluster declines
+        broadcasts that are overwhelmingly worth taking — a 4 MiB threshold that is really a
+        per-core cache share, against Spark's 10 MB `autoBroadcastJoinThreshold`, on the
+        transport (`resolve_transport` picks Flight for every genuine multi-node cluster) where
+        the shuffle it is avoiding is a network round-trip rather than a cache miss.
+
+        The distributed ceiling is what a worker must *hold*, not what its cache likes, so it
+        is a fixed multiple of the cache figure (`_BROADCAST_DISTRIBUTED_FACTOR`) floored at
+        `_BROADCAST_DISTRIBUTED_FLOOR` — the floor so a small-cache host does not decline every
+        broadcast a large-cache host takes. It stays an estimate either way: the executor
+        re-checks the *measured* build side against this same number before replicating it, so
+        a planner under-estimate costs a fallback to the shuffle rather than a cluster-wide OOM.
+
+        A pinned `broadcast_max_bytes` (any positive value) always wins, at any worker count.
+        When it is `0` (auto) and the cache is unknown (`l3_cache_bytes <= 0`, e.g. a non-Linux
+        host), it falls back to `_BROADCAST_FALLBACK_BYTES` — the historical 4 MiB — so behavior
+        only ever *improves* where the cache is readable and is unchanged where it is not.
 
         Examples:
             .. doctest::
@@ -718,20 +779,29 @@ class OptimizerConfig:
                 >>> OptimizerConfig().resolved_broadcast_max_bytes(16 * 1024 * 1024)
                 4194304
 
+                >>> OptimizerConfig().resolved_broadcast_max_bytes(16 * 1024 * 1024, workers=8)
+                67108864
+
                 >>> OptimizerConfig(broadcast_max_bytes=10 << 20).resolved_broadcast_max_bytes(0)
                 10485760
 
         Args:
             l3_cache_bytes: Detected last-level cache size; `0` when undetectable.
+            workers: The worker fan-out the plan targets; `1` (the default) is single-node.
 
         Returns:
             The broadcast-eligibility threshold in bytes.
         """
         if self.broadcast_max_bytes > 0:
             return self.broadcast_max_bytes
-        if l3_cache_bytes <= 0:
-            return _BROADCAST_FALLBACK_BYTES
-        return max(1, int(l3_cache_bytes * _BROADCAST_L3_FRACTION))
+        cache = (
+            _BROADCAST_FALLBACK_BYTES
+            if l3_cache_bytes <= 0
+            else max(1, int(l3_cache_bytes * _BROADCAST_L3_FRACTION))
+        )
+        if workers <= 1:
+            return cache
+        return max(_BROADCAST_DISTRIBUTED_FLOOR, cache * _BROADCAST_DISTRIBUTED_FACTOR)
 
 
 #: Share of the last-level cache a broadcast hash table may occupy before the partitioned join
@@ -742,6 +812,14 @@ _BROADCAST_L3_FRACTION = 0.25
 #: Broadcast threshold when the cache cannot be read (non-Linux) and none was pinned — the
 #: historical default, so an unreadable machine behaves exactly as before.
 _BROADCAST_FALLBACK_BYTES = 4 * 1024 * 1024
+#: How much larger a distributed broadcast budget is than the single-node cache one. The
+#: replicated side is held once per worker, so this is bounded by a worker's memory envelope
+#: rather than its cache: 16x a quarter-L3 is 64 MiB on a 16 MiB-L3 host, comfortably inside
+#: that envelope and comfortably above the dimension tables the widening exists to admit.
+_BROADCAST_DISTRIBUTED_FACTOR = 16
+#: Floor on the distributed budget, so a host whose cache the probe cannot read — or one with
+#: a genuinely small cache — still broadcasts an ordinary dimension table.
+_BROADCAST_DISTRIBUTED_FLOOR = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -1532,10 +1610,20 @@ class DistributedConfig:
     # keyed group-by would open ~100M mapper→reducer streams and collapse. The reducer count
     # only needs to be enough to balance keys and keep each reducer's state in memory — past a
     # few thousand it adds shuffle overhead, not parallelism (Spark's 200-default lineage). So
-    # `n_reducers = min(workers, this)`: regular clusters (≤ this many nodes) are UNCHANGED,
-    # while very large clusters stay bounded. Mergeable algebra makes any reducer count
-    # correct (result-identical), so this is purely a scaling knob. 0 disables the cap.
+    # `n_reducers = min(workers x shuffle_partition_multiplier, this)`, so very large
+    # clusters stay bounded. Mergeable algebra makes any reducer count correct
+    # (result-identical), so this is purely a scaling knob. 0 disables the cap.
     max_shuffle_partitions: int = 2048
+    # CEILING on shuffle buckets per worker, as a multiple of the worker count — not a
+    # target. One bucket per worker is the floor and the cold-start shape; this bounds how
+    # far a *measured* shuffle volume may raise it above that. Buckets above the floor buy
+    # skew tolerance (with one bucket per worker, a key group carrying twice the average
+    # carries it for the whole query, and there is no second bucket on that worker to
+    # average it against — the reason Spark sizes partitions independently of executor
+    # count) and lower per-reducer memory. They are not free: the exchange opens
+    # `mappers x reducers` streams, so every extra multiple is another round of Flight
+    # fetches per mapper. 1 pins the count at one bucket per worker.
+    shuffle_partition_multiplier: int = 4
     # Submit-ahead cap on concurrent map/inference partition tasks (`gather_map_results`).
     # Seeding Ray with every partition at once floods the scheduler / object store at high
     # fan-out (the "too many pending tasks" anti-pattern). `0` (default) derives the window
@@ -1894,6 +1982,7 @@ class Config:
     execution: ExecutionConfig = ExecutionConfig()
     memory: MemoryConfig = MemoryConfig()
     flow_control: FlowControlConfig = FlowControlConfig()
+    streaming: StreamingConfig = StreamingConfig()
     optimizer: OptimizerConfig = OptimizerConfig()
     pid: PIDConfig = PIDConfig()
     metadata: MetadataConfig = MetadataConfig()

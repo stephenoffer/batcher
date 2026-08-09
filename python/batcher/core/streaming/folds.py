@@ -27,6 +27,7 @@ from batcher.config import active_config
 from batcher.core.mergeable import RunningAggregate
 from batcher.io.source import Source, iter_source
 from batcher.plan.logical import Aggregate
+from batcher.plan.streaming import StateOperatorProgress
 
 __all__ = ["check_agg_state_bounded", "empty_global_aggregate", "streaming_state_budget"]
 
@@ -132,7 +133,7 @@ class _AggFold:
     snapshots for checkpoint recovery.
     """
 
-    __slots__ = ("_cfg", "_fold", "_input_ir", "_nat")
+    __slots__ = ("_cfg", "_fold", "_input_ir", "_nat", "_updated")
 
     def __init__(self, agg: Aggregate) -> None:
         self._nat = engine()
@@ -142,16 +143,36 @@ class _AggFold:
         # and rebuilt this every time — a config lookup plus a JSON dump charged to the
         # latency of every epoch, which is exactly what S10 hoisted out of `stream_topn`.
         self._cfg = active_config().engine_config_json()
+        # Partial rows this fold last absorbed, reported as `num_rows_updated`. See `metrics`.
+        self._updated = 0
 
     def push(self, batch: pa.RecordBatch) -> int:
         """Fold one source batch into the running state; return rows consumed."""
+        self._updated = 0
         if batch.num_rows == 0:
             return 0
         rows = self._nat.execute_plan(self._input_ir, [[batch]], self._cfg)
         if not rows or sum(b.num_rows for b in rows) == 0:
             return 0
         self._fold.push(rows)
+        self._updated = sum(b.num_rows for b in rows)
         return batch.num_rows
+
+    def metrics(self) -> StateOperatorProgress:
+        """This fold's state after the last `push` — what the progress record reports.
+
+        A streaming aggregation with no watermark never evicts, so `num_rows_removed` is
+        always zero and `num_rows_total` is the whole answer: it is the number that grows
+        without bound when the group key is too wide, and the one an operator watches to
+        see it happening before the memory guard fires.
+        """
+        state = self._fold.state()
+        return StateOperatorProgress(
+            operator_name="aggregate",
+            num_rows_total=0 if state is None else state.num_rows,
+            num_rows_updated=self._updated,
+            memory_used_bytes=self._fold.nbytes(),
+        )
 
     def finalize(self) -> pa.RecordBatch | None:
         """Materialize the current aggregate result, or None if no groups yet."""
@@ -219,9 +240,12 @@ class _WindowedAggFold:
         "_evicted_through",
         "_fold",
         "_input_ir",
+        "_late_dropped",
         "_lateness",
         "_nat",
+        "_removed",
         "_time_col",
+        "_updated",
         "_w_alias",
         "_width",
         "_wm",
@@ -244,6 +268,13 @@ class _WindowedAggFold:
         # The retained open-window state is bounded by the watermark advancing; cap it
         # so a stalled watermark fails loudly instead of OOMing (read once here).
         self._cap = active_config().memory.streaming_state_budget_bytes()
+        # Per-micro-batch counters, reported through `metrics`. `_late_dropped` is the one
+        # that mattered and did not exist: a row below the watermark is filtered out in
+        # Rust and simply never appears in the result, so a window that closed too early
+        # left a total quietly short by an amount nothing anywhere recorded.
+        self._late_dropped = 0
+        self._removed = 0
+        self._updated = 0
 
     def _advance_watermark(self, batch: pa.RecordBatch) -> None:
         import pyarrow.compute as pc
@@ -264,6 +295,7 @@ class _WindowedAggFold:
     def push(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
         from batcher.plan.expr_ir import col, lit
 
+        self._late_dropped = self._removed = self._updated = 0
         if batch.num_rows == 0:
             return []
         cfg = self._cfg
@@ -274,13 +306,18 @@ class _WindowedAggFold:
         if self._wm is not None:
             on_time = col(self._time_col).cast("timestamp") >= lit(_EPOCH + _td(self._wm))
             kept = self._nat.execute_plan(_scan_filter_ir(on_time), [[batch]], cfg)
+            # Counted here rather than inferred later: this is the only point at which
+            # the difference between "arrived" and "counted" is still visible.
+            self._late_dropped = batch.num_rows - sum(b.num_rows for b in kept)
         else:
             kept = [batch]
         self._advance_watermark(batch)
         for b in kept:
             if b.num_rows == 0:
                 continue
-            self._fold.push(self._nat.execute_plan(self._input_ir, [[b]], cfg))
+            partial = self._nat.execute_plan(self._input_ir, [[b]], cfg)
+            self._fold.push(partial)
+            self._updated += sum(p.num_rows for p in partial)
         out = self._evict(cfg)
         # After eviction, what remains is the open-window state; if it has outgrown the
         # cap the watermark is not closing windows (a stall), so fail clearly.
@@ -343,9 +380,28 @@ class _WindowedAggFold:
             )
             if b.num_rows
         ]
+        self._removed = sum(b.num_rows for b in closed)
         self._fold.combine_all(open_)
         result = self._fold.finalize_partials(closed)
         return [result] if result is not None else []
+
+    def metrics(self) -> StateOperatorProgress:
+        """This fold's state after the last `push` — what the progress record reports.
+
+        `num_late_inputs_dropped` is the field this whole path exists to surface: rows
+        that arrived below the watermark were filtered out in Rust and never appeared in
+        the output, so the only symptom was a total that was slightly too low.
+        """
+        state = self._fold.state()
+        return StateOperatorProgress(
+            operator_name="windowed_aggregate",
+            num_rows_total=0 if state is None else state.num_rows,
+            num_rows_updated=self._updated,
+            num_rows_removed=self._removed,
+            memory_used_bytes=self._fold.nbytes(),
+            num_late_inputs_dropped=self._late_dropped,
+            watermark_micros=self._wm,
+        )
 
     def flush(self) -> pa.RecordBatch | None:
         """Finalize and emit every remaining (open) window — the end-of-stream flush."""

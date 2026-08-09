@@ -15,15 +15,19 @@ from batcher._internal.errors import ResourceError
 from batcher.config import active_config
 from batcher.core.streaming_query import StreamingQueryEngine
 from batcher.io.formats.streaming.checkpoint import CheckpointStore
+from batcher.plan.streaming import Trigger
 
 
 def _engine(checkpoint) -> StreamingQueryEngine:
+    # A real `Trigger`, not a stand-in: the engine reads its cadence to decide whether an
+    # idle unbounded source means "wait" or "the stream is over", so a bare `object()`
+    # tested a runner the engine cannot actually build.
     return StreamingQueryEngine(
         name="t",
         source=object(),
         sink=object(),
         processor=object(),
-        trigger=object(),
+        trigger=Trigger.processing_time(0),
         output_mode="append",
         checkpoint=checkpoint,
     )

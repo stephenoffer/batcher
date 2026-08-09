@@ -261,7 +261,7 @@ def test_distributed_broadcast_runtime_guard_falls_back_to_shuffle(monkeypatch):
     single = left.join(right, on="k").collect()
     # Planner threshold huge → it marks the join broadcast; config threshold tiny →
     # the executor's runtime guard rejects the actual build side and shuffles instead.
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: 1 << 40)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: 1 << 40)
     cfg = active_config()
     guarded_cfg = cfg.replace(optimizer=dataclasses.replace(cfg.optimizer, broadcast_max_bytes=1))
     with config_context(guarded_cfg):
@@ -281,7 +281,7 @@ def test_distributed_broadcast_equals_shuffle_and_single_node(how, monkeypatch):
     single = left.join(right, on="k", how=how).collect()
     bcast = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)
     shuffled = left.join(right, on="k", how=how).collect(distributed=True, num_workers=4)
 
     assert _rowset(bcast) == _rowset(single)
@@ -331,7 +331,7 @@ def test_distributed_broadcast_join_correct_with_speculation_enabled():
     assert _rowset(distrib) == _rowset(single)
 
 
-def test_broadcast_join_streams_left_in_chunks(tmp_path):
+def test_broadcast_join_streams_left_in_chunks(cluster_tmp_path):
     """The broadcast probe streams its left side in byte-bounded chunks: with a tiny
     chunk target a multi-batch left partition spans several chunks, yet the joined output
     equals one direct join over the whole partition (bounded memory, same result)."""
@@ -365,7 +365,13 @@ def test_broadcast_join_streams_left_in_chunks(tmp_path):
     # chunk_bytes=1 forces a chunk boundary after every batch — the eight left batches
     # stream through as eight separate probe chunks against the resident right.
     out_path = _stream_broadcast_join(
-        left_ir, iter(left_batches), join_ir, [right_batch], str(tmp_path / "out.arrow"), cfg, 1
+        left_ir,
+        iter(left_batches),
+        join_ir,
+        [right_batch],
+        str(cluster_tmp_path / "out.arrow"),
+        cfg,
+        1,
     )
     streamed = pa.Table.from_batches(read_ipc(out_path))
     direct = pa.Table.from_batches(nat.execute_plan(join_ir, [left_batches, [right_batch]], cfg))
@@ -383,7 +389,7 @@ def test_distributed_skew_join_salting_equals_single_node(how, monkeypatch):
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)
 
     rng = np.random.default_rng(7)
     # Left: key 0 is hot (1000 rows ≈ 33%); keys 1..20 are cold (100 each).
@@ -449,7 +455,7 @@ def test_distributed_runtime_bloom_join_equals_single_node(how, monkeypatch):
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)  # force the shuffle path
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)  # force the shuffle path
 
     rng = np.random.default_rng(11)
     lk = rng.integers(0, 1000, 5000).astype("int64")
@@ -480,7 +486,7 @@ def test_distributed_runtime_bloom_join_multikey_equals_single_node(how, monkeyp
     from batcher.config import DistributedConfig
     from batcher.kyber.rules import selection
 
-    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda: -1)  # force the shuffle path
+    monkeypatch.setattr(selection, "_broadcast_max_bytes", lambda *a: -1)  # force the shuffle path
 
     rng = np.random.default_rng(7)
     n = 5000
@@ -699,7 +705,7 @@ def test_flight_join_matches_single_node(how):
     assert _rowset(single) == _rowset(flight)
 
 
-def test_flight_splittable_source_matches_single_node(tmp_path):
+def test_flight_splittable_source_matches_single_node(cluster_tmp_path):
     """A splittable source (Parquet row-groups) over the Flight path is shared-nothing:
     each worker gets a split-manifest as a Ray arg and reads its row-groups directly —
     no driver-local work_dir. (Also guards the path where the old code read a manifest
@@ -711,7 +717,7 @@ def test_flight_splittable_source_matches_single_node(tmp_path):
     t = pa.table(
         {"k": rng.integers(0, 40, n).astype("int64"), "v": rng.integers(0, 100, n).astype("int64")}
     )
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=10_000)  # 10 row-groups → 10 splits
 
     def q(ds):
@@ -737,7 +743,7 @@ def _spy_distributed_map(monkeypatch) -> list:
     return calls
 
 
-def test_distributed_breaker_free_scan_fans_out_over_splits(tmp_path, monkeypatch):
+def test_distributed_breaker_free_scan_fans_out_over_splits(cluster_tmp_path, monkeypatch):
     # A breaker-free scan/filter/project over a SPLITTABLE source distributes: each
     # worker reads its own row-groups in parallel (the distributed-scan case) instead of
     # one node reading the whole source. Result must equal single-node, and the parallel
@@ -752,7 +758,7 @@ def test_distributed_breaker_free_scan_fans_out_over_splits(tmp_path, monkeypatc
             "v": rng.integers(0, 100, n).astype("int64"),
         }
     )
-    path = str(tmp_path / "scan.parquet")
+    path = str(cluster_tmp_path / "scan.parquet")
     pq.write_table(t, path, row_group_size=10_000)  # 8 row-groups → splittable
 
     def q(ds):
@@ -782,7 +788,7 @@ def test_distributed_breaker_free_in_memory_stays_single_node(monkeypatch):
     assert _rowset(got) == _rowset(single)
 
 
-def test_distributed_iter_batches_scan_streams_off_driver(tmp_path):
+def test_distributed_iter_batches_scan_streams_off_driver(cluster_tmp_path):
     # iter_batches(distributed=True) over a breaker-free splittable scan fans the read
     # out across workers AND streams each worker's output back one partition at a time —
     # the driver never holds the whole scan result. Rows must equal collect, and the
@@ -797,7 +803,7 @@ def test_distributed_iter_batches_scan_streams_off_driver(tmp_path):
             "v": rng.integers(0, 100, n).astype("int64"),
         }
     )
-    path = str(tmp_path / "scan.parquet")
+    path = str(cluster_tmp_path / "scan.parquet")
     pq.write_table(t, path, row_group_size=10_000)  # 8 row-groups → splittable
 
     def q(ds):
@@ -955,7 +961,7 @@ def test_distributed_disk_sort_nulls_match_single_node(descending, nulls_first):
     assert single.column("k").to_pylist() == distrib.column("k").to_pylist()
 
 
-def test_distributed_disk_sort_never_reads_full_source_on_driver(tmp_path, monkeypatch):
+def test_distributed_disk_sort_never_reads_full_source_on_driver(cluster_tmp_path, monkeypatch):
     """The disk sort samples boundaries from per-worker KLL sketches, so a splittable
     source's rows are read only inside the worker tasks — never materialized on the
     driver. Spy on the driver-side `read_source` to prove it is never called."""
@@ -971,7 +977,7 @@ def test_distributed_disk_sort_never_reads_full_source_on_driver(tmp_path, monke
             "v": rng.integers(0, 100, n).astype("int64"),
         }
     )
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=10_000)  # 10 row-groups → splittable
 
     # The driver-side eager read path goes through `read_source`; the splittable
@@ -1059,7 +1065,7 @@ def test_distributed_honors_engine_config_from_context():
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_limit_matches_single_node(tmp_path, transport):
+def test_distributed_limit_matches_single_node(cluster_tmp_path, transport):
     """A bare `LIMIT`/`head` over a splittable source distributes, and returns *exactly*
     the rows single-node returns — same values, same order, same schema.
 
@@ -1071,7 +1077,7 @@ def test_distributed_limit_matches_single_node(tmp_path, transport):
 
     n = 50_000
     t = pa.table({"i": np.arange(n, dtype="int64"), "v": (np.arange(n) % 97).astype("int64")})
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=5_000)  # 10 row-groups → 10 splits
 
     cases = [
@@ -1093,7 +1099,7 @@ def test_distributed_limit_matches_single_node(tmp_path, transport):
         assert single.to_pydict() == dist.to_pydict()  # ordered: the same first-k rows
 
 
-def test_distributed_empty_limit_result_keeps_its_schema(tmp_path):
+def test_distributed_empty_limit_result_keeps_its_schema(cluster_tmp_path):
     """A filter that matches nothing, then a limit, yields zero batches — the result must
     still carry the real column types (not null placeholders), identically on one node and
     many. Otherwise a downstream concat / write_parquet breaks only on the empty case."""
@@ -1101,7 +1107,7 @@ def test_distributed_empty_limit_result_keeps_its_schema(tmp_path):
 
     n = 10_000
     t = pa.table({"i": np.arange(n, dtype="int64"), "s": ["x"] * n})
-    path = str(tmp_path / "e.parquet")
+    path = str(cluster_tmp_path / "e.parquet")
     pq.write_table(t, path, row_group_size=1_000)
 
     def q(ds):
@@ -1116,7 +1122,7 @@ def test_distributed_empty_limit_result_keeps_its_schema(tmp_path):
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_multi_table_join_matches_single_node(tmp_path, transport):
+def test_distributed_multi_table_join_matches_single_node(cluster_tmp_path, transport):
     """Star/snowflake joins (3 and 4 tables) distribute and equal the single-node result.
 
     The one-shot dispatcher co-partitions exactly two sources per join, so a join whose
@@ -1136,7 +1142,7 @@ def test_distributed_multi_table_join_matches_single_node(tmp_path, transport):
     d3 = pa.table({"d2": np.arange(3, dtype="int64"), "label": [f"g{i}" for i in range(3)]})
     paths = []
     for name, tbl, rg in [("f", fact, 3_000), ("d1", d1, 5), ("d2", d2, 2), ("d3", d3, 1)]:
-        p = str(tmp_path / f"{name}.parquet")
+        p = str(cluster_tmp_path / f"{name}.parquet")
         pq.write_table(tbl, p, row_group_size=rg)
         paths.append(p)
     pf, p1, p2, p3 = paths
@@ -1161,7 +1167,7 @@ def test_distributed_multi_table_join_matches_single_node(tmp_path, transport):
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_aggregate_over_join_grouped_by_non_key(tmp_path, transport):
+def test_distributed_aggregate_over_join_grouped_by_non_key(cluster_tmp_path, transport):
     """An aggregate over a join grouped by a column that is NOT the join key.
 
     The Flight path folds the partial aggregate into the join's reducers; the disk path has
@@ -1176,8 +1182,8 @@ def test_distributed_aggregate_over_join_grouped_by_non_key(tmp_path, transport)
         {"k": rng.integers(0, 50, n).astype("int64"), "v": rng.integers(0, 100, n).astype("int64")}
     )
     dim = pa.table({"k": np.arange(50, dtype="int64"), "grp": (np.arange(50) % 6).astype("int64")})
-    pf = str(tmp_path / "f.parquet")
-    pd_ = str(tmp_path / "d.parquet")
+    pf = str(cluster_tmp_path / "f.parquet")
+    pd_ = str(cluster_tmp_path / "d.parquet")
     pq.write_table(fact, pf, row_group_size=4_000)
     pq.write_table(dim, pd_, row_group_size=10)
 
@@ -1192,7 +1198,7 @@ def test_distributed_aggregate_over_join_grouped_by_non_key(tmp_path, transport)
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_empty_results_keep_their_types(tmp_path, transport):
+def test_distributed_empty_results_keep_their_types(cluster_tmp_path, transport):
     """A filter matching nothing must give the same SCHEMA distributed as single-node.
 
     A zero-row result still has types. Fabricating `null`-typed placeholder columns made
@@ -1208,7 +1214,7 @@ def test_distributed_empty_results_keep_their_types(tmp_path, transport):
         {"k": (np.arange(n) % 50).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
     )
     dim = pa.table({"k": np.arange(50, dtype="int64"), "lbl": [f"g{i}" for i in range(50)]})
-    pf, pd_ = str(tmp_path / "f.parquet"), str(tmp_path / "d.parquet")
+    pf, pd_ = str(cluster_tmp_path / "f.parquet"), str(cluster_tmp_path / "d.parquet")
     pq.write_table(fact, pf, row_group_size=2_000)
     pq.write_table(dim, pd_, row_group_size=10)
 
@@ -1240,7 +1246,7 @@ def test_distributed_empty_results_keep_their_types(tmp_path, transport):
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_sort_by_computed_key_matches_single_node(tmp_path, transport):
+def test_distributed_sort_by_computed_key_matches_single_node(cluster_tmp_path, transport):
     """`ORDER BY <expression>` distributes by hoisting the key into a hidden column.
 
     The range partitioner splits on the leading key's *values*, so it needs a column;
@@ -1262,7 +1268,7 @@ def test_distributed_sort_by_computed_key_matches_single_node(tmp_path, transpor
             "s": [f"n{i % 37}" for i in range(n)],
         }
     )
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=3_000)
 
     def rowset(tb):
@@ -1311,7 +1317,7 @@ def test_distributed_sort_by_computed_key_matches_single_node(tmp_path, transpor
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_global_window_matches_single_node(tmp_path, transport):
+def test_distributed_global_window_matches_single_node(cluster_tmp_path, transport):
     """`<agg>(x) OVER ()` — no PARTITION BY, no ORDER BY — distributes as a whole-relation
     aggregate broadcast: a zero-key mergeable aggregate, then a stateless map that appends
     the scalar. It used to raise `PlanError` (nothing to hash-shuffle on).
@@ -1329,7 +1335,7 @@ def test_distributed_global_window_matches_single_node(tmp_path, transport):
     t = pa.table(
         {"k": rng.integers(0, 20, n).astype("int64"), "v": rng.integers(0, 100, n).astype("int64")}
     )
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=3_000)
 
     def rowset(tb):
@@ -1358,7 +1364,7 @@ def test_distributed_global_window_matches_single_node(tmp_path, transport):
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_provably_empty_relation_runs_everywhere(tmp_path, transport):
+def test_distributed_provably_empty_relation_runs_everywhere(cluster_tmp_path, transport):
     """Kyber folds a provably-false predicate to `Limit(0)`. Every operator above it must
     still execute — there is no data to distribute, so one node is the *optimal* plan, not a
     perf cliff. `window` used to raise, because the folded `Limit` reads as a pipeline
@@ -1370,7 +1376,7 @@ def test_distributed_provably_empty_relation_runs_everywhere(tmp_path, transport
     t = pa.table(
         {"k": (np.arange(n) % 20).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
     )
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=2_000)
 
     never = col("v") > 10**9
@@ -1392,7 +1398,7 @@ def test_distributed_provably_empty_relation_runs_everywhere(tmp_path, transport
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_breaker_beneath_breaker_is_not_run_per_partition(tmp_path, transport):
+def test_distributed_breaker_beneath_breaker_is_not_run_per_partition(cluster_tmp_path, transport):
     """A pipeline breaker beneath another breaker must not be run as a per-partition map prefix.
 
     The aggregate and join executors ship the inner plan to every worker and re-run it against
@@ -1414,7 +1420,7 @@ def test_distributed_breaker_beneath_breaker_is_not_run_per_partition(tmp_path, 
         {"k": (np.arange(n) % 20).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
     )
     dim = pa.table({"k": np.arange(20, dtype="int64"), "lbl": [f"g{i}" for i in range(20)]})
-    pm, pd_ = str(tmp_path / "m.parquet"), str(tmp_path / "d.parquet")
+    pm, pd_ = str(cluster_tmp_path / "m.parquet"), str(cluster_tmp_path / "d.parquet")
     pq.write_table(t, pm, row_group_size=2_000)
     pq.write_table(dim, pd_, row_group_size=5)
 
@@ -1445,7 +1451,7 @@ def test_distributed_breaker_beneath_breaker_is_not_run_per_partition(tmp_path, 
         assert rowset(single) == rowset(dist)  # VALUES, not just row counts
 
 
-def test_unsound_one_shot_shape_raises_rather_than_returning_wrong_values(tmp_path):
+def test_unsound_one_shot_shape_raises_rather_than_returning_wrong_values(cluster_tmp_path):
     """With staging explicitly disabled, a breaker-under-breaker must FAIL, never compute.
 
     Silently evaluating the inner plan per partition is the wrong-answer bug above; refusing
@@ -1457,7 +1463,7 @@ def test_unsound_one_shot_shape_raises_rather_than_returning_wrong_values(tmp_pa
     t = pa.table(
         {"k": (np.arange(n) % 20).astype("int64"), "v": (np.arange(n) % 97).astype("int64")}
     )
-    path = str(tmp_path / "m.parquet")
+    path = str(cluster_tmp_path / "m.parquet")
     pq.write_table(t, path, row_group_size=1_000)
 
     with pytest.raises(PlanError, match="stage by stage"):
@@ -1467,7 +1473,7 @@ def test_unsound_one_shot_shape_raises_rather_than_returning_wrong_values(tmp_pa
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_row_wise_reshapers_and_row_index(tmp_path, transport):
+def test_distributed_row_wise_reshapers_and_row_index(cluster_tmp_path, transport):
     """`unpivot`, `with_row_index`, `with_random` and `tail` distribute exactly.
 
     `unpivot` (melt) is stateless and row-wise — the neutral `plan.logical.is_streamable`
@@ -1489,7 +1495,7 @@ def test_distributed_row_wise_reshapers_and_row_index(tmp_path, transport):
             "w": (np.arange(n) % 13).astype("int64"),
         }
     )
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=2_000)
 
     unordered = [lambda d: d.select("k", "v", "w").unpivot(index="k")]
@@ -1517,7 +1523,7 @@ def test_distributed_row_wise_reshapers_and_row_index(tmp_path, transport):
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
-def test_distributed_sample_matches_single_node(tmp_path, transport):
+def test_distributed_sample_matches_single_node(cluster_tmp_path, transport):
     """`sample(fraction)` is a per-row predicate — a seeded hash of the row's values — so it
     distributes exactly. A *fixed-count* `sample(n=)` keeps the `n` smallest-hash rows of the
     whole relation, so it is a breaker and must NOT run per partition (each worker would keep
@@ -1537,7 +1543,7 @@ def test_distributed_sample_matches_single_node(tmp_path, transport):
             "w": (np.arange(n) % 13).astype("int64"),
         }
     )
-    path = str(tmp_path / "t.parquet")
+    path = str(cluster_tmp_path / "t.parquet")
     pq.write_table(t, path, row_group_size=2_000)
 
     def rowset(tb):
@@ -1557,14 +1563,24 @@ def test_distributed_sample_matches_single_node(tmp_path, transport):
         assert single.schema == dist.schema
         assert rowset(single) == rowset(dist)
 
-    # Fixed-count sample is a breaker: refuse rather than keep `n` rows per worker.
-    with pytest.raises(PlanError):
-        bt.read.parquet(path).sample(n=5, seed=3).collect(
-            distributed=True, num_workers=4, transport=transport
+    # Fixed-count sample is not row-wise, so it once reached `_unsupported` and was refused
+    # on distributed data. It is mergeable top-N — a row among the globally `n` smallest
+    # hashes is among its own partition's `n` smallest, so re-applying the operator to the
+    # union of the per-partition results selects exactly the global answer — and
+    # `dist/executor.py` now runs it that way. This asserts the answer rather than the
+    # refusal, and at two widths, because "keeps `n` per worker" is the failure it replaced:
+    # that bug shows up as a row *count* that scales with `num_workers`.
+    single_n = bt.read.parquet(path).sample(n=5, seed=3).collect(distributed=False)
+    assert single_n.num_rows == 5
+    for workers in (4, 8):
+        dist_n = bt.read.parquet(path).sample(n=5, seed=3).collect(
+            distributed=True, num_workers=workers, transport=transport
         )
+        assert dist_n.num_rows == 5, f"{workers} workers kept n rows each"
+        assert rowset(single_n) == rowset(dist_n)
 
 
-def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(tmp_path):
+def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(cluster_tmp_path):
     """`union -> group_by` runs, but its result cannot feed a join or a second aggregate.
 
     The controls matter more than the assertions here, because three plausible readings of
@@ -1590,7 +1606,7 @@ def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(tmp_p
     t = pa.table(
         {"a": (np.arange(n) % 40).astype("int64"), "b": (np.arange(n) % 31).astype("int64")}
     )
-    path = str(tmp_path / "au.parquet")
+    path = str(cluster_tmp_path / "au.parquet")
     pq.write_table(t, path, row_group_size=500)
     e = bt.read.parquet(path)
 

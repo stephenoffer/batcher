@@ -57,6 +57,8 @@ class StandardScaler(Preprocessor):
         with_std: divide by the standard deviation (scale) when True.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "mean_", "scale_", "with_mean", "with_std")
 
     def __init__(
@@ -90,6 +92,7 @@ class StandardScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__m"] = col(c).mean()
@@ -171,6 +174,8 @@ class MinMaxScaler(Preprocessor):
         feature_range: the ``(lo, hi)`` target range (``hi`` must exceed ``lo``).
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "data_max_", "data_min_", "feature_range")
 
     def __init__(
@@ -204,6 +209,7 @@ class MinMaxScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -267,6 +273,8 @@ class MaxAbsScaler(Preprocessor):
         columns: the numeric columns to scale (replaced in place).
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "max_abs_")
 
     def __init__(self, columns: str | Sequence[str]) -> None:
@@ -294,6 +302,7 @@ class MaxAbsScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         aggs = {}
         for c in self.columns:
             aggs[f"{c}__min"] = col(c).min()
@@ -353,6 +362,8 @@ class RobustScaler(Preprocessor):
         quantile_range: the ``(lo, hi)`` percentiles bounding the IQR (default 25/75).
     """
 
+    numeric_only = True
+
     __slots__ = ("center_", "columns", "iqr_", "quantile_range")
 
     def __init__(
@@ -388,6 +399,7 @@ class RobustScaler(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         q_lo, q_hi = self.quantile_range
         aggs = {}
         for c in self.columns:
@@ -454,6 +466,8 @@ class Normalizer(Preprocessor):
         columns: the numeric columns that together form each row's vector.
         norm: the norm to divide by — ``"l1"``, ``"l2"``, or ``"max"``.
     """
+
+    numeric_only = True
 
     __slots__ = ("columns", "norm")
 

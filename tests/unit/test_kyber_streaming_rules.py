@@ -124,3 +124,101 @@ def test_bounded_plan_is_never_reported_unbounded():
     plan = _source()._plan
     assert not has_unbounded_input(plan, ctx)
     assert emits_incrementally(plan, ctx)
+
+
+# --- push_filter_into_stream_join_side, and what an outer join forbids ----------------
+
+
+def _stream_join(how: str = "inner", *, predicate=None):
+    """A two-stream interval join, optionally under a filter, for the pushdown rules."""
+    from batcher.plan.logical import JoinOutputCol, WatermarkStreamJoin
+
+    left = _source()._plan
+    right = _source()._plan
+    output = (
+        JoinOutputCol("left", "k", "k"),
+        JoinOutputCol("left", "t", "t"),
+        JoinOutputCol("left", "v", "v"),
+        JoinOutputCol("right", "v", "v_right"),
+    )
+    join = WatermarkStreamJoin(left, right, ("k",), ("k",), output, "t", "t", 1_000_000, 0, how)
+    return Filter(join, predicate) if predicate is not None else join
+
+
+def _the_join(plan):
+    from batcher.plan.logical import WatermarkStreamJoin
+
+    joins = [n for n in walk(plan) if isinstance(n, WatermarkStreamJoin)]
+    assert len(joins) == 1
+    return joins[0]
+
+
+def _sides_carrying(plan, needle: str) -> set[str]:
+    """Which sides of the join now carry a `Filter` mentioning `needle`.
+
+    Keyed on the predicate's text rather than on "is there a Filter", because
+    `reject_null_join_keys` also adds one and the two rules must be told apart: a test
+    that only asked whether a side had *a* filter passed while the wrong rule fired.
+    """
+    join = _the_join(plan)
+    return {
+        side
+        for side, node in (("left", join.left), ("right", join.right))
+        if isinstance(node, Filter) and needle in repr(node.predicate)
+    }
+
+
+def test_a_side_pure_filter_pushes_into_an_inner_stream_join():
+    """The rewrite that pays: a buffered row filtered before the join is never buffered."""
+    rewritten = _rewrite(_stream_join("inner", predicate=col("v") > lit(5)))
+    assert _sides_carrying(rewritten, "> lit(5)") == {"left"}
+
+
+def test_a_filter_on_the_preserved_side_of_a_left_join_still_pushes():
+    """A left row removed before the join simply never appears — same rows, less state."""
+    rewritten = _rewrite(_stream_join("left", predicate=col("v") > lit(5)))
+    assert _sides_carrying(rewritten, "> lit(5)") == {"left"}
+
+
+def test_a_filter_on_the_null_supplying_side_of_a_left_join_does_not_push():
+    """Pushing there does not remove output rows, it *replaces* matched rows with
+    null-padded ones — a different answer, not a smaller one."""
+    rewritten = _rewrite(_stream_join("left", predicate=col("v_right") > lit(5)))
+    assert _sides_carrying(rewritten, "> lit(5)") == set()
+
+
+def test_a_filter_on_the_null_supplying_side_of_a_right_join_does_not_push():
+    rewritten = _rewrite(_stream_join("right", predicate=col("v") > lit(5)))
+    assert _sides_carrying(rewritten, "> lit(5)") == set()
+
+
+@pytest.mark.parametrize("predicate_col", ["v", "v_right"])
+def test_a_full_outer_join_pushes_into_neither_side(predicate_col):
+    """Both sides supply nulls, so neither can be filtered before the join."""
+    rewritten = _rewrite(_stream_join("full", predicate=col(predicate_col) > lit(5)))
+    assert _sides_carrying(rewritten, "> lit(5)") == set()
+
+
+def test_the_pushdown_preserves_the_join_kind():
+    """A rule that rebuilt the node without `how` would silently turn an outer join into
+    an inner one — the rows would simply be missing."""
+    assert _the_join(_rewrite(_stream_join("left", predicate=col("v") > lit(5)))).how == "left"
+
+
+# --- reject_null_join_keys, and what an outer join forbids ----------------------------
+
+
+def test_null_keys_are_rejected_on_both_sides_of_an_inner_stream_join():
+    """A null-keyed row matches nothing and is buffered for the whole window regardless,
+    so removing it is free state."""
+    assert _sides_carrying(_rewrite(_stream_join("inner")), "is_not_null") == {"left", "right"}
+
+
+@pytest.mark.parametrize(
+    ("how", "expected"),
+    [("left", {"right"}), ("right", {"left"}), ("full", set())],
+)
+def test_a_preserved_sides_null_keys_are_its_output_not_its_dead_weight(how, expected):
+    """An outer join emits its preserved side's unmatched rows null-padded, and a
+    null-keyed row is exactly an unmatched one — so removing it deletes output."""
+    assert _sides_carrying(_rewrite(_stream_join(how)), "is_not_null") == expected

@@ -151,7 +151,44 @@ def run_relational(
         carbonite.ResourceManager(hub=ctx.hub).admit() as grant,
         _with_grant(scope, grant),
     ):
-        return _run_relational(plan, sources, ctx, distributed=distributed, materialize=materialize)
+        return _run_seeded_topn(plan, sources, ctx, distributed, materialize)
+
+
+def _run_seeded_topn(plan, sources, ctx, distributed, materialize):
+    """Run `plan`, first trying it seeded with a remembered top-N bound.
+
+    Kyber decides whether the shape is seedable and what bound to use
+    (`kyber.learned_tuning.topn_bound`); what happens *here* is the half a plan → plan pass
+    cannot express — run it, look at how many rows came back, and run the original instead
+    when the answer says the bound was stale.
+
+    The check is a row count and nothing more, because that is all it has to be: the seeded
+    plan removes only rows strictly beyond the bound, so any `k` survivors are the true
+    top-k regardless of what the bound was learned from. A short result is the *only* way
+    seeding can go wrong, and it is not a wrong answer, just a wasted (cheap) scan.
+    """
+    from batcher.kyber.learned_tuning.topn_bound import record_topn_bound, seed_topn_bound
+
+    def run(target):
+        return _run_relational(
+            target, sources, ctx, distributed=distributed, materialize=materialize
+        )
+
+    # Seeding needs a materialized result to count, and the whole loop is keyed on the plan
+    # *as written* — never on the seeded rewrite, which is a different shape and would learn
+    # a bound under a signature no later run asks for.
+    seed = seed_topn_bound(plan, ctx.hub) if materialize else None
+    if seed is not None:
+        table, decisions = run(seed.plan)
+        if table is not None and table.num_rows >= seed.k:
+            return table, decisions
+        # The remembered bound no longer separates `k` rows. Nothing about the seeded run is
+        # reusable — a wider bound could admit rows it never looked at — so redo as written.
+
+    table, decisions = run(plan)
+    if materialize:
+        record_topn_bound(ctx.hub, plan, table)
+    return table, decisions
 
 
 @contextlib.contextmanager

@@ -19,7 +19,7 @@ import pytest
 pypdf = pytest.importorskip("pypdf")
 
 import batcher.io.formats.unstructured.documents as doc_mod  # noqa: E402
-from batcher._internal.errors import FormatError  # noqa: E402
+from batcher._internal.errors import BackendError, FormatError  # noqa: E402
 from batcher.io.formats.unstructured.documents import DocumentSource  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -86,6 +86,42 @@ def test_projection_is_honored(corpus) -> None:
     assert batch.schema.names == ["page"]
 
 
+def test_a_projection_without_text_never_extracts_any(corpus, monkeypatch) -> None:
+    """Projecting `text` away must skip the extraction, not just drop the column.
+
+    Laying a page out into reading order is essentially the entire cost of this reader —
+    around 90% of a 300-page document's read time — and it was paid unconditionally. So
+    `select("path", "page")` cost the same as reading the prose, and a bare `count()` cost
+    it too. Nothing about that shows up in a row count or a schema, which is why it needs
+    an assertion on the *call*: an explosive `extract_text` is the only way to state
+    "this was never reached".
+    """
+
+    def explode(self):
+        raise AssertionError("extract_text ran for a projection that excluded `text`")
+
+    monkeypatch.setattr(pypdf._page.PageObject, "extract_text", explode)
+    for projection in (["page"], ["path"], ["path", "page"], []):
+        rows = sum(b.num_rows for b in DocumentSource(corpus).iter_batches(projection))
+        assert rows == 1200, f"{projection} lost rows"
+
+
+def test_text_is_still_extracted_when_it_is_projected(corpus, monkeypatch) -> None:
+    """The other half of the pushdown: skipping must not become skipping always."""
+    calls = {"n": 0}
+    original = pypdf._page.PageObject.extract_text
+
+    def counted(self, *args, **kwargs):
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pypdf._page.PageObject, "extract_text", counted)
+    for projection in (None, ["text"], ["path", "text"]):
+        calls["n"] = 0
+        list(DocumentSource(corpus).iter_batches(projection))
+        assert calls["n"] == 1200, f"{projection} did not extract every page"
+
+
 def test_a_page_that_will_not_extract_is_null_under_skip(corpus, monkeypatch) -> None:
     """One bad page in a 900-page report must not cost the other 899."""
 
@@ -130,3 +166,63 @@ def test_the_batch_size_is_what_splits_the_pages(tmp_path, monkeypatch) -> None:
     batches = list(DocumentSource(str(tmp_path)).iter_batches())
 
     assert [b.num_rows for b in batches] == [10, 10, 5]
+
+
+def _encrypted_pdf(path, *, user_password: str, owner_password: str = "owner") -> None:
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_blank_page(width=200, height=200)
+    writer.encrypt(user_password=user_password, owner_password=owner_password)
+    with open(path, "wb") as fh:
+        writer.write(fh)
+
+
+def test_a_password_protected_corpus_can_be_read(tmp_path) -> None:
+    """There was nowhere to put the password, so these documents could not be read at all.
+
+    An enterprise or scanned corpus routinely carries them, and the failure was
+    `FileNotDecryptedError: File has not been decrypted` — which says what happened and
+    not one thing about what to do about it.
+    """
+    _encrypted_pdf(tmp_path / "locked.pdf", user_password="s3cret")
+    table = pa.Table.from_batches(
+        list(DocumentSource(str(tmp_path), password="s3cret").iter_batches())
+    )
+
+    assert table.num_rows == 2
+
+
+def test_a_permissions_only_pdf_needs_no_password(tmp_path) -> None:
+    """Encrypting a PDF to restrict printing leaves the *user* password empty.
+
+    Every other reader opens those silently, so requiring a password for them would
+    reject a large part of a real corpus for no reason.
+    """
+    _encrypted_pdf(tmp_path / "restricted.pdf", user_password="")
+    table = pa.Table.from_batches(list(DocumentSource(str(tmp_path)).iter_batches()))
+
+    assert table.num_rows == 2
+
+
+def test_a_wrong_password_names_the_parameter_that_would_fix_it(tmp_path) -> None:
+    """The error a caller can act on, rather than the backend's own."""
+    from batcher._internal.errors import FormatError
+
+    _encrypted_pdf(tmp_path / "locked.pdf", user_password="s3cret")
+    source = DocumentSource(str(tmp_path), password="wrong")
+
+    with pytest.raises((FormatError, BackendError), match="password"):
+        list(source.iter_batches())
+
+
+def test_the_password_travels_to_a_distributed_worker(tmp_path) -> None:
+    """A worker rebuilds the reader from `_reader_kwargs`.
+
+    Without the password there, every encrypted file would fail on the cluster while
+    succeeding locally — a distributed result that differs from the single-node one,
+    which is the failure mode the mergeable contract exists to prevent.
+    """
+    _encrypted_pdf(tmp_path / "locked.pdf", user_password="s3cret")
+    source = DocumentSource(str(tmp_path), password="s3cret")
+
+    assert source._reader_kwargs()["password"] == "s3cret"

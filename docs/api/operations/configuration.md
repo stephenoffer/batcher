@@ -1,6 +1,6 @@
 # Configuration API reference
 
-This page covers the public configuration surface: the `Config` dataclass, the two entry points that install one, and how the layers combine. For the field-by-field reference of every section, see {doc}`configuration/options </configuration/options>`.
+This page covers the public configuration surface: the {py:class}`Config <batcher.Config>` dataclass, the two entry points that install one, and how the layers combine. For the field-by-field reference of every section, see {doc}`configuration/options </configuration/options>`.
 
 ```python
 from batcher import Config, set_config, config_context
@@ -34,25 +34,26 @@ Sections are themselves frozen dataclasses. Read fields directly, and derive new
 ### Section classes
 
 The section dataclasses are exported so you can construct one and slot it into
-`Config.replace`. Their fields are documented in
+{py:meth}`Config.replace <batcher.Config.replace>`. Their fields are documented in
 {doc}`configuration/options </configuration/options>`; each is summarized here.
 
 | Class | Configures |
 | --- | --- |
-| `ExecutionConfig` | parallelism, morsel size, file-split size, CPUs per task |
-| `MemoryConfig` | buffer-pool envelope, soft/hard limits, and spill thresholds |
-| `FlowControlConfig` | credit-based shuffle backpressure and AIMD credit tuning |
-| `OptimizerConfig` | Kyber planning thresholds, cost model, and cardinality defaults |
-| `PIDConfig` | gains for the adaptive batch-size PID controller |
-| `MetadataConfig` | learned-stats backend, URI, and decay rate |
-| `GovernanceConfig` | whether row/column policy is advisory or mandatory |
-| `TenantConfig` | which tenant a scope's work belongs to, and its share |
-| `AcceleratorConfig` | GPU placement, VRAM headroom, MIG preference, and KV-cache sizing |
-| `EnergyConfig` | the site's power budget, energy price, grid carbon intensity, and PUE |
-| `DeviceHealthConfig` | when a device is derated or taken out of rotation |
-| `DeviceMemoryConfig` | the device allocator, its pool sizing, and host spilling |
-| `FaultToleranceConfig` | the retry budget and what happens when a device corrupts rather than loses |
-| `QuarantineConfig` | when repeated task failures take a node or device out of rotation |
+| {py:class}`ExecutionConfig <batcher.ExecutionConfig>` | parallelism, morsel size, file-split size, CPUs per task |
+| {py:class}`MemoryConfig <batcher.MemoryConfig>` | buffer-pool envelope, soft/hard limits, and spill thresholds |
+| {py:class}`FlowControlConfig <batcher.FlowControlConfig>` | credit-based shuffle backpressure and AIMD credit tuning |
+| {py:class}`StreamingConfig <batcher.StreamingConfig>` | the micro-batch loop's idle cadence and progress history |
+| {py:class}`OptimizerConfig <batcher.OptimizerConfig>` | Kyber planning thresholds, cost model, and cardinality defaults |
+| {py:class}`PIDConfig <batcher.PIDConfig>` | gains for the adaptive batch-size PID controller |
+| {py:class}`MetadataConfig <batcher.MetadataConfig>` | learned-stats backend, URI, and decay rate |
+| {py:class}`GovernanceConfig <batcher.GovernanceConfig>` | whether row/column policy is advisory or mandatory |
+| {py:class}`TenantConfig <batcher.TenantConfig>` | which tenant a scope's work belongs to, and its share |
+| {py:class}`AcceleratorConfig <batcher.config.AcceleratorConfig>` | GPU placement, VRAM headroom, MIG preference, and KV-cache sizing |
+| {py:class}`EnergyConfig <batcher.config.EnergyConfig>` | the site's power budget, energy price, grid carbon intensity, and PUE |
+| {py:class}`DeviceHealthConfig <batcher.config.DeviceHealthConfig>` | when a device is derated or taken out of rotation |
+| {py:class}`DeviceMemoryConfig <batcher.config.DeviceMemoryConfig>` | the device allocator, its pool sizing, and host spilling |
+| {py:class}`FaultToleranceConfig <batcher.config.FaultToleranceConfig>` | the retry budget and what happens when a device corrupts rather than loses |
+| {py:class}`QuarantineConfig <batcher.config.QuarantineConfig>` | when repeated task failures take a node or device out of rotation |
 
 ### Config.replace
 
@@ -74,7 +75,7 @@ print(cfg.execution.parallelism)
 
 ### Config.from_env
 
-`Config.from_env(environ=None, base=None)` overlays `BATCHER_*` environment variables
+{py:meth}`Config.from_env(environ=None, base=None) <batcher.Config.from_env>` overlays `BATCHER_*` environment variables
 onto `base` (defaults when omitted) and returns a new `Config`. Pass an explicit
 mapping to overlay specific variables.
 
@@ -88,7 +89,7 @@ print(cfg.execution.parallelism)
 
 ### Config.from_file
 
-`Config.from_file(path, base=None)` overlays a JSON document of nested section
+{py:meth}`Config.from_file(path, base=None) <batcher.Config.from_file>` overlays a JSON document of nested section
 overrides onto `base` and returns a new `Config`. The JSON mirrors the section
 structure. See {doc}`configuration/environment </configuration/environment>` for the
 format.
@@ -102,13 +103,13 @@ cfg = Config.from_file("/etc/batcher/config.json")
 
 ### Config.validate and Config.engine_config_json
 
-`Config.validate()` checks the configuration and raises `ConfigError` on a bad value. `Config.engine_config_json()` serializes the Rust-relevant execution knobs for the data plane, which is the JSON the engine receives.
+{py:meth}`Config.validate() <batcher.Config.validate>` checks the configuration and raises {py:exc}`ConfigError <batcher.ConfigError>` on a bad value. {py:meth}`Config.engine_config_json() <batcher.Config.engine_config_json>` serializes the Rust-relevant execution knobs for the data plane, which is the JSON the engine receives.
 
 ## set_config
 
-`set_config(config)` installs a `Config` as the process-wide active configuration.
+{py:func}`set_config(config) <batcher.set_config>` installs a `Config` as the process-wide active configuration.
 It takes a `Config` object, not keyword fields, and sits above the environment and
-file layers but below `config_context`.
+file layers but below {py:func}`config_context <batcher.config_context>`.
 
 ```python
 from batcher import Config, set_config

@@ -9,7 +9,80 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["await_any_termination", "compact", "streams", "vacuum"]
+__all__ = [
+    "add_streaming_listener",
+    "await_any_termination",
+    "compact",
+    "remove_streaming_listener",
+    "reset_terminated",
+    "streaming_listeners",
+    "streams",
+    "vacuum",
+]
+
+
+def add_streaming_listener(listener: Any) -> None:
+    """Register a `StreamingQueryListener` (Spark ``spark.streams.addListener``).
+
+    Every streaming query in this process — already running or started later — reports
+    its start, each completed micro-batch, and its termination to the listener. A
+    listener that raises is logged and skipped, never allowed to fail the query.
+
+    Args:
+        listener: A `StreamingQueryListener` subclass instance. Registering the same
+            one twice adds it once.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> listener = bt.StreamingQueryListener()
+            >>> bt.add_streaming_listener(listener)
+            >>> bt.remove_streaming_listener(listener)
+            True
+    """
+    from batcher.plan.streaming import add_streaming_listener as _add
+
+    _add(listener)
+
+
+def remove_streaming_listener(listener: Any) -> bool:
+    """Unregister a `StreamingQueryListener` (Spark ``spark.streams.removeListener``).
+
+    Args:
+        listener: The listener to remove.
+
+    Returns:
+        ``True`` if it was registered, ``False`` if it was not.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.remove_streaming_listener(bt.StreamingQueryListener())
+            False
+    """
+    from batcher.plan.streaming import remove_streaming_listener as _remove
+
+    return _remove(listener)
+
+
+def streaming_listeners() -> list[Any]:
+    """Every registered `StreamingQueryListener`, in registration order.
+
+    Returns:
+        The registered listeners.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.streaming_listeners()
+            []
+    """
+    from batcher.plan.streaming import streaming_listeners as _listeners
+
+    return _listeners()
 
 
 def streams() -> list[Any]:
@@ -55,6 +128,27 @@ def await_any_termination(timeout: float | None = None) -> bool:
     from batcher.api.streaming import await_any_termination as _await_any
 
     return _await_any(timeout)
+
+
+def reset_terminated() -> None:
+    """Forget terminations already reported by `await_any_termination` (Spark parity).
+
+    Spark's `awaitAnyTermination` returns immediately once any query has terminated, and
+    keeps doing so until `resetTerminated()` clears the record — so a supervisor that
+    restarts a failed query and loops back in without resetting spins at full speed on a
+    termination it has already handled.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> bt.reset_terminated()
+            >>> bt.await_any_termination(timeout=0.0)
+            True
+    """
+    from batcher.api.streaming._query import reset_terminated as _reset
+
+    _reset()
 
 
 def compact(

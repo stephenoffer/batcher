@@ -4,7 +4,7 @@ A `GROUP BY` over a bounded table finishes. Over a stream it never does: every g
 stays live forever, because another row for it might arrive tomorrow.
 
 :::{warning}
-Run a plain `group_by("user").agg(...)` against Kafka in `complete` mode and the state grows
+Run a plain {py:meth}`group_by("user").agg(...) <batcher.Dataset.group_by>` against Kafka in `complete` mode and the state grows
 for as long as the job runs. Eventually it is the job's memory that ends the query.
 :::
 
@@ -51,7 +51,7 @@ stream.
 
 :::{tab-item} An unbounded source
 
-Now the source never ends. Add `.with_watermark(time_col, lateness)` and the identical
+Now the source never ends. Add {py:meth}`.with_watermark(time_col, lateness) <batcher.Dataset.with_watermark>` and the identical
 `group_by(...).agg(...)` becomes a windowed streaming aggregation: state is one running
 partial per open window, and a window is emitted the moment the watermark passes its
 end.
@@ -126,16 +126,16 @@ The three output modes are not interchangeable, and the engine will tell you so:
 
 | `output_mode` | What a micro-batch emits | The catch |
 | --- | --- | --- |
-| `"append"` | a window's row once, when the watermark closes it | needs a watermark on a windowed aggregation; ask for it on a plain `group_by("user")` and you get a `PlanError`, because the engine cannot know a group is final |
+| `"append"` | a window's row once, when the watermark closes it | needs a watermark on a windowed aggregation; ask for it on a plain `group_by("user")` and you get a {py:exc}`PlanError <batcher.PlanError>`, because the engine cannot know a group is final |
 | `"complete"` | the whole result table, every micro-batch | right for a small, bounded key space (a dashboard of 50 regions), wrong for unbounded keys, because every group is retained forever |
 | `"update"` | only the rows that changed | your sink must be able to upsert |
 
-`Trigger.continuous(...)` does not run aggregations at all; it is stateless pipelines
+{py:meth}`Trigger.continuous(...) <batcher.Trigger.continuous>` does not run aggregations at all; it is stateless pipelines
 only. Use a processing-time trigger.
 
 ## Sessions
 
-Windows with fixed boundaries do not describe user behavior. `session_window` groups
+Windows with fixed boundaries do not describe user behavior. {py:meth}`session_window <batcher.Dataset.session_window>` groups
 consecutive events per key whose gap is under a timeout, and starts a new session when
 the gap is exceeded. Same aggregate expressions:
 
@@ -150,6 +150,55 @@ print(sessions.select("user", "session_start", "total").to_pydict()["total"])
 User `a` clicked at 00:00 and again at 01:30, a 90-minute gap, so two sessions (3 and 7),
 not one of 10.
 
+### A session over a stream has to wait
+
+A fixed window knows its end before a single row arrives, so the engine can close one the
+instant the watermark passes it. A session knows nothing in advance: every event extends
+the session it lands in, and an event arriving between two sessions merges them into one.
+So the operator holds a session's rows until the watermark passes its last event plus the
+gap, and only then aggregates and emits it.
+
+The call is unchanged. Only the source is:
+
+```python
+session_schema = pa.schema([("user", pa.string()), ("ts", pa.timestamp("us")),
+                            ("amount", pa.int64())])
+
+
+def click_feed():
+    yield pa.record_batch(
+        {"user": ["a", "a"], "ts": [base, base + 2 * minute], "amount": [3, 4]},
+        schema=session_schema,
+    )
+    yield pa.record_batch(
+        {"user": ["a"], "ts": [base + 300 * minute], "amount": [9]}, schema=session_schema
+    )
+
+
+clicks = bt.from_batches(click_feed, session_schema, bounded=False)
+
+for batch in clicks.session_window(
+    "ts", "45m", partition_by=["user"], total=col("amount").sum()
+).iter_batches():
+    print(batch.to_pydict()["total"])
+# [7]
+# [9]
+```
+
+The first session emitted while the stream was still running, because the 05:00 event
+pushed the watermark past 00:02 plus the 45-minute gap. The second was still open when
+the feed ended, so it came out in the end-of-stream flush.
+
+That gives the operator its memory bound: it buffers rows for sessions that are still
+open, which is the live key space times the gap rather than the length of the stream.
+
+:::{warning}
+**A late event cannot reopen a session that was already emitted.** It is dropped, the
+same way a late row is dropped from a closed window, and for the same reason: the row
+downstream has already been written. `with_watermark("ts", "10m")` is how you buy a
+straggler room, and it costs exactly that much more buffering before any session closes.
+:::
+
 ## What bounds the state
 
 Memory for a windowed streaming aggregate is proportional to the number of *open*
@@ -158,15 +207,16 @@ when event time advances. So an idle partition, a clock skew, or a source that s
 producing will stall the watermark, and open windows accumulate.
 
 Batcher caps that state and fails loudly rather than dying by OOM: the retained state is
-checked against `memory.streaming_state_max_bytes` and a `ResourceError` names the column
+checked against `memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>` names the column
 whose watermark is not advancing. That is a real signal, not a tuning knob to raise
 reflexively. If it fires, the usual cause is an event-time gap or a dead partition, not
 an undersized budget.
 
 :::{important}
-There is no side output for the rows the watermark drops, and no per-batch late-row
-counter in `recent_progress()`. A window that closed early is quietly short, and nothing in
-the job's metrics says so. Late data is covered in
+There is no side output for the rows the watermark drops, so a window that closed early is
+short and the rows are gone. It is not silent, though: each micro-batch's `num_late_rows`
+counts what it discarded, and `state_operators` reports the watermark and the open-window
+state behind it. Late data is covered in
 {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>`.
 :::
 

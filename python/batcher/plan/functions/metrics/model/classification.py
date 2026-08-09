@@ -179,6 +179,23 @@ def accuracy(y_true: IntoExpr, y_pred: IntoExpr) -> Expr:
     return matched / count_if(_as_column(y_true).is_not_null() & _as_column(y_pred).is_not_null())
 
 
+def _rate(numerator: Expr, denominator: Expr) -> Expr:
+    """``numerator / denominator``, or 0.0 when the denominator counts nothing.
+
+    Every rate here is a count over a count, and each one has an input that makes the
+    denominator zero: a batch with no positive predictions has no precision, a batch with no
+    actual positives has no recall. Plain division answered NaN, which is defensible in
+    isolation and wrong in place - the docstrings promise a value in ``[0, 1]``, and NaN is
+    not in it. Worse, it spreads: one fold with no positives makes the mean over folds NaN,
+    so a cross-validation score or a streaming metric goes quietly undefined because of a
+    single batch, which is the ordinary case on imbalanced data rather than a rare one.
+
+    Zero is scikit-learn's convention for this (``zero_division=0``), which is what the rest
+    of these metrics are checked against.
+    """
+    return when(denominator == lit(0)).then(lit(0.0)).otherwise(numerator / denominator)
+
+
 def precision(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
     """Of the rows predicted positive, the fraction that are — ``tp / (tp + fp)``.
 
@@ -190,7 +207,7 @@ def precision(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
         positive: The value that counts as the positive class.
 
     Returns:
-        The precision in ``[0, 1]``.
+        The precision in ``[0, 1]``, and 0.0 when nothing was predicted positive.
 
     Examples:
         .. doctest::
@@ -201,7 +218,7 @@ def precision(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
             {'m': [0.5]}
     """
     tp = true_positives(y_true, y_pred, positive=positive)
-    return tp / (tp + false_positives(y_true, y_pred, positive=positive))
+    return _rate(tp, tp + false_positives(y_true, y_pred, positive=positive))
 
 
 def recall(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -215,7 +232,7 @@ def recall(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
         positive: The value that counts as the positive class.
 
     Returns:
-        The recall in ``[0, 1]``.
+        The recall in ``[0, 1]``, and 0.0 when there are no positive rows to find.
 
     Examples:
         .. doctest::
@@ -226,7 +243,7 @@ def recall(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
             {'m': [0.5]}
     """
     tp = true_positives(y_true, y_pred, positive=positive)
-    return tp / (tp + false_negatives(y_true, y_pred, positive=positive))
+    return _rate(tp, tp + false_negatives(y_true, y_pred, positive=positive))
 
 
 def specificity(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -238,7 +255,7 @@ def specificity(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Exp
         positive: The value that counts as the positive class.
 
     Returns:
-        The specificity in ``[0, 1]``.
+        The specificity in ``[0, 1]``, and 0.0 when there are no negative rows.
 
     Examples:
         .. doctest::
@@ -249,7 +266,7 @@ def specificity(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Exp
             {'m': [0.5]}
     """
     tn = true_negatives(y_true, y_pred, positive=positive)
-    return tn / (tn + false_positives(y_true, y_pred, positive=positive))
+    return _rate(tn, tn + false_positives(y_true, y_pred, positive=positive))
 
 
 def false_positive_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -288,7 +305,8 @@ def negative_predictive_value(y_true: IntoExpr, y_pred: IntoExpr, *, positive: A
         positive: The value that counts as the positive class.
 
     Returns:
-        The negative predictive value in ``[0, 1]``.
+        The negative predictive value in ``[0, 1]``, and 0.0 when nothing was predicted
+        negative.
 
     Examples:
         .. doctest::
@@ -299,7 +317,7 @@ def negative_predictive_value(y_true: IntoExpr, y_pred: IntoExpr, *, positive: A
             {'m': [0.6666666666666666]}
     """
     tn = true_negatives(y_true, y_pred, positive=positive)
-    return tn / (tn + false_negatives(y_true, y_pred, positive=positive))
+    return _rate(tn, tn + false_negatives(y_true, y_pred, positive=positive))
 
 
 def f1_score(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -339,7 +357,8 @@ def fbeta_score(
         positive: The value that counts as the positive class.
 
     Returns:
-        The F-beta score in ``[0, 1]``.
+        The F-beta score in ``[0, 1]``, and 0.0 when neither the truth nor the prediction
+        has a positive row.
 
     Examples:
         .. doctest::
@@ -353,7 +372,7 @@ def fbeta_score(
     fp = false_positives(y_true, y_pred, positive=positive)
     fn = false_negatives(y_true, y_pred, positive=positive)
     squared = beta * beta
-    return (lit(1.0 + squared) * tp) / (lit(1.0 + squared) * tp + lit(squared) * fn + fp)
+    return _rate(lit(1.0 + squared) * tp, lit(1.0 + squared) * tp + lit(squared) * fn + fp)
 
 
 def balanced_accuracy(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1) -> Expr:
@@ -485,7 +504,7 @@ def false_negative_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1
         positive: The value that counts as the positive class.
 
     Returns:
-        The false negative rate in ``[0, 1]``.
+        The false negative rate in ``[0, 1]``, and 0.0 when there are no positive rows.
 
     Examples:
         .. doctest::
@@ -497,4 +516,4 @@ def false_negative_rate(y_true: IntoExpr, y_pred: IntoExpr, *, positive: Any = 1
     """
     tp = true_positives(y_true, y_pred, positive=positive)
     fn = false_negatives(y_true, y_pred, positive=positive)
-    return fn / (tp + fn)
+    return _rate(fn, tp + fn)

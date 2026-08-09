@@ -232,3 +232,35 @@ class TestPlanCacheSeesIt:
 
         assert _read_cost_key(None, None) == "-"
         assert _read_cost_key(MetadataHub(InProcessBackend()), None) == "-"
+
+
+class TestTheDegradedKeyIsTraced:
+    """A learned read that fails must degrade *and say so* — it must not fail invisibly.
+
+    Returning `"-"` is the all-1.0 vector: every source looks equally cheap, so plans stop
+    specializing on read cost and simply get a little worse. That is the exact difference
+    `note_suppressed` exists to record — "this optimization did not apply" against "this
+    optimization has been broken since March" — and the branch carried a
+    `pragma: no cover` instead of a test.
+    """
+
+    def test_a_failing_relative_read_cost_degrades_to_the_neutral_key(self, monkeypatch) -> None:
+        from batcher.kyber import plan_cache
+
+        class _Src:
+            def identity(self) -> str:
+                return "a"
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("hub backend went away")
+
+        monkeypatch.setattr("batcher.metadata.io_stats.relative_read_cost", _boom)
+        traced: list[tuple] = []
+        monkeypatch.setattr(
+            plan_cache, "note_suppressed", lambda *a: traced.append(a), raising=True
+        )
+
+        assert plan_cache._read_cost_key(object(), [_Src()]) == "-"
+        assert traced, "the degraded read left no trace"
+        assert traced[0][0] == "kyber"
+        assert isinstance(traced[0][2], RuntimeError)

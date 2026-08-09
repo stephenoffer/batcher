@@ -121,6 +121,10 @@ class _Translator:
         self._registry = registry
         self._functions = functions
         self._agg_map: dict[str, tuple[str, AggExpr]] | None = None
+        # Per select node (by id), which joined-relation column each source contributed:
+        # `{alias: {bare column -> column now carrying it}}`. Written by
+        # `_disambiguate_columns`, read by a qualified `x.*`.
+        self._star_sources: dict[int, dict[str, dict[str, str]]] = {}
         self._agg_n = 0
         self._scalar_sub_n = 0
         self._udf_n = 0

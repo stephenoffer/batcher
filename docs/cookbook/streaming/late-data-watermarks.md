@@ -6,8 +6,10 @@ lateness to ten minutes and an event stamped 01:20 came through. The tunnel even
 01:25 with an event time of 00:47. They belong to a window that no longer exists.
 
 :::{warning}
-Batcher drops them. Silently: no side output, no counter in `recent_progress()`. Your
-hourly total is quietly, permanently 3% low, and nothing in the job's metrics says so.
+Batcher drops them. There is no side output and no dead-letter, so your hourly total is
+quietly, permanently 3% low. What there *is* is a count: every micro-batch's
+`num_late_rows` says how many rows it discarded, so the shortfall is measurable rather
+than merely suspected.
 :::
 
 This page is about choosing that tradeoff on purpose instead of discovering it in a
@@ -121,7 +123,7 @@ Two failure shapes to keep in mind:
 **A stalled watermark.** Event time advances on the *maximum* event time seen. If a
 partition goes idle, or a source stops producing, nothing advances, so no window closes and
 state grows. Batcher does not let that end in an OOM: retained state is checked against
-`memory.streaming_state_max_bytes` and a `ResourceError` names the column whose watermark
+`memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>` names the column whose watermark
 is not advancing. Read it as a diagnosis, not a budget request.
 
 **A clock from the future.** One device with a badly-set clock emits an event stamped next
@@ -140,7 +142,7 @@ print(sane.is_streaming)
 
 ## Bounded state for deduplication
 
-The same mechanism bounds a dedup. `drop_duplicates_within_watermark` keeps the first row
+The same mechanism bounds a dedup. {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row
 per key inside the watermark window and forgets keys the watermark has passed, so the
 seen-key set does not grow forever. An at-least-once producer that re-sends on a timeout is
 exactly what this is for:
@@ -183,7 +185,7 @@ your producer's retry behavior, not only to your window latency.
 
 :::{important}
 There is no late-data side output. A dropped row is not routed anywhere, and
-`StreamingQueryProgress` reports `num_input_rows` and `num_output_rows` but no late-row
+{py:class}`StreamingQueryProgress <batcher.StreamingQueryProgress>` reports `num_input_rows` and `num_output_rows` but no late-row
 count. If losing a straggler is unacceptable for your use case, the honest options are: set
 a lateness that actually covers your lag distribution; or land raw events and recompute the
 affected windows in a batch job, which is a reconciliation pipeline, not a streaming one.

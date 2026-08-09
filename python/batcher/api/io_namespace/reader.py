@@ -488,13 +488,19 @@ class Reader:
         """
         return _read(path, format="binary", **opts)
 
-    def documents(self, path: PathLike, **opts: Any) -> Dataset:
+    def documents(self, path: PathLike, *, password: str | None = None, **opts: Any) -> Dataset:
         """Read PDF document(s) — a file, directory, or glob — as extracted text rows.
 
         Needs the optional extra: ``pip install 'batcher-engine[pdf]'``.
 
+        Extracting the text is skipped entirely when the ``text`` column is not projected,
+        so ``select("path", "page")`` and ``count()`` read the page tree and stop. Laying a
+        page out into reading order is most of the cost of this reader.
+
         Args:
             path: A PDF file, directory, or glob to read.
+            password: The user password for an encrypted corpus. A PDF encrypted for
+                *permissions* only opens without it.
             opts: Format-specific reader options forwarded to the source.
 
         Returns:
@@ -506,7 +512,7 @@ class Reader:
                 >>> import batcher as bt
                 >>> ds = bt.read.documents("docs/*.pdf")  # doctest: +SKIP
         """
-        return _read(path, format="documents", **opts)
+        return _read(path, format="documents", password=password, **opts)
 
     def numpy(self, path: PathLike, **opts: Any) -> Dataset:
         """Read NumPy ``.npy``/``.npz`` file(s) — file, directory, or glob — as tensor rows.
@@ -790,8 +796,10 @@ class Reader:
         """List video file(s) + header-metadata rows.
 
         ``decode=True`` (or passing ``size=``) appends a ``frames`` (num_frames, H, W, 3)
-        uint8 tensor column via PyAV; decoding needs the optional extra:
-        ``pip install 'batcher-engine[video]'``.
+        uint8 tensor column. An engine built with the ``video`` feature decodes it in the
+        data plane; otherwise the decode falls back to PyAV, which needs the optional
+        extra ``pip install 'batcher-engine[video]'``. Either way a clip that will not
+        decode is null rather than a black frame.
 
         Args:
             path: A video file, directory, or glob.
@@ -1258,7 +1266,16 @@ class Reader:
             topic: The Kafka topic to consume.
             bootstrap_servers: Broker address(es), comma-separated.
             group: Consumer group id (offsets are committed under it).
-            opts: Further consumer options (e.g. ``partitions=``) passed through.
+            opts: Further consumer options passed through: ``partitions=`` to pin
+                topic-partitions, ``max_offsets_per_trigger=`` and
+                ``max_bytes_per_trigger=`` (the Spark spellings of ``poll_size`` and
+                ``poll_bytes``) to bound one micro-batch by message count and by payload
+                size, ``starting_offsets=`` (``"earliest"``, ``"latest"``, or a
+                ``{partition: offset}`` map) for where a first run begins,
+                ``fail_on_data_loss=`` for whether aged-out offsets stop the query,
+                ``include_headers=True`` to add a ``headers`` column of
+                ``array<struct<key:string,value:binary>>``, and anything else the
+                ``confluent-kafka`` consumer accepts.
 
         Returns:
             A lazy `Dataset` streaming from the Kafka topic.
@@ -1377,12 +1394,21 @@ class Reader:
     def files_incremental(self, path: PathLike, file_format: str, **opts: Any) -> Dataset:
         """Incrementally discover and read newly arrived files under `path`.
 
-        A Databricks Auto Loader analog: tracks already-seen files across runs.
+        A Databricks Auto Loader analog: tracks already-seen files across runs. Under a
+        streaming trigger the directory is re-listed every cadence, so a query started
+        against it keeps ingesting whatever lands later.
+
+        Backpressure is two bounds that compose, and a large backlog usually wants both:
+        ``max_files_per_trigger=`` caps how many new files one micro-batch takes, and
+        ``max_bytes_per_trigger=`` caps their total size. A file count alone is a poor
+        proxy for the memory a batch needs when files range from kilobytes to gigabytes.
 
         Args:
             path: Directory or glob to watch for new files.
             file_format: Underlying format of those files (e.g. ``"parquet"``, ``"json"``).
-            opts: Options forwarded to the underlying file reader.
+            opts: ``state_dir=`` for the durable seen-file store,
+                ``max_files_per_trigger=`` / ``max_bytes_per_trigger=`` for backpressure,
+                and any further options forwarded to the underlying file reader.
 
         Returns:
             A lazy `Dataset` streaming rows from newly arrived files.
@@ -1419,6 +1445,34 @@ class Reader:
                 ... )
         """
         return _read_table("rate", rows_per_second, **opts)
+
+    def rate_micro_batch(self, rows_per_batch: int = 1, **opts: Any) -> Dataset:
+        """Generate exactly `rows_per_batch` rows per micro-batch (Spark ``rate-micro-batch``).
+
+        The difference from `rate` is the unit, and it is the whole point. `rate` promises
+        rows per *second*, so how many land in a micro-batch depends on how long the
+        previous one took — which makes it useless as a benchmark input, because the thing
+        being measured changes the input. This promises rows per *batch*, so a run is
+        reproducible and a comparison between two builds is a comparison.
+
+        Args:
+            rows_per_batch: Rows in every micro-batch.
+            opts: ``num_rows=`` to bound it, ``start_timestamp=`` and
+                ``advance_ms_per_batch=`` to shape the event-time column so a windowed
+                query over it is deterministic too.
+
+        Returns:
+            A lazy `Dataset` of generated ``(timestamp, value)`` rows.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> demo = bt.read.rate_micro_batch(3, num_rows=9)
+                >>> [b.num_rows for b in demo.iter_batches()]
+                [3, 3, 3]
+        """
+        return _read_table("rate_micro_batch", rows_per_batch, **opts)
 
     def socket(self, host: str = "localhost", port: int = 9999, **opts: Any) -> Dataset:
         """Read newline-delimited text from a TCP socket (Spark `socket`; dev only).

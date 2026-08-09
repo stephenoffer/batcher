@@ -409,6 +409,9 @@ def current_ordinal() -> int | None:
         try:
             return int(cupy.cuda.runtime.getDevice())
         except Exception:
+            # A probe, not a query path: cupy is present but cannot answer (no driver, no
+            # device, a version whose runtime API moved). Fall through to the next library
+            # rather than fail — the caller's contract is `None` for "nobody could tell".
             pass
     numba = sys.modules.get("numba")
     if numba is not None:
@@ -417,6 +420,7 @@ def current_ordinal() -> int | None:
 
             return int(numba_cuda.get_current_device().id)
         except Exception:
+            # Same as the cupy probe above: numba is importable but has no current device.
             pass
     return None
 

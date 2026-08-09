@@ -26,7 +26,7 @@ from types import ModuleType
 
 from batcher._internal.errors import BackendError
 
-__all__ = ["engine", "engine_or_none", "has_engine"]
+__all__ = ["engine", "engine_features", "engine_or_none", "has_engine"]
 
 
 def engine_or_none() -> ModuleType | None:
@@ -80,3 +80,22 @@ def has_engine() -> bool:
         ``True`` when ``batcher._native`` can be imported, ``False`` otherwise.
     """
     return engine_or_none() is not None
+
+
+def engine_features() -> frozenset[str]:
+    """Return the optional cargo features this engine was compiled with.
+
+    Optional decoders link system C libraries, so whether one is in the binary is a
+    property of the *build*, not of the Python environment — and no amount of inspection
+    on the Python side can tell. The engine reports it so the control plane can choose a
+    native kernel over a Python fallback at plan-build time rather than discovering the
+    answer as a run-time error.
+
+    An engine that is missing, or one built before this was reported, yields an empty
+    set: absent evidence of a feature, assume it is absent.
+
+    Returns:
+        The enabled feature names, e.g. ``frozenset({"video"})``.
+    """
+    mod = engine_or_none()
+    return frozenset(getattr(mod, "__engine_features__", ()) or ())

@@ -123,6 +123,55 @@ rather than Python's `hash()`, which varies per process and would be a silent sk
 
 `BinaryEncoder` is the middle ground between `OneHotEncoder` and `HashingEncoder` when a column has many categories but not unboundedly many: it assigns each category an integer and writes it in base 2, so 100 categories cost 7 bit columns rather than 100 one-hot columns, with no collisions. An unseen category encodes as all-zero bits.
 
+## Choosing how much to trust a category
+
+`TargetEncoder` shrinks every category toward the global mean by the same fixed weight. Two
+other encoders answer the same question differently, and the difference shows on a
+long-tailed column where categories differ wildly in size.
+
+{py:class}`LeaveOneOutEncoder <batcher.ml.preprocessors.LeaveOneOutEncoder>` doesn't shrink
+at all. It removes the row's own contribution instead, so a row's encoding is the mean of
+the *other* rows in its category and the target cannot leak into its own feature:
+
+```python
+from batcher.ml.preprocessors import LeaveOneOutEncoder
+
+spend = bt.from_pydict({"city": ["a", "a", "a"], "amount": [0.0, 3.0, 6.0]})
+print(LeaveOneOutEncoder(["city"], "amount").fit_transform(spend).to_pydict()["city"])
+# [4.5, 3.0, 1.5]
+```
+
+`fit_transform` applies that leave-one-out form because those are the training rows;
+`transform` applies the plain category mean, because a held-out row contributed nothing to
+subtract.
+
+The exactness has a cost worth knowing. On a binary target in a category of two rows, the
+encoding *is* the other row's label, so a model can learn to read the feature backwards.
+Prefer it where categories have a reasonable number of rows each, and prefer
+`TargetEncoder(cv=...)` when the tail is thin.
+
+{py:class}`JamesSteinEncoder <batcher.ml.preprocessors.JamesSteinEncoder>` derives the
+shrinkage from the data rather than taking it as a hyperparameter. A category whose own
+target scatters widely relative to the spread between categories is trusted less; one that
+is both large and consistent keeps almost all of its own mean:
+
+```python
+from batcher.ml.preprocessors import JamesSteinEncoder
+
+mixed = bt.from_pydict(
+    {"city": ["big"] * 20 + ["tiny"] * 2, "churn": [1.0] * 20 + [1.0, 1.0]}
+)
+fitted = JamesSteinEncoder(["city"], "churn").fit(mixed)
+print(round(fitted.mapping_["city"]["big"], 4) >= round(fitted.mapping_["city"]["tiny"], 4))
+# True
+```
+
+That removes the one number `TargetEncoder` asks you to guess, which matters when a single
+`smoothing` that suits a category with ten rows over-shrinks one with ten thousand.
+
+Both learn from one mergeable `group_by` per column and encode with a lazy CASE expression,
+like every other encoder here. An unseen category, and a null, take the global mean.
+
 ## Weight-of-evidence encoding
 
 `TargetEncoder` replaces a category with the target's mean; `WOEEncoder` replaces it with the
@@ -165,6 +214,41 @@ print(imputer.transform(train).collect().column("age").to_pylist())
 The learned fill value in `imputer.statistics_` is reused on every split, so train and
 validation get the *same* fill. The standard impute-then-scale ordering composes by
 sequencing the objects, as **Composing a pipeline** below shows.
+
+## Imputing from the other columns
+
+{py:class}`SimpleImputer <batcher.ml.preprocessors.SimpleImputer>` fills a column with one
+number, which discards everything the row's *other* columns say about it. A missing income
+in a row with a known job title and postcode is not well described by the global mean.
+
+{py:class}`IterativeImputer <batcher.ml.preprocessors.IterativeImputer>` is the MICE-style
+alternative, matching scikit-learn's: model each incomplete column from the remaining ones,
+fill the gaps with the model's prediction, and repeat so later rounds see better fills than
+earlier ones did.
+
+```python
+from batcher.ml.preprocessors import IterativeImputer, SimpleImputer
+
+related = bt.from_pydict(
+    {"a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "b": [2.0, 4.0, None, 8.0, 10.0, 12.0]}
+)
+print(round(IterativeImputer(["a", "b"]).fit_transform(related).to_pydict()["b"][2], 3))
+# 6.0
+print(round(SimpleImputer(["b"]).fit_transform(related).to_pydict()["b"][2], 3))
+# 7.2
+```
+
+`b` is exactly twice `a`, so 6.0 is the right answer and 7.2 is the column mean. That gap is
+the whole reason to pay for this.
+
+`fit` records the entire schedule — the initial per-column fill, then one model per
+incomplete column per round, in order — and `transform` replays it. A serving row is
+therefore imputed by the same models in the same sequence as a training row, which is the
+part a hand-rolled loop usually gets wrong.
+
+The cost is real. A fit is up to `max_iter * len(incomplete columns)` model fits, each a
+pass over the data, so reach for `SimpleImputer` when the columns are unrelated. Rounds stop
+early once nothing moves by more than `tol`, and `n_iter_` reports how many actually ran.
 
 ## Binning continuous values
 

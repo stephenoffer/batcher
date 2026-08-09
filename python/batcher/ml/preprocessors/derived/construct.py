@@ -58,6 +58,8 @@ class Binarizer(Preprocessor):
         threshold: A value strictly above this becomes 1, at or below becomes 0.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "threshold")
 
     def __init__(self, columns: str | Sequence[str], *, threshold: float = 0.0) -> None:
@@ -214,6 +216,8 @@ class InteractionFeatures(Preprocessor):
         columns: The columns to cross; every distinct pair becomes a product column.
     """
 
+    numeric_only = True
+
     __slots__ = ("columns",)
 
     def __init__(self, columns: Sequence[str]) -> None:
@@ -331,6 +335,8 @@ class VarianceThreshold(Preprocessor):
             genuinely constant columns).
     """
 
+    numeric_only = True
+
     __slots__ = ("columns", "kept_", "threshold")
 
     def __init__(self, columns: str | Sequence[str], *, threshold: float = 0.0) -> None:
@@ -360,6 +366,7 @@ class VarianceThreshold(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         cell = fit_aggregate(ds, {f"{c}__v": col(c).var() for c in self.columns})
         self.kept_ = [
             c

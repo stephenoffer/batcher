@@ -109,6 +109,12 @@ These turn categorical columns into numeric ones:
 .. autoclass:: RareCategoryEncoder
    :members:
 
+.. autoclass:: LeaveOneOutEncoder
+   :members:
+
+.. autoclass:: JamesSteinEncoder
+   :members:
+
 .. autoclass:: WOEEncoder
    :members:
 ```
@@ -124,6 +130,9 @@ The rest of the estimators cover discretization, missing values, text splitting,
 .. autoclass:: SimpleImputer
    :members:
 
+.. autoclass:: IterativeImputer
+   :members:
+
 .. autoclass:: Tokenizer
    :members:
 
@@ -131,6 +140,12 @@ The rest of the estimators cover discretization, missing values, text splitting,
    :members:
 
 .. autoclass:: PolynomialFeatures
+   :members:
+
+.. autoclass:: SplineTransformer
+   :members:
+
+.. autoclass:: FunctionTransformer
    :members:
 
 .. autoclass:: Clipper
@@ -149,6 +164,82 @@ The rest of the estimators cover discretization, missing values, text splitting,
    :members:
 
 .. autoclass:: ColumnDropper
+   :members:
+```
+
+## Feature selection
+
+These prune columns rather than transform them, and they hold the choice as fitted state so
+the validation split is pruned by the training split's decision:
+
+```{eval-rst}
+.. autoclass:: SelectKBest
+   :members:
+
+.. autoclass:: SelectPercentile
+   :members:
+
+.. autoclass:: DropCorrelated
+   :members:
+
+.. autoclass:: SelectFromModel
+   :members:
+
+.. autoclass:: RFE
+   :members:
+
+.. autofunction:: feature_importances
+```
+
+## Random projection and kernel approximation
+
+Dimensionality reduction and kernel feature maps that need no covariance matrix. All four
+lower to plain arithmetic over the source columns, so the transform runs column-wise:
+
+```{eval-rst}
+.. autoclass:: GaussianRandomProjection
+   :members:
+
+.. autoclass:: SparseRandomProjection
+   :members:
+
+.. autoclass:: RBFSampler
+   :members:
+
+.. autoclass:: Nystroem
+   :members:
+
+.. autofunction:: johnson_lindenstrauss_min_dim
+```
+
+## Probability calibration
+
+`batcher.ml.metrics` measures calibration; these two correct it. Both are fitted on a split
+the model did not train on, and both are monotone in the score, so neither changes the
+model's ranking:
+
+```{eval-rst}
+.. autoclass:: PlattCalibrator
+   :members:
+
+.. autoclass:: IsotonicCalibrator
+   :members:
+```
+
+## Text vectorizers
+
+These turn a text column into the bag-of-words features a classical text model trains on.
+`CountVectorizer` and `TfidfVectorizer` learn a vocabulary; `HashingVectorizer` decides a
+term's feature index arithmetically and so needs no fit pass at all:
+
+```{eval-rst}
+.. autoclass:: CountVectorizer
+   :members:
+
+.. autoclass:: TfidfVectorizer
+   :members:
+
+.. autoclass:: HashingVectorizer
    :members:
 ```
 

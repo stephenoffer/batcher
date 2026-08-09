@@ -23,7 +23,7 @@
 //! pipelined model, where operators interleave and no wall-clock interval belongs to one alone.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 use arrow::array::RecordBatch;
@@ -47,6 +47,18 @@ struct Counters {
     /// Nanoseconds after the meter's epoch at which this operator's *last* morsel ended, across
     /// every worker (a running `fetch_max`).
     span_end_ns: AtomicU64,
+    /// Which expression backend ran this operator, as an index into [`BACKENDS`]. Written once
+    /// by an operator that actually compiles something; the default is `"interp"`, which is
+    /// what every operator on this tier that does not JIT genuinely runs on.
+    backend: AtomicU8,
+}
+
+/// The backend tags, indexed by the code stored in [`Counters::backend`]. Index 0 is the
+/// default so an operator that never reports one reads as `"interp"`.
+const BACKENDS: [&str; 3] = ["interp", "jit", "interp+jit"];
+
+fn backend_code(tag: &str) -> u8 {
+    BACKENDS.iter().position(|t| *t == tag).unwrap_or(0) as u8
 }
 
 impl Default for Counters {
@@ -62,6 +74,7 @@ impl Default for Counters {
             // operator appear to have started at the query's first instant.
             span_start_ns: AtomicU64::new(u64::MAX),
             span_end_ns: AtomicU64::new(0),
+            backend: AtomicU8::new(0),
         }
     }
 }
@@ -152,6 +165,23 @@ impl Meter {
         c.rows_build.fetch_max(rows, Ordering::Relaxed);
     }
 
+    /// Record which expression backend ran an operator.
+    ///
+    /// This tier reported a hardcoded `"interp"` for every operator, which was right for filter
+    /// and project — they genuinely stay on the interpreter here, a measured choice documented
+    /// in `stream::build_with` — and wrong for the aggregate, which compiles its computed group
+    /// keys and inputs through `ops::compile_agg`. So `ds.stats()` showed `interp` on TPC-H q1,
+    /// whose `sum(l_extendedprice * (1 - l_discount))` is compiled, and the one column a user
+    /// profiling a query would read to see whether Tier-1 fired could never say yes.
+    ///
+    /// `store`, not a running combine: the tag is a property of the compiled plan, so every
+    /// worker and every fold round reports the same value.
+    pub(crate) fn note_backend(&self, op: u32, tag: &str) {
+        self.counters[op as usize]
+            .backend
+            .store(backend_code(tag), Ordering::Relaxed);
+    }
+
     /// Record a breaker: what it consumed, what it held at once, and what it produced.
     pub(crate) fn breaker(
         &self,
@@ -232,7 +262,7 @@ impl Meter {
                 spilled: false,
                 spill_bytes: 0,
                 peak_rss_bytes: 0,
-                backend: "interp",
+                backend: BACKENDS[c.backend.load(Ordering::Relaxed) as usize % BACKENDS.len()],
                 // Unmeasured, for the same reason `cpu_ns` is: the OS counters are
                 // process-wide, and attributing them to one operator is only sound when that
                 // operator owns an exclusive wall interval. In this tier operators interleave

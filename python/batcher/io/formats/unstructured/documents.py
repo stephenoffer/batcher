@@ -57,7 +57,53 @@ class DocumentSource(FileSource):
     suffix = ".pdf"
     format_name = "documents"
 
-    __slots__ = ()
+    __slots__ = ("_password",)
+
+    def __init__(self, path: str, *, password: str | None = None, **kwargs: Any) -> None:
+        """Open a PDF corpus, optionally supplying the password its files are locked with.
+
+        Args:
+            path: A PDF file, directory, or glob.
+            password: The user password for an encrypted corpus. A PDF encrypted for
+                *permissions* only carries an empty user password and opens without this;
+                one with a real password could not be read at all before, since there was
+                nowhere to put it.
+            kwargs: Forwarded to `FileSource` (``on_error``, ``schema_mode``, ...).
+        """
+        super().__init__(path, **kwargs)
+        self._password = password
+
+    def _reader_kwargs(self) -> dict[str, object]:
+        # A worker rebuilds the reader from these, and without the password every
+        # encrypted file in the corpus would fail there while succeeding single-node —
+        # a distributed result that differs from the local one.
+        return {**super()._reader_kwargs(), "password": self._password}
+
+    def _open_reader(self, pypdf: Any, source: Any, name: str) -> Any:
+        """A `PdfReader` over `source`, decrypted when the file is locked.
+
+        pypdf opens a permissions-only PDF on its own (its user password is empty), so
+        this fires exactly for the files that genuinely need a secret. Failing here with
+        the parameter's name is the point: the underlying error is
+        ``FileNotDecryptedError: File has not been decrypted``, which tells a caller what
+        happened and not one thing about what to do next.
+        """
+        try:
+            reader = pypdf.PdfReader(source)
+        except Exception as exc:
+            raise BackendError(f"failed to read PDF {name!r}: {exc}") from exc
+        if not reader.is_encrypted:
+            return reader
+        try:
+            opened = reader.decrypt(self._password or "")
+        except Exception as exc:
+            raise BackendError(f"failed to decrypt PDF {name!r}: {exc}") from exc
+        if not opened:
+            raise BackendError(
+                f"PDF {name!r} is encrypted and the password did not open it; pass the "
+                "user password as `bt.read.documents(path, password=...)`"
+            )
+        return reader
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:  # noqa: ARG002 (fixed schema)
         return DOCUMENT_SCHEMA
@@ -82,10 +128,7 @@ class DocumentSource(FileSource):
         """
         pypdf = _require_pypdf()
         name = getattr(fh, "name", self._path)
-        try:
-            reader = pypdf.PdfReader(fh)
-        except Exception as exc:
-            raise BackendError(f"failed to read PDF {name!r}: {exc}") from exc
+        reader = self._open_reader(pypdf, fh, name)
         paths, pages, texts = [], [], []
         for number, page in enumerate(reader.pages):
             paths.append(name)
@@ -100,26 +143,33 @@ class DocumentSource(FileSource):
         extracted text is resident at once — and a document corpus is exactly where that
         bites, since page counts are unbounded and vary by orders of magnitude.
 
+        **Extraction is skipped entirely when `text` is not projected.** Laying out a page
+        into reading order is essentially the whole cost of this reader — measured at ~90%
+        of a 300-page document's read time — and it was being paid unconditionally, so
+        `select("path", "page")` cost the same as reading the prose and a bare `count()`
+        cost it too. The other two columns come from enumerating `reader.pages`, which
+        only walks the page tree.
+
         A page that will not extract is a *page*-level failure, not a document-level one:
         under ``on_error="skip"`` its text is null (distinguishable from a genuinely empty
         page) and the document is recorded in `corrupt_files()`, rather than one bad page
         in a 900-page report costing the other 899.
         """
         pypdf = _require_pypdf()
+        wants_text = projection is None or "text" in projection
         with self._fs.open(path) as fh:
-            try:
-                reader = pypdf.PdfReader(fh)
-            except Exception as exc:
-                raise BackendError(f"failed to read PDF {path!r}: {exc}") from exc
+            reader = self._open_reader(pypdf, fh, path)
             paths: list[str] = []
             pages: list[int] = []
             texts: list[str | None] = []
             for number, page in enumerate(reader.pages):
-                try:
-                    text: str | None = page.extract_text() or ""
-                except Exception as exc:
-                    self._errors.tolerate(path, exc, format_name=self.format_name)
-                    text = None
+                text: str | None = None
+                if wants_text:
+                    try:
+                        text = page.extract_text() or ""
+                    except Exception as exc:
+                        self._errors.tolerate(path, exc, format_name=self.format_name)
+                        text = None
                 paths.append(path)
                 pages.append(number)
                 texts.append(text)

@@ -57,8 +57,8 @@ print(events.is_streaming)
 # True
 ```
 
-In production the source is `bt.read.kafka(...)`, `bt.read.kinesis(...)`,
-`bt.read.delta(uri, stream=True)`, or `bt.read.files_incremental(...)`. Nothing below this
+In production the source is {py:meth}`bt.read.kafka(...) <batcher.api.io_namespace.reader.Reader.kafka>`, {py:meth}`bt.read.kinesis(...) <batcher.api.io_namespace.reader.Reader.kinesis>`,
+{py:meth}`bt.read.delta(uri, stream=True) <batcher.api.io_namespace.reader.Reader.delta>`, or {py:meth}`bt.read.files_incremental(...) <batcher.api.io_namespace.reader.Reader.files_incremental>`. Nothing below this
 line changes when you swap it.
 
 ## 2. Transform it exactly like a table
@@ -73,15 +73,15 @@ print(sum(batch.num_rows for batch in big.iter_batches()))
 ```
 
 :::{warning}
-An unbounded dataset cannot `collect()`. It would never finish, and it raises a clear
-`PlanError` if you try. Consume it with `iter_batches()` or write it to a sink. This is the
+An unbounded dataset cannot {py:meth}`collect() <batcher.Dataset.collect>`. It would never finish, and it raises a clear
+{py:exc}`PlanError <batcher.PlanError>` if you try. Consume it with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` or write it to a sink. This is the
 first thing everyone hits, and the error message is telling you the truth rather than being
 awkward.
 :::
 
 ## 3. Deduplicate, in bounded memory
 
-Streams redeliver. `drop_duplicates_within_watermark` keeps the first row per key seen
+Streams redeliver. {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row per key seen
 inside the watermark window and *forgets* keys the watermark has passed, so its state cannot
 grow without bound.
 
@@ -119,12 +119,12 @@ Nothing has run yet. It is still a lazy plan.
 
 ## 5. Write it, with a trigger
 
-`ds.write` is the one write surface. Give it a `trigger` and it runs as a streaming query,
+{py:obj}`ds.write <batcher.Dataset.write>` is the one write surface. Give it a `trigger` and it runs as a streaming query,
 appending each micro-batch and handing you back a `StreamingQuery`.
 
-`Trigger.available_now()` drains everything the source has at that moment and stops, which is
+{py:meth}`Trigger.available_now() <batcher.Trigger.available_now>` drains everything the source has at that moment and stops, which is
 the incremental-batch and backfill cadence, and the one that makes a tutorial finish.
-`Trigger.processing_time("30 seconds")` is the continuous one.
+{py:meth}`Trigger.processing_time("30 seconds") <batcher.Trigger.processing_time>` is the continuous one.
 
 | Choice | Emits | Use it for |
 |---|---|---|
@@ -191,7 +191,7 @@ replay, so the batch is written twice and the duplicate is yours to find.
 
 ## 7. Custom per-batch logic
 
-`for_each_batch` hands you the whole Arrow table for each micro-batch, never a row. It is the
+{py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>` hands you the whole Arrow table for each micro-batch, never a row. It is the
 hook for a custom upsert, a fan-out to several sinks, or a commit protocol the built-in sinks
 do not cover.
 
@@ -230,8 +230,8 @@ import batcher as bt
 )
 ```
 
-Manage it with the handle: `q.status`, `q.recent_progress()`, `q.stop()`, and
-`bt.streams()` for every active query in the process.
+Manage it with the handle: `q.status`, `q.recent_progress`, `q.stop()`, and
+{py:func}`bt.streams() <batcher.streams>` for every active query in the process.
 
 ## What you learned
 

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, unknown_message
 from batcher.plan.expr_ir import Col, array, col, hash_rows
 
 if TYPE_CHECKING:
@@ -287,10 +287,28 @@ def build_similarity_join(
     rows_per_band = _validate_similarity_join(
         left, right, left_on, right_on, threshold, num_bits, bands
     )
+    # The canonical unknown-name shape, the same one `left_on`/`right_on` raise a few lines
+    # up. These two were the only column checks in this file still hand-rolling their own
+    # phrasing, so a user who mistyped `left_key` got a bare message with no suggestion and
+    # no list of what does exist, while mistyping `left_on` got both.
     if left_key is not None and left_key not in left.columns:
-        raise PlanError(f"similarity_join(): unknown left key column {left_key!r}")
+        raise PlanError(
+            unknown_message(
+                "column",
+                left_key,
+                left.columns,
+                hint="Pass an existing column to left_key.",
+            )
+        )
     if right_key is not None and right_key not in right.columns:
-        raise PlanError(f"similarity_join(): unknown right key column {right_key!r}")
+        raise PlanError(
+            unknown_message(
+                "column",
+                right_key,
+                right.columns,
+                hint="Pass an existing column to right_key.",
+            )
+        )
 
     # One `seed` for both sides: signatures are only comparable when they were projected
     # onto the *same* hyperplanes.

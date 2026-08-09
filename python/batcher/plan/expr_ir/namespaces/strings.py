@@ -215,6 +215,44 @@ class _StrNamespace:
         """
         return StrFunc("crc32", self._e)
 
+    def mime_type(self) -> StrFunc:
+        """Identify a payload from its leading bytes (``image/png``, ``video/mp4``, ...).
+
+        The byte-oriented sibling of the ``mime`` column the media and blob readers produce,
+        for the bytes that never came from a file read: a :meth:`~batcher.Dataset.ml`
+        download, a blob column in a Parquet table, a payload pulled out of an archive.
+        Those carry no filename to guess from, so until this there was no way to identify
+        them at all and routing a mixed blob corpus meant a Python UDF.
+
+        Reads the same magic-number table the readers do, so the two cannot disagree about
+        what a file is. It recognizes the formats an unstructured pipeline routes on —
+        images (PNG, JPEG, GIF, WebP, TIFF, BMP, HEIC, AVIF), audio (MP3, FLAC, Ogg, WAV,
+        M4A), video (MP4, MOV, WebM, Matroska, AVI, 3GP, MPEG), documents (PDF, the Office
+        family, EPUB), and the archive and columnar formats (gzip, zstd, bzip2, xz, zip,
+        Parquet, Arrow, Avro, SQLite).
+
+        Null for unrecognized bytes rather than ``application/octet-stream``, because those
+        are different claims: an expression sees only bytes, and a caller that also has a
+        filename may still identify the row. Combine with :meth:`~batcher.Expr.coalesce` to
+        supply your own default.
+
+        Returns:
+            A new Utf8 expression: the MIME type, or null when nothing recognizes the
+            leading bytes (and for null input).
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> blobs = bt.from_pydict({"b": [b"\x89PNG\r\n\x1a\n" + bytes(8), b"nope"]})
+                >>> blobs.select(bt.col("b").str.mime_type().alias("m")).to_pydict()
+                {'m': ['image/png', None]}
+
+                >>> # Route a mixed blob corpus without a UDF.
+                >>> images = blobs.filter(bt.col("b").str.mime_type().str.starts_with("image/"))
+        """
+        return StrFunc("mime_type", self._e)
+
     def xxhash64(self) -> StrFunc:
         """Compute a fast non-cryptographic 64-bit xxHash of the bytes (→ Int64).
 

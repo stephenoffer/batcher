@@ -44,6 +44,9 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 .. autoclass:: RidgeClassifier
    :members:
 
+.. autoclass:: RidgeCV
+   :members:
+
 .. autoclass:: LogisticRegression
    :members:
 ```
@@ -70,6 +73,12 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
 
 .. autoclass:: ElasticNet
    :members:
+
+.. autoclass:: LassoCV
+   :members:
+
+.. autoclass:: ElasticNetCV
+   :members:
 ```
 
 `batcher.ml.glm` fits the Tweedie family of generalized linear models by the same one-scan IRLS steps, covering the general form and its Poisson and gamma special cases.
@@ -84,6 +93,9 @@ solve runs on the driver. Both reproduce scikit-learn's coefficients exactly.
    :members:
 
 .. autoclass:: GammaRegressor
+   :members:
+
+.. autoclass:: HuberRegressor
    :members:
 ```
 
@@ -114,6 +126,19 @@ its own (quadratic boundaries).
    :members:
 
 .. autoclass:: QuadraticDiscriminantAnalysis
+   :members:
+```
+
+`batcher.ml.multiclass` extends a two-class estimator to any number of classes.
+{py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits a single weight
+vector, so it answers one yes-or-no question and rejects a target with more than two labels.
+{py:class}`OneVsRestClassifier <batcher.ml.multiclass.OneVsRestClassifier>` fits one such
+model per class and predicts whichever scores highest.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.multiclass
+
+.. autoclass:: OneVsRestClassifier
    :members:
 ```
 
@@ -186,6 +211,9 @@ the three standard rules (IQR, z-score, MAD), each a per-column bound learned in
 .. autofunction:: mahalanobis_distance
 .. autoclass:: OutlierClipper
    :members:
+
+.. autoclass:: EllipticEnvelope
+   :members:
 ```
 
 ## Clustering
@@ -232,6 +260,79 @@ Score a clustering against a reference labeling with `batcher.ml.metrics`, each 
 .. autofunction:: pair_confusion_matrix
 .. autofunction:: calinski_harabasz_score
 .. autofunction:: davies_bouldin_score
+```
+
+## Pipelines
+
+Preprocessing and a model as one fitted object, so the sequence `predict` replays is by
+construction the one `fit` used:
+
+```{eval-rst}
+.. currentmodule:: batcher.ml
+
+.. autoclass:: Pipeline
+   :members:
+
+.. autoclass:: TransformedTargetRegressor
+   :members:
+
+.. autoclass:: MultiOutputRegressor
+   :members:
+
+.. autoclass:: MultiOutputClassifier
+   :members:
+```
+
+## Nearest neighbours
+
+Prediction and imputation by local similarity. All three fold a bounded reference set into
+the expression, so scoring is one projection rather than a join:
+
+```{eval-rst}
+.. currentmodule:: batcher.ml
+
+.. autoclass:: KNeighborsRegressor
+   :members:
+
+.. autoclass:: KNeighborsClassifier
+   :members:
+
+.. autoclass:: KNNImputer
+   :members:
+
+.. autofunction:: smote
+```
+
+## Model persistence
+
+A fitted estimator has to outlive the process that fitted it, or a model trained across a
+cluster cannot be moved anywhere. These write it as readable JSON, the same format the
+preprocessors use:
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.persistence
+
+.. autofunction:: save_model
+.. autofunction:: load_model
+.. autofunction:: model_to_dict
+.. autofunction:: model_from_dict
+```
+
+## Ensembling
+
+Combining several models into one prediction. `blend_predictions` is a weighted average and
+needs no fit; `StackingEnsemble` fits a meta-model on out-of-fold predictions, so the
+meta-model never sees a base model scoring a row it was fitted on.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.ensemble
+
+.. autofunction:: blend_predictions
+.. autofunction:: majority_vote
+.. autofunction:: out_of_fold_features
+
+.. autoclass:: StackingEnsemble
+   :members:
 ```
 
 ## Feature selection

@@ -19,7 +19,12 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import argmax_prediction, linear_score, require_fitted
+from batcher.ml._estimator import (
+    argmax_prediction,
+    linear_score,
+    require_fitted,
+    require_numeric,
+)
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -28,6 +33,71 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["LinearDiscriminantAnalysis", "QuadraticDiscriminantAnalysis"]
+
+
+def class_moments(
+    ds: Dataset, features: Sequence[str], target: str
+) -> tuple[list[object], dict[object, int], dict[object, list[float]], dict[object, object]]:
+    """Every class's count, mean vector and covariance matrix, from one grouped pass.
+
+    Both discriminants used to filter the frame per class and run a count, a mean aggregate
+    and a covariance over each — three scans per class, so a ten-class fit read the data
+    thirty-one times. A covariance is recoverable from sums and sums of products, and those
+    are ordinary mergeable aggregates, so every class's moments ride a single
+    ``group_by(target)`` and only the tiny ``d x d`` arithmetic happens on the driver.
+
+    The covariance uses the ``E[xy] - E[x]E[y]`` form with the sample (``n - 1``) divisor,
+    matching what a per-class `covariance_matrix` returned.
+
+    Args:
+        ds: The training data.
+        features: The numeric feature columns.
+        target: The class label column.
+
+    Returns:
+        ``(classes, counts, means, covariances)`` keyed by class label; `covariances` holds
+        one ``d x d`` NumPy array per class, and a class with a single row maps to ``None``
+        because a sample covariance is undefined there.
+    """
+    import numpy as np
+
+    from batcher.plan.functions.aggregate import sum as sum_
+
+    width = len(features)
+    aggregates: dict[str, object] = {"__bt_n": col(features[0]).count()}
+    for i, name in enumerate(features):
+        aggregates[f"__bt_s{i}"] = sum_(col(name).cast("float64"))
+    for i in range(width):
+        for j in range(i, width):
+            left = col(features[i]).cast("float64")
+            right = col(features[j]).cast("float64")
+            aggregates[f"__bt_p{i}_{j}"] = sum_(left * right)
+    grouped = ds.group_by(target).agg(**aggregates).collect()
+
+    classes: list[object] = []
+    counts: dict[object, int] = {}
+    means: dict[object, list[float]] = {}
+    covariances: dict[object, object] = {}
+    for row in range(grouped.num_rows):
+        label = grouped.column(target)[row].as_py()
+        count = int(grouped.column("__bt_n")[row].as_py() or 0)
+        if not count:
+            continue
+        sums = [float(grouped.column(f"__bt_s{i}")[row].as_py() or 0.0) for i in range(width)]
+        classes.append(label)
+        counts[label] = count
+        means[label] = [s / count for s in sums]
+        if count < 2:
+            covariances[label] = None
+            continue
+        matrix = np.zeros((width, width))
+        for i in range(width):
+            for j in range(i, width):
+                product = float(grouped.column(f"__bt_p{i}_{j}")[row].as_py() or 0.0)
+                value = (product - sums[i] * sums[j] / count) / (count - 1)
+                matrix[i, j] = matrix[j, i] = value
+        covariances[label] = matrix
+    return classes, counts, means, covariances
 
 
 class QuadraticDiscriminantAnalysis:
@@ -107,9 +177,6 @@ class QuadraticDiscriminantAnalysis:
         """
         import numpy as np
 
-        from batcher.ml.stats.multivariate import covariance_matrix
-        from batcher.plan.functions.aggregate import mean as mean_
-
         for name in (*self.features, self.target):
             if name not in ds.columns:
                 from batcher._internal.errors import ColumnNotFoundError, unknown_message
@@ -117,14 +184,12 @@ class QuadraticDiscriminantAnalysis:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
-        total = ds.count()
-        labels = [
-            v.as_py() for v in ds.select(self.target).distinct().collect().column(self.target)
-        ]
+        require_numeric(self, ds, self.features)
+        labels, counts, means, covariances = class_moments(ds, self.features, self.target)
+        total = sum(counts.values())
         self.classes_, self.means_, self.precision_, self.log_prior_ = [], {}, {}, {}
         for label in labels:
-            subset = ds.filter(col(self.target) == label)
-            count = subset.count()
+            count = counts[label]
             if count < 2:
                 # A full per-class covariance divides by `count - 1`, so a class with a single
                 # example produces a NaN matrix and `pinv` then raised
@@ -138,11 +203,9 @@ class QuadraticDiscriminantAnalysis:
                     f"rare class, or use LinearDiscriminantAnalysis, which pools one covariance "
                     f"across all classes."
                 )
-            means = subset.agg(**{name: mean_(col(name)) for name in self.features}).collect()
-            covariance = covariance_matrix(subset, self.features).to_pydict()
-            matrix = np.array([covariance[name] for name in self.features], dtype=float).T
+            matrix = covariances[label]
             self.classes_.append(label)
-            self.means_[label] = [float(means.column(name)[0].as_py()) for name in self.features]
+            self.means_[label] = means[label]
             sign, logdet = np.linalg.slogdet(matrix)
             inverse = np.linalg.pinv(matrix)
             self.precision_[label] = (inverse, float(logdet if sign > 0 else 0.0))
@@ -255,9 +318,6 @@ class LinearDiscriminantAnalysis:
         """
         import numpy as np
 
-        from batcher.ml.stats.multivariate import covariance_matrix
-        from batcher.plan.functions.aggregate import mean as mean_
-
         for name in (*self.features, self.target):
             if name not in ds.columns:
                 from batcher._internal.errors import ColumnNotFoundError, unknown_message
@@ -265,26 +325,19 @@ class LinearDiscriminantAnalysis:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
-        total = ds.count()
-        labels = [
-            v.as_py() for v in ds.select(self.target).distinct().collect().column(self.target)
-        ]
+        require_numeric(self, ds, self.features)
+        labels, counts, class_means, covariances = class_moments(ds, self.features, self.target)
+        total = sum(counts.values())
         d = len(self.features)
         means: dict[object, object] = {}
         priors: dict[object, float] = {}
         scatter = np.zeros((d, d))
         for label in labels:
-            subset = ds.filter(col(self.target) == label)
-            count = subset.count()
-            mean_row = subset.agg(**{name: mean_(col(name)) for name in self.features}).collect()
-            means[label] = np.array(
-                [float(mean_row.column(name)[0].as_py()) for name in self.features]
-            )
-            priors[label] = count / total
-            if count > 1:
-                covariance = covariance_matrix(subset, self.features).to_pydict()
-                matrix = np.array([covariance[name] for name in self.features], dtype=float).T
-                scatter += matrix * (count - 1)
+            means[label] = np.asarray(class_means[label])
+            priors[label] = counts[label] / total
+            matrix = covariances[label]
+            if matrix is not None:
+                scatter += matrix * (counts[label] - 1)
         pooled = scatter / max(total - len(labels), 1)
         precision = np.linalg.pinv(pooled)
         self.classes_, self.weights_, self.bias_ = [], {}, {}

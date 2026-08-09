@@ -70,6 +70,8 @@ class RankTransformer(Preprocessor):
         columns: The numeric columns to rank (replaced in place).
     """
 
+    numeric_only = True
+
     __slots__ = ("columns",)
 
     def __init__(self, columns: str | Sequence[str]) -> None:

@@ -37,6 +37,49 @@ agent's work here:
   and ignores the rest of the index. If you use plain `git commit`, read
   `git diff --cached --stat` immediately before it and confirm every line is yours.
 
+- **`--only` bounds the *paths*, not the *hunks inside them*.** This is the trap on the far
+  side of the fix above, and it is easy to walk into precisely because `--only` feels safe.
+  A path you own one line of carries **every** uncommitted change in that file, including
+  another agent's. It has happened: a commit adding a one-line `fill: None` to a test fixture
+  in `bc-interp/src/par.rs` swept up 203 lines of a neighbouring session's half-finished
+  aggregation work — without the `agg_par.rs` those lines call into — and **the Rust
+  workspace stopped compiling at HEAD** until someone else committed the missing half.
+
+  So the check is per *file*, not per commit: `git diff <path>` every entry on your list and
+  confirm you wrote all of it. The trap is the file you add **last**, to fix some small thing
+  the gate complained about — that is the one you inspect a single hunk of rather than the
+  whole diff. A cheap tell after the fact is `git show --numstat`: a file you touched once
+  showing `+153 -50` is not a file you touched once.
+
+  **Make that check mechanical, because reading it does not work.** The session that wrote
+  this entry then did the same thing twice more within the hour, both times on the file added
+  last: `tools/lint_ir_contract.py` (which shipped a checker referencing constants that were
+  not committed, so `lint-ir-contract` failed at HEAD) and `python/batcher/plan/ir_tags.py`
+  (which happened to commit the missing constants and repair it, by luck rather than intent).
+  Three instances, one cause, and an entry warning about it in between two of them.
+
+  What did work, in the same session, was a script that refused:
+
+  ```bash
+  # In the commit-retry loop, BEFORE `git commit`:
+  foreign=$(git diff -- "$path" | grep -E '^[+-]' | grep -vE '^[+-][+-]' \
+            | grep -vc 'a pattern matching only your own lines')
+  [ "$foreign" -eq 0 ] || { echo "$path carries $foreign foreign line(s)"; sleep 60; continue; }
+  ```
+
+  It held for an hour across thirty attempts and was never once tempting to override, where
+  the same judgement applied by hand failed three times out of four. If you cannot express
+  "your own lines" as a pattern, the general form is to copy each file aside the moment you
+  first edit it and diff the working tree against that copy at commit time: anything that
+  appears is someone else's, no judgement required.
+
+  When the wait is long, check whether the file is *blocking* or *broken*. Twice in that
+  session the uncommitted content in a shared file was not work-in-progress at all, it was
+  the missing half of a change whose other half was already at HEAD — so HEAD did not
+  compile, and the right move was to commit that file **alone**, verbatim, as a labelled
+  repair, and only then land your own change on top. Restore your own lines out of the file
+  first so the repair commit is purely theirs.
+
   To back a path out of a commit you already made, without touching the working tree:
   `git restore --source=HEAD~1 --staged <path>` then `git commit --amend --no-edit`. Their
   content stays in the tree and goes back to being unstaged. Guard any `--amend` with

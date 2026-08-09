@@ -660,8 +660,23 @@ fn floor_div(a: i64, b: i64) -> i64 {
     }
 }
 
+/// The input's timezone, when it has one. `window_start`/`window_buckets` label an
+/// instant with the window containing it, so the label must carry the same timezone the
+/// instant did: dropping it turns a `Timestamp(us, "UTC")` column into a naive one with
+/// the right value and a type that no longer says what the value means, which anything
+/// rendering a local time downstream reads as a wrong answer. The *unit* is deliberately
+/// normalized to microseconds instead of preserved, matching `date_trunc` and the rest of
+/// the temporal surface — the boundaries are microsecond quantities either way.
+fn timestamp_zone(arr: &ArrayRef) -> Option<Arc<str>> {
+    match arr.data_type() {
+        DataType::Timestamp(_, tz) => tz.clone(),
+        _ => None,
+    }
+}
+
 /// `window_start(ts, width, origin)` — the start of the fixed-width tumbling window
-/// containing each instant: `origin + ⌊(t−origin)/width⌋·width`. → Timestamp(us).
+/// containing each instant: `origin + ⌊(t−origin)/width⌋·width`. → Timestamp(us), keeping
+/// the input's timezone.
 pub(crate) fn eval_window_start(
     arr: &ArrayRef,
     width_micros: i64,
@@ -676,6 +691,7 @@ pub(crate) fn eval_window_start(
             arg: "width (must be > 0)",
         });
     }
+    let zone = timestamp_zone(arr);
     let ts = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
     let micros = cast(&ts, &DataType::Int64)?;
     let m = micros.as_primitive::<Int64Type>();
@@ -688,7 +704,7 @@ pub(crate) fn eval_window_start(
         .collect();
     Ok(cast(
         &(Arc::new(out) as ArrayRef),
-        &DataType::Timestamp(TimeUnit::Microsecond, None),
+        &DataType::Timestamp(TimeUnit::Microsecond, zone),
     )?)
 }
 
@@ -710,6 +726,7 @@ pub(crate) fn eval_window_buckets(
             arg: "width/slide (must be > 0)",
         });
     }
+    let zone = timestamp_zone(arr);
     let ts = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
     let micros = cast(&ts, &DataType::Int64)?;
     let m = micros.as_primitive::<Int64Type>();
@@ -732,15 +749,9 @@ pub(crate) fn eval_window_buckets(
         }
         lengths.push(n);
     }
-    let child = cast(
-        &(Arc::new(values.finish()) as ArrayRef),
-        &DataType::Timestamp(TimeUnit::Microsecond, None),
-    )?;
-    let field = Arc::new(Field::new(
-        "item",
-        DataType::Timestamp(TimeUnit::Microsecond, None),
-        true,
-    ));
+    let bucket_type = DataType::Timestamp(TimeUnit::Microsecond, zone);
+    let child = cast(&(Arc::new(values.finish()) as ArrayRef), &bucket_type)?;
+    let field = Arc::new(Field::new("item", bucket_type, true));
     let offsets = OffsetBuffer::from_lengths(lengths);
     Ok(Arc::new(ListArray::new(field, offsets, child, None)))
 }
@@ -983,6 +994,47 @@ mod tests {
 
         // An unknown unit still errors cleanly (no silent null-out).
         assert!(eval_date_trunc(&arr, "fortnight").is_err());
+    }
+
+    #[test]
+    fn window_start_keeps_the_inputs_timezone() {
+        // A window label is a statement about the same instant the input was, so it must
+        // carry the same timezone. Dropping it left the value right and the type lying.
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+        let arr: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![1_000i64, 250]).with_timezone("UTC"));
+        let out = eval_window_start(&arr, 100, 0).unwrap();
+        assert_eq!(
+            out.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn window_start_leaves_a_naive_column_naive() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+        let arr: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![1_000i64]));
+        let out = eval_window_start(&arr, 100, 0).unwrap();
+        assert_eq!(
+            out.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn window_buckets_keep_the_inputs_timezone_on_the_list_item() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::{Field, TimeUnit};
+        let arr: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![1_000i64]).with_timezone("UTC"));
+        let out = eval_window_buckets(&arr, 200, 100).unwrap();
+        let item = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(
+            out.data_type(),
+            &DataType::List(Arc::new(Field::new("item", item, true)))
+        );
     }
 
     #[test]

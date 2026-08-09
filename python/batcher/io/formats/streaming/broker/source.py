@@ -43,6 +43,9 @@ class BrokerSource(ABC):
     #: Partitions are independent, offset-addressable work units, so a micro-batch can be
     #: read partition-per-worker across the cluster (see `BrokerSplit.read_epoch`).
     partitionable = True
+    #: Per-partition offsets carry forward, so a fresh poll loop resumes where the last one
+    #: stopped rather than replaying the topic. See `io.source.continues_across_passes`.
+    continues_across_passes = True
 
     #: Payload bytes one poll may accumulate before it stops early, whatever `poll_size` says.
     #:
@@ -60,6 +63,7 @@ class BrokerSource(ABC):
     DEFAULT_POLL_BYTES = 128 << 20
 
     __slots__ = (
+        "_include_headers",
         "_options",
         "_positions",
         "_resume_from",
@@ -75,6 +79,9 @@ class BrokerSource(ABC):
         *,
         poll_size: int = 16_384,
         poll_bytes: int | None = None,
+        max_offsets_per_trigger: int | None = None,
+        max_bytes_per_trigger: int | None = None,
+        include_headers: bool = False,
         **options: Any,
     ) -> None:
         """Create a broker source for ``topic`` polling ``poll_size`` per batch.
@@ -82,7 +89,36 @@ class BrokerSource(ABC):
         ``poll_bytes`` additionally bounds a poll by payload size (see `DEFAULT_POLL_BYTES`);
         ``options`` are passed through to the concrete client (broker addresses,
         credentials, consumer group, …); subclasses document what they accept.
+
+        ``max_offsets_per_trigger`` and ``max_bytes_per_trigger`` are the Spark spellings of
+        the same two bounds, accepted so a ported job's options carry over verbatim. One
+        poll *is* one micro-batch here, so they are exact synonyms rather than an
+        approximation — but a reader who knows the Spark names should not have to discover
+        that, and a job that passed `maxOffsetsPerTrigger` as an unknown option used to have
+        it forwarded silently into the client config, where librdkafka rejected it or, worse,
+        ignored it.
         """
+        if max_offsets_per_trigger is not None:
+            poll_size = max_offsets_per_trigger
+        if max_bytes_per_trigger is not None:
+            poll_bytes = max_bytes_per_trigger
+        if poll_size < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"broker poll_size / max_offsets_per_trigger must be >= 1, got {poll_size}"
+            )
+        if poll_bytes is not None and poll_bytes < 1:
+            from batcher._internal.errors import PlanError
+
+            raise PlanError(
+                f"broker poll_bytes / max_bytes_per_trigger must be >= 1, got {poll_bytes}"
+            )
+        # Spark's `includeHeaders`, off by default and opt-in for the same reason: headers
+        # are per-message metadata most pipelines never read, and a nested Arrow column
+        # costs on every message of every poll. A broker that cannot supply them simply
+        # leaves the column null rather than refusing the option.
+        self._include_headers = include_headers
         self.topic = topic
         self.poll_size = poll_size
         self.poll_bytes = self.DEFAULT_POLL_BYTES if poll_bytes is None else poll_bytes
@@ -117,7 +153,7 @@ class BrokerSource(ABC):
 
     # ---- shared, do-not-override ------------------------------------------
     def schema(self) -> pa.Schema:
-        return broker_schema()
+        return broker_schema(self._include_headers)
 
     def row_count(self) -> int | None:
         return None  # unbounded stream
@@ -305,30 +341,34 @@ class BrokerSource(ABC):
                 partition=p,
                 poll_size=self.poll_size,
                 poll_bytes=self.poll_bytes,
+                include_headers=self._include_headers,
                 options=dict(self._options),
             )
             for p in self._discover_partitions()
         ]
 
-    @staticmethod
-    def _make_batch(messages: list[BrokerMessage]) -> pa.RecordBatch:
+    def _make_batch(self, messages: list[BrokerMessage]) -> pa.RecordBatch:
         """Assemble polled messages into one Arrow batch (column-at-a-time).
 
         Builds each column from the whole message list in one pass — no per-row
         Python beyond the unavoidable attribute reads — and returns a batch in
-        the fixed broker schema.
+        the broker schema this source was configured for.
         """
-        return pa.record_batch(
-            {
-                "key": pa.array([m.key for m in messages], type=pa.binary()),
-                "value": pa.array([m.value for m in messages], type=pa.binary()),
-                "partition": pa.array([m.partition for m in messages], type=pa.int64()),
-                "offset": pa.array([m.offset for m in messages], type=pa.int64()),
-                "timestamp": pa.array([m.timestamp for m in messages], type=pa.int64()),
-                "topic": pa.array([m.topic for m in messages], type=pa.string()),
-            },
-            schema=broker_schema(),
-        )
+        from batcher.io.formats.streaming.broker.schema import HEADERS_TYPE
+
+        columns: dict[str, Any] = {
+            "key": pa.array([m.key for m in messages], type=pa.binary()),
+            "value": pa.array([m.value for m in messages], type=pa.binary()),
+            "partition": pa.array([m.partition for m in messages], type=pa.int64()),
+            "offset": pa.array([m.offset for m in messages], type=pa.int64()),
+            "timestamp": pa.array([m.timestamp for m in messages], type=pa.int64()),
+            "topic": pa.array([m.topic for m in messages], type=pa.string()),
+        }
+        if self._include_headers:
+            columns["headers"] = pa.array(
+                [_header_rows(m.headers) for m in messages], type=HEADERS_TYPE
+            )
+        return pa.record_batch(columns, schema=broker_schema(self._include_headers))
 
     # ---- override points --------------------------------------------------
     @abstractmethod
@@ -342,6 +382,18 @@ class BrokerSource(ABC):
         Returns a (possibly empty) list of messages, or ``None`` to signal
         end-of-stream for a bounded source.
         """
+
+
+def _header_rows(headers: list[tuple[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """One message's headers as the ``[{"key": ..., "value": ...}]`` the column holds.
+
+    None (rather than an empty list) for a message with no headers, so "this broker does
+    not carry headers" and "this message had none" stay distinguishable — the same
+    distinction Spark's null-vs-empty-array draws.
+    """
+    if not headers:
+        return None
+    return [{"key": str(name), "value": value} for name, value in headers]
 
 
 #: Live per-partition consumers, keyed by split identity, reused across micro-batches within

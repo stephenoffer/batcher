@@ -54,6 +54,11 @@ def _np() -> Any:
 _SUFFIXES = (".bin", ".pcd", ".ply")
 _FRAME = "frame"
 
+# How much of a file to read when inferring its schema. PCD and PLY headers are a few
+# hundred bytes; this is generous enough for a PLY declaring dozens of properties and
+# still nothing next to the sweep behind it.
+_HEADER_PEEK = 64 << 10
+
 # PCD/PLY scalar type -> NumPy dtype. Keyed by (kind, size) for PCD, by name for PLY.
 _PCD_TYPES = {
     ("F", 4): "<f4", ("F", 8): "<f8",
@@ -136,12 +141,46 @@ class PointCloudSource(FileSource):
         return table.to_batches()
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
+        """The column names and types, from the file's header rather than its points.
+
+        This used to parse the whole file and keep only the field names. A point cloud is
+        the one place that is ruinous rather than merely wasteful: a single 2-million-point
+        LiDAR sweep took **7.9 seconds and 59 MB** to answer `ds.schema`, and an
+        autonomous-driving corpus is thousands of sweeps in a directory. The names were
+        knowable the whole time — PCD and PLY both declare their fields in an ASCII header,
+        and a raw `.bin` has no header at all because the caller supplied the layout.
+
+        Falls back to the full parse when the header does not fit in the peek, so an
+        unusual file is slow rather than wrong.
+
+        Args:
+            fh: An open binary handle positioned at the start of the file.
+
+        Returns:
+            The Arrow schema of the rows this source produces for that file.
+        """
+        head = fh.read(_HEADER_PEEK)
+        schema = self._header_schema(head)
+        if schema is None:
+            # `head` is already consumed, so continue from where the peek stopped rather
+            # than re-reading it — seeking is not available on every filesystem handle.
+            schema = self._parse(head + fh.read(), None).schema
         # The per-file reads append a `frame` column (see `_parse`); the schema, parsed
         # without a path, must carry it too or normalization would drop it.
-        schema = self._parse(fh.read(), None).schema
         if self._frame_col is not None:
             schema = schema.append(pa.field(self._frame_col, pa.string()))
         return schema
+
+    def _header_schema(self, head: bytes) -> pa.Schema | None:
+        """The schema from `head` alone, or `None` when the header needs more bytes."""
+        kind = _sniff(head)
+        if kind == ".bin":
+            # A raw buffer carries no header, so the layout is the constructor's — which
+            # means the schema of a `.bin` sweep costs no file access at all.
+            dtype = _arrow_of(self._bin_dtype)
+            return pa.schema([pa.field(name, dtype) for name in self._bin_cols])
+        fields = _pcd_header_fields(head) if kind == ".pcd" else _ply_header_fields(head)
+        return None if fields is None else pa.schema(fields)
 
     def _file_row_count(self, path: str) -> int | None:
         """Exact point count from the file header (or size), without loading points."""
@@ -295,3 +334,79 @@ def _ply_point_count(head: bytes) -> int | None:
         if len(parts) >= 3 and parts[0] == "element" and parts[1] == "vertex":
             return int(parts[2])
     return None
+
+
+def _arrow_of(numpy_dtype: str) -> pa.DataType:
+    """The Arrow type `pa.array` produces for a NumPy dtype string."""
+    np = _np()
+    return pa.from_numpy_dtype(np.dtype(numpy_dtype))
+
+
+def _pcd_header_fields(head: bytes) -> list[pa.Field] | None:
+    """PCD field names and types from the ASCII header, or `None` if it is not all here.
+
+    The types must match what `_parse_pcd` actually produces rather than what the header
+    declares, and those differ: an `ascii` body goes through `np.loadtxt(dtype=float64)`,
+    so every field comes back Float64 whatever `TYPE` says. A schema that reported the
+    declared type would be a schema the reader then contradicts.
+    """
+    end = head.find(b"DATA")
+    if end < 0:
+        return None
+    line_end = head.find(b"\n", end)
+    if line_end < 0:
+        return None
+    fields: dict[str, str] = {}
+    for line in head[:line_end].decode("ascii", "replace").splitlines():
+        parts = line.split()
+        if parts:
+            fields[parts[0].upper()] = " ".join(parts[1:])
+    if "FIELDS" not in fields or "DATA" not in fields:
+        return None
+    names = fields["FIELDS"].split()
+    if fields["DATA"].strip().lower() == "ascii":
+        return [pa.field(name, pa.float64()) for name in names]
+    try:
+        sizes = [int(s) for s in fields["SIZE"].split()]
+        types = fields["TYPE"].split()
+        return [
+            pa.field(name, _arrow_of(_PCD_TYPES[(kind, size)]))
+            for name, kind, size in zip(names, types, sizes, strict=True)
+        ]
+    except (KeyError, ValueError):
+        # An unsupported layout: let the full parse raise the specific error rather than
+        # guessing a schema for a file that will not read.
+        return None
+
+
+def _ply_header_fields(head: bytes) -> list[pa.Field] | None:
+    """PLY vertex property names and types from the header, or `None` if it is truncated.
+
+    As with PCD, an `ascii` body is read as Float64 throughout, so that is what the schema
+    reports — the declared per-property types apply only to the binary encodings.
+    """
+    marker = b"end_header\n"
+    end = head.find(marker)
+    if end < 0 or not head.lstrip().startswith(b"ply"):
+        return None
+    fmt = "ascii"
+    props: list[tuple[str, str]] = []
+    in_vertex = False
+    for line in head[:end].decode("ascii", "replace").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "format":
+            fmt = parts[1]
+        elif parts[0] == "element":
+            in_vertex = parts[1] == "vertex"
+        elif parts[0] == "property" and in_vertex:
+            if parts[1] == "list" or parts[1] not in _PLY_TYPES:
+                return None  # faces, or a type the parser will reject anyway
+            props.append((_PLY_TYPES[parts[1]], parts[2]))
+    if not props:
+        return None
+    if fmt == "ascii":
+        return [pa.field(name, pa.float64()) for _, name in props]
+    endian = "<" if "little" in fmt else ">"
+    return [pa.field(name, _arrow_of(endian + t)) for t, name in props]

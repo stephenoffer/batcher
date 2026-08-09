@@ -32,7 +32,19 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher.api.terminal.stream.rebatch import _rebatch_exact
-from batcher.api.terminal.stream.union import union_branch_sources, union_streams_branchwise
+from batcher.api.terminal.stream.static_join import (
+    refuse_reason as static_join_refusal,
+)
+from batcher.api.terminal.stream.static_join import (
+    stream_static_join,
+    stream_static_sides,
+)
+from batcher.api.terminal.stream.union import (
+    interleave,
+    union_branch_sources,
+    union_streams_branchwise,
+    union_streams_interleaved,
+)
 from batcher.api.terminal.stream.watermark import stream_stream_join, stream_watermark_dedup
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
@@ -68,6 +80,8 @@ def _iter_batches(
         Distinct,
         Limit,
         Sort,
+        StreamingSessionWindow,
+        TransformWithState,
         Union,
         WatermarkDedup,
         WatermarkStreamJoin,
@@ -121,6 +135,24 @@ def _iter_batches(
             )
         return
 
+    # A union over *streams* interleaves instead of concatenating: an unbounded branch
+    # never ends, so concatenation would emit branch 0 forever and branch 1 never. UNION
+    # ALL is a multiset union and makes no ordering claim, so a row from whichever branch
+    # has one next is as correct as any other order — which is what makes this sound.
+    if isinstance(plan, Union) and union_streams_interleaved(plan, sources):
+        yield from interleave(
+            [
+                _iter_batches(
+                    remap_sources(branch, -sid),
+                    [sources[sid]],
+                    branch.available_columns(),
+                    batch_size,
+                )
+                for branch, sid in union_branch_sources(plan)
+            ]
+        )
+        return
+
     # A distributed breaker streams its result off the workers one bucket at a time,
     # bounding driver memory. A breaker-free pipeline already streams in bounded memory
     # single-node, so it stays on that path even when `distributed` is requested.
@@ -144,6 +176,20 @@ def _iter_batches(
         if distributable_scan_source(plan, sources) is not None:
             yield from iter_distributed_scan(plan, sources, num_workers, batch_size)
             return
+
+    # Stream-static join: one side is a table that does not move, so it is read once and
+    # every micro-batch joins against the whole of it. A `Join` is a pipeline breaker, so
+    # without this the router saw an unbounded input beneath a breaker and refused the most
+    # common thing anyone does to a stream.
+    static_sides = stream_static_sides(plan, sources)
+    if static_sides is not None:
+        from batcher._internal.errors import PlanError
+
+        reason = static_join_refusal(plan.join_type, static_sides[0])
+        if reason is not None:
+            raise PlanError(reason)
+        yield from stream_static_join(plan, sources, static_sides[0], batch_size)
+        return
 
     # Stream-stream interval join: two streams, buffered + watermark-evicted.
     if isinstance(plan, WatermarkStreamJoin) and len(sources) == 2:
@@ -171,6 +217,20 @@ def _iter_batches(
         # Watermark-bounded streaming deduplication (bounded seen-key state).
         if isinstance(plan, WatermarkDedup) and is_streamable(plan.input):
             yield from stream_watermark_dedup(plan, sources[0], batch_size)
+            return
+        # Arbitrary keyed state: the user function owns one key's state, the engine owns
+        # when it is called and expired. State is bounded by the key space and the TTL.
+        # Gap-based sessions: a session's end is only knowable once the gap has passed
+        # with nothing arriving, so rows are held until the watermark says so.
+        if isinstance(plan, StreamingSessionWindow) and is_streamable(plan.input):
+            from batcher.api.terminal.stream.session import stream_session_window
+
+            yield from stream_session_window(plan, sources[0], batch_size)
+            return
+        if isinstance(plan, TransformWithState) and is_streamable(plan.input):
+            from batcher.core.streaming import stream_keyed_state
+
+            yield from stream_keyed_state(plan, sources[0], batch_size)
             return
         # A top-level aggregate/distinct over a breaker-free relational input streams
         # with bounded memory: fold each micro-batch's partial into one running state.

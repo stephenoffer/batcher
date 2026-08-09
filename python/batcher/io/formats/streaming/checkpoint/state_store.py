@@ -9,6 +9,7 @@ query without recomputing from the start of the stream.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import pyarrow as pa
@@ -76,18 +77,50 @@ class StateStore:
         _sync_dir(self._dir)
 
     def restore(self, batch_id: int) -> pa.RecordBatch | None:
-        """Reload the running state snapshot for `batch_id`, or None if absent."""
+        """Reload the running state snapshot for `batch_id`, or None if absent.
+
+        **A snapshot with no rows is still a snapshot.** `Table.to_batches()` returns an
+        empty list for a table with no rows — and for the zero-*column* table the windowed
+        fold writes when its watermark has advanced past every open window, which is the
+        ordinary state of a windowed query between windows. Returning ``None`` there made
+        the engine skip `restore_state` entirely, so the watermark silently rewound to
+        whatever the next batch happened to carry: rows the old watermark had correctly
+        ruled late were re-admitted, and folded into windows that had already been emitted.
+        The snapshot side goes out of its way to persist that case; this is the side that
+        was dropping it.
+
+        Rebuilding from the reader's schema rather than the table's batches keeps the
+        payload that lives in the schema *metadata* — which is where the watermark rides,
+        precisely so it needs no sidecar file.
+
+        Args:
+            batch_id: The micro-batch whose snapshot to reload.
+
+        Returns:
+            The snapshotted state, or None when no snapshot exists for `batch_id`.
+        """
         path = self._path(batch_id)
         if not os.path.exists(path):
             return None
         with ipc.open_file(path) as reader:
+            schema = reader.schema
             table = reader.read_all()
         batches = table.to_batches()
-        return batches[0] if batches else None
+        return batches[0] if batches else pa.RecordBatch.from_pylist([], schema=schema)
 
     def prune(self, keep_through: int) -> None:
-        """Delete snapshots for batch ids below `keep_through` (state retention)."""
+        """Delete snapshots for batch ids below `keep_through` (state retention).
+
+        Stale ``.tmp`` files go too. A crash between the write and the rename leaves one
+        behind, and nothing else ever removes it — so the directory this method exists to
+        bound would grow one orphan per crash, forever, and the *only* symptom would be a
+        checkpoint location that slowly fills a disk.
+        """
         for name in os.listdir(self._dir):
+            if name.endswith(".tmp"):
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(self._dir, name))
+                continue
             if not name.startswith("batch-") or not name.endswith(".arrow"):
                 continue
             try:

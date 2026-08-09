@@ -5,13 +5,14 @@ rendered from the source docstrings. It's the exhaustive backstop behind the
 {doc}`quick reference <reference>` and the example-first {doc}`area pages <index>`. Each
 top-level function links to its own page.
 
-Two large surfaces have their own pages rather than sitting here: {doc}`/api/relational/functions` for
-the scalar, horizontal, aggregate, and window functions, and {doc}`/api/models/metrics` for the
-scoring and statistical aggregates.
+Three surfaces have their own pages rather than sitting here: {doc}`/api/relational/functions` for
+the scalar, horizontal, aggregate, and window functions, {doc}`/api/models/metrics` for the
+scoring and statistical aggregates, and {doc}`/api/operations/streaming` for triggers, output
+modes, query progress, and listeners.
 
 ## Construction and I/O
 
-Build a `Dataset` from in-memory data, another framework, or a storage source, and
+Build a {py:class}`Dataset <batcher.Dataset>` from in-memory data, another framework, or a storage source, and
 register SQL functions or sessions.
 
 ```{eval-rst}
@@ -58,6 +59,7 @@ register SQL functions or sessions.
    sql
    streams
    await_any_termination
+   reset_terminated
    register_function
    udf
    compact
@@ -96,7 +98,7 @@ Reference and derive columns, build literals, and branch.
 
 ## Column selectors
 
-A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as `ds.select(bt.numeric())` or `ds.with_columns(bt.floating().round(2))`, and it expands against the input schema. See the {doc}`transformations guide </user-guide/transform/rows/transformations>` for how they compose.
+A *selector* stands for every column matching a predicate. Pass one anywhere a column is expected, such as {py:meth}`ds.select(bt.numeric()) <batcher.Dataset.select>` or {py:meth}`ds.with_columns(bt.floating().round(2)) <batcher.Dataset.with_columns>`, and it expands against the input schema. See the {doc}`transformations guide </user-guide/transform/rows/transformations>` for how they compose.
 
 ```{eval-rst}
 .. autosummary::
@@ -167,7 +169,7 @@ Address any tunable by its dotted path, in the style of `pandas.set_option` and
 
 ### Logging and verbosity
 
-One-line switches over `ObservabilityConfig`. See
+One-line switches over {py:class}`ObservabilityConfig <batcher.config.config.ObservabilityConfig>`. See
 {doc}`observability </user-guide/operate/running/observability>`.
 
 ```{eval-rst}
@@ -234,7 +236,7 @@ See the {doc}`governance guide </user-guide/trust/governance>` for how these fit
 .. autofunction:: batcher.running_queries
 ```
 
-Column-level lineage is reached from the dataset itself: :meth:`batcher.Dataset.lineage`.
+Column-level lineage is reached from the dataset itself: :meth:{py:meth}`batcher.Dataset.lineage <batcher.Dataset.lineage>`.
 
 ## Expressions
 
@@ -250,7 +252,7 @@ Column-level lineage is reached from the dataset itself: :meth:`batcher.Dataset.
 
 ### Expression accessors
 
-These are the typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.struct`, `.json`, and `.map`. Multimodal columns add `.image`, `.audio`, and `.video`.
+These are the typed namespaces reached as `col("x").str`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>`, and {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>`. Multimodal columns add {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>`, and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>`.
 
 ```{eval-rst}
 .. autoclass:: batcher.plan.expr_ir.namespaces.strings._StrNamespace
@@ -292,7 +294,7 @@ These are the typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.stru
 
 ## Reading and writing
 
-`bt.read` is the reader namespace; `ds.write` is the writer namespace.
+{py:obj}`bt.read <batcher.read>` is the reader namespace; {py:obj}`ds.write <batcher.Dataset.write>` is the writer namespace.
 
 ```{eval-rst}
 .. autoclass:: batcher.api.io_namespace.reader.Reader
@@ -306,7 +308,7 @@ These are the typed namespaces reached as `col("x").str`, `.dt`, `.list`, `.stru
 
 ## Dataset accessors
 
-The `ds.ml`, `ds.dq`, and `ds.scd` namespaces for machine learning, data quality,
+The {py:obj}`ds.ml <batcher.Dataset.ml>`, {py:obj}`ds.dq <batcher.Dataset.dq>`, and {py:obj}`ds.scd <batcher.Dataset.scd>` namespaces for machine learning, data quality,
 and slowly-changing-dimension workflows.
 
 ```{eval-rst}
@@ -329,7 +331,7 @@ and slowly-changing-dimension workflows.
 
 ## Metadata shortcuts
 
-The `ds.meta` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the {doc}`metadata shortcuts guide </user-guide/analyze/metadata-shortcuts>`.
+The {py:obj}`ds.meta <batcher.Dataset.meta>` namespace and the accessors it hands out read answers from footers, manifests, and catalogs instead of from the data. See the {doc}`metadata shortcuts guide </user-guide/analyze/metadata-shortcuts>`.
 
 ```{eval-rst}
 .. autoclass:: batcher.api.dataset.meta.frame.DatasetMeta
@@ -373,16 +375,6 @@ The `ds.meta` namespace and the accessors it hands out read answers from footers
    :member-order: groupwise
 ```
 
-## Streaming
-
-```{eval-rst}
-.. autoclass:: batcher.Trigger
-   :members:
-
-.. autoclass:: batcher.OutputMode
-   :members:
-```
-
 ## Configuration classes
 
 The tunables, grouped by subsystem. See the {doc}`configuration guide </api/operations/configuration>`
@@ -399,6 +391,9 @@ for what each one does and when to change it.
    :members:
 
 .. autoclass:: batcher.FlowControlConfig
+   :members:
+
+.. autoclass:: batcher.StreamingConfig
    :members:
 
 .. autoclass:: batcher.OptimizerConfig
@@ -460,5 +455,5 @@ for what each one does and when to change it.
 
 - {doc}`reference`: the same surface as a short lookup table rather than a full listing.
 - {doc}`/api/relational/dataset`: the `Dataset` methods, with the semantics behind each one.
-- {doc}`/api/relational/expressions`: the `Expr` surface these methods take.
+- {doc}`/api/relational/expressions`: the {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` surface these methods take.
 - {doc}`../user-guide/index`: the task-oriented guides behind this reference.

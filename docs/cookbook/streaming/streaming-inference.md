@@ -72,7 +72,7 @@ predicates before the model when you can, and the expensive ones after it.
 
 :::{tab-item} A real model, on a topic
 
-Same shape, different `__call__`. `ds.ml.infer` takes a HuggingFace model id and does the
+Same shape, different `__call__`. {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` takes a HuggingFace model id and does the
 class-per-worker construction for you; `num_gpus` and `concurrency` place it:
 
 ```python
@@ -154,6 +154,48 @@ you uptime at the price of silent data loss. If the loss matters, catch the exce
 yourself downstream.
 :::
 
+## Rolling the scores up
+
+Scoring is rarely the last stage. A rollup over the scored stream -- alerts per model
+version, a running mean, a count above threshold -- is an ordinary aggregation over a
+`map_batches` input, and it writes to a sink like any other streaming aggregation:
+
+```python
+rollup_schema = pa.schema([("model", pa.string()), ("text", pa.string())])
+
+
+def rollup_batches():
+    yield pa.record_batch({"model": ["v1", "v2"], "text": ["ok", "no"]},
+                          schema=rollup_schema)
+    yield pa.record_batch({"model": ["v1"], "text": ["fine"]}, schema=rollup_schema)
+
+
+def score_length(batch):
+    return {"model": batch.column("model").to_pylist(),
+            "score": [len(t) for t in batch.column("text").to_pylist()]}
+
+
+rollup = (
+    bt.from_batches(rollup_batches, rollup_schema, bounded=False)
+    .map_batches(score_length, output_columns=["model", "score"])
+    .group_by("model")
+    .agg(total=col("score").sum())
+)
+for batch in rollup.iter_batches():
+    print(sorted(zip(batch.to_pydict()["model"], batch.to_pydict()["total"], strict=True)))
+# [('v1', 6), ('v2', 2)]
+```
+
+The UDF runs in Python once per micro-batch and the fold runs in the engine over what it
+returns, so a long-running rollup never holds the scored output, only the running state.
+
+:::{warning}
+`checkpoint=` is refused on this shape. The running state is folded against whatever schema
+the UDF returns, which is not knowable before the UDF has run, so there is nothing for a
+restart to resume into. Accepting it would advance the offset log while the totals silently
+restarted at zero. Land the scores first and aggregate the table if you need resumption.
+:::
+
 ## Watching it run
 
 The query handle is how you know whether the model is keeping up:
@@ -161,7 +203,7 @@ The query handle is how you know whether the model is keeping up:
 :::{dropdown} Per-batch progress, straight off the query handle
 
 ```python
-progress = q.recent_progress()
+progress = q.recent_progress
 print([(p.batch_id, p.num_input_rows, p.num_output_rows) for p in progress])
 # [(0, 1, 1), (1, 1, 0), (2, 1, 1)]
 print(q.is_active)
@@ -193,7 +235,7 @@ distributed *batch* job over the landed bronze table instead.
 - {doc}`Exactly-once sinks </cookbook/streaming/exactly-once-sink>`: what the Delta write above actually guarantees.
 - {doc}`LLM batch scoring </cookbook/ml/pipelines/text/llm-batch-scoring>`: the same stage, run over the landed table
   as a distributed batch.
-- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, checkpoints, and `recent_progress()`.
+- {doc}`Streaming </user-guide/moving-data/streaming>`: triggers, checkpoints, and `recent_progress`.
 - {doc}`ML API reference </api/models/ml>`: `ds.ml.infer`, `map_batches`, `max_errored_rows`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: what a warm, resident model is worth.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: the pool the model lives in.

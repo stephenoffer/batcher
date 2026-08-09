@@ -22,14 +22,21 @@ from batcher.plan.streaming._duration import parse_interval_seconds
 
 __all__ = [
     "OutputMode",
-    "StreamingQueryProgress",
-    "StreamingQueryStatus",
     "Trigger",
     "Watermark",
     "parse_interval_seconds",
 ]
 
 _TRIGGER_KINDS: Final = ("processing_time", "once", "available_now", "continuous")
+
+#: Triggers that process the data available when they fire and then stop, rather than
+#: waiting for more (Spark ``Once`` / ``AvailableNow``). Every layer that has to tell a
+#: *finished* stream from an *idle* one asks this question, and each one used to answer it
+#: with its own tuple of kind strings — the conductor, the distributed runner, and the
+#: single-node runner. That is the shape of divergence: the single-node runner's version of
+#: the question was "did the iterator end", which reads an idle unbounded source as a
+#: finished one and silently stops the query.
+_DRAIN_KINDS: Final = frozenset({"once", "available_now"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,8 +47,12 @@ class Trigger:
 
     * ``Trigger.processing_time("5 seconds")`` — fire a micro-batch on a fixed wall
       clock interval (the default streaming cadence).
-    * ``Trigger.once()`` — process one micro-batch of all currently-available data,
-      then stop.
+    * ``Trigger.once()`` — process all currently-available data, then stop. Spark's
+      ``Once`` puts it in a *single* micro-batch and was deprecated for exactly that
+      reason (an unbounded backlog is an unbounded batch); here it drains across as
+      many micro-batches as the data needs, which keeps the promise and the memory
+      bound. Prefer ``available_now()`` in new code — it is the same execution under
+      the name Spark now recommends.
     * ``Trigger.available_now()`` — drain all currently-available data across as many
       micro-batches as needed, then stop (the incremental-batch / backfill trigger).
     * ``Trigger.continuous("1 second")`` — lowest-latency processing: micro-batches
@@ -71,6 +82,30 @@ class Trigger:
                 ".once(), .available_now(), or .continuous()." + (f" {hint}" if hint else "")
             )
 
+    @property
+    def is_drain(self) -> bool:
+        """Whether this trigger stops once the currently-available data is processed.
+
+        ``once`` and ``available_now`` drain and stop; ``processing_time`` and
+        ``continuous`` keep waiting for more. This is the one question every layer asks to
+        tell a *finished* stream from an *idle* one, so it is answered here rather than by
+        a tuple of kind strings restated per layer.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.Trigger.available_now().is_drain
+                True
+
+                >>> bt.Trigger.processing_time("5 seconds").is_drain
+                False
+
+        Returns:
+            True for a draining trigger, False for a continuously-running one.
+        """
+        return self.kind in _DRAIN_KINDS
+
     @classmethod
     def processing_time(cls, interval: float | int | str | timedelta) -> Trigger:
         """Fire a micro-batch every `interval` (seconds, or a string like '5 seconds').
@@ -93,7 +128,11 @@ class Trigger:
 
     @classmethod
     def once(cls) -> Trigger:
-        """Process one micro-batch of available data, then stop.
+        """Process all currently-available data, then stop (Spark ``Once``).
+
+        Drains across as many micro-batches as the data needs rather than forcing it
+        into one, which is why Spark deprecated its own `Once`. `available_now` is the
+        same execution under the name Spark now recommends.
 
         Examples:
             .. doctest::
@@ -168,7 +207,7 @@ class Trigger:
 
     @classmethod
     def Once(cls) -> Trigger:
-        """Spark spelling of `once` — process one micro-batch of available data, then stop.
+        """Spark spelling of `once` — process all currently-available data, then stop.
 
         Examples:
             .. doctest::
@@ -284,88 +323,6 @@ class OutputMode:
                 + (f" {hint}" if hint else "")
             )
         return mode
-
-
-@dataclass(frozen=True, slots=True)
-class StreamingQueryProgress:
-    """Metrics for one completed micro-batch (Spark `StreamingQueryProgress` parity).
-
-    ``behind_by_ms`` is how much longer the micro-batch took than the trigger cadence it
-    fires on — the one question a low-latency query needs answered and the one nothing here
-    could answer. Throughput says how fast the batch ran; it cannot say whether that was
-    fast *enough*, because "enough" is the trigger interval and the progress record did not
-    carry it. A query behind by a growing amount is falling behind its source no matter how
-    healthy its rows-per-second looks. ``0.0`` when the batch kept up, and for a trigger
-    with no interval (``once`` / ``available_now`` / ``continuous``), where there is no
-    cadence to be late for.
-    """
-
-    batch_id: int
-    num_input_rows: int
-    num_output_rows: int
-    duration_ms: float
-    timestamp: float
-    behind_by_ms: float = 0.0
-
-    @property
-    def input_rows_per_second(self) -> float:
-        """Throughput for this micro-batch (rows / second), 0 if it took no time."""
-        return self.num_input_rows / (self.duration_ms / 1000.0) if self.duration_ms else 0.0
-
-    @property
-    def output_rows_per_second(self) -> float:
-        """Emission throughput for this micro-batch (output rows / second), 0 if instant.
-
-        Distinct from `input_rows_per_second`: a filter or a windowed aggregate emits far
-        fewer rows than it consumes, so this measures how fast the query *produces* results
-        rather than how fast it *reads* input.
-        """
-        return self.num_output_rows / (self.duration_ms / 1000.0) if self.duration_ms else 0.0
-
-    @property
-    def is_behind(self) -> bool:
-        """Whether this micro-batch overran the trigger cadence it fires on.
-
-        Examples:
-            .. doctest::
-
-                >>> from batcher.plan.streaming import StreamingQueryProgress
-                >>> p = StreamingQueryProgress(0, 10, 10, 250.0, 0.0, behind_by_ms=150.0)
-                >>> p.is_behind
-                True
-
-        Returns:
-            True when the batch took longer than its trigger interval.
-        """
-        return self.behind_by_ms > 0.0
-
-    def __str__(self) -> str:
-        """A one-line human summary: batch id, rows in/out, duration, throughput.
-
-        A batch that overran its trigger says so, because a throughput figure alone reads
-        as healthy right up until the query is hours behind its source.
-        """
-        late = f", {self.behind_by_ms:.0f}ms behind" if self.is_behind else ""
-        return (
-            f"batch {self.batch_id}: {self.num_input_rows} in -> {self.num_output_rows} out "
-            f"in {self.duration_ms:.0f}ms ({self.input_rows_per_second:.0f} rows/s{late})"
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class StreamingQueryStatus:
-    """A point-in-time snapshot of a running query (Spark `StreamingQueryStatus` parity)."""
-
-    is_active: bool
-    is_data_available: bool
-    is_trigger_active: bool
-    message: str
-    batches_processed: int
-
-    def __str__(self) -> str:
-        """A one-line human summary: liveness, the status message, and batches processed."""
-        state = "active" if self.is_active else "stopped"
-        return f"[{state}] {self.message} ({self.batches_processed} batches processed)"
 
 
 @dataclass(frozen=True, slots=True)

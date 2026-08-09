@@ -68,7 +68,7 @@ def test_each_micro_batch_is_exactly_one_transaction(tmp_path):
     for batch in range(3):
         _land(src, batch)
         query = _stream(src, state, out, ckpt)
-        assert [p.batch_id for p in query.recent_progress()] == [batch]
+        assert [p.batch_id for p in query.recent_progress] == [batch]
 
     table = deltalake.DeltaTable(str(out))
     # Three arrivals, three micro-batches, three commits — even though several workers
@@ -181,9 +181,9 @@ def test_a_continuous_stream_spans_arrivals_and_stops_on_demand(tmp_path):
         num_workers=2,
     )
     try:
-        _wait_for(lambda: len(query.recent_progress()) >= 1)
+        _wait_for(lambda: len(query.recent_progress) >= 1)
         _land(src, 1, files=2)  # a second arrival, while the same query is still running
-        _wait_for(lambda: len(query.recent_progress()) >= 2)
+        _wait_for(lambda: len(query.recent_progress) >= 2)
     finally:
         query.stop()
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 from batcher.core.streaming.drivers import (
     stream_aggregate,
     stream_distinct,
+    stream_keyed_state,
     stream_limit,
     stream_topn,
     stream_windowed_aggregate,
@@ -24,6 +25,7 @@ from batcher.core.streaming.folds import (
     empty_global_aggregate,
     streaming_state_budget,
 )
+from batcher.core.streaming.keyed_state import KeyedStateFold
 
 # The underscore names are engine-internal but *cross-module* — the `map_batches` streaming
 # aggregate, the checkpoint state store, and the watermark drivers all reach for them — and
@@ -32,6 +34,7 @@ from batcher.core.streaming.folds import (
 # defined separately in `tools/public_surface.py`.
 __all__ = [
     "_WATERMARK_META",
+    "KeyedStateFold",
     "_AggFold",
     "_WindowedAggFold",
     "_rebatch",
@@ -40,6 +43,7 @@ __all__ = [
     "empty_global_aggregate",
     "stream_aggregate",
     "stream_distinct",
+    "stream_keyed_state",
     "stream_limit",
     "stream_topn",
     "stream_windowed_aggregate",

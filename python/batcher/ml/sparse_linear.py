@@ -16,11 +16,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import linear_score, require_fitted, require_rows
+from batcher.ml._estimator import (
+    linear_score,
+    require_fitted,
+    require_numeric,
+    require_rows,
+)
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from numpy.typing import NDArray
 
     from batcher.api.dataset import Dataset
 
@@ -34,6 +41,48 @@ def _soft_threshold(value: float, amount: float) -> float:
     if value < -amount:
         return value + amount
     return 0.0
+
+
+def _descend(
+    gram, xty, alpha: float, l1_ratio: float, max_iter: int, tol: float
+) -> tuple[NDArray, int]:
+    """Coordinate descent for the elastic net, over a Gram matrix rather than over rows.
+
+    Pulled out of `ElasticNet.fit` so the cross-validated search can reuse it. Everything it
+    touches is ``d x d``, which is what lets a whole penalty path be explored without going
+    back to the data.
+
+    Args:
+        gram: The centered feature covariance matrix.
+        xty: The centered feature-target covariances.
+        alpha: The overall penalty strength.
+        l1_ratio: The share of the penalty that is L1; 1.0 is the lasso.
+        max_iter: The sweep ceiling.
+        tol: The coefficient change below which the sweep stops.
+
+    Returns:
+        The fitted coefficients and the number of sweeps taken.
+    """
+    import numpy as np
+
+    d = len(xty)
+    beta = np.zeros(d)
+    l1 = alpha * l1_ratio
+    l2 = alpha * (1.0 - l1_ratio)
+    taken = 0
+    for iteration in range(max_iter):
+        change = 0.0
+        for j in range(d):
+            if gram[j, j] + l2 == 0:
+                continue
+            rho = xty[j] - gram[j] @ beta + gram[j, j] * beta[j]
+            new = _soft_threshold(rho, l1) / (gram[j, j] + l2)
+            change = max(change, abs(new - beta[j]))
+            beta[j] = new
+        taken = iteration + 1
+        if change < tol:
+            break
+    return beta, taken
 
 
 class ElasticNet:
@@ -144,6 +193,8 @@ class ElasticNet:
                 raise ColumnNotFoundError(
                     unknown_message("column", name, ds.columns, hint="Pass an existing column.")
                 )
+        require_numeric(self, ds, self.features)
+        require_numeric(self, ds, [self.target], role="target")
         d = len(self.features)
         require_rows(self, ds.count(), 2, because="its moments divide by n - 1")
         aggregates: dict[str, object] = {
@@ -161,21 +212,7 @@ class ElasticNet:
             xty[i] = float(row.column(f"__gy{i}")[0].as_py())
             for j in range(i, d):
                 gram[i, j] = gram[j, i] = float(row.column(f"__g{i}_{j}")[0].as_py())
-        beta = np.zeros(d)
-        l1 = self.alpha * self.l1_ratio
-        l2 = self.alpha * (1.0 - self.l1_ratio)
-        for iteration in range(self.max_iter):
-            change = 0.0
-            for j in range(d):
-                if gram[j, j] + l2 == 0:
-                    continue
-                rho = xty[j] - gram[j] @ beta + gram[j, j] * beta[j]
-                new = _soft_threshold(rho, l1) / (gram[j, j] + l2)
-                change = max(change, abs(new - beta[j]))
-                beta[j] = new
-            self.n_iter_ = iteration + 1
-            if change < self.tol:
-                break
+        beta, self.n_iter_ = _descend(gram, xty, self.alpha, self.l1_ratio, self.max_iter, self.tol)
         self.coef_ = [float(b) for b in beta]
         self.intercept_ = means[d] - sum(beta[i] * means[i] for i in range(d))
         return self
@@ -255,5 +292,268 @@ class Lasso(ElasticNet):
             l1_ratio=1.0,
             max_iter=max_iter,
             tol=tol,
+            output_column=output_column,
+        )
+
+
+class ElasticNetCV:
+    """Elastic net with the penalty chosen by cross-validation, in one pass over the data.
+
+    The same saving `RidgeCV` gets, for the same reason. Coordinate descent never looks at a
+    row: it works from the centered Gram matrix and the feature-target covariances, and those
+    are moments that do not depend on the penalty. The held-out squared error expands into the
+    same moments. So the whole search is one grouped aggregate of the moments per fold, and
+    every ``(fold, alpha)`` pair is a descent over small matrices.
+
+    Each fold's training moments are the total minus that fold's own, because moments add.
+    That additivity is what makes the operator distributable, so the search behaves identically
+    on one node and across a cluster, and folds come from a content hash of the row so a row
+    lands in the same fold however the data is partitioned.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml import ElasticNetCV
+            >>> ds = bt.from_pydict(
+            ...     {"a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ...      "b": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
+            ...      "y": [2.0, 4.1, 5.9, 8.0, 10.1, 12.0, 13.9, 16.1]}
+            ... )
+            >>> model = ElasticNetCV(["a", "b"], "y", alphas=(0.001, 1.0), cv=4).fit(ds)
+            >>> model.alpha_ in (0.001, 1.0)
+            True
+
+    Args:
+        features: The predictor columns.
+        target: The column to predict.
+        alphas: The candidate penalties to choose between.
+        l1_ratio: The share of the penalty that is L1; 1.0 is the lasso, 0.0 is ridge.
+        cv: How many cross-validation folds to score each candidate on.
+        max_iter: The coordinate-descent sweep ceiling.
+        tol: The coefficient change below which a descent stops.
+        seed: Seed for the content-hash fold assignment.
+        output_column: The name of the prediction column `predict` appends.
+
+    Raises:
+        PlanError: If `features` is empty or over `MAX_CV_FEATURES`, if `alphas` is empty or
+            holds a negative penalty, if `l1_ratio` is outside ``[0, 1]``, or if `cv` is
+            below two.
+    """
+
+    __slots__ = (
+        "alpha_",
+        "alphas",
+        "coef_",
+        "cv",
+        "features",
+        "intercept_",
+        "l1_ratio",
+        "max_iter",
+        "output_column",
+        "scores_",
+        "seed",
+        "target",
+        "tol",
+    )
+
+    def __init__(
+        self,
+        features: Sequence[str],
+        target: str,
+        *,
+        alphas: Sequence[float] = (0.001, 0.01, 0.1, 1.0, 10.0),
+        l1_ratio: float = 0.5,
+        cv: int = 5,
+        max_iter: int = 1000,
+        tol: float = 1e-4,
+        seed: int = 0,
+        output_column: str = "prediction",
+    ) -> None:
+        from batcher.ml.linear import MAX_CV_FEATURES
+
+        self.features = list(features)
+        if not self.features:
+            raise PlanError(f"{type(self).__name__} needs at least one feature column.")
+        if len(self.features) > MAX_CV_FEATURES:
+            raise PlanError(
+                f"{type(self).__name__} lowers to one aggregate per pair of terms, so "
+                f"{len(self.features)} features exceed the ceiling of {MAX_CV_FEATURES}. "
+                "Select features first with SelectKBest, or fit at a fixed alpha."
+            )
+        self.alphas = [float(a) for a in alphas]
+        if not self.alphas:
+            raise PlanError(f"{type(self).__name__} needs at least one candidate in alphas.")
+        if any(a < 0 for a in self.alphas):
+            raise PlanError(
+                f"{type(self).__name__}: every alpha must be non-negative, got {self.alphas}."
+            )
+        if not 0.0 <= l1_ratio <= 1.0:
+            raise PlanError(f"l1_ratio must be between 0 and 1, got {l1_ratio}.")
+        if cv < 2:
+            raise PlanError(
+                f"{type(self).__name__} needs at least two folds to hold one out, got {cv}."
+            )
+        self.target = target
+        self.l1_ratio = float(l1_ratio)
+        self.cv = cv
+        self.max_iter = max_iter
+        self.tol = tol
+        self.seed = seed
+        self.output_column = output_column
+        self.coef_: list[float] = []
+        self.intercept_: float = 0.0
+        self.alpha_: float = 0.0
+        self.scores_: dict[float, float] = {}
+
+    def _solve(self, count: float, sums, products, alpha: float):
+        """Descend to the coefficients for one penalty, from moments alone."""
+        import numpy as np
+
+        d = len(self.features)
+        centered = products - np.outer(sums, sums) / count
+        beta, _ = _descend(
+            centered[:d, :d] / count,
+            centered[:d, d] / count,
+            alpha,
+            self.l1_ratio,
+            self.max_iter,
+            self.tol,
+        )
+        means = sums / count
+        return beta, float(means[d] - beta @ means[:d])
+
+    def fit(self, ds: Dataset) -> ElasticNetCV:
+        """Score every candidate on every fold from a single grouped aggregate.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml import ElasticNetCV
+                >>> ds = bt.from_pydict(
+                ...     {"a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ...      "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}
+                ... )
+                >>> model = ElasticNetCV(["a"], "y", alphas=(0.01, 1.0), cv=3).fit(ds)
+                >>> sorted(model.scores_) == [0.01, 1.0]
+                True
+
+        Args:
+            ds: The training dataset.
+
+        Returns:
+            ``self``, fitted at the best-scoring alpha over all the data.
+
+        Raises:
+            PlanError: If a feature or the target is not numeric, or too few rows remain.
+            ColumnNotFoundError: If a named column is missing.
+        """
+        from batcher.ml.linear import _fold_moments, _sse_from_moments
+
+        blocks, totals = _fold_moments(self, ds, self.features, self.target, self.cv, self.seed)
+        total_n, total_sums, total_products = totals
+        d = len(self.features)
+
+        self.scores_ = {}
+        for alpha in self.alphas:
+            error, held = 0.0, 0.0
+            for count, sums, products in blocks:
+                train_n = total_n - count
+                if train_n <= d + 1 or count <= 0:
+                    continue
+                beta, intercept = self._solve(
+                    train_n, total_sums - sums, total_products - products, alpha
+                )
+                error += _sse_from_moments(count, sums, products, beta, intercept)
+                held += count
+            self.scores_[alpha] = error / held if held else float("inf")
+
+        self.alpha_ = min(self.alphas, key=lambda a: (self.scores_[a], a))
+        beta, intercept = self._solve(total_n, total_sums, total_products, self.alpha_)
+        self.coef_ = [float(b) for b in beta]
+        self.intercept_ = intercept
+        return self
+
+    def predict(self, ds: Dataset) -> Dataset:
+        """Append the prediction from the fit at the chosen penalty.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml import ElasticNetCV
+                >>> ds = bt.from_pydict(
+                ...     {"a": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]}
+                ... )
+                >>> model = ElasticNetCV(["a"], "y", alphas=(0.0001,), cv=2).fit(ds)
+                >>> round(model.predict(ds).to_pydict()["prediction"][1], 2)
+                4.0
+
+        Args:
+            ds: The dataset to score.
+
+        Returns:
+            A new lazy `Dataset` with the prediction column appended.
+        """
+        require_fitted(self, self.coef_)
+        expression = linear_score(self.features, self.coef_, self.intercept_)
+        return ds.with_columns(**{self.output_column: expression})
+
+
+class LassoCV(ElasticNetCV):
+    """Lasso with the penalty chosen by cross-validation, in one pass over the data.
+
+    `ElasticNetCV` with `l1_ratio` fixed at 1.0, so the whole penalty is L1 and the search
+    selects features as well as a strength: a larger alpha zeroes more coefficients outright.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml import LassoCV
+            >>> ds = bt.from_pydict(
+            ...     {"signal": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ...      "noise": [0.3, -0.1, 0.2, -0.4, 0.1, 0.5, -0.2, 0.0],
+            ...      "y": [2.0, 4.1, 5.9, 8.0, 10.1, 12.0, 13.9, 16.1]}
+            ... )
+            >>> model = LassoCV(["signal", "noise"], "y", alphas=(0.001, 0.1), cv=4).fit(ds)
+            >>> model.l1_ratio
+            1.0
+
+    Args:
+        features: The predictor columns.
+        target: The column to predict.
+        alphas: The candidate L1 penalties to choose between.
+        cv: How many cross-validation folds to score each candidate on.
+        max_iter: The coordinate-descent sweep ceiling.
+        tol: The coefficient change below which a descent stops.
+        seed: Seed for the content-hash fold assignment.
+        output_column: The name of the prediction column `predict` appends.
+    """
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        features: Sequence[str],
+        target: str,
+        *,
+        alphas: Sequence[float] = (0.001, 0.01, 0.1, 1.0, 10.0),
+        cv: int = 5,
+        max_iter: int = 1000,
+        tol: float = 1e-4,
+        seed: int = 0,
+        output_column: str = "prediction",
+    ) -> None:
+        super().__init__(
+            features,
+            target,
+            alphas=alphas,
+            l1_ratio=1.0,
+            cv=cv,
+            max_iter=max_iter,
+            tol=tol,
+            seed=seed,
             output_column=output_column,
         )

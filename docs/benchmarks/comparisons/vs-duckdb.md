@@ -25,7 +25,7 @@ methodology above is what makes these numbers comparable, so read them together:
 | Window `rank()`, `lag()` | DuckDB |
 | `MEDIAN` / `QUANTILE_CONT` per group | Batcher, 1.1× |
 | Join → aggregate | DuckDB, 1.15× |
-| TPC-H overall (sf1), DuckDB on its native store | DuckDB, geomean ~1.40× |
+| TPC-H overall (sf1), DuckDB on its native store | Parity on the per-query geomean (0.99×); DuckDB 1.19× on the suite total |
 | TPC-H overall (sf1), DuckDB reading the same Arrow | Batcher, all 22 queries |
 | TPC-H overall (sf10), DuckDB on its native store | DuckDB, 2.08×; Batcher wins 4 of 22 |
 | TPC-H overall (sf10), DuckDB reading the same Arrow | Batcher, 1.89×; wins 21 of 22 |
@@ -90,7 +90,17 @@ instead of the handful of groups.
 Against DuckDB reading the same Arrow, **Batcher wins all 22 queries**, by 1.1x to 7.1x. That is the like-for-like execution comparison, and it is the one Batcher's Arrow-only contract makes fair.
 
 :::{note}
-Against DuckDB's native compressed store at scale factor 1 on 16 cores, the suite is **1.23x behind** as of 2026-07-31, and Batcher leads on **13 of 22** queries as of the 2026-07-26 sweep. The last per-query publication, 2026-07-18, predates both and had DuckDB ahead on 15 of 22 with a geometric mean near 1.40x. That is what you get from `duckdb` at a prompt, where DuckDB decompresses its own format as it scans and never pays an Arrow ingest, so it measures a storage engine plus an execution engine against an execution engine alone. Both columns are published, per query, on {doc}`/benchmarks/results/tpch`.
+Against DuckDB's native compressed store at scale factor 1 on 16 cores, re-measured 2026-08-02, the two summary statistics disagree and both are reported:
+
+| Statistic | Value | What it says |
+|---|---|---|
+| Per-query geometric mean | **0.99x** | Parity. The typical query is a coin flip. |
+| Suite total | **1.19x behind** (786 ms against 658 ms) | DuckDB is ahead on the sum. |
+| Queries won | **12 of 22** | Batcher takes a bare majority. |
+
+The divergence is one query. **q21 is 189 ms against 69 ms**, and its 120 ms excess is almost exactly the suite's 128 ms deficit. Remove it and the totals are within 1%. Reporting only the total would hide that the gap is one shape rather than a broad deficit; reporting only the geomean would hide that the shape is expensive. Earlier publications on this page quoted a geometric mean near 1.40x from the 2026-07-18 sweep, which is superseded.
+
+That is what you get from `duckdb` at a prompt, where DuckDB decompresses its own format as it scans and never pays an Arrow ingest, so it measures a storage engine plus an execution engine against an execution engine alone. Both columns are published, per query, on {doc}`/benchmarks/results/tpch`.
 :::
 
 The pattern is clean. Batcher takes the scan-and-aggregate queries and trails on the multi-join ones. The cause is single-node parallelism: it plateaus after roughly 8 cores where DuckDB and Daft use effectively all 16, and Batcher does roughly 2x more CPU work per query. `GROUP BY` alone scales 19.2x while the join alone scales only 5.9x, so the join is the ceiling. Closing that is a runtime-parallelism and kernel-efficiency effort tracked as an open lever in `benchmarks/BENCHMARK_RESULTS.md`. It isn't a knob you can turn.

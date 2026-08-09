@@ -41,6 +41,7 @@ from batcher.dist.fleet.plan_id import next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
+from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
 from batcher.io.source import Source
 from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.logical import LogicalPlan, Sort
@@ -222,21 +223,38 @@ def execute_sort_flight(
         stage_base = next_stage_base(1)
 
         # SAMPLE: each worker samples its own split's leading-key distribution.
+        #
+        # Skipped outright when this sort shape has been sampled before. The barrier
+        # executes the entire mapped prefix — scan, pushed predicate, projection — over
+        # every split to produce a few dozen floats per worker, and `range_publish` below
+        # then executes that same prefix a second time to do the actual partitioning. A
+        # learned grid removes the first of those two passes. It is safe even when stale:
+        # boundaries decide only which reducer a row lands on, and the ordered concat is
+        # correct for any monotone boundary list (see this module's header and
+        # `dist/sort_boundaries.py`), so a grid that no longer fits the data costs balance
+        # and never a row.
         _s = _t.perf_counter()
-        grids, dead = map_barrier(
-            workers,
-            lambda host, src: actors[host].sample_quantiles.remote(
-                map_ir, key_name, _SAMPLE_PROBS, parts[src]
-            ),
-            dead=dead,
-        )
+        shape_key = sort_shape_key(map_ir, key_name)
+        grids = load_learned_grids(shape_key)
+        learned = grids is not None
+        if not learned:
+            grids, dead = map_barrier(
+                workers,
+                lambda host, src: actors[host].sample_quantiles.remote(
+                    map_ir, key_name, _SAMPLE_PROBS, parts[src]
+                ),
+                dead=dead,
+            )
+            persist_grids(shape_key, grids)
         # Cut into exactly `n_buckets` ranges: `shuffle_partitions` can trim the reducer
         # count below `workers` (the `max_shuffle_partitions` cap / learned fan-out), and
         # `merge_boundaries(grids, workers)` would emit up to `workers-1` boundaries — more
         # than `n_buckets-1` — routing rows past the last bucket and panicking the range
-        # partitioner. Size the boundaries by the actual bucket count.
+        # partitioner. Size the boundaries by the actual bucket count. This is also why the
+        # *grids* are what persist rather than the boundaries: the bucket count moves
+        # between runs, so a stored boundary list would be the wrong length.
         boundaries = merge_boundaries(grids, n_buckets)
-        _phase("sample", _t.perf_counter() - _s, buckets=n_buckets)
+        _phase("sample", _t.perf_counter() - _s, buckets=n_buckets, learned=learned)
 
         # MAP: range-partition each split by the boundaries and publish raw rows.
         _s = _t.perf_counter()

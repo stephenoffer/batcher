@@ -47,7 +47,7 @@ def run():
         query_name="bronze-rate",
     )
     query.await_termination()
-    return [(p.batch_id, p.num_input_rows) for p in query.recent_progress()]
+    return [(p.batch_id, p.num_input_rows) for p in query.recent_progress]
 
 
 print(run())
@@ -83,9 +83,9 @@ key column below is the identity the sink compares:
 
 | Sink | Dedup | Key |
 | --- | --- | --- |
-| `ds.write(path, format=...)` | by **position** | the file name, `part-batch00007.parquet` |
-| `ds.write.delta(uri)` | by **transaction id** | a `txn` action of `(app_id, batch_id)` in the log |
-| `for_each_batch` | none, but you are handed the `batch_id` | whatever idempotency key you build from it |
+| {py:obj}`ds.write(path, format=...) <batcher.Dataset.write>` | by **position** | the file name, `part-batch00007.parquet` |
+| {py:meth}`ds.write.delta(uri) <batcher.api.io_namespace.writer.Writer.delta>` | by **transaction id** | a `txn` action of `(app_id, batch_id)` in the log |
+| {py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>` | none, but you are handed the `batch_id` | whatever idempotency key you build from it |
 | `for_each`, `console`, `memory` | none | none |
 
 **File sinks** (`ds.write(path, format="parquet")`) write one file per micro-batch, named
@@ -182,13 +182,13 @@ Kinesis sequence numbers, Pulsar message ids), as does the Delta stream reader a
 `rate` generator.
 
 :::{important}
-An arbitrary `from_batches` iterator does **not**. Hand one a
+An arbitrary {py:func}`from_batches <batcher.from_batches>` iterator does **not**. Hand one a
 `checkpoint` and no offsets are recorded, so a restart quietly re-reads the source from
 the beginning. Nothing warns you. The output survived it in the runs above only because the
 file sink deduped by position.
 :::
 
-`files_incremental` is a third case: it never uses the offset log at all. It tracks
+{py:meth}`files_incremental <batcher.api.io_namespace.reader.Reader.files_incremental>` is a third case: it never uses the offset log at all. It tracks
 already-ingested files in its own `state_dir`, which is what makes it exactly-once per
 file, and which is separate state you must also keep.
 

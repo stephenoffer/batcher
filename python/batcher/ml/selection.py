@@ -36,6 +36,8 @@ from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from batcher.api.dataset import Dataset
 
 __all__ = ["constant_columns", "correlated_columns", "feature_profile", "feature_report"]
@@ -109,7 +111,11 @@ def constant_columns(
 
 
 def correlated_columns(
-    ds: Dataset, columns: list[str] | None = None, *, threshold: float = 0.95
+    ds: Dataset,
+    columns: list[str] | None = None,
+    *,
+    threshold: float = 0.95,
+    keep: Sequence[str] = (),
 ) -> list[str]:
     """The columns to drop so that no surviving pair correlates above `threshold`.
 
@@ -119,10 +125,17 @@ def correlated_columns(
     two pipelines that disagree about which of two identical columns survived are impossible
     to compare.
 
+    `keep` is expressed through that same rule rather than as a filter over the result: a
+    protected name is moved to the front of the ordering, so it wins every pair it is in and
+    its partner is the one dropped. Removing protected names from the answer afterwards
+    would instead leave *both* columns of the pair standing, which is the opposite of what
+    the caller asked for.
+
     Args:
         ds: The dataset to screen.
         columns: The columns to consider; every numeric column when omitted.
         threshold: The absolute correlation above which a pair is redundant.
+        keep: Columns that must survive; their correlated partners are dropped instead.
 
     Returns:
         The names to drop, so that the remaining columns are pairwise below `threshold`.
@@ -141,12 +154,17 @@ def correlated_columns(
             ... )
             >>> correlated_columns(ds)
             ['copy']
+            >>> correlated_columns(ds, keep=["copy"])
+            ['a']
     """
     if not 0.0 < threshold <= 1.0:
         raise PlanError(f"threshold must be in (0, 1], got {threshold}")
     import batcher as bt
 
     names = _numeric_columns(ds, columns)
+    if keep:
+        protected = [n for n in keep if n in names]
+        names = protected + [n for n in names if n not in set(protected)]
     if len(names) < 2:
         return []
     pairs = {
@@ -199,6 +217,10 @@ def feature_report(
         columns: The features to screen; every numeric column but the target when omitted.
         buckets: Quantile bins for the information value.
         positive: The label value that counts as the positive class.
+
+    Cost is one aggregate carrying every feature's correlation, signal ratio and null rate,
+    plus one quantile-binned pass per feature for the information value, which needs the
+    feature's own bin edges and so cannot ride the shared aggregate.
 
     Returns:
         A lazy `Dataset` of ``feature``, ``information_value``, ``point_biserial``,
@@ -282,9 +304,15 @@ def feature_profile(ds: Dataset, columns: list[str] | None = None) -> Dataset:
     """What each numeric column looks like as a *feature*, and what it is asking for.
 
     `Dataset.profile` answers the data-quality question — how much is present, how many
-    distinct values. This answers the modelling one, in the same single pass: how
-    concentrated the column is, how skewed, how heavy its tails are, and therefore which
-    transform it wants before a model sees it.
+    distinct values. This answers the modelling one: how concentrated the column is, how
+    skewed, how heavy its tails are, and therefore which transform it wants before a model
+    sees it.
+
+    Cost is one aggregate carrying every column's null rate, skew, kurtosis and robust
+    spread, plus **one grouped query per column** for the mode share. That last one cannot
+    join the others: a mode is a `group_by` on the column itself, and two columns cannot
+    share a grouping. Profile the columns you are actually considering rather than the whole
+    frame when it is wide.
 
     The ``suggestion`` column is a convention rather than a rule, and deliberately blunt:
 

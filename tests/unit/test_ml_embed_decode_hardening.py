@@ -35,6 +35,7 @@ from batcher.ml.embed import (
 # package object, so `batcher.ml.decode` is resolved through importlib rather than by
 # attribute access, which would break the same way if `decode` were ever re-exported too.
 decode_mod = importlib.import_module("batcher.ml.decode")
+video_mod = importlib.import_module("batcher.ml.decode.video")
 
 pytestmark = pytest.mark.unit
 
@@ -297,9 +298,21 @@ def test_bounded_map_preserves_order_and_caps_work_in_flight() -> None:
     assert in_flight["peak"] <= 3
 
 
+def _pin_the_python_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force `video_dataset` down the PyAV fallback whatever the engine was built with.
+
+    The decoder is chosen from the engine's compiled features, and on a `video`-enabled
+    build the native kernel is a pure `with_columns` — so the `map_batches` callback these
+    tests drive is never installed, and a fake PyAV proves nothing about the path that
+    actually ran. Tests of the fallback have to say they mean the fallback.
+    """
+    monkeypatch.setattr(video_mod, "engine_features", frozenset)
+
+
 def test_video_decode_consumes_clips_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
     """At most `decode_concurrency` clips are pulled ahead of the decoder."""
     pytest.importorskip("PIL")
+    _pin_the_python_decoder(monkeypatch)
     _install_fake_av(monkeypatch, frames=6)
     ds = _StubDataset(["bytes"])
     decode_mod.video_dataset(
@@ -555,6 +568,7 @@ def test_upload_resolves_the_filesystem_once_per_batch(monkeypatch: pytest.Monke
 def test_video_frames_stay_uint8(monkeypatch: pytest.MonkeyPatch) -> None:
     """float32 is 4x the bytes and belongs at the GPU, not in the decode stage."""
     pytest.importorskip("PIL")
+    _pin_the_python_decoder(monkeypatch)
     _install_fake_av(monkeypatch, frames=10)
     ds = _StubDataset(["bytes"])
     decode_mod.video_dataset(ds, size=(4, 4), num_frames=2, source_column="bytes")

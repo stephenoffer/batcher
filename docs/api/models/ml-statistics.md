@@ -116,6 +116,24 @@ loop, and each fold's data runs through the engine rather than a driver-held arr
 .. autofunction:: validation_curve
 ```
 
+## Hyperparameter search
+
+The same fold loop, run once per parameter combination. Every combination is scored on the
+same folds, so the comparison between two of them is paired rather than confounded with
+fold-assignment luck.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.model_selection
+
+.. autofunction:: param_grid
+.. autofunction:: param_samples
+.. autofunction:: grid_search
+.. autofunction:: random_search
+
+.. autoclass:: SearchResult
+   :members:
+```
+
 ## Cross-validation splits
 
 `batcher.ml.splitting` builds folds as content-hash filters rather than a materialized
@@ -127,6 +145,7 @@ however the data is partitioned.
 
 .. autofunction:: kfold
 .. autofunction:: stratified_kfold
+.. autofunction:: stratified_split
 .. autofunction:: group_kfold
 .. autofunction:: time_series_split
 .. autofunction:: fold_column

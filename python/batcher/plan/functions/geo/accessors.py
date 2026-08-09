@@ -220,8 +220,13 @@ def st_geometry_type(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'g': ['POINT(2 2)', 'LINESTRING(0 0, 3 4)', 'POLYGON((0 0, 4 0, 4 4, 0
-            ...     4, 0 0))']}
+            ...     {
+            ...         'g': [
+            ...             'POINT(2 2)',
+            ...             'LINESTRING(0 0, 3 4)',
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...         ],
+            ...     }
             ... )
             >>> got = bt.st_geometry_type(bt.col("g"))
             >>> ds.select(v=got).to_pydict()
@@ -248,8 +253,13 @@ def st_dimension(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'g': ['POINT(2 2)', 'LINESTRING(0 0, 3 4)', 'POLYGON((0 0, 4 0, 4 4, 0
-            ...     4, 0 0))']}
+            ...     {
+            ...         'g': [
+            ...             'POINT(2 2)',
+            ...             'LINESTRING(0 0, 3 4)',
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...         ],
+            ...     }
             ... )
             >>> got = bt.st_dimension(bt.col("g"))
             >>> ds.select(v=got).to_pydict()
@@ -374,8 +384,12 @@ def st_num_interior_rings(geom: Expr | str) -> Expr:
 
             >>> import batcher as bt
             >>> ds = bt.from_pydict(
-            ...     {'g': ['POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4
-            ...     4))', 'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))']}
+            ...     {
+            ...         'g': [
+            ...             'POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (4 4, 6 4, 6 6, 4 6, 4 4))',
+            ...             'POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))',
+            ...         ],
+            ...     }
             ... )
             >>> got = bt.st_num_interior_rings(bt.col("g"))
             >>> ds.select(v=got).to_pydict()

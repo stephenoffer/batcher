@@ -29,8 +29,9 @@ use rayon::prelude::*;
 use crate::agg_par;
 use crate::error::InterpError;
 use crate::join_par::{
-    broadcast_join, broadcast_join_streaming, is_skewed_bucket, is_skewed_bucket_bytes,
-    skew_salting_eligible, spilling_asof_join, spilling_hash_join_streaming,
+    broadcast_join, broadcast_join_streaming, build_side_swap_pays, flip_output, is_skewed_bucket,
+    is_skewed_bucket_bytes, skew_salting_eligible, spilling_asof_join,
+    spilling_hash_join_streaming,
 };
 use crate::metrics::{ExecMetrics, IdGen, OpMetric, Stopwatch};
 use crate::ops;
@@ -770,7 +771,7 @@ fn exec(
             // once. When grouping does reduce, the sample's partials are the first slice of
             // the work below, and are reused rather than recomputed.
             let partition_keys = agg_par::partitionable(group_keys, &parts);
-            let partials = match agg_par::decide(
+            let (partials, est_groups) = match agg_par::decide(
                 &parts,
                 group_keys,
                 aggregates,
@@ -779,17 +780,15 @@ fn exec(
             )? {
                 // The partition path holds the gathered relation where the reducing path can
                 // spill its partials, so the pool decides. Declining costs the sample only.
-                agg_par::AggPlan::Partition(keys) => {
+                agg_par::AggPlan::Partition {
+                    keys,
+                    width,
+                    groups,
+                } => {
                     match admit(opts, op_id, agg_par::partition_footprint(in_bytes)) {
                         Admit::InMemory(_reservation) => {
                             let out = agg_par::partitioned_aggregate(
-                                &parts,
-                                &keys,
-                                group_keys,
-                                aggregates,
-                                &agg_jit,
-                                &funcs,
-                                rayon::current_num_threads().max(1),
+                                &parts, &keys, group_keys, aggregates, &agg_jit, &funcs, width,
                             )?;
                             // The partition path holds the gathered relation *and* the source
                             // morsels at once (~2×), the same footprint it was admitted on —
@@ -808,12 +807,16 @@ fn exec(
                             );
                             return Ok(out);
                         }
-                        Admit::Spill => {
-                            agg_par::partials(&parts, group_keys, aggregates, &agg_jit)?
-                        }
+                        // The pool declined the gathered relation, so the bounded reducing
+                        // path runs instead — over a group-by the sample says does NOT
+                        // reduce, which is exactly where the merge wants a wide regroup.
+                        Admit::Spill => (
+                            agg_par::partials(&parts, group_keys, aggregates, &agg_jit)?,
+                            groups,
+                        ),
                     }
                 }
-                agg_par::AggPlan::Partials(partials) => partials,
+                agg_par::AggPlan::Partials { partials, groups } => (partials, groups),
             };
 
             // Spill once the partial state exceeds the per-operator budget *or* the
@@ -894,8 +897,12 @@ fn exec(
                     }
                 }
                 Admit::InMemory(_reservation) => {
-                    let merged =
-                        agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+                    let merged = agg::combine_sized(
+                        &partials,
+                        &funcs,
+                        opts.tuning.radix_parallel_threshold,
+                        est_groups,
+                    )?;
                     let agg_cols = agg::finalize(&funcs, &merged)?;
                     (merged.group_columns, agg_cols)
                 }
@@ -1347,8 +1354,42 @@ fn exec(
         } => {
             let left_batches = exec(left, sources, opts, m, ids)?;
             let right_batches = exec(right, sources, opts, m, ids)?;
+
+            // ── Runtime build-side correction ────────────────────────────────────────
+            // The planner chose which side to build from *estimated* cardinalities. Both
+            // relations are now materialized, so their sizes are facts, and every decision
+            // below this line — spill vs in-memory, streaming probe vs shuffle, hash-table
+            // cache residency — is made against the build side. Correcting the orientation
+            // here costs two slice rebindings and an output re-label; leaving it wrong
+            // costs a grace hash join that did not need to happen. See
+            // `join_par::build_side_swap_pays` for why this is restricted to `Inner`.
+            let swap = build_side_swap_pays(
+                *join_type,
+                count_rows(&left_batches) as usize,
+                count_rows(&right_batches) as usize,
+            );
+            let (left_batches, right_batches) = if swap {
+                (right_batches, left_batches)
+            } else {
+                (left_batches, right_batches)
+            };
+            let (left_keys, right_keys) = if swap {
+                (right_keys, left_keys)
+            } else {
+                (left_keys, right_keys)
+            };
+            let flipped_output: Vec<bc_ir::JoinOutputCol>;
+            let output: &[bc_ir::JoinOutputCol] = if swap {
+                flipped_output = flip_output(output);
+                &flipped_output
+            } else {
+                output
+            };
+
             // The probe side (left) drives the per-row probe cost; the build side (right)
-            // drives the hash table's memory. Their sum made both meaningless.
+            // drives the hash table's memory. Their sum made both meaningless. Both are
+            // read *after* the correction above, so what Carbonite learns as `n_build` is
+            // the table the join actually built, not the one the planner nominated.
             let rows_in = count_rows(&left_batches);
             let rows_build = count_rows(&right_batches);
             // The hash table / chain / null mask built over the build side is the join's
@@ -2446,6 +2487,66 @@ fn try_fused_join_aggregate(
     Ok(Some(out))
 }
 
+/// Run the fused linear chain over one morsel, returning the chained batch and the row count
+/// after each stage (which is what gives the fused ops exact selectivity metrics).
+fn run_chain(
+    stages: &[FusedStage],
+    b: &RecordBatch,
+    opts: &ExecOptions,
+) -> Result<(RecordBatch, Vec<u64>), InterpError> {
+    opts.check_cancelled()?;
+    let mut cur = b.clone();
+    let mut stage_rows = Vec::with_capacity(stages.len());
+    for stage in stages {
+        cur = stage.apply(&cur)?;
+        stage_rows.push(cur.num_rows() as u64);
+    }
+    Ok((cur, stage_rows))
+}
+
+/// Emit one metric per fused linear op (children before parents), as `exec_fused` does.
+///
+/// The chain's wall/CPU time is split evenly across its stages: they ran interleaved inside
+/// one parallel map, so there is no per-stage measurement to report and an even split is the
+/// only honest attribution.
+fn emit_stage_metrics(
+    m: &mut ExecMetrics,
+    stages: &[FusedStage],
+    totals: &[u64],
+    base_rows: u64,
+    stage_t0: Stopwatch,
+) {
+    let n = stages.len().max(1) as u64;
+    let stage_elapsed = stage_t0.elapsed_ns().max(1) / n;
+    let (fused_cpu, _fused_rss, fused_hw) = stage_t0.measure();
+    let stage_cpu = fused_cpu / n;
+    let stage_hw = fused_hw.split(n);
+    let threads = rayon::current_num_threads().max(1) as u32;
+    for (i, stage) in stages.iter().enumerate() {
+        let rows_in = if i == 0 { base_rows } else { totals[i - 1] };
+        m.record(OpMetric {
+            op_id: stage.op_id(),
+            kind: stage.kind(),
+            rows_in,
+            rows_out: totals[i],
+            elapsed_ns: stage_elapsed,
+            wall_span_ns: 0,
+            cpu_ns: stage_cpu,
+            threads,
+            peak_bytes: 0,
+            result_bytes: 0,
+            rows_build: 0,
+            spilled: false,
+            spill_bytes: 0,
+            // These linear stages hold no relation of their own (the aggregate downstream
+            // does), so there is no working set to attribute a high-water mark to.
+            peak_rss_bytes: 0,
+            backend: stage.backend(),
+            hw: stage_hw,
+        });
+    }
+}
+
 /// Fused Filter/Project → Aggregate: build each morsel's partial state directly from the
 /// linear chain's per-morsel output, without ever collecting the transformed relation.
 /// The chain is numbered and metered exactly as the recursive `exec` would (so adaptive
@@ -2500,59 +2601,111 @@ fn exec_agg_fused(
 
     // Per morsel: run the chain, then fold the result straight into a partial. Track the
     // row count after each stage so the fused ops keep exact selectivity metrics.
+    //
+    // A *sample* of the morsels goes first, and its chained batches are kept rather than
+    // dropped. Fusing pre-aggregates every morsel, which is the wrong shape for exactly the
+    // same reason it is wrong unfused: when the group-by does not reduce, the per-morsel
+    // hash build is thrown away and the merge inherits the whole relation. The sample says
+    // which regime this is, and keeping its chained batches means choosing "partition" costs
+    // no re-run of the chain over the rows already filtered.
     let n = stages.len();
-    let results: Vec<(agg::Partial, Vec<u64>)> = base_morsels
+    let threads = rayon::current_num_threads().max(1);
+    let sample_n = agg_par::sample_size(threads, base_morsels.len());
+    let sample_chained: Vec<(RecordBatch, Vec<u64>)> = base_morsels[..sample_n]
+        .par_iter()
+        .map(|b| run_chain(&stages, b, opts))
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    let sample_partials: Vec<agg::Partial> = sample_chained
+        .par_iter()
+        .map(|(b, _)| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    let sample_rows: usize = sample_chained.iter().map(|(b, _)| b.num_rows()).sum();
+
+    let mut totals = vec![0u64; n];
+    let add_rows = |rows: &[u64], totals: &mut Vec<u64>| {
+        for (i, r) in rows.iter().enumerate() {
+            totals[i] += r;
+        }
+    };
+
+    // The chain has only run over the sample, so the size of the post-chain relation is not
+    // yet known and `base_rows` — the chain's *input* — stands in for it. It is exact when
+    // nothing filters, and an over-estimate when something does; both only widen the
+    // partitioning slightly, which the flat region of `agg_par::GROUPS_PER_PARTITION`
+    // absorbs. Running the chain over everything first to get the true figure would cost the
+    // whole materialization this branch may then decline.
+    let partition_width = match agg_par::plain_key_columns(group_keys) {
+        Some(keys) if base_morsels.len() >= 2 => {
+            agg_par::width_from_sample(&sample_partials, sample_rows, sample_n, base_rows as usize)
+                .map(|w| (keys, w))
+        }
+        _ => None,
+    };
+    if let Some((keys, width)) = partition_width {
+        if let Admit::InMemory(_reservation) =
+            admit(opts, op_id, agg_par::partition_footprint(base_bytes))
+        {
+            let mut chained: Vec<RecordBatch> = Vec::with_capacity(base_morsels.len());
+            for (b, rows) in sample_chained {
+                add_rows(&rows, &mut totals);
+                chained.push(b);
+            }
+            let rest: Vec<(RecordBatch, Vec<u64>)> = base_morsels[sample_n..]
+                .par_iter()
+                .map(|b| run_chain(&stages, b, opts))
+                .collect::<Result<Vec<_>, InterpError>>()?;
+            for (b, rows) in rest {
+                add_rows(&rows, &mut totals);
+                chained.push(b);
+            }
+            emit_stage_metrics(m, &stages, &totals, base_rows, stage_t0);
+            let agg_t0 = Stopwatch::start();
+            let funcs = ops::agg_funcs(aggregates);
+            let chained_bytes = batch_bytes(&chained);
+            let out = agg_par::partitioned_aggregate(
+                &chained, &keys, group_keys, aggregates, &agg_jit, &funcs, width,
+            )?;
+            push_breaker(
+                m,
+                op_id,
+                "aggregate",
+                *totals.last().unwrap_or(&base_rows),
+                0,
+                agg_par::partition_footprint(chained_bytes) as u64,
+                &out,
+                agg_t0,
+                false,
+                "par-agg-partitioned",
+            );
+            return Ok(out);
+        }
+    }
+
+    // The merge below cannot measure its own output size; the sample already taken can.
+    let est_groups =
+        agg_par::groups_from_sample(&sample_partials, sample_rows, sample_n, base_rows as usize);
+
+    // Reducing (or the pool declined the partitioned shape): fold every remaining morsel
+    // straight into a partial, dropping its chained batch as the fusion always has. The
+    // sample's partials are the first slice of that work and are reused, not recomputed.
+    let mut partials = Vec::with_capacity(base_morsels.len());
+    for ((_, rows), partial) in sample_chained.into_iter().zip(sample_partials) {
+        add_rows(&rows, &mut totals);
+        partials.push(partial);
+    }
+    let rest: Vec<(agg::Partial, Vec<u64>)> = base_morsels[sample_n..]
         .par_iter()
         .map(|b| {
-            opts.check_cancelled()?;
-            let mut cur = b.clone();
-            let mut stage_rows = Vec::with_capacity(n);
-            for stage in &stages {
-                cur = stage.apply(&cur)?;
-                stage_rows.push(cur.num_rows() as u64);
-            }
+            let (cur, stage_rows) = run_chain(&stages, b, opts)?;
             let partial = ops::eval_partial_jit(&cur, group_keys, aggregates, &agg_jit)?;
             Ok((partial, stage_rows))
         })
         .collect::<Result<Vec<_>, InterpError>>()?;
-
-    let mut totals = vec![0u64; n];
-    let mut partials = Vec::with_capacity(results.len());
-    for (partial, rows) in results {
-        for (i, r) in rows.iter().enumerate() {
-            totals[i] += r;
-        }
+    for (partial, rows) in rest {
+        add_rows(&rows, &mut totals);
         partials.push(partial);
     }
-    // Emit one metric per fused linear op (children before parents), as `exec_fused` does.
-    let stage_elapsed = stage_t0.elapsed_ns().max(1) / n as u64;
-    let (fused_cpu, _fused_rss, fused_hw) = stage_t0.measure();
-    let stage_cpu = fused_cpu / n as u64;
-    let stage_hw = fused_hw.split(n as u64);
-    let threads = rayon::current_num_threads().max(1) as u32;
-    for (i, stage) in stages.iter().enumerate() {
-        let rows_in = if i == 0 { base_rows } else { totals[i - 1] };
-        m.record(OpMetric {
-            op_id: stage.op_id(),
-            kind: stage.kind(),
-            rows_in,
-            rows_out: totals[i],
-            elapsed_ns: stage_elapsed,
-            wall_span_ns: 0,
-            cpu_ns: stage_cpu,
-            threads,
-            peak_bytes: 0,
-            result_bytes: 0,
-            rows_build: 0,
-            spilled: false,
-            spill_bytes: 0,
-            // These linear stages hold no relation of their own (the aggregate downstream
-            // does), so there is no working set to attribute a high-water mark to.
-            peak_rss_bytes: 0,
-            backend: stage.backend(),
-            hw: stage_hw,
-        });
-    }
+    emit_stage_metrics(m, &stages, &totals, base_rows, stage_t0);
 
     // Combine the partials — the same in-memory / grace-spill path as the unfused
     // aggregate (no value-list aggregate reaches here, so no raw-morsel spill is needed).
@@ -2583,8 +2736,12 @@ fn exec_agg_fused(
             (res.group_columns, res.agg_columns)
         }
         Admit::InMemory(_reservation) => {
-            let merged =
-                agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
+            let merged = agg::combine_sized(
+                &partials,
+                &funcs,
+                opts.tuning.radix_parallel_threshold,
+                est_groups,
+            )?;
             let agg_cols = agg::finalize(&funcs, &merged)?;
             (merged.group_columns, agg_cols)
         }
@@ -2889,6 +3046,85 @@ mod tests {
     /// A plan with no media decode — the common case for the `auto_width` cap tests.
     fn no_media_plan() -> RelOp {
         RelOp::Scan { source_id: 0 }
+    }
+
+    /// A join whose planner-nominated build side turns out to be the *larger* relation is
+    /// re-oriented at execution, and the re-oriented join is the same relation.
+    ///
+    /// Both halves matter. The multiset equality against the sequential oracle is the
+    /// correctness proof: the oracle never swaps (`lib.rs` ignores the orientation
+    /// entirely), so agreeing with it is exactly the statement that a swap changes nothing
+    /// observable but the row order. The `rows_build` assertion is what stops the test from
+    /// being true by construction — without it a rule that never fired would pass, and
+    /// `rows_build` is reported *after* the correction, so it names the table the join
+    /// actually built. 40 k build against 5 k probe clears both the 2× ratio and the
+    /// one-morsel floor; after the swap the engine must report having built the 5 k side.
+    #[test]
+    fn oversized_build_side_is_re_oriented_and_still_matches_the_oracle() {
+        let probe_keys: Vec<i64> = (0..5_000).collect();
+        let probe_vals: Vec<i64> = (0..5_000).map(|k| k * 10).collect();
+        let build_keys: Vec<i64> = (0..40_000).collect();
+        let build_vals: Vec<i64> = (0..40_000).map(|k| k * 100).collect();
+
+        let plan = RelOp::HashJoin {
+            left: Box::new(RelOp::Scan { source_id: 0 }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: bc_ir::JoinType::Inner,
+            output: vec![
+                bc_ir::JoinOutputCol {
+                    side: bc_ir::JoinSide::Left,
+                    name: "v".into(),
+                    alias: "lv".into(),
+                },
+                bc_ir::JoinOutputCol {
+                    side: bc_ir::JoinSide::Right,
+                    name: "v".into(),
+                    alias: "rv".into(),
+                },
+            ],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        let sources = vec![
+            vec![batch(&probe_keys, &probe_vals)],
+            vec![batch(&build_keys, &build_vals)],
+        ];
+
+        // Sorted so the comparison is a multiset one: the swap deliberately changes the
+        // emitted order (output follows the probe), which is the one thing it may change.
+        let rows = |bs: &[RecordBatch]| -> Vec<(i64, i64)> {
+            let mut out = Vec::new();
+            for b in bs {
+                let lv = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let rv = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                for i in 0..b.num_rows() {
+                    out.push((lv.value(i), rv.value(i)));
+                }
+            }
+            out.sort();
+            out
+        };
+
+        let (par, metrics) =
+            execute_parallel_with_metrics(&plan, &sources, &ExecOptions::default()).unwrap();
+        let oracle = execute(&plan, &sources).unwrap();
+
+        // Column identity survives the re-label: `lv` still comes from the left input.
+        assert_eq!(rows(&par), rows(&oracle));
+        assert_eq!(rows(&par).len(), 5_000);
+        assert!(rows(&par).iter().all(|(lv, rv)| *rv == *lv * 10));
+
+        let join = metrics
+            .ops
+            .iter()
+            .find(|o| o.kind == "hash_join")
+            .expect("the plan has a hash join");
+        assert_eq!(
+            join.rows_build, 5_000,
+            "the executor built the planner's oversized side instead of correcting it"
+        );
+        assert_eq!(join.rows_in, 40_000, "the larger side should be the probe");
     }
 
     /// The fused join→aggregate must produce exactly what the sequential oracle produces —
@@ -3469,9 +3705,8 @@ mod tests {
                     mean: None,
                     std: None,
                     channels_first: false,
-                    x: None,
-                    y: None,
                     format: None,
+                    fill: None,
                 },
                 alias: "img".into(),
             }],

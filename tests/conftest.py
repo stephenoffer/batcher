@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -187,3 +189,89 @@ def _isolate_metadata_hub():
     reset_default_hub()
     yield
     reset_default_hub()
+
+
+#: Env var naming a directory mounted on **every** node of the Ray cluster under test.
+#: Takes precedence over the conventional mounts below.
+SHARED_DIR_ENV = "BATCHER_TEST_SHARED_DIR"
+
+#: Conventional cluster-wide mounts to fall back on when the env var is unset. These are the
+#: shared volumes a managed Ray cluster provides; on a laptop and in CI neither exists, so the
+#: fixtures below get `tmp_path` and behave exactly as they always did.
+_SHARED_DIR_CANDIDATES = ("/mnt/cluster_storage", "/mnt/shared_storage")
+
+
+def _shared_base() -> Path | None:
+    """A directory every worker node can read, or `None` if there is no reason to think so.
+
+    Existence plus writability is the whole test. It is a heuristic — a path that exists on
+    the driver is not *proof* the workers mount it — but the failure mode is bounded: the
+    worst case is the `FileNotFoundError` these tests already produced, so a wrong guess is
+    never worse than not guessing.
+    """
+    for candidate in (os.environ.get(SHARED_DIR_ENV), *_SHARED_DIR_CANDIDATES):
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.is_dir() and os.access(path, os.W_OK):
+            return path
+    return None
+
+
+def _safe_dirname(name: str) -> str:
+    """A test id turned into a directory component that is safe to *glob*.
+
+    A parametrized test is named `test_x[flight]`, and the readers under test open their
+    input through a glob — where `[...]` is a character class, not two literal brackets. A
+    directory named after the raw id therefore reads back as "matched no files", which is a
+    confusing way to say "your path had metacharacters in it".
+    """
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)[:120]
+
+
+@pytest.fixture
+def cluster_tmp_path(tmp_path, request):
+    """A scratch directory every Ray worker can open — `tmp_path` when they all share one.
+
+    A distributed test that writes its fixture to pytest's `tmp_path` is writing to
+    **driver-local** disk. On a single-node Ray that is fine, because the workers are the
+    same machine. On a genuine multi-node cluster it is not: the worker opens a path that
+    does not exist on its node and the test dies with `FileNotFoundError` from inside a Ray
+    task, which reads like an engine defect and is not one.
+
+    The cost of that is not hypothetical. `tests/integration/test_distributed.py` had never
+    been run against a multi-node cluster — CI installs no Ray, and a local single-node Ray
+    is the most it had ever seen. The first real-cluster run surfaced **two genuine defects**
+    (a silently zero-row `iter_batches(distributed=True)` over Flight, and five monkeypatches
+    dead since `_broadcast_max_bytes` gained a parameter) underneath **21** failures of
+    exactly this fixture kind, which is a good way to have real findings dismissed as noise.
+    With a cluster-visible directory the same file goes from 40 failed / 56 passed to 96
+    passed.
+
+    Set `BATCHER_TEST_SHARED_DIR` to override the mount chosen.
+    """
+    base = _shared_base()
+    if base is None:
+        yield tmp_path
+        return
+    scratch = base / "batcher-tests" / _safe_dirname(request.node.name)
+    scratch.mkdir(parents=True, exist_ok=True)
+    yield scratch
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def cluster_tmp_dir(tmp_path_factory):
+    """Session-scoped [`cluster_tmp_path`], for a corpus a whole module builds once.
+
+    Same contract and same reason; separate only because `tmp_path_factory` is
+    session-scoped and a function-scoped fixture cannot be consumed from one.
+    """
+    base = _shared_base()
+    if base is None:
+        yield tmp_path_factory.mktemp("cluster")
+        return
+    scratch = base / "batcher-tests-session"
+    scratch.mkdir(parents=True, exist_ok=True)
+    yield scratch
+    shutil.rmtree(scratch, ignore_errors=True)

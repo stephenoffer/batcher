@@ -42,11 +42,17 @@ pub(crate) fn eval_audio(
     threshold_db: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
     let mel = MelParams::resolve(func, rate, n_fft, hop, n_mels, n_mfcc)?;
+    // An all-null column is typed `Null`, not `Binary`; see `widen_null_column`.
+    if let Some(nulls) = super::widen_null_column(arr) {
+        return eval_audio_sized::<i32>(func, &nulls, rate, mel, threshold_db);
+    }
     match arr.data_type() {
         DataType::Binary => eval_audio_sized::<i32>(func, arr, rate, mel, threshold_db),
         DataType::LargeBinary => eval_audio_sized::<i64>(func, arr, rate, mel, threshold_db),
         other => Err(ExprError::ExpectedBinary {
-            func: format!("{func:?}"),
+            // Namespaced, because `Decode` alone is a name three namespaces share and the
+            // error otherwise reported an audio failure as an image one.
+            func: format!("audio.{func:?}"),
             got: other.to_string(),
         }),
     }

@@ -1425,7 +1425,12 @@ class DatasetML:
         )
 
     def train_test_split(
-        self, test_size: float = 0.25, *, seed: int = 0, key: str | list[str] | None = None
+        self,
+        test_size: float = 0.25,
+        *,
+        seed: int = 0,
+        key: str | list[str] | None = None,
+        stratify: str | None = None,
     ) -> tuple[Dataset, Dataset]:
         """Split the rows into a disjoint train and test `Dataset`.
 
@@ -1439,6 +1444,10 @@ class DatasetML:
         Args:
             test_size: The fraction of rows to place in the test part, in ``(0, 1)``.
             seed: Seed for the row assignment; the same seed reproduces the split.
+            stratify: A column whose distribution to hold constant across both halves.
+                Without it the split is proportional only in expectation, so a rare class can
+                land almost entirely on one side and every metric computed on the other
+                becomes meaningless. Pass the label column on an imbalanced problem.
             key: The column(s) identifying a row. Prefer it on a real corpus: hashing
                 only these keeps the split stable when the *other* columns change
                 (recompute a feature and the same rows stay in train), costs one hash
@@ -1462,6 +1471,10 @@ class DatasetML:
                 >>> train.count() + test.count()
                 1000
         """
+        if stratify is not None:
+            from batcher.ml.splitting import stratified_split
+
+            return stratified_split(self._ds, stratify, test_size=test_size, seed=seed, key=key)
         return build_train_test_split(self._ds, test_size, seed=seed, key=_as_key_columns(key))
 
     def drift(

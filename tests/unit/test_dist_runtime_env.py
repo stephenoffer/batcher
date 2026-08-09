@@ -204,3 +204,84 @@ def test_force_local_overrides_managed_detection(_no_cluster_signal, restore_con
     kwargs = lifecycle._ray_init_kwargs(workers=5, force_local=True)
     assert "address" not in kwargs
     assert kwargs["num_cpus"] == 5
+
+
+# --- The self-shipped package is cached per Ray SESSION, not per process ---------
+
+
+def _reset_rt_cache(scheduling):
+    scheduling._WORKER_RT_ENV = None
+    scheduling._WORKER_RT_ENV_SESSION = None
+
+
+def test_worker_runtime_env_reuploads_after_a_ray_session_change(monkeypatch, restore_config):
+    """A reconnect must re-upload: a `gcs://` URI is only valid in the GCS that stored it.
+
+    The cache used to be keyed by nothing, on the reasoning that the driver's batcher
+    package is fixed per run. The package is, but the *cluster it was uploaded to* is not.
+    A driver that outlives one Ray session — a cluster restart, a `ray.shutdown()` and
+    reconnect — would then hand every task a package URI the new cluster cannot resolve,
+    and every remote fails in runtime_env setup rather than in anything the user wrote.
+    """
+    from batcher.dist.executors.ray_runtime import scheduling
+
+    _with_distributed(trust_cluster_image=False)
+    monkeypatch.setattr(scheduling, "_JOB_SHIPS_BATCHER", False)
+    _reset_rt_cache(scheduling)
+
+    uploads: list[str] = []
+
+    def _fake_upload(rt, include_gitignore=False):
+        uploads.append(rt["py_modules"][0])
+        return {"py_modules": [f"gcs://_ray_pkg_{len(uploads)}.zip"]}
+
+    monkeypatch.setattr(
+        "ray._private.runtime_env.py_modules.upload_py_modules_if_needed", _fake_upload
+    )
+
+    session = {"id": "job-1"}
+    monkeypatch.setattr(scheduling, "ray_session_key", lambda: session["id"])
+
+    first = scheduling.worker_runtime_env()
+    assert first == {"py_modules": ["gcs://_ray_pkg_1.zip"]}
+    # Same session: cached, no second upload.
+    assert scheduling.worker_runtime_env() is first
+    assert len(uploads) == 1
+
+    # A new Ray session invalidates the URI, so the package is uploaded again.
+    session["id"] = "job-2"
+    second = scheduling.worker_runtime_env()
+    assert second == {"py_modules": ["gcs://_ray_pkg_2.zip"]}
+    assert len(uploads) == 2
+
+    _reset_rt_cache(scheduling)
+
+
+def test_worker_runtime_env_is_none_when_the_job_already_ships_batcher(monkeypatch):
+    """The common case — batcher initialized Ray — attaches no per-remote runtime_env."""
+    from batcher.dist.executors.ray_runtime import scheduling
+
+    monkeypatch.setattr(scheduling, "_JOB_SHIPS_BATCHER", True)
+    assert scheduling.worker_runtime_env() is None
+
+
+def test_ray_session_key_is_none_when_ray_is_down_or_the_api_drifts(monkeypatch):
+    """An unknown session must degrade to `None`, never propagate out of scheduling.
+
+    The key is only used to scope caches, so losing it costs a redundant upload — while
+    letting the exception escape would break scheduling on a Ray version whose
+    runtime-context API moved.
+    """
+    import ray
+
+    from batcher.dist.executors.ray_runtime import scheduling
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
+    assert scheduling.ray_session_key() is None
+
+    def _boom():
+        raise AttributeError("get_runtime_context moved")
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray, "get_runtime_context", _boom)
+    assert scheduling.ray_session_key() is None

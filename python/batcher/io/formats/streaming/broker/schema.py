@@ -16,7 +16,60 @@ import pyarrow as pa
 
 from batcher.io.formats.sql._common import connection_fingerprint
 
-__all__ = ["BrokerMessage", "broker_schema", "redact_broker_options"]
+__all__ = [
+    "HEADERS_TYPE",
+    "BrokerMessage",
+    "broker_schema",
+    "normalize_starting_position",
+    "redact_broker_options",
+]
+
+#: The two whole-stream starting positions every broker understands, under the names Spark
+#: uses. Each concrete broker maps them onto its own vocabulary (Kafka's
+#: ``auto.offset.reset``, Kinesis's ``ShardIteratorType``, Event Hubs' offset sentinel).
+STARTING_POSITIONS = ("earliest", "latest")
+
+
+def normalize_starting_position(value: object, *, aliases: dict[str, str]) -> str:
+    """Map a `starting_position` onto one concrete broker's own vocabulary.
+
+    Five brokers, five spellings of the same two ideas: Kafka says
+    ``auto.offset.reset=earliest``, Kinesis says ``ShardIteratorType=TRIM_HORIZON``, Event
+    Hubs says offset ``-1``, Pulsar says ``MessageId.earliest``. A reader who knows one has
+    to look up the other four, and a job ported from Spark knows none of them — it knows
+    ``startingOffsets`` / ``startingPosition``, which is ``"earliest"`` or ``"latest"``.
+
+    So the *option* is the same everywhere and the mapping lives with the broker that needs
+    it. A broker's native spelling still works, because refusing it would break the readers
+    that already pass one.
+
+    Args:
+        value: What the user asked for — a shared name, or this broker's native spelling.
+        aliases: This broker's ``{shared_name: native_value}`` mapping.
+
+    Returns:
+        The native value to hand the client.
+
+    Raises:
+        PlanError: If `value` is neither a shared name nor a recognized native one.
+    """
+    from batcher._internal.errors import PlanError, suggestion
+
+    if not isinstance(value, str):
+        raise PlanError(
+            f"starting_position must be a string, not {type(value).__name__} ({value!r}); "
+            f"use one of {list(STARTING_POSITIONS)}"
+        )
+    if value in aliases:
+        return aliases[value]
+    native = set(aliases.values())
+    if value in native:
+        return value  # this broker's own spelling, passed through unchanged
+    known = [*STARTING_POSITIONS, *sorted(native)]
+    hint = suggestion(value, known)
+    raise PlanError(
+        f"unknown starting_position {value!r}; use one of {known}." + (f" {hint}" if hint else "")
+    )
 
 
 #: Two forces pull on this list. Too narrow and a credential reaches a log line and the
@@ -85,21 +138,39 @@ def _options_fingerprint(options: Mapping[str, Any]) -> str:
 #: micro-batch, allocating six `pa.Field` objects per poll on the latency-critical path, and
 #: two batches built from separately-constructed (equal) schemas do not share a schema pointer,
 #: so downstream concatenation had to fall back to a field-by-field comparison.
-_BROKER_SCHEMA = pa.schema(
-    [
-        pa.field("key", pa.binary()),
-        pa.field("value", pa.binary()),
-        pa.field("partition", pa.int64()),
-        pa.field("offset", pa.int64()),
-        pa.field("timestamp", pa.int64()),
-        pa.field("topic", pa.string()),
-    ]
-)
+_BROKER_FIELDS = [
+    pa.field("key", pa.binary()),
+    pa.field("value", pa.binary()),
+    pa.field("partition", pa.int64()),
+    pa.field("offset", pa.int64()),
+    pa.field("timestamp", pa.int64()),
+    pa.field("topic", pa.string()),
+]
+
+#: The `headers` column's type, matching Spark's Kafka source exactly
+#: (``array<struct<key:string,value:binary>>``) so a ported job's accessors keep working.
+HEADERS_TYPE = pa.list_(pa.struct([pa.field("key", pa.string()), pa.field("value", pa.binary())]))
+
+_BROKER_SCHEMA = pa.schema(_BROKER_FIELDS)
+_BROKER_SCHEMA_WITH_HEADERS = pa.schema([*_BROKER_FIELDS, pa.field("headers", HEADERS_TYPE)])
 
 
-def broker_schema() -> pa.Schema:
-    """The fixed broker message schema shared by every broker source."""
-    return _BROKER_SCHEMA
+def broker_schema(include_headers: bool = False) -> pa.Schema:
+    """The broker message schema shared by every broker source.
+
+    `include_headers` adds the `headers` column, off by default and opt-in for the reason
+    Spark's ``includeHeaders`` is: headers are per-message metadata most pipelines never
+    read, and decoding them into a nested Arrow column costs on every message of every
+    poll. A stream that does want them — for a trace id, a schema-registry id, a routing
+    hint — could not reach them at all before.
+
+    Args:
+        include_headers: Whether to add the `headers` column.
+
+    Returns:
+        The shared, immutable schema for that choice.
+    """
+    return _BROKER_SCHEMA_WITH_HEADERS if include_headers else _BROKER_SCHEMA
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,3 +193,6 @@ class BrokerMessage:
     topic: str
     key: bytes | None = None
     resume_token: Any = None
+    #: Per-message headers as ``[(name, value)]``, or None when the source was not asked
+    #: for them. Only populated when the broker supports headers *and* the reader opted in.
+    headers: list[tuple[str, bytes | None]] | None = None

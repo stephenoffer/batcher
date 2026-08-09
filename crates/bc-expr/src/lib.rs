@@ -27,6 +27,16 @@ mod select;
 pub use error::ExprError;
 pub use select::ConjunctOrder;
 
+/// What a payload's leading bytes say it is, or `None` when nothing recognizes them.
+///
+/// Public so the IO layer can reach the *same* magic-number table the `.str.mime_type()`
+/// expression uses, through a `bc-py` helper. A reader that kept its own copy would be a
+/// second answer to "what is this file", and the two would drift the first time a format
+/// was added to one of them.
+pub fn sniff_mime(data: &[u8]) -> Option<&'static str> {
+    eval::mime::sniff(data)
+}
+
 // The per-variant evaluation bodies (and `Expr::eval` itself) live in `eval`; the
 // wire-contract enum definitions stay here in `lib.rs`.
 mod eval;
@@ -136,15 +146,12 @@ pub enum Expr {
         std: Option<Vec<f64>>,
         #[serde(default)]
         channels_first: bool,
-        /// `Crop` only: the top-left corner of the window. `#[serde(default)]`, so every
-        /// other image op's IR round-trips unchanged.
-        #[serde(default)]
-        x: Option<i64>,
-        #[serde(default)]
-        y: Option<i64>,
         /// `Encode` only: the target container format.
         #[serde(default)]
         format: Option<String>,
+        /// `Letterbox` only: the byte value the leftover canvas is filled with.
+        #[serde(default)]
+        fill: Option<i64>,
     },
 
     /// An audio decode op over a binary (audio-bytes) sub-expression. Library-backed
@@ -174,6 +181,29 @@ pub enum Expr {
         threshold_db: Option<i64>,
     },
 
+    /// A crop over an image column whose window is **four sub-expressions rather than
+    /// four constants**.
+    ///
+    /// Its own variant rather than four more `Option<i64>` on `Image`, because the
+    /// distinction is real: every other image op's dimensions are part of its output
+    /// *type* (a `to_tensor(224, 224)` column is `fixed_shape_tensor(uint8, [224,224,3])`
+    /// and cannot be per-row), while a crop window is *data*. Cropping the bounding box a
+    /// detector predicted is the operation a vision pipeline is built around, and with
+    /// literal-only arguments it was the one thing this namespace could not express —
+    /// leaving a per-row Python loop as the only way to cut objects out of frames.
+    ///
+    /// The bounds are evaluated to arrays once per batch and read per row, so a literal
+    /// costs one broadcast array and needs no separate path. Output is PNG `Binary`; a
+    /// window clipped by an edge yields the part that exists, one starting past the image
+    /// yields null, and so does a null, negative, or empty window.
+    ImageCrop {
+        input: Box<Expr>,
+        x: Box<Expr>,
+        y: Box<Expr>,
+        width: Box<Expr>,
+        height: Box<Expr>,
+    },
+
     /// A video decode op over a binary (video-bytes) sub-expression. Backed by the
     /// system FFmpeg behind the `video` feature; without it, evaluation errors. The
     /// JIT falls back to this interpreter path.
@@ -181,6 +211,26 @@ pub enum Expr {
         #[serde(rename = "fn")]
         func: VideoFunc,
         input: Box<Expr>,
+        /// `Frames` only: how many evenly-spaced frames to sample from each clip.
+        /// `#[serde(default)]` throughout, so `decode`'s IR round-trips byte-identical
+        /// to what it was before the sampling ops existed.
+        #[serde(default)]
+        num_frames: Option<i64>,
+        /// `Frames`/`Thumbnail`/`FrameAt`: the size every sampled frame is scaled to.
+        /// A fixed size is what makes the output a fixed-shape tensor column rather than
+        /// a ragged one, so it is required rather than defaulted to the clip's own size.
+        #[serde(default)]
+        width: Option<i64>,
+        #[serde(default)]
+        height: Option<i64>,
+        /// `FrameAt` only: the timestamp to seek to, in seconds from the clip start —
+        /// an **expression**, because a timestamp is data. The row that wants a still
+        /// usually already carries the moment it wants (a detection, a caption, a scene
+        /// boundary), so a constant here would make the one common case the one this
+        /// cannot express. The other three arguments stay constants: they describe the
+        /// output, not the row.
+        #[serde(default)]
+        second: Option<Box<Expr>>,
     },
 
     /// First non-null among the sub-expressions, per row (SQL COALESCE).
@@ -923,13 +973,6 @@ pub enum ImageFunc {
     /// `resize(width, height)` → re-encoded PNG bytes at the new size (Daft
     /// `image.resize`). Null/undecodable input → null. → Binary.
     Resize,
-    /// `crop(x, y, width, height)` → the requested region, re-encoded as PNG bytes. The
-    /// arbitrary-offset counterpart of `CenterCrop`, for pulling a detection's bounding box
-    /// out of a frame and keeping it as an image rather than as a tensor. A window that
-    /// runs past an edge is clipped to the image, so the output can be smaller than
-    /// requested; a window entirely outside it is null. Null/undecodable input → null.
-    /// → Binary.
-    Crop,
     /// `encode(format)` → the image re-encoded in `format` (`png`, `jpeg`, `bmp`, `gif`),
     /// pixels unchanged. Normalizes a mixed-format corpus to one codec, or trades a PNG
     /// for a smaller JPEG. Null/undecodable input → null. → Binary.
@@ -946,6 +989,32 @@ pub enum ImageFunc {
     /// it is a similarity join. Null/undecodable input → null. → Int64 (the 64 bits
     /// reinterpreted: the FFI boundary rejects a `u64` above `i64::MAX`).
     Dhash,
+    /// `auto_orient()` → the image rotated/flipped per its Exif `Orientation` tag, as PNG
+    /// bytes. A camera records which way up it was held rather than rotating the sensor
+    /// data, so a portrait phone photo is *stored* landscape with a "rotate 90" note. Every
+    /// viewer honours that note, and so does anything built on `PIL.ImageOps.exif_transpose`
+    /// or `cv2.imread`; the decoder under this namespace does not. Without this, a corpus of
+    /// phone photographs decodes a quarter turn from what the rest of the pipeline sees —
+    /// right shape, real pixels, wrong image. Null/undecodable input → null. → Binary.
+    AutoOrient,
+    /// `exif_orientation()` → the Exif orientation code, 1..8 (Int32). The diagnostic half
+    /// of `AutoOrient`, since whether a corpus needs orienting is otherwise invisible. `1`
+    /// ("already upright") is reported both for an image carrying no tag and for a format
+    /// that cannot carry one, because that is what the code means. Null input → null.
+    ExifOrientation,
+    /// `thumbnail(max_size)` → the image scaled so its **longest side** is `max_size`,
+    /// as PNG bytes. The aspect-preserving counterpart of `Resize`, which takes both
+    /// dimensions and therefore stretches anything not already at the target ratio — a
+    /// distortion no shape assertion can see. Never upscales, matching Pillow's
+    /// `Image.thumbnail`. Reads the `width` slot. Null/undecodable → null. → Binary.
+    Thumbnail,
+    /// `letterbox(width, height, fill)` → aspect-preserving fit onto a `(width, height)`
+    /// canvas with the remainder filled, flattened to RGB8. The standard object-detection
+    /// preprocessing: `ToTensor` stretches, which moves every predicted box off its
+    /// object, and `CenterCrop` discards the border, which is where the missed detections
+    /// live. `fill` defaults to 114, the YOLO family's grey. Null/undecodable → null.
+    /// → FixedSizeList&lt;UInt8&gt; of `height * width * 3`.
+    Letterbox,
 }
 
 /// Element-wise arithmetic between two equal-length numeric `List` columns (the `.list`
@@ -1034,12 +1103,29 @@ pub enum AudioFunc {
     Mfcc,
 }
 
-/// Video-decode operations for the `.video` namespace. `Decode` reads each clip's
-/// metadata into a struct. Requires the `video` cargo feature (system FFmpeg).
+/// Video-decode operations for the `.video` namespace. Requires the `video` cargo
+/// feature (system FFmpeg).
+///
+/// The three sampling ops exist because a video pipeline's first step is always "turn a
+/// clip into pixels a model or a person can look at", and doing that outside the engine
+/// means a per-row Python decode loop — the one thing the control plane must never do.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoFunc {
+    /// `decode()` → struct `{width, height, num_frames, duration_secs, fps}`, read from
+    /// the container header without decoding a single frame.
     Decode,
+    /// `frames(n, w, h)` → `FixedSizeList<UInt8>` of `n*h*w*3` RGB8 samples: `n`
+    /// evenly-spaced frames, each scaled to `(w, h)`. The training-ingest kernel.
+    Frames,
+    /// `thumbnail(w, h)` → PNG bytes of the clip's middle frame, scaled to `(w, h)`.
+    /// The middle rather than the first because the first frame of a real clip is very
+    /// often a black or title frame.
+    Thumbnail,
+    /// `frame_at(second, w, h)` → PNG bytes of the frame at `second`, scaled to
+    /// `(w, h)`. Seeks rather than decoding the whole clip, so the cost does not grow
+    /// with how far into the clip the timestamp is.
+    FrameAt,
 }
 
 /// Map-column accessors (over an Arrow `Map` column). Wire tags are snake_case (the
@@ -1051,6 +1137,13 @@ pub enum MapFunc {
     MapKeys,
     /// `map_values(m)` → `List<V>` of each row's values (DuckDB `map_values`).
     MapValues,
+    /// `map_entries(m)` → `List<Struct<key, value>>`, the row's entries as a list of
+    /// pairs (DuckDB and Spark both spell it `map_entries`).
+    ///
+    /// This is the one accessor that keeps a key beside its value. `map_keys` and
+    /// `map_values` each return a list, and pairing them back up relies on the two
+    /// sharing an order — true here, but not a guarantee a caller should have to know.
+    MapEntries,
     /// `element_at(m, key)` → the value for the literal `key` (null if absent).
     ElementAt,
 }
@@ -1383,6 +1476,17 @@ pub enum StrFunc {
     Sha256,
     /// CRC-32 (IEEE) checksum of the UTF-8 bytes (Spark `crc32`). → Int64.
     Crc32,
+    /// `mime_type()` → what the value's leading bytes say it is (`image/png`,
+    /// `video/mp4`, `application/pdf`, …), or **null** when nothing recognizes them.
+    ///
+    /// The byte-oriented sibling of the IO layer's `mime` column, for the bytes that never
+    /// came from a file read — a `ds.ml.download`, a blob column in a Parquet table, a
+    /// payload extracted from an archive. Those have no filename to guess from and, until
+    /// this, no way to be identified at all, so routing a mixed blob corpus meant a Python
+    /// UDF. Null rather than `application/octet-stream` because this reader knows only what
+    /// the bytes say: "unrecognized" and "opaque binary" are different claims, and only a
+    /// caller with a filename left to try can collapse them.
+    MimeType,
     /// 64-bit xxHash of the UTF-8 bytes (the u64 digest reinterpreted as i64). The
     /// fast non-cryptographic hash for bucketing/sharding. Null → null. → Int64.
     #[serde(rename = "xxhash64")]

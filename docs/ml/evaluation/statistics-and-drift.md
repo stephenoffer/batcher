@@ -160,6 +160,16 @@ different kinds of signal, so a feature strong on any of them survives.
 
 `batcher.ml.feature_scores` is the univariate filter that scikit-learn's `SelectKBest` runs, one score per feature against the target: `f_classif_scores` (ANOVA F for a categorical target), `f_regression_scores` (regression F for a continuous one), `chi2_scores` (categorical against categorical), and `mutual_info_scores` (bits shared, which catches a non-monotone link the F scores miss). `select_k_best` turns any of those score dicts into the columns to keep.
 
+`f_classif_scores` and `f_regression_scores` score every feature in **one pass** over the
+data, however wide the table is. Both statistics are recoverable from mergeable moments, so
+a hundred features ride a single `group_by` rather than costing a hundred scans, which is
+what makes them usable as a first screen on a wide frame and on the distributed path where
+each scan is a pass across the cluster.
+
+`chi2_scores` and `mutual_info_scores` still cost a pass per feature: each needs its own
+contingency grid over a different pair of category sets, and those do not share a scan.
+Screen with the F scores first if the table is wide.
+
 ```python
 from batcher.ml.feature_scores import f_classif_scores, select_k_best
 
@@ -221,6 +231,29 @@ scored = mahalanobis_distance(ds, ["height", "weight"])
 print(scored.to_pydict()["mahalanobis"][3] == max(scored.to_pydict()["mahalanobis"]))  # the light-but-average-height row
 ```
 
+`mahalanobis_distance` relearns the centre and the covariance from whatever dataset you hand it. That is what you want for a one-off audit and the wrong thing for scoring new data: a batch made entirely of outliers relearns itself as normal and comes back clean. {py:class}`EllipticEnvelope <batcher.ml.outliers.EllipticEnvelope>` splits the two steps, so the envelope is learned once on the training data and applied unchanged to whatever arrives:
+
+```python
+from batcher.ml import EllipticEnvelope
+
+train = bt.from_pydict(
+    {
+        "height": [1.70, 1.75, 1.80, 1.85, 1.65, 1.78, 1.72, 1.82],
+        "weight": [64.0, 70.0, 76.0, 82.0, 58.0, 73.0, 66.0, 79.0],
+    }
+)
+
+envelope = EllipticEnvelope(["height", "weight"], contamination=0.05).fit(train)
+
+incoming = bt.from_pydict({"height": [1.76, 1.79], "weight": [71.0, 55.0]})
+print(envelope.predict(incoming).to_pydict()["is_outlier"])
+# [False, True]
+```
+
+The second row is the case the univariate rules miss: 1.79m and 55kg are each unremarkable, and the pair is not. `contamination` is the share of training rows expected to fall outside, which sets the chi-squared cutoff, and `score_samples` returns the distance itself when you would rather rank rows than threshold them.
+
+The fit is a mean and a covariance, both mergeable aggregates, so it is one pass and gives the same envelope on a cluster as on one machine. Scoring adds no pass at all, because it lowers to a single expression.
+
 ## Drift monitoring
 
 When a model has been deployed and the labels have not arrived yet, the only observable thing is whether the *inputs* still look like the training data.
@@ -276,6 +309,32 @@ print(class_counts(oversample(ds, "y"), "y"))     # exactly balanced by duplicat
 (a per-row weight column). Both rebalance the *loss* without discarding or duplicating a
 single row. `class_counts` is the first thing to look at.
 
+{py:func}`smote <batcher.ml.smote>` is the alternative to duplicating. `oversample` repeats
+minority rows, so a model can still memorize the exact points and tighten its boundary around
+them rather than around the region they occupy. SMOTE makes *new* points instead, each on the
+segment between a real minority row and one of its nearest minority neighbours:
+
+```python
+from batcher.ml import smote
+
+rare = bt.from_pydict(
+    {"x": [0.0, 0.1, 0.2, 5.0, 5.1, 5.2, 5.3, 5.4],
+     "label": ["rare"] * 3 + ["common"] * 5}
+)
+print(smote(rare, "label", minority="rare", features=["x"]).count())
+# 10
+```
+
+The synthetic rows are interpolations, never extrapolations, so they stay inside the
+minority region. Both random draws are content hashes of the row, so the same input produces
+the same synthetic rows however the data is partitioned — an imbalanced experiment stays
+repeatable.
+
+Two things to know before using it. Scale the features first, because distance decides which
+neighbours a row is drawn towards and therefore where the new points land. And only the
+`features` and the label are filled: any other column is null on a synthetic row, because
+there is no honest value to interpolate for an identifier or a free-text field.
+
 `stratified_sample` is the different tool for a different job: it keeps the same fraction of *every* stratum rather than equalizing them, so it shrinks a dataset for a quick experiment while preserving its class balance. You get a proportional 10% sample rather than 10% of the whole, which would starve the rare classes.
 
 ```python
@@ -284,6 +343,30 @@ from batcher.ml.sampling import class_counts, stratified_sample
 ds = bt.from_pydict({"y": [0] * 100 + [1] * 20, "x": list(range(120))})
 print(class_counts(stratified_sample(ds, "y", 0.5, seed=1), "y"))  # {0: 50, 1: 10}
 ```
+
+## Holding out a test set that still has the rare class in it
+
+`ds.ml.train_test_split` assigns each row by a content hash, which makes the split proportional in expectation and nothing more. On 200 rows with ten positives and a quarter held out, the test half should get two or three. Across seeds it gets between one and four, and one positive makes precision, recall and AUC meaningless without anything reporting a problem.
+
+`stratify=` names a column whose distribution to hold constant across both halves:
+
+```python
+sales = bt.from_pydict(
+    {
+        "amount": [float(i) for i in range(200)],
+        "fraud": [1 if i % 20 == 0 else 0 for i in range(200)],
+    }
+)
+
+plain = sales.ml.train_test_split(test_size=0.25, seed=3)[1]
+kept = sales.ml.train_test_split(test_size=0.25, seed=3, stratify="fraud")[1]
+print(sum(plain.to_pydict()["fraud"]), sum(kept.to_pydict()["fraud"]))
+# 4 3
+```
+
+The stratified count is the same for every seed, because it is a property of the split rather than of the draw. Every label with at least two rows reaches both halves, and the cut rounds towards putting a rare class in the test half rather than away from it. A label with a single row goes to train, since a model that never saw the class is the worse of the two mistakes.
+
+Reach for {py:func}`stratified_split <batcher.ml.splitting.stratified_split>` directly when you want the same behaviour outside the `ds.ml` surface.
 
 ## Cross-validation splits
 

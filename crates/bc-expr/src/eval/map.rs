@@ -48,6 +48,14 @@ pub(crate) fn eval_map(
             map.values().clone(),
             map.nulls(),
         )),
+        // The entries child is already a `Struct<key, value>`; re-wrapping it under the
+        // map's own offsets is the whole operation, so this allocates nothing but the
+        // list wrapper and shares both child buffers with the input.
+        MapFunc::MapEntries => Ok(list_of(
+            map.offsets().clone(),
+            Arc::new(map.entries().clone()) as ArrayRef,
+            map.nulls(),
+        )),
         MapFunc::ElementAt => element_at(map, key),
     }
 }
@@ -78,6 +86,15 @@ fn struct_field(
         }
         MapFunc::MapValues => Err(ExprError::ExpectedType {
             func: "map_values".into(),
+            want: "a Map argument (a struct's values need not share one type)",
+            got: fields.data_type().to_string(),
+        }),
+        // Same reason `map_values` refuses: the entries of a `Struct<a: Int, b: Utf8>`
+        // would need `Struct<key: Utf8, value: ???>`, and there is no honest `value`
+        // type. Refusing beats inventing one (a `Utf8` cast would silently stringify
+        // numbers) or returning a differently-shaped result per input schema.
+        MapFunc::MapEntries => Err(ExprError::ExpectedType {
+            func: "map_entries".into(),
             want: "a Map argument (a struct's values need not share one type)",
             got: fields.data_type().to_string(),
         }),
@@ -215,6 +232,62 @@ mod tests {
         b.append(true).unwrap();
         b.append(false).unwrap(); // null map row
         Arc::new(b.finish())
+    }
+
+    /// `map_entries` must pair each key with its own value, keep the row's null, and agree
+    /// with `map_keys`/`map_values` element for element.
+    ///
+    /// That last check is the point of the function: the two existing accessors are only
+    /// usable together if they share an order, and this asserts that they do rather than
+    /// leaving a caller to assume it.
+    #[test]
+    fn map_entries_pairs_each_key_with_its_value() {
+        let m = sample_map();
+        let out = eval_map(MapFunc::MapEntries, &m, None).unwrap();
+        let list = out.as_list::<i32>();
+
+        assert!(list.is_null(2), "a null map row stays a null list row");
+        assert_eq!(list.value_length(0), 2);
+        assert_eq!(list.value_length(1), 1);
+
+        let keys = eval_map(MapFunc::MapKeys, &m, None).unwrap();
+        let values = eval_map(MapFunc::MapValues, &m, None).unwrap();
+        let (klist, vlist) = (keys.as_list::<i32>(), values.as_list::<i32>());
+
+        for row in 0..list.len() {
+            if list.is_null(row) {
+                continue;
+            }
+            let entries = list.value(row);
+            let st = entries.as_struct();
+            let ek = st.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let ev = st.column(1).as_primitive::<Int64Type>();
+            let rk = klist.value(row);
+            let rv = vlist.value(row);
+            let rk = rk.as_any().downcast_ref::<StringArray>().unwrap();
+            let rv = rv.as_primitive::<Int64Type>();
+            assert_eq!(st.len(), rk.len(), "row {row} entry count");
+            for i in 0..st.len() {
+                assert_eq!(ek.value(i), rk.value(i), "row {row} key {i}");
+                assert_eq!(ev.value(i), rv.value(i), "row {row} value {i}");
+            }
+        }
+    }
+
+    /// A `Struct` has no honest entry type, so it must refuse rather than invent one.
+    #[test]
+    fn map_entries_refuses_a_struct() {
+        let s: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![1i64])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+            ),
+        ]));
+        assert!(eval_map(MapFunc::MapEntries, &s, None).is_err());
     }
 
     #[test]

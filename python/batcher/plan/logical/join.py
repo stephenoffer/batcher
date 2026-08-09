@@ -177,13 +177,19 @@ class Join(LogicalPlan):
 
 @dataclass(frozen=True, slots=True)
 class WatermarkStreamJoin(LogicalPlan):
-    """A watermark-bounded stream-stream interval inner join (Spark stream-stream join).
+    """A watermark-bounded stream-stream interval join (Spark stream-stream join).
 
     Joins two streams on equality keys *and* an event-time interval
     (``|left_time - right_time| <= within``), which is what lets buffered state be
     evicted once the watermark guarantees no future match — keeping memory bounded.
     A streaming-only node executed by the driver (over bounded sources a plain `join`
     is used), so it is never lowered to the Rust IR.
+
+    `how` is ``"inner"`` (only matched pairs), or ``"left"`` / ``"right"`` / ``"full"``,
+    where a row that reaches the end of its watermark window unmatched is emitted once,
+    padded with nulls. The interval bound is what makes an outer join expressible at all
+    on an unbounded stream: without it there is no moment at which "no match will ever
+    arrive" becomes true.
     """
 
     left: LogicalPlan
@@ -195,6 +201,17 @@ class WatermarkStreamJoin(LogicalPlan):
     right_time: str
     within_micros: int
     lateness_micros: int
+    how: str = "inner"
+
+    @property
+    def emits_unmatched_left(self) -> bool:
+        """Whether an unmatched left row is emitted null-padded when its window closes."""
+        return self.how in ("left", "full")
+
+    @property
+    def emits_unmatched_right(self) -> bool:
+        """Whether an unmatched right row is emitted null-padded when its window closes."""
+        return self.how in ("right", "full")
 
     def available_columns(self) -> list[str]:
         return [o.alias for o in self.output]

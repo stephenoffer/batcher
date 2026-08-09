@@ -17,7 +17,12 @@ from batcher.plan.streaming import StreamingQueryProgress, StreamingQueryStatus
 if TYPE_CHECKING:
     from batcher.core.streaming_query import StreamingQueryEngine
 
-__all__ = ["StreamingQuery", "active_streams", "await_any_termination"]
+__all__ = [
+    "StreamingQuery",
+    "active_streams",
+    "await_any_termination",
+    "reset_terminated",
+]
 
 
 # Process-wide registry of running queries, surfaced as `bt.streams`.
@@ -31,6 +36,19 @@ def _next_name() -> str:
     with _LOCK:
         _COUNTER += 1
         return f"query-{_COUNTER}"
+
+
+def _sweep_stopped() -> None:
+    """Drop queries that have finished. **Caller must hold `_LOCK`.**
+
+    A query is removed on `stop()` or a completed `await_termination()`, and a driver
+    that does neither is ordinary: a scheduler firing an `available_now` backfill every
+    few minutes gets its rows and moves on. Those entries stayed forever, each holding a
+    handle, an engine, a processor, a sink and a bounded progress deque — invisible in
+    `bt.streams()`, which filters on liveness, and unbounded in the dict behind it.
+    """
+    for name in [n for n, q in _ACTIVE.items() if not q.is_active]:
+        _ACTIVE.pop(name, None)
 
 
 def _register(name: str, query: StreamingQuery) -> None:
@@ -50,6 +68,7 @@ def _register(name: str, query: StreamingQuery) -> None:
                 f"a streaming query named {name!r} is already active; stop it first or "
                 "pass a distinct name= to write(...)"
             )
+        _sweep_stopped()
         _ACTIVE[name] = query
 
 
@@ -88,9 +107,31 @@ def _warn_if_checkpoint_not_durable(location: str) -> None:
 
 
 def active_streams() -> list[StreamingQuery]:
-    """All currently-active streaming queries (the `bt.streams` accessor)."""
+    """All currently-active streaming queries (the `bt.streams` accessor).
+
+    Sweeps the finished ones out on the way past, so the registry is bounded by the
+    queries actually running rather than by every query the process ever started.
+    """
     with _LOCK:
-        return [q for q in _ACTIVE.values() if q.is_active]
+        _sweep_stopped()
+        return list(_ACTIVE.values())
+
+
+#: Queries that have terminated since the last `reset_terminated()`. Spark's
+#: `awaitAnyTermination` returns immediately once *any* query has ever terminated, until
+#: `resetTerminated()` clears the flag — so a supervisor loop that forgets to reset spins.
+_TERMINATED: list[str] = []
+
+
+def reset_terminated() -> None:
+    """Forget the terminations `await_any_termination` has already reported (Spark parity).
+
+    Spark's `awaitAnyTermination` returns immediately once *any* query has terminated, and
+    keeps doing so until `resetTerminated()` clears the record. A supervisor that restarts
+    a failed query and loops back into `awaitAnyTermination` without resetting therefore
+    spins at full speed on a termination it has already handled. This is that reset.
+    """
+    _TERMINATED.clear()
 
 
 def await_any_termination(timeout: float | None = None) -> bool:
@@ -114,6 +155,8 @@ def await_any_termination(timeout: float | None = None) -> bool:
     """
     import time
 
+    if _TERMINATED:
+        return True  # a termination already reported and not yet reset — Spark's semantics
     watching = active_streams()
     if not watching:
         return True
@@ -121,6 +164,7 @@ def await_any_termination(timeout: float | None = None) -> bool:
     while True:
         for q in watching:
             if not q.is_active:
+                _TERMINATED.append(q.name)
                 q.await_termination(0.0)  # re-raise if it failed; deregister
                 return True
         if deadline is not None and time.monotonic() >= deadline:
@@ -138,11 +182,29 @@ class StreamingQuery:
     `await_termination(timeout)`, `status`, `recent_progress`, `is_active`.
     """
 
-    __slots__ = ("_engine", "_name")
+    __slots__ = ("_engine", "_name", "_plan", "_run_id", "_sources")
 
-    def __init__(self, name: str, engine: StreamingQueryEngine) -> None:
+    def __init__(
+        self,
+        name: str,
+        engine: StreamingQueryEngine,
+        plan: object = None,
+        sources: list | None = None,
+    ) -> None:
+        import uuid
+
         self._name = name
         self._engine = engine
+        # Kept so `explain()` can render what this query is actually running. A running
+        # stream is the case where you most want the plan and least want to re-derive it
+        # by rebuilding the Dataset from memory.
+        self._plan = plan
+        self._sources = sources
+        # Spark distinguishes `id` (stable across restarts of the same checkpoint) from
+        # `runId` (fresh per start). Conflating them is what makes a restart indistinguishable
+        # from a still-running query in a metrics system keyed on the identifier, so the two
+        # exist here for the same reason.
+        self._run_id = str(uuid.uuid4())
 
     def __repr__(self) -> str:
         """Show the query name, liveness, and the most recent micro-batch's progress."""
@@ -172,8 +234,28 @@ class StreamingQuery:
 
     @property
     def id(self) -> str:
-        """A stable identifier for the query (its name); Spark `StreamingQuery.id` parity."""
+        """A stable identifier for the query (its name); Spark `StreamingQuery.id` parity.
+
+        Stable across restarts of the same query, which is what makes it the right key for
+        a dashboard or an alert: two runs of the same pipeline are the same `id`.
+        """
         return self._name
+
+    @property
+    def run_id(self) -> str:
+        """A fresh identifier for *this* run (Spark `StreamingQuery.runId` parity).
+
+        New on every start, so a restart is visibly a restart. `id` answers "which query is
+        this"; `run_id` answers "which attempt" — and a metrics system keyed only on `id`
+        cannot tell a query that has been up for a week from one that has crash-looped
+        every ten minutes.
+        """
+        return self._run_id
+
+    @property
+    def runId(self) -> str:
+        """Spark spelling of `run_id` — a fresh identifier for this run."""
+        return self._run_id
 
     @property
     def is_active(self) -> bool:
@@ -203,8 +285,16 @@ class StreamingQuery:
         """A point-in-time snapshot of the query's state."""
         return self._engine.status()
 
+    @property
     def recent_progress(self) -> list[StreamingQueryProgress]:
-        """Per-micro-batch metrics for the most recent batches (rolling window)."""
+        """Per-micro-batch metrics for the most recent batches (rolling window).
+
+        A *property*, matching `status` and `last_progress` beside it and Spark's
+        `recentProgress`. It was the one accessor on this handle that had to be called,
+        so a ported `query.recentProgress` read back as a bound method — truthy, with a
+        `len()` that raises — rather than as the list of batches it names. The window is
+        bounded by `streaming.progress_history`.
+        """
         return self._engine.recent_progress()
 
     @property
@@ -212,6 +302,62 @@ class StreamingQuery:
         """The most recent micro-batch's metrics, or None if none completed yet."""
         progress = self._engine.recent_progress()
         return progress[-1] if progress else None
+
+    def explain(self, *, format: str = "text") -> str:
+        """The plan this query is running, as a tree (Spark ``StreamingQuery.explain``).
+
+        The *planned* shape only. `Dataset.explain(analyze=True)` runs the query to
+        measure it, which a stream cannot do twice: the source has moved on, and running
+        it again would double-consume the topic. Per-micro-batch measurements are in
+        `recent_progress` instead, which is where a stream's equivalent of the analyze
+        numbers lives.
+
+        Args:
+            format: ``"text"`` (or its alias ``"tree"``) for the rendered tree,
+                ``"json"`` for the machine-readable profile.
+
+        Returns:
+            The plan as text or JSON.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> stream = bt.read.rate(rows_per_second=5, num_rows=5, pace=False)
+                >>> q = stream.write.memory(  # doctest: +SKIP
+                ...     "m", trigger=bt.Trigger.available_now()
+                ... )
+                >>> print(q.explain())  # doctest: +SKIP
+        """
+        from batcher._internal.errors import PlanError
+        from batcher.api.terminal import _explain
+
+        if self._plan is None:
+            raise PlanError(
+                "this streaming query was started without a plan to explain (a drain "
+                "handle over already-finished work); there is nothing still running to "
+                "describe"
+            )
+        fmt = "text" if format == "tree" else format
+        return _explain(
+            self._plan,
+            self._sources or [],
+            self._plan.available_columns(),
+            analyze=False,
+            fmt=fmt,
+        )
+
+    def process_all_available(self) -> bool:
+        """Block until all currently-available data is processed (Spark parity).
+
+        Waits for the query to finish draining. This is meaningful for a draining
+        trigger (`Trigger.once` / `Trigger.available_now`); on a never-ending
+        continuous stream it blocks until the query is stopped elsewhere.
+
+        Returns:
+            Whether the query has stopped once all available data was processed.
+        """
+        return self.await_termination()
 
     def exception(self) -> BaseException | None:
         """The exception that terminated the query, or None if it is healthy.
@@ -253,16 +399,12 @@ class StreamingQuery:
         return self.await_termination(timeout)
 
     def processAllAvailable(self) -> bool:
-        """Block until all currently-available data is processed (Spark parity).
-
-        Waits for the query to finish draining. This is meaningful for a draining
-        trigger (`Trigger.once` / `Trigger.available_now`); on a never-ending
-        continuous stream it blocks until the query is stopped elsewhere.
+        """Spark spelling of `process_all_available` — block until the backlog is done.
 
         Returns:
             Whether the query has stopped once all available data was processed.
         """
-        return self.await_termination()
+        return self.process_all_available()
 
     @property
     def isActive(self) -> bool:
@@ -274,6 +416,7 @@ class StreamingQuery:
         """Spark spelling of `last_progress` — the most recent micro-batch's metrics."""
         return self.last_progress
 
+    @property
     def recentProgress(self) -> list[StreamingQueryProgress]:
         """Spark spelling of `recent_progress` — metrics for the most recent batches."""
-        return self.recent_progress()
+        return self.recent_progress

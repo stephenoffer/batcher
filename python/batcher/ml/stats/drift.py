@@ -166,8 +166,24 @@ def population_stability_index(
             >>> round(population_stability_index(train, same, "x", buckets=4), 6)
             0.0
     """
-    pairs = _aligned_shares(reference, current, column, buckets)
-    return sum((c - r) * math.log(c / r) for r, c in pairs)
+    return _psi_from_pairs(_aligned_shares(reference, current, column, buckets))
+
+
+def _psi_from_pairs(pairs: list[tuple[float, float]]) -> float:
+    """The population stability index of already-aligned ``(reference, current)`` shares."""
+    return sum(
+        (observed - expected) * math.log(observed / expected) for expected, observed in pairs
+    )
+
+
+def _js_from_pairs(pairs: list[tuple[float, float]], base: float) -> float:
+    """The Jensen-Shannon divergence of already-aligned ``(reference, current)`` shares."""
+    total = 0.0
+    for expected, observed in pairs:
+        mean = (expected + observed) / 2.0
+        total += 0.5 * expected * math.log(expected / mean)
+        total += 0.5 * observed * math.log(observed / mean)
+    return total / math.log(base)
 
 
 def kl_divergence(
@@ -234,12 +250,7 @@ def js_divergence(
             0.5488
     """
     pairs = _aligned_shares(reference, current, column, buckets)
-    total = 0.0
-    for expected, observed in pairs:
-        mean = (expected + observed) / 2.0
-        total += 0.5 * expected * math.log(expected / mean)
-        total += 0.5 * observed * math.log(observed / mean)
-    return total / math.log(base)
+    return _js_from_pairs(pairs, base)
 
 
 def categorical_drift(reference: Dataset, current: Dataset, column: str) -> float:
@@ -425,20 +436,34 @@ def drift_report(
         "mean_shift": [],
         "null_rate_shift": [],
     }
-    for name in columns:
-        summary = [
-            frame.agg(m=col(name).mean(), nulls=bt.null_rate(col(name))).collect()
-            for frame in (reference, current)
-        ]
+    # Every column's mean and null rate in one aggregate per frame, rather than one
+    # aggregate per column per frame. Both are mergeable reductions, so the whole report's
+    # summary half costs two passes however many columns are checked.
+    summaries = [
+        frame.agg(
+            **{f"__bt_m_{i}": col(name).mean() for i, name in enumerate(columns)},
+            **{f"__bt_z_{i}": bt.null_rate(col(name)) for i, name in enumerate(columns)},
+        ).collect()
+        for frame in (reference, current)
+    ]
+    for index, name in enumerate(columns):
+        # One binning per column, feeding both metrics. PSI and Jensen-Shannon are two
+        # readings of the *same* aligned shares, and computing them separately binned and
+        # joined the column twice for one answer.
+        pairs = _aligned_shares(reference, current, name, buckets)
         rows["column"].append(name)
-        rows["psi"].append(population_stability_index(reference, current, name, buckets=buckets))
-        rows["js_divergence"].append(js_divergence(reference, current, name, buckets=buckets))
+        rows["psi"].append(_psi_from_pairs(pairs))
+        rows["js_divergence"].append(_js_from_pairs(pairs, 2.0))
         rows["mean_shift"].append(
-            _difference(summary[1].column("m")[0].as_py(), summary[0].column("m")[0].as_py())
+            _difference(
+                summaries[1].column(f"__bt_m_{index}")[0].as_py(),
+                summaries[0].column(f"__bt_m_{index}")[0].as_py(),
+            )
         )
         rows["null_rate_shift"].append(
             _difference(
-                summary[1].column("nulls")[0].as_py(), summary[0].column("nulls")[0].as_py()
+                summaries[1].column(f"__bt_z_{index}")[0].as_py(),
+                summaries[0].column(f"__bt_z_{index}")[0].as_py(),
             )
         )
     return bt.from_pydict(rows).sort("psi", descending=True)

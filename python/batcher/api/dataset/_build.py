@@ -308,6 +308,19 @@ def build_distinct(
         raise PlanError(f"distinct(): unknown subset column(s) {sorted(unknown)}")
     if keep not in ("first", "last", "any"):
         raise PlanError(f"distinct(): keep must be 'first'/'last'/'any', got {keep!r}")
+    # Refused here, by name, rather than at execution as a generic breaker. The generic
+    # message advises "restructure to ... a single top-level aggregate / distinct", which
+    # is the thing the caller just wrote -- a subset makes this a window, not a distinct,
+    # and no restructuring of it streams.
+    if not _all_bounded(ds):
+        raise PlanError(
+            "distinct(subset=...) cannot stream: keeping one row per key across an "
+            "unbounded input needs the key set held for the life of the query, and which "
+            "row wins is decided by an ordering over rows that have not arrived. Use "
+            "drop_duplicates_within_watermark(subset, event_time=..., lateness=...), whose "
+            "state the watermark bounds, or distinct() with no subset when the whole row "
+            "is the key."
+        )
 
     if keep == "any":
         order: list[tuple[str, bool]] = [(c, False) for c in subset]
@@ -351,31 +364,115 @@ def build_session_window(
     ``partition_by + session_id`` — emitting ``session_start``/``session_end`` and the
     requested aggregates. All row work is the existing window + group-by engine.
     """
-    from batcher.plan.expr_ir import col
     from batcher.plan.functions.temporal import _duration_micros
 
     if time_col not in ds.columns:
         raise PlanError(f"session_window(): unknown time column {time_col!r}")
+    # Checked here rather than left to the window node underneath: by then the plan
+    # carries the internal `_t` epoch copy, so the "available columns" the error listed
+    # included a column the caller never wrote and cannot use.
+    unknown = [name for name in partition_by if name not in ds.columns]
+    if unknown:
+        raise PlanError(
+            f"session_window(): unknown partition_by column(s) {unknown}; "
+            f"available: {sorted(ds.columns)}"
+        )
     if not aggs:
         raise PlanError("session_window() requires at least one named aggregate")
     gap_us = _duration_micros(gap, arg="session gap")
     pk = list(partition_by)
+
+    # Over an unbounded source the composition below cannot run: a session's end is not
+    # known until the gap has elapsed with nothing arriving, so the operator has to hold
+    # rows until the watermark says so. That is a driver-side stateful node, and it
+    # re-applies these same aggregates to each closed batch.
+    if not _all_bounded(ds):
+        from batcher.plan.logical import StreamingSessionWindow
+
+        lateness = ds._watermark.lateness_micros if ds._watermark is not None else 0
+        return ds._derive(
+            StreamingSessionWindow(
+                ds._plan, time_col, gap_us, tuple(pk), tuple(aggs.items()), lateness
+            )
+        )
+    return sessionize(ds, time_col, gap_us, pk, aggs)
+
+
+def _all_bounded(ds: Dataset) -> bool:
+    """Whether every source behind `ds` is bounded."""
+    from batcher.io.source import is_bounded
+
+    return all(is_bounded(s) for s in ds._sources)
+
+
+def mark_sessions(ds: Dataset, time_col: str, gap_us: int, pk: list[str]) -> Dataset:
+    """Tag every row with the session it belongs to, as `_t`/`_sid`.
+
+    Ordered by event time within each `pk` group, a row starts a new session when the gap
+    to the row before it exceeds `gap_us` (or there is no row before it); the session id
+    is the running count of those starts. `_t` is the event time in epoch microseconds,
+    which the gap arithmetic and the session bounds both need — the engine has no
+    Timestamp min/max.
+
+    Args:
+        ds: The rows to tag.
+        time_col: The event-time column.
+        gap_us: The gap that separates two sessions, in microseconds.
+        pk: The partition-key columns; empty for one global session chain.
+
+    Returns:
+        `ds` with `_t` and `_sid` added.
+    """
+    from batcher.plan.expr_ir import col
+
     order = [(time_col, False)]
-    # Epoch micros for gap arithmetic and min/max (the engine has no Timestamp min/max).
-    s = ds.with_columns(_t=col(time_col).cast("int64"))
+    # Through `timestamp` first, not straight to int64. A `date32` column casts to int64 as
+    # a count of *days*, which was then compared against a gap expressed in microseconds --
+    # so every gap looked smaller than every threshold and a whole key collapsed into one
+    # session. Silently: the answer was one plausible row per key.
+    s = ds.with_columns(_t=col(time_col).cast("timestamp").cast("int64"))
     s = build_window(
         s, partition_by=pk, order_by=order, functions={"_prev": ("lag", "_t", 1)}, frame=None
     )
     new_session = ((col("_t") - col("_prev") > gap_us) | col("_prev").is_null()).cast("int64")
     s = s.with_columns(_new=new_session)
-    s = build_window(
+    return build_window(
         s, partition_by=pk, order_by=order, functions={"_sid": ("sum", "_new")}, frame=None
     )
-    grouped = s.group_by(*pk, "_sid").agg(_ss=col("_t").min(), _se=col("_t").max(), **aggs)
-    out = grouped.with_columns(
-        session_start=col("_ss").cast("timestamp"), session_end=col("_se").cast("timestamp")
+
+
+def sessionize(
+    ds: Dataset, time_col: str, gap_us: int, pk: list[str], aggs: dict[str, Any]
+) -> Dataset:
+    """Aggregate `ds` by gap-based session, emitting `session_start`/`session_end`.
+
+    The bounded computation, and the one the streaming operator runs over each batch of
+    rows whose sessions the watermark has closed — so the two paths agree by construction
+    rather than by a second implementation agreeing with the first.
+
+    Args:
+        ds: The rows to sessionize.
+        time_col: The event-time column.
+        gap_us: The gap that separates two sessions, in microseconds.
+        pk: The partition-key columns.
+        aggs: The named aggregates to compute per session.
+
+    Returns:
+        One row per session: the partition keys, its bounds, and the aggregates.
+    """
+    from batcher.plan.expr_ir import col
+
+    s = mark_sessions(ds, time_col, gap_us, pk)
+    # The bounds are min/max of the event-time column *itself*, not of the epoch-micros
+    # copy the gap arithmetic needs. Going through the copy and casting back produced a
+    # naive `timestamp[us]` whatever the input was, so a `timestamp[us, tz=UTC]` column
+    # came back with the right instant and no timezone, and a `timestamp[ms]` column came
+    # back in microseconds. Right values, wrong type — which anything rendering a local
+    # time downstream reads as a wrong answer.
+    grouped = s.group_by(*pk, "_sid").agg(
+        session_start=col(time_col).min(), session_end=col(time_col).max(), **aggs
     )
-    return out.select(*pk, "session_start", "session_end", *aggs.keys())
+    return grouped.select(*pk, "session_start", "session_end", *aggs.keys())
 
 
 def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:
@@ -489,3 +586,76 @@ def build_unpivot(
     idx = list(index) if index is not None else [c for c in cols if c not in set(on or ())]
     vals = list(on) if on is not None else [c for c in cols if c not in set(idx)]
     return ds._derive(Unpivot(ds._plan, tuple(idx), tuple(vals), variable_name, value_name))
+
+
+def _bounded_interval_join(
+    left: Dataset,
+    right: Dataset,
+    left_keys: list[str],
+    right_keys: list[str],
+    left_time: str,
+    right_time: str,
+    within_us: int,
+    how: str,
+) -> Dataset:
+    """`join_stream` over two *bounded* inputs — the same answer, with no watermark.
+
+    The interval is part of the join *condition*, not a filter above it. That distinction
+    is invisible for an inner join and decides the answer for an outer one: a left row
+    whose key matches but whose event time is outside the interval has not matched, so a
+    left outer join must emit it null-padded. Filtering above the join deleted it instead,
+    while the streaming driver — which never counts such a pair as a match — emitted it.
+    The same query over bounded and unbounded inputs returned two different answers.
+
+    Expressed with the relational surface rather than a non-equi join: the matched pairs
+    are an inner join plus the interval filter, and each preserved side's unmatched rows
+    are what an anti-join against those pairs leaves behind. A synthetic row index gives
+    the anti-join a row identity, so duplicates on either side are handled exactly. The
+    unmatched rows are then joined against an *empty* copy of the opposite side, which is
+    what types their null columns — cheaper to reason about than constructing typed null
+    literals, and it cannot drift from the matched rows' column order.
+
+    Args:
+        left: The left input.
+        right: The right input.
+        left_keys: The left equality keys.
+        right_keys: The right equality keys.
+        left_time: The left event-time column.
+        right_time: The right event-time column.
+        within_us: The interval half-width, in microseconds.
+        how: ``"inner"``, ``"left"``, ``"right"``, or ``"full"``.
+
+    Returns:
+        A `Dataset` of the interval-joined rows in the join's output shape.
+    """
+    diff = Col(left_time).cast("int64") - Col(right_time).cast("int64")
+    matched = (diff <= within_us) & (diff >= -within_us)
+    if how == "inner":
+        return left.join(right, left_on=left_keys, right_on=right_keys, how="inner").filter(matched)
+
+    lid, rid = "__ij_left_id", "__ij_right_id"
+    tagged_left = left.with_row_index(lid)
+    tagged_right = right.with_row_index(rid)
+    pairs = tagged_left.join(
+        tagged_right, left_on=left_keys, right_on=right_keys, how="inner"
+    ).filter(matched)
+
+    parts = [pairs]
+    if how in ("left", "full"):
+        unmatched = tagged_left.join(pairs.select(lid), on=[lid], how="anti")
+        parts.append(
+            unmatched.join(
+                tagged_right.limit(0), left_on=left_keys, right_on=right_keys, how="left"
+            )
+        )
+    if how in ("right", "full"):
+        unmatched = tagged_right.join(pairs.select(rid), on=[rid], how="anti")
+        parts.append(
+            tagged_left.limit(0).join(
+                unmatched, left_on=left_keys, right_on=right_keys, how="right"
+            )
+        )
+    combined = parts[0]
+    for part in parts[1:]:
+        combined = combined.union(part)
+    return combined.select(*[c for c in pairs.columns if c not in (lid, rid)])

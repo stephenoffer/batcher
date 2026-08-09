@@ -178,3 +178,125 @@ def test_delta_genuine_commit_failure_still_raises(fake_delta):
     sink.open()
     with pytest.raises(CommitError):
         sink.write_batch(4, pa.table({"id": pa.array([4], pa.int64())}))
+
+
+# --- console options and the ForeachWriter shape ------------------------------------
+
+
+def test_the_console_sink_truncates_wide_strings_by_default(capsys):
+    """Spark truncates by default, and a Kafka stream's `value` column is exactly the
+    shape that fills a terminal without it."""
+    from batcher.io.formats.streaming.sinks import ConsoleStreamSink
+
+    ConsoleStreamSink().write_batch(0, pa.table({"v": ["x" * 50]}))
+    printed = capsys.readouterr().out
+    assert "x" * 20 in printed
+    assert "x" * 21 not in printed
+
+
+def test_the_console_sink_can_be_told_not_to_truncate(capsys):
+    from batcher.io.formats.streaming.sinks import ConsoleStreamSink
+
+    ConsoleStreamSink(truncate=False).write_batch(0, pa.table({"v": ["x" * 50]}))
+    assert "x" * 50 in capsys.readouterr().out
+
+
+def test_the_console_sink_takes_an_explicit_truncation_width(capsys):
+    from batcher.io.formats.streaming.sinks import ConsoleStreamSink
+
+    ConsoleStreamSink(truncate=5).write_batch(0, pa.table({"v": ["abcdefghij"]}))
+    out = capsys.readouterr().out
+    assert "abcde" in out and "abcdef" not in out
+
+
+def test_truncation_leaves_non_string_columns_alone(capsys):
+    from batcher.io.formats.streaming.sinks import ConsoleStreamSink
+
+    ConsoleStreamSink().write_batch(0, pa.table({"n": [1234567890123456789]}))
+    assert "1234567890123456789" in capsys.readouterr().out
+
+
+def test_a_foreach_writer_gets_open_process_close_in_order():
+    from batcher.io.formats.streaming.sinks import ForeachStreamSink, ForeachWriter
+
+    class _Writer(ForeachWriter):
+        def __init__(self):
+            self.log = []
+
+        def open(self, partition_id, epoch_id):
+            self.log.append(("open", partition_id, epoch_id))
+            return True
+
+        def process(self, row):
+            self.log.append(("process", row["n"]))
+
+        def close(self, error):
+            self.log.append(("close", error))
+
+    writer = _Writer()
+    ForeachStreamSink(writer).write_batch(7, pa.table({"n": [1, 2]}))
+    assert writer.log == [("open", 0, 7), ("process", 1), ("process", 2), ("close", None)]
+
+
+def test_a_foreach_writer_that_declines_an_epoch_processes_nothing():
+    from batcher.io.formats.streaming.sinks import ForeachStreamSink, ForeachWriter
+
+    class _Writer(ForeachWriter):
+        def __init__(self):
+            self.rows = []
+
+        def open(self, partition_id, epoch_id):
+            return False
+
+        def process(self, row):
+            self.rows.append(row)
+
+    writer = _Writer()
+    token = ForeachStreamSink(writer).write_batch(0, pa.table({"n": [1]}))
+    assert writer.rows == []
+    assert token.endswith("skipped")
+
+
+def test_a_failing_epoch_still_closes_the_writer_with_the_error():
+    """The whole reason the shape exists: the connection is released either way."""
+    from batcher.io.formats.streaming.sinks import ForeachStreamSink, ForeachWriter
+
+    class _Writer(ForeachWriter):
+        def __init__(self):
+            self.closed = []
+
+        def process(self, row):
+            raise RuntimeError("destination refused")
+
+        def close(self, error):
+            self.closed.append(error)
+
+    writer = _Writer()
+    with pytest.raises(RuntimeError, match="destination refused"):
+        ForeachStreamSink(writer).write_batch(0, pa.table({"n": [1]}))
+    assert isinstance(writer.closed[0], RuntimeError)
+
+
+def test_a_plain_function_still_works_unchanged():
+    from batcher.io.formats.streaming.sinks import ForeachStreamSink
+
+    seen = []
+    ForeachStreamSink(seen.append).write_batch(0, pa.table({"n": [1, 2]}))
+    assert [r["n"] for r in seen] == [1, 2]
+
+
+def test_an_object_with_only_process_is_accepted():
+    """Spark's `ForeachWriter` requires all three; a writer with just `process` is the
+    minimal useful shape and must not need the base class."""
+    from batcher.io.formats.streaming.sinks import ForeachStreamSink
+
+    class _Minimal:
+        def __init__(self):
+            self.rows = []
+
+        def process(self, row):
+            self.rows.append(row)
+
+    writer = _Minimal()
+    ForeachStreamSink(writer).write_batch(0, pa.table({"n": [1]}))
+    assert len(writer.rows) == 1

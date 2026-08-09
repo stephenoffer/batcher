@@ -90,7 +90,7 @@ def test_polars_format_may_return_a_series(ds: bt.Dataset) -> None:
 def test_torch_format_warns_about_the_columns_it_cannot_pass(ds: bt.Dataset) -> None:
     """A dropped string ``name``/``id`` is invisible otherwise, and it is usually the join key."""
     pytest.importorskip("torch")
-    from batcher.ml import batch_format as bf
+    from batcher.interop import formats as bf
 
     bf._WARNED_DROPS.clear()
     with pytest.warns(UserWarning, match=r"non-numeric column\(s\) \['name'\]"):
@@ -101,7 +101,7 @@ def test_torch_format_warns_about_the_columns_it_cannot_pass(ds: bt.Dataset) -> 
 def test_the_drop_warning_reaches_the_streaming_path_too(ds: bt.Dataset, terminal: str) -> None:
     """`iter_batches` runs a different executor, and a guard that misses it is the usual gap."""
     pytest.importorskip("torch")
-    from batcher.ml import batch_format as bf
+    from batcher.interop import formats as bf
 
     bf._WARNED_DROPS.clear()
     plan = ds.map_batches(lambda b: {"x": b["x"]}, batch_format="torch")
@@ -119,7 +119,7 @@ def test_a_frame_return_works_on_the_streaming_path_too(ds: bt.Dataset, terminal
 def test_torch_format_warns_only_once_per_column_set(ds: bt.Dataset) -> None:
     """A per-batch warning would emit thousands of identical lines on a real scan."""
     pytest.importorskip("torch")
-    from batcher.ml import batch_format as bf
+    from batcher.interop import formats as bf
 
     bf._WARNED_DROPS.clear()
     with pytest.warns(UserWarning):

@@ -11,6 +11,7 @@ batches and parallelizes across the cluster.
 | Page | Covers |
 |---|---|
 | {doc}`/ml/preparing/multimodal/decoding` | Getting the bytes, and turning them into tensors. |
+| {doc}`/ml/preparing/multimodal/video` | Sampling frames, pulling stills, and reading a clip without decoding it. |
 | {doc}`/ml/preparing/multimodal/curating` | A scraped corpus is mostly rows that decode perfectly and teach a model nothing. |
 | {doc}`/ml/preparing/multimodal/pipelines` | What changes once media is a column: what it costs to move, how it reaches a model, and how it is retrieved. |
 
@@ -18,13 +19,14 @@ batches and parallelizes across the cluster.
 
 - {doc}`Inference </ml/inference/inference>`: run a model over the decoded tensors.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: assemble the decoded features into a training matrix.
-- {doc}`Expressions API </api/relational/expressions>`: the `.image`/`.audio`/`.video` and vector
-  `.list` method reference.
+- {doc}`Expressions API </api/relational/expressions>`: the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`/{py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>`/{py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>` and vector
+  {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` method reference.
 
 ```{toctree}
 :hidden:
 
 decoding
+video
 curating
 pipelines
 ```

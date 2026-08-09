@@ -15,7 +15,35 @@ import pyarrow as pa
 from batcher.io.formats import SINKS, CSVSink, JSONSink, ParquetSink
 from batcher.io.manifest import WriteManifest, WrittenFile
 
-__all__ = ["SINKS", "CSVSink", "JSONSink", "ParquetSink", "Sink"]
+__all__ = ["SINKS", "CSVSink", "JSONSink", "ParquetSink", "Sink", "table_sink_kwargs"]
+
+
+def table_sink_kwargs(fmt: str, path: str) -> dict[str, object]:
+    """The constructor kwargs a *table*-format sink needs but a file sink does not.
+
+    A file sink takes its destination per call (``write(table, path)``); a table format
+    may need it at construction, because staging and commit both address the table rather
+    than a file. Iceberg is the one that does today: the write `path` **is** the table
+    identifier, and it also wants a per-write token so the staged files of one write share
+    a name prefix and cannot clobber a file an earlier snapshot still references.
+
+    This lives here rather than in the caller because there are now two callers — the
+    batch write path and the streaming table sink — and the second one did not know about
+    the first's special case, so a streaming Iceberg write failed at the first micro-batch
+    with a bare ``TypeError`` from inside the sink's constructor.
+
+    Args:
+        fmt: The registered sink format.
+        path: The write destination, which for a table format is its identifier.
+
+    Returns:
+        Kwargs to pass to ``SINKS.get(fmt)(...)``; empty for a format that needs none.
+    """
+    if fmt != "iceberg":
+        return {}
+    import uuid
+
+    return {"identifier": path, "write_token": uuid.uuid4().hex[:12]}
 
 
 @runtime_checkable

@@ -11,5 +11,6 @@ rows is one pass and the same report *per segment* costs the same.
 :hidden:
 
 evaluation
+model-selection
 statistics-and-drift
 ```

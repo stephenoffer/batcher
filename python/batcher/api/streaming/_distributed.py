@@ -37,9 +37,6 @@ if TYPE_CHECKING:
 
 __all__ = ["start_distributed_stream", "start_distributed_stream_drain"]
 
-# Triggers that drain the currently-available data and stop (Spark `AvailableNow` / `Once`).
-_DRAIN_TRIGGER_KINDS = ("available_now", "once")
-
 
 def start_distributed_stream(
     plan: LogicalPlan,
@@ -91,7 +88,7 @@ def start_distributed_stream(
 
     query_name = name or _next_name()
     workers = num_workers if num_workers is not None else _drain_workers(sources[0])
-    drain = trigger.kind in _DRAIN_TRIGGER_KINDS
+    drain = trigger.is_drain
 
     def make_runner(should_stop):
         from batcher.dist.streaming.microbatch import DistributedRunner
@@ -120,7 +117,7 @@ def start_distributed_stream(
         checkpoint=store,
         runner_factory=make_runner,
     )
-    query = StreamingQuery(query_name, engine)
+    query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)
     try:
         engine.start()

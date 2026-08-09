@@ -1,6 +1,6 @@
 # Reading data
 
-A pipeline starts by building a `Dataset` from a source. Sources come in two groups:
+A pipeline starts by building a {py:class}`Dataset <batcher.Dataset>` from a source. Sources come in two groups:
 in-memory constructors, which wrap data already in the process, and path readers,
 which load from disk or object storage. Both are lazy.
 
@@ -11,7 +11,7 @@ are what the rest of the documentation uses for its runnable examples.
 
 ### From a column dict
 
-`from_pydict` takes a column-oriented dictionary. This is the constructor used
+{py:func}`from_pydict <batcher.from_pydict>` takes a column-oriented dictionary. This is the constructor used
 throughout the docs because it needs no files.
 
 ```python
@@ -30,7 +30,7 @@ print(ds.to_pydict())
 
 ### From arrow
 
-`from_arrow` wraps a `pyarrow.Table`, a `RecordBatch`, or a list of batches with
+{py:func}`from_arrow <batcher.from_arrow>` wraps a `pyarrow.Table`, a `RecordBatch`, or a list of batches with
 no copy of the underlying buffers.
 
 ```python
@@ -44,7 +44,7 @@ print(ds.to_pydict())
 
 ### From a streaming factory
 
-`from_batches` builds a streaming source from a callable that returns a fresh
+{py:func}`from_batches <batcher.from_batches>` builds a streaming source from a callable that returns a fresh
 iterator of Arrow batches each time it is called, plus the schema those batches
 follow.
 
@@ -64,7 +64,7 @@ print(ds.to_pydict())
 
 ### From items and generators
 
-`from_items` builds a `Dataset` from a Python list, one row per item.
+{py:func}`from_items <batcher.from_items>` builds a `Dataset` from a Python list, one row per item.
 A dict item expands to columns, and a scalar becomes a single `item` column. `date_range`
 generates a calendar dimension, the date-typed sibling of `range`.
 
@@ -78,8 +78,8 @@ print(bt.date_range("2024-01-01", "2024-01-03").count())
 ### From other frameworks
 
 Adapters convert a frame from another library into a `Dataset`:
-`from_pandas`, `from_polars`, `from_numpy`, `from_spark`, `from_dask`,
-`from_huggingface`, `from_torch`, and `from_tf`. They require the corresponding
+{py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_numpy <batcher.from_numpy>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_dask <batcher.from_dask>`,
+{py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>`. They require the corresponding
 library to be installed.
 
 ```python
@@ -142,6 +142,7 @@ take their connection as keyword options rather than a path.
 | `read.hdf5(path)` | HDF5 files, datasets as columns | `[hdf5]` |
 | `read.zarr(path)` | A Zarr store of chunked n-dimensional arrays | `[zarr]` |
 | `read.numpy(path)` | NumPy `.npy` and `.npz` files as tensor rows | nothing extra |
+| `read.documents(path)` | PDF documents, one row per page as `{path, page, text}` | `[pdf]` |
 | `read.point_cloud(path)` | LiDAR point-cloud files in `.pcd`, `.ply`, or raw `.bin`, one row per point | nothing extra |
 | `read.mcap(path)` | MCAP robot and vehicle logs from ROS 2 or ADAS, one row per message | `[robotics]` |
 | `read.mdf(path)` | ASAM MDF4 vehicle measurements over CAN/LIN and sensors, one row per sample | `[robotics]` |
@@ -169,7 +170,7 @@ grids = bt.read.zarr("s3://bucket/array.zarr")
 
 ### Web crawls (WARC)
 
-`bt.read.warc(path)` reads the format every web-scale crawler ships, Common Crawl
+{py:meth}`bt.read.warc(path) <batcher.api.io_namespace.reader.Reader.warc>` reads the format every web-scale crawler ships, Common Crawl
 included. Each record becomes a row: the named WARC headers as typed columns, every other
 header as JSON in `warc_headers`, and the payload as `warc_content`. `.warc.gz` is read
 transparently, including the per-record gzip members a crawler normally writes.
@@ -240,6 +241,44 @@ print(events.schema.field("v").type)
 Pick a branch out with the usual struct accessor, so `col("v").struct.field("member1")` is
 the string arm. Or `coalesce` the arms together once you know they are compatible.
 
+### PDF documents
+
+`read.documents` extracts a PDF corpus into `{path, page, text}`, one row per page. That
+shape is what makes the rest of a document pipeline relational: chunking, embedding, and
+retrieval all run as expressions over the `text` column, and `path` keeps a page attached
+to the document it came from.
+
+```python
+# docs: skip
+import batcher as bt
+from batcher import col
+
+pages = bt.read.documents("s3://bucket/reports/")
+chunks = pages.with_columns(chunk=col("text").str.chunk(512, overlap=64, boundary="sentence"))
+```
+
+Two properties are worth knowing before you point it at a large corpus.
+
+**Extraction is skipped when you do not ask for the text.** Laying a page out into reading
+order is most of the cost of reading a PDF, so `select("path", "page")` and `count()` walk
+the page tree and stop. Surveying a corpus is therefore cheap, and it is the right first
+step: `group_by("path").agg(pages=col("page").count())` tells you the shape of what you
+have without extracting a word.
+
+**Encrypted documents need their password.** A PDF encrypted for *permissions* only, to
+restrict printing or copying, carries an empty user password and opens without anything
+extra. One with a real password takes `password=`:
+
+```python
+# docs: skip
+locked = bt.read.documents("s3://bucket/contracts/", password="s3cret")
+```
+
+A page that will not extract is a page-level failure rather than a document-level one:
+under `on_error="skip"` its text is null, distinguishable from a genuinely empty page, and
+one bad page in a 900-page report does not cost the other 899. The document is recorded in
+`corrupt_files()`.
+
 ### Point clouds and sensor arrays for robotics
 
 `read.point_cloud` reads the native LiDAR and autonomous-driving point-cloud formats,
@@ -248,8 +287,14 @@ Each file is one frame, and every point becomes a row with a column per field, s
 `x`, `y`, `z`, and `intensity`, plus a `frame` column naming the source file. The cloud is
 columnar, so the usual robotics preprocessing is a native engine operator: crop a region,
 remove the ground plane, bin into voxels. A directory of sweeps stays separable with
-`group_by("frame")`. A raw `.bin` buffer carries no schema, so pass its `columns=` layout.
+{py:meth}`group_by("frame") <batcher.Dataset.group_by>`. A raw `.bin` buffer carries no schema, so pass its `columns=` layout.
 That defaults to `x, y, z, intensity`.
+
+Reading the schema does not read the points. PCD and PLY declare their fields in an ASCII
+header, and a raw `.bin` has no header at all because you supplied the layout, so
+`ds.schema` costs a few hundred bytes per file rather than a parse of every sweep in the
+directory. That matters at corpus scale: an autonomous-driving dataset is thousands of
+files, and each one is millions of points.
 
 ```python
 import os
@@ -381,7 +426,7 @@ data. That is the discovery step before a query names the handful of channels it
 
 ### Hive-partitioned Parquet directories
 
-Partitioned Parquet needs only local files, so it runs end to end. `parquet_dataset`
+Partitioned Parquet needs only local files, so it runs end to end. {py:meth}`parquet_dataset <batcher.api.io_namespace.reader.Reader.parquet_dataset>`
 recovers the partition columns from the Hive directory layout and prunes whole
 partitions when a filter matches the partition key:
 
@@ -412,7 +457,7 @@ print(people.columns)
 # ['id', 'name']
 ```
 
-The reads above run on the compiled Rust data plane. `engine_version` reports which
+The reads above run on the compiled Rust data plane. {py:func}`engine_version <batcher.engine_version>` reports which
 engine build is loaded, distinct from the Python package version:
 
 ```python

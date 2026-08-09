@@ -11,10 +11,11 @@ import base64
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
+from batcher.plan.expr_ir.fn_names import IMAGE_FNS
 from batcher.plan.expr_ir.node_base import IRNode, child, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
-__all__ = ["ImageFunc", "_ImageNamespace"]
+__all__ = ["ImageCrop", "ImageFunc", "_ImageNamespace"]
 
 # Container formats `.image.encode` can write; mirrors `bc-expr`'s `ENCODE_FORMATS`.
 # WebP is readable but not writable by the underlying decoder, so it is deliberately
@@ -29,6 +30,24 @@ _IMAGE_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
 
 
 @expr_node
+class ImageCrop(IRNode):
+    """A crop whose window is four sub-expressions rather than four constants.
+
+    Its own node rather than four more scalars on `ImageFunc`, because the distinction is
+    real: every other image op's dimensions are part of its output *type* and so cannot
+    vary per row, while a crop window is data. Cropping the box a detector predicted is
+    what a vision pipeline is built around.
+    """
+
+    tag = ExprTag.IMAGE_CROP
+    input: Expr = child()
+    x: Expr = child()
+    y: Expr = child()
+    width: Expr = child()
+    height: Expr = child()
+
+
+@expr_node
 class ImageFunc(IRNode):
     """An image decode op over a binary (image-bytes) sub-expression (via `.image`).
 
@@ -40,6 +59,7 @@ class ImageFunc(IRNode):
     """
 
     tag = ExprTag.IMAGE
+    vocab = IMAGE_FNS
     fn: str = scalar()
     input: Expr = child()
     width: int | None = scalar(omit_none=True, default=None)
@@ -49,12 +69,11 @@ class ImageFunc(IRNode):
     mean: list[float] | None = scalar(omit_none=True, default=None)
     std: list[float] | None = scalar(omit_none=True, default=None)
     channels_first: bool = scalar(omit_falsy=True, default=False)
-    # `crop` only: the window's top-left corner. `encode` only: the target container.
-    # All three are omitted from the IR unless set, so every other image op's wire shape
-    # is byte-identical to what it was.
-    x: int | None = scalar(omit_none=True, default=None)
-    y: int | None = scalar(omit_none=True, default=None)
+    # `encode` only: the target container; `convert` reuses the slot for its color mode.
+    # Omitted from the IR unless set, so every other image op's wire shape is unchanged.
     format: str | None = scalar(omit_none=True, default=None)
+    # `letterbox` only: the byte the leftover canvas is filled with.
+    fill: int | None = scalar(omit_none=True, default=None)
 
 
 # A 1x1 red PNG. Exported so the doctests here (and the docs) have a real image to
@@ -122,19 +141,37 @@ class _ImageNamespace:
         """
         return ImageFunc("decode", self._e)
 
-    def crop(self, x: int, y: int, width: int, height: int) -> ImageFunc:
+    def crop(
+        self,
+        x: int | Expr,
+        y: int | Expr,
+        width: int | Expr,
+        height: int | Expr,
+    ) -> ImageCrop:
         """Cut the window at ``(x, y)`` out of each image, as PNG bytes.
 
         The arbitrary-offset counterpart of :meth:`center_crop`, and the shape a detection
         pipeline needs: pull a bounding box out of a frame and keep it as an *image* rather
         than as a tensor.
 
+        **Each bound may be a column.** That is what makes this the operation a vision
+        pipeline is built around rather than a fixed-window utility: the boxes a detector
+        predicts are data, one per row, so cutting them out of their frames needs the
+        window to vary per row. Mixing constants and columns is fine — a fixed-size patch
+        at a per-row position is ``crop(col("cx"), col("cy"), 64, 64)``.
+
         A window that runs past an edge is **clipped**, so the result can be smaller than
         requested. That is the opposite of :meth:`center_crop`, which zero-pads, and the
         difference is deliberate: `center_crop` feeds a model that needs a fixed input
         size, while a cropped image is something a person or another tool will look at,
         and inventing black pixels there would be inventing data. A window that starts
-        past the image entirely is null.
+        past the image entirely is null, as is one whose bounds are null, negative, or
+        non-positive in extent — a box the caller could not supply is a row with no
+        answer, not a reason to fail the batch.
+
+        Because the window varies per row, the result is encoded bytes rather than a
+        fixed-shape tensor: rows genuinely differ in size. Feed a model by following it
+        with :meth:`to_tensor` or :meth:`letterbox`.
 
         Args:
             x: Left edge of the window, in pixels from the left of the image.
@@ -144,7 +181,7 @@ class _ImageNamespace:
 
         Returns:
             An expression evaluating to PNG bytes of the cropped region; null for null,
-            undecodable, or entirely-out-of-bounds input.
+            undecodable, or entirely-out-of-bounds input, and for an unusable window.
 
         Examples:
             .. doctest::
@@ -155,8 +192,16 @@ class _ImageNamespace:
                 >>> region = bt.col("img").image.crop(0, 0, 1, 1)
                 >>> ds.select(d=region.image.decode().struct.field("width")).to_pydict()
                 {'d': [1]}
+
+                >>> # A detector's boxes, cut out of the frames they were found in.
+                >>> patch = bt.col("frame").image.crop(
+                ...     bt.col("box_x"), bt.col("box_y"), bt.col("box_w"), bt.col("box_h")
+                ... )
         """
-        return ImageFunc("crop", self._e, width=width, height=height, x=x, y=y)
+        from batcher.plan.expr_ir.constructors import lit
+
+        bounds = [b if isinstance(b, Expr) else lit(int(b)) for b in (x, y, width, height)]
+        return ImageCrop(self._e, *bounds)
 
     def encode(self, format: str) -> ImageFunc:
         """Re-encode each image in `format`, pixels unchanged.
@@ -472,6 +517,146 @@ class _ImageNamespace:
                 [None]
         """
         return ImageFunc("sharpness", self._e)
+
+    def thumbnail(self, max_size: int) -> ImageFunc:
+        """Scale so the longest side is `max_size`, keeping the aspect ratio (→ PNG bytes).
+
+        The aspect-preserving counterpart of :meth:`resize`, and the one to reach for when
+        the output is for a person rather than a model. `resize` takes both dimensions, so
+        it stretches anything not already at the target ratio: a corpus of mixed portrait
+        and landscape photographs run through ``resize(256, 256)`` comes out squashed, and
+        nothing about the shape of the result says so.
+
+        Never *up*scales. Enlarging a small image to reach `max_size` invents detail and
+        costs bytes, which is also what Pillow's ``Image.thumbnail`` does, so a corpus
+        already normalized against that stays comparable.
+
+        Args:
+            max_size: Length of the longest side of the result, in pixels.
+
+        Returns:
+            An expression evaluating to PNG bytes; null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> small = bt.col("img").image.thumbnail(256)
+                >>> ds.select(d=small.image.decode()).to_pydict()["d"][0]["width"]
+                1
+        """
+        return ImageFunc("thumbnail", self._e, width=max_size)
+
+    def letterbox(self, width: int, height: int, *, fill: int = 114) -> ImageFunc:
+        """Fit onto a ``(width, height)`` canvas keeping the aspect ratio, padding the rest.
+
+        The standard object-detection preprocessing, and the reason neither
+        :meth:`to_tensor` nor :meth:`center_crop` covers it. `to_tensor` stretches, which
+        moves every box a model predicts off its object; `center_crop` throws the border
+        away, which is where the missed detections live. Letterboxing does neither: the
+        whole image survives at its true aspect ratio, and the leftover canvas is a
+        constant the model learns to ignore.
+
+        The image is centered on the canvas, so the padding is split evenly between the two
+        sides. An off-centre paste would bias every coordinate a model predicts, in a way
+        that is easy to miss and hard to trace back.
+
+        Args:
+            width: Canvas width in pixels.
+            height: Canvas height in pixels.
+            fill: Byte value the leftover canvas is filled with, ``0``-``255``. The default
+                ``114`` is the YOLO family's grey, so a model trained against that
+                preprocessing sees the padding it expects.
+
+        Returns:
+            An expression evaluating to a ``FixedSizeList<u8>`` of ``height * width * 3``
+            RGB8 samples (a fixed-shape-tensor column); null for null or undecodable input.
+
+        Raises:
+            PlanError: If `fill` is outside ``0``-``255``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> boxed = bt.col("img").image.letterbox(4, 4)
+                >>> len(ds.select(t=boxed).to_pydict()["t"][0])
+                48
+        """
+        if not 0 <= fill <= 255:
+            raise PlanError(f"image.letterbox(): fill must be in 0..=255, got {fill}")
+        return ImageFunc("letterbox", self._e, width=width, height=height, fill=fill)
+
+    def auto_orient(self) -> ImageFunc:
+        """Apply each image's EXIF orientation, re-encoded as PNG bytes.
+
+        A camera almost never rotates its sensor data. It records which way up it was held
+        in the EXIF ``Orientation`` tag and leaves the pixels as the sensor read them, so a
+        portrait phone photo is *stored* landscape with a "rotate 90" note attached. Every
+        viewer, phone gallery, and browser honours that note, as does ``cv2.imread`` and
+        anything built on ``PIL.ImageOps.exif_transpose``.
+
+        The decoder behind this namespace does not. So a corpus of phone photographs
+        decodes a quarter turn from what the rest of a pipeline sees — the right shape,
+        real pixels, the wrong image — and nothing downstream can tell. Insert this before
+        the decode ops and the two agree:
+
+        ``col("bytes").image.auto_orient().image.to_tensor(224, 224)``
+
+        It is a separate operation rather than a changed default because flipping the
+        default would rotate the output of pipelines that already compensate. Use
+        :meth:`exif_orientation` to find out whether a corpus needs it at all.
+
+        The result is PNG, which carries no EXIF, so the rotation cannot be applied twice.
+        An image that is already upright, or in a format that cannot carry orientation, is
+        re-encoded unchanged.
+
+        Returns:
+            An expression evaluating to PNG bytes; null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> upright = bt.col("img").image.auto_orient()
+                >>> ds.select(d=upright.image.decode().struct.field("width")).to_pydict()
+                {'d': [1]}
+        """
+        return ImageFunc("auto_orient", self._e)
+
+    def exif_orientation(self) -> ImageFunc:
+        """Read each image's EXIF orientation code, 1 through 8 (→ Int32).
+
+        The diagnostic half of :meth:`auto_orient`. Whether a corpus needs orienting is
+        otherwise invisible — a rotated decode is a valid image of the right size — so this
+        is how you find out, and how you measure how much of a corpus is affected:
+
+        ``ds.filter(bt.col("bytes").image.exif_orientation() != 1).count()``
+
+        The codes are the EXIF standard's: 1 upright, 2 mirrored, 3 rotated 180, 4 flipped
+        vertically, 5-8 the quarter turns and their mirrors.
+
+        Returns:
+            An expression evaluating to an Int32 in ``1..8``; null for null or undecodable
+            input. An image carrying no orientation reports ``1``, as does one in a format
+            that cannot carry the tag — the code means "already upright", not "absent".
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_1X1
+                >>> ds = bt.from_pydict({"img": [_PNG_1X1]})
+                >>> ds.select(o=bt.col("img").image.exif_orientation()).to_pydict()
+                {'o': [1]}
+        """
+        return ImageFunc("exif_orientation", self._e)
 
     def resize(self, width: int, height: int) -> ImageFunc:
         """Resize the image and re-encode it as PNG bytes.

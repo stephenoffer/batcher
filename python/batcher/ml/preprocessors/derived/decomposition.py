@@ -60,6 +60,8 @@ class PCA(Preprocessor):
         keep_original: Keep the input columns alongside the components instead of dropping them.
     """
 
+    numeric_only = True
+
     __slots__ = (
         "columns",
         "components_",
@@ -113,6 +115,7 @@ class PCA(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         import numpy as np
 
         from batcher.ml.stats.multivariate import covariance_matrix
@@ -199,6 +202,8 @@ class TruncatedSVD(Preprocessor):
         keep_original: Keep the input columns alongside the components instead of dropping them.
     """
 
+    numeric_only = True
+
     __slots__ = (
         "columns",
         "components_",
@@ -247,6 +252,7 @@ class TruncatedSVD(Preprocessor):
         Returns:
             ``self``, fitted.
         """
+        self._check_numeric(ds)
         import numpy as np
 
         from batcher.plan.functions.aggregate import sum as sum_

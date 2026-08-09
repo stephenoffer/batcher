@@ -2,14 +2,13 @@
 
 A preprocessor is only useful because its state is *learned once and reused*: the scaler
 that standardizes a request at serving time has to hold the training set's mean, not the
-request's. That means the fitted state has to outlive the process that fitted it, and how
-it is written down decides whether it can be trusted six months later.
+request's. That means the fitted state has to outlive the process that fitted it.
 
-Pickle is the usual answer and the wrong one here. A pickle is opaque (you cannot read what
-the model will actually do to a column), version-fragile (it breaks when a class moves or a
-slot is renamed), and unsafe to load from anywhere you do not fully control. What is written
-instead is plain JSON naming the class, its hyperparameters, and its learned state — a file
-a person can read, a reviewer can diff, and a serving stack in another language can consume.
+The document format — version, class, constructor parameters, learned state — and the
+reasons for choosing JSON over a pickle live in `batcher.ml.persistence.document`, which the
+estimator half uses too. What is specific to a preprocessor, and therefore lives here, is
+the registry of loadable classes and the handling of a preprocessor nested inside another
+one's parameters.
 
 Round-tripping is exact for every preprocessor in this package, and `to_dict` refuses
 rather than guesses on state it cannot represent, so a silently lossy save is not possible.
@@ -17,84 +16,46 @@ rather than guesses on state it cannot represent, so a silently lossy save is no
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.persistence.document import (
+    SCHEMA_VERSION,
+    check_version,
+    decode_value,
+    encode_value,
+    read_document,
+    state_names,
+    write_document,
+)
 
 if TYPE_CHECKING:
     from batcher.ml.preprocessors.base import Preprocessor
 
 __all__ = ["from_dict", "load", "save", "to_dict"]
 
-#: Bumped when the on-disk shape changes in a way an older reader cannot handle. Written
-#: into every document so a mismatch is an error rather than a misread field.
-SCHEMA_VERSION = 1
 
-#: JSON has no tuple and no set. Both appear in fitted state (a category list, a bounds
-#: pair), so they are tagged on the way out and restored on the way in rather than being
-#: silently flattened into a list — which would round-trip to a *different* object.
-_TUPLE_TAG = "__tuple__"
+def _nested_encoder(value: Any) -> Any:
+    """Encode a nested `Preprocessor` as its own document, or return ``None`` for anything else.
 
-#: A preprocessor nested inside another one's parameters — `Chain`'s steps. Written as its
-#: own `to_dict` document under this tag so a whole fitted pipeline saves and loads as one
-#: file, which is the thing users actually persist. Without it `to_dict(Chain(...))` failed
-#: with "cannot serialize fitted state of type StandardScaler": the chain named the one
-#: value the encoder had no case for, and the pipeline was the only preprocessor that could
-#: not be saved.
-_PREPROCESSOR_TAG = "__preprocessor__"
+    `Chain` holds its steps as constructor parameters, so a fitted pipeline has to save as
+    one file. Without this, `to_dict(Chain(...))` failed with "cannot serialize fitted state
+    of type StandardScaler" — the chain named the one value the encoder had no case for, and
+    the pipeline was the only preprocessor that could not be saved.
+    """
+    from batcher.ml.preprocessors.base import Preprocessor
+
+    return to_dict(value) if isinstance(value, Preprocessor) else None
 
 
 def _encode(value: Any) -> Any:
-    """Convert fitted state into JSON-representable form, tagging what JSON would lose."""
-    from batcher.ml.preprocessors.base import Preprocessor
-
-    if isinstance(value, Preprocessor):
-        return {_PREPROCESSOR_TAG: to_dict(value)}
-    if isinstance(value, tuple):
-        return {_TUPLE_TAG: [_encode(v) for v in value]}
-    if isinstance(value, list):
-        return [_encode(v) for v in value]
-    if isinstance(value, dict):
-        # A dict keyed by anything but a string is routine here (a category set keyed by an
-        # int), and JSON would coerce those keys to strings and lose the type on reload, so
-        # the mapping is written as an explicit pair list instead.
-        return {"__items__": [[_encode(k), _encode(v)] for k, v in value.items()]}
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    raise PlanError(
-        f"cannot serialize fitted state of type {type(value).__name__}. Preprocessor state "
-        "must be built from JSON-representable values so a saved preprocessor stays readable "
-        "and portable."
-    )
+    """Encode one value, understanding a nested preprocessor."""
+    return encode_value(value, nested=_nested_encoder)
 
 
 def _decode(value: Any) -> Any:
-    """Restore what `_encode` wrote, including tuples and non-string dict keys."""
-    if isinstance(value, dict):
-        if _PREPROCESSOR_TAG in value:
-            return from_dict(value[_PREPROCESSOR_TAG])
-        if _TUPLE_TAG in value:
-            return tuple(_decode(v) for v in value[_TUPLE_TAG])
-        if "__items__" in value:
-            return {_decode(k): _decode(v) for k, v in value["__items__"]}
-        return {k: _decode(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_decode(v) for v in value]
-    return value
-
-
-def _state_names(preprocessor: Preprocessor) -> list[str]:
-    """The trailing-underscore attributes holding learned state (scikit-learn's convention)."""
-    names: list[str] = []
-    for klass in type(preprocessor).__mro__:
-        for slot in getattr(klass, "__slots__", ()):
-            if slot.endswith("_") and not slot.startswith("_") and slot not in names:
-                names.append(slot)
-    for attr in getattr(preprocessor, "__dict__", {}):
-        if attr.endswith("_") and not attr.startswith("_") and attr not in names:
-            names.append(attr)
-    return names
+    """Decode one value, rebuilding a nested preprocessor."""
+    return decode_value(value, nested=from_dict)
 
 
 def to_dict(preprocessor: Preprocessor) -> dict[str, Any]:
@@ -126,7 +87,7 @@ def to_dict(preprocessor: Preprocessor) -> dict[str, Any]:
         "version": SCHEMA_VERSION,
         "class": type(preprocessor).__name__,
         "params": {k: _encode(v) for k, v in preprocessor.get_params().items()},
-        "state": {n: _encode(getattr(preprocessor, n)) for n in _state_names(preprocessor)},
+        "state": {n: _encode(getattr(preprocessor, n)) for n in state_names(preprocessor)},
         "fitted": bool(preprocessor.is_fitted),
     }
 
@@ -214,12 +175,7 @@ def from_dict(document: dict[str, Any]) -> Preprocessor:
             >>> from_dict(to_dict(pre)).mean_
             {'x': 2.0}
     """
-    version = document.get("version")
-    if version != SCHEMA_VERSION:
-        raise PlanError(
-            f"unsupported preprocessor schema version {version!r}; this build reads "
-            f"version {SCHEMA_VERSION}."
-        )
+    check_version(document)
     name = document.get("class")
     classes = _registry()
     if name not in classes:
@@ -269,12 +225,7 @@ def save(preprocessor: Preprocessor, path: str) -> None:
             >>> load(target).scale_
             {'x': 1.0}
     """
-    from batcher.io.filesystem import resolve_filesystem
-
-    payload = json.dumps(to_dict(preprocessor), indent=2, sort_keys=True).encode()
-    filesystem = resolve_filesystem(path)
-    with filesystem.atomic_writer(path) as handle:
-        handle.write(payload)
+    write_document(to_dict(preprocessor), path)
 
 
 def load(path: str) -> Preprocessor:
@@ -301,13 +252,10 @@ def load(path: str) -> Preprocessor:
             >>> load(target).is_fitted
             True
     """
-    from batcher.io.filesystem import resolve_filesystem
-
-    filesystem = resolve_filesystem(path)
-    with filesystem.open(path, "rb") as handle:
-        raw = handle.read()
     try:
-        document = json.loads(raw)
-    except ValueError as exc:
+        document = read_document(path)
+    except PlanError as exc:
+        # The shared reader says "not a saved Batcher object"; this entry point knows which
+        # kind was expected, and the narrower message is what the caller can act on.
         raise PlanError(f"{path!r} is not a saved preprocessor: {exc}") from exc
     return from_dict(document)

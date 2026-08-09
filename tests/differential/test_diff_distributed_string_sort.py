@@ -45,7 +45,7 @@ def _keys(table) -> list:
 
 
 @pytest.fixture(scope="module")
-def splittable(tmp_path_factory):
+def splittable(cluster_tmp_dir):
     """The same rows as a parquet file, which is a **splittable** source.
 
     This is load-bearing, not incidental. With an in-memory `from_arrow` source the
@@ -54,7 +54,7 @@ def splittable(tmp_path_factory):
     source is what withdraws the fallback, which is both the reason these queries used to
     fail and the only way to prove they no longer take that route.
     """
-    path = tmp_path_factory.mktemp("strsort") / "rows.parquet"
+    path = cluster_tmp_dir / "strsort_rows.parquet"
     pq.write_table(_T, path, row_group_size=128)
     return bt.read.parquet(str(path))
 
@@ -110,9 +110,9 @@ def test_a_secondary_string_key_still_sorts_by_the_full_key_list(splittable):
     assert _tuples(ds.collect(distributed=True, num_workers=3)) == _tuples(ds.collect())
 
 
-def test_an_all_null_string_key_still_distributes(tmp_path):
+def test_an_all_null_string_key_still_distributes(cluster_tmp_path):
     """No sample means no boundaries; every row must still land somewhere and come back."""
     t = pa.table({"w": pa.array([None] * 50, type=pa.string()), "v": list(range(50))})
-    pq.write_table(t, tmp_path / "nulls.parquet")
-    ds = bt.read.parquet(str(tmp_path / "nulls.parquet")).sort("w")
+    pq.write_table(t, cluster_tmp_path / "nulls.parquet")
+    ds = bt.read.parquet(str(cluster_tmp_path / "nulls.parquet")).sort("w")
     assert _keys(ds.collect(distributed=True, num_workers=3)) == _keys(ds.collect())

@@ -271,5 +271,8 @@ def test_invalid_parameters_are_rejected(corpus, kwargs, match):
 
 
 def test_unknown_column_is_rejected(corpus):
-    with pytest.raises(PlanError, match="unknown column"):
+    # The canonical `unknown_message` shape: what failed, the offending value, the
+    # alternatives, the next action. Asserted on the value and the parameter rather than on
+    # the prose, so rewording the message does not fail this while a *wrong* message would.
+    with pytest.raises(PlanError, match=r"Unknown column 'nope'.*Available columns.*column"):
         corpus.ml.near_duplicates("nope")
