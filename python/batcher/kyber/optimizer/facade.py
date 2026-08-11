@@ -24,6 +24,7 @@ from batcher.kyber.rules.projections import (
     required_predicates_per_source,
 )
 from batcher.kyber.rules.selection import BuildSideDecision
+from batcher.kyber.spill_rates import learned_spill_factor
 from batcher.metadata import MetadataHub
 from batcher.metadata.io_stats import relative_read_cost
 from batcher.plan.logical import LogicalPlan
@@ -31,7 +32,7 @@ from batcher.plan.physical import PhysicalPlan
 from batcher.plan.resource import HardwareProfile
 from batcher.plan.source_stats import source_identity
 from batcher.plan.stats import RelStats
-from batcher.plan.visitor import children
+from batcher.plan.visitor import children, walk
 
 __all__ = ["Optimizer", "optimize", "optimize_full", "optimize_logical", "optimize_traced"]
 
@@ -59,10 +60,20 @@ class Optimizer:
         # (footer/manifest/catalog metadata). Kyber never reads `io` itself — the
         # stats are handed in, keeping the layer boundary intact.
         self._source_stats = source_stats
-        all_rules = rules if rules is not None else DEFAULT_REGISTRY.rules()
-        self._by_phase: dict[Phase, list[Rule]] = {p: [] for p in Phase}
-        for r in all_rules:
-            self._by_phase[r.phase].append(r)
+        # The default registry partitions itself once and hands back the *same* lists every
+        # time. That identity matters: `expr_dispatch.expr_type_index` memoizes a rule list's
+        # expression-type inversion on `id(rules)`, and an `Optimizer` is constructed per
+        # query — so partitioning here re-created seven lists per query, missed that memo on
+        # all but one of its eight lookups, and re-inverted the whole rule set each time.
+        # An explicit `rules` list (tests, a caller driving a subset) still partitions here,
+        # because it has no registry to memoize against and is not on the per-query path.
+        if rules is None:
+            self._by_phase: dict[Phase, list[Rule]] = DEFAULT_REGISTRY.by_phase()
+        else:
+            by_phase: dict[Phase, list[Rule]] = {p: [] for p in Phase}
+            for r in rules:
+                by_phase[r.phase].append(r)
+            self._by_phase = by_phase
 
     def _context(self) -> OptimizerContext:
         learned = load_learned_stats(self._hub) if self._hub is not None else {}
@@ -74,11 +85,23 @@ class Optimizer:
         )
         # Coefficients calibrated from measured op_stats (defaults until a workload
         # has run): this is what lets the cost model reflect the real engine.
-        coeffs = calibrate(self._hub, self._config)
+        # Fitted from what the *target* machine class measured, not what this process did:
+        # planning runs on the driver, which on a cluster executes none of the work.
+        coeffs = calibrate(self._hub, self._config, self._hardware.fingerprint or None)
         # Each source's measured read throughput, as a multiplier on what its bytes cost
         # relative to the plan's median source. Cold, single-source, or unidentifiable
         # sources all yield 1.0, which is the ranking this had before there was a measurement.
         io_factors = relative_read_cost(self._hub, [source_identity(s) for s in self._sources])
+        # The read side of that measurement has a write-side twin. A spilled byte is priced
+        # from the device *class*, which is a structural reading that errs toward pessimism by
+        # construction, and the fleet's own spill history can falsify it. `None` — a cold
+        # store, a device already at the floor, or too few spills — keeps the class factor.
+        spill_factor = learned_spill_factor(
+            self._hub,
+            self._hardware.storage_class or "",
+            self._config,
+            self._hardware.fingerprint or None,
+        )
         # The fleet the plan will run across drives the `net` axis. `1` single-node, which
         # makes that axis identically zero — so a single-node plan is ranked exactly as it
         # was before shuffle volume was costed at all.
@@ -87,6 +110,7 @@ class Optimizer:
             coeffs,
             workers=self._hardware.worker_count,
             source_io_factors=io_factors,
+            spill_device_factor=spill_factor,
             # The whole profile, not just its worker count: the `net` axis is priced against
             # the fleet's interconnect *tiers*, and how a shuffle splits over them is a
             # question about node density and fabric width that a worker count cannot answer.
@@ -158,7 +182,7 @@ class Optimizer:
                 ctx.estimator,
                 ctx.config,
                 ctx.costs(),
-                load_cpu_utilization(self._hub, self._config),
+                load_cpu_utilization(self._hub, self._config, self._hardware.fingerprint or None),
                 # The fleet shape, so the PACK/SPREAD preference can be a comparison rather
                 # than a constant: on dense nodes, concentrating a gang moves a large exchange
                 # off the network entirely, which an absolute byte threshold cannot express.
@@ -166,6 +190,7 @@ class Optimizer:
             ),
             source_projections=required_columns_per_source(plan),
             source_predicates=_source_predicates(logical, plan),
+            prefer_materializing_aggregate=_prefers_materializing_aggregate(plan, ctx),
         )
         return phys, plan, ctx.notes.get("build_side_decisions", [])
 
@@ -236,6 +261,56 @@ def _format_plan(node: LogicalPlan, est: CardinalityEstimator, depth: int = 0) -
     for child in children(node):
         out += _format_plan(child, est, depth + 1)
     return out
+
+
+#: Estimated groups at or above which a join-free grouped aggregate is cheaper on the
+#: materializing executor than on the streaming one.
+#:
+#: Measured on the H2O `groupby` suite at its own 1e7-row tier, streaming against
+#: materializing: 100 groups 31.8 vs 36.3 ms and 10,000 groups 141 vs 196 ms (streaming
+#: wins), against 100,000 groups 185 vs 94 ms and 1e7 groups 1,569 vs 715 ms (materializing
+#: wins, by 2.0x and 2.2x). Both executors parallelize and both return the identical answer;
+#: what changes is CPU spent — streaming burned roughly twice as much at the high end, and
+#: below ~1e4 groups its per-morsel pre-aggregation collapses the relation early enough that
+#: holding the whole input buys nothing.
+#:
+#: The crossover is therefore somewhere in 1e4..1e5 and this sits at its midpoint. Stated
+#: plainly because it is an interpolation, not a measurement: the two sides of the bracket
+#: are measured and the point between them is not.
+MATERIALIZE_AGG_MIN_GROUPS = 50_000
+
+
+def _prefers_materializing_aggregate(plan: LogicalPlan, ctx: OptimizerContext) -> bool:
+    """Whether this plan's grouped aggregate is worth materializing rather than streaming.
+
+    Only for the shape that was measured: a **join-free** plan whose root is a grouped
+    `Aggregate`. A grouped aggregate under a join is a different plan with different
+    intermediates and none of it was measured, so it keeps the existing routing. The engine
+    re-checks the shape itself and ANDs in its own memory-affordability test, so this is a
+    hint the data plane may decline, never an instruction.
+
+    A row-wise `Project` **above** the aggregate is peeled first, and must be: most grouped
+    aggregates do not have the aggregate at the root, and the projection above it says nothing
+    about which executor should run them. `max(v1) - min(v2)` leaves one for the subtraction
+    and `stddev` leaves one for its `sqrt` — H2O `groupby` q7 and q6 — so both were rejected
+    here and ran ~1.8x slower than the path they qualify for on every other count. The
+    projection is over one row per group, so peeling it cannot change the verdict. The Rust
+    guard (`materializing_aggregate_is_faster`) peels the same way; the two must agree or the
+    hint is discarded by the engine's own shape check.
+    """
+    from batcher.plan.logical import Aggregate, Join, Project
+
+    node = plan
+    while isinstance(node, Project):
+        node = node.input
+    if not isinstance(node, Aggregate) or not node.group_keys:
+        return False
+    if any(isinstance(n, Join) for n in walk(plan)):
+        return False
+    try:
+        return ctx.estimator.estimate(plan).rows >= MATERIALIZE_AGG_MIN_GROUPS
+    except Exception:
+        return False  # no estimate is not evidence for changing the route
 
 
 def _source_predicates(logical: LogicalPlan, optimized: LogicalPlan) -> dict[int, dict]:

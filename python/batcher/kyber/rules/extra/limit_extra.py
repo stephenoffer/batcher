@@ -78,7 +78,6 @@ from batcher.plan.logical import (
     Union,
 )
 from batcher.plan.logical.aggregate import SortKeySpec
-from batcher.plan.stats import Provenance
 
 __all__ = [
     "collapse_topn_over_topn",
@@ -197,7 +196,7 @@ def collapse_topn_over_topn(node: Sort, _ctx: OptimizerContext) -> LogicalPlan |
 
 @rule(
     name="empty_topn_to_empty",
-    phase=Phase.SELECTION,
+    phase=Phase.FUSION,
     matches=(Sort,),
     category=RuleCategory.REWRITE,
 )
@@ -306,7 +305,7 @@ def prune_sort_keys_after_unique_key(node: Sort, ctx: OptimizerContext) -> Logic
             continue
         stat = stats.column(key.expr.name)
         if (
-            stat.provenance is Provenance.EXACT
+            stat.ndv_is_exact
             and stat.ndv is not None
             and stat.null_count == 0
             and stat.ndv >= stats.rows

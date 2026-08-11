@@ -42,8 +42,8 @@ print(docs.count())
 # 3
 ```
 
-In production this is `bt.read.parquet("s3://corpus/")`, or a directory of PDFs and HTML you
-have already extracted. `bt.col("body").str.strip_html()` turns markup into prose if that is
+In production this is {py:meth}`bt.read.parquet("s3://corpus/") <batcher.api.io_namespace.reader.Reader.parquet>`, or a directory of PDFs and HTML you
+have already extracted. {py:func}`bt.col("body").str.strip_html() <batcher.col>` turns markup into prose if that is
 what you have.
 
 ## 2. Chunk
@@ -72,8 +72,8 @@ Real chunks are 200 to 1,000 characters, not 40. The small size here keeps the o
 
 ## 3. Embed
 
-With a real model, embedding is one call. `ds.ml.embed` loads a sentence-transformers model
-**once per worker**, keeps it warm across `collect()`s in the session, and appends the vector
+With a real model, embedding is one call. {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` loads a sentence-transformers model
+**once per worker**, keeps it warm across {py:meth}`collect() <batcher.Dataset.collect>`s in the session, and appends the vector
 as a tensor column:
 
 ```python
@@ -121,11 +121,11 @@ print(index.count())
 
 ## 4. Retrieve
 
-Retrieval is a score and a top-N. `.list.cosine_similarity` scores each row's vector against
+Retrieval is a score and a top-N. {py:meth}`.list.cosine_similarity <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_similarity>` scores each row's vector against
 a query vector broadcast as a literal, and `top_k` keeps the best rows without sorting the
 relation, using the fused top-N heap, which runs 8.1x faster than Daft on the top-N benchmark.
 
-The `l2_norm` filter drops empty vectors: a zero vector has no direction, cannot clear any
+The {py:meth}`l2_norm <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` filter drops empty vectors: a zero vector has no direction, cannot clear any
 threshold, and would otherwise pollute the ranking with undefined scores.
 
 ```python
@@ -176,7 +176,7 @@ hits = vector_search("s3://index/chunks.lance", query_vector, k=5)
 ::::
 
 And when you are matching *two* corpora rather than one question against one corpus,
-`ds.ml.similarity_join` does it without the quadratic blowup: SimHash signatures band the
+{py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` does it without the quadratic blowup: SimHash signatures band the
 vectors into candidate pairs, and only the candidates get the exact cosine score.
 
 ## 5. Generate
@@ -283,7 +283,7 @@ Where the embedding and generation throughput comes from.
   each half.
 - {doc}`RAG index recipe </cookbook/ml/pipelines/text/rag-index>` and
   {doc}`text embeddings recipe </cookbook/ml/pipelines/text/text-embeddings>`: the short versions.
-- {doc}`Expressions </user-guide/transform/columns/expressions>`: `.str.chunk`, `.list.cosine_similarity`, and
+- {doc}`Expressions </user-guide/transform/columns/expressions>`: {py:meth}`.str.chunk <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>`, {py:meth}`.list.cosine_similarity <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_similarity>`, and
   the rest of the column language this page leans on.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the warm pool and the stage overlap
   behind both halves.

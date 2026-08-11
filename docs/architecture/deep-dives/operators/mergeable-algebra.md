@@ -69,8 +69,8 @@ whatever is enough to compute the answer from any partition:
 | `var`, `stddev` | Welford's `(mean, M2, count)` | Bessel-corrected variance |
 | `median`, `quantile` | the group's non-null values as one `List` column | sort and index |
 | `array_agg` | the group's non-null values as one `List` column | the list as-is, empty becomes null |
-| `count_distinct` | the group's distinct values as one `List` column | union then count |
-| `approx_count_distinct` | an HLL sketch | estimate |
+| {py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` | the group's distinct values as one `List` column | union then count |
+| {py:meth}`approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>` | an HLL sketch | estimate |
 | `approx_quantile` | a DDSketch | query |
 | `corr`, `covar` | co-moments, as `(n, mean_x, mean_y, C2, M2x, M2y)` | the closed form |
 

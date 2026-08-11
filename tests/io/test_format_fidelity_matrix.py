@@ -73,6 +73,15 @@ NOT_LOCALLY_WRITABLE: dict[str, str] = {
     "adbc": "needs a live ADBC driver/database",
     "ipc": "the same writer as `arrow`, reached through a second registry name",
     "feather": "the same writer as `arrow`, reached through a second registry name",
+    # The bioinformatics sinks take a **fixed schema**, not an arbitrary relation: a FASTA
+    # record is (id, description, sequence) and a BED line is (chrom, start, end, ...), so
+    # there is nowhere to put this matrix's `int64_precision` or `timestamp_us` column and
+    # nothing it would mean if there were. Their fidelity is pinned on the schema they do
+    # accept, by the `*_round_trips` tests in the two suites named here.
+    "fasta": "fixed record schema; round-tripped by tests/io/test_io_fasta_fastq.py",
+    "fastq": "fixed record schema; round-tripped by tests/io/test_io_fasta_fastq.py",
+    "bed": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
+    "gff": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
 }
 
 #: Type class -> a 4-row column carrying that class's hard values.

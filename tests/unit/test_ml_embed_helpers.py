@@ -196,3 +196,53 @@ def test_mrr_scores_first_relevant_rank():
     relevant = bt.from_pydict({"qid": [1, 2], "cid": [10, 21]})
     # q1 first-relevant at rank 1 -> 1.0; q2 at rank 2 -> 0.5; mean 0.75
     assert ranked.ml.mrr(relevant, query_key="qid", corpus_key="cid") == 0.75
+
+
+# --- the streaming `embed` pool's write-back contract ---------------------------------
+
+
+def _counting_encoder():
+    """An encoder that fails loudly if a non-string ever reaches it."""
+    import numpy as np
+
+    def factory():
+        def encode(texts):
+            assert all(isinstance(t, str) for t in texts), f"non-string reached model: {texts}"
+            return np.array([[float(len(t)), 1.0] for t in texts], dtype=np.float32)
+
+        return encode
+
+    return factory
+
+
+def test_a_null_text_does_not_reach_the_model():
+    """One null cell used to fail the whole batch.
+
+    `None` reaches sentence-transformers and every tokenizer behind it as an unhandled type,
+    on the one column type most likely to have nulls. The served-endpoint encoders already
+    rendered a null as `""`; the local ones did not.
+    """
+    from batcher.ml.embed import embed
+
+    batch = pa.RecordBatch.from_pydict({"t": ["abc", None, "de"]})
+    out = next(iter(embed([batch], _counting_encoder(), text_column="t")))
+
+    assert out.column("t").to_pylist() == ["abc", None, "de"]  # the input is untouched
+    assert out.num_rows == 3  # and every row still carries a vector
+
+
+def test_embedding_into_an_existing_column_replaces_it():
+    """Arrow permits duplicate field names, so appending left two columns of one name.
+
+    `to_pydict()` then keeps the last, expressions resolve the first, and nothing raises.
+    Re-embedding into the column you read is the ordinary way to hit it.
+    """
+    from batcher.ml.embed import embed
+
+    batch = pa.RecordBatch.from_pydict({"t": ["abc"], "embedding": [[9.0, 9.0]]})
+    out = next(
+        iter(embed([batch], _counting_encoder(), text_column="t", output_type="fixed_size_list"))
+    )
+
+    assert out.schema.names == ["t", "embedding"]
+    assert out.column("embedding").to_pylist() == [[3.0, 1.0]]

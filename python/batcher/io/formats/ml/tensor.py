@@ -15,14 +15,21 @@ into a correctly-shaped, zero-copy-friendly torch tensor for a training loop.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
 if TYPE_CHECKING:
     import numpy as np
 
-__all__ = ["as_tensor_column", "is_tensor_column", "tensor_type", "to_tensor_column"]
+__all__ = [
+    "as_tensor_column",
+    "is_tensor_column",
+    "tensor_from_values",
+    "tensor_type",
+    "to_tensor_column",
+]
 
 
 def as_tensor_column(storage: pa.Array, shape: tuple[int, ...]) -> pa.Array:
@@ -96,3 +103,37 @@ def is_tensor_column(array: pa.Array | pa.ChunkedArray | pa.DataType) -> bool:
     """Whether `array` (or its type) is a fixed-shape-tensor column."""
     dtype = array if isinstance(array, pa.DataType) else array.type
     return isinstance(dtype, pa.FixedShapeTensorType)
+
+
+def tensor_from_values(values: Sequence[Any]) -> pa.Array | None:
+    """A fixed-shape-tensor column for `values`, or `None` when they are not one.
+
+    The list-of-arrays spelling of what `to_tensor_column` takes stacked. A `map_batches`
+    returning ``[img, img, img]`` and a ``from_pydict({"img": [img, img]})`` are both
+    ordinary things to write, and both used to reach Arrow as a list of >1-D arrays it cannot
+    type — answered with "convert it to an ndarray", which the caller had already done.
+
+    Nulls decline rather than being filled: a null row has no shape, and `np.stack` has no
+    way to leave a hole. `ragged.ragged_from_values` takes those, since its layout stores a
+    shape per row and can leave one absent.
+
+    **1-D rows decline too**, and that is a compatibility rule rather than a limitation:
+    ``[vec, vec]`` already converts to a ``list<T>`` column and has since before tensor
+    columns existed, so claiming it here would silently change the schema of every embedding
+    column in existing pipelines. Only the shapes Arrow genuinely cannot type are claimed.
+
+    Args:
+        values: The column's values, as handed to Arrow.
+
+    Returns:
+        The built column, or None if this is not a uniform-shape array column.
+    """
+    import numpy as np
+
+    if not isinstance(values, Sequence) or isinstance(values, str | bytes) or not values:
+        return None
+    if not all(isinstance(v, np.ndarray) and v.ndim >= 2 for v in values):
+        return None
+    if len({v.shape for v in values}) != 1 or len({v.dtype for v in values}) != 1:
+        return None
+    return to_tensor_column(np.stack(values))

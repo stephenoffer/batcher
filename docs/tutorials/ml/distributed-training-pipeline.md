@@ -16,8 +16,8 @@ need GPUs and a cluster, so they are shown and not run.
 
 | Step | Runs here | Needs |
 |---|---|---|
-| Shape, split, fit, `iter_torch_batches` | Yes | `pip install batcher-engine` |
-| `epoch_order`, `stream_loader` | Yes | Nothing more |
+| Shape, split, fit, {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` | Yes | `pip install batcher-engine` |
+| `epoch_order`, {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` | Yes | Nothing more |
 | The DDP training loop | No | GPUs, NCCL, `torch.distributed` |
 | Sharded corpus, distributed preprocessing | No | A cluster and object storage |
 
@@ -73,7 +73,7 @@ buys you: no shuffle, no materialization, and the same assignment on every node.
 
 ## 3. Fit the preprocessor on train, transform both
 
-A `StandardScaler` is a fit/transform pair, and the fit is one mergeable pass over the data,
+A {py:class}`StandardScaler <batcher.ml.preprocessors.StandardScaler>` is a fit/transform pair, and the fit is one mergeable pass over the data,
 the same `partial → combine → finalize` algebra the aggregates use, so it runs on one core or
 a cluster with the same result. The transform stays inside the engine.
 
@@ -93,7 +93,7 @@ The statistics come from `train` only. `test_x` is transformed with them, never 
 
 ## 4. Stream tensors, single process
 
-`ds.ml.iter_torch_batches` yields `{column: tensor}` dicts. It consumes the stream
+{py:meth}`ds.ml.iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` yields `{column: tensor}` dicts. It consumes the stream
 incrementally, so memory stays bounded and the loop starts before the whole dataset is read,
 and it overlaps the host→device copy of one batch with the host work of the next.
 
@@ -150,7 +150,7 @@ corpus size, and seeking to sample 900,000,000,000 is modular arithmetic rather 
 
 ## 6. One iterable per rank
 
-`ds.ml.stream_loader` returns a `torch.utils.data.IterableDataset` over this rank's slice of
+{py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` returns a `torch.utils.data.IterableDataset` over this rank's slice of
 that global order.
 
 :::{warning}
@@ -268,14 +268,15 @@ stream = shard_stream_loader(
 ::::
 
 For a source with no global length (a Kafka topic, an unbounded file feed),
-`batcher.ml.streaming_split` fans one read of the stream out to `world_size` rank iterators,
+{py:func}`batcher.ml.streaming_split <batcher.ml.streaming_split>` fans one read of the stream out to `world_size` rank iterators,
 consumed concurrently with backpressure.
 
 ## 9. Preprocessing on the cluster
 
 When the corpus lives in object storage and the features are expensive, run the shaping
-distributed. It is the same plan; only the scheduling changes, and the result is bit-identical
-to the single-node one.
+distributed. It is the same plan; only the scheduling changes, and the result is the same rows,
+column names, and column types as the single-node one. A floating-point reduction is identical
+up to reassociation, since the partition count sets the summation order.
 
 ```python
 # docs: skip
@@ -314,7 +315,7 @@ Device transfer, prefetch, collate, zero-copy.
 :::{grid-item-card} {octicon}`gear;1.1em` Feature engineering
 :link: /tutorials/ml/feature-engineering
 :link-type: doc
-Preprocessors and `Chain`, the step-3 story in full.
+Preprocessors and {py:class}`Chain <batcher.ml.preprocessors.Chain>`, the step-3 story in full.
 :::
 ::::
 

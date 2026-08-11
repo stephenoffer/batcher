@@ -3,8 +3,14 @@
 The running state in `core.streaming._AggFold` is one Arrow ``RecordBatch`` (the
 output of the native ``combine``), so it serializes with ``pyarrow.ipc`` exactly
 like the ML shard writer — no FFI addition needed. Snapshots are written atomically
-(temp file + rename) per micro-batch and reloaded on recovery to resume a stateful
-query without recomputing from the start of the stream.
+per micro-batch and reloaded on recovery to resume a stateful query without
+recomputing from the start of the stream.
+
+Local and remote are written differently, and `location.py` says why: a local write is
+fsynced and renamed and the directory fsynced, because the engine snapshots state and
+*then* records the commit; on an object store a PUT is durable when it returns and there is
+no rename to make durable separately. Reading, listing, and deleting are the same code on
+both, because none of them has a durability ordering to preserve.
 """
 
 from __future__ import annotations
@@ -14,6 +20,8 @@ import os
 
 import pyarrow as pa
 from pyarrow import ipc
+
+from batcher.io.formats.streaming.checkpoint.location import CheckpointDir, is_local_location
 
 __all__ = ["StateStore"]
 
@@ -38,43 +46,73 @@ def _sync_dir(directory: str) -> None:
         os.close(fd)
 
 
+def _serialize(state: pa.RecordBatch) -> bytes:
+    """One state batch as an Arrow IPC file, in memory.
+
+    Buffering costs nothing that is not already paid: this state is capped by
+    `memory.streaming_state_max_bytes` and is a live in-process `RecordBatch` at the moment
+    it is asked for, so the serialized copy is bounded by the same budget. Having the bytes
+    in hand is what lets the local and remote writers differ only in *how they land them*.
+    """
+    sink = pa.BufferOutputStream()
+    with ipc.new_file(sink, state.schema) as writer:
+        writer.write_batch(state)
+    return sink.getvalue().to_pybytes()
+
+
 class StateStore:
     """Per-micro-batch Arrow-IPC snapshots of the running state under a directory."""
 
-    __slots__ = ("_dir",)
+    __slots__ = ("_dir", "_local")
 
     def __init__(self, directory: str) -> None:
-        self._dir = directory
-        os.makedirs(directory, exist_ok=True)
+        from batcher.io.filesystem import local_path
 
-    def _path(self, batch_id: int) -> str:
-        return os.path.join(self._dir, f"batch-{batch_id:08d}.arrow")
+        self._local = local_path(directory) if is_local_location(directory) else None
+        if self._local is not None:
+            os.makedirs(self._local, exist_ok=True)
+        # Built for both, because reads, listing and deletes go through it either way.
+        self._dir = CheckpointDir(self._local if self._local is not None else directory)
+
+    @staticmethod
+    def _name(batch_id: int) -> str:
+        return f"batch-{batch_id:08d}.arrow"
 
     def snapshot(self, batch_id: int, state: pa.RecordBatch) -> None:
-        """Atomically write the running `state` for `batch_id` (temp file + rename).
+        """Atomically write the running `state` for `batch_id`.
 
-        Any scalar that must ride with the state (the windowed fold's watermark) travels in
-        the batch's Arrow schema metadata, which IPC persists — so there is no separate
-        sidecar to keep consistent with the ``.arrow`` file.
+        Any scalar that must ride with the state (the windowed fold's watermark and its
+        per-partition maxima) travels in the batch's Arrow schema metadata, which IPC
+        persists — so there is no separate sidecar to keep consistent with the ``.arrow``
+        file.
 
-        The write is made **durable** before the rename, and the rename itself is made
+        On local disk the write is made **durable** before the rename, and the rename itself
         durable by syncing the directory. The rename alone is atomic, not durable: it
         guarantees a reader never sees a half-written snapshot, and guarantees nothing about
         an OS-level crash. The engine snapshots the state and *then* records the commit, so
         without these syncs a crash could leave the commit on disk and the state not — and
         recovery would resume past data it had consumed with an empty running aggregate,
         which is silent wrong output rather than a lost query. Two fsyncs per stateful
-        micro-batch is what that ordering costs to actually hold.
+        micro-batch is what that ordering costs to actually hold. On an object store the
+        same ordering holds without them, because the PUT does not return until the object
+        is durable.
+
+        Args:
+            batch_id: The micro-batch this snapshot belongs to.
+            state: The running state to persist.
         """
-        path = self._path(batch_id)
+        payload = _serialize(state)
+        if self._local is None:
+            self._dir.write(self._name(batch_id), payload)
+            return
+        path = os.path.join(self._local, self._name(batch_id))
         tmp = f"{path}.tmp"
         with open(tmp, "wb") as fh:
-            with ipc.new_file(fh, state.schema) as writer:
-                writer.write_batch(state)
+            fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
-        _sync_dir(self._dir)
+        _sync_dir(self._local)
 
     def restore(self, batch_id: int) -> pa.RecordBatch | None:
         """Reload the running state snapshot for `batch_id`, or None if absent.
@@ -99,10 +137,11 @@ class StateStore:
         Returns:
             The snapshotted state, or None when no snapshot exists for `batch_id`.
         """
-        path = self._path(batch_id)
-        if not os.path.exists(path):
+        name = self._name(batch_id)
+        if not self._dir.exists(name):
             return None
-        with ipc.open_file(path) as reader:
+        with self._dir.open_reader(name) as fh:
+            reader = ipc.open_file(fh)
             schema = reader.schema
             table = reader.read_all()
         batches = table.to_batches()
@@ -114,18 +153,20 @@ class StateStore:
         Stale ``.tmp`` files go too. A crash between the write and the rename leaves one
         behind, and nothing else ever removes it — so the directory this method exists to
         bound would grow one orphan per crash, forever, and the *only* symptom would be a
-        checkpoint location that slowly fills a disk.
+        checkpoint location that slowly fills a disk. Only the local writer produces them;
+        an object store's PUT has no temp sibling to leave.
         """
-        for name in os.listdir(self._dir):
-            if name.endswith(".tmp"):
-                with contextlib.suppress(OSError):
-                    os.remove(os.path.join(self._dir, name))
-                continue
-            if not name.startswith("batch-") or not name.endswith(".arrow"):
+        if self._local is not None:
+            for name in os.listdir(self._local):
+                if name.endswith(".tmp"):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(self._local, name))
+        for name in self._dir.names(".arrow"):
+            if not name.startswith("batch-"):
                 continue
             try:
                 bid = int(name[len("batch-") : -len(".arrow")])
             except ValueError:
                 continue
             if bid < keep_through:
-                os.remove(os.path.join(self._dir, name))
+                self._dir.remove(name)

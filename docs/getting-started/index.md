@@ -1,7 +1,7 @@
 # Getting started
 
 Install Batcher, run a query, then pick up the one idea the whole API rests on. A
-`Dataset` is a lazy handle to a plan. Nothing runs until you ask for results.
+{py:class}`Dataset <batcher.Dataset>` is a lazy handle to a plan. Nothing runs until you ask for results.
 
 ::::{grid} 1 3 3 3
 :gutter: 3

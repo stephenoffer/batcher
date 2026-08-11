@@ -20,7 +20,7 @@ ds = bt.from_pydict(
 
 A Dataset is lazy and immutable. Each operation returns a new Dataset and runs no
 work. The plan executes only at a terminal operation such as `collect`,
-`to_pydict`, or a write. Chain the whole transformation, then collect once. The
+{py:meth}`to_pydict <batcher.Dataset.to_pydict>`, or a write. Chain the whole transformation, then collect once. The
 optimizer sees the entire pipeline and can reorder and fuse it.
 
 ```python
@@ -40,7 +40,7 @@ forces work the optimizer could have skipped and pulls rows into Python.
 
 ## Express column work as expressions, not Python loops
 
-Use the `Expr` API for every per-row computation. Expressions lower to Rust and run
+Use the {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` API for every per-row computation. Expressions lower to Rust and run
 vectorized over Arrow batches. Iterating rows in Python is the one thing the design
 is built to avoid: it is slow and it crosses the control-plane boundary.
 
@@ -51,7 +51,7 @@ print(out.to_pydict()["total"])
 # [10.0, 40.0, 90.0, 160.0, 250.0]
 ```
 
-Don't pull data into Python to compute a column. If you reach for `to_pylist`
+Don't pull data into Python to compute a column. If you reach for {py:meth}`to_pylist <batcher.Dataset.to_pylist>`
 inside a loop to build a new field, rewrite it as an expression instead. When a
 computation genuinely needs Python, use `map_batches`, which hands you a whole
 Arrow batch rather than one row at a time.

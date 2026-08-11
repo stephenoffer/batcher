@@ -35,7 +35,15 @@ def _example_files() -> list[Path]:
     # Recursive: the per-API-family scripts live in subdirectories (`expressions/`,
     # `metrics/`, ...) so the tree stays navigable as it grows. A flat glob would
     # collect the handful at the root and silently skip every one of those.
-    return sorted(p for p in EXAMPLES_ROOT.rglob("*.py") if "__pycache__" not in p.parts)
+    #
+    # Underscore-prefixed parts are support code, not examples: `_common/` holds the
+    # shared S3 dataset loader and device-selection helpers that the scripts import.
+    # Running those as scripts would prove nothing, and `__pycache__` is not source.
+    return sorted(
+        p
+        for p in EXAMPLES_ROOT.rglob("*.py")
+        if not any(part.startswith("_") for part in p.relative_to(EXAMPLES_ROOT).parts)
+    )
 
 
 def _is_skipped(text: str) -> bool:

@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns as _require
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.functions.aggregate import count_if
 
@@ -37,17 +38,6 @@ __all__ = [
     "residual_summary",
     "top_k_accuracy",
 ]
-
-
-def _require(ds: Dataset, *names: str) -> None:
-    """Raise a `ColumnNotFoundError` naming the closest real column for any missing name."""
-    for name in names:
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )
 
 
 def residual_summary(

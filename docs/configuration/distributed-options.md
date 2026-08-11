@@ -60,7 +60,7 @@ output is recomputed from its (durable) source partition and re-fetched.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `task_max_retries` | `2` | Ray reruns a failed shuffle task this many times. Shuffle tasks are deterministic and recomputed from a durable source, so a rerun is safe. |
+| `task_max_retries` | `2` | Application-error retries for a shuffle task, which is deterministic and recomputed from a durable source, so a rerun is safe. **Not a count of preemption retries:** any non-zero value gives Ray *unlimited* retries for system errors (preemption, worker loss), and `0` makes the task non-retryable so a single preemption kills it. See the note below. |
 | `retry_on_transient` | `True` | Extend task retries to application exceptions (not just worker death). |
 | `actor_max_restarts` | `1` | Respawn a crashed compute actor (the map/inference pool) this many times. |
 | `actor_max_task_retries` | `1` | Rerun an in-flight actor call on the respawned actor this many times. |
@@ -72,10 +72,16 @@ output is recomputed from its (durable) source partition and re-fetched.
 | `speculation_max_backups` | `1` | Max concurrent speculative backup tasks at a shuffle barrier. One backup catches the single worst straggler without letting a uniformly slow stage spawn a backup per task. `0` disables straggler speculation, making the barrier a plain wait. |
 | `speculation_straggler_factor` | `1.5` | Back up a task whose elapsed time exceeds this multiple of the median finished task's time. Batcher also learns this factor per operator family from measured task-time variance, so a stage that finishes uniformly raises its own bar. |
 | `speculation_min_finished_frac` | `0.75` | Fraction of tasks that must finish before speculation starts. |
-| `skew_join_salt` | `0` | Spread a hot join key's rows across this many reducers (`0` disables skew-aware salting). |
+| `skew_join_salt` | `0` | How many reducers a hot join key's rows spread across. `0` does not mean off: salting engages on measured skew and sizes its own fan-out. A positive value forces the detection pre-pass and pins the fan-out; a negative value never salts. |
 | `skew_join_fraction` | `0.10` | A value is "hot" when it exceeds this fraction of a side's rows. |
 | `shuffle_token` | `None` | Shared secret authenticating Flight shuffle fetches. Also read from `BATCHER_SHUFFLE_TOKEN`. |
 | `shuffle_port_range` | `None` | `(min, max)` the Flight shuffle listener may bind, instead of an OS-ephemeral port. Also read from `BATCHER_SHUFFLE_PORT_RANGE` (`"40000-40100"`). |
+
+:::{important}
+**Retry counts are a step function, not a dial.** Ray treats any non-zero `max_retries` as "this task is safe to rerun" and then retries *system* errors — spot preemption, worker crash, node loss — without decrementing the count. The number bounds only application errors. At `0` the task becomes non-retryable and a single preemption kills it permanently.
+
+So `task_max_retries=2` means "unlimited preemption retries, two application retries", and lowering it to `0` to reduce retry noise silently removes every spot protection on that path. The same holds for `actor_max_restarts`. On a churning cluster set `resilience="spot"`, which raises both rather than leaving you to reason about the step.
+:::
 
 ### Restricted networks
 
@@ -100,7 +106,21 @@ The autoscale wait auto-enables when Batcher detects an autoscaling cluster, mea
 | `autoscale_wait_s` | `-1.0` (auto) | Seconds to wait for autoscaler-launched nodes before sizing the fan-out. `-1` resolves to a bounded wait on an autoscaling cluster and to `0`, meaning off, on a fixed one. `0` disables it even on an autoscaling cluster. A positive value caps the budget. |
 | `autoscale_poll_s` | `5.0` | Poll interval while waiting for capacity to arrive. |
 | `autoscale_stall_s` | `90.0` | Grace window. Give up the wait once capacity has been flat this long, which happens on a fixed cluster or when spot capacity can't be had, so the wait never blocks the whole budget on nodes that won't arrive. Any capacity gain resets it. Sized longer than a node's boot time. |
-| `max_shuffle_partitions` | `2048` | Cap on shuffle reducers, so the reducer count scales with the cluster but an all-to-all exchange stays bounded (not O(nodes²)) at thousands of nodes. `0` disables the cap. |
+| `map_partition_multiplier` | `4` | Ceiling on map partitions per worker, which is the shuffle's task granularity. Above 1 a straggler holds a fraction of a node's share of the input rather than all of it, and a lost worker's partitions are re-dealt across survivors. Bounded by the splits the source actually has, so a small input makes fewer partitions rather than empty tasks. `1` pins one partition per worker. |
+| `shuffle_partition_multiplier` | `4` | Ceiling on shuffle reducers per worker. Above the one-per-worker floor, more buckets lower each reducer's memory. They do not fix skew: a hash bucket is the unit a key can't be split below, which is what `skew_join_salt` is for. |
+| `max_shuffle_partitions` | `2048` | Cap on both counts above, so they scale with the cluster while an all-to-all exchange stays bounded (not O(nodes²)) at thousands of nodes. `0` disables the cap. |
+
+Both multipliers are ceilings rather than targets, and both are pure scheduling: the mergeable algebra makes any partitioning produce the same rows, so raising or lowering either changes cost and never the answer.
+
+### Where the fleet lands
+
+Placement decides which nodes hold the shuffle fleet. It never changes the answer, so it is a cost and latency knob.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `zone_aware_placement` | `True` | Reserve the fleet's placement-group bundles inside one availability zone when the cluster spans several and one of them can host the whole fleet. A shuffle sends nearly all its bytes worker to worker, and every cloud bills those bytes in both directions across a zone boundary; the bundles are interchangeable, so a fleet that fits in one zone is placed in one. A no-op on a single-zone cluster, on nodes with no zone label, and when no one zone has room. Set `False` when the zone spread is deliberate, bought for availability. |
+
+The zone is chosen by free capacity, not nameplate, so the pin never lands the fleet where a co-tenant has already filled the zone. And it is applied to the bundles rather than the tasks: a group that can't form is abandoned at `placement_timeout_s` and the stage falls back to ordinary scheduling, where a pin on the tasks themselves would leave them pending indefinitely.
 
 The worker fan-out itself isn't a `Config` field. Pass `num_workers=` to the terminal call, such as {py:meth}`ds.collect(num_workers=16) <batcher.Dataset.collect>`, to pin it and skip the wait. Leave it unset and Batcher auto-sizes to one worker per node on a multi-node cluster, or to all cores on a single node.
 
@@ -161,5 +181,5 @@ allowed to fetch this partition.
 ## See also
 
 - {doc}`options`: every other configuration section.
-- {doc}`/user-guide/scale/distributed`: running a pipeline on a cluster.
+- {doc}`/architecture/deep-dives/distribution/distributed-scheduling`: running a pipeline on a cluster.
 - {doc}`fault-tolerance`: what happens when nodes and devices fail underneath a job.

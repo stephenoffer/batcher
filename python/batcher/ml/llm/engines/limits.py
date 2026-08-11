@@ -29,17 +29,50 @@ __all__ = ["RateLimiter", "build_limiter"]
 _CHARS_PER_TOKEN = 4.0
 
 
-def _estimated_tokens(prompt: str, body: dict) -> int:
-    """Tokens one request is expected to spend — the prompt, plus the reply it asked for.
+#: Tokens charged for one image on a vision request. `requests._MAX_IMAGE_EDGE` bounds every
+#: image to 1024px on its longest edge before it is sent, and the providers price an image at
+#: roughly ``width * height / 750`` tokens, so ~1400 is the ceiling for one. A rate limiter
+#: should over-estimate rather than under: too high costs a slightly longer wait, too low costs
+#: the 429 the limiter exists to prevent.
+_TOKENS_PER_IMAGE = 1400
 
-    Both halves matter to a tokens-per-minute quota: providers count input and output
-    together, and a request with `max_tokens=4096` reserves far more of the quota than its
-    prompt suggests. The estimate is deliberately coarse (see `_CHARS_PER_TOKEN`); an error
-    here costs a slightly wrong wait, not a wrong result.
+
+def _estimated_tokens(prompt: str, body: dict) -> int:
+    """Tokens one request is expected to spend — the prompt, its images, and the reply.
+
+    All three matter to a tokens-per-minute quota: providers count input and output together,
+    a request with `max_tokens=4096` reserves far more of the quota than its prompt suggests,
+    and **an image is most of a vision request's input**. Counting only the text under-charged
+    a vision batch by ~1400 tokens a row, so the limiter let it run far over quota and the 429
+    it exists to prevent arrived anyway.
+
+    The estimate is deliberately coarse (see `_CHARS_PER_TOKEN`); an error here costs a
+    slightly wrong wait, not a wrong result.
     """
     reply = body.get("max_tokens")
     reserved = int(reply) if isinstance(reply, int | float) else 0
-    return int(len(prompt) / _CHARS_PER_TOKEN) + reserved
+    images = _image_blocks(body) * _TOKENS_PER_IMAGE
+    return int(len(prompt) / _CHARS_PER_TOKEN) + reserved + images
+
+
+def _image_blocks(body: dict) -> int:
+    """How many image blocks a request body carries, across both engines' wire shapes.
+
+    Anthropic spells one ``{"type": "image", ...}`` and OpenAI ``{"type": "image_url", ...}``,
+    so matching on the ``image`` prefix covers both without this module having to know which
+    engine built the body.
+    """
+    count = 0
+    for message in body.get("messages") or ():
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue  # a plain-string content is text-only
+        count += sum(
+            1
+            for block in content
+            if isinstance(block, dict) and str(block.get("type", "")).startswith("image")
+        )
+    return count
 
 
 class RateLimiter:

@@ -55,7 +55,7 @@ def _accepts(monkeypatch, provenance: Provenance, node) -> bool:
     """Whether the predicate would stage a breaker estimated with `provenance`."""
     import batcher.api.adaptive.gating as gating
 
-    monkeypatch.setattr(gating, "_build_estimator", lambda srcs, hub: _Estimator(provenance))
+    monkeypatch.setattr(gating, "build_estimator", lambda srcs, hub: _Estimator(provenance))
     return _worth_staging([], None)(node)
 
 
@@ -103,7 +103,7 @@ def test_an_estimator_that_raises_still_stages(monkeypatch, plan_node):
     def _boom(srcs, hub):
         raise RuntimeError("estimator unavailable")
 
-    monkeypatch.setattr(gating, "_build_estimator", _boom)
+    monkeypatch.setattr(gating, "build_estimator", _boom)
     assert _worth_staging([], None)(plan_node), (
         "an unreadable estimate must fall back to staging, not to skipping"
     )

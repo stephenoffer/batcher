@@ -15,6 +15,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher.io.source.base import Source
 from batcher.io.splits import Split
 from batcher.plan.source_stats import SourceStatistics
@@ -26,6 +27,8 @@ __all__ = [
     "plan_splits",
     "read_source",
     "source_statistics",
+    "watermark_partition_columns",
+    "watermark_partitions",
 ]
 
 
@@ -140,6 +143,60 @@ def continues_across_passes(source: Source) -> bool:
         True when re-opening the source continues the stream.
     """
     return getattr(source, "continues_across_passes", False)
+
+
+def watermark_partition_columns(source: Source) -> tuple[str, ...]:
+    """The columns of `source`'s batches that say which partition a row arrived from.
+
+    An event-time watermark over a partitioned stream is the *minimum* over per-partition
+    maxima, and computing that minimum needs each row attributed to a partition. A broker
+    already carries the attribution in its batches (``topic`` and ``partition``), so this
+    names those columns rather than inventing a side channel; a source that declares none
+    is treated as a single partition, where a minimum and a maximum agree.
+
+    Read via `getattr` so any duck-typed source is unpartitioned unless it opts in.
+
+    Args:
+        source: The source to ask.
+
+    Returns:
+        The partition-identifying column names, empty when the source has none.
+    """
+    return tuple(getattr(source, "watermark_partition_columns", ()) or ())
+
+
+def watermark_partitions(source: Source) -> tuple[tuple[object, ...], ...]:
+    """The partitions `source` expects to read from, before any of them has delivered.
+
+    "Which partitions exist" and "which partitions have sent me something" differ exactly
+    at startup, and that difference is a watermark bug: a minimum over the partitions seen
+    so far is a minimum over partition 0 alone while partition 1 is still connecting, which
+    over-claims event time and drops partition 1's first rows as late. A source that can
+    enumerate its partitions up front closes that window.
+
+    Best-effort by design. Discovery talks to a broker, and a broker that will not answer
+    must not prevent the query from starting — the tracker then simply learns its partitions
+    as they deliver, which is the behavior of a source that cannot enumerate at all.
+
+    Args:
+        source: The source to ask.
+
+    Returns:
+        One tuple of partition-column values per expected partition, empty when the source
+        cannot enumerate them.
+    """
+    discover = getattr(source, "watermark_partitions", None)
+    if discover is None:
+        return ()
+    try:
+        return tuple(tuple(p) for p in discover())
+    except Exception as exc:
+        # An unreachable broker degrades this to "learn partitions as they arrive", which is
+        # exactly the contract for a source that never had the method. Failing the query over
+        # an optional startup optimization would be the worse answer — but the degradation is
+        # the startup window this exists to close, so it is on the record rather than silent.
+        note_suppressed("io", "enumerate the source's watermark partitions", exc)
+        return ()
 
 
 def iter_source(

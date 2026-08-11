@@ -19,6 +19,7 @@ from batcher.dist.adaptive_sizing.sizing import (
     record_actor_pool_reuse,
     record_aggregate_cardinality,
     record_partition_rows,
+    row_shuffle_reducer_count,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "record_actor_pool_reuse",
     "record_aggregate_cardinality",
     "record_partition_rows",
+    "row_shuffle_reducer_count",
 ]

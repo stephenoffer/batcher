@@ -16,8 +16,8 @@ import batcher as bt
 from batcher.api.dataset.frame import Dataset
 from batcher.carbonite.spill.store import TieredSpillStore
 from batcher.dist import spill_breakers as br
+from batcher.dist.global_window import stream_spilling_global_window
 from batcher.dist.spill import execute_spilling_aggregate, spill_collect
-from batcher.dist.window_stream import stream_spilling_global_window
 from batcher.plan.logical import Scan
 from batcher.plan.schema import SchemaRef
 
@@ -134,15 +134,12 @@ def counting_store(monkeypatch):
         made.append(store)
         return store
 
-    import batcher.dist.spill as spill_mod
-    import batcher.dist.spill_breakers.join as join_mod
-    import batcher.dist.spill_breakers.sort as sort_mod
-    import batcher.dist.spill_breakers.window as window_mod
-    import batcher.dist.window_stream as global_window_mod
+    import batcher.dist.spill.buckets as buckets_mod
 
-    # Every module imported `_make_store` by name, so each binding has to be replaced.
-    for module in (spill_mod, sort_mod, window_mod, join_mod, global_window_mod):
-        monkeypatch.setattr(module, "_make_store", factory, raising=False)
+    # One binding, because there is now one caller: every breaker takes its store from
+    # `buckets.spill_scratch`. Each of the five used to build its own, so this fixture had to
+    # patch `_make_store` in five modules and stay in step with the list.
+    monkeypatch.setattr(buckets_mod, "_make_store", factory)
     return made
 
 

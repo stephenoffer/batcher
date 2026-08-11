@@ -1,6 +1,6 @@
 # Pulsar
 
-`bt.read.pulsar(topic)` consumes an Apache Pulsar topic as an unbounded `Dataset`, via
+{py:meth}`bt.read.pulsar(topic) <batcher.api.io_namespace.reader.Reader.pulsar>` consumes an Apache Pulsar topic as an unbounded {py:class}`Dataset <batcher.Dataset>`, via
 `pulsar-client`. Read only. Batcher has no Pulsar sink.
 
 | | |
@@ -49,7 +49,7 @@ is monotonic within a ledger. It is not something you can hand back to a Pulsar 
 is not comparable across ledgers.
 
 `timestamp` is the publish time in milliseconds, not the event time. If your payload carries
-an event time, extract it and use *that* for `with_watermark` and windowing.
+an event time, extract it and use *that* for {py:meth}`with_watermark <batcher.Dataset.with_watermark>` and windowing.
 :::
 
 ## `num_partitions` is a claim, not a lookup
@@ -67,7 +67,7 @@ on subscribe.
 
 ## How it parallelizes
 
-A `Source` divides into `Split`s, and each split is a unit of read parallelism. Pulsar's split
+A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>`s, and each split is a unit of read parallelism. Pulsar's split
 is the partition: split *n* subscribes to the physical topic `<topic>-partition-<n>`, so a
 worker reads exactly one partition. A non-partitioned topic is one split, and reads on one
 worker. That is the same rule Kafka has, expressed through Pulsar's partitioned-topic naming.
@@ -156,8 +156,8 @@ q.await_termination()
 ```
 
 The checkpoint directory is SQLite plus Arrow IPC on a real filesystem, not an object-store
-path. `collect()` on an unbounded source raises `PlanError`; use `iter_batches()`, a triggered
-write, or `bt.Trigger.available_now()` to drain the backlog that has already arrived and stop.
+path. {py:meth}`collect() <batcher.Dataset.collect>` on an unbounded source raises {py:exc}`PlanError <batcher.PlanError>`; use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a triggered
+write, or {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>` to drain the backlog that has already arrived and stop.
 
 ## Failure modes worth knowing
 

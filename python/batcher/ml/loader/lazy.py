@@ -313,7 +313,8 @@ def _round_robin_split(
     by repeating batches from the front of the round, per `drop_last` — either way every rank
     yields an equal count. A producer error surfaces to every consumer."""
     import queue
-    import threading
+
+    from batcher._internal.concurrency import start_context_thread
 
     queues: list[queue.Queue] = [queue.Queue(maxsize=queue_depth) for _ in range(world_size)]
     state: dict = {"error": None}
@@ -339,7 +340,10 @@ def _round_robin_split(
             for q in queues:
                 q.put(done)
 
-    threading.Thread(target=_producer, daemon=True).start()
+    # The producer runs a Batcher pipeline (`iter_torch_batches`), so it has to see the same
+    # `Config` the caller does. A bare thread reads every context variable at its default,
+    # which silently dropped a `config_context` around the loader.
+    start_context_thread(_producer, name="batcher-loader-producer", daemon=True)
 
     def _rank_iter(q: queue.Queue) -> Any:
         while True:

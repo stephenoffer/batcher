@@ -1,7 +1,7 @@
 # Encoding and imputation
 
 This page covers turning non-numeric columns into numeric ones, filling the gaps, and
-bucketing continuous values: the encoders, `SimpleImputer`, and `KBinsDiscretizer`.
+bucketing continuous values: the encoders, {py:class}`SimpleImputer <batcher.ml.preprocessors.SimpleImputer>`, and {py:class}`KBinsDiscretizer <batcher.ml.preprocessors.KBinsDiscretizer>`.
 
 A model needs numbers. Which encoder you want depends on the column's cardinality and
 whether the categories have an order.
@@ -12,8 +12,8 @@ Categorical encoders learn the category set in `fit` with one `distinct` over th
 and lower `transform` to a `CASE` expression or a set of indicator columns. No per-row
 Python runs anywhere in the path.
 
-`OrdinalEncoder` replaces each categorical column with an integer code in sorted
-category order. `LabelEncoder` is the one-column variant for a target label.
+{py:class}`OrdinalEncoder <batcher.ml.preprocessors.OrdinalEncoder>` replaces each categorical column with an integer code in sorted
+category order. {py:class}`LabelEncoder <batcher.ml.preprocessors.LabelEncoder>` is the one-column variant for a target label.
 
 ```python
 import batcher as bt
@@ -27,7 +27,7 @@ print(LabelEncoder("city").fit_transform(ds).collect().column("city").to_pylist(
 # [1, 2, 1, 0]
 ```
 
-`OneHotEncoder` drops each categorical column and adds one `{column}_{category}` 0/1
+{py:class}`OneHotEncoder <batcher.ml.preprocessors.OneHotEncoder>` drops each categorical column and adds one `{column}_{category}` 0/1
 indicator per category, following the scikit-learn naming convention. Pass
 `drop_first=True` for dummy encoding, which omits the first category to avoid
 collinearity.
@@ -44,7 +44,7 @@ print(encoded.to_pydict())
 # {'id': [1, 2, 3], 'color_green': [0, 1, 0], 'color_red': [1, 0, 1]}
 ```
 
-`MultiHotEncoder` is the multi-label counterpart for a **list** column holding a tag set
+{py:class}`MultiHotEncoder <batcher.ml.preprocessors.MultiHotEncoder>` is the multi-label counterpart for a **list** column holding a tag set
 per row. `fit` learns the distinct elements across all the lists, and `transform` emits
 one indicator column per element, 1 where that element appears in the row's list. The
 list column is kept alongside the indicators. Pass `categories=[...]` to fix the
@@ -62,11 +62,11 @@ print(encoded.column("tags_news").to_pylist())
 # [1, 1, 0]
 ```
 
-`TargetEncoder` is the encoder for **high-cardinality** categoricals such as user IDs,
+{py:class}`TargetEncoder <batcher.ml.preprocessors.TargetEncoder>` is the encoder for **high-cardinality** categoricals such as user IDs,
 ZIP codes, and product SKUs, where one-hot would explode the width. It replaces each
 category with a smoothed mean of a target column. That is the standard encoding for
 gradient-boosted and linear tabular models, matching scikit-learn's `TargetEncoder`,
-cuML, and `category_encoders`. `fit` is one mergeable `group_by(col).agg(count, sum)` per
+cuML, and `category_encoders`. `fit` is one mergeable {py:meth}`group_by(col).agg(count, sum) <batcher.Dataset.group_by>` per
 column, so it scales to millions of categories across a cluster. The m-estimate smoothing
 pulls rare categories toward the global mean, and unseen-at-fit categories map to that
 prior. So **fit on the training split only**, or the target leaks into the features.
@@ -93,7 +93,7 @@ cardinality the plan can express. Real categorical columns break that cap consta
 path, a product SKU, a user agent, a postcode. Three strategies handle it, in increasing
 order of the cardinality they tolerate.
 
-`FrequencyEncoder` replaces each category with how often it occurs. One numeric column, and
+{py:class}`FrequencyEncoder <batcher.ml.preprocessors.FrequencyEncoder>` replaces each category with how often it occurs. One numeric column, and
 it often carries real signal, because a rare value behaves differently from a common one. An unseen
 category encodes as 0, which is the correct answer.
 
@@ -104,7 +104,7 @@ ds = bt.from_pydict({"agent": ["chrome", "chrome", "chrome", "curl"]})
 print(FrequencyEncoder("agent").fit_transform(ds).to_pydict())
 ```
 
-`RareCategoryEncoder` keeps the categories worth keeping and collapses the tail into one
+{py:class}`RareCategoryEncoder <batcher.ml.preprocessors.RareCategoryEncoder>` keeps the categories worth keeping and collapses the tail into one
 bucket. This is the step that makes a one-hot encoding possible on a long-tailed column, and
 it also fixes the serving-time unknown-category problem, because the bucket already exists.
 
@@ -116,12 +116,12 @@ encoder = RareCategoryEncoder("c", min_frequency=0.05).fit(ds)
 print(encoder.transform(bt.from_pydict({"c": ["never_seen"]})).to_pydict())
 ```
 
-`HashingEncoder` hashes into a fixed number of buckets. Unbounded cardinality, no fitted
+{py:class}`HashingEncoder <batcher.ml.preprocessors.HashingEncoder>` hashes into a fixed number of buckets. Unbounded cardinality, no fitted
 state at all, and therefore no train/serve skew, at the cost of collisions, which a tree
 model tolerates better than most people expect. It uses the engine's stable `xxhash64`
-rather than Python's `hash()`, which varies per process and would be a silent skew.
+rather than Python's {py:meth}`hash() <batcher.plan.expr_ir.core.Expr.hash>`, which varies per process and would be a silent skew.
 
-`BinaryEncoder` is the middle ground between `OneHotEncoder` and `HashingEncoder` when a column has many categories but not unboundedly many: it assigns each category an integer and writes it in base 2, so 100 categories cost 7 bit columns rather than 100 one-hot columns, with no collisions. An unseen category encodes as all-zero bits.
+{py:class}`BinaryEncoder <batcher.ml.preprocessors.BinaryEncoder>` is the middle ground between `OneHotEncoder` and `HashingEncoder` when a column has many categories but not unboundedly many: it assigns each category an integer and writes it in base 2, so 100 categories cost 7 bit columns rather than 100 one-hot columns, with no collisions. An unseen category encodes as all-zero bits.
 
 ## Choosing how much to trust a category
 
@@ -174,7 +174,7 @@ like every other encoder here. An unseen category, and a null, take the global m
 
 ## Weight-of-evidence encoding
 
-`TargetEncoder` replaces a category with the target's mean; `WOEEncoder` replaces it with the
+`TargetEncoder` replaces a category with the target's mean; {py:class}`WOEEncoder <batcher.ml.preprocessors.WOEEncoder>` replaces it with the
 log-odds of the target relative to the overall odds. That is the transform a regulated credit
 scorecard is built on, because WOE is additive in the log-odds space a logistic regression
 works in. A WOE-encoded feature enters a linear model as a straight, interpretable
@@ -266,7 +266,7 @@ print(binned.column("x").to_pylist())
 # [0, 1, 1, 1, 2, 3, 3, 3]
 ```
 
-When the edges are known up front rather than learned from the data, `bt.cut` is the pure expression for the job. It needs no `fit`, takes explicit break points, and returns the integer bin index or a label per bucket, so it composes anywhere an expression does and runs in one streaming pass.
+When the edges are known up front rather than learned from the data, {py:func}`bt.cut <batcher.cut>` is the pure expression for the job. It needs no `fit`, takes explicit break points, and returns the integer bin index or a label per bucket, so it composes anywhere an expression does and runs in one streaming pass.
 
 ```python
 ds = bt.from_pydict({"age": [5, 18, 40, 70]})

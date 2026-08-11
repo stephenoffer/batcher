@@ -4,7 +4,7 @@ This page covers the analysis surface around a model rather than the model itsel
 
 ## Statistical expressions
 
-The single-pass statistics are `Expr`, so they belong inside `agg()` and compose with `group_by` exactly as the metrics do:
+The single-pass statistics are {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, so they belong inside `agg()` and compose with `group_by` exactly as the metrics do:
 
 ```python
 import batcher as bt
@@ -21,19 +21,19 @@ The mean and the standard deviation are the wrong summary for most real columns,
 |---|---|
 | `midhinge` | The midpoint of the middle half, ignoring the outer quartiles entirely. |
 | `trimean` | Tukey's robust location estimate, weighting the median twice. |
-| `quartile_dispersion` | Unitless spread in `[0, 1]`, comparable across columns. |
-| `robust_cv` | Interquartile range over the median: the outlier-proof coefficient of variation. |
-| `interdecile_range` | The span containing the middle 80% of values. |
-| `decile_ratio` | P90 over P10, the classic inequality ratio. |
+| {py:func}`quartile_dispersion <batcher.quartile_dispersion>` | Unitless spread in `[0, 1]`, comparable across columns. |
+| {py:func}`robust_cv <batcher.robust_cv>` | Interquartile range over the median: the outlier-proof coefficient of variation. |
+| {py:func}`interdecile_range <batcher.interdecile_range>` | The span containing the middle 80% of values. |
+| {py:func}`decile_ratio <batcher.decile_ratio>` | P90 over P10, the classic inequality ratio. |
 
-A second family expresses spread *relative to level*, so the number is unitless and comparable across columns on different scales. `bt.index_of_dispersion` is the variance-to-mean ratio (the Fano factor, exactly 1 for a Poisson process), `bt.signal_to_noise` is the mean over the standard deviation (the reciprocal of the coefficient of variation), `bt.studentized_range` is the range in standard deviations (a quick outlier smell), and `bt.relative_range` is the range over the mean. Each is a single aggregate over the existing moment primitives:
+A second family expresses spread *relative to level*, so the number is unitless and comparable across columns on different scales. {py:func}`bt.index_of_dispersion <batcher.index_of_dispersion>` is the variance-to-mean ratio (the Fano factor, exactly 1 for a Poisson process), {py:func}`bt.signal_to_noise <batcher.signal_to_noise>` is the mean over the standard deviation (the reciprocal of the coefficient of variation), {py:func}`bt.studentized_range <batcher.studentized_range>` is the range in standard deviations (a quick outlier smell), and {py:func}`bt.relative_range <batcher.relative_range>` is the range over the mean. Each is a single aggregate over the existing moment primitives:
 
 ```python
 ds = bt.from_pydict({"counts": [8.0, 12.0, 9.0, 11.0, 10.0]})
 print(ds.agg(fano=bt.index_of_dispersion("counts"), snr=bt.signal_to_noise("counts")).to_pydict())
 ```
 
-`bt.geometric_std` is the multiplicative standard deviation for a strictly positive, log-normal column that spans orders of magnitude: a value of 2 means a typical observation is within a factor of 2 of the geometric mean, which describes scatter on a log scale honestly where an ordinary standard deviation is dominated by the largest values.
+{py:func}`bt.geometric_std <batcher.geometric_std>` is the multiplicative standard deviation for a strictly positive, log-normal column that spans orders of magnitude: a value of 2 means a typical observation is within a factor of 2 of the geometric mean, which describes scatter on a log scale honestly where an ordinary standard deviation is dominated by the largest values.
 
 ### Distribution shape
 
@@ -44,13 +44,13 @@ ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 100.0]})
 print(ds.agg(skew=bt.bowley_skew("x"), normality=bt.jarque_bera("x")).to_pydict())
 ```
 
-`bowley_skew` and `moors_kurtosis` are the quantile-based versions, which stay meaningful on a column whose fourth moment does not exist. That covers most real latency, revenue, and file-size columns. `jarque_bera` combines skew and kurtosis into the standard normality statistic, useful as a screen over hundreds of features.
+{py:func}`bowley_skew <batcher.bowley_skew>` and {py:func}`moors_kurtosis <batcher.moors_kurtosis>` are the quantile-based versions, which stay meaningful on a column whose fourth moment does not exist. That covers most real latency, revenue, and file-size columns. {py:func}`jarque_bera <batcher.jarque_bera>` combines skew and kurtosis into the standard normality statistic, useful as a screen over hundreds of features.
 
 ### Weighted statistics
 
 Survey weights, recency decay, and per-group sizes all give some rows more influence than others,
-and the plain mean and variance are wrong once they do. `bt.weighted_mean`, `bt.weighted_var`, `bt.weighted_std`,
-`bt.weighted_covariance`, and `bt.weighted_correlation` are the frequency-weighted forms, each
+and the plain mean and variance are wrong once they do. {py:func}`bt.weighted_mean <batcher.weighted_mean>`, {py:func}`bt.weighted_var <batcher.weighted_var>`, {py:func}`bt.weighted_std <batcher.weighted_std>`,
+{py:func}`bt.weighted_covariance <batcher.weighted_covariance>`, and {py:func}`bt.weighted_correlation <batcher.weighted_correlation>` are the frequency-weighted forms, each
 a single aggregate matching `numpy.average`:
 
 ```python
@@ -76,9 +76,9 @@ print(
 )
 ```
 
-`welch_t_statistic` is the unequal-variance test, which is the one to use by default. `cohens_d` and `hedges_g` give the effect *size*, which is what distinguishes a real effect from a merely detectable one. At a large enough row count every difference is "significant".
+{py:func}`welch_t_statistic <batcher.welch_t_statistic>` is the unequal-variance test, which is the one to use by default. {py:func}`cohens_d <batcher.cohens_d>` and {py:func}`hedges_g <batcher.hedges_g>` give the effect *size*, which is what distinguishes a real effect from a merely detectable one. At a large enough row count every difference is "significant".
 
-`proportion_z_statistic` is the conversion-rate equivalent, and `mean_ci_half_width` / `proportion_ci_half_width` give the error bar. `group_mean` is the building block all of them share: the mean of a column over the rows a boolean expression selects. Reach for it directly whenever you want one arm's average without running a second query.
+{py:func}`proportion_z_statistic <batcher.proportion_z_statistic>` is the conversion-rate equivalent, and {py:func}`mean_ci_half_width <batcher.mean_ci_half_width>` / {py:func}`proportion_ci_half_width <batcher.proportion_ci_half_width>` give the error bar. {py:func}`group_mean <batcher.group_mean>` is the building block all of them share: the mean of a column over the rows a boolean expression selects. Reach for it directly whenever you want one arm's average without running a second query.
 
 ### Screening features against a target
 
@@ -97,9 +97,9 @@ print(
 )
 ```
 
-`point_biserial` is Pearson's correlation with a boolean coded 0/1, so a numeric feature and a boolean one rank on the same `[-1, 1]` axis. `signal_ratio` asks only whether the feature *separates* the two classes, in standard deviations, so it survives a relationship that reverses direction and a correlation would miss.
+{py:func}`point_biserial <batcher.point_biserial>` is Pearson's correlation with a boolean coded 0/1, so a numeric feature and a boolean one rank on the same `[-1, 1]` axis. {py:func}`signal_ratio <batcher.signal_ratio>` asks only whether the feature *separates* the two classes, in standard deviations, so it survives a relationship that reverses direction and a correlation would miss.
 
-`correlation_ratio` is the categorical-feature version: the share of a numeric column's variance that sits *between* groups rather than within them. It takes the per-row group mean, which is what keeps it a single aggregate:
+{py:func}`correlation_ratio <batcher.correlation_ratio>` is the categorical-feature version: the share of a numeric column's variance that sits *between* groups rather than within them. It takes the per-row group mean, which is what keeps it a single aggregate:
 
 ```python
 ds = bt.from_pydict({"spend": [1.0, 2.0, 10.0, 11.0], "plan": ["free", "free", "pro", "pro"]})
@@ -107,7 +107,7 @@ with_means = ds.with_columns(m=bt.mean(bt.col("spend")).over(partition_by=["plan
 print(round(with_means.agg(eta=bt.correlation_ratio("spend", "m")).to_pydict()["eta"][0], 4))
 ```
 
-`pearson_mode_skew` reads directly as "how many standard deviations the average sits above the most common value", which is the sentence a non-statistician understands. Reach for it when the audience for a data-quality report is not the modelling team.
+{py:func}`pearson_mode_skew <batcher.pearson_mode_skew>` reads directly as "how many standard deviations the average sits above the most common value", which is the sentence a non-statistician understands. Reach for it when the audience for a data-quality report is not the modelling team.
 
 ```{note}
 These expressions return a statistic, not a p-value. To turn one into a decision, use the matching test in `batcher.ml.stats` (the hypothesis tests described later on this page), which pairs the statistic with a dependency-free p-value on the driver. That p-value is arithmetic on the one aggregated number, not a second pass over the data.
@@ -115,7 +115,7 @@ These expressions return a statistic, not a p-value. To turn one into a decision
 
 ### Statistics that need a second pass
 
-A rank correlation needs an ordering and a trimmed mean needs the quantiles before it can filter on them, so these are functions over a `Dataset` rather than expressions. They are still entirely relational, built from a window, a `group_by`, or a second aggregate, so nothing materializes on the driver:
+A rank correlation needs an ordering and a trimmed mean needs the quantiles before it can filter on them, so these are functions over a {py:class}`Dataset <batcher.Dataset>` rather than expressions. They are still entirely relational, built from a window, a {py:meth}`group_by <batcher.Dataset.group_by>`, or a second aggregate, so nothing materializes on the driver:
 
 ```python
 from batcher.ml.stats import cramers_v, entropy, mutual_information, spearman_corr
@@ -137,7 +137,7 @@ Where `cramers_v` is symmetric, `theils_u` is directional: it reports the fracti
 
 ## Profiling features before modeling
 
-`Dataset.profile` answers the data-quality question of how much is present and how many distinct
+{py:meth}`Dataset.profile <batcher.Dataset.profile>` answers the data-quality question of how much is present and how many distinct
 values there are. `feature_profile` answers the modeling one in the same single pass, and names the
 transform each column is asking for:
 
@@ -218,7 +218,7 @@ flagged = flag_outliers(ds, "latency", method="iqr")   # a boolean flag column, 
 ```
 
 `flag_outliers` marks them (the decision to keep or drop is yours), `count_outliers` tallies
-them, and `OutlierClipper` clamps them as a fitted preprocessor that applies the *training*
+them, and {py:class}`OutlierClipper <batcher.ml.outliers.OutlierClipper>` clamps them as a fitted preprocessor that applies the *training*
 bounds to serving data. `outlier_bounds` returns the raw cut points.
 
 Those rules are univariate, judging one column at a time. `mahalanobis_distance` is the multivariate score for a row that looks ordinary on every column but is an outlier in the *joint* distribution, measuring distance from the center in units that account for the columns' correlations. Its square is chi-squared with one degree of freedom per column, which is how you turn it into a threshold.
@@ -305,7 +305,7 @@ print(class_counts(oversample(ds, "y"), "y"))     # exactly balanced by duplicat
 
 `undersample` discards majority rows; `oversample` duplicates minority rows deterministically;
 `balanced_sample` moves every class to the median count. When the model supports it, prefer
-`class_weights` (a `{class: weight}` dict for the model's ``class_weight``) or `sample_weights`
+{py:meth}`class_weights <batcher.Dataset.class_weights>` (a `{class: weight}` dict for the model's ``class_weight``) or `sample_weights`
 (a per-row weight column). Both rebalance the *loss* without discarding or duplicating a
 single row. `class_counts` is the first thing to look at.
 
@@ -406,11 +406,11 @@ ensemble needs), and `learning_curve` scores against training-set size to answer
 data would help. Each takes a `fit` and a `predict` callable, so any scikit-learn-style model
 composes.
 
-`batcher.ml.splitting.fold_column` is the primitive underneath. Reach for it when the split should outlive the pipeline that created it: it writes one column that every downstream job can filter on without re-deriving the assignment.
+{py:func}`batcher.ml.splitting.fold_column <batcher.ml.splitting.fold_column>` is the primitive underneath. Reach for it when the split should outlive the pipeline that created it: it writes one column that every downstream job can filter on without re-deriving the assignment.
 
 ## Hypothesis tests
 
-A test statistic says how large an effect is; the p-value says how surprising it is under the null hypothesis, and the p-value is what you act on. `batcher.ml.stats` pairs each statistic with its p-value in one pass and returns a `TestResult` carrying the statistic, its degrees of freedom, and the p-value.
+A test statistic says how large an effect is; the p-value says how surprising it is under the null hypothesis, and the p-value is what you act on. `batcher.ml.stats` pairs each statistic with its p-value in one pass and returns a {py:class}`TestResult <batcher.ml.stats.TestResult>` carrying the statistic, its degrees of freedom, and the p-value.
 
 Use `t_test_1samp` to check a column's mean against a target, `t_test_ind` for Welch's two-sample test of two groups, `anova_test` to extend that to several groups, `chi_square_test` for the independence of two categorical columns, and `normality_test` (Jarque-Bera) to screen a column before assuming it is Gaussian. `pearson_test` and `spearman_test` add a p-value to a linear or monotone correlation, `proportion_ztest` checks a success rate against a target (with `binomial_test` the exact small-sample version), and `mcnemar_test` compares two classifiers' error rates on the same rows. `mcnemar_test` is the paired test to reach for when deciding whether one model genuinely beats another.
 

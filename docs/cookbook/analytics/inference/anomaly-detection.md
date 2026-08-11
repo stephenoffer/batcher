@@ -47,7 +47,7 @@ scrapes over that line by seven milliseconds, so a 400ms spike would sail straig
 Meanwhile host `b`, whose normal is 50ms, would have to reach 403ms (eight times its own
 baseline) before anyone heard about it.
 
-Compute the baseline per host. That is a `group_by` and a join back:
+Compute the baseline per host. That is a {py:meth}`group_by <batcher.Dataset.group_by>` and a join back:
 
 ```python
 baseline = metrics.group_by("host").agg(mu=col("latency").mean(), sd=col("latency").std())
@@ -174,7 +174,7 @@ print(robust.filter(col("score").abs() > 3.5).select("host", "minute", "latency"
 :::{dropdown} Two caveats before you ship this
 MAD can be zero. If more than half a host's readings are identical (a counter pinned at 0, a
 rounded gauge) then the MAD is 0 and every score is a division by zero. Guard it with
-`bt.when(col("mad") > 0).then(...).otherwise(bt.lit(0.0))`, or fall back to an interquartile
+{py:func}`bt.when(col("mad") > 0).then(...).otherwise(bt.lit(0.0)) <batcher.when>`, or fall back to an interquartile
 range: `col("latency").quantile(0.75) - col("latency").quantile(0.25)`.
 
 A whole-history baseline is also not a baseline. Comparing today's latency to the median of

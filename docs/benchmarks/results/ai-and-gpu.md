@@ -21,7 +21,7 @@ Each row is a distinct model and modality, run out of the box with no per-worklo
 | Video-clip inference | ResNet-18 per frame, 16-frame clips | **2,074.8 clip/s** |
 | LLM batch inference | HF gpt2, FP16, greedy decode | **814.8 prompt/s** |
 | Image generation | diffusers ddpm-cifar10, 20 DDIM steps | **169.1 img/s** |
-| Training-data ingest | `iter_torch_batches`, zero-copy DLPack | **1.06 M rows/s** |
+| Training-data ingest | {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`, zero-copy DLPack | **1.06 M rows/s** |
 
 On every family where device utilization was sampled, the GPU holds at or above the 80% target:
 
@@ -61,7 +61,7 @@ A single maximally large, compute-bound job runs at the hardware ceiling: one T4
 
 ## Zero configuration
 
-The simplest possible call, `ds.map_batches(Model, num_gpus=1)` with no `batch_size`, runs at 2,451 img/s and 82% utilization. That is within 2% of the hand-tuned `batch_size=128` path, with no knobs. Batcher picks a VRAM-safe default, streams it with stage overlap, and halves the batch on a CUDA OOM.
+The simplest possible call, {py:meth}`ds.map_batches(Model, num_gpus=1) <batcher.Dataset.map_batches>` with no `batch_size`, runs at 2,451 img/s and 82% utilization. That is within 2% of the hand-tuned `batch_size=128` path, with no knobs. Batcher picks a VRAM-safe default, streams it with stage overlap, and halves the batch on a CUDA OOM.
 
 Byte-aware morselization is what makes the default safe on wide rows. A morsel splits at whichever bound trips first, count or bytes, so the 16-frame video clips above (about 0.6 MB per row) stream at 2,074.8 clip/s without a hand-picked batch size and without exhausting device memory.
 

@@ -15,19 +15,30 @@ import json
 import pyarrow as pa
 
 from batcher._internal.native import engine
+from batcher.carbonite.resilience import SourcePlacement
+from batcher.dist.adaptive_sizing import row_shuffle_reducer_count
 from batcher.dist.executor import _apply_above, _ensure_ray, _relabel_single_source
-from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
+from batcher.dist.executors.partition_io import (
+    empty_descriptor,
+    partition_descriptors,
+    source_pushdown,
+)
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     map_barrier,
+    map_partitions,
     shuffle_partitions,
+    skew_join_salt,
 )
+from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
 from batcher.dist.fleet import acquire_fleet, release_fleet
 from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
+from batcher.dist.flight_broadcast import broadcast_eligible, execute_broadcast_join_flight
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
+from batcher.dist.skew import join_skew_key, resolve_hot_keys, salting_preserves_result
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
@@ -46,6 +57,8 @@ def execute_join_flight(
     combine_partials: bool = False,
     materialize: bool = True,
     _fault_inject_map: set[int] | None = None,
+    hub=None,
+    metrics_out=None,
 ):
     """Co-partition both join sides over a Flight shuffle and join per bucket.
 
@@ -75,6 +88,21 @@ def execute_join_flight(
     barrier."""
     import ray
 
+    # A broadcast-marked join replicates its small build side and shuffles nothing — see
+    # `flight_broadcast`. Tried first and only for the join types where it yields the same
+    # relation; it returns None (build side empty or over the measured budget) to fall
+    # through to the co-partition shuffle below, which is always correct.
+    #
+    # `combine_partials` is not passed on: it distinguishes a reducer that may finalize its
+    # bucket from one that may not, and a broadcast join co-partitions nothing, so its
+    # aggregate is *always* a partial the driver closes. The flag has no counterpart here.
+    if broadcast_eligible(join):
+        out = execute_broadcast_join_flight(
+            above, join, sources, workers, fused_agg=fused_agg, materialize=materialize
+        )
+        if out is not None:
+            return out
+
     nat = engine()
     _ensure_ray(workers)
     cfg_json = engine_config_json()  # driver config → shipped to worker actors
@@ -94,13 +122,9 @@ def execute_join_flight(
     right_ir = json.dumps(right_plan.to_ir())
     join_ir = json.dumps(
         {
-            "op": "hash_join",
+            **join.shape_ir(),
             "left": {"op": "scan", "source_id": 0},
             "right": {"op": "scan", "source_id": 1},
-            "left_keys": list(join.left_keys),
-            "right_keys": list(join.right_keys),
-            "join_type": join.join_type,
-            "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in join.output],
         }
     )
     # A fused aggregate's group keys/aggregates (over the join output columns), shipped to
@@ -125,7 +149,12 @@ def execute_join_flight(
     # one we tear down. Every Flight operator must borrow it — spawning a second
     # placement group would contend with the fleet's held bundles and deadlock.
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
-    n_buckets = shuffle_partitions(workers)
+    # A join exchanges raw rows, so the bucket count is what bounds the build-side hash
+    # table a reducer holds at once. Sized by the exchanged volume (`row_shuffle_reducer_count`),
+    # never below the one-per-worker floor. `right_plan` was relabeled to read source 0, so the
+    # estimator is handed that one source — passing the whole list would size the build side
+    # from whichever table happens to be source 0.
+    n_buckets = row_shuffle_reducer_count(right_plan, shuffle_partitions(workers), sources, rsid)
     # Keep the join's output ON the workers only when it is a plain intermediate: nothing
     # to apply above it, and no fused aggregate (which already shrinks the bucket to a
     # partial before it leaves — a far smaller thing to hand back than the join itself).
@@ -142,12 +171,33 @@ def execute_join_flight(
         # agreed with the relabeled id, which is why only the right side paid for it.
         lproj, lpred = source_pushdown(left_plan, 0)
         rproj, rpred = source_pushdown(right_plan, 0)
+        # More map partitions than workers where the sources have splits to fill them, so a
+        # straggler holds a fraction of a node's share rather than all of it (see
+        # `map_partitions`). Both sides map through ONE barrier under a single source id, so
+        # the two lists have to be the same length — and each side's count is bounded by its
+        # own splits. Pad the shorter one with no-op partitions rather than re-planning the
+        # longer one's splits, which on a star-schema join is the expensive side.
+        ceiling = map_partitions(workers)
         lparts = partition_descriptors(
-            sources[lsid], workers, projection=lproj, predicate=lpred, worker_addrs=fleet_addrs
+            sources[lsid],
+            workers,
+            projection=lproj,
+            predicate=lpred,
+            worker_addrs=fleet_addrs,
+            max_partitions=ceiling,
         )
         rparts = partition_descriptors(
-            sources[rsid], workers, projection=rproj, predicate=rpred, worker_addrs=fleet_addrs
+            sources[rsid],
+            workers,
+            projection=rproj,
+            predicate=rpred,
+            worker_addrs=fleet_addrs,
+            max_partitions=ceiling,
         )
+        n_sources = max(len(lparts), len(rparts))
+        lparts += [empty_descriptor(sources[lsid], lproj) for _ in range(n_sources - len(lparts))]
+        rparts += [empty_descriptor(sources[rsid], rproj) for _ in range(n_sources - len(rparts))]
+        placement = SourcePlacement(workers)
 
         # Simulate worker loss BEFORE the map barrier (test hook).
         if _fault_inject_map:
@@ -167,13 +217,47 @@ def execute_join_flight(
                 (right_ir, list(join.right_keys), rparts[src]),
             )
 
+        # Skew-aware salting. A single hot join key sends `fraction x rows` to ONE reducer
+        # however wide the shuffle is, so the join does not merely stop scaling — it goes
+        # *backwards*. Measured on this path, 40M ⋈ 10M with 40% of the probe on one key
+        # (`benchmarks/BENCHMARK_RESULTS.md`): a uniform join of the same shape and size runs
+        # 3,712 -> 2,016 -> 1,657 ms across 2, 4 and 8 workers, while the skewed one runs
+        # 6,138 -> 3,332 -> **12,801** ms. Adding workers shrinks every reducer except the
+        # one that matters, and the widening fan-out is then pure overhead against it.
+        #
+        # Salting splits that key across sub-buckets (replicating its build rows to each),
+        # which is a pure scheduling change: `salting_preserves_result` states the three
+        # conditions, and `finalize` is the one that matters here — a reducer closing a fused
+        # aggregate is relying on co-partitioning that salting deliberately breaks.
+        finalize = not combine_partials
+        skew = None
+        if salting_preserves_result(join, reducer_finalizes=fused_agg is not None and finalize):
+            cfg_salt, frac = skew_join_salt()
+            hot, salt = resolve_hot_keys(
+                join,
+                sources,
+                join_skew_key(left_ir, right_ir, join),
+                frac,
+                n_buckets,
+                cfg_salt,
+                lambda: _detect_hot_keys_flight(
+                    actors,
+                    (left_ir, join.left_keys[0], lparts),
+                    (right_ir, join.right_keys[0], rparts),
+                    frac,
+                ),
+            )
+            skew = (hot, salt) if salt else None
+
         def _launch(host: int, src: int):
             left, right = _sides(src)
             return actors[host].map_publish_join.remote(
-                left, right, n_buckets, src, 0, current_plan_id(), stage_base
+                left, right, n_buckets, src, 0, current_plan_id(), stage_base, skew
             )
 
-        mapper_addrs, mapper_dead = map_barrier(workers, _launch)
+        mapper_addrs, mapper_dead = map_barrier(
+            n_sources, _launch, workers=workers, placement=placement
+        )
 
         # Placed HERE, as soon as the buckets exist and before anything can take a worker
         # away — replicating after a loss would be probing a corpse. A join's mapper
@@ -203,11 +287,13 @@ def execute_join_flight(
             workers,
             gk,
             aj,
-            finalize=not combine_partials,
+            finalize=finalize,
             dead=mapper_dead,
             publish=publish,
             replicas=replicas,
             stage_base=stage_base,
+            skew=skew,
+            placement=placement,
         )
         if publish:
             from batcher.dist.fleet import FlightMaterializedSource
@@ -223,6 +309,10 @@ def execute_join_flight(
             return FlightMaterializedSource(handles, schema, src_actors, src_pg)
         batches = out
     finally:
+        # Collect what the workers measured before anything below can kill them. Nothing
+        # subscribes to the event bus inside a Ray worker, so the measurements are pulled;
+        # this is the one point every exit path passes through with the actors still alive.
+        drain_worker_metrics(actors, hub, metrics_out)
         # A published result leaves its buckets ON the actors, so a fleet we own is handed
         # to the source rather than torn down here.
         if not keep_actors:
@@ -243,6 +333,54 @@ def execute_join_flight(
     else:
         table = empty_result_table(join, [o.alias for o in join.output])
     return table if not above else _apply_above(above, table)
+
+
+def _detect_hot_keys_flight(actors, left, right, fraction: float) -> tuple[list[str], float]:
+    """Detect the join key's hot values across BOTH sides, on the workers.
+
+    Each side's splits are scanned in place by the actor that owns them (Misra-Gries per
+    split), and the local counts are summed here; a value is hot when it clears `fraction`
+    of *that side's* total rows. Both sides are examined because either one can be the
+    skewed one, and a hot key on the build side overloads a reducer exactly as a hot probe
+    key does.
+
+    The Flight counterpart of the disk path's `_detect_hot_keys`, differing only in that
+    the splits are descriptors read by an actor rather than files read by a task — the data
+    is never pulled to the driver either way.
+
+    Args:
+        actors: The worker fleet.
+        left: `(sub_ir, key_name, partitions)` for the probe side.
+        right: `(sub_ir, key_name, partitions)` for the build side.
+        fraction: The share of a side's rows a value must hold to count as hot.
+
+    Returns:
+        `(hot_values, max_share)` — the values sorted, and the largest one's measured share
+        of its side, which is what sizes the salt fan-out (see `skew.resolve_hot_keys`).
+        `([], 0.0)` when neither side is skewed.
+    """
+    import ray
+
+    hot: set[str] = set()
+    peak = 0.0
+    for sub_ir, key_name, parts in (left, right):
+        refs = [
+            actors[i % len(actors)].heavy_hitters.remote(sub_ir, key_name, parts[i], fraction)
+            for i in range(len(parts))
+        ]
+        counts: dict[str, int] = {}
+        total = 0
+        for pairs, n in ray.get(refs):
+            total += n
+            for v, c in pairs:
+                counts[v] = counts.get(v, 0) + c
+        if not total:
+            continue
+        for v, c in counts.items():
+            if c >= fraction * total:
+                hot.add(v)
+                peak = max(peak, c / total)
+    return sorted(hot), peak
 
 
 def _empty_fused(fused_agg: Aggregate) -> pa.Table:
@@ -300,6 +438,8 @@ def _join_reduce_with_recovery(
     publish=False,
     replicas=None,
     stage_base=0,
+    skew=None,
+    placement=None,
 ):
     """Run the join reduce under recompute-on-worker-loss recovery.
 
@@ -313,6 +453,12 @@ def _join_reduce_with_recovery(
 
     `dead` seeds the workers the map barrier already lost, so no reducer is hosted on
     an actor that is gone.
+
+    `skew` is the `(hot_keys, salt_count)` the map barrier bucketed under, and it MUST be
+    carried here: a recompute republishes a lost source's buckets, and bucketing that
+    replacement plainly while its peers are salted would send the hot key's replacement
+    rows to a different reducer than the build rows they must meet — a silently short join
+    result, on the recovery path, which no test that never loses a worker would see.
     """
     import ray
 
@@ -374,6 +520,7 @@ def _join_reduce_with_recovery(
                 0,
                 current_plan_id(),
                 stage_base,
+                skew,
             )
         )
 
@@ -387,6 +534,7 @@ def _join_reduce_with_recovery(
         dead=dead,
         mapper_addrs=addrs,
         replicas=replicas,
+        placement=placement,
     )
     if publish:
         # One `(addr, ticket, rows, schema)` handle per non-empty bucket, still on its worker.

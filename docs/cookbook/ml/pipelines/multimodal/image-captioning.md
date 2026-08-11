@@ -7,7 +7,7 @@ single 404 that takes down a job five hours in.
 
 ## Fetch, decode, caption
 
-`ds.ml.download` fetches each URL's bytes into a column (`s3://`, `gs://`, `az://`,
+{py:meth}`ds.ml.download <batcher.api.dataset.ml.DatasetML.download>` fetches each URL's bytes into a column (`s3://`, `gs://`, `az://`,
 `http(s)://`, or a local path), fetching a batch's rows concurrently and parallelizing
 across workers.
 
@@ -130,9 +130,9 @@ default, so the fixed part of the instruction is encoded once rather than a mill
 ## Resize before the model, not inside it
 
 A 4000×3000 product photo is 36 MB decoded, and a batch of them will exhaust host memory
-before the GPU sees anything. `.image.resize(w, h)` decodes, resizes, and **re-encodes to
+before the GPU sees anything. {py:meth}`.image.resize(w, h) <batcher.plan.expr_ir.image._ImageNamespace.resize>` decodes, resizes, and **re-encodes to
 PNG bytes**, so the column stays a compact blob that is cheap to ship, spill, and shuffle.
-`.image.to_tensor(w, h)` is the other half of the pair: it produces a tensor column, which
+{py:meth}`.image.to_tensor(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` is the other half of the pair: it produces a tensor column, which
 is what you want when the next stage is a model that takes pixels directly.
 
 ```python
@@ -171,7 +171,7 @@ Two things to check when the GPU is idle anyway:
 
 :::{dropdown} Uploading the resized column back to object storage
 
-`ds.ml.upload` is the counterpart to `download`: it writes a bytes column back to object
+{py:meth}`ds.ml.upload <batcher.api.dataset.ml.DatasetML.upload>` is the counterpart to `download`: it writes a bytes column back to object
 storage and appends the written paths, with concurrent writes and a content hash for a name
 when you do not supply one.
 
@@ -192,7 +192,7 @@ written = (
 - {doc}`LLM inference </ml/retrieval/llm/index>`: vision engines, guided decoding, token accounting.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: decode expressions, tensor columns, blob offload.
 - {doc}`GPU scheduling </ml/inference/gpu>`: `num_gpus`, `concurrency`, and accelerator placement.
-- {doc}`ML API reference </api/models/ml>`: `ds.ml.download`, `ds.ml.upload`, `ds.ml.generate`.
+- {doc}`ML API reference </api/models/ml>`: {py:meth}`ds.ml.download <batcher.api.dataset.ml.DatasetML.download>`, {py:meth}`ds.ml.upload <batcher.api.dataset.ml.DatasetML.upload>`, {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`.
 - {doc}`Multimodal-ingest benchmarks </benchmarks/results/multimodal-ingest>` and
   {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the decode and overlap numbers
   quoted here.

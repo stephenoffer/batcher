@@ -137,7 +137,7 @@ def test_the_session_bounds_keep_the_event_time_columns_own_type(arrow_type, exp
     the right instant and no timezone, and a millisecond column came back in microseconds
     -- right values, wrong type, which is the shape of bug an order-independent value
     comparison cannot see and anything rendering a local time downstream reads as wrong."""
-    base = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc if arrow_type.tz else None)
+    base = dt.datetime(2024, 1, 1, tzinfo=dt.UTC if arrow_type.tz else None)
     table = pa.table(
         {
             "k": pa.array(["a", "a"], pa.string()),

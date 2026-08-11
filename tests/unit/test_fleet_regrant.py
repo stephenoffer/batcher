@@ -131,8 +131,43 @@ def test_acquire_respawns_a_fleet_too_narrow_to_re_grant(monkeypatch, _no_ray):
     assert len(got.actors) == 8
 
 
+def test_a_staged_query_widens_the_fleet_it_leases_itself(monkeypatch):
+    """A query's own query-scope lease must not veto the resize it is held across.
+
+    Runs against the real `ray` module (unlike the tests above): opening the lease mints a
+    plan id, which reaches `flight_worker` — a module that needs a genuine `ray.remote` to
+    import. Nothing here reaches the cluster: the fleet is faked and `spawn` is patched.
+
+    `api.adaptive.staging` takes a `session_fleet_lease` for the whole query *before* its
+    first stage runs, so the raw lease count is already 1 when that stage's operator asks
+    for a fleet. Testing the raw count therefore made the too-narrow branch unreachable on
+    the staged path, and a staged query inherited whatever fan-out the first query of the
+    process created — permanently, since nothing else resizes it.
+    """
+    narrow = _fleet_of(2, credits=64, cfg_json="{}")
+    monkeypatch.setattr(_fleet, "_SESSION", narrow)
+    monkeypatch.setattr(_fleet, "_SESSION_LEASES", 0)
+    monkeypatch.setattr(_fleet, "_SESSION_QUERY_LEASES", 0)
+    monkeypatch.setattr(_fleet, "_session_fleet_alive", lambda _f: True)
+    monkeypatch.setattr(_fleet.ShuffleFleet, "cleanup", lambda _self: None)
+    monkeypatch.setattr(
+        _fleet.ShuffleFleet,
+        "spawn",
+        classmethod(lambda _c, w, credits, cfg_json: _fleet_of(w, credits, cfg_json)),
+    )
+
+    with _fleet.session_fleet_lease():
+        got = _fleet._acquire_session_fleet(8, 64, "{}")
+
+    assert len(got.actors) == 8
+
+
 def test_a_leased_fleet_is_never_torn_down(monkeypatch, _no_ray):
-    """Another operator is mid-shuffle over its actors; killing them would fail the query."""
+    """Another operator is mid-shuffle over its actors; killing them would fail the query.
+
+    The lease here is an *operator* lease (no matching query-scope lease), which is exactly
+    the kind `_session_fleet_resizable` still refuses on.
+    """
     narrow = _fleet_of(2, credits=64, cfg_json="{}")
     monkeypatch.setattr(
         _fleet.ShuffleFleet,

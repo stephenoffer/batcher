@@ -20,4 +20,4 @@ python examples/dataset/null_handling.py
 - {doc}`/cookbook/dataset/inspecting/meta_schema`: asking about a dataset's shape without executing it.
 - {doc}`/cookbook/dataset/inspecting/profiling`: profiling a table you have just been handed.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
-- {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.
+- {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

@@ -24,19 +24,24 @@ from batcher.io.formats.base import SOURCES
 from batcher.io.formats.structured import _parquet_native
 from batcher.io.formats.structured.parquet import _native_stream
 from batcher.io.splits import FileSplit, Split, parquet_row_group_splits
-from batcher.io.stats.file_identity import file_identity
+from batcher.io.splits.parquet import _parquet_footer
+from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["ParquetSource"]
 
-# Process-wide cache of per-file Parquet row counts, keyed by full path/URI. A footer
-# read is a ~80 ms object-store round trip; Parquet is write-once, so a file's row count
-# is immutable and safe to cache by path — the same "never read a footer twice" guarantee
-# the Rust reader's `meta_cache` gives the data plane. Without it, EVERY distributed
-# `collect` re-reads every source file's footer just to size the worker fan-out
-# (`learned_num_workers` → `total_source_rows`): measured ~0.9 s/collect on a 10-file sf10
-# groupby, dwarfing the 0.26 s shuffle it was sizing.
-_ROW_COUNT_CACHE: dict[tuple[str, int, int], int] = {}
+# Process-wide cache of per-file Parquet row counts, keyed by file identity. A footer read
+# is a ~80 ms object-store round trip, and without this EVERY distributed `collect` re-reads
+# every source file's footer just to size the worker fan-out (`learned_num_workers` →
+# `total_source_rows`): measured ~0.9 s/collect on a 10-file sf10 groupby, dwarfing the
+# 0.26 s shuffle it was sizing.
+#
+# Bounded, where it used to be a plain `dict`. An unbounded memo here grows with every file
+# the *process* has ever counted rather than with any query's working set — a long-lived
+# worker cycling through datasets leaks one entry per file, forever. The entries are single
+# integers, so the budget is generous: comfortably more than the per-file-sweep ceiling, so a
+# whole planning pass stays resident and the bound only ever trims history.
+_ROW_COUNT_CACHE = FileMetaCache(65_536)
 
 
 @SOURCES.register("parquet")
@@ -430,18 +435,25 @@ class ParquetSource(FileSource):
         answers a `count()` with the previous file's total while `collect()` returns the
         new rows — a metadata shortcut contradicting the data it summarizes, with nothing
         in either result to reveal it. A file that cannot be stat-ed is counted uncached.
-        """
-        import pyarrow.parquet as pq
 
+        On a miss the footer comes from the **shared** footer cache rather than a private
+        read. Both caches are per file identity and both are filled from the same bytes, so
+        reading privately meant a query that asked for a row count and then planned splits
+        walked every footer in the dataset twice — the count pass filled a cache the split
+        pass could not see, and threw away the metadata the split pass was about to re-fetch.
+        On 4,096 local files that second walk was ~660 ms; on an object store it is a second
+        round trip per file. The cheap int memo is kept in front of it because the footer
+        cache is bounded by resident row-groups and may evict, and re-deriving a count that
+        is already known should not cost a fetch.
+        """
         identity = file_identity(path, self._fs)
         if identity is not None:
             hit = _ROW_COUNT_CACHE.get(identity)
             if hit is not None:
                 return hit
-        with self._fs.open(path) as fh:
-            n = pq.ParquetFile(fh).metadata.num_rows
+        n = _parquet_footer(path, self._fs).num_rows
         if identity is not None:
-            _ROW_COUNT_CACHE[identity] = n
+            _ROW_COUNT_CACHE.put(identity, n)
         return n
 
     def _file_splits(
@@ -467,7 +479,7 @@ class ParquetSource(FileSource):
             or self._errors.mode != "raise"
         ):
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
-        return parquet_row_group_splits(path, target_size, predicate)
+        return parquet_row_group_splits(path, target_size, predicate, self._fs)
 
     def statistics(self) -> SourceStatistics | None:
         """Footer-derived row count + per-column min/max/null, no data scan.
@@ -482,12 +494,21 @@ class ParquetSource(FileSource):
                 >>> ParquetSource("s3://bucket/lineitem/").statistics().row_count  # doctest: +SKIP
                 600037902
 
+        Above the shared per-file-sweep ceiling this declines and falls back to the base's
+        listing-derived byte size. The footer walk is one metadata round trip per file, and
+        at a million files that is the whole query: twenty-odd minutes of driver time,
+        before a task launches, to produce bounds for a scan that is already parallel a
+        million ways. `splits()`, `row_count()`, and `_total_byte_size()` all refuse the
+        same sweep at the same count; this was the one that still paid it.
+
         Returns:
             The source's row count and per-column bounds, or None if the footers
             cannot be read.
         """
         from batcher.io.stats import parquet_statistics
 
+        if self._too_many_files_to_sweep():
+            return super().statistics()
         try:
             return self._stats_apply(parquet_statistics(self._fs, self._files(), self.schema()))
         except Exception:

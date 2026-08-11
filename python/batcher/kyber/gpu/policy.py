@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from batcher._internal.device_share import device_headroom, pack_fraction
-from batcher.config import active_config
+from batcher.config import DistributedConfig, active_config
 from batcher.kyber.gpu.shape import broadcast_join, is_shardable
 from batcher.kyber.gpu.spread import devices_worth_using
 
@@ -141,6 +141,31 @@ def decide_gpu_backend(
             else GpuDecision(False, False, "size unknown; GPU overhead not justified")
         )
 
+    cpu = _cpu_veto(plan, hub, rows, ws_gb, dc, force=force, accelerator_type=accelerator_type)
+    if cpu is not None:
+        return cpu
+
+    return _route_by_memory(
+        plan, sources, hub, rows, ws_gb, dc, gpu_count=gpu_count, gpu_memory_gb=gpu_memory_gb
+    )
+
+
+def _cpu_veto(
+    plan: LogicalPlan,
+    hub: MetadataHub | None,
+    rows: int,
+    ws_gb: float,
+    dc: DistributedConfig,
+    *,
+    force: bool,
+    accelerator_type: str | None,
+) -> GpuDecision | None:
+    """A reason to stay on the CPU even though the plan is GPU-shaped, or `None` to proceed.
+
+    Two refusals in the order they are cheap to decide: the input is too small to amortize the
+    device's fixed overhead, then the host copy would cost more than the device saves. Both are
+    skipped under `force`, and both only ever *remove* a GPU choice.
+    """
     # The row threshold below which the GPU overhead isn't amortized: the measured crossover
     # learned from this hub's own GPU/CPU runs when available (Core measures, Kyber consumes),
     # else the config default. This is what makes the backend choice adaptive to the hardware.
@@ -195,6 +220,26 @@ def decide_gpu_backend(
         if veto is not None:
             return GpuDecision(False, False, veto, rows)
 
+    return None
+
+
+def _route_by_memory(
+    plan: LogicalPlan,
+    sources: list[Source],
+    hub: MetadataHub | None,
+    rows: int,
+    ws_gb: float,
+    dc: DistributedConfig,
+    *,
+    gpu_count: int,
+    gpu_memory_gb: float | None,
+) -> GpuDecision:
+    """Route a GPU-worthy plan by how its working set sits against the fleet's VRAM.
+
+    Fits one device (spread it anyway if that is worth a dispatch) -> exceeds one but fits the
+    cluster -> exceeds the cluster but shards small enough to pipeline -> the spillable CPU
+    engine, which is the honest destination for a plan with nothing to shard on.
+    """
     # The device's *capacity* — both suppliers now report the same thing — less the headroom
     # every other consumer already subtracts. This alone did not, so a working set was routed
     # to a single device at 100% of its VRAM, with nothing left for the CUDA context, the hash

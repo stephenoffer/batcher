@@ -152,9 +152,18 @@ class LocalNativeExecutor:
     """Single-node native execution: Kyber → Carbonite → Core, with feedback."""
 
     def execute(self, plan: LogicalPlan, sources: list[Source], ctx: ExecutionContext) -> pa.Table:
-        return _cached_or_run(
-            plan, sources, ctx, lambda: run_relational(plan, sources, ctx, distributed=False)[0]
-        )
+        # Plan-level common-subplan elimination: a subtree appearing more than once is
+        # executed once and scanned thereafter. Inside the `run` closure, not around it,
+        # so a result-cache hit still costs nothing — the rewrite executes the shared
+        # subplan, which would be wasted work on a hit. The cache key stays the query the
+        # user wrote; the rewrite is an implementation detail of computing it.
+        def run() -> pa.Table:
+            from batcher.api.subplan_reuse import reuse_common_subplans
+
+            run_plan, run_sources = reuse_common_subplans(plan, sources, ctx)
+            return run_relational(run_plan, run_sources, ctx, distributed=False)[0]
+
+        return _cached_or_run(plan, sources, ctx, run)
 
 
 def record_udf_cardinality(hub, plan: LogicalPlan, out_rows: int) -> None:

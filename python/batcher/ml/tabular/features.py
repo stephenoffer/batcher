@@ -253,10 +253,22 @@ def append_columns(batch: pa.RecordBatch, columns: dict[str, pa.Array]) -> pa.Re
             >>> append_columns(batch, {"p": pa.array([0.5])}).schema.names
             ['a', 'p']
     """
-    out = batch
+    # Built in one pass rather than by K successive `set_column`/`append_column` calls.
+    # Each of those rebuilds the whole batch (and `Schema.names` materializes a fresh list
+    # per lookup), so writing K columns onto a C-column batch was O(K x C) — and this runs
+    # per batch on the LLM-extraction, judge and media-decode UDF paths, where K is the
+    # number of extracted fields. One rebuild makes it O(C + K).
+    index = {name: i for i, name in enumerate(batch.schema.names)}
+    fields = list(batch.schema)
+    arrays = [batch.column(i) for i in range(batch.num_columns)]
     for name, array in columns.items():
-        if name in out.schema.names:
-            out = out.set_column(out.schema.get_field_index(name), name, array)
+        field = pa.field(name, array.type)
+        at = index.get(name)
+        if at is None:
+            index[name] = len(fields)
+            fields.append(field)
+            arrays.append(array)
         else:
-            out = out.append_column(name, array)
-    return out
+            fields[at] = field
+            arrays[at] = array
+    return pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields))

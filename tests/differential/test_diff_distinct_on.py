@@ -3,8 +3,12 @@
 ``SELECT DISTINCT ON (keys) ... ORDER BY ...`` keeps one row per key set — the first
 row in ORDER BY order — then orders the survivors by the same ORDER BY (Postgres/DuckDB
 semantics). This was previously rejected with ``NotImplementedError``; every case here
-returned nothing (raised) before the translator learned to lower it to a
-``row_number()`` per-key window + filter.
+returned nothing (raised) before the translator learned to lower it.
+
+It lowers through ``Dataset.distinct(subset, keep="first", order_by=…)``, which is one
+mergeable reduction — it was a ``row_number()`` per-key window and filter when these tests
+were written. The SQL front-end deliberately shares that lowering rather than building its
+own, so the two spellings of the same query cannot drift into different plans.
 """
 
 from __future__ import annotations

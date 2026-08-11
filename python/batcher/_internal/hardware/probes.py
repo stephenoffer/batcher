@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from batcher._internal.accelerators import reset_accelerator_probes
 from batcher._internal.hardware import cache, cgroup, isa, memory, nvml, profile, storage, topology
+from batcher._internal.hardware.amd import reset_amd_probe
 from batcher._internal.hardware.engine import detected as engine_detected
 from batcher._internal.hardware.fabric.rdma import reset_fabric_probes
 from batcher._internal.hardware.telemetry.dcgm import reset_dcgm_probe
@@ -37,7 +38,7 @@ _MEMOIZED = (
     ),
     (cache, ("cache_hierarchy",)),
     (memory, ("machine_memory_bytes", "page_size_bytes", "hugepage_bytes", "swap_configured")),
-    (isa, ("_cpuinfo_fields", "cpu_features", "cpu_vendor", "cpu_model_name")),
+    (isa, ("_cpuinfo_fields", "cpu_features", "cpu_vendor", "cpu_model_name", "simd_width_bits")),
     (topology, ("numa_node_count", "cpus_per_numa_node", "physical_core_count")),
     (storage, ("device_class",)),
     # The NVML handshake, not a reading: telemetry itself is deliberately never cached.
@@ -67,6 +68,13 @@ def reset_hardware_probes() -> None:
                 clear()
     profile._reset_profile()
     reset_accelerator_probes()
+    # AMD memoizes its device *identity* (the card names present at first probe) for the same
+    # reason NVML memoizes its handshake. It has always exposed `reset_amd_probe`, and this hook
+    # — which promises to forget *every* memoized reading, and is what the whole test suite calls
+    # — never invoked it. So an AMD test that faked `/sys/class/drm` and reset in the documented
+    # way kept reading the previous answer: a test that passes while testing nothing, which is
+    # the failure mode this module's explicit-list design exists to prevent and then had itself.
+    reset_amd_probe()
     # The interconnect readings memoize per PCI address rather than once, so they clear
     # through their own hook instead of being listed above.
     reset_fabric_probes()

@@ -214,6 +214,17 @@ def cgroup_throttled_ratio() -> float | None:
         periods = stat.get("nr_periods", 0)
         if periods > 0:
             return stat.get("nr_throttled", 0) / periods
+    # cgroup v1 keeps the identical counters under a per-controller mount point, so the v2
+    # walk above never finds them: `cgroup_v2_dirs()` yields `/sys/fs/cgroup` and the v2 leaf
+    # path, while v1's file is at `/sys/fs/cgroup/cpu/cpu.stat`. Without this branch throttling
+    # was invisible on every cgroup v1 host — which is still what a large share of older
+    # Kubernetes, EKS, and plain Docker deployments run — so a container being throttled to a
+    # third of its quota reported *no* contention, and the fan-out and CPU-share loops both
+    # read the resulting idle cores as "this workload does not want them".
+    stat = read_cgroup_stat("/sys/fs/cgroup/cpu", "cpu.stat")
+    periods = stat.get("nr_periods", 0)
+    if periods > 0:
+        return stat.get("nr_throttled", 0) / periods
     return None
 
 

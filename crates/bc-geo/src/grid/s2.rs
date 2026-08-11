@@ -247,18 +247,6 @@ pub fn cell_bbox(id: u64) -> GeoResult<Bbox> {
     out.ok_or_else(|| GeoError::invalid("cell has no corners"))
 }
 
-/// The approximate area of a level-`l` cell in square metres.
-///
-/// Average, not exact: cell areas vary by about a factor of two across a face even
-/// under the quadratic transform. Reported so a caller can pick a level for a target
-/// resolution without a lookup table.
-pub fn average_area_m2(level: u32) -> GeoResult<f64> {
-    check_level(level)?;
-    let r = crate::proj::geodesy::EARTH_RADIUS_M;
-    let sphere = 4.0 * std::f64::consts::PI * r * r;
-    Ok(sphere / (6.0 * 4f64.powi(level as i32)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,16 +343,6 @@ mod tests {
         let c = cell_center(id).unwrap();
         assert!(b.contains_coord(c));
         assert!(b.contains_coord(Coord::new(-122.4194, 37.7749)));
-    }
-
-    #[test]
-    fn average_area_halves_by_four_each_level() {
-        let a10 = average_area_m2(10).unwrap();
-        let a11 = average_area_m2(11).unwrap();
-        assert!((a10 / a11 - 4.0).abs() < 1e-9);
-        // Level 0 is a sixth of the globe.
-        let whole = average_area_m2(0).unwrap() * 6.0;
-        assert!((whole / 5.1e14 - 1.0).abs() < 0.01, "got {whole}");
     }
 
     #[test]

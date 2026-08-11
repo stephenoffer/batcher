@@ -16,9 +16,8 @@ from batcher.plan.logical.aggregate import (
     Aggregate,
     AggregateSpec,
     Sort,
-    SortKeySpec,
 )
-from batcher.plan.logical.base import LogicalPlan
+from batcher.plan.logical.base import LogicalPlan, SortKeySpec
 from batcher.plan.logical.join import (
     AsofJoin,
     Join,
@@ -26,6 +25,8 @@ from batcher.plan.logical.join import (
     RangeCondition,
     RangeJoin,
     WatermarkStreamJoin,
+    align_join_key_types,
+    asof_tolerance,
 )
 from batcher.plan.logical.relational import (
     Distinct,
@@ -43,6 +44,7 @@ from batcher.plan.logical.relational import (
 )
 from batcher.plan.logical.reshape import RowId, Unnest, Unpivot
 from batcher.plan.logical.transforms import (
+    constant_column_literal,
     empty_result_schema,
     hoist_computed_keys,
     is_cartesian_key_pair,
@@ -84,6 +86,9 @@ __all__ = [
     "Window",
     "WindowFrame",
     "WindowFuncSpec",
+    "align_join_key_types",
+    "asof_tolerance",
+    "constant_column_literal",
     "empty_result_schema",
     "hoist_computed_keys",
     "is_cartesian_key_pair",

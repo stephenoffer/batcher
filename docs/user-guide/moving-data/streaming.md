@@ -63,6 +63,27 @@ files and tables:
 | Rate generator (dev) | {py:meth}`bt.read.rate(rows_per_second) <batcher.api.io_namespace.reader.Reader.rate>` |
 | TCP socket (dev) | {py:meth}`bt.read.socket(host, port) <batcher.api.io_namespace.reader.Reader.socket>` |
 
+`files_incremental` forwards anything it does not recognize to the file reader for each
+new file, so a watched directory is configured the way a batch read of it would be: a CSV
+`delimiter`, a declared `schema`, `storage_options` for the store the files live in, and the
+two tolerance flags. The flags matter more on a stream than in a batch job, because the
+files arrive from a producer nobody is watching and a query that cannot be told to tolerate
+one bad record stops on it and stays stopped.
+
+```python
+# docs: skip
+q = bt.read.files_incremental(
+    "s3://bucket/landing/", "csv",
+    state_dir="s3://bucket/_seen",
+    delimiter=";",
+    on_error="skip",        # a truncated upload drops the file
+    on_bad_lines="skip",    # a ragged line drops the line
+).write.delta("s3://lake/bronze", trigger="30 seconds")
+```
+
+An option the reader does not accept is refused when the query is built, not when the file
+carrying it arrives.
+
 Every broker takes the same `starting_position=` — `"earliest"` or `"latest"` — whatever it
 calls the idea itself (Kafka's `auto.offset.reset`, Kinesis's `ShardIteratorType`, Event
 Hubs' offset sentinel, Pulsar's `InitialPosition`). Each connector's native spelling still
@@ -97,6 +118,22 @@ recent = clicks.filter(col("partition") == 0)
 for batch in recent.iter_batches():
     handle(batch)
 ```
+
+### Looking at a stream before you build on it
+
+A materializing terminal on an unbounded source has no finite answer, so `to_pydict()` and
+friends refuse it. `head(n)` and {py:meth}`show <batcher.Dataset.show>` are the exception, because their answer *is*
+finite: the engine stops reading the moment it has the rows.
+
+```python
+peek = bt.read.rate(5, num_rows=100, pace=False).head(3)
+print(peek.count())
+# 3
+```
+
+That works against a topic that never ends, which is what makes it the right first thing to
+type. What still refuses is a limit over a *sort*: top-N is finite too, and not knowable
+until the last row has arrived.
 
 ## Writing streams: the unified `ds.write`
 
@@ -193,6 +230,34 @@ print(dict(zip(*[bt.read_memory("running_totals").to_pydict()[c]
                  for c in ("user", "total")], strict=True)))
 ```
 
+### Sizing the files a stream leaves behind
+
+A file-sink stream writes one file per micro-batch, so the file size is whatever the
+trigger interval happened to produce. Over days that is the small-files problem in its
+purest form, and nothing in the query says otherwise unless you say it: `max_rows_per_file`
+caps each output file and splits a micro-batch across as many as it needs. The chunk index
+joins the batch id in the name, so files stay named by position and a replayed epoch still
+recognizes its own output.
+
+```python
+import glob
+import os
+import tempfile
+
+capped_dir = os.path.join(tempfile.mkdtemp(), "capped")
+q = bt.from_pydict({"v": list(range(20))}).write(
+    capped_dir, format="parquet", trigger=bt.Trigger.available_now(), max_rows_per_file=6
+)
+q.await_termination()
+print(len(glob.glob(os.path.join(capped_dir, "*.parquet"))))
+# 4
+```
+
+The option applies to file sinks. A transactional target (Delta, Iceberg, Hudi) makes each
+micro-batch one transaction and owns the file layout inside it, so the cap is refused
+there with a pointer to `bt.compact`; so is a `distributed=True` drain, whose files are
+named for their epoch and shard and are not subdivided further.
+
 ## Monitoring a running query
 
 A streaming write hands back a `StreamingQuery`. It carries the query's liveness, the
@@ -245,12 +310,12 @@ once per window it belongs to. That is a wrong answer, so the engine rejects it 
 at `explode`. A tumbling window (no slide) is a single start and groups directly.
 :::
 
-:::{important}
-Watermark-driven window eviction recognizes tumbling windows only. After the `explode` a
-sliding aggregation groups by an ordinary column, so the engine cannot tell which window is
-closed, and it will not evict one. On an unbounded source that means the aggregation's state
-grows without bound. Sliding windows are a batch operation today; use a tumbling window for
-a long-running stream.
+:::{note}
+Watermark-driven eviction recognizes the sliding shape too. After the `explode` the group
+key is an ordinary column, so the engine reads the width and the hop from the
+`window(..., slide)` beneath it and closes each window when the watermark passes its end,
+exactly as it does for a tumbling one. State is bounded by the number of *open* windows,
+which for overlapping windows is `width / slide` of them rather than one.
 :::
 
 On an unbounded stream, declare a **watermark** so windowed state stays bounded:

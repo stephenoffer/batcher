@@ -284,6 +284,26 @@ def test_detect_framework_rejects_an_object_with_no_predict() -> None:
         detect_framework(object())
 
 
+@pytest.mark.parametrize(
+    ("attribute", "method"),
+    [
+        ("predict_proba", "predict_proba"),
+        ("decision_function", "raw"),
+        ("transform", "transform"),
+    ],
+)
+def test_a_duck_typed_model_is_detected_from_the_method_it_offers(attribute, method) -> None:
+    # Gating detection on `predict` alone refused a probability calibrator, a one-class
+    # scorer and a fitted transformer at the door — each of which the sklearn adapter can
+    # score perfectly well through `method=`, and each of which worked the moment the
+    # caller followed the error's own advice and passed `framework="sklearn"`.
+    model = type("Scorer", (), {attribute: lambda self, x: [[0.5]] * len(x)})()
+    assert detect_framework(model) == "sklearn"
+    ds = bt.from_pydict({"a": [1.0, 2.0]})
+    got = ds.ml.predict(model, features=["a"], method=method, as_list=True).to_pydict()
+    assert got["prediction"] == [[0.5], [0.5]]
+
+
 def test_the_predictor_class_is_memoized(sample) -> None:
     # The distributed warm pool keys on the UDF's identity, so two identical calls must
     # hand the engine the same class or the model reloads on every collect().

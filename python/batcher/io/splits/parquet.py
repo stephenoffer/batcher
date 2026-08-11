@@ -10,17 +10,17 @@ with the lakehouse connectors, whose tables are Parquet datasets underneath.
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
 from batcher.io.splits.base import Split
-from batcher.io.stats.file_identity import file_identity
+from batcher.io.stats.file_identity import FileMetaCache, file_identity
 
 __all__ = ["RowGroupSplit", "fragment_index", "pack_row_groups", "parquet_row_group_splits"]
 
@@ -57,13 +57,21 @@ def fragment_index(key: Any, build_dataset: Any) -> tuple[Any, dict[str, Any]]:
     return cached
 
 
-def _parquet_footer(path: str):
+def _parquet_footer(path: str, fs: Any | None = None):
     """The Parquet `FileMetaData` for `path`, read once per *version* and cached.
 
     Reading the footer (row-group offsets, schema) is a ~100ms object-store round trip;
     a worker reads many row-group splits of the same file, so caching the footer turns
-    N footer reads into one. Bounded LRU so a long-lived process scanning many files
-    stays memory-bounded.
+    N footer reads into one.
+
+    Pass `fs` whenever the caller already has the filesystem the file was listed through —
+    the driver planning a whole dataset's splits always does. Without it the identity probe
+    below resolves a filesystem *per file*, and the instance it resolves is not the one that
+    listed the directory, so it holds none of the sizes and mtimes that listing already
+    fetched: every file then costs a fresh backend lookup plus a real `get_file_info`, which
+    is a syscall locally and a HEAD request per file on an object store. Over 4,096 local
+    files that was 38 ms against 1.8 ms — and on S3 it is an O(files) round-trip sweep on
+    the driver for information the listing had already paid for.
 
     Keyed on the file's identity — `(path, size, mtime)` — not on the path. The path
     alone was justified by "Parquet is write-once", which holds for an immutable lake and
@@ -77,24 +85,37 @@ def _parquet_footer(path: str):
     A file that cannot be stat-ed is read uncached rather than cached under a token that
     could not detect its changing.
     """
-    identity = file_identity(path)
+    identity = file_identity(path, fs)
     if identity is None:
-        return _read_footer(path)
-    return _parquet_footer_cached(identity)
+        return _read_footer(path, fs)
+    hit = _FOOTERS.get(identity)
+    if hit is None:
+        hit = _read_footer(identity[0], fs)
+        # Weighed by row groups: that is what makes the footer's resident size, and it is
+        # what lets a small-file corpus keep every footer for the cost of a few wide ones.
+        _FOOTERS.put(identity, hit, weight=int(getattr(hit, "num_row_groups", 1) or 1))
+    return hit
 
 
-@lru_cache(maxsize=1024)
-def _parquet_footer_cached(identity: tuple[str, int, int]):
-    """`_parquet_footer` keyed on the file identity (see there)."""
-    return _read_footer(identity[0])
+#: Row groups the footer cache may hold. Weighed by row-group count rather than entries,
+#: because a `FileMetaData` is not a fixed-size thing — see `FileMetaCache`. Sized so a full
+#: planning pass at the per-file-sweep ceiling (10,000 files) stays resident for the workers
+#: that then read the same files, with ample room for the small-file corpus this serves:
+#: a million single-row-group files cost what a few thousand wide ones do. It was 1,024
+#: *entries*, an order of magnitude below the one pass guaranteed to fill it.
+#: Env-overridable for a process reading unusually wide files.
+_MAX_CACHED_ROW_GROUPS = max(1, int(os.environ.get("BATCHER_FOOTER_CACHE_ROW_GROUPS", "262144")))
+
+_FOOTERS = FileMetaCache(_MAX_CACHED_ROW_GROUPS)
 
 
-def _read_footer(path: str):
+def _read_footer(path: str, fs: Any | None = None):
     import pyarrow.parquet as pq
 
-    from batcher.io.filesystem import resolve_filesystem
+    if fs is None:
+        from batcher.io.filesystem import resolve_filesystem
 
-    fs = resolve_filesystem(path)
+        fs = resolve_filesystem(path)
     with fs.open(path) as fh:
         return pq.ParquetFile(fh).metadata
 
@@ -270,7 +291,7 @@ def pack_row_groups(
 
 
 def parquet_row_group_splits(
-    path: str, target_size: int | None, predicate: dict | None = None
+    path: str, target_size: int | None, predicate: dict | None = None, fs: Any | None = None
 ) -> list[Split]:
     """Build `RowGroupSplit`s for a single Parquet file, dropping the ones that cannot match.
 
@@ -287,8 +308,9 @@ def parquet_row_group_splits(
     and cannot happen.
     """
     # The cached footer avoids re-reading the metadata here AND on the worker that later
-    # reads these splits (a ~100ms object-store round trip per call); see `_parquet_footer`.
-    meta = _parquet_footer(path)
+    # reads these splits (a ~100ms object-store round trip per call); see `_parquet_footer`,
+    # which also explains why `fs` is worth threading down from a caller that has one.
+    meta = _parquet_footer(path, fs)
     targets = list(range(meta.num_row_groups))
     if predicate is not None:
         targets = _surviving_row_groups(meta, predicate)

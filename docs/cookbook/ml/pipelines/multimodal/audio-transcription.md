@@ -17,7 +17,7 @@ at the same mono waveform column, and neither one touches Python per sample.
 ::::{tab-set}
 :::{tab-item} A directory of clips
 
-`bt.read.audio(..., decode=True, sample_rate=16000)` lists the files, decodes them, and
+{py:meth}`bt.read.audio(..., decode=True, sample_rate=16000) <batcher.api.io_namespace.reader.Reader.audio>` lists the files, decodes them, and
 resamples natively, giving you a `list<float>` waveform column per row.
 
 ```python
@@ -35,12 +35,12 @@ obviously wrong before paying for a decode.
 :::{tab-item} A column of encoded bytes
 
 When the audio is already a column of encoded bytes (downloaded, or read from a table), the
-`.audio` expressions do the same work in-pipeline. `.audio.to_waveform()` decodes and
-averages the channels down to mono. `.audio.resample(rate)` decodes and band-limit-resamples
+{py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>` expressions do the same work in-pipeline. {py:meth}`.audio.to_waveform() <batcher.plan.expr_ir.audio._AudioNamespace.to_waveform>` decodes and
+averages the channels down to mono. {py:meth}`.audio.resample(rate) <batcher.plan.expr_ir.audio._AudioNamespace.resample>` decodes and band-limit-resamples
 in one native pass, which is the one you want in front of a model with a fixed input rate.
 
 When the model wants **mel features** rather than a raw waveform (Whisper, wav2vec2, HuBERT
-all do), `.audio.mel_spectrogram(rate, n_fft=400, hop_length=160, n_mels=80)` decodes,
+all do), {py:meth}`.audio.mel_spectrogram(rate, n_fft=400, hop_length=160, n_mels=80) <batcher.plan.expr_ir.audio._AudioNamespace.mel_spectrogram>` decodes,
 resamples, and computes the mel power spectrogram in one native pass. Its output
 numerically matches `torchaudio.transforms.MelSpectrogram`, so it drops straight into a
 model trained on torchaudio features (apply the model's own log/normalization downstream):
@@ -59,7 +59,7 @@ and they matter more than they look. Recorded clips carry seconds of room tone a
 every one of those samples is paid for twice: once in the spectrogram and again in the model's
 sequence length.
 
-`.audio.trim_silence()` drops the leading and trailing quiet. It leaves interior pauses alone,
+{py:meth}`.audio.trim_silence() <batcher.plan.expr_ir.audio._AudioNamespace.trim_silence>` drops the leading and trailing quiet. It leaves interior pauses alone,
 because those carry the timing an acoustic model reads — an utterance with its pauses removed is
 not the same utterance. A clip that is quiet throughout trims to an empty list, which is how you
 find the silent recordings:
@@ -69,12 +69,12 @@ find the silent recordings:
 speech = clips.filter(col("bytes").audio.trim_silence().list.len() > 0)
 ```
 
-`.audio.peak_normalize()` scales each clip so its loudest sample sits at full scale. A model
+{py:meth}`.audio.peak_normalize() <batcher.plan.expr_ir.audio._AudioNamespace.peak_normalize>` scales each clip so its loudest sample sits at full scale. A model
 trained on normalized audio reads a quiet recording as a different distribution rather than a
 quieter one, so mismatched levels cost accuracy invisibly. It is peak, not loudness (LUFS),
 normalization: a clip with one loud click stays quiet everywhere else.
 
-`.audio.zero_crossing_rate()` is the cheapest useful descriptor of a waveform and the classic
+{py:meth}`.audio.zero_crossing_rate() <batcher.plan.expr_ir.audio._AudioNamespace.zero_crossing_rate>` is the cheapest useful descriptor of a waveform and the classic
 voiced/unvoiced split — a vowel crosses zero rarely, a fricative constantly. It separates speech
 from silence-with-hiss without computing a spectrogram, which makes it a good first-pass filter
 over a corpus nobody has curated.
@@ -88,7 +88,7 @@ usable = clips.filter(
 ```
 
 For classical speech models (and many audio classifiers) that want the compact **MFCC**
-feature instead, `.audio.mfcc(rate, n_mfcc=13)` runs the whole
+feature instead, {py:meth}`.audio.mfcc(rate, n_mfcc=13) <batcher.plan.expr_ir.audio._AudioNamespace.mfcc>` runs the whole
 `mel → AmplitudeToDB → DCT` chain natively. Its output numerically matches
 `torchaudio.transforms.MFCC`:
 
@@ -264,7 +264,7 @@ composable.
 - {doc}`GPU scheduling </ml/inference/gpu>`: `num_gpus`, `concurrency`, and `model_memory_gb`.
 - {doc}`Image classification </cookbook/ml/pipelines/multimodal/image-classification>`: the same decode → model shape, for pixels.
 - {doc}`Image captioning </cookbook/ml/pipelines/multimodal/image-captioning>`: the same shape again, with a vision-language model.
-- {doc}`ML API reference </api/models/ml>`: `bt.read.audio`, `ds.ml.infer`, `max_errored_rows`.
+- {doc}`ML API reference </api/models/ml>`: {py:meth}`bt.read.audio <batcher.api.io_namespace.reader.Reader.audio>`, {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>`, `max_errored_rows`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: where the 38,546 clip/s on the
   audio pipeline comes from.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: the CPU/GPU overlap that produces it.

@@ -189,3 +189,32 @@ def test_record_worker_metrics_survives_a_malformed_document():
     before = sum(len(v) for v in hub.op_stats_by_kind().values())
     record_worker_metrics(hub, ["", "not json", '{"ops": []}'])
     assert sum(len(v) for v in hub.op_stats_by_kind().values()) == before
+
+
+@pytest.mark.integration
+def test_the_driver_keeps_each_workers_whole_metrics_document():
+    """The out-channel carries documents, not bare op-lists.
+
+    A worker's share of what the run cost the machine — CPU across its threads, resident
+    growth, real block-device bytes — is measured per task and rides in the document's
+    ``query`` block. Keeping only ``ops`` on the driver threw it away irrecoverably, so a
+    distributed run could report every operator's rows and nothing at all about what the
+    cluster spent producing them.
+    """
+    from batcher.dist.executors.ray_runtime import record_worker_metrics
+    from batcher.plan.profile import ProfileCollector
+
+    out: list[dict] = []
+    record_worker_metrics(
+        None,
+        ['{"ops": [{"op_id": 0, "kind": "scan", "rows_out": 7}], "query": {"cpu_ns": 4000000}}'],
+        out,
+    )
+    assert out and out[0]["query"]["cpu_ns"] == 4_000_000
+
+    collector = ProfileCollector()
+    collector.optimized_ir = {"op": "scan", "source_id": 0}
+    collector.worker_metrics = out
+    profile = collector.to_profile(total_ms=1.0, rows=7)
+    assert profile.usage.cpu_ms == 4.0
+    assert [op.rows_out for op in profile.worker_ops] == [7]

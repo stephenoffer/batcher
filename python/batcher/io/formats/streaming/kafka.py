@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 
@@ -35,13 +36,13 @@ __all__ = ["KafkaSource"]
 
 def _import_consumer() -> Any:
     """Import ``confluent_kafka.Consumer`` or raise a guiding ``BackendError``."""
-    try:
-        from confluent_kafka import Consumer
-    except ImportError as exc:
-        raise BackendError(
-            "reading from Kafka needs the kafka extra: pip install 'batcher-engine[kafka]'"
-        ) from exc
-    return Consumer
+    return require(
+        "confluent_kafka",
+        "Consumer",
+        feature="Kafka support",
+        provides="confluent-kafka",
+        extra="kafka",
+    )
 
 
 #: librdkafka's "you have reached the end of this partition" pseudo-error. It is delivered as

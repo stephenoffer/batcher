@@ -1,11 +1,17 @@
 """`CheckpointStore` — the offset log, commit log, and state store under one dir.
 
-A streaming query's ``checkpoint_location`` is a directory holding ``offsets.sqlite``,
-``commits.sqlite``, and a ``state/`` subdirectory of Arrow-IPC running-state
-snapshots. The store ties them to the micro-batch boundary so a crash is recoverable:
-the offset is recorded write-ahead, the state snapshot and sink commit follow, and
-the commit-log entry is written last — so a batch present in offsets but absent from
-commits is exactly the in-flight batch to replay.
+A streaming query's ``checkpoint_location`` is a directory holding an offset log, a commit
+log, and a ``state/`` subdirectory of Arrow-IPC running-state snapshots. The store ties them
+to the micro-batch boundary so a crash is recoverable: the offset is recorded write-ahead,
+the state snapshot and sink commit follow, and the commit-log entry is written last — so a
+batch present in offsets but absent from commits is exactly the in-flight batch to replay.
+
+**The location may be remote**, and until it could be, the engine's own spot-resilience
+warning was advice it did not honor: it told the caller that a node-local checkpoint is lost
+with the node and to use ``s3://``, then wrote to a local directory named ``s3:``. A local
+location keeps the SQLite logs, which are the right tool for a lockable seekable file; a
+remote one uses the file-per-batch logs in `fs_logs`, which are the right tool for a store
+that has neither. The state store spans both itself.
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ import os
 
 import pyarrow as pa
 
-from batcher.io.formats.streaming.checkpoint.logs import CommitLog, OffsetLog
+from batcher.io.formats.streaming.checkpoint.location import is_local_location
 from batcher.io.formats.streaming.checkpoint.state_store import StateStore
 
 __all__ = ["CheckpointStore"]
@@ -30,11 +36,26 @@ class CheckpointStore:
     __slots__ = ("_dir", "_pruned_through", "commits", "offsets", "state")
 
     def __init__(self, location: str) -> None:
-        os.makedirs(location, exist_ok=True)
         self._dir = location
-        self.offsets = OffsetLog(os.path.join(location, "offsets.sqlite"))
-        self.commits = CommitLog(os.path.join(location, "commits.sqlite"))
-        self.state = StateStore(os.path.join(location, "state"))
+        if is_local_location(location):
+            from batcher.io.filesystem import local_path
+            from batcher.io.formats.streaming.checkpoint.logs import CommitLog, OffsetLog
+
+            root = local_path(location)
+            os.makedirs(root, exist_ok=True)
+            self.offsets = OffsetLog(os.path.join(root, "offsets.sqlite"))
+            self.commits = CommitLog(os.path.join(root, "commits.sqlite"))
+            self.state = StateStore(os.path.join(root, "state"))
+        else:
+            from batcher.io.formats.streaming.checkpoint.fs_logs import (
+                FileCommitLog,
+                FileOffsetLog,
+            )
+
+            root = location.rstrip("/")
+            self.offsets = FileOffsetLog(f"{root}/offsets")
+            self.commits = FileCommitLog(f"{root}/commits")
+            self.state = StateStore(f"{root}/state")
         self._pruned_through = 0
 
     @property

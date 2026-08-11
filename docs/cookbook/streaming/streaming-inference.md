@@ -196,6 +196,41 @@ restart to resume into. Accepting it would advance the offset log while the tota
 restarted at zero. Land the scores first and aggregate the table if you need resumption.
 :::
 
+### The scored stream is an ordinary stream
+
+A rollup is not the only thing that can sit above the model. The scored stream joins a
+static dimension, deduplicates, or takes the first *n* rows like any other, and each of
+those writes to a sink:
+
+```python
+registry = bt.from_pydict({"model": ["v1", "v2"], "owner": ["ads", "risk"]})
+
+attributed = (
+    bt.from_batches(rollup_batches, rollup_schema, bounded=False)
+    .map_batches(score_length, output_columns=["model", "score"])
+    .join(registry, on="model", how="left")
+)
+for batch in attributed.iter_batches():
+    print(sorted(zip(batch.to_pydict()["model"], batch.to_pydict()["owner"], strict=True)))
+# [('v1', 'ads'), ('v1', 'ads'), ('v2', 'risk')]
+```
+
+Taking the first few scored rows is how you check a model against a live topic without
+waiting for the topic to end:
+
+```python
+sample = (
+    bt.from_batches(rollup_batches, rollup_schema, bounded=False)
+    .map_batches(score_length, output_columns=["model", "score"])
+    .head(2)
+)
+for batch in sample.iter_batches():
+    print(batch.to_pydict()["score"])
+# [2, 2]
+```
+
+The query stops on its own once the count is met, rather than running until you stop it.
+
 ## Watching it run
 
 The query handle is how you know whether the model is keeping up:

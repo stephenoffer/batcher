@@ -21,6 +21,37 @@ use hashbrown::HashTable;
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
 
+/// The output group columns: each key column `take`n at its groups' first-seen rows — or
+/// handed back untouched when every row is already its own group.
+///
+/// `reps` is **strictly increasing**: group ids are handed out in first-seen row order, so
+/// group `g + 1` was first seen after group `g`. Every entry is therefore a distinct row
+/// index below `num_rows`, and `reps.len() == num_rows` forces `reps` to be exactly
+/// `0..num_rows` — an identity permutation whose `take` copies each column only to
+/// reproduce it.
+///
+/// That is not a corner case. It is precisely the near-unique key the partitioned aggregate
+/// exists to serve, where the group count equals the row count: H2O `groupby` q10 groups by
+/// all six id columns, 10 M groups over 10 M rows, and three of those six are strings. Before
+/// this, such a query gathered every key column **twice** — once to build the partition and
+/// again here — and the second gather produced a column equal, element for element, to the
+/// one it read. The arrays returned may be slices where `take` would have returned fresh
+/// buffers; that is invisible to every consumer, which reads them through `Array`.
+fn group_columns(
+    keys: &[ArrayRef],
+    reps: Vec<u32>,
+    num_rows: usize,
+) -> Result<Vec<ArrayRef>, RuntimeError> {
+    if reps.len() == num_rows {
+        return Ok(keys.to_vec());
+    }
+    let reps_arr = UInt32Array::from(reps);
+    Ok(keys
+        .iter()
+        .map(|a| arrow::compute::take(a, &reps_arr, None))
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
 /// Assign each row a dense group id, returning the ids, the group count, and the
 /// distinct group-key columns (in first-seen order).
 pub(crate) fn assign_groups(
@@ -107,11 +138,7 @@ pub(crate) fn assign_groups(
         if group_keys.len() <= 8 {
             if let Some((ids, reps)) = bytes1_multi_group_ids(group_keys, num_rows) {
                 let num_groups = reps.len();
-                let reps_arr = UInt32Array::from(reps);
-                let group_columns = group_keys
-                    .iter()
-                    .map(|a| arrow::compute::take(a, &reps_arr, None))
-                    .collect::<Result<_, _>>()?;
+                let group_columns = group_columns(group_keys, reps, num_rows)?;
                 return Ok((ids, num_groups, group_columns));
             }
         }
@@ -192,11 +219,7 @@ pub(crate) fn assign_groups(
     // the encoded rows. Decoding would hand back the *canonical* float (`0.0` for a group first
     // seen as `-0.0`), whereas every other grouping path here returns the first-seen value — and
     // so does DuckDB. Taking from the source keeps the paths identical and skips a decode.
-    let reps_arr = UInt32Array::from(reps);
-    let group_columns = group_keys
-        .iter()
-        .map(|a| arrow::compute::take(a, &reps_arr, None))
-        .collect::<Result<_, _>>()?;
+    let group_columns = group_columns(group_keys, reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -381,7 +404,7 @@ where
 {
     let (group_ids, reps) = int_group_ids::<T>(arr.as_primitive::<T>(), num_rows);
     let num_groups = reps.len();
-    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+    let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -401,7 +424,7 @@ fn assign_groups_f64(
     let key_arr = arrow::array::UInt64Array::from(keys);
     let (group_ids, reps) = int_group_ids::<UInt64Type>(&key_arr, num_rows);
     let num_groups = reps.len();
-    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+    let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -440,7 +463,26 @@ where
     }
 
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
-    let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
+    // The table stores `(key, group_id)`, **not** the group id alone.
+    //
+    // Holding only the id costs four bytes a slot instead of sixteen, which looks like the
+    // cache-friendly choice and is the opposite. Verifying a probe then has to recover the
+    // key it is comparing against, and the only route back is `a.value(reps[g])` — two
+    // dependent loads, the second landing at a random offset in the *whole input column*.
+    // That array is `8 × num_rows` (32 MiB at 4 M rows), so on a key too sparse for the dense
+    // map above, every probe takes a guaranteed cache miss that the hash lookup itself
+    // already paid for once. Measured single-threaded, one `SUM` over an `Int64` key:
+    // **146.6 ns/row** at 1.7 M groups and **308.0 ns/row** at 5.1 M, against 5.5-11.7 ns/row
+    // on the dense path — a cliff far too steep for the extra work being done.
+    //
+    // Inlining the key removes the indirection outright: the comparison reads a value the
+    // probe has already pulled into cache. The table is 4x wider, which is the trade, and it
+    // is worth it precisely when the key is sparse — the case that reaches here at all.
+    //
+    // `reps` is still built, because the output group column is `take`n from it, but it is
+    // now write-only on this path and never read inside the probe loop.
+    let mut table: HashTable<(T::Native, u32)> =
+        HashTable::with_capacity(group_table_capacity(num_rows));
     let mut null_gid: Option<u32> = None;
     for i in 0..num_rows {
         if a.is_null(i) {
@@ -454,17 +496,12 @@ where
         }
         let v = a.value(i);
         let hash = state.hash_one(v);
-        // The table holds only non-null groups, so a rep is always a valid value.
-        let gid = match table.entry(
-            hash,
-            |&g| a.value(reps[g as usize] as usize) == v,
-            |&g| state.hash_one(a.value(reps[g as usize] as usize)),
-        ) {
-            Entry::Occupied(e) => *e.get(),
+        let gid = match table.entry(hash, |&(k, _)| k == v, |&(k, _)| state.hash_one(k)) {
+            Entry::Occupied(e) => e.get().1,
             Entry::Vacant(e) => {
                 let gid = reps.len() as u32;
                 reps.push(i as u32);
-                e.insert(gid);
+                e.insert((v, gid));
                 gid
             }
         };
@@ -527,8 +564,8 @@ fn assign_groups_dict(
     let num_groups = reps.len();
     // The distinct group-key values, one per group (first-seen row), decoded to the plain
     // value type — small (num_groups rows), so this decode is not the O(rows) one avoided.
-    let group_vals = arrow::compute::take(arr, &UInt32Array::from(reps), None)?;
-    let group_columns = vec![arrow::compute::cast(&group_vals, &value_type)?];
+    let group_vals = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
+    let group_columns = vec![arrow::compute::cast(&group_vals[0], &value_type)?];
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -571,7 +608,7 @@ where
         // indirection, no `u64` scratch array, no hashing — one pass over `num_rows` bytes.
         if let Some((ids, reps)) = byte1_group_ids::<T>(a, num_rows) {
             let num_groups = reps.len();
-            let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+            let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
             return Ok((ids, num_groups, group_columns));
         }
         // Short strings (≤ 7 bytes): pack `(len, bytes)` into a `u64` and group on the integer,
@@ -581,7 +618,7 @@ where
             let keys = arrow::array::UInt64Array::from(packed);
             let (group_ids, reps) = int_group_ids::<UInt64Type>(&keys, num_rows);
             let num_groups = reps.len();
-            let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+            let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
             return Ok((group_ids, num_groups, group_columns));
         }
     }
@@ -630,7 +667,7 @@ where
     }
 
     let num_groups = reps.len();
-    let group_columns = vec![arrow::compute::take(arr, &UInt32Array::from(reps), None)?];
+    let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -760,6 +797,36 @@ where
 /// grouping produce the exact same groups as hashing the slices directly. One linear pass over
 /// the offsets bails out the moment a value is too long, so a long-string column pays only a
 /// cheap scan before falling back.
+///
+/// ## Seven bytes, and why widening it to fifteen does not pay
+///
+/// Seven is a low ceiling for a categorical key — an ISO code, a SKU, a `YYYY-MM-DD`, most real
+/// identifiers are wider — and the byte-slice hash path beyond it is the engine's worst measured
+/// group-by shape. On the H2O db-benchmark's group-by table at its 1e7-row tier, over 100,000
+/// groups and the identical `sum(v1)`:
+///
+/// | key | bytes | Batcher | DuckDB |
+/// |---|---|---:|---:|
+/// | `id6` (`int32`) | — | 26.0 ms | 31.6 ms |
+/// | `id3` (`'id0000039083'`) | 12 | 54.5 ms | 32.0 ms |
+///
+/// Same cardinality, same aggregate: the string key costs **2.1x** what the integer one does,
+/// while DuckDB pays the same either way. So the obvious move is to pack 8-15 bytes into an
+/// `i128` and route it through [`int_group_ids`] exactly as this does for `u64`.
+///
+/// **It was built and measured, and it is 1.13x *slower*** (`id3` 49.7/53.0 ms -> 57.6/59.2 ms
+/// over two interleaved rounds, same tree, two `.so`s differing only in this). Two costs swamp
+/// the saving, and both are properties of the wide key rather than of the implementation: the
+/// packing is a second full pass that materializes a 160 MB `Vec<i128>` the hash path never
+/// allocates, and `int_group_ids`' inline-key table becomes 20 bytes a slot against the byte
+/// path's 4, so it loses far more to cache misses on a 100,000-group probe than it gains by
+/// comparing registers instead of slices. The byte path is not naive: it already keeps each
+/// group's representative *slice* beside its id, so its comparison costs no indirection either.
+///
+/// The gap is real and still open; a wider pack of the same shape is not the way to close it.
+/// What the measurement points at is the representation, not the key width — a `StringView`
+/// leaf with an inline prefix, so the comparison never leaves the array that was scanned
+/// (`competitor_technique_review.md` item 2).
 fn pack_short_bytes<T>(a: &GenericByteArray<T>, num_rows: usize) -> Option<Vec<u64>>
 where
     T: arrow::array::types::ByteArrayType,
@@ -859,15 +926,25 @@ fn assign_groups_int64_multi(
                 group_ids.push(*slot);
             }
             let num_groups = reps.len();
-            let reps_arr = UInt32Array::from(reps);
-            let group_columns = group_keys
-                .iter()
-                .map(|a| arrow::compute::take(a, &reps_arr, None))
-                .collect::<Result<_, _>>()?;
+            let group_columns = group_columns(group_keys, reps, num_rows)?;
             return Ok((group_ids, num_groups, group_columns));
         }
     }
 
+    // **Tried and reverted: delegating a two-column key to `assign_groups_packed`.** The loop
+    // below verifies a probe with `eq_rows(reps[g], i)`, reading the rep row in *every* key
+    // column — one random access per column into an array of `8 × num_rows` bytes, on the
+    // critical path of each probe. That is the defect [`int_group_ids`] carried, multiplied by
+    // the column count, and it costs **362.7 ns/row** at 1.7 M groups and **469.6 ns/row** at
+    // 5.1 M (single-threaded, 2 x `Int64`, one `SUM`).
+    //
+    // Packing the pair into the 16-byte key `assign_groups_packed` compares beside the group id
+    // does fix that end: 260.6 and 299.5 ns/row, **1.4-1.6x**. It also costs a `u128` pack on
+    // *every* row, which is pure overhead once the table is small enough to stay in L1 — the
+    // low-cardinality composite key (`GROUP BY <region>, <status>`) measured **21.4 ns/row
+    // against 12.3**, a 1.7x regression on the commoner shape. Two cached loads beat building
+    // a key. Restoring the delegation needs a cardinality signal to gate it on, which is not
+    // available here before the probe loop has run.
     let state = ahash::RandomState::with_seeds(0x9E37, 0x79B9, 0x7F4A, 0x7C15);
     // Hash a row's composite key by folding each column's raw value into one hasher —
     // no per-row allocation (unlike encoding a key tuple), the same values the equality
@@ -903,11 +980,7 @@ fn assign_groups_int64_multi(
     }
 
     let num_groups = reps.len();
-    let reps_arr = UInt32Array::from(reps);
-    let group_columns = group_keys
-        .iter()
-        .map(|a| arrow::compute::take(a, &reps_arr, None))
-        .collect::<Result<_, _>>()?;
+    let group_columns = group_columns(group_keys, reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -1016,11 +1089,7 @@ fn assign_groups_multi_raw(
     }
 
     let num_groups = reps.len();
-    let reps_arr = UInt32Array::from(reps);
-    let group_columns = group_keys
-        .iter()
-        .map(|a| arrow::compute::take(a, &reps_arr, None))
-        .collect::<Result<_, _>>()?;
+    let group_columns = group_columns(group_keys, reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -1160,11 +1229,7 @@ fn assign_groups_packed(
         group_ids.push(gid);
     }
     let num_groups = reps.len();
-    let reps_arr = UInt32Array::from(reps);
-    let group_columns = group_keys
-        .iter()
-        .map(|a| arrow::compute::take(a, &reps_arr, None))
-        .collect::<Result<_, _>>()?;
+    let group_columns = group_columns(group_keys, reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -1279,14 +1344,16 @@ fn assign_groups_packed_wide(
             table.reserve(extra, |&g| {
                 state.hash_one(&keys[g as usize * stride..(g as usize + 1) * stride])
             });
+            // `keys` is the widest per-group structure here (`stride` bytes against the
+            // table's four), so the doubling cascade `GroupGrowth` exists to remove costs
+            // more in it than in the table: at H2O q10's 49-byte key it re-copies ~1 MB per
+            // partition. The same projection sizes both.
+            reps.reserve(extra);
+            keys.reserve(extra * stride);
         }
     }
     let num_groups = reps.len();
-    let reps_arr = UInt32Array::from(reps);
-    let group_columns = group_keys
-        .iter()
-        .map(|a| arrow::compute::take(a, &reps_arr, None))
-        .collect::<Result<_, _>>()?;
+    let group_columns = group_columns(group_keys, reps, num_rows)?;
     Ok((group_ids, num_groups, group_columns))
 }
 
@@ -1324,6 +1391,61 @@ mod tests {
         assert_eq!(n, want_n, "num_groups for {vals:?}");
         let want_cols = arrow::compute::take(&arr, &UInt32Array::from(want_reps), None).unwrap();
         assert_eq!(&cols[0], &want_cols, "group columns for {vals:?}");
+    }
+
+    /// An all-distinct key returns the key columns themselves, and they must equal what the
+    /// `take` produced — the short-circuit in [`group_columns`] is only sound because
+    /// `reps.len() == num_rows` forces `reps` to be the identity permutation.
+    ///
+    /// Checked across the paths that reach it by different routes: a plain integer key, a
+    /// string key past the short-pack cap, a composite integer key, and the wide packed
+    /// composite the H2O six-key group-by takes.
+    #[test]
+    fn an_all_distinct_key_returns_the_columns_unchanged() {
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![5i64, 9, 1, 7]));
+        let longs: ArrayRef = Arc::new(StringArray::from(vec![
+            "alpha-value-one",
+            "alpha-value-two",
+            "alpha-value-three",
+            "alpha-value-four",
+        ]));
+        let more: ArrayRef = Arc::new(Int64Array::from(vec![100i64, 200, 300, 400]));
+        for keys in [
+            vec![ints.clone()],
+            vec![longs.clone()],
+            vec![ints.clone(), more.clone()],
+            vec![longs.clone(), ints.clone(), more.clone()],
+        ] {
+            let (ids, n, cols) = assign_groups(&keys, 4).unwrap();
+            assert_eq!(ids, vec![0, 1, 2, 3], "every row is its own group");
+            assert_eq!(n, 4);
+            let identity = UInt32Array::from(vec![0u32, 1, 2, 3]);
+            for (got, key) in cols.iter().zip(&keys) {
+                let taken = arrow::compute::take(key, &identity, None).unwrap();
+                assert_eq!(got, &taken, "short-circuited column differs from the take");
+            }
+        }
+    }
+
+    /// The mirror of the case above: one duplicate makes `reps` shorter than the input, so the
+    /// `take` must still run and must still select the *first-seen* row of each group.
+    #[test]
+    fn one_duplicate_key_still_takes_the_representatives() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![
+            "alpha-value-one",
+            "alpha-value-two",
+            "alpha-value-one",
+        ]));
+        let (ids, n, cols) = assign_groups(std::slice::from_ref(&arr), 3).unwrap();
+        assert_eq!(ids, vec![0, 1, 0]);
+        assert_eq!(n, 2);
+        assert_eq!(
+            cols[0].len(),
+            2,
+            "the column must shrink to the group count"
+        );
+        let want = arrow::compute::take(&arr, &UInt32Array::from(vec![0u32, 1]), None).unwrap();
+        assert_eq!(&cols[0], &want);
     }
 
     /// The packed short-key path must be identical to the general raw multi-key path.
@@ -1729,6 +1851,47 @@ mod tests {
     #[test]
     fn boundary_length_seven_and_eight() {
         check_str(vec!["abcdefg", "abcdefgh", "abcdefg", "abcdefgh"]);
+    }
+
+    /// 8-15 byte keys — the ordinary categorical width (ISO codes, SKUs, `YYYY-MM-DD`, short
+    /// identifiers) — take the byte-slice hash path, mixed with shorter values that would have
+    /// packed. Widening the packing to an `i128` to cover this range was tried and is **1.13x
+    /// slower**; see `pack_short_bytes` for the measurement. The coverage is worth keeping
+    /// either way: this is the width most real group keys have.
+    #[test]
+    fn medium_strings_stay_correct_on_the_hash_path() {
+        check_str(vec![
+            "id0000039083",
+            "id0000039084",
+            "id0000039083",
+            "abcdefgh",
+            "abcdefghi",
+            "abcdefgh",
+            "",
+            "abcdefghijklmno", // exactly 15 — the widest the packing takes
+            "abcdefghijklmno",
+        ]);
+    }
+
+    /// Long keys either side of a 16-byte boundary, which is where a wider packing would have
+    /// had to give up. Both take the hash path and must group identically to the oracle.
+    #[test]
+    fn boundary_length_fifteen_and_sixteen() {
+        check_str(vec![
+            "abcdefghijklmno",
+            "abcdefghijklmnop",
+            "abcdefghijklmno",
+            "abcdefghijklmnop",
+        ]);
+    }
+
+    /// The H2O db-benchmark's `id3` shape: a 12-byte key at a cardinality high enough that no
+    /// dense map applies, so it walks the byte-slice hash table. This is the engine's worst
+    /// measured group-by shape against DuckDB (1.7x), which is reason enough to pin it.
+    #[test]
+    fn h2o_shaped_medium_key_matches_reference() {
+        let vals: Vec<String> = (0..400).map(|i| format!("id{:010}", i % 97)).collect();
+        check_str(vals.iter().map(String::as_str).collect());
     }
 
     /// Two single-byte string keys (the `GROUP BY l_returnflag, l_linestatus` shape) take the

@@ -90,8 +90,8 @@ The Kleene row is why the JIT has a separate ABI for compound predicates
 
 :::{warning}
 `x != x` does not detect NaN in this engine. The `!=` operator uses a *total* ordering, in
-which `NaN == NaN`, so the familiar idiom silently returns all-false. Use `is_nan`, which is
-its own `Expr` variant for exactly this reason. `is_inf` is likewise a variant rather than a
+which `NaN == NaN`, so the familiar idiom silently returns all-false. Use {py:meth}`is_nan <batcher.plan.expr_ir.core.Expr.is_nan>`, which is
+its own {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` variant for exactly this reason. `is_inf` is likewise a variant rather than a
 comparison, because an infinite literal does not survive a JSON round-trip and so cannot be
 written as one. Both fall back to the interpreter in the JIT.
 :::
@@ -117,7 +117,7 @@ The cast dtype vocabulary is not per-module. `bc_arrow::dtype_from_name` is the 
 
 ## Media decode is different
 
-`.image`, `.audio`, and `.video` decodes are the one family that breaks the "per-row work is
+{py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>`, and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>` decodes are the one family that breaks the "per-row work is
 cheap" assumption. Decoding a JPEG is thousands of times more expensive than adding two
 integers, and the *input* is tiny (a 5 KB encoded blob), so a whole corpus of images can look
 like a single morsel to the scheduler and get one core.
@@ -153,13 +153,13 @@ print(out)
 
 Row 4 shows both rules at once. `big` is null because `null > 1` is null and
 `null AND true` is null: Kleene, not `false`. `label` is `'missing'` because `Case` selects
-a branch on the *result* of `is_null`, which is never itself null.
+a branch on the *result* of {py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is_null>`, which is never itself null.
 
-## What it costs, and where it loses
+## What the intermediate arrays buy
 
 The intermediate-array cost is real and it's why the JIT exists, but consider what the interpreter buys with it. Every sub-expression is a materialized Arrow array, so a batch can be handed to any Arrow kernel and any operator at any point, and an operator's state lives in Arrow rather than in registers. That is what lets a compiled pipeline be abandoned at a pipeline breaker without losing progress.
 
-Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the operator benchmarks a filter-then-project over TPC-H `lineitem` at scale factor 1 runs in 13.9 ms against DuckDB's 12.9 ms and Polars' 9.2 ms. This is a shape where the engine is competitive but not ahead, and the gap is expression-evaluation overhead, not scheduling.
+Kernel dispatch is per batch, not per row, so the overhead amortizes over 16,384 rows. On the operator benchmarks a filter-then-project over TPC-H `lineitem` at scale factor 1 runs in 13.9 ms, within a millisecond of both DuckDB and Polars on a shape that is almost pure expression evaluation.
 
 ## The two tiers, side by side
 

@@ -38,7 +38,7 @@ what else that decision buys.
 
 ## Chain the transforms
 
-`Chain` is the sklearn `Pipeline` equivalent. It fits each step on the **previous step's
+{py:class}`Chain <batcher.ml.preprocessors.Chain>` is the sklearn `Pipeline` equivalent. It fits each step on the **previous step's
 output** and replays the fitted steps, in order, over any split. Sequencing this by hand
 is where leaks appear: fit step *i* on data that steps *0..i-1* have not transformed and
 the statistics no longer match what the model will see at serving time. Nothing fails. The
@@ -63,7 +63,7 @@ print(train_x.collect().column_names)
 
 `fit` is the one place a preprocessor touches data: it runs a single mergeable aggregate
 over the engine, so it distributes and spills like any other aggregation. `transform` is a
-lazy `Expr` projection, with no Python per row and nothing materialized until a terminal op.
+lazy {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` projection, with no Python per row and nothing materialized until a terminal op.
 
 The fitted state is on the object, so you can read what it learned:
 
@@ -82,9 +82,9 @@ direction.
 
 ## Assemble the vector
 
-`Concatenator` stacks the numeric columns into one list column: the "make a feature vector"
+{py:class}`Concatenator <batcher.ml.preprocessors.Concatenator>` stacks the numeric columns into one list column: the "make a feature vector"
 step before a training loop. A tensor column travels with its shape, so
-`iter_torch_batches` hands the loop an `(n, d)` tensor with no reshape at the edge.
+{py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` hands the loop an `(n, d)` tensor with no reshape at the edge.
 
 ```python
 from batcher.ml import Concatenator
@@ -100,7 +100,7 @@ print(train_v.collect().column("features").to_pylist()[0])
 
 `Concatenator` is stateless, but it still follows the three-call contract (`fit` /
 `transform` / `fit_transform`), so the pipeline reads the same whether a step learns
-something or not. Calling `transform` before `fit` raises `PlanError` rather than silently
+something or not. Calling `transform` before `fit` raises {py:exc}`PlanError <batcher.PlanError>` rather than silently
 using an unfitted object.
 
 ## Hand it to the training loop
@@ -129,10 +129,10 @@ training runs, not by the features:
 
 | Loader | Hands you | Reach for it when |
 | --- | --- | --- |
-| `ds.ml.iter_torch_batches(...)` | `{column: tensor}` dicts, placed on the device | training in a single process |
-| `ds.ml.stream_loader(...)` | a torch `IterableDataset`, one shard per rank | DDP or FSDP over a bounded corpus |
-| `batcher.ml.streaming_split(...)` | one rank iterator per rank, from a single read | the source is unbounded, so there is no length to shard on |
-| `batcher.ml.to_torch_iterable(...)` | a torch iterable over any batch iterator | you already have a batch iterator and want to keep it |
+| {py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` | `{column: tensor}` dicts, placed on the device | training in a single process |
+| {py:meth}`ds.ml.stream_loader(...) <batcher.api.dataset.ml.DatasetML.stream_loader>` | a torch `IterableDataset`, one shard per rank | DDP or FSDP over a bounded corpus |
+| {py:func}`batcher.ml.streaming_split(...) <batcher.ml.streaming_split>` | one rank iterator per rank, from a single read | the source is unbounded, so there is no length to shard on |
+| {py:func}`batcher.ml.to_torch_iterable(...) <batcher.ml.to_torch_iterable>` | a torch iterable over any batch iterator | you already have a batch iterator and want to keep it |
 
 The full map, including the two ways to shard a stream wrongly, is in
 {doc}`data loaders </ml/training/data-loaders>`.
@@ -161,7 +161,7 @@ reads, and its cardinality has to be measured rather than estimated.
 
 :::{dropdown} Quantile bins, learned on the training split
 
-`KBinsDiscretizer` with `strategy="quantile"` learns the quantile edges so each bin holds
+{py:class}`KBinsDiscretizer <batcher.ml.preprocessors.KBinsDiscretizer>` with `strategy="quantile"` learns the quantile edges so each bin holds
 roughly equal counts. That is the right move for a heavy-tailed column such as spend, where
 equal *width* bins put 95% of your rows in bin 0.
 

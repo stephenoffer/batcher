@@ -116,6 +116,56 @@ print(enriched.to_pydict())
 #  'amount': [10, 20, 30, 40, 50], 'region': ['west', 'east', 'west', 'east', 'west']}
 ```
 
+## As-of joins
+
+Two time series rarely share a clock. A trade lands at 10:31:07.412 and the quote it should
+be priced against arrived at 10:31:07.198, so an equi-join on the timestamp finds nothing.
+{py:meth}`join_asof <batcher.Dataset.join_asof>` matches each left row to the *nearest* right
+row instead, which is the join every market-data, sensor-fusion, and slowly-changing-dimension
+pipeline is built on.
+
+It is left-style: every left row survives, with null right columns when nothing matched. Pass
+`by=` for columns that must match exactly, so one instrument's quotes never price another's
+trades.
+
+```python
+trades = bt.from_pydict({"sym": ["A", "A", "B"], "t": [10, 40, 10], "size": [100, 200, 50]})
+quotes = bt.from_pydict({"sym": ["A", "A", "B"], "t": [8, 38, 1], "price": [1.0, 1.1, 9.0]})
+
+print(trades.join_asof(quotes, on="t", by="sym").sort("sym", "t").to_pydict())
+# {'sym': ['A', 'A', 'B'], 't': [10, 40, 10], 'size': [100, 200, 50],
+#  'price': [1.0, 1.1, 9.0]}
+```
+
+The `B` trade at `t=10` matched a quote from `t=1`. That is the correct nearest earlier
+quote, and it may also be badly stale. `tolerance` is how you say so: beyond it, the row is
+left unmatched rather than carrying a value nobody would stand behind.
+
+```python
+print(trades.join_asof(quotes, on="t", by="sym", tolerance=5).sort("sym", "t").to_pydict())
+# {'sym': ['A', 'A', 'B'], 't': [10, 40, 10], 'size': [100, 200, 50],
+#  'price': [1.0, 1.1, None]}
+```
+
+Give `tolerance` a number for a numeric key, and a duration such as `"5m"` (or a
+`datetime.timedelta`) for a timestamp or date key. Reach for it whenever a missing match is
+more useful than a stale one, which in practice is most of the time.
+
+`direction` chooses which way to look. The default `"backward"` takes the last value at or
+before the left row, which is the causal reading and the one you almost always want.
+`"forward"` looks the other way, for questions like "what happened next". `"nearest"` takes
+whichever is closer and is right when the two clocks drift either side of each other, as with
+two sensors sampling the same physical event.
+
+```python
+print(trades.join_asof(quotes, on="t", by="sym", direction="nearest").sort("sym", "t").to_pydict())
+# {'sym': ['A', 'A', 'B'], 't': [10, 40, 10], 'size': [100, 200, 50],
+#  'price': [1.0, 1.1, 9.0]}
+```
+
+Both `tolerance` and `"nearest"` have to subtract two keys, so they need a numeric or
+temporal `on` column. A string key still orders fine for a plain backward or forward search.
+
 ## See also
 
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: summarize joined results.

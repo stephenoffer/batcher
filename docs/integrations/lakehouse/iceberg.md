@@ -6,8 +6,8 @@ file pruning; writes are `append` or `overwrite`, committed as one snapshot by t
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.iceberg(identifier, catalog=...)`, with `snapshot_id=` |
-| **Write** | `ds.write.iceberg(identifier, mode="append"\|"overwrite")` |
+| **Read** | {py:meth}`bt.read.iceberg(identifier, catalog=...) <batcher.api.io_namespace.reader.Reader.iceberg>`, with `snapshot_id=` |
+| **Write** | {py:meth}`ds.write.iceberg(identifier, mode="append"\|"overwrite") <batcher.api.io_namespace.writer.Writer.iceberg>` |
 | **Extra** | `pip install 'batcher-engine[iceberg]'` |
 | **Parallelism** | One split per data file surviving `plan_files`; serial on merge-on-read |
 | **Pushdown** | Predicates into `plan_files`, answered against the manifests |
@@ -169,7 +169,7 @@ always this.
 
 **Version drift.** A pyiceberg whose expression API differs degrades to no predicate pushdown
 rather than failing, so the result is right and the scan is wide. The incremental append scan
-(`read_incremental`) is stricter: on a version that lacks it, you get a clear `BackendError`.
+(`read_incremental`) is stricter: on a version that lacks it, you get a clear {py:exc}`BackendError <batcher.BackendError>`.
 
 ## See also
 

@@ -8,7 +8,7 @@ Both GPU paths are Python. The `bc-*` crates contain no GPU code at all, which f
 
 | Path | What runs on the device | Where |
 |---|---|---|
-| GPU relational backend (`collect(backend="gpu")`) | cuDF dataframe ops, with a torch scatter-reduce fallback | `core/gpu_plan/` translates, `dist/gpu/` schedules, in Ray tasks with `num_gpus=1` |
+| GPU relational backend ({py:meth}`collect(backend="gpu") <batcher.Dataset.collect>`) | cuDF dataframe ops, with a torch scatter-reduce fallback | `core/gpu_plan/` translates, `dist/gpu/` schedules, in Ray tasks with `num_gpus=1` |
 | GPU inference stage (`map_batches(..., num_gpus=...)`) | the user's torch model | a Python Ray actor |
 
 The second is the larger workload. The first is an opt-in accelerator for relational shapes, described in the next section. An unsupported shape, an OOM, or a GPU-less cluster falls back to the CPU engine, so `backend="gpu"` is always safe to request.
@@ -144,7 +144,7 @@ A latency PID optimizes the wrong thing for a batch job. What you want is maximu
 :::
 ::::
 
-The PID's shipped gains come from `PIDConfig`.
+The PID's shipped gains come from {py:class}`PIDConfig <batcher.PIDConfig>`.
 
 ```python
 from batcher.config import PIDConfig

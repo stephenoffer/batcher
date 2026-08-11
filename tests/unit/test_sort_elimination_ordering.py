@@ -72,3 +72,71 @@ def test_topn_sort_not_eliminated():
     inner = _t().sort("x")._plan
     topn = Sort(inner, inner.keys, limit=2)
     assert sort_elimination_from_ordering(topn, _ctx()) is None
+
+
+# --- direction-aware orderings ------------------------------------------------------------
+#
+# `RelStats.sorted_by` carries each key's direction, so a descending ordering is tracked and
+# consumed exactly as an ascending one is. Before that, `ORDER BY ts DESC` delivered no
+# ordering at all and none of these cases could fire.
+
+
+def test_redundant_descending_resort_eliminated():
+    plan = _t().sort("x", descending=True).sort("x", descending=True)._plan
+    ir = Optimizer().optimize(plan).ir
+    assert _num_sorts(ir) == 1
+    assert ir["keys"][0]["descending"] is True  # and it is the descending one that survived
+
+
+def test_coarser_descending_resort_is_prefix_eliminated():
+    plan = _t().sort("x", "y", descending=True).sort("x", descending=True)._plan
+    ir = Optimizer().optimize(plan).ir
+    assert _num_sorts(ir) == 1
+    assert [k["expr"]["name"] for k in ir["keys"]] == ["x", "y"]
+
+
+def test_ascending_resort_over_a_descending_input_is_not_eliminated():
+    """The mirror of `test_descending_resort_not_eliminated`: opposite directions are
+    different orderings, and neither satisfies the other."""
+    plan = _t().sort("x", descending=True).sort("x")._plan
+    ir = Optimizer().optimize(plan).ir
+    assert _num_sorts(ir) == 2
+
+
+def test_descending_ordering_survives_a_projection():
+    """A projection renames columns and reorders nothing, so the direction rides through."""
+    ds = _t().sort("x", descending=True).select(bt.col("x").alias("k"))
+    plan = ds.sort("k", descending=True)._plan
+    ir = Optimizer().optimize(plan).ir
+    assert _num_sorts(ir) == 1
+
+
+def test_nulls_first_resort_over_a_nulls_last_input_is_not_eliminated():
+    """Null placement is part of the ordering wherever a null can actually appear."""
+    plan = _t().sort("x").sort("x", nulls_first=True)._plan
+    ir = Optimizer().optimize(plan).ir
+    assert _num_sorts(ir) == 2
+
+
+# --- the removed `topn_over_sorted_input_to_limit` -------------------------------------------
+#
+# It rewrote `Sort(x, keys, limit=n)` -> `Limit(x, n)`. Sound, and dead: `Sort.limit` is set
+# only by rules in FUSION (phase 5) and later, so a REWRITE (phase 2) rule never sees one.
+# `ds.sort(...).limit(n)` reaches REWRITE as `Limit(Sort(...))`, which the rule above already
+# collapses. Its own tests passed because they built `Sort(limit=n)` by hand and called the
+# function directly -- a shape the optimizer does not produce there.
+
+
+def test_the_topn_rule_is_not_registered():
+    assert "topn_over_sorted_input_to_limit" not in {r.name for r in DEFAULT_REGISTRY.rules()}
+
+
+def test_a_top_n_over_a_sorted_input_still_collapses_to_a_limit():
+    """The behaviour the removed rule aimed at, achieved by the plain-sort rule above.
+
+    Built through the public API rather than by hand, which is the whole point: the shape the
+    optimizer actually sees is a `Limit` above a plain `Sort`, not a `Sort` carrying a limit.
+    """
+    plan = _t().sort("x", descending=True).sort("x", descending=True).limit(2)._plan
+    ir = Optimizer().optimize(plan).ir
+    assert _num_sorts(ir) == 1

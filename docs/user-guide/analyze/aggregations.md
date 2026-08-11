@@ -25,8 +25,8 @@ ds = bt.from_pydict(
 keywords to name the output, or positionally to keep the source column's name.
 {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; the column aggregates are methods
 on an expression (`.sum()`, `.mean()`, and so on) or the top-level shorthands
-{py:obj}`bt.sum("x") <batcher.sum>`, `bt.mean`, `bt.min`, `bt.max`, `bt.median`,
-`bt.std`, `bt.var`, `bt.n_unique`. `bt.sum("x")` reads as `col("x").sum()`, the
+{py:obj}`bt.sum("x") <batcher.sum>`, {py:func}`bt.mean <batcher.mean>`, {py:func}`bt.min <batcher.min>`, {py:func}`bt.max <batcher.max>`, {py:func}`bt.median <batcher.median>`,
+{py:func}`bt.std <batcher.std>`, {py:func}`bt.var <batcher.var>`, {py:func}`bt.n_unique <batcher.n_unique>`. `bt.sum("x")` reads as `col("x").sum()`, the
 Polars `pl.sum` convention.
 
 ```python
@@ -78,9 +78,9 @@ two-column statistic.
 
 The aggregate methods available inside `agg` are `sum`, `min`, `max`, `mean`,
 `var`, `std`, `median`, `quantile(q)`, `count`, and `n_unique` (also spelled
-`count_distinct`). {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
+{py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`). {py:obj}`bt.count() <batcher.count>` counts rows. Each of these
 builds an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that `agg(...)`
-consumes and that `.over(...)` lifts into a {doc}`window function </user-guide/analyze/window-functions>`.
+consumes and that {py:meth}`.over(...) <batcher.AggExpr.over>` lifts into a {doc}`window function </user-guide/analyze/window-functions>`.
 You rarely name it directly.
 
 ```python
@@ -158,9 +158,12 @@ bivariate = market.group_by("region").agg(
     cov_s=bt.covar_samp(bt.col("spend"), bt.col("revenue")),
 ).sort("region")
 print(bivariate.to_pydict())
-# {'region': ['east', 'west'], 'r': [-1.0, 1.0],
+# {'region': ['east', 'west'], 'r': [-0.9999999999999998, 0.9999999999999998],
 #  'cov_p': [-6.666666666666667, 6.666666666666667], 'cov_s': [-10.0, 10.0]}
 ```
+
+A perfect correlation prints as `0.9999999999999998` rather than `1.0`: the coefficient is a ratio of floating-point sums, so the last bits are the arithmetic's, not the data's.
+
 
 ## Expressions over aggregates
 
@@ -267,7 +270,7 @@ print(approx.to_pydict())
 
 ## Multiple grouping keys
 
-Pass several keys to `group_by` to group by each unique combination.
+Pass several keys to {py:meth}`group_by <batcher.Dataset.group_by>` to group by each unique combination.
 
 ```python
 sales = bt.from_pydict(
@@ -304,10 +307,36 @@ print(ds.count())
 # 5
 ```
 
+Each single-column reduction also has a **scalar terminal** that skips the one-row frame and
+hands back the value itself. `min`, `max`, `sum`, `mean`, `median`, `quantile`, `std`, `var`
+and `n_unique` are joined by the distribution's shape and by the boolean reductions:
+
+```python
+print(ds.product("price"), ds.mode("category"))
+# 12000000.0 a
+
+print(ds.skewness("price"), ds.kurtosis("price"), ds.mad("price"))
+# 0.0 -1.2000000000000004 10.0
+```
+
+{py:meth}`mad <batcher.Dataset.mad>` is the mean absolute deviation. It does not square the
+deviations the way the standard deviation does, so one far-out value moves it far less —
+which is the spread to prefer when outliers are expected rather than exceptional.
+
+{py:meth}`any <batcher.Dataset.any>` and {py:meth}`all <batcher.Dataset.all>` reduce a
+boolean column. Both return `None` for an empty or all-null column rather than `False` or
+`True`, so a vacuous answer never passes for a checked one:
+
+```python
+flags = bt.from_pydict({"ok": [True, True, False]})
+print(flags.any("ok"), flags.all("ok"))
+# True False
+```
+
 ## Derived grouping keys
 
 `group_by` accepts derived expressions, not just column names. Define the key in
-`with_columns` (or pass an expression) and group on it.
+{py:meth}`with_columns <batcher.Dataset.with_columns>` (or pass an expression) and group on it.
 
 ```python
 buckets = (

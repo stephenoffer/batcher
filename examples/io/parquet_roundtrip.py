@@ -9,6 +9,7 @@ Partitioning on a column you always filter by turns that skipping into directory
 
 from __future__ import annotations
 
+import datetime
 import tempfile
 from pathlib import Path
 
@@ -50,10 +51,10 @@ def main() -> None:
         print("partitions:", dirs)
         assert dirs == ["day=2024-01-01", "day=2024-01-02"]
 
-        # Reading it back needs the *partition-aware* reader. A plain `read.parquet` only
-        # reads files, and the partition key lives in the directory name, so `day` would be
-        # missing -- it warns loudly rather than losing the column silently.
-        assert "day" not in bt.read.parquet(str(parts)).schema.names
+        # The partition key lives in the *directory name*, not in any file, so recovering it
+        # is the reader's job. Both readers do: `read.parquet` detects the Hive layout, and
+        # `read.parquet_dataset` is the explicit entry point for it.
+        assert "day" in bt.read.parquet(str(parts)).schema.names
 
         partitioned = bt.read.parquet_dataset(str(parts))
         assert "day" in partitioned.schema.names
@@ -62,7 +63,13 @@ def main() -> None:
         one_day = partitioned.filter(col("day") == "2024-01-02").to_pydict()
         print(one_day)
         assert sorted(one_day["amount"]) == [30, 40]
-        assert set(one_day["day"]) == {"2024-01-02"}
+
+        # The value is recovered by *parsing the directory name*, so its type is inferred
+        # rather than carried over: `day` was written as a string and reads back as a date.
+        # DuckDB's `hive_partitioning=true` does the same, and a partition column is the one
+        # place a Parquet round trip is not type-preserving. Filter with a string either
+        # way -- the comparison casts.
+        assert set(one_day["day"]) == {datetime.date(2024, 1, 2)}
 
         # Save modes: `overwrite` replaces, the default refuses to clobber.
         events.write.parquet(str(flat), mode="overwrite")

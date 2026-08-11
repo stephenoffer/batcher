@@ -57,6 +57,14 @@ filters into one. For Parquet, a pushed predicate lets the reader skip row group
 whose statistics rule them out, and skip partitions entirely when the column is a
 partition key. On a selective scan that can cut the work by orders of magnitude.
 
+A source pushes what its backend can express, and no more. Every backend has terms it
+cannot spell: a database has no portable literal for `NaN`, a Parquet reader will not
+prune on a temporal literal whose physical unit it cannot verify. When one term of an
+`AND` is untranslatable, the rest are still pushed, because dropping a conjunct only
+widens what the source returns and the engine keeps its own `Filter` to re-check every
+row. An `OR` is the opposite case and pushes all or nothing: dropping a disjunct would
+narrow the filter and lose rows that never crossed the wire.
+
 ### Projection and column pruning
 
 Only the columns a query actually uses are read and carried. Kyber tracks column

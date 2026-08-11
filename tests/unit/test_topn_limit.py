@@ -7,6 +7,8 @@ Importing the module registers its `@rule` decorators into `DEFAULT_REGISTRY`.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import batcher as bt
 from batcher.config import active_config
 from batcher.kyber.optimizer import Optimizer
@@ -15,11 +17,13 @@ from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rules.extra.topn_limit import (
     drop_redundant_limit,
     empty_limit_past_cardinality,
+    fuse_limit_into_distinct,
     push_limit_through_row_index,
     push_offset_limit_into_union,
 )
 from batcher.kyber.stats.estimator import StatsEstimator
-from batcher.plan.logical import Limit, RowId, Scan, Union
+from batcher.plan.logical import Distinct, Limit, RowId, Scan, Union
+from batcher.plan.stats import Provenance
 
 
 def _ds(n=5):
@@ -178,3 +182,110 @@ def test_push_offset_limit_into_union_idempotent():
     ds = _ds(3).union(_ds(4)).limit(2, offset=1)
     once = push_offset_limit_into_union(ds._plan, None)
     assert push_offset_limit_into_union(once, None) is None  # branches already capped
+
+
+# --- fuse_limit_into_distinct -------------------------------------------------
+
+
+def _distinct_ds(n=4000):
+    """A nearly-unique key, so the fusion's cardinality gate opens."""
+    return bt.from_pydict({"g": list(range(n))}).select("g").distinct()
+
+
+def _find_op(ir, op):
+    """The first node with tag `op`, or None."""
+    if ir.get("op") == op:
+        return ir
+    for v in ir.values():
+        if isinstance(v, dict) and "op" in v:
+            found = _find_op(v, op)
+            if found is not None:
+                return found
+        elif isinstance(v, list):
+            for e in v:
+                if isinstance(e, dict) and "op" in e:
+                    found = _find_op(e, op)
+                    if found is not None:
+                        return found
+    return None
+
+
+def test_fuse_limit_into_distinct_registered():
+    assert "fuse_limit_into_distinct" in {r.name for r in DEFAULT_REGISTRY.rules()}
+
+
+def test_fuse_limit_into_distinct_fires_on_high_cardinality():
+    ds = _distinct_ds().limit(5)
+    out = fuse_limit_into_distinct(ds._plan, _ctx(ds))
+    assert isinstance(out, Limit)
+    assert isinstance(out.input, Distinct)
+    assert out.input.limit == 5
+
+
+def test_fuse_limit_into_distinct_reaches_the_ir():
+    """The whole optimizer emits the capped operator, not just the rule in isolation."""
+    ds = _distinct_ds().limit(5)
+    distinct_ir = _find_op(_ir(ds), "distinct")
+    assert distinct_ir is not None
+    assert distinct_ir["limit"] == 5
+
+
+def test_fuse_limit_into_distinct_caps_at_offset_plus_n():
+    """The dedup must reach `offset + n` distinct rows for the outer window to be there."""
+    ds = _distinct_ds().limit(2, offset=3)
+    out = fuse_limit_into_distinct(ds._plan, _ctx(ds))
+    assert out.input.limit == 5
+    assert (out.n, out.offset) == (2, 3)
+
+
+def test_fuse_limit_into_distinct_noop_on_measured_low_cardinality():
+    """A *measured* low ndv declines: the dense direct-map already wins there.
+
+    An unmeasured column is a different case and deliberately still fuses — the operator's
+    own bounded probe decides it on measured data. Only evidence declines here.
+    """
+    ds = _distinct_ds().limit(5)
+    ctx = _ctx(ds)
+    est = ctx.estimator
+
+    class _LowNdv:
+        """An estimator reporting a measured, low distinct count."""
+
+        def estimate(self, node):
+            base = est.estimate(node)
+            return replace(base, rows=10.0, provenance=Provenance.SKETCH)
+
+    low = OptimizerContext(
+        config=active_config(), sources=ds._sources, hub=None, estimator=_LowNdv()
+    )
+    assert fuse_limit_into_distinct(ds._plan, low) is None
+
+
+def test_fuse_limit_into_distinct_fires_on_unmeasured_cardinality():
+    """No ndv is not evidence of a low one, so the rule fuses and the operator probes."""
+    ds = bt.from_pydict({"g": [i % 4 for i in range(1000)]}).select("g").distinct().limit(5)
+    ctx = _ctx(ds)
+    assert ctx.estimator.estimate(ds._plan.input).provenance is Provenance.DEFAULT
+    assert fuse_limit_into_distinct(ds._plan, ctx) is not None
+
+
+def test_fuse_limit_into_distinct_noop_on_keyed_distinct():
+    """A keyed dedup's survivor can be replaced by a later row, so no prefix settles it."""
+    ds = bt.from_pydict({"g": list(range(4000)), "v": list(range(4000))})
+    keyed = ds.distinct(["g"]).limit(5)
+    assert fuse_limit_into_distinct(keyed._plan, _ctx(keyed)) is None
+
+
+def test_fuse_limit_into_distinct_idempotent():
+    ds = _distinct_ds().limit(5)
+    ctx = _ctx(ds)
+    once = fuse_limit_into_distinct(ds._plan, ctx)
+    assert fuse_limit_into_distinct(once, ctx) is None
+
+
+def test_unfused_distinct_omits_the_limit_from_the_ir():
+    """The wire shape is unchanged when nothing fused, so old plans stay byte-identical."""
+    ds = bt.from_pydict({"g": [i % 4 for i in range(1000)]}).select("g").distinct()
+    distinct_ir = _find_op(_ir(ds), "distinct")
+    assert distinct_ir is not None
+    assert "limit" not in distinct_ir

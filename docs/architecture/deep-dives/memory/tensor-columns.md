@@ -57,11 +57,11 @@ Two conventions coexist, and it is worth knowing which you have:
 
 | Per-row rank | Arrow type | Produced by |
 |---|---|---|
-| 1 (an embedding) | plain `FixedSizeList<T, dim>` | `bt.from_numpy` on an `(n, dim)` array |
+| 1 (an embedding) | plain `FixedSizeList<T, dim>` | {py:func}`bt.from_numpy <batcher.from_numpy>` on an `(n, dim)` array |
 | ≥ 2 (image, clip, point cloud) | `arrow.fixed_shape_tensor` extension | native decode; a UDF returning `ndim >= 2` |
 
 Both read back as `(n, *shape)` through the numpy and torch converters, so it is invisible
-in practice, though the Arrow schema differs, and if you are inspecting `ds.schema()` you will
+in practice, though the Arrow schema differs, and if you are inspecting {py:obj}`ds.schema() <batcher.Dataset.schema>` you will
 see it.
 
 ```python
@@ -167,7 +167,7 @@ read-only and handing one to torch is undefined behavior the moment anything wri
 `zero_copy=True` opts into `torch.from_dlpack`, with a copy as fallback.
 
 That default is a real cost, and it is the honest kind: correctness first. The
-zero-copy DLPack path is what `iter_torch_batches` uses for training ingest, where it streams
+zero-copy DLPack path is what {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` uses for training ingest, where it streams
 1.76 M rows/s on 10M rows by 32 features, well above what most training loops consume.
 
 ```python
@@ -197,12 +197,59 @@ That interception is what makes a two-stage decode-then-model pipeline expressib
 returning `{"emb": (B, 2048) float32}` round-trips zero-copy through the FFI, out to numpy and
 torch, where without it the batch construction fails outright.
 
+## When the rows have different shapes
+
+The canonical type carries one shape for a whole column, so a corpus of mixed-resolution
+images has no fixed-shape form at all. That is the ordinary result of decoding a folder of
+photos, and it used to be where a multimodal pipeline stopped: the only advice was to resize
+before the engine saw the data.
+
+Those columns are carried by a second representation, in
+`python/batcher/io/formats/ml/ragged.py`. Each row is stored as its own row-major buffer
+beside its own shape and dtype:
+
+```text
+struct<data: binary, shape: list<int32>, dtype: string>
+```
+
+Both halves of that layout are doing work. It is a **plain struct**, so it crosses the FFI,
+writes to Parquet, shuffles, and passes through every operator with no engine change, no IR
+tag, and no wire-contract change — unlike an extension type, which the Rust side would have
+had to learn. And `data` is a **binary buffer rather than a list of elements**, because the
+boundary widens narrow numerics: a `list<uint8>` image column arrives as `list<int64>`, eight
+bytes per pixel, for the one workload the representation exists to carry.
+
+Nothing asks for it. A `map_batches` returning arrays of differing shape, or a `from_pydict`
+given them, produces one automatically, and `to_numpy` and `batch_format="numpy"` decode it
+back to per-row arrays:
+
+```python
+# docs: skip
+import numpy as np
+
+ds = bt.from_pydict({"img": [np.zeros((2, 2), "uint8"), np.ones((3, 4), "uint8")]})
+print([a.shape for a in ds.to_numpy()["img"]])
+# [(2, 2), (3, 4)]
+```
+
+What it does not do is present itself to torch as a tensor. Rows of differing shape have no
+stacked form, so the bridges hand back per-row arrays rather than silently padding. A model
+that needs one tensor still needs a resize, and the resize is now a choice made in the
+pipeline rather than a precondition for entering it.
+
 ## Costs and limits
 
-A tensor column is dense and fixed-shape. Every row pays the full `prod(shape) ×
-sizeof(dtype)` bytes whether it needs them or not, and rows of *differing* shape cannot share
-a column, so a corpus of mixed-resolution images has to be resized on decode. Which is why
-`.image.to_tensor()` takes a width and height rather than inferring one.
+A fixed-shape tensor column is dense. Every row pays the full `prod(shape) × sizeof(dtype)`
+bytes whether it needs them or not, which is why
+{py:meth}`.image.to_tensor() <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` takes a width and height rather than inferring one.
+The variable-shape form above lifts the shape restriction but not the density: it stores the
+same bytes, plus a shape and a dtype string per row.
+
+One `batch_format` cannot carry the shape. `pyarrow`, `numpy`, and `pandas` all hand a
+function per-row arrays with their real shape, and rebuild the tensor column from what comes
+back. Polars has no dtype for a per-row tensor, so it reads the canonical extension type as
+its flat storage and a `(3, 3)` image arrives as a 9-element list. The values are unharmed;
+the shape is not. Use `numpy` or `pandas` when the function needs it.
 
 The bytes are real, and they are what `execution.morsel_bytes` (1 MiB) exists for: a morsel is
 split at whichever bound trips first, rows or bytes, so a column of 224×224×3 images produces
@@ -243,6 +290,7 @@ handed to a model:
 | Concern | File |
 |---|---|
 | The type helpers | `python/batcher/io/formats/ml/tensor.py` |
+| The variable-shape representation | `python/batcher/io/formats/ml/ragged.py` |
 | Metadata preservation in projection | `crates/bc-interp/src/ops/project_field.rs` |
 | Decode kernels | `crates/bc-expr/src/eval/media/{image,audio,video}.rs` |
 | Decode orchestration | `python/batcher/ml/decode.py` |

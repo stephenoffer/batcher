@@ -100,8 +100,21 @@ pub enum RelOp {
         right_on: String,
         left_by: Vec<String>,
         right_by: Vec<String>,
-        /// `true` = backward (largest right.on ≤ left.on); `false` = forward.
-        backward: bool,
+        /// Which side of the left key a match may come from.
+        #[serde(default)]
+        direction: AsofDirection,
+        /// Cap on how far apart the two `on` keys may be, in the key's own units and in
+        /// **microseconds** for any temporal key. `None` = no cap, which matches whatever
+        /// the nearest row is however stale it has become. Requires a numeric or temporal
+        /// `on` key, as does `direction = nearest`.
+        #[serde(default)]
+        tolerance: Option<f64>,
+        /// Whether a right row whose `on` key *equals* the left row's may be the match.
+        /// `false` is pandas' `allow_exact_matches=False`, the strict form that keeps a
+        /// backtest honest: a quote stamped at the same instant as the trade is information
+        /// the trade did not have.
+        #[serde(default = "default_true")]
+        allow_exact_matches: bool,
         output: Vec<JoinOutputCol>,
     },
 
@@ -128,8 +141,49 @@ pub enum RelOp {
         output: Vec<JoinOutputCol>,
     },
 
-    /// Deduplicate rows (DISTINCT over all columns). A pipeline breaker.
-    Distinct { input: Box<RelOp> },
+    /// Deduplicate rows. A pipeline breaker.
+    ///
+    /// With no `keys`, this is `DISTINCT` over every column: rows that agree on all of them
+    /// collapse, and there is no payload to choose between. With `keys` it is `DISTINCT ON`
+    /// — the named columns decide which rows collapse, and the surviving row still carries
+    /// every other column. `order` then names the row that survives (the minimum under it);
+    /// empty `order` takes an arbitrary one.
+    ///
+    /// Both forms are one mergeable reduction, so the parallel and distributed paths are
+    /// scheduling over the same operator rather than a second semantics — see
+    /// `bc_runtime::agg::distinct_on`.
+    Distinct {
+        input: Box<RelOp>,
+        /// The dedup key. Empty = every column (plain `DISTINCT`).
+        #[serde(default)]
+        keys: Vec<String>,
+        /// Which row survives per key: the minimum under this ordering. Empty = any row.
+        /// Only meaningful alongside `keys`; a whole-row `DISTINCT` has no payload to order.
+        #[serde(default)]
+        order: Vec<SortKey>,
+        /// Stop once this many distinct rows exist, for a `LIMIT` fused in from above.
+        ///
+        /// Without it a `DISTINCT` under a `LIMIT` consumes its whole input before the limit
+        /// discards nearly all of it, which is asymptotic rather than constant: on a
+        /// high-cardinality key the dedup does work proportional to the *input* to answer a
+        /// question about `k` rows. DuckDB fuses the same pair
+        /// (`PhysicalLimitedDistinct`, whose `Sink` returns `FINISHED` once the hash table
+        /// holds `limit` groups).
+        ///
+        /// **The rows kept are the first `k` in input order**, not an arbitrary `k`. That
+        /// distinction is the whole reason this is sound here. SQL leaves the choice open,
+        /// and DuckDB takes whichever `k` its threads happen to reach first — but invariant
+        /// #7 requires a result identical on one node and on many, and "whichever `k` won the
+        /// race" is not. First-in-input-order is deterministic, costs nothing extra to
+        /// maintain (the dedup already visits morsels in order), and still permits the early
+        /// exit, because a prefix that already holds `k` distinct rows determines the answer
+        /// whatever follows it.
+        ///
+        /// Only set when the surviving order is genuinely unconstrained — no `Sort` between
+        /// the `Distinct` and its `Limit`. `None` = no limit (a plain dedup).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
 
     /// Window functions: partition rows by `partition_keys`, order within each
     /// partition by `order_keys`, and append one output column per function
@@ -381,6 +435,22 @@ pub enum AggFunc {
     ApproxQuantile,
     /// `mode` — most frequent value per group (ties → smallest, so mergeable).
     Mode,
+    /// `n50`/`n90` — assembly contiguity: the *length* such that pieces at least that long
+    /// hold the `param` fraction of the total. The fraction rides `AggregateItem::param`
+    /// (0.5 for N50, 0.9 for N90), as for `Quantile`. Base-weighted, which is what makes it
+    /// different from a quantile over the same lengths. Mergeable (same value-list state).
+    NLength,
+    /// `l50`/`l90` — the *count* of pieces needed to reach `param` of the total. → Int64.
+    LCount,
+    /// `aun` — the area under the Nx curve, `Σ(l²)/Σ(l)`: the threshold-free contiguity
+    /// statistic. Takes no param. Mergeable.
+    ///
+    /// Renamed explicitly because the derive would spell this `au_n`: the field's name is
+    /// "auN" (one word, a capital N), and `snake_case` has no way to know that. The wire tag
+    /// is what Python's `to_ir()` sends, so the two must agree — and they did not until the
+    /// engine rejected the plan by name, which is the contract working.
+    #[serde(rename = "aun")]
+    AuN,
     /// `arg_min` / `arg_max` — the value (`input`) at the row with the min/max
     /// ordering key (`input2`). Two-input, 2-column-state, mergeable.
     ArgMin,
@@ -448,11 +518,28 @@ pub struct WindowFunc {
     /// the aggregate functions; ignored by ranking/value functions.
     #[serde(default)]
     pub frame: Option<WindowFrame>,
+    /// EWM smoothing factor in `(0, 1]` — required by `ewm_mean`/`ewm_var`/`ewm_std`
+    /// and absent for every other function. Carried as the resolved alpha rather than
+    /// as the `span`/`halflife`/`com` a caller may have spelled it with, so the engine
+    /// has one number to honour and the conversion lives in one place.
+    #[serde(default)]
+    pub alpha: Option<f64>,
+    /// EWM half-life in the ORDER BY key's own units, and in **microseconds** for a temporal
+    /// key. Set instead of `alpha` when the smoother should decay by *elapsed key value*
+    /// rather than by row position — the form an irregularly sampled series needs, where an
+    /// hour's silence must not cost the same weight as a second's. Only `ewm_mean` takes it.
+    #[serde(default)]
+    pub half_life: Option<f64>,
     pub alias: String,
 }
 
 fn default_offset() -> i64 {
     1
+}
+
+/// `serde` default for a flag whose absence means "the permissive, pre-existing behaviour".
+fn default_true() -> bool {
+    true
 }
 
 /// An explicit window frame: the rows each output row aggregates over.
@@ -486,6 +573,22 @@ pub enum FrameBound {
     CurrentRow,
     Following { n: u64 },
     UnboundedFollowing,
+}
+
+/// Which side of the left key an ASOF match may come from (`RelOp::AsofJoin::direction`).
+///
+/// `Backward` is the default in pandas, Polars and DuckDB alike, and is the reading that
+/// makes an ASOF join useful: the last known value at or before the left row. `Forward`
+/// looks the other way, and `Nearest` takes whichever is closer, preferring the backward
+/// one on an exact tie. `Nearest` needs to subtract two keys, so it requires a numeric or
+/// temporal `on` key where the other two work on any ordered type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsofDirection {
+    #[default]
+    Backward,
+    Forward,
+    Nearest,
 }
 
 /// Window function tags. The wire names are the contract with the engine.
@@ -525,7 +628,7 @@ pub enum WindowFn {
     /// (DuckDB, Spark, Polars) allows any aggregate over a window; these are the ones
     /// whose running form is O(1) per row, which is what lets them share the same
     /// whole-partition and running machinery as the five above. Order statistics
-    /// (`median`/`quantile`/`mode`) are deliberately absent — see `bc_runtime::window_agg`.
+    /// (`median`/`quantile`/`mode`) are deliberately absent — see `bc_runtime::window::agg`.
     Var,
     Stddev,
     Product,
@@ -535,6 +638,18 @@ pub enum WindowFn {
     BitOr,
     BitXor,
     CountDistinct,
+    /// The whole-prefix series recurrences. Unlike every function above, each row's
+    /// answer is a function of the entire ordered prefix carried in a running state, so
+    /// they take no frame and, like the fills, require an ORDER BY.
+    ///
+    /// `ewm_mean`/`ewm_var`/`ewm_std` are the exponentially weighted moving statistics,
+    /// smoothed by [`WindowFunc::alpha`]; `interpolate` draws a straight line across an
+    /// interior null run; `rle_id` numbers the runs of equal values.
+    EwmMean,
+    EwmVar,
+    EwmStd,
+    Interpolate,
+    RleId,
 }
 
 /// One output column of a `Project`: an expression and the name it is bound to.
@@ -558,7 +673,7 @@ impl RelOp {
             | RelOp::Aggregate { input, .. }
             | RelOp::Sort { input, .. }
             | RelOp::Limit { input, .. }
-            | RelOp::Distinct { input }
+            | RelOp::Distinct { input, .. }
             | RelOp::Window { input, .. }
             | RelOp::Unnest { input, .. }
             | RelOp::RowId { input, .. }
@@ -600,7 +715,7 @@ impl RelOp {
     /// new `RelOp` variant is a compile error until someone classifies its expressions.
     fn own_exprs(&self) -> Vec<&Expr> {
         match self {
-            RelOp::Scan { .. } | RelOp::Distinct { .. } => Vec::new(),
+            RelOp::Scan { .. } => Vec::new(),
             RelOp::Limit { .. }
             | RelOp::Unnest { .. }
             | RelOp::RowId { .. }
@@ -626,6 +741,9 @@ impl RelOp {
                 )
                 .collect(),
             RelOp::Sort { keys, .. } => keys.iter().map(|k| &k.expr).collect(),
+            // The dedup key is named by column, but the ordering that picks the surviving
+            // row is a general expression, so it counts here exactly as `Sort`'s does.
+            RelOp::Distinct { order, .. } => order.iter().map(|k| &k.expr).collect(),
             RelOp::Window {
                 partition_keys,
                 order_keys,
@@ -720,6 +838,36 @@ mod tests {
             drift.is_err(),
             "an unknown RelOp field must be rejected, not ignored"
         );
+    }
+
+    /// A keyed dedup arrives with its key and ordering, and a whole-row one arrives without
+    /// them — the `serde(default)` that makes the two forms one node on the wire.
+    ///
+    /// The defaulted half is what needs pinning. `deny_unknown_fields` would catch a *new*
+    /// field Rust does not know, but nothing catches a field Rust knows that Python stops
+    /// sending: it would quietly default, and a `distinct(["k"])` whose `keys` went missing is
+    /// a whole-row DISTINCT that runs, returns rows, and returns the wrong ones.
+    #[test]
+    fn distinct_carries_its_key_and_ordering() {
+        let whole = RelOp::from_json(r#"{"op":"distinct","input":{"op":"scan","source_id":0}}"#)
+            .expect("a whole-row DISTINCT sends neither field");
+        let RelOp::Distinct { keys, order, .. } = whole else {
+            panic!("expected a Distinct")
+        };
+        assert!(keys.is_empty() && order.is_empty());
+
+        let keyed = RelOp::from_json(
+            r#"{"op":"distinct","input":{"op":"scan","source_id":0},"keys":["k"],
+                "order":[{"expr":{"e":"col","name":"ts"},"descending":true,
+                          "nulls_first":false}]}"#,
+        )
+        .expect("a keyed dedup sends both");
+        let RelOp::Distinct { keys, order, .. } = keyed else {
+            panic!("expected a Distinct")
+        };
+        assert_eq!(keys, vec!["k".to_string()]);
+        assert_eq!(order.len(), 1);
+        assert!(order[0].descending && !order[0].nulls_first);
     }
 
     /// The guard reaches `Expr` (the other half of the wire contract) too: an unknown

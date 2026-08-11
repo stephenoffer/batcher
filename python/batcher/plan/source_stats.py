@@ -23,9 +23,14 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from batcher.plan.stats import ColumnStat, Provenance, RelStats
+from batcher.plan.stats import ColumnStat, Provenance, RelStats, SortOrder, as_sort_orders
 
-__all__ = ["SourceStatistics", "source_identity", "source_stats_key"]
+__all__ = [
+    "SourceStatistics",
+    "source_identity",
+    "source_stats_key",
+    "stable_source_key",
+]
 
 
 # Per-instance serials for shape-keyed sources, and the counter that issues them.
@@ -80,6 +85,38 @@ def source_identity(source: object) -> str:
         return str(identity_fn() or "")
     except Exception:  # pragma: no cover - a source that cannot identify itself
         return ""
+
+
+def stable_source_key(source: object) -> str:
+    """The source's key **only when its identity is data-stable**, else `""`.
+
+    `kyber.signature` puts this in the scan token so a learned value keyed by plan signature
+    belongs to the relation it was measured from. It is deliberately narrower than
+    `source_stats_key`, and the difference is the whole point.
+
+    A source with a data-stable identity — a file path, a table URI — keeps that identity as
+    its data grows. Keying a signature by it fixes the collision that let one table's measured
+    selectivity answer for another's *and* preserves the property that makes a ratio worth
+    learning: the same table at 1M rows and at 10M rows is the same key, so a selectivity
+    measured on one applies to the other.
+
+    An **in-memory** source has no such identity. Its `identity()` is schema plus row count, so
+    two unrelated relations of the same shape collide and the *same* relation grown by a row
+    does not. Neither half of that is usable in a signature: the first re-creates the defect,
+    the second destroys the size-generalization above. So it contributes `""`, which is the
+    shared token every scan had before, and the residual collision among same-shaped in-memory
+    relations is left to the confidence gate in `kyber.measured_selectivity` — a bounded,
+    process-local exposure, against a durable and cross-run one for real tables.
+
+    Args:
+        source: A bound input source.
+
+    Returns:
+        The stable key, or `""` when the source has no durable identity.
+    """
+    if not getattr(source, "stable_stats_identity", True):
+        return ""
+    return source_stats_key(source) or ""
 
 
 def source_stats_key(source: object) -> str | None:
@@ -160,9 +197,13 @@ class SourceStatistics:
     row_count: int | None = None
     byte_size: int | None = None
     columns: Mapping[str, ColumnStat] = field(default_factory=dict)
-    # Columns the source is physically sorted by — ascending, nulls-last (the
-    # canonical ordering `RelStats.sorted_by` consumes for redundant-sort removal).
-    sorted_by: tuple[str, ...] = ()
+    # The ordering the source is physically stored in, as `SortOrder` keys — the
+    # ordering `RelStats.sorted_by` consumes for redundant-sort removal. A connector
+    # that knows only "sorted by k" may write the bare column name and
+    # `as_sort_orders` reads it as ascending, nulls-last; one whose format records the
+    # direction (a Parquet footer's sorting columns, a lakehouse sort key) should say so,
+    # because a descending ordering is just as useful and used to be discarded.
+    sorted_by: tuple[SortOrder | str, ...] = ()
     partition_keys: tuple[str, ...] = ()
     exact_rows: bool = True
     # How many physical blocks the source is stored in (Parquet row groups, ORC
@@ -228,5 +269,5 @@ class SourceStatistics:
             rows=rows,
             provenance=prov,
             columns=dict(self.columns),
-            sorted_by=self.sorted_by,
+            sorted_by=as_sort_orders(self.sorted_by),
         )

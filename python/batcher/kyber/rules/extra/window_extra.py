@@ -67,6 +67,13 @@ _ROW_VALUE_FNS = frozenset({"first_value", "last_value", "forward_fill", "backwa
 # Windowed aggregates whose value over a *non-empty* frame of a constant column is that
 # constant (`sum`/`avg`/`count` depend on how many rows the frame holds, so they are not).
 _EXTREME_FNS = frozenset({"min", "max"})
+# Functions that name a row of the frame **by position**, so their answer depends on the
+# ordering even when the frame is the whole partition. Unlike a ranking function, each of
+# these accepts an explicit frame, which is what let them slip past a "frame spans
+# everything, so the order cannot matter" test that is sound only for aggregates.
+_POSITIONAL_FNS = frozenset(
+    {"first_value", "last_value", "nth_value", "lag", "lead", "forward_fill", "backward_fill"}
+)
 
 
 def _sig(expr: Expr) -> object:
@@ -225,16 +232,24 @@ def drop_order_keys_under_unbounded_frames(
 ) -> LogicalPlan | None:
     """Drop the ORDER BY when *every* function spans the whole partition anyway — a sort saved.
 
-    A function whose frame is ``UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING`` reads its entire
-    partition regardless of the row order, so the ordering it is computed under is unobservable
-    in its output. When every function in the window is such an aggregate, the order keys (and
-    with them a full sort, the window's dominant cost) are dead. The `all(...)` gate implies
-    there is no ranking or fill function — those carry no frame and *do* read the order — and
-    no `rank_limit`, which requires a ranking function.
+    An **aggregate** whose frame is ``UNBOUNDED PRECEDING .. UNBOUNDED FOLLOWING`` reads its
+    entire partition regardless of the row order, so the ordering it is computed under is
+    unobservable in its output. When every function in the window is such an aggregate, the
+    order keys (and with them a full sort, the window's dominant cost) are dead. The
+    `all(...)` gate implies there is no ranking or fill function — those carry no frame and
+    *do* read the order — and no `rank_limit`, which requires a ranking function.
+
+    The frame spanning the whole partition is **not** sufficient on its own, and that is the
+    trap: `first_value` / `last_value` / `nth_value` also accept an explicit frame, and over
+    the whole partition they still name a row *by position*, so dropping the ordering silently
+    answers them from the scan order. `FIRST_VALUE(v) OVER (ORDER BY o ROWS BETWEEN UNBOUNDED
+    PRECEDING AND UNBOUNDED FOLLOWING)` returned whichever row happened to arrive first.
     """
     if not node.order_keys or not node.functions:
         return None
     if not all(_whole_partition_frame(fn) for fn in node.functions):
+        return None
+    if any(fn.func in _POSITIONAL_FNS for fn in node.functions):
         return None
     return _checked(node, dataclasses.replace(node, order_keys=()))
 

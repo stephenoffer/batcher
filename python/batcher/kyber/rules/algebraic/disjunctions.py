@@ -44,13 +44,47 @@ def factor_common_conjuncts(node: Filter, _ctx: OptimizerContext) -> LogicalPlan
     top-level conjunct, so an equi-join condition hidden inside a disjunction (TPC-H
     Q19's `(p=l AND ...) OR (p=l AND ...) OR ...`) is exposed where predicate pushdown
     and join-key derivation can see it — without it the join degrades to a cartesian
-    product. A branch whose conjuncts are *all* common contributes a `TRUE` disjunct,
-    collapsing the residual `OR` to nothing (the factored conjuncts alone).
+    product.
 
-    Fires only when at least one conjunct is shared by all branches and the predicate
-    is a genuine top-level `OR` (a non-OR predicate is left to the other rules).
+    Every conjunct of the predicate is factored, not just a predicate that is *itself* a
+    top-level `OR`. That distinction is the whole rule in practice: TPC-H Q19's `WHERE` is
+    one bare disjunction, so matching the top level was enough for it — but TPC-DS q13 and
+    q48 write `join-preds AND (…OR…OR…) AND (…OR…OR…)`, where the *only* mention of the
+    equi-key for two of the dimension tables is inside those disjunctions. Matching only the
+    top level left both keys buried and the six-way join planned as a chain of cartesian
+    products: 1.2e16 estimated rows on q13, which does not fail with an error, it gets the
+    process killed. (q85 is the milder form of the same shape — the equalities it shares
+    across branches are between two aliases of `customer_demographics`.)
     """
-    disjuncts = split_disjuncts(node.predicate)
+    conjuncts = split_conjuncts(node.predicate)
+    factored: list[Expr] = []
+    changed = False
+    for conjunct in conjuncts:
+        pulled = _factor_disjunction(conjunct)
+        if pulled is None:
+            factored.append(conjunct)
+        else:
+            factored.extend(pulled)
+            changed = True
+    if not changed:
+        return None
+    return Filter(node.input, combine_conjuncts(factored))
+
+
+def _factor_disjunction(predicate: Expr) -> list[Expr] | None:
+    """The conjuncts `predicate` factors into, or `None` if it is not a factorable `OR`.
+
+    A branch whose conjuncts are *all* common contributes a `TRUE` disjunct, collapsing
+    the residual `OR` to nothing — the factored conjuncts alone imply it.
+
+    Args:
+        predicate: One conjunct of a filter's predicate.
+
+    Returns:
+        The replacement conjuncts, or `None` when no conjunct is shared by every branch
+        (including when `predicate` is not a disjunction at all).
+    """
+    disjuncts = split_disjuncts(predicate)
     if len(disjuncts) < 2:
         return None  # not a disjunction
 
@@ -81,10 +115,10 @@ def factor_common_conjuncts(node: Filter, _ctx: OptimizerContext) -> LogicalPlan
             break
         residuals.append(combine_conjuncts(rest))
 
-    factored = list(common)
+    out = list(common)
     if not any_empty:
-        factored.append(combine_disjuncts(residuals))
-    return Filter(node.input, combine_conjuncts(factored))
+        out.append(combine_disjuncts(residuals))
+    return out
 
 
 def _ir_key(expr: Expr) -> str:

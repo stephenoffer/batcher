@@ -31,6 +31,7 @@ __all__ = [
     "local_scratch_root",
     "reset_scratch_probe",
     "scratch_volumes",
+    "spill_scratch_dir",
 ]
 
 #: Mount points that hold node-local fast storage across the platforms Batcher runs on, in no
@@ -198,6 +199,35 @@ def local_scratch_root() -> str | None:
         return override if os.path.isdir(override) and _writable(override) else None
     volumes = scratch_volumes()
     return volumes[0].path if volumes else None
+
+
+def spill_scratch_dir() -> str:
+    """The directory a spill will actually land in — configured, measured, or the tempdir.
+
+    The three-step resolution every spill path answers "which disk?" with: the operator's
+    `memory.spill_dir` when they named one, else the best measured local volume, else the
+    system tempdir. Unlike `local_scratch_root` this always returns a path, because the
+    caller is about to write to one.
+
+    It lives here rather than in Carbonite because more than one layer needs it and they must
+    agree. When they disagree the failure is quiet: the hardware fingerprint that keys every
+    learned spill threshold described the container's overlay while the spill itself landed on
+    the node's NVMe, which merged two machine classes that behave nothing alike.
+
+    (`_internal.hardware.profile._scratch_dir` is a third copy of this, left in place only
+    because that file is mid-edit elsewhere. It should call this.)
+
+    Returns:
+        A directory path. Not verified writable here — `local_scratch_root` only ever returns
+        a volume it probed, and a configured root is the operator's own instruction.
+    """
+    try:
+        from batcher.config import active_config
+
+        configured = active_config().memory.spill_dir
+    except Exception:  # pragma: no cover - config unavailable this early in a process
+        configured = None
+    return configured or local_scratch_root() or tempfile.gettempdir()
 
 
 def reset_scratch_probe() -> None:

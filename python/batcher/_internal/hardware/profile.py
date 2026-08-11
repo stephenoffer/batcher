@@ -38,7 +38,12 @@ from typing import Any
 from batcher._internal.accelerators import gpu_devices_absent, gpu_inventory
 from batcher._internal.hardware.cache import cache_hierarchy
 from batcher._internal.hardware.cpu import available_cpu_count
-from batcher._internal.hardware.isa import cpu_model_name, cpu_vendor, simd_width_bits
+from batcher._internal.hardware.isa import (
+    cpu_model_name,
+    cpu_vendor,
+    simd_width_bits,
+    vendor_display_name,
+)
 from batcher._internal.hardware.memory import machine_memory_bytes, page_size_bytes
 from batcher._internal.hardware.storage import device_class
 from batcher._internal.hardware.topology import numa_node_count, physical_core_count
@@ -145,7 +150,12 @@ class HardwareProfile:
         Returns:
             A compact machine-shape description such as ``x86_64/16c/64GiB/l3=32MiB/nvme``.
         """
-        parts = [self.vendor or platform.machine() or "cpu", f"{self.logical_cpus}c"]
+        # The vendor is translated for display only: on ARM `cpu_vendor()` is the implementer's
+        # hex code, which is the right fingerprint material and useless in a log line.
+        parts = [
+            vendor_display_name(self.vendor) or platform.machine() or "cpu",
+            f"{self.logical_cpus}c",
+        ]
         if self.numa_nodes > 1:
             parts.append(f"{self.numa_nodes}numa")
         if self.memory_bytes:

@@ -17,7 +17,7 @@ it into "before and after some instant", which generalizes to nothing; a linear 
 it as a number that grows forever. What a model can learn from is the *parts*, because those
 repeat.
 
-`DateTimeFeaturizer` expands a timestamp into calendar parts as ordinary integer columns,
+{py:class}`DateTimeFeaturizer <batcher.ml.preprocessors.DateTimeFeaturizer>` expands a timestamp into calendar parts as ordinary integer columns,
 which is what a tree wants, because it can split on "hour >= 18" directly.
 
 ```python
@@ -31,7 +31,7 @@ featurized = DateTimeFeaturizer("ordered_at", parts=["hour", "weekday", "is_week
 print(featurized.fit_transform(ds).columns)
 ```
 
-`CyclicalEncoder` is what a linear model, a distance metric, or a neural net needs instead.
+{py:class}`CyclicalEncoder <batcher.ml.preprocessors.CyclicalEncoder>` is what a linear model, a distance metric, or a neural net needs instead.
 Encoded as an integer, hour 23 and hour 0 sit 23 units apart while being one hour apart, so
 the model learns a discontinuity at midnight that is not there, and no amount of scaling
 fixes it. Two coordinates on a circle put them adjacent, which is the truth.
@@ -54,7 +54,7 @@ fitted in between.
 An embedding is the powerful way to featurize text and the expensive one. A great many text
 signals need no model at all: whether a review is long, whether a message is all-caps, and how
 many digits a field has. Those are what a gradient-boosted model actually splits on.
-`TextStatFeaturizer` computes them as pure string expressions, so a dozen text features over
+{py:class}`TextStatFeaturizer <batcher.ml.preprocessors.TextStatFeaturizer>` computes them as pure string expressions, so a dozen text features over
 a billion rows is one pass and no GPU.
 
 ```python
@@ -76,7 +76,7 @@ a rolling mean that includes the current row has the target's own value inside i
 feature, and a "last 7 days" window computed over the whole table mixes entities together.
 Both produce a cross-validated score no deployment reproduces, and neither raises.
 
-`RollingFeaturizer`'s window therefore ends at the **previous** row by construction, with no
+{py:class}`RollingFeaturizer <batcher.ml.preprocessors.RollingFeaturizer>`'s window therefore ends at the **previous** row by construction, with no
 option to include the current one, and both take a `partition_by` that keeps each series
 separate.
 
@@ -173,7 +173,7 @@ obvious mistake to make here.
 
 ## Reducing dimensionality
 
-`PCA` projects a block of correlated numeric columns onto their top principal components, replacing them with a few uncorrelated `pc1`, `pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a wide table for a downstream model, and its `explained_variance_ratio_` tells you how many components to keep. The fit is a single scan, because the mean and covariance are aggregates, and only the small eigendecomposition runs on the driver.
+{py:class}`PCA <batcher.ml.preprocessors.PCA>` projects a block of correlated numeric columns onto their top principal components, replacing them with a few uncorrelated `pc1`, `pc2`, ... columns ordered by the variance they carry. It kills multicollinearity, shrinks a wide table for a downstream model, and its `explained_variance_ratio_` tells you how many components to keep. The fit is a single scan, because the mean and covariance are aggregates, and only the small eigendecomposition runs on the driver.
 
 ```python
 from batcher.ml.preprocessors import PCA
@@ -184,7 +184,7 @@ print(reducer.transform(ds).columns)
 # ['pc1', 'pc2']
 ```
 
-`TruncatedSVD` is the same idea without centering the columns first, which is what you want on a non-negative or sparse feature block (a bag-of-words count matrix) where centering would destroy the structure. On centered data it coincides with `PCA`.
+{py:class}`TruncatedSVD <batcher.ml.preprocessors.TruncatedSVD>` is the same idea without centering the columns first, which is what you want on a non-negative or sparse feature block (a bag-of-words count matrix) where centering would destroy the structure. On centered data it coincides with `PCA`.
 
 ## Reducing dimensionality without a covariance pass
 
@@ -254,7 +254,7 @@ cost of a fit pass.
 
 ## Assembling features
 
-`Concatenator` stacks several numeric columns into one list column. It is the "make a
+{py:class}`Concatenator <batcher.ml.preprocessors.Concatenator>` stacks several numeric columns into one list column. It is the "make a
 feature vector" step before training. It is stateless, so `fit` is a no-op, but it
 follows the contract, so use `fit_transform` or `fit` then `transform`. The source
 columns are kept unless `drop=True`.
@@ -276,8 +276,8 @@ The assembled list column becomes a tensor for training with zero or one copy. S
 
 ### Deriving and selecting columns
 
-Before assembly, you often build new columns and drop useless ones. `InteractionFeatures`
-appends the pairwise products of its columns, and `RatioFeatures` appends the ratio of
+Before assembly, you often build new columns and drop useless ones. {py:class}`InteractionFeatures <batcher.ml.preprocessors.InteractionFeatures>`
+appends the pairwise products of its columns, and {py:class}`RatioFeatures <batcher.ml.preprocessors.RatioFeatures>` appends the ratio of
 each named pair. Both give a linear model a signal it cannot learn from the raw columns:
 
 ```python
@@ -293,8 +293,8 @@ print(ratioed.collect().column_names)
 # ['a', 'b', 'a_per_b']
 ```
 
-`GroupStatEncoder` attaches a per-group statistic of a value column to every row of that
-group, so a row can see how it compares to its cohort. `GroupImputer` fills nulls with the
+{py:class}`GroupStatEncoder <batcher.ml.preprocessors.GroupStatEncoder>` attaches a per-group statistic of a value column to every row of that
+group, so a row can see how it compares to its cohort. {py:class}`GroupImputer <batcher.ml.preprocessors.GroupImputer>` fills nulls with the
 group's mean rather than the global one, which matters when the groups differ:
 
 ```python
@@ -311,10 +311,10 @@ print(imputed.collect().column("val").to_pylist())
 # [1.0, 3.0, 5.0, 5.0]
 ```
 
-`Binarizer` maps a numeric column to 0/1 by a threshold. `VarianceThreshold` drops columns
+{py:class}`Binarizer <batcher.ml.preprocessors.Binarizer>` maps a numeric column to 0/1 by a threshold. {py:class}`VarianceThreshold <batcher.ml.preprocessors.VarianceThreshold>` drops columns
 whose variance is at or below a threshold, which removes constant columns for free.
-`ColumnSelector` and `ColumnDropper` are the projection steps as pipeline stages, for when
-selection has to sit inside a `Chain`:
+{py:class}`ColumnSelector <batcher.ml.preprocessors.ColumnSelector>` and {py:class}`ColumnDropper <batcher.ml.preprocessors.ColumnDropper>` are the projection steps as pipeline stages, for when
+selection has to sit inside a {py:class}`Chain <batcher.ml.preprocessors.Chain>`:
 
 ```python
 from batcher.ml.preprocessors import (
@@ -340,7 +340,7 @@ print(ColumnDropper(["const"]).fit_transform(table).collect().column_names)
 ### Pinning the feature contract
 
 A trained model is valid only against the exact columns, order, and dtypes it saw during
-training. `FeatureSpec` captures that contract so a scoring frame can be checked against it
+training. {py:class}`FeatureSpec <batcher.ml.FeatureSpec>` captures that contract so a scoring frame can be checked against it
 rather than producing wrong numbers on a silently reordered or retyped input:
 
 ```python
@@ -353,7 +353,7 @@ print(spec.dtypes)
 # {'age': 'float64', 'income': 'float64'}
 ```
 
-`Tokenizer` maps a text column through a user-supplied tokenizer, which is either a
+{py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` maps a text column through a user-supplied tokenizer, which is either a
 `str -> list` callable or any object with `.encode`, such as a HuggingFace tokenizer.
 Tokenization is inherently per-string, so it runs as a whole-batch `map_batches` UDF. It
 needs a real tokenizer, so it is shown but not run here.

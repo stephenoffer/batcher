@@ -9,14 +9,14 @@ Which tool you reach for depends on what the text actually is:
 
 | The column holds | Reach for | What you get |
 | --- | --- | --- |
-| Documents to feed a model | `Tokenizer` wrapping a fast tokenizer class | a `List<Int64>` column of token ids |
+| Documents to feed a model | {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` wrapping a fast tokenizer class | a `List<Int64>` column of token ids |
 | Documents for causal-LM pretraining | `pack_sequences` over that token column | dense fixed-length blocks, nothing padded |
-| A category, not a document | `LabelEncoder` | one integer per distinct value, learned on the train split |
+| A category, not a document | {py:class}`LabelEncoder <batcher.ml.preprocessors.LabelEncoder>` | one integer per distinct value, learned on the train split |
 
 ## The Tokenizer preprocessor
 
 `Tokenizer(column, tokenizer, output_column=None)` applies any callable from a string to
-a list. It is a `Preprocessor`, so it has the standard `fit`, `transform`, and
+a list. It is a {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>`, so it has the standard `fit`, `transform`, and
 `fit_transform` contract, and it is stateless. There is nothing to learn, so `fit` is a
 no-op and `transform` runs anywhere.
 
@@ -193,7 +193,7 @@ token.
 
 Omit the argument and the emitted schema is exactly what it was.
 
-It operates on a batch iterator rather than a `Dataset`, so it composes with anything
+It operates on a batch iterator rather than a {py:class}`Dataset <batcher.Dataset>`, so it composes with anything
 that yields batches, and it holds one buffer of tokens at a time, so a trillion-token
 corpus packs in bounded memory.
 

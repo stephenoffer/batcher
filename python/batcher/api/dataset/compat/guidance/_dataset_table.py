@@ -13,6 +13,7 @@ from __future__ import annotations
 from batcher.api.dataset.compat.guidance._dataset_naming import (
     DATASET_EXPORTERS,
     DATASET_NAMING,
+    DATASET_RAY_DATA,
 )
 
 __all__ = ["DATASET_UNSUPPORTED"]
@@ -165,8 +166,8 @@ _NEEDS_ORDER: dict[str, str] = {
         "window: ds.window(order_by=['t'], functions={'running': ('sum', 'x')})."
     ),
     "cumprod": (
-        "A running product needs an explicit row order (a relation has none) and is "
-        "not a supported window aggregate; compute it with ds.map_batches()."
+        "A running product needs an explicit row order (a relation has none). Use a window: "
+        "ds.window(order_by=['t'], functions={'running': ('product', 'x')})."
     ),
     "cummax": (
         "A running maximum needs an explicit row order (a relation has none). Use a "
@@ -177,37 +178,42 @@ _NEEDS_ORDER: dict[str, str] = {
         "window: ds.window(order_by=['t'], functions={'running': ('min', 'x')})."
     ),
     "rolling": (
-        "Rolling windows are spelled with an explicit frame: "
-        "ds.window(order_by=['t'], functions={'avg3': ('avg', 'x')}, frame=(-2, 0))."
+        "A row-count window is an explicit frame: "
+        "ds.window(order_by=['t'], functions={'avg3': ('avg', 'x')}, frame=(-2, 0)). "
+        "For a *time* window use bt.col('x').rolling_mean_by('t', '5m')."
     ),
     "expanding": (
         "Expanding windows are spelled with an explicit frame: "
         "ds.window(order_by=['t'], functions={'run': ('sum', 'x')}, frame=(None, 0))."
     ),
     "ewm": (
-        "Exponentially weighted stats are not built in. For rolling or expanding "
-        "aggregates use bt.col('x').rolling_mean(...) / .expanding_mean() in a window."
+        "Exponentially weighted stats are expressions: bt.col('x').ewm_mean(span=n) bound with "
+        ".over(order_by=[...]), or .ewm_mean_by('t', half_life) to decay by elapsed time."
     ),
     "resample": (
-        "Time bucketing is a group_by over a truncated timestamp: "
-        "ds.group_by(bucket=bt.col('t').dt.truncate('1h')).agg(bt.col('x').sum())."
+        "Downsampling is a group_by over a bucketed timestamp: "
+        "ds.group_by(bucket=bt.window(bt.col('t'), '1h')).agg(s=bt.col('x').sum()). "
+        "bt.window takes a duration; .dt.truncate takes a calendar unit ('hour', 'month')."
     ),
     "asfreq": (
-        "Resampling to a fixed frequency is a group_by over a truncated timestamp: "
-        "ds.group_by(bucket=bt.col('t').dt.truncate('1d')).agg(...)."
+        "Bucketing to a fixed frequency is "
+        "ds.group_by(bucket=bt.window(bt.col('t'), '1d')).agg(...). To emit the empty "
+        "buckets too, left-join onto a bt.date_range grid -- see the time-series user guide."
     ),
     "upsample": (
-        "Resampling is a group_by over a truncated timestamp: "
-        "ds.group_by(bucket=bt.col('t').dt.truncate('1h')).agg(...)."
+        "Build the grid and left-join onto it: bt.date_range(lo, hi, interval='1h') gives the "
+        "rows, ds.join(..., how='left') attaches what you have, and "
+        "bt.col('x').interpolate() / .forward_fill() fills the gaps. See the time-series "
+        "user guide."
     ),
     "group_by_dynamic": (
-        "Time-window grouping is ds.group_by(bucket=bt.col('t').dt.truncate('1h')).agg(...), "
-        "or ds.session_window(time_col, gap) for gap-based sessions."
+        "Time-window grouping is ds.group_by(bucket=bt.window(bt.col('t'), '1h')).agg(...); "
+        "pass a slide to bt.window for overlapping windows, or use "
+        "ds.session_window(time_col, gap) for gap-based sessions."
     ),
     "interpolate": (
-        "Interpolation is not built in. Forward/backward fill with "
-        "bt.col('x').forward_fill() / .backward_fill(), or ds.map_batches() for numeric "
-        "interpolation."
+        "Interpolation is an expression: bt.col('x').interpolate() bound with "
+        ".over(order_by=[...]); .forward_fill() / .backward_fill() hold a value flat instead."
     ),
     "ffill": (
         "Forward fill is bt.col('x').forward_fill(); combine with a window's order_by for "
@@ -226,9 +232,12 @@ _NEEDS_ORDER: dict[str, str] = {
         "ordered fill."
     ),
     "asof": "An as-of join is ds.join_asof(other, on='t', by=['key']).",
-    "at_time": "Filter on the timestamp's time parts: ds.filter(bt.col('t').dt.hour == 9).",
+    "at_time": (
+        "Filter on the clock time: ds.filter(bt.col('t').dt.is_between_time('09:00', '09:00'))."
+    ),
     "between_time": (
-        "Filter on the timestamp's time parts: ds.filter(bt.col('t').dt.hour.is_between(9, 17))."
+        "Filter on the clock time: ds.filter(bt.col('t').dt.is_between_time('09:00', '17:00')); "
+        "it wraps past midnight, which an hour comparison does not."
     ),
     "tz_convert": "Convert a timezone with bt.col('t').dt.convert_timezone('UTC').",
     "tz_localize": "Attach a timezone with bt.col('t').dt.convert_timezone('UTC').",
@@ -248,18 +257,10 @@ _NEEDS_ORDER: dict[str, str] = {
 
 # --- reductions that exist per-expression, reached through .agg(...) at frame level ---
 _AGG_REDUCTIONS: dict[str, str] = {
-    "any": "Reduce a boolean column with ds.agg(hit=bt.col('flag').any()).",
-    "all": "Reduce a boolean column with ds.agg(ok=bt.col('flag').all()).",
-    "prod": "Multiply a column with ds.agg(p=bt.col('x').product()).",
-    "product": "Multiply a column with ds.agg(p=bt.col('x').product()).",
-    "mode": "The most frequent value is ds.select(bt.col('x').mode()).",
-    "skew": "Skewness is ds.agg(s=bt.col('x').skew()).",
-    "kurt": "Kurtosis is ds.agg(k=bt.col('x').kurtosis()).",
-    "kurtosis": "Kurtosis is ds.agg(k=bt.col('x').kurtosis()).",
+    "prod": "Spelled ds.product('x') here (or bt.col('x').product() inside ds.agg(...)).",
+    "skew": "Spelled ds.skewness('x') here (or bt.col('x').skewness() inside ds.agg(...)).",
+    "kurt": "Spelled ds.kurtosis('x') here (or bt.col('x').kurtosis() inside ds.agg(...)).",
     "sem": "Standard error of the mean is bt.sem(bt.col('x')) inside ds.agg(...).",
-    "mad": (
-        "Mean absolute deviation is not built in; compute it from expressions or ds.map_batches()."
-    ),
     "corrwith": "Pairwise correlation is ds.corr('a', 'b'); the full matrix is ds.corr_matrix().",
     "dot": "A matrix product is not a relational op. Use ds.to_numpy() then NumPy.",
     "nunique_approx": (
@@ -388,7 +389,7 @@ def _merge(*tables: dict[str, str]) -> dict[str, str]:
     return out
 
 
-#: The full pandas/Polars/Spark → Batcher redirect table for `Dataset.__getattr__`.
+#: The full pandas/Polars/Spark/Ray Data → Batcher redirect table for `Dataset.__getattr__`.
 DATASET_UNSUPPORTED: dict[str, str] = _merge(
     _NO_INDEX,
     _NO_TRANSPOSE,
@@ -400,5 +401,6 @@ DATASET_UNSUPPORTED: dict[str, str] = _merge(
     _RESHAPE,
     _MANAGED,
     DATASET_NAMING,
+    DATASET_RAY_DATA,
     DATASET_EXPORTERS,
 )

@@ -324,22 +324,32 @@ class PressureMonitor:
     def _engine_used_fraction() -> float:
         """Fraction of the memory ceiling in use, by whichever measure is highest.
 
-        Takes the MAX of the engine's reserved buffer-pool envelope and the process's
-        *actual* footprint (the cgroup's unreclaimable usage, else RSS). Memory the pool
-        does not track — the in-memory Flight shuffle `PartitionStore`, off-pool pyarrow
-        buffers — therefore cannot let the monitor report NORMAL while the kernel
-        OOM-kills a shuffle-heavy worker. The footprint term deliberately excludes the
+        Takes the MAX of **both** buffer-pool envelopes and the process's *actual*
+        footprint (the cgroup's unreclaimable usage, else RSS). Memory the pools do not
+        track — off-pool pyarrow buffers — therefore cannot let the monitor report NORMAL
+        while the kernel OOM-kills a worker. The footprint term deliberately excludes the
         page cache: it is reclaimable, so counting it would report a box that has merely
         *read files* as one under pressure — which is not a safe over-read but a silent
         throttle (it halves every morsel). Falls back to the machine's used fraction when
         neither a pool nor a live reading exists.
+
+        Both pools, because there are two and the control plane's is the smaller half of
+        the picture. `execute_plan` charges operator state and the Flight transit buffers to
+        a process-wide pool the engine owns; Carbonite's own pool sees only the coarse
+        per-query reservations it makes itself. Reading one of them meant a query holding
+        90% of the *engine's* envelope classified as NORMAL, and the level only rose once
+        the footprint term caught up — which is RSS, so it lags the reservation by however
+        long the operator takes to actually fill the state it reserved.
         """
-        from batcher.carbonite.memory.pool import current_process_pool
+        from batcher.carbonite.memory.pool import current_process_pool, engine_pool_utilization
 
         candidates: list[float] = []
         pool = current_process_pool()
         if pool is not None and pool.limit > 0:
             candidates.append(pool.utilization)
+        engine = engine_pool_utilization()
+        if engine is not None:
+            candidates.append(engine)
         # Against the ceiling that actually binds, which is `memory.high` where one is set.
         # Dividing by `memory.max` reports a container as half-full at the exact moment the
         # kernel starts sleeping it in direct reclaim, so the level stays NORMAL through the

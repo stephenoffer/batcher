@@ -1,10 +1,10 @@
 # Migrating to Batcher
 
-This section maps the operations you know from pandas, Polars, PySpark, DuckDB, and Daft
-onto their Batcher equivalents, and shows how to prove the port is correct.
+This section maps the operations you know from pandas, Polars, PySpark, DuckDB, Daft, and
+Ray Data onto their Batcher equivalents, and shows how to prove the port is correct.
 
 Batcher's surface is deliberately close to the libraries you already know, so most of
-your vocabulary carries over. Absorb one concept before anything else: a `Dataset` is
+your vocabulary carries over. Absorb one concept before anything else: a {py:class}`Dataset <batcher.Dataset>` is
 *lazy*. Transformations such as `select`, `filter`, `group_by().agg()`, and `join`
 build a plan and return a new `Dataset`, and nothing runs until a terminal operation
 such as `collect`, `to_arrow`, `to_pandas`, `write`, `count`, or `iter_batches`. This
@@ -29,7 +29,7 @@ call. `assign`, `groupby`, and `merge` become `with_columns`, `group_by().agg()`
 :::{grid-item-card} {octicon}`code;1.1em` Polars
 :link: /getting-started/migration/transforming
 :link-type: doc
-You already know the `LazyFrame` model. Expressions, `group_by().agg()`, `.over(...)`,
+You already know the `LazyFrame` model. Expressions, {py:meth}`group_by().agg() <batcher.Dataset.group_by>`, {py:meth}`.over(...) <batcher.AggExpr.over>`,
 and the typed accessors carry over almost verbatim.
 :::
 
@@ -43,7 +43,7 @@ verbs carry over, and so do the save modes and `MERGE INTO`.
 :::{grid-item-card} {octicon}`database;1.1em` DuckDB and SQL
 :link: /user-guide/analyze/sql
 :link-type: doc
-The query itself often ports unchanged. `bt.sql(...)` builds the same plan the
+The query itself often ports unchanged. {py:func}`bt.sql(...) <batcher.sql>` builds the same plan the
 DataFrame verbs build, so you can mix the two.
 :::
 
@@ -54,6 +54,14 @@ Both engines are lazy, so that model ports unchanged. The shift is the UDF contr
 `@daft.udf` becomes `@bt.udf`, and declaring `input_columns` wrong is a correctness bug
 rather than a slow query, because an undeclared column can be pruned out from under the
 function.
+:::
+
+:::{grid-item-card} {octicon}`stack;1.1em` Ray Data
+:link: /getting-started/migration/ray-data
+:link-type: doc
+The verbs port almost directly. The shift is that bulk data never enters the Ray object
+store, so there is no object store to size and no spill storm to diagnose, and
+distribution is an argument to `collect` rather than a property of the dataset.
 :::
 ::::
 
@@ -129,8 +137,8 @@ returns the same rows as the original. See {doc}`/agents`.
 
 ## Reporting a problem
 
-`bt.show_versions()` prints the Batcher version, the compiled engine version, Python,
-the platform, and which optional backends are installed. `bt.versions()` returns the
+{py:func}`bt.show_versions() <batcher.show_versions>` prints the Batcher version, the compiled engine version, Python,
+the platform, and which optional backends are installed. {py:func}`bt.versions() <batcher.versions>` returns the
 same information as a dict.
 
 ## See also
@@ -145,6 +153,7 @@ same information as a dict.
 
 reading-and-writing
 transforming
+ray-data
 ml-pipelines
 differences
 ```

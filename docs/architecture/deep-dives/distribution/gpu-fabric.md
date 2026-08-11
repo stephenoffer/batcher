@@ -63,7 +63,7 @@ print(sorted(fabric.get("rails", {}).get("assignment", {})) or "no rails on this
 print(fabric.get("peers", {}).get("largest_island", 0))
 ```
 
-Two conditions are called out in `bt.accelerator_problems()` because they cost throughput without costing correctness, which is the class of fault a job's own timings never reveal:
+Two conditions are called out in {py:func}`bt.accelerator_problems() <batcher.accelerator_problems>` because they cost throughput without costing correctness, which is the class of fault a job's own timings never reveal:
 
 - devices unevenly spread over the rails, so a cross-node stage uses part of the port rate;
 - no device pair able to copy directly, so every exchange stages through host memory.

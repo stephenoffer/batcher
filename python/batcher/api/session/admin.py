@@ -179,6 +179,16 @@ def compact(
       Hive-partitioned by `by`), written back, and the replaced part-files removed. Nothing
       references the old files, so removing them is safe. Single-writer only.
 
+    Compaction changes a table's file *sizes*, not its content and not its organization.
+    Content matters most because the rewrite **deletes the files it replaced**: a directory
+    whose files disagree (a table that gained a column midway) is read as the union of every
+    column any file holds, so nothing is narrowed away and then destroyed. Organization is
+    carried forward the same way: a directory already partitioned by ``dt=`` comes back
+    partitioned by ``dt=``. Pass `by` to repartition it differently. A partitioned
+    directory in a format whose reader cannot recover partition columns from the layout
+    (anything but Parquet) is **refused** rather than flattened, since the rewrite would
+    drop both the partitioning and the columns it encodes.
+
     Examples:
         .. doctest::
 
@@ -201,18 +211,20 @@ def compact(
         z_order: Columns to Z-order the rewritten rows by (transactional tables only).
         where: Partition filters limiting the scope (transactional tables only).
         format: The dataset format; inferred from `path` when omitted.
-        **opts: Extra options forwarded to the writer / maintenance backend.
+        **opts: Extra options forwarded to the writer / maintenance backend. For a file
+            directory that includes ``sort_by=[cols]``, which clusters the rewritten rows
+            so each new file's min/max bounds are tight — the file-directory answer to
+            `z_order`, and worth pairing with a compaction since the rows are being
+            rewritten anyway.
 
     Returns:
         The `WriteManifest` for a file directory; the backend's optimize metrics for a
         transactional table.
     """
-    import os
-
     from batcher._internal.errors import PlanError
     from batcher.api.session.read import read
-    from batcher.io.detect import detect_format
-    from batcher.io.filesystem import resolve_filesystem
+    from batcher.io.detect import detect_format, hive_partition_keys
+    from batcher.io.filesystem import prune_empty_dirs, resolve_filesystem
     from batcher.io.formats.base import SOURCES
     from batcher.io.formats.lakehouse.maintenance import table_maintenance
 
@@ -242,20 +254,77 @@ def compact(
     except OSError:
         old_files = []
 
+    # A compaction changes a table's *file sizes*, never its organization. So an existing
+    # Hive layout is carried forward unless the caller names a different one: reading a
+    # partitioned tree and writing it back flat leaves the rows intact and destroys what
+    # the table is organized by, and the next partition-pruned query reads all of it.
+    if by is None:
+        by = hive_partition_keys(path) or None
     spec: dict[str, Any] = {"by": by} if by is not None else {}
     if num_files is not None:
         spec["num_files"] = num_files
     else:
         spec["target_size_mb"] = target_size_mb
-    manifest = (
-        read(path, format=fmt).repartition(**spec).write(path, format=fmt, mode="overwrite", **opts)
-    )
 
-    new_names = {os.path.basename(f.path) for f in manifest.files}
+    # Union, not the default: `read` types a directory from its *first* file, so a table
+    # that gained a column midway reads back without it. That is survivable on a read and
+    # not here -- compaction writes the result back and deletes the files the column still
+    # lived in, so the narrowing becomes permanent. Compaction changes file sizes, never
+    # content.
+    source = read(path, format=fmt, schema_mode="union")
+    _check_partition_keys_readable(source, by, path, fmt)
+    manifest = source.repartition(**spec).write(path, format=fmt, mode="overwrite", **opts)
+
+    # Remove whatever the rewrite did not replace. The overwrite inside `write` already
+    # prunes, and declines to when it cannot see its own files in the listing; this second
+    # pass covers that decline, which for `compact` is the whole operation — leaving a
+    # stale part behind means the next read unions its rows back in.
+    #
+    # Compared by *path*, not basename. Under `by=`, the rewritten files live in
+    # ``c=v/part-00000`` directories while the files being replaced sat flat at the root,
+    # so every one of them shares the basename ``part-00000`` with some new file and a
+    # basename comparison keeps them all — the duplicate-rows outcome this exists to avoid.
+    new_paths = {f.path.rstrip("/") for f in manifest.files}
     for f in old_files:
-        if os.path.basename(f) not in new_names:
+        if f.rstrip("/") not in new_paths:
             fs.remove(f)
+    # Recompacting from one partitioning to another leaves the *old* partition directories
+    # standing once their data files are gone, so the tree would advertise two partition
+    # schemes at once and nothing reading the layout could say what it is partitioned by.
+    prune_empty_dirs(fs, path)
     return manifest
+
+
+def _check_partition_keys_readable(source: Any, by: Any, path: str, fmt: str) -> None:
+    """Refuse a rewrite that would silently flatten a partitioned directory.
+
+    The layout says the table is partitioned by these columns and the read cannot see
+    them: only the Parquet reader recovers a Hive partition column from the directory
+    name. Rewriting anyway drops the partitioning *and* the columns it encodes, with every
+    row still present — so nothing fails until the next partition-pruned query reads the
+    whole table.
+
+    Args:
+        source: The `Dataset` the rewrite will read from.
+        by: The partition columns the rewrite will write to, if any.
+        path: The dataset location, for the message.
+        fmt: The dataset format, for the message.
+
+    Raises:
+        PlanError: If a named partition column is absent from what the read returns.
+    """
+    from batcher._internal.errors import PlanError
+
+    keys = [by] if isinstance(by, str) else list(by or ())
+    missing = [k for k in keys if k not in source.columns]
+    if not missing:
+        return
+    raise PlanError(
+        f"compact(): {path!r} is partitioned by {missing}, but the {fmt!r} reader does "
+        "not recover partition columns from the directory layout, so a rewrite would "
+        "flatten the table and lose them. Compact each partition directory on its own, "
+        "or store the table as Parquet, where the partition columns come back."
+    )
 
 
 def vacuum(

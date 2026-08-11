@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import shutil
 import threading
 
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import note_suppressed
 from batcher._internal.paths import package_dir
 from batcher.config import active_config
 from batcher.io.source import Source, read_source
@@ -33,6 +35,7 @@ from .policies import actor_fault_options, fault_options
 from .scaling import cluster_topology
 from .scheduling import (
     current_envelope,
+    job_ships_batcher,
     ray_session_key,
     set_job_ships_batcher,
     task_options,
@@ -96,16 +99,27 @@ def engine_config_json(num_cpus: float | None = None) -> str:
 # `_ensure_ray` rebinds each `<module>.<name> = ray.remote(<module>.<name>)`.
 _TASK_FUNCS: dict[str, tuple[str, ...]] = {
     "batcher.dist.executors.map": ("_map_udf_task", "_map_agg_task", "_MapActor"),
-    "batcher.dist.executors.aggregate": ("_map_task", "_reduce_task"),
+    "batcher.dist.executors.aggregate": ("_map_task", "_combine_task", "_reduce_task"),
     "batcher.dist.executors.join": (
         "_join_map_task",
         "_join_reduce_task",
         "_broadcast_join_task",
         "_join_detect_task",
     ),
-    "batcher.dist.executors.sort": ("_sample_task", "_range_task", "_sort_reduce_task"),
-    "batcher.dist.executors.window": ("_map_task", "_reduce_task"),
+    "batcher.dist.executors.sort": (
+        "_sample_task",
+        "_range_task",
+        "_sort_reduce_task",
+        "_topn_task",
+    ),
+    # The window and the keyed dedup share one row-shuffle driver, so their tasks are
+    # registered under the module that owns them rather than under either operator.
+    "batcher.dist.executors.keyed_shuffle": ("_map_task", "_reduce_task"),
     "batcher.dist.executors.write": ("_write_shard", "_write_plan_shard"),
+    # The keyless ASOF's range task lives beside the dispatch that routes to it (the
+    # `executors` subpackage is at its file-count ceiling), so it registers under
+    # `dist.executor` rather than under an operator module.
+    "batcher.dist.executor": ("_asof_range_task",),
     "batcher.dist.streaming.microbatch": ("_stage_shard",),
 }
 
@@ -368,8 +382,65 @@ def _ensure_ray_locked(ray, workers: int) -> None:
         _ship_session = ray_session_key()
     from .capacity import warn_once_if_allocation_is_wider_than_ray
 
+    _report_attachment(ray)
     warn_once_if_allocation_is_wider_than_ray()
     _wrap_tasks(ray, task_options(current_envelope()))
+
+
+#: The Ray session the attachment has already been reported for. Per session rather than per
+#: process, so a reconnect — a cluster restart, a notebook switching addresses — is reported
+#: again while an ordinary run says it once.
+#:
+#: Seeded with `""`, which is not a value `ray_session_key` can return, so the first call
+#: always reports. `None` IS one of its return values ("session unreadable"), and seeding with
+#: that would make the unreadable case compare equal to the seed and never report — or, if the
+#: guard tested `is not None` first, report on every single call instead.
+_reported_session: str | None = ""
+
+
+def _report_attachment(ray) -> None:
+    """Say once, per Ray session, what cluster this process is actually running on.
+
+    The most expensive Ray misunderstanding has no error attached to it: a bare `ray.init()`
+    on a managed workspace that exports no `RAY_ADDRESS`, or a cluster that was not reachable
+    when the driver looked, starts a **local single-node Ray** — and the job then runs, returns
+    the right answer, and uses one machine's worth of capacity that was billed for a fleet.
+    `ray.md` documents that failure mode; nothing in the engine reported it, because from
+    inside, a one-node cluster is a perfectly ordinary cluster.
+
+    So this states the three facts that settle it — the address, the node count, and the
+    cores and devices behind them — and whether Batcher started the cluster or attached to one
+    that was already there. At INFO, because someone asking "did it use the cluster" should not
+    have had to enable debug logging before the run they are asking about.
+
+    Best-effort and once per session: a fact about the environment must not be able to fail
+    the query it describes, and repeating it per operator would train the reader to skip it.
+    """
+    global _reported_session
+    try:
+        session = ray_session_key()
+        if session == _reported_session:
+            return
+        _reported_session = session
+        from batcher._internal.logging import get_logger, log_kv
+
+        topo = cluster_topology()
+        ctx = ray.get_runtime_context()
+        log_kv(
+            get_logger("dist"),
+            logging.INFO,
+            "attached to Ray",
+            address=str(getattr(ctx, "gcs_address", "") or "local"),
+            nodes=int(topo["nodes"]),
+            cpus=float(topo["cpus"]),
+            gpus=float(topo["gpus"]),
+            # Which of the two things happened. `set_job_ships_batcher(True)` is set exactly
+            # where Batcher performed the `ray.init` itself, so it is the honest witness —
+            # and it is also the fact that decides whether workers get the driver's package.
+            started_by="batcher" if job_ships_batcher() else "another process",
+        )
+    except Exception as exc:  # pragma: no cover - a report must never fail a query
+        note_suppressed("dist", "report the Ray attachment", exc)
 
 
 def resolve_transport(transport: str, workers: int) -> str:

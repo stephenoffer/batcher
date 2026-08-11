@@ -24,6 +24,7 @@ from batcher.kyber.properties import (
 )
 from batcher.kyber.stats.estimator import StatsEstimator
 from batcher.plan.logical import Sort
+from batcher.plan.stats import SortOrder
 from batcher.plan.visitor import walk
 
 pytestmark = pytest.mark.unit
@@ -47,17 +48,17 @@ def _ds():
 
 
 def test_a_sort_delivers_its_ordering():
-    assert _props(_ds().sort("a")).ordering == ("a",)
+    assert _props(_ds().sort("a")).ordering == (SortOrder("a"),)
 
 
 def test_ordering_survives_a_renaming_projection():
     """The gap this closes: a `Project` used to drop the delivered order entirely."""
-    assert _props(_ds().sort("a").select(x=col("a"), y=col("b"))).ordering == ("x",)
+    assert _props(_ds().sort("a").select(x=col("a"), y=col("b"))).ordering == (SortOrder("x"),)
 
 
 def test_ordering_truncates_at_a_key_the_projection_drops():
     ds = _ds().sort("a", "b").select(x=col("a"))  # `b` is not carried
-    assert _props(ds).ordering == ("x",)
+    assert _props(ds).ordering == (SortOrder("x"),)
 
 
 def test_a_computed_output_cannot_carry_the_order():
@@ -67,15 +68,45 @@ def test_a_computed_output_cannot_carry_the_order():
     assert _props(ds).ordering == ()
 
 
-def test_a_descending_sort_is_not_expressible_and_is_not_claimed():
-    """The canonical form is ascending/nulls-last; anything else is simply not recorded."""
-    assert _props(_ds().sort("a", descending=True)).ordering == ()
+def test_a_descending_sort_delivers_a_descending_ordering():
+    """The direction is part of the key, so `ORDER BY a DESC` delivers a real ordering.
+
+    It used to deliver nothing: the recorded form was ascending, nulls-last only, so the
+    single most common ordered shape in analytics was invisible to every consumer."""
+    assert _props(_ds().sort("a", descending=True)).ordering == (SortOrder("a", descending=True),)
+
+
+def test_a_nulls_first_sort_delivers_a_nulls_first_ordering():
+    assert _props(_ds().sort("a", nulls_first=True)).ordering == (SortOrder("a", nulls_first=True),)
+
+
+def test_a_descending_ordering_survives_a_renaming_projection():
+    ds = _ds().sort("a", descending=True).select(x=col("a"))
+    assert _props(ds).ordering == (SortOrder("x", descending=True),)
 
 
 def test_a_stronger_ordering_satisfies_a_weaker_requirement():
-    have = PhysicalProperties(ordering=("a", "b"))
-    assert satisfies(have, PhysicalProperties(ordering=("a",)))
-    assert not satisfies(PhysicalProperties(ordering=("a",)), PhysicalProperties(("a", "b")))
+    have = PhysicalProperties(ordering=(SortOrder("a"), SortOrder("b")))
+    assert satisfies(have, PhysicalProperties(ordering=(SortOrder("a"),)))
+    assert not satisfies(
+        PhysicalProperties(ordering=(SortOrder("a"),)),
+        PhysicalProperties((SortOrder("a"), SortOrder("b"))),
+    )
+
+
+def test_an_ordering_never_satisfies_the_opposite_direction():
+    """`a ASC` and `a DESC` are different orderings and neither satisfies the other."""
+    asc = PhysicalProperties(ordering=(SortOrder("a"),))
+    desc = PhysicalProperties(ordering=(SortOrder("a", descending=True),))
+    assert not satisfies(asc, desc)
+    assert not satisfies(desc, asc)
+
+
+def test_null_placement_is_relaxed_only_for_a_column_proven_free_of_nulls():
+    have = PhysicalProperties(ordering=(SortOrder("a"),))
+    want = PhysicalProperties(ordering=(SortOrder("a", nulls_first=True),))
+    assert not satisfies(have, want)
+    assert satisfies(have, want, non_nullable=frozenset({"a"}))
 
 
 def test_the_redundant_sort_across_a_select_is_eliminated():

@@ -24,6 +24,7 @@ pub(crate) type FastSet<T> = std::collections::HashSet<T, ahash::RandomState>;
 
 pub(crate) mod binary;
 pub(crate) mod cast;
+pub(crate) mod coerce;
 mod dispatch;
 pub(crate) mod generate;
 pub(crate) mod geo;
@@ -36,5 +37,7 @@ pub(crate) mod math;
 pub(crate) mod media;
 pub(crate) mod mime;
 pub(crate) mod security;
+pub(crate) mod seq;
+pub(crate) mod spatial;
 pub(crate) mod str;
 pub(crate) mod temporal;

@@ -197,10 +197,49 @@ def _record_skipped(split, exc: Exception) -> None:
         pass
 
 
-def _all_rowgroup(splits) -> bool:
-    from batcher.io.splits import RowGroupSplit
+def _scannable_fragments(splits):
+    """``[(path, row_groups | None)]`` when the coalesced dataset scan can read `splits`.
 
-    return all(isinstance(s, RowGroupSplit) for s in splits)
+    Two split kinds qualify, and admitting the second is what lets a small-file corpus be
+    planned cheaply *and* read quickly:
+
+    - `RowGroupSplit` — the driver read the footer, so the exact row-groups are known.
+    - A **whole-file** Parquet split (`FileSplit`/`MultiFileSplit`) — the row-groups are not
+      known, and do not need to be: a fragment built without them covers the file, and the
+      worker reads that footer itself, concurrently with every other fragment's.
+
+    That second case is the point. Sub-file splits read faster here (the scanner coalesces
+    column-chunk ranges and reads fragments ahead in C++, and the result is cacheable), but
+    knowing where the row-groups are costs the *driver* one footer read per file before any
+    worker starts — 18.3 s over 8,192 files, serial with the whole cluster idle. Whole-file
+    splits used to fall out of this fast path onto the per-split reader, so avoiding that
+    sweep meant giving up the reader too, and a 24 GB corpus measured 5.5 s read + 18.3 s
+    plan against 9.3 s read + 0.07 s plan — a choice between two bad halves. Accepting them
+    here removes the choice: the footer work moves off the driver and onto the workers that
+    were going to open the files anyway.
+
+    Returns None — caller falls back — for any other split kind, and for a Parquet split
+    carrying reader kwargs. Those kwargs are a bring-your-own filesystem, `storage_options`,
+    or an `on_error` policy (`FileSource._reader_kwargs`), none of which this scanner
+    applies: it resolves the backend itself and reads fail-fast. This is the same condition
+    on which `ParquetSource._file_splits` declines its own row-group fast path, for the same
+    reason — a split whose credentials or tolerance would be silently dropped must be read
+    by the reader that honors them.
+    """
+    from batcher.io.splits import FileSplit, MultiFileSplit, RowGroupSplit
+
+    frags: list[tuple[str, list[int] | None]] = []
+    for split in splits:
+        if isinstance(split, RowGroupSplit):
+            frags.append((split.path, list(split.row_groups)))
+            continue
+        if not isinstance(split, FileSplit | MultiFileSplit):
+            return None
+        if split.format_name != "parquet" or split.kwargs:
+            return None
+        paths = (split.path,) if isinstance(split, FileSplit) else split.paths
+        frags.extend((p, None) for p in paths)
+    return frags or None
 
 
 def _scan_cache_key(splits, projection, predicate) -> tuple:
@@ -273,7 +312,9 @@ def _read_split_batches(splits, projection, predicate, on_read_error="error"):
     Under ``on_read_error="skip"`` the read bypasses the cache and the coalesced bulk
     scans for the per-split reader, so an unreadable split is skipped in isolation without
     poisoning a cache entry (see `_read_split_batches_uncached`)."""
-    if on_read_error == "skip" or not (_scan_cache_cap() > 0 and splits and _all_rowgroup(splits)):
+    if on_read_error == "skip" or not (
+        _scan_cache_cap() > 0 and splits and _scannable_fragments(splits) is not None
+    ):
         yield from _read_split_batches_uncached(splits, projection, predicate, on_read_error)
         return
     key = _scan_cache_key(splits, projection, predicate)
@@ -427,15 +468,14 @@ def _native_uri(path: str) -> str:
 
 
 def _dataset_scan_batches(splits, projection, predicate):
-    """A streaming pyarrow dataset scanner over `splits` as Parquet row-group fragments,
-    or `None` when they aren't all uniform Parquet row-group splits OR the scan can't be
-    built (caller then falls back). Reads the worker's row-groups concurrently in C++
-    (`pre_buffer` coalesces the projected column-chunk byte ranges; fragment/batch
-    readahead overlap I/O) — no Python read loop, no whole-partition materialization.
+    """A streaming pyarrow dataset scanner over `splits` as Parquet fragments, or `None`
+    when `_scannable_fragments` declines them OR the scan can't be built (caller then falls
+    back). Reads the worker's fragments concurrently in C++ (`pre_buffer` coalesces the
+    projected column-chunk byte ranges; fragment/batch readahead overlap I/O) — no Python
+    read loop, no whole-partition materialization.
     Result-invariant: same rows/columns as the per-split read."""
-    from batcher.io.splits import RowGroupSplit
-
-    if not splits or not all(isinstance(s, RowGroupSplit) for s in splits):
+    fragments = _scannable_fragments(splits) if splits else None
+    if fragments is None:
         return None
     try:
         import pyarrow.dataset as pads
@@ -443,18 +483,18 @@ def _dataset_scan_batches(splits, projection, predicate):
         from batcher.io.filesystem import ensure_io_threads, resolve_filesystem
 
         ensure_io_threads()  # lift the 8-thread S3 read cap (shared with the single-node path)
-        fsw = resolve_filesystem(splits[0].path)
+        fsw = resolve_filesystem(fragments[0][0])
         pafs = getattr(fsw, "_fs", None)
         if pafs is None:
             return None
         fmt = pads.ParquetFileFormat(
             default_fragment_scan_options=pads.ParquetFragmentScanOptions(pre_buffer=True)
         )
+        # `row_groups=None` means the whole file, and is how a whole-file split avoids
+        # needing the footer the driver never read — the scanner opens it on the worker.
         frags = [
-            fmt.make_fragment(
-                fsw._p(s.path).rstrip("/"), filesystem=pafs, row_groups=list(s.row_groups)
-            )
-            for s in splits
+            fmt.make_fragment(fsw._p(path).rstrip("/"), filesystem=pafs, row_groups=row_groups)
+            for path, row_groups in fragments
         ]
         dset = pads.FileSystemDataset(frags, frags[0].physical_schema, fmt, pafs)
         expr = None

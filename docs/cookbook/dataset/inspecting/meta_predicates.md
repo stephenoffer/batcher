@@ -20,4 +20,4 @@ python examples/dataset/meta_predicates.py
 - {doc}`/cookbook/dataset/inspecting/meta_comparison`: asking about a join before running it, and reading approximate statistics.
 - {doc}`/cookbook/dataset/inspecting/meta_schema`: asking about a dataset's shape without executing it.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
-- {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.
+- {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

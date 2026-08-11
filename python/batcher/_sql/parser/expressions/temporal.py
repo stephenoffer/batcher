@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from sqlglot import expressions as exp
 
-from batcher.plan.expr_ir import Cast, Expr, lit, when
+from batcher.plan.expr_ir import Binary, Cast, Expr, lit
 from batcher.plan.expr_ir.func_nodes import DateOffset, WindowStart
 from batcher.plan.functions.temporal import (
     current_timestamp,
@@ -25,12 +25,22 @@ from batcher.plan.functions.temporal import (
     from_unix_date,
     make_timestamp,
 )
+from batcher.plan.ir_tags import MICROS_PER_DAY
 
 __all__ = ["temporal_function"]
 
 # sqlglot records `epoch_ms`'s scale as the decimal exponent of the unit (3 for
 # milliseconds); `to_timestamp` carries no scale at all.
-_SCALE_UNIT = {"3": "ms", "6": "us", "9": "ns"}
+#
+# Scale 0 is seconds, and it used to be missing. Every unlisted scale fell through to a
+# default of `"ms"`, so `TO_TIMESTAMP(n, 0)` and `TO_TIMESTAMP(n, 3)` returned the *same*
+# instant — a silent 1000x error on the one spelling a Snowflake port is most likely to
+# use. There is no safe default here, so an unrecognized scale now raises.
+_SCALE_UNIT = {"0": "s", "3": "ms", "6": "us", "9": "ns"}
+
+# The `.dt` reader for each unit. Seconds is spelled `epoch`, not `epoch_s`, so the unit
+# name cannot be interpolated into the method name for all four.
+_UNIT_EPOCH_METHOD = {"s": "epoch", "ms": "epoch_ms", "us": "epoch_us", "ns": "epoch_ns"}
 
 # `make_timestamp_ms(n)` — DuckDB's epoch constructors that sqlglot leaves anonymous.
 _EPOCH_NAME_UNIT = {"make_timestamp_ms": "ms", "make_timestamp_ns": "ns"}
@@ -82,13 +92,23 @@ _JULIAN_EPOCH = 2440588.0
 # larger are absent on purpose: DuckDB aligns calendar buckets to 2000-01-01, which an
 # epoch-aligned width cannot express.
 _BUCKET_MICROS = {
-    "DAY": 86_400_000_000,
+    "DAY": MICROS_PER_DAY,
     "HOUR": 3_600_000_000,
     "MINUTE": 60_000_000,
     "SECOND": 1_000_000,
     "MILLISECOND": 1_000,
     "MICROSECOND": 1,
 }
+
+# DuckDB anchors `time_bucket` at 2000-01-03 00:00:00, not at the Unix epoch; that is
+# 10,959 days later. `WindowStart` is epoch-anchored, so the two agree only when the bucket
+# width divides the gap between the origins evenly — which is why the units above looked
+# correct: 1 DAY, 2 HOUR and 5 MINUTE all do. A width that does not (2 DAY, 7 DAY) puts
+# every boundary on the wrong instant, silently: `time_bucket(INTERVAL 2 DAY, DATE
+# '2021-01-01')` answered 2021-01-01 where DuckDB answers 2020-12-31, and a whole week's
+# rows land in the neighbouring bucket. Such a width is refused, the same way MONTH already
+# is, rather than answered with a shifted grid.
+_BUCKET_ORIGIN_MICROS = 10_959 * MICROS_PER_DAY
 
 
 def temporal_function(tr, node) -> Expr | None:
@@ -136,10 +156,13 @@ def temporal_function(tr, node) -> Expr | None:
             # The cast is load-bearing: `epoch_us` of a Date32 is not its microsecond
             # count, and a DATE is the argument `julian` is most often given.
             micros = Cast(tr._scalar(args[0]), "timestamp").dt.epoch_us()
-            return micros / lit(86_400_000_000.0) + lit(_JULIAN_EPOCH)
+            return micros / lit(float(MICROS_PER_DAY)) + lit(_JULIAN_EPOCH)
         if name == "era":
-            # 1 for the Common Era, 0 before it — the year sign is the whole test.
-            return when(tr._scalar(args[0]).dt.year() > lit(0)).then(lit(1)).otherwise(lit(0))
+            # 1 for the Common Era, 0 before it — the year sign is the whole test. Cast
+            # the comparison rather than branching on it: a null date has a null year, so
+            # `year > 0` is null and a `when/otherwise` would take the else branch and
+            # report a missing date as BCE.
+            return (tr._scalar(args[0]).dt.year() > lit(0)).cast("int64")
     if len(args) == 1:
         unit = _SPARK_EPOCH_UNIT.get(name)
         if unit is not None:
@@ -387,10 +410,13 @@ def _unix_to_time(tr, node) -> Expr:
     scale = node.args.get("scale")
     if scale is None:
         return from_epoch(tr._scalar(node.this), "s")
-    unit = _SCALE_UNIT.get(str(scale.name if hasattr(scale, "name") else scale), "ms")
+    key = str(scale.name if hasattr(scale, "name") else scale)
+    if key not in _SCALE_UNIT:
+        raise NotImplementedError(f"epoch scale {key} is not supported; use 0 (seconds), 3, 6 or 9")
+    unit = _SCALE_UNIT[key]
     if _is_integer_literal(node.this):
         return from_epoch(tr._scalar(node.this), unit)
-    return getattr(tr._scalar(node.this).dt, f"epoch_{unit}")()
+    return getattr(tr._scalar(node.this).dt, _UNIT_EPOCH_METHOD[unit])()
 
 
 def _is_integer_literal(node) -> bool:
@@ -416,4 +442,81 @@ def _time_bucket(tr, node) -> Expr | None:
     width = int(interval.this.name) * micros
     if width <= 0:
         return None
+    if _BUCKET_ORIGIN_MICROS % width:
+        raise NotImplementedError(
+            f"time_bucket(INTERVAL {interval.this.name} {unit}, ...) is not supported: "
+            "buckets here start from the Unix epoch, DuckDB starts them from 2000-01-03, "
+            "and this width does not divide the gap — every boundary would land on a "
+            "different instant. Use a width that divides a day evenly (1 DAY, 6 HOUR, "
+            "15 MINUTE), or date_trunc for calendar buckets"
+        )
     return WindowStart(tr._scalar(node.expression), width)
+
+
+#: Fixed-width `date_diff` units, in microseconds.
+#:
+#: `date_diff` counts **boundary crossings**, not elapsed time: DuckDB answers
+#: `date_diff('hour', '00:59', '01:00')` with 1 (one minute apart, but one hour boundary
+#: between them) and `date_diff('hour', '00:00', '00:59')` with 0. So the unit is a grid to
+#: snap both endpoints onto, and the answer is the number of grid cells between them —
+#: not the elapsed span divided by the unit, which gets both of those cases backwards.
+#:
+#: Snapping is `floor_div` on the epoch microsecond count rather than a `date_trunc`,
+#: because the Unix epoch is itself aligned on every boundary in this table, so the two
+#: agree exactly. Integer division also keeps it exact where a float divide would not, and
+#: *floor* (not truncate) is what keeps a pre-1970 timestamp snapping to the period that
+#: contains it.
+_DIFF_MICROS = {
+    "MICROSECOND": 1,
+    "MILLISECOND": 1_000,
+    "SECOND": 1_000_000,
+    "MINUTE": 60_000_000,
+    "HOUR": 3_600_000_000,
+    "DAY": MICROS_PER_DAY,
+}
+
+#: Calendar `date_diff` units, as (periods per year, `.dt` accessor for the period).
+#: These cannot use a microsecond grid because months and quarters are not a fixed width;
+#: the field arithmetic below counts calendar boundaries directly, which is the same thing
+#: DuckDB does.
+_DIFF_CALENDAR = {"MONTH": (12, "month"), "QUARTER": (4, "quarter")}
+
+
+def _epoch_cell(value: Expr, micros: int) -> Expr:
+    """Which `micros`-wide cell of the epoch grid `value` falls in."""
+    epoch_us = Cast(value, "timestamp").dt.epoch_us()
+    if micros == 1:
+        return epoch_us
+    return Binary("floor_div", epoch_us, lit(micros))
+
+
+def _date_diff(tr, node) -> Expr:
+    """`date_diff(unit, a, b)` — the number of `unit` boundaries crossed going a → b."""
+    unit = (node.text("unit") or "DAY").upper().rstrip("S")
+    # sqlglot: this=end (b), expression=start (a).
+    end, start = tr._scalar(node.this), tr._scalar(node.expression)
+
+    micros = _DIFF_MICROS.get(unit)
+    if micros is not None:
+        return Cast(_epoch_cell(end, micros) - _epoch_cell(start, micros), "int64")
+
+    if unit == "WEEK":
+        # The one unit that is *not* boundary-crossing: DuckDB reports the whole number of
+        # 7-day spans, truncated toward zero (so -6 days is 0, not -1). Verified against
+        # DuckDB across the Monday boundary, which a week-grid reading would count and
+        # this correctly does not.
+        days = _epoch_cell(end, _DIFF_MICROS["DAY"]) - _epoch_cell(start, _DIFF_MICROS["DAY"])
+        return Cast((days / lit(7)).trunc(), "int64")
+
+    if unit == "YEAR":
+        return Cast(end.dt.year() - start.dt.year(), "int64")
+
+    if unit in _DIFF_CALENDAR:
+        per, field = _DIFF_CALENDAR[unit]
+        ordinal = lambda v: v.dt.year() * lit(per) + getattr(v.dt, field)()  # noqa: E731
+        return Cast(ordinal(end) - ordinal(start), "int64")
+
+    raise NotImplementedError(
+        f"date_diff unit {unit} is not supported; use one of "
+        f"{', '.join(sorted({*_DIFF_MICROS, *_DIFF_CALENDAR, 'WEEK', 'YEAR'}))}"
+    )

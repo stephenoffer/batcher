@@ -336,11 +336,11 @@ def test_cache_size_is_parsed_from_sys():
 
 
 def test_cpu_list_parsing_covers_ranges_and_singletons():
-    assert topology._parse_cpu_list("0-3,8,10-11") == {0, 1, 2, 3, 8, 10, 11}
-    assert topology._parse_cpu_list("") == set()
+    assert topology.parse_cpu_list("0-3,8,10-11") == {0, 1, 2, 3, 8, 10, 11}
+    assert topology.parse_cpu_list("") == set()
     # A kernel that spells the list in a way we do not expect must yield nothing rather than
     # raise: topology is an optimization input, never a correctness one.
-    assert topology._parse_cpu_list("not-a-list") == set()
+    assert topology.parse_cpu_list("not-a-list") == set()
 
 
 def test_simd_width_reports_the_widest_available_lane(monkeypatch):
@@ -545,3 +545,470 @@ def test_a_machine_with_devices_still_gets_its_inventory(monkeypatch):
     monkeypatch.setattr(profile_mod, "gpu_devices_absent", lambda: False)
     monkeypatch.setattr(profile_mod, "gpu_inventory", lambda: [{"name": "T4"}, {"name": "A100"}])
     assert profile_mod._accelerator_names() == ("A100", "T4")
+
+
+# --- The contention signals a container can actually trust -----------------------------------
+
+
+def test_oversubscription_reads_the_host_run_queue_not_the_container_slice(monkeypatch):
+    # A 4-core container on a 128-core host that is HALF IDLE (load 64 of 128). The run queue
+    # is a host-wide number and Linux publishes no per-cgroup equivalent, so dividing it by the
+    # container's own 4 cores reported a sixteen-fold oversubscription — and the CPU-budget
+    # policy then collapsed the fan-out to a sliver on a machine with abundant headroom. The
+    # honest ratio divides the host-wide numerator by the host-wide denominator: 0.5.
+    monkeypatch.setattr(cpu, "available_cpu_count", lambda: 4)
+    monkeypatch.setattr(os, "cpu_count", lambda: 128)
+    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
+    monkeypatch.setattr(cpu, "cgroup_throttled_ratio", lambda: None)
+    monkeypatch.setattr(cpu, "cgroup_pressure", dict)
+
+    signals = hardware.cpu_contention()
+    # Both are reported: the slice-relative figure is what a *diagnostic* asks for, and it is
+    # still 16 — the box does have four times more runnable work than this process has cores.
+    assert signals["load_per_core"] == 16.0
+    assert signals["host_load_per_core"] == 0.5
+    # But the verdict that gates fan-out reads the host-scoped one, so a half-idle host is
+    # never reported as oversubscribed.
+    assert cpu.cpu_oversubscription() == 1.0
+
+
+def test_oversubscription_still_fires_when_the_host_really_is_oversubscribed(monkeypatch):
+    # Same small container, host now at 2x its cores. That contention is real and reaches us.
+    monkeypatch.setattr(cpu, "available_cpu_count", lambda: 4)
+    monkeypatch.setattr(os, "cpu_count", lambda: 128)
+    monkeypatch.setattr(os, "getloadavg", lambda: (256.0, 256.0, 256.0))
+    monkeypatch.setattr(cpu, "cgroup_throttled_ratio", lambda: None)
+    monkeypatch.setattr(cpu, "cgroup_pressure", dict)
+    assert cpu.cpu_oversubscription() == pytest.approx(2.0)
+
+
+def test_cgroup_v1_throttling_is_visible(monkeypatch):
+    # cgroup v1 keeps `cpu.stat` under a per-controller mount, which the v2 directory walk
+    # never reaches. Throttling was therefore invisible on every v1 host — so a container
+    # pinned at its quota reported NO contention, and both the fan-out and the CPU-share loop
+    # read the resulting idle cores as "this workload does not want them".
+    import builtins
+
+    files = {
+        "/proc/self/cgroup": "1:cpu:/docker/abc\n",  # no `0::` line: this host is v1
+        "/sys/fs/cgroup/cpu/cpu.stat": "nr_periods 1000\nnr_throttled 250\nthrottled_time 5\n",
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    assert cgroup.cgroup_throttled_ratio() == 0.25
+
+
+def test_a_v2_reading_still_wins_over_the_v1_fallback(monkeypatch):
+    import builtins
+
+    files = {
+        "/proc/self/cgroup": "0::/pod\n",
+        "/sys/fs/cgroup/cpu.stat": "nr_periods 100\nnr_throttled 10\n",
+        "/sys/fs/cgroup/pod/cpu.stat": "nr_periods 100\nnr_throttled 50\n",
+        "/sys/fs/cgroup/cpu/cpu.stat": "nr_periods 100\nnr_throttled 90\n",  # v1: must not win
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    assert cgroup.cgroup_throttled_ratio() == pytest.approx(0.1)
+
+
+def test_a_heterogeneous_slurm_allocation_still_bounds_the_fan_out(monkeypatch):
+    # `SLURM_CPUS_ON_NODE` is a run-length list on a heterogeneous job. Any value carrying a
+    # repeat count used to fall through entirely, leaving NO Slurm bound — so the job sized to
+    # the affinity mask, which on an unconfined HPC node is every core on a shared machine.
+    monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
+    monkeypatch.setenv("SLURM_CPUS_ON_NODE", "4(x2),8")
+    monkeypatch.setattr(os, "cpu_count", lambda: 128)
+    monkeypatch.setattr(cpu, "_affinity_count", lambda: 128)
+    monkeypatch.setattr(cpu, "cfs_quota_count", lambda: None)
+    # The smallest grant in the expansion binds: which entry is *this* node is not derivable
+    # from the variable, and under-parallelizing costs throughput where over-parallelizing on
+    # the node that got the small grant is what gets a job killed.
+    assert hardware.available_cpu_count() == 4
+
+    monkeypatch.setenv("SLURM_CPUS_ON_NODE", "16")  # the plain-int case is unchanged
+    assert hardware.available_cpu_count() == 16
+
+    monkeypatch.setenv("SLURM_CPUS_ON_NODE", "weird")  # unparseable → no bound, not a wrong one
+    assert hardware.available_cpu_count() == 128
+
+
+# --- The cache domain this process actually runs in ------------------------------------------
+
+
+def _cache_files(cpu_id: int, *, l2: str, l3: str, shared: str) -> dict[str, str]:
+    """The `/sys` cache tree for one CPU: an L1d, an L2, and an L3 shared with `shared`."""
+    root = f"/sys/devices/system/cpu/cpu{cpu_id}/cache"
+    return {
+        f"{root}/index0/level": "1",
+        f"{root}/index0/type": "Data",
+        f"{root}/index0/size": "32K",
+        f"{root}/index0/coherency_line_size": "64",
+        f"{root}/index0/shared_cpu_list": str(cpu_id),
+        f"{root}/index2/level": "2",
+        f"{root}/index2/type": "Unified",
+        f"{root}/index2/size": l2,
+        f"{root}/index2/coherency_line_size": "64",
+        f"{root}/index2/shared_cpu_list": str(cpu_id),
+        f"{root}/index3/level": "3",
+        f"{root}/index3/type": "Unified",
+        f"{root}/index3/size": l3,
+        f"{root}/index3/coherency_line_size": "64",
+        f"{root}/index3/shared_cpu_list": shared,
+    }
+
+
+def _fake_cache_glob(files: dict[str, str]):
+    """A `glob.glob` stand-in returning the `index*` dirs present in `files`."""
+
+    def globber(pattern):
+        prefix = pattern.removesuffix("index*")
+        return sorted({p.rsplit("/", 1)[0] for p in files if p.startswith(prefix)})
+
+    return globber
+
+
+def test_the_cache_is_read_from_a_cpu_this_process_can_run_on(monkeypatch):
+    # A container pinned by cpuset to cores 8-9 of a host whose cpu0 sits on a different,
+    # larger cache domain. `/sys` is host-wide, so reading `cpu0` unconditionally described a
+    # core this process can never be scheduled on — and a broadcast threshold sized to that
+    # 32 MiB domain spills out of the 8 MiB domain the work actually runs in.
+    import builtins
+
+    files = {
+        **_cache_files(0, l2="2M", l3="32M", shared="0-7"),
+        **_cache_files(8, l2="512K", l3="8M", shared="8-9"),
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    monkeypatch.setattr(cache.glob, "glob", _fake_cache_glob(files))
+    monkeypatch.setattr(cache, "affinity_cpu_ids", lambda: {8, 9})
+
+    hierarchy = cache.cache_hierarchy()
+    assert hierarchy["l3"] == 8 * (1 << 20)
+    assert hierarchy["l2"] == 512 * (1 << 10)
+
+
+def test_a_heterogeneous_socket_reports_its_binding_cache_domain(monkeypatch):
+    # An AMD part with stacked cache: one CCD carries 96 MiB of L3 and its neighbour 32 MiB, a
+    # threefold spread inside one socket. Whichever CCD happened to hold cpu0 used to decide
+    # the figure. The smallest is the binding one — a table resident there is resident on both.
+    import builtins
+
+    files = {
+        **_cache_files(0, l2="1M", l3="96M", shared="0-7"),
+        **_cache_files(8, l2="1M", l3="32M", shared="8-15"),
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    monkeypatch.setattr(cache.glob, "glob", _fake_cache_glob(files))
+    monkeypatch.setattr(cache, "affinity_cpu_ids", lambda: set(range(16)))
+    assert cache.cache_hierarchy()["l3"] == 32 * (1 << 20)
+
+
+def test_one_sys_read_per_cache_domain_not_per_core(monkeypatch):
+    # Cost control: a core in an already-measured domain answers identically, so it is skipped.
+    # A 16-core, 2-domain machine must read two CPUs, not sixteen.
+    import builtins
+
+    files = {
+        **_cache_files(0, l2="1M", l3="32M", shared="0-7"),
+        **_cache_files(8, l2="1M", l3="32M", shared="8-15"),
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    monkeypatch.setattr(cache, "affinity_cpu_ids", lambda: set(range(16)))
+    probed: list[str] = []
+
+    globber = _fake_cache_glob(files)
+
+    def counting_glob(pattern):
+        probed.append(pattern)
+        return globber(pattern)
+
+    monkeypatch.setattr(cache.glob, "glob", counting_glob)
+    cache.cache_hierarchy()
+    assert len(probed) == 2
+
+
+def test_the_cache_line_is_the_widest_not_the_narrowest(monkeypatch):
+    # Sizes bind the working set, so the smallest wins. The line size sizes false-sharing
+    # padding, where the LARGEST is the safe one: padding to 64 bytes on a core with 128-byte
+    # lines still false-shares.
+    import builtins
+
+    files = {
+        **_cache_files(0, l2="1M", l3="32M", shared="0"),
+        **_cache_files(1, l2="1M", l3="32M", shared="1"),
+    }
+    files["/sys/devices/system/cpu/cpu1/cache/index0/coherency_line_size"] = "128"
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    monkeypatch.setattr(cache.glob, "glob", _fake_cache_glob(files))
+    monkeypatch.setattr(cache, "affinity_cpu_ids", lambda: {0, 1})
+    assert cache.cache_hierarchy()["line"] == 128
+
+
+# --- What the memory ceiling really is --------------------------------------------------------
+
+
+def test_reserved_hugepages_come_off_the_memory_ceiling(monkeypatch):
+    # Hugetlb pool memory exists and cannot be allocated by anything this engine does: it is
+    # carved out of the general allocator at reservation time. Sizing to `SC_PHYS_PAGES` alone
+    # therefore promised a hash table memory that structurally could not hold it.
+    monkeypatch.setattr(memory, "hugepage_bytes", lambda: 8 * (1 << 30))
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(32 << 30))
+    monkeypatch.setattr(memory, "cgroup_v2_dirs", tuple)
+    monkeypatch.setattr(memory, "read_cgroup_bytes", lambda path: None)
+    assert memory.machine_memory_bytes() == 24 * (1 << 30)
+
+
+def test_a_hugepage_figure_larger_than_ram_cannot_make_memory_negative(monkeypatch):
+    monkeypatch.setattr(memory, "hugepage_bytes", lambda: 999 << 30)
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(32 << 30))
+    monkeypatch.setattr(memory, "cgroup_v2_dirs", tuple)
+    monkeypatch.setattr(memory, "read_cgroup_bytes", lambda path: None)
+    assert memory.machine_memory_bytes() == 0
+
+
+def test_hugepage_pools_of_every_size_class_are_counted(monkeypatch):
+    # A node commonly reserves 2 MiB pages for one tenant and 1 GiB pages for another; reading
+    # only the default class would miss whichever one the operator actually used.
+    import builtins
+
+    pools = {
+        "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages": "512",  # 1 GiB
+        "/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages": "4",  # 4 GiB
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(pools))
+    monkeypatch.setattr(memory.glob, "glob", lambda p: [k.rsplit("/", 1)[0] for k in sorted(pools)])
+    assert memory.hugepage_bytes() == 5 * (1 << 30)
+
+
+def test_the_memory_high_throttle_binds_the_budget(monkeypatch):
+    # `memory.high` is not a kill boundary, which is why it was skipped — but a cgroup above it
+    # is put into synchronous reclaim and made to crawl. Budgeting to `memory.max` on such a
+    # cgroup buys a thrashing query where spilling earlier buys a finishing one.
+    caps = {
+        "/sys/fs/cgroup/pod/memory.max": 16 << 30,
+        "/sys/fs/cgroup/pod/memory.high": 12 << 30,
+    }
+    monkeypatch.setattr(memory, "hugepage_bytes", lambda: 0)
+    monkeypatch.setattr(os, "sysconf", _fake_sysconf(64 << 30))
+    monkeypatch.setattr(memory, "cgroup_v2_dirs", lambda: ("/sys/fs/cgroup/pod",))
+    monkeypatch.setattr(memory, "read_cgroup_bytes", caps.get)
+    assert memory.machine_memory_bytes() == 12 << 30
+
+
+def test_swap_is_reported_from_the_cgroup_before_the_host(monkeypatch):
+    # A container with host swap can still be denied it (`memory.swap.max = 0`, which is what
+    # Kubernetes writes), and there the host's swap partitions are present and irrelevant.
+    # Swapless means overshooting the budget is terminal rather than merely slow, so the engine
+    # must spill earlier — and nothing could tell the two apart before.
+    import builtins
+
+    files = {
+        "/sys/fs/cgroup/pod/memory.swap.max": "0",
+        "/proc/swaps": "Filename\tType\tSize\n/dev/sda2\tpartition\t8388604\n",
+    }
+    monkeypatch.setattr(builtins, "open", _fake_open(files))
+    monkeypatch.setattr(memory, "cgroup_v2_dirs", lambda: ("/sys/fs/cgroup", "/sys/fs/cgroup/pod"))
+    assert memory.swap_configured() is False
+
+    files["/sys/fs/cgroup/pod/memory.swap.max"] = "max"  # unlimited → the host decides
+    memory.swap_configured.cache_clear()
+    assert memory.swap_configured() is True
+
+
+def test_a_swapless_host_reports_no_swap(monkeypatch):
+    import builtins
+
+    monkeypatch.setattr(builtins, "open", _fake_open({"/proc/swaps": "Filename\tType\tSize\n"}))
+    monkeypatch.setattr(memory, "cgroup_v2_dirs", tuple)
+    assert memory.swap_configured() is False
+
+
+# --- What the spill device really is ----------------------------------------------------------
+
+
+def test_an_lvm_volume_is_priced_by_what_is_underneath_it(monkeypatch):
+    # LVM over a network-attached volume is an ordinary cloud root-and-scratch layout. The
+    # `dm-` prefix says nothing about speed, and reporting it as `mapped` carried the DEFAULT
+    # cost factor — so a spilled byte on EBS was priced as local flash, understating it tenfold
+    # in the one term that decides whether an out-of-core plan is acceptable at all.
+    monkeypatch.setattr(storage, "_sys_block_name", lambda path: "dm-0")
+    monkeypatch.setattr(os, "listdir", lambda p: ["nbd0"] if p.endswith("/slaves") else [])
+    monkeypatch.setattr(os.path, "exists", lambda p: p == "/sys/block/nbd0")
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "network"
+    assert storage.device_cost_factor("/scratch") == 10.0
+
+
+def test_a_stripe_is_priced_at_its_slowest_member(monkeypatch):
+    # A stripe finishes at the rate of its slowest member, and an external merge's concurrent
+    # run reads touch every member.
+    monkeypatch.setattr(storage, "_sys_block_name", lambda path: "md0")
+    monkeypatch.setattr(
+        os, "listdir", lambda p: ["nvme0n1", "nbd3"] if p.endswith("/slaves") else []
+    )
+    monkeypatch.setattr(os.path, "exists", lambda p: p in ("/sys/block/nvme0n1", "/sys/block/nbd3"))
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "network"
+
+
+def test_an_unresolvable_mapper_still_names_itself(monkeypatch):
+    # No `slaves/` to read → fall back to the prefix, exactly as before. An unreadable `/sys`
+    # must re-rank no plan.
+    monkeypatch.setattr(storage, "_sys_block_name", lambda path: "dm-7")
+    monkeypatch.setattr(os, "listdir", _raise_oserror)
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "mapped"
+    assert storage.device_cost_factor("/scratch") == 1.0
+
+
+def test_nvme_over_fabrics_is_not_local_flash(monkeypatch):
+    # An NVMe-oF namespace is named exactly like a local one, so the device name — the only
+    # signal used before — reported the fastest class in the table for storage that crosses a
+    # network. The driver publishes the transport; ask it.
+    import builtins
+
+    monkeypatch.setattr(storage, "_sys_block_name", lambda path: "nvme0n1")
+    monkeypatch.setattr(
+        builtins, "open", _fake_open({"/sys/block/nvme0n1/device/transport": "tcp"})
+    )
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "network"
+
+    monkeypatch.setattr(
+        builtins, "open", _fake_open({"/sys/block/nvme0n1/device/transport": "pcie"})
+    )
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "nvme"
+
+
+def test_a_kernel_that_does_not_publish_a_transport_assumes_local(monkeypatch):
+    import builtins
+
+    monkeypatch.setattr(storage, "_sys_block_name", lambda path: "nvme0n1")
+    monkeypatch.setattr(builtins, "open", _fake_open({}))
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "nvme"
+
+
+def test_an_iscsi_lun_is_not_an_ssd(monkeypatch):
+    # A remote LUN answers `rotational = 0` and was therefore classified `ssd`, at a tenth of
+    # its real cost, on exactly the SAN-backed deployments where pricing an out-of-core plan
+    # matters. Its place in the `/sys` device tree is a positive identification, not a guess.
+    monkeypatch.setattr(storage, "_sys_block_name", lambda path: "sdb")
+    monkeypatch.setattr(
+        os.path,
+        "realpath",
+        lambda p: "/sys/devices/platform/host6/session1/target6:0:0/6:0:0:0",
+    )
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "network"
+
+
+def test_a_local_sas_disk_is_still_classified_by_its_medium(monkeypatch):
+    monkeypatch.setattr(storage, "_sys_block_name", lambda path: "sdb")
+    monkeypatch.setattr(os.path, "realpath", lambda p: "/sys/devices/pci0000:00/0000:00:17.0/ata1")
+    monkeypatch.setattr(storage, "_read_int", lambda p: 1)
+    storage.device_class.cache_clear()
+    assert storage.device_class("/scratch") == "rotational"
+
+
+def _raise_oserror(*_a, **_k):
+    raise OSError
+
+
+def _fake_sysconf(total_bytes: int, page: int = 4096):
+    """An `os.sysconf` stand-in reporting a host with `total_bytes` of RAM."""
+
+    def sysconf(name):
+        if name == "SC_PAGE_SIZE":
+            return page
+        if name == "SC_PHYS_PAGES":
+            return total_bytes // page
+        raise ValueError(name)
+
+    return sysconf
+
+
+# --- The vector width an ARM part actually has ------------------------------------------------
+
+
+def test_sve_width_is_read_from_the_kernel_not_assumed(monkeypatch):
+    """SVE has no architectural width — an implementation picks anything from 128 to 2048
+    bits, and the server parts differ: Graviton3 is 256-bit, Graviton4 is 128, A64FX is 512.
+    A flat 256 was right on one of the three and overstated Graviton4 twofold, in a figure that
+    both scales a throughput estimate and keys every learned coefficient on the machine."""
+    import builtins
+
+    monkeypatch.setattr(isa, "cpu_features", lambda: frozenset({"asimd", "sve"}))
+    monkeypatch.setattr(builtins, "open", _fake_open({isa._SVE_VECTOR_LENGTH_PATH: "16\n"}))
+    isa.simd_width_bits.cache_clear()
+    assert isa.simd_width_bits() == 128  # 16 bytes: Neoverse V2
+
+    monkeypatch.setattr(builtins, "open", _fake_open({isa._SVE_VECTOR_LENGTH_PATH: "64\n"}))
+    isa.simd_width_bits.cache_clear()
+    assert isa.simd_width_bits() == 512  # 64 bytes: A64FX
+
+
+def test_an_unreadable_sve_length_falls_back_to_the_neon_floor(monkeypatch):
+    """Every aarch64 part has at least NEON, so 128 is a floor rather than a guess."""
+    import builtins
+
+    monkeypatch.setattr(isa, "cpu_features", lambda: frozenset({"asimd", "sve"}))
+    monkeypatch.setattr(builtins, "open", _fake_open({}))
+    isa.simd_width_bits.cache_clear()
+    assert isa.simd_width_bits() == 128
+
+
+def test_an_implausible_sve_length_is_discarded(monkeypatch):
+    """A width outside the architectural range would have to come from a kernel reporting
+    something this code does not understand, and it propagates into the machine fingerprint."""
+    import builtins
+
+    monkeypatch.setattr(isa, "cpu_features", lambda: frozenset({"asimd", "sve2"}))
+    for bogus in ("7", "0", "9999"):
+        monkeypatch.setattr(builtins, "open", _fake_open({isa._SVE_VECTOR_LENGTH_PATH: bogus}))
+        isa.simd_width_bits.cache_clear()
+        assert isa.simd_width_bits() == 128
+
+
+def test_x86_widths_are_untouched_by_the_sve_path(monkeypatch):
+    monkeypatch.setattr(isa, "cpu_features", lambda: frozenset({"sse2", "avx", "avx2"}))
+    isa.simd_width_bits.cache_clear()
+    assert isa.simd_width_bits() == 256
+
+
+def test_an_arm_implementer_code_is_readable_in_a_label():
+    """`0x41/64c/128GiB` in a log line tells nobody which fleet ran the query. The code stays
+    the fingerprint material — remapping it would move every ARM machine's key and discard
+    everything learned on it — and only the display is translated."""
+    assert isa.vendor_display_name("0x41") == "ARM"
+    assert isa.vendor_display_name("0xc0") == "Ampere"
+    assert isa.vendor_display_name("GenuineIntel") == "GenuineIntel"
+    assert isa.vendor_display_name("") == ""
+
+    raw = profile.HardwareProfile(logical_cpus=64, memory_bytes=128 << 30, vendor="0xc0")
+    assert raw.label().startswith("Ampere/64c/")
+    # The key is built from the raw code and not from the display name, so translating for a
+    # log line cannot move a machine's fingerprint out from under everything it has learned.
+    translated = profile.HardwareProfile(logical_cpus=64, memory_bytes=128 << 30, vendor="Ampere")
+    assert raw.fingerprint() != translated.fingerprint()
+
+
+def test_the_reset_hook_forgets_every_vendor_probe(monkeypatch):
+    """`reset_hardware_probes` promises to forget *every* memoized reading, and is what the
+    whole suite's fixtures call. It never cleared AMD's device-identity memo, so an AMD test
+    that faked `/sys/class/drm` and reset in the documented way kept reading the previous
+    answer — a test that passes while testing nothing, which is the exact failure mode the
+    explicit-list design of `probes` exists to prevent."""
+    from batcher._internal.hardware.amd import devices as amd_devices
+
+    seen: list[int] = []
+    monkeypatch.setattr(amd_devices, "_probe", lambda: seen.append(1) or ())
+    amd_devices._cached_identity.cache_clear()
+
+    amd_devices.amd_present()
+    amd_devices.amd_present()
+    assert len(seen) == 1  # memoized, as intended
+
+    hardware.reset_hardware_probes()
+    amd_devices.amd_present()
+    assert len(seen) == 2  # ...and the documented reset actually reaches it

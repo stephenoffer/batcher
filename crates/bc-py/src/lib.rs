@@ -45,7 +45,7 @@ mod sketches;
 mod tracing_init;
 use normalize::{
     narrow_output, normalize_batch, original_narrow_types, parse_aggregates, parse_group_keys,
-    supported_cast_dtypes, unwrap_batches,
+    resolve_cast_dtype, supported_cast_dtypes, unwrap_batches,
 };
 use process::shared_memory_pool;
 
@@ -137,6 +137,13 @@ fn execute_plan_metered(
         budget,
         materialize_fits,
     } = prepare_exec(plan_json, sources, engine_config, query_id)?;
+    // Started outside `allow_threads` so it brackets *everything* the executor does,
+    // including a streaming-to-materializing hand-off. This is the one boundary that sees
+    // every tier, which is why the whole-execution resource measurement is taken here rather
+    // than inside an executor: the streaming tier cannot attribute OS counters to an operator
+    // (its operators interleave), so without this the default tier reported no CPU, memory,
+    // or disk consumption at all.
+    let query_watch = bc_interp::QueryStopwatch::start();
     let (out, metrics) = py
         .allow_threads(|| {
             if streaming {
@@ -158,6 +165,7 @@ fn execute_plan_metered(
             }
         })
         .map_err(errors::interp_to_pyerr)?;
+    let metrics = metrics.with_query(query_watch);
     let out = narrow_output(out, &narrow);
     Ok((
         out.into_iter().map(PyArrowType).collect(),
@@ -275,8 +283,20 @@ fn prepare_exec(
     // it can only be read off the build sides once they exist — so the two halves meet by the
     // executor reporting `PreferMaterializing` and this side honoring it (see `run_materializing`).
     let materialize_fits = budget > 0 && src_bytes.saturating_mul(8) < budget;
-    let materialize_is_safe_and_faster =
-        !bc_interp::streaming_parallelizes(&plan) && materialize_fits;
+    // Two independent reasons the materializing executor is the better answer, sharing one
+    // envelope guard: a plan streaming cannot shard (a repeated source), and a join-free
+    // grouped aggregation, which streaming computes correctly but for about twice the CPU.
+    // Two independent reasons the materializing executor is the better answer, sharing one
+    // envelope guard. The first is structural and the engine can see it: a plan streaming
+    // cannot shard (a repeated source). The second is a *cardinality* question the engine
+    // cannot answer before it has grouped — a join-free grouped aggregate is cheaper
+    // materialized once the group count is high, and dearer below it — so Kyber decides it
+    // and sends the verdict in the config. The shape check stays here as the engine's own
+    // guard, so a stale or over-eager flag cannot reroute a plan this was never measured on.
+    let materialize_is_safe_and_faster = (!bc_interp::streaming_parallelizes(&plan)
+        || (cfg.prefer_materializing_aggregate
+            && bc_interp::materializing_aggregate_is_faster(&plan)))
+        && materialize_fits;
     let streaming = use_streaming(&cfg) && !materialize_is_safe_and_faster;
     // Record pre-widening source widths *before* normalization (which widens them
     // away), and only when output re-narrowing is requested; an empty map makes
@@ -754,10 +774,14 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(flight::set_flight_client_tls, m)?)?;
     m.add_function(wrap_pyfunction!(flight::shm_available, m)?)?;
     m.add_function(wrap_pyfunction!(flight::shuffle_peer_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(flight::shuffle_flow_totals, m)?)?;
+    m.add_function(wrap_pyfunction!(flight::shuffle_bdp_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(flight::reset_shuffle_peer_stats, m)?)?;
     m.add_function(wrap_pyfunction!(supported_cast_dtypes, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_cast_dtype, m)?)?;
     m.add_class::<flight::ShuffleClient>()?;
     m.add_class::<pool::MemoryPool>()?;
+    m.add_function(wrap_pyfunction!(pool::engine_pool_stats, m)?)?;
     // What the engine process itself detected about its CPU, and what its allocator is
     // holding — neither is observable from the Python side (see `hardware.rs`).
     hardware::register(m)?;

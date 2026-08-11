@@ -268,6 +268,33 @@
       }
     ]
   },
+  "image_crop": {
+    "e": "image_crop",
+    "height": {
+      "e": "lit",
+      "value": {
+        "int": 64
+      }
+    },
+    "input": {
+      "e": "col",
+      "name": "img"
+    },
+    "width": {
+      "e": "lit",
+      "value": {
+        "int": 64
+      }
+    },
+    "x": {
+      "e": "col",
+      "name": "x"
+    },
+    "y": {
+      "e": "col",
+      "name": "y"
+    }
+  },
   "image_simple": {
     "e": "image",
     "fn": "decode",
@@ -619,6 +646,34 @@
       }
     }
   },
+  "seq_bare": {
+    "e": "seq",
+    "fn": "reverse_complement",
+    "input": {
+      "e": "col",
+      "name": "dna"
+    }
+  },
+  "seq_kmers": {
+    "e": "seq",
+    "fn": "minimizers",
+    "input": {
+      "e": "col",
+      "name": "dna"
+    },
+    "k": 21,
+    "window": 10
+  },
+  "seq_translate": {
+    "e": "seq",
+    "fn": "translate",
+    "frame": 1,
+    "input": {
+      "e": "col",
+      "name": "dna"
+    },
+    "to_stop": true
+  },
   "sequence": {
     "e": "sequence",
     "start": {
@@ -639,6 +694,94 @@
         "int": 10
       }
     }
+  },
+  "spatial_pose": {
+    "args": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 0.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 0.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 0.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 0.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 1.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 1.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 2.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 3.0
+        }
+      }
+    ],
+    "e": "spatial",
+    "fn": "se3_transform_x"
+  },
+  "spatial_quat": {
+    "args": [
+      {
+        "e": "col",
+        "name": "x"
+      },
+      {
+        "e": "col",
+        "name": "y"
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 0.0
+        }
+      },
+      {
+        "e": "lit",
+        "value": {
+          "float": 1.0
+        }
+      }
+    ],
+    "e": "spatial",
+    "fn": "quat_norm"
   },
   "str_contains": {
     "e": "str",

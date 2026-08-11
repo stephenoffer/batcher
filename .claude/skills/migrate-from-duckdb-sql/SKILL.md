@@ -109,17 +109,19 @@ rather than returning a wrong answer.
 | SQL construct | Status | Do this instead |
 |---|---|---|
 | `read_parquet('f.parquet')` and friends | **no file-scanning table functions** | `bt.read.parquet("f.parquet")` and bind it: `bt.sql("… FROM t", t=ds)` |
-| `ASOF JOIN` | not parsed | `left.join_asof(right, on="ts", by="symbol", direction="backward")` |
+| `ASOF JOIN` | **parsed** — `ON l.k = r.k AND l.t >= r.t` lowers to `join_asof` | the DataFrame form `left.join_asof(right, on="ts", by="symbol", tolerance="5m")` adds a staleness cap and `direction="nearest"`, which the SQL clause cannot express |
 | Non-equi / theta join (`ON a > b` only) | equi-only engine | equality conjunct + a `WHERE` residual, or pre-filter |
-| `PIVOT` / `UNPIVOT` | rejected by name | `ds.pivot(...)` / `ds.unpivot(...)` (`ds.melt`, `ds.crosstab`) |
+| `PIVOT` / `UNPIVOT` | **parsed** with an explicit `IN (...)` value list | `ds.pivot(...)` / `ds.unpivot(...)` (`ds.melt`, `ds.crosstab`) when the values are discovered rather than listed |
 | `QUALIFY` on a window not in `SELECT` | partial | project the window with an alias, then `QUALIFY alias = 1` — or `.with_columns(rn=…over(…)).filter(bt.col("rn") == 1)` |
-| `LATERAL`, `UNNEST` in `FROM` | not parsed | `ds.explode("col")` / `ds.unnest("struct_col")` |
+| `LATERAL`, `UNNEST` in `FROM` | **parsed** — `FROM t, UNNEST(arr)` and `LATERAL (SELECT …)` both lower; `UNNEST` adds the element column (named `unnest`, or by `AS u(x)`) beside the list, as DuckDB does | `ds.explode("col")` / `ds.unnest("struct_col")` for the DataFrame form |
 | `WITH RECURSIVE` | body translated once — **wrong answer risk** | rewrite as an explicit loop of `Dataset` unions in Python |
 | `MERGE INTO` | unsupported DML | `ds.write.delta(uri, merge_on=["id"])` — one transactional call |
-| `SUM(DISTINCT x)`, `array_agg(DISTINCT x)` | only `COUNT/MIN/MAX(DISTINCT)` | pre-aggregate the distinct values in a subquery |
-| `RANGE`/`GROUPS` window frames, frame `EXCLUDE` | `ROWS` frames only | express the frame in rows, or use `Dataset.window(frame=(…, …, "range"))` |
-| `lag(x, 1, default)` | default value rejected | `bt.lag("x").over(...)` then `.fill_null(default)` |
-| Non-column `PARTITION BY`/window `ORDER BY` | plain columns only | project the expression to a column first |
+| `array_agg(DISTINCT x)`, `string_agg(DISTINCT x)` | rejected — the list aggregates have no dedup form | pre-aggregate the distinct values in a subquery |
+| `SUM(DISTINCT x)` beside `AVG`/`STDDEV`/`VAR`/a quantile/a second `COUNT(DISTINCT y)` | rejected — those have no single-column mergeable partial to survive the dedup | compute them in a separate subquery and join (`SUM/AVG/MIN/MAX(DISTINCT x)` alone, or beside `COUNT`/`SUM`/`MIN`/`MAX`/`BOOL_*`/`BIT_*`/`PRODUCT`/`ANY_VALUE`, is fine) |
+| Frame `EXCLUDE (TIES/GROUP/CURRENT ROW)` | rejected — honouring the frame while dropping `EXCLUDE` would be a wrong answer | rewrite the exclusion as a predicate, or use a `GROUPS` frame |
+| `x > ANY (subquery)`, `x >= ALL (subquery)` | rejected — `> ALL` over a NULL is UNKNOWN, and the `max()` rewrite says TRUE | `x > (SELECT min(c) …)` for `ANY`; for `ALL` add `AND NOT EXISTS (SELECT 1 … WHERE c IS NULL)`. `= ANY`/`= SOME`/`<> ALL` need no rewrite — they are `IN`/`NOT IN` |
+| `IN (subquery)` under `OR` | rejected — a semi-join drops the rows the `OR` keeps | write it as `EXISTS (SELECT 1 FROM s WHERE s.c = t.x)`, qualifying the outer column |
+| Non-column `PARTITION BY`/window `ORDER BY` | **supported** — a computed key is hoisted into a hidden column | nothing; `PARTITION BY date_trunc('month', ts)` works |
 | `INSERT … ON CONFLICT` / `RETURNING` | unsupported | `write.delta(..., merge_on=...)` |
 | Scalar UDF in `GROUP BY` / agg arg / `ORDER BY` | rejected | compute it as a projected alias in a subquery first |
 | Non-constant `LIKE`/`regexp_*`/`substr` arguments | constants only | restructure, or use the `.str` expression namespace |

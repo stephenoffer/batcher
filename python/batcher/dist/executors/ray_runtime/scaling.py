@@ -22,6 +22,7 @@ from batcher._internal.accelerators import (
 )
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
+from batcher.dist.executors.ray_runtime.fabric.topology import is_preemptible, node_zone
 from batcher.plan.resource import HardwareProfile
 
 
@@ -32,16 +33,29 @@ class _Topology:
     the same paths: without it here, every `_worker_eligible` call inside a scope would make
     its own GCS round trip, which is the O(workers x nodes) cost this snapshot exists to
     remove.
+
+    And the per-node **free** CPU, for the same reason and because it was the hole in it.
+    `node_classes` reads that through `capacity.free_cpus_by_node`, which went straight to the
+    GCS on every call — so a scope that had carefully snapshotted `ray.nodes()` still paid one
+    round trip per `node_classes()`, and the placement phase calls it from five places (the
+    pack decision, the node-class selector, `placeable_workers`, the zone selector, the
+    pending-demand diagnosis). `None` when the figures could not be read, which every reader
+    already treats as "assume nameplate".
     """
 
-    __slots__ = ("alive_nodes", "draining", "resources")
+    __slots__ = ("alive_nodes", "draining", "free_cpus", "resources")
 
     def __init__(
-        self, alive_nodes: list[dict], resources: dict, draining: frozenset[str] = frozenset()
+        self,
+        alive_nodes: list[dict],
+        resources: dict,
+        draining: frozenset[str] = frozenset(),
+        free_cpus: dict[str, float] | None = None,
     ) -> None:
         self.alive_nodes = alive_nodes
         self.resources = resources
         self.draining = draining
+        self.free_cpus = free_cpus
 
 
 # The topology snapshot in force for the current scheduling phase, if any. A distributed
@@ -143,10 +157,13 @@ def _schedulable(nodes: list[dict]) -> list[dict]:
 def _read_topology() -> _Topology:
     import ray
 
+    from batcher.dist.executors.ray_runtime.capacity import _live_free_cpus_by_node
+
     return _Topology(
         [n for n in ray.nodes() if n.get("Alive", True)],
         ray.cluster_resources(),
         _read_draining(),
+        _live_free_cpus_by_node(),
     )
 
 
@@ -261,8 +278,8 @@ def worker_node_memory_bytes() -> int:
 
 
 def node_classes() -> list[dict]:
-    """Per-alive-node resource class:
-    ``{"node_id", "cpus", "free_cpus", "gpus", "memory", "accelerators", "accelerator_type"}``.
+    """Per-alive-node resource class: ``{"node_id", "cpus", "free_cpus", "gpus", "memory",
+    "accelerators", "accelerator_type", "zone_label", "zone", "preemptible"}``.
 
     The explicit cluster-heterogeneity model the scheduler lacked: a node is a "GPU
     node" when it exposes a `GPU` resource, a "CPU-only node" otherwise. The accelerator
@@ -288,6 +305,7 @@ def node_classes() -> list[dict]:
                 continue
             labels = n.get("Labels", {}) or {}
             node_id = n.get("NodeID", "")
+            zone_label, zone = node_zone(labels)
             out.append(
                 {
                     "node_id": node_id,
@@ -303,6 +321,21 @@ def node_classes() -> list[dict]:
                     # `GPU`; lets the CPU-fleet isolation treat a TPU node as an accelerator node.
                     "accelerators": accelerator_units(res),
                     "accelerator_type": labels.get("ray.io/accelerator-type"),
+                    # The availability zone, and the label key it was read from. Both, because
+                    # a fleet pinned to a zone must be selected on the key that actually
+                    # carries it — a managed Kubernetes fleet labels
+                    # `topology.kubernetes.io/zone` and a plain Ray one
+                    # `ray.io/availability-zone`, and selecting on the wrong one matches
+                    # nothing. `("", "")` on an unlabelled node, which every zone-aware
+                    # decision reads as "no opinion".
+                    "zone_label": zone_label,
+                    "zone": zone,
+                    # Whether the node is spot capacity. A reclamation wave takes a whole
+                    # instance group, so this is the failure domain a shuffle replica most
+                    # needs to be placed outside of — a second copy on another spot node of
+                    # the same group dies with the first. False on an unlabelled node, which
+                    # keeps an unlabelled fleet behaving exactly as it did before.
+                    "preemptible": is_preemptible(labels),
                 }
             )
         return out
@@ -334,6 +367,18 @@ def cluster_hardware_profile() -> HardwareProfile | None:
     Returns `None` when the topology is unreadable (Ray down), so the caller falls back to the
     single-node local profile rather than a fabricated one.
     """
+    # One snapshot for the whole build. Assembling a profile reads the topology from four
+    # places — `node_classes`, `worker_node_memory_bytes`, `cluster_shape`, and the worker
+    # probe's own node list — and without a scope each is a separate GCS round trip *per
+    # planned query*. They must also agree with each other: an autoscale landing between two of
+    # them produced a profile whose binding core count and fleet shape described different
+    # clusters. Nesting is a no-op, so a caller that already holds a scope keeps its own.
+    with topology_scope():
+        return _cluster_hardware_profile()
+
+
+def _cluster_hardware_profile() -> HardwareProfile | None:
+    """The unsnapshotted build behind `cluster_hardware_profile`."""
     classes = node_classes()
     if not classes:
         return None
@@ -343,6 +388,9 @@ def cluster_hardware_profile() -> HardwareProfile | None:
     from batcher.dist.executors.ray_runtime.fabric.shape import cluster_shape
     from batcher.dist.executors.ray_runtime.hardware_probe import (
         cluster_l3_cache_bytes,
+        cluster_measured_gpu_memory_bytes,
+        cluster_storage_class,
+        cluster_worker_fingerprint,
         warn_once_if_fleet_is_mixed,
     )
 
@@ -353,11 +401,25 @@ def cluster_hardware_profile() -> HardwareProfile | None:
         memory_bytes=worker_node_memory_bytes(),
         worker_count=worker_count,
         gpu_count=gpu_devices,
-        gpu_memory_bytes=binding_gpu_memory_bytes(classes),
+        # What the workers *measured*, falling back to what their model label *implies*. The
+        # label lookup is the only thing available on an unprobeable fleet and it is blind to
+        # an unlabelled node, an unrecognized part, and a MIG instance — where it does not
+        # merely report unknown but reports the whole board for a seventh of one. The probe has
+        # already been paid for by the cache and fingerprint fields beside it.
+        gpu_memory_bytes=cluster_measured_gpu_memory_bytes() or binding_gpu_memory_bytes(classes),
         # The binding worker's L3, probed from the workers themselves — Ray's topology omits
         # cache, so this was left `0` and every cluster query fell back to the config broadcast
         # threshold. Cached per topology and best-effort, so an unprobeable cluster is unchanged.
         l3_cache_bytes=cluster_l3_cache_bytes(),
+        # The machine class anything learned in machine units about this fleet is keyed by.
+        # Kyber runs here on the driver, which executes none of the work, so without this the
+        # cost coefficients and CPU shares it reads back describe the driver's machine and every
+        # worker's measurement is dropped at the reader. `""` on a mixed fleet.
+        fingerprint=cluster_worker_fingerprint(),
+        # The volume the *workers* spill to. Priced from the driver's own disk, an
+        # out-of-core plan on a fleet with network-attached scratch was costed as though it
+        # ran on the head node's NVMe.
+        storage_class=cluster_storage_class(),
     )
 
 

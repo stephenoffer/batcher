@@ -36,13 +36,12 @@ def set_columns(batch: Any, columns: dict[str, Any]) -> Any:
     Returns:
         A new `RecordBatch` carrying the requested columns.
     """
-    out = batch
-    for name, values in columns.items():
-        if name in out.schema.names:
-            out = out.set_column(out.schema.get_field_index(name), name, values)
-        else:
-            out = out.append_column(name, values)
-    return out
+    # One rebuild, not one per column: `set_column`/`append_column` each copy the whole
+    # column list, and `Schema.names` materializes a fresh list per membership test, so
+    # this was O(columns x batch width) on a path that runs per batch.
+    from batcher.ml.tabular.features import append_columns
+
+    return append_columns(batch, columns)
 
 
 def _row_segments(list_array: Any) -> tuple[Any, np.ndarray]:

@@ -90,7 +90,16 @@ def streaming_topn(nat, local_ir, merge_ir, batches, engine_config, chunk_bytes=
 
 
 def streaming_map_buckets(
-    nat, sub_ir, key_names, batches, n_buckets, engine_config, chunk_bytes=_FOLD_CHUNK_BYTES
+    nat,
+    sub_ir,
+    key_names,
+    batches,
+    n_buckets,
+    engine_config,
+    chunk_bytes=_FOLD_CHUNK_BYTES,
+    hot_keys=(),
+    salt_count=0,
+    replicate=False,
 ):
     """Run a join's map prefix over a partition and hash it into `n_buckets`, a chunk at a time.
 
@@ -117,6 +126,14 @@ def streaming_map_buckets(
     `limit(5).join(dim)` kept five rows on each of four workers and returned twenty. Chunking
     within a partition is safe exactly where partitioning already is.
 
+    There is one deliberate exception, and it is the reason to say "breaker-free" rather than
+    "no breaker ever": a **mergeable** breaker whose reducer re-applies it. The keyed dedup
+    (`executors/distinct.py`) passes its own `Distinct` node as `sub_ir` so each mapper reduces
+    before it ships, and that is sound for the property `limit` lacks — the reduction is
+    idempotent and associative, so reducing per chunk and reducing the union of those results
+    gives the rows reducing the whole partition would. A caller relying on this must re-apply
+    the operator on the reduce side; nothing here can check that it does.
+
     Args:
         nat: The native engine module.
         sub_ir: The map prefix's plan IR, as JSON.
@@ -125,11 +142,21 @@ def streaming_map_buckets(
         n_buckets: How many hash buckets to produce.
         engine_config: The worker's engine config JSON.
         chunk_bytes: Bytes of input to accumulate before running the prefix over them.
+        hot_keys: Skewed key values (as strings), which are spread across `salt_count`
+            sub-buckets instead of all landing on one reducer. Empty disables salting.
+        salt_count: Sub-buckets per hot key. `0` disables salting.
+        replicate: True on the build side (every hot row goes to *all* of its key's
+            sub-buckets, so each salted reducer can match it), False on the probe side
+            (each hot row goes to one). Cold keys hash identically either way, which is
+            what leaves the joined relation unchanged.
 
     Returns:
         `n_buckets` lists of `RecordBatch`, empty ones included, so a reducer's failed fetch
         still means a lost worker rather than an empty bucket.
     """
+    # Salting is per-chunk-safe for the same reason plain bucketing is: a row's bucket is a
+    # function of its key alone, so which chunk it arrived in cannot change where it lands.
+    salted = bool(salt_count) and bool(hot_keys) and len(key_names) == 1
     buckets: list[list] = [[] for _ in range(n_buckets)]
     chunk: list = []
     size = 0
@@ -145,7 +172,14 @@ def streaming_map_buckets(
             return
         if not key_idx:
             key_idx = [mapped[0].schema.get_field_index(k) for k in key_names]
-        for i, part in enumerate(nat.partition_batches(mapped, key_idx, n_buckets)):
+        parts = (
+            nat.salted_partition_batches(
+                mapped, key_idx, n_buckets, list(hot_keys), salt_count, replicate
+            )
+            if salted
+            else nat.partition_batches(mapped, key_idx, n_buckets)
+        )
+        for i, part in enumerate(parts):
             buckets[i].extend(part)
 
     for b in batches:

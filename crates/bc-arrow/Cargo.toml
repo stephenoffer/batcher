@@ -15,6 +15,11 @@ arrow.workspace = true
 # elsewhere. `libc` is already in the workspace graph (bc-interp uses it for `getrusage`), so
 # this edge adds no third-party code to the build.
 libc.workspace = true
+# Calendar arithmetic for `offset`: adding a month has to go through a civil date, and the
+# month-end clamping rule is not something to re-derive. `chrono` is already in the build via
+# `bc-expr`, which sits *above* this crate, so this edge changes the compile order and adds no
+# third-party code — the same trade the `libc` note above describes.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [lints]
 workspace = true

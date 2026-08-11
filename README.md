@@ -4,7 +4,7 @@
 across CPU and GPU, from a laptop to a cluster, on the same code.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://pypi.org/project/batcher-engine/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://pypi.org/project/batcher-engine/)
 [![PyPI](https://img.shields.io/badge/pypi-batcher--engine-blue.svg)](https://pypi.org/project/batcher-engine/)
 [![Docs](https://img.shields.io/badge/docs-batcher-blue.svg)](https://stephenoffer.github.io/batcher/)
 
@@ -40,7 +40,7 @@ print(revenue.to_pydict())   # nothing runs until here
 
 ## Install
 
-Prebuilt wheels ship for Linux, macOS, and Windows on Python 3.10+ — no Rust needed.
+Prebuilt wheels ship for Linux, macOS, and Windows on Python 3.11+ — no Rust needed.
 Batcher is on PyPI as `batcher-engine` and imported as `batcher` (the bare `batcher`
 name belongs to an unrelated project):
 
@@ -79,7 +79,10 @@ bad guess corrects itself instead of failing.
 
 Being precise about that, because it is easy to overclaim: this is stage-boundary
 re-optimization, the same mechanism and granularity as Spark AQE, and it engages only
-on a joined query whose scan input clears 20M rows or roughly 1.3 GB. Two things about
+on a joined query large enough to pay for the re-planning: 5M rows, or roughly 320 MB,
+for each pipeline breaker the loop would cut at. That is about 10M rows for the simplest
+joined shape and proportionally more for a many-join query, because each cut is what
+costs. Two things about
 it *are* different. It runs **single-node**, where DuckDB has no equivalent at all, and
 what it measured is **kept**: cardinality sketches, cost coefficients calibrated from
 measured operator times, and a bandit over join strategies all feed the *next* run, so

@@ -72,7 +72,7 @@ result = (
 
 ![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](/_static/diagrams/lifecycle.svg)
 
-1. **Build.** Each operation returns a new `Dataset` wrapping a `LogicalPlan`.
+1. **Build.** Each operation returns a new {py:class}`Dataset <batcher.Dataset>` wrapping a `LogicalPlan`.
    Nothing executes, and the plan accumulates.
 1. **Optimize.** On `collect`, Kyber rewrites the logical plan with predicate and
    projection pushdown, join reordering, and fusion, then lowers it to a physical plan
@@ -87,7 +87,7 @@ result = (
    estimate was badly wrong, Kyber re-plans the rest of the query on the measured
    numbers before continuing.
 1. **Return.** Results come back as a PyArrow `Table` from `collect`, a Python dict
-   from `to_pydict`, a stream of batches from `iter_batches`, or are written to files.
+   from {py:meth}`to_pydict <batcher.Dataset.to_pydict>`, a stream of batches from {py:meth}`iter_batches <batcher.Dataset.iter_batches>`, or are written to files.
 
 Step 5 is the feedback loop that distinguishes Batcher from a purely static optimizer.
 DuckDB optimizes once before it runs. Batcher's loop is stage-boundary re-optimization,

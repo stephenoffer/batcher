@@ -39,6 +39,12 @@ pub use topology::{affinity_cpus, numa_node_cpus, prefetch_read, CpuTopology};
 pub mod hash;
 pub use hash::{mix64, xxhash64, PortableBuildHasher, PortableHasher};
 
+pub mod offset;
+pub use offset::TypedOffset;
+
+pub mod dtype_name;
+pub use dtype_name::{dtype_from_name, CAST_DTYPE_NAMES};
+
 pub mod float_ident;
 pub use float_ident::{
     canon_f32, canon_f32_bits, canon_f64, canon_f64_bits, canon_float_array, float_total_cmp,
@@ -91,56 +97,6 @@ pub fn fixed_width(dt: &DataType) -> Option<usize> {
         _ => return None, // Utf8/LargeUtf8/Binary/LargeBinary/List/Struct/Map/...
     })
 }
-
-/// Map a cast dtype *name* (the JSON IR wire contract) to its Arrow `DataType`.
-///
-/// This is the single canonical name→type table for the whole engine. The dtype
-/// name on `bc_expr::Expr::Cast` is a raw string on the wire, so this set of
-/// accepted names *is* part of the IR contract with the Python control plane.
-/// `bc_expr::parse_dtype` and the `bc-codegen` cast classifier both delegate here
-/// so the vocabulary cannot drift between tiers; the Python `CAST_DTYPES` set is
-/// pinned to it by a parity test (`supported_cast_dtypes`).
-///
-/// Returns `None` for any unknown name (the caller raises the tier-appropriate
-/// error). Each accepted name and its alias map to the same type.
-pub fn dtype_from_name(name: &str) -> Option<DataType> {
-    use arrow::datatypes::TimeUnit;
-    Some(match name {
-        "int64" | "long" => DataType::Int64,
-        "int32" | "int" => DataType::Int32,
-        "float64" | "double" => DataType::Float64,
-        "float32" | "float" => DataType::Float32,
-        "bool" | "boolean" => DataType::Boolean,
-        "string" | "utf8" => DataType::Utf8,
-        "date" | "date32" => DataType::Date32,
-        "timestamp" | "datetime" => DataType::Timestamp(TimeUnit::Microsecond, None),
-        _ => return None,
-    })
-}
-
-/// Every cast dtype name `dtype_from_name` accepts, including aliases.
-///
-/// The single source of truth the FFI introspection helper (`bc-py`) exposes so
-/// the Python `CAST_DTYPES` set can be parity-tested against the live engine
-/// vocabulary rather than a snapshot that can rot.
-pub const CAST_DTYPE_NAMES: &[&str] = &[
-    "int64",
-    "long",
-    "int32",
-    "int",
-    "float64",
-    "double",
-    "float32",
-    "float",
-    "bool",
-    "boolean",
-    "string",
-    "utf8",
-    "date",
-    "date32",
-    "timestamp",
-    "datetime",
-];
 
 /// A morsel-size target with two independent bounds: a morsel is "full" when it
 /// reaches **either** `rows` or `bytes`.
@@ -257,28 +213,6 @@ mod tests {
             Some(4 * 128)
         );
         assert_eq!(fixed_width(&DataType::FixedSizeBinary(20)), Some(20));
-    }
-
-    #[test]
-    fn dtype_from_name_covers_every_listed_name() {
-        // Every name in the published list must resolve, and the list must not
-        // contain a name the resolver rejects (the two stay in lockstep).
-        for name in CAST_DTYPE_NAMES {
-            assert!(
-                dtype_from_name(name).is_some(),
-                "CAST_DTYPE_NAMES lists `{name}` but dtype_from_name rejects it"
-            );
-        }
-        // Spot-check the alias pairs collapse to one type.
-        assert_eq!(dtype_from_name("long"), dtype_from_name("int64"));
-        assert_eq!(dtype_from_name("double"), dtype_from_name("float64"));
-        assert_eq!(dtype_from_name("utf8"), Some(DataType::Utf8));
-        assert_eq!(
-            dtype_from_name("datetime"),
-            Some(DataType::Timestamp(TimeUnit::Microsecond, None))
-        );
-        assert_eq!(dtype_from_name("decimal"), None);
-        assert_eq!(dtype_from_name(""), None);
     }
 
     #[test]

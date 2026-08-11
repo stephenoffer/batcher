@@ -593,21 +593,6 @@ pub fn is_ccw(ring: &[Coord]) -> bool {
     signed_area2(ring) > 0.0
 }
 
-/// Reject a geometry whose coordinates are not all finite.
-///
-/// Every predicate in the crate is a chain of comparisons, and NaN makes each of them
-/// false in both directions — so an unchecked NaN does not raise, it silently reports
-/// "outside", "not equal", "does not intersect" for a row that has no answer.
-pub fn require_finite(g: &Geom, op: &'static str) -> GeoResult<()> {
-    if g.coords().iter().any(|c| c.is_nan()) {
-        return Err(GeoError::parse(
-            "WKB",
-            format!("{op}: geometry contains a NaN coordinate"),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

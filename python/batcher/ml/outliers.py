@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 from batcher._internal.errors import PlanError
 from batcher.ml._estimator import require_fitted
 from batcher.ml.preprocessors.base import Preprocessor, columns_arg
+from batcher.ml.stats._shared import require_columns as _require
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -48,17 +49,6 @@ __all__ = [
 
 #: The outlier rules `outlier_bounds` and its callers understand.
 METHODS = ("iqr", "zscore", "mad")
-
-
-def _require(ds: Dataset, *names: str) -> None:
-    """Raise a `ColumnNotFoundError` naming the closest real column for any missing name."""
-    for name in names:
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )
 
 
 def outlier_bounds(

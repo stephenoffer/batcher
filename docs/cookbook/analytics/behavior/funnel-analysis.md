@@ -121,7 +121,7 @@ Now every step condition is an ordinary comparison on that one row, and a step o
 counts if the whole prefix ahead of it happened in order.
 
 :::{tip}
-Nulls do the work for free: `None > 1709287200` is null, which `count_if` does not count.
+Nulls do the work for free: `None > 1709287200` is null, which {py:func}`count_if <batcher.count_if>` does not count.
 A user who never carted therefore drops out of every downstream step without a single
 explicit null check.
 :::

@@ -104,9 +104,7 @@ def test_max_files_per_trigger_splits_a_backlog_across_micro_batches(watched):
     data, state = watched
     for i in range(4):
         _write(data, f"f{i}.parquet", [i])
-    ds = bt.read.files_incremental(
-        str(data), "parquet", state_dir=state, max_files_per_trigger=1
-    )
+    ds = bt.read.files_incremental(str(data), "parquet", state_dir=state, max_files_per_trigger=1)
 
     q = ds.write.memory("inc_rate", trigger=bt.Trigger.available_now())
     assert q.await_termination(timeout=30) is True

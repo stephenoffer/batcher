@@ -153,6 +153,44 @@ def test_drop_distinct_when_unique_kept_without_stats():
     assert drop_distinct_when_unique(ds.distinct()._plan, _ctx(ds)) is None
 
 
+def test_drop_distinct_when_unique_kept_when_only_the_ndv_is_guessed():
+    """An EXACT *bundle* whose ndv carries its own DEFAULT tag proves nothing.
+
+    This is the shape every in-memory and Parquet scan actually produces: exact bounds and
+    an exact null count beside an `ndv` that is only the row count as an upper bound
+    (`ndv_provenance=DEFAULT`). Reading the bundle tag made `ndv >= rows` true for *every*
+    such column, so the rule deleted real dedups — `filter(a IS NULL) UNION filter(a IS NOT
+    NULL)` came back with its duplicates intact. The gate is `ndv_is_exact`, per facet.
+    """
+    ds = bt.from_pydict({"id": [1, 2, 3]})
+    stats = [
+        SourceStatistics(
+            row_count=3,
+            columns={
+                "id": ColumnStat(
+                    ndv=3,
+                    null_count=0,
+                    provenance=Provenance.EXACT,
+                    ndv_provenance=Provenance.DEFAULT,
+                )
+            },
+        )
+    ]
+    assert drop_distinct_when_unique(ds.distinct()._plan, _ctx(ds, stats)) is None
+
+
+def test_a_guessed_ndv_does_not_delete_a_real_union_dedup():
+    """End to end: the wrong answer the per-facet gate exists to prevent.
+
+    `a IS NOT NULL` is always true over a non-null column, so both branches reduce to the
+    scan and the distinct union collapses to `Distinct(scan)`. Dropping that `Distinct` on a
+    guessed ndv returned the input's duplicate rows.
+    """
+    ds = bt.from_pydict({"a": [0, 1, 0, 3]})
+    both = ds.filter(col("a").is_not_null()).union(ds.filter(col("a").is_null()), distinct=True)
+    assert sorted(both.collect().to_pydict()["a"]) == [0, 1, 3]
+
+
 def test_drop_distinct_when_unique_idempotent():
     ds = bt.from_pydict({"id": [1, 2, 3]})
     stats = _unique_stats(3)

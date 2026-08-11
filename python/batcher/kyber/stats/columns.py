@@ -14,6 +14,7 @@ changes, so nothing can silently over-claim.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 from collections.abc import Iterable, Mapping
 
 from batcher.kyber.stats.aggregate_columns import (
@@ -44,6 +45,7 @@ __all__ = [
     "filter_columns",
     "global_aggregate_columns",
     "grouped_aggregate_columns",
+    "integral_range_ndv",
     "join_columns",
     "limit_columns",
     "project_columns",
@@ -61,6 +63,7 @@ __all__ = [
 def scan_columns(
     source_columns: Mapping[str, ColumnStat],
     learned: Mapping[str, ColumnStat],
+    rows: float | None = None,
 ) -> dict[str, ColumnStat]:
     """Seed a `Scan`'s column stats from the connector's declared statistics,
     supplemented by the statistics measured for **this source** in past runs.
@@ -82,6 +85,9 @@ def scan_columns(
 
     The descriptive statistics (quantiles, mcv, avg_bytes) never carried that risk — nothing
     answers a query from them — so they attach to any column, exact or not.
+
+    `rows` is the source's row count, and it is what lets an *integral* column with no
+    measured ndv still get one — see `integral_range_ndv`.
     """
     cols: dict[str, ColumnStat] = dict(source_columns)
     for name, measured in learned.items():
@@ -99,7 +105,71 @@ def scan_columns(
             mcv=existing.mcv or measured.mcv,
             avg_bytes=existing.avg_bytes or measured.avg_bytes,
         )
+    if rows is not None:
+        for name, stat in cols.items():
+            bound = integral_range_ndv(stat, rows)
+            if bound is not None:
+                cols[name] = dataclasses.replace(stat, ndv=bound, ndv_provenance=Provenance.DEFAULT)
     return cols
+
+
+def integral_range_ndv(stat: ColumnStat, rows: float) -> float | None:
+    """A distinct-count *upper bound* read straight off an integral column's `[min, max]`.
+
+    An integer column cannot hold more distinct values than its range has integers:
+    `ndv <= max - min + 1`, exactly, with no sampling and no sketch. Where that span is no
+    wider than the relation, it is a strictly better statement than the row count — and
+    where there is no measured ndv at all, it is the difference between a join estimate and
+    a guess.
+
+    That gap is not academic, it is the dominant cardinality defect on a star schema.
+    Neither an in-memory Arrow table nor a Parquet footer records a distinct count, so a
+    surrogate-key column reached `_inner_join_rows` with `ndv=None`, which falls through to
+    `max(|L|, |R|)` — an assumption that every join is a key lookup. On TPC-DS **q72** that
+    priced `inventory (11,745,000) ⋈ catalog_sales (1,441,548)` on `item_sk` at
+    **11,745,000** rows; it actually produces **1,178,470,760**, because `item_sk` holds
+    18,000 distinct values on both sides and the join is many-to-many. The explosion was
+    invisible to the cost model, so join reordering picked it as the *first* join and the
+    query took 31.7 s against DuckDB's 60 ms. Both columns are bounded `[1, 18000]`, so this
+    bound alone makes the 940 M-row estimate visible for the price of a subtraction.
+
+    Two properties keep it safe to apply everywhere a `Scan` is estimated:
+
+    - **It is sound, not heuristic.** The bound holds for any integral column, and `min`/`max`
+      only ever survive as bounds themselves, so a widened range only weakens the claim.
+    - **It never overrides a measurement.** A column with a real (HLL) ndv keeps it, and the
+      result is tagged `DEFAULT` so it can inform cost and never answer `count_distinct`.
+
+    Args:
+        stat: The column's statistics as the source and the learned bundle left them.
+        rows: The relation's row count, the other bound on any distinct count.
+
+    Returns:
+        The bound, or `None` when the column is not integral, already has an ndv, or has a
+        range wider than the relation (where `min(ndv, rows)` is already the better answer
+        and claiming a distinct value per row would be a guess rather than a bound).
+    """
+    if stat.ndv is not None:
+        return None
+    lo, hi = stat.min, stat.max
+    # `bool` is an `int` subclass and a date is not, so both are named explicitly. Floats and
+    # decimals are excluded on purpose: their range says nothing about how many of the
+    # representable values actually occur.
+    if isinstance(lo, bool) or isinstance(hi, bool):
+        return None
+    if isinstance(lo, int) and isinstance(hi, int):
+        span = float(hi - lo + 1)
+    elif isinstance(lo, datetime.date) and isinstance(hi, datetime.date):
+        # `datetime` is a `date` subclass whose extra precision this bound cannot see, so a
+        # timestamp column is left alone rather than bounded at its day count.
+        if isinstance(lo, datetime.datetime) or isinstance(hi, datetime.datetime):
+            return None
+        span = float((hi - lo).days + 1)
+    else:
+        return None
+    if span <= 0 or span > rows:
+        return None
+    return max(1.0, span)
 
 
 def project_columns(
@@ -312,7 +382,7 @@ def row_id_columns(node, child: RelStats) -> dict[str, ColumnStat]:
     return out
 
 
-def distinct_columns(child: RelStats) -> dict[str, ColumnStat]:
+def distinct_columns(child: RelStats, keys: tuple[str, ...] = ()) -> dict[str, ColumnStat]:
     """Distinct output column stats: dedup preserves the exact *value set*, so
     min/max/ndv pass through at their original provenance; null_count is no
     longer known (dedup collapses duplicate nulls to one).
@@ -322,39 +392,75 @@ def distinct_columns(child: RelStats) -> dict[str, ColumnStat]:
     most-common-values do not: dedup collapses every duplicate, which is precisely the
     frequency information an MCV records — a value held by 90% of rows is one row after a
     `DISTINCT`, so carrying its frequency forward would claim a skew that no longer exists.
+
+    `keys` names the columns a *keyed* dedup dedups on, and it changes which columns the
+    value-set argument above applies to. Every distinct key survives exactly once, so a key
+    column's value set is preserved and its `ndv` still holds. A **payload** column's does
+    not: one row per key survives and the rest are dropped, so the column keeps a *subset* of
+    its values. Its `ndv` is then an upper bound rather than a count, which is exactly the
+    wrong shape for the readers that matter — `is_unique` and `is_key` compare `ndv` against a
+    row count and answer a yes/no a rewrite acts on. So a payload column's `ndv` and quantile
+    grid are dropped. `min`/`max` are kept: they are used as outer bounds, and a subset's
+    bounds can only sit inside them.
     """
     out: dict[str, ColumnStat] = {}
+    key_set = set(keys)
     for name, stat in child.columns.items():
+        payload = bool(keys) and name not in key_set
         out[name] = dataclasses.replace(
             stat,
             null_count=None,
             total_sum=None,  # sum changes under dedup
             mean=None,  # so does the mean
             mcv=None,  # dedup destroys frequency; see above
+            ndv=None if payload else stat.ndv,
+            ndv_provenance=None if payload else stat.ndv_provenance,
+            quantiles=None if payload else stat.quantiles,
         )
     return out
 
 
-def union_columns(children: list[RelStats], output_names: list[str]) -> dict[str, ColumnStat]:
+def union_columns(
+    children: list[RelStats],
+    output_names: list[str],
+    branch_names: list[list[str]] | None = None,
+) -> dict[str, ColumnStat]:
     """UNION ALL output column stats, by output position.
 
     For each output column, min = min over branches, max = max over branches;
     null_count = sum over branches. Each is `EXACT` only when every branch's
     corresponding stat is `EXACT` and present. The distributional statistics merge by the
     identities `UNION ALL` makes available — see `_merge_union_column`.
+
+    `branch_names` carries each branch's **declared** output columns, which is what a
+    union aligns on: SQL matches branches by position, not by name. Positional alignment
+    must resolve against those declared names and never against `RelStats.columns`, which
+    holds only the columns the estimator could say something about. That dict is sparse,
+    so indexing it by output position hands a column another column's statistics.
+
+    That is not a soft mis-estimate. A branch whose only tracked column is a literal
+    ``weight = 1.0`` reported ``min == max == 1.0`` for output position 0 — so a *string*
+    join key was "proven" to be the constant 1.0, `infer_join_predicate_from_constant_key`
+    mirrored ``key = 1.0`` onto the other side, and the query died at execution with
+    `Utf8 == Float64`. With compatible types it would not have raised at all; it would
+    have pushed a predicate matching nothing and returned silently wrong rows.
+
+    Without `branch_names` the positional fallback is dropped entirely: a name that no
+    branch reports is skipped, which loses an estimate but cannot invent one.
     """
     out: dict[str, ColumnStat] = {}
-    # Resolve each branch's columns in its own output order, aligned by position.
-    branch_cols = [list(c.columns.values()) for c in children]
     rows = [c.rows for c in children]
     for pos, name in enumerate(output_names):
         stats: list[ColumnStat] = []
         for bi, branch in enumerate(children):
-            # Prefer name match; fall back to positional alignment across branches.
-            if name in branch.columns:
-                stats.append(branch.columns[name])
-            elif pos < len(branch_cols[bi]):
-                stats.append(branch_cols[bi][pos])
+            # Prefer a name match, then the branch's declared column at this position.
+            source = name
+            if name not in branch.columns and branch_names is not None:
+                declared = branch_names[bi]
+                source = declared[pos] if pos < len(declared) else name
+            stat = branch.columns.get(source)
+            if stat is not None:
+                stats.append(stat)
         if len(stats) != len(children):
             continue  # a branch lacks this column → can't combine safely
         out[name] = _merge_union_column(stats, rows)

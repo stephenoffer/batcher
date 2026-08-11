@@ -228,16 +228,35 @@ class WindowedAggregateProcessor:
     """Append-mode windowed aggregation: emit each window as the watermark closes it.
 
     Backed by the same `_WindowedAggFold` as the `iter_batches` windowed driver, so
-    bounded streaming state and append output share one implementation. `finalize`
-    flushes any windows still open when the query stops.
+    bounded streaming state and append output share one implementation — including the
+    per-partition watermark, so the two terminals cannot disagree about which rows are
+    late. `finalize` flushes any windows still open when the query stops.
     """
 
     __slots__ = ("_fold",)
 
-    def __init__(self, agg: Aggregate, w_alias: str, width: int) -> None:
-        from batcher.core.streaming import _WindowedAggFold
+    def __init__(self, agg: Aggregate, key, source=None) -> None:
+        """Fold `agg` into the windows `key` describes over `source`'s partitions.
 
-        self._fold = _WindowedAggFold(agg, w_alias, width)
+        Args:
+            agg: The watermarked windowed aggregate.
+            key: Which group key is the window, and its width and hop.
+            source: The stream, asked which columns attribute a row to a partition and
+                which partitions it expects. None (a plan with no bound source yet) leaves
+                the watermark unpartitioned.
+        """
+        from batcher.core.streaming import _WindowedAggFold
+        from batcher.io.source import watermark_partition_columns, watermark_partitions
+
+        # The runner reads a windowed aggregate's source with no projection (Kyber's
+        # pushdown is built only for the stateless path), so the partition columns are
+        # already in the batch and none has to be stripped again.
+        self._fold = _WindowedAggFold(
+            agg,
+            key,
+            partition_cols=() if source is None else watermark_partition_columns(source),
+            expected_partitions=() if source is None else watermark_partitions(source),
+        )
 
     def process(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
         return self._fold.push(batch)
@@ -304,12 +323,17 @@ def make_processor(
     plan,
     output_mode: str,
     run_batch: Callable[[pa.RecordBatch], list[pa.RecordBatch]] | None,
+    source=None,
 ) -> MicroBatchProcessor:
     """Pick the processor for `plan` under `output_mode` (built by the conductor).
 
     Stateless (breaker-free) plans require `append`; aggregates require
     `complete`/`update`. The mismatch cases raise `PlanError` with the Spark-parity
     rule, so an impossible query fails at `start()`, not mid-stream.
+
+    `source` is passed through to a windowed aggregation, which needs to know how the
+    stream is partitioned before it can take a watermark as the minimum over those
+    partitions rather than the maximum over rows.
     """
     from batcher._internal.errors import PlanError
     from batcher.plan.logical import Aggregate, Distinct, TransformWithState, is_streamable
@@ -326,17 +350,29 @@ def make_processor(
                 "map_batches over one source); this plan has a pipeline breaker beneath it"
             )
         return KeyedStateProcessor(plan)
+    if isinstance(plan, Distinct) and plan.keys:
+        raise PlanError(
+            "distinct(subset=...) cannot run as a streaming query: keeping one row per key "
+            "needs the key set held for the life of the query, and which row wins is decided "
+            "by an ordering over rows that have not arrived. Use "
+            "drop_duplicates_within_watermark(subset, event_time=..., lateness=...), whose "
+            "state the watermark bounds, or distinct() with no subset when the whole row is "
+            "the key."
+        )
     if isinstance(plan, (Aggregate, Distinct)):
         if output_mode == OutputMode.APPEND:
             from batcher.core.streaming import _window_key
 
             key = _window_key(plan) if isinstance(plan, Aggregate) else None
             if isinstance(plan, Aggregate) and plan.watermark is not None and key is not None:
-                return WindowedAggregateProcessor(plan, key[0], key[1])
+                return WindowedAggregateProcessor(plan, key, source)
             raise PlanError(
-                "output_mode='append' on a streaming aggregation needs a watermark "
-                "(use .with_watermark(...) with a windowed group_by, or output_mode "
-                "'complete'/'update')"
+                "output_mode='append' on a streaming aggregation needs a watermark and a "
+                "windowed group key — an event-time window is the only thing a watermark "
+                "can close, so it is the only thing that makes a row final. Use "
+                ".with_watermark(...) with group_by(w=bt.window(col('ts'), '1h')) (or an "
+                "exploded bt.window(col('ts'), '1h', '30m') for overlapping windows), or "
+                "output_mode 'complete'/'update'"
             )
         agg = plan if isinstance(plan, Aggregate) else _distinct_as_aggregate(plan)
         # `run_batch` is present here only for a `map → agg`: the conductor builds it from

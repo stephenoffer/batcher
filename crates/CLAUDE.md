@@ -18,6 +18,10 @@ near-leaves (nothing below them but bc-arrow, the DAG root), consumed higher up:
   bc-geo      → bc-expr (geometry model, WKB/WKT/GeoJSON, planar algorithms, grids,
                 CRS transforms). Knows nothing about Arrow: the array-level plumbing
                 is bc-expr's `eval/geo`, which keeps the geometry pure and testable
+  bc-spatial  → bc-expr (rigid-body motion in 3D: quaternions, poses, frame
+                transforms — the robotics/AV surface). Same split as bc-geo and for the
+                same reason: no Arrow, no dependencies, so the mathematics unit-tests
+                without a `RecordBatch`; `eval/spatial` does the array-level work
   bc-udf → (nothing depends on it — not on a live path)
 ```
 
@@ -87,7 +91,7 @@ state and a SIMD/NUMA/spill rewrite lands without touching callers.
 
 - **Sorting is in `bc-interp::ops`**, not `bc-runtime` (radix, sample-sort, stable string,
   external merge). A sort carries no state *between* morsels the way agg/join build does.
-- **Window** straddles: kernels in `bc-runtime/window*.rs`, out-of-core in
+- **Window** straddles: kernels in `bc-runtime/window/`, out-of-core in
   `bc-interp::window_spill`.
 - **Filter/project/limit** have no file of their own — they are arms in `bc-interp/ops/mod.rs`.
 - **`keys.rs`** is the ONE canonical grouping/partitioning key form; every hash path (assign /

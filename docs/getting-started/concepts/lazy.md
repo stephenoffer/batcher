@@ -1,6 +1,6 @@
 # Lazy, immutable datasets
 
-A `Dataset` holds no data. It's a handle to a logical plan plus the inputs bound to
+A {py:class}`Dataset <batcher.Dataset>` holds no data. It's a handle to a logical plan plus the inputs bound to
 it. Every operation returns a *new* `Dataset`. Nothing is mutated in place, and no
 work happens until you ask for results.
 
@@ -29,12 +29,12 @@ you call a *terminal* operation.
 
 The common terminals:
 
-- `to_pydict()` gives you a column-oriented dict; `to_pylist()` gives you a list of
+- {py:meth}`to_pydict() <batcher.Dataset.to_pydict>` gives you a column-oriented dict; {py:meth}`to_pylist() <batcher.Dataset.to_pylist>` gives you a list of
   row dicts.
 - `collect()` returns a `pyarrow.Table`, and `count()` returns only the row count.
-- `iter_batches()` streams Arrow record batches instead of materializing everything.
+- {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` streams Arrow record batches instead of materializing everything.
 - `write.parquet(...)`, `write.csv(...)`, `write.json(...)`, and the generic
-  `write(...)` send the result to a sink.
+  {py:obj}`write(...) <batcher.Dataset.write>` send the result to a sink.
 
 ```python
 plan = ds.filter(bt.col("x") >= 2).select("x")   # nothing runs yet

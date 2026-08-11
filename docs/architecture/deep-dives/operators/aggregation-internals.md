@@ -1,7 +1,7 @@
 # Aggregation internals
 
 `GROUP BY` is the operator the engine is best at, and the one where the interesting decisions
-are made at runtime rather than at plan time. This page follows a `group_by(...).agg(...)`
+are made at runtime rather than at plan time. This page follows a {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>`
 from the morsel to the output rows.
 
 The algebra it obeys (`partial → combine → finalize`, with `combine` associative and
@@ -46,7 +46,7 @@ is unchanged and the result is element-for-element identical. The complex aggreg
 pass, as do two-input aggregates, which decline fusion outright.
 
 `partial` emits **state**, not answers. `mean` emits `(sum, count)`. `median` emits the
-group's values as a `List`. `approx_count_distinct` emits an HLL register array. When a partial
+group's values as a `List`. {py:meth}`approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>` emits an HLL register array. When a partial
 crosses the distributed boundary its state columns are given synthetic names of the form
 `__s{aggregate_index}_{state_column_index}` (`crates/bc-interp/src/dist.rs`), so the partial
 travels as an ordinary Arrow batch across a thread, a spill file, or a network hop.

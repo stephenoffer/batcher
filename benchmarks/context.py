@@ -45,6 +45,9 @@ SOURCE_FOR = {
     "clickbench": "clickbench",
     "operators": "tpch",
     "json": "json",
+    "h2o-groupby": "h2o-groupby",
+    "h2o-join": "h2o-join",
+    "job": "job",
 }
 
 # Datasets built from a file *corpus* rather than named tables: the cases construct each

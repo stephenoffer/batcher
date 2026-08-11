@@ -1,6 +1,6 @@
 # Expressions
 
-Column work in Batcher is expressed with the `Expr` API, never with Python loops.
+Column work in Batcher is expressed with the {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` API, never with Python loops.
 An expression is a small, typed description of a computation. It lowers to the
 Rust data plane and runs over Arrow batches, so the same code is fast on three
 rows or three billion.
@@ -55,7 +55,7 @@ print(out.to_pydict())
 
 ## Conditionals: when / then / otherwise
 
-{py:obj}`bt.when(cond).then(value) <batcher.when>` builds a SQL `CASE`. Chain more `.when(...).then(...)`
+{py:obj}`bt.when(cond).then(value) <batcher.when>` builds a SQL `CASE`. Chain more {py:func}`.when(...).then(...) <batcher.when>`
 clauses and close with `.otherwise(default)`.
 
 ```python
@@ -100,6 +100,27 @@ print(out.to_pydict())
 # {'first_present': [1, 8, 3], 'filled': [1, 0, 3], 'bigger': [9, 8, 7]}
 ```
 
+A column where *every* value is null carries Arrow's `null` type, which records no other
+type at all. That is an ordinary thing to have: a left join that matched nothing, a column
+of all `None`, an empty aggregation, or a batch of model generations the engine could not
+produce all give you one. Every expression treats it the way it treats a null value, so a
+function over it returns nulls rather than raising, and you do not need to special-case the
+column before parsing it:
+
+```python
+empty = bt.from_pydict({"note": [None, None]})
+out = empty.select(
+    shouted=bt.col("note").str.upper(),
+    width=bt.col("note").str.len(),
+)
+print(out.to_pydict())
+# {'shouted': [None, None], 'width': [None, None]}
+```
+
+That holds across the string, list, math, temporal, map, and struct methods alike, and it
+matches what DuckDB returns. Use `.is_null()` or a `count()` if you need to *know* the
+column was empty, because the result on its own cannot tell you.
+
 A floating-point `NaN` is distinct from null. {py:obj}`bt.nanvl(value, fallback) <batcher.nanvl>`
 (Spark's `nanvl`) substitutes `fallback` only where `value` is `NaN`. Real numbers
 are left alone, and so are nulls.
@@ -116,11 +137,11 @@ print(out.to_pydict())
 ## Row-wise (horizontal) reductions
 
 Aggregates fold a column *down* to one value; the `*_horizontal` functions fold
-*across* columns within each row. `sum_horizontal`/`mean_horizontal` combine numeric
-columns (nulls treated as 0 / skipped), and `min_horizontal`/`max_horizontal` are the
+*across* columns within each row. {py:func}`sum_horizontal <batcher.sum_horizontal>`/{py:func}`mean_horizontal <batcher.mean_horizontal>` combine numeric
+columns (nulls treated as 0 / skipped), and {py:func}`min_horizontal <batcher.min_horizontal>`/{py:func}`max_horizontal <batcher.max_horizontal>` are the
 Polars-named row-wise `least`/`greatest`. `all_horizontal`/`any_horizontal` reduce
 many boolean columns into one, which is how you combine validation flags.
-`count_horizontal` counts the non-null values in each row and `product_horizontal`
+{py:func}`count_horizontal <batcher.count_horizontal>` counts the non-null values in each row and {py:func}`product_horizontal <batcher.product_horizontal>`
 multiplies them (nulls treated as 1).
 
 ```python
@@ -136,7 +157,7 @@ print(out.to_pydict())
 # {'total': [12, 16, 18], 'smallest': [1, 2, 3], 'filled': [3, 3, 3], 'prod': [28, 96, 162], 'all_even': [False, True, False]}
 ```
 
-When no named `*_horizontal` helper fits, `reduce_horizontal(fn, *exprs)` folds the
+When no named `*_horizontal` helper fits, {py:func}`reduce_horizontal(fn, *exprs) <batcher.reduce_horizontal>` folds the
 columns left-to-right with your own binary combiner, and `fold_horizontal(acc, fn,
 *exprs)` does the same from an explicit seed. The combiner runs once at plan-build
 time on `Expr` operands, never on a row, so the fold still lowers to pure Rust:
@@ -172,7 +193,7 @@ print(out.to_pydict())
 Numeric expressions carry a full set of math methods, including `.abs()`,
 `.round(digits)`, `.sqrt()`, `.pow(e)`, `.floor()`, `.ceil()`, `.ln()`,
 `.log10()`, `.log2()`, `.exp()`, the trig family (`.sin()`, `.cos()`, `.tan()`,
-`.asin()`, `.acos()`, `.atan()`, `.sinh()`, `.cosh()`, `.tanh()`, `.cot()`),
+{py:meth}`.asin() <batcher.plan.expr_ir.core.Expr.asin>`, {py:meth}`.acos() <batcher.plan.expr_ir.core.Expr.acos>`, {py:meth}`.atan() <batcher.plan.expr_ir.core.Expr.atan>`, {py:meth}`.sinh() <batcher.plan.expr_ir.core.Expr.sinh>`, {py:meth}`.cosh() <batcher.plan.expr_ir.core.Expr.cosh>`, {py:meth}`.tanh() <batcher.plan.expr_ir.core.Expr.tanh>`, {py:meth}`.cot() <batcher.plan.expr_ir.core.Expr.cot>`),
 `.sign()`, `.trunc()`, `.cbrt()`, `.degrees()`, and `.radians()`.
 {py:obj}`bt.atan2(y, x) <batcher.atan2>` is a top-level two-argument form.
 
@@ -259,7 +280,7 @@ print(out.to_pydict())
 
 Aggregate methods such as `.sum()`, `.mean()`, `.min()`, `.max()`, `.median()`,
 `.std()`, `.var()`, `.quantile(q)`, `.count()`, and `.n_unique()` are used inside
-`group_by(...).agg(...)`. {py:obj}`bt.count() <batcher.count>` is the top-level `COUNT(*)`.
+{py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>`. {py:obj}`bt.count() <batcher.count>` is the top-level `COUNT(*)`.
 
 ```python
 out = ds.group_by().agg(
@@ -275,8 +296,8 @@ print(out.to_pydict())
 
 The rest of the expression language continues on two more pages:
 
-- {doc}`Expression accessors </user-guide/transform/columns/expression-accessors>`: the `.str`, `.dt`, `.list`,
-  `.struct`, and `.json` namespaces, which hold the methods specific to one kind of
+- {doc}`Expression accessors </user-guide/transform/columns/expression-accessors>`: the {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`,
+  {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, and {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>` namespaces, which hold the methods specific to one kind of
   column.
 - {doc}`Expression recipes </user-guide/transform/columns/expression-recipes>`: porting from pandas or Polars, feature
   engineering, and curating a text corpus.

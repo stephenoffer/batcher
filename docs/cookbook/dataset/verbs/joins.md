@@ -20,4 +20,4 @@ python examples/dataset/joins.py
 - {doc}`/cookbook/dataset/verbs/iteration`: batches, rows, slices, and the single-value cases.
 - {doc}`/cookbook/dataset/inspecting/meta_columns`: bounds, uniqueness, nulls, and constancy.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
-- {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.
+- {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

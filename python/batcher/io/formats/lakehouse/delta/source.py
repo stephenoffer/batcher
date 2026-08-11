@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import pyarrow as pa
@@ -153,7 +154,7 @@ class DeltaSource:
         table_uri: str,
         *,
         version: int | None = None,
-        timestamp: str | None = None,
+        timestamp: str | datetime | None = None,
         storage_options: dict[str, str] | None = None,
     ) -> None:
         if version is not None and timestamp is not None:

@@ -1,7 +1,7 @@
 # Elasticsearch
 
 **Elasticsearch is read-only in Batcher.** There is a source; there is no sink.
-`bt.read.elasticsearch(...)` pulls an index into the engine. If you need to write *back* to
+{py:meth}`bt.read.elasticsearch(...) <batcher.api.io_namespace.reader.Reader.elasticsearch>` pulls an index into the engine. If you need to write *back* to
 Elasticsearch, use the cluster's own bulk API from your application. A search index is a serving
 system with its own mappings and refresh semantics, and a columnar batch writer has no business
 pretending otherwise.
@@ -150,7 +150,7 @@ for one (`| STATS COUNT(*)`) and let the cluster compute it.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: sources, splits, pushdown.
 - {doc}`Anomaly detection </cookbook/analytics/inference/anomaly-detection>`: the analysis a log index is
   usually pulled into.
-- {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the `Source`/`Split` protocol, if you
+- {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the {py:class}`Source <batcher.io.Source>`/{py:class}`Split <batcher.io.Split>` protocol, if you
   need the sink this connector does not have.
 - {doc}`I/O API </api/relational/io>`: the full reader reference.
 - {doc}`MongoDB </integrations/databases/mongodb>`: the other document store, read *and* write.

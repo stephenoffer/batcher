@@ -23,7 +23,12 @@ import pyarrow as pa
 
 from batcher._internal.errors import FormatError, SchemaError
 
-__all__ = ["invalid_utf8_error", "mismatch_reported"]
+__all__ = ["RAGGED_ROW_MARKER", "invalid_utf8_error", "mismatch_reported", "ragged_row_error"]
+
+#: What pyarrow's ragged-row failure says. Matched rather than parsed: the counts are in
+#: the message and nowhere else, and all this has to decide is which of two opposite fixes
+#: to offer.
+RAGGED_ROW_MARKER = "csv parse error: expected"
 
 
 def invalid_utf8_error(path: str, detail: str) -> FormatError:
@@ -50,6 +55,34 @@ def invalid_utf8_error(path: str, detail: str) -> FormatError:
     )
 
 
+def ragged_row_error(path: str, detail: str) -> FormatError:
+    """The error for a CSV line whose field count disagrees with the header.
+
+    Kept apart from the type-mismatch diagnosis next to it because the two failures have
+    opposite fixes and the raw pyarrow message does not distinguish them: a value that will
+    not convert is answered by declaring the column's type, and declaring a type does
+    nothing whatsoever for a ragged line.
+
+    The advice matters more than usual here. The wrapper above this one offers
+    ``on_error="skip"``, which drops the *whole file* — so one stray line in a
+    ten-million-row export is answered by discarding all ten million, silently, as a
+    warning. ``on_bad_lines="skip"`` drops the line and keeps the file.
+
+    Args:
+        path: The file holding the ragged line.
+        detail: What pyarrow reported, which carries the expected and actual field counts.
+
+    Returns:
+        The error to raise.
+    """
+    return FormatError(
+        f"CSV file {path!r} has a row whose field count disagrees with the header: {detail}. "
+        "Pass on_bad_lines='skip' to drop such rows and keep the rest of the file (or "
+        "'warn' to log each one). Do not reach for on_error='skip' here: that drops the "
+        "entire file, so one bad line would discard every good row in it."
+    )
+
+
 @contextlib.contextmanager
 def mismatch_reported(path: str):
     """Report a conversion failure as either a type mismatch or undecodable bytes.
@@ -71,8 +104,11 @@ def mismatch_reported(path: str):
     try:
         yield
     except pa.ArrowInvalid as exc:
-        if "invalid utf8" in str(exc).lower():
+        lowered = str(exc).lower()
+        if "invalid utf8" in lowered:
             raise invalid_utf8_error(path, str(exc)) from exc
+        if RAGGED_ROW_MARKER in lowered:
+            raise ragged_row_error(path, str(exc)) from exc
         raise SchemaError(
             f"CSV value does not fit the inferred column type in {path!r}: {exc}. "
             "The schema is inferred from the file's first block, so a value further down "

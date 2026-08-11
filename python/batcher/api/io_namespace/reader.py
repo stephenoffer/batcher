@@ -23,6 +23,7 @@ from batcher.api.session import read_table as _read_table
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import datetime
 
     from batcher.api.dataset import Dataset
 
@@ -189,11 +190,18 @@ class Reader:
         and each byte-range split) is pinned to the advertised schema, so they cannot
         disagree with it or with each other.
 
+        A row whose field count disagrees with the header is a different failure, and it
+        aborts the file rather than the value. ``on_bad_lines="skip"`` (or ``"warn"``) drops
+        such a row and keeps the rest, which is what a corpus at scale needs — reaching for
+        ``on_error="skip"`` there discards every good row in the file to be rid of one bad
+        line. Dropped rows are counted as ``malformed_rows_total`` on the metrics export.
+
         Args:
             path: A CSV file, directory, or glob to read.
             opts: Format-specific reader options forwarded to the source — notably
-                ``schema`` (a `pyarrow.Schema` declaring the column types) and
-                ``on_error``.
+                ``schema`` (a `pyarrow.Schema` declaring the column types), ``on_error``
+                (drop an unreadable *file*), and ``on_bad_lines`` (drop a malformed *row*:
+                ``"error"``, ``"warn"``, or ``"skip"``).
 
         Returns:
             A lazy `Dataset` over the CSV source.
@@ -214,9 +222,17 @@ class Reader:
 
         One JSON object per line; column types are inferred from the records.
 
+        A line that is not JSON at all aborts the file. ``on_bad_lines="skip"`` (or
+        ``"warn"``) drops that record and keeps the rest, which is what an event or log
+        corpus needs — reaching for ``on_error="skip"`` there discards every good record in
+        the file. A record that *parses* but does not fit the inferred types is deliberately
+        not dropped: that is inference having been shown too little, answered by ``schema=``.
+
         Args:
             path: A JSON file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source.
+            opts: Format-specific reader options forwarded to the source — notably
+                ``on_error`` (drop an unreadable *file*) and ``on_bad_lines`` (drop an
+                unparseable *record*: ``"error"``, ``"warn"``, or ``"skip"``).
 
         Returns:
             A lazy `Dataset` over the JSON source.
@@ -295,6 +311,151 @@ class Reader:
                 >>> ds = bt.read.avro("data/events.avro")  # doctest: +SKIP
         """
         return _read(path, format="avro", **opts)
+
+    def fasta(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read FASTA file(s) as rows of ``{id, description, sequence}``.
+
+        One row per record, with the sequence lines re-joined — a FASTA writer wraps a
+        sequence across as many lines as it likes, and the row boundary is the ``>`` header,
+        not the newline. The header is split on its first whitespace into `id` and
+        `description`, the NCBI convention. Any of ``.fasta``, ``.fa``, ``.faa``, ``.fna``,
+        and ``.ffn`` are recognized, so a directory mixing them reads in one call.
+
+        Reading streams, so a reference genome held in a handful of enormous records never
+        materializes whole.
+
+        Args:
+            path: A FASTA file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the FASTA source.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.fasta("genomes/GRCh38.fa")  # doctest: +SKIP
+                >>> gc = ds.select(bt.col("sequence").seq.gc_content())  # doctest: +SKIP
+        """
+        return _read(path, format="fasta", **opts)
+
+    def fastq(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read FASTQ file(s) as rows of ``{id, description, sequence, quality}``.
+
+        One row per sequencing read. ``.fastq`` and ``.fq`` are both recognized.
+
+        The quality string arrives as **text**, not as decoded scores, because the ASCII
+        offset is not recoverable from the bytes — Sanger and Illumina 1.8+ encode ``Q+33``
+        and the older pipelines ``Q+64``, and the ranges overlap. Decode it through the
+        ``.seq`` accessor (``phred_quality``, ``mean_quality``, ``expected_errors``) once you
+        know which encoding the run used.
+
+        A record whose sequence and quality strings differ in length raises: the quality
+        string is one character per base, so a mismatch would attribute every score
+        downstream to the wrong base.
+
+        Args:
+            path: A FASTQ file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the FASTQ source.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> reads = bt.read.fastq("run/*.fq.gz")  # doctest: +SKIP
+                >>> clean = reads.filter(  # doctest: +SKIP
+                ...     bt.col("quality").seq.expected_errors() < 1.0
+                ... )
+        """
+        return _read(path, format="fastq", **opts)
+
+    def bed(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read BED interval file(s), with the standard column names for the file's width.
+
+        BED3 yields ``chrom/start/end``; wider files add ``name``, ``score``, ``strand`` and
+        the BED12 block columns in the specification's order. The width is read from the
+        file's first data line. Browser ``track`` and ``browser`` lines are skipped.
+
+        ``.bed``, ``.bed.gz``, and ``.bedgraph`` are recognized.
+
+        .. important::
+           BED coordinates are **0-based and half-open**, unlike GFF and VCF which are
+           1-based and inclusive. They are read exactly as written — nothing here normalizes
+           between the two conventions, because a silent shift would make an interval
+           disagree with its own file.
+
+        Args:
+            path: A BED file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the BED source.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> exons = bt.read.bed("annotations/exons.bed")  # doctest: +SKIP
+        """
+        return _read(path, format="bed", **opts)
+
+    def gff(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read GFF3 or GTF annotation file(s) as nine-column rows.
+
+        Both dialects read through one source: they differ only in how the ninth column
+        encodes its attributes, and that column arrives as raw text rather than parsed, since
+        the dialect is not reliably recoverable from the file. Pull a key out with the string
+        vocabulary, e.g. ``col("attributes").str.regexp_extract(r"ID=([^;]+)", 1)``.
+
+        ``.gff``, ``.gff3``, ``.gtf`` and their gzipped forms are recognized. Coordinates are
+        1-based and inclusive; ``.`` reads as null in every optional column.
+
+        Args:
+            path: A GFF/GTF file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the annotation source.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> genes = bt.read.gff("gencode.v44.gtf")  # doctest: +SKIP
+        """
+        return _read(path, format="gff", **opts)
+
+    def vcf(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read VCF variant file(s), with one column per sample when genotypes are present.
+
+        The eight fixed columns are ``chrom``, ``pos``, ``id``, ``ref``, ``alt``, ``qual``,
+        ``filter``, ``info``. Sample names come from the file's ``#CHROM`` header, so a
+        joint-called cohort yields ``format`` plus one string column per sample. ``.`` reads
+        as null.
+
+        ``INFO`` and the genotype columns arrive as raw text, because their keys are declared
+        per file and differ per row; extract with the string vocabulary, e.g.
+        ``col("info").str.regexp_extract(r"AF=([0-9.]+)", 1).cast("float64")``.
+
+        Args:
+            path: A VCF file, directory, or glob to read.
+            opts: Format-specific reader options forwarded to the source.
+
+        Returns:
+            A lazy `Dataset` over the variant source.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> variants = bt.read.vcf("cohort.vcf")  # doctest: +SKIP
+                >>> passing = variants.filter(bt.col("filter") == "PASS")  # doctest: +SKIP
+        """
+        return _read(path, format="vcf", **opts)
 
     def lance(self, path: PathLike, **opts: Any) -> Dataset:
         """Read a Lance dataset (columnar ML format) by directory path.
@@ -830,7 +991,7 @@ class Reader:
         table_uri: str,
         *,
         version: int | None = None,
-        timestamp: str | None = None,
+        timestamp: str | datetime | None = None,
         stream: bool = False,
         starting_version: int = 0,
         **opts: Any,
@@ -863,33 +1024,72 @@ class Reader:
         return _read_table("delta", table_uri, version=version, timestamp=timestamp, **opts)
 
     def read_change_feed(
-        self, table_uri: str, *, starting_version: int = 0, **opts: Any
+        self,
+        table_uri: str,
+        *,
+        starting_version: int | None = None,
+        ending_version: int | None = None,
+        starting_timestamp: str | datetime | None = None,
+        ending_timestamp: str | datetime | None = None,
+        **opts: Any,
     ) -> Dataset:
-        """Stream a Delta table's Change Data Feed (Databricks ``readChangeFeed``).
+        """Read a Delta table's Change Data Feed (Databricks ``readChangeFeed``).
 
         Yields row-level changes — ``_change_type`` (insert/update/delete),
-        ``_commit_version``, ``_commit_timestamp`` plus the data columns — for every
-        commit after `starting_version`, as an unbounded source. Requires
+        ``_commit_version``, ``_commit_timestamp`` plus the data columns. Requires
         ``delta.enableChangeDataFeed = true`` on the table.
+
+        Naming **any** bound (``ending_version``, ``starting_timestamp``,
+        ``ending_timestamp``) makes this a *bounded* read of that window, which you can
+        collect, count, join, and merge into a target — the shape an incremental ETL step
+        wants. With no bound it is an unbounded stream of new commits, for
+        `write.stream`-style continuous processing.
 
         Args:
             table_uri: Path/URI of the Delta table root.
-            starting_version: First commit version to stream changes from (default 0).
+            starting_version: First commit version to read changes from. Defaults to
+                version 0, unless ``starting_timestamp`` names the start instead.
+            ending_version: Last commit version to read, inclusive. Bounds the read.
+            starting_timestamp: Read changes from the first commit at or after this time,
+                instead of a version. Bounds the read. Ignored if ``starting_version`` is
+                also given, which is delta-rs's precedence.
+            ending_timestamp: Read changes up to the last commit at or before this time.
+                Bounds the read.
             opts: Connector options passed through to the Delta source.
 
         Returns:
-            A lazy `Dataset` streaming row-level change records.
+            A lazy `Dataset` of row-level change records — bounded if any bound was given.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.read.read_change_feed(  # doctest: +SKIP
-                ...     "s3://bucket/delta/events", starting_version=10
+                >>> changes = bt.read.read_change_feed(  # doctest: +SKIP
+                ...     "s3://bucket/delta/events", starting_version=10, ending_version=20
                 ... )
+                >>> inserts = changes.filter(  # doctest: +SKIP
+                ...     bt.col("_change_type") == "insert"
+                ... )
+                >>> inserts.count()  # doctest: +SKIP
+                42
         """
+        bounds = (ending_version, starting_timestamp, ending_timestamp)
+        if all(b is None for b in bounds):
+            return _read_table(
+                "delta_stream",
+                table_uri,
+                starting_version=0 if starting_version is None else starting_version,
+                change_feed=True,
+                **opts,
+            )
         return _read_table(
-            "delta_stream", table_uri, starting_version=starting_version, change_feed=True, **opts
+            "delta_cdf",
+            table_uri,
+            starting_version=starting_version,
+            ending_version=ending_version,
+            starting_timestamp=starting_timestamp,
+            ending_timestamp=ending_timestamp,
+            **opts,
         )
 
     def iceberg(

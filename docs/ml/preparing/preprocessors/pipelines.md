@@ -6,7 +6,7 @@ learned.
 
 ## Chaining steps
 
-`Chain` is the sklearn `Pipeline` equivalent. It fits each step on the **previous
+{py:class}`Chain <batcher.ml.preprocessors.Chain>` is the sklearn `Pipeline` equivalent. It fits each step on the **previous
 step's output** and replays the fitted steps, in order, over any split. Doing this by
 hand means fitting step *i* on data that steps *0..i-1* have already transformed. That
 is easy to get subtly wrong, and the mistake leaks held-out statistics into training
@@ -26,7 +26,7 @@ print(chain)
 ```
 
 Call `fit` on the training split only, then `transform` on both. A `Chain` is itself a
-`Preprocessor`, so it nests. Its steps stay introspectable through `chain[0]` and
+{py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>`, so it nests. Its steps stay introspectable through `chain[0]` and
 `len(chain)`, which is how you read a fitted step's learned state.
 
 You can also sequence several preprocessors by hand. Fit each on the previous

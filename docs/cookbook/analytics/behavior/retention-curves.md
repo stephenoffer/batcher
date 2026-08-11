@@ -85,7 +85,7 @@ print(naive.to_pydict())
 Four "active users" on day 0 of the May 1st cohort. There are three. `u1` logged in twice
 and got counted twice, so day-0 retention comes out as 4/3 = 133%.
 
-| Cohort, day | `bt.count()` rows | `n_unique()` people |
+| Cohort, day | {py:func}`bt.count() <batcher.count>` rows | `n_unique()` people |
 | --- | --- | --- |
 | 2024-05-01, day 0 | 4 | 3 |
 | 2024-05-01, day 1 | 2 | 2 |

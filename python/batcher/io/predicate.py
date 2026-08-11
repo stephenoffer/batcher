@@ -9,7 +9,19 @@ always safe — it just reads more rows. This module owns the IR→backend mappi
 
 Pushable subset: comparisons (`= != < <= > >=`) between a column and a literal,
 `IS NULL` / `IS NOT NULL`, and `AND`/`OR` of pushable terms. Anything else makes
-the whole expression unpushable for that backend (returns ``None``).
+the term unpushable for that backend.
+
+**An `AND` keeps whichever side translated; an `OR` is all-or-nothing.** Dropping a
+conjunct only ever *widens* the rows read, and the engine's `Filter` re-checks every one
+of them, so a partial `AND` costs pruning and never a row. Dropping a disjunct narrows the
+filter and would lose rows, so an `OR` with an untranslatable side declines entirely.
+
+That asymmetry is why the read-path translators here return a partial filter rather than
+`None`: a six-predicate warehouse query with one unpushable term used to extract the whole
+table over the network because a single conjunct could not be spelled. The one exception is
+a predicate used to *choose rows to replace* rather than to skip I/O (Iceberg's
+``replace_where``), where widening would delete rows the caller did not name — that keeps
+the strict form, which is why `to_iceberg_expression` asks before it prunes.
 """
 
 from __future__ import annotations
@@ -87,7 +99,7 @@ def _timestamp_scalar(micros: int, col_type: Any, pa: Any) -> Any:
     column gets a UTC-aware datetime (same instant), a tz-naive column a naive one, so the
     comparison type-checks either way.
     """
-    moment = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc) + _dt.timedelta(microseconds=micros)
+    moment = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC) + _dt.timedelta(microseconds=micros)
     if col_type.tz is None:
         moment = moment.replace(tzinfo=None)
     return pa.scalar(moment, col_type)
@@ -155,12 +167,16 @@ def _comparable(col_type: Any | None, lit: dict[str, Any]) -> bool:
         return kind in ("str", "bytes")
     if pa.types.is_boolean(col_type):
         return kind in ("bool", "int")
-    if (
-        pa.types.is_integer(col_type)
-        or pa.types.is_floating(col_type)
-        or pa.types.is_decimal(col_type)
-    ):
-        return kind in ("int", "float", "bool")
+    if pa.types.is_decimal(col_type):
+        # Arrow rescales the literal into the column's own precision and raises
+        # `ArrowInvalid: Precision is not great enough` on an integer that does not fit.
+        # ``WHERE price = 2`` against a DECIMAL(5,2) is ordinary SQL, and the scanner
+        # raised there while the engine answered it. A `Decimal` lowers to a float
+        # literal, so the float case covers both spellings a caller actually writes.
+        return kind == "float"
+    if pa.types.is_integer(col_type) or pa.types.is_floating(col_type):
+        # Arrow promotes between numeric widths but has no `equal(int64, bool)`.
+        return kind in ("int", "float")
     return True  # a type this does not model: unchanged, push it
 
 
@@ -268,8 +284,37 @@ def _sql_literal(value: Any) -> str:
     return str(value)
 
 
+def _combine(op: str, left: Any, right: Any, both: Any) -> Any | None:
+    """Fold a translated `AND`/`OR` pair, keeping a partial conjunction.
+
+    `both` is the already-combined value, evaluated by the caller only when neither side
+    is None. An `AND` degrades to whichever side translated; an `OR` declines unless both
+    did. See this module's docstring for why the two directions differ.
+
+    Args:
+        op: ``"and"`` or ``"or"``.
+        left: The translated left operand, or None.
+        right: The translated right operand, or None.
+        both: The combination of the two, used when both translated.
+
+    Returns:
+        The folded filter, or None when nothing can be pushed.
+    """
+    if left is not None and right is not None:
+        return both
+    if op == "or":
+        return None
+    return left if left is not None else right
+
+
 def to_sql_where(ir: dict[str, Any]) -> str | None:
-    """Translate the pushable subset of `ir` to a SQL ``WHERE`` fragment, or None."""
+    """Translate the pushable subset of `ir` to a SQL ``WHERE`` fragment, or None.
+
+    An `AND` whose operands only partly translate yields the part that did, which is safe
+    because the engine's own `Filter` re-checks every row a source returns. Do not reuse
+    this for a ``DELETE``/``UPDATE`` predicate, where a widened filter would change rows
+    the caller never named.
+    """
     e = ir.get("e")
     if e == "is_null" and ir["input"].get("e") == "col":
         return f"{ir['input']['name']} IS NULL"
@@ -281,9 +326,8 @@ def to_sql_where(ir: dict[str, Any]) -> str | None:
     if op in ("and", "or"):
         left = to_sql_where(ir["left"])
         right = to_sql_where(ir["right"])
-        if left is None or right is None:
-            return None
-        return f"({left} {op.upper()} {right})"
+        both = f"({left} {op.upper()} {right})" if left and right else None
+        return _combine(op, left, right, both)
     if op in COMPARISON_OPS:
         parsed = _col_and_literal(ir["left"], ir["right"])
         if parsed is None:
@@ -300,8 +344,23 @@ def to_sql_where(ir: dict[str, Any]) -> str | None:
     return None
 
 
-def to_iceberg_expression(ir: dict[str, Any]) -> Any | None:
-    """Translate the pushable subset of `ir` to a `pyiceberg` row filter, or None."""
+def to_iceberg_expression(ir: dict[str, Any], *, allow_partial: bool = False) -> Any | None:
+    """Translate the pushable subset of `ir` to a `pyiceberg` row filter, or None.
+
+    `allow_partial` lets an `AND` push whichever conjuncts translated, which is what a
+    *scan* wants: the filter only prunes I/O and the engine's `Filter` re-checks the rows.
+    It defaults off because the same translation drives ``replace_where``, where a widened
+    predicate would overwrite rows the caller never named. A caller pruning a read opts in;
+    a caller choosing rows to replace must not.
+
+    Args:
+        ir: The predicate's IR dictionary.
+        allow_partial: Push the translatable conjuncts of an `AND` instead of declining
+            the whole expression. Only ever correct for a read.
+
+    Returns:
+        The `pyiceberg` expression, or None when nothing translates.
+    """
     from pyiceberg import expressions as ie
 
     cmp_ctor = {
@@ -326,7 +385,7 @@ def to_iceberg_expression(ir: dict[str, Any]) -> Any | None:
             left = walk(node["left"])
             right = walk(node["right"])
             if left is None or right is None:
-                return None
+                return _combine(op, left, right, None) if allow_partial else None
             return ie.And(left, right) if op == "and" else ie.Or(left, right)
         if op in COMPARISON_OPS:
             parsed = _col_and_literal(node["left"], node["right"])
@@ -420,9 +479,8 @@ def to_mongo_filter(ir: dict[str, Any]) -> dict[str, Any] | None:
     if op in ("and", "or"):
         left = to_mongo_filter(ir["left"])
         right = to_mongo_filter(ir["right"])
-        if left is None or right is None:
-            return None
-        return {f"${op}": [left, right]}
+        both = {f"${op}": [left, right]} if left is not None and right is not None else None
+        return _combine(op, left, right, both)
     if op in COMPARISON_OPS:
         parsed = _col_and_literal(ir["left"], ir["right"])
         if parsed is None:

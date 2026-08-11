@@ -102,20 +102,36 @@ def _render(
     prefix = _few_shot_prefix(few_shot)
     if template is None:
         return [prefix + _cell(v) for v in batch.column(column).to_pylist()]
-    _validate_template(template, batch.schema.names)
+    referenced = _validate_template(template, batch.schema.names)
+    if not referenced:
+        return [prefix + template] * batch.num_rows  # a constant prompt for every row
+    # Materialize ONLY the columns the template names. `batch.to_pylist()` converts every
+    # column of every row into Python objects, so a vision generation — whose batch carries an
+    # image column precisely because `_decode_image_inputs` needs it — used to decode every
+    # image into a Python `bytes` a second time just to format a text template, doubling the
+    # batch's peak memory and adding O(rows) work over a column the prompt never mentions.
+    cells = {name: batch.column(name).to_pylist() for name in referenced}
     # A null in any referenced column renders as "" rather than "None" (see `_cell`).
     return [
-        prefix + template.format(**{k: _cell(v) if v is None else v for k, v in row.items()})
-        for row in batch.to_pylist()
+        prefix
+        + template.format(
+            **{
+                name: _cell(values[i]) if values[i] is None else values[i]
+                for name, values in cells.items()
+            }
+        )
+        for i in range(batch.num_rows)
     ]
 
 
-def _validate_template(template: str, names: list[str]) -> None:
-    """Raise a `PlanError` naming any ``{placeholder}`` the batch has no column for.
+def _validate_template(template: str, names: list[str]) -> set[str]:
+    """The batch columns `template` references, raising if it names one the batch lacks.
 
-    Without this a template referencing a missing column fails deep in the engine with a
+    Without the check a template referencing a missing column fails deep in the engine with a
     bare ``KeyError`` that names neither the template nor the column — and it fails the
     whole batch. Catching it here turns that into an actionable message at the UDF's edge.
+    The referenced set is returned because `_render` needs exactly it to avoid materializing
+    the columns the template does not mention.
     """
     import string
 
@@ -125,7 +141,8 @@ def _validate_template(template: str, names: list[str]) -> None:
             # ``{a.b}`` / ``{a[0]}`` reference column ``a``; take that root.
             referenced.add(field.split(".", 1)[0].split("[", 1)[0])
     known = set(names)
-    missing = sorted(f for f in referenced if f and not f.isdigit() and f not in known)
+    resolved = {f for f in referenced if f and not f.isdigit()}
+    missing = sorted(f for f in resolved if f not in known)
     if missing:
         from batcher._internal.errors import PlanError
 
@@ -133,6 +150,7 @@ def _validate_template(template: str, names: list[str]) -> None:
             f"generate template references column(s) not in the data: {missing}. "
             f"Available columns: {sorted(names)}."
         )
+    return resolved
 
 
 #: The request-dict keys carrying a per-row *sampling* override, mapped to the spec field
@@ -217,15 +235,10 @@ def _decode_image_inputs(column: pa.Array) -> list:
     is the shape that blows the context window and the worker's memory at once."""
     import io as _io
 
+    from batcher._internal.optional import require
     from batcher.io.formats.ml.tensor import is_tensor_column
 
-    try:
-        from PIL import Image
-    except ImportError as exc:  # pragma: no cover - optional extra
-        from batcher._internal.errors import BackendError
-
-        msg = "vision LLM input needs Pillow: pip install 'batcher-engine[image]'"
-        raise BackendError(msg) from exc
+    Image = require("PIL", "Image", feature="Vision LLM input", provides="Pillow", extra="image")
 
     if is_tensor_column(column):
         if hasattr(column, "combine_chunks"):

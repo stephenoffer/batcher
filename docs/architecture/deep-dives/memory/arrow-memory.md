@@ -121,9 +121,9 @@ Table int64
 [1, 2, 3]
 ```
 
-`collect()` returns a pyarrow `Table`: the same buffers the engine produced, handed back through
+{py:meth}`collect() <batcher.Dataset.collect>` returns a pyarrow `Table`: the same buffers the engine produced, handed back through
 the C Data Interface. There is no Python list, no dict, no per-row object anywhere in that path.
-Converting to Python containers (`to_pydict()`) is a deliberate, explicit step, and it is a
+Converting to Python containers ({py:meth}`to_pydict() <batcher.Dataset.to_pydict>`) is a deliberate, explicit step, and it is a
 hot-path tuple touch if you do it inside a loop.
 
 ## Accounting bytes correctly

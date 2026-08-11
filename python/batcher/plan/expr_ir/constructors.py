@@ -60,8 +60,17 @@ def array(*elements: IntoExpr) -> Array:
     type. Use it to pack several columns into one list column — a feature vector,
     an embedding, or a set passed to a list operation.
 
+    A single list or tuple is accepted as the elements themselves, so a query vector
+    already held in a Python list needs no unpacking. That spelling is the natural one
+    for the vector-distance kernels — ``col("emb").list.cosine_similarity(array(q))`` —
+    and it used to build an ``Array`` whose one element was the list, failing much later
+    inside ``to_ir`` with ``unsupported literal type: list``: a message naming neither
+    this function nor the remedy, on a traceback pointing at ``collect()``. There is no
+    competing meaning, because a nested list has no literal spelling here.
+
     Args:
-        *elements: One or more expressions, one per list position.
+        *elements: One or more expressions, one per list position, or a single list or
+            tuple holding them.
 
     Returns:
         An expression producing a `List` column.
@@ -73,7 +82,14 @@ def array(*elements: IntoExpr) -> Array:
             >>> ds = bt.from_pydict({"a": [1], "b": [2]})
             >>> ds.select(pair=bt.array(bt.col("a"), bt.col("b"))).to_pydict()
             {'pair': [[1, 2]]}
+
+            >>> ds = bt.from_pydict({"emb": [[1.0, 0.0]]})
+            >>> sim = bt.col("emb").list.cosine_similarity(bt.array([1.0, 0.0]))
+            >>> ds.select(sim=sim).to_pydict()
+            {'sim': [1.0]}
     """
+    if len(elements) == 1 and isinstance(elements[0], (list, tuple)):
+        elements = tuple(elements[0])
     if not elements:
         raise ValueError("array() requires at least one element")
     return Array([_wrap(e) for e in elements])

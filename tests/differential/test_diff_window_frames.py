@@ -10,7 +10,6 @@ import pytest
 
 import batcher as bt
 from _harness import assert_same
-from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.differential
 
@@ -52,16 +51,16 @@ def test_range_peer_frame_matches_duckdb(duck):
     assert_same(got, want)
 
 
-def test_numeric_range_offset_rejected_not_silently_wrong(duck):
-    """A numeric ``RANGE`` offset is value-based, not row-based; the engine does not
-    implement it and used to silently run the *default* running frame — a wrong result
-    vs DuckDB. It must now raise cleanly instead of fabricating an answer.
+def test_numeric_range_offset_is_honoured_not_silently_downgraded(duck):
+    """A numeric ``RANGE`` offset is value-based, and the engine now computes it.
 
-    For ``t = [10, 12, 13, 20, 21, 30]`` and ``RANGE BETWEEN 5 PRECEDING AND 5
-    FOLLOWING`` DuckDB sums the peers whose value is within 5 → ``[6, 6, 6, 9, 9, 6]``,
-    but the engine silently returned the cumulative running sum ``[1, 3, 6, 10, 15,
-    21]``. Confirm both that DuckDB's answer differs from the running frame (so a silent
-    fallback is genuinely wrong) and that the engine refuses the frame.
+    This case is the one that proves it is not being quietly served by some other frame.
+    For ``t = [10, 12, 13, 20, 21, 30]`` and ``RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING``
+    DuckDB sums the rows whose *value* is within 5 -> ``[6, 6, 6, 9, 9, 6]``, while the
+    default running frame gives the cumulative ``[1, 3, 6, 10, 15, 21]``. The engine once
+    returned the second answer for the first query, silently; it was then made to raise,
+    and now it returns the first. Asserting that the two frames genuinely disagree keeps
+    the check honest — without it, a downgrade would pass.
     """
     ds = bt.from_pydict({"g": ["a"] * 6, "t": [10, 12, 13, 20, 21, 30], "v": [1, 2, 3, 4, 5, 6]})
     duck.register("t", ds.collect())
@@ -80,12 +79,37 @@ def test_numeric_range_offset_rejected_not_silently_wrong(duck):
         ).fetchall()
     ]
     assert want != running  # the two frames genuinely disagree here
-    with pytest.raises(PlanError, match="numeric RANGE"):
+    got = (
         ds.window(
             partition_by=["g"],
             order_by=["t"],
             functions={"s": ("sum", "v")},
             frame=(-5, 5, "range"),
+        )
+        .sort("t")
+        .to_pydict()["s"]
+    )
+    assert got == want
+
+
+def test_a_range_offset_over_an_unmeasurable_key_is_declined_not_approximated(duck):
+    """The one shape the engine still refuses, and it refuses rather than substituting.
+
+    A string order key sorts perfectly well, so a peer-bounded ``RANGE`` frame over it is
+    fine — but ``2 PRECEDING`` would have to subtract two strings. Falling back to the peer
+    frame there would answer a different question with no error, so it errors.
+    """
+    ds = bt.from_pydict({"g": ["a"] * 3, "t": ["x", "y", "z"], "v": [1, 2, 3]})
+    peer = ds.window(
+        partition_by=["g"], order_by=["t"], functions={"s": ("sum", "v")}, frame=(None, 0, "range")
+    )
+    assert peer.sort("t").to_pydict()["s"] == [1, 3, 6]
+    with pytest.raises(Exception, match="numeric or temporal"):
+        ds.window(
+            partition_by=["g"],
+            order_by=["t"],
+            functions={"s": ("sum", "v")},
+            frame=(-2, 0, "range"),
         ).collect()
 
 

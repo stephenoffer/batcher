@@ -31,8 +31,20 @@ def _power_iteration(
     combine: object,
     max_iterations: int,
     tolerance: float,
+    *,
+    rescale_each_round: bool = True,
 ) -> Dataset:
-    """Shared body of eigenvector and Katz centrality: propagate, combine, normalize."""
+    """Shared body of eigenvector and Katz centrality: propagate, combine, normalize.
+
+    `rescale_each_round` is what separates the two, and it is not a tuning knob.
+    Eigenvector centrality iterates a *linear* map, whose iterates grow or shrink by the
+    leading eigenvalue every round, so rescaling inside the loop is the only thing keeping
+    the numbers finite and the convergence test measuring a shape. Katz iterates an
+    *affine* one, ``x = beta + alpha * A' x``, which already has a bounded fixed point —
+    and rescaling that changes the fixed point, because it shrinks the propagated term
+    against the constant `beta` that is the whole point of Katz. So Katz iterates raw and
+    normalizes once at the end, which leaves the returned vector unit-L2 either way.
+    """
     nodes = g.nodes().cache()
     n = nodes.count()
     if n == 0:
@@ -51,21 +63,26 @@ def _power_iteration(
         raw = nodes.join(incoming, on=NODE, how="left").select(
             **{NODE: bt.col(NODE), "_raw": combine(bt.coalesce(bt.col("_in"), bt.lit(0.0)))}
         )
-        # Normalize to unit L2 norm. Without it eigenvector centrality either explodes or
-        # collapses to zero depending on the leading eigenvalue, and the convergence test
-        # measures a scale rather than a shape.
-        norm = raw.agg(s=bt.sum(bt.col("_raw") * bt.col("_raw"))).to_pydict()["s"]
-        total = float(norm[0]) ** 0.5 if norm and norm[0] else 0.0
-        factor = 1.0 / total if total > 0.0 else 0.0
-        return raw.select(**{NODE: bt.col(NODE), value: bt.col("_raw") * bt.lit(factor)})
+        if not rescale_each_round:
+            return raw.select(**{NODE: bt.col(NODE), value: bt.col("_raw")})
+        return _unit_l2(raw.select(**{NODE: bt.col(NODE), value: bt.col("_raw")}), value)
 
-    return iterate(
+    settled = iterate(
         initial,
         step,
         max_iterations=max_iterations,
         delta=max_abs_change(NODE, value),
         tolerance=tolerance,
     ).state
+    return settled if rescale_each_round else _unit_l2(settled, value)
+
+
+def _unit_l2(state: Dataset, value: str) -> Dataset:
+    """Scale `value` so the whole column has unit L2 norm; an all-zero column stays zero."""
+    norm = state.agg(s=bt.sum(bt.col(value) * bt.col(value))).to_pydict()["s"]
+    total = float(norm[0]) ** 0.5 if norm and norm[0] else 0.0
+    factor = 1.0 / total if total > 0.0 else 0.0
+    return state.select(**{NODE: bt.col(NODE), value: bt.col(value) * bt.lit(factor)})
 
 
 def eigenvector_centrality(
@@ -160,6 +177,9 @@ def katz_centrality(
         lambda incoming: bt.lit(baseline) + bt.lit(attenuation) * incoming,
         max_iterations,
         tolerance,
+        # Katz's recurrence is affine and already bounded, so rescaling it every round
+        # would move the fixed point rather than merely keep it in range.
+        rescale_each_round=False,
     )
 
 

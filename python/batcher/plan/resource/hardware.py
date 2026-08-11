@@ -59,6 +59,25 @@ class HardwareProfile:
                             none of which is derivable from a byte count. `""` is the
                             pre-existing behavior: every model-specific decision then reports
                             no opinion and the plan is sized exactly as it was before.
+    * `fingerprint`       — the hardware-scoping key of the machine class the plan will run
+                            on, or `""` when the fleet is mixed or unprobeable. This is what
+                            lets a learned quantity measured in *machine units* be read back
+                            for the machine it will be spent on: Kyber runs on the driver,
+                            which on a cluster executes none of the work, so a cost
+                            coefficient or a CPU share looked up under the local key describes
+                            the wrong machine. `""` means "no single honest answer", and every
+                            consumer then falls back to the local key, which is the behavior
+                            that held before this field existed. The rule matches
+                            `accelerator_type` above, for the same reason.
+    * `storage_class`     — device class backing the spill volume of the node that will spill
+                            (`nvme`, `ssd`, `rotational`, `network`, ...), `""` when unknown.
+                            The spread across those classes is roughly thirtyfold and it runs
+                            in the direction that decides whether an out-of-core plan is
+                            acceptable, so a spilled byte priced against the *driver's* disk
+                            is the same class of error as one priced against its memory. The
+                            **worst** class across the fleet, for the reason every field here
+                            is the binding one: a plan that is affordable on the slowest
+                            volume it might land on is affordable everywhere.
     * `cluster`           — the fleet's *shape* (`ClusterShape`): one record per node with its
                             devices, coherent fabric width, rack, and egress. The binding-node
                             fields above cannot express it, and it is what decides whether an
@@ -74,6 +93,8 @@ class HardwareProfile:
     gpu_memory_bytes: int = 0
     worker_count: int = 1
     accelerator_type: str = ""
+    fingerprint: str = ""
+    storage_class: str = ""
     cluster: ClusterShape = field(default_factory=ClusterShape)
 
     @property
@@ -118,6 +139,7 @@ class HardwareProfile:
         from batcher._internal.device_specs import resolve_device_name
         from batcher._internal.hardware import (
             available_cpu_count,
+            fingerprint,
             gpu_inventory,
             l3_cache_bytes,
             machine_memory_bytes,
@@ -156,6 +178,10 @@ class HardwareProfile:
             gpu_memory_bytes=vram,
             worker_count=1,
             accelerator_type=model,
+            # Single-node: the machine that will run the plan is the one asking, so the local
+            # key is the honest answer rather than a fallback.
+            fingerprint=fingerprint(),
+            storage_class=_local_storage_class(),
             cluster=shape,
         )
 
@@ -170,6 +196,8 @@ class HardwareProfile:
         gpu_memory_bytes: int = 0,
         l3_cache_bytes: int = 0,
         accelerator_type: str = "",
+        fingerprint: str = "",
+        storage_class: str = "",
         cluster: ClusterShape | None = None,
     ) -> HardwareProfile:
         """A profile for a distributed run, built by the conductor from live cluster topology.
@@ -182,29 +210,70 @@ class HardwareProfile:
 
         `accelerator_type` is the model every GPU node shares, or `""` on a mixed fleet — the
         same rule `cluster_accelerator_type()` follows, because there is no honest single
-        answer when the models differ.
+        answer when the models differ. `fingerprint` follows that rule exactly: the
+        hardware-scoping key every probed worker shares, `""` when they differ or none could be
+        probed. A caller reading a machine-scoped learned value then gets the workers' key on a
+        uniform fleet and falls back to its own on a mixed one, which is the pre-existing
+        behavior and errs toward the model it already had rather than toward a blend.
 
         `cluster` is the fleet's shape. `None` — what a caller that cannot read per-node
         topology passes, and what every existing caller passed before it existed — leaves it
         empty, and every locality-aware decision then reports the flat single-tier answer it
-        always did. When a shape *is* supplied and `accelerator_type` is not, the model is
-        derived from the shape, so "what device is this fleet" is decided in one place rather
-        than restated by every caller that happens to build a profile.
+        always did.
+
+        **Every binding-node field a caller leaves unknown is derived from that shape**, not
+        just `accelerator_type`. Deriving one field and not the others was an inconsistency
+        with a real consequence: a caller that could read per-node topology but not the
+        device-model labels (an unlabelled on-prem fleet, a Ray version whose node labels are
+        absent) passed `gpu_memory_bytes=0` and got a profile reporting *no VRAM* for a cluster
+        whose shape recorded it node by node — so every VRAM-sized decision took its default on
+        a fleet that had, in the same object, said exactly how much it had. A value the caller
+        *did* supply always wins; derivation only fills a stated unknown.
         """
         shape = cluster or ClusterShape()
         model = accelerator_type
         if not model and shape.homogeneous_gpus:
             model = shape.device_models[0]
         return cls(
-            cpu_cores=max(0, cpu_cores),
-            memory_bytes=max(0, memory_bytes),
+            # `or` rather than `max`: `0` is this contract's "unknown", so an unsupplied field
+            # falls through to the shape and a supplied one is kept even where the shape
+            # disagrees — the caller measured the fleet directly and the shape may be partial.
+            cpu_cores=max(0, cpu_cores) or shape.binding_cpu_cores,
+            memory_bytes=max(0, memory_bytes) or shape.binding_memory_bytes,
             l3_cache_bytes=max(0, l3_cache_bytes),
-            gpu_count=max(0, gpu_count),
-            gpu_memory_bytes=max(0, gpu_memory_bytes),
+            gpu_count=max(0, gpu_count) or shape.total_gpus,
+            gpu_memory_bytes=max(0, gpu_memory_bytes) or shape.binding_gpu_memory_bytes,
             worker_count=max(1, worker_count),
             accelerator_type=model,
+            fingerprint=fingerprint,
+            storage_class=storage_class,
             cluster=shape,
         )
+
+
+def _local_storage_class() -> str:
+    """This machine's spill-device class, or `""` when it cannot be determined.
+
+    Resolved through the same three steps the spill paths themselves use — configured
+    `spill_dir`, else the node's measured local scratch volume, else a system tempdir — so the
+    class describes where bytes actually land rather than where the process happens to run.
+    Best-effort: an unreadable device reports `""`, which every consumer treats as "no opinion"
+    and prices exactly as it did before.
+    """
+    from batcher._internal.hardware.storage import device_class
+
+    try:
+        from batcher._internal.site import local_scratch_root
+        from batcher.config import active_config
+
+        configured = active_config().memory.spill_dir
+    except Exception:  # pragma: no cover - config unavailable this early in a process
+        return ""
+    import tempfile
+
+    path = configured or local_scratch_root() or tempfile.gettempdir()
+    found = device_class(path)
+    return "" if found == "unknown" else found
 
 
 def _local_nvlink_domain(model: str, devices: int) -> int:

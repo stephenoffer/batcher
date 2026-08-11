@@ -30,7 +30,7 @@ from __future__ import annotations
 import datetime
 import enum
 import math
-from collections.abc import Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -42,9 +42,12 @@ __all__ = [
     "ColumnStat",
     "Provenance",
     "RelStats",
+    "SortOrder",
     "ambiguous_float_bound",
     "arrow_ordinal_axis",
+    "as_sort_orders",
     "mismatched_exactness",
+    "orderings_satisfy",
     "ordinal_with_axis",
     "weakest",
 ]
@@ -100,7 +103,7 @@ def ordinal_with_axis(value: Any) -> tuple[str, float] | None:
     if isinstance(value, (int, float, Decimal)):
         return AXIS_NUMERIC, float(value)
     if isinstance(value, datetime.datetime):
-        stamp = value if value.tzinfo is not None else value.replace(tzinfo=datetime.timezone.utc)
+        stamp = value if value.tzinfo is not None else value.replace(tzinfo=datetime.UTC)
         return AXIS_DATETIME, stamp.timestamp()
     if isinstance(value, datetime.date):
         return AXIS_DATE, float((value - _EPOCH_DATE).days)
@@ -367,6 +370,84 @@ class ColumnStat:
         )
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class SortOrder:
+    """One key of a physical ordering: a column, a direction, and where its nulls sit.
+
+    This is the vocabulary a producer and a consumer of an ordering both speak.
+    `RelStats.sorted_by` is a tuple of these, and a `Sort` is redundant exactly when its
+    own keys are a prefix of what its input already delivers — compared key for key,
+    *including direction and null placement*, because `x ASC` and `x DESC` are different
+    orderings and neither satisfies the other.
+
+    Recording the direction is what makes the ordering property useful on real queries.
+    A prefix restricted to ascending, nulls-last keys cannot describe ``ORDER BY ts DESC``,
+    so the single most common ordered shape in analytics — a recent-first feed, a top-N
+    over a timestamp, a descending lakehouse sort key — delivered no ordering at all and
+    every consumer of the property was blind to it.
+
+    Null placement is part of the ordering and not a detail: `nulls_first` decides where
+    the null rows land, so two orderings differing only there interleave their rows
+    differently. It is compared exactly, with one sound relaxation available through
+    `orderings_satisfy` for a column proven to hold no nulls, where the two coincide.
+    """
+
+    column: str
+    descending: bool = False
+    nulls_first: bool = False
+
+
+def as_sort_orders(spec: Iterable[SortOrder | str]) -> tuple[SortOrder, ...]:
+    """Normalize an ordering written as column names, `SortOrder`s, or a mix.
+
+    A bare column name means ascending, nulls-last — the default a connector that only
+    knows "this file is sorted by `k`" is asserting.
+
+    Args:
+        spec: The ordering keys.
+
+    Returns:
+        The ordering as `SortOrder` keys.
+    """
+    return tuple(SortOrder(k) if isinstance(k, str) else k for k in spec)
+
+
+def orderings_satisfy(
+    have: Sequence[SortOrder],
+    want: Sequence[SortOrder],
+    *,
+    non_nullable: Collection[str] = (),
+) -> bool:
+    """Whether a relation delivering `have` is already ordered as `want` requires.
+
+    An ordering satisfies a requirement when it is a **prefix-extension** of it: rows
+    sorted by ``(a, b)`` are also sorted by ``(a,)``, never the reverse. Each key must
+    match on column *and* direction.
+
+    `non_nullable` names columns proven to contain no nulls, where `nulls_first` is
+    unobservable — there is no null row whose position could distinguish the two
+    spellings — so the requirement is satisfied whichever way either side spells it.
+    Without that relaxation a `Sort` written with the API's default null placement fails
+    to match a source that declared the opposite, and the two describe the same row order.
+
+    Args:
+        have: The ordering the relation delivers.
+        want: The ordering the consumer requires.
+        non_nullable: Columns proven free of nulls.
+
+    Returns:
+        True iff no further sort is needed.
+    """
+    if len(want) > len(have):
+        return False
+    for got, need in zip(have, want, strict=False):
+        if got.column != need.column or got.descending != need.descending:
+            return False
+        if got.nulls_first != need.nulls_first and need.column not in non_nullable:
+            return False
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class RelStats:
     """A relation's statistics as propagated through a plan.
@@ -375,16 +456,31 @@ class RelStats:
     answerable iff `rows_exact`); `columns` carries per-column `ColumnStat` for
     aggregate (`min`/`max`/`sum`/`count_distinct`) and pruning shortcuts;
     `sorted_by` records a physical ordering an order-preserving operator can
-    carry, letting a redundant `Sort` be elided. By contract it lists only a
-    *canonical* ascending, nulls-last column prefix — the one ordering a producer
-    and a consumer can compare unambiguously (a descending or nulls-first key is
-    simply not recorded).
+    carry, letting a redundant `Sort` be elided. It is a prefix of `SortOrder`
+    keys, each naming a column, a direction, and its null placement, so a
+    descending or nulls-first ordering is carried as faithfully as an ascending one.
     """
 
     rows: float
     provenance: Provenance
     columns: Mapping[str, ColumnStat] = field(default_factory=dict)
-    sorted_by: tuple[str, ...] = ()
+    sorted_by: tuple[SortOrder, ...] = ()
+
+    def non_null_columns(self) -> frozenset[str]:
+        """Columns this relation proves hold no nulls — the `non_nullable` set for ordering.
+
+        Only an EXACT zero null count proves it; an estimate does not, and an unknown
+        count certainly does not. The answer is one-sided, so an unproven column simply
+        keeps the stricter null-placement comparison.
+
+        Returns:
+            The names of columns proven free of nulls.
+        """
+        return frozenset(
+            name
+            for name, stat in self.columns.items()
+            if stat.null_count == 0 and stat.null_count_is_exact
+        )
 
     @property
     def rows_exact(self) -> bool:

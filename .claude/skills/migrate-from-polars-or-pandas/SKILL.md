@@ -44,6 +44,7 @@ round-trips.
 | pandas | Polars | Batcher |
 |---|---|---|
 | `pd.read_parquet(p)` | `pl.scan_parquet(p)` | `bt.read.parquet(p)` (lazy) |
+| `pd.read_csv(p, on_bad_lines="skip")` | `pl.read_csv(p, ignore_errors=True)` | `bt.read.csv(p, on_bad_lines="skip")` — same three values as pandas |
 | `pd.DataFrame(d)` | `pl.DataFrame(d)` | `bt.from_pydict(d)` |
 | `df[["a","b"]]` | `df.select("a","b")` | `ds.select("a", "b")` |
 | `df.assign(c=...)` | `df.with_columns(c=...)` | `ds.with_columns(c=...)` |
@@ -85,6 +86,22 @@ canonical spelling above — one obvious way per operation.
 - **Null semantics are SQL's, not pandas'.** Null and `NaN` are distinct: `.is_null()`
   / `.fill_null()` for missing, `.is_nan()` / `.fill_nan()` / `bt.nanvl` for `NaN`.
   There is no `NaN`-as-missing conflation, and aggregates skip nulls.
+- **The Polars-named window helpers keep SQL semantics, and the numbers differ.** This is
+  the one divergence that ports silently — same method name, same types, different values —
+  so check any use of these three. Over `x = [1.0, NaN, 3.0, null, 5.0]`:
+
+  | Call | Batcher (= DuckDB) | Polars |
+  |---|---|---|
+  | `cum_sum()` | `[1.0, NaN, NaN, NaN, NaN]` | `[1.0, NaN, NaN, null, NaN]` |
+  | `rolling_mean(2)` | `[1.0, NaN, NaN, 3.0, 5.0]` | `[null, NaN, NaN, null, null]` |
+  | `rank()` | `[1, 4, 2, 5, 3]` (int) | `[1.0, 4.0, 2.0, null, 3.0]` (float) |
+
+  Batcher matches `SUM/AVG/RANK() OVER (...)` exactly: a partial leading frame produces a
+  value rather than null, nulls are skipped inside the frame rather than poisoning it, a
+  null row still gets a rank, and `rank()` is `RANK()` (integer, ties share a rank) rather
+  than Polars' average method. For Polars' shape, gate the value yourself —
+  `bt.when(bt.col("x").is_null()).then(None).otherwise(bt.col("x").cum_sum())` — or set an
+  explicit `frame=` where you meant `min_periods`.
 - **No index.** There is no pandas index or `reset_index`. Row position comes from an
   explicit `ds.with_row_index()`.
 - **Round-trips are cheap and symmetric.** `bt.from_pandas` / `bt.from_polars` /

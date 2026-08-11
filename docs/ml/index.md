@@ -6,7 +6,7 @@ Most ML pipelines pay a tax at the seam: a query engine produces rows, something
 converts them, and a separate system runs the model. Batcher removes the seam. The `ml`
 accessor hands your Python functions and models whole Arrow batches rather than one row
 at a time, and it places that work on GPUs and across worker actors for you. The same
-`Dataset` you filtered and joined is the one the model reads.
+{py:class}`Dataset <batcher.Dataset>` you filtered and joined is the one the model reads.
 
 That has a practical consequence worth stating up front. Because inference is an
 operator rather than a separate job, it streams. A batch-scoring run over more data than

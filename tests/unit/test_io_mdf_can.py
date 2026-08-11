@@ -24,10 +24,11 @@ pytest.importorskip("asammdf")
 from asammdf import MDF, Signal
 
 from batcher.io.formats.robotics import MDFSource
+from batcher.io.formats.robotics.mdf import _epoch_nanos
 
 pytestmark = pytest.mark.unit
 
-_START = dt.datetime(2026, 7, 18, 12, 0, 0, tzinfo=dt.timezone.utc)
+_START = dt.datetime(2026, 7, 18, 12, 0, 0, tzinfo=dt.UTC)
 
 
 def _write_measurement(path, *, seconds: float = 2.0) -> None:
@@ -89,7 +90,7 @@ def test_timestamps_are_absolute(measurement) -> None:
     a measurement be joined against a log recorded by a different system."""
     table = _table(MDFSource(measurement)).sort_by([("timestamp", "ascending")])
 
-    assert table.column("timestamp")[0].as_py().replace(tzinfo=dt.timezone.utc) == _START
+    assert table.column("timestamp")[0].as_py().replace(tzinfo=dt.UTC) == _START
 
 
 def test_signals_lists_the_readable_channels(measurement) -> None:
@@ -209,3 +210,39 @@ def test_can_signals_fuse_with_a_robot_log_across_formats(tmp_path) -> None:
     # Scenario extraction — the query an ADAS corpus exists to answer.
     braking = lidar.join_asof(can, on="timestamp").filter(col("speed") < 20)
     assert 0 < braking.count() < 20
+
+
+def test_the_measurement_origin_is_exact_to_the_nanosecond() -> None:
+    """`start_time` converts without going through a float that cannot hold it.
+
+    `start.timestamp() * 1e9` is a `float64` around 1.7e18, where the spacing between
+    representable values is 256 ns — so the conversion quantizes the measurement's origin
+    and shifts *every* sample in the file by the same amount. The whole point of an
+    absolute `timestamp` column is joining against a nanosecond-stamped log from another
+    system, so the error is small and still worth not having.
+
+    A whole-second start time cannot see this; the sub-second ones below can.
+    """
+    epoch = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
+    inexact = []
+    for micros in range(0, 1_000_000, 9_973):
+        start = dt.datetime(2026, 7, 18, 12, 0, 0, micros, tzinfo=dt.UTC)
+        delta = start - epoch
+        want = (delta.days * 86_400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1_000
+        got = _epoch_nanos(start)
+        if got != want:
+            inexact.append((micros, got - want))
+    assert not inexact, f"{len(inexact)} start times converted inexactly: {inexact[:4]}"
+
+
+def test_a_naive_measurement_origin_is_read_as_utc() -> None:
+    """Guessing the recorder's local zone would shift a drive by hours, invisibly."""
+    naive = dt.datetime(2026, 7, 18, 12, 0, 0, 500_000)
+    aware = naive.replace(tzinfo=dt.UTC)
+    assert _epoch_nanos(naive) == _epoch_nanos(aware)
+
+
+def test_a_measurement_before_the_epoch_converts_with_the_right_sign() -> None:
+    """`timedelta` normalizes to a negative `days` with non-negative seconds, which the
+    arithmetic has to add up rather than treat as two independent signs."""
+    assert _epoch_nanos(dt.datetime(1969, 12, 31, 23, 59, 59, tzinfo=dt.UTC)) == -1_000_000_000

@@ -1,7 +1,7 @@
 # SQL
 
 {py:obj}`bt.sql <batcher.sql>` runs a SQL query against one or more in-memory datasets and returns a
-lazy `Dataset`. The query is parsed, lowered to the same plan the DataFrame API
+lazy {py:class}`Dataset <batcher.Dataset>`. The query is parsed, lowered to the same plan the DataFrame API
 builds, and optimized by the same passes, so SQL and DataFrame code share one
 engine and one set of semantics.
 
@@ -32,7 +32,7 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 
 | Clause / feature | Notes |
 | --- | --- |
-| `SELECT` | Column lists, derived expressions, `AS` aliases, `*`, the `* EXCLUDE (…)` / `* REPLACE (… AS c)` / `* RENAME (c AS d)` star modifiers, and `COLUMNS(*)` / `COLUMNS('regex')` dynamic columns (including `func(COLUMNS(...))`). |
+| `SELECT` | Column lists, derived expressions, `AS` aliases, `*`, the `* EXCLUDE (…)` / `* REPLACE (… AS c)` / `* RENAME (c AS d)` star modifiers, and `COLUMNS(*)` / `COLUMNS('regex')` dynamic columns (including {py:obj}`func(COLUMNS(...)) <batcher.AggExpr.func>`). |
 | `WHERE` | Boolean predicates over scalar expressions. |
 | `GROUP BY` | With aggregates in the projection; `ROLLUP` / `CUBE` / `GROUPING SETS`. Positional `GROUP BY <n>` refers to a `SELECT` item. |
 | `HAVING` | Filters on aggregated results. |
@@ -41,13 +41,13 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | `JOIN` | Inner, left, right, full, cross, and `NATURAL` joins on equi-keys (`ON` / `USING` / shared columns); an extra non-equi `AND` condition is applied as a filter on the join result. |
 | Set operations | `UNION` / `UNION ALL`, `INTERSECT`, `EXCEPT`. |
 | `WITH` | Common table expressions (CTEs). |
-| Subqueries | Derived tables, `IN` / `NOT IN`, `EXISTS` / `NOT EXISTS`, correlated scalar subqueries. |
+| Subqueries | Derived tables, `IN` / `NOT IN`, `EXISTS` / `NOT EXISTS`, `= ANY` / `= SOME` / `<> ALL`, correlated scalar subqueries. See [Subqueries](#subqueries) for the forms that don't translate. |
 | Window functions | `<fn> OVER (PARTITION BY ... ORDER BY ... [ROWS BETWEEN ...])`: ranking, aggregates, and `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`, with explicit `ROWS` frames. |
 | `QUALIFY` | Filter on a window-function result (referenced by its output alias). |
 | `TABLESAMPLE` | `BERNOULLI(p PERCENT)` (fraction) or `RESERVOIR(n ROWS)` (fixed count). |
 | `CASE` | `CASE WHEN ... THEN ... ELSE ... END`. |
 | `CAST` | `CAST(expr AS type)`. |
-| Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates. |
+| Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms. See [DISTINCT aggregates](#distinct-aggregates) for what they may be mixed with. |
 | Scalar expressions | Arithmetic, comparison, boolean, and function calls (incl. registered Python functions). |
 | DDL | `CREATE [OR REPLACE] {TABLE,VIEW} … AS …` and `DROP TABLE` register/unregister a lazy table in the session. |
 
@@ -144,10 +144,96 @@ print(out.to_pydict())
 # {'category': ['a', 'b'], 'region': ['west', 'east'], 'n': [3, 2]}
 ```
 
+(distinct-aggregates)=
+### DISTINCT aggregates
+
+`COUNT(DISTINCT x)` is a native aggregate and mixes with anything. The others —
+`SUM(DISTINCT x)`, `AVG(DISTINCT x)`, `MIN`/`MAX(DISTINCT x)` — are answered by grouping on
+the group keys plus `x`, which dedups `x`, and then aggregating that. Any other aggregate in
+the same query has to survive that pre-aggregation, so it must combine from per-sub-group
+partials: `COUNT`, `SUM`, `MIN`, `MAX`, `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR`,
+`BIT_XOR`, `PRODUCT`, and `ANY_VALUE`.
+
+```python
+sales = bt.from_pydict(
+    {
+        "region": ["w", "w", "w", "e", "e"],
+        "customer": [1, 1, 2, 3, 3],
+        "amount": [10, 10, 20, 30, 40],
+    }
+)
+
+out = bt.sql(
+    """
+    SELECT region, SUM(DISTINCT customer) AS customers, SUM(amount) AS total
+    FROM sales GROUP BY region ORDER BY region
+    """,
+    sales=sales,
+)
+print(out.to_pydict())
+# {'region': ['e', 'w'], 'customers': [3, 3], 'total': [70, 40]}
+```
+
+`AVG`, `STDDEV`, `VAR`, the quantiles, and a second `COUNT(DISTINCT ...)` over a *different*
+column cannot: an average needs a sum and a count, which one column cannot carry. Those raise
+rather than approximate. Compute them in a separate subquery and join.
+
+(subqueries)=
+### Subqueries
+
+Set-membership subqueries are folded into joins, so they run as one plan rather than once per
+row. `= ANY` and `= SOME` are `IN`; `<> ALL` is `NOT IN`; all four spell the same predicate.
+
+```python
+vip = bt.from_pydict({"category": ["a", "c"]})
+
+out = bt.sql(
+    """
+    SELECT category, COUNT(*) AS n
+    FROM events
+    WHERE category = ANY (SELECT category FROM vip)
+    GROUP BY category
+    ORDER BY category
+    """,
+    events=events,
+    vip=vip,
+)
+print(out.to_pydict())
+# {'category': ['a'], 'n': [3]}
+```
+
+`EXISTS` may also sit under `OR`, where it becomes a boolean marker column instead of a
+join, because a join would drop the rows the `OR` keeps.
+
+```python
+out = bt.sql(
+    """
+    SELECT id FROM events
+    WHERE EXISTS (SELECT 1 FROM vip WHERE vip.category = events.category)
+       OR amount > 40
+    ORDER BY id
+    """,
+    events=events,
+    vip=vip,
+)
+print(out.to_pydict())
+# {'id': [1, 3, 5]}
+```
+
+Two forms raise rather than translate, both because the honest answer needs SQL's third
+truth value and the natural rewrite cannot express it:
+
+- The inequality quantifiers (`> ANY`, `>= ALL`, …). `x > ALL (S)` is UNKNOWN, not TRUE,
+  when `S` yields a NULL, and `x > (SELECT max(c) FROM S)` says TRUE because `max` skips
+  NULLs.
+- `IN` under `OR`. Write it as the `EXISTS` above, qualifying the outer column.
+
+Each error names the rewrite that works.
+
 ## Sessions, registered tables, and dialects
 
 {py:obj}`bt.Session <batcher.Session>` is the DuckDB-connection / SparkSession
-analogue: a context that holds a table catalog, registered Python functions, and a dialect. The module-level `bt.sql` and `bt.register_function` delegate to a shared default session, so the zero-setup spelling keeps working. Build a `Session` when you want to register named tables, isolate a workload, or pick a different dialect.
+analogue: a context that holds a table catalog, registered Python functions, and a dialect. The module-level {py:func}`bt.sql <batcher.sql>` and {py:func}`bt.register_function <batcher.register_function>` delegate to a shared default session, so the zero-setup spelling keeps working. Build a {py:class}`Session <batcher.Session>` when you want to register named tables, isolate a workload, or pick a different dialect.
 
 ```python
 s = bt.Session()
@@ -200,6 +286,68 @@ print(out.to_pydict())
 
 Scalar functions aren't supported directly in a `GROUP BY` key, an aggregate argument, or `ORDER BY`. Compute them in a subquery or a projected alias first.
 
+## Scoring a model from SQL
+
+`ML_PREDICT(relation, model)` appends a fitted model's predictions to a relation, so a query
+can score and then keep filtering, joining and aggregating the result without leaving SQL.
+Register the model on the session first, or name a saved one by quoted path:
+
+```python
+from batcher.ml import LinearRegression
+
+train = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
+s.register_model("doubler", LinearRegression(features=["x"], target="y").fit(train))
+s.register("points", bt.from_pydict({"x": [5.0, 10.0]}))
+
+out = s.sql("SELECT x, prediction FROM ML_PREDICT(points, doubler) ORDER BY x")
+print(out.to_pydict())
+# {'x': [5.0, 10.0], 'prediction': [10.0, 20.0]}
+```
+
+The prediction is an ordinary column, so the rest of the query sees it:
+
+```python
+out = s.sql("SELECT COUNT(*) AS n FROM ML_PREDICT(points, doubler) WHERE prediction > 15")
+print(out.to_pydict())
+# {'n': [1]}
+```
+
+The model is either a fitted `batcher.ml` estimator, which scores a relation directly, or a
+model from another framework (XGBoost, LightGBM, CatBoost, scikit-learn, ONNX) given as an
+object or a path to a saved file. A framework model is scored through
+{py:meth}`ds.ml.predict <batcher.Dataset.ml>`, so it loads once per worker and each batch
+crosses as one dense matrix.
+
+Three settings can be passed as `name => value`:
+
+| Setting | Meaning |
+|---|---|
+| `features` | The feature columns, in model order. Framework models only; a `batcher.ml` estimator was fitted with its own. |
+| `method` | What to compute, such as `predict_proba`. Defaults to `predict`. |
+| `output_column` | The name of the appended column. Defaults to `prediction`. |
+
+```python
+out = s.sql(
+    "SELECT score FROM ML_PREDICT(points, doubler, output_column => 'score') ORDER BY score"
+)
+print(out.to_pydict())
+# {'score': [10.0, 20.0]}
+```
+
+BigQuery's own spelling works too, for a query being ported rather than written fresh. It is
+BigQuery grammar, so it needs the BigQuery read dialect:
+
+```python
+bq = bt.Session(dialect="bigquery")
+bq.register("points", bt.from_pydict({"x": [5.0, 10.0]}))
+bq.register_model("doubler", LinearRegression(features=["x"], target="y").fit(train))
+out = bq.sql("SELECT x, prediction FROM ML.PREDICT(MODEL doubler, TABLE points) ORDER BY x")
+print(out.to_pydict())
+# {'x': [5.0, 10.0], 'prediction': [10.0, 20.0]}
+```
+
+Settings there go in the trailing `STRUCT`, as `ML.PREDICT(MODEL m, TABLE t, STRUCT('score' AS output_column))`.
+
 ## Defining tables and views with SQL
 
 `CREATE TABLE/VIEW ... AS` and `DROP TABLE` register and unregister a **lazy** dataset in the session catalog. Nothing is materialized until a terminal operation runs it:
@@ -212,7 +360,7 @@ print(s.sql("SELECT * FROM big_events ORDER BY id").to_pydict())
 
 ## Binding the current dataset
 
-`Dataset.sql` runs a query with the dataset bound to a name (`self` by default,
+{py:meth}`Dataset.sql <batcher.Dataset.sql>` runs a query with the dataset bound to a name (`self` by default,
 the Polars spelling), so a query can build on an existing pipeline:
 
 ```python

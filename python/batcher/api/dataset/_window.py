@@ -54,7 +54,7 @@ def _window_node(plan: LogicalPlan, alias: str, we: WindowExpr) -> Window:
         else:
             order_specs.append(SortKeySpec(_as_key_expr(key)))
     frame = WindowFrame(*we.frame) if we.frame is not None else None
-    spec = WindowFuncSpec(we.func, we.input, alias, we.offset, frame)
+    spec = WindowFuncSpec(we.func, we.input, alias, we.offset, frame, we.alpha, we.half_life)
     return Window(plan, part_keys, tuple(order_specs), (spec,))
 
 

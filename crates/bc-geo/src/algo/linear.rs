@@ -11,7 +11,8 @@
 //! so it is refused rather than silently answered against whichever member happens to
 //! be first.
 
-use crate::algo::primitive::{closest_on_segment, dist};
+use crate::algo::primitive::{closest_on_segment, dist, segment_intersection, PointRing};
+use crate::algo::relate::point_in_geometry;
 use crate::error::{GeoError, GeoResult};
 use crate::types::{Coord, Geometry, LineString};
 
@@ -197,48 +198,119 @@ pub fn segmentize(g: &Geometry, max_len: f64) -> GeoResult<Geometry> {
 /// Asymmetric on purpose, like PostGIS `ST_ClosestPoint`: it returns a point *on the
 /// first geometry*, which is what a snap-to-road or snap-to-boundary step needs.
 pub fn closest_point(g: &Geometry, other: &Geometry) -> Option<Geometry> {
-    let targets: Vec<Coord> = {
-        let mut v = Vec::new();
-        other.collect_coords(&mut v);
-        v
-    };
-    if targets.is_empty() {
-        return None;
-    }
-    let mut best: Option<(f64, Coord)> = None;
-    let mut consider = |c: Coord, to: Coord| {
-        let d = dist(c, to);
-        if best.is_none_or(|(bd, _)| d < bd) {
-            best = Some((d, c));
-        }
-    };
-    for t in &targets {
-        for l in g.lines() {
-            if l.len() == 1 {
-                consider(l[0], *t);
-            }
-            for w in l.windows(2) {
-                consider(closest_on_segment(*t, w[0], w[1]).0, *t);
-            }
-        }
-        for p in g.points() {
-            consider(p, *t);
-        }
-    }
-    best.map(|(_, c)| Geometry::Point(Some(c)))
+    closest_pair(g, other).map(|(p, _)| Geometry::Point(Some(p)))
 }
 
 /// The two-point line joining the closest positions of two geometries.
 pub fn shortest_line(a: &Geometry, b: &Geometry) -> Option<Geometry> {
-    let pa = match closest_point(a, b)? {
-        Geometry::Point(Some(c)) => c,
-        _ => return None,
-    };
-    let pb = match closest_point(b, &Geometry::Point(Some(pa)))? {
-        Geometry::Point(Some(c)) => c,
-        _ => return None,
-    };
-    Some(Geometry::LineString(vec![pa, pb]))
+    closest_pair(a, b).map(|(p, q)| Geometry::LineString(vec![p, q]))
+}
+
+/// One position on each geometry, realizing the minimum distance between them.
+///
+/// The sweep is over *segment pairs*, not over one geometry's vertices. Two chains
+/// approach each other most closely between vertices as often as at one: think of two
+/// long roads crossing at a shallow angle, where the nearest positions are interior to
+/// both. Scoring only the vertices of `other` against `g` answers a different question,
+/// and it is the reason `ST_Length(ST_ShortestLine(a, b))` used to disagree with
+/// `ST_Distance(a, b)` — which is measured segment-to-segment.
+///
+/// Containment is the other case a linework sweep cannot see: a point inside a polygon
+/// touches no ring, so it is scored against the boundary and reported as far away when
+/// the distance is zero. Every position of one geometry that lies in the other is
+/// therefore offered as its own nearest pair.
+fn closest_pair(a: &Geometry, b: &Geometry) -> Option<(Coord, Coord)> {
+    let mut best: Option<(f64, Coord, Coord)> = None;
+    {
+        let mut consider = |p: Coord, q: Coord| {
+            let d = dist(p, q);
+            if best.is_none_or(|(bd, _, _)| d < bd) {
+                best = Some((d, p, q));
+            }
+        };
+        for ea in elements(a) {
+            for eb in elements(b) {
+                let (p, q) = closest_between(ea, eb);
+                consider(p, q);
+            }
+        }
+        // A position of one geometry lying in the other is at distance zero from it, and
+        // is its own closest counterpart.
+        let mut coords_a = Vec::new();
+        a.collect_coords(&mut coords_a);
+        for c in coords_a {
+            if point_in_geometry(c, b) != PointRing::Outside {
+                consider(c, c);
+            }
+        }
+        let mut coords_b = Vec::new();
+        b.collect_coords(&mut coords_b);
+        for c in coords_b {
+            if point_in_geometry(c, a) != PointRing::Outside {
+                consider(c, c);
+            }
+        }
+    }
+    best.map(|(_, p, q)| (p, q))
+}
+
+/// A geometry decomposed into the primitives distance is measured between.
+#[derive(Clone, Copy)]
+enum Elem {
+    /// An isolated position: a POINT member, or a degenerate one-vertex chain.
+    Position(Coord),
+    /// One segment of a chain or a polygon ring.
+    Segment(Coord, Coord),
+}
+
+/// Every position and segment of a geometry, rings included.
+fn elements(g: &Geometry) -> Vec<Elem> {
+    let mut out = Vec::new();
+    for l in g.lines() {
+        if l.len() == 1 {
+            out.push(Elem::Position(l[0]));
+            continue;
+        }
+        for w in l.windows(2) {
+            out.push(Elem::Segment(w[0], w[1]));
+        }
+    }
+    for p in g.points() {
+        out.push(Elem::Position(p));
+    }
+    out
+}
+
+/// The nearest pair of positions between two primitives, first one on `x`.
+fn closest_between(x: Elem, y: Elem) -> (Coord, Coord) {
+    match (x, y) {
+        (Elem::Position(p), Elem::Position(q)) => (p, q),
+        (Elem::Position(p), Elem::Segment(c, d)) => (p, closest_on_segment(p, c, d).0),
+        (Elem::Segment(a, b), Elem::Position(q)) => (closest_on_segment(q, a, b).0, q),
+        (Elem::Segment(a, b), Elem::Segment(c, d)) => {
+            // Crossing segments meet, so the nearest pair is the crossing position on
+            // both sides. Taken from `segment_intersection` rather than from a vertex
+            // projection, which cannot reach a crossing interior to both segments.
+            if let Some(p) = segment_intersection(a, b, c, d) {
+                return (p, p);
+            }
+            // Otherwise the minimum is attained with at least one endpoint involved, so
+            // the four endpoint projections cover it.
+            let candidates = [
+                (closest_on_segment(c, a, b).0, c),
+                (closest_on_segment(d, a, b).0, d),
+                (a, closest_on_segment(a, c, d).0),
+                (b, closest_on_segment(b, c, d).0),
+            ];
+            let mut best = candidates[0];
+            for cand in &candidates[1..] {
+                if dist(cand.0, cand.1) < dist(best.0, best.1) {
+                    best = *cand;
+                }
+            }
+            best
+        }
+    }
 }
 
 /// A position guaranteed to lie on the geometry — inside it when it has an interior.
@@ -345,5 +417,31 @@ mod tests {
             crate::algo::relate::point_in_geometry(coord, &c),
             crate::algo::primitive::PointRing::Inside
         );
+    }
+
+    #[test]
+    fn the_shortest_line_is_as_long_as_the_distance() {
+        // The closest approach of these two chains is interior to a segment of each, so a
+        // sweep over the other geometry's vertices lands nowhere near it.
+        let a = geom("LINESTRING(0 0, 10 0)");
+        let b = geom("LINESTRING(3 5, 7 5)");
+        let line = shortest_line(&a, &b).expect("line");
+        let coords = match &line {
+            Geometry::LineString(l) => l.clone(),
+            other => panic!("expected a line, got {other:?}"),
+        };
+        assert!((dist(coords[0], coords[1]) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_closest_point_to_a_contained_position_is_that_position() {
+        let square = geom("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))");
+        let inside = geom("POINT(4 6)");
+        match closest_point(&square, &inside).expect("point") {
+            Geometry::Point(Some(c)) => {
+                assert!((c.x - 4.0).abs() < 1e-9 && (c.y - 6.0).abs() < 1e-9);
+            }
+            other => panic!("expected a point, got {other:?}"),
+        }
     }
 }

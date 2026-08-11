@@ -263,6 +263,12 @@ so copying it is much cheaper than regenerating it. A replica is advertised only
 its copy has been acknowledged, and a source's replicas are retired when it's
 recomputed, so a reducer can never read a stale replica under a superseded epoch.
 
+Every Flight shuffle takes it: aggregate, join, sort, and window. A wide aggregate
+reduces through a combiner tree, and each level's merged partials are copied off-node
+before the next level is built on them, so losing a combiner costs a re-fetch rather
+than discarding every level built so far. That is the cheapest copy in the shuffle,
+because a level's output is several partials already merged into one.
+
 ## Requirements and limitations
 
 Fault tolerance applies to the distributed path, which needs the optional `[ray]`
@@ -271,13 +277,8 @@ overhead.
 
 - Shuffle output is held in memory. `bc-transport`'s partition store has no disk tier,
   so a lost worker's buckets are gone unless replication placed a copy elsewhere.
-- Shuffle-output replication covers the flat aggregate reduce. A wide shuffle, where
-  the worker count exceeds the fan-in and the reduce goes through the combiner tree,
-  doesn't thread replicas and still degrades to recompute.
 - `shuffle_replication` defaults to 1, meaning no replica. Only the `"spot"` profile
-  raises it.
-- `speculation_max_backups` defaults to 0, so speculative execution is off until you
-  turn it on or select the `"spot"` profile.
+  raises it, which a preemptible environment selects automatically.
 - Draining runs only under the `"spot"` profile, so a stable cluster starts no monitor
   and pays nothing. A preemptible or time-limited environment selects that profile
   automatically, but a cluster whose signals Batcher can't see needs `BATCHER_SPOT=1`,

@@ -75,9 +75,10 @@ pub struct FooterStats {
     pub files_read: usize,
     /// Per-column non-bound facts, in schema order.
     pub columns: Vec<ColumnFooterStats>,
-    /// Whether every row group of every file declares the *same* leading sorting column,
-    /// ascending and nulls-last — the necessary precondition for claiming the dataset is
-    /// globally sorted, and nothing more.
+    /// Whether every row group of every file declares the *same* leading sorting column
+    /// running the *same* direction — the necessary precondition for claiming the dataset
+    /// is globally sorted, and nothing more. Either direction qualifies; `nulls_first` is
+    /// not part of the agreement, because the prover refuses a key holding any null.
     ///
     /// Deliberately not the claim itself. `SourceStatistics.sorted_by` lets Kyber *delete*
     /// a `Sort`, so getting it wrong reorders a user's rows silently rather than merely
@@ -467,7 +468,7 @@ pub fn parquet_footer_stats(uris: &[String]) -> Result<FooterStats, IoError> {
         (0i64, 0i64, 0i64, 0);
     // A gap in the footers breaks any sort proof — the missing file could hold anything —
     // so an unreadable file forces the flag off, exactly as `proved_sorted_by` bails on one.
-    let mut sort_key: Option<i32> = None;
+    let mut sort_key: Option<(i32, bool)> = None;
     let mut sort_possible = metas.iter().all(Option::is_some) && !metas.is_empty();
 
     for amd in metas.iter().flatten() {
@@ -509,26 +510,31 @@ pub fn parquet_footer_stats(uris: &[String]) -> Result<FooterStats, IoError> {
     })
 }
 
-/// Whether `rg` declares the same ascending, nulls-last leading sorting column as its
-/// predecessors, recording it on the first row group seen.
+/// Whether `rg` declares the same leading sorting column *and direction* as its
+/// predecessors, recording them on the first row group seen.
 ///
-/// Descending and nulls-first are *different* orderings than the canonical one
-/// `sorted_by` denotes, so they are refused rather than reinterpreted — reinterpreting
-/// them is precisely the wrong-order bug this whole path is careful about.
-fn agrees_on_sort_key(rg: &RowGroupMetaData, sort_key: &mut Option<i32>) -> bool {
+/// This decides one thing only: whether a global-sortedness claim is worth *proving*.
+/// Both directions are worth proving — a descending key is an ordinary way to store an
+/// event table, and `SortOrder` records which way a key runs, so there is no
+/// reinterpretation to get wrong. Row groups that disagree about the direction describe
+/// no single ordering, so they end the possibility here and nothing is claimed.
+///
+/// `nulls_first` is deliberately not part of the key. The prover this routes to
+/// (`io.stats.sortedness`) refuses any row group whose key holds a null, so the flag
+/// describes the placement of rows that are proved not to exist; letting it split the
+/// agreement would only decline datasets the prover would have settled.
+fn agrees_on_sort_key(rg: &RowGroupMetaData, sort_key: &mut Option<(i32, bool)>) -> bool {
     let Some(cols) = rg.sorting_columns() else {
         return false;
     };
     let Some(first) = cols.first() else {
         return false;
     };
-    if first.descending || first.nulls_first {
-        return false;
-    }
+    let declared = (first.column_idx, first.descending);
     match sort_key {
-        Some(existing) => *existing == first.column_idx,
+        Some(existing) => *existing == declared,
         None => {
-            *sort_key = Some(first.column_idx);
+            *sort_key = Some(declared);
             true
         }
     }
@@ -580,8 +586,26 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// A directory private to the caller, so two tests can pick the same file name.
+    ///
+    /// It used to be one directory shared by every test in this module, and that is a race
+    /// rather than a tidiness question: `reports_a_descending_sort_declaration` and
+    /// `refuses_files_disagreeing_about_sort_direction` both write `desc.parquet`, cargo runs
+    /// them on different threads, and whichever read landed while the other was rewriting the
+    /// file saw row groups that disagreed about the sort direction. It failed about two runs
+    /// in five, and it failed as `assert!(st.sort_declared)` — an assertion about *the writer's
+    /// metadata*, pointing nowhere near the actual cause.
+    ///
+    /// The counter is what makes it private; the process id alone does not, since all of these
+    /// tests share one process.
     fn tmpdir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("bcio_fs_{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "bcio_fs_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::create_dir_all(&d);
         d
     }
@@ -741,10 +765,11 @@ mod tests {
         assert!(st.sort_declared);
     }
 
-    /// A descending declaration is a *different* ordering than `sorted_by` denotes, so it
-    /// must not set the flag — reinterpreting it is the wrong-order bug.
+    /// A *descending* declaration is an ordering too, and one worth proving: the flag
+    /// routes it to the prover exactly as an ascending one does, and `SortOrder` records
+    /// the direction so nothing is reinterpreted.
     #[test]
-    fn refuses_a_descending_sort_declaration() {
+    fn reports_a_descending_sort_declaration() {
         use parquet::format::SortingColumn;
         let d = tmpdir();
         let path = d.join("desc.parquet");
@@ -758,7 +783,33 @@ mod tests {
         w.write(&batch).unwrap();
         w.close().unwrap();
         let st = parquet_footer_stats(&[path.to_string_lossy().into_owned()]).unwrap();
-        assert!(!st.sort_declared);
+        assert!(st.sort_declared);
+    }
+
+    /// Two files that disagree about which way the key runs describe no single ordering,
+    /// so no claim is even possible and the caller takes the cheap path.
+    #[test]
+    fn refuses_files_disagreeing_about_sort_direction() {
+        use parquet::format::SortingColumn;
+        let d = tmpdir();
+        let mut paths = Vec::new();
+        for (name, descending, rows) in [
+            ("asc.parquet", false, (0..50).collect::<Vec<i64>>()),
+            ("desc.parquet", true, (50..100).rev().collect::<Vec<i64>>()),
+        ] {
+            let path = d.join(name);
+            let batch = int_batch(rows);
+            let props = WriterProperties::builder()
+                .set_max_row_group_size(10)
+                .set_sorting_columns(Some(vec![SortingColumn::new(0, descending, false)]))
+                .build();
+            let file = std::fs::File::create(&path).unwrap();
+            let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        assert!(!parquet_footer_stats(&paths).unwrap().sort_declared);
     }
 
     /// The intermediate collapse at `BOUND_COLLAPSE_AT` is only sound because folding is

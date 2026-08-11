@@ -1,10 +1,22 @@
-//! MEDIAN / continuous-quantile — exact, mergeable via a per-group value list
-//! (no dedup, unlike COUNT(DISTINCT)).
+//! Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup
+//! (unlike COUNT(DISTINCT)).
+//!
+//! Two families share that one state, which is why they share this module. The *order*
+//! statistics (median, quantile, `array_agg`) answer a question about a rank. The
+//! *contiguity* statistics (N50, N90, L50, auN) answer one about how a total is distributed
+//! across the values — genome-assembly quality — and are emphatically not quantiles of the
+//! same numbers: a median weighs every item equally, so an assembly of one 10 Mb chromosome
+//! plus a thousand 500 bp fragments has a median of 500 and an N50 of 10 Mb.
+//!
+//! Because both fold into the same `List` partial, the contiguity family is mergeable for
+//! free: only the finalize differs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Float64Builder, Int64Array, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, Float64Builder, Int64Array, Int64Builder, UInt32Array,
+};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::row::{RowConverter, SortField};
@@ -164,7 +176,7 @@ fn finalize_select(
 
 /// One group's non-null values as `f64` (Int64 widened). The list state is Int64 or
 /// Float64 element lists; any other element type is an unsupported aggregate.
-fn group_values_f64(vals: &ArrayRef, func: &str) -> Result<Vec<f64>, RuntimeError> {
+pub(super) fn group_values_f64(vals: &ArrayRef, func: &str) -> Result<Vec<f64>, RuntimeError> {
     match vals.data_type() {
         DataType::Int64 => {
             let a = vals.as_primitive::<Int64Type>();
@@ -526,6 +538,140 @@ pub(crate) fn finalize_histogram(state: &ArrayRef) -> Result<ArrayRef, RuntimeEr
     Ok(Arc::new(map))
 }
 
+/// Which contiguity statistic a finalize computes.
+///
+/// One enum rather than four functions because they share the whole computation up to the
+/// last line: sort descending, walk the cumulative sum. Splitting them would be four copies
+/// of the loop that has to agree on the `>=` boundary — which is exactly the detail these
+/// statistics are most often got wrong on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Contiguity {
+    /// `n50`/`n90` → the *length* of the piece at which the running total first reaches the
+    /// stated fraction of the assembly. The permille is carried so `n50` and `n90` are one
+    /// code path (500 and 900).
+    NLength(u16),
+    /// `l50`/`l90` → the *count* of pieces needed to reach that fraction. The companion of
+    /// `NLength`, and the one people mix it up with: N is a length, L is a count.
+    LCount(u16),
+    /// `auN` → the area under the Nx curve, `Σ(lᵢ²) / Σ(lᵢ)`.
+    ///
+    /// The one statistic here with no threshold, which is the point of it. N50 is a step
+    /// function of the length distribution, so a single contig crossing the halfway mark
+    /// moves it discontinuously and two assemblies can swap rank on a rounding difference.
+    /// auN integrates over every threshold instead and is continuous in the lengths.
+    AuN,
+}
+
+/// Sort descending and return the total, in place.
+///
+/// Descending is the whole definition: N50 asks about the *largest* pieces holding half the
+/// sequence, so an ascending walk answers a different question with the same shape — which is
+/// the failure mode a hand-written version has, and it produces a plausible smaller number
+/// rather than an error.
+fn prepare(values: &mut Vec<f64>) -> f64 {
+    // A negative length is not a contig; a NaN is not a length. Both are dropped rather than
+    // sorted, because either would corrupt the total that every statistic divides by — and
+    // NaN would additionally make the comparator inconsistent, which `sort_unstable_by` is
+    // entitled to turn into an arbitrary order.
+    values.retain(|v| v.is_finite() && *v >= 0.0);
+    values.sort_unstable_by(|a, b| b.partial_cmp(a).expect("NaN and infinity were filtered"));
+    values.iter().sum()
+}
+
+/// Compute one contiguity statistic from a group's lengths.
+///
+/// Returns `None` for a group with no usable lengths, and for one whose lengths sum to zero —
+/// a set of zero-length contigs has no piece that holds half of nothing, and every statistic
+/// here divides by that total.
+pub(crate) fn contiguity(values: &mut Vec<f64>, what: Contiguity) -> Option<f64> {
+    let total = prepare(values);
+    if values.is_empty() || total <= 0.0 {
+        return None;
+    }
+    if let Contiguity::AuN = what {
+        // Σ(l²)/Σ(l). Equivalently the base-weighted mean length: each base contributes the
+        // length of the contig it sits in. No sort is needed, but it shares this function so
+        // the null and filtering rules cannot drift from its siblings'.
+        return Some(values.iter().map(|l| l * l).sum::<f64>() / total);
+    }
+    let permille = match what {
+        Contiguity::NLength(p) | Contiguity::LCount(p) => p,
+        Contiguity::AuN => unreachable!("handled above"),
+    };
+    let target = total * f64::from(permille) / 1000.0;
+    let mut running = 0.0;
+    for (i, &length) in values.iter().enumerate() {
+        running += length;
+        // `>=`, not `>`. At exactly half the assembly the piece that got you there *is* the
+        // N50 piece; requiring a strict excess shifts the answer one contig down the sorted
+        // list whenever the split is exact, which is common in a synthetic or a balanced
+        // assembly and invisible in a real one.
+        if running >= target {
+            return Some(match what {
+                Contiguity::NLength(_) => length,
+                // 1-based: L50 counts pieces, and "you need 3 contigs" is the answer, not 2.
+                Contiguity::LCount(_) => (i + 1) as f64,
+                Contiguity::AuN => unreachable!("handled above"),
+            });
+        }
+    }
+    // Floating-point summation can leave `running` a few ulps under `target` after consuming
+    // every value. The last piece is the answer in that case, by definition.
+    Some(match what {
+        Contiguity::NLength(_) => *values.last().expect("non-empty"),
+        Contiguity::LCount(_) => values.len() as f64,
+        Contiguity::AuN => unreachable!("handled above"),
+    })
+}
+
+/// Finalize a contiguity statistic per group, across cores.
+///
+/// `L50` is a count and comes back Int64; the rest are lengths or a weighted mean and come
+/// back Float64. Typing L50 as a float would be the same mistake as reporting a row count as
+/// one — it is a number of contigs, and no assembly has 3.5 of them.
+pub(crate) fn finalize_contiguity(
+    state: &ArrayRef,
+    what: Contiguity,
+) -> Result<ArrayRef, RuntimeError> {
+    use rayon::prelude::*;
+
+    let list = state.as_list::<i32>();
+    let name = match what {
+        Contiguity::NLength(500) => "n50",
+        Contiguity::NLength(900) => "n90",
+        Contiguity::LCount(500) => "l50",
+        Contiguity::LCount(900) => "l90",
+        Contiguity::NLength(_) | Contiguity::LCount(_) => "nx",
+        Contiguity::AuN => "aun",
+    };
+    let results: Vec<Option<f64>> = (0..list.len())
+        .into_par_iter()
+        .map(|row| -> Result<Option<f64>, RuntimeError> {
+            let mut v = group_values_f64(&list.value(row), name)?;
+            Ok(contiguity(&mut v, what))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if let Contiguity::LCount(_) = what {
+        let mut b = Int64Builder::with_capacity(results.len());
+        for r in results {
+            match r {
+                Some(v) => b.append_value(v as i64),
+                None => b.append_null(),
+            }
+        }
+        return Ok(std::sync::Arc::new(b.finish()));
+    }
+    let mut b = Float64Builder::with_capacity(results.len());
+    for r in results {
+        match r {
+            Some(v) => b.append_value(v),
+            None => b.append_null(),
+        }
+    }
+    Ok(std::sync::Arc::new(b.finish()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,5 +907,137 @@ mod tests {
         // The 3rd-of-4 quantile (q=2/3) brackets ranks 2 and 3 → value 3.0, never the NaN.
         let mut v2 = vec![1.0, 2.0, 3.0, neg_nan];
         assert_eq!(super::quickselect_quantile(&mut v2, 2.0 / 3.0), 3.0);
+    }
+
+    mod contiguity_tests {
+        use super::super::*;
+
+        fn stat(mut lengths: Vec<f64>, what: Contiguity) -> Option<f64> {
+            contiguity(&mut lengths, what)
+        }
+
+        #[test]
+        fn n50_is_the_textbook_worked_example() {
+            // Lengths 1..=9 sum to 45; half is 22.5. Descending: 9 (9), 8 (17), 7 (24) — 24 is
+            // the first total at or past 22.5, so N50 is 7 and L50 is 3.
+            let l = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+            assert_eq!(stat(l.clone(), Contiguity::NLength(500)), Some(7.0));
+            assert_eq!(stat(l, Contiguity::LCount(500)), Some(3.0));
+        }
+
+        #[test]
+        fn n50_weighs_by_base_where_a_median_weighs_by_contig() {
+            // One chromosome and a thousand fragments. The median describes the debris; N50
+            // describes the assembly. This is the entire reason the statistic exists.
+            let mut lengths = vec![10_000_000.0];
+            lengths.extend(std::iter::repeat_n(500.0, 1000));
+            assert_eq!(
+                stat(lengths.clone(), Contiguity::NLength(500)),
+                Some(10_000_000.0)
+            );
+            // The median of the same multiset is 500.
+            let mut sorted = lengths;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(sorted[sorted.len() / 2], 500.0);
+        }
+
+        #[test]
+        fn n90_reaches_further_down_the_list_than_n50() {
+            let l = vec![100.0, 50.0, 20.0, 10.0, 5.0, 1.0];
+            let n50 = stat(l.clone(), Contiguity::NLength(500)).unwrap();
+            let n90 = stat(l.clone(), Contiguity::NLength(900)).unwrap();
+            assert!(n90 <= n50, "N90 {n90} must not exceed N50 {n50}");
+            let l50 = stat(l.clone(), Contiguity::LCount(500)).unwrap();
+            let l90 = stat(l, Contiguity::LCount(900)).unwrap();
+            assert!(l90 >= l50, "L90 {l90} must not be under L50 {l50}");
+        }
+
+        #[test]
+        fn the_boundary_is_inclusive() {
+            // Two equal contigs: the first one *reaches* exactly half, so it is the N50 piece and
+            // L50 is 1. A strict `>` would walk on and answer 2, which is the classic off-by-one.
+            assert_eq!(stat(vec![10.0, 10.0], Contiguity::LCount(500)), Some(1.0));
+            assert_eq!(stat(vec![10.0, 10.0], Contiguity::NLength(500)), Some(10.0));
+        }
+
+        #[test]
+        fn a_single_contig_is_its_own_n50() {
+            assert_eq!(stat(vec![42.0], Contiguity::NLength(500)), Some(42.0));
+            assert_eq!(stat(vec![42.0], Contiguity::LCount(500)), Some(1.0));
+            assert_eq!(stat(vec![42.0], Contiguity::AuN), Some(42.0));
+        }
+
+        #[test]
+        fn aun_is_the_base_weighted_mean_length() {
+            // Σ(l²)/Σ(l): each base contributes the length of the contig holding it.
+            let l = vec![10.0, 20.0, 30.0];
+            let expect = (100.0 + 400.0 + 900.0) / 60.0;
+            assert!((stat(l, Contiguity::AuN).unwrap() - expect).abs() < 1e-12);
+        }
+
+        #[test]
+        fn aun_is_continuous_where_n50_steps() {
+            // The reason auN exists. Nudging one contig across the halfway mark moves N50
+            // discontinuously; auN barely moves.
+            let a = vec![100.0, 99.0, 98.0];
+            let b = vec![100.0, 101.0, 98.0];
+            let (n_a, n_b) = (
+                stat(a.clone(), Contiguity::NLength(500)).unwrap(),
+                stat(b.clone(), Contiguity::NLength(500)).unwrap(),
+            );
+            let (u_a, u_b) = (
+                stat(a, Contiguity::AuN).unwrap(),
+                stat(b, Contiguity::AuN).unwrap(),
+            );
+            assert!((u_a - u_b).abs() < (n_a - n_b).abs().max(1.0) * 2.0);
+            assert!(u_a > 0.0 && u_b > 0.0);
+        }
+
+        #[test]
+        fn negative_and_non_finite_lengths_are_excluded_not_summed() {
+            // A negative length would cancel real sequence out of the total and lower every
+            // statistic; a NaN would additionally make the sort comparator inconsistent.
+            let clean = stat(vec![9.0, 8.0, 7.0], Contiguity::NLength(500));
+            let dirty = stat(
+                vec![9.0, -100.0, 8.0, f64::NAN, 7.0, f64::INFINITY],
+                Contiguity::NLength(500),
+            );
+            assert_eq!(clean, dirty);
+        }
+
+        #[test]
+        fn an_empty_or_all_zero_group_has_no_statistic() {
+            for what in [
+                Contiguity::NLength(500),
+                Contiguity::LCount(500),
+                Contiguity::AuN,
+            ] {
+                assert_eq!(stat(vec![], what), None);
+                assert_eq!(stat(vec![0.0, 0.0], what), None, "zero-length contigs");
+            }
+        }
+
+        #[test]
+        fn the_statistic_does_not_depend_on_the_arrival_order() {
+            // The mergeability property, at the finalize level: concatenating two partials in
+            // either order must give the same answer, which holds iff the finalize is
+            // order-independent. The operator-level invariant is tested in `bc-interp`.
+            let mut a = vec![1.0, 9.0, 3.0, 7.0, 5.0];
+            let mut b = vec![5.0, 7.0, 3.0, 9.0, 1.0];
+            for what in [
+                Contiguity::NLength(500),
+                Contiguity::LCount(500),
+                Contiguity::NLength(900),
+                Contiguity::AuN,
+            ] {
+                assert_eq!(
+                    contiguity(&mut a.clone(), what),
+                    contiguity(&mut b.clone(), what),
+                    "{what:?} depended on order"
+                );
+            }
+            a.clear();
+            b.clear();
+        }
     }
 }

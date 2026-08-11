@@ -17,10 +17,12 @@ from __future__ import annotations
 
 from sqlglot import expressions as exp
 
+from batcher._sql.parser.expressions.literals import _const_int_arg, _const_str_arg
+from batcher._sql.parser.expressions.maps import map_subscript
 from batcher.plan.expr_ir import Expr, array, lit, nullif, when
 from batcher.plan.functions.collection import element, sequence
 
-__all__ = ["collection_function"]
+__all__ = ["collection_function", "list_function"]
 
 # `f(vector, other)` → a binary `.list` method. Spark's `vector_*` family is the same
 # arithmetic as the engine's embedding methods under different names.
@@ -212,3 +214,239 @@ def _array_insert(tr, node) -> Expr | None:
     head = xs.list.slice(0, position - 1)
     tail = xs.list.slice(position - 1, 2**31 - 1)
     return head.list.concat(value).list.concat(tail)
+
+
+# Typed `Array*` reduction nodes → `.list` method name. `SortArray` is *not* here: it
+# carries a direction (`list_reverse_sort` parses as `SortArray(asc=False)`) that a bare
+# method name cannot express, and folding it in here sorted descending calls ascending.
+_LIST_REDUCE = {
+    "ArrayMin": "min",
+    "ArrayMax": "max",
+    "ArraySum": "sum",
+    "ArrayDistinct": "unique",
+}
+# `list_*` functions that sqlglot parses as `Anonymous` → `.list` method name. DuckDB
+# spells every one of these `array_*` as well; `_list_anon_method` strips either prefix,
+# so the keys are the bare operation.
+#
+# `unique` is the trap: DuckDB's `list_unique` returns the **count** of distinct
+# elements, and `list_distinct` returns the distinct elements. Mapping both to the
+# distinct list returned a list where DuckDB returns an integer.
+_LIST_ANON = {
+    "sum": "sum",
+    "avg": "mean",
+    "mean": "mean",
+    "product": "product",
+    "reverse": "reverse",
+    "unique": "n_unique",
+    "distinct": "unique",
+    # `count` is deliberately absent: it ignores nulls and is handled above, where the
+    # two-step composition it needs can be expressed.
+    "length": "len",
+    "min": "min",
+    "max": "max",
+}
+
+# Two-argument vector functions → the binary `.list` method. Both DuckDB's canonical
+# `list_*` spellings and the bare names are accepted, so a vector search reads naturally in
+# SQL: ``ORDER BY cosine_similarity(emb, [0.1, 0.2]) DESC LIMIT 10``. This is the SQL-level
+# vector-search / embedding-math surface (cf. DuckDB's list functions, BigQuery `ML.DISTANCE`).
+_LIST_BINARY_ANON = {
+    "list_cosine_similarity": "cosine_similarity",
+    "cosine_similarity": "cosine_similarity",
+    "list_cosine_distance": "cosine_distance",
+    "cosine_distance": "cosine_distance",
+    "list_distance": "l2_distance",  # DuckDB's L2 spelling
+    "l2_distance": "l2_distance",
+    "euclidean_distance": "l2_distance",
+    "l1_distance": "l1_distance",
+    "manhattan_distance": "l1_distance",
+    "hamming_distance": "hamming_distance",
+    "list_dot_product": "dot",
+    "list_inner_product": "dot",
+    "inner_product": "dot",
+    "dot_product": "dot",
+    "list_jaccard": "jaccard",
+    # Element-wise vector arithmetic.
+    "list_add": "add",
+    "list_subtract": "subtract",
+    "list_multiply": "multiply",
+}
+
+# sqlglot expression *types* (not `Anonymous`) for two-arg vector functions → binary method.
+_LIST_TYPED_BINARY = {
+    "EuclideanDistance": "l2_distance",
+    "CosineDistance": "cosine_distance",
+    "DotProduct": "dot",
+}
+
+
+def list_function(tr, node):
+    """List/array operations dispatched to the `.list` namespace, or None."""
+    if isinstance(node, exp.ArraySize):  # array_length / len(list)
+        return tr._scalar(node.this).list.len()
+    if isinstance(node, exp.ArrayContainsAll):  # array_has_all / arrays_contain_all
+        return tr._scalar(node.this).list.has_all(tr._scalar(node.expression))
+    if isinstance(node, exp.ArrayOverlaps):  # list_has_any / arrays_overlap
+        return tr._scalar(node.this).list.has_any(tr._scalar(node.expression))
+    if isinstance(node, exp.ArrayConcat):
+        # `list_concat`/`array_cat` — sqlglot puts the first operand in `this` and the
+        # rest in `expressions`, so a three-way concat folds left to right.
+        result = tr._scalar(node.this)
+        for operand in node.expressions:
+            result = result.list.concat(tr._scalar(operand))
+        return result
+    if isinstance(node, exp.Flatten):  # flatten(list-of-lists) — one level
+        return tr._scalar(node.this).list.flatten()
+    if isinstance(node, exp.ArraySort):  # array_sort(l) without a comparator
+        if node.expression is not None:
+            raise NotImplementedError("array_sort with a comparator is not supported")
+        return tr._scalar(node.this).list.sort()
+    if isinstance(node, exp.ArrayToString):  # array_join(l, sep) / list_aggr concat
+        sep = _const_str_arg(node.expression, "array_join()", "separator")
+        return tr._scalar(node.this).list.join(sep)
+    if isinstance(node, exp.ArrayPosition):
+        # Spark's `array_position(l, v)` is the 1-based index of `v`, 0 when absent —
+        # which is what `.list.position` returns.
+        return tr._scalar(node.this).list.position(_raw_value(node.expression))
+    if isinstance(node, exp.ArraySlice):
+        # `slice(l, start, length)`. SQL counts the start from 1 and `.list.slice` from
+        # 0, so the index is shifted; sqlglot names the second operand `end`, but Spark's
+        # is a *length*, so it passes through as the length rather than as an index.
+        # Getting either wrong returns a plausible window one element along.
+        start = _const_int_arg(node.args["start"], "slice(): start")
+        size = node.args.get("end")
+        length = _const_int_arg(size, "slice(): length") if size is not None else None
+        return tr._scalar(node.this).list.slice(start - 1, length)
+    if isinstance(node, exp.ArrayContains):  # list_contains(a, v)
+        return tr._scalar(node.this).list.contains(_raw_value(node.expression))
+    if isinstance(node, exp.Bracket):
+        # `a[i]`. sqlglot 0-bases the index for the dialects whose subscript is 1-based
+        # (duckdb, postgres) and leaves `offset` unset; where it cannot, it keeps the
+        # written index and records the base in `offset` — Spark's `element_at(a, 2)`
+        # becomes `Bracket(expressions=[2], offset=1)`. Ignoring `offset` made every such
+        # subscript return the *next* element: `element_at(array(1,2,3), 2)` answered 3.
+        idxs = node.expressions
+        if len(idxs) == 1 and not isinstance(idxs[0], exp.Slice):
+            # A map subscript is the same node as a list one, so `maps` reads it first.
+            if (as_map := map_subscript(tr, node)) is not None:
+                return as_map
+            offset = int(node.args.get("offset") or 0)
+            index = _subscript_value(idxs[0])
+            if index < 0:
+                # A negative subscript counts from the end (`a[-1]` is the last element),
+                # which is what `.list.get` already means — but sqlglot 0-bases a 1-based
+                # dialect by subtracting one from *whatever was written*, negatives
+                # included. Undo it there, and only there.
+                index = index + 1 if offset == 0 else index
+                return tr._scalar(node.this).list.get(index)
+            return tr._scalar(node.this).list.get(index - offset)
+        if len(idxs) == 1 and isinstance(idxs[0], exp.Slice):
+            return _list_slice(tr, node, idxs[0])
+        return None
+    reduce = _LIST_REDUCE.get(type(node).__name__)
+    if reduce is not None:
+        return getattr(tr._scalar(node.this).list, reduce)()
+    if isinstance(node, exp.SortArray):
+        # `list_sort(l)` ascending; `list_reverse_sort(l)` descending — the latter
+        # parses as the same node with `asc=False`, which used to be dropped, so
+        # `list_reverse_sort` returned the ascending order.
+        value = tr._scalar(node.this)
+        asc = node.args.get("asc")
+        descending = asc is not None and not _boolean_arg(asc)
+        # Descending is its own kernel rather than `sort().reverse()`. Ascending places
+        # nulls last, so reversing lands them at the *front*, where DuckDB keeps them at
+        # the back — `list_reverse_sort([4, NULL, 6])` is `[6, 4, NULL]`, not
+        # `[NULL, 6, 4]`.
+        return value.list.sort_desc() if descending else value.list.sort()
+    # sqlglot promotes a few vector functions to typed nodes (two args in `this`/`expression`)
+    # rather than `Anonymous`; dispatch them to the same binary `.list` methods.
+    typed_binary = _LIST_TYPED_BINARY.get(type(node).__name__)
+    if typed_binary is not None:
+        return getattr(tr._scalar(node.this).list, typed_binary)(tr._scalar(node.expression))
+    if isinstance(node, exp.Anonymous):
+        name = node.name.lower()
+        if name in ("list_count", "array_count") and node.expressions:
+            # `list_count` is a COUNT, not a length: DuckDB ignores nulls, so
+            # `list_count([NULL, 4])` is 1 and `list_count([NULL, NULL])` is 0. This was
+            # mapped straight to `len`, which returned the element count including nulls —
+            # the same number for a list of four values and a list of four nulls.
+            return tr._scalar(node.expressions[0]).list.drop_nulls().list.len()
+        method = _list_anon_method(name)
+        if method is not None and node.expressions:
+            return getattr(tr._scalar(node.expressions[0]).list, method)()
+        binary = _LIST_BINARY_ANON.get(name)
+        if binary is not None and len(node.expressions) == 2:
+            left = tr._scalar(node.expressions[0])
+            right = tr._scalar(node.expressions[1])
+            return getattr(left.list, binary)(right)
+    return None
+
+
+def _subscript_value(node) -> int:
+    """The signed integer a subscript node carries.
+
+    More than ``int(node.name)`` because a negative subscript parses as ``exp.Neg``
+    wrapping the magnitude, and ``.name`` reads straight through to the child — so the
+    sign was dropped and ``a[-1]`` asked for element 2 instead of the last one.
+    """
+    if isinstance(node, exp.Neg):
+        return -int(node.this.name)
+    return int(node.name)
+
+
+def _list_slice(tr, node, sl) -> Expr:
+    """``a[lo:hi]`` — a list slice, in SQL's 1-based, both-ends-inclusive convention.
+
+    ``list.slice`` is 0-based and takes a *length*, so ``a[2:3]`` is ``slice(1, 2)``.
+    Either bound may be omitted (``a[2:]``, ``a[:3]``).
+
+    A negative bound is rejected rather than translated: DuckDB counts it back from the
+    end, while `list.slice` clamps it to the start and returns the whole list — so
+    ``a[-2:]`` would answer the entire list instead of its last two elements. Declining
+    costs an error; translating it would cost a wrong answer.
+    """
+    lo_node, hi_node = sl.this, sl.expression
+    lo = _const_int_arg(lo_node, "list slice: lower bound") if lo_node is not None else 1
+    hi = _const_int_arg(hi_node, "list slice: upper bound") if hi_node is not None else None
+    for bound, value in (("lower", lo), ("upper", hi)):
+        if value is not None and value < 0:
+            raise NotImplementedError(
+                f"a negative {bound} bound in a list slice ({node.sql()}) is not supported; "
+                "index from the start, or use list_reverse first"
+            )
+    if lo < 1:
+        # DuckDB treats `a[0:n]` as `a[1:n]`; 0-basing it here would take one element
+        # too many.
+        lo = 1
+    length = None if hi is None else max(hi - lo + 1, 0)
+    return tr._scalar(node.this).list.slice(lo - 1, length)
+
+
+def _list_anon_method(name: str) -> str | None:
+    """The `.list` method for a `list_*`/`array_*` DuckDB spelling, or None.
+
+    DuckDB gives every list operation both prefixes; stripping either here keeps one
+    row per operation instead of two tables that can drift apart.
+    """
+    for prefix in ("list_", "array_"):
+        if name.startswith(prefix):
+            return _LIST_ANON.get(name.removeprefix(prefix))
+    return None
+
+
+def _boolean_arg(node) -> bool:
+    """The boolean a sqlglot `Boolean`/literal argument denotes."""
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    return str(node.this).lower() not in ("false", "0")
+
+
+def _raw_value(node):
+    """The Python value of a literal node (for `.list.contains`)."""
+    if not isinstance(node, exp.Literal):
+        raise NotImplementedError("list_contains requires a constant value")
+    if node.is_string:
+        return node.name
+    text = node.name
+    return float(text) if ("." in text or "e" in text.lower()) else int(text)

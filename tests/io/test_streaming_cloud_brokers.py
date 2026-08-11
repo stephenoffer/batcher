@@ -7,6 +7,8 @@ result comparison can see. Driven against fakes that model the client surfaces u
 
 from __future__ import annotations
 
+import datetime
+
 import pytest
 
 from batcher.io.formats.streaming.eventhubs import (
@@ -94,16 +96,42 @@ def test_a_commit_with_nothing_pending_sends_no_request():
 # --------------------------------------------------------------------------
 # Event Hubs: one consumer per partition, not one per poll.
 # --------------------------------------------------------------------------
+class _FakeEvent:
+    """One `EventData` as `azure-eventhub` actually shapes it.
+
+    The property names are the load-bearing part of this fake. The source used to read
+    ``body_as_bytes()`` and ``enqueued_time_utc_ms``, **neither of which exists** on any
+    released `azure-eventhub` — and the old fake defined them, so the suite proved the
+    connector agreed with a client that was never there. Modeling the real surface is what
+    turns "can't make progress at all" into a failing test.
+    """
+
+    def __init__(self, body: object, offset: str = "1", partition_key: bytes | None = None):
+        self.body = body
+        self.offset = offset
+        self.partition_key = partition_key
+        self.enqueued_time = datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC)
+
+
 class _FakeConsumer:
-    def __init__(self, partition_id: str, position: str) -> None:
+    """An `EventHubConsumer` stand-in: `receive` returns None and delivers via the callback."""
+
+    def __init__(self, partition_id: str, position: str, on_event_received) -> None:
         self.partition_id = partition_id
         self.position = position
         self.waits: list[float] = []
         self.closed = 0
+        self._deliver = on_event_received
+        #: Events the hub is holding for this partition; handed over on the next `receive`.
+        self.pending: list[_FakeEvent] = []
 
-    def receive_message_batch(self, max_batch_size, max_wait_time):
+    def receive(self, batch, max_batch_size, max_wait_time):
+        assert batch is True, "the source must ask for batched delivery"
         self.waits.append(max_wait_time)
-        return []
+        ready, self.pending = self.pending[:max_batch_size], self.pending[max_batch_size:]
+        if ready:
+            self._deliver(ready)
+        return None  # the real client returns nothing; the callback is the only channel
 
     def close(self):
         self.closed += 1
@@ -121,7 +149,7 @@ class _FakeHubClient:
         return list(self._partitions)
 
     def _create_consumer(self, consumer_group, partition_id, event_position, on_event_received):
-        consumer = _FakeConsumer(partition_id, event_position)
+        consumer = _FakeConsumer(partition_id, event_position, on_event_received)
         self.created.append(consumer)
         return consumer
 
@@ -187,6 +215,75 @@ def test_close_releases_every_consumer_and_then_the_client():
     src.close()
     assert all(c.closed == 1 for c in client.created)
     assert client.closed == 1
+
+
+# --------------------------------------------------------------------------
+# Event Hubs: the source actually delivers the events the client hands it.
+# --------------------------------------------------------------------------
+def test_polled_events_reach_the_batch():
+    """The whole source was a no-op: `receive_message_batch` exists on no released client,
+    and the `on_event_received` callback it registered was ``lambda *_: None``, so every
+    event the client fetched was discarded. A hub with data produced nothing, forever."""
+    src, client = _hub(["0"])
+    src._poll()  # opens the consumer
+    client.created[0].pending = [_FakeEvent(b"one", "11"), _FakeEvent(b"two", "12")]
+
+    messages = src._poll()
+
+    assert [m.value for m in messages] == [b"one", b"two"]
+    assert [m.partition for m in messages] == [0, 0]
+    assert [m.resume_token for m in messages] == ["11", "12"]
+    assert [m.offset for m in messages] == [11, 12]
+    assert all(m.topic == "hub" for m in messages)
+
+
+def test_an_events_enqueued_time_becomes_the_timestamp_column():
+    """`EventData` carries `enqueued_time` (a datetime), never `enqueued_time_utc_ms`."""
+    src, client = _hub(["0"])
+    src._poll()
+    client.created[0].pending = [_FakeEvent(b"x")]
+
+    (message,) = src._poll()
+
+    expected = datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC).timestamp() * 1000
+    assert message.timestamp == int(expected)
+
+
+def test_a_multi_section_data_body_is_joined_not_stringified():
+    """A DATA body is `bytes` *or an iterable of bytes*, one element per AMQP data section.
+    Assuming the scalar shape turns a chunked payload into the `repr` of a list."""
+    src, client = _hub(["0"])
+    src._poll()
+    client.created[0].pending = [_FakeEvent([b"ab", b"cd"])]
+
+    (message,) = src._poll()
+
+    assert message.value == b"abcd"
+
+
+def test_a_non_numeric_offset_does_not_kill_the_query():
+    """An Event Hubs offset is typed `str` and only conventionally numeric; `int(...)` on a
+    token that is not raised `ValueError` out of the poll loop."""
+    src, client = _hub(["0"])
+    src._poll()
+    client.created[0].pending = [_FakeEvent(b"x", offset="abc")]
+
+    (message,) = src._poll()
+
+    assert message.resume_token == "abc"  # the seekable position is preserved verbatim
+    assert isinstance(message.offset, int)
+
+
+def test_an_event_batch_becomes_one_arrow_batch_with_the_broker_schema():
+    """End to end: the messages a poll produces assemble into the fixed broker schema."""
+    src, client = _hub(["0"])
+    src._poll()
+    client.created[0].pending = [_FakeEvent(b"one", "11"), _FakeEvent(b"two", "12")]
+
+    batch = src._make_batch(src._poll())
+
+    assert batch.num_rows == 2
+    assert batch.column("value").to_pylist() == [b"one", b"two"]
     src.close()  # idempotent
     assert client.closed == 1
 

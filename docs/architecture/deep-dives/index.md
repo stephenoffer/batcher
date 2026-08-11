@@ -19,7 +19,7 @@ they are meant to be read in this order:
 :::{grid-item-card} {octicon}`zap;1.1em` The query, end to end
 :link: /architecture/deep-dives/query/query-lifecycle
 :link-type: doc
-From `collect()` to Arrow and back: the plan IR, the interpreter, the JIT.
+From {py:meth}`collect() <batcher.Dataset.collect>` to Arrow and back: the plan IR, the interpreter, the JIT.
 :::
 
 :::{grid-item-card} {octicon}`git-merge;1.1em` Parallelism and the operator core

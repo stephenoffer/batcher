@@ -1,12 +1,12 @@
 # Governance and security
 
 Batcher enforces *who may read which rows and columns, and through what mask*, in the
-engine itself. A `SecurityCatalog` declares the policy, a `Principal` is the identity a
-query runs as, and `bt.security(...)` binds the two to a scope. Everything read inside
+engine itself. A {py:class}`SecurityCatalog <batcher.SecurityCatalog>` declares the policy, a {py:class}`Principal <batcher.Principal>` is the identity a
+query runs as, and {py:func}`bt.security(...) <batcher.security>` binds the two to a scope. Everything read inside
 that scope is governed.
 
 Policy is applied when a table is **read**, not when a query is executed. That is what
-makes it unbypassable: a `Dataset` never holds an ungoverned plan, so there is no
+makes it unbypassable: a {py:class}`Dataset <batcher.Dataset>` never holds an ungoverned plan, so there is no
 `count()`, `write()`, or streaming path that could skip the check. A database works the
 same way. A masking policy resolves against the role in effect when the column is read.
 
@@ -68,7 +68,7 @@ with bt.security(catalog, analyst):
 print(ds.columns)
 ```
 
-Each call records a `Grant`: a role, a table, and the columns that role may read
+Each call records a {py:class}`Grant <batcher.governance.Grant>`: a role, a table, and the columns that role may read
 (`select=None` means all of them). A catalog is a list of those. That is what keeps it a
 value you can print and diff and review, rather than a service you have to interrogate.
 
@@ -84,7 +84,7 @@ Classify a column once with `tag`, then govern every column carrying that tag wi
 covered automatically.
 
 The masks themselves are ordinary expressions ({doc}``mask` <../api/complete>`,
-`hmac_sha256`, `aes_encrypt`), so they run in the Rust data plane at full speed.
+{py:func}`hmac_sha256 <batcher.hmac_sha256>`, {py:func}`aes_encrypt <batcher.aes_encrypt>`), so they run in the Rust data plane at full speed.
 
 ```python
 catalog = (
@@ -114,9 +114,9 @@ An explicit `mask_column` overrides the tag-derived mask for that one column, an
 principal holding an `exempt` role reads the raw value.
 
 The two spellings record two different policy objects, and the difference is the whole
-reason to classify a column at all. `mask_column` records a `ColumnMask`, bound to one
+reason to classify a column at all. `mask_column` records a {py:class}`ColumnMask <batcher.governance.ColumnMask>`, bound to one
 `table`.`column`: precise, and one entry per column per table. `mask_tag` records a
-`TagMask`, bound to a *tag*, so it governs every column carrying that tag in every table,
+{py:class}`TagMask <batcher.governance.TagMask>`, bound to a *tag*, so it governs every column carrying that tag in every table,
 including the table someone adds next quarter that nobody will remember to come back and
 mask. Per-column bindings are what you reach for to override a case; tags are what make
 the catalog survive the tenth table.
@@ -145,9 +145,9 @@ authority, not the caller's.
 Multiple row filters on one table are conjoined, so adding one can never widen what a
 principal sees.
 
-Each call records a `RowFilter`. Note the shape of the predicate: it takes the
+Each call records a {py:class}`RowFilter <batcher.governance.RowFilter>`. Note the shape of the predicate: it takes the
 *principal*, not a row. It is called once, while the plan is being built, and returns an
-ordinary `Expr`, here `col("region") == "EU"`. The engine then treats that expression
+ordinary {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, here `col("region") == "EU"`. The engine then treats that expression
 like any predicate you wrote yourself: Kyber pushes it down toward the scan and fuses it
 with neighboring filters. Row-level security therefore costs one filter, not a policy
 callback per row.
@@ -224,7 +224,7 @@ enc = bt.from_pydict({"ssn": ["123-45-6789"]}).select(c=bt.aes_encrypt(bt.col("s
 print(enc.select(s=bt.aes_decrypt(bt.col("c"), key)).to_pydict())
 ```
 
-`aes_decrypt` under the wrong key yields NULL rather than failing the query. One
+{py:func}`aes_decrypt <batcher.aes_decrypt>` under the wrong key yields NULL rather than failing the query. One
 unreadable row must not abort a scan of a billion. An all-NULL result is the unambiguous
 signal that the key is wrong.
 
@@ -248,7 +248,7 @@ Hiding a value is half of governance. The other half is proving what a value *wa
 without keeping the plaintext around. A hash reduces a row (or a column) to a fixed
 digest you can compare, deduplicate, or diff across snapshots.
 
-`hash_rows(*exprs, seed=0)` is a deterministic 64-bit digest of several columns at once,
+{py:func}`hash_rows(*exprs, seed=0) <batcher.hash_rows>` is a deterministic 64-bit digest of several columns at once,
 stable across partitions and runs and machines. It is the change-detection and dedup-key
 primitive: fingerprint each row, and any later row whose fingerprint differs is one that
 changed.
@@ -267,8 +267,8 @@ fp_after = after.select(fp=bt.hash_rows(*cols)).to_pydict()["fp"]
 print([i for i, (a, b) in enumerate(zip(fp_before, fp_after)) if a != b])  # [1] — only row 1 changed
 ```
 
-For a single column, the `.str` digests produce a per-value fingerprint.
-`.str.xxhash64()` and `.str.hash64()` are fast non-cryptographic 64-bit hashes, the ones
+For a single column, the {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>` digests produce a per-value fingerprint.
+{py:meth}`.str.xxhash64() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.xxhash64>` and {py:meth}`.str.hash64() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.hash64>` are fast non-cryptographic 64-bit hashes, the ones
 to reach for when sharding or bucketing.
 
 ```python
@@ -277,8 +277,8 @@ print(accounts.select(bucket=bt.col("email").str.xxhash64().abs() % 4).to_pydict
 # [3, 3, 2, 0]
 ```
 
-`.str.md5()` and `.str.sha1()` return the lowercase-hex cryptographic digest
-(matching DuckDB's `md5` / `sha1`), and `.str.crc32()` returns the CRC-32 integrity
+{py:meth}`.str.md5() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.md5>` and {py:meth}`.str.sha1() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.sha1>` return the lowercase-hex cryptographic digest
+(matching DuckDB's `md5` / `sha1`), and {py:meth}`.str.crc32() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.crc32>` returns the CRC-32 integrity
 checksum:
 
 ```python
@@ -309,12 +309,12 @@ print(ds.count())  # still 2 — the plan was governed when the table was read
 ```
 
 Nested blocks restore the outer policy on exit. A table read outside any block is
-ungoverned, and an in-memory dataset (`from_pydict`, `from_arrow`) is never governed:
+ungoverned, and an in-memory dataset ({py:func}`from_pydict <batcher.from_pydict>`, {py:func}`from_arrow <batcher.from_arrow>`) is never governed:
 there is no durable name to write a policy about a dict you are already holding.
 
 ## Auditing
 
-Every governed read emits a `GovernanceEvent`: who asked, what they were allowed to see,
+Every governed read emits a {py:class}`GovernanceEvent <batcher.GovernanceEvent>`: who asked, what they were allowed to see,
 what was withheld, what was masked, which row filters applied. Denials are audited too,
 before the error is raised. The access a compliance review most wants to find is the one
 that was refused.
@@ -336,7 +336,7 @@ pass a sink.
 
 ## Column-level lineage
 
-Tagging `email` as PII only helps if you can answer where it went. `ds.lineage()` reads
+Tagging `email` as PII only helps if you can answer where it went. {py:meth}`ds.lineage() <batcher.Dataset.lineage>` reads
 the plan, executing nothing, and reports the source columns each output column's *values*
 are derived from.
 
@@ -385,7 +385,7 @@ Two properties make the answer trustworthy:
   as though every output column derives from every input column. A false "this might carry
   PII" costs a review; a false "it cannot" costs a breach.
 
-A column built only from literals, or generated by `with_row_index`, has no origin.
+A column built only from literals, or generated by {py:meth}`with_row_index <batcher.Dataset.with_row_index>`, has no origin.
 
 ## Persisting a policy
 
@@ -406,9 +406,9 @@ catalog = (
 )
 ```
 
-`Redact`, `Pseudonymize`, `Encrypt`, and `Nullify` cover the masking shapes an enterprise
-policy uses (and lower to the data-plane functions above); `MatchesAttribute` and
-`AttributeIn` cover attribute-based row access. Batcher persists nothing itself. It hands
+{py:class}`Redact <batcher.governance.Redact>`, {py:class}`Pseudonymize <batcher.governance.Pseudonymize>`, {py:class}`Encrypt <batcher.governance.Encrypt>`, and {py:class}`Nullify <batcher.governance.Nullify>` cover the masking shapes an enterprise
+policy uses (and lower to the data-plane functions above); {py:class}`MatchesAttribute <batcher.governance.MatchesAttribute>` and
+{py:class}`AttributeIn <batcher.governance.AttributeIn>` cover attribute-based row access. Batcher persists nothing itself. It hands
 you picklable policy objects and enforces the catalog you give it. Where that policy lives
 is your platform's decision.
 

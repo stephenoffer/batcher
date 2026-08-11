@@ -10,6 +10,7 @@ guessed at is usually not the one costing the time.
 | {doc}`Caching results <caching>` | Why a plan runs twice, and when to make it run once |
 | {doc}`Reading query plans <explain-plans>` | `explain()`, what each operator line means, and how to find the expensive one |
 | {doc}`Best practices <best-practices>` | The patterns that follow from keeping per-row work out of Python |
+| {doc}`Reading a very large table <large-tables>` | What changes once planning a table costs more than reading it |
 
 ## See also
 
@@ -23,4 +24,5 @@ performance
 caching
 explain-plans
 best-practices
+large-tables
 ```

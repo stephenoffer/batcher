@@ -6,8 +6,8 @@ goes through the same optimizer and resource manager as any other query.
 
 ## Batch inference and ML pipelines
 
-`ds.map_batches(fn)` runs a function over Arrow batches, and `ds.ml.infer(model)` and
-`ds.ml.embed(model)` run a model. Pass a class instead of an instance and the model
+{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` runs a function over Arrow batches, and {py:meth}`ds.ml.infer(model) <batcher.api.dataset.ml.DatasetML.infer>` and
+{py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` run a model. Pass a class instead of an instance and the model
 loads once per worker, with `num_gpus=` and `concurrency=` for GPU actor pools. The
 relational work around the model goes through the same optimizer (Kyber) and resource
 manager (Carbonite) as any other query, so it's planned and sized for you rather than
@@ -17,13 +17,13 @@ The entry points below cover the common ML shapes.
 
 | Task | Batcher | Note |
 |------|---------|------|
-| Map a model over batches | `ds.ml.map_batches(Model, ...)` | class = model loaded once per worker |
+| Map a model over batches | {py:meth}`ds.ml.map_batches(Model, ...) <batcher.api.dataset.ml.DatasetML.map_batches>` | class = model loaded once per worker |
 | Batch inference | `ds.ml.infer(model, num_gpus=, concurrency=)` | CPU readers feed GPU actors |
-| Embeddings | `ds.ml.embed(model)` / `batcher.ml.embed(...)` | text or image to a vector column |
-| LLM generation | `batcher.ml.llm_generate(..., engine=vllm_engine("..."))` | engine self-batches; no outer PID |
-| Distributed training feed | `ds.ml.stream_loader(world_size=, rank=, ...)` | deterministic, balanced, resumable |
-| Per-op metrics | `ds.stats()` | measured rows, time, bytes, and bottleneck |
-| Bounded output files | `ds.write.parquet(max_rows_per_file=)` | honored even with `partition_by` |
+| Embeddings | {py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` / {py:func}`batcher.ml.embed(...) <batcher.ml.embed>` | text or image to a vector column |
+| LLM generation | {py:func}`batcher.ml.llm_generate(..., engine=vllm_engine("...")) <batcher.ml.llm_generate>` | engine self-batches; no outer PID |
+| Distributed training feed | {py:meth}`ds.ml.stream_loader(world_size=, rank=, ...) <batcher.api.dataset.ml.DatasetML.stream_loader>` | deterministic, balanced, resumable |
+| Per-op metrics | {py:meth}`ds.stats() <batcher.Dataset.stats>` | measured rows, time, bytes, and bottleneck |
+| Bounded output files | {py:meth}`ds.write.parquet(max_rows_per_file=) <batcher.api.io_namespace.writer.Writer.parquet>` | honored even with `partition_by` |
 | Resumable writes | `ds.write.parquet(resume=True)` | skips committed shards on re-run |
 
 Settings other engines make you tune by hand are measured defaults here. Batch size
@@ -59,7 +59,7 @@ print(bt.read.parquet("/tmp/bt_resume_demo").count())
 ```
 
 Feeding a distributed PyTorch trainer, whether DDP, FSDP, or DeepSpeed, uses
-`stream_loader`. It gives every rank the same number of batches in a seed-reproducible
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>`. It gives every rank the same number of batches in a seed-reproducible
 order that's independent of world size, so a job can resume on a differently sized
 cluster with no repeated or skipped samples. Disable the framework's own sampler,
 because `stream_loader` is the single shard authority.

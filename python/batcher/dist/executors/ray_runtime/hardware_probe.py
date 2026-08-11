@@ -23,6 +23,8 @@ exact value the field held before, so a cluster that can't be probed plans as it
 
 from __future__ import annotations
 
+import contextlib
+
 from batcher._internal.logging import get_logger, note_suppressed
 
 __all__ = [
@@ -30,16 +32,62 @@ __all__ = [
     "cluster_hardware_profiles",
     "cluster_is_heterogeneous",
     "cluster_l3_cache_bytes",
+    "cluster_measured_gpu_memory_bytes",
+    "cluster_storage_class",
+    "cluster_worker_fingerprint",
     "reset_fleet_health",
+    "reset_hardware_probe_cache",
+    "sampled_device_health",
+    "unhealthy_gpus_by_node",
     "unhealthy_nodes",
     "warn_once_if_fleet_is_mixed",
 ]
 
 # Worker hardware profiles per topology signature, so the probe runs once per distinct cluster
 # shape rather than on every query. Autoscaling changes the signature and re-probes.
+#
+# **Only a successful probe is memoized.** Caching a failure here is what made a transient
+# miss permanent: on an autoscaling fleet the first distributed query of a session routinely
+# races worker start-up, the probe's short wait expires, and the empty result was then stored
+# against the topology — so every later query in that session planned with default cache
+# sizing even though the workers were up and would have answered in milliseconds. Observed on
+# a 9-node cluster whose workers were scaling from idle.
 _PROFILES_BY_TOPOLOGY: dict[tuple, tuple[dict, ...]] = {}
 
+# Failed attempts per topology, so a genuinely unprobeable fleet still stops paying the wait.
+_FAILED_ATTEMPTS: dict[tuple, int] = {}
+
+# How many times a topology may fail before its emptiness is taken as settled.
+#
+# The cold-start race this exists for is over after the first query — by the second the
+# workers are live — so a couple of retries recover it. The bound is what keeps a fleet that
+# truly cannot answer (a worker image without the engine) from paying the wait on every query
+# for the life of the session.
+_MAX_PROBE_ATTEMPTS = 3
+
 _UNPROBEABLE_WARNED = False
+
+
+def reset_hardware_probe_cache() -> None:
+    """Forget every memoized worker profile, failure count, and one-shot warning.
+
+    Two callers need this and neither had it. A **test** substituting a fake topology otherwise
+    inherits whatever a previous test memoized against a signature it happens to reproduce. And
+    an **operator** who has just fixed the reason a fleet could not answer — the usual one being
+    a worker image on a different Batcher build than the driver — is otherwise stuck: after
+    `_MAX_PROBE_ATTEMPTS` the emptiness is taken as settled *for the life of the process*, and
+    the fix is invisible until the driver restarts. That is the right default (a fleet that
+    cannot answer must stop being asked on every query) and the wrong terminal state.
+
+    Deliberately separate from `reset_fleet_health`, which drops the *device-health* sample: one
+    is machine shape, which changes when the cluster does, and the other is device condition,
+    which changes on its own.
+    """
+    global _UNPROBEABLE_WARNED, _MIXED_FLEET_WARNED
+    _PROFILES_BY_TOPOLOGY.clear()
+    _FAILED_ATTEMPTS.clear()
+    _UNPROBEABLE_WARNED = False
+    _MIXED_FLEET_WARNED = False
 
 
 def _note_fleet_unprobeable(shapes: int) -> None:
@@ -60,6 +108,30 @@ def _note_fleet_unprobeable(shapes: int) -> None:
 _PROBE_TIMEOUT_S = 5.0
 
 
+def _cancel_pending(ray, pending) -> None:
+    """Cancel probe tasks that never scheduled, so they do not queue forever.
+
+    Both fleet probes pin their task to a specific node with
+    `NodeAffinitySchedulingStrategy(..., soft=False)`, which is semantically right — the probe
+    measures *that* node, so landing anywhere else would be a wrong reading — and is also the
+    one node-affinity mode Ray never gives up on. A hard pin at a node that is gone, drained,
+    or simply full leaves the task `PENDING_NODE_ASSIGNMENT` indefinitely; bounding the
+    `ray.wait` bounds the *caller*, not the task.
+
+    That matters because the probes are not one-shot. `cluster_hardware_profile` runs per
+    planned distributed query and `cluster_device_health` per drain check, so on a churning
+    fleet each unreachable node leaks one immortal pending task per call, for the life of the
+    driver. They ask for no resources (`num_cpus=0`), so nothing is *reserved* — what
+    accumulates is scheduler queue entries and a `ray status` pending list that describes
+    nothing anyone is waiting for.
+
+    Best-effort, and the same idiom `gpu.cudf_probe` already applies for the same reason.
+    """
+    for ref in pending:
+        with contextlib.suppress(Exception):
+            ray.cancel(ref, force=True)
+
+
 def _profile_on_this_worker() -> dict:
     """Run on a worker: that node's measured hardware profile. Layer-0 only.
 
@@ -67,10 +139,28 @@ def _profile_on_this_worker() -> dict:
     every additional field is free once the task has been scheduled. Cores, memory, cache
     hierarchy, NUMA nodes and the fingerprint all describe how a plan should be sized for
     *this* node shape, and none of them can be read from the driver.
+
+    Device memory is added on top of the profile because it is the one hardware fact the
+    control plane otherwise has to *guess*. Ray reports a device count and a model label and
+    never a byte figure, so `accelerators.binding_gpu_memory_bytes` recovers the size by looking
+    the label up in a nameplate table — which reports `0` for an unlabelled fleet, an on-prem
+    part the table has never heard of, a MIG instance (whose usable memory is a fraction of the
+    board's), and any device newer than the table. Here the driver is already talking to the
+    node that holds the device, and the node can simply say. A measurement, where the existing
+    path had a lookup with a documented hole in it.
     """
+    from batcher._internal.accelerators import gpu_inventory
     from batcher._internal.hardware import hardware_profile
 
-    return hardware_profile().to_dict()
+    profile = hardware_profile().to_dict()
+    devices = gpu_inventory()
+    sized = [size for d in devices if (size := int(d.get("memory_bytes") or 0)) > 0]
+    profile["gpu_count"] = len(devices)
+    # The smallest device on the node, for the reason every binding figure is the weakest: a
+    # node with a big card and a small one can only host a shard the small one holds. `0` when
+    # nothing reported a size, which every reader treats as "unknown" and not as "no memory".
+    profile["gpu_memory_bytes"] = min(sized, default=0)
+    return profile
 
 
 def cluster_hardware_profiles() -> tuple[dict, ...]:
@@ -92,19 +182,29 @@ def cluster_hardware_profiles() -> tuple[dict, ...]:
 
         if not ray.is_initialized():
             return ()
-        nodes = [n for n in ray.nodes() if n.get("Alive", True)]
-        reps = _representative_node_ids(nodes)
+        reps = _representative_node_ids(_alive_node_records(ray))
         if not reps:
             return ()
         signature = tuple(sorted(reps))
         cached = _PROFILES_BY_TOPOLOGY.get(signature)
         if cached is not None:
             return cached
+        if _FAILED_ATTEMPTS.get(signature, 0) >= _MAX_PROBE_ATTEMPTS:
+            return ()  # settled: this fleet does not answer, and re-asking only costs the wait
         result = _probe_representatives(ray, reps)
-        # A fleet where *no* shape answered differs from one never asked, and only this shows
-        # it: each node's failure is a DEBUG note, so a wholly mute cluster leaves no mark.
-        if not result and not _UNPROBEABLE_WARNED:
-            _note_fleet_unprobeable(len(reps))
+        if not result:
+            # Do NOT memoize this. The overwhelmingly common cause is a worker that has not
+            # finished starting, which the next query will find running — see the note on
+            # `_PROFILES_BY_TOPOLOGY`. Count it instead, so a fleet that never answers still
+            # stops paying the wait after `_MAX_PROBE_ATTEMPTS`.
+            _FAILED_ATTEMPTS[signature] = _FAILED_ATTEMPTS.get(signature, 0) + 1
+            # A fleet where *no* shape answered differs from one never asked, and only this
+            # shows it: each node's failure is a DEBUG note, so a wholly mute cluster leaves
+            # no mark. Warned once per process, on the last attempt — before that the miss is
+            # very likely transient and saying so would train the reader to ignore it.
+            if _FAILED_ATTEMPTS[signature] >= _MAX_PROBE_ATTEMPTS and not _UNPROBEABLE_WARNED:
+                _note_fleet_unprobeable(len(reps))
+            return ()
         _PROFILES_BY_TOPOLOGY[signature] = result
         return result
     except Exception as exc:  # pragma: no cover - Ray optional / probe unschedulable
@@ -157,16 +257,178 @@ def cluster_l3_cache_bytes() -> int:
     return min(positive) if positive else 0
 
 
+def cluster_storage_class() -> str:
+    """The **worst** spill-device class across probed node shapes, `""` when unknowable.
+
+    The worst rather than the commonest, for the reason every binding-node field here takes the
+    weakest: a plan whose spill is affordable on the slowest volume it might land on is
+    affordable on every node, and the reverse is what produces a query that runs fine on most
+    of the fleet and falls over on the rest.
+
+    The spread the ordering encodes is large — a rotational volume costs about thirty times
+    local flash for an external merge's concurrent run reads, a network volume about ten — so
+    pricing a distributed spill against the *driver's* NVMe is the same class of error as
+    pricing it against the driver's RAM. Derived from the same per-shape probe as
+    `cluster_hardware_profiles`, so it costs no extra round trip.
+
+    Returns:
+        The binding worker's device class, or `""` when the cluster can't be probed.
+    """
+    from batcher._internal.hardware.storage import (
+        SPILL_DEVICE_FACTOR,
+        SPILL_DEVICE_FACTOR_DEFAULT,
+    )
+
+    classes = [
+        found
+        for p in cluster_hardware_profiles()
+        if (found := str(p.get("storage_class", "") or "")) and found != "unknown"
+    ]
+    if not classes:
+        return ""
+    return max(classes, key=lambda c: SPILL_DEVICE_FACTOR.get(c, SPILL_DEVICE_FACTOR_DEFAULT))
+
+
+def cluster_measured_gpu_memory_bytes() -> int:
+    """VRAM of the smallest device the *workers themselves* reported, or `0` when unprobed.
+
+    The measured counterpart of `accelerators.binding_gpu_memory_bytes`, which recovers a size
+    from the `ray.io/accelerator-type` label through a nameplate table. That lookup is the only
+    thing available when the workers cannot be reached, and it is blind in four situations that
+    are not rare:
+
+    * an **unlabelled fleet** — on-prem, or a Ray deployment that does not set node labels;
+    * a **part the table has not seen**, which by contract reports unknown rather than guessing;
+    * a **MIG instance**, whose usable memory is a seventh or a half of the board the label
+      names, so the table's figure is not merely unknown but wrong and too large;
+    * a **variant sharing one label**, where the table deliberately records the *smallest*
+      shipping configuration — correct as a bound, and up to 2x under the real device.
+
+    In every one of those the workers know the answer exactly, and the probe is already talking
+    to them. The minimum across node shapes is taken for the usual reason: a shard sized to the
+    largest device out-of-memories on every other one.
+
+    Returns:
+        Binding measured VRAM in bytes, or `0` when the cluster can't be probed or reports no
+        device — which the caller must read as "fall back to the label lookup", not as "no VRAM".
+    """
+    sized = [
+        size
+        for p in cluster_hardware_profiles()
+        if (size := int(p.get("gpu_memory_bytes", 0) or 0)) > 0
+    ]
+    return min(sized) if sized else 0
+
+
+def cluster_worker_fingerprint() -> str:
+    """The hardware-scoping key every probed worker shares, or `""` when they differ.
+
+    The key under which anything learned in *machine units* about this fleet is stored: a cost
+    coefficient in nanoseconds per row, a measured CPU utilization, a spill threshold. Kyber
+    runs on the driver, which on a cluster executes none of the work, so reading those back
+    under the driver's own key describes the wrong machine — and on a fat head node beside small
+    workers it is wrong by the whole reason the scoping exists.
+
+    `""` on a mixed fleet, following the same rule as `accelerator_type`: there is no single
+    honest answer, and every consumer then falls back to its local key, which is what it did
+    before this existed. A mixed fleet is *reported* by `warn_once_if_fleet_is_mixed`, so the
+    condition is visible rather than silently degrading.
+
+    Returns:
+        The shared worker fingerprint, or `""` when the fleet is mixed or unprobeable.
+    """
+    keys = {str(p.get("fingerprint", "") or "") for p in cluster_hardware_profiles()}
+    keys.discard("")
+    return keys.pop() if len(keys) == 1 else ""
+
+
+#: Granularity the node memory figure is bucketed to before it keys a node shape. Nodes of one
+#: instance type report the same RAM to within whatever the kubelet and the object store
+#: reserved, so raw bytes would give each node its own shape and turn the representative sample
+#: back into an O(nodes) fan-out. A gibibyte separates every instance family that shares a core
+#: count (32 / 64 / 128 GiB at sixteen vCPUs) while merging none of them.
+_MEMORY_SHAPE_BUCKET = 1 << 30
+
+
+def _memory_bucket(node_bytes: float) -> int:
+    """`node_bytes` rounded to the nearest `_MEMORY_SHAPE_BUCKET` — nearest, never floored.
+
+    Flooring puts a node reporting *just under* a round capacity a whole bucket away from its
+    identical peers, and reporting just under is the normal case rather than the exception:
+    Ray's `memory` resource is the node's RAM less its object-store reservation, so two nodes
+    of one instance type routinely straddle a boundary. `profile._nearest_power_of_two` makes
+    exactly this choice for exactly this reason.
+    """
+    return round(max(0.0, node_bytes) / _MEMORY_SHAPE_BUCKET)
+
+
+def _alive_node_records(ray) -> list[dict]:
+    """Alive node records, from the active `topology_scope()` snapshot when one is held.
+
+    The profile build is wrapped in a scope precisely so its four topology readers share one
+    GCS round trip and describe one cluster; reading live here would have left this one outside
+    both guarantees, so an autoscale landing mid-build could have the probe sampling a node
+    shape that the shape and core-count fields did not contain.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import _TOPOLOGY
+
+    snapshot = _TOPOLOGY.get()
+    nodes = snapshot.alive_nodes if snapshot is not None else ray.nodes()
+    return [n for n in nodes if n.get("Alive", True)]
+
+
+def _worker_nodes(nodes: list[dict]) -> list[dict]:
+    """`nodes` minus the Ray head — unless that would leave nothing.
+
+    The probe describes the machines that will *run* the plan, and the head runs none of it:
+    worker actors are never placed there. Including it was not a harmless extra sample, because
+    every consumer of these profiles takes a binding or an agreement across them:
+
+    * `cluster_l3_cache_bytes` takes the **minimum**, so a modest head node beside large workers
+      pinned the broadcast threshold to the head's cache — the exact defaulting this probe
+      exists to remove, arriving through the probe itself;
+    * `cluster_storage_class` takes the **worst**, so a head on a network root volume priced
+      every worker's spill at ten times its real cost;
+    * `cluster_worker_fingerprint` requires **agreement**, and a head node is a different
+      machine class from its workers on essentially every cluster anyone runs — a fat head
+      beside small workers is the shape the surrounding code repeatedly names as the normal
+      one. So it returned `""` almost always, and `""` means "fall back to the driver's own
+      key": every cost coefficient, CPU share, and learned threshold measured on the workers
+      was filed where nothing would read it, silently, on the fleets this was written for.
+    * `warn_once_if_fleet_is_mixed` then reported a uniform cluster as mixed, teaching a reader
+      to ignore the one message that explains a model failing to converge.
+
+    Survivors-or-nothing, matching `scaling._worker_eligible`: a single-node cluster is its head
+    and must still be described.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import _HEAD_MARKER
+
+    workers = [n for n in nodes if _HEAD_MARKER not in (n.get("Resources") or {})]
+    return workers or nodes
+
+
 def _representative_node_ids(nodes: list[dict]) -> list[str]:
-    """One node id per distinct resource shape (cores / GPUs / accelerator type).
+    """One node id per distinct worker shape (cores / memory / GPUs / accelerator type).
 
     Nodes with identical advertised resources are the same instance type, so they share every
     hardware fact the probe reads — cache, NUMA layout, vector width, scratch device. Probing
     one representative of each shape therefore measures the cluster's real heterogeneity
     without an O(nodes) fan-out on a large fleet.
+
+    **Memory is part of the shape**, because core count alone does not identify an instance
+    type and the families that share one are exactly the families a mixed fleet mixes: at
+    sixteen vCPUs, AWS alone offers a 32 GiB compute-optimized, a 64 GiB general-purpose and a
+    128 GiB memory-optimized node, and on a Graviton fleet the same core count is a different
+    vendor and vector width again. All of them collapsed into one shape, so one of them was
+    probed and the rest were *assumed* to match it — reporting a uniform cluster, suppressing
+    the mixed-fleet notice, and handing the whole fleet one machine class's L3, scratch device,
+    and fingerprint. Memory is bucketed rather than compared exactly, for the reason every
+    capacity in this engine is; see `_MEMORY_SHAPE_BUCKET`.
+
+    The Ray head is excluded — see [`_worker_nodes`].
     """
     by_shape: dict[tuple, str] = {}
-    for n in nodes:
+    for n in _worker_nodes(nodes):
         res = n.get("Resources", {})
         cpus = float(res.get("CPU", 0.0))
         if cpus <= 0:
@@ -175,7 +437,12 @@ def _representative_node_ids(nodes: list[dict]) -> list[str]:
         if not node_id:
             continue
         labels = n.get("Labels", {}) or {}
-        shape = (cpus, float(res.get("GPU", 0.0)), labels.get("ray.io/accelerator-type"))
+        shape = (
+            cpus,
+            _memory_bucket(float(res.get("memory", 0.0))),
+            float(res.get("GPU", 0.0)),
+            labels.get("ray.io/accelerator-type"),
+        )
         by_shape.setdefault(shape, node_id)  # first node of each shape represents it
     return list(by_shape.values())
 
@@ -201,7 +468,8 @@ def _probe_representatives(ray, node_ids: list[str]) -> tuple[dict, ...]:
         ).remote()
         for node_id in node_ids
     ]
-    ready, _ = ray.wait(refs, num_returns=len(refs), timeout=_PROBE_TIMEOUT_S)
+    ready, pending = ray.wait(refs, num_returns=len(refs), timeout=_PROBE_TIMEOUT_S)
+    _cancel_pending(ray, pending)
     out: list[dict] = []
     for ref in ready:
         try:
@@ -419,6 +687,60 @@ def cluster_device_health() -> tuple[dict, ...]:
     return probed
 
 
+def sampled_device_health() -> tuple[dict, ...]:
+    """The fleet-health sample **if one is already in hand**, without probing for it.
+
+    `cluster_device_health` fans a task out to every accelerator node, which is the right cost
+    for a health report and the wrong one for a path that runs per planned query. This is the
+    read for such a path: it returns what the last sample said while that sample is still fresh,
+    and an empty tuple otherwise.
+
+    That asymmetry is deliberate rather than a compromise. The alternative designs are both
+    worse: probing from the planner puts a fleet-wide round trip on every optimize, and caching
+    a *stale* verdict forever makes a device that recovered stay condemned. Reporting "no
+    information" until something else has paid for the sample keeps planning free and keeps the
+    verdict fresh, and every consumer already treats absence as "assume healthy" — which is
+    exactly the behavior that held before health reached the plan at all.
+
+    Returns:
+        The current health records, or empty when none has been sampled recently.
+    """
+    import time
+
+    if time.monotonic() < float(_HEALTH_SAMPLE["expires"]):  # type: ignore[arg-type]
+        return _HEALTH_SAMPLE["value"]  # type: ignore[return-value]
+    return ()
+
+
+def unhealthy_gpus_by_node(records: tuple[dict, ...] | None = None) -> dict[str, int]:
+    """How many devices each node has out of rotation, from a health sample.
+
+    Quarantined and degraded devices are counted together and deduplicated: a board the fleet
+    will not schedule on and a board running at a fraction of its rate are different conditions,
+    but a fan-out sized against either one asks for capacity it will not get. Deduplicated
+    because a device is routinely reported under both.
+
+    Args:
+        records: Health records, or `None` to use the already-sampled ones (never a fresh probe;
+            see `sampled_device_health`).
+
+    Returns:
+        Node id to the count of devices out of rotation. Nodes absent from the map — including
+        every node when nothing has been sampled — are treated as fully healthy by the caller,
+        which is the behavior that held before this existed.
+    """
+    out: dict[str, int] = {}
+    for record in sampled_device_health() if records is None else records:
+        node_id = str(record.get("node_id") or "")
+        if not node_id:
+            continue
+        down = {str(d) for d in (record.get("quarantined") or ())}
+        down |= {str(d) for d in (record.get("degraded") or ())}
+        if down:
+            out[node_id] = len(down)
+    return out
+
+
 def _probe_fleet_health() -> tuple[dict, ...]:
     """The unsampled fan-out behind `cluster_device_health`."""
     try:
@@ -443,7 +765,8 @@ def _probe_fleet_health() -> tuple[dict, ...]:
             for n in nodes
             if n.get("NodeID")
         }
-        ready, _ = ray.wait(list(refs), num_returns=len(refs), timeout=_PROBE_TIMEOUT_S)
+        ready, pending = ray.wait(list(refs), num_returns=len(refs), timeout=_PROBE_TIMEOUT_S)
+        _cancel_pending(ray, pending)
         out = []
         for ref in ready:
             # Per node: the one whose probe raises (NVML throwing, a wedged driver) is

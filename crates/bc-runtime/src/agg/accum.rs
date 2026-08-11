@@ -43,16 +43,72 @@ pub(super) fn accumulate_call(
 /// reductions (`sum`/`min`/`max`/`count`/`mean`) hit their `num_groups == 1` kernels; the
 /// rest scatter into the one group through a shared zero-id buffer. Group columns are empty
 /// (a global aggregate has no key), matching the grouped `partial`'s `Partial` shape.
+///
+/// **The zero-id buffer is built only if some call actually reads it**, and that is the whole
+/// performance story of a keyless aggregate. It is one `u32` per row — 64 KiB at a full morsel —
+/// and a `SUM` over 6 M rows folds 366 morsels, so unconditionally allocating and zeroing it
+/// moved **23 MB the query has no use for**, against the 48 MB the column itself is worth. The
+/// cost lands twice: single-threaded it was 8.6 ms against `pyarrow`'s 5.1 ms for the same
+/// reduction, and in the pool it competes for the very memory bandwidth the sum is bound by, so
+/// the parallel path saturated at 2.5x. The kernels that never read the buffer are exactly those
+/// with a whole-column reduction ([`global_reduces_whole_column`]), and they now get an empty
+/// slice — the convention [`count_non_null`] and `var::var_state` already documented but nothing
+/// supplied.
 pub(crate) fn global_partial(calls: &[AggCall], num_rows: usize) -> Result<Partial, RuntimeError> {
-    let zeros = vec![0u32; num_rows];
+    let mut zeros: Vec<u32> = Vec::new();
     let mut states = Vec::with_capacity(calls.len());
     for call in calls {
-        states.push(accumulate_call(call, &zeros, 1)?);
+        // `COUNT(*)` reads no values at all, so its whole-column answer is the row count — which
+        // the scatter loop can only recover by counting a buffer of zeros it was handed.
+        if matches!(call.func, AggFunc::CountStar) {
+            states.push(vec![
+                Arc::new(Int64Array::from(vec![num_rows as i64])) as ArrayRef
+            ]);
+            continue;
+        }
+        let ids: &[u32] = if global_reduces_whole_column(call) {
+            &[]
+        } else {
+            if zeros.len() < num_rows {
+                zeros = vec![0u32; num_rows];
+            }
+            &zeros[..num_rows]
+        };
+        states.push(accumulate_call(call, ids, 1)?);
     }
     Ok(Partial {
         group_columns: Vec::new(),
         states,
     })
+}
+
+/// Whether `call`'s kernel answers a single group from the whole column, never reading the
+/// per-row group ids.
+///
+/// This is the *complement* of the `num_groups == 1` short-circuits in [`sum_acc`],
+/// [`minmax_acc`] and [`count_non_null`], and it has to stay their complement exactly: claiming a
+/// pair that still scatters would hand it an empty slice and silently return a zero-row state.
+/// `global_partial_agrees_with_the_scatter_path` holds the two in step over every aggregate, so a
+/// short-circuit added or removed without updating this shows up as a failing test rather than a
+/// wrong answer.
+fn global_reduces_whole_column(call: &AggCall) -> bool {
+    let Some(dt) = call.values.as_ref().map(|v| v.data_type()) else {
+        return false;
+    };
+    match call.func {
+        // `count_non_null` subtracts the null count; no type has a scatter-only path.
+        AggFunc::Count => true,
+        // Arrow's SIMD reduction, for the two types `sum_acc` routes to it. Decimal keeps the
+        // exact `i128` scatter.
+        AggFunc::Sum => matches!(dt, DataType::Int64 | DataType::Float64),
+        // `partial` widens a `Mean`'s input to `Float64` before this runs, so its `sum_acc` half
+        // always takes the fast path and its `count_non_null` half always does.
+        AggFunc::Mean => matches!(dt, DataType::Float64),
+        // Int64 and Decimal128 only: a float `MIN`/`MAX` must keep the scatter, whose comparator
+        // ranks NaN the way the engine's float identity says and arrow's kernel does not.
+        AggFunc::Min | AggFunc::Max => matches!(dt, DataType::Int64 | DataType::Decimal128(_, _)),
+        _ => false,
+    }
 }
 
 pub(crate) fn sum_acc(
@@ -870,5 +926,155 @@ mod tests {
         assert_eq!(and.as_primitive::<Int64Type>().value(0), 6 & 3 & 5);
         assert_eq!(or.as_primitive::<Int64Type>().value(0), 6 | 3 | 5);
         assert_eq!(xor.as_primitive::<Int64Type>().value(0), 6 ^ 3 ^ 5);
+    }
+}
+
+#[cfg(test)]
+mod global_partial_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+
+    use super::*;
+
+    /// [`global_partial`] hands an empty group-id slice to every kernel
+    /// [`global_reduces_whole_column`] claims, and a real buffer of zeros to the rest. This holds
+    /// the claim to its consequence, aggregate by aggregate: the two must produce the identical
+    /// partial state.
+    ///
+    /// The failure it exists to catch is silent and total. A kernel wrongly claimed here iterates
+    /// an empty slice and returns a state for **zero rows** — not a wrong number, an absent one —
+    /// and every keyless query using that aggregate answers null. So the coverage is the whole
+    /// `AggFunc` surface rather than the handful currently claimed, because the risk is in what
+    /// someone claims *next*.
+    #[test]
+    fn global_partial_agrees_with_the_scatter_path() {
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(3i64),
+            None,
+            Some(-7),
+            Some(3),
+            Some(9),
+        ]));
+        // Signed zero and NaN are in here deliberately: `MIN`/`MAX` over floats must keep the
+        // scatter comparator, and this is what says so if it ever stops.
+        let floats: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.5f64),
+            None,
+            Some(-0.0),
+            Some(f64::NAN),
+            Some(2.0),
+        ]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("b"),
+            None,
+            Some("a"),
+            Some("b"),
+            Some("c"),
+        ]));
+        let bools: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+        ]));
+        let n = ints.len();
+
+        let single = [
+            AggFunc::CountStar,
+            AggFunc::Count,
+            AggFunc::CountDistinct,
+            AggFunc::Sum,
+            AggFunc::Min,
+            AggFunc::Max,
+            AggFunc::Mean,
+            AggFunc::Var,
+            AggFunc::Stddev,
+            AggFunc::Median,
+            AggFunc::Quantile(250),
+            AggFunc::QuantileDisc(250),
+            AggFunc::ApproxQuantile(500),
+            AggFunc::ApproxCountDistinct,
+            AggFunc::ListAgg,
+            AggFunc::Mode,
+            // The contiguity statistics ride `Median`'s state, so they must agree with the
+            // scatter path exactly as it does — this list is what says so if they stop.
+            AggFunc::NLength(500),
+            AggFunc::LCount(500),
+            AggFunc::AuN,
+            AggFunc::Histogram,
+            AggFunc::AnyValue,
+            AggFunc::Entropy,
+            AggFunc::Mad,
+            AggFunc::Product,
+            AggFunc::KahanSum,
+            AggFunc::ApproxTopK(2),
+            AggFunc::Skewness,
+            AggFunc::Kurtosis,
+            AggFunc::KurtosisPop,
+            AggFunc::BitAnd,
+            AggFunc::BitOr,
+            AggFunc::BitXor,
+        ];
+        let mut cases: Vec<AggCall> = Vec::new();
+        for func in single {
+            for values in [&ints, &floats, &strings, &bools] {
+                cases.push(AggCall::new(func, Some(Arc::clone(values))));
+            }
+        }
+        for func in [AggFunc::BoolAnd, AggFunc::BoolOr] {
+            cases.push(AggCall::new(func, Some(Arc::clone(&bools))));
+        }
+        for func in [
+            AggFunc::ArgMin,
+            AggFunc::ArgMax,
+            AggFunc::CovarPop,
+            AggFunc::CovarSamp,
+            AggFunc::Corr,
+        ] {
+            cases.push(AggCall::with_key(
+                func,
+                Some(Arc::clone(&floats)),
+                Some(Arc::clone(&ints)),
+            ));
+        }
+
+        let zeros = vec![0u32; n];
+        for call in &cases {
+            let lazy = global_partial(std::slice::from_ref(call), n);
+            let eager = accumulate_call(call, &zeros, 1);
+            match (lazy, eager) {
+                (Ok(lazy), Ok(eager)) => {
+                    let lazy = &lazy.states[0];
+                    assert_eq!(
+                        lazy.len(),
+                        eager.len(),
+                        "{:?} over {:?}: state arity",
+                        call.func,
+                        call.values.as_ref().map(|v| v.data_type())
+                    );
+                    for (got, want) in lazy.iter().zip(&eager) {
+                        assert_eq!(
+                            got.as_ref(),
+                            want.as_ref(),
+                            "{:?} over {:?}",
+                            call.func,
+                            call.values.as_ref().map(|v| v.data_type())
+                        );
+                    }
+                }
+                // A function that rejects a type must reject it the same way on both paths;
+                // what must never happen is one succeeding where the other errors.
+                (Err(_), Err(_)) => {}
+                (lazy, eager) => panic!(
+                    "{:?} over {:?}: one path succeeded and the other did not ({}, {})",
+                    call.func,
+                    call.values.as_ref().map(|v| v.data_type()),
+                    lazy.is_ok(),
+                    eager.is_ok()
+                ),
+            }
+        }
     }
 }

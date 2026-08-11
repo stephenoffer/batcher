@@ -2,7 +2,7 @@
 
 Scoring and statistical aggregates, from classification and regression metrics to
 descriptive and inferential statistics. Every one is an ordinary aggregate, so it
-composes with `group_by(...).agg(...)` and scores per segment in one pass.
+composes with {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and scores per segment in one pass.
 
 The metrics that need a global ordering or return a table live in `batcher.ml.metrics`
 instead, on {doc}`/api/models/ml-models`.

@@ -106,15 +106,23 @@ def test_in_lists_on_different_columns_are_left_alone():
     assert plan.count('"in_list"') == 2 or '{"int": 1}' in plan
 
 
-def test_a_disjoint_pair_is_not_folded_by_this_rule():
-    """An empty intersection is FALSE for a present value and NULL for a null one, so
-    this rule declines it and leaves the contradiction to the rule that owns it."""
-    from batcher.kyber.rules.normalize.predicates import _intersect_conjoined_in_lists
+def test_a_disjoint_pair_becomes_the_empty_relation():
+    """An empty intersection under a filter keeps no row, so the scan is dropped entirely.
 
+    This asserted the *opposite* until the duplicate `intersect_in_lists` was removed. Two
+    rules shared that name; `RuleRegistry.add` kept whichever registered first, and this
+    test reached past the registry into the loser's private helper — so it described a
+    decline that the shipped optimizer never made. Both halves of the mistake are now
+    closed: the dead copy is gone, and `test_no_two_rules_share_a_name` fails on a repeat.
+
+    The fold is sound because a `Filter` cannot tell NULL from FALSE. `a IN (1,2) AND a IN
+    (3,4)` is FALSE for a present `a` and NULL for a null one, and both drop the row.
+    """
     # Two values per list, because a one-value `is_in` is built as a plain equality and
-    # never becomes an `InList` for this rule to see.
-    predicate = col("a").is_in([1, 2]) & col("a").is_in([3, 4])
-    assert _intersect_conjoined_in_lists(predicate) is None
+    # never becomes an `InList` for the rule to see.
+    plan = _plan(DS.filter(col("a").is_in([1, 2]) & col("a").is_in([3, 4])))
+    assert '"in_list"' not in plan
+    assert '"limit"' in plan and '"n": 0' in plan
 
 
 # --- constant group key -----------------------------------------------------

@@ -220,3 +220,4 @@ terminated and keeps doing so until the record is cleared, so a loop that forget
 - {doc}`streaming`: sources, sinks, triggers, output modes, and checkpoints.
 - {doc}`/cookbook/streaming/late-data-watermarks`: what the allowed lateness costs.
 - {doc}`/configuration/options`: the `streaming` section's idle cadence and history bound.
+- {doc}`/user-guide/operate/running/metrics`: the same per-batch numbers as scrapeable counters, so a chart sees the lag a single reading cannot.

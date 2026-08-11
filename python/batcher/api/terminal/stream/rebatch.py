@@ -1,4 +1,4 @@
-"""The exact output-granularity contract for `iter_batches(batch_size=N)`.
+"""The exact output-shape contract for `iter_batches`: how many rows, in what chunks.
 
 `batch_size` is a promise about the *output*: every emitted batch holds exactly N rows
 except the last. None of the per-path chunkers can keep it — they slice each engine batch
@@ -6,6 +6,10 @@ independently, so a stream of unevenly-sized batches leaks a short one at every 
 rather than at the end only. This module is the one place that buffers across boundaries
 and cuts on the exact row count, and it lives apart from the router because the router
 chooses *which* strategy runs while this shapes what any of them emitted.
+
+`_take` is the other half of that contract: `LIMIT n OFFSET m` over a stream is a statement
+about how many rows leave, answered here for the same reason -- it is a pure function over
+an emitted iterator, and the router should be choosing strategies rather than counting rows.
 """
 
 from __future__ import annotations
@@ -57,3 +61,33 @@ def _rebatch_exact(batches: Iterator[pa.RecordBatch], batch_size: int) -> Iterat
         rows = rest.num_rows
     if buf:
         yield from pa.Table.from_batches(buf).combine_chunks().to_batches()
+
+
+def _take(
+    batches: Iterator[pa.RecordBatch], n: int, offset: int, batch_size: int | None
+) -> Iterator[pa.RecordBatch]:
+    """Yield `n` rows after skipping `offset`, then stop reading.
+
+    Stopping is the point: a limited stream *ends*, so the generator is abandoned as soon
+    as the count is met rather than draining a source that never will.
+    """
+    skipped = 0
+    taken = 0
+    for batch in batches:
+        if taken >= n:
+            break
+        rows = batch
+        if skipped < offset:
+            drop = min(offset - skipped, rows.num_rows)
+            skipped += drop
+            rows = rows.slice(drop)
+        if rows.num_rows == 0:
+            continue
+        if taken + rows.num_rows > n:
+            rows = rows.slice(0, n - taken)
+        taken += rows.num_rows
+        if batch_size is None or rows.num_rows <= batch_size:
+            yield rows
+        else:
+            for start in range(0, rows.num_rows, batch_size):
+                yield rows.slice(start, batch_size)

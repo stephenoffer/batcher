@@ -73,6 +73,11 @@ def _shape(plan) -> list[str]:
     return [type(n).__name__ for n in walk(plan)]
 
 
+def _limits(plan) -> list[Limit]:
+    """Every `Limit` in `plan` — for asserting on row counts rather than on node shape."""
+    return [n for n in walk(plan) if isinstance(n, Limit)]
+
+
 def _global_agg(inner=None) -> Aggregate:
     """A keyless (global) aggregate — exactly one output row, by construction."""
     return Aggregate(
@@ -319,9 +324,17 @@ def test_topn_of_zero_over_one_row_is_kept():
     plan = Sort(Limit(_scan(), 1), KEYS, limit=0)
     out = _stream().logical_rewrite(plan)
     # This rule declines; `empty_topn_to_empty` then models the top-0 as a `Limit(0)`.
-    # What must NOT happen is the one-row input coming back for a zero-row request.
+    # What must NOT happen is the one-row input coming back for a zero-row request, and
+    # `n == 0` at the root is exactly that property: a surviving `Limit(_, 1)` root would
+    # carry `n == 1`.
     assert isinstance(out, Limit) and out.n == 0, _shape(out)
-    assert _shape(out) != ["Limit", "Scan"], _shape(out)
+    # The *shape* is deliberately not pinned. This used to assert `!= ["Limit", "Scan"]`
+    # as a proxy for the same thing, which broke the moment the empty-relation rules moved
+    # into the iterating FUSION phase and became able to fold `Limit(Limit(scan, 1), 0)`
+    # down to `Limit(scan, 0)`. Both spell the same empty relation over the same schema, so
+    # the two-node form is a strictly better plan, not a regression — the proxy was
+    # over-specified, while the assertion above states the property that actually matters.
+    assert all(n.n == 0 for n in _limits(out)), _shape(out)
 
 
 def test_topn_of_one_over_one_row_is_dropped():

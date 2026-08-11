@@ -24,7 +24,7 @@ print(counts.to_pydict())
 # {'g': ['a', 'b'], 'n': [2, 2]}
 ```
 
-Passing `distributed=True` to `collect()` runs that same plan across workers, and the
+Passing `distributed=True` to {py:meth}`collect() <batcher.Dataset.collect>` runs that same plan across workers, and the
 output matches the single-node result above. There is no separate distributed operator
 to learn. Going from a sample to petabytes is a deployment change, not a rewrite of your
 query.

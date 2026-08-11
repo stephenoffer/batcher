@@ -15,7 +15,7 @@ from typing import Any
 from batcher.plan.feedback import cpu_utilization
 from batcher.plan.physical import PhysicalOp
 from batcher.plan.profile.stages import StageRecorder
-from batcher.plan.profile.types import Decision, OpProfile, QueryProfile
+from batcher.plan.profile.types import Decision, OpProfile, QueryProfile, QueryUsage
 
 __all__ = ["ProfileCollector", "build_op_profiles", "merge_metric_ops", "worker_op_profiles"]
 
@@ -39,14 +39,31 @@ class ProfileCollector:
     carbonite_summary: str = ""
     adaptive_stages: list[dict[str, Any]] = field(default_factory=list)
     distributed: bool = False
-    # Raw `ExecMetrics` op-lists shipped back by distributed workers (the map sub-plan),
-    # one list per worker. Merged into `QueryProfile.worker_ops` by `to_profile`.
-    worker_metrics: list[list[dict[str, Any]]] = field(default_factory=list)
+    # Raw `ExecMetrics` documents shipped back by distributed workers (the map sub-plan),
+    # one per worker. `to_profile` merges their op-lists into `QueryProfile.worker_ops` and
+    # sums their whole-execution `query` blocks into `usage`. The whole document rather than
+    # just the op-list, because a worker's share of the CPU, memory and disk cost is measured
+    # per task and is unrecoverable once the driver has thrown the rest of it away.
+    worker_metrics: list[dict[str, Any]] = field(default_factory=list)
+    # What the run cost the machine, measured across the execution as a whole. One reading
+    # on the single-node path; one per worker task on the distributed path, folded together
+    # by `QueryUsage.merged` because a stage's cost is the sum of what its workers spent.
+    usage: QueryUsage = field(default_factory=QueryUsage)
     # Measurements for the Python-UDF stages the engine never sees (`map_batches`). Kept
     # apart from `metric_ops` — which the engine fills — because the two are numbered against
     # different trees: engine ops against the optimized IR, stages against the logical plan.
     # `api` picks whichever tree the plan actually has.
     stage_recorder: StageRecorder = field(default_factory=StageRecorder)
+
+    def record_usage(self, doc: dict[str, Any] | None) -> None:
+        """Fold one `ExecMetrics.query` block in, summing with anything already recorded.
+
+        Args:
+            doc: The ``query`` object from an `ExecMetrics` document, or `None` for an
+                engine build that does not report one.
+        """
+        if doc:
+            self.usage = self.usage.merged(QueryUsage.from_metrics(doc))
 
     def to_profile(
         self, *, total_ms: float, rows: int, query_id: str = "", memory_budget_bytes: int = 0
@@ -54,9 +71,17 @@ class ProfileCollector:
         """Assemble the collected planned + measured facts into a `QueryProfile`."""
         ir = self.optimized_ir or {}
         ops = build_op_profiles(ir, self.physical_ops, self.metric_ops or None)
-        worker_ops = (
-            worker_op_profiles(merge_metric_ops(self.worker_metrics)) if self.worker_metrics else ()
-        )
+        worker_ops: tuple[OpProfile, ...] = ()
+        # Folded into a local rather than into `self.usage`: assembling a profile is a read,
+        # and a caller that assembles twice (a `stats()` after an `explain(analyze=True)`)
+        # must not see the cluster's cost counted twice.
+        usage = self.usage
+        if self.worker_metrics:
+            worker_ops = worker_op_profiles(
+                merge_metric_ops([doc.get("ops", []) for doc in self.worker_metrics])
+            )
+            for doc in self.worker_metrics:
+                usage = usage.merged(QueryUsage.from_metrics(doc.get("query")))
         return QueryProfile(
             ops=ops,
             total_ms=total_ms,
@@ -71,6 +96,7 @@ class ProfileCollector:
             optimized_ir=self.optimized_ir,
             memory_budget_bytes=memory_budget_bytes,
             worker_ops=worker_ops,
+            usage=usage,
         )
 
 
@@ -119,6 +145,7 @@ def build_op_profiles(
                 rows_in=int(m.get("rows_in", 0)),
                 rows_out=int(m.get("rows_out", 0)),
                 elapsed_ms=float(m.get("elapsed_ns", 0)) / 1e6,
+                cpu_ms=float(m.get("cpu_ns", 0)) / 1e6,
                 # The engine now reports both: `result_bytes` (output arrays) and
                 # `peak_bytes` (true peak working set). Older engines only had the latter,
                 # holding output size, so fall back to it.
@@ -247,6 +274,7 @@ def worker_op_profiles(merged: Sequence[Mapping[str, Any]]) -> tuple[OpProfile, 
                 rows_in=int(m.get("rows_in", 0)),
                 rows_out=int(m.get("rows_out", 0)),
                 elapsed_ms=float(m.get("elapsed_ns", 0)) / 1e6,
+                cpu_ms=float(m.get("cpu_ns", 0)) / 1e6,
                 result_bytes=int(m.get("result_bytes", m.get("peak_bytes", 0))),
                 spilled=bool(m.get("spilled", False)),
                 spill_bytes=int(m.get("spill_bytes", 0)),

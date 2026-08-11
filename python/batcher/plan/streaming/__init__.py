@@ -2,8 +2,10 @@
 
 The immutable values the conductor (`api`) and executor (`core`) exchange to run a
 streaming query: the `Trigger` cadence and `OutputMode` in `spec`, the per-micro-batch
-`StreamingQueryProgress` and its state/source/sink detail in `progress`, and the
-`StreamingQueryListener` registry in `listener`. Like all of `plan`, this imports no
+`StreamingQueryProgress` and its state/source/sink detail in `progress`, the
+`StreamingQueryListener` registry in `listener`, and the per-partition `WatermarkTracker`
+in `tracker` — the one definition of how far event time has actually advanced, shared by
+the `core` folds and the `api` streaming drivers. Like all of `plan`, this imports no
 subsystem, so both layers share one definition.
 """
 
@@ -28,18 +30,22 @@ from batcher.plan.streaming.progress import (
     StreamingQueryProgress,
     StreamingQueryStatus,
 )
+from batcher.plan.streaming.rate import RateController, RateLimit
 from batcher.plan.streaming.spec import (
     OutputMode,
     Trigger,
     Watermark,
     parse_interval_seconds,
 )
+from batcher.plan.streaming.tracker import WatermarkTracker, event_micros
 
 __all__ = [
     "OutputMode",
     "QueryProgressEvent",
     "QueryStartedEvent",
     "QueryTerminatedEvent",
+    "RateController",
+    "RateLimit",
     "SinkProgress",
     "SourceProgress",
     "StateOperatorProgress",
@@ -48,7 +54,9 @@ __all__ = [
     "StreamingQueryStatus",
     "Trigger",
     "Watermark",
+    "WatermarkTracker",
     "add_streaming_listener",
+    "event_micros",
     "notify_query_progress",
     "notify_query_started",
     "notify_query_terminated",

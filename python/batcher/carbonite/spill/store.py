@@ -116,6 +116,14 @@ class TieredSpillStore:
         # How many buckets were pushed to the remote tier. The single number that explains
         # a spill phase that suddenly got slow: it means the local tier filled.
         self._overflowed = 0
+        # Lifetime totals, which the live `_local_used`/`_remote_used` cannot supply: a
+        # bucket is dropped as soon as it has been read back, so by the end of a reduce phase
+        # a store that moved gigabytes reports zero bytes held. Without these, "how much did
+        # this query spill" had no answer at the only moment anyone asks it.
+        self._bytes_written = 0
+        self._buckets_written = 0
+        self._peak_local_used = 0
+        self._peak_remote_used = 0
         # Writers handed out and not yet finalized. `cleanup` aborts whatever is left, which
         # is the only way an abandoned *remote* bucket ever gets deleted.
         self._open_writers: set[BucketWriter] = set()
@@ -179,9 +187,16 @@ class TieredSpillStore:
         """A snapshot of this store's accounting, for telemetry and tests.
 
         Returns:
-            Bytes and bucket counts per tier, how many buckets overflowed, the local budget
-            in force (`-1` when the local tier is unbounded), and the volume's measured
-            pressure and free space (`-1` when it cannot be stat'd).
+            Bytes and bucket counts *held* per tier and their high-water marks, the lifetime
+            volume written, how many buckets overflowed, the local budget in force (`-1` when
+            the local tier is unbounded), and the volume's measured pressure and free space
+            (`-1` when it cannot be stat'd).
+
+            The held figures and the lifetime ones answer different questions and both are
+            needed. A reduce phase drops each bucket as it reads it back, so a store that
+            moved gigabytes reports `local_bytes` of zero by the time anyone asks — while
+            `bytes_written` is the volume that went to disk and `peak_local_bytes` is the
+            most that was ever resident on it at once.
         """
         free = disk.free_disk_bytes(self._local_dir)
         return {
@@ -189,6 +204,10 @@ class TieredSpillStore:
             "remote_bytes": self._remote_used,
             "local_buckets": len(self._local_paths),
             "remote_buckets": len(self._remote_paths),
+            "peak_local_bytes": self._peak_local_used,
+            "peak_remote_bytes": self._peak_remote_used,
+            "bytes_written": self._bytes_written,
+            "buckets_written": self._buckets_written,
             "overflowed": self._overflowed,
             "local_budget_bytes": -1 if self._local_budget is None else self._local_budget,
             "local_pending_bytes": self._local_pending,
@@ -232,9 +251,13 @@ class TieredSpillStore:
         if tier is SpillTier.LOCAL:
             self._local_used += nbytes
             self._local_paths.append(path)
+            self._peak_local_used = max(self._peak_local_used, self._local_used)
         else:
             self._remote_used += nbytes
             self._remote_paths.append(path)
+            self._peak_remote_used = max(self._peak_remote_used, self._remote_used)
+        self._bytes_written += nbytes
+        self._buckets_written += 1
         return nbytes
 
     @staticmethod
@@ -427,7 +450,28 @@ class TieredSpillStore:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        # Read *before* cleanup, which zeroes the accounting: the interesting figures are
+        # what the store held at its high-water, and after the buckets are removed there is
+        # nothing left to report. An out-of-core query that is otherwise invisible in the
+        # counters — it returns the right answer, slowly — shows up here as tier volumes and
+        # an overflow count.
+        self.publish_stats()
         self.cleanup()
+
+    def publish_stats(self) -> None:
+        """Put this store's accounting on the event bus as a `RESOURCE` reading.
+
+        A no-op when nothing is listening, which is the default. `free_disk_bytes` costs a
+        `statvfs`, so a process exporting no metrics must not pay for it.
+
+        Returns:
+            None.
+        """
+        from batcher._internal import events
+
+        if not events.listening():
+            return
+        events.publish(events.RESOURCE, name="spill", stats=self.stats())
 
 
 def _verify_complete(handle: SpillHandle, seen: int) -> None:

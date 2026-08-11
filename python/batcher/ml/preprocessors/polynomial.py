@@ -266,6 +266,12 @@ class SplineTransformer(Preprocessor):
     def transform(self, ds: Dataset) -> Dataset:
         """Append the spline basis columns for each fitted column.
 
+        A basis peaks at ``0.99`` rather than ``1.0`` in the example below because the
+        default ``knots="quantile"`` takes its cut points from the **approximate**
+        quantile sketch: on the three-row input it puts the middle knot at ``0.99``
+        rather than exactly ``1.0``. ``knots="uniform"`` spaces them by range instead
+        and peaks at an exact ``1.0``.
+
         Examples:
             .. doctest::
 
@@ -274,7 +280,7 @@ class SplineTransformer(Preprocessor):
                 >>> ds = bt.from_pydict({"x": [0.0, 1.0, 2.0]})
                 >>> pre = SplineTransformer("x", n_knots=3, degree=1).fit(ds)
                 >>> [round(v, 3) for v in pre.transform(ds).to_pydict()["x_sp1"]]
-                [0.0, 1.0, 0.0]
+                [0.0, 0.99, 0.0]
 
         Args:
             ds: The dataset to expand.

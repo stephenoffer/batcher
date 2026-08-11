@@ -1,0 +1,13 @@
+[package]
+name = "bc-spatial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No dependencies, deliberately. Rigid-body math is `f64` arithmetic and the standard
+# library's transcendental functions; a linear-algebra crate would put a matrix type
+# into every build of the engine to hold twelve numbers.
+
+[lints]
+workspace = true

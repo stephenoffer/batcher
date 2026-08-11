@@ -9,7 +9,7 @@ page is to not get in its way.
 
 ## Read, decode, classify
 
-`bt.read.images(..., decode=True, size=(h, w))` lists the files, decodes and resizes in
+{py:meth}`bt.read.images(..., decode=True, size=(h, w)) <batcher.api.io_namespace.reader.Reader.images>` lists the files, decodes and resizes in
 the data plane (SIMD JPEG, SIMD resize, fanned out across every core), and hands you a
 fixed-shape `(h, w, 3)` tensor column. Always pass a `size`: a batch of full-resolution
 frames will exhaust host memory long before it reaches the model.
@@ -64,7 +64,7 @@ model on every batch.
 
 The decode half runs anywhere, with no GPU and no weights, because it is an engine
 expression.
-`.image.to_tensor(w, h)` decodes and resizes natively; the classifier below is a
+{py:meth}`.image.to_tensor(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>` decodes and resizes natively; the classifier below is a
 brightness threshold standing in for a forward pass, with exactly the shape a real one
 has.
 
@@ -167,7 +167,7 @@ scored = (
 )
 ```
 
-`.image.to_tensor_f32(w, h, mean=, std=, channels_first=)` does the full torchvision
+{py:meth}`.image.to_tensor_f32(w, h, mean=, std=, channels_first=) <batcher.plan.expr_ir.image._ImageNamespace.to_tensor_f32>` does the full torchvision
 `ToTensor` + `Normalize` step natively: it decodes, resizes, scales to `[0, 1]`, applies
 the per-channel ImageNet mean/std, and emits a channel-first `float32` tensor. The
 whole preprocessing chain stays in the engine, and the model receives a ready tensor with
@@ -175,10 +175,10 @@ no per-batch Python (`/255`, `Normalize`, `permute`). Use the plain `.image.to_t
 when the model wants raw `uint8` HWC pixels instead.
 
 When the model was trained with the classic *resize-then-crop* recipe (`Resize(256)` then
-`CenterCrop(224)`), `.image.center_crop(w, h)` is the crop half. It decodes and takes the
+`CenterCrop(224)`), {py:meth}`.image.center_crop(w, h) <batcher.plan.expr_ir.image._ImageNamespace.center_crop>` is the crop half. It decodes and takes the
 centered `(w, h)` window, zero-padding a too-small image the way torchvision `CenterCrop`
 does, so you can chain it with the tensor step to match the model's exact eval
-transform. For a model that takes a single-channel input, `.image.to_grayscale(w, h)` decodes,
+transform. For a model that takes a single-channel input, {py:meth}`.image.to_grayscale(w, h) <batcher.plan.expr_ir.image._ImageNamespace.to_grayscale>` decodes,
 resizes, and reduces to one Rec.601 luminance channel (`(h, w, 1)`) in the same native pass.
 :::
 
@@ -231,8 +231,8 @@ Pin a device model with `accelerator_type="NVIDIA_A100"` on a heterogeneous clus
 - {doc}`GPU scheduling </ml/inference/gpu>`: fractional packing and autoscaling pools in full.
 - {doc}`Inference </ml/inference/inference>` and {doc}`batch scoring </ml/inference/batch-scoring>`: the
   `map_batches` / `ml.infer` surface these calls lower to.
-- {doc}`Multimodal </ml/preparing/multimodal/index>`: the `.image` decode expressions.
-- {doc}`ML API reference </api/models/ml>`: every argument of `ds.ml.infer` and `ds.ml.download`.
+- {doc}`Multimodal </ml/preparing/multimodal/index>`: the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>` decode expressions.
+- {doc}`ML API reference </api/models/ml>`: every argument of {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.download <batcher.api.dataset.ml.DatasetML.download>`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: where the numbers above come from.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: how the CPU and GPU stages overlap.
 - {doc}`PyTorch integration </integrations/compute/pytorch>`: handing these tensors to a training

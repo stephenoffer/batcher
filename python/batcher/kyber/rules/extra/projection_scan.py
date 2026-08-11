@@ -59,7 +59,6 @@ __all__ = [
     "drop_self_cast_in_filter",
     "drop_self_cast_in_projection",
     "drop_self_cast_in_sort_key",
-    "eliminate_sort_before_sample",
     "empty_on_impossible_null_check",
     "empty_sample_n",
     "fold_nested_sample_same_seed",
@@ -71,17 +70,25 @@ __all__ = [
 # --- ordering: drop work the ordering makes irrelevant -----------------------
 
 
-@rule(name="eliminate_sort_before_sample", phase=Phase.NORMALIZE, matches=(Sample,))
-def eliminate_sort_before_sample(node: Sample, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`Sample(Sort(x))` → `Sample(x)`. A row is kept by a stable hash of its *values*
-    (fraction mode) or by being among the `n` smallest such hashes — neither depends on
-    input order, so the sampled multiset is identical and the sort is pure overhead.
-    Skipped when the sort carries a `limit` (a top-N changes the input set that is
-    sampled)."""
-    inner = node.input
-    if isinstance(inner, Sort) and inner.limit is None:
-        return dataclasses.replace(node, input=inner.input)
-    return None
+# REMOVED: `eliminate_sort_before_sample`, which rewrote `Sample(Sort(x))` -> `Sample(x)`.
+#
+# Its argument was that a row is kept by a stable hash of its *values*, so the sampled
+# **multiset** does not depend on input order. That much is true, and it is why an
+# intervening `Sample` cannot change *which* rows an order-indifferent consumer sees.
+# It is not enough to delete the sort, because the multiset is not the only observable:
+# `Sample` is order-*preserving* in the engine, so the rewrite changed the order of the
+# rows the user got back.
+#
+# Concretely, `ds.sort("a").sample(fraction=0.3)` over 200 shuffled rows returned them in
+# scan order rather than in `a` order. Nothing caught it: every rule here is checked with
+# `assert_same`, which is order-independent by design, and the estimator separately
+# declined to propagate an ordering through `Sample`, so the two halves agreed with each
+# other and disagreed with the executor.
+#
+# The sound shape of this optimization matches the *consumer* whose output order is
+# unspecified, the way `eliminate_sort_before_aggregate` and `stream_drop_sort_under_distinct`
+# both do; `eliminate_sort_before_aggregate` now looks through a `Sample` for exactly that
+# reason. Do not reinstate a version that matches `Sample` itself.
 
 
 def _sort_key_sig(key: object) -> tuple:
@@ -171,7 +178,7 @@ def drop_always_true_null_check(node: Filter, _ctx: OptimizerContext) -> Logical
     return Filter(node.input, combine_conjuncts(kept))
 
 
-@rule(name="empty_on_impossible_null_check", phase=Phase.SELECTION, matches=(Filter,))
+@rule(name="empty_on_impossible_null_check", phase=Phase.FUSION, matches=(Filter,))
 def empty_on_impossible_null_check(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold a filter to an empty relation when a conjunct is `col IS NULL` over a column
     the schema declares NOT NULL.
@@ -192,7 +199,7 @@ def empty_on_impossible_null_check(node: Filter, _ctx: OptimizerContext) -> Logi
 # --- sample: degenerate/composable bounds, per the engine's semantics --------
 
 
-@rule(name="empty_sample_n", phase=Phase.SELECTION, matches=(Sample,))
+@rule(name="empty_sample_n", phase=Phase.FUSION, matches=(Sample,))
 def empty_sample_n(node: Sample, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Sample(x, n=0)` → empty. A fixed-count sample of zero rows keeps nothing (the
     engine returns no rows for `n == 0`), so it is the empty relation `Limit(x, 0)` —

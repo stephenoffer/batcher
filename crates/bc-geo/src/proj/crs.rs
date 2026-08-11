@@ -83,25 +83,6 @@ pub fn is_supported(epsg: i32) -> bool {
         || parse_utm(epsg).is_some()
 }
 
-/// A human-readable name for a supported EPSG code.
-pub fn crs_name(epsg: i32) -> Option<String> {
-    if epsg == EPSG_WGS84 {
-        return Some("WGS 84 (lon/lat degrees)".to_string());
-    }
-    if epsg == EPSG_WEB_MERCATOR {
-        return Some("WGS 84 / Pseudo-Mercator (metres)".to_string());
-    }
-    if epsg == EPSG_EQUAL_AREA {
-        return Some("WGS 84 / NSIDC EASE-Grid 2.0 Global (equal-area metres)".to_string());
-    }
-    parse_utm(epsg).map(|(zone, north)| {
-        format!(
-            "WGS 84 / UTM zone {zone}{} (metres)",
-            if north { "N" } else { "S" }
-        )
-    })
-}
-
 fn unsupported(epsg: i32) -> GeoError {
     GeoError::invalid(format!(
         "EPSG:{epsg} is not a supported CRS. Supported: 4326 (WGS 84 lon/lat), \
@@ -330,27 +311,6 @@ pub fn transform(g: &Geometry, from: i32, to: i32) -> GeoResult<Geometry> {
     }
 }
 
-/// A scale factor: how many metres one unit of `epsg` is, at the given latitude.
-///
-/// For a projected CRS in metres this is 1 (or the Mercator stretch, which grows without
-/// bound toward the poles); for degrees it is the local metres-per-degree. Exposed so a
-/// tolerance stated in metres can be converted into the units a planar predicate needs.
-pub fn metres_per_unit(epsg: i32, lat: f64) -> GeoResult<f64> {
-    if epsg == EPSG_WGS84 {
-        // One degree of latitude, which is the smaller of the two and therefore the
-        // conservative choice for a tolerance.
-        return crate::proj::geodesy::haversine(0.0, lat, 0.0, lat + 1.0);
-    }
-    if epsg == EPSG_WEB_MERCATOR {
-        // Mercator exaggerates by 1/cos(lat); one projected metre is cos(lat) real ones.
-        return Ok(lat.to_radians().cos().max(1e-9));
-    }
-    if epsg == EPSG_EQUAL_AREA || parse_utm(epsg).is_some() {
-        return Ok(1.0);
-    }
-    Err(unsupported(epsg))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,12 +454,5 @@ mod tests {
         assert_eq!(out.num_points(), g.geometry.num_points());
         assert_eq!(out.polygons()[0].interiors.len(), 1);
         assert!(transform(&g.geometry, 4326, 9999).is_err());
-    }
-
-    #[test]
-    fn metres_per_unit_reports_the_tolerance_conversion() {
-        close(metres_per_unit(EPSG_WGS84, 0.0).unwrap(), 111_195.0, 200.0);
-        assert_eq!(metres_per_unit(32610, 37.0).unwrap(), 1.0);
-        assert!(metres_per_unit(EPSG_WEB_MERCATOR, 60.0).unwrap() < 0.51);
     }
 }

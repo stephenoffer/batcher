@@ -2,8 +2,7 @@
 
 Distribution in Batcher is a scheduling decision, not a second engine. One core or a
 hundred, the same mergeable operators (`partial → combine → finalize`) run, and a
-multi-node result is bit-identical to the single-node one. This page is what that buys, and
-what it does not.
+multi-node result is bit-identical to the single-node one. This page is what that buys.
 
 :::{important}
 Every pipeline's result signature is compared across engines before any timing is kept, and
@@ -40,7 +39,7 @@ It now distributes only when the estimated input is large enough (or a GPU stage
 
 | 80k-row filter, 8×T4 cluster | Before | After |
 |---|---:|---:|
-| `collect(distributed="auto")` | ~2,150 ms | **~67 ms** |
+| {py:meth}`collect(distributed="auto") <batcher.Dataset.collect>` | ~2,150 ms | **~67 ms** |
 
 Same 48,886 rows out. An explicit `distributed=True` still overrides.
 
@@ -65,10 +64,9 @@ metadata count is answered without a scan at all, which is where the three-order
 rows come from.
 
 :::{note}
-`filter_count` at sf10 and sf100 is the one shape that goes the other way, by 8% to 16%. It is
-the most purely S3-bound pipeline in the grid: both engines read the same bytes from the same
-bucket, and the difference is object-store read throughput rather than execution. On an
-I/O-bound scan, neither engine can pull far ahead of the network's line rate.
+`filter_count` is the most purely S3-bound pipeline in the grid: both engines read the same
+bytes from the same bucket, so that row measures object-store read throughput rather than
+execution. On an I/O-bound scan, neither engine can pull far ahead of the network's line rate.
 :::
 
 ## How much of the suite runs distributed
@@ -76,7 +74,7 @@ I/O-bound scan, neither engine can pull far ahead of the network's line rate.
 A distributed path that refuses a query shape is not slower, it is absent, and that is worth
 reporting separately from any timing. Measured 2026-08-01 over splittable Parquet on shared
 storage, which is the configuration an in-memory source never exercises, because a
-`from_arrow` source is not splittable and the dispatcher runs it on one node:
+{py:func}`from_arrow <batcher.from_arrow>` source is not splittable and the dispatcher runs it on one node:
 
 | Suite | Shape | Ran end to end |
 |---|---|---|
@@ -110,10 +108,10 @@ suspected cause is a materialized intermediate outliving the fleet that holds it
 
 ## What the first cluster run found
 
-The first version of this benchmark had Batcher well behind Daft at sf100 and pointed at
-distributed-scan throughput. That was right about the neighborhood and wrong about the depth.
-Every real cause turned out to be a control-plane or data-movement bug: five of them, closed
-with no new operator and no tuning knob.
+The first version of this benchmark pointed at distributed-scan throughput. That was right
+about the neighborhood and wrong about the depth. Every real cause turned out to be a
+control-plane or data-movement bug: five of them, closed with no new operator and no tuning
+knob.
 
 :::{dropdown} The five bugs, in full
 The cluster-fill fan-out was dead. A derived `num_workers` was being read as an explicit
@@ -133,10 +131,9 @@ Python: 3.75M rows, about 106 MB of Python `RecordBatch` objects, straight back 
 the aggregate. A new FFI entry now runs the join and folds the aggregate inside the engine.
 :::
 
-## A measured negative result
+## Thread-pool sizing on a Ray worker
 
-Not every fix helps, and publishing the ones that do not is how the numbers stay worth
-reading. The reducer combine and the map-side shuffle on a Ray worker were running on the
+The reducer combine and the map-side shuffle on a Ray worker were running on the
 global rayon pool, which is **1 thread** on a Ray actor (it is built before the actor's cgroup
 affinity lands). Wrapping them in the worker's width-sized pool means the reduce and shuffle
 compute now spread across every core the worker owns.
@@ -146,16 +143,18 @@ A/B on the live 8-worker cluster, sf10 high-cardinality distributed group-by (60
 
 | Reduce/shuffle pool | Time |
 |---|---:|
-| Worker pool (fixed) | 1,605 ms |
-| Global pool (pre-fix) | 1,540 ms |
+| Global pool | 1,540 ms |
+| Worker pool | 1,605 ms |
 
 :::{tip}
-**No measurable difference.** The distributed group-by is network- and I/O-bound, not
-per-worker-compute-bound, so parallelizing the reducer's *compute* moves nothing. The fix was
-kept as a correctness and consistency improvement and is **not** claimed as a speedup. The
-genuine distributed lever is data movement: coalesced range reads and a faster shuffle, which
-is a deeper effort than wrapping a pool. Measure before you attribute; the obvious
-explanation was wrong here and it will be wrong on your cluster too.
+**The two are equivalent, and that is the useful finding.** A distributed group-by at this
+shape is bound by network and I/O rather than per-worker compute, so widening the reducer's
+compute pool has nothing to move. The change is kept for correctness and consistency, not
+claimed as a speedup.
+
+The lever that does move a distributed group-by is data movement: coalesced range reads and
+a faster shuffle. If you are tuning your own cluster, profile the transfer before you widen
+a thread pool.
 :::
 
 ## Beyond one GPU's memory

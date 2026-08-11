@@ -23,7 +23,7 @@ from batcher.config import Config
 from batcher.kyber.metadata_answer import _root_stats
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.logical import LogicalPlan
-from batcher.plan.stats import Provenance, RelStats
+from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
 __all__ = [
     "answer_column_summary",
@@ -77,13 +77,28 @@ def approx_column_summary(
         stat = stats.columns.get(col)
         # An entry holding *only* `approx_n_unique` is intentional — surfacing the sketch for
         # a column with no exact facets is the whole point of this variant. But the count must
-        # be genuinely approximate: when the ndv is exact, `_exact_entry` already reported it
-        # as `n_unique`, and repeating it here would label an exact value approximate.
-        if stat is not None and stat.ndv is not None and not stat.ndv_is_exact:
+        # be genuinely approximate *and* genuinely measured, which is two conditions rather
+        # than one. When the ndv is exact, `_exact_entry` already reported it as `n_unique`,
+        # and repeating it here would label an exact value approximate. And when it is only a
+        # DEFAULT *bound* — which is what a scan publishes when nothing measured the column,
+        # typically the row count itself — reporting it as an approximate distinct count
+        # dresses a guess as a measurement. `approx_*` promises a sketch, not a placeholder.
+        if stat is not None and stat.ndv is not None and _is_measured_sketch(stat):
             entry["approx_n_unique"] = int(stat.ndv)
         if entry:
             result[col] = entry
     return result or None
+
+
+def _is_measured_sketch(stat: ColumnStat) -> bool:
+    """Whether `stat.ndv` is an approximate count something actually measured.
+
+    `HISTOGRAM`/`SKETCH` are measurements of the data (KLL, HLL); `LEARNED` is a prior from a
+    past run and `DEFAULT` is an unconstrained bound. Only the first pair may be published as
+    `approx_n_unique`, and `EXACT` belongs to `n_unique` instead.
+    """
+    tag = stat.ndv_provenance if stat.ndv_provenance is not None else stat.provenance
+    return tag in (Provenance.HISTOGRAM, Provenance.SKETCH)
 
 
 def _exact_entry(stats: RelStats, col: str) -> dict[str, Any]:

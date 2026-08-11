@@ -96,9 +96,9 @@ def test_the_windowed_fold_still_names_its_own_cause():
         .agg(s=bt.col("v").sum())
         ._plan
     )
-    alias, width = _window_key(plan)
+    key = _window_key(plan)
     with config_context(_tiny_budget()):
-        fold = _WindowedAggFold(plan, alias, width)
+        fold = _WindowedAggFold(plan, key)
         with pytest.raises(ResourceError, match="watermark on 't' is not advancing"):
             fold.push(pa.record_batch({"t": [base], "v": [1]}))
 

@@ -27,18 +27,64 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import pyarrow as pa
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-__all__ = ["retained_bytes", "total_retained_bytes"]
+__all__ = ["logical_bytes", "retained_bytes", "total_retained_bytes"]
+
+
+def logical_bytes(data: Any) -> int:
+    """Bytes the rows `data` addresses, on every Arrow layout — the safe `nbytes`.
+
+    `nbytes` is not total on `pyarrow`: it walks the buffer layout and raises
+    `ArrowTypeError("Extracting byte ranges not supported for type ...")` for the *view*
+    layouts (`string_view`, `binary_view`, `list_view`). Those are not exotic. They are
+    what a Parquet reader with view types enabled, DuckDB, Polars, and any Velox-backed
+    producer hand over, so a bare `.nbytes` read is a crash waiting on the shape of
+    someone else's data rather than on anything the caller did.
+
+    A raising property also defeats the obvious guard: `getattr(batch, "nbytes", 0)`
+    propagates the error rather than returning the default, because the default applies
+    only to a *missing* attribute. Read the figure through here instead.
+
+    Args:
+        data: A `pyarrow.Table`, `RecordBatch`, `ChunkedArray`, or `Array`.
+
+    Returns:
+        The logical byte count, falling back to the total buffer size on a layout
+        `nbytes` cannot walk, and to `0` for an object that reports neither.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.plan.types import logical_bytes
+            >>> logical_bytes(pa.record_batch({"v": pa.array([1, 2, 3])}))
+            24
+            >>> logical_bytes(pa.array(["a", "b"], type=pa.string_view())) > 0
+            True
+    """
+    try:
+        return int(data.nbytes)
+    except pa.ArrowTypeError:
+        total = getattr(data, "get_total_buffer_size", None)
+        try:
+            return int(total()) if total is not None else 0
+        except (TypeError, ValueError):  # pragma: no cover - an unusable API
+            return 0
+    except (AttributeError, TypeError, ValueError):
+        return 0
 
 
 def retained_bytes(data: Any) -> int:
     """Bytes the process cannot reclaim while `data` is referenced.
 
     Use this, not `nbytes`, wherever the number decides something: whether to spill, how
-    much to hold in a chunk, whether a build side fits a broadcast. Use `nbytes` where the
-    number is only reported, since it is the figure a user recognizes as their data's size.
+    much to hold in a chunk, whether a build side fits a broadcast. Use `logical_bytes` where
+    the number is only reported, since it is the figure a user recognizes as their data's
+    size — and never a bare `nbytes`, which raises on the view layouts.
 
     Args:
         data: A `pyarrow.Table`, `RecordBatch`, `ChunkedArray`, or `Array`.
@@ -49,7 +95,7 @@ def retained_bytes(data: Any) -> int:
         inside a memory guard.
     """
     total = getattr(data, "get_total_buffer_size", None)
-    logical = int(getattr(data, "nbytes", 0) or 0)
+    logical = logical_bytes(data)
     if total is None:
         return logical
     try:

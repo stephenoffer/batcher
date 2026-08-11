@@ -20,4 +20,4 @@ python examples/expressions/strings_ratios.py
 - {doc}`/cookbook/expressions/strings/matching/strings_predicates`: the screen in front of an expensive stage.
 - {doc}`/cookbook/expressions/strings/matching/strings_regex`: extract, replace, and count.
 - {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
-- {doc}`/api/relational/expressions`: the complete `Expr` reference.
+- {doc}`/api/relational/expressions`: the complete {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` reference.

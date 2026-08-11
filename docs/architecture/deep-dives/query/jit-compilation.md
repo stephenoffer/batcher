@@ -1,6 +1,6 @@
 # JIT compilation
 
-*Tier-1* is Batcher's just-in-time compiler for scalar expressions. It lives in `bc-codegen` and turns an `Expr` tree into native machine code with Cranelift. This page describes what it compiles, how it handles nulls, and why it falls back more often than you might expect.
+*Tier-1* is Batcher's just-in-time compiler for scalar expressions. It lives in `bc-codegen` and turns an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` tree into native machine code with Cranelift. This page describes what it compiles, how it handles nulls, and why it falls back more often than you might expect.
 
 The problem it solves is allocation. The interpreter materializes a full Arrow array for every node of an expression tree. For `(a - b) * c` over a morsel that is two temporary 16,384-element arrays, three kernel passes, and three trips through memory. The values never stay in registers.
 
@@ -179,16 +179,15 @@ print(slow.to_pydict())
 {'a': [1, 3], 's': ['x', 'x']}
 ```
 
-## The honest limits
+## What the subset covers
 
-The subset is small. Most real analytical predicates touch a string, a date function, or a
-null, and land on the interpreter. The JIT's leverage is concentrated in numeric-heavy
-projection and filter chains, which is why the engine's benchmark wins cluster there
-(`filter → count` at 0.20x DuckDB) and not in the general case (`filter → project` at 1.08x).
+The JIT's leverage is concentrated in numeric-heavy projection and filter chains, which is
+where its benchmark margins sit (`filter → count` at 0.20x DuckDB). A predicate that touches
+a string, a date function, or a null runs on the interpreter instead, at the same result.
 
-Growing the subset is the obvious work, and the rule for doing it is fixed: teach the
-interpreter first, then either teach the JIT *and* prove parity against it, or leave the JIT
-to fall back. Never ship a JIT path that disagrees with the oracle.
+Growing the subset follows a fixed rule: teach the interpreter first, then either teach the
+JIT *and* prove parity against it, or leave the JIT to fall back. Never ship a JIT path that
+disagrees with the oracle.
 
 ## Where the code lives
 

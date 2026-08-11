@@ -62,6 +62,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListZip,
     MakeTemporal,
     MapFunc,
+    SpatialFunc,
     Strftime,
     StrFunc,
     Strptime,
@@ -69,7 +70,8 @@ from batcher.plan.expr_ir.func_nodes import (
     WindowBuckets,
     WindowStart,
 )
-from batcher.plan.expr_ir.image import ImageFunc
+from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
+from batcher.plan.expr_ir.namespaces.sequence import SeqFunc
 from batcher.plan.expr_ir.nodes import (
     Array,
     Case,
@@ -124,6 +126,25 @@ def _representatives() -> dict[str, Any]:
         "geo_unary": GeoFunc("st_area", [_X]),
         "geo_binary": GeoFunc("st_intersects", [_X, Lit("POINT(1 2)")]),
         "geo_ternary": GeoFunc("st_dwithin", [_X, Lit("POINT(1 2)"), Lit(5.0)]),
+        # And one `spatial` node per arity band, for the same reason: the whole
+        # rigid-body surface rides one wire shape, so a change to how the argument list
+        # is emitted would move all 42 functions at once.
+        "spatial_quat": SpatialFunc("quat_norm", [_X, _Y, Lit(0.0), Lit(1.0)]),
+        "spatial_pose": SpatialFunc(
+            "se3_transform_x",
+            [
+                _X,
+                _Y,
+                Lit(0.0),
+                Lit(0.0),
+                Lit(0.0),
+                Lit(0.0),
+                Lit(1.0),
+                Lit(1.0),
+                Lit(2.0),
+                Lit(3.0),
+            ],
+        ),
         "math2": Math2Expr("pow", _X, Lit(2)),
         "coalesce": Coalesce([_X, Lit(0)]),
         # --- nodes.py leaves ----------------------------------------------------
@@ -175,8 +196,19 @@ def _representatives() -> dict[str, Any]:
         # --- multimodal ---------------------------------------------------------
         "image_simple": ImageFunc("decode", Col("img")),
         "image_to_tensor": ImageFunc("to_tensor", Col("img"), width=224, height=224),
+        # A crop's window is four *sub-expressions*, not four scalars, so it is the one
+        # multimodal node whose wire shape can drift without any `ImageFunc` case moving.
+        "image_crop": ImageCrop(Col("img"), Col("x"), Col("y"), Lit(64), Lit(64)),
         "audio": AudioFunc("decode", Col("clip")),
         "video": VideoFunc("decode", Col("clip")),
+        # --- sequence -----------------------------------------------------------
+        # Three representatives, because the node's eight argument slots are used by
+        # disjoint subsets of the family and only a bare op proves the rest stay off the
+        # wire: a `reverse_complement` that started emitting `"k": null` would break the
+        # Rust round-trip while every Python test still passed.
+        "seq_bare": SeqFunc("reverse_complement", Col("dna")),
+        "seq_kmers": SeqFunc("minimizers", Col("dna"), k=21, window=10),
+        "seq_translate": SeqFunc("translate", Col("dna"), frame=1, to_stop=True),
     }
     out = {label: node.to_ir() for label, node in nodes.items()}
     # AggExpr is not an Expr: its to_ir takes an output alias.

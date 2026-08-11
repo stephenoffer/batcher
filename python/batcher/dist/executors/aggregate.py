@@ -134,21 +134,29 @@ def _distributed_aggregate(
         # records the workers' measured operator metrics into the hub so the cost
         # model calibrates from distributed runs too (the measure→consume loop is
         # not single-node-only). Best-effort, by operator kind.
-        map_results = gather_with_backups(map_refs, _map_for, pol)
+        map_results = gather_with_backups(map_refs, _map_for, pol, stage="aggregate.map")
         shuffle_paths = [paths for paths, _metrics in map_results]
         record_worker_metrics(hub, (m for _paths, m in map_results), metrics_out)
+
+        # COMBINE: collapse each bucket's mapper partials through a tree of bounded-fan-in
+        # combines, so no reducer reads more than `shuffle_fan_in` of them. Skipped
+        # entirely (and costing nothing) when there are already few enough mappers.
+        bucket_inputs = _tree_combine_buckets(
+            shuffle_paths, n_reducers, group_keys_json, aggregates_json, work_dir, cfg_json, pol
+        )
 
         # REDUCE: each reducer combines+finalizes the partials routed to it. The worker
         # config (shipped `cfg_json`) carries its memory envelope, so a reducer whose merged
         # group state would exceed it spills out of core instead of OOMing.
         def _reduce_for(r: int):
-            inputs = [paths[r] for paths in shuffle_paths]
             return _reduce_task.remote(
-                group_keys_json, aggregates_json, inputs, work_dir, r, cfg_json
+                group_keys_json, aggregates_json, bucket_inputs[r], work_dir, r, cfg_json
             )
 
         reduce_refs = [_reduce_for(r) for r in range(n_reducers)]
-        result_paths = gather_with_backups(reduce_refs, _reduce_for, pol)  # [(path, rows)]
+        result_paths = gather_with_backups(
+            reduce_refs, _reduce_for, pol, stage="aggregate.reduce"
+        )  # [(path, rows)]
 
         # Keep the result partitioned on disk for the next adaptive stage: hand back
         # a MaterializedSource over the reducer IPC files (exact row count from the
@@ -211,6 +219,161 @@ def _map_task(
     return write_shuffle_buckets(buckets, work_dir, "m", mapper_id), metrics_json
 
 
+# How many times the fan-in the mapper count must reach before the combiner tree engages.
+# A level of the disk tree costs a task, a write and a read per chunk against a saving of
+# `m - f - m/f` combines, so at `m` just past `f` the trade is roughly even; at `4f` the
+# saving is five times the tasks spent, which is where it is worth taking unconditionally.
+_TREE_MIN_MAPPERS = 4
+
+
+def _combine_task(
+    group_keys_json, aggregates_json, input_paths, work_dir, out_name, engine_config=""
+):
+    """Merge a chunk of a bucket's partials into ONE partial file — an interior level of
+    the combiner tree.
+
+    `combine`, never `combine_finalize`: an interior node's output is consumed by another
+    combine, and finalizing early would aggregate an average of averages. The distinction
+    is the whole reason the tree is expressible at all — partial state is closed under
+    `combine`, and only the last step leaves that algebra.
+
+    **Declines rather than OOMs.** The reducer has an out-of-core fold
+    (`combine_finalize_spilling`) for the case where merged group state exceeds the shipped
+    memory envelope; an interior combine has no such thing, because spilling is only defined
+    for the step that *finalizes*. So a chunk whose inputs already exceed the envelope hands
+    its paths back untouched instead of merging them, and that bucket reaches the reducer as
+    wide as it was — which is exactly the input the spilling fold is written for. Without
+    this the tree would turn a high-cardinality aggregate that used to spill and finish into
+    one that dies in a level nobody can see.
+
+    Returns the paths the next level should read: one merged file normally, the inputs
+    unchanged when declined, and an empty list when every input was empty (so an empty
+    bucket costs no file)."""
+    import os as _os
+
+    nat = engine()
+    from batcher.dist.shuffle_io import read_ipc, reduce_envelope, write_ipc
+
+    budget = reduce_envelope(engine_config).budget
+    if budget > 0:
+        on_disk = sum(_os.path.getsize(p) for p in input_paths if _os.path.exists(p))
+        # On-disk bytes are a floor for the in-memory state (IPC never expands), so a
+        # chunk under the envelope is safe to merge and the common case pays one stat
+        # per input for that certainty.
+        if on_disk > budget:
+            return list(input_paths)
+
+    running = None
+    for path in input_paths:
+        batch = read_ipc(path)
+        if not batch:
+            continue
+        merged = batch if running is None else [running, *batch]
+        running = nat.combine(group_keys_json, aggregates_json, merged)
+    if running is None:
+        return []
+    return [write_ipc([running], _os.path.join(work_dir, out_name))]
+
+
+def _tree_combine_buckets(
+    shuffle_paths, n_reducers, group_keys_json, aggregates_json, work_dir, cfg_json, pol
+):
+    """Collapse every bucket's mapper partials to at most `shuffle_fan_in` files, in
+    `ceil(log_fan_in(mappers))` parallel levels.
+
+    Without this the reduce side is a **line**: reducer `r` opens one file per mapper and
+    folds them one after another, so its critical path is Θ(mappers). That term grows as
+    the cluster does — one mapper per worker is the floor — while the map phase it runs
+    after shrinks, which is Amdahl's serial fraction appearing precisely at the scale that
+    motivated adding nodes. Measured as a shape rather than a constant: at `W` workers the
+    reduce does `W` sequential combines of a `G`-group state, so `T_reduce = Θ(W·G)` and
+    total time bottoms out around `W = sqrt(N/G)` and *rises* past it.
+
+    Rebracketing the same fold as a tree of arity `f` costs the identical number of
+    combines but puts `ceil(m/f)` of them in each level and runs the levels' tasks in
+    parallel, so the critical path is `Θ(f·log_f W)` — the term that lets total time keep
+    falling as workers are added. It is sound for any `f` because `combine` is associative
+    and commutative, so every bracketing of the same partials is the same state; `f` buys
+    critical path against per-node fan-out and never buys correctness.
+
+    This is the disk transport's half of what `flight_aggregate._tree_reduce` already does
+    over Flight, and it applies to the keyless global aggregate too — there `n_reducers` is
+    1, so the line was `W` long on a single node with the rest of the cluster idle.
+
+    **It engages later than the Flight tree does, and deliberately.** Flight's interior
+    partials live in memory, so a level costs a combine and nothing else; here a level costs
+    a task launch, a file write and a file read per chunk, and those are charged against a
+    saving of `m - f - m/f` combines. Just past `m > f` that trade is roughly even and can
+    be negative when the group state is small — so the tree waits for `_TREE_MIN_MAPPERS`
+    times the fan-in, where the saving is several times the tasks it spends. Below that a
+    shuffle takes the flat fold it always did and pays nothing for this existing.
+
+    Args:
+        shuffle_paths: One list of `n_reducers` bucket paths per mapper.
+        n_reducers: The bucket count.
+        group_keys_json: The aggregate's group-key spec.
+        aggregates_json: The aggregate's expression spec.
+        work_dir: The shared shuffle scratch directory.
+        cfg_json: The shipped worker engine config, which carries the memory envelope an
+            interior combine declines against.
+        pol: The speculation policy for the per-level barrier.
+
+    Returns:
+        `bucket_inputs[r]`, the (at most `fan_in`) partial paths the reducer for bucket `r`
+        should fold. The mapper paths themselves when no level was needed.
+    """
+    from batcher.config import active_config
+    from batcher.dist.reduction import chunks
+
+    n_mappers = len(shuffle_paths)
+    fan_in = max(2, active_config().flow_control.shuffle_fan_in)
+    bucket_inputs = [[paths[r] for paths in shuffle_paths] for r in range(n_reducers)]
+    if n_mappers < _TREE_MIN_MAPPERS * fan_in:
+        return bucket_inputs
+
+    from batcher.carbonite.resilience import gather_with_backups
+
+    level = 0
+    while max((len(b) for b in bucket_inputs), default=0) > fan_in:
+        # One task per (bucket, chunk), flattened into a single barrier so a level's tasks
+        # across every bucket run concurrently — the parallelism the tree exists for. A
+        # chunk of one carries straight over: it is already the merge of itself, and a task
+        # would cost a full read and write to reproduce bytes that exist.
+        merged: list[list[str]] = [[] for _ in range(n_reducers)]
+        specs: list[tuple[int, int, list[str]]] = []
+        for r, inputs in enumerate(bucket_inputs):
+            for i, chunk in enumerate(chunks(inputs, fan_in)):
+                if len(chunk) == 1:
+                    merged[r].append(chunk[0])
+                else:
+                    specs.append((r, i, list(chunk)))
+
+        def _combine_for(t: int, _specs=specs, _level=level):
+            r, i, chunk = _specs[t]
+            return _combine_task.remote(
+                group_keys_json,
+                aggregates_json,
+                chunk,
+                work_dir,
+                f"c{_level}_r{r}_{i}.arrow",
+                cfg_json,
+            )
+
+        refs = [_combine_for(t) for t in range(len(specs))]
+        out = gather_with_backups(refs, _combine_for, pol, stage=f"aggregate.combine.{level}")
+        for (r, _i, _chunk), paths in zip(specs, out, strict=True):
+            merged[r].extend(paths)
+        widest_before = max((len(b) for b in bucket_inputs), default=0)
+        bucket_inputs = merged
+        # A level that shrank nothing is one where every chunk declined on memory, and a
+        # further level would decline identically — so stop rather than spin. The bucket goes
+        # to the reducer as wide as it started, which is the out-of-core fold's input.
+        if max((len(b) for b in bucket_inputs), default=0) >= widest_before:
+            break
+        level += 1
+    return bucket_inputs
+
+
 def _reduce_task(
     group_keys_json, aggregates_json, input_paths, work_dir, reducer_id, engine_config=""
 ):
@@ -218,13 +381,18 @@ def _reduce_task(
     ``(ipc_path, row_count)`` for a non-empty bucket, else ``(None, 0)`` — the exact
     count lets the driver size a materialized intermediate without reading it back.
 
-    The mappers' partials are folded **incrementally** with `combine` — each input merged
-    into one running state (bounded by the group cardinality) and then dropped — rather than
-    materializing every mapper's partial for this reducer at once. So a high-fan-in or
-    skewed reducer's peak memory is one running state + one input, not the sum of all W
-    inputs (the disk path now matches the Flight path's bounded tree-reduce). `combine` is
-    associative+commutative, so the folded result is bit-identical to combining them all in
-    one call — the mergeable-algebra invariant.
+    The partials are folded **incrementally** with `combine` — each input merged into one
+    running state (bounded by the group cardinality) and then dropped — rather than
+    materializing them all at once. So a high-fan-in or skewed reducer's peak memory is one
+    running state + one input, not the sum of its inputs. `combine` is associative and
+    commutative, so the folded result is what combining them all in one call gives — the
+    mergeable-algebra invariant.
+
+    How *many* inputs there are is `_tree_combine_buckets`'s answer, not the mapper count:
+    the tree collapses a wide bucket to at most `shuffle_fan_in` partials first, so this
+    fold's length no longer grows with the cluster. Bounded memory was never the same
+    property as a bounded critical path, and folding a `W`-long list incrementally only ever
+    bought the first.
 
     The running state itself is still O(groups): a high-cardinality `GROUP BY` / `DISTINCT`
     can make it exceed one worker's RAM even though each *input* is bounded. When the shipped
@@ -237,23 +405,19 @@ def _reduce_task(
     import os as _os
 
     nat = engine()
-    from batcher.dist.shuffle_io import read_ipc, write_ipc
+    from batcher.dist.shuffle_io import read_ipc, reduce_envelope, write_ipc
 
-    budget = 0
-    cfg = {}
-    if engine_config:
-        cfg = json.loads(engine_config)
-        budget = int(cfg.get("memory_budget_bytes", 0) or 0)
-    if budget > 0:
+    envelope = reduce_envelope(engine_config)
+    if envelope.budget > 0:
         on_disk = sum(_os.path.getsize(p) for p in input_paths if _os.path.exists(p))
-        if on_disk > budget:
+        if on_disk > envelope.budget:
             result = nat.combine_finalize_spilling(
                 group_keys_json,
                 aggregates_json,
                 list(input_paths),
-                budget,
-                cfg.get("spill_dir") or work_dir,
-                cfg.get("spill_compression"),
+                envelope.budget,
+                envelope.spill_dir or work_dir,
+                envelope.compression,
             )
             if result.num_rows == 0:
                 return (None, 0)

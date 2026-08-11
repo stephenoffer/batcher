@@ -31,6 +31,7 @@ date in March. A mapping cannot answer that, so the plan goes to the CPU engine 
 from __future__ import annotations
 
 from batcher.core.gpu_plan.backend import Unsupported
+from batcher.plan.ir_tags import MICROS_PER_DAY
 
 __all__ = [
     "DATE_FNS",
@@ -45,9 +46,6 @@ __all__ = [
 #: wrapped date — the engine's `i32::try_from` in column form.
 _I32_MAX = 2**31 - 1
 
-#: Microseconds in a day. Every calendar truncation here is a whole number of these away from
-#: the input's own midnight, which is the one step both backends express identically.
-_DAY_US = 86_400_000_000
 
 #: `date_trunc` units this module truncates to, beyond the fixed-duration ones `scalar_fns`
 #: floors directly. `week` is the ISO week (starting Monday), matching the engine.
@@ -109,7 +107,7 @@ def _floor_day(us):
     truncating toward zero would round such an instant *up* to the following midnight. Both
     backends' `//` on integers floors toward negative infinity, which is the engine's rule.
     """
-    return (us // _DAY_US) * _DAY_US
+    return (us // MICROS_PER_DAY) * MICROS_PER_DAY
 
 
 def _as_int(series, be, fill):
@@ -228,9 +226,9 @@ def eval_calendar_trunc(x, unit: str, be):
         # infinity, which is the engine's `div_euclid` and keeps the pre-year-1 cases agreeing.
         year = _as_int(x.dt.year, be, 1970)
         floored = (year // span) * span
-        truncated = days_from_civil(floored, _ones(floored), _ones(floored), be) * _DAY_US
+        truncated = days_from_civil(floored, _ones(floored), _ones(floored), be) * MICROS_PER_DAY
     else:
-        truncated = _floor_day(us) - _days_back(x, unit, be) * _DAY_US
+        truncated = _floor_day(us) - _days_back(x, unit, be) * MICROS_PER_DAY
     # The year-span units are computed from a *filled* year, so their nullness has to be put
     # back explicitly; the others inherit it from `us` and this is a no-op for them.
     return truncated.where(x.notna(), None).astype(be.dtype(_timestamp_us()))
@@ -272,7 +270,7 @@ def eval_date_offset(x, months: int, days: int, micros: int, be):
     # commutative with clamping: shifting Jan 31 by a month and then a day gives Mar 1, while
     # a day and then a month gives Mar 1 too only by coincidence of February's length.
     base = _shifted_months(x, us, months, be) if months else us
-    shifted = base + (days * _DAY_US + micros)
+    shifted = base + (days * MICROS_PER_DAY + micros)
     stepped = shifted.astype(be.dtype(_timestamp_us()))
     return stepped.astype(be.dtype(_date32())) if is_date else stepped
 
@@ -298,7 +296,7 @@ def _shifted_months(x, us, months: int, be):
     clamped = day.where(day <= length, length)
     # The time of day is carried across untouched: a month shift moves the date and nothing
     # else, so it is the input's own offset from its midnight.
-    return days_from_civil(year, month, clamped, be) * _DAY_US + (us - _floor_day(us))
+    return days_from_civil(year, month, clamped, be) * MICROS_PER_DAY + (us - _floor_day(us))
 
 
 def _year_month(index):
@@ -409,5 +407,5 @@ def _last_day(x, be):
     """
     us = epoch_micros(x, be)
     remaining = _as_int(x.dt.days_in_month, be, 1) - _as_int(x.dt.day, be, 1)
-    stepped = (_floor_day(us) + remaining * _DAY_US).astype(be.dtype(_timestamp_us()))
+    stepped = (_floor_day(us) + remaining * MICROS_PER_DAY).astype(be.dtype(_timestamp_us()))
     return stepped.astype(be.dtype(_date32()))

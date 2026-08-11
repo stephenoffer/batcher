@@ -334,14 +334,26 @@ class LogisticRegression:
             # binary target, and Arrow will not subtract a float from a boolean: the IRLS
             # residual raised ``Invalid arithmetic operation: Boolean - Float64`` from inside
             # the engine, naming neither the column nor the fix.
-            residual = col(self.target).cast("float64") - probability
-            weight = probability * (lit(1.0) - probability)
+            # Materialize the residual and the IRLS weight as *columns* before aggregating,
+            # rather than letting each aggregate carry its own copy of them. The gradient and
+            # the Hessian's upper triangle are `m + m(m+1)/2` aggregates — 252 of them at 20
+            # features — and every one embedded the whole `probability` subtree, which embeds
+            # `eta`, which is a sum over every feature. Written that way the engine evaluated
+            # the dot product and its `exp` 252 times per row per iteration instead of once,
+            # and the per-iteration IR carried ~11,000 nodes. Two projected columns collapse
+            # that to one evaluation each, and the aggregates below then read plain columns.
+            working = ds.with_columns(
+                __bt_residual=col(self.target).cast("float64") - probability,
+                __bt_weight=probability * (lit(1.0) - probability),
+            )
+            residual = col("__bt_residual")
+            weight = col("__bt_weight")
             aggregates = {}
             for j in range(m):
                 aggregates[f"g{j}"] = sum_(residual * terms[j])
                 for k in range(j, m):
                     aggregates[f"h{j}_{k}"] = sum_(weight * terms[j] * terms[k])
-            row = ds.agg(**aggregates).collect()
+            row = working.agg(**aggregates).collect()
             gradient = np.array([float(row.column(f"g{j}")[0].as_py()) for j in range(m)])
             hessian = np.zeros((m, m))
             for j in range(m):

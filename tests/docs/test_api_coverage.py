@@ -48,7 +48,11 @@ from public_surface import expression_names, public_names  # noqa: E402
 # The expression reference: the pages whose job is to enumerate every method a user can
 # call on an `Expr` — the fluent builder on one, every accessor namespace on the other.
 # Together they must be exhaustive; neither alone is.
-_EXPR_REFERENCE = ("api/relational/expressions.md", "api/relational/expression-accessors.md")
+_EXPR_REFERENCE = (
+    "api/relational/expressions.md",
+    "api/relational/expressions-datascience.md",
+    "api/relational/expression-accessors.md",
+)
 
 # Public names not yet documented (drain toward empty). Keep each with a reason.
 KNOWN_UNDOCUMENTED: dict[str, str] = {

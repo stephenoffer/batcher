@@ -139,3 +139,42 @@ def test_log_base_matches_duckdb(duck):
     duck.register("t", data)
     out = bt.from_arrow(data).select(l2=log(2, col("x")), l10=log(10, col("x"))).collect()
     assert_same(out, duck.sql("SELECT ln(x)/ln(2) AS l2, ln(x)/ln(10) AS l10 FROM t"))
+
+
+@pytest.mark.differential
+def test_array_accepts_a_sequence_as_its_elements(duck):
+    """`array([...])` is the spelling a query vector arrives in, and it must not fail late.
+
+    Passing the elements as one list built an `Array` whose single element was the list
+    itself. Nothing objected until `to_ir`, which raised `unsupported literal type: list`
+    from inside `collect()` — so the traceback pointed at execution and named neither
+    `array` nor a remedy. The vector-distance kernels are where this bites: a query
+    embedding is a Python list, not an argument list.
+    """
+    data = pa.table({"emb": [[1.0, 0.0], [0.0, 1.0]]})
+    duck.register("t", data)
+    out = (
+        bt.from_arrow(data)
+        .select(s=col("emb").list.cosine_similarity(bt.array([1.0, 0.0])))
+        .collect()
+    )
+    assert_same(out, duck.sql("SELECT list_cosine_similarity(emb, [1.0, 0.0]) AS s FROM t"))
+
+
+@pytest.mark.differential
+def test_array_sequence_and_varargs_are_the_same_expression():
+    """One spelling must not be able to drift from the other -- they are one constructor."""
+    data = pa.table({"a": [1, 4], "b": [2, 5], "c": [3, 6]})
+    ds = bt.from_arrow(data)
+    packed = ds.select(p=bt.array(col("a"), col("b"), col("c"))).to_pydict()
+    as_list = ds.select(p=bt.array([col("a"), col("b"), col("c")])).to_pydict()
+    as_tuple = ds.select(p=bt.array((col("a"), col("b"), col("c")))).to_pydict()
+    assert packed == as_list == as_tuple
+    assert packed["p"] == [[1, 2, 3], [4, 5, 6]]
+
+
+def test_array_still_rejects_no_elements():
+    """An empty sequence is empty, however it was spelled."""
+    for empty in ((), ([],), ((),)):
+        with pytest.raises(ValueError, match="at least one element"):
+            bt.array(*empty)

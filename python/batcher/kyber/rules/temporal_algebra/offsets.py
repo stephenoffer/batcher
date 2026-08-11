@@ -30,19 +30,19 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.exprs.guards import is_date, is_timestamp, schema_rule
+from batcher.kyber.rules.exprs.guards import (
+    is_date,
+    is_timestamp,
+    register_schema_leaf_rule,
+)
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import DateOffset
-from batcher.plan.ir_tags import COMPARISON_FLIP
-from batcher.plan.logical import Filter, Project
+from batcher.plan.ir_tags import COMPARISON_FLIP, MICROS_PER_DAY
 from batcher.plan.schema import SchemaRef
 
 __all__ = ["OFFSET_DATE_SHIFT_RULES", "OFFSET_SHIFT_RULES"]
 
 _COMPARISONS = ("lt", "le", "gt", "ge", "eq", "ne")
-_MICROS_PER_DAY = 86_400_000_000
 
 
 def _instant_literal(expr: Expr) -> dt.datetime | None:
@@ -76,7 +76,7 @@ def _shifted(instant: dt.datetime, offset: DateOffset) -> Lit | None:
     a calendar month or would leave the representable range."""
     if offset.months:
         return None
-    micros = offset.days * _MICROS_PER_DAY + offset.micros
+    micros = offset.days * MICROS_PER_DAY + offset.micros
     try:
         return Lit(instant - dt.timedelta(microseconds=micros))
     except OverflowError:
@@ -101,18 +101,13 @@ def _offset_leaf(op_wanted: str) -> Callable[[Expr, SchemaRef | None], Expr]:
 
 def _register(op: str):
     leaf = _offset_leaf(op)
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            f"offset_by_{op}_to_shifted_instant",
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: schema_rule(node, _leaf, carries=(Binary,)),
-            matches=(Filter, Project),
-            expr_schema_fn=leaf,
-            expr_matches=(Binary,),
-            # Both `op` and its mirror: the comparison is normalized with the computed side
-            # on the left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
-            expr_ops=(op, COMPARISON_FLIP[op]),
-        )
+    # Both `op` and its mirror: the comparison is normalized with the computed side on the
+    # left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
+    return register_schema_leaf_rule(
+        f"offset_by_{op}_to_shifted_instant",
+        leaf,
+        expr_matches=(Binary,),
+        expr_ops=(op, COMPARISON_FLIP[op]),
     )
 
 
@@ -174,18 +169,13 @@ def _offset_date_leaf(op_wanted: str) -> Callable[[Expr, SchemaRef | None], Expr
 
 def _register_date(op: str):
     leaf = _offset_date_leaf(op)
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            f"offset_by_{op}_to_shifted_date",
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: schema_rule(node, _leaf, carries=(Binary,)),
-            matches=(Filter, Project),
-            expr_schema_fn=leaf,
-            expr_matches=(Binary,),
-            # Both `op` and its mirror: the comparison is normalized with the computed side
-            # on the left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
-            expr_ops=(op, COMPARISON_FLIP[op]),
-        )
+    # Both `op` and its mirror: the comparison is normalized with the computed side on the
+    # left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
+    return register_schema_leaf_rule(
+        f"offset_by_{op}_to_shifted_date",
+        leaf,
+        expr_matches=(Binary,),
+        expr_ops=(op, COMPARISON_FLIP[op]),
     )
 
 

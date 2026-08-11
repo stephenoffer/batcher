@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher.carbonite.policies.congestion import (
+    ChannelCongestion,
+    StarvationMeter,
+    occupancy_from_starvation,
+    probe_pressure,
+)
 from batcher.carbonite.transfer.fabric_usage import fabric_baseline, fabric_usage, rail_usage
 from batcher.carbonite.transfer.lifecycle import host_of, process_client, register_session
 from batcher.carbonite.transfer.locality import (
@@ -27,7 +33,7 @@ from batcher.carbonite.transfer.locality import (
     locality_ratio_counts,
     select_mode,
 )
-from batcher.carbonite.transfer.peers import straggler_peer
+from batcher.carbonite.transfer.peers import flow_totals, straggler_peer
 from batcher.carbonite.transfer.server import FlightShuffleServer, ShuffleTicket
 
 if TYPE_CHECKING:
@@ -88,6 +94,11 @@ class ShuffleSession:
         # the static path — and distributed==single-node equivalence — is unchanged.
         self._flow_control = flow_control
         self._pressure = pressure
+        # The hysteresis state behind the three-state verdict. Constructed unconditionally
+        # (it holds two floats) so the non-adaptive path is byte-identical: nothing reads it
+        # unless a controller is present.
+        self._congestion = ChannelCongestion()
+        self._starvation = StarvationMeter()
         # Shared memory writes a second (tmpfs) copy of each bucket, so it must be
         # pressure-aware. If shm is on but no monitor was supplied (the non-adaptive
         # path), attach one purely to gate the shm mirror — it drives no flow control
@@ -130,20 +141,28 @@ class ShuffleSession:
         return self._flow_control.window if self._flow_control is not None else self._credits
 
     def _observe_backpressure(self) -> None:
-        """Feed one round's congestion signal to the AIMD controller (if adaptive).
+        """Feed one round's congestion verdict to the AIMD controller (if adaptive).
 
-        Congestion = memory past the soft (spill) threshold: cut the window to
-        relieve pressure; otherwise grow it. This consumes the measured
-        `PressureMonitor.level()` — the signal that was previously gathered but never
-        acted on."""
+        Two independent facts decide a credit window, and this used to gather only one of
+        them. Memory pressure past the spill threshold still cuts the window unconditionally,
+        because a slow shuffle is recoverable and an OOM-killed worker is not. But on a
+        healthy node that signal never fires, so every round read as "grow" and the window
+        climbed to its ceiling whether or not the extra credits moved a byte — a ramp rather
+        than a control loop, and the surest way to manufacture the very pressure it backs off
+        on.
+
+        The second fact is the channel's own: the transport records how long the consumer sat
+        waiting for the next batch, and its complement is buffer occupancy. A saturated
+        channel *holds* its window; only a starved one grows. See
+        `carbonite.policies.congestion`.
+        """
         if self._flow_control is None:
             return
-        congested = False
-        if self._pressure is not None:
-            from batcher.carbonite.memory.pressure import PressureLevel
-
-            congested = self._pressure.level() >= PressureLevel.SPILL
-        self._flow_control.observe(congested=congested)
+        signal = self._congestion.observe(
+            pressured=probe_pressure(self._pressure),
+            occupancy=occupancy_from_starvation(self._starvation.sample(flow_totals())),
+        )
+        self._flow_control.observe_signal(signal)
 
     @property
     def addr(self) -> str:
@@ -417,6 +436,11 @@ class ShuffleSession:
         }
         if self._flow_control is not None:
             out.update({f"credit_{k}": v for k, v in self._flow_control.stats().items()})
+            # The verdict behind the last window decision, so `credit_hold_rate` can be read
+            # as convergence rather than guessed at. A window pinned at its ceiling with the
+            # signal reading STARVED is a channel the ceiling is throttling; the same window
+            # reading SATURATED is a channel that found its bandwidth-delay product.
+            out["credit_signal"] = int(self._congestion.signal)
         elif self._credits is not None:
             out["credit_window"] = self._credits
         out.update(fabric_usage(self._fabric_baseline, self._fabric_started))

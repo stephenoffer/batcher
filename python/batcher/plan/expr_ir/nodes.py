@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
-from batcher.plan.expr_ir.core import Expr, IntoExpr, _col_or_expr, _wrap
+from batcher.plan.expr_ir.core import Expr, FrameSpec, IntoExpr, _col_or_expr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
 
@@ -177,7 +177,16 @@ class WindowExpr(Expr):
     an optional ``(start, end)`` ROWS frame (aggregates only).
     """
 
-    __slots__ = ("frame", "func", "input", "offset", "order_by", "partition_by")
+    __slots__ = (
+        "alpha",
+        "frame",
+        "func",
+        "half_life",
+        "input",
+        "offset",
+        "order_by",
+        "partition_by",
+    )
 
     def __init__(
         self,
@@ -185,8 +194,10 @@ class WindowExpr(Expr):
         input: Expr | None,
         partition_by: list[Any],
         order_by: list[Any],
-        frame: tuple[int | None, int | None] | None,
+        frame: FrameSpec | None,
         offset: int = 1,
+        alpha: float | None = None,
+        half_life: float | None = None,
     ) -> None:
         self.func = func
         self.input = input
@@ -194,6 +205,8 @@ class WindowExpr(Expr):
         self.order_by = order_by
         self.frame = frame
         self.offset = offset
+        self.alpha = alpha
+        self.half_life = half_life
 
     def to_ir(self) -> dict[str, Any]:
         """Always raises: a window has no scalar IR — it must be hoisted to a `Window` node."""
@@ -207,14 +220,21 @@ class WindowExpr(Expr):
     def with_input(self, input: Expr | None) -> WindowExpr:
         """A copy of this window function over a different argument expression."""
         return WindowExpr(
-            self.func, input, self.partition_by, self.order_by, self.frame, self.offset
+            self.func,
+            input,
+            self.partition_by,
+            self.order_by,
+            self.frame,
+            self.offset,
+            self.alpha,
+            self.half_life,
         )
 
     def over(
         self,
         partition_by: Iterable[Any] = (),
         order_by: Iterable[Any] = (),
-        frame: tuple[int | None, int | None] | None = None,
+        frame: FrameSpec | None = None,
     ) -> WindowExpr:
         """Bind this window function to a partition/order (and optional frame).
 
@@ -230,6 +250,8 @@ class WindowExpr(Expr):
             normalize_key_list(order_by),
             frame if frame is not None else self.frame,
             self.offset,
+            self.alpha,
+            self.half_life,
         )
 
 

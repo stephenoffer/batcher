@@ -25,6 +25,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from batcher.io.formats.structured.parquet import source as pqmod
+from batcher.io.stats.file_identity import FileMetaCache
 
 pytestmark = pytest.mark.unit
 
@@ -34,7 +35,7 @@ def _write(path: str, n: int) -> None:
 
 
 def test_row_count_is_correct_and_cached(tmp_path, monkeypatch):
-    monkeypatch.setattr(pqmod, "_ROW_COUNT_CACHE", {})
+    monkeypatch.setattr(pqmod, "_ROW_COUNT_CACHE", FileMetaCache(65_536))
     f = tmp_path / "a.parquet"
     _write(str(f), 1234)
     src = pqmod.ParquetSource(str(f))
@@ -56,7 +57,7 @@ def test_row_count_is_correct_and_cached(tmp_path, monkeypatch):
 
 def test_a_rewritten_file_is_recounted(tmp_path, monkeypatch):
     """The premise the old key rested on — that the file cannot change. It can."""
-    monkeypatch.setattr(pqmod, "_ROW_COUNT_CACHE", {})
+    monkeypatch.setattr(pqmod, "_ROW_COUNT_CACHE", FileMetaCache(65_536))
     f = tmp_path / "part-00000.parquet"
     _write(str(f), 1234)
     assert pqmod.ParquetSource(str(f)).row_count() == 1234
@@ -67,7 +68,7 @@ def test_a_rewritten_file_is_recounted(tmp_path, monkeypatch):
 
 
 def test_multi_file_row_count_sums(tmp_path, monkeypatch):
-    monkeypatch.setattr(pqmod, "_ROW_COUNT_CACHE", {})
+    monkeypatch.setattr(pqmod, "_ROW_COUNT_CACHE", FileMetaCache(65_536))
     for i, n in enumerate((100, 250, 7)):
         _write(str(tmp_path / f"part-{i}.parquet"), n)
     src = pqmod.ParquetSource(str(tmp_path / "*.parquet"))

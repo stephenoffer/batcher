@@ -77,6 +77,28 @@ def _best_ms(fn, directory: str, batch_size: int, runs: int) -> tuple[float, int
     return best * 1000, result
 
 
+# Anyscale mounts this on every node in the cluster; a plain `/tmp` path is node-local.
+_SHARED_STORAGE = "/mnt/cluster_storage"
+
+
+def _corpus_dir() -> str:
+    """A staging directory every node can read.
+
+    This scenario writes a corpus and hands the *path* to each engine. On one node `/tmp`
+    is fine. On a multi-node cluster it is not: Ray Data distributes the file listing, and
+    a `ListFiles()` task scheduled on another node raises `FileNotFoundError` for a
+    directory that plainly exists on this one. That is a real failure of the benchmark, not
+    of the engine under test, and it made this script unrunnable on the very cluster shape
+    it is meant to measure.
+
+    Returns:
+        A fresh directory under cluster-shared storage when that exists, else under `/tmp`.
+    """
+    if os.path.isdir(_SHARED_STORAGE) and os.access(_SHARED_STORAGE, os.W_OK):
+        return tempfile.mkdtemp(prefix="bt_pcd_", dir=_SHARED_STORAGE)
+    return tempfile.mkdtemp(prefix="bt_pcd_")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Point-cloud loading (batcher vs Ray Data)")
     parser.add_argument("--shards", type=int, default=200, help="number of .npy shards")
@@ -86,7 +108,7 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=3, help="best-of-N timed repeats")
     args = parser.parse_args()
 
-    directory = tempfile.mkdtemp(prefix="bt_pcd_")
+    directory = _corpus_dir()
     try:
         print(
             f"writing {args.shards} shards x {args.frames} frames x {args.points}x3 ...",

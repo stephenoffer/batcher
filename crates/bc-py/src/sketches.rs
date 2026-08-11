@@ -169,12 +169,20 @@ pub(crate) fn column_ndv(
 /// Mergeable, so it composes across partitions — Core can collect this during
 /// execution and persist it to the MetadataHub for Kyber's `__column_ndv__` /
 /// `__column_avg_bytes__` / range-selectivity to consume.
+///
+/// The GIL is released across the sketch build, as `column_ndv` does. Without that the
+/// rayon fold inside `merge_column_stats` cannot actually run in parallel — measured on
+/// TPC-DS `store_sales` (2.9 M rows, 23 columns), holding the GIL pinned it at **1.00x
+/// parallelism and 2,345 ms** while `column_ndv` on the same arrays reached **12.9x and
+/// 74 ms**. That difference is the whole reason the optimizer could not afford to ask for
+/// these statistics.
 #[pyfunction]
 pub(crate) fn column_stats(
+    py: Python<'_>,
     columns: Vec<String>,
     batches: Vec<PyArrowType<RecordBatch>>,
 ) -> PyResult<std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>> {
-    let merged = merge_column_stats(&columns, &batches);
+    let merged = py.allow_threads(|| merge_column_stats(&columns, &batches));
     let mut out = std::collections::HashMap::new();
     for (name, s) in merged {
         let mut d = std::collections::HashMap::new();
@@ -204,24 +212,57 @@ pub(crate) fn column_stats(
 ///
 /// The distinct estimate is unchanged bit-for-bit (an HLL register is a maximum either way).
 /// See `ColumnStats::update` for why the quantile sketch is not, and why that is fine.
+///
+/// The walk is parallel over **(column x chunk-of-batches)**, which is what makes these
+/// statistics affordable enough for the optimizer to ask for them on the query path. Serial,
+/// this was the single most expensive thing in planning a join: 2.2 s to summarize TPC-DS
+/// `store_sales` (2.9 M rows, 23 columns) on a 16-core box — longer than the query it was
+/// meant to speed up, so nothing could call it and every join estimate fell back to a
+/// default.
+///
+/// The chunking is what keeps the allocation win described above. Folding batch-by-batch
+/// inside a chunk means one 16 KB HLL per (column, *chunk*) rather than per (column, morsel),
+/// so the register arrays stay bounded no matter how many morsels arrive. `CHUNK_TARGET` is a
+/// fixed count rather than the core count on purpose: the merge shape then does not vary with
+/// the machine, so a KLL quantile — the one part of `ColumnStats` a different merge order can
+/// perturb — is reproducible run to run and box to box.
 pub(crate) fn merge_column_stats(
     columns: &[String],
     batches: &[PyArrowType<RecordBatch>],
 ) -> std::collections::HashMap<String, bc_sketches::ColumnStats> {
-    let mut merged: std::collections::HashMap<String, bc_sketches::ColumnStats> =
-        std::collections::HashMap::new();
-    for batch in batches {
-        let b = &batch.0;
-        for name in columns {
-            if let Some(col) = b.column_by_name(name) {
-                merged
-                    .entry(name.clone())
-                    .or_insert_with(bc_sketches::ColumnStats::empty)
-                    .update(col);
-            }
-        }
+    use rayon::prelude::*;
+
+    /// Batch groups to split each column into. Fixed, so the merge tree is machine-independent.
+    const CHUNK_TARGET: usize = 16;
+
+    if batches.is_empty() || columns.is_empty() {
+        return std::collections::HashMap::new();
     }
-    merged
+    let chunk = batches.len().div_ceil(CHUNK_TARGET).max(1);
+    columns
+        .par_iter()
+        .filter_map(|name| {
+            let per_chunk: Vec<bc_sketches::ColumnStats> = batches
+                .par_chunks(chunk)
+                .filter_map(|group| {
+                    let mut acc: Option<bc_sketches::ColumnStats> = None;
+                    for batch in group {
+                        if let Some(col) = batch.0.column_by_name(name) {
+                            acc.get_or_insert_with(bc_sketches::ColumnStats::empty)
+                                .update(col);
+                        }
+                    }
+                    acc
+                })
+                .collect();
+            let mut it = per_chunk.into_iter();
+            let mut merged = it.next()?;
+            for rest in it {
+                merged.merge(&rest);
+            }
+            Some((name.clone(), merged))
+        })
+        .collect()
 }
 
 /// Quantile boundaries at `probs` for a numeric column's sketch; an empty list
@@ -242,6 +283,7 @@ pub(crate) fn quantile_values(s: &bc_sketches::ColumnStats, probs: &[f64]) -> Ve
 /// collect it online and persist it to the MetadataHub alongside `column_stats`.
 #[pyfunction]
 pub(crate) fn column_quantiles(
+    py: Python<'_>,
     columns: Vec<String>,
     batches: Vec<PyArrowType<RecordBatch>>,
     probs: Vec<f64>,
@@ -251,7 +293,8 @@ pub(crate) fn column_quantiles(
     // on — so a distributed `ORDER BY <date>` gets balanced boundaries instead of an empty
     // grid (one overloaded reducer). Numeric columns are untouched.
     let batches = temporal_cols_as_i64(&columns, &batches);
-    let merged = merge_column_stats(&columns, &batches);
+    // GIL released for the sketch build; see `column_stats` for why it dominates the cost.
+    let merged = py.allow_threads(|| merge_column_stats(&columns, &batches));
     Ok(merged
         .into_iter()
         .map(|(name, s)| (name, quantile_values(&s, &probs)))
@@ -266,6 +309,7 @@ pub(crate) fn column_quantiles(
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 pub(crate) fn column_stats_full(
+    py: Python<'_>,
     columns: Vec<String>,
     batches: Vec<PyArrowType<RecordBatch>>,
     probs: Vec<f64>,
@@ -273,7 +317,8 @@ pub(crate) fn column_stats_full(
     std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>,
     std::collections::HashMap<String, Vec<f64>>,
 )> {
-    let merged = merge_column_stats(&columns, &batches);
+    // GIL released for the sketch build; see `column_stats` for why it dominates the cost.
+    let merged = py.allow_threads(|| merge_column_stats(&columns, &batches));
     let mut stats = std::collections::HashMap::new();
     let mut quants = std::collections::HashMap::new();
     for (name, s) in merged {

@@ -42,21 +42,39 @@ What follows is what that cost obliges you to do instead.
 
 **The translator's suite runs on pandas, never on cuDF**, because CI has no GPU. `DfBackend`
 branches on `is_gpu` at every Arrow boundary, so the two backends do not take the same code
-path where it matters most — and that gap has already shipped two defects, both *column type*
-bugs with correct values:
+path where it matters most — and that gap has already shipped several defects. **Every one of
+them was a column *type* defect with correct values:**
 
 - a DATE column returning `date32` under pandas and `timestamp[ms]` on a real device
   (`backend.py::remember_date_alias`);
-- an integer `abs` widening to double (`backend.py::is_integer`).
+- an integer `abs` widening to double (`backend.py::is_integer`);
+- an **empty** cuDF string column converting to Arrow `null` (`backend.py::_restore_empty_strings`).
 
-A pandas replay cannot catch the next one either. So:
+That pattern is not a coincidence and it is what the tier's verification is built around.
+
+**The schema contract is always on and needs no device.** `LogicalPlan.available_schema` is
+the engine's own static type analysis — the one `Dataset.schema` is answered from — and it runs
+before either backend does, on no rows. So every device result is held against the engine's
+declared column types on every query, for the price of a field-list walk
+(`api/terminal/gpu_backend/verify.py::enforce_schema_contract`). A result that disagrees is
+refused and the CPU engine answers. All three defects above would have declined instead of
+returning a wrong column. **Do not gate this behind a flag or skip it for a "cheap" path** —
+its value is that it is unconditional, and it is the only check that sees the tier's
+characteristic defect without a GPU lane.
+
+It sees *types*, not values. So:
 
 - **Changing anything under `core/gpu_plan/` requires a run with
   `distributed.gpu_shadow_verify=True` on real hardware**, and the clean result recorded in
   `benchmarks/BENCHMARK_RESULTS.md`. Shadow-verify re-runs each result on the CPU engine and
-  compares schema first, then values; it is the only oracle the device has.
-- Add the pandas-backed case to `tests/unit/test_gpu_plan.py` as well. It is necessary and not
-  sufficient — treat a green suite as "the translation is plausible", not "the device agrees".
+  compares schema first, then values; it is the only oracle for *values* the device has.
+- Add the pandas-backed case to `tests/unit/test_gpu_plan.py` as well, and — when the change
+  can move a result's type — to `tests/unit/test_gpu_schema_contract.py`, which runs the real
+  translation and holds it to the declared schema. Both are necessary and neither is
+  sufficient: treat a green suite as "the translation is plausible", not "the device agrees".
+- **Derive a type rule, never restate one.** `plan.types.widen` is the control plane's single
+  mirror of `bc_py::normalize_to`; `backend.py::widened_type` delegates to it. A second copy
+  is how the device came to keep a `dictionary` column encoded where the engine decodes it.
 
 ## Structure
 

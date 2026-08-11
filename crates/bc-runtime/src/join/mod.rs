@@ -14,7 +14,7 @@
 //! Keys are encoded with arrow's row format (multi-key, any type). SQL null
 //! semantics are honored: a row with any null key never matches (NULL ≠ NULL).
 
-use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::array::{Array, ArrayRef, OffsetSizeTrait, UInt32Array};
 use arrow::buffer::NullBuffer;
 use arrow::row::{RowConverter, Rows, SortField};
 use bc_sketches::BloomFilter;
@@ -33,7 +33,7 @@ mod range;
 mod sort_merge;
 mod stream;
 
-pub use asof::asof_join_indices;
+pub use asof::{asof_join_indices, AsofDirection, AsofSpec};
 pub use key_filter::KeyFilter;
 pub use range::{range_join_indices, RangeOp};
 pub use sort_merge::sort_merge_join_indices;
@@ -230,7 +230,14 @@ pub fn hash_join_indices_with(
     let left_rows = left_keys.first().map_or(0, |a| a.len());
     let right_rows = right_keys.first().map_or(0, |a| a.len());
     let use_bloom = use_probe_bloom_with(right_rows, left_rows, bloom_min_build_rows);
-    hash_join_indices_impl(left_keys, right_keys, join_type, use_bloom, bloom_fp_rate)
+    hash_join_indices_impl(
+        left_keys,
+        right_keys,
+        join_type,
+        use_bloom,
+        bloom_fp_rate,
+        bloom_min_build_rows,
+    )
 }
 
 /// The hash-join index builder, with the probe-side bloom pre-filter made explicit.
@@ -238,12 +245,38 @@ pub fn hash_join_indices_with(
 /// `use_bloom` is decided by [`use_probe_bloom_with`] on the public path; tests drive it
 /// both ways to prove the bloom is a pure performance short-circuit (the produced
 /// [`JoinIndices`] relation is identical with the filter on or off).
+///
+/// `bloom_min_build_rows` is carried in *addition* to `use_bloom` for one reason: the
+/// semi/anti swap below exchanges which side is built, so the caller's `use_bloom` — decided
+/// for the other orientation — cannot answer whether the *new*, smaller build side deserves a
+/// bloom. It is re-decided there from this threshold, which is why the threshold and not just
+/// the verdict has to reach this far. Every other path uses `use_bloom` as given.
+#[allow(clippy::too_many_arguments)]
+/// Run `$body` with a [`BytesKeys`] bound to `$name`, at whichever offset width the key
+/// carries; falls through when the key is not a single byte-array column.
+///
+/// A macro rather than a function because the probe loop is generic over [`JoinKeys`] and
+/// **must monomorphize** — boxing a `dyn JoinKeys` would put a virtual call on the per-row
+/// hash and comparison, which is the cost this path exists to remove. Every call site
+/// returns from `$body`, so at most one arm ever runs.
+macro_rules! with_bytes_keys {
+    ($left:expr, $right:expr, |$name:ident| $body:block) => {
+        if let Some($name) = BytesKeys::<i32>::try_new($left, $right) {
+            $body
+        }
+        if let Some($name) = BytesKeys::<i64>::try_new($left, $right) {
+            $body
+        }
+    };
+}
+
 pub(crate) fn hash_join_indices_impl(
     left_keys: &[ArrayRef],
     right_keys: &[ArrayRef],
     join_type: JoinType,
     use_bloom: bool,
     bloom_fp_rate: f64,
+    bloom_min_build_rows: usize,
 ) -> Result<JoinIndices, RuntimeError> {
     // Canonicalize float keys before ANY key handling below.
     //
@@ -278,6 +311,28 @@ pub(crate) fn hash_join_indices_impl(
     let right_rows = right_keys.first().map_or(0, |a| a.len());
     let left_null = null_mask(left_keys, left_rows);
     let right_null = null_mask(right_keys, right_rows);
+
+    // A semi/anti join returns left rows and uses the right only as a membership test, so
+    // when the right is much the larger side the build-right convention builds a hash table
+    // over the relation it is about to throw away. Build over the left instead and mark it.
+    // Checked before the radix dispatch below, because the point is to not build that table
+    // at all — partitioning it into cache-sized pieces first would be optimizing the work
+    // this removes. Same relation, same row order; see `semi_anti_swapped`.
+    if matches!(join_type, JoinType::Semi | JoinType::Anti)
+        && swap_semi_build(left_rows, right_rows)
+    {
+        return semi_anti_swapped(
+            left_keys,
+            right_keys,
+            left_rows,
+            right_rows,
+            &left_null,
+            &right_null,
+            join_type,
+            bloom_fp_rate,
+            bloom_min_build_rows,
+        );
+    }
 
     // Fast path: a single integer key column hashes/compares its native values
     // directly, skipping the `RowConverter` encoding pass (a per-row allocation +
@@ -337,6 +392,21 @@ pub(crate) fn hash_join_indices_impl(
             bloom_fp_rate,
         ));
     }
+
+    // Single string/binary key fast path: hash and compare the raw bytes instead of
+    // encoding every row of both sides through the `RowConverter`. See [`BytesKeys`].
+    with_bytes_keys!(left_keys, right_keys, |keys| {
+        return Ok(build_probe_flat(
+            &keys,
+            left_rows,
+            right_rows,
+            &left_null,
+            &right_null,
+            join_type,
+            use_bloom,
+            bloom_fp_rate,
+        ));
+    });
 
     // General path: encode both sides' keys with one shared converter (types align).
     let fields: Vec<SortField> = right_keys
@@ -501,6 +571,97 @@ impl JoinKeys for I64x2Keys<'_> {
     }
     fn right_eq_left(&self, r: usize, l: usize) -> bool {
         self.right.0[r] == self.left.0[l] && self.right.1[r] == self.left.1[l]
+    }
+}
+
+/// One side's byte-array key column, addressed as `data[offsets[i]..offsets[i + 1]]`.
+///
+/// `value_offsets` is already adjusted for a sliced array and indexes `value_data`
+/// absolutely, so a morsel that is a slice of a larger batch reads only its own values.
+struct ByteCol<'a, O: OffsetSizeTrait> {
+    data: &'a [u8],
+    offsets: &'a [O],
+}
+
+impl<O: OffsetSizeTrait> ByteCol<'_, O> {
+    #[inline]
+    fn get(&self, i: usize) -> &[u8] {
+        &self.data[self.offsets[i].as_usize()..self.offsets[i + 1].as_usize()]
+    }
+}
+
+/// Raw byte-slice keys (the fast path): a single string/binary key column per side.
+///
+/// A string join key is the one common shape that had no fast path, so it fell all the way
+/// to [`RowConverter`], which encodes **every probe row** into arrow's escaped row format —
+/// a 32-byte block plus a continuation token per value, written into a fresh buffer, in one
+/// pass before the join starts. On a fact-to-dimension join whose fact side is the probe
+/// (H2O `join` q4 joins 10 M rows to 10 k on a string key), that pass encodes the entire
+/// large side to gain nothing the raw bytes do not already give: equal non-null values are
+/// equal byte slices, so hashing and comparing the slices is exactly the encoded comparison
+/// without the encode. Rows with a null key never match and are excluded by `null_mask`
+/// before any key is read, so the offsets under a null slot are never dereferenced.
+///
+/// The same argument `assign_groups_bytes` makes for `GROUP BY <string>`, where it measured
+/// ~25% on the low-cardinality keys and removed the encode outright on the high-cardinality
+/// ones. Both sides must carry the same byte type, which is what the planner's key coercion
+/// already guarantees.
+struct BytesKeys<'a, O: OffsetSizeTrait> {
+    right: ByteCol<'a, O>,
+    left: ByteCol<'a, O>,
+}
+
+impl<'a, O: OffsetSizeTrait> BytesKeys<'a, O> {
+    /// `Some` when both sides are exactly one byte-array column of the same type, whose
+    /// offset width is `O`.
+    fn try_new(left_keys: &'a [ArrayRef], right_keys: &'a [ArrayRef]) -> Option<Self> {
+        use arrow::array::{GenericBinaryArray, GenericStringArray};
+        use arrow::datatypes::DataType;
+        if left_keys.len() != 1 || right_keys.len() != 1 {
+            return None;
+        }
+        let dt = left_keys[0].data_type();
+        if dt != right_keys[0].data_type() {
+            return None;
+        }
+        // The offset width the caller instantiated must be the one this type carries;
+        // otherwise the downcasts below fail and the other instantiation answers.
+        match dt {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {}
+            _ => return None,
+        }
+        let col = |a: &'a ArrayRef| -> Option<ByteCol<'a, O>> {
+            if let Some(s) = a.as_any().downcast_ref::<GenericStringArray<O>>() {
+                return Some(ByteCol {
+                    data: s.value_data(),
+                    offsets: s.value_offsets(),
+                });
+            }
+            let b = a.as_any().downcast_ref::<GenericBinaryArray<O>>()?;
+            Some(ByteCol {
+                data: b.value_data(),
+                offsets: b.value_offsets(),
+            })
+        };
+        Some(Self {
+            right: col(&right_keys[0])?,
+            left: col(&left_keys[0])?,
+        })
+    }
+}
+
+impl<O: OffsetSizeTrait> JoinKeys for BytesKeys<'_, O> {
+    fn hash_right(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one(self.right.get(i))
+    }
+    fn hash_left(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        state.hash_one(self.left.get(i))
+    }
+    fn right_eq_right(&self, a: usize, b: usize) -> bool {
+        self.right.get(a) == self.right.get(b)
+    }
+    fn right_eq_left(&self, r: usize, l: usize) -> bool {
+        self.right.get(r) == self.left.get(l)
     }
 }
 
@@ -816,6 +977,64 @@ impl JoinTable {
         }
         // Only meaningful while the bloom was actually consulted; once it is latched off the
         // rate is frozen at whatever the trial measured.
+        if bloom.is_some() {
+            self.bloom_trial.observe(seen, rejected);
+        }
+    }
+
+    /// Probe rows `range` against the table, recording *which build rows were hit* rather
+    /// than emitting index pairs — the semi/anti join's inverted direction.
+    ///
+    /// [`Self::probe_range`] answers "does this probe row have a match", which is the question
+    /// a semi join asks when the table is built on the side it does *not* return. This answers
+    /// "was this build row matched by anything", which is the same question asked of a table
+    /// built on the side it *does* return. See [`semi_anti_swapped`] for when that is the
+    /// cheaper way round and why the emitted relation is unchanged.
+    ///
+    /// No output buffer grows here: a match sets one byte, so a probe side that fans out
+    /// heavily costs the same as one that does not. That is the second win, and it is why
+    /// this is not expressed as an inner join whose right indices are then deduplicated.
+    ///
+    /// `matched` is shared across the ranges [`mark_probe`] runs concurrently. Relaxed is the
+    /// right ordering and not a shortcut: a slot only ever moves `false → true`, never back,
+    /// so concurrent writers cannot disagree about the value and no writer reads one. The
+    /// reader runs after `par_iter().for_each` has joined, and that join is the
+    /// happens-before edge that publishes every write.
+    fn mark_range<K: JoinKeys>(
+        &self,
+        keys: &K,
+        range: std::ops::Range<usize>,
+        probe_null: Option<&[bool]>,
+        matched: &[std::sync::atomic::AtomicBool],
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bloom = self
+            .bloom
+            .as_ref()
+            .filter(|_| self.bloom_trial.worth_consulting());
+        let mut rejected = 0u64;
+        let seen = range.len() as u64;
+        for i in range {
+            let is_null = probe_null.is_some_and(|m| m[i]);
+            let Some(mut r) = self.head_for(keys, i, is_null, bloom, &mut rejected) else {
+                continue;
+            };
+            matched[r as usize].store(true, Relaxed);
+            // A unique build key ⇒ the chain is exactly one row, so skip the `next[r]` load
+            // whose answer (`u32::MAX`) is already known — the same reasoning, and the same
+            // random multi-megabyte access avoided, as in `probe_range`.
+            if self.unique {
+                continue;
+            }
+            loop {
+                let nxt = self.next[r as usize];
+                if nxt == u32::MAX {
+                    break;
+                }
+                r = nxt;
+                matched[r as usize].store(true, Relaxed);
+            }
+        }
         if bloom.is_some() {
             self.bloom_trial.observe(seen, rejected);
         }
@@ -1189,6 +1408,179 @@ fn emit_null_probe_unmatched(
 
 /// The single-table hash join (no radix): build one chain table over the whole right
 /// side and probe the whole left. The correctness oracle and the small-build fast path.
+/// Probe rows a semi/anti join's *returned* side must be under before the table is built on
+/// it instead of on the other one.
+///
+/// Below this the whole question is noise — the build being optimized away is a few thousand
+/// rows — and the swap's one cost (a `Vec<bool>` over the returned side, plus a pass over it
+/// to emit) is not worth reasoning about either way. `1 << 16` is the same figure
+/// [`RADIX_MIN_BUILD_ROWS`] uses to decide a build has outgrown cache, for the same reason:
+/// it is where a hash table stops being free.
+const SEMI_SWAP_MIN_PROBE_ROWS: usize = 1 << 16;
+
+/// How many times larger the discarded side must be before the swap is taken.
+///
+/// Both orders do ~`|L| + |R|` hash operations, so the swap is not a complexity win — it is a
+/// *build* win, and a build row costs several times a probe row (it allocates a table slot,
+/// writes a chain link, and is later walked by random access). Requiring a 4x margin means
+/// the swap is only taken where that difference dominates the arithmetic either way, so an
+/// imprecise estimate of the per-row constants cannot make it a loss. TPC-H q4's
+/// `orders SEMI lineitem` sits at 66x (3.79M against 57k), far inside it.
+const SEMI_SWAP_MIN_RATIO: usize = 4;
+
+/// Whether a semi/anti join should build its table on the left (returned) side.
+///
+/// `left_rows` is the side the join returns; `right_rows` is the side it only tests against.
+fn swap_semi_build(left_rows: usize, right_rows: usize) -> bool {
+    right_rows >= SEMI_SWAP_MIN_PROBE_ROWS
+        && right_rows >= left_rows.saturating_mul(SEMI_SWAP_MIN_RATIO)
+}
+
+/// `Semi`/`Anti` with the hash table built on the **left** side and the right side scanned
+/// to mark it — the opposite of this module's build-right convention, for the case where
+/// that convention builds over the larger relation.
+///
+/// A semi join returns left rows and discards the right entirely, so the right exists only to
+/// answer "does this key occur". Building on it is therefore backwards whenever it is the
+/// bigger side, and it routinely is: TPC-H q4 is `orders SEMI lineitem`, where the standard
+/// order builds a table over **3.79M** filtered `lineitem` rows and probes it with **57k**
+/// orders. Semi joins are not commutative, so no plan-level rewrite can fix this — the sides
+/// are fixed by the query, and only the *physical* build direction is free. That is what this
+/// chooses.
+///
+/// **The relation is identical, row for row and in the same order.** Both directions emit
+/// ascending left indices with a null right index: `probe_range` pushes `i` as it walks the
+/// left side in order, and this pushes `i` as it walks `matched` in order. Nulls agree
+/// because they are handled in the same two places — a null *probe* key is refused by
+/// [`JoinTable::head_for`], and a null *build* key is never inserted into the table
+/// ([`radix::partition_side`] skips it) — so a null-keyed left row is unmatched either way,
+/// which `Semi` drops and `Anti` keeps, exactly as SQL requires. It is a pure performance
+/// short-circuit, and the tests drive both directions over the same inputs to pin that.
+#[allow(clippy::too_many_arguments)]
+fn semi_anti_swapped(
+    left_keys: &[ArrayRef],
+    right_keys: &[ArrayRef],
+    left_rows: usize,
+    right_rows: usize,
+    left_null: &[bool],
+    right_null: &[bool],
+    join_type: JoinType,
+    bloom_fp_rate: f64,
+    bloom_min_build_rows: usize,
+) -> Result<JoinIndices, RuntimeError> {
+    // The build side is now the left, so the bloom is sized and admitted on *its* row count.
+    let use_bloom = use_probe_bloom_with(left_rows, right_rows, bloom_min_build_rows);
+    // Every `JoinKeys` implementation names its two sides "right" (build) and "left" (probe).
+    // Constructing one with the arguments exchanged is what puts our left on the build side;
+    // nothing below this line has to know the swap happened.
+    if let Some(keys) = I64Keys::try_new(right_keys, left_keys) {
+        return Ok(mark_probe(
+            &keys,
+            left_rows,
+            right_rows,
+            left_null,
+            right_null,
+            join_type,
+            use_bloom,
+            bloom_fp_rate,
+        ));
+    }
+    if let Some(keys) = I64x2Keys::try_new(right_keys, left_keys) {
+        return Ok(mark_probe(
+            &keys,
+            left_rows,
+            right_rows,
+            left_null,
+            right_null,
+            join_type,
+            use_bloom,
+            bloom_fp_rate,
+        ));
+    }
+    with_bytes_keys!(right_keys, left_keys, |keys| {
+        return Ok(mark_probe(
+            &keys,
+            left_rows,
+            right_rows,
+            left_null,
+            right_null,
+            join_type,
+            use_bloom,
+            bloom_fp_rate,
+        ));
+    });
+    // The converter is built from the *build* side's types, which is now the left.
+    let fields: Vec<SortField> = left_keys
+        .iter()
+        .map(|a| SortField::new(a.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields)?;
+    let keys = RowKeys {
+        right: converter.convert_columns(left_keys)?,
+        left: converter.convert_columns(right_keys)?,
+    };
+    Ok(mark_probe(
+        &keys,
+        left_rows,
+        right_rows,
+        left_null,
+        right_null,
+        join_type,
+        use_bloom,
+        bloom_fp_rate,
+    ))
+}
+
+/// Build over the returned side, mark it with the discarded side, then emit in row order.
+#[allow(clippy::too_many_arguments)]
+fn mark_probe<K: JoinKeys + Sync>(
+    keys: &K,
+    build_rows: usize,
+    probe_rows: usize,
+    build_null: &[bool],
+    probe_null: &[bool],
+    join_type: JoinType,
+    use_bloom: bool,
+    bloom_fp_rate: f64,
+) -> JoinIndices {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    let table = JoinTable::build(keys, build_rows, build_null, use_bloom, bloom_fp_rate);
+    let matched: Vec<AtomicBool> = (0..build_rows).map(|_| AtomicBool::new(false)).collect();
+
+    // The probe side is the *large* one here — that is the entire premise of the swap — so
+    // scanning it on one core throws away more than the smaller build saves. Measured on
+    // TPC-H q4: a sequential mark made the query 45 ms → 90 ms against the parallel radix
+    // path it replaced, which is a 2x regression rather than the win the smaller build
+    // predicted. Row ranges are independent (a mark is a write, never a read), so this
+    // parallelizes with no coordination beyond the relaxed store.
+    let threads = rayon::current_num_threads().max(1);
+    // Never smaller than a morsel: below that the range is pure scheduling overhead.
+    let chunk = probe_rows
+        .div_ceil(threads)
+        .max(bc_arrow::DEFAULT_MORSEL_ROWS);
+    let ranges: Vec<std::ops::Range<usize>> = (0..probe_rows)
+        .step_by(chunk)
+        .map(|s| s..(s + chunk).min(probe_rows))
+        .collect();
+    ranges
+        .par_iter()
+        .for_each(|r| table.mark_range(keys, r.clone(), Some(probe_null), &matched));
+
+    // `Semi` keeps the rows something matched; `Anti` keeps exactly the others. Ascending
+    // build index, which is the order the build-right path emits too.
+    let keep = matches!(join_type, JoinType::Semi);
+    let mut left_out = IndexBuf::with_capacity(build_rows);
+    let mut right_out = IndexBuf::with_capacity(build_rows);
+    for (i, hit) in matched.iter().enumerate() {
+        if hit.load(Relaxed) == keep {
+            left_out.push(i as u32);
+            right_out.push_null();
+        }
+    }
+    JoinIndices::from_bufs(left_out, right_out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_probe_flat<K: JoinKeys + Sync>(
     keys: &K,
@@ -1362,6 +1754,9 @@ pub fn broadcast_hash_join_indices(
         }
         return Ok(run!(keys));
     }
+    with_bytes_keys!(left_keys, right_keys, |keys| {
+        return Ok(run!(keys));
+    });
     let fields: Vec<SortField> = right_keys
         .iter()
         .map(|a| SortField::new(a.data_type().clone()))
@@ -1923,6 +2318,92 @@ mod tests {
         }
     }
 
+    /// The single byte-array fast path (`BytesKeys`) must match the row-encoded oracle for
+    /// every join type. The cases that matter are the ones where raw bytes and arrow's
+    /// escaped row encoding could conceivably disagree: an empty string (a zero-length
+    /// slice, which the row format encodes with its own token), a value that is a strict
+    /// prefix of another (`"a"` against `"ab"` — the length must separate them), a
+    /// duplicate key on both sides, and a null key.
+    #[test]
+    fn bytes_fast_path_matches_row_encoded() {
+        use arrow::array::StringArray;
+        let left: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("ab"),
+            Some("ab"),
+            None,
+            Some(""),
+            Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+        ]))];
+        let right: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![
+            Some("ab"),
+            Some("ab"),
+            Some("b"),
+            None,
+            Some(""),
+            Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+        ]))];
+        let ln = null_mask(&left, 6);
+        let rn = null_mask(&right, 6);
+        let bytekeys = BytesKeys::<i32>::try_new(&left, &right).expect("both single Utf8");
+        let conv = RowConverter::new(vec![SortField::new(DataType::Utf8)]).unwrap();
+        let rowkeys = RowKeys {
+            right: conv.convert_columns(&right).unwrap(),
+            left: conv.convert_columns(&left).unwrap(),
+        };
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            for bloom in [false, true] {
+                let fast = build_probe_flat(&bytekeys, 6, 6, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let slow = build_probe_flat(&rowkeys, 6, 6, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                assert_eq!(
+                    sorted_pairs(&fast),
+                    sorted_pairs(&slow),
+                    "bytes vs row mismatch for {jt:?} bloom={bloom}"
+                );
+            }
+        }
+    }
+
+    /// A **sliced** key column indexes its own rows. `value_offsets` is offset-adjusted but
+    /// `value_data` is the whole backing buffer, so a fast path that mixed the two would
+    /// silently read another morsel's bytes — and morsels are almost always slices.
+    #[test]
+    fn bytes_fast_path_reads_only_a_slices_own_rows() {
+        use arrow::array::StringArray;
+        let whole: ArrayRef = Arc::new(StringArray::from(vec!["aa", "bb", "cc", "dd"]));
+        let left: Vec<ArrayRef> = vec![whole.slice(2, 2)]; // "cc", "dd"
+        let right: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["dd", "aa"]))];
+        let ln = null_mask(&left, 2);
+        let rn = null_mask(&right, 2);
+        let keys = BytesKeys::<i32>::try_new(&left, &right).expect("both single Utf8");
+        let out = build_probe_flat(&keys, 2, 2, &ln, &rn, JoinType::Inner, false, BLOOM_FP_RATE);
+        // Only "dd" matches: left row 1 against right row 0.
+        assert_eq!(sorted_pairs(&out), vec![(Some(1), Some(0))]);
+    }
+
+    /// A `LargeUtf8` key takes the `i64`-offset instantiation and the `i32` one declines,
+    /// which is what keeps the macro's two arms from both firing.
+    #[test]
+    fn bytes_fast_path_picks_the_right_offset_width() {
+        use arrow::array::{LargeStringArray, StringArray};
+        let large: Vec<ArrayRef> = vec![Arc::new(LargeStringArray::from(vec!["a", "b"]))];
+        assert!(BytesKeys::<i32>::try_new(&large, &large).is_none());
+        assert!(BytesKeys::<i64>::try_new(&large, &large).is_some());
+        let small: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["a", "b"]))];
+        assert!(BytesKeys::<i32>::try_new(&small, &small).is_some());
+        assert!(BytesKeys::<i64>::try_new(&small, &small).is_none());
+        // Mismatched widths on the two sides decline both arms and keep the oracle.
+        assert!(BytesKeys::<i32>::try_new(&small, &large).is_none());
+        assert!(BytesKeys::<i64>::try_new(&small, &large).is_none());
+    }
+
     /// The two-`Int64`-key fast path (`I64x2Keys`) must match the row-encoded oracle
     /// for every join type, including a partial-key match (first component equal,
     /// second differs → no match), duplicate composite keys, and null keys.
@@ -2095,8 +2576,24 @@ mod tests {
             JoinType::Semi,
             JoinType::Anti,
         ] {
-            let with = hash_join_indices_impl(&left, &right, jt, true, BLOOM_FP_RATE).unwrap();
-            let without = hash_join_indices_impl(&left, &right, jt, false, BLOOM_FP_RATE).unwrap();
+            let with = hash_join_indices_impl(
+                &left,
+                &right,
+                jt,
+                true,
+                BLOOM_FP_RATE,
+                BLOOM_MIN_BUILD_ROWS,
+            )
+            .unwrap();
+            let without = hash_join_indices_impl(
+                &left,
+                &right,
+                jt,
+                false,
+                BLOOM_FP_RATE,
+                BLOOM_MIN_BUILD_ROWS,
+            )
+            .unwrap();
             assert_eq!(
                 sorted_pairs(&with),
                 sorted_pairs(&without),
@@ -2114,10 +2611,24 @@ mod tests {
             (0..1_000i64).collect::<Vec<_>>(),
         ))];
         let right: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![10, 20, 999, 5000]))];
-        let with =
-            hash_join_indices_impl(&left, &right, JoinType::Inner, true, BLOOM_FP_RATE).unwrap();
-        let without =
-            hash_join_indices_impl(&left, &right, JoinType::Inner, false, BLOOM_FP_RATE).unwrap();
+        let with = hash_join_indices_impl(
+            &left,
+            &right,
+            JoinType::Inner,
+            true,
+            BLOOM_FP_RATE,
+            BLOOM_MIN_BUILD_ROWS,
+        )
+        .unwrap();
+        let without = hash_join_indices_impl(
+            &left,
+            &right,
+            JoinType::Inner,
+            false,
+            BLOOM_FP_RATE,
+            BLOOM_MIN_BUILD_ROWS,
+        )
+        .unwrap();
         assert_eq!(sorted_pairs(&with), sorted_pairs(&without));
         // 10, 20, 999 are in [0,1000); 5000 is not — three matches.
         assert_eq!(with.left.len(), 3);
@@ -2384,5 +2895,179 @@ mod hunt_tests {
             b.sort();
             assert_eq!(a, b, "build-side asymmetry for {jt:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod semi_swap_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+
+    fn i64_col(v: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(v.to_vec()))
+    }
+
+    fn str_col(v: &[Option<&str>]) -> ArrayRef {
+        Arc::new(StringArray::from(v.to_vec()))
+    }
+
+    /// `(left_index, right_index)` pairs in emitted order — order included on purpose, since
+    /// the claim being tested is that the two directions agree on it and not merely on the set.
+    fn pairs(idx: &JoinIndices) -> Vec<(Option<u32>, Option<u32>)> {
+        (0..idx.left.len())
+            .map(|i| {
+                let l = (!idx.left.is_null(i)).then(|| idx.left.value(i));
+                let r = (!idx.right.is_null(i)).then(|| idx.right.value(i));
+                (l, r)
+            })
+            .collect()
+    }
+
+    /// Run one shape both ways and require the *same relation in the same order*.
+    ///
+    /// `hash_join_indices` is the build-right oracle: every input here is far below
+    /// [`SEMI_SWAP_MIN_PROBE_ROWS`], so the dispatch inside it never takes the swap and it is
+    /// genuinely the other implementation. `semi_anti_swapped` is called directly, which is
+    /// what lets the equivalence be pinned on small, readable inputs instead of on the 65k
+    /// rows the production threshold requires.
+    fn assert_same_relation(left: &[ArrayRef], right: &[ArrayRef], what: &str) {
+        let left_rows = left[0].len();
+        let right_rows = right[0].len();
+        for jt in [JoinType::Semi, JoinType::Anti] {
+            let oracle = hash_join_indices(left, right, jt).unwrap();
+            let l_null = null_mask(left, left_rows);
+            let r_null = null_mask(right, right_rows);
+            for &bloom in &[false, true] {
+                // Drive the bloom both ways: it has no false negatives, so it may only skip a
+                // provably-empty chain and the relation must be identical either setting.
+                let swapped = semi_anti_swapped(
+                    left,
+                    right,
+                    left_rows,
+                    right_rows,
+                    &l_null,
+                    &r_null,
+                    jt,
+                    BLOOM_FP_RATE,
+                    if bloom { 0 } else { usize::MAX },
+                )
+                .unwrap();
+                assert_eq!(
+                    pairs(&oracle),
+                    pairs(&swapped),
+                    "{what}: {jt:?} diverged (bloom={bloom})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swapped_semi_anti_matches_the_build_right_oracle() {
+        // Plain: some match, some do not.
+        assert_same_relation(
+            &[i64_col(&[Some(1), Some(2), Some(3), Some(4)])],
+            &[i64_col(&[Some(2), Some(4), Some(9)])],
+            "plain",
+        );
+        // Duplicates on the returned side: every copy is judged independently.
+        assert_same_relation(
+            &[i64_col(&[Some(1), Some(1), Some(2), Some(1)])],
+            &[i64_col(&[Some(1)])],
+            "duplicate left keys",
+        );
+        // Duplicates on the discarded side: a chain longer than one, so the walk in
+        // `mark_range` is exercised rather than the `unique` short-circuit.
+        assert_same_relation(
+            &[i64_col(&[Some(1), Some(2)])],
+            &[i64_col(&[Some(1), Some(1), Some(1), Some(2)])],
+            "duplicate right keys",
+        );
+        // NULL on the returned side never matches: `Semi` drops it, `Anti` keeps it.
+        assert_same_relation(
+            &[i64_col(&[Some(1), None, Some(3)])],
+            &[i64_col(&[Some(1), Some(3)])],
+            "null left key",
+        );
+        // NULL on the discarded side matches nothing, so it cannot rescue a left row.
+        assert_same_relation(
+            &[i64_col(&[Some(1), Some(2)])],
+            &[i64_col(&[None, Some(2)])],
+            "null right key",
+        );
+        assert_same_relation(
+            &[i64_col(&[None, None])],
+            &[i64_col(&[None, None])],
+            "nulls on both sides",
+        );
+        // Degenerate sizes.
+        assert_same_relation(&[i64_col(&[])], &[i64_col(&[Some(1)])], "empty left");
+        assert_same_relation(&[i64_col(&[Some(1)])], &[i64_col(&[])], "empty right");
+        assert_same_relation(
+            &[i64_col(&[Some(1), Some(2)])],
+            &[i64_col(&[Some(7), Some(8)])],
+            "no matches at all",
+        );
+        assert_same_relation(
+            &[i64_col(&[Some(1), Some(2)])],
+            &[i64_col(&[Some(1), Some(2)])],
+            "everything matches",
+        );
+        // The `RowKeys` (row-encoded) path — a string key has no integer fast path.
+        assert_same_relation(
+            &[str_col(&[Some("a"), None, Some("c"), Some("a")])],
+            &[str_col(&[Some("a"), Some("z"), None])],
+            "string key",
+        );
+        // The `I64x2Keys` (composite integer) path.
+        assert_same_relation(
+            &[
+                i64_col(&[Some(1), Some(1), Some(2)]),
+                i64_col(&[Some(10), Some(20), Some(10)]),
+            ],
+            &[i64_col(&[Some(1), Some(2)]), i64_col(&[Some(20), Some(10)])],
+            "two-column integer key",
+        );
+    }
+
+    /// The threshold must actually route a real semi join through the swapped path, and the
+    /// answer must still be the oracle's. Sized past [`SEMI_SWAP_MIN_PROBE_ROWS`] so the
+    /// production dispatch — not the direct call above — is what is under test.
+    #[test]
+    fn the_dispatch_takes_the_swap_and_still_agrees() {
+        // TPC-H q4's shape in miniature: a small returned side against a large discarded one.
+        let left: Vec<Option<i64>> = (0..2_000).map(Some).collect();
+        let right: Vec<Option<i64>> = (0..100_000).map(|i| Some(i % 3_000)).collect();
+        assert!(
+            swap_semi_build(left.len(), right.len()),
+            "this shape must reach the swapped path or the test proves nothing"
+        );
+        let l = [i64_col(&left)];
+        let r = [i64_col(&right)];
+        for jt in [JoinType::Semi, JoinType::Anti] {
+            // The oracle, with the swap refused by making the ratio unreachable.
+            let l_null = null_mask(&l, left.len());
+            let r_null = null_mask(&r, right.len());
+            let oracle = build_probe_flat(
+                &I64Keys::try_new(&l, &r).unwrap(),
+                left.len(),
+                right.len(),
+                &l_null,
+                &r_null,
+                jt,
+                false,
+                BLOOM_FP_RATE,
+            );
+            let dispatched = hash_join_indices(&l, &r, jt).unwrap();
+            assert_eq!(pairs(&oracle), pairs(&dispatched), "{jt:?} at scale");
+        }
+        // Keys 0..2000 all occur in the right side (which cycles 0..3000), so Semi keeps
+        // everything and Anti keeps nothing — a check that the relation is the expected one
+        // and not merely self-consistent.
+        let semi = hash_join_indices(&l, &r, JoinType::Semi).unwrap();
+        assert_eq!(semi.left.len(), 2_000);
+        let anti = hash_join_indices(&l, &r, JoinType::Anti).unwrap();
+        assert_eq!(anti.left.len(), 0);
     }
 }

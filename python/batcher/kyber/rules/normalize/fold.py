@@ -26,7 +26,7 @@ from batcher.plan.expr_ir.func_nodes import DateOffset
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import LogicalPlan
-from batcher.plan.types import DTYPE_REGISTRY
+from batcher.plan.types import resolve_dtype
 from batcher.plan.visitor import transform_up
 
 __all__ = ["ConstantFolding", "fold_constants", "fold_expression"]
@@ -180,7 +180,7 @@ def _fold_cast(value: object, dtype: str) -> Lit | None:
     range selectivity (TPC-H Q1's filter estimated a flat 1/3 against an exactly-known
     date span).
     """
-    target = DTYPE_REGISTRY.get(dtype)
+    target = resolve_dtype(dtype)
     source = _literal_type(value)
     if target is None or source is None or not _cast_is_exact(source, target):
         return None

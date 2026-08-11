@@ -81,7 +81,7 @@ def _parse_date(raw: str) -> dt.datetime | None:
         return None
     # Batcher timestamps are tz-naive UTC instants; normalize then drop the zone.
     if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        parsed = parsed.astimezone(dt.UTC).replace(tzinfo=None)
     return parsed
 
 

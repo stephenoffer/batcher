@@ -20,6 +20,7 @@ from .lifecycle import (
     resolve_transport,
 )
 from .metering import (
+    drain_worker_metrics,
     execute_metered,
     record_worker_metrics,
 )
@@ -37,8 +38,8 @@ from .policies import (
     speculation_policy,
 )
 from .readiness import await_autoscale
-from .reduce import run_bucket_reduce
-from .reducers import shuffle_partitions
+from .reduce import gather_in_windows, run_bucket_reduce
+from .reducers import map_partitions, shuffle_partitions
 from .scaling import (
     alive_node_count,
     clamp_workers,
@@ -71,14 +72,17 @@ __all__ = [
     "cluster_topology",
     "create_worker_placement",
     "current_envelope",
+    "drain_worker_metrics",
     "draining_workers",
     "engine_config_json",
     "execute_metered",
     "fault_options",
     "fleet_actor_options",
+    "gather_in_windows",
     "gather_map_results",
     "is_recoverable_task_failure",
     "map_barrier",
+    "map_partitions",
     "node_class_selector",
     "placement_actor_options",
     "record_worker_metrics",

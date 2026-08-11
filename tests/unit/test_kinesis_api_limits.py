@@ -84,9 +84,13 @@ def test_poll_passes_a_smaller_poll_size_through():
 
 @pytest.mark.parametrize("shard_count", [1, 100, 101, 250])
 def test_list_shards_is_paginated(shard_count):
+    # `_shards()` yields the whole shard *descriptor*, not a bare id: `ParentShardId` /
+    # `AdjacentParentShardId` are what say which shards replaced one a reshard closed, and
+    # `_adopt_children` needs them. The property under test is unchanged either way — every
+    # page is followed, so nothing past the hundredth shard goes missing.
     fake = _FakeKinesis(shard_count=shard_count)
     src = _source(fake)
-    assert src._shards() == fake.shard_ids
+    assert [s["ShardId"] for s in src._shards()] == fake.shard_ids
     assert len(src._shards()) == shard_count
 
 

@@ -11,6 +11,11 @@ rank <= k)` — the shape SQL `QUALIFY` lowers to — fuses the bound into the w
 `rank_limit`, so the engine keeps only the top-`k` rows per partition and the
 separate filter (and the full windowed intermediate) disappears.
 
+`rank1_window_to_distinct_on` finishes the job for the `= 1` case, which is the ordinary
+keyed dedup. `rank_limit` bounds what the window *emits*, not what it *computes*: the engine
+still ranks every row, which means fully sorting every partition to answer a per-key argmin.
+That case is a `DISTINCT ON`, and `Distinct` is already the mergeable operator for it.
+
 `fuse_topn` is registered as the `topn_fusion` `plan_rule` in `Phase.FUSION`
 (see `kyber.registry.register_builtin_rules`).
 """
@@ -25,12 +30,13 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
-from batcher.plan.expr_ir import Binary, Cast, Col, referenced_columns
+from batcher.plan.expr_ir import Binary, Cast, Col, Lit, referenced_columns
 from batcher.plan.expr_rewrite import combine_conjuncts, split_conjuncts
 from batcher.plan.ir_tags import COMPARISON_FLIP, WINDOW_RANKING
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
+    Distinct,
     Filter,
     Join,
     Limit,
@@ -43,7 +49,7 @@ from batcher.plan.logical import (
 )
 from batcher.plan.logical.aggregate import SortKeySpec
 from batcher.plan.logical.relational import Projection
-from batcher.plan.types import DTYPE_REGISTRY, infer_type
+from batcher.plan.types import infer_type, resolve_dtype
 
 __all__ = [
     "collapse_adjacent_windows",
@@ -51,6 +57,7 @@ __all__ = [
     "fuse_topn",
     "push_down_narrowing_cast",
     "qualify_to_partition_topn",
+    "rank1_window_to_distinct_on",
 ]
 
 # Flip a comparison operator when the column is on the right (`lit <= col` ≡ `col >= lit`).
@@ -120,6 +127,49 @@ def qualify_to_partition_topn(node: Filter, _ctx: OptimizerContext) -> LogicalPl
 
     fused = Window(win.input, win.partition_keys, win.order_keys, win.functions, rank_limit=limit)
     return fused if not rest else Filter(fused, combine_conjuncts(rest))
+
+
+@rule(name="rank1_window_to_distinct_on", phase=Phase.FUSION, matches=(Window,))
+def rank1_window_to_distinct_on(node: Window, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`row_number() OVER (PARTITION BY k ORDER BY o) = 1` → `DISTINCT ON (k) ORDER BY o`.
+
+    The shape is the canonical keyed dedup — "collapse an event log to its earliest row per
+    key" — and `qualify_to_partition_topn` above already folds the `= 1` into `rank_limit`.
+    But `rank_limit` is applied *after the fact*: `window_batch_with` computes the full
+    ranking for **every** row, which means fully sorting every partition, and only then masks
+    to rank ≤ k. Answering a per-key argmin by sorting the whole relation is the wrong
+    algorithm, and it is the whole gap this rewrite closes.
+
+    `Distinct` already means exactly this — "the survivor per key, the minimum under `order`"
+    — and it is one mergeable reduction in `bc_runtime::agg::distinct_on`, with a spilling
+    form and a partition-equivalence test. So this is a rewrite onto an existing operator
+    rather than a new one, and the single-node, parallel, distributed and out-of-core paths
+    all come with it.
+
+    Restricted to `row_number`. `rank` and `dense_rank` keep boundary ties, so `rank = 1` can
+    admit several rows per partition and is not a `DISTINCT ON`. Every partition key must be
+    a bare column, because `Distinct.keys` are names rather than expressions.
+
+    The window appends its rank column and `Distinct` does not, so the projection restores it
+    as the literal 1 every surviving row has by construction. That keeps the output schema
+    identical for whatever sits above; when nothing reads it, column pruning drops it again.
+    """
+    if node.rank_limit != 1 or len(node.functions) != 1:
+        return None
+    fn = node.functions[0]
+    if fn.func != "row_number" or not node.partition_keys or not node.order_keys:
+        return None
+    if not all(isinstance(k, Col) for k in node.partition_keys):
+        return None
+
+    survivor = Distinct(
+        node.input,
+        keys=tuple(k.name for k in node.partition_keys),
+        order=tuple(node.order_keys),
+    )
+    items = [Projection(name, Col(name)) for name in node.input.available_columns()]
+    items.append(Projection(fn.alias, Lit(1)))
+    return Project(survivor, tuple(items))
 
 
 @rule(name="count_over_filter_to_count_if", phase=Phase.FUSION, matches=(Aggregate,))
@@ -327,7 +377,7 @@ def _narrows(expr: object, input_node: LogicalPlan, dtype: str) -> bool:
     if schema is None:
         return False
     src = infer_type(expr, schema)
-    target = DTYPE_REGISTRY.get(dtype)
+    target = resolve_dtype(dtype)
     if src is None or target is None:
         return False
     src_w, tgt_w = _byte_width(src), _byte_width(target)

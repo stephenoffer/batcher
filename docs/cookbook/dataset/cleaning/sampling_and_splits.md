@@ -20,4 +20,4 @@ python examples/dataset/sampling_and_splits.py
 - {doc}`/cookbook/dataset/verbs/reshaping`: pivot, unpivot, explode, unnest, and set operations.
 - {doc}`/cookbook/dataset/verbs/sql_interface`: SQL over the same engine, and mixing SQL with DataFrame verbs.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
-- {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.
+- {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

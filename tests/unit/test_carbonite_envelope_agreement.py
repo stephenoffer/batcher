@@ -74,7 +74,7 @@ class _DoublingModel:
     concurrent-peak correction off for every store that had learned anything.
     """
 
-    def blend_peak(self, kind: str, planned: int) -> int:
+    def blend_peak(self, kind: str, planned: int, row_size: float | None = None) -> int:
         return planned * 2
 
 

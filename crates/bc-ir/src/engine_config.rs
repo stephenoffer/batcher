@@ -63,6 +63,23 @@ pub struct EngineConfig {
     /// e.g. an older control plane or an ad-hoc IR with no `PhysicalOp` DAG) ⇒ every
     /// operator falls back to `memory_budget_bytes`, so behavior is unchanged.
     pub op_budgets: HashMap<u32, usize>,
+
+    /// Kyber's verdict that this plan's grouped aggregate is better **materialized** than
+    /// streamed, from the estimated group count it alone knows.
+    ///
+    /// Both executors compute the identical answer and both parallelize; what differs is the
+    /// CPU they spend. On the H2O `groupby` suite the streaming aggregate burned about twice
+    /// the materializing one's CPU at 1e5 groups and above (`sum(v1:v3) by id6`: 178 ms /
+    /// 2,505 cpu-ms streamed against 97 ms / 955 cpu-ms materialized), and *lost* to it below
+    /// ~1e4 groups, where per-morsel pre-aggregation collapses the relation early and holding
+    /// the whole input buys nothing (`sum(v1) by id1`, 100 groups: 31.8 ms against 36.3 ms).
+    ///
+    /// So it is a cardinality question, and cardinality is the control plane's to answer — the
+    /// engine cannot know the group count before it has done the grouping. Kyber sends its half
+    /// of the decision here; the engine ANDs it with its own affordability check (`the input
+    /// footprint against the envelope`), which is the half only the engine can see. `false`
+    /// (the default, and every older control plane) keeps the existing routing exactly.
+    pub prefer_materializing_aggregate: bool,
     /// Fuse runs of linear, per-morsel streaming operators (Filter/Project) into a
     /// single pass over the input's morsels in the parallel executor. A relation-level
     /// no-op (same rows, same order — verified against the sequential oracle); it only
@@ -133,6 +150,7 @@ impl Default for EngineConfig {
             spill_dir: None,
             spill_compression: Some("auto".to_string()),
             op_budgets: HashMap::new(),
+            prefer_materializing_aggregate: false,
             fuse_linear: true,
             shrink_output_dtypes: false,
             streaming: true,

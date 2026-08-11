@@ -1,8 +1,8 @@
 # Score a tabular model
 
-This page describes how to run a fitted XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model over a Batcher `Dataset`.
+This page describes how to run a fitted XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model over a Batcher {py:class}`Dataset <batcher.Dataset>`.
 
-Tabular models are the ones most production ML actually runs, and they have a different shape from a language model. The input is dozens of numeric columns rather than one text column, the model is megabytes rather than gigabytes, and the bottleneck is feeding the model rather than the model itself. `ds.ml.predict` is the entry point built for that shape.
+Tabular models are the ones most production ML actually runs, and they have a different shape from a language model. The input is dozens of numeric columns rather than one text column, the model is megabytes rather than gigabytes, and the bottleneck is feeding the model rather than the model itself. {py:meth}`ds.ml.predict <batcher.api.dataset.ml.DatasetML.predict>` is the entry point built for that shape.
 
 ## How it works
 
@@ -88,7 +88,7 @@ top_driver = explained.select(
 
 ## Scale it out
 
-The scheduling keywords are the same ones `ds.ml.infer` takes, because it is the same operator underneath:
+The scheduling keywords are the same ones {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` takes, because it is the same operator underneath:
 
 ```python
 # docs: skip
@@ -108,7 +108,7 @@ scored.write.parquet("s3://bucket/scored/", distributed=True)
 
 ## A linear baseline for free
 
-Before reaching for a boosted tree, a linear baseline is worth having, and `batcher.ml.linear` fits one without leaving the engine: `LinearRegression` and `Ridge` build their normal equations from the feature and target moments, so the whole fit is a single scan and prediction is a linear-combination expression. Both reproduce scikit-learn's coefficients exactly.
+Before reaching for a boosted tree, a linear baseline is worth having, and `batcher.ml.linear` fits one without leaving the engine: {py:class}`LinearRegression <batcher.ml.linear.LinearRegression>` and {py:class}`Ridge <batcher.ml.linear.Ridge>` build their normal equations from the feature and target moments, so the whole fit is a single scan and prediction is a linear-combination expression. Both reproduce scikit-learn's coefficients exactly.
 
 ```python
 import batcher as bt
@@ -122,15 +122,15 @@ print(round(model.coef_[0], 1), round(model.intercept_, 1))
 
 `Ridge(alpha=...)` adds an L2 penalty that stabilizes the fit when features are collinear, which is the case where ordinary least squares is unreliable. Encode categorical columns to numbers first, as for every other model here.
 
-Where ridge shrinks every coefficient, `batcher.ml.sparse_linear.Lasso` and `ElasticNet` drive the irrelevant ones to *exactly* zero, so the fit selects features as it trains. That makes them the tool for a wide, correlated table. Their coordinate descent needs only the centered Gram matrix and the feature-target covariances (one scan), and because the objective is strictly convex the coefficients match scikit-learn's.
+Where ridge shrinks every coefficient, {py:class}`batcher.ml.sparse_linear.Lasso <batcher.ml.sparse_linear.Lasso>` and {py:class}`ElasticNet <batcher.ml.sparse_linear.ElasticNet>` drive the irrelevant ones to *exactly* zero, so the fit selects features as it trains. That makes them the tool for a wide, correlated table. Their coordinate descent needs only the centered Gram matrix and the feature-target covariances (one scan), and because the objective is strictly convex the coefficients match scikit-learn's.
 
-For a count target such as events, arrivals, or claim frequencies, `batcher.ml.glm.PoissonRegressor` fits a log-link generalized linear model by the same IRLS Newton steps, keeping the predicted rate positive where least squares would predict a negative count. It matches scikit-learn's `PoissonRegressor` across penalty strengths. For a positive, right-skewed *amount* such as a claim size, a duration, or a spend, `GammaRegressor` is the matching GLM, with a variance that grows with the mean. `TweedieRegressor` is the general form these two specialize: a `power` between 1 and 2 fits the compound distribution of a target that is exactly zero for many rows and positive for the rest, such as an insurance pure premium.
+For a count target such as events, arrivals, or claim frequencies, {py:class}`batcher.ml.glm.PoissonRegressor <batcher.ml.glm.PoissonRegressor>` fits a log-link generalized linear model by the same IRLS Newton steps, keeping the predicted rate positive where least squares would predict a negative count. It matches scikit-learn's {py:class}`PoissonRegressor <batcher.ml.glm.PoissonRegressor>` across penalty strengths. For a positive, right-skewed *amount* such as a claim size, a duration, or a spend, {py:class}`GammaRegressor <batcher.ml.glm.GammaRegressor>` is the matching GLM, with a variance that grows with the mean. {py:class}`TweedieRegressor <batcher.ml.glm.TweedieRegressor>` is the general form these two specialize: a `power` between 1 and 2 fits the compound distribution of a target that is exactly zero for many rows and positive for the rest, such as an insurance pure premium.
 
-For classification, `RidgeClassifier` casts it as regression on one-vs-rest targets (a closed-form single-scan fit), while `LogisticRegression` fits the probabilistic model by iteratively reweighted least squares, one scan per Newton step, and reproduces scikit-learn's unpenalized coefficients. `predict_proba` appends the positive-class probability, and `predict` thresholds it to a 0/1 label.
+For classification, {py:class}`RidgeClassifier <batcher.ml.linear.RidgeClassifier>` casts it as regression on one-vs-rest targets (a closed-form single-scan fit), while {py:class}`LogisticRegression <batcher.ml.linear.LogisticRegression>` fits the probabilistic model by iteratively reweighted least squares, one scan per Newton step, and reproduces scikit-learn's unpenalized coefficients. `predict_proba` appends the positive-class probability, and `predict` thresholds it to a 0/1 label.
 
-`batcher.ml.naive_bayes.GaussianNB` is the even cheaper baseline. Its whole fit, a per-class prior, mean, and variance, is a single `group_by(target)` aggregate, and it reproduces scikit-learn's predictions. It is naive by assumption but a strong instant baseline in high dimensions. `MultinomialNB` and `BernoulliNB` are the count-feature and binary-feature variants that do the text-classification work, fitted the same way from grouped sums.
+{py:class}`batcher.ml.naive_bayes.GaussianNB <batcher.ml.naive_bayes.GaussianNB>` is the even cheaper baseline. Its whole fit, a per-class prior, mean, and variance, is a single {py:meth}`group_by(target) <batcher.Dataset.group_by>` aggregate, and it reproduces scikit-learn's predictions. It is naive by assumption but a strong instant baseline in high dimensions. {py:class}`MultinomialNB <batcher.ml.naive_bayes.MultinomialNB>` and {py:class}`BernoulliNB <batcher.ml.naive_bayes.BernoulliNB>` are the count-feature and binary-feature variants that do the text-classification work, fitted the same way from grouped sums.
 
-When the features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance instead of assuming independence: `LinearDiscriminantAnalysis` shares one covariance across classes for a stable linear boundary, and `QuadraticDiscriminantAnalysis` gives each class its own for a quadratic one. Both reproduce scikit-learn exactly.
+When the features are correlated within a class, the `batcher.ml.discriminant` classifiers model that covariance instead of assuming independence: {py:class}`LinearDiscriminantAnalysis <batcher.ml.discriminant.LinearDiscriminantAnalysis>` shares one covariance across classes for a stable linear boundary, and {py:class}`QuadraticDiscriminantAnalysis <batcher.ml.discriminant.QuadraticDiscriminantAnalysis>` gives each class its own for a quadratic one. Both reproduce scikit-learn exactly.
 
 ## When a few rows are wrong
 
@@ -258,9 +258,12 @@ The base estimator must expose `predict_proba`. Ranking classes means comparing 
 
 {py:class}`RidgeClassifier <batcher.ml.linear.RidgeClassifier>` already does this decomposition internally and takes a multiclass target directly. It is the cheaper option when a closed-form fit is enough, since it needs one scan rather than one per Newton step.
 
+A fitted classifier's scores are not probabilities until they are calibrated; see
+{doc}`/ml/inference/calibration` for when that matters and how to fix it.
+
 ## Clustering without labels
 
-Not every tabular job has a target. `batcher.ml.cluster.KMeans` segments rows by similarity, learning its centroids in the engine: each Lloyd iteration is one nearest-centroid assignment expression and one grouped mean, so the fit is a handful of scans and labeling any dataset is a single streaming pass. The `inertia_` it learns is the total squared distance to the centroids, which is the number an elbow plot uses to choose the cluster count.
+Not every tabular job has a target. {py:class}`batcher.ml.cluster.KMeans <batcher.ml.cluster.KMeans>` segments rows by similarity, learning its centroids in the engine: each Lloyd iteration is one nearest-centroid assignment expression and one grouped mean, so the fit is a handful of scans and labeling any dataset is a single streaming pass. The `inertia_` it learns is the total squared distance to the centroids, which is the number an elbow plot uses to choose the cluster count.
 
 ```python
 import batcher as bt
@@ -275,9 +278,9 @@ print(labels[0] == labels[1], labels[2] == labels[3], labels[0] != labels[2])
 
 The centroids are seeded from a reproducible content-hash sample, so a fit is identical however the data is partitioned. Encode categorical columns to numbers first, exactly as for the predictors above.
 
-When clusters overlap or the goal is a density rather than a partition, `batcher.ml.mixture.GaussianMixture` models the data as a blend of Gaussians fitted by expectation-maximization: `predict` gives soft-clustering labels, `predict_proba` the membership probabilities, and `score_samples` a per-row log-likelihood that turns the fitted model into an anomaly detector.
+When clusters overlap or the goal is a density rather than a partition, {py:class}`batcher.ml.mixture.GaussianMixture <batcher.ml.mixture.GaussianMixture>` models the data as a blend of Gaussians fitted by expectation-maximization: `predict` gives soft-clustering labels, `predict_proba` the membership probabilities, and `score_samples` a per-row log-likelihood that turns the fitted model into an anomaly detector.
 
-When the groups *are* the labels, `batcher.ml.cluster.NearestCentroid` is the supervised counterpart: it fits one centroid per class and labels a row by the nearest, reproducing scikit-learn's `NearestCentroid`.
+When the groups *are* the labels, {py:class}`batcher.ml.cluster.NearestCentroid <batcher.ml.cluster.NearestCentroid>` is the supervised counterpart: it fits one centroid per class and labels a row by the nearest, reproducing scikit-learn's {py:class}`NearestCentroid <batcher.ml.cluster.NearestCentroid>`.
 
 ## Save a model Batcher fitted
 
@@ -445,7 +448,7 @@ agree wherever the neighbourhood is unambiguous.
 
 Each framework is an optional extra: `pip install 'batcher-engine[xgboost]'`, `[lightgbm]`, `[catboost]`, `[onnx]`, or `[sklearn]`. `[tabular]` installs all of them.
 
-Feature columns must be numeric, boolean, or decimal. Encode a categorical column first, with `OrdinalEncoder`, `TargetEncoder`, or one of the cardinality-tolerant encoders on {doc}`/ml/preparing/preprocessors/index`. A string column raises an error naming the column rather than failing deep inside the model.
+Feature columns must be numeric, boolean, or decimal. Encode a categorical column first, with {py:class}`OrdinalEncoder <batcher.ml.preprocessors.OrdinalEncoder>`, {py:class}`TargetEncoder <batcher.ml.preprocessors.TargetEncoder>`, or one of the cardinality-tolerant encoders on {doc}`/ml/preparing/preprocessors/index`. A string column raises an error naming the column rather than failing deep inside the model.
 
 The estimators Batcher fits itself are stricter than `ds.ml.predict` on one point: a feature column must be an integer, a float, or a decimal. They fit through engine aggregates, which are not defined on a boolean, so a flag column has to be cast before it can be used as a feature:
 

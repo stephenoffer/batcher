@@ -29,8 +29,8 @@ import threading
 from typing import Any
 
 from batcher._internal.errors import ConfigError
+from batcher._internal.hardware import fingerprint
 from batcher._internal.logging import get_logger
-from batcher.metadata.hardware_scope import measured_here
 from batcher.metadata.params import LearnedParams
 from batcher.metadata.store import MetadataBackend, check_backend
 from batcher.metadata.views import (
@@ -88,16 +88,23 @@ class MetadataHub:
             ConfigError: If `backend` does not implement `MetadataBackend`.
         """
         self._backend = check_backend(backend)
+        # Resolved once: a backend that can take a structured row (`InProcessBackend`, the
+        # default) lets `_record_locked` skip serializing a flat dict of scalars purely so a
+        # later read can parse it back. A backend that must produce real bytes does not
+        # offer it and keeps the `put` path unchanged.
+        self._put_row = getattr(backend, "put_row", None)
         self._seq = 0
         # The learned-parameter half of the store, with its own parsed-read cache. A separate
         # object because it is a separate job: this class absorbs measurements and maintains
         # views over them, `LearnedParams` holds what the tuning loops read back at plan time.
         self._params = LearnedParams(self._backend)
-        # Bucketed-by-kind view of the feedback history: loaded from the backend once,
-        # then folded forward by `record`. Consumers reduce each bucket to a median or a
-        # regression, so buckets are bounded (`PER_KIND_MAX`) — the whole point is that
-        # neither a read nor a record costs anything proportional to session history.
-        self._by_kind: dict[str, list[dict[str, Any]]] | None = None
+        # Feedback history bucketed by machine class, then by operator kind: loaded from the
+        # backend once, then folded forward by `record`. Consumers reduce each bucket to a
+        # median or a regression, so buckets are bounded (`PER_KIND_MAX`) — the whole point is
+        # that neither a read nor a record costs anything proportional to session history.
+        # Bucketed rather than filtered to the local class, so a driver can read what its
+        # *workers* measured; see `op_stats_by_kind`.
+        self._by_fp: dict[str, dict[str, list[dict[str, Any]]]] | None = None
         # Chronological, bounded, in-memory view of the signature-carrying feedback rows.
         # Kyber's cardinality correction reads it on *every* optimize. Loaded once from
         # the backend on first read, then maintained incrementally by `record`.
@@ -144,13 +151,17 @@ class MetadataHub:
         self._seq += 1
         key = (int(feedback.op_id), self._seq)
         row = _row_of(feedback)
-        self._backend.put(_OP_STATS, key, json.dumps(row).encode())
+        if self._put_row is not None:
+            self._put_row(_OP_STATS, key, row)
+        else:
+            self._backend.put(_OP_STATS, key, json.dumps(row).encode())
         # Fold the row into whichever derived views have been materialized. A view
         # still `None` has not been read yet; its lazy load will pick this row up
         # from the backend, so there is nothing to do.
-        # Same filter `_load_by_kind` applies; the two must agree or it leaks after a write.
-        if self._by_kind is not None and measured_here(row):
-            bucket = self._by_kind.setdefault(row["kind"], [])
+        # Same bucketing `build_views` applies; the two must agree or it leaks after a write.
+        machine = str(row.get("hw_fingerprint", "") or "")
+        if self._by_fp is not None and machine:
+            bucket = self._by_fp.setdefault(machine, {}).setdefault(row["kind"], [])
             bucket.append(row)
             trimmed(bucket, PER_KIND_MAX)
         if self._signed is not None and row["signature"]:
@@ -228,17 +239,26 @@ class MetadataHub:
         out = [json.loads(value) for _key, value in self._backend.scan(_OP_STATS, (op_id,))]
         return out
 
-    def op_stats_by_kind(self) -> dict[str, list[dict[str, Any]]]:
-        """Operator feedback **measured on this machine**, bucketed by operator `kind`.
+    def op_stats_by_kind(self, hw_fingerprint: str | None = None) -> dict[str, list[dict]]:
+        """Operator feedback measured on **one machine class**, bucketed by operator `kind`.
 
         The shape Kyber's cost calibration consumes: per-row/per-byte coefficients
         are fit per operator family (`scan`, `filter`, `hash_join`, ...), not per
         operator id.
 
-        Restricted to rows measured on **this machine class** (`metadata.hardware_scope`):
-        everything fit from this view is in machine units and none of it transfers. Its
-        counterpart `op_stats_with_signature` is deliberately *not* restricted, because
-        cardinality is a property of the data.
+        Scoped to a single machine class, because everything fit from this view is in machine
+        units and none of it transfers (`metadata.hardware_scope`). Its counterpart
+        `op_stats_with_signature` is deliberately *unscoped*, because cardinality is a property
+        of the data.
+
+        **Which class, though, is the caller's question, not this hub's.** Defaulting to the
+        local machine is right for a single-node run and wrong for every distributed one: Kyber
+        runs on the driver, which executes none of the work, so a view of "what this process
+        measured" excluded every worker row on any cluster whose driver was a different machine
+        class. The rows arrived correctly attributed (a worker stamps its own fingerprint before
+        shipping) and were then dropped at the reader, which silently disabled cost calibration
+        and the CPU-share loop on exactly the deployment they exist for. A caller planning for a
+        worker passes that worker's fingerprint.
 
         The backend is scanned exactly once; `record` folds every later row straight
         into its bucket, so a steady-state read is O(1) rather than a re-parse of the
@@ -246,11 +266,20 @@ class MetadataHub:
         far more than the median/regression its consumers fit needs, and enough to
         keep a long-lived session's planning cost flat.
 
+        Args:
+            hw_fingerprint: The machine class to read, from `HardwareProfile.fingerprint`.
+                `None` reads this process's own class, which is the single-node answer and
+                what every caller without a cluster profile wants. An unknown class yields
+                an empty view rather than another machine's rows.
+
+        Returns:
+            `{kind: rows}` for that machine class, empty when it has measured nothing.
+
         Best-effort; a malformed row is skipped, not raised."""
-        if self._by_kind is None:
+        if self._by_fp is None:
             self._load_views()
-        assert self._by_kind is not None
-        return self._by_kind
+        assert self._by_fp is not None
+        return self._by_fp.get(hw_fingerprint or fingerprint(), {})
 
     def op_stats_with_signature(self) -> list[dict[str, Any]]:
         """Signature-carrying operator feedback, **oldest first**.
@@ -297,12 +326,12 @@ class MetadataHub:
         the one the learning loop weights most. The lock is held for one scan per process.
         """
         with self._lock:
-            if self._by_kind is not None and self._signed is not None:
+            if self._by_fp is not None and self._signed is not None:
                 return  # another thread finished the load while this one waited
             scanned = list(self._backend.scan(_OP_STATS, ()))
-            by_kind, signed = build_views(scanned)
-            if self._by_kind is None:
-                self._by_kind = by_kind
+            by_fp, signed = build_views(scanned)
+            if self._by_fp is None:
+                self._by_fp = by_fp
             if self._signed is None:
                 self._signed = signed
                 self._signed_appends = len(signed)

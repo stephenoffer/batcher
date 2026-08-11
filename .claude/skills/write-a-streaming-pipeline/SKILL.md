@@ -106,17 +106,29 @@ ds.with_watermark("ts", "5s")             # correct
 ## Watermarks and late data
 
 A watermark is the promise "no more events older than this". It advances to
-`max(observed event time) - lateness`; older rows are dropped as late, and windows whose
-end falls below it are emitted and **evicted** — which is what keeps state bounded.
+`min over partitions(max observed event time) - lateness` — the **minimum**, because a
+partitioned topic is only as far along as its slowest partition, and a maximum would drop
+every row a lagging partition later delivers. Older rows are dropped as late, and windows
+whose end falls below it are emitted and **evicted**, which is what keeps state bounded.
+
+A minimum stalls on a silent partition, so one that has delivered nothing for
+`streaming.watermark_idle_timeout_seconds` (60 by default) stops holding it back. Raise that
+for a bursty partition; zero disables idleness and never advances past a silent partition.
 
 ```python
 events = (
     bt.read.kafka("clicks")
     .with_watermark("ts", "10m")                       # tolerate 10m of lateness
-    .group_by(w=bt.window(bt.col("ts"), "1h"))         # tumbling; add a 3rd arg to slide
+    .group_by(w=bt.window(bt.col("ts"), "1h"))         # tumbling
     .agg(hits=bt.count())
 )
 ```
+
+Overlapping windows are watermark-evicted too, but they are spelled differently: a row is in
+several of them, so `bt.window(col("ts"), "1h", "30m")` is the *list* of their starts and
+must be `explode`d before the `group_by`. A watermark on an aggregate with **no** event-time
+window key has nothing to close, and over an unbounded source is refused rather than run as
+a running aggregate that never emits.
 
 `lateness` is the whole trade: larger means fewer dropped late events but more retained
 state and later emission. Set it from your source's measured lag, not by taste.
@@ -159,11 +171,15 @@ q = bt.read.kafka("orders").write(
 )
 ```
 
-The checkpoint dir holds `offsets.sqlite`, `commits.sqlite`, and a `state/` dir of Arrow IPC
-snapshots. Per micro-batch the order is **offsets write-ahead → state snapshotted → sink
-commits → commit-log entry last**, so a batch in offsets but not in commits is exactly the
-in-flight batch, and restart replays that one only. Verified: draining the same source
-twice against one checkpoint left the output at 20 rows, not 40.
+A **local** checkpoint dir holds `offsets.sqlite`, `commits.sqlite`, and a `state/` dir of
+Arrow IPC snapshots. A **remote** one (`s3://`, `gs://`, `hdfs://` — what you want under
+`resilience="spot"`, since a node-local checkpoint dies with the node) holds `offsets/` and
+`commits/` directories of one small JSON file per batch id, because SQLite needs a lockable
+seekable file an object store does not have. Either way, per micro-batch the order is
+**offsets write-ahead → state snapshotted → sink commits → commit-log entry last**, so a
+batch in offsets but not in commits is exactly the in-flight batch, and restart replays that
+one only. Verified: draining the same source twice against one checkpoint left the output at
+20 rows, not 40.
 
 **The engine is deliberately at-least-once; end-to-end exactly-once is bought by the
 sink.** Know which one you have:
@@ -190,6 +206,14 @@ ds.write.memory("name", output_mode="complete")    # read back with bt.read_memo
 ds.write.for_each_batch(fn)                        # fn(table: pa.Table, batch_id: int)
 ds.write.for_each(fn)                              # fn(row: dict) — convenience, slower
 ```
+
+A file-sink stream writes **one file per micro-batch**, so its file size is whatever the
+trigger interval produced — over days, the small-files problem in its purest form. Pass
+`max_rows_per_file=` to cap it; the chunk index joins the batch id in the name, so files
+stay named by position and a replayed epoch still recognizes its own output. It is refused
+(not ignored) on a transactional target, whose micro-batch is one transaction that owns its
+own layout, and on a `distributed=True` drain — use `bt.compact(path, target_size_mb=...)`
+there instead.
 
 `bt.read.table(name)` raises `unknown source` — a memory sink reads back only via
 **`bt.read_memory(name)`**; in `complete` mode it replaces its table each batch, else grows.

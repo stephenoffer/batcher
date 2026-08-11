@@ -300,3 +300,245 @@ def test_csv_invalid_utf8_file_is_skippable_like_any_other_bad_file() -> None:
     with open(os.path.join(d, "bad.csv"), "wb") as f:
         f.write(b"a\n\xff\xfe\n")
     assert bt.read.csv(d, on_error="skip").to_pydict() == {"a": ["hello"]}
+
+
+# ------------------------------------------------------- a ragged row inside a good file
+def _ragged(rows: int = 3, *, bad_at: tuple[int, ...] = (2,)) -> str:
+    """A CSV of `rows` two-field rows, with the ones at `bad_at` given a third field."""
+    p = tempfile.mktemp(suffix=".csv")
+    lines = ["a,b"]
+    for i in range(1, rows + 1):
+        lines.append(f"{i},{i}," if i in bad_at else f"{i},{i}")
+    with open(p, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return p
+
+
+def test_ragged_row_error_offers_the_fix_that_keeps_the_file() -> None:
+    """The default refusal must not send the reader to the flag that discards every row.
+
+    A field-count mismatch and a value that will not convert arrive as the same
+    `ArrowInvalid`, and they have opposite fixes. This one used to be reported as an
+    unreadable *file*, whose advice is `on_error='skip'` — which drops all ten million good
+    rows to be rid of one bad line.
+    """
+    with pytest.raises(FormatError, match="field count disagrees with the header") as exc:
+        bt.read.csv(_ragged()).to_pydict()
+    assert "on_bad_lines='skip'" in str(exc.value)
+
+
+@pytest.mark.parametrize("mode", ["skip", "warn"])
+def test_on_bad_lines_drops_the_row_and_keeps_the_rest_of_the_file(mode) -> None:
+    """One stray line costs one row, not the whole file."""
+    got = bt.read.csv(_ragged(rows=5, bad_at=(2, 4)), on_bad_lines=mode).to_pydict()
+    assert got == {"a": [1, 3, 5], "b": [1, 3, 5]}
+
+
+def test_on_bad_lines_agrees_across_collect_iter_and_count() -> None:
+    """Every read path shares one parse, so a dropped row is dropped on all of them.
+
+    `schema()`, `read()` and `iter_batches()` build their pyarrow options separately; only
+    a shared builder keeps a tolerance flag from applying on one path and not another.
+    """
+    p = _ragged(rows=5, bad_at=(2, 4))
+    ds = bt.read.csv(p, on_bad_lines="skip")
+    assert ds.schema.names == ["a", "b"]
+    assert ds.count() == 3
+    assert [b.num_rows for b in ds.iter_batches()] == [3]
+
+
+def test_on_bad_lines_counts_each_dropped_row_exactly_once() -> None:
+    """Inference re-reads the first block, so a naive count reports every row twice."""
+    from batcher._internal import events
+
+    seen: list[int] = []
+    off = events.subscribe(
+        lambda e: seen.append(int(e.fields["count"])) if e.kind == events.MALFORMED else None
+    )
+    try:
+        bt.read.csv(_ragged(rows=6, bad_at=(2, 4)), on_bad_lines="skip").to_pydict()
+    finally:
+        off()
+    assert sum(seen) == 2
+
+
+def test_on_bad_lines_rejects_an_unknown_mode_before_anything_is_read() -> None:
+    """A typo in a tolerance flag must not be discovered by a worker mid-query.
+
+    Under `on_error='skip'` a late raise is swallowed as an unreadable file, so a
+    misspelled flag would turn into silent whole-corpus loss.
+    """
+    from batcher._internal.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="on_bad_lines must be one of"):
+        bt.read.csv(_ragged(), on_bad_lines="Skip")
+
+
+def test_on_bad_lines_default_still_refuses() -> None:
+    """Tolerance is opt-in: nothing changes for a caller who does not ask for it."""
+    with pytest.raises(FormatError):
+        bt.read.csv(_ragged()).to_pydict()
+
+
+@pytest.mark.parametrize(
+    ("kw", "pointer"),
+    [("mode", "on_bad_lines='skip'"), ("ignore_errors", "on_bad_lines='skip'")],
+)
+def test_a_spark_or_polars_spelling_points_at_the_batcher_one(kw, pointer) -> None:
+    """A migrant's flag is refused with the translation, not with 'unknown option'."""
+    with pytest.raises(FormatError, match="is not a Batcher option") as exc:
+        bt.read.csv(_ragged(), **{kw: True})
+    assert pointer in str(exc.value)
+
+
+def test_on_bad_lines_survives_to_a_byte_range_split() -> None:
+    """The distributed CSV read *is* the byte-range split, so the flag must ride along.
+
+    A range rebuilds its reader from the split alone. An option left out of `range_kwargs`
+    reverts to its default there and nowhere else, so a corpus with a stray line would read
+    fine single-node and fail only on a cluster — the worst shape a defect can take.
+    """
+    from batcher.io.formats.base import SOURCES
+
+    p = tempfile.mktemp(suffix=".csv")
+    lines = ["a,b"] + [f"{i},{i}," if i % 500 == 0 else f"{i},{i}" for i in range(1, 40001)]
+    with open(p, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    splits = SOURCES.get("csv")(p, on_bad_lines="skip").splits(100_000)
+    assert len(splits) > 1, "the file must actually subdivide for this to test anything"
+    assert splits[0].options == {"on_bad_lines": "skip"}
+    assert sum(sum(b.num_rows for b in s.read()) for s in splits) == 40000 - 80
+
+
+# ---------------------------------------------------- an unparseable record inside NDJSON
+def _ndjson(rows: int = 5, *, bad_at: tuple[int, ...] = (2,)) -> str:
+    """An NDJSON file of `rows` records, with the ones at `bad_at` replaced by non-JSON."""
+    p = tempfile.mktemp(suffix=".jsonl")
+    with open(p, "w") as f:
+        for i in range(1, rows + 1):
+            f.write("<html>not json</html>\n" if i in bad_at else f'{{"a": {i}}}\n')
+    return p
+
+
+@pytest.mark.parametrize("mode", ["skip", "warn"])
+def test_json_on_bad_lines_drops_the_record_and_keeps_the_file(mode) -> None:
+    """pyarrow's JSON parser has no per-row hook, so one bad record aborted the file."""
+    got = bt.read.json(_ndjson(bad_at=(2, 4)), on_bad_lines=mode).to_pydict()
+    assert got == {"a": [1, 3, 5]}
+
+
+def test_json_on_bad_lines_agrees_across_collect_iter_and_count() -> None:
+    """Schema inference, the whole-file read and the windowed stream are three parses."""
+    ds = bt.read.json(_ndjson(rows=6, bad_at=(2, 5)), on_bad_lines="skip")
+    assert ds.schema.names == ["a"]
+    assert ds.count() == 4
+    assert sum(b.num_rows for b in ds.iter_batches()) == 4
+
+
+def test_json_on_bad_lines_counts_each_dropped_record_exactly_once() -> None:
+    """Inference re-parses the records the read is about to, so a naive count doubles."""
+    from batcher._internal import events
+
+    seen: list[int] = []
+    off = events.subscribe(
+        lambda e: seen.append(int(e.fields["count"])) if e.kind == events.MALFORMED else None
+    )
+    try:
+        bt.read.json(_ndjson(rows=6, bad_at=(2, 5)), on_bad_lines="skip").to_pydict()
+    finally:
+        off()
+    assert sum(seen) == 2
+
+
+def test_json_on_bad_lines_never_deletes_a_row_over_a_type_disagreement() -> None:
+    """A record that parses but does not fit the schema is answered by `schema=`, not by
+    deleting it. Dropping it would silently remove the rows that were about to say the
+    inferred type is wrong — the exact silent loss this whole area exists to prevent.
+    """
+    p = tempfile.mktemp(suffix=".jsonl")
+    with open(p, "w") as f:
+        f.write('{"a": 1}\n{"a": {"nested": 2}}\n')
+    with pytest.raises((FormatError, SchemaError)):
+        bt.read.json(p, on_bad_lines="skip").to_pydict()
+
+
+def test_json_on_bad_lines_survives_to_a_byte_range_split() -> None:
+    """A range rebuilt from the split alone must parse the way the driver planned.
+
+    `LineRangeSplit` carried no reader keywords at all, so a JSON file merely large enough
+    to subdivide lost `on_error=`, `filesystem=` and `storage_options=` too — configured on
+    the driver, defaulted on every worker.
+    """
+    from batcher.io.formats.base import SOURCES
+
+    p = tempfile.mktemp(suffix=".jsonl")
+    with open(p, "w") as f:
+        for i in range(1, 20001):
+            f.write("nope\n" if i % 500 == 0 else f'{{"a": {i}}}\n')
+
+    splits = SOURCES.get("json")(p, on_bad_lines="skip").splits(100_000)
+    assert len(splits) > 1, "the file must actually subdivide for this to test anything"
+    assert splits[0].options == {"on_bad_lines": "skip"}
+    assert sum(sum(b.num_rows for b in s.read()) for s in splits) == 20000 - 40
+
+
+def test_json_split_carries_the_on_error_policy_it_used_to_drop() -> None:
+    """The whole-file branch carried `on_error`; the byte-range branch did not."""
+    from batcher.io.formats.base import SOURCES
+
+    p = tempfile.mktemp(suffix=".jsonl")
+    with open(p, "w") as f:
+        for i in range(200_000):
+            f.write(f'{{"a": {i}}}\n')
+
+    splits = SOURCES.get("json")(p, on_error="skip").splits(100_000)
+    assert len(splits) > 1
+    assert splits[0].options == {"on_error": "skip"}
+
+
+# --------------------------------------------- the dropped-row count, across reader and UDF
+def test_a_dropped_row_is_counted_once_per_source_and_per_stage() -> None:
+    """One number answers 'how much did this job quietly throw away', and says where.
+
+    Two things used to defeat it. A UDF row dropped under `max_errored_rows` published only
+    a `LOG` event, which `observe` folds into a per-level log count and nowhere else — so
+    the loss reached no metric at all. And the post-query stats sample re-reads a prefix of
+    the source, meeting the same malformed records again, which inflated the reader's share.
+    """
+    from batcher.observe import metrics
+
+    p = _ragged(rows=4, bad_at=(2,))
+
+    def boom(batch):
+        if 3 in batch.column("a").to_pylist():
+            raise ValueError("this row is poison")
+        return batch
+
+    metrics.start_metrics()
+    try:
+        metrics.reset_metrics()
+        got = bt.read.csv(p, on_bad_lines="skip").map_batches(boom, max_errored_rows=5)
+        assert got.to_pydict() == {"a": [1, 4], "b": [1, 4]}
+        snap = metrics.metrics_snapshot()["skipped"]
+    finally:
+        metrics.stop_metrics()
+
+    assert snap["malformed_rows_total"] == 2
+    assert snap["malformed_rows_by_source"] == {"csv": 1, "map_batches": 1}
+
+
+def test_the_dropped_row_metric_is_exported_with_its_source_label() -> None:
+    """A fleet alerts on the metric, not on the log line, so it has to be scrapeable."""
+    from batcher.observe import metrics
+
+    metrics.start_metrics()
+    try:
+        metrics.reset_metrics()
+        bt.read.csv(_ragged(rows=3, bad_at=(2,)), on_bad_lines="skip").to_pydict()
+        text = metrics.prometheus_text()
+    finally:
+        metrics.stop_metrics()
+
+    assert "batcher_malformed_rows_total 1" in text
+    assert 'batcher_malformed_rows_by_source_total{source="csv"} 1' in text

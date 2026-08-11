@@ -117,3 +117,27 @@ def test_map_entries_explodes_to_one_row_per_entry(duck):
             "SELECT e.key AS k, e.value AS v FROM (SELECT unnest(map_entries(m)) AS e FROM t)"
         ),
     )
+
+
+@pytest.mark.differential
+def test_sql_map_entries_reaches_the_kernel(duck):
+    """The SQL name must route to the kernel the tests above already prove correct.
+
+    Every case above goes through ``.map.entries()``. That left the *SQL* spelling
+    untested, and it was not wired: ``bt.sql("SELECT map_entries(m) ...")`` raised
+    "unknown function" beside a kernel that answers DuckDB exactly. A ported query hit an
+    error, not a wrong answer, so nothing in the differential suite could see it.
+    """
+    t = _map_table([[("a", 1), ("b", 2)], [("c", 3)], [], None])
+    duck.register("t", t)
+    out = bt.sql("SELECT map_entries(m) AS e FROM t", t=bt.from_arrow(t)).collect()
+    assert_same(out, duck.sql("SELECT map_entries(m) AS e FROM t"))
+
+
+@pytest.mark.differential
+def test_sql_map_entries_agrees_with_the_expression_spelling():
+    """The two spellings are one kernel, so they must not be able to disagree."""
+    t = _map_table([[("a", 1), ("b", 2)], [("c", 3)], [], None])
+    via_sql = bt.sql("SELECT map_entries(m) AS e FROM t", t=bt.from_arrow(t)).to_pydict()
+    via_expr = bt.from_arrow(t).select(bt.col("m").map.entries().alias("e")).to_pydict()
+    assert via_sql == via_expr

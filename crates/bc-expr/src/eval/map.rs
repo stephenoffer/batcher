@@ -7,9 +7,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, ListArray, MapArray, StructArray, UInt32Array};
-use arrow::compute::take;
-use arrow::datatypes::Field;
+use arrow::array::{
+    Array, ArrayRef, AsArray, ListArray, MapArray, NullArray, StructArray, UInt32Array,
+};
+use arrow::compute::{is_null, take};
+use arrow::datatypes::{DataType, Field};
 
 use crate::eval::list::eq_against_literal;
 use crate::{ExprError, Literal, MapFunc};
@@ -28,6 +30,13 @@ pub(crate) fn eval_map(
     // argument, got Struct" on a query that is valid in DuckDB, Spark and Polars alike.
     if let Some(fields) = arr.as_any().downcast_ref::<StructArray>() {
         return struct_field(func, fields, key);
+    }
+    // An all-null column types as `Null`, which is a real type and not an error — the same
+    // gap the aggregate, string, list, math and temporal families each had. There is no
+    // struct to reach into and no map to read keys from, so the answer is a null per row,
+    // which is what DuckDB gives and what every other family here now returns.
+    if matches!(arr.data_type(), DataType::Null) {
+        return Ok(Arc::new(NullArray::new(arr.len())));
     }
     let map = arr
         .as_any()
@@ -207,6 +216,37 @@ fn element_at(map: &MapArray, key: Option<&Literal>) -> Result<ArrayRef, ExprErr
         );
     }
     Ok(take(map.values().as_ref(), &UInt32Array::from(idx), None)?)
+}
+
+/// Extract field `name` from a `Struct` column, propagating struct-level nulls.
+pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, ExprError> {
+    // An all-null column types as `Null`. That is a real type rather than an error — it is
+    // what `SELECT NULL AS x`, an all-`None` column and a left join that matched nothing
+    // produce — and it is the gap the aggregate, string, list, math, temporal and map
+    // families each had. There is no struct to reach into, so every row's field is null,
+    // which is what DuckDB returns.
+    if matches!(arr.data_type(), DataType::Null) {
+        return Ok(Arc::new(NullArray::new(arr.len())));
+    }
+    if !matches!(arr.data_type(), DataType::Struct(_)) {
+        return Err(ExprError::ExpectedType {
+            func: "struct.field".into(),
+            want: "a Struct argument",
+            got: arr.data_type().to_string(),
+        });
+    }
+    let s = arr.as_struct();
+    let child = s
+        .column_by_name(name)
+        .cloned()
+        .ok_or_else(|| ExprError::UnknownColumn(name.to_string()))?;
+    // A null struct row makes the extracted field null too.
+    if s.null_count() > 0 {
+        let mask = is_null(s)?;
+        Ok(arrow::compute::nullif(&child, &mask)?)
+    } else {
+        Ok(child)
+    }
 }
 
 #[cfg(test)]
@@ -390,5 +430,22 @@ mod tests {
     fn a_non_string_key_on_a_struct_is_refused() {
         let s = sample_struct();
         assert!(eval_map(MapFunc::ElementAt, &s, Some(&Literal::Int(0))).is_err());
+    }
+
+    #[test]
+    fn an_all_null_column_yields_a_null_per_row() {
+        let arr: ArrayRef = Arc::new(NullArray::new(3));
+        let out = eval_struct_field(&arr, "a").unwrap();
+        // A `Null`-typed array is all-null by its type: it carries no validity buffer, so
+        // Arrow's generic `is_null` reports false while every reader (pyarrow included)
+        // sees null. The type and the length are the contract.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.data_type(), &DataType::Null);
+    }
+
+    #[test]
+    fn a_non_struct_column_is_still_a_typed_error() {
+        let arr: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![1, 2]));
+        assert!(eval_struct_field(&arr, "a").is_err());
     }
 }

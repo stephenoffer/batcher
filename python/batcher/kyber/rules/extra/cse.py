@@ -149,13 +149,32 @@ def project_common_subexpression(node: Project, ctx: OptimizerContext) -> Logica
     for expr in definitions.values():
         needed |= referenced_columns(expr)
 
+    # Which projection of the chain a binding is emitted in is dictated by the definitions
+    # that were actually built, **not** by the `level` nesting depth they were derived from.
+    # The two are supposed to agree, and when they do not the chain emits a projection whose
+    # definition reads a binding one further up it -- an invalid plan, raised as a
+    # `ColumnNotFoundError` out of `Project` rather than a wrong answer, but it fails the
+    # query outright (TPC-DS q84). Reading the order back off the substituted definitions
+    # makes the two impossible to disagree: a binding is emitted only once every binding it
+    # actually references is available.
+    emitted: dict[str, int] = {}
+    pending = {
+        name: {r for r in referenced_columns(expr) if r in definitions}
+        for name, expr in definitions.items()
+    }
+    while pending:
+        ready = [name for name, deps in pending.items() if deps <= emitted.keys()]
+        if not ready:
+            return None  # a cycle among the bindings: decline rather than emit an invalid plan
+        for name in ready:
+            emitted[name] = 1 + max((emitted[d] for d in pending[name]), default=-1)
+            del pending[name]
+
     current: LogicalPlan = node.input
-    for lv in range(max(level.values()) + 1):
+    for lv in range(max(emitted.values()) + 1):
         carried = [Projection(c, Col(c)) for c in current.available_columns() if c in needed]
         fresh = [
-            Projection(names[key], definitions[names[key]])
-            for key, depth in level.items()
-            if depth == lv
+            Projection(name, definitions[name]) for name, depth in emitted.items() if depth == lv
         ]
         current = Project(current, tuple(carried + fresh))
     return Project(current, rewritten)

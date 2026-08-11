@@ -12,7 +12,7 @@ use arrow::compute::{cast, is_not_null};
 use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::error::ArrowError;
 
-use crate::eval::binary::coerce_numeric;
+use crate::eval::coerce::{align_decimals_for_cmp, coerce_numeric};
 use crate::{Expr, ExprError, Math2Func, MathFunc};
 
 /// `is_nan(x)`: true where a value is IEEE NaN (a float-only notion, distinct from
@@ -211,6 +211,13 @@ pub(crate) fn eval_extreme(
         // float) before comparing, so a valid int×float call returns a value instead of
         // erroring `Int64 >= Float64`. Matches DuckDB and the sibling `coalesce`.
         let (acc_c, b) = coerce_numeric(&acc, &b)?;
+        // Then align two decimals, which `coerce_numeric` deliberately leaves alone: it
+        // runs ahead of *arithmetic* too, where pre-widening the operands compounds with
+        // the operator's own scale rule and moves the result type. `greatest`/`least` are
+        // the comparison case, and the comparison kernels below demand identical decimal
+        // precision AND scale — `greatest(decimal(10,2), decimal(12,4))` otherwise raised
+        // `Invalid comparison operation`. `binary.rs` does the same thing for `=`/`<`/...
+        let (acc_c, b) = align_decimals_for_cmp(&acc_c, &b)?;
         // Rank on the engine's float identity, not arrow's raw-bit total order: a
         // *negative* NaN must rank greatest (not below -inf) and `-0.0`/`0.0` must
         // compare equal, so `greatest`/`least` agree with `MIN`/`MAX`, `GROUP BY`,
@@ -326,6 +333,17 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             // not lose, which is what retires the branch.
             let out: Float64Array = unary(a, |v| apply_unary(func, v));
             Ok(Arc::new(out))
+        }
+        // An all-null column types as `Null`, which is a real type rather than an error: it
+        // is what `SELECT NULL AS x`, an all-`None` column, and a left join that matched
+        // nothing all produce. Arithmetic, `cast` and `coalesce` already answer null for it,
+        // and the aggregate, string and list families were each taught to; this one still
+        // rejected the column and failed the query. Promoting to an all-null `Float64` is the
+        // same move the `Int64`/`Decimal` arms above make, and every function's own null
+        // handling takes it from there — which is what DuckDB returns for all of them.
+        (_, DataType::Null) => {
+            let f = cast(arr, &DataType::Float64)?;
+            eval_math(func, &f)
         }
         (_, other) => Err(ExprError::ExpectedType {
             func: format!("{func:?}"),

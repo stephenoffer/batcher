@@ -8,11 +8,13 @@ function or a module-level constant — no translator state is required.
 from __future__ import annotations
 
 import datetime as _dt
+import re as _re
 
 from sqlglot import expressions as exp
 
 from batcher.plan.expr_ir import Binary, Cast, Expr, lit
 from batcher.plan.expr_ir.func_nodes import DateOffset
+from batcher.plan.types import resolve_dtype
 
 _AGG_FUNCS = {
     "sum": "sum",
@@ -145,6 +147,48 @@ _EXTRACT_PART = {
     "doy": "dayofyear",
     "dayofyear": "dayofyear",
     "epoch": "epoch",
+    # Fields the `.dt` namespace already computes but this table never listed, so
+    # `EXTRACT(isodow FROM ...)` — ISO-8601 weekday numbering, the one a report actually
+    # wants — raised "field not supported" while `.dt.isodow()` sat right there. Each is
+    # checked against DuckDB's answer for the same instant, not assumed equivalent by name:
+    # `isodow` counts Monday as 1 where `dow` counts Sunday as 0, and `isoyear` is the year
+    # the ISO *week* belongs to, which differs from `year` around New Year.
+    "isodow": "isodow",
+    "isoyear": "iso_year",
+    "weekofyear": "week_of_year",
+    "dayofmonth": "day",
+    "century": "century",
+    "millennium": "millennium",
+    "decade": "decade",
+}
+
+# EXTRACT fields that are *not* a single `.dt` accessor. DuckDB (and Postgres) report
+# `microsecond` and `millisecond` as the whole seconds field scaled — `03:04:05.123456`
+# gives 5123456 microseconds, not 123456 — while `.dt.microsecond()` is the sub-second
+# remainder alone. Mapping them by name would have looked right and been off by the
+# seconds, so they are built here instead of listed above.
+_EXTRACT_COMPOSITE = {
+    "microsecond": lambda dt: dt.second() * 1_000_000 + dt.microsecond(),
+    "microseconds": lambda dt: dt.second() * 1_000_000 + dt.microsecond(),
+    "millisecond": lambda dt: dt.second() * 1_000 + dt.millisecond(),
+    "milliseconds": lambda dt: dt.second() * 1_000 + dt.millisecond(),
+    # `weekday` is DuckDB's Sunday=0 numbering, *not* the ISO Monday=1 one that
+    # `.dt.weekday()` spells — the two agree on every day but Sunday, which is the kind of
+    # near-miss that reaches production. It is `dayofweek` under another name.
+    "weekday": lambda dt: dt.dayofweek(),
+    # The ISO year and week as one number, `yyyyww` — and the year has to be the *ISO*
+    # one, which differs from the calendar year in the days around New Year that are the
+    # only reason anybody asks for this.
+    "yearweek": lambda dt: dt.iso_year() * 100 + dt.week_of_year(),
+    # 1 in the Common Era, 0 before it. Built from a comparison rather than a branch so a
+    # null date stays null instead of being reported as BCE.
+    "era": lambda dt: (dt.year() > 0).cast("int64"),
+    # `date_part('epoch', ...)` is DOUBLE and keeps the fraction — `23:59:59.999999` on
+    # 1969-12-31 is -1e-06 seconds, not -1. `.dt.epoch()` is the integer-seconds accessor
+    # (DuckDB spells that one `epoch(...)` with no `date_part`), so pointing this field at
+    # it discarded the sub-second part of every timestamp.
+    "epoch": lambda dt: dt.epoch_us().cast("float64") / 1_000_000.0,
+    "epoch_seconds": lambda dt: dt.epoch_us().cast("float64") / 1_000_000.0,
 }
 
 
@@ -383,43 +427,84 @@ def _temporal_literal(text: str, kind: str) -> Expr:
         return lit(_dt.datetime.combine(_dt.date.fromisoformat(text), _dt.time()))
 
 
+#: SQL type names with no engine dtype of their own, mapped to the nearest one that exists.
+#: Everything else is handed to `resolve_dtype` verbatim, because the registry already
+#: spells every SQL name at its true width (``tinyint`` is int8, ``usmallint`` is uint16,
+#: ``decimal(10,2)`` is decimal128).
+#:
+#: A lookup table here used to flatten all twelve integer widths onto ``int64``, which made
+#: a narrowing cast a no-op: ``CAST(32768 AS TINYINT)`` returned 32768 instead of raising,
+#: and ``TRY_CAST(32768 AS TINYINT)`` — whose entire purpose is to NULL what does not fit —
+#: returned it too, so the idiom used to *filter* out-of-range values filtered nothing.
+#:
+#: The keys are what **sqlglot renders**, not what the user wrote, and the two differ more
+#: than they look: the duckdb dialect normalizes ``UINTEGER`` to ``UINT``, ``HUGEINT`` to
+#: ``INT128``, and — the one that matters most — plain ``TIMESTAMP`` to ``TIMESTAMPNTZ``.
+#: Every entry below was arrived at by rendering the type through each supported dialect and
+#: checking what actually came out, not by reading the SQL the user types.
+_DTYPE_ALIAS = {
+    "uint": "uint32",  # duckdb dialect's rendering of UINTEGER
+    "int128": "int64",  # HUGEINT — int64 is the widest integer the engine has
+    "varbinary": "binary",  # BLOB
+    "decimal": "float64",  # bare DECIMAL/NUMERIC with no precision; a parametrized
+    "numeric": "float64",  # ``decimal(p,s)`` resolves properly and is left alone
+    "uuid": "string",  # no native type, and text is how both DuckDB and Arrow carry it
+    "json": "string",
+    "char": "string",  # CHAR/CHAR(n) — Batcher does not pad to a fixed width
+    "nchar": "string",
+    # `CAST(x AS TIMESTAMP)` reaches here spelled `TIMESTAMPNTZ`, and `TIMESTAMPTZ` is how
+    # both duckdb and spark render their tz-aware forms. All three map to the naive
+    # microsecond timestamp, which is what this did before the widths were fixed — a
+    # tz-carrying cast target is `timestamp(us, <tz>)` and resolves on its own.
+    "timestampntz": "timestamp",
+    "timestamptz": "timestamp",
+    "timestampltz": "timestamp",
+}
+
+
 def _dtype_name(to) -> str:
-    name = to.sql().lower()
-    # Longest-prefix wins so that e.g. ``bigint`` isn't shadowed by ``int`` — a
-    # dict iteration order is not a reliable tiebreak, and ``smallint`` must not
-    # fall through to the ``string`` default (which silently cast integers to text).
-    table = {
-        "tinyint": "int64",
-        "smallint": "int64",
-        "bigint": "int64",
-        "hugeint": "int64",
-        "int128": "int64",
-        "int": "int64",
-        "integer": "int64",
-        "long": "int64",
-        "ubigint": "int64",
-        "uinteger": "int64",
-        "usmallint": "int64",
-        "utinyint": "int64",
-        "double": "float64",
-        "decimal": "float64",
-        "numeric": "float64",
-        "float": "float64",
-        "real": "float64",
-        "varchar": "string",
-        "text": "string",
-        "string": "string",
-        "boolean": "bool",
-        "bool": "bool",
-        "date": "date",
-        "timestamp": "timestamp",
-        "datetime": "timestamp",
-    }
-    best = None
-    for k, v in table.items():
-        if name.startswith(k) and (best is None or len(k) > len(best[0])):
-            best = (k, v)
-    return best[1] if best is not None else "string"
+    """Map a SQL type name onto the engine dtype name of the same width."""
+    name = to.sql().lower().strip()
+    if resolve_dtype(name) is not None:
+        return name
+    # ``VARCHAR(10)``, ``TIMESTAMP WITH TIME ZONE``, ``DECIMAL``: reduce to the head word
+    # and try again. The alias table is consulted first so a bare ``DECIMAL`` cannot
+    # resolve as something else.
+    head = _re.split(r"[(\s]", name, maxsplit=1)[0]
+    if head in _DTYPE_ALIAS:
+        return _DTYPE_ALIAS[head]
+    if resolve_dtype(head) is not None:
+        return head
+    # Refusing beats the ``string`` default this used to end in. That default made an
+    # unknown type name a *silent* cast to text — ``CAST(i AS UINTEGER)`` returned
+    # ``['1', '300', '-5']`` — which is a wrong answer wearing the wrong type, and no
+    # value comparison against DuckDB catches it because the query still returns rows.
+    raise NotImplementedError(f"CAST to {to.sql()} is not supported; Batcher has no dtype for it")
+
+
+def _trunc_div(a: Expr, b: Expr) -> Expr:
+    """SQL `//` — integer division truncating *toward zero*, built on the engine's floor.
+
+    The obvious spelling, `(a / b).trunc()`, is wrong in three ways at once, and all three
+    are silent. True division casts to Float64, so the result type is DOUBLE where DuckDB
+    gives BIGINT; the cast happens *before* the truncation, so `9223372036854775807 // 2`
+    came back as `4.611686018427388e+18` instead of the exact `4611686018427387903`; and a
+    zero divisor produced `inf` rather than the NULL every SQL engine returns.
+
+    `floor_div` has none of those problems -- it is type-preserving, exact above 2^53, and
+    NULL on a zero divisor -- so the only thing left is to convert its *floor* into a
+    *truncation*. They differ by exactly one, and only when the division is inexact and the
+    operands have opposite signs: `-7 // 3` floors to -3 and truncates to -2.
+
+    The inexactness test uses the engine's `%`, which truncates toward zero, so a non-zero
+    remainder means "not exact" regardless of sign.
+    """
+    from batcher.plan.expr_ir.constructors import when
+
+    floor = Binary("floor_div", a, b)
+    inexact = Binary("mod", a, b) != lit(0)
+    opposite_signs = (a < lit(0)) != (b < lit(0))
+    return when(inexact & opposite_signs).then(floor + lit(1)).otherwise(floor)
 
 
 def _build_binops():
@@ -429,9 +514,8 @@ def _build_binops():
         exp.Mul: lambda a, b: a * b,
         exp.Div: lambda a, b: a / b,
         # SQL `//` is integer division that truncates *toward zero* (DuckDB/C
-        # semantics), not Python's floor: `-7 // 3` is `-2`, not `-3`. The engine's
-        # `//` floors, so build it as a truncated true-division instead.
-        exp.IntDiv: lambda a, b: (a / b).trunc(),
+        # semantics), not Python's floor: `-7 // 3` is `-2`, not `-3`.
+        exp.IntDiv: _trunc_div,
         exp.Pow: lambda a, b: a**b,  # SQL `^` / power() / `**`
         exp.Mod: lambda a, b: a % b,
         exp.EQ: lambda a, b: a == b,

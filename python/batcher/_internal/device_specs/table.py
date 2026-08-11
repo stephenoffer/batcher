@@ -97,15 +97,32 @@ class DeviceSpec:
 # `_SPECS` widens them to the dataclass's float fields, which keeps every row on one line.
 _ROWS: tuple[tuple, ...] = (
     # NVIDIA datacenter, newest first.
+    ("NVIDIA_GB300", "nvidia", "blackwell", 288, 8000, 0, 0, 0, 0, 72, 1800, 7),
+    ("NVIDIA_B300", "nvidia", "blackwell", 288, 8000, 0, 0, 0, 0, 8, 1800, 7),
     ("NVIDIA_GB200", "nvidia", "blackwell", 186, 8000, 1200, 300, 2250, 4500, 72, 1800, 7),
     ("NVIDIA_B200", "nvidia", "blackwell", 180, 8000, 1000, 250, 2250, 4500, 8, 1800, 7),
     ("NVIDIA_H200", "nvidia", "hopper", 141, 4800, 700, 150, 989, 1979, 8, 900, 7),
+    # Grace Hopper: one Hopper die beside a Grace CPU on a coherent package. The compute
+    # columns are H100's because it is the same die; `tdp_watts` is the *GPU's* share, not the
+    # ~1000 W the whole superchip draws, so it stays comparable with every other row here. The
+    # base 96 GiB HBM3 part is recorded rather than the 144 GiB HBM3e one, per this table's
+    # smallest-shipping-variant rule.
+    ("NVIDIA_GH200", "nvidia", "hopper", 96, 4000, 700, 150, 989, 1979, 8, 900, 7),
     ("NVIDIA_H100", "nvidia", "hopper", 80, 3350, 700, 150, 989, 1979, 8, 900, 7),
+    # Export-restricted Hopper and Ampere parts. Same dies and same memory as the H100 and
+    # A100 SXM they derive from, with the vendor fabric cut to 400 GB/s — which is the whole
+    # reason they need rows of their own rather than an alias onto the unrestricted part: the
+    # NVLink width is what decides where a tensor-parallel shard may land, and inheriting the
+    # H100's 900 would place a collective on bandwidth the device does not have.
+    ("NVIDIA_H800", "nvidia", "hopper", 80, 3350, 700, 150, 989, 1979, 8, 400, 7),
     ("NVIDIA_H20", "nvidia", "hopper", 96, 4000, 400, 0, 0, 0, 8, 900, 7),
+    ("NVIDIA_RTX_PRO_6000_BLACKWELL", "nvidia", "blackwell", 96, 1792, 600, 0, 0, 0, 1, 0, 0),
     ("NVIDIA_L40S", "nvidia", "ada", 48, 864, 350, 40, 181, 362, 1, 0, 0),
     ("NVIDIA_L40", "nvidia", "ada", 48, 864, 300, 0, 0, 0, 1, 0, 0),
+    ("NVIDIA_L20", "nvidia", "ada", 48, 864, 275, 0, 0, 0, 1, 0, 0),
     ("NVIDIA_RTX_6000_ADA", "nvidia", "ada", 48, 960, 300, 0, 0, 0, 1, 0, 0),
     ("NVIDIA_L4", "nvidia", "ada", 24, 300, 72, 15, 121, 242, 1, 0, 0),
+    ("NVIDIA_A800_80G", "nvidia", "ampere", 80, 2039, 400, 80, 312, 0, 8, 400, 7),
     ("NVIDIA_A100_80G", "nvidia", "ampere", 80, 2039, 400, 80, 312, 0, 8, 600, 7),
     ("NVIDIA_A100_40G", "nvidia", "ampere", 40, 1555, 400, 80, 312, 0, 8, 600, 7),
     ("NVIDIA_A100", "nvidia", "ampere", 40, 1555, 400, 80, 312, 0, 8, 600, 7),
@@ -113,6 +130,12 @@ _ROWS: tuple[tuple, ...] = (
     ("NVIDIA_A30", "nvidia", "ampere", 24, 933, 165, 30, 165, 0, 2, 200, 4),
     ("NVIDIA_A10G", "nvidia", "ampere", 24, 600, 300, 30, 70, 0, 1, 0, 0),
     ("NVIDIA_A10", "nvidia", "ampere", 24, 600, 150, 25, 62.5, 0, 1, 0, 0),
+    # Dense inference/VDI parts. The A16 is one board carrying four independent GPUs, and the
+    # memory column is *per device* — which is what Ray counts and what a shard must fit —
+    # rather than the 64 GiB the board is sold as. Reading the board figure here would tell a
+    # sizing decision it had four times the memory any one device can hold.
+    ("NVIDIA_A16", "nvidia", "ampere", 16, 200, 250, 0, 0, 0, 1, 0, 0),
+    ("NVIDIA_A2", "nvidia", "ampere", 16, 200, 60, 0, 0, 0, 1, 0, 0),
     ("NVIDIA_RTX_A6000", "nvidia", "ampere", 48, 768, 300, 0, 0, 0, 2, 112, 0),
     # 15, not the 16 the part is sold as: NVIDIA markets this board in decimal GB and the
     # column is GiB. Measured on a `g4dn.12xlarge`, NVML reports 16106127360 bytes = 15.0 GiB
@@ -136,17 +159,21 @@ _ROWS: tuple[tuple, ...] = (
     ("NVIDIA_RTX_4090", "nvidia", "ada", 24, 1008, 450, 0, 0, 0, 1, 0, 0),
     ("NVIDIA_RTX_3090", "nvidia", "ampere", 24, 936, 350, 0, 0, 0, 2, 112, 0),
     # AMD Instinct.
+    ("AMD_INSTINCT_MI355X", "amd", "cdna4", 288, 8000, 1400, 0, 0, 0, 8, 1075, 0),
     ("AMD_INSTINCT_MI325X", "amd", "cdna3", 256, 6000, 1000, 180, 1307, 2615, 8, 896, 0),
     ("AMD_INSTINCT_MI300X", "amd", "cdna3", 192, 5300, 750, 150, 1307, 2615, 8, 896, 0),
     ("AMD_INSTINCT_MI300A", "amd", "cdna3", 128, 5300, 550, 0, 0, 0, 4, 896, 0),
     ("AMD_INSTINCT_MI250X", "amd", "cdna2", 128, 3200, 560, 100, 383, 0, 8, 800, 0),
     ("AMD_INSTINCT_MI210", "amd", "cdna2", 64, 1600, 300, 60, 181, 0, 2, 300, 0),
+    ("AMD_INSTINCT_MI100", "amd", "cdna1", 32, 1229, 300, 0, 184.6, 0, 4, 0, 0),
     # Intel Data Center GPU Max.
     ("INTEL_MAX_1550", "intel", "ponte-vecchio", 128, 3200, 600, 120, 832, 0, 8, 0, 0),
+    ("INTEL_MAX_1350", "intel", "ponte-vecchio", 96, 3277, 450, 0, 0, 0, 8, 0, 0),
     ("INTEL_MAX_1100", "intel", "ponte-vecchio", 48, 1229, 300, 60, 362, 0, 1, 0, 0),
     # Google Cloud TPU — HBM per chip, the unit Ray's `TPU` resource counts. Power and fabric
     # figures are not published per chip in a comparable form, so they read unknown (0) rather
     # than guessed; the memory column is what callers use these entries for.
+    ("TPU-V7X", "google", "ironwood", 192, 7370, 0, 0, 0, 0, 256, 0, 0),
     ("TPU-V6E", "google", "trillium", 32, 1640, 0, 0, 0, 0, 256, 0, 0),
     ("TPU-V5P", "google", "tpu-v5", 95, 2765, 0, 0, 0, 0, 8960, 0, 0),
     ("TPU-V5E", "google", "tpu-v5", 16, 819, 0, 0, 0, 0, 256, 0, 0),
@@ -163,19 +190,30 @@ _ROWS: tuple[tuple, ...] = (
 #: every Hopper board is PCIe 5.0, and stating that once per row invites the day one row says
 #: otherwise. A part absent here has no comparable host link (the TPUs) and reads as unknown.
 _HOST_LINK: dict[str, tuple[str, float]] = {
+    # Coherent CPU-GPU packages: the "host link" is an on-package fabric, so a batch handed to
+    # the device does not cross PCIe at all. Getting this wrong is not a small mis-pricing —
+    # `host_transfer_seconds` decides whether a scan-shaped stage is worth moving to a device,
+    # and a Grace-Hopper part charged the PCIe rate is charged nine times its real cost.
+    "NVIDIA_GB300": ("nvlink-c2c", 450.0),
     "NVIDIA_GB200": ("nvlink-c2c", 450.0),
+    "NVIDIA_GH200": ("nvlink-c2c", 450.0),
+    "NVIDIA_B300": ("pcie5", 50.0),
     "NVIDIA_B200": ("pcie5", 50.0),
     "NVIDIA_H200": ("pcie5", 50.0),
     "NVIDIA_H100": ("pcie5", 50.0),
+    "NVIDIA_H800": ("pcie5", 50.0),
     "NVIDIA_H20": ("pcie5", 50.0),
+    "NVIDIA_RTX_PRO_6000_BLACKWELL": ("pcie5", 50.0),
     "NVIDIA_L40S": ("pcie4", 25.0),
     "NVIDIA_L40": ("pcie4", 25.0),
+    "NVIDIA_L20": ("pcie4", 25.0),
     "NVIDIA_RTX_6000_ADA": ("pcie4", 25.0),
     "NVIDIA_RTX_5090": ("pcie5", 50.0),
     "NVIDIA_RTX_4090": ("pcie4", 25.0),
     "NVIDIA_RTX_3090": ("pcie4", 25.0),
     "NVIDIA_RTX_A6000": ("pcie4", 25.0),
     "NVIDIA_L4": ("pcie4", 25.0),
+    "NVIDIA_A800_80G": ("pcie4", 25.0),
     "NVIDIA_A100_80G": ("pcie4", 25.0),
     "NVIDIA_A100_40G": ("pcie4", 25.0),
     "NVIDIA_A100": ("pcie4", 25.0),
@@ -183,6 +221,8 @@ _HOST_LINK: dict[str, tuple[str, float]] = {
     "NVIDIA_A30": ("pcie4", 25.0),
     "NVIDIA_A10G": ("pcie4", 25.0),
     "NVIDIA_A10": ("pcie4", 25.0),
+    "NVIDIA_A16": ("pcie4", 25.0),
+    "NVIDIA_A2": ("pcie4", 25.0),
     "NVIDIA_TESLA_T4": ("pcie3", 12.0),
     "NVIDIA_TESLA_V100": ("pcie3", 12.0),
     "NVIDIA_TESLA_P100": ("pcie3", 12.0),
@@ -196,7 +236,10 @@ _HOST_LINK: dict[str, tuple[str, float]] = {
     "AMD_INSTINCT_MI300A": ("coherent", 0.0),
     "AMD_INSTINCT_MI250X": ("pcie4", 25.0),
     "AMD_INSTINCT_MI210": ("pcie4", 25.0),
+    "AMD_INSTINCT_MI100": ("pcie4", 25.0),
+    "AMD_INSTINCT_MI355X": ("pcie5", 50.0),
     "INTEL_MAX_1550": ("pcie5", 50.0),
+    "INTEL_MAX_1350": ("pcie5", 50.0),
     "INTEL_MAX_1100": ("pcie5", 50.0),
 }
 
@@ -239,11 +282,23 @@ RAY_LABEL_ALIASES: dict[str, str] = {
     "L4": "NVIDIA_L4",
     "L40": "NVIDIA_L40",
     "L40S": "NVIDIA_L40S",
+    "A16": "NVIDIA_A16",
+    "A2": "NVIDIA_A2",
+    "L20": "NVIDIA_L20",
     "H20": "NVIDIA_H20",
     "H100": "NVIDIA_H100",
     "H200": "NVIDIA_H200",
     "B200": "NVIDIA_B200",
+    "B300": "NVIDIA_B300",
     "GB200": "NVIDIA_GB200",
+    "GB300": "NVIDIA_GB300",
+    "GH200": "NVIDIA_GH200",
+    # The export-restricted parts. A bare `A800` takes the 80 GB row, the only configuration
+    # it ships in.
+    "H800": "NVIDIA_H800",
+    "A800": "NVIDIA_A800_80G",
+    "A800_80G": "NVIDIA_A800_80G",
+    "A800_80GB": "NVIDIA_A800_80G",
     # Ray labels the MI250 and MI250X with one shared string. The X is the larger part, and
     # the row it points at is the one this table carries.
     "AMD_INSTINCT_MI250X_MI250": "AMD_INSTINCT_MI250X",
@@ -256,7 +311,12 @@ RAY_LABEL_ALIASES: dict[str, str] = {
     "AMD_INSTINCT_MI300X_OAM": "AMD_INSTINCT_MI300X",
     # Ray spells the Intel parts with the `GPU` segment the row keys leave out.
     "INTEL_GPU_MAX_1550": "INTEL_MAX_1550",
+    "INTEL_GPU_MAX_1350": "INTEL_MAX_1350",
     "INTEL_GPU_MAX_1100": "INTEL_MAX_1100",
+    # The Blackwell workstation part is spelled several ways by the tools that write a node
+    # label; all of them name one board.
+    "NVIDIA_RTX_PRO_6000_BLACKWELL_SERVER_EDITION": "NVIDIA_RTX_PRO_6000_BLACKWELL",
+    "RTX_PRO_6000_BLACKWELL": "NVIDIA_RTX_PRO_6000_BLACKWELL",
 }
 
 SPECS: dict[str, DeviceSpec] = {

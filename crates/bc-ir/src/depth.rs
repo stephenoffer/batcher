@@ -26,6 +26,28 @@
 //!
 //! Roughly 3.2 KiB of stack per level, consistently across both.
 //!
+//! # Parsing is not the expensive pass, and this limit used to be set as if it were
+//!
+//! The table above measures **deserialization**, and calibrating the limit against it alone
+//! was wrong: a plan is not only parsed, it is *evaluated*, and `Expr::eval` — with its
+//! analyses and the compiler-generated `Drop` of the recursive enum — carries Arrow arrays
+//! and match temporaries in every frame. Measured on the same debug profile, evaluation
+//! costs **roughly 20 KiB per level, about six times deserialization**, so on rayon's
+//! 2 MiB worker default a plan **evaluated** only to ~84 levels and aborted by 104 — against
+//! a limit of 512 that had admitted it.
+//!
+//! That gap was a live `SIGSEGV`, not a theoretical one. Everything in it parsed cleanly and
+//! passed this guard before dying: `col.is_in(values)` over 100 members (318 for
+//! `TfidfVectorizer(stop_words="english")`), an `IsotonicCalibrator` at its default 100 bins,
+//! a 100-term arithmetic chain.
+//!
+//! The fix is on the other side of the pair: `bc_interp::par::WORKER_STACK_BYTES` gives each
+//! worker 32 MiB, which carries evaluation to 509 measured levels — past this limit, so the
+//! guard is once again the binding constraint and a too-deep plan gets this error instead of
+//! a signal. **The two constants are a pair.** Raising [`MAX_PLAN_DEPTH`] without raising the
+//! worker stack re-opens exactly the window described here, and it re-opens it silently,
+//! because the parse measurements above will keep looking comfortable.
+//!
 //! [`MAX_PLAN_DEPTH`] is 512, which is chosen against three separate bounds:
 //!
 //! - **Above anything real.** A 100-operator `.filter(...)` chain — the shape that
@@ -38,8 +60,9 @@
 //!   having deliberately raised their own recursion limit, which means **this guard
 //!   rejects nothing that used to work**.
 //! - **Below where the stack breaks.** 5x margin on the 8 MiB thread that really calls
-//!   `from_json`, and still clear of the 650 measured on the smallest stack in the
-//!   process, in the build profile with the fattest frames.
+//!   `from_json`, and clear of the 509 levels a worker can *evaluate* on
+//!   `bc_interp::par::WORKER_STACK_BYTES`, in the build profile with the fattest frames.
+//!   Evaluation is the tighter of the two bounds and therefore the one to check.
 
 /// Maximum nesting depth accepted in a plan IR document.
 ///

@@ -9,7 +9,7 @@ operators are the same ones you already use.
 :::{grid-item-card} {octicon}`broadcast;1.1em` Kafka
 :link: /integrations/streams/kafka
 :link-type: doc
-One reader per topic partition. No sink; publish back through `for_each_batch`.
+One reader per topic partition. No sink; publish back through {py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>`.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Kinesis

@@ -47,7 +47,7 @@ print(ds.schema)
 ```
 
 The widening is **value-preserving** (`Int32` fits in `Int64`, `Float32` in `Float64`)
-and it happens on the way in, so `ds.schema` tells you the truth without executing
+and it happens on the way in, so {py:obj}`ds.schema <batcher.Dataset.schema>` tells you the truth without executing
 anything.
 
 Consequences worth internalizing:
@@ -59,12 +59,12 @@ differs slightly from a `Float32` engine's answer, and it is the more accurate o
 :::{warning}
 A schema assertion copied from a pandas or Spark test fails on the type *name*, and it
 reads as a data bug when it is not one. `int32` in the file is `int64` in the
-`Dataset`, every time. Assert on the value, or assert on `int64`.
+{py:class}`Dataset <batcher.Dataset>`, every time. Assert on the value, or assert on `int64`.
 :::
 
 ## Getting narrow types back on output
 
-By default, output types match `Dataset.schema` exactly: what you see before running is
+By default, output types match {py:obj}`Dataset.schema <batcher.Dataset.schema>` exactly: what you see before running is
 what you get after. If a narrow output column matters, because you are writing Parquet
 and want the smaller footprint, turn on `shrink_output_dtypes`. A pass-through of a narrow
 *source* column is then cast back to its source width where that is lossless.
@@ -83,8 +83,8 @@ to shrink to, so only a straight pass-through narrows. Do not rely on it to cont
 type of a computed column. `cast` that one explicitly.
 
 :::{note}
-The re-narrowing happens on the way out of the engine, so a `collect()` with no operations
-at all (`bt.from_arrow(t).collect()`, a bare scan) skips it and hands back the normalized
+The re-narrowing happens on the way out of the engine, so a {py:meth}`collect() <batcher.Dataset.collect>` with no operations
+at all ({py:func}`bt.from_arrow(t).collect() <batcher.from_arrow>`, a bare scan) skips it and hands back the normalized
 `Int64`. Any real query takes the engine path and narrows, whether that is a `select`, a
 `filter`, or anything else. If you want the narrow type from a bare scan, project the
 columns.
@@ -119,23 +119,85 @@ raw.select(n=bt.col("s").cast("int64")).to_pydict()
 ::::
 
 :::{tip}
-On ingest of anything you did not produce yourself, `try_cast` is nearly always the right
+On ingest of anything you did not produce yourself, {py:meth}`try_cast <batcher.plan.expr_ir.core.Expr.try_cast>` is nearly always the right
 one, and a `filter(col("n").is_null())` afterwards tells you exactly what it could not
 parse.
 :::
 
-Cast targets are named as strings. The accepted names, with their aliases:
+### Naming a cast target
+
+Cast targets are named as strings, and the name is matched case-insensitively, so
+`"Int64"`, `"int64"` and `"BIGINT"` are the same target.
+
+Names that take no parameters:
 
 | Name | Aliases | Arrow type |
 | --- | --- | --- |
-| `int64` | `long` | 64-bit signed integer |
-| `int32` | `int` | 32-bit signed integer |
+| `int64` | `long`, `bigint` | 64-bit signed integer |
+| `int32` | `int`, `integer` | 32-bit signed integer |
+| `int16` | `smallint` | 16-bit signed integer |
+| `int8` | `tinyint` | 8-bit signed integer |
+| `uint64` | `ubigint` | 64-bit unsigned integer |
+| `uint32` | `uinteger` | 32-bit unsigned integer |
+| `uint16` | `usmallint` | 16-bit unsigned integer |
+| `uint8` | `utinyint` | 8-bit unsigned integer |
 | `float64` | `double` | 64-bit float |
-| `float32` | `float` | 32-bit float |
-| `string` | `utf8` | UTF-8 string |
+| `float32` | `float`, `real` | 32-bit float |
+| `float16` | `half` | 16-bit float |
+| `string` | `utf8`, `varchar`, `text` | UTF-8 string |
+| `large_string` | `large_utf8` | UTF-8 string, 64-bit offsets |
+| `binary` | `blob`, `bytea` | raw bytes |
+| `large_binary` | | raw bytes, 64-bit offsets |
 | `bool` | `boolean` | boolean |
 | `date32` | `date` | days since epoch |
+| `date64` | | milliseconds since epoch |
 | `timestamp` | `datetime` | microsecond timestamp |
+| `null` | | the empty type |
+
+Names that carry parameters in parentheses. Spaces inside the parentheses are ignored,
+so `decimal(12,4)` and `decimal(12, 4)` are the same target:
+
+| Name | Example | What it means |
+| --- | --- | --- |
+| `decimal(p, s)` | `decimal(12, 4)` | Exact decimal, `p` total digits and `s` after the point. Scale defaults to 0. Aliases: `decimal128`, `numeric`. |
+| `decimal256(p, s)` | `decimal256(50, 10)` | The same, past 38 digits. |
+| `timestamp(unit)` | `timestamp(ns)` | An instant at `s`, `ms`, `us` or `ns` resolution. |
+| `timestamp(unit, tz)` | `timestamp(us, UTC)` | The same, carrying a timezone. |
+| `time(unit)` | `time(us)` | Time of day, at the width the resolution requires. |
+| `time32(unit)` / `time64(unit)` | `time64(ns)` | Time of day at a specific width. |
+| `duration(unit)` | `duration(s)` | An elapsed span. Alias: `interval`. |
+
+```python
+money = bt.from_pydict({"raw": ["1.50", "2.25"]})
+print(money.select(amt=bt.col("raw").cast("decimal(12,4)")).schema)
+# amt: decimal128(12, 4)
+```
+
+### Casting in SQL
+
+SQL `CAST` and `TRY_CAST` resolve against the same table, so a SQL type name means the
+width it says. `CAST(x AS TINYINT)` produces an 8-bit column and raises on a value that
+does not fit, and `TRY_CAST(x AS TINYINT)` produces the same column with those values
+nulled. That makes `TRY_CAST` a range filter, which is the usual reason to reach for it:
+
+```python
+wide = bt.from_pydict({"n": [1, 300, -5]})
+print(bt.sql("SELECT TRY_CAST(n AS TINYINT) AS small FROM wide", wide=wide).to_pydict())
+# {'small': [1, None, -5]}
+```
+
+A type name Batcher has no dtype for raises rather than casting to something else.
+
+:::{important}
+A timezone keeps its case where the type name does not. Arrow compares a timezone
+byte-for-byte, so `timestamp(us, UTC)` and `timestamp(us, utc)` are different types.
+Write the zone exactly as the IANA name spells it.
+:::
+
+An out-of-range parameter is rejected rather than clamped: `decimal(39, 2)` raises,
+because quietly building the widest decimal that fits would overflow on exactly the
+values the extra digits were asked for. So does `time32(us)`, since a 32-bit time cannot
+carry microseconds. Write `time(us)` and let the width follow the resolution.
 
 A cast *inside* a query does produce the narrow type. The boundary normalization is
 about what crosses the FFI edge, not about what an expression may compute.
@@ -145,7 +207,7 @@ print(ds.select(small=bt.col("i32").cast("int32")).schema)
 # small: int32
 ```
 
-`ds.cast({"col": "type"})` casts several columns at once, and `strict=False` makes the
+{py:meth}`ds.cast({"col": "type"}) <batcher.Dataset.cast>` casts several columns at once, and `strict=False` makes the
 whole set behave the way `try_cast` does.
 
 ```python
@@ -160,7 +222,7 @@ print(ds.cast({"i32": "float64", "i8": "string"}).schema)
 ## Null is absence, NaN is a value
 
 They are not the same thing and no operator conflates them. A null has no value. A NaN
-is a float, the result of an operation such as `0.0 / 0.0`. `is_null()` never sees a NaN, and
+is a float, the result of an operation such as `0.0 / 0.0`. {py:meth}`is_null() <batcher.plan.expr_ir.core.Expr.is_null>` never sees a NaN, and
 `fill_null()` never replaces one. `fill_nan()` does.
 
 ```python
@@ -174,7 +236,7 @@ print(mixed.select(
 ```
 
 :::{important}
-Look at the `nan` column: `is_nan()` on a *null* is null, not False. Three-valued logic
+Look at the `nan` column: {py:meth}`is_nan() <batcher.plan.expr_ir.core.Expr.is_nan>` on a *null* is null, not False. Three-valued logic
 applies to every predicate, which is why `filter(bt.col("x") > 0)` drops null rows:
 `null > 0` is null, and a filter keeps only rows that are *true*. A predicate you expect
 to partition the data into two halves partitions it into three.
@@ -201,6 +263,82 @@ print(nums.select(
 
 If you want floor division, be explicit: `(bt.col("a") / bt.col("b")).floor()`.
 
+## When two columns must become one
+
+A union, a `coalesce`, a `when`/`otherwise`, a `greatest`, a comparison, and a join key
+all have to hold two differently-typed values in one place. Batcher answers that with a
+single *promotion lattice*: the one type both sides widen into, with neither narrowed.
+The same lattice decides what `schema` reports, so what you see before the query runs is
+what the query produces.
+
+```python
+one = bt.from_arrow(pa.table({"amt": pa.array([1, 2], pa.int64())}))
+two = bt.from_arrow(pa.table({"amt": pa.array([1.5, 2.5], pa.float64())}))
+print(one.union(two).schema.field("amt").type)
+# double
+print(sorted(one.union(two).to_pydict()["amt"]))
+# [1.0, 1.5, 2.0, 2.5]
+```
+
+These are the rules, ordered from the pairs you meet most often to the ones you meet on
+a bad day:
+
+| The two types | Promote to | Why |
+|---|---|---|
+| `null` and anything | the other side | An all-null column has no values to lose. |
+| two integers of any width | `int64` | The width every integer normalizes to anyway. |
+| an integer and a float | `double` | SQL's one deliberately inexact promotion. |
+| `bool` and an integer | `int64` | `true` reads as 1, as in SQL. |
+| two decimals | the finer scale, the wider integer part | `decimal(10,2)` with `decimal(12,4)` gives `decimal(12,4)`. |
+| a decimal and an integer | a decimal wide enough for both | Keeps the cents; a float round-trip would not. |
+| a decimal and a float | `double` | `DOUBLE` dominates `DECIMAL`, as in DuckDB. |
+| two timestamps, same zone | the finer resolution | `timestamp[ms]` with `timestamp[us]` gives `timestamp[us]`. |
+| a date and a timestamp | the timestamp | A date is midnight, so nothing is lost. |
+| `string` and `large_string` | `large_string` | A wider offset holds the narrower one. |
+
+Anything not on that list has no lossless common type, and the query raises instead of
+guessing. An `int64` column unioned with a `string` one is a data-contract problem, and
+Batcher will not resolve it by stringifying your numbers.
+
+:::{note}
+A join reaches the lattice by a slightly different route. Its row encoder compares keys
+byte-for-byte and needs the two sides to have the identical type, so Batcher widens both
+key columns to their common supertype before the encoder sees them. Widening cannot
+change a key's value, so no match is gained or lost. A pair with no common type still
+raises, naming both columns.
+:::
+
+:::{warning}
+Two timestamps in *different* timezones are the one pair that looks promotable and is
+not. The same stored value denotes a different instant in each, so there is no type that
+holds both without deciding which zone was meant. Cast one side explicitly.
+:::
+
+The three most useful consequences, since they are the cases that used to be a puzzle:
+
+```python
+partial = bt.from_arrow(
+    pa.table({"k": pa.array([1, 2], pa.int64()), "v": pa.array([None, None], pa.null())})
+)
+# An all-null column coalesces, compares, and unions like any other.
+print(partial.select(v=bt.coalesce(bt.col("v"), bt.col("k"))).to_pydict())
+# {'v': [1, 2]}
+
+# Two decimals of differing scale join as numbers, not as encodings.
+from decimal import Decimal
+
+coarse = bt.from_arrow(pa.table({"amt": pa.array([Decimal("1.50")], pa.decimal128(10, 2))}))
+fine = bt.from_arrow(pa.table({"amt": pa.array([Decimal("1.5000")], pa.decimal128(12, 4))}))
+print(coarse.join(fine, on="amt", how="inner").count())
+# 1
+
+# Files written at different timestamp resolutions read as one column.
+ms = bt.from_arrow(pa.table({"ts": pa.array([1_000], pa.timestamp("ms"))}))
+us = bt.from_arrow(pa.table({"ts": pa.array([2_000_000], pa.timestamp("us"))}))
+print(ms.union(us).schema.field("ts").type)
+# timestamp[us]
+```
+
 ## Inspecting types without running anything
 
 `schema` gives the pyarrow `Schema`, `dtypes` the list of types, and `columns` the names.
@@ -220,7 +358,7 @@ read.
 ## Nested types
 
 Lists, structs, and maps pass through the boundary unchanged, and each has an accessor
-namespace rather than a pile of top-level functions (`.list`, `.struct`, `.map`,
+namespace rather than a pile of top-level functions ({py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>`,
 `.json`). `explode` turns a list column into rows; `unnest` lifts a struct's fields into
 top-level columns.
 

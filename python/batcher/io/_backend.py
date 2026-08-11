@@ -11,6 +11,7 @@ changing a single import path.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import fnmatch
 import io
 import os
@@ -54,6 +55,31 @@ def _scheme(path: str) -> str:
     """The URI scheme of `path` (``""`` for a bare local path)."""
     idx = path.find("://")
     return path[:idx].lower() if idx > 0 else ""
+
+
+#: fsspec's modification-time key, per backend. S3 reports `LastModified`, GCS `updated`,
+#: Azure `last_modified`, and the local/memory filesystems `mtime`. There is no common one,
+#: so they are tried in turn.
+_FSSPEC_MTIME_KEYS = ("LastModified", "last_modified", "updated", "mtime")
+
+
+def _fsspec_mtime_ns(info: dict[str, Any]) -> int:
+    """Modification time in nanoseconds from an fsspec info dict, or ``0`` if absent.
+
+    Zero matches what `_record_listing` stores when pyarrow reports no `mtime_ns`, and means
+    the identity rests on `(path, size)` alone — enough for the overwrite case
+    `file_identity` exists to catch in this process, since `atomic_writer`/`remove` drop the
+    entry as they write.
+    """
+    for key in _FSSPEC_MTIME_KEYS:
+        raw = info.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, datetime.datetime):
+            return int(raw.timestamp() * 1_000_000_000)
+        if isinstance(raw, (int, float)):
+            return int(raw * 1_000_000_000)
+    return 0
 
 
 def _is_data_file(path: str) -> bool:
@@ -138,6 +164,31 @@ class FileSystem(Protocol):
     def remove(self, path: str) -> None:
         """Delete a single file (no error if it is already absent). Used to clear the
         stale part-files left behind when compacting a multi-file output in place."""
+        ...
+
+    def is_dir(self, path: str) -> bool:
+        """Whether `path` exists and is a directory.
+
+        `exists` cannot answer this, and the difference decides the *shape* of a write: a
+        destination that is already a directory of part files must be rewritten as one, not
+        replaced by a single file at the same path — which fails outright on local disk and
+        would otherwise need every caller to guess.
+        """
+        ...
+
+    def remove_empty_dir(self, path: str) -> bool:
+        """Delete `path` if it holds nothing at all; report whether it was removed.
+
+        The counterpart to `mkdirs`, and the thing a *re*-partitioning rewrite needs: when
+        a table partitioned by ``dt=`` is rewritten partitioned by ``g=``, removing the
+        stale data files leaves the ``dt=`` directories standing, and a reader that then
+        looks at the layout sees two different partition schemes side by side.
+
+        Emptiness is checked immediately before the delete and includes subdirectories, so
+        this can never remove a directory that still holds data. That matters most on an
+        object store, where a "directory" is a key prefix and deleting one is deleting
+        everything under it.
+        """
         ...
 
 
@@ -381,6 +432,15 @@ class _ArrowFileSystem:
         Returns URIs only when fsspec is installed for the scheme *and* found files, so an
         empty/errored probe never masks the pyarrow listing (which owns the empty-is-error
         and credential-failure semantics). Local/backendless schemes return ``None``.
+
+        Lists with ``detail=True`` and records what comes back, for the reason `_glob`'s
+        slower path spells out at length: without it `file_identity` stats every matched
+        file, three times per query. This path was the one that still did — and it is the
+        one a ``dir/PREFIX*.ext`` glob takes, so the storm landed on exactly the
+        many-small-files scans the prefix scoping exists to make fast. Measured on a
+        1,024-file S3 corpus: 3,072 `_stat` calls costing 1.58 s, against a 340 ms read of
+        the same files. `detail=True` is part of fsspec's base `glob` contract, so it costs
+        no extra request — the LIST already carried the size and the timestamp.
         """
         scheme = _scheme(pattern)
         if scheme in ("", "file"):
@@ -399,11 +459,32 @@ class _ArrowFileSystem:
             return None
         try:
             backend = fsspec.filesystem(scheme)
-            matches = backend.glob(in_pat)
+            matches = backend.glob(in_pat, detail=True)
         except Exception:
             return None  # missing backend (e.g. s3fs), credential, or API issue → pyarrow.
         files = sorted(self._uri(m) for m in matches if _is_data_file(m))
-        return files or None
+        if not files:
+            return None
+        self._record_fsspec_listing(matches)
+        return files
+
+    def _record_fsspec_listing(self, detail: dict[str, Any]) -> None:
+        """Remember each fsspec-listed file's `(size, mtime_ns)`, as `_record_listing` does.
+
+        Separate from `_record_listing` because the shape differs: pyarrow hands back
+        `FileInfo` objects, fsspec a `{path: info-dict}` whose timestamp key is per-backend
+        (`LastModified` on S3, `updated` on GCS, `mtime` locally). A file whose size cannot be
+        read is skipped rather than recorded as zero — an entry that lies about the size is
+        worse than no entry, because `file_identity` would then serve one file's cached
+        footer for another of the same (wrong) size.
+        """
+        for path, info in detail.items():
+            if not isinstance(info, dict) or not _is_data_file(path):
+                continue
+            size = info.get("size", info.get("Size"))
+            if size is None:
+                continue
+            self._listing_info[self._uri(path)] = (int(size), _fsspec_mtime_ns(info))
 
     def open(self, path: str, mode: str = "rb") -> IO[Any]:  # noqa: ARG002 (read-only façade)
         # A buffered wrapper over the pyarrow input file gives the full Python file protocol
@@ -498,3 +579,23 @@ class _ArrowFileSystem:
         if self._fs.get_file_info(in_path).type != pafs.FileType.NotFound:
             with contextlib.suppress(FileNotFoundError):
                 self._fs.delete_file(in_path)
+
+    def is_dir(self, path: str) -> bool:
+        in_path = self._p(path).rstrip("/") or "/"
+        return self._fs.get_file_info(in_path).type == pafs.FileType.Directory
+
+    def remove_empty_dir(self, path: str) -> bool:
+        self._forget_listing(path)
+        in_path = self._p(path).rstrip("/")
+        if not in_path or self._fs.get_file_info(in_path).type != pafs.FileType.Directory:
+            return False
+        # Recursive, so a directory holding only *other* directories is not "empty" either.
+        # This is the guard that makes the delete below safe on an object store, where the
+        # directory is a key prefix and deleting it deletes every object beneath it.
+        sel = pafs.FileSelector(in_path, recursive=True, allow_not_found=True)
+        if self._fs.get_file_info(sel):
+            return False
+        with contextlib.suppress(OSError, FileNotFoundError):
+            self._fs.delete_dir(in_path)
+            return True
+        return False

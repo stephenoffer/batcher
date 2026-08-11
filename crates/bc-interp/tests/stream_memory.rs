@@ -267,3 +267,65 @@ fn an_over_budget_breaker_gives_way_before_materializing_its_input() {
          the handoff to the spilling executor happens after the OOM it exists to prevent"
     );
 }
+
+/// A dimension whose *build side* is large but whose *join output* is not.
+///
+/// Keys `0..rows`, of which only `0..100` match `facts`. The unmatched remainder inflates the
+/// table the join must hold without inflating the result it produces, which is what separates
+/// "the build sides do not fit" from "the query returns too much".
+fn fat_dim(name: &str, rows: i64) -> Vec<RecordBatch> {
+    let k: ArrayRef = Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>()));
+    let d: ArrayRef = Arc::new(Int64Array::from(
+        (0..rows).map(|i| i * 10).collect::<Vec<_>>(),
+    ));
+    vec![RecordBatch::try_from_iter(vec![("k", k), (name, d)]).unwrap()]
+}
+
+/// Build sides that each fit the envelope but together do not must give way to the spilling
+/// executor.
+///
+/// `prebuild_joins` prepares **every** join's build side before the probe pipeline runs, and
+/// they all stay resident for the whole query -- so the quantity that has to fit is their sum.
+/// Checking each side against the full envelope on its own is the bug this pins: three sides
+/// at 40% of the envelope each are individually fine and collectively 120% of it, so no check
+/// fires and the process is killed at exactly the point the handoff exists to prevent. The
+/// per-side view is seductive because a build side really is "small by construction" relative
+/// to the relation it broadcasts -- it is small *per join*, and there are several joins.
+///
+/// TPC-H q9 at sf100 is the real instance: five build sides, an auto-sensed 82 GB envelope,
+/// and a 184 GB machine that the query was killed on. The same query under a 40 GB cap -- low
+/// enough that one side alone crosses it -- spilled and completed, which is what identified
+/// the sum rather than any single side as the thing going unchecked.
+#[test]
+fn build_sides_that_only_together_exceed_the_envelope_give_way() {
+    let _measuring = measuring();
+    let plan = deep_plan(2);
+    let rows = 1_000_000;
+    let one = fat_dim("a", rows)[0].get_array_memory_size();
+    let srcs = vec![
+        facts(100_000, 2),
+        fat_dim("a", rows),
+        fat_dim("b", rows),
+        fat_dim("c", rows),
+    ];
+
+    // Sized off the measured side rather than a literal, so allocator padding cannot quietly
+    // move a side across the line and make this test pass for the wrong reason. One side is
+    // half the envelope; three are one and a half times it.
+    let budget = one * 2;
+
+    let err = execute_streaming(&plan, &srcs, budget).expect_err(
+        "three {one}-byte build sides under a {budget}-byte envelope must give way: they are \
+         all resident at once, so the sum is what has to fit",
+    );
+    assert!(
+        matches!(err, bc_interp::InterpError::MemoryBudgetExceeded { .. }),
+        "expected MemoryBudgetExceeded so the caller re-runs on the executor that spills, \
+         got: {err:?}"
+    );
+
+    // The converse, so this cannot pass by refusing everything: the same plan under an
+    // envelope that genuinely fits all three sides must run.
+    execute_streaming(&plan, &srcs, one * 8)
+        .expect("build sides that fit must still run on the streaming executor");
+}

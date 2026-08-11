@@ -52,17 +52,23 @@ def constraints_provably_hold(ds: Dataset, constraints: Sequence[object]) -> boo
     whole set by executing, exactly as it did before. So this only ever removes work — it can
     never wave a violation through, which is the one failure this must not have.
     """
+    from batcher.api.dataset.dq.constraints import RowConstraint, UniqueConstraint
+
     if not constraints:
         return True  # no contract to violate
     for constraint in constraints:
-        keys = getattr(constraint, "keys", None)
-        if keys is not None:  # a uniqueness constraint
-            if not keys_provably_unique(ds, keys):
+        # Dispatch on the type rather than on the presence of an attribute. Duck-typing on
+        # `keys` read a *reference* constraint's `reference_keys` sibling as a key tuple once
+        # the constraint vocabulary grew past two kinds, and the failure mode of guessing
+        # wrong here is discharging a contract that does not hold.
+        if isinstance(constraint, UniqueConstraint):
+            if not keys_provably_unique(ds, constraint.keys):
                 return False
-        elif not getattr(constraint, "total", False) or not violations_provably_absent(
-            ds, constraint.valid
-        ):
-            return False
+        elif isinstance(constraint, RowConstraint):
+            if not constraint.total or not violations_provably_absent(ds, constraint.valid):
+                return False
+        else:
+            return False  # relation-level, schema, or referential — not provable from a footer
     return True
 
 

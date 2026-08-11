@@ -185,6 +185,11 @@ def http_engine(
             engine.last_usage = usage  # the documented legacy channel
             return [r.text for r in results]
 
+        # The pool lives as long as the worker, which is the point — but nothing was ever
+        # shutting it down, so `concurrency` threads outlived every engine that was built.
+        # `close` is the teardown contract `core.udf.lifecycle` and `InferencePool` already
+        # look for, so exposing it here is all that is needed to plug the leak.
+        engine.close = lambda: pool.shutdown(wait=False)
         return engine
 
     return factory

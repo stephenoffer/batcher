@@ -58,6 +58,17 @@ pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprEr
             )));
             cast(arr, &target).map_err(ExprError::from)
         }
+        // An all-null column types as `Null`, which is a real type and not an error: it is
+        // what a left join that matched nothing, an empty aggregation, and
+        // `from_pydict({"e": [None, None]})` all produce. Arithmetic, `cast`, `coalesce`
+        // and `is_null` already answer `null` for it; the `.list` namespace instead
+        // rejected the column and failed the whole query. Casting to an all-null `List`
+        // hands each kernel its own null handling, so `f(null)` is `null` — the convention
+        // the numeric path already sets, and what DuckDB does.
+        DataType::Null => {
+            let target = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
+            cast(arr, &target).map_err(ExprError::from)
+        }
         other => Err(ExprError::ExpectedType {
             func: func.to_string(),
             want: "a List argument",
@@ -169,6 +180,18 @@ mod tests {
         let list = out.as_list::<i32>();
         assert_eq!(list.len(), 2);
         assert_eq!(list.value_offsets(), &[0, 2, 4]);
+    }
+
+    #[test]
+    fn an_all_null_column_coerces_to_an_all_null_list() {
+        // An all-null column types as `Null`, which every other family already answers
+        // `null` for. The `.list` namespace rejected it and failed the whole query.
+        use arrow::array::NullArray;
+        let src: ArrayRef = Arc::new(NullArray::new(3));
+        let out = as_var_list(&src, "list.Len").unwrap();
+        assert!(matches!(out.data_type(), DataType::List(_)));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.null_count(), 3);
     }
 
     #[test]

@@ -223,30 +223,45 @@ def test_range_join_reducer_ir_matches_the_wire_contract(bands):
     planned = _find_ir(physical.ir, "range_join")
     assert planned is not None, "the cartesian+filter rewrite did not produce a range_join"
 
-    reducer = _range_join_reducer_ir(_RangeJoinLike(planned))
+    node = _real_range_join(planned, bt.from_arrow(_table()), bt.from_arrow(bands))
+    reducer = _range_join_reducer_ir(node)
     assert reducer["op"] == "range_join"
     assert reducer["left"] == {"op": "scan", "source_id": 0}
     assert reducer["right"] == {"op": "scan", "source_id": 1}
     for key in ("conditions", "join_type", "output"):
         assert reducer[key] == planned[key], key
+    # The drift guard: every key the single-node lowering emits, other than the two inputs,
+    # must appear in the reducer with the same value. A field added to `RangeJoin` and
+    # forgotten in the distributed path fails here — which is the whole point, since only
+    # the distributed path sends this IR and no differential test would see it.
+    single = node.to_ir()
+    assert {k: v for k, v in single.items() if k not in ("left", "right")} == {
+        k: v for k, v in reducer.items() if k not in ("left", "right")
+    }
 
 
-class _RangeJoinLike:
-    """The planned IR node re-exposed with the attribute names `_range_join_reducer_ir`
-    reads, so the reducer is checked against what the planner actually emitted rather than
-    against a hand-built node that could drift from it."""
+def _real_range_join(ir: dict, left, right):
+    """A **real** `RangeJoin` carrying the conditions/join_type/output the planner emitted.
 
-    def __init__(self, ir: dict) -> None:
-        from batcher.plan.logical import JoinOutputCol, RangeCondition
+    A look-alike object with the same attribute names would pass this test forever. The
+    reducer and the single-node lowering now share `RangeJoin.shape_ir`, so only a real node
+    exercises that sharing — and only a real node grows a new field when the node does,
+    which is what makes the drift guard below able to fail.
+    """
+    from batcher.plan.logical import JoinOutputCol, RangeCondition, RangeJoin
 
-        self.conditions = tuple(
+    return RangeJoin(
+        left._plan,
+        right._plan,
+        tuple(
             RangeCondition(left_key=c["left_key"], right_key=c["right_key"], op=c["op"])
             for c in ir["conditions"]
-        )
-        self.join_type = ir["join_type"]
-        self.output = tuple(
+        ),
+        ir["join_type"],
+        tuple(
             JoinOutputCol(side=o["side"], name=o["name"], alias=o["alias"]) for o in ir["output"]
-        )
+        ),
+    )
 
 
 # --- the dispatcher routes these shapes instead of refusing them ----------------

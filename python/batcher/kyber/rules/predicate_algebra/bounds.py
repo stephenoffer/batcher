@@ -37,17 +37,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Binary, Expr, InList, Lit
 from batcher.plan.expr_rewrite import expr_key
 from batcher.plan.ir_tags import COMPARISON_FLIP
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["PREDICATE_BOUND_RULES"]
 
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 #: Which side of the number line each ordered operator bounds, and whether it includes the
 #: endpoint. The inclusive flag is the tie-break when two bounds share a literal.
 _UPPER = {"lt": False, "le": True}
@@ -318,21 +314,11 @@ def _collapse_degenerate_range(expr: Expr) -> Expr:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr]):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=(Binary, InList),
-            # Every leaf here reads a *connective* -- it absorbs, widens, or unions the two
-            # sides of one `AND`/`OR`. A comparison Binary is only ever its operand, reached
-            # by recursion rather than offered to the leaf. `InList` carries no operator, so
-            # the one leaf that targets it is unaffected by this filter.
-            expr_ops=("and", "or"),
-        )
-    )
+    # Every leaf here reads a *connective* -- it absorbs, widens, or unions the two sides of
+    # one `AND`/`OR`. A comparison Binary is only ever its operand, reached by recursion
+    # rather than offered to the leaf. `InList` carries no operator, so the one leaf that
+    # targets it is unaffected by this filter.
+    return register_leaf_rule(name, leaf, expr_matches=(Binary, InList), expr_ops=("and", "or"))
 
 
 #: The nine disjunction/absorption/folding rules this module registers, in the order the

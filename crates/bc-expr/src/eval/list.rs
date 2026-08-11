@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
-use arrow::compute::{cast, is_null};
+use arrow::compute::cast;
 use arrow::datatypes::DataType;
 
 use bc_arrow::float_total_cmp;
@@ -136,6 +136,11 @@ pub(crate) fn compare_type(child: &DataType, literal: &DataType) -> DataType {
         |t: &DataType| matches!(t, DataType::Float16 | DataType::Float32 | DataType::Float64);
     if child == literal {
         child.clone()
+    } else if matches!(child, DataType::Null) {
+        // An all-null child cannot be cast *down* to, so `[].contains(1)` failed with
+        // "Casting from Int64 to Null not supported". Widening it is lossless and every
+        // comparison is null, which is the answer.
+        literal.clone()
     } else if is_text(child) || is_text(literal) {
         DataType::Utf8
     } else if child.is_numeric() && literal.is_numeric() {
@@ -295,7 +300,6 @@ pub(crate) fn eval_list_position(arr: &ArrayRef, value: &Literal) -> Result<Arra
     Ok(Arc::new(b.finish()))
 }
 
-/// Extract field `name` from a `Struct` column, propagating struct-level nulls.
 /// Build a `Struct` column from named sub-expressions (one field per `NamedExpr`),
 /// each field carrying that expression's per-row value. The read-side counterpart
 /// is `eval_struct_field`.
@@ -318,30 +322,6 @@ pub(crate) fn eval_make_struct(
         columns,
         None,
     )))
-}
-
-pub(crate) fn eval_struct_field(arr: &ArrayRef, name: &str) -> Result<ArrayRef, ExprError> {
-    use arrow::array::{Array, AsArray};
-
-    if !matches!(arr.data_type(), DataType::Struct(_)) {
-        return Err(ExprError::ExpectedType {
-            func: "struct.field".into(),
-            want: "a Struct argument",
-            got: arr.data_type().to_string(),
-        });
-    }
-    let s = arr.as_struct();
-    let child = s
-        .column_by_name(name)
-        .cloned()
-        .ok_or_else(|| ExprError::UnknownColumn(name.to_string()))?;
-    // A null struct row makes the extracted field null too.
-    if s.null_count() > 0 {
-        let mask = is_null(s)?;
-        Ok(arrow::compute::nullif(&child, &mask)?)
-    } else {
-        Ok(child)
-    }
 }
 
 /// `list[index]`: gather the indexed element of each row's list, preserving the
@@ -519,8 +499,9 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     if let ListFunc::Reverse = func {
         return rebuild_list(list, |s, e| (s..e).rev().map(|k| k as u32).collect());
     }
-    if let ListFunc::Sort = func {
+    if let ListFunc::Sort | ListFunc::SortDesc = func {
         use arrow::compute::{sort_to_indices, SortOptions};
+        let descending = matches!(func, ListFunc::SortDesc);
         let child = list.values();
         // DuckDB `list_sort` is ascending, NULLS LAST. arrow-rs `sort_to_indices` defaults
         // to NULLS FIRST, so pass explicit options — otherwise nulls sorted to the front and
@@ -530,7 +511,7 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         // `0.0`) to match the engine's float identity, then gather the *original* elements.
         let child_key = bc_arrow::canon_float_array(child);
         let opts = SortOptions {
-            descending: false,
+            descending,
             nulls_first: false,
         };
         return rebuild_list(list, |s, e| {
@@ -798,6 +779,30 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
 mod tests {
     use super::*;
     use arrow::array::{Array, Float64Builder, Int64Array, ListBuilder};
+
+    #[test]
+    fn a_null_child_compares_in_the_literals_type() {
+        // An all-null (or all-empty) list column's child types as `Null`, and casting the
+        // literal *down* to it is not a cast Arrow has: `[].contains(1)` failed with
+        // "Casting from Int64 to Null not supported" instead of answering null.
+        assert_eq!(
+            compare_type(&DataType::Null, &DataType::Int64),
+            DataType::Int64
+        );
+        assert_eq!(
+            compare_type(&DataType::Null, &DataType::Utf8),
+            DataType::Utf8
+        );
+        // and the ordinary lattice is untouched
+        assert_eq!(
+            compare_type(&DataType::Int64, &DataType::Float64),
+            DataType::Float64
+        );
+        assert_eq!(
+            compare_type(&DataType::Int64, &DataType::Int64),
+            DataType::Int64
+        );
+    }
 
     fn lists(rows: &[Option<Vec<f64>>]) -> ArrayRef {
         let mut b = ListBuilder::new(Float64Builder::new());

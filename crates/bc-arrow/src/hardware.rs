@@ -92,23 +92,80 @@ fn cfs_quota_cores() -> Option<usize> {
     None
 }
 
+/// Cores this Slurm allocation granted on this node, or `None` off Slurm.
+///
+/// A container is confined by cgroups, which the affinity mask and the CFS quota above already
+/// report. A Slurm allocation is not, unless the site configured `task/cgroup` confinement —
+/// and plenty of HPC sites do not. There the affinity mask reports every core on a shared node,
+/// so a job granted 8 cores starts a thread per host core: it oversubscribes the node, steals
+/// from the co-tenants Slurm placed there, and at a site with enforcement is what gets the job
+/// killed.
+///
+/// This is the bound the Python control plane has always applied
+/// (`_internal.hardware.cpu._slurm_cpu_count`) and the data plane did not, so the two planes
+/// disagreed about the machine on exactly these nodes: the planner sized a fan-out to the grant
+/// while the executor sized its rayon pool and its tokio runtime to the whole node. The data
+/// plane is the half that actually spawns the threads, so it is the half where the gap bites.
+///
+/// `SLURM_CPUS_ON_NODE` is a run-length list on a heterogeneous job (`"4(x2),8"`). Which entry
+/// describes *this* node is not derivable from the variable, so the smallest is taken: under-
+/// parallelizing costs throughput, where over-parallelizing on the node that got the small
+/// grant is the failure this bound exists to prevent.
+fn slurm_granted_cores() -> Option<usize> {
+    // Most specific first: `SLURM_CPUS_PER_TASK` is set when the job asked with
+    // `--cpus-per-task`; `SLURM_CPUS_ON_NODE` is the node's whole share of the allocation and
+    // is the fallback for a job that did not.
+    ["SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"]
+        .iter()
+        .find_map(|var| {
+            std::env::var(var)
+                .ok()
+                .and_then(|raw| slurm_expansion_min(raw.trim()))
+        })
+}
+
+/// The smallest per-node count in a Slurm CPU-count value, or `None` if it does not parse.
+///
+/// Split out from [`slurm_granted_cores`] so the parse is testable as a pure function: the
+/// lookup around it reads process-global environment, which no test can exercise without
+/// racing every other test in the binary.
+fn slurm_expansion_min(raw: &str) -> Option<usize> {
+    raw.split(',')
+        .map(|part| {
+            part.split('(')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        // An unrecognized shape yields `None` for the whole value: no bound beats a wrong
+        // one, and a missing bound is exactly the behavior that held before.
+        .collect::<Option<Vec<usize>>>()?
+        .into_iter()
+        .filter(|n| *n > 0)
+        .min()
+}
+
 /// Cores this process may actually use: `available_parallelism` capped by the cgroup CFS
-/// quota. Never fewer than 1.
+/// quota and by any Slurm allocation. Never fewer than 1.
 ///
 /// `available_parallelism` honors the CPU *affinity mask* (a cpuset pin) but not the CFS
 /// *bandwidth* quota, and Kubernetes' `cpu` limit is the latter — a pod limited to 15 cores
 /// on a 16-core node reports 16 and sizes every pool one thread too wide. Oversubscription
 /// does not merely waste a thread: exceeding the quota gets the whole cgroup throttled for
-/// the rest of the CFS period, so the extra worker buys stalls for *all* the others. This is
-/// the figure to size thread pools and shard counts from.
+/// the rest of the CFS period, so the extra worker buys stalls for *all* the others. It
+/// honors no scheduler grant either; see [`slurm_granted_cores`]. This is the figure to size
+/// thread pools and shard counts from.
 pub fn usable_cores() -> usize {
     let affinity = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    match cfs_quota_cores() {
-        Some(q) => affinity.min(q).max(1),
-        None => affinity.max(1),
-    }
+    [cfs_quota_cores(), slurm_granted_cores()]
+        .into_iter()
+        .flatten()
+        .fold(affinity, usize::min)
+        .max(1)
 }
 
 fn detect_raw() -> HardwareProfile {
@@ -258,5 +315,47 @@ mod usable_cores_tests {
         if let Some(q) = cfs_quota_cores() {
             assert!(q >= 1, "a sub-core quota must round up to one usable core");
         }
+    }
+}
+
+#[cfg(test)]
+mod slurm_grant_tests {
+    use super::*;
+
+    /// A heterogeneous job's `SLURM_CPUS_ON_NODE` is a run-length list (`"4(x2),8"`), and the
+    /// *smallest* grant in it binds.
+    ///
+    /// Which entry describes this node is not derivable from the variable, and the asymmetry is
+    /// what decides the direction: under-parallelizing costs throughput, where over-parallelizing
+    /// on the node that got the small grant oversubscribes a shared HPC node and, at a site with
+    /// enforcement, gets the job killed.
+    #[test]
+    fn an_expansion_binds_to_its_smallest_grant() {
+        assert_eq!(slurm_expansion_min("4(x2),8"), Some(4));
+        assert_eq!(slurm_expansion_min("8,4(x2)"), Some(4));
+        assert_eq!(slurm_expansion_min("16"), Some(16));
+        assert_eq!(slurm_expansion_min("32(x4)"), Some(32));
+    }
+
+    /// An unrecognized shape must yield no bound at all. A wrong bound silently
+    /// under-parallelizes every query for the life of the job; a missing one is exactly the
+    /// behavior that held before this existed.
+    #[test]
+    fn an_unparseable_value_yields_no_bound() {
+        assert_eq!(slurm_expansion_min("weird"), None);
+        assert_eq!(slurm_expansion_min("4,weird"), None);
+        assert_eq!(slurm_expansion_min(""), None);
+        assert_eq!(slurm_expansion_min("0"), None);
+    }
+
+    /// The Slurm grant may only ever *narrow* the core budget, never widen it past what the
+    /// affinity mask and the cgroup quota already allow.
+    #[test]
+    fn usable_cores_is_still_bounded_by_the_affinity_mask() {
+        let affinity = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert!(usable_cores() <= affinity.max(1));
+        assert!(usable_cores() >= 1);
     }
 }

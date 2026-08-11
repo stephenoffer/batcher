@@ -1,18 +1,130 @@
 //! COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the
 //! `bucket_values_into_list` helper shared with the median path and the single-pass
-//! whole-row `distinct_batch` dedup.
+//! whole-row `distinct_parts` dedup, and [`DistinctPrefix`], the order-preserving dedup that
+//! stops once `k` distinct rows exist.
 
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Int64Array, ListArray, RecordBatch, UInt32Array};
 use arrow::buffer::OffsetBuffer;
-use arrow::compute::take;
+use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Int64Type};
 use rayon::prelude::*;
 
 use super::assign_groups;
 use super::group::dense_budget;
 use crate::error::RuntimeError;
+
+/// A `DISTINCT` that keeps the **first `k` distinct rows in input order** and can say when it
+/// has them, so the caller stops pulling.
+///
+/// # Why first-in-order rather than any `k`
+///
+/// A `DISTINCT` under a `LIMIT k` currently deduplicates its whole input and then throws
+/// nearly all of it away. That is asymptotic, not a constant factor: on a high-cardinality key
+/// the work is proportional to the *input* to answer a question about `k` rows. DuckDB fuses
+/// the pair (`PhysicalLimitedDistinct`) and stops its `Sink` the moment the hash table holds
+/// `limit` groups, taking whichever `k` its threads reach first.
+///
+/// Batcher cannot take whichever `k` wins the race. Invariant #7 requires a result identical
+/// on one node and on many, and a thread-order-dependent `k` is not. Keeping the *first* `k`
+/// in input order is deterministic, costs nothing extra ([`assign_groups`] already returns
+/// representatives in first-seen order), and still permits the early exit — because once a
+/// prefix of the input holds `k` distinct rows, nothing after it can change the answer.
+///
+/// # Why it is still mergeable
+///
+/// `combine` is ordered concatenation followed by re-applying this operator, which is exactly
+/// the shape `sample_n_batches` already uses. It is associative but **not commutative**, so
+/// the distributed driver must assemble partitions by index — the same `preserve_order=True`
+/// contract `dist/executor.py` already applies to a plain `Limit`, and for the same reason.
+///
+/// The argument that this is sound: if a row `v` is among the global first `k` distinct rows,
+/// then within `v`'s own partition the number of distinct rows occurring before it is at most
+/// the global number before it, which is `< k`. So `v` survives its own partition's first-`k`,
+/// the union of the per-partition results contains the global answer, and re-applying the
+/// operator to that ordered union selects exactly it.
+#[derive(Debug)]
+pub struct DistinctPrefix {
+    /// The distinct rows seen so far, in first-seen order. Never more than `target` rows, so
+    /// this is bounded by the limit rather than by the input.
+    kept: Option<RecordBatch>,
+    target: usize,
+}
+
+impl DistinctPrefix {
+    /// A prefix collector for `target` distinct rows. `target == 0` is satisfied immediately.
+    pub fn new(target: usize) -> Self {
+        Self { kept: None, target }
+    }
+
+    /// True once `target` distinct rows are held, so the caller can stop pulling its input.
+    pub fn is_satisfied(&self) -> bool {
+        self.kept
+            .as_ref()
+            .map_or(self.target == 0, |b| b.num_rows() >= self.target)
+    }
+
+    /// How many distinct rows are held.
+    pub fn len(&self) -> usize {
+        self.kept.as_ref().map_or(0, |b| b.num_rows())
+    }
+
+    /// True when nothing has been kept yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Fold one batch in, keeping first-seen order and never growing past `target`.
+    ///
+    /// Cost is `O(|kept| + |batch|)` with `|kept| <= target`, so a small limit makes this
+    /// proportional to the batch rather than to everything seen so far.
+    pub fn push(&mut self, batch: &RecordBatch) -> Result<(), RuntimeError> {
+        if self.is_satisfied() || batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let schema = batch.schema();
+        // Order matters: `kept` first, so `assign_groups`' first-seen representatives put
+        // already-kept rows ahead of anything new in this batch.
+        let combined = match self.kept.take() {
+            Some(kept) => concat_batches(&schema, [&kept, batch])?,
+            None => batch.clone(),
+        };
+        let keys: Vec<ArrayRef> = combined.columns().to_vec();
+        let (_ids, _n, group_cols) = assign_groups(&keys, combined.num_rows())?;
+        let deduped = RecordBatch::try_new(schema, group_cols)?;
+        self.kept = Some(match deduped.num_rows() > self.target {
+            true => deduped.slice(0, self.target),
+            false => deduped,
+        });
+        Ok(())
+    }
+
+    /// The kept rows, or `None` when nothing was ever pushed.
+    ///
+    /// `None` rather than an empty batch because the caller owns the schema decision: an
+    /// empty input defers to the path that supplies a correctly-typed empty relation.
+    pub fn finish(self) -> Option<RecordBatch> {
+        self.kept
+    }
+}
+
+/// Whole-relation `DISTINCT` over `parts` keeping the first `target` distinct rows in order.
+///
+/// The single-shot form of [`DistinctPrefix`], for callers that already hold their input.
+pub fn distinct_prefix(
+    parts: &[RecordBatch],
+    target: usize,
+) -> Result<Option<RecordBatch>, RuntimeError> {
+    let mut acc = DistinctPrefix::new(target);
+    for batch in parts {
+        acc.push(batch)?;
+        if acc.is_satisfied() {
+            break;
+        }
+    }
+    Ok(acc.finish())
+}
 
 /// Whole-relation `DISTINCT` over a **single dense integer column**, without hashing,
 /// partitioning, or materializing the input.
@@ -118,38 +230,64 @@ pub fn distinct_dense(parts: &[RecordBatch]) -> Result<Option<RecordBatch>, Runt
     Ok(Some(RecordBatch::try_new(first.schema(), vec![out])?))
 }
 
-/// Single-pass whole-row DISTINCT: hash-partition the batch's rows by *all* columns into
-/// `num_partitions` buckets (equal rows co-partition), then dedup each bucket independently
-/// across cores and concatenate the per-bucket distinct rows. Unlike the per-morsel
-/// `partial` + `combine` path, this hashes each row **once** — the win for a
-/// high-cardinality DISTINCT whose per-morsel partial reduces nothing yet is still hashed
-/// again in the combine. The caller gates this on null-free key columns (so the fast
-/// integer/byte partition co-locates equal rows) and an in-memory working set.
-pub fn distinct_batch(
-    batch: &RecordBatch,
+/// Single-pass whole-row DISTINCT over a relation held as morsels: hash-partition every
+/// morsel's rows by *all* columns into `num_partitions` buckets (equal rows co-partition),
+/// then dedup each bucket independently across cores and concatenate the per-bucket distinct
+/// rows. Unlike the per-morsel `partial` + `combine` path, this hashes each row **once** —
+/// the win for a high-cardinality DISTINCT whose per-morsel partial reduces nothing yet is
+/// still hashed again in the combine. The caller gates it on an in-memory working set.
+///
+/// Each partition's rows are gathered from the morsels in **one** `interleave` pass, rather
+/// than scattered per morsel and concatenated back. Both shapes move the relation once; the
+/// difference is fragmentation, and it is not small — a 600-morsel relation cut into 600xP
+/// pieces costs tens of thousands of `concat` calls on ~600-row arrays to stitch back, which
+/// measured slower than materializing the whole relation first and partitioning that.
+///
+/// Nulls are fine here and are not the caller's business to screen for: `bucket_of_rows` routes
+/// a null-bearing row deterministically (a fixed bucket for an integer key, the row encoding
+/// otherwise), so equal null-bearing rows land together, and `assign_groups` inside the bucket
+/// compares them exactly.
+pub fn distinct_parts(
+    parts: &[RecordBatch],
     num_partitions: usize,
-) -> Result<RecordBatch, RuntimeError> {
-    let ncols = batch.num_columns();
-    let key_idx: Vec<usize> = (0..ncols).collect();
-    let buckets = crate::shuffle::partition_by_keys(batch, &key_idx, num_partitions)?;
-    // Each bucket's distinct rows are its `assign_groups` representatives (first-seen);
-    // the buckets partition the key space, so their union is the global distinct set.
-    let per: Vec<Vec<ArrayRef>> = buckets
+) -> Result<Vec<RecordBatch>, RuntimeError> {
+    let Some(first) = parts.first() else {
+        return Ok(Vec::new());
+    };
+    let ncols = first.num_columns();
+    let csr: Vec<(Vec<u32>, Vec<u32>)> = parts
         .par_iter()
         .map(|b| {
             let keys: Vec<ArrayRef> = b.columns().to_vec();
-            let (_ids, _n, group_cols) = assign_groups(&keys, b.num_rows())?;
-            Ok::<_, RuntimeError>(group_cols)
+            let part_of = crate::shuffle::bucket_of_rows(&keys, b.num_rows(), num_partitions)?;
+            Ok::<_, RuntimeError>(crate::shuffle::bucket_csr(&part_of, num_partitions))
         })
         .collect::<Result<_, _>>()?;
-    let out_cols: Vec<ArrayRef> = (0..ncols)
+    // Each bucket's distinct rows are its `assign_groups` representatives (first-seen); the
+    // buckets partition the key space, so their union is the global distinct set.
+    (0..num_partitions)
         .into_par_iter()
-        .map(|c| {
-            let arrs: Vec<&dyn Array> = per.iter().map(|g| g[c].as_ref()).collect();
-            Ok::<_, RuntimeError>(arrow::compute::concat(&arrs)?)
+        .map(|p| {
+            let mut coords: Vec<(usize, usize)> = Vec::new();
+            for (m, (rows, offsets)) in csr.iter().enumerate() {
+                let span = offsets[p] as usize..offsets[p + 1] as usize;
+                coords.extend(rows[span].iter().map(|&r| (m, r as usize)));
+            }
+            if coords.is_empty() {
+                return Ok(None);
+            }
+            let keys: Vec<ArrayRef> = (0..ncols)
+                .map(|c| {
+                    let arrs: Vec<&dyn Array> =
+                        parts.iter().map(|b| b.column(c).as_ref()).collect();
+                    arrow::compute::interleave(&arrs, &coords)
+                })
+                .collect::<Result<_, _>>()?;
+            let (_ids, _n, group_cols) = assign_groups(&keys, coords.len())?;
+            Ok(Some(RecordBatch::try_new(first.schema(), group_cols)?))
         })
-        .collect::<Result<_, _>>()?;
-    Ok(RecordBatch::try_new(batch.schema(), out_cols)?)
+        .collect::<Result<Vec<_>, RuntimeError>>()
+        .map(|v| v.into_iter().flatten().collect())
 }
 
 /// Partial state for COUNT(DISTINCT): each group's distinct non-null values as one
@@ -442,6 +580,91 @@ mod dense_tests {
 
     fn values(b: &RecordBatch) -> Vec<i64> {
         b.column(0).as_primitive::<Int64Type>().values().to_vec()
+    }
+
+    /// The prefix keeps the FIRST `k` distinct rows in input order, not an arbitrary `k`.
+    ///
+    /// This is the property the whole fusion rests on: an arbitrary `k` would make the
+    /// distributed result depend on which worker won a race, which invariant #7 forbids.
+    #[test]
+    fn prefix_keeps_the_first_k_in_input_order() {
+        let parts = batches(vec![
+            vec![Some(7), Some(3), Some(7)],
+            vec![Some(1), Some(3), Some(9)],
+        ]);
+        let out = distinct_prefix(&parts, 3).unwrap().expect("rows exist");
+        // First-seen order is 7, 3, 1 — NOT ascending, and not whichever three hash first.
+        assert_eq!(values(&out), vec![7, 3, 1]);
+    }
+
+    /// A limit larger than the distinct count is simply not binding.
+    #[test]
+    fn prefix_under_target_returns_every_distinct_row() {
+        let parts = batches(vec![vec![Some(2), Some(2), Some(5)]]);
+        let out = distinct_prefix(&parts, 100).unwrap().expect("rows exist");
+        assert_eq!(values(&out), vec![2, 5]);
+    }
+
+    /// An empty input yields `None`, so the caller can defer to the path that owns the
+    /// correctly-typed empty relation rather than inventing a schema here.
+    #[test]
+    fn prefix_of_nothing_is_none() {
+        assert!(distinct_prefix(&[], 5).unwrap().is_none());
+        assert!(distinct_prefix(&batches(vec![vec![]]), 5)
+            .unwrap()
+            .is_none());
+    }
+
+    /// `target == 0` is satisfied before anything is pushed, so no input is read at all.
+    #[test]
+    fn prefix_of_zero_reads_nothing() {
+        let mut acc = DistinctPrefix::new(0);
+        assert!(acc.is_satisfied());
+        acc.push(&batches(vec![vec![Some(1)]])[0]).unwrap();
+        assert!(acc.finish().is_none());
+    }
+
+    /// **The mergeability invariant.** Splitting the input into partitions, taking each
+    /// partition's own first-`k` prefix, then re-applying the operator to the ordered union
+    /// must equal the single-node answer — for every split point and every `k`.
+    ///
+    /// This is what makes `combine` sound despite being non-commutative: the ordered union is
+    /// what the distributed driver assembles under `preserve_order=True`.
+    #[test]
+    fn combine_finalize_of_partitions_equals_single_node() {
+        let rows: Vec<Option<i64>> = vec![
+            Some(5),
+            Some(1),
+            Some(5),
+            Some(9),
+            Some(1),
+            Some(3),
+            Some(7),
+            Some(3),
+            Some(8),
+        ];
+        let whole = batches(vec![rows.clone()]);
+        for k in 1..=6 {
+            let single = distinct_prefix(&whole, k).unwrap().expect("rows exist");
+            for cut in 1..rows.len() {
+                let (a, b) = rows.split_at(cut);
+                let parts = batches(vec![a.to_vec(), b.to_vec()]);
+                // `partial`: each partition keeps its own first `k`.
+                let per_partition: Vec<RecordBatch> = parts
+                    .iter()
+                    .filter_map(|p| distinct_prefix(std::slice::from_ref(p), k).unwrap())
+                    .collect();
+                // `combine` + `finalize`: re-apply to the ordered union.
+                let merged = distinct_prefix(&per_partition, k)
+                    .unwrap()
+                    .expect("rows exist");
+                assert_eq!(
+                    values(&merged),
+                    values(&single),
+                    "k={k} cut={cut}: partitioned answer differs from single-node"
+                );
+            }
+        }
     }
 
     /// Distinct values across morsels, ascending, with duplicates collapsed.

@@ -27,13 +27,21 @@ import argparse
 import dataclasses
 import sys
 import time
+from pathlib import Path
 
 import pyarrow as pa
 
-sys.path.insert(0, "benchmarks")
+# Resolved from this file, not from the working directory: the previous
+# `sys.path.insert(0, "benchmarks")` resolved against the *cwd*, so the import only worked
+# when the script was launched from the repo root and raised `ModuleNotFoundError: No module
+# named 'harness'` anywhere else.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from harness import results_match
 
-_PKG = "/home/ray/default_cld_g54aiirwj1s8t9ktgzikqur41k/batcher/python/batcher"
+# Likewise derived rather than hard-coded. This was an absolute path carrying one Anyscale
+# workspace's ID — the only such path in the repo — so the Ray `py_modules` upload it feeds
+# resolved on exactly one machine and nowhere else.
+_PKG = str(Path(__file__).resolve().parents[2] / "python" / "batcher")
 _REGION = "us-west-2"
 # positional -> canonical for the lineitem columns the aggregation needs
 _REN = {

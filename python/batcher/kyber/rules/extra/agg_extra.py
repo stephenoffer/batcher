@@ -418,7 +418,11 @@ def drop_distinct_before_agg(node: Aggregate, _ctx: OptimizerContext) -> Logical
     which already dedups, qualifies vacuously).
     """
     inner = node.input
-    if not isinstance(inner, Distinct):
+    # `not inner.keys` is what makes the argument above hold: a removed row had an identical
+    # twin only under a WHOLE-ROW dedup. A keyed dedup removes rows that differ outside its
+    # key, so the values reaching each group genuinely change and dropping it is a wrong
+    # answer rather than a faster plan.
+    if not isinstance(inner, Distinct) or inner.keys:
         return None
     if any(
         spec.agg.func not in _DUP_INSENSITIVE or spec.agg.input2 is not None

@@ -33,6 +33,18 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         return eval_date(func, &parsed);
     }
 
+    // An all-null column types as `Null`, which is a real type and not an error: it is what
+    // `SELECT NULL AS x`, an all-`None` column, and a left join that matched nothing all
+    // produce. Arithmetic, `cast` and `coalesce` already answer null for it, and the
+    // aggregate, string, list and math families were each taught to; the temporal one still
+    // handed the array to Arrow's kernel, which reported "Year does not support: Null" and
+    // failed the query. Hoisting the cast here covers all twenty-one functions at once, the
+    // same way the text coercion above does, and DuckDB returns NULL for every one.
+    if matches!(arr.data_type(), DataType::Null) {
+        let nulls = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+        return eval_date(func, &nulls);
+    }
+
     // `epoch` isn't a date-part: whole seconds since the Unix epoch, as Int64.
     //
     // The division MUST floor, not truncate toward zero. Arrow's
@@ -529,15 +541,13 @@ pub(crate) fn eval_date_offset(
 ) -> Result<ArrayRef, ExprError> {
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{Date32Type, Int64Type, TimeUnit};
-    use chrono::{DateTime, Duration, Months, NaiveDate};
+    use bc_arrow::TypedOffset;
 
-    let shift_months = |d: NaiveDate| -> Option<NaiveDate> {
-        if months >= 0 {
-            d.checked_add_months(Months::new(months as u32))
-        } else {
-            d.checked_sub_months(Months::new((-months) as u32))
-        }
-    };
+    // The scalar arithmetic — month-end clamping, exact days, and the checked-overflow-to-null
+    // rule — lives in `bc_arrow::offset`, because the window frame and ASOF-tolerance paths in
+    // `bc-runtime` ask the identical question and cannot reach this crate. What stays here is
+    // the array plumbing and the type-specific errors.
+    let offset = TypedOffset::new(months, days, micros);
 
     match arr.data_type() {
         DataType::Date32 => {
@@ -548,25 +558,20 @@ pub(crate) fn eval_date_offset(
                 });
             }
             let a = arr.as_primitive::<Date32Type>();
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             let out: Date32Array = (0..a.len())
                 .map(|i| {
                     if a.is_null(i) {
                         return None;
                     }
-                    // Every step is checked: a far-future/past Date32, a huge `days`
-                    // offset, or a shift past chrono's date range yields null rather
-                    // than panicking (`Duration::days`/`NaiveDate + Duration` both
-                    // panic on overflow — never on a data path).
-                    let d = epoch.checked_add_signed(Duration::try_days(a.value(i) as i64)?)?;
-                    shift_months(d)
-                        .and_then(|d| d.checked_add_signed(Duration::try_days(days)?))
-                        .map(|nd| (nd - epoch).num_days() as i32)
+                    offset
+                        .shift_scalar(&DataType::Date32, a.value(i) as i64, 1)
+                        .map(|d| d as i32)
                 })
                 .collect();
             Ok(Arc::new(out))
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let ty = arr.data_type().clone();
             let m = cast(arr, &DataType::Int64)?;
             let a = m.as_primitive::<Int64Type>();
             let out: TimestampMicrosecondArray = (0..a.len())
@@ -574,12 +579,7 @@ pub(crate) fn eval_date_offset(
                     if a.is_null(i) {
                         return None;
                     }
-                    let dt = DateTime::from_timestamp_micros(a.value(i))?.naive_utc();
-                    let shifted = shift_months(dt.date())?.and_time(dt.time());
-                    shifted
-                        .checked_add_signed(Duration::try_days(days)?)?
-                        .checked_add_signed(Duration::microseconds(micros))
-                        .map(|x| x.and_utc().timestamp_micros())
+                    offset.shift_scalar(&ty, a.value(i), 1)
                 })
                 .collect();
             Ok(Arc::new(out))

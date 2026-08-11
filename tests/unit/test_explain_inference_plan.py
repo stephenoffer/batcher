@@ -111,12 +111,17 @@ def test_relational_explain_is_byte_identical() -> None:
     integer column's values instead of interpolating across them as a continuum, which is what
     makes `a > 1` over `[1, 4]` come out at three quarters rather than all of them.
 
-    It is still labelled `default` rather than `exact`: the provenance describes how the number
-    was derived, and a uniformity assumption over known bounds is not a proof, even when it lands
-    on the right answer.
+    The aggregate reads 3 for the same reason and by the same route: `group_by("a")` over the
+    three surviving rows produces three groups, which the estimator derives from the column's
+    distinct count instead of falling back to a flat guess of one.
+
+    Both are still labelled `default` rather than `exact`: the provenance describes how the
+    number was derived, and neither a uniformity assumption over known bounds nor a damped
+    combination of *unmeasured* distinct counts is a proof, even when it lands on the right
+    answer.
     """
     expected = (
-        "aggregate                       est≈1 (default)\n"
+        "aggregate                       est≈3 (default)\n"
         "  filter                        est≈3 (default)\n"
         "    scan                        est≈4 (exact)"
     )

@@ -3,7 +3,7 @@
 Batcher reads two environment-driven config layers once when the package is
 imported: `BATCHER_*` variables and an optional JSON file at `BATCHER_CONFIG_FILE`.
 Both overlay onto the built-in defaults and can be reproduced explicitly with
-`Config.from_env` and `Config.from_file`.
+{py:meth}`Config.from_env <batcher.Config.from_env>` and {py:meth}`Config.from_file <batcher.Config.from_file>`.
 
 ## BATCHER_ variables
 
@@ -33,7 +33,7 @@ python my_pipeline.py
 ```
 
 You can reproduce the overlay in code by passing an explicit environment mapping.
-`Config.from_env` returns a new `Config` and does not mutate its base.
+`Config.from_env` returns a new {py:class}`Config <batcher.Config>` and does not mutate its base.
 
 ```python
 from batcher import Config
@@ -116,8 +116,8 @@ job. You don't set these; they're listed so you can tell what Batcher already kn
 
 The two layers here sit in the middle of the resolution order, highest first:
 
-1. `config_context(...)`.
-1. `set_config(...)`.
+1. {py:func}`config_context(...) <batcher.config_context>`.
+1. {py:func}`set_config(...) <batcher.set_config>`.
 1. `BATCHER_*` environment variables.
 1. `BATCHER_CONFIG_FILE` JSON.
 1. Built-in defaults.

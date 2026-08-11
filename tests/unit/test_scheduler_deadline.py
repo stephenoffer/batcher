@@ -14,6 +14,7 @@ every core on the box, so sizing to it fans a job out far past what it was grant
 from __future__ import annotations
 
 import dataclasses
+import os
 import signal
 import time
 
@@ -240,11 +241,27 @@ class TestSlurmCpuAllocation:
         self.monkeypatch.setenv("SLURM_CPUS_PER_TASK", "100000")
         assert available_cpu_count() == unbounded
 
-    @pytest.mark.parametrize("bad", ["", "4(x2)", "not-a-number", "0", "-1"])
+    @pytest.mark.parametrize("bad", ["", "not-a-number", "0", "-1"])
     def test_unparseable_allocation_is_ignored(self, bad):
-        """A heterogeneous-job expansion or a junk value must degrade to the old behavior,
-        never to a silent single-core run."""
+        """A junk value must degrade to the old behavior, never to a silent single-core run."""
         self.monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
         unbounded = available_cpu_count()
         self.monkeypatch.setenv("SLURM_CPUS_PER_TASK", bad)
         assert available_cpu_count() == unbounded
+
+    @pytest.mark.parametrize(("expansion", "granted"), [("4(x2)", 4), ("8,4(x2)", 4), ("2(x8)", 2)])
+    def test_a_heterogeneous_expansion_binds_rather_than_being_ignored(self, expansion, granted):
+        """A run-length expansion used to be classified unparseable and dropped, leaving the job
+        with **no** Slurm bound at all.
+
+        That was the wrong half of the trade. The stated worry was a half-parse producing a
+        silent single-core run — but the failure it chose instead is the one this bound exists
+        to prevent: with no bound the job sizes to the affinity mask, which on an HPC node
+        without `task/cgroup` confinement is every core on a shared machine. The smallest grant
+        in the expansion is taken, since which entry describes *this* node is not derivable from
+        the variable, and under-parallelizing costs throughput where over-parallelizing on the
+        node that got the small grant is what gets a job killed.
+        """
+        self.monkeypatch.delenv("SLURM_CPUS_ON_NODE", raising=False)
+        self.monkeypatch.setenv("SLURM_CPUS_PER_TASK", expansion)
+        assert available_cpu_count() == min(granted, os.cpu_count() or granted)

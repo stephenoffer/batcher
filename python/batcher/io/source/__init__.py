@@ -12,7 +12,13 @@ Layer: `io`, the control-plane boundary that hands a plan's leaves to the engine
 from __future__ import annotations
 
 from batcher.io.formats import SOURCES, CSVSource, JSONSource, ParquetSource
-from batcher.io.source.base import Checkpointable, Source, is_checkpointable
+from batcher.io.source.base import (
+    Checkpointable,
+    RateLimited,
+    Source,
+    is_checkpointable,
+    is_rate_limited,
+)
 from batcher.io.source.inmemory import InMemorySource
 from batcher.io.source.iterator import IteratorSource
 from batcher.io.source.materialized import MaterializedSource
@@ -23,6 +29,8 @@ from batcher.io.source.read import (
     plan_splits,
     read_source,
     source_statistics,
+    watermark_partition_columns,
+    watermark_partitions,
 )
 from batcher.io.splits import Split
 
@@ -35,13 +43,17 @@ __all__ = [
     "JSONSource",
     "MaterializedSource",
     "ParquetSource",
+    "RateLimited",
     "Source",
     "Split",
     "continues_across_passes",
     "is_bounded",
     "is_checkpointable",
+    "is_rate_limited",
     "iter_source",
     "plan_splits",
     "read_source",
     "source_statistics",
+    "watermark_partition_columns",
+    "watermark_partitions",
 ]

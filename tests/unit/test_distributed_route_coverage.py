@@ -98,24 +98,12 @@ STAGED: frozenset[str] = frozenset(
 )
 
 #: What distribution genuinely cannot do, with the reason. A standing invitation to delete a
-#: line: every entry is a gap, not a decision.
+#: line: every entry is a gap, not a decision. Empty is the goal, not an oversight — a shape
+#: that loses its route must be added back here with the reason, never quietly deleted from
+#: `SHAPES`.
 UNROUTED: dict[str, str] = {
     # No equality to co-partition on and no `by` group to hash, so the shuffle every other
     # join uses is unavailable; the result needs one global order over the `on` key.
-    "asof_keyless": "no `by` keys: nothing to co-partition, and it needs one global order",
-    # `row_number() OVER (ORDER BY x)` and running aggregates need one global row order.
-    # `dist/window_stream.py` already implements the algorithm that would lift this —
-    # range-partition on the order key, compute per bucket, then apply each bucket's constant
-    # prefix offset — but only the single-node streaming/spill path uses it today.
-    "window_global_ordered": "one global row order; the ordered-bucket-offset algorithm "
-    "exists in dist/window_stream.py but is not wired into the dispatcher",
-    # A UDF pipeline feeding a *join*. `_stage_map_prefix` lands a map prefix on shared
-    # scratch so the breaker above it sees an ordinary splittable source, but it walks a
-    # single-input chain: a join has two operands, and substituting one of them is a
-    # different rewrite. The single-input breakers (sort / distinct / window / limit) are
-    # routed by that staging and are deliberately absent from this list.
-    "map_then_join": "a join has two operands; the map-prefix stage rewrites single-input "
-    "chains only",
 }
 
 SHAPES["agg_over_asof_join"] = lambda: (
@@ -138,6 +126,11 @@ SHAPES["map_then_agg"] = lambda: _mapped().group_by("k").agg(s=c("v").sum())
 SHAPES["map_then_sort"] = lambda: _mapped().sort("v")
 SHAPES["map_then_distinct"] = lambda: _mapped().select("k").distinct()
 SHAPES["map_then_join"] = lambda: _mapped().join(_r(), on="k")
+SHAPES["join_of_two_mapped"] = lambda: _mapped().join(_r().map_batches(lambda b: b), on="k")
+SHAPES["map_then_union"] = lambda: _mapped().select("k").union(_mapped().select("k"))
+SHAPES["map_then_join_then_agg"] = lambda: (
+    _mapped().join(_r(), on="k").group_by("k").agg(s=c("v").sum())
+)
 SHAPES["map_then_window"] = lambda: _mapped().with_columns(s=c("v").sum().over(partition_by="g"))
 SHAPES["map_then_limit"] = lambda: _mapped().limit(3)
 
@@ -207,6 +200,7 @@ _ROUTES: tuple[tuple[str, str], ...] = (
     ("batcher.dist.executors.join", "_distributed_join"),
     ("batcher.dist.executors.join", "_distributed_join_aggregate"),
     ("batcher.dist.executor", "_distributed_asof"),
+    ("batcher.dist.executor", "_distributed_asof_keyless"),
     ("batcher.dist.executor", "_distributed_range_join"),
     ("batcher.dist.executor", "_staged_aggregate_over_join"),
     ("batcher.dist.executor", "_single_node"),
@@ -215,6 +209,8 @@ _ROUTES: tuple[tuple[str, str], ...] = (
     ("batcher.dist.flight_sort", "execute_sort_flight"),
     ("batcher.dist.flight_sort", "execute_topn_flight"),
     ("batcher.dist.flight_window", "execute_window_flight"),
+    ("batcher.dist.global_window", "execute_global_window_disk"),
+    ("batcher.dist.global_window", "execute_global_window_flight"),
 )
 
 
@@ -244,6 +240,21 @@ def route(monkeypatch):
     # `executor` binds `_single_node` at import, so the module attribute must be patched too.
     monkeypatch.setattr(dex, "_single_node", stub("_single_node"), raising=False)
     monkeypatch.setattr(dex, "_require_shared_scratch", lambda _op: None)
+
+    def land(node, srcs, workers, hub, work_dir, source_id):
+        """Stand in for the real map stage: hand back a splittable scan of its output.
+
+        Without this the stubbed `_distributed_map` writes nothing, the scratch carries no
+        schema, and every staged shape declines — so the routing decision that matters, the
+        one made *after* the UDF prefix is landed, would never be reached. Returning a real
+        splittable source instead is what lets this file assert `map_batches(...).join(...)`
+        reaches `_distributed_join` rather than merely reaching the map stage.
+        """
+        cols = [name for name in node.available_columns() if name in LEFT.column_names]
+        table = LEFT.select(cols) if cols else LEFT
+        return dex.Scan(source_id, SchemaRef.from_arrow(table.schema)), _SplittableSource(table)
+
+    monkeypatch.setattr(dex, "_land_map_stage", land)
 
     def go(ds):
         from batcher._internal.errors import PlanError
@@ -359,3 +370,22 @@ def test_the_fixture_source_is_actually_splittable():
 
     assert _is_splittable_source(_SplittableSource(LEFT))
     assert SchemaRef.from_arrow(LEFT.schema) is not None
+
+
+#: The shapes whose route is worth naming rather than merely counting. A UDF prefix under a
+#: multi-operand breaker is staged and then dispatched, and the whole point of staging is
+#: that what runs afterwards is the *ordinary* distributed operator — with its shuffle, its
+#: broadcast decision, its skew handling and its spill. Asserting only "something routed"
+#: would pass if the staging quietly fell back to the map path and joined on the driver.
+STAGED_OPERAND_ROUTES: dict[str, str] = {
+    "asof_keyless": "_distributed_asof_keyless",
+    "map_then_join": "_distributed_join",
+    "join_of_two_mapped": "_distributed_join",
+    "map_then_union": "_distributed_union",
+    "map_then_join_then_agg": "_distributed_join_aggregate",
+}
+
+
+@pytest.mark.parametrize("name", sorted(STAGED_OPERAND_ROUTES))
+def test_a_udf_operand_is_staged_and_then_takes_the_real_operator(name, route):
+    assert route(SHAPES[name]()) == STAGED_OPERAND_ROUTES[name]

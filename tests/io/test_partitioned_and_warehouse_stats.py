@@ -68,14 +68,25 @@ def test_partitioned_statistics_reach_kyber_shortcuts(partitioned) -> None:
 
 
 def test_partitioned_large_dataset_skips_footer_sweep(partitioned, monkeypatch) -> None:
-    """Above the footer-plan ceiling the sweep is skipped (the driver would stall)."""
+    """Above the footer-plan ceiling nothing sweeps a footer per file — including the count.
+
+    This used to assert that ``row_count()`` "is still cheaply available" above the ceiling.
+    It is not: `pyarrow.dataset.count_rows` opens a footer per data file, which is the same
+    O(files) driver sweep the ceiling exists to refuse — a million object-store round trips
+    before a task launches. It now declines like every other O(files) path, and
+    `statistics()` answers with what it can state without the sweep.
+    """
     import batcher.io.formats.structured.parquet.dataset as mod
 
     monkeypatch.setattr(mod, "_MAX_FOOTER_PLAN_FILES", 0)
-    # With the ceiling at zero, no footer sweep runs, so full statistics decline...
-    assert ParquetDatasetSource(partitioned).statistics() is None
-    # ...but the exact row count is still cheaply available.
-    assert ParquetDatasetSource(partitioned).row_count() == 4
+    assert ParquetDatasetSource(partitioned).row_count() is None
+
+    stats = ParquetDatasetSource(partitioned).statistics()
+    assert stats is not None, "declining the sweep must not mean declining every fact"
+    assert stats.exact_rows is False, "nothing above the ceiling may pass as an exact count"
+    assert stats.byte_size and stats.byte_size > 0  # the listing already reported the sizes
+    assert "region" in stats.partition_keys  # the directory names cost nothing to read
+    assert stats.columns == {}, "a sampled bound is not provable, so none is published"
 
 
 # --- BigQuery __TABLES__ --------------------------------------------------------

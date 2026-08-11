@@ -13,6 +13,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import FormatError, SchemaError
+from batcher.io.base._bad_rows import bad_row_handler
 from batcher.io.formats.structured._csv_options.dtypes import (
     DATE_FORMATS,
     arrow_type,
@@ -43,6 +44,11 @@ class CSVReadOptions:
     date_columns: tuple[str, ...] = ()
     declared_schema: pa.Schema | None = None
     schema_overrides: tuple[tuple[str, pa.DataType], ...] = ()
+    #: What to do with a line whose field count disagrees with the header. Defaults to
+    #: aborting the read, which is pyarrow's behavior and the safe answer for a file you
+    #: just wrote; ``"skip"``/``"warn"`` drop the line instead, which is what a corpus at
+    #: scale needs. See `_csv_diagnostics.BadRowPolicy`.
+    on_bad_lines: str = "error"
 
     @property
     def range_safe(self) -> bool:
@@ -82,8 +88,14 @@ class CSVReadOptions:
             encoding=self.encoding,
         )
 
-    def parse_options(self) -> Any:
+    def parse_options(self, path: str = "", *, observe: bool = True) -> Any:
         """The pyarrow `ParseOptions` for this configuration.
+
+        Args:
+            path: The file about to be parsed, used only in the malformed-row warning so a
+                corpus read says which member the dropped line came from.
+            observe: Whether dropped rows are counted and announced. False for the
+                schema-inference pass, which meets the same rows the read will.
 
         Returns:
             The configured `pyarrow.csv.ParseOptions`.
@@ -97,6 +109,12 @@ class CSVReadOptions:
             kwargs["quote_char"] = self.quote_char
         if self.escape_char is not None:
             kwargs["escape_char"] = self.escape_char
+        # Built fresh per call rather than cached on the (frozen) options: the handler keeps
+        # a drop count, and one shared across every file of a corpus would report the corpus
+        # total against whichever file happened to trip the warning limit first.
+        handler = bad_row_handler(self.on_bad_lines, path, format_name="csv", observe=observe)
+        if handler is not None:
+            kwargs["invalid_row_handler"] = handler
         return pacsv.ParseOptions(**kwargs)
 
     def convert_options(
@@ -213,6 +231,11 @@ class CSVReadOptions:
             "false_values",
             "decimal_point",
             "try_parse_dates",
+            # Range-safe by construction: a field-count mismatch is a property of one line,
+            # and byte ranges are newline-aligned, so a line is whole inside exactly one
+            # range. Omitting it would make a distributed read of a corpus with a stray line
+            # fail where the single-node read of the same file succeeded.
+            "on_bad_lines",
         )
         return {k: v for k, v in self.as_kwargs().items() if k in keep}
 
@@ -248,7 +271,13 @@ def resolve_read_options(opts: dict[str, Any]) -> CSVReadOptions:
         if name in resolved:
             out[name] = tuple(resolved.pop(name))
     out.update(resolved)
-    return CSVReadOptions(**out)
+    options = CSVReadOptions(**out)
+    # Validate here rather than at parse time. `on_bad_lines="Skip"` would otherwise build a
+    # source, infer a schema and plan a query before the first byte-range worker raised, and
+    # under `on_error="skip"` the raise would be swallowed as an unreadable file — a typo in
+    # a tolerance flag turning into silent whole-corpus loss.
+    bad_row_handler(options.on_bad_lines)
+    return options
 
 
 def _dates(value: Any) -> dict[str, Any]:

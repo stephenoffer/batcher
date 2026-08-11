@@ -1,6 +1,6 @@
 # Kinesis
 
-`bt.read.kinesis(stream_name)` consumes an AWS Kinesis Data Stream as an unbounded `Dataset`,
+{py:meth}`bt.read.kinesis(stream_name) <batcher.api.io_namespace.reader.Reader.kinesis>` consumes an AWS Kinesis Data Stream as an unbounded {py:class}`Dataset <batcher.Dataset>`,
 over `boto3` and the classic `GetRecords` API. Read only. There is no Kinesis sink.
 
 | | |
@@ -194,8 +194,8 @@ Empty polls are normal. `GetRecords` returns an empty record list constantly on 
 the poll loop skips those and keeps going. An idle stream produces no batches. It is not an
 end-of-stream.
 
-`collect()` raises, because the source is unbounded. Use `iter_batches()` or a triggered
-write, or bound the read with `bt.Trigger.available_now()`.
+{py:meth}`collect() <batcher.Dataset.collect>` raises, because the source is unbounded. Use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` or a triggered
+write, or bound the read with {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>`.
 
 Records are bytes, and that includes KPL aggregation. Producers using the Kinesis Producer
 Library pack several user records into one Kinesis record inside a protobuf envelope. Batcher

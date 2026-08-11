@@ -58,15 +58,32 @@ def column_occurrence_counts(exprs: list[Expr]) -> dict[str, int]:
     return counts
 
 
-def referenced_columns(expr: Expr) -> set[str]:
+def referenced_columns(expr: Expr) -> frozenset[str]:
     """The set of input column names an expression reads.
 
-    Memoized on the (immutable) node: the projection/pushdown/fusion rules call this
-    on the same expressions across every fixpoint iteration, and it otherwise re-walks
-    the whole subtree each time. The result is used only as a read-only operand
-    (``need |= referenced_columns(e)``, ``<=``, ``in`` — verified: no caller mutates it),
-    so sharing the cached set is safe. `Expr` sets no `__slots__`, so every node has a
-    `__dict__` to cache in.
+    Memoized on the (immutable) node: the projection/pushdown/fusion rules call this on the
+    same expressions across every fixpoint iteration, and it otherwise re-walks the whole
+    subtree each time. `Expr` sets no `__slots__`, so every node has a `__dict__` to cache in.
+
+    **The result is a `frozenset` because the cache is shared by reference.** Every caller
+    gets the *same* object, so one in-place update rewrites what that expression is recorded
+    as reading, for every later reader, for the rest of the process. This used to be a
+    comment promising that no caller mutated it — a promise that was already false in this
+    very module, where `_referenced_columns_impl` seeded its accumulator from a child's
+    cached answer and then unioned the siblings into it.
+
+    The damage was not a bad estimate. `Project.__post_init__` validates its items with this
+    function, so a projection could be reported as reading a column it does not reference,
+    and TPC-DS q80 failed to plan with ``projection 'id' references unknown column(s)
+    ['store_id']``. Immutability makes that mechanical: `need |= referenced_columns(e)`
+    still works (it rebinds `need`), `<=`, `in` and iteration are unchanged, and an actual
+    in-place mutation is now an `AttributeError` at the offending line.
+
+    Args:
+        expr: The expression to inspect.
+
+    Returns:
+        The input column names it reads, as an immutable set.
     """
     if isinstance(expr, AggExpr):
         # An aggregate reached a scalar-expression context (select/with_columns/filter).
@@ -80,12 +97,12 @@ def referenced_columns(expr: Expr) -> set[str]:
     cached = expr.__dict__.get("_c_refcols")
     if cached is not None:
         return cached
-    cols = _referenced_columns_impl(expr)
+    cols = frozenset(_referenced_columns_impl(expr))
     expr.__dict__["_c_refcols"] = cols
     return cols
 
 
-def _referenced_columns_impl(expr: Expr) -> set[str]:
+def _referenced_columns_impl(expr: Expr) -> frozenset[str] | set[str]:
     # The set of columns an expression reads is the union of what its sub-expressions
     # read, and an `IRNode` already declares which of its fields are sub-expressions. So
     # this walks that declaration rather than enumerating node types: a per-type cascade

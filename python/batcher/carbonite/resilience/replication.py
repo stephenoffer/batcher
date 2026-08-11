@@ -34,6 +34,7 @@ def assign_replica_hosts(
     factor: int,
     dead: frozenset[int] | set[int] = frozenset(),
     suspect: frozenset[int] | set[int] = frozenset(),
+    preemptible: frozenset[int] | set[int] = frozenset(),
 ) -> dict[int, list[int]]:
     """Pick the workers that hold a replica of each source's shuffle output.
 
@@ -44,6 +45,15 @@ def assign_replica_hosts(
     onto one host. Returns at most `factor - 1` replicas per source, and fewer (or none)
     when the cluster is too small to place them — replication is an optimization, so a
     cluster that cannot host a copy degrades to the recompute path rather than failing.
+
+    The node is not the only failure domain, and on the fleet replication exists for it is
+    not the binding one. A spot reclamation takes an *instance group*, not a machine, so a
+    copy on a second spot node goes away in the same wave as the first and buys nothing —
+    which is precisely the case the `spot` resilience profile turns replication on for. A
+    non-preemptible candidate therefore outranks a preemptible one, below the off-node rule
+    and above the load tie-break. On a fleet that is entirely spot, or entirely on-demand, or
+    carries no market labels at all, every candidate ranks the same and the placement is
+    exactly what it was.
 
     Args:
         primaries: Source id → the worker index whose memory holds that source's output.
@@ -57,6 +67,8 @@ def assign_replica_hosts(
             are suspect there would be nowhere left to put a copy, and no replica at all is
             strictly worse than one on a shaky host. Ranked last instead, so they are used
             only when nothing healthier is available.
+        preemptible: Workers whose node is spot capacity. Deprioritized as replica hosts,
+            for the same reason and with the same "prefer, never exclude" rule as `suspect`.
 
     Returns:
         Source id → the worker indices holding a replica, excluding the primary.
@@ -99,10 +111,11 @@ def assign_replica_hosts(
     for worker in suspect:
         if worker in load:
             load[worker] += _SUSPECT_LOAD
+    spot = frozenset(preemptible)
     for src in sorted(primaries):
         primary = primaries[src]
         primary_node = nodes[primary] if primary < len(nodes) else None
-        out[src] = _pick_replicas(primary, primary_node, live, nodes, load, wanted)
+        out[src] = _pick_replicas(primary, primary_node, live, nodes, load, wanted, spot)
         for w in out[src]:
             load[w] += 1
     return out
@@ -115,6 +128,7 @@ def _pick_replicas(
     nodes: Sequence[str],
     load: dict[int, int],
     wanted: int,
+    preemptible: frozenset[int] = frozenset(),
 ) -> list[int]:
     """The workers holding one source's replicas: each in a fresh failure domain if possible.
 
@@ -135,8 +149,16 @@ def _pick_replicas(
         candidates = [w for w in live if w != primary and w not in chosen]
         if not candidates:
             break
-        # Rank: a node no copy is on yet, then the least-loaded worker, then the lowest
-        # index so a replay assigns the same hosts.
-        chosen.append(min(candidates, key=lambda w: (nodes[w] in used_nodes, load[w], w)))
+        # Rank: a node no copy is on yet, then durable capacity over spot, then the
+        # least-loaded worker, then the lowest index so a replay assigns the same hosts.
+        # Spot sits below the off-node rule because a same-node copy is useless outright,
+        # where a same-market copy is merely correlated; and above load because an evenly
+        # spread set of copies that all vanish together is not a spread set.
+        chosen.append(
+            min(
+                candidates,
+                key=lambda w: (nodes[w] in used_nodes, w in preemptible, load[w], w),
+            )
+        )
         used_nodes.add(nodes[chosen[-1]])
     return chosen

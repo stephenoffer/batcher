@@ -21,7 +21,7 @@ sales = bt.from_pydict(
 
 ## pivot: long to wide
 
-`pivot(index=, on=, values=, aggregate="sum")` groups by `index`, spreads the distinct
+{py:meth}`pivot(index=, on=, values=, aggregate="sum") <batcher.Dataset.pivot>` groups by `index`, spreads the distinct
 values of `on` into columns, and fills each cell with `aggregate(values)`.
 
 ```python
@@ -46,7 +46,7 @@ print(sales.pivot(index=["region"], on="quarter", values="amount", aggregate="me
 Omit `columns` and the engine runs an eager pass over `on` to discover the distinct
 values, before the real query even starts. On a large scan that is a second read of the
 data, and worse, it makes the output schema unpredictable: a month with no rows yet has
-no column, so a downstream `select("q3")` fails on Tuesday and works on Wednesday.
+no column, so a downstream {py:meth}`select("q3") <batcher.Dataset.select>` fails on Tuesday and works on Wednesday.
 :::
 
 Pass `columns=[...]` when you know the vocabulary. The pre-pass disappears, the schema
@@ -66,7 +66,7 @@ you get a stable schema by declaring it, and declaring it means owning it.
 :::{note}
 Mind the cardinality. `on` a column with 50,000 distinct values produces a 50,000 column
 table, and nothing in the API stops you. Pivot on a dimension with a small, known domain
-(quarter, status, country); for anything wider, keep it long and `group_by` it.
+(quarter, status, country); for anything wider, keep it long and {py:meth}`group_by <batcher.Dataset.group_by>` it.
 :::
 
 ## unpivot: wide to long
@@ -152,8 +152,8 @@ print(back.drop_nulls().sort("region", "quarter").to_pydict())
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the aggregate a pivot cell is built from.
 - {doc}`Transformations </user-guide/transform/rows/transformations>`: `explode` and `unnest`, the other two reshapers.
 - {doc}`SQL </user-guide/analyze/sql>`: the SQL surface. SQL `PIVOT` and `UNPIVOT` are *not* supported and raise
-  `NotImplementedError`. Reshaping goes through `ds.pivot(...)` and `ds.unpivot(...)`,
-  which you can call on the result of a `bt.sql(...)` query.
+  `NotImplementedError`. Reshaping goes through {py:meth}`ds.pivot(...) <batcher.Dataset.pivot>` and {py:meth}`ds.unpivot(...) <batcher.Dataset.unpivot>`,
+  which you can call on the result of a {py:func}`bt.sql(...) <batcher.sql>` query.
 - {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: the grouped hash
   aggregate a pivot cell is computed by.
 - {doc}`Time-series rollups </cookbook/analytics/aggregates/time-series-rollups>`: a wide report

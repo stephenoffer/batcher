@@ -75,6 +75,35 @@ def _pending_window(task_cpus: float = 1.0) -> int:
     return max(1, int(cores / share) * max(1, d.pending_window_factor))
 
 
+def _stall_diagnosis(task_cpus: float, outstanding: int) -> str | None:
+    """Why this barrier's outstanding tasks have not been placed, or `None`.
+
+    The map path sizes each task's CPU share from its own partition, so the ask that is
+    actually pending is `task_cpus` — not the ambient fleet envelope, which describes a
+    whole worker. The rest of the envelope (GPUs, the memory grant, a custom accelerator)
+    is still the fleet's, so it is folded in around that share.
+    """
+    try:
+        from batcher.dist.executors.ray_runtime.capacity import Demand, describe_pending_demand
+        from batcher.dist.executors.ray_runtime.scheduling import current_envelope
+
+        demand = Demand.from_envelope(current_envelope(), count=outstanding)
+        return describe_pending_demand(
+            Demand(
+                num_cpus=max(float(task_cpus), 1e-3),
+                num_gpus=demand.num_gpus,
+                memory_bytes=demand.memory_bytes,
+                resources=demand.resources,
+                count=outstanding,
+            )
+        )
+    except Exception as exc:  # a diagnostic must never be the thing that fails the query
+        from batcher._internal.logging import note_suppressed
+
+        note_suppressed("dist", "diagnose the stalled barrier", exc)
+        return None
+
+
 def gather_map_results(
     submit,
     n: int,
@@ -83,6 +112,7 @@ def gather_map_results(
     max_pending: int | None = None,
     on_lost=None,
     on_done=None,
+    sink=None,
     task_cpus: float = 1.0,
     budget=None,
 ) -> list:
@@ -118,6 +148,15 @@ def gather_map_results(
     using them — finishing hours later with whatever error happened to be last rather than
     with the first one, which said exactly what was wrong. When the budget is spent the next
     failure is raised with its own traceback instead of being retried.
+
+    `sink(idx, value)`, when given, **consumes each result as it lands** instead of the
+    barrier retaining it, and the returned list is all-`None`. That is what a caller whose
+    next step is a mergeable fold wants, and the difference is asymptotic rather than
+    tidiness: retaining every result makes the driver hold `W` partial states at once and
+    then fold them in a line *after* the barrier, so both its peak memory and a Θ(W) serial
+    tail grow with the cluster. Folding on arrival makes the peak one running state, and
+    hides the fold inside the map phase it overlaps — the same Θ(W) total work, off the
+    critical path. A `sink` that raises fails the stage, so it must be a pure accumulate.
 
     This is the map/inference analogue of the shuffle recompute loop
     (`ShuffleRecovery`): a stateless map partition has no published lineage, but it
@@ -173,13 +212,20 @@ def gather_map_results(
             waited = time.monotonic() - barrier_started
             if not finished and waited > STALL_WARN_AFTER_S * (stall_warnings + 1):
                 stall_warnings += 1
-                warn_barrier_stalled(waited, n)
+                warn_barrier_stalled(waited, n, _stall_diagnosis(task_cpus, len(inflight)))
             continue
         finished += 1
         ref = done[0]
         idx = inflight.pop(ref)
         try:
-            results[idx] = ray.get(ref)
+            value = ray.get(ref)
+            # Consumed on arrival, or retained — never both, so the driver's peak is the
+            # sink's running state rather than every partition's result at once.
+            if sink is not None:
+                sink(idx, value)
+            else:
+                results[idx] = value
+            del value
             if on_done is not None:
                 on_done(idx)
         except RayTaskError as exc:
@@ -226,7 +272,14 @@ def gather_map_results(
     return results
 
 
-def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None) -> tuple:
+def map_barrier(
+    sources: int,
+    launch,
+    policy=None,
+    dead: set[int] | None = None,
+    workers: int | None = None,
+    placement=None,
+) -> tuple:
     """Run a shuffle MAP barrier under worker-loss recovery. Returns `(results, dead)`.
 
     `launch(host, src)` must issue source `src`'s map-publish on actor `host` and return
@@ -234,6 +287,26 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
     Flight server the buckets landed on, or (for a sampling barrier) the sample itself.
     On a clean run every source maps to its own actor (`host == src`), so the returned
     `results[src]` is exactly the fleet's address list and behavior is unchanged.
+
+    **More sources than workers** (`workers` given and smaller than `sources`) is how a
+    shuffle decouples its task granularity from its node count. The barrier then keeps
+    exactly `workers` tasks in flight and hands each new source to whichever actor just
+    went idle, so the assignment is *dynamic*: a slow node takes fewer partitions instead
+    of holding the barrier open on the one oversized partition it was statically dealt,
+    and a lost worker's outstanding partitions are re-dealt across every survivor rather
+    than replayed whole onto one. `workers is None` (the default) means one source per
+    worker, which pins `host == src` and is byte-identical to the pinned behavior.
+
+    The generalization is safe because a source is identified by its `src` id, never by
+    the host that happens to compute it: the buckets are published under `(stage, src,
+    bucket)` tickets and the partition is a deterministic function of its durable
+    descriptor. That is the same property relocation already relied on, applied from the
+    first attempt rather than only after a death.
+
+    `placement` (a `SourcePlacement`), when given, is filled in with where each source
+    actually landed. The reduce stage needs it to answer "what did this worker's death
+    lose", and once the assignment is dynamic the barrier is the only thing that knows —
+    the answer is no longer the source id.
 
     `dead` seeds (and is mutated with) the known-lost workers, so a stage with several
     barriers — the sort's sample, then its range-publish — shares one view of the fleet
@@ -263,6 +336,8 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
     """
     from batcher._internal.errors import ResourceError
 
+    pinned = workers is None or workers >= sources
+    workers = sources if workers is None else workers
     ledger = node_ledger()
     if ledger is not None:
         # The fleet size the blast-radius cap is measured against. Without it the cap sees
@@ -298,9 +373,25 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
         rotation += 1
         return sorted(live)[rotation % len(live)]  # spread relocations, don't pile on one host
 
+    # Actors free to take the next source, in the order they went idle. Only consulted
+    # when there are more sources than workers; the pinned barrier never touches it.
+    idle: deque[int] = deque(range(workers))
+
+    def _next_idle() -> int:
+        while idle:
+            host = idle.popleft()
+            if host not in dead:
+                return host
+        # The pool is empty when every actor is busy or has failed without returning its
+        # slot (a transient task error frees no host). Falling back to any survivor keeps
+        # the barrier making progress; the window bounds how many pile onto it.
+        return _pick_live()
+
     def _submit(src: int):
-        host = src if src not in dead else _pick_live()
+        host = (src if src not in dead else _pick_live()) if pinned else _next_idle()
         assigned[src] = host
+        if placement is not None:
+            placement.relocate(src, host)
         return launch(host, src)
 
     def _on_lost(src: int) -> bool:
@@ -325,11 +416,24 @@ def map_barrier(workers: int, launch, policy=None, dead: set[int] | None = None)
 
     def _on_done(src: int) -> None:
         confirmed.add(assigned[src])
+        if not pinned and assigned[src] not in dead:
+            idle.append(assigned[src])  # this actor is free for the next source
         if ledger is not None:
             # The only evidence that clears a quarantine. Without recording successes the
             # ledger is a one-way record of everything that ever went wrong, and the fleet it
             # describes only ever shrinks.
             ledger.record_success(str(assigned[src]))
 
-    results = gather_map_results(_submit, workers, policy, on_lost=_on_lost, on_done=_on_done)
+    # An over-partitioned barrier runs exactly `workers` tasks at a time: the window IS the
+    # actor pool, so a completion both frees a host and releases the slot that refills it.
+    # A wider window would queue several sources behind one actor and give the assignment
+    # back to Ray's arrival order, which is the static dealing this exists to avoid.
+    results = gather_map_results(
+        _submit,
+        sources,
+        policy,
+        max_pending=None if pinned else workers,
+        on_lost=_on_lost,
+        on_done=_on_done,
+    )
     return results, dead

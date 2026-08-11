@@ -8,7 +8,7 @@ SQL query, or feed a DataFrame pipeline into SQL.
 {py:obj}`bt.sql <batcher.sql>` reads DuckDB syntax by default; pass `dialect=` to
 read another sqlglot dialect. For a reusable catalog of tables and Python functions,
 build a {py:obj}`bt.Session <batcher.Session>`, the DuckDB-connection / SparkSession
-analogue. `bt.sql` and `bt.register_function` use a shared default session.
+analogue. {py:func}`bt.sql <batcher.sql>` and {py:func}`bt.register_function <batcher.register_function>` use a shared default session.
 
 ```python
 import batcher as bt
@@ -43,13 +43,17 @@ A query may use:
 
 - `SELECT` with column references, scalar expressions, aggregates
 - `WHERE` filters
-- `GROUP BY` with `HAVING` (and `ROLLUP` / `CUBE` / `GROUPING SETS`)
-- `ORDER BY`, `LIMIT` / `OFFSET`
+- `GROUP BY` with `HAVING` (and `ROLLUP` / `CUBE` / `GROUPING SETS`, with `GROUPING()`
+  to tell a subtotal row from a real one)
+- `ORDER BY` (including `ORDER BY ALL`), `LIMIT` / `OFFSET`, and the ANSI
+  `FETCH FIRST n ROWS ONLY`
 - `INNER` / `LEFT` / `RIGHT` / `FULL` / `CROSS JOIN` (equi-keys; an extra non-equi
-  `AND` condition is applied as a filter)
+  `AND` condition is applied as a filter), `NATURAL JOIN`, and `ASOF JOIN`
 - `UNION` / `INTERSECT` / `EXCEPT`, `WITH` (CTEs), and subqueries
-- Window functions, including explicit `ROWS BETWEEN ...` frames
-- `CASE` expressions and `CAST`
+- Window functions over any expression, including a computed `PARTITION BY` / `ORDER BY` key such as `date_trunc('month', ts)`, with explicit `ROWS` / `RANGE` / `GROUPS` frames — including `RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING` for a time window
+- `CASE` expressions, `CAST`, and `SIMILAR TO`
+- `generate_series(a, b)` / `range(a, b)` in `FROM`, for a generated integer spine
+- `UNNEST`, in the `FROM` clause or written directly in the `SELECT` list
 
 You can also register Python functions and call them from SQL, and define tables and
 views with `CREATE`/`DROP`. See [Sessions and Python functions](#sessions-tables-and-python-functions).
@@ -155,16 +159,179 @@ print(s.sql("SELECT * FROM cheap ORDER BY price").to_pydict())
 # {'category': ['a', 'b'], 'price': [10.0, 20.0]}
 ```
 
-`ds.sql("... FROM self")` binds the current dataset directly:
+{py:meth}`ds.sql("... FROM self") <batcher.Dataset.sql>` binds the current dataset directly:
 
 ```python
 print(ds.sql("SELECT category FROM self WHERE price >= 50 ORDER BY price").to_pydict())
 # {'category': ['a', 'c']}
 ```
 
+A fitted model registers the same way, with {py:meth}`register_model <batcher.Session.register_model>`, and `ML_PREDICT` then scores a relation inside the query. The prediction is an ordinary column, so the rest of the statement filters, joins and aggregates over it without leaving SQL:
+
+```python
+from batcher.ml import LinearRegression
+
+train = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
+s.register_model("doubler", LinearRegression(features=["x"], target="y").fit(train))
+s.register("points", bt.from_pydict({"x": [5.0, 10.0]}))
+
+print(s.sql("SELECT COUNT(*) AS n FROM ML_PREDICT(points, doubler) WHERE prediction > 15").to_pydict())
+# {'n': [1]}
+```
+
+Scoring stays inside the plan, so the model runs where the data is rather than pulling rows back to the driver. A saved model can be named by quoted path instead of registering it first; see the {doc}`SQL API </api/relational/sql>`.
+
+## Matching each row to the nearest one
+
+`ASOF JOIN` matches every left row to the single nearest right row rather than to every
+row satisfying the condition. The `ON` splits into exact-match keys, written as
+equalities, and one nearest-match key, written as `>=` (look backward) or `<=` (look
+forward). It is how you attach the most recent quote to each trade, or the prevailing
+price to each event.
+
+```python
+trades = bt.from_pydict({"sym": ["A", "A", "B"], "ts": [5, 30, 12], "qty": [1, 2, 3]})
+quotes = bt.from_pydict({"sym": ["A", "A", "B"], "ts": [1, 20, 10], "bid": [9.0, 11.0, 7.0]})
+
+out = bt.sql(
+    "SELECT t.sym, t.ts, q.bid FROM t ASOF JOIN q "
+    "ON t.sym = q.sym AND t.ts >= q.ts ORDER BY t.sym, t.ts",
+    t=trades,
+    q=quotes,
+)
+print(out.to_pydict())
+# {'sym': ['A', 'A', 'B'], 'ts': [5, 30, 12], 'bid': [9.0, 11.0, 7.0]}
+```
+
+`ASOF JOIN` drops a left row that matches nothing; `ASOF LEFT JOIN` keeps it with NULL
+right columns.
+
+## Measuring the gap between two timestamps
+
+`date_diff(unit, start, end)` reports how many `unit` boundaries lie between two instants.
+The units run from `microsecond` through `year`, and both `DATE` and `TIMESTAMP` inputs
+work.
+
+```python
+import datetime as dt
+
+events = bt.from_pydict(
+    {
+        "opened": [dt.datetime(2024, 1, 1, 9, 55), dt.datetime(2024, 1, 1, 9, 0)],
+        "closed": [dt.datetime(2024, 1, 1, 10, 5), dt.datetime(2024, 1, 1, 9, 59)],
+    }
+)
+print(
+    bt.sql(
+        "SELECT date_diff('minute', opened, closed) AS mins,"
+        "       date_diff('hour', opened, closed) AS hrs FROM events",
+        events=events,
+    ).to_pydict()
+)
+# {'mins': [10, 59], 'hrs': [1, 0]}
+```
+
+Both rows above are worth reading twice, because they show the rule. `date_diff` counts
+**boundary crossings**, not elapsed time. The first row spans ten minutes and reports one
+hour, because a clock hour ticks over between 9:55 and 10:05. The second spans fifty-nine
+minutes and reports zero hours, because none does. If you want elapsed time instead,
+subtract the two timestamps and read the duration, or take the difference of
+`epoch(ts)` values.
+
+`week` is the one unit that does not follow that rule: DuckDB defines it as the number of
+whole seven-day spans, truncated toward zero, so a Thursday to the following Monday is `0`
+even though a calendar week boundary falls between them. Batcher matches DuckDB here.
+
+## Window functions over an expression
+
+A window function's argument is an ordinary expression, not only a column name, so a
+running total of a computed value or a conditional running count is written directly.
+`lag` and `lead` take a third argument that fills the rows whose offset falls outside
+the partition.
+
+```python
+sales = bt.from_pydict(
+    {"day": [1, 2, 3, 4], "price": [10.0, 20.0, 30.0, 40.0], "qty": [1, 2, 1, 3]}
+)
+
+out = bt.sql(
+    "SELECT day, "
+    "SUM(price * qty) OVER (ORDER BY day) AS revenue, "
+    "SUM(CASE WHEN qty > 1 THEN 1 ELSE 0 END) OVER (ORDER BY day) AS bulk_orders, "
+    "LAG(price, 1, 0.0) OVER (ORDER BY day) AS prev_price "
+    "FROM s ORDER BY day",
+    s=sales,
+)
+print(out.to_pydict())
+# {'day': [1, 2, 3, 4], 'revenue': [10.0, 50.0, 80.0, 200.0], 'bulk_orders': [0, 1, 1, 2], 'prev_price': [0.0, 10.0, 20.0, 30.0]}
+```
+
+The default fills only the rows that have no row at that offset. A NULL the column
+genuinely holds inside the partition stays NULL.
+
+## Duplicate output names
+
+SQL lets a `SELECT` list emit the same name twice, most often when a join projects a key
+from both sides. A Dataset is keyed by column name, so the second one is suffixed —
+`id`, then `id_1` — which is the same name DuckDB assigns when it has to make result
+names unique.
+
+```python
+left = bt.from_pydict({"id": [1, 2], "v": [10, 20]})
+right = bt.from_pydict({"id": [1, 2], "w": [7, 8]})
+
+out = bt.sql("SELECT l.id, r.id, l.v FROM l JOIN r ON l.id = r.id ORDER BY l.id", l=left, r=right)
+print(out.columns)
+# ['id', 'id_1', 'v']
+```
+
+## Requirements and limitations
+
+Constructs Batcher rejects rather than approximates. Each raises a clear error, because
+answering with a different row set and reporting success is the failure nothing
+downstream can detect.
+
+| Construct | Why, and what to write instead |
+|---|---|
+| `LIMIT n PERCENT`, `FETCH ... WITH TIES` | Both need a cardinality measured before the limit applies. Use a plain row count. |
+| `POSITIONAL JOIN` | Row position is not defined for a Batcher relation, which is morsel-parallel and may span nodes. Join on a key, or number both sides with `row_number() OVER (ORDER BY ...)` first. |
+| `ASOF JOIN` on a strict `>` or `<` | The nearest-match key is inclusive. Use `>=` or `<=`. |
+| A negative list-slice bound, `a[-2:]` | Counts back from the end in DuckDB; the underlying slice clamps to the start. Index from the front, or reverse the list first. |
+| A correlated subquery whose correlation is an inequality | An equality correlation decorrelates to a join and is supported; an inequality one is not. |
+| `time_bucket` with a width that doesn't divide a day evenly | Buckets start from the Unix epoch, DuckDB starts them from 2000-01-03, so a width such as `INTERVAL 2 DAY` would put every boundary on a different instant. Use a width that divides a day (`1 DAY`, `6 HOUR`, `15 MINUTE`), or `date_trunc` for calendar buckets. |
+| Two `UNNEST` calls in one `SELECT` list | SQL zips them into one relation. Unnest one list per query, or use `FROM t, UNNEST(...)` for each. |
+
+One construct succeeds and returns the same values under a **different type**. Adding a
+date-granular interval to a `DATE` keeps a `DATE`, where DuckDB and Postgres widen to
+`TIMESTAMP`:
+
+```python
+out = bt.sql("SELECT DATE '2024-01-01' + INTERVAL 1 DAY AS d")
+print(out.schema.field("d").type, out.to_pydict()["d"][0])
+# date32[day] 2024-01-02
+```
+
+Batcher widens only when the interval carries a time component, so `+ INTERVAL 2 HOUR`
+does give a `TIMESTAMP`. This matches Spark and keeps a date column usable as a date;
+cast explicitly if you need DuckDB's type. The row values are identical either way.
+
+Descending list sorts agree with DuckDB, NULLs included. `list_reverse_sort` lowers to
+`.list.sort_desc()`, which is a kernel of its own rather than `sort().reverse()` — ascending
+puts NULLs last, so reversing would lift them to the front, where DuckDB keeps them at the
+back. Both spellings return `[2, 1, NULL]` for `[1, NULL, 2]`.
+
+### Known divergences
+
+One construct returns a result that differs from DuckDB's, and it is tracked as a defect
+rather than intended behavior:
+
+| Construct | How it differs |
+|---|---|
+| `epoch_ms` and `to_timestamp(n, scale)` applied to a *column* | The literal forms build a timestamp, as DuckDB does. Given a column the same call reads an epoch count back out instead, because the construct-or-extract choice is made from the argument's syntax rather than its type. Use `to_timestamp(n)` for a second count, which is unambiguous and correct for columns. |
+
 ## See also
 
-- {doc}`SQL API </api/relational/sql>`: the `Session`, function registration, and the supported
+- {doc}`SQL API </api/relational/sql>`: the {py:class}`Session <batcher.Session>`, function registration, and the supported
   SQL surface.
 - {doc}`Expressions </user-guide/transform/columns/expressions>`: the DataFrame column language SQL lowers to.
 - {doc}`Joins </user-guide/analyze/joins>` and {doc}`Window functions </user-guide/analyze/window-functions>`: the relational

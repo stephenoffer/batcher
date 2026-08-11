@@ -144,11 +144,22 @@ def _stream(build, table, *, streaming: bool) -> pa.Table:
         set_config(prev)
 
 
+#: The join types `_build` can rebuild against the widened `BIG_RIGHT`.
+#:
+#: Named explicitly rather than derived by stripping the `join_` prefix. The prefix strip
+#: assumed every `join_*` key in the shared matrix is spelled `join_<how>`, and the moment
+#: byte-keyed cases (`join_inner_str`, ...) were added there it produced `how="inner_str"`
+#: and every one of them raised `unsupported join type`. Those cases join on a *string* key
+#: against their own right-hand table, so there is nothing here to widen: `BIG` already
+#: drives them past the sharding threshold, which is the property this module adds.
+_WIDENED_JOINS = ("inner", "left", "right", "full", "outer", "semi", "anti")
+
+
 def _build(op):
     """The small matrix's builder, with the join's build side widened to match `BIG`."""
     build, sql = UNORDERED_OPS[op]
-    if op.startswith("join_"):
-        how = op.removeprefix("join_")
+    how = op.removeprefix("join_")
+    if op.startswith("join_") and how in _WIDENED_JOINS:
         return (lambda d: d.join(bt.from_arrow(BIG_RIGHT), left_on="k", right_on="k", how=how)), sql
     return build, sql
 

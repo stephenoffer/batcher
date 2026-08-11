@@ -46,6 +46,13 @@ use crate::ops;
 /// (the same mergeable path the parallel executor uses): the combine of per-morsel
 /// partials equals one partial over the whole input, so the result is bit-identical to
 /// the sequential fold — only the core count changes. A single morsel stays sequential.
+///
+/// Which fold it runs is measured, not assumed, exactly as the single-node executor measures
+/// it (`agg_par`): a sample of morsels says whether the group-by reduces. When it does not,
+/// `combine` would re-hash nearly the whole partition to discover that almost every key is
+/// unique, so the mapper hash-partitions its own partition instead and the merge becomes a
+/// concat of key-disjoint partials. Both folds emit the same one partial-state batch and both
+/// are `combine`d again by the reducer, so this changes only how much work the mapper does.
 pub fn partial_aggregate(
     group_keys: &[ProjectionItem],
     aggregates: &[AggregateItem],
@@ -75,14 +82,53 @@ pub fn partial_aggregate(
     // across every core. `usable_cores` reads the actor's applied CPU affinity *and* the
     // cgroup CPU quota, which is what a Ray/K8s worker is actually limited by.
     let width = bc_arrow::usable_cores();
-    let partials: Vec<agg::Partial> = crate::par::pool_for(width)?.install(|| {
-        non_empty
+    let owned: Vec<RecordBatch> = non_empty.iter().map(|b| (*b).clone()).collect();
+    crate::par::pool_for(width)?.install(|| -> Result<RecordBatch, InterpError> {
+        let sample_n = crate::agg_par::sample_size(width, owned.len());
+        let sample: Vec<agg::Partial> = owned[..sample_n]
             .par_iter()
             .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
-            .collect::<Result<_, InterpError>>()
-    })?;
-    let merged = agg::combine(&partials, &funcs)?;
-    partial_to_batch(group_keys, &merged)
+            .collect::<Result<_, InterpError>>()?;
+        let sample_rows: usize = owned[..sample_n].iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = owned.iter().map(|b| b.num_rows()).sum();
+
+        // The mapper faces the same choice the single-node executor does, for the same
+        // reason: when the group-by does not reduce, `combine`ing the per-morsel partials
+        // re-hashes nearly the whole partition to discover that almost every key is unique.
+        // Partitioning the partition instead makes each bucket's partial final, so the merge
+        // is a concat. Nothing about the wire format changes — the mapper still emits one
+        // partial-state batch — and the reducer still combines across mappers, so this is a
+        // local scheduling choice, not a second semantics.
+        let width_of = match crate::agg_par::plain_key_columns(group_keys) {
+            Some(keys) if owned.len() >= 2 => {
+                crate::agg_par::width_from_sample(&sample, sample_rows, sample_n, total_rows)
+                    .map(|w| (keys, w))
+            }
+            _ => None,
+        };
+        let merged = match width_of {
+            Some((keys, parts)) => {
+                let disjoint = crate::agg_par::partitioned_partials(
+                    &owned, &keys, group_keys, aggregates, &agg_jit, parts,
+                )?;
+                // Key-disjoint by construction (see `partitioned_partials`), so the merge is
+                // a concat rather than a regroup.
+                agg::concat_disjoint(&disjoint)?
+            }
+            None => {
+                let mut partials = sample;
+                partials.par_extend(
+                    owned[sample_n..]
+                        .par_iter()
+                        .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, &agg_jit))
+                        .collect::<Result<Vec<_>, InterpError>>()?
+                        .into_par_iter(),
+                );
+                agg::combine(&partials, &funcs)?
+            }
+        };
+        partial_to_batch(group_keys, &merged)
+    })
 }
 
 /// Per-aggregate partial-state column count (mean keeps sum+count; var/stddev keep

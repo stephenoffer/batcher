@@ -21,7 +21,7 @@ The document nests two independent trees, each defined by one Rust type.
 
 `RelOp`, in `crates/bc-ir/src/lib.rs`, is the relational plan. Its serde attributes are `tag = "op"`, `rename_all = "snake_case"`, and `deny_unknown_fields`, so every node in the document announces itself with an `op` key holding a snake_case variant name. The fifteen variants are `scan`, `filter`, `project`, `aggregate`, `sort`, `limit`, `hash_join`, `asof_join`, `distinct`, `window`, `union`, `unnest`, `unpivot`, `row_id`, and `sample`.
 
-`Expr`, in `crates/bc-expr/src/lib.rs`, is the scalar expression tree carried inside `RelOp` nodes. It uses the same attributes with `tag = "e"`, and its variants include `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `is_not_null`, `is_nan`, `is_inf`, `case`, `str`, and `date`.
+{py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, in `crates/bc-expr/src/lib.rs`, is the scalar expression tree carried inside `RelOp` nodes. It uses the same attributes with `tag = "e"`, and its variants include `col`, `lit`, `binary`, `not`, `cast`, `is_null`, `is_not_null`, `is_nan`, `is_inf`, `case`, `str`, and `date`.
 
 :::{important}
 There is exactly one of each. The interpreter, the JIT, the runtime primitives, and the

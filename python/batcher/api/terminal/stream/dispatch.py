@@ -31,7 +31,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
-from batcher.api.terminal.stream.rebatch import _rebatch_exact
+from batcher.api.terminal.stream.rebatch import _rebatch_exact, _take
 from batcher.api.terminal.stream.static_join import (
     refuse_reason as static_join_refusal,
 )
@@ -252,8 +252,13 @@ def _iter_batches(
                 plan, _iter_streaming(plan.input, sources, None), batch_size
             )
             return
+        # A *keyed* dedup is deliberately not routed here. It is not a group-by — its
+        # surviving row carries columns the key does not determine — so the aggregate fold
+        # below cannot express it, and it falls through to the ordinary materializing path
+        # exactly as it did when it lowered to a window.
         if (
             isinstance(plan, (Aggregate, Distinct))
+            and not (isinstance(plan, Distinct) and plan.keys)
             and is_streamable(plan.input)
             and not core.has_map_batches(plan.input)
         ):
@@ -296,6 +301,16 @@ def _iter_batches(
 
             yield from stream_limit(plan, sources[0], batch_size, projection=_pushdown(plan))
             return
+        # The same limit over a `map_batches` pipeline. `core.streaming.stream_limit`
+        # cannot take it: it asks Kyber to lower the plan, and a UDF is Python. Scoring
+        # the first hundred events off an unfamiliar topic is how anyone smoke-tests a
+        # model against live data, and it answered "the plan must materialize" -- which a
+        # limit does not, and which named a breaker the caller had not written.
+        if isinstance(plan, Limit) and is_streamable(plan.input):
+            yield from _take(
+                _iter_streaming(plan.input, sources, None), plan.n, plan.offset, batch_size
+            )
+            return
 
     # Pipeline breakers (sort / join / window) over bounded sources stream their result
     # from the out-of-core bucket pipeline: the input is consumed to disk, then the
@@ -329,12 +344,12 @@ def _iter_batches(
             if supports_spilling_window(plan):
                 gen = stream_spilling_window(plan, sources)
             else:
-                from batcher.dist.window_stream import (
+                from batcher.dist.global_window import (
                     stream_spilling_global_window,
-                    supports_streaming_global_window,
+                    supports_ordered_bucket_offsets,
                 )
 
-                if supports_streaming_global_window(plan):
+                if supports_ordered_bucket_offsets(plan):
                     gen = stream_spilling_global_window(plan, sources)
         if gen is not None:
             for b in gen:
@@ -497,14 +512,31 @@ def _iter_streaming(
         from batcher.api.terminal.map_stream import max_map_workers, stream_windowed
         from batcher.config import active_config
 
+        # The row target is a *cap*, not the operating point: `stream_windowed` also flushes on
+        # a byte budget, and for ordinary (narrow) rows that is what binds. Sized so a window
+        # still holds at least one morsel per worker — the pool has to have something to fan
+        # across — but far enough above it that the fixed per-window cost is amortized instead
+        # of paid every 245,760 rows. Wide rows flush on bytes long before this.
         workers = max(1, max_map_workers(resident))
-        target_rows = workers * max(1, active_config().execution.morsel_rows)
+        morsel = max(1, active_config().execution.morsel_rows)
+        target_rows = max(workers * morsel, active_config().optimizer.target_rows_per_task)
 
         def run_window(window_batches):
             return core.execute_with_udfs(resident, [InMemorySource(window_batches)])
 
         try:
-            yield from stream_windowed(source, run_window, target_rows, batch_size)
+            # Read only the columns the pipeline needs. `collect()` has always done this
+            # (`kyber.required_columns_per_source`, via the UDF executor) and so has the
+            # relational branch below; the *streamed* map branch read the source whole. On a
+            # 31-column corpus whose `fn` declares four `input_columns` that is 27 columns
+            # decoded per window and discarded, measured at **4,425 ms against 733 ms for the
+            # same query collected** — the streaming API, which exists for inputs too large to
+            # collect, was the one paying for the widest read. An undeclared `fn` still yields
+            # `None` here and still reads everything, which is the only safe answer for a
+            # black box.
+            yield from stream_windowed(
+                source, run_window, target_rows, batch_size, projection=_pushdown(plan)
+            )
         finally:
             # `prebuild_factories` made this generator the models' owner, and `teardown_udf`
             # declines a prebuilt instance for exactly that reason — so without this a

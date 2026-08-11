@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from batcher.ml.cluster import KMeans, NearestCentroid
 from batcher.ml.compose import (
+    CalibratedClassifierCV,
     MultiOutputClassifier,
     MultiOutputRegressor,
     Pipeline,
@@ -219,6 +220,7 @@ __all__ = [
     "Binarizer",
     "BinaryEncoder",
     "BoxCoxTransformer",
+    "CalibratedClassifierCV",
     "Chain",
     "Clipper",
     "ColumnDropper",

@@ -24,11 +24,11 @@ runs, and you find out because a day of orders is missing.
 | Re-read the whole directory | nothing | cost grows with the table, forever |
 | `mtime > last_run` | the writer's clock | skew, and a file touched after you read it |
 | A JSON bookmark of processed paths | your own bookkeeping | two overlapping runs clobber it |
-| `files_incremental(state_dir=...)` | a durable set of paths already read | one writer per state directory |
+| {py:meth}`files_incremental(state_dir=...) <batcher.api.io_namespace.reader.Reader.files_incremental>` | a durable set of paths already read | one writer per state directory |
 
 ## The seen-file store
 
-`bt.read.files_incremental(path, format, state_dir=...)` keeps that bookkeeping for
+{py:meth}`bt.read.files_incremental(path, format, state_dir=...) <batcher.api.io_namespace.reader.Reader.files_incremental>` keeps that bookkeeping for
 you. Each read is one discovery pass: it lists `path`, subtracts the files already
 recorded in `state_dir`, reads only what is left, and records them. The store is a
 SQLite file (no service, no extra dependency), so it survives a process restart.
@@ -57,8 +57,8 @@ drop_file("2024-01-01T00.parquet", [1, 2])
 drop_file("2024-01-01T01.parquet", [2, 3])
 ```
 
-The source is unbounded (the directory keeps growing), so it will not `collect()`.
-Consume it with `iter_batches()`:
+The source is unbounded (the directory keeps growing), so it will not {py:meth}`collect() <batcher.Dataset.collect>`.
+Consume it with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`:
 
 ```python
 def arrivals():
@@ -206,4 +206,4 @@ preemption finishes the parts it did not write instead of starting over.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: the full reader surface.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: `merge`, `resume`, and the sink options.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>`: the transactional target and its commits.
-- {doc}`IO API reference </api/relational/io>`: `bt.read` and `ds.write` in full.
+- {doc}`IO API reference </api/relational/io>`: {py:obj}`bt.read <batcher.read>` and {py:obj}`ds.write <batcher.Dataset.write>` in full.

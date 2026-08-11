@@ -14,11 +14,15 @@ data-quality gate switched off.
 ``to_parquet(dir, partition_by=["k"])`` writes ``k`` into the directory *names*, and a
 plain file reader only ever reads files — so the obvious read-back returned every row and
 no ``k``. Nothing failed, the row count was right, and the result was indistinguishable
-from a correct read of a table that never had the column. DuckDB detects the layout and
-recovers the column; `read.parquet_dataset` is the reader here that does. The plain
-reader now warns rather than staying silent, because rerouting it would quietly discard
-the caller's `on_error`/`schema_mode`/`columns`/`n_rows`, which that reader accepts and
-the dataset reader does not — a second silent change to cover the first.
+from a correct read of a table that never had the column. That was first made *loud* (a
+`DataWarning` naming the missing columns) and is now simply fixed: `read.parquet` detects
+the layout and recovers the column, as DuckDB does with ``hive_partitioning=true`` and as
+the explicit `read.parquet_dataset` entry point already did.
+
+The tests below therefore pin the recovered *values* against DuckDB rather than the
+warning. The remaining warning tests are the negative ones — a flat directory, and a
+column that is present in the files as well as in the path, neither of which loses
+anything and neither of which may announce that it did.
 """
 
 from __future__ import annotations
@@ -77,14 +81,33 @@ def test_foreign_key_still_finds_every_real_orphan() -> None:
 
 
 # -------------------------------------------------------------- partition columns
-def test_partitioned_read_back_warns_instead_of_silently_losing_the_column(tmp_path) -> None:
-    """Write with `partition_by`, read it back the obvious way, and be told what is missing."""
+def test_partitioned_read_back_recovers_the_column_rather_than_losing_it(tmp_path) -> None:
+    """Write with `partition_by`, read it back the obvious way, and get the column back.
+
+    This used to assert a `DataWarning`: `bt.read.parquet` returned every row *without* the
+    partition column, because that column lives in the directory names rather than in any
+    file, and being told was better than losing it silently. The plain reader is now
+    partition-aware, so there is nothing to warn about — and what is worth pinning is the
+    recovery, not the notice. A test that waits for a warning passes just as happily when the
+    column is lost as when it is recovered, so it stops meaning anything once the gap closes.
+
+    Held against DuckDB reading the same layout with `hive_partitioning=true`, which is the
+    same claim `test_the_partition_aware_reader_recovers_the_column_like_duckdb` makes for
+    the explicit `read.parquet_dataset` entry point.
+    """
+    duckdb = pytest.importorskip("duckdb")
     bt.from_pydict({"k": ["a", "b"], "v": [1, 2]}).to_parquet(str(tmp_path), partition_by=["k"])
-    with pytest.warns(DataWarning, match="partition columns"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DataWarning)  # nothing is lost, so nothing is announced
         got = bt.read.parquet(str(tmp_path)).to_pydict()
-    # The warning describes what actually happened: every row, without `k`.
-    assert sorted(got["v"]) == [1, 2]
-    assert "k" not in got
+    expected = (
+        duckdb.connect()
+        .execute(
+            f"select v, k from read_parquet('{tmp_path}/**/*.parquet', hive_partitioning=true)"
+        )
+        .fetchall()
+    )
+    assert sorted(zip(got["v"], got["k"], strict=True)) == sorted(expected)
 
 
 def test_the_partition_aware_reader_recovers_the_column_like_duckdb(tmp_path) -> None:

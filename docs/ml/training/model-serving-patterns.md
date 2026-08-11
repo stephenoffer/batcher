@@ -65,7 +65,7 @@ When the model lives elsewhere, pick the adapter for the backend that holds it.
 | `triton_client(...)` | NVIDIA Triton |
 | `torchserve_client(...)` | TorchServe |
 | `serve_deployment(...)` | A Ray Serve deployment |
-| `serving_udf(connect, ...)` | Your own `ServingClient` |
+| `serving_udf(connect, ...)` | Your own {py:class}`ServingClient <batcher.ml.ServingClient>` |
 
 The adapter sends a **batch** per request, not a row. That is the whole reason the
 pattern is viable. Ten million rows at `batch_size=64` is 156,000 requests instead of ten
@@ -87,7 +87,7 @@ Writing your own adapter means implementing `ServingClient` and handing `serving
 
 The problem with a single map stage doing decode-then-forward is that both wait on each
 other. The CPU decodes batch *n+1* only after the GPU finishes batch *n*.
-`run_pipeline` chains `Stage`s with credit-based backpressure, so each stage runs while
+`run_pipeline` chains {py:class}`Stage <batcher.ml.Stage>`s with credit-based backpressure, so each stage runs while
 the next one is still working. No stage can run ahead far enough to blow up memory,
 because credits bound the queue between them.
 
@@ -129,7 +129,7 @@ control the engine's shuffle uses.
 
 ## Adaptive batching with InferencePool
 
-`InferencePool` sits underneath the `infer` path and is worth reaching for directly when
+{py:class}`InferencePool <batcher.ml.InferencePool>` sits underneath the `infer` path and is worth reaching for directly when
 you are driving the stream yourself, in a serving process or a custom loop. It keeps
 workers alive, so the factory runs once per worker and the model loads once, and it
 *rebatches* the incoming stream to a target size. That is the difference between feeding
@@ -187,7 +187,7 @@ it is. Find your situation below:
 
 | Situation | Reach for |
 | --- | --- |
-| A batch job, model you can schedule | `ds.ml.infer(ModelClass, num_gpus=…)` |
+| A batch job, model you can schedule | {py:meth}`ds.ml.infer(ModelClass, num_gpus=…) <batcher.api.dataset.ml.DatasetML.infer>` |
 | Model owned by another team or another cluster | `http_client`, `triton_client`, or `serve_deployment` |
 | CPU preprocessing starving a GPU stage | `run_pipeline` with `Stage` credits |
 | You are driving the stream, and want adaptive batching | `InferencePool` |

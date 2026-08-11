@@ -54,6 +54,12 @@ _MIN_TASK_CPU = max(0.01, float(os.environ.get("BATCHER_MIN_TASK_CPU", "0.125"))
 # How much heavier a per-batch UDF / inference stage is per row than a plain scan/filter.
 # A `map_batches` partition gets this many times the CPU a same-sized scan would — the
 # plan-level compute-skew factor (data skew is handled per-partition by `descriptor_rows`).
+#
+# **The CPU a partition reserves, and nothing else.** It was also multiplied into the
+# *partition count*, which made every task four times smaller for no gain — a task's
+# intra-task `num_workers` is derived from this same share, so the wider task runs the UDF
+# just as many ways, and it does so with a quarter of the per-task overhead. Measured 1.4-2.0x
+# slower the other way; see `_adaptive_partition_count`. Keep it out of the count.
 _MAP_COMPUTE_WEIGHT = max(1.0, float(os.environ.get("BATCHER_MAP_COMPUTE_WEIGHT", "4.0")))
 # Hard ceiling on the per-actor submit-ahead depth (partitions an inference actor keeps in
 # flight). Single source in the neutral `_internal.hardware`, shared with the ML autobatcher
@@ -521,9 +527,11 @@ def _evict_pipeline_pools(plan0, registry: dict) -> None:
     _unpin_pool_keys(keys)
 
 
-def _map_resources(plan: LogicalPlan) -> tuple[float, bool, object, str | None]:
-    """GPU reservation, whether an actor pool is needed, its size spec, and the
-    accelerator type to pin GPU actors/tasks to.
+def _map_resources(
+    plan: LogicalPlan,
+) -> tuple[float, bool, object, str | None, dict[str, float]]:
+    """GPU reservation, whether an actor pool is needed, its size spec, the accelerator type
+    to pin GPU actors/tasks to, and the custom Ray resources the fused stages ask for.
 
     The size spec is an `int` (fixed pool), a ``(min, max)`` tuple (autoscale to the
     workload), or `None` (default to the worker count)."""
@@ -633,6 +641,11 @@ def _distributed_map(
     partitions = partition_descriptors(
         sources[sid], n_parts, projection=proj, predicate=pred, preserve_order=preserve_order
     )
+    if write_spec is not None:
+        # A `num_files` layout names a total across the whole write, so each shard needs to
+        # know how many shards it is one of before it can take its share of that budget.
+        # Only knowable here, where the partition count is decided.
+        write_spec = {**write_spec, "shards": len(partitions)}
 
     opts = _gpu_options(num_gpus, accelerator_type, resources)
     if wants_pool:
@@ -706,6 +719,8 @@ def _distributed_map(
         # risk or the cluster is large enough that DEFAULT's balancing suffices. On a
         # heterogeneous cluster this also keeps a CPU-only map fleet off GPU nodes.
         sched = _map_scheduling_options(env, shares)
+        plan_ref = _shared_arg(plan0)
+        cfg_for = _engine_config_cache()
 
         def _launch(idx):
             # Intra-task workers = this task's own CPU share (>=1); cluster-wide
@@ -725,7 +740,7 @@ def _distributed_map(
             # takes this branch because it wants no actor pool) back behind the CPU
             # reservation the zero exists to escape.
             return _map_udf_task.options(**{"num_cpus": shares[idx], **opts, **sched}).remote(
-                plan0, partitions[idx], workers, engine_config_json(shares[idx]), write_spec, idx
+                plan_ref, partitions[idx], workers, cfg_for(shares[idx]), write_spec, idx
             )
 
         # `task_cpus` is the smallest share any of these tasks asks for, so the
@@ -763,6 +778,62 @@ def _distributed_map(
     from batcher.io.schema.evolution import reconcile_batches
 
     return pa.Table.from_batches(reconcile_batches(batches))
+
+
+def _shared_arg(value):
+    """`value` as one object-store entry every task of this stage shares, not per-task bytes.
+
+    A Ray task argument is serialized **once per `.remote()` call**. The map plan is the same
+    object for every partition and it is not small — it carries the cloudpickled UDF, which for
+    an ML stage closes over a tokenizer, a config, or a model handle. So the driver paid a full
+    pickle of it per partition, on the one thread that also has to submit every task: measured
+    at 128 partitions on this cluster, 233 ms of a 2,244 ms query (10%) went into submission
+    alone, and that term is linear in the fan-out. The byte-bounded partitioning above
+    deliberately produces *thousands* of partitions on a large scan, where the same term would
+    dominate the query outright.
+
+    Putting it once hands every task a reference instead: one serialization, one object-store
+    copy fetched at most once per node, and Ray dereferences it into the task's argument so no
+    task body changes. Falls back to the value itself if `ray.put` is unavailable (a stubbed
+    Ray in a unit test), which is exactly the previous behaviour.
+
+    **The size of the payload is the whole justification, so do not extend this to the shuffle
+    map barrier**, which passes a JSON `map_ir` per source rather than a pickled UDF. Measured
+    on this cluster at 512 submissions of a 210-byte argument: by-value 95 / 123 / 69 ms
+    against by-reference 87 / 124 / 91 ms over three alternating rounds — indistinguishable.
+    A first, unrepeated measurement showed 201 ms against 71 ms and looked like a 2.8x win; it
+    was the first batch of submissions paying one-time costs, and running the two orders
+    alternately is what showed it. The win here is real because a cloudpickled tokenizer is
+    orders of magnitude larger, not because `.remote()` dislikes arguments.
+    """
+    try:
+        import ray
+
+        return ray.put(value)
+    except Exception as exc:  # pragma: no cover - an optimization, never a requirement
+        note_suppressed("dist", "share the map plan through the object store", exc)
+        return value
+
+
+def _engine_config_cache():
+    """A memoized `engine_config_json(share)` for one stage's task submissions.
+
+    The map path sizes each task's CPU grant from its own partition, so the config has to be
+    rebuilt per *distinct share* — but not per *task*. `engine_config_json` re-serializes the
+    active config and round-trips it through `json.loads`/`json.dumps` on every call, and the
+    shares repeat heavily (every same-sized partition asks for the same grant; on a balanced
+    scan they are all identical). Caching within the stage keeps the config exactly as
+    per-task-correct as before while paying for it once per distinct value.
+    """
+    cache: dict[float, str] = {}
+
+    def cfg_for(share: float) -> str:
+        cached = cache.get(share)
+        if cached is None:
+            cached = cache[share] = engine_config_json(share)
+        return cached
+
+    return cfg_for
 
 
 def _record_source_rows(hub, source, rows: int) -> None:
@@ -949,11 +1020,49 @@ def _scan_pushdown(plan0: LogicalPlan) -> tuple[list[str] | None, dict | None]:
 def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
     """How many tasks to split a map/scan source into — data- and compute-driven.
 
-    `ceil(total_rows x compute_weight / rows_per_cpu)`, clamped to `[1, cluster_cores]`
-    and to the number of splits. So a tiny source runs as a few (even one) tasks while a
-    large one fans out to ~one task per core — and a per-batch UDF (weight > 1), being
-    single-threaded per task, fans out to MORE tasks (the way to parallelize it) rather
-    than reserving idle cores on fewer tasks.
+    Two independent terms, taken as a **maximum**, because they answer different questions
+    and only one of them may be traded away for the other:
+
+    * *Parallelism* — `ceil(total_rows / rows_per_cpu)`, clamped to the cluster's core count.
+      A tiny source runs as a few (even one) tasks; a large one fans out until a task holds
+      about `rows_per_cpu` rows. More tasks than cores buys nothing, so the clamp is right.
+    * *Memory* — `_byte_partition_count`, the count that holds one task's input to
+      `target_bytes_per_task`. This one is a **bound, not a preference**, and the core clamp
+      must not apply to it. It used to: `min(max(rows_term, bytes_term), cluster_cores)`
+      discarded the byte term for any source bigger than `cores x target_bytes_per_task`,
+      which is precisely the range it exists for. A 1 TB scan on this 128-core cluster asked
+      for 4,096 partitions and got 128 — **8 GiB per task against a 256 MiB budget, growing
+      linearly with the data**. That is not a slow query; it is an OOM, and it arrives exactly
+      when the shape the byte term was added for (a wide multimodal scan) gets large.
+
+    `min(n, len(splits))` still caps both: a task with no split to read is not a task.
+
+    **Neither compute weight belongs in this count** — not `_MAP_COMPUTE_WEIGHT` and not the
+    learned CPU factor. Both describe how *heavy* a row is, which decides how much CPU a task
+    should reserve (`_adaptive_task_cpus`), not how many tasks there are. Multiplying the count
+    by them instead made every task correspondingly *smaller*, and the two errors compounded:
+    the learned factor's [0.25, 1.0] range cancelled the fixed 4.0 outright, so a map measured
+    as IO-bound quietly ran a quarter of the tasks next run.
+
+    Fewer, wider tasks are also simply faster here, which is the part that is easy to get
+    backwards. The old docstring justified the multiplier by claiming a per-batch UDF is
+    "single-threaded per task" — but `_map_udf_task` sets its intra-task `num_workers` from
+    the very CPU share this weight inflates, so a 4-core task runs the UDF four ways. The two
+    arrangements buy the same total threads; one buys them with a quarter of the dispatch,
+    descriptor decoding, engine setup and worker acquisition. Measured on this cluster over
+    64 M rows, best of three, wall-clock:
+
+    | UDF cost/row | 32 tasks x 4 CPU | 64 x 2 | 128 x 1 |
+    |---|--:|--:|--:|
+    | light   |   **532 ms** |   884 ms |  524 ms |
+    | medium  |   **642 ms** | 1,158 ms | 1,215 ms |
+    | heavy   | **1,554 ms** | 2,157 ms | 2,047 ms |
+
+    and a GIL-bound pure-Python UDF — the case where intra-task *threads* cannot help and the
+    multiplier looked most justified — preferred fewer tasks hardest of all (730 ms at 8 tasks
+    against 1,787 ms at 32), because a wider task also gets a wider `map_batches` process pool.
+    Dropping the multiplier lands this workload on 32 tasks of 4 CPUs, which is the winning
+    column at every weight.
 
     When the source's row total isn't cheaply known from a footer, a *measured* total row
     count learned from a prior run of the same source (`learned_partition_rows`) seeds the
@@ -962,7 +1071,6 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
     import math
 
     from batcher.config import active_config
-    from batcher.core.udf import has_map_batches
     from batcher.dist.adaptive_sizing import learned_partition_rows
 
     total = _source_total_rows(source)
@@ -971,12 +1079,10 @@ def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:
             total = learned_partition_rows(_learning_hub(hub), source.identity())
     if total is None:
         return fallback
-    weight = _MAP_COMPUTE_WEIGHT if has_map_batches(plan) else 1.0
-    weight *= _learned_weight_factor(plan, hub)
     rows_per_cpu = max(1, active_config().optimizer.target_rows_per_task // 2)
-    want = math.ceil((total * weight) / rows_per_cpu)
-    want = max(want, _byte_partition_count(source, plan, total, hub))
-    n = max(1, min(want, int(_cluster_cores())))
+    by_rows = math.ceil(total / rows_per_cpu)
+    n = max(1, min(by_rows, int(_cluster_cores())))
+    n = max(n, _byte_partition_count(source, plan, total, hub))
     with contextlib.suppress(Exception):
         n = min(n, max(1, len(source.splits())))  # never more tasks than splits
     return n
@@ -1090,7 +1196,8 @@ def stream_distributed_map(plan: LogicalPlan, sources: list[Source], workers: in
     partitions = partition_descriptors(sources[sid], workers, projection=proj, predicate=pred)
     opts = _gpu_options(num_gpus, accelerator_type, resources)
     task = _map_udf_task.options(**opts) if opts else _map_udf_task
-    pending = [task.remote(plan0, p) for p in partitions]
+    plan_ref = _shared_arg(plan0)  # one object-store copy for the stage — see `_shared_arg`
+    pending = [task.remote(plan_ref, p) for p in partitions]
     # Collect one finished partition at a time so the driver holds a single partition's
     # output, not the whole result — the bounded-memory way to pull a large scan.
     while pending:
@@ -1447,6 +1554,26 @@ def _prebuild_factories(node: LogicalPlan) -> LogicalPlan:
     return prebuild_factories(node)
 
 
+def _sustained_utilization():
+    """A utilization window for one resident actor, sampled on a timer.
+
+    Every resident stage actor — the terminal `_MapActor` here and the middle
+    `RelayActor` in `dist.streaming.relay` — needs the same window, for the same
+    reason (see `SustainedUtilization`: a post-forward reading calls a 13%-busy stage
+    86% busy, which holds the packing and submit-depth levers shut).
+
+    It is a function rather than a second `from batcher.ml.gpu import ...` at the
+    relay's call site because that import is one of the six ratcheted `dist -> ml`
+    exemptions in `pyproject.toml`. The class belongs in `interop`, and moving it
+    there needs a GPU and a recorded `gpu_shadow_verify` run
+    (`.claude/rules/device-tier.md`); until then the edge stays at the sites already
+    recorded rather than growing a seventh.
+    """
+    from batcher.ml.gpu import SustainedUtilization
+
+    return SustainedUtilization()
+
+
 def _lazy_partition_source(partition: dict):
     """A lazy `IteratorSource` over a partition descriptor, or None if it is empty.
 
@@ -1490,8 +1617,6 @@ class _MapActor:
         # Build the (class) UDFs locally, once — the model load happens here. The pool's
         # size is the parallelism, so each actor runs its UDF serially (workers=1) rather
         # than spawning a full-width intra-actor pool that would oversubscribe the node.
-        from batcher.ml.gpu import SustainedUtilization
-
         self._plan = _with_inference_workers(_prebuild_factories(plan0))
         self._write_spec = write_spec
         self._gpu_vram_max: float | None = None
@@ -1500,7 +1625,7 @@ class _MapActor:
         # after a forward pass reads the device at its busiest, which reported 86% for a stage
         # whose true sustained figure was 13%, and that is above every threshold the packing
         # and submit-depth levers trigger on. The measurement held its own fix shut.
-        self._util = SustainedUtilization()
+        self._util = _sustained_utilization()
 
     def run(self, partition: dict, idx: int = 0):
         from batcher import core
@@ -1670,13 +1795,27 @@ def _write_udf_output(batches: list, write_spec: dict, idx: int) -> list:
     (`_map_udf_task`) so a distributed inference write has exactly one write semantics.
     The shard name is deterministic (`part-{idx}`), so a partition recomputed after a
     preemption overwrites its own partial file rather than orphaning it.
+
+    The spec's `layout` is resolved here, against this shard's own rows: a batch-inference
+    write is the case where the driver has *never* seen the output, so the row cap behind
+    `repartition(num_files=...)` / `repartition(target_size_mb=...)` can only be computed
+    on the worker. `resume` likewise has to arrive here to mean anything.
     """
+    from batcher.dist.executors.write import _shard_rows_per_file
     from batcher.io.sink import SINKS
 
     table = pa.Table.from_batches(batches)
     sink = SINKS.get(write_spec["fmt"])(**(write_spec.get("sink_kwargs") or {}))
+    layout = write_spec.get("layout")
+    if layout is not None:
+        layout = layout.for_shard(idx, int(write_spec.get("shards", 1)))
     return sink.write_partitioned(
-        table, write_spec["path"], partition_by=write_spec.get("partition_by"), file_index=idx
+        table,
+        write_spec["path"],
+        partition_by=write_spec.get("partition_by"),
+        file_index=idx,
+        resume=bool(write_spec.get("resume", False)),
+        max_rows_per_file=_shard_rows_per_file(table, layout),
     )
 
 
@@ -1752,20 +1891,44 @@ def _distributed_map_aggregate(above, agg, sources, workers):
     # placement resolves SPREAD vs locality-aware DEFAULT against the live cluster.
     shares = _adaptive_task_cpus(partitions, agg.input)
     sched = _map_scheduling_options(current_envelope(), shares)
+    # One object-store copy of the map prefix for the whole stage — see `_shared_arg`.
+    plan_ref = _shared_arg(map_plan)
 
     def _launch(idx):
         workers = max(1, round(shares[idx]))
         return _map_agg_task.options(num_cpus=shares[idx], **sched).remote(
-            map_plan, partitions[idx], gk, aj, workers
+            plan_ref, partitions[idx], gk, aj, workers
         )
 
-    partials = gather_map_results(
-        _launch, len(partitions), task_cpus=min(shares) if shares else 1.0
+    # Fold each partition's partial into a running state **as it lands**, rather than
+    # holding all of them and folding after the barrier. `combine` is associative and
+    # commutative, so the running fold is the same state; what changes is that the driver's
+    # peak is one partial instead of `partitions` of them, and the Θ(partitions) fold
+    # overlaps the map phase instead of forming a serial tail behind it — the term that
+    # would otherwise grow as the cluster does.
+    #
+    # The fold is in **arrival** order, where the gathered list was in partition order, and
+    # that is a deliberate trade rather than an oversight: it puts a float reduction's
+    # summation order under the scheduler, so a sum can move in its last bits between two
+    # runs over the same data. That is the reassociation the distributed contract already
+    # allows (partition count moves it too, and `bc-runtime`'s Neumaier compensation is what
+    # bounds it either way) — but it was previously only *across* configurations, and here
+    # it is also within one. Integer and min/max/count aggregates are unaffected; a caller
+    # needing bit-repeatable float sums has the same recourse it always had, which is to fix
+    # the partition count.
+    running: list = [None]
+
+    def _fold(_idx, partial):
+        if partial is None:
+            return
+        running[0] = partial if running[0] is None else nat.combine(gk, aj, [running[0], partial])
+
+    gather_map_results(
+        _launch, len(partitions), task_cpus=min(shares) if shares else 1.0, sink=_fold
     )
-    flat = [p for p in partials if p is not None]
-    if not flat:
+    if running[0] is None:
         table = _empty_agg_table(agg)
     else:
-        out = nat.combine_finalize(gk, aj, flat)
+        out = nat.combine_finalize(gk, aj, [running[0]])
         table = pa.Table.from_batches([out]) if out is not None else _empty_agg_table(agg)
     return table if not above else _apply_above(above, table)

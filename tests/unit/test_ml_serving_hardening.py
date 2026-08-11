@@ -195,6 +195,26 @@ def test_serving_udf_keeps_a_single_request_when_the_batch_fits() -> None:
     assert seen == [8]
 
 
+def test_serving_udf_replaces_an_output_column_the_batch_already_has() -> None:
+    """An echoed or re-scored column must replace, not append beside itself.
+
+    Arrow permits duplicate field names, so appending produced a batch carrying two columns
+    of one name — `to_pydict()` keeps the last, expressions resolve the first, and nothing
+    raises. The model-id inference path already replaced in place; this one did not.
+    """
+
+    class _Client:
+        def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+            return {"x": inputs["x"] * 2, "y": inputs["x"] + 1}
+
+    udf = serving_udf(lambda: _Client(), input_columns=["x"], output_columns=["x", "y"])()
+    out = udf(_batch(4))
+
+    assert out.schema.names == ["x", "id", "y"]  # x replaced in place, y appended
+    assert out.column("x").to_pylist() == [0, 2, 4, 6]
+    assert out.column("y").to_pylist() == [1, 2, 3, 4]
+
+
 # --- 3. every serving client retries, with jittered backoff -------------------
 
 
@@ -727,3 +747,35 @@ def test_serving_accepts_a_numeric_input_column():
     udf = serving_udf(lambda: _Client(), input_columns=["x"], output_columns=["out"])()
     out = udf(pa.record_batch({"x": [1, 2, 3]}))
     assert out.column("out").to_pylist() == [2, 4, 6]
+
+
+def test_serving_udf_closes_the_backend_connection_when_the_worker_is_done() -> None:
+    """`close` is the teardown contract, and it is looked for on the UDF instance.
+
+    Without one, a client holding a real connection (a Triton HTTP pool or gRPC channel, a
+    database handle) was released only whenever the garbage collector reached it, so two
+    serving stages run back to back held both generations of connections at once.
+    """
+    closed: list[int] = []
+
+    class _Client:
+        def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+            return {"y": inputs["x"] * 2}
+
+        def close(self) -> None:
+            closed.append(1)
+
+    udf = serving_udf(lambda: _Client(), input_columns=["x"])()
+    udf(_batch(4))
+    assert not closed  # not released while the worker is still serving batches
+    udf.close()
+    assert closed == [1]
+
+
+def test_serving_udf_close_is_a_no_op_for_a_client_that_needs_no_teardown() -> None:
+    class _Client:
+        def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+            return {"y": inputs["x"]}
+
+    udf = serving_udf(lambda: _Client(), input_columns=["x"])()
+    udf.close()  # must not raise

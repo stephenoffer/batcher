@@ -44,6 +44,7 @@ import weakref
 from statistics import median
 
 from batcher._internal.logging import note_suppressed
+from batcher._internal.mathx import is_concentrated
 from batcher.config import Config, active_config
 from batcher.metadata import MetadataHub
 from batcher.plan.feedback import oversubscribed
@@ -74,10 +75,10 @@ _CLASS_TO_TAG: dict[str, str] = {
 }
 
 # Per-hub memo of the learned utilization map, keyed weakly by the hub (a dropped hub
-# evicts its entry). Value is `(hub.version, min_samples, util_by_tag)`: reused while
-# the hub has absorbed no new feedback, so planning doesn't re-scan the whole op_stats
-# history on every optimize (the calibration loop caches the same way).
-_CPU_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, int, dict[str, float]]] = (
+# evicts its entry). Value is `(hub.version, (min_samples, machine class), util_by_tag)`:
+# reused while the hub has absorbed no new feedback, so planning doesn't re-scan the whole
+# op_stats history on every optimize (the calibration loop caches the same way).
+_CPU_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, dict[str, float]]] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -96,30 +97,36 @@ _MAX_REL_SPREAD = 1.0
 _SMOOTH_ALPHA = 0.5
 
 
-def _is_confident(xs: list[float]) -> bool:
-    """Whether utilization samples `xs` are concentrated enough to trust their median.
-
-    A single sample is trivially confident; otherwise the spread must be within
-    ``_MAX_REL_SPREAD`` of the median. Constant samples (spread 0) always pass.
-    """
-    if len(xs) <= 1:
-        return True
-    med = median(xs)
-    return med <= 0.0 or (max(xs) - min(xs)) <= _MAX_REL_SPREAD * med
-
-
 def class_ir_tag(class_name: str) -> str | None:
     """The native metrics `kind` tag for a `LogicalPlan` class name, if measured."""
     return _CLASS_TO_TAG.get(class_name)
 
 
-def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) -> dict[str, float]:
+def load_cpu_utilization(
+    hub: MetadataHub | None,
+    config: Config | None = None,
+    hw_fingerprint: str | None = None,
+) -> dict[str, float]:
     """Median measured CPU utilization per operator `kind` tag from the hub.
 
     Returns an empty map when there is no hub, no measured CPU data, or no family
     with enough samples — so a cold metadata store leaves the static priors in place.
     Only positive utilizations count (0.0 is the "unmeasured" sentinel from an engine
     that reports no CPU time).
+
+    Args:
+        hub: The metadata hub holding the measured history.
+        config: The config supplying the sample-count gate.
+        hw_fingerprint: The machine class whose measurements to read, from
+            `HardwareProfile.fingerprint`. `None` reads this process's own class. That
+            default was the whole loop's blind spot: the share being sized is a *distributed
+            task's* `num_cpus`, every sample for it is measured on a worker, and this code runs
+            on the driver — so on any cluster whose driver was a different machine class this
+            returned `{}` and every family silently kept its static prior. `""` (a mixed fleet)
+            falls back to the local class.
+
+    Returns:
+        `{kind tag: median utilization}` for the families with enough confident evidence.
     """
     if hub is None:
         return {}
@@ -131,18 +138,17 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
     # `collect()`). These medians only steer per-task CPU shares, never results.
     version = hub.version
     cached = _CPU_CACHE.get(hub)
-    if (
-        cached is not None
-        and cached[1] == min_samples
-        and 0 <= version - cached[0] < _REFRESH_AFTER
-    ):
+    # The machine class is part of the cache key for the reason it is part of `calibrate`'s: one
+    # hub serves different target hardware across a session, and these medians are per-machine.
+    key = (min_samples, hw_fingerprint or "")
+    if cached is not None and cached[1] == key and 0 <= version - cached[0] < _REFRESH_AFTER:
         return cached[2]
     # The previously learned map (if any) is the smoothing anchor: a refreshed median is
     # blended toward its prior value so a family's grant tracks a stable trend, not noise.
     prior = cached[2] if cached is not None else {}
     try:
         out: dict[str, float] = {}
-        for tag, rows in hub.op_stats_by_kind().items():
+        for tag, rows in hub.op_stats_by_kind(hw_fingerprint).items():
             utils = [u for r in rows if (u := float(r.get("cpu_utilization", 0.0) or 0.0)) > 0.0]
             # A family whose cores were *taken* reads exactly like one that never wanted them,
             # and shrinking its share is the wrong half of that ambiguity — it packs more tasks
@@ -152,25 +158,24 @@ def load_cpu_utilization(hub: MetadataHub | None, config: Config | None = None) 
             if oversubscribed(rows):
                 continue
             # Confidence gate: enough samples AND concentrated enough to trust the median.
-            if len(utils) >= min_samples and _is_confident(utils):
+            if len(utils) >= min_samples and is_concentrated(utils, _MAX_REL_SPREAD):
                 med = median(utils)
                 p = prior.get(tag)
                 out[tag] = med if p is None else _SMOOTH_ALPHA * med + (1.0 - _SMOOTH_ALPHA) * p
     except Exception as exc:  # pragma: no cover - planning must never break on bad feedback
         note_suppressed("kyber", "load cpu utilization", exc)
         out = {}
-    _CPU_CACHE[hub] = (version, min_samples, out)
+    _CPU_CACHE[hub] = (version, key, out)
     return out
 
 
-def refit_version(hub) -> int:
-    """The hub version at which the utilization medians now in force were refreshed (`0` if
-    never). The same role `calibration.refit_version` plays, for the same reason: these medians
-    steer per-task CPU shares, which are annotated onto a plan, so a memoized plan is keyed by
-    which refresh it was annotated under.
+def live_shares(hub) -> dict[str, float] | None:
+    """The utilization medians currently in force, without provoking a refresh.
+
+    Fingerprinted by `plan_cache` for the reason `calibration.live_coefficients` is.
     """
     cached = _CPU_CACHE.get(hub) if hub is not None else None
-    return int(cached[0]) if cached is not None else 0
+    return cached[2] if cached is not None else None
 
 
 def recommend_num_cpus(util: float | None, base: float, config: Config | None = None) -> float:

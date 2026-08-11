@@ -1,7 +1,7 @@
 # Snowflake
 
-Snowflake is one of the two warehouses Batcher both reads and writes. `bt.read.snowflake(query)`
-pulls a query result back as parallel Arrow chunks, and `ds.write.snowflake(table)` ingests a
+Snowflake is one of the two warehouses Batcher both reads and writes. {py:meth}`bt.read.snowflake(query) <batcher.api.io_namespace.reader.Reader.snowflake>`
+pulls a query result back as parallel Arrow chunks, and {py:meth}`ds.write.snowflake(table) <batcher.api.io_namespace.writer.Writer.snowflake>` ingests a
 dataset into a table.
 
 | | |
@@ -69,7 +69,7 @@ orders = bt.read.snowflake(
 Snowflake's connector exposes `get_result_batches()`: after one query execution it hands back a
 list of `ResultBatch` handles, each a picklable pointer to one chunk of the result set sitting
 in cloud storage. That is exactly Batcher's split model. `splits()` returns one split per
-chunk, each worker calls `to_arrow()` on its own handle, and the query is not re-run.
+chunk, each worker calls {py:meth}`to_arrow() <batcher.Dataset.to_arrow>` on its own handle, and the query is not re-run.
 
 Parallelism is therefore set by Snowflake's chunking of the result, not by anything you
 configure. A small result comes back as one chunk and reads on one worker. A large one fans out
@@ -83,7 +83,7 @@ Three things run up the bill, and all three are avoidable.
 :::{important}
 **The query is submitted more than once.** `bt.read.snowflake(...)` is not free at
 construction: the reader needs a schema, and it gets one by executing the query and inspecting
-the first result chunk. Then `collect()` executes it again. A heavy query behind a
+the first result chunk. Then {py:meth}`collect() <batcher.Dataset.collect>` executes it again. A heavy query behind a
 `bt.read.snowflake` call is a heavy query you have paid for at least twice.
 :::
 
@@ -104,7 +104,7 @@ not.
 | --- | --- |
 | Columns named in the query text | The warehouse, before anything is returned |
 | `.filter(...)` after the read | The warehouse, as a `WHERE` around your query |
-| `.select(...)` after the read | Your process, on the Arrow table that already arrived |
+| {py:meth}`.select(...) <batcher.Dataset.select>` after the read | Your process, on the Arrow table that already arrived |
 
 The fourth cost is not Batcher's. A suspended warehouse takes seconds to resume, and that
 latency lands on the first query of the run. If you are reading Snowflake in a
@@ -150,7 +150,7 @@ Pass `mode="overwrite"` to replace the destination table instead. Overwrite is t
 destructive one: the rows that were there are gone.
 :::
 
-And it goes through pandas. The Arrow table is converted with `to_pandas()` and staged by
+And it goes through pandas. The Arrow table is converted with {py:meth}`to_pandas() <batcher.Dataset.to_pandas>` and staged by
 `write_pandas`, which is a full copy in driver memory. That is why this path is fine for a few
 million rows and wrong for a few billion. For bulk loads, write Parquet to a stage and
 `COPY INTO` it.

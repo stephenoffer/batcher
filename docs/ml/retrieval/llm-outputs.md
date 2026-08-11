@@ -11,7 +11,7 @@ Read {doc}`/ml/retrieval/llm/index` first for how the generation itself runs.
 No analyst can filter, join, or aggregate a string, so turning it into a column is the
 actual ETL step. Two Dataset methods do it.
 
-`ds.ml.extract(engine, schema=...)` appends one **typed** column per declared field. The
+{py:meth}`ds.ml.extract(engine, schema=...) <batcher.api.dataset.ml.DatasetML.extract>` appends one **typed** column per declared field. The
 declaration decides the Arrow type, not whatever the model happened to emit:
 
 ```python
@@ -31,6 +31,29 @@ pins every batch to the same types and makes the missing value a null. In the ex
 above, `"42"` came back as a *string* and landed in a `float64` column, because values are
 coerced per row.
 
+A field can declare a string, a number, a boolean, or a **date, time, timestamp, or binary**
+type. A model answers a date question with an ISO string, because that is what dates look
+like in the text it learned from, so that string becomes a real `date32` column you can
+compare, filter, and group by:
+
+```python
+import batcher as bt
+
+invoices = bt.from_pydict({"note": ["Invoice 7 dated 2024-01-05, total 42 USD"]})
+stub = lambda: (lambda ps: ['{"due": "2024-01-05", "total": 42}'] * len(ps))
+typed = invoices.ml.extract(
+    stub, schema={"due": "date32", "total": "float64"}, prompt_column="note"
+)
+print(typed.schema.field("due").type)
+# date32[day]
+print(typed.to_pydict()["due"])
+# [datetime.date(2024, 1, 5)]
+```
+
+A dtype that no JSON output can fill, such as `duration` or `interval`, is rejected when you
+declare it. That is deliberate: the alternative is a column of nulls handed back after the
+generation is already paid for, under a schema that looks exactly right.
+
 Failures degrade one row, never the batch. An unparseable response, a missing key, or a
 value that will not coerce becomes null, and the damage is countable:
 
@@ -39,7 +62,7 @@ value that will not coerce becomes null, and the damage is countable:
 bad = extracted.filter(bt.col("total").is_null()).count()
 ```
 
-`ds.ml.classify(engine, labels=[...])` labels each row with exactly one of `labels`. A
+{py:meth}`ds.ml.classify(engine, labels=[...]) <batcher.api.dataset.ml.DatasetML.classify>` labels each row with exactly one of `labels`. A
 model asked for `"positive"` will answer `"Positive."` or `"The sentiment is positive."`.
 Taken verbatim those give a category column with a long tail that never groups together.
 `classify` resolves the answer against the declared set and **nulls anything else**, so the
@@ -80,9 +103,9 @@ GPU and no second inference pass. These are ordinary scalar functions, so they v
 push down, and compose with any other expression. Each returns an empty string where the
 fragment is absent, so a malformed row degrades to a filterable empty rather than an error.
 
-`extract_json` and `extract_json_array` recover the JSON a model wrapped in prose, which is
-the common case that breaks a bare `json.loads`. `extract_code_block` drops the triple-backtick
-fences and language tag from a returned snippet. `extract_first_number` parses the first
+{py:func}`extract_json <batcher.extract_json>` and {py:func}`extract_json_array <batcher.extract_json_array>` recover the JSON a model wrapped in prose, which is
+the common case that breaks a bare `json.loads`. {py:func}`extract_code_block <batcher.extract_code_block>` drops the triple-backtick
+fences and language tag from a returned snippet. {py:func}`extract_first_number <batcher.extract_first_number>` parses the first
 numeric span to a float, for a model asked to score or count in free text.
 
 ```python
@@ -105,8 +128,8 @@ print(
 # {'obj': ['{"vendor": "Acme", "total": 42}', ''], 'score': [42.0, 87.0]}
 ```
 
-Reasoning models fence their chain of thought. `extract_reasoning` reads the `<think>...</think>`
-trace and `strip_reasoning` removes it to leave the user-facing answer. `extract_tag` reads any
+Reasoning models fence their chain of thought. {py:func}`extract_reasoning <batcher.extract_reasoning>` reads the `<think>...</think>`
+trace and {py:func}`strip_reasoning <batcher.strip_reasoning>` removes it to leave the user-facing answer. {py:func}`extract_tag <batcher.extract_tag>` reads any
 named XML-style tag, the convention prompts use to mark a final answer:
 
 ```python
@@ -123,9 +146,9 @@ print(
 # {'why': ['2+2 is 4'], 'answer': ['4'], 'clean': ['<answer>4</answer>']}
 ```
 
-`extract_after` and `extract_between` slice around literal markers, for the `Answer:` and
-delimiter conventions that few-shot prompts create. `extract_choice` reads a standalone
-multiple-choice letter, and `is_refusal` flags the common refusal phrasings so you can measure
+{py:func}`extract_after <batcher.extract_after>` and {py:func}`extract_between <batcher.extract_between>` slice around literal markers, for the `Answer:` and
+delimiter conventions that few-shot prompts create. {py:func}`extract_choice <batcher.extract_choice>` reads a standalone
+multiple-choice letter, and {py:func}`is_refusal <batcher.is_refusal>` flags the common refusal phrasings so you can measure
 a refusal rate or filter them out before scoring:
 
 ```python
@@ -147,9 +170,9 @@ print(
 ```
 
 Three more read the answer conventions that {doc}`llm-evaluation` already measures the
-*compliance* of. `bt.extract_boxed` reads the LaTeX `\boxed{}` a math benchmark grades on, and
-`bt.extract_last_number` reads the conclusion of a reasoning chain — which is not the same as
-`bt.extract_first_number`, because a model that reasons before answering emits its intermediate
+*compliance* of. {py:func}`bt.extract_boxed <batcher.extract_boxed>` reads the LaTeX `\boxed{}` a math benchmark grades on, and
+{py:func}`bt.extract_last_number <batcher.extract_last_number>` reads the conclusion of a reasoning chain — which is not the same as
+{py:func}`bt.extract_first_number <batcher.extract_first_number>`, because a model that reasons before answering emits its intermediate
 quantities first.
 
 ```python
@@ -164,7 +187,7 @@ print(
 # {'boxed': ['8'], 'first': [12.0], 'last': [8.0]}
 ```
 
-`bt.extract_citations` returns every `[n]` marker as a list, which is what turns a citation rate
+{py:func}`bt.extract_citations <batcher.extract_citations>` returns every `[n]` marker as a list, which is what turns a citation rate
 into a citation *check*: set-subtract the retrieved passage ids and whatever is left is a
 reference to a source that was never retrieved.
 
@@ -216,15 +239,15 @@ For a fixed pattern rather than a full schema, `guided_regex` constrains the out
 a regular expression such as `r"\d{4}-\d{2}-\d{2}"` for a date.
 
 Guided decoding is not always available, so measure whether the output actually held its shape.
-`bt.valid_json_rate` is the strict JSON-mode compliance rate (the whole output parses as JSON),
-`bt.json_present_rate` is the lenient rate (a JSON object is recoverable from surrounding prose), and
-`bt.tagged_answer_rate` is the compliance rate for a tag-delimited format. Watch them per model or
+{py:func}`bt.valid_json_rate <batcher.valid_json_rate>` is the strict JSON-mode compliance rate (the whole output parses as JSON),
+{py:func}`bt.json_present_rate <batcher.json_present_rate>` is the lenient rate (a JSON object is recoverable from surrounding prose), and
+{py:func}`bt.tagged_answer_rate <batcher.tagged_answer_rate>` is the compliance rate for a tag-delimited format. Watch them per model or
 per prompt version to catch a format regression before the parser starts nulling rows.
 
 Benchmark harnesses grade a specific answer shape, and an output without it is ungradeable rather
-than wrong. `bt.numeric_answer_rate` is the fraction with a parseable number (math and counting
-tasks), `bt.choice_answer_rate` the fraction with a standalone multiple-choice letter, and
-`bt.boxed_answer_rate` the fraction with a LaTeX `\boxed{}` answer (the MATH convention). A low rate
+than wrong. {py:func}`bt.numeric_answer_rate <batcher.numeric_answer_rate>` is the fraction with a parseable number (math and counting
+tasks), {py:func}`bt.choice_answer_rate <batcher.choice_answer_rate>` the fraction with a standalone multiple-choice letter, and
+{py:func}`bt.boxed_answer_rate <batcher.boxed_answer_rate>` the fraction with a LaTeX `\boxed{}` answer (the MATH convention). A low rate
 points at the prompt, not the model's reasoning.
 
 ```python
@@ -242,4 +265,4 @@ print(
 
 - {doc}`/ml/retrieval/llm/index`: running the generation these outputs come from.
 - {doc}`/ml/retrieval/llm-evaluation`: scoring the parsed results.
-- {doc}`/user-guide/transform/columns/expression-accessors`: the `.json` accessor these methods build on.
+- {doc}`/user-guide/transform/columns/expression-accessors`: the {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>` accessor these methods build on.

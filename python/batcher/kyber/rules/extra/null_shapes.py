@@ -14,6 +14,7 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.exprs.guards import SchemaNode
 from batcher.kyber.rules.extra.boolean_algebra import _rewrite_node
 from batcher.kyber.rules.extra.nullability import _EXPR_NODES, _never_null, _non_null_cols
 from batcher.plan.expr_ir import AggExpr, Coalesce, Expr, IsNotNull, IsNull, Not
@@ -21,14 +22,10 @@ from batcher.plan.expr_rewrite import combine_conjuncts, combine_disjuncts
 from batcher.plan.logical import (
     Aggregate,
     AggregateSpec,
-    Filter,
     LogicalPlan,
-    Project,
     Sort,
     SortKeySpec,
 )
-
-_Node = Filter | Project
 
 __all__ = [
     "canonicalize_not_null_check",
@@ -54,7 +51,7 @@ def _expand_is_null_coalesce(expr: Expr) -> Expr:
     expr=_expand_is_null_coalesce,
     expr_matches=(Coalesce, IsNull),
 )
-def expand_is_null_of_coalesce(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def expand_is_null_of_coalesce(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, b) IS NULL` → `a IS NULL AND b IS NULL`.
 
     COALESCE is NULL exactly when every argument is NULL, so the two forms agree on every row
@@ -83,7 +80,7 @@ def _expand_is_not_null_coalesce(expr: Expr) -> Expr:
     expr=_expand_is_not_null_coalesce,
     expr_matches=(Coalesce, IsNotNull),
 )
-def expand_is_not_null_of_coalesce(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def expand_is_not_null_of_coalesce(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, b) IS NOT NULL` → `a IS NOT NULL OR b IS NOT NULL` — the De Morgan dual
     of `expand_is_null_of_coalesce`: a COALESCE is non-null exactly when *some* argument is.
     Both forms evaluate every argument, so no purity guard is needed; over a NOT NULL `a`
@@ -110,7 +107,7 @@ def _canonicalize_not_null_check(expr: Expr) -> Expr:
     expr=_canonicalize_not_null_check,
     expr_matches=(IsNotNull, IsNull, Not),
 )
-def canonicalize_not_null_check(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def canonicalize_not_null_check(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NOT (x IS NULL)` → `x IS NOT NULL`, and `NOT (x IS NOT NULL)` → `x IS NULL`.
 
     Exact under three-valued logic precisely *because* the null checks are total: `IS NULL`

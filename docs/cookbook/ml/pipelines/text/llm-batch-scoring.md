@@ -8,7 +8,7 @@ time, after the GPU work is paid for.
 
 ## Label a column, with the domain pinned
 
-`ds.ml.classify(engine, labels=[...])` resolves the model's answer against the declared
+{py:meth}`ds.ml.classify(engine, labels=[...]) <batcher.api.dataset.ml.DatasetML.classify>` resolves the model's answer against the declared
 label set and **nulls anything that does not resolve to exactly one**. The output column's
 domain is the list you passed, not whatever the model felt like saying.
 
@@ -114,11 +114,11 @@ paying a 7-second load on every execution.
 
 ## Typed columns, not JSON blobs
 
-`ds.ml.extract(engine, schema=...)` appends one typed Arrow column per declared field. The
+{py:meth}`ds.ml.extract(engine, schema=...) <batcher.api.dataset.ml.DatasetML.extract>` appends one typed Arrow column per declared field. The
 **declaration** decides the type, not what the model emitted in a given batch.
 
 :::{warning}
-That is the difference from `generate(parse_json=True)`, whose struct type is inferred per
+That is the difference from {py:meth}`generate(parse_json=True) <batcher.api.dataset.ml.DatasetML.generate>`, whose struct type is inferred per
 batch: ask for `{vendor, total}`, have the model omit `total` on one batch, and the two
 batches carry incompatible struct types and the scan dies at concat, after the GPU work is
 already paid for.
@@ -131,7 +131,7 @@ million rows costs one row, and it is countable.
 | --- | --- | --- |
 | `ds.ml.classify(engine, labels=[...])` | one column whose domain is the label list | the `labels` you declared; anything that does not resolve to exactly one is null |
 | `ds.ml.extract(engine, schema={...})` | one typed Arrow column per field | the `schema` you declared; an unparseable row is nulls in its own columns |
-| `ds.ml.generate(engine, ...)` | the raw text the model produced | nothing, because with `parse_json=True` the struct type is inferred per batch |
+| {py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` | the raw text the model produced | nothing, because with `parse_json=True` the struct type is inferred per batch |
 
 ```python
 import batcher as bt

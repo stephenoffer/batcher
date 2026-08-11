@@ -18,6 +18,7 @@ import pyarrow as pa
 
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
+from batcher.plan.ir_tags import MICROS_PER_DAY
 
 __all__ = ["RateMicroBatchSource", "RateSource", "SocketSource"]
 
@@ -240,7 +241,7 @@ class SocketSource:
         # sat a whole UTC offset away from a Kafka stream it was joined or watermarked
         # against, which reads as "no matches" rather than as a timezone mistake.
         now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
-        micros = (now - _EPOCH).days * 86_400_000_000 + (now - _EPOCH).seconds * 1_000_000
+        micros = (now - _EPOCH).days * MICROS_PER_DAY + (now - _EPOCH).seconds * 1_000_000
         micros += (now - _EPOCH).microseconds
         # Broadcast the scalar through numpy rather than replicating a `datetime` object per
         # row: `[now] * len(lines)` is O(rows) Python object handling in the data plane, the

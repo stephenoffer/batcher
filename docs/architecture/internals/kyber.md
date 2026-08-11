@@ -112,8 +112,8 @@ on. The modules and what each one rewrites:
 | `exprs/text_folds` | constant folding for the string functions -- lengths, the digests (`md5`/`sha1`/`sha256`/`crc32`), `hex`, the pads, `repeat`, `initcap`, and the trims, each verified against the engine and ASCII-guarded where Unicode case or whitespace handling could differ |
 | `exprs/text_algebra` | the remaining regex de-specializations (`regexp_replace_all` to `replace`, `regexp_split` to `split`) and composing stacked `substr` calls |
 | `exprs/text` | regex de-specialization, where a metacharacter-free `regexp_matches` becomes `contains`, `starts_with`, `ends_with`, or `=`, plus the string identities `reverse(reverse(x))`, `repeat(x, 1)`, and a full-range `substr` |
-| `exprs/temporal` | reading a date part through a finer truncation (`year(date_trunc('day', t))`), `last_day` idempotence, and day/microsecond offset fusion |
-| `streaming/windows` | collapses nested event-time window alignment (`window(window(t, 5m), 15m)`) when the outer width is a whole multiple of the inner -- per-row work removed from a pipeline that never ends |
+| `exprs/temporal` | reading a date part through a finer truncation ({py:meth}`year(date_trunc('day', t)) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.year>`), {py:meth}`last_day <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.last_day>` idempotence, and day/microsecond offset fusion |
+| `streaming/windows` | collapses nested event-time window alignment ({py:meth}`window(window(t, 5m), 15m) <batcher.Dataset.window>`) when the outer width is a whole multiple of the inner -- per-row work removed from a pipeline that never ends |
 | `relational/windows` | transposing two independent `Window` nodes into a canonical spec order so the collapse rule can find them, and pushing a top-N below an unpartitioned ranking window |
 
 Two constraints shape what these families can contain, and both are worth knowing
@@ -170,7 +170,7 @@ rules are written to respect them:
   and a null comparison is null. `boolean_algebra` proves each law under all three
   values (`T`, `F`, and `N`) and guards anything that would hold only for non-null
   operands. `x AND NOT x → FALSE`, for instance, fires only on never-null predicates
-  such as `is_null`.
+  such as {py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is_null>`.
 
 ## Cost and cardinality
 
@@ -225,8 +225,9 @@ on the measured numbers. The same mechanism works single-node and distributed.
 
 DuckDB optimizes once, before execution, and cannot revise the plan afterwards.
 Spark AQE re-plans at stage boundaries, and so does Kyber: it is the same mechanism at
-the same granularity, not a finer one. It also engages only on a joined query whose scan
-input clears 20M rows or roughly 1.3 GB, so small queries never reach it.
+the same granularity, not a finer one. It also engages only on a joined query big enough
+to pay for its own re-planning: 5M rows, or roughly 320 MB, per pipeline breaker the loop
+would cut at. Small queries never reach it.
 
 What has no equivalent in either engine is the *cross-query* half. Core records each
 run's measured cardinalities, operator times, and peak memory into the MetadataHub, and

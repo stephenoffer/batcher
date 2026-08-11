@@ -78,18 +78,22 @@ def _reads_a_big_global(batch):
     return batch
 
 
-def test_an_unpicklable_callable_is_rejected_not_measured():
-    """A closure over large data never reaches the size check — it fails to pickle first."""
+def test_a_closure_over_large_data_is_flagged_now_that_it_can_cross():
+    """A closure over large data is exactly the shape the warning exists for.
+
+    It used to escape the check by failing to pickle at all. `cloudpickle` sends it by value,
+    so it now both reaches a worker and gets measured on the way — the reach Ray has.
+    """
     table = _BIG
 
     def closure(batch):
         _ = table.size  # genuinely closes over the array
         return batch
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", PerformanceWarning)
-        # A local closure is picklable-by-reference only if importable; this one is not.
-        processes.is_picklable(closure)
+    if processes._cloudpickle() is None:
+        pytest.skip("cloudpickle is not installed, so the closure cannot cross at all")
+    with pytest.warns(PerformanceWarning, match="15 MB"):
+        assert processes.is_picklable(closure)
 
 
 def test_it_warns_once_not_per_probe():

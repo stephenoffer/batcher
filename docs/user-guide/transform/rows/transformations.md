@@ -1,8 +1,8 @@
 # Transformations
 
 Transformations reshape the columns of a dataset. You choose which columns survive,
-derive new ones, rename or drop what is left. Each call returns a new `Dataset` and
-runs nothing until a terminal operation. Column work is expressed with `Expr` values
+derive new ones, rename or drop what is left. Each call returns a new {py:class}`Dataset <batcher.Dataset>` and
+runs nothing until a terminal operation. Column work is expressed with {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` values
 and evaluated in the Rust data plane.
 
 ## Setup
@@ -41,7 +41,7 @@ print(ds.select("name", "price").to_pydict())
 
 ## with_columns
 
-`with_columns` adds or replaces columns and keeps every other column. New columns
+{py:meth}`with_columns <batcher.Dataset.with_columns>` adds or replaces columns and keeps every other column. New columns
 are passed as keyword arguments. Adding several in one call evaluates them in a
 single pass.
 
@@ -65,7 +65,7 @@ print(out.to_pydict())
 
 ## with_column
 
-`with_column` adds or replaces a single column by name. It is the one-column form
+{py:meth}`with_column <batcher.Dataset.with_column>` adds or replaces a single column by name. It is the one-column form
 of `with_columns`.
 
 ```python
@@ -99,10 +99,10 @@ print(ds.rename({"qty": "quantity"}).to_pydict())
 The transforms above name columns one at a time. A **selector** stands for *every*
 column matching a rule: a name, a name pattern, an Arrow dtype. One written
 expression then becomes as many computed columns as match. Because a selector is an
-`Expr` leaf (`Selector`), the whole scalar algebra composes onto it, and it works
+`Expr` leaf ({py:class}`Selector <batcher.plan.expr_ir.selectors.Selector>`), the whole scalar algebra composes onto it, and it works
 anywhere a projection is built (`select`, `with_columns`, `drop`).
 
-`bt.exclude(...)` selects every column except the named ones, the mirror image of
+{py:func}`bt.exclude(...) <batcher.exclude>` selects every column except the named ones, the mirror image of
 listing the ones you want to keep:
 
 ```python
@@ -110,15 +110,15 @@ print(ds.select(bt.exclude("qty")).columns)
 # ['name', 'price']
 ```
 
-The dtype selectors pick columns by kind. `bt.numeric()` covers integer, float, and
-decimal, and `bt.integer()`, `bt.floating()`, `bt.string()`, and `bt.boolean()` narrow
-that to one kind each. `bt.temporal()` covers date, time, timestamp, and duration, and
-`bt.by_dtype(pa.int32(), ...)` matches exact Arrow types.
+The dtype selectors pick columns by kind. {py:func}`bt.numeric() <batcher.numeric>` covers integer, float, and
+decimal, and {py:func}`bt.integer() <batcher.integer>`, {py:func}`bt.floating() <batcher.floating>`, {py:func}`bt.string() <batcher.string>`, and {py:func}`bt.boolean() <batcher.boolean>` narrow
+that to one kind each. {py:func}`bt.temporal() <batcher.temporal>` covers date, time, timestamp, and duration, and
+{py:func}`bt.by_dtype(pa.int32(), ...) <batcher.by_dtype>` matches exact Arrow types.
 
-The name selectors match column *names*. `bt.matches(regex)` matches by regular
-expression, and `bt.starts_with(...)`, `bt.ends_with(...)`, and `bt.contains(...)` match
+The name selectors match column *names*. {py:func}`bt.matches(regex) <batcher.matches>` matches by regular
+expression, and {py:func}`bt.starts_with(...) <batcher.starts_with>`, {py:func}`bt.ends_with(...) <batcher.ends_with>`, and {py:func}`bt.contains(...) <batcher.contains>` match
 by literal prefix, suffix, and substring. Each of those three accepts several arguments.
-`bt.all()` matches every column.
+{py:func}`bt.all() <batcher.all>` matches every column.
 
 ```python
 import datetime
@@ -135,7 +135,7 @@ print(events.select(bt.temporal()).columns)  # ['day']
 ```
 
 Because a selector is an expression, composing scalar work onto it computes over
-every matched column at once, and the `.name` accessor renames the expanded
+every matched column at once, and the {py:class}`.name <batcher.plan.expr_ir.selectors.core._SelectorNameNamespace>` accessor renames the expanded
 outputs:
 
 ```python
@@ -143,10 +143,10 @@ print(ds.select(bt.numeric().name.prefix("n_")).to_pydict())
 # {'n_price': [10.0, 20.0, 30.0], 'n_qty': [1, 2, 3]}
 ```
 
-`alias(...)` names exactly one column, so it cannot name a selector that matched
+{py:meth}`alias(...) <batcher.plan.expr_ir.core.Expr.alias>` names exactly one column, so it cannot name a selector that matched
 several. The `.name` accessor derives each output name from its matched input name
-instead: `.name.prefix(...)`, `.name.suffix(...)`, `.name.to_lowercase()`,
-`.name.to_uppercase()`, `.name.map(fn)` for an arbitrary rule, and `.name.keep()`
+instead: {py:meth}`.name.prefix(...) <batcher.plan.expr_ir.selectors.core._SelectorNameNamespace.prefix>`, {py:meth}`.name.suffix(...) <batcher.plan.expr_ir.selectors.core._SelectorNameNamespace.suffix>`, {py:meth}`.name.to_lowercase() <batcher.plan.expr_ir.selectors.core._SelectorNameNamespace.to_lowercase>`,
+{py:meth}`.name.to_uppercase() <batcher.plan.expr_ir.selectors.core._SelectorNameNamespace.to_uppercase>`, {py:meth}`.name.map(fn) <batcher.plan.expr_ir.selectors.core._SelectorNameNamespace.map>` for an arbitrary rule, and {py:meth}`.name.keep() <batcher.plan.expr_ir.selectors.core._SelectorNameNamespace.keep>`
 to state the default explicitly. Normalizing a messy header row is a one-liner:
 
 ```python
@@ -238,9 +238,9 @@ print(people.unnest("person").to_pydict())
 # {'age': [30, 25], 'name': ['Ann', 'Bo']}
 ```
 
-To reach a single field without flattening the whole struct, use the `.struct` and
-`.json` accessors (see {doc}`Expressions </user-guide/transform/columns/expressions>`) in a `select`: `.struct.field(name)`
-projects one struct field, and `.json.extract_int(path)` (and its typed siblings)
+To reach a single field without flattening the whole struct, use the {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>` and
+`.json` accessors (see {doc}`Expressions </user-guide/transform/columns/expressions>`) in a `select`: {py:meth}`.struct.field(name) <batcher.plan.expr_ir.namespaces.collections._StructNamespace.field>`
+projects one struct field, and {py:meth}`.json.extract_int(path) <batcher.plan.expr_ir.namespaces.collections._JsonNamespace.extract_int>` (and its typed siblings)
 reads a value from a JSON-text column by JSONPath without a decode step. Explode a
 list of structs first, then `unnest`, to flatten a nested array of records into a
 flat table.

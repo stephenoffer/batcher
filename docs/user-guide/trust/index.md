@@ -11,6 +11,12 @@ Decide what counts as a valid row, and who may read which rows and columns.
 Expectations, and the fail/drop/quarantine choice.
 :::
 
+:::{grid-item-card} {octicon}`law;1.1em` Data contracts
+:link: /user-guide/trust/data-contracts
+:link-type: doc
+Row counts, distributions, freshness, and schema — the checks no single row fails.
+:::
+
 :::{grid-item-card} {octicon}`shield-lock;1.1em` Governance and security
 :link: /user-guide/trust/governance
 :link-type: doc
@@ -34,6 +40,7 @@ The settings to change before production, and the boundaries Batcher does not en
 :hidden:
 
 data-quality
+data-contracts
 governance
 secrets
 hardening

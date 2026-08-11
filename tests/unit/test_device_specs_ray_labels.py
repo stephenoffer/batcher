@@ -25,13 +25,11 @@ pytestmark = pytest.mark.unit
 #: the fabricated figure the table exists to avoid.
 _KNOWN_ABSENT = frozenset(
     {
-        "AMD-Instinct-MI100",
         "AMD-Radeon-HD-7900",
         "AMD-Radeon-R9-200-HD-7900",
         "Intel-GAUDI",
         "MXC500",
         "MXC550",
-        "TPU-V7X",
         "aws-neuron-core",
     }
 )

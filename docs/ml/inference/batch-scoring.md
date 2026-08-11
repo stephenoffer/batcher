@@ -145,6 +145,45 @@ Set it deliberately and keep it small. A budget of a million silently deleted ro
 resilience. It is a data-loss bug with a config flag.
 :::
 
+## Retry the endpoint, not the job
+
+A hosted model answers with a 429 or a 503 as a matter of routine, and re-running a
+six-hour job because one request out of a million was throttled is not an option.
+`max_retries` retries a batch whose model call raised, with `retry_backoff` seconds of
+jittered exponential backoff between attempts, and `timeout` bounds one call so a hung
+request cannot stall the run. `retry_on` narrows which exceptions count when you want a
+genuine bug to fail fast.
+
+The same five options work on every entry point that calls a model, so `generate`,
+`extract`, `classify`, `infer`, `predict`, and `embed` take them exactly as `map_batches`
+does:
+
+```python
+import batcher as bt
+
+attempts = {"n": 0}
+
+
+def flaky_engine():
+    def engine(prompts):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("503 from the provider")
+        return [p.upper() for p in prompts]
+
+    return engine
+
+
+reviews = bt.from_pydict({"text": ["good", "bad"]})
+print(reviews.ml.generate(flaky_engine, prompt_column="text", max_retries=3, timeout=30.0).to_pydict())
+# {'text': ['good', 'bad'], 'response': ['GOOD', 'BAD']}
+```
+
+Retries and the error budget compose, and they run in that order: a batch is retried
+first, and only a failure that survives every attempt is charged against
+`max_errored_rows`. So a transient outage costs latency, and a row the model will never
+accept costs one row.
+
 ## Idempotency, because workers get preempted
 
 :::{warning}

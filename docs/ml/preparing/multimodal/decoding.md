@@ -344,6 +344,35 @@ or `"torch"`, the per-row tensors arrive **stacked** into one leading-batch arra
 `(batch, H, W, 3)` block, which is exactly the shape a vision model's forward pass
 wants. No manual stacking or reshaping in the UDF.
 
+### Images of different sizes
+
+The canonical type carries one shape for a whole column, so a corpus at native resolution has
+no fixed-shape form. Return the arrays anyway. A `map_batches` whose column holds arrays of
+differing shape produces a variable-shape tensor column, and `to_numpy` and
+`batch_format="numpy"` decode it back to one array per row:
+
+```python
+import numpy as np
+
+sizes = bt.from_pydict({"id": [1, 2, 3]})
+
+
+def decode(batch):
+    shapes = [(2, 2), (3, 4), (1, 5)]
+    return {"img": [np.zeros(s, dtype=np.uint8) for s in shapes]}
+
+
+out = sizes.map_batches(decode, output_columns=["img"])
+print([a.shape for a in out.to_numpy()["img"]])
+# [(2, 2), (3, 4), (1, 5)]
+```
+
+The column is an ordinary Arrow struct underneath, so it filters, joins, shuffles, and writes
+to Parquet like any other, and a distributed run returns exactly what a single-node run does.
+What it cannot do is become one torch tensor, because rows of different shape have no stacked
+form: `batch_format="torch"` drops such a column and says so. Resize when a model needs a
+batch, and let the pipeline carry the originals until then.
+
 A nested list column holds several small vectors per row, such as per-frame features or a
 ragged batch of patches. {py:meth}`.list.flatten() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.flatten>` collapses it into one flat list per row,
 removing a single level of nesting and keeping element order. Use it before a

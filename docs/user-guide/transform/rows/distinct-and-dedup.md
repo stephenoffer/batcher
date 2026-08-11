@@ -1,9 +1,9 @@
 # Distinct and deduplication
 
 There are three different jobs hiding under the word "dedupe", and picking the wrong
-one is where the bugs come from. Dropping fully identical rows is `distinct()`. Keeping
+one is where the bugs come from. Dropping fully identical rows is {py:meth}`distinct() <batcher.Dataset.distinct>`. Keeping
 the newest row per key is `distinct(subset, keep="last", order_by=...)`. Collapsing
-rows that are *nearly* the same text is `ds.ml.drop_near_duplicates`. They have
+rows that are *nearly* the same text is {py:meth}`ds.ml.drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>`. They have
 different costs and different failure modes.
 
 ## Setup
@@ -77,14 +77,19 @@ print(bt.sql(
 :::
 ::::
 
-The two lower to the same plan, which is the point: `keep="last"` *is* a ranked window
-with a filter on rank 1, spelled shorter.
+The two lower to the same plan, which is the point: the SQL is a way of saying the same
+thing, not a different query.
 
 `keep="first"` takes the earliest row in `order_by` order; `keep="last"` takes the
-latest. Both *require* `order_by`, because without an order there is no first. `keep="any"`
-(the default) skips the ordering and takes an arbitrary but deterministic row, which is
-fine when the non-key columns are functionally dependent on the key and wrong when they
-are not.
+latest. Both *require* `order_by`, because without an order there is no first.
+
+`keep="any"` (the default) skips the ordering and takes an **arbitrary** row. Arbitrary
+means arbitrary: which row you get may differ between runs, and between a single-node and a
+distributed run, because the engine keeps whichever row it reached first. That is fine when
+the non-key columns are functionally dependent on the key — the rows it is choosing between
+are identical — and wrong when they are not. If the surviving row's other columns matter,
+pass `order_by` with `"first"` or `"last"` and the choice becomes a property of your data
+rather than of the schedule.
 
 ```python
 print(events.distinct(["user"], keep="first", order_by="ts").sort("user").to_pydict())
@@ -92,10 +97,22 @@ print(events.distinct(["user"], keep="first", order_by="ts").sort("user").to_pyd
 ```
 
 `order_by` also takes a list, and `[("ts", True)]` reverses a key, so
-`keep="first", order_by=[("ts", True)]` is another spelling of "newest wins". This
-lowers to `row_number() OVER (PARTITION BY subset ORDER BY ...)`, which is exactly what
-you would write by hand in SQL. See {doc}`window functions </user-guide/analyze/window-functions>` if you need
-the rank itself.
+`keep="first", order_by=[("ts", True)]` is another spelling of "newest wins".
+
+This runs as a single reduction, not as a ranking: the engine hashes each row by its key
+once and keeps the minimum under the ordering, so nothing is sorted and no rank column is
+built. It is also *mergeable*, which is what lets it stay bounded under spill and lets a
+distributed run reduce each partition before the shuffle, sending one row per key instead of
+every row.
+
+That matters most at scale, because the two shapes grow differently. A ranking sorts, so its
+cost grows faster than the data; a reduction is a hash pass, so it grows with it. On a 5%-
+distinct key the reduction is roughly 3x faster than the equivalent window at 2 million rows
+and 7 to 12x faster at 32 million — see the dedup section of
+`benchmarks/BENCHMARK_RESULTS.md` for the measurement and the hardware.
+
+If you want the rank itself rather than one row per key, write the window: see
+{doc}`window functions </user-guide/analyze/window-functions>`.
 
 ## Float keys: NaN and -0.0 collapse
 
@@ -126,7 +143,7 @@ Look before you delete. Duplicates are often a finding about the upstream system
 than noise, and once they are dropped the finding is gone with them.
 :::
 
-`value_counts` gives the per-value tally, and `.is_duplicated()` flags every row that
+{py:meth}`value_counts <batcher.Dataset.value_counts>` gives the per-value tally, and {py:meth}`.is_duplicated() <batcher.plan.expr_ir.core.Expr.is_duplicated>` flags every row that
 shares its key with another.
 
 ```python
@@ -139,7 +156,7 @@ print(flagged.to_pydict())
 #  'dup': [True, True, True, True, False]}
 ```
 
-`.is_unique()` is the complement. Both are window expressions (`count(*) OVER
+{py:meth}`.is_unique() <batcher.plan.expr_ir.core.Expr.is_unique>` is the complement. Both are window expressions (`count(*) OVER
 (PARTITION BY x)`), so they mark rows without collapsing them. That is what you want when
 the duplicates are a data-quality finding to report rather than noise to drop.
 
@@ -183,7 +200,7 @@ print(sorted(kept.to_pydict()["id"]))
 # [1, 3]
 ```
 
-`ds.ml.near_duplicates` returns the pairs instead of dropping rows, so you can inspect
+{py:meth}`ds.ml.near_duplicates <batcher.api.dataset.ml.DatasetML.near_duplicates>` returns the pairs instead of dropping rows, so you can inspect
 what would go before you commit to it.
 
 ```python
@@ -203,7 +220,7 @@ tuning detail.
 
 ## Streams: bound the state with a watermark
 
-An unbounded stream cannot remember every key it has ever seen. `drop_duplicates_within_watermark`
+An unbounded stream cannot remember every key it has ever seen. {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>`
 forgets a key once the event-time watermark passes it, so memory stays bounded and a
 redelivery that arrives inside the lateness window is still caught.
 

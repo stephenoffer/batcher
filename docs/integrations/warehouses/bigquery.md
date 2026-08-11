@@ -1,6 +1,6 @@
 # BigQuery
 
-BigQuery is read-only in Batcher. `bt.read.bigquery(...)` pulls a table or a query result
+BigQuery is read-only in Batcher. {py:meth}`bt.read.bigquery(...) <batcher.api.io_namespace.reader.Reader.bigquery>` pulls a table or a query result
 through the Storage Read API as parallel Arrow streams. There is no BigQuery sink; to land
 results in BigQuery, write Parquet to GCS and load it, or use `bq load`.
 
@@ -82,9 +82,9 @@ To read a whole table instead, pass `table=` and leave the positional slot empty
 :::
 
 :::{important}
-A query read is paid for more than once. Constructing the `Dataset` needs a schema, and the
+A query read is paid for more than once. Constructing the {py:class}`Dataset <batcher.Dataset>` needs a schema, and the
 source gets one by opening a read session and reading the first stream, which for a query read
-means running the query. `collect()` then runs it again. **Read tables, not queries,** wherever
+means running the query. {py:meth}`collect() <batcher.Dataset.collect>` then runs it again. **Read tables, not queries,** wherever
 you can.
 :::
 
@@ -93,7 +93,7 @@ at the table.
 
 ## How it parallelizes
 
-A `Source` divides into `Split`s, and a split is the unit of read parallelism. One
+A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>`s, and a split is the unit of read parallelism. One
 `create_read_session(data_format=ARROW, max_stream_count=N)` call returns up to `N` independent
 read streams over the table, and `splits()` returns one split per stream. Each split is nothing
 but a stream name, a string, so it ships to a worker cleanly, and the worker builds its own read
@@ -126,7 +126,7 @@ charges you for the difference.
 | --- | --- |
 | `selected_fields=(...)` | The server, before a byte moves |
 | `row_restriction="..."`, or a `filter` Kyber can push | The server, as the session's `row_restriction` |
-| `.select(...)` after the read | Your process, on the Arrow table that already arrived |
+| {py:meth}`.select(...) <batcher.Dataset.select>` after the read | Your process, on the Arrow table that already arrived |
 
 ```python
 # docs: skip
@@ -157,10 +157,10 @@ up, can find its streams dead by the time they run. Short queues, or a re-plan.
 
 Two smaller ones. A stream that fails mid-read is re-read from the start of that stream by
 whatever retry runs it, not resumed at the offset it reached. And nested or repeated fields come
-back as Arrow structs and lists, so use the `.struct` and `.list` accessors; nothing is flattened
+back as Arrow structs and lists, so use the {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>` and {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` accessors; nothing is flattened
 for you.
 
-A `BackendError` at construction means the client libraries are missing, or that you supplied
+A {py:exc}`BackendError <batcher.BackendError>` at construction means the client libraries are missing, or that you supplied
 neither `query=` nor `table=`.
 
 ## See also

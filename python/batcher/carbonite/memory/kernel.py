@@ -75,6 +75,22 @@ SAMPLE_TTL_SECONDS = 0.05
 
 _state_cache: tuple[float, KernelMemoryState] | None = None
 
+#: Per-file TTL cache for the ancestry-wide limit scan: `name -> (deadline, value)`.
+#:
+#: `kernel_memory_state` is sampled, but `cgroup_high_bytes` is a *public* reader that
+#: reaches `_tightest` directly and so bypassed that window entirely. It is on the
+#: per-query path (`probe.effective_limit_bytes` → `_engine_used_fraction` → the pressure
+#: level), and each call re-opens `memory.high` at **every** level of the cgroup ancestry.
+#: Measured on a point-lookup shape inside a four-level cgroup: 16.4 of the 21.1 cgroup
+#: reads a query performed were this one function re-reading the same static file.
+#:
+#: A limit is *configuration* — an orchestrator rewrites it, the kernel never does — so it
+#: moves orders of magnitude more slowly than the PSI averages and monotonic counters the
+#: same window already covers. Sharing `SAMPLE_TTL_SECONDS` is therefore conservative, and
+#: it keeps a live `memory.high` change visible within one sampling window rather than
+#: pinning it for the process's life the way an `lru_cache` would.
+_limit_cache: dict[str, tuple[float, int | None]] = {}
+
 
 @dataclass(frozen=True, slots=True)
 class KernelMemoryState:
@@ -211,10 +227,13 @@ def reset_kernel_sampling() -> None:
     """Drop the cached snapshot so the next read re-opens the cgroup files.
 
     For tests that fake `/sys/fs/cgroup`, which otherwise observe whichever reading the first
-    test in the process happened to take.
+    test in the process happened to take. Clears the limit scan (`_tightest`) as well as the
+    snapshot: a test that rewrites `memory.high` and then reads it back through
+    `cgroup_high_bytes` would otherwise be answered from the previous file's value.
     """
     global _state_cache
     _state_cache = None
+    _limit_cache.clear()
 
 
 def kernel_memory_state() -> KernelMemoryState:
@@ -331,11 +350,24 @@ def memory_stall_full() -> float | None:
 
 
 def _tightest(name: str) -> int | None:
-    """The smallest value of a byte-valued cgroup v2 file across the whole ancestry."""
+    """The smallest value of a byte-valued cgroup v2 file across the whole ancestry.
+
+    TTL-cached per file name on `SAMPLE_TTL_SECONDS`; see `_limit_cache` for why a limit
+    tolerates that window and why it is a TTL rather than a permanent memo. `None` (no
+    level publishes the file) is cached like any other answer — an unlimited cgroup is the
+    common case, and leaving it uncached would keep the full ancestry scan on exactly the
+    hosts that can never benefit from it.
+    """
+    now = time.monotonic()
+    cached = _limit_cache.get(name)
+    if cached is not None and now < cached[0]:
+        return cached[1]
     values = [
         v for d in cgroup_v2_dirs() if (v := read_cgroup_bytes(os.path.join(d, name))) is not None
     ]
-    return min(values) if values else None
+    value = min(values) if values else None
+    _limit_cache[name] = (now + SAMPLE_TTL_SECONDS, value)
+    return value
 
 
 def _usage_dirs() -> tuple[str, ...]:

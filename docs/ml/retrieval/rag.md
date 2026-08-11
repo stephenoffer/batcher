@@ -7,20 +7,20 @@ back with no way to trace it to a source. None of that is a model problem. All o
 fixed on the ingest side, in operators.
 
 The chain is **load → clean → chunk → dedupe → embed → index**, then at query time
-**embed → retrieve → prompt → generate**. Ingest is a batch job over a `Dataset`.
+**embed → retrieve → prompt → generate**. Ingest is a batch job over a {py:class}`Dataset <batcher.Dataset>`.
 Retrieval is a query. Keep them separate.
 
 ## Ingest
 
 Ingest turns a raw corpus into an indexed set of chunks. Each of the four stages below
-runs as engine operators over a `Dataset`, so the whole chain streams and distributes.
+runs as engine operators over a {py:class}`Dataset <batcher.Dataset>`, so the whole chain streams and distributes.
 
 ### Clean the markup
 
-A scraped page is markup. The `regexp_replace('<[^>]*>', '')` idiom that everyone
+A scraped page is markup. The {py:meth}`regexp_replace('<[^>]*>', '') <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_replace>` idiom that everyone
 reaches for is wrong in three ways. It leaves the body of `<script>` in the corpus as
 prose, it leaves `&amp;` undecoded, and it welds `<p>a</p><p>b</p>` into `ab`.
-`.str.strip_html()` is a text extractor instead. It drops script and style bodies,
+{py:meth}`.str.strip_html() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.strip_html>` is a text extractor instead. It drops script and style bodies,
 decodes entities, and separates block elements.
 
 ```python
@@ -46,7 +46,7 @@ abort the scan.
 
 ### Chunk, and keep the provenance
 
-`.str.chunk(size, overlap)` slices text into overlapping windows, and `explode` turns the
+{py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` slices text into overlapping windows, and `explode` turns the
 list into one row per chunk. Carry the source id through, and add a chunk index. A
 retrieved chunk that cannot name its source document is a citation you cannot render.
 
@@ -95,7 +95,7 @@ print(sorted(clean.to_pydict()["chunk_id"]))
 # [1, 4]
 ```
 
-`distinct` gets the byte-identical ones cheaply. `drop_near_duplicates`, built on MinHash
+`distinct` gets the byte-identical ones cheaply. {py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>`, built on MinHash
 and LSH, gets the ones that differ by a header or a trailing exclamation mark. On a web
 corpus the near-duplicate rate is routinely 20% to 40%, and every one of them is a wasted
 GPU forward pass and a polluted retrieval.
@@ -185,7 +185,7 @@ have to throw away". See {doc}`vector search </ml/retrieval/vector-search>`.
 ## Building the prompt
 
 Concatenate the retrieved chunks into one context string per question. This is a
-`group_by` with `array_agg` and a list join. It is an aggregate, not a Python loop.
+{py:meth}`group_by <batcher.Dataset.group_by>` with `array_agg` and a list join. It is an aggregate, not a Python loop.
 
 ```python
 prompt = retrieved.group_by().agg(context=col("chunk").array_agg())
@@ -200,7 +200,7 @@ has to sign off on its output.
 
 ## Generation
 
-`ds.ml.generate(engine, ...)` runs the LLM stage over batches. An engine is any callable
+{py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` runs the LLM stage over batches. An engine is any callable
 from a list of prompts to a list of completions, which is why a local vLLM engine and a
 hosted OpenAI-compatible endpoint are interchangeable at this seam.
 
@@ -270,14 +270,14 @@ without a separate pass.
 
 The failures below are easier to fix than to notice, so measure them. Each of these is an
 aggregate over a column, so a whole eval set is one scan and every one breaks down by index
-version, tenant, or day with `group_by`.
+version, tenant, or day with {py:meth}`group_by <batcher.Dataset.group_by>`.
 
 Start on the retrieval side, because a grounding score computed over a context that was never
-retrieved is measuring nothing. `bt.empty_retrieval_rate` counts the queries that got no
+retrieved is measuring nothing. {py:func}`bt.empty_retrieval_rate <batcher.empty_retrieval_rate>` counts the queries that got no
 passages at all, which is the failure that presents as unexplained hallucination: with no
 context the model answers from its parameters, fluently and without a citation.
-`bt.duplicate_context_rate` catches the same chunk arriving twice, which spends the window
-twice on one passage, and `bt.mean_retrieved_passages` shows when the retriever is quietly
+{py:func}`bt.duplicate_context_rate <batcher.duplicate_context_rate>` catches the same chunk arriving twice, which spends the window
+twice on one passage, and {py:func}`bt.mean_retrieved_passages <batcher.mean_retrieved_passages>` shows when the retriever is quietly
 returning fewer than the `k` you asked for.
 
 ```python
@@ -301,12 +301,12 @@ print(
 )
 ```
 
-`bt.context_token_estimate` sizes what the retrieval is about to cost. Retrieved context is
+{py:func}`bt.context_token_estimate <batcher.context_token_estimate>` sizes what the retrieval is about to cost. Retrieved context is
 usually the largest part of a RAG prompt and the part that grows silently: raising `k` from 5
 to 10 doubles the input bill of every request, and nothing in the pipeline says so.
 
-On the answer side, `bt.answer_groundedness` measures how much of the answer its context backs
-at the vocabulary level, and `bt.phrase_groundedness` does the same at the phrase level. Read
+On the answer side, {py:func}`bt.answer_groundedness <batcher.answer_groundedness>` measures how much of the answer its context backs
+at the vocabulary level, and {py:func}`bt.phrase_groundedness <batcher.phrase_groundedness>` does the same at the phrase level. Read
 them together. An answer built from the context's own words, rearranged into a claim the
 context never made, scores perfectly on the first and badly on the second — and that gap is
 what a confident hallucination looks like.
@@ -326,7 +326,7 @@ print(
 )
 ```
 
-`bt.unsupported_phrase_rate` is the same signal inverted, which is the direction a dashboard
+{py:func}`bt.unsupported_phrase_rate <batcher.unsupported_phrase_rate>` is the same signal inverted, which is the direction a dashboard
 wants: it rises as the system gets worse, so a threshold and an alert read the way you expect.
 
 ## The failure modes, in order
@@ -336,7 +336,7 @@ so long.
 
 | What you see | Where it comes from | The fix |
 | --- | --- | --- |
-| Answers that ignore the end of a document | chunks larger than the model's context, silently cut | check the length distribution first: `ds.select(n=col("chunk").str.len()).describe()` |
+| Answers that ignore the end of a document | chunks larger than the model's context, silently cut | check the length distribution first: {py:meth}`ds.select(n=col("chunk").str.len()).describe() <batcher.Dataset.select>` |
 | The same paragraph three times in a top-5 | deduping at the document level while boilerplate repeats across pages | dedupe at the chunk level |
 | An answer nobody can attribute | the source id dropped somewhere in ingest | carry `url` and `chunk_id` from ingest all the way through retrieval |
 | Retrieval that is subtly, consistently poor | model skew: the query embedded by a different model than the corpus | store the model name alongside the vectors |

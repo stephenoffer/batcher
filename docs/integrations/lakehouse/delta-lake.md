@@ -7,12 +7,12 @@ implementation is delta-rs plus Batcher's own commit path.
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.delta(uri)`, with `version=`, `timestamp=`, or `stream=True` |
-| **Write** | `ds.write.delta(uri)` with `mode="append"`/`"overwrite"`, `merge_on=`, `replace_where=` |
+| **Read** | {py:meth}`bt.read.delta(uri) <batcher.api.io_namespace.reader.Reader.delta>`, with `version=`, `timestamp=`, or `stream=True` |
+| **Write** | {py:meth}`ds.write.delta(uri) <batcher.api.io_namespace.writer.Writer.delta>` with `mode="append"`/`"overwrite"`, `merge_on=`, `replace_where=` |
 | **Extra** | `pip install 'batcher-engine[delta]'` |
 | **Parallelism** | One split per surviving data file, chosen from the log at plan time |
 | **Pushdown** | Predicates skip files by the log's per-file min/max statistics |
-| **Maintenance** | `bt.compact`, `bt.vacuum` |
+| **Maintenance** | {py:func}`bt.compact <batcher.compact>`, {py:func}`bt.vacuum <batcher.vacuum>` |
 
 :::{important}
 The thing that bites people is not the API. It is treating a Delta table as a directory of
@@ -68,6 +68,41 @@ version `0`; passing both is an error.
 print(bt.read.delta(table, version=0).sort("id").to_pydict()["id"])
 # [1, 2, 3]
 ```
+
+`timestamp=` reads whichever version was current at that moment. It takes a `datetime`, a `date`,
+or any of the string spellings you would write by hand:
+
+```python
+import datetime
+
+print(bt.read.delta(table, timestamp="2999-01-01").count())
+# 4
+print(bt.read.delta(table, timestamp=datetime.datetime(2999, 1, 1)).count())
+# 4
+print(bt.read.delta(table, timestamp="2999-01-01 12:30:00").count())
+# 4
+```
+
+A timestamp with no UTC offset is read in the **driver's local timezone**, which is what Delta and
+Spark's `timestampAsOf` do. Pass an explicit offset (`"2024-03-01T00:00:00Z"`) when the same query
+must resolve to the same version wherever it runs.
+
+## Table properties
+
+Delta's protocol features are switched on by table properties, Spark's `TBLPROPERTIES`. Pass them
+to any write: they are set when the write creates the table, and altered onto it when it already
+exists. Setting a property already in force commits nothing, so a pipeline can pass them on every
+run.
+
+```python
+props = os.path.join(work, "props")
+bt.from_pydict({"id": [1]}).write.delta(
+    props, mode="overwrite", table_properties={"delta.enableChangeDataFeed": "true"}
+)
+```
+
+The change data feed is the one that matters most, because it is not retroactive: a table has to
+carry the property *before* the commits you later want to read as changes.
 
 ## Upsert and partition replace
 
@@ -189,6 +224,51 @@ ds = bt.read.delta(
 ```
 :::
 
+(reading-changes)=
+## Reading changes
+
+`bt.read.read_change_feed(uri)` reads row-level changes rather than the table's current state:
+each row carries `_change_type` (`insert`, `update_preimage`, `update_postimage`, `delete`),
+`_commit_version`, and `_commit_timestamp` beside the data columns.
+
+Name a bound and you get an ordinary bounded relation over that window, which you can count, join
+and merge. Name none and you get an unbounded stream of new commits, for a continuous query.
+
+```python
+changes = os.path.join(work, "changes")
+bt.from_pydict({"id": [1, 2], "amount": [10, 20]}).write.delta(
+    changes, mode="overwrite", table_properties={"delta.enableChangeDataFeed": "true"}
+)
+bt.from_pydict({"id": [3], "amount": [30]}).write.delta(changes, mode="append")
+
+window = bt.read.read_change_feed(changes, starting_version=1, ending_version=1)
+print(window.select("id", "_change_type").sort("id").to_pydict())
+# {'id': [3], '_change_type': ['insert']}
+```
+
+This is the shape an incremental job wants. Record the version you last processed, read the window
+from there, and merge it into the target:
+
+```python
+# docs: skip
+last = read_watermark()
+latest = bt.read.delta(source).meta.version
+changes = bt.read.read_change_feed(source, starting_version=last + 1, ending_version=latest)
+changes.filter(bt.col("_change_type") != "update_preimage").write.merge(
+    target, source=changes, on="id"
+).when_matched_update_all().when_not_matched_insert_all().execute()
+write_watermark(latest)
+```
+
+Bounding on both ends is what makes that re-runnable: the window is a fixed set of commits, so a
+retry after a crash reads exactly the same rows. `starting_timestamp=` and `ending_timestamp=`
+bound the window by time instead, taking the same spellings as `timestamp=` above.
+
+:::{note}
+Without a bound the feed is an unbounded source, so `collect()`, `count()` and joins raise. That is
+deliberate — consume it with `iter_batches()` or a streaming write.
+:::
+
 ## Exactly-once writes from a stream
 
 A restarted streaming query replays the micro-batch it was committing when it died. Pass an
@@ -208,7 +288,7 @@ it.
 ## Failure modes worth knowing
 
 **Concurrent writers.** Two writers that commit conflicting versions do not corrupt the table. The
-loser raises `CommitError`. Catch it and retry the write; the data files it already staged are
+loser raises {py:exc}`CommitError <batcher.CommitError>`. Catch it and retry the write; the data files it already staged are
 unreferenced, and vacuum will reclaim them.
 
 **Deletion vectors.** A table with DVs enabled cannot be read file by file, because the data files
@@ -217,9 +297,9 @@ DataFusion path, which applies the vectors. Correct, but it costs the split-para
 exact row-count-from-log. If a Delta read is unexpectedly slow and single-threaded, check
 `delta.enableDeletionVectors`.
 
-**Change data feed.** `bt.read.delta(uri, stream=True, starting_version=N)` reads the table as an
-unbounded stream of commits. It needs `delta.enableChangeDataFeed = true` set on the table *before*
-the commits you want to read. CDF is not retroactive.
+**Change data feed.** Needs `delta.enableChangeDataFeed = true` on the table *before* the commits
+you want to read. CDF is not retroactive, and turning it on later does not recover the history in
+between. See [Reading changes](#reading-changes) for how to read it.
 
 **Schema drift.** An append whose schema does not match the table's fails at commit. Align the
 columns in the plan (`select`, `cast`) rather than hoping the writer coerces.

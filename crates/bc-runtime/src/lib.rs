@@ -24,13 +24,9 @@ mod error;
 pub mod gather;
 pub mod join;
 pub(crate) mod keys;
+mod measure;
 pub mod shuffle;
 pub mod topn;
 pub mod window;
-mod window_agg;
-mod window_fill;
-pub mod window_frame;
-mod window_parallel;
-mod window_partition_agg;
 
 pub use error::RuntimeError;

@@ -1,8 +1,8 @@
 # Inference
 
 Batch inference applies a model to every row of a dataset. Two calls on the `.ml`
-accessor do it: `ds.ml.infer(model, ...)` for predictions, `ds.ml.embed(model, ...)`
-for vectors. Both are lazy and hand back a new `Dataset`. Both give the model whole
+accessor do it: {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` for predictions, {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>`
+for vectors. Both are lazy and hand back a new {py:class}`Dataset <batcher.Dataset>`. Both give the model whole
 Arrow batches, so parallelism, batch sizing, and GPU placement stay in the engine.
 
 ## The model is a callable over batches
@@ -172,8 +172,8 @@ embedded = docs.ml.embed(Embedder, batch_size=256, num_gpus=1, concurrency=2)
 ## Driving the pool yourself
 
 `ds.ml.infer` runs on a `Dataset`. Sometimes what you hold is a bare stream of Arrow
-batches instead: the output of `iter_batches()`, a reader, or a previous stage.
-`InferencePool` gives you that same worker pool with no plan around it.
+batches instead: the output of {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a reader, or a previous stage.
+{py:class}`InferencePool <batcher.ml.InferencePool>` gives you that same worker pool with no plan around it.
 
 Two callables define it. A `Worker` maps one `pyarrow.RecordBatch` to one
 `RecordBatch`: the forward pass, the tokenizer, whatever the batch has to go through. A
@@ -218,7 +218,7 @@ row that still runs out of memory raises.
 ## Overlapping stages with `run_pipeline`
 
 A real inference job is a chain: read, decode, forward pass. Run them in lockstep and
-the GPU idles while the CPU decodes the next batch. `run_pipeline` runs each `Stage` on
+the GPU idles while the CPU decodes the next batch. `run_pipeline` runs each {py:class}`Stage <batcher.ml.Stage>` on
 its own thread with a bounded queue between them, so the GPU stage works on batch *k*
 while the CPU stage prepares *k+1*.
 

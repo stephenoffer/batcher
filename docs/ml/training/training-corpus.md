@@ -5,7 +5,7 @@ several sources at the ratio you meant, dropping the documents that are not pros
 the evaluation data that leaked in. Each one is a data bug that presents as a model bug when
 it's skipped, which is why they're worth doing before the expensive part.
 
-Everything here is in `batcher.ml` and built on the public `Dataset` API, so each step is a plan
+Everything here is in `batcher.ml` and built on the public {py:class}`Dataset <batcher.Dataset>` API, so each step is a plan
 the optimizer sees whole rather than a pass over materialized rows.
 
 ## Mixing sources at declared weights
@@ -37,7 +37,7 @@ Weights are normalized, so `{"web": 3, "code": 1}` and `{"web": 0.75, "code": 0.
 same thing. Every row is tagged with a `source` column, which is what lets you read a loss or a
 quality metric per corpus afterwards.
 
-Read the `MixtureReport` rather than assuming the mixture matched its configuration. A source
+Read the {py:class}`MixtureReport <batcher.ml.MixtureReport>` rather than assuming the mixture matched its configuration. A source
 with fewer rows than its weight calls for cannot fill its share, and `mix_corpora` will not
 repeat rows to make it: repeating changes the effective number of epochs for that source, which
 is a decision to make on purpose.

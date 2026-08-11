@@ -958,14 +958,29 @@ the check is one command rather than a reading.
    of the nine that landed honours an explicit `ROWS` frame. **Closed by entries 171-176**
    for the six folds; `var`/`stddev` and `count_distinct` remain, and cannot be closed the
    same way (a Welford state is not a fold, and a distinct count needs a multiset).
-3. **Aggregates the engine does not have at all**: `entropy`, `mad`, `approx_top_k`,
-   `bitstring_agg`, `histogram_exact`, `quantile_disc`, the `arg_*_null` variants, and a
-   true `any_value`/`first`/`last` with no ordering requirement.
-4. **`struct` and `map` namespaces.** `.struct` has one method (`field`); DuckDB has
-   `struct_insert`/`struct_keys`/`struct_values`, Polars has more. `.map` is at five of
-   DuckDB's eleven after entries 177-178; the six that remain (`map_entries`,
-   `map_from_entries`, `map_concat`, `map_extract`, `element_at` on a map) each need a
-   kernel, since none is recoverable from the key list the way `len` and `contains` were.
+3. **Aggregates the engine does not have at all.** **Mostly stale, re-checked 2026-08-05**
+   against `bc_ir::AggFunc` and a `bt.sql` probe. `entropy` (`AggFunc::Entropy`), `mad`
+   (`AggFunc::Mad`) and `any_value` (`AggFunc::AnyValue`, resolved to the minimum so the
+   combine stays commutative) all exist, and `approx_top_k` and `quantile_disc` both run
+   from SQL. What remains is `bitstring_agg`, `histogram_exact`, the `arg_*_null`
+   variants, and `first`/`last` with no ordering requirement — the last of which is a
+   *semantic* refusal rather than a missing kernel, since scan order is not a property a
+   partition-order-independent fold can have.
+4. **`struct` and `map` namespaces.** **Re-checked 2026-08-05.** `.struct` is at three
+   methods, not one: `field`, `keys` and `get`. `.map` is at six — `keys`, `values`,
+   `entries`, `len`, `contains`, `get` — and `map_entries` now reaches its kernel from SQL
+   too (it was wired 2026-08-05; the kernel already matched DuckDB element for element and
+   only the SQL name was missing, which no differential test could see because every case
+   went through `.map.entries()`).
+
+   Still needing a kernel: `map_from_entries`, `map_concat`, `struct_insert` and
+   `struct_values` (which DuckDB returns as an anonymous *struct* of the values, not a
+   list). `map_extract`/`element_at` are a separate case and are **deliberately declined**
+   rather than missing — DuckDB returns a **list** (`[1]` for a hit, `[]` for a miss) where
+   `.map.get` returns the bare value, so the obvious wiring would answer `1`/`NULL`: a
+   plausible result that is not DuckDB's. The reason is recorded beside the table in
+   `_sql/parser/expressions/anonymous.py`, where the next person to reach for it will read
+   it.
 5. ~~**`ROLLUP`/`CUBE`/`GROUPING SETS` on the DataFrame API.**~~ **Closed.**
    `api/multi_group.py` (`MultiLevelGroupBy`, `rollup_levels`, `cube_levels`) provides
    `ds.rollup(...)`, `ds.cube(...)` and `ds.grouping_sets(...)`, wired from

@@ -60,8 +60,10 @@ from batcher._internal.hardware.engine import (
 )
 from batcher._internal.hardware.isa import cpu_features, cpu_model_name, cpu_vendor, simd_width_bits
 from batcher._internal.hardware.memory import (
+    hugepage_bytes,
     machine_memory_bytes,
     page_size_bytes,
+    swap_configured,
 )
 from batcher._internal.hardware.nvml import (
     DeviceTelemetry,
@@ -105,6 +107,7 @@ __all__ = [
     "gpu_devices_absent",
     "gpu_inventory",
     "hardware_profile",
+    "hugepage_bytes",
     "l3_cache_bytes",
     "machine_memory_bytes",
     "numa_node_count",
@@ -116,5 +119,6 @@ __all__ = [
     "release_retained_memory",
     "reset_hardware_probes",
     "simd_width_bits",
+    "swap_configured",
     "total_power_watts",
 ]

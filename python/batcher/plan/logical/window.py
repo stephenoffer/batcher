@@ -14,16 +14,23 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
 from batcher.plan.ir_tags import (
+    FRAME_UNITS,
     WINDOW_AGGREGATES,
+    WINDOW_EWM,
     WINDOW_FILL,
     WINDOW_FRAMEABLE,
     WINDOW_FUNCS,
     WINDOW_RANKING,
+    WINDOW_SERIES,
     WINDOW_VALUE,
     Op,
 )
-from batcher.plan.logical.aggregate import SortKeySpec
-from batcher.plan.logical.base import LogicalPlan, _validate_refs, available_column_set
+from batcher.plan.logical.base import (
+    LogicalPlan,
+    SortKeySpec,
+    _validate_refs,
+    available_column_set,
+)
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type, widen
 
@@ -36,9 +43,11 @@ def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataTyp
     # so they are Float64 — the plain-int64 ranking branch below would misreport the schema.
     if fn.func in ("percent_rank", "cume_dist"):
         return pa.float64()
-    if fn.func in WINDOW_RANKING or fn.func == "count":
+    if fn.func in WINDOW_RANKING or fn.func in ("count", "rle_id"):
         return pa.int64()
-    if fn.func == "avg":
+    # The EWM statistics and `interpolate` are ratios of weighted sums, so an integer
+    # input widens: the value between two integers is generally not one.
+    if fn.func == "avg" or fn.func in WINDOW_EWM or fn.func == "interpolate":
         return pa.float64()
     if fn.input is None:  # value/min/max/sum all need an input
         return None
@@ -52,7 +61,9 @@ def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataTyp
     return None
 
 
-_FRAME_UNITS = ("rows", "range", "groups")
+#: Fixed order for the error message; membership is `FRAME_UNITS`, which is the wire
+#: vocabulary and lives with every other IR tag in `plan/ir_tags.py`.
+_FRAME_UNIT_ORDER = ("rows", "range", "groups")
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,10 +80,15 @@ class WindowFrame:
     - ``"groups"`` — peer groups (rows sharing an ORDER BY value).
       ``WindowFrame(-1, 0, "groups")`` covers the current peer group and the one
       before it.
-    - ``"range"`` — value-based peers; only peer bounds (current row / unbounded)
-      are honored, e.g. ``WindowFrame(None, 0, "range")``. A numeric ``range``
-      offset (value-based ``n PRECEDING``/``FOLLOWING``) is not supported and raises
-      — use ``"rows"`` for a physical-row frame.
+    - ``"range"`` — the ORDER BY key's own **values**. ``WindowFrame(-300_000_000, 0,
+      "range")`` over a microsecond timestamp is "the last five minutes", a window whose
+      row count varies with how densely the series was sampled, where a ``"rows"`` frame
+      of the same shape is always the same number of rows. A ``0`` bound (or ``None``) is
+      the peer/unbounded form, e.g. ``WindowFrame(None, 0, "range")``.
+
+    A value-based ``range`` offset needs exactly one ORDER BY key and a numeric or
+    temporal one, because the bound is arithmetic on the key. The engine rejects a key it
+    cannot subtract rather than quietly substituting the peer frame.
     """
 
     start: int | None
@@ -80,24 +96,12 @@ class WindowFrame:
     units: str = "rows"
 
     def __post_init__(self) -> None:
-        if self.units not in _FRAME_UNITS:
-            raise PlanError(f"window frame units must be one of {_FRAME_UNITS}, got {self.units!r}")
+        if self.units not in FRAME_UNITS:
+            raise PlanError(
+                f"window frame units must be one of {_FRAME_UNIT_ORDER}, got {self.units!r}"
+            )
         if self.start is not None and self.end is not None and self.start > self.end:
             raise PlanError(f"window frame start {self.start} is after end {self.end}")
-        # A numeric RANGE offset (`n PRECEDING`/`FOLLOWING`, i.e. a non-zero bound) is
-        # value-based — it selects peers whose ORDER BY *value* is within `n`, not `n`
-        # rows. The engine does not implement that typed order-key arithmetic and
-        # silently ran the default running frame instead, a wrong result vs SQL. Reject
-        # it (only peer bounds — CURRENT ROW / UNBOUNDED — are honored for `range`),
-        # matching the SQL translator, which already rejects `RANGE BETWEEN n …`.
-        if self.units == "range" and (
-            (self.start is not None and self.start != 0) or (self.end is not None and self.end != 0)
-        ):
-            raise PlanError(
-                "numeric RANGE window frame offsets are not supported; only peer "
-                "bounds (CURRENT ROW / UNBOUNDED) are honored for range units. Use "
-                "'rows' units for a physical-row frame."
-            )
 
     def to_ir(self) -> dict[str, Any]:
         return {
@@ -137,18 +141,52 @@ class WindowFuncSpec:
     alias: str
     offset: int = 1
     frame: WindowFrame | None = None
+    #: EWM smoothing factor in ``(0, 1]``; set only for `ewm_mean`/`ewm_var`/`ewm_std`.
+    alpha: float | None = None
+    #: EWM half-life in the ORDER BY key's units (microseconds for a temporal key). Set
+    #: instead of `alpha` to decay by elapsed key value; only `ewm_mean` takes it.
+    half_life: float | None = None
 
     def __post_init__(self) -> None:
         if self.func not in WINDOW_FUNCS:
             raise PlanError(
                 f"unknown window function {self.func!r}; expected one of {sorted(WINDOW_FUNCS)}"
             )
-        if self.func in (WINDOW_AGGREGATES | WINDOW_VALUE) and self.input is None:
+        if self.func in (WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES) and self.input is None:
             raise PlanError(f"window function {self.func!r} requires an input column")
         if self.func in WINDOW_RANKING and self.input is not None:
             raise PlanError(f"window ranking function {self.func!r} takes no input")
         if self.frame is not None and self.func not in WINDOW_FRAMEABLE:
             raise PlanError(f"window function {self.func!r} does not support an explicit frame")
+        # An alpha on a non-EWM function would be silently dropped by the engine, and an
+        # EWM function without one has no curve to compute — reject both rather than pick
+        # a default, which would return a plausible answer to a question nobody asked.
+        if self.func in WINDOW_EWM:
+            # Exactly one decay: an alpha per row, or a half-life per unit of elapsed key.
+            # Both would be two answers to one question, and neither leaves nothing to decay.
+            if (self.alpha is None) == (self.half_life is None):
+                raise PlanError(
+                    f"window function {self.func!r} requires exactly one of a smoothing "
+                    f"factor alpha or a half_life, got alpha={self.alpha!r} "
+                    f"half_life={self.half_life!r}"
+                )
+            if self.alpha is not None and not 0.0 < self.alpha <= 1.0:
+                raise PlanError(
+                    f"window function {self.func!r} requires a smoothing factor alpha in "
+                    f"(0, 1], got {self.alpha!r}"
+                )
+            if self.half_life is not None and self.func != "ewm_mean":
+                raise PlanError(
+                    f"window function {self.func!r} does not take a half_life; only "
+                    "ewm_mean decays by elapsed time"
+                )
+            if self.half_life is not None and not self.half_life > 0:
+                raise PlanError(
+                    f"window function {self.func!r} requires a positive half_life, got "
+                    f"{self.half_life!r}"
+                )
+        elif self.alpha is not None or self.half_life is not None:
+            raise PlanError(f"window function {self.func!r} does not take a smoothing factor")
 
     def to_ir(self) -> dict[str, Any]:
         item: dict[str, Any] = {"func": self.func, "alias": self.alias, "offset": self.offset}
@@ -156,6 +194,10 @@ class WindowFuncSpec:
             item["input"] = self.input.to_ir()
         if self.frame is not None:
             item["frame"] = self.frame.to_ir()
+        if self.alpha is not None:
+            item["alpha"] = self.alpha
+        if self.half_life is not None:
+            item["half_life"] = self.half_life
         return item
 
 
@@ -201,12 +243,30 @@ class Window(LogicalPlan):
             _validate_refs(key.expr, available, what="window order key")
         for fn in self.functions:
             if fn.func in WINDOW_RANKING and not self.order_keys:
-                raise PlanError(f"window ranking function {fn.func!r} requires order_by keys")
-            if fn.func in WINDOW_FILL and not self.order_keys:
+                # Spark rejects this too (WINDOW_FUNCTION_FRAME_NOT_ORDERED), for the reason
+                # that applies here: without an order there is no "first" row, so the answer
+                # would depend on arrival order, which a morselized or distributed scan does
+                # not fix. DuckDB and Polars accept it because a single-node engine can
+                # define arrival order cheaply; an engine whose contract is
+                # single-node == distributed cannot.
+                #
+                # `row_number()` over the whole relation is the one that ports, because the
+                # thing a migrant wants from it — a positional column, any order — is a
+                # capability Batcher has under another name. Naming it here is what turns a
+                # refusal into a fix. The suggestion is withheld when `partition_by` is set:
+                # `with_row_index` numbers the relation, not each group, so offering it there
+                # would trade a clear refusal for a wrong answer.
+                hint = (
+                    " — for a plain positional column with no ordering, use ds.with_row_index('n')"
+                    if fn.func == "row_number" and not self.partition_keys
+                    else ""
+                )
+                raise PlanError(f"window ranking function {fn.func!r} requires order_by keys{hint}")
+            if fn.func in (WINDOW_FILL | WINDOW_SERIES) and not self.order_keys:
                 # Without an order there is no "previous" row: the result would depend on
                 # arrival order, which a morselized/distributed scan does not fix.
                 raise PlanError(
-                    f"window function {fn.func!r} requires order_by keys — a fill carries "
+                    f"window function {fn.func!r} requires order_by keys — it carries "
                     "values along a defined row order, and an unordered relation has none"
                 )
             if fn.input is not None:

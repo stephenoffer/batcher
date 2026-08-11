@@ -1,8 +1,9 @@
 """SQL ranking/value window functions newly wired in the SQL translator, vs DuckDB.
 
 `percent_rank`/`cume_dist`/`ntile` (ranking family) and `nth_value` were previously
-`NotImplementedError` in the SQL parser though the runtime supports them; `lag`/`lead`
-with a default value must give a clean error rather than a silently wrong NULL.
+`NotImplementedError` in the SQL parser though the runtime supports them, as was
+`lag`/`lead` with a default value — which is now rewritten onto the functions the engine
+does have rather than refused.
 """
 
 from __future__ import annotations
@@ -72,8 +73,12 @@ def test_lag_lead_offset_and_negative(duck, t):
     )
 
 
-def test_lag_with_default_value_is_rejected(t):
-    # DuckDB fills the out-of-range rows with the default; the engine has no such
-    # parameter, so it must raise rather than silently return NULL there.
-    with pytest.raises(NotImplementedError, match="default value"):
-        bt.sql("SELECT lag(v, 1, -1) OVER (ORDER BY i) AS l FROM t", t=t).collect()
+def test_lag_with_default_value_fills_the_out_of_range_rows(duck, t):
+    # This used to assert a *rejection*: the window operator has no default parameter, so
+    # the translator refused the three-argument form rather than return NULL where SQL
+    # returns the default. The form is now rewritten into window functions the engine does
+    # have (`CASE WHEN row_number() OVER w <= n THEN d ELSE lag(x, n) END`), so the
+    # assertion is the answer itself — strictly stronger than the refusal it replaces.
+    # `tests/differential/test_diff_sql_lag_lead_default.py` covers the rewrite in full,
+    # including the NULL-inside-the-partition case a COALESCE would get wrong.
+    _same(duck, t, "SELECT i, lag(v, 1, -1) OVER (ORDER BY i) AS l FROM t")

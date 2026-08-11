@@ -59,7 +59,7 @@ the right error, and it tells you the real question is *which* row wins.
 
 ## Sequence, not arrival
 
-`ds.scd.apply_changes` is the CDC-aware upsert (Delta Live Tables spells it
+{py:meth}`ds.scd.apply_changes <batcher.api.dataset.scd.DatasetSCD.apply_changes>` is the CDC-aware upsert (Delta Live Tables spells it
 `APPLY CHANGES INTO`). You give it the key, the column that sequences the changes, and
 a predicate that identifies a delete:
 
@@ -164,7 +164,7 @@ Delta table, where the commit is a real transaction.
 ## Wiring the real feed
 
 The feed itself comes off Kafka or a Delta change feed. Only the source line changes, and the
-`apply_changes` call is the same one you ran above.
+{py:meth}`apply_changes <batcher.api.dataset.scd.DatasetSCD.apply_changes>` call is the same one you ran above.
 
 ::::{tab-set}
 

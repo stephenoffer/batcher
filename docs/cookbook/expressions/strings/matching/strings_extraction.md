@@ -20,4 +20,4 @@ python examples/expressions/strings_extraction.py
 - {doc}`/cookbook/expressions/strings/measuring/strings_counts`: words, lines, sentences, and entities.
 - {doc}`/cookbook/expressions/strings/measuring/strings_hashing`: keys, checksums, and safe transport.
 - {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
-- {doc}`/api/relational/expressions`: the complete `Expr` reference.
+- {doc}`/api/relational/expressions`: the complete {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` reference.

@@ -13,7 +13,8 @@ from typing import Any
 
 from batcher.api.dataset import Dataset
 from batcher.api.session._scan import _scan
-from batcher.io.detect import detect_format
+from batcher.io.detect import detect_format, partition_aware_format
+from batcher.io.filesystem import require_success_marker
 from batcher.io.formats.base import SOURCES
 
 __all__ = [
@@ -49,10 +50,18 @@ def read(path: str, *, format: str | None = None, **opts: Any) -> Dataset:
     format="csv")``. For database/catalog sources use `read_table` or the typed
     ``read_*`` helpers.
 
+    ``require_success=True`` refuses a directory whose producing write never published a
+    ``_SUCCESS`` marker. Every data file is written atomically, so none is ever half-written
+    — but a run that died partway leaves a directory of *valid* files that reads back
+    cleanly and silently short, and the marker is the only thing that distinguishes the two.
+    Off by default, because a directory Batcher did not write has no marker and is not
+    thereby incomplete; turn it on for a path another job produces.
+
     Args:
         path: A file, directory, glob, or URI to read.
         format: Force a format instead of inferring one from `path`.
-        **opts: Format-specific reader options forwarded to the source.
+        **opts: Format-specific reader options forwarded to the source, plus
+            ``require_success`` (see above), which is consumed here.
 
     Returns:
         A lazy `Dataset` over the source.
@@ -67,7 +76,9 @@ def read(path: str, *, format: str | None = None, **opts: Any) -> Dataset:
             >>> bt.read(path).count()
             3
     """
-    fmt = detect_format(path, format)
+    if opts.pop("require_success", False):
+        require_success_marker(path)
+    fmt = partition_aware_format(path, detect_format(path, format), opts)
     return _scan(SOURCES.get(fmt)(path, **opts))
 
 

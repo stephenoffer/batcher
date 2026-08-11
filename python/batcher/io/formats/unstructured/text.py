@@ -7,6 +7,7 @@ from collections.abc import Iterator
 import pyarrow as pa
 
 from batcher._internal.errors import FormatError
+from batcher.io.base._lines import iter_line_blocks, one_array
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
@@ -87,20 +88,52 @@ class TextSource:
     ) -> Iterator[pa.RecordBatch]:
         """Stream one file's lines, in batches, without ever holding it whole."""
         lineno = 0
-        lines: list[str] = []
-        for line in self._iter_lines(path):
-            lines.append(line)
-            if len(lines) >= _TEXT_LINES_PER_BATCH:
-                yield self._line_batch(path, lineno, lines, projection)
-                lineno += len(lines)
-                lines = []
-        if lines or lineno == 0:
+        held: list[pa.Array] = []
+        n_held = 0
+        # Blocks arrive as Arrow arrays (or lists, when the exact Python fallback ran) and
+        # are concatenated only at batch boundaries, so a line is never a Python object on
+        # the fast path. See `io.base._lines` for why the splitting is Arrow's.
+        for block in self._iter_lines(path):
+            arr = block if isinstance(block, pa.Array) else pa.array(block, pa.string())
+            held.append(arr)
+            n_held += len(arr)
+            while n_held >= _TEXT_LINES_PER_BATCH:
+                # Sliced to the batch size rather than emitted whole. Emitting the whole
+                # accumulation avoids a concatenation, and it also unbounds the batch: a
+                # block is 16 MiB of *bytes*, which for short lines is millions of rows, so
+                # the batch-size knob would stop bounding anything and line mode exists to
+                # bound exactly that. `Array.slice` is a zero-copy view, so the remainder
+                # costs nothing to carry — only rejoining it to the next block copies.
+                lines = one_array(held)
+                yield self._line_batch(
+                    path, lineno, lines.slice(0, _TEXT_LINES_PER_BATCH), projection
+                )
+                lineno += _TEXT_LINES_PER_BATCH
+                held = [lines.slice(_TEXT_LINES_PER_BATCH)]
+                n_held -= _TEXT_LINES_PER_BATCH
+        if n_held or lineno == 0:
             # An empty file still yields one empty batch, so the schema is observable and
-            # the whole-file path's behaviour is preserved.
-            yield self._line_batch(path, lineno, lines, projection)
+            # the whole-file path's behaviour is preserved — and it reaches here with no
+            # block at all, which `concat_arrays` refuses.
+            yield self._line_batch(path, lineno, one_array(held), projection)
 
-    def _iter_lines(self, path: str) -> Iterator[str]:
-        """Yield the file's lines, matching `str.splitlines()` exactly.
+    def _iter_lines(self, path: str) -> Iterator[pa.Array | list[str]]:
+        """Yield each block's complete lines, matching `str.splitlines()` exactly.
+
+        UTF-8 — the default, and what text files overwhelmingly are — goes through the
+        shared Arrow-backed splitter, which produces the column with no Python object per
+        line. Any other encoding keeps the incremental-decoder path below, because that
+        splitter reads UTF-8 and nothing else; a `latin-1` or `utf-16` file is decoded here
+        exactly as it always was.
+        """
+        if self._encoding.lower().replace("-", "").replace("_", "") in ("utf8", "u8", "utf"):
+            with self._fs.open(path) as fh:
+                yield from iter_line_blocks(fh, splitlines=True)
+            return
+        yield from self._iter_lines_decoded(path)
+
+    def _iter_lines_decoded(self, path: str) -> Iterator[list[str]]:
+        """`_iter_lines` for a non-UTF-8 encoding, decoded incrementally in Python.
 
         `splitlines` — not `split("\n")` — because it is what the whole-file path used,
         and it also breaks on `\r`, `\v`, `\f`, `\x85`, `\u2028` and friends. Reading in
@@ -110,6 +143,15 @@ class TextSource:
         * a `\r` at the end of a block that turns out to be the start of a `\r\n`, which
           would otherwise be reported as one line where the file has none. It is held back
           until the next block resolves it.
+
+        A **block** of lines is yielded rather than each line, and the terminators are
+        stripped by splitting the block's body **once** rather than per line. The previous
+        form called `piece.splitlines()[0]` on every individual line — to undo the terminator
+        `keepends=True` had just attached — so each line cost a second scan, a fresh
+        one-element list, an index, and a generator resume. That is per-row Python in the
+        read path, and it was most of the cost: this source read **12.8 MB/s** where
+        `pyarrow.csv` reads the same line-delimited bytes at over 1 GB/s. `keepends` is now
+        used only to find where the complete body ends.
         """
         import codecs
 
@@ -127,22 +169,35 @@ class TextSource:
                     continue
                 # The last piece is incomplete unless it carries its terminator — and a
                 # trailing lone "\r" may still become "\r\n", so it waits too.
-                carry = ""
-                if pieces[-1] == pieces[-1].splitlines()[0] or pieces[-1].endswith("\r"):
-                    carry = pieces.pop()
-                for piece in pieces:
-                    yield piece.splitlines()[0]
-        for piece in carry.splitlines():
-            yield piece
+                tail = pieces[-1]
+                if tail == tail.splitlines()[0] or tail.endswith("\r"):
+                    body, carry = carry[: len(carry) - len(tail)], tail
+                else:
+                    body, carry = carry, ""
+                if body:
+                    yield body.splitlines()
+        if carry:
+            yield carry.splitlines()
 
     def _line_batch(
-        self, path: str, first_line: int, lines: list[str], projection: list[str] | None
+        self, path: str, first_line: int, lines: pa.Array, projection: list[str] | None
     ) -> pa.RecordBatch:
+        """One batch of lines, with the two derived columns built without per-row Python.
+
+        `path` is the same string on every row and `line_number` is a contiguous run, so
+        neither needs a Python list per batch: `[path] * len(lines)` allocated a list of
+        16,384 references to one string and `range(...)` boxed 16,384 integers, both only
+        for Arrow to walk them straight back. `pa.repeat` and `numpy.arange` produce the
+        same two columns entirely in C.
+        """
+        import numpy as np
+
+        n = len(lines)
         batch = pa.RecordBatch.from_arrays(
             [
-                pa.array([path] * len(lines), pa.string()),
-                pa.array(range(first_line + 1, first_line + len(lines) + 1), pa.int64()),
-                pa.array(lines, pa.string()),
+                pa.repeat(pa.scalar(path, pa.string()), n),
+                pa.array(np.arange(first_line + 1, first_line + n + 1, dtype=np.int64)),
+                lines,
             ],
             names=["path", "line_number", "text"],
         )
@@ -223,8 +278,66 @@ class TextSource:
             return f"{base}#enc={self._encoding}"
         return base
 
-    def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
+    def splits(
+        self, target_size: int | None = None, projection: list[str] | None = None
+    ) -> list[Split]:
+        """Independently-readable slices — byte ranges when the scan allows, else one per file.
+
+        A whole file was the only unit here, so one 50 GB log was one task however many nodes
+        the cluster had. Line mode is newline-delimited, so it can range-split exactly as
+        NDJSON and CSV do — except for `line_number`, which counts from the start of the file
+        and therefore cannot be produced by a range that starts in the middle of one. So the
+        ranges are offered only when the pushed projection does not ask for it, which is the
+        common shape (grep the lines, count matches, extract a field). See
+        `io.splits.text` for the reasoning in full.
+
+        File mode is one row per file and cannot subdivide at all; a non-UTF-8 encoding keeps
+        the whole-file split because the range reader decodes UTF-8.
+
+        Args:
+            target_size: Rough bytes per split; `ExecutionConfig.split_bytes` when omitted.
+            projection: The columns Kyber pushed to this scan, if any.
+
+        Returns:
+            The splits covering this source exactly once.
+        """
+        files = self._files()
+        if self._can_range_split(projection):
+            from batcher.config import active_config
+            from batcher.io.splits import line_range_splits
+
+            chunk = target_size or active_config().execution.split_bytes
+            out: list[Split] = []
+            for f in files:
+                try:
+                    size = self._fs.size(f)
+                except (OSError, ValueError):
+                    size = None
+                if size is None or size <= chunk:
+                    out.append(WholeSourceSplit(TextSource(f, mode=self._mode)))
+                    continue
+                out.extend(
+                    line_range_splits(
+                        "text",
+                        f,
+                        size,
+                        chunk,
+                        text_column="text",
+                        columns=tuple(projection or ()),
+                        splitlines=True,
+                    )
+                )
+            return out
         return [
-            WholeSourceSplit(TextSource(f, mode=self._mode, encoding=self._encoding))
-            for f in self._files()
+            WholeSourceSplit(TextSource(f, mode=self._mode, encoding=self._encoding)) for f in files
         ]
+
+    def _can_range_split(self, projection: list[str] | None) -> bool:
+        """Whether this scan can be served by byte ranges rather than whole files."""
+        return (
+            self._mode == "line"
+            and projection is not None
+            and "line_number" not in projection
+            and bool(projection)
+            and self._encoding.lower().replace("-", "").replace("_", "") in ("utf8", "u8", "utf")
+        )

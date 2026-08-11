@@ -125,13 +125,23 @@ def video_dataset(
         storage = pa.FixedSizeListArray.from_arrays(
             pa.array(flat.reshape(-1)), per_row, mask=pa.array(missing)
         )
-        out = batch.append_column(output_column, as_tensor_column(storage, shape))
+        # `append_columns` replaces a name the batch already carries. A bare `append_column`
+        # left two Arrow fields of one name — `to_pydict()` keeps the last, expressions
+        # resolve the first, nothing raises — which is what decoding into an existing
+        # column, or re-running a decode stage, produced.
+        from batcher.ml.tabular.features import append_columns
+
+        written = {output_column: as_tensor_column(storage, shape)}
         if error_column:
-            out = out.append_column(error_column, pa.array(failed))
-        return out
+            written[error_column] = pa.array(failed)
+        return append_columns(batch, written)
 
     appended = [output_column, *([error_column] if error_column else [])]
-    return ds.map_batches(_decode, output_columns=[*list(ds.columns), *appended])
+    existing = list(ds.columns)
+    # A written column the dataset already has is *replaced*, so declaring it twice would
+    # promise the plan a schema the stage does not produce.
+    declared = [*existing, *[name for name in appended if name not in existing]]
+    return ds.map_batches(_decode, output_columns=declared)
 
 
 def _native_frames(

@@ -376,6 +376,36 @@ class InferencePool:
             return self._throughput_ctl.update(throughput, vram)
         return None
 
+    def _publish_batch(self, rows: int, latency_ms: float, blocked_ms: float, pending: int) -> None:
+        """Report one finished micro-batch and the pool's depth on the event bus.
+
+        The pool already measures every one of these for its own controller and then threw
+        them away, so a multi-hour batch-inference job — the workload with the longest gap
+        between "started" and "finished" of anything the engine runs — reported no progress
+        at all. `observe.InferenceProgress` and the `inference` metrics section were both
+        written against these events and neither had a publisher.
+
+        `blocked_ms` is the signal worth having: it is the time the *consumer* spent waiting
+        on this pool, so a large value means the pool is the bottleneck and a near-zero one
+        means the pool is starved by whatever feeds it. The two look identical in rows/sec
+        and want opposite fixes — more workers, or a faster source.
+
+        A no-op when nothing is listening, which is the default; this runs once per
+        micro-batch, so it must cost a tuple check on the common path.
+        """
+        from batcher._internal import events
+
+        if not events.listening():
+            return
+        events.publish(
+            events.INFER,
+            name="inference",
+            rows=rows,
+            latency_ms=latency_ms,
+            blocked_ms=blocked_ms,
+        )
+        events.publish(events.POOL, name="inference", size=self._num_workers, pending=pending)
+
     def run(self, batches: Iterable[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
         """Stream `batches` through the pool, yielding result batches in order.
 
@@ -419,7 +449,15 @@ class InferencePool:
             with ThreadPoolExecutor(max_workers=self._num_workers) as pool:
 
                 def pop_head() -> pa.RecordBatch:
-                    out, latency_ms = pending.popleft().result()  # blocks until the head is done
+                    blocked = time.perf_counter()
+                    head = pending.popleft()
+                    done = head.done()
+                    out, latency_ms = head.result()  # blocks until the head is done
+                    # Time the *consumer* spent waiting on this pool, which is what
+                    # distinguishes a saturated pool from a starved one — and is zero
+                    # whenever the head had already finished before we asked.
+                    blocked_ms = 0.0 if done else (time.perf_counter() - blocked) * 1000.0
+                    self._publish_batch(out.num_rows, latency_ms, blocked_ms, len(pending))
                     target = self._next_target(out, latency_ms)
                     if target is not None:
                         self._batcher.set_target(target)

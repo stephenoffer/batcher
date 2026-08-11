@@ -14,7 +14,6 @@ from batcher.kyber.rules.extra.projection_scan import (
     drop_self_cast_in_filter,
     drop_self_cast_in_projection,
     drop_self_cast_in_sort_key,
-    eliminate_sort_before_sample,
     empty_on_impossible_null_check,
     empty_sample_n,
     fold_nested_sample_same_seed,
@@ -39,7 +38,6 @@ _RULE_NAMES = {
     "drop_self_cast_in_filter",
     "drop_self_cast_in_projection",
     "drop_self_cast_in_sort_key",
-    "eliminate_sort_before_sample",
     "empty_on_impossible_null_check",
     "empty_sample_n",
     "fold_nested_sample_same_seed",
@@ -62,23 +60,17 @@ def test_all_rules_registered():
     assert registered >= _RULE_NAMES
 
 
-# --- eliminate_sort_before_sample --------------------------------------------
+# --- the removed `eliminate_sort_before_sample` -------------------------------
+#
+# That rule rewrote `Sample(Sort(x))` -> `Sample(x)`, which is wrong: `Sample` is
+# order-preserving in the engine, so it changed the order of the rows the user got back.
+# The sound form of the optimization now lives on the order-indifferent consumer
+# (`eliminate_sort_before_aggregate`, which looks through a `Sample`). This asserts the
+# rule is *gone*, so reinstating it fails here rather than silently reordering results.
 
 
-def test_sort_before_sample_dropped():
-    scan = _scan()
-    node = Sample(Sort(scan, (SortKeySpec(Col("x")),)), fraction=0.5, seed=7)
-    out = eliminate_sort_before_sample(node, None)
-    assert isinstance(out, Sample) and out.input is scan
-    assert out.fraction == 0.5 and out.seed == 7
-    assert eliminate_sort_before_sample(out, None) is None
-
-
-def test_sort_before_sample_keeps_topn():
-    scan = _scan()
-    node = Sample(Sort(scan, (SortKeySpec(Col("x")),), limit=2), fraction=0.5, seed=7)
-    assert eliminate_sort_before_sample(node, None) is None
-    assert eliminate_sort_before_sample(Sample(scan, 0.5, 7), None) is None
+def test_sort_before_sample_rule_is_not_registered():
+    assert "eliminate_sort_before_sample" not in {r.name for r in DEFAULT_REGISTRY.rules()}
 
 
 # --- dedupe_sort_keys --------------------------------------------------------

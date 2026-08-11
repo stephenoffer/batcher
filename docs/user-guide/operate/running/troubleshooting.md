@@ -12,7 +12,7 @@ and follow it. The rest of this page covers the exceptions themselves.
 
 | Symptom | Read this |
 |---|---|
-| Nothing ran, or the result is a `Dataset` repr | "Nothing happened when I called a transformation", below |
+| Nothing ran, or the result is a {py:class}`Dataset <batcher.Dataset>` repr | "Nothing happened when I called a transformation", below |
 | The answer is wrong | {doc}`/user-guide/operate/tuning/explain-plans`, then {doc}`/user-guide/trust/data-quality` to assert what you expected |
 | Correct, but too slow | {doc}`/user-guide/operate/tuning/performance`, then {doc}`/tutorials/foundations/optimizing-a-slow-query` |
 | A query is taking far too long and you want it to stop | "Stopping a query that is taking too long", below |
@@ -46,7 +46,7 @@ Terminal operations are `collect`, `to_pydict`, `to_pylist`, `count`,
 
 ## Unknown column
 
-Referencing a column that is not in the input raises `PlanError` with the available
+Referencing a column that is not in the input raises {py:exc}`PlanError <batcher.PlanError>` with the available
 names. Check for typos and confirm earlier steps did not drop or rename the column.
 
 ```python
@@ -66,7 +66,7 @@ print(ds.with_columns(z=bt.col("x") + bt.col("y")).columns)
 
 ## filter needs an expression, not a string
 
-`filter` takes an `Expr`. A raw string is not a predicate; build the condition with
+`filter` takes an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`. A raw string is not a predicate; build the condition with
 {py:obj}`bt.col <batcher.col>`.
 
 ```python
@@ -99,7 +99,7 @@ print(named.sort("x").to_pydict())
 # {'x': [1, 2, 3], 'total': [10, 20, 30]}
 ```
 
-There is no `.alias()` on an aggregate. The keyword is the output name.
+There is no {py:meth}`.alias() <batcher.plan.expr_ir.core.Expr.alias>` on an aggregate. The keyword is the output name.
 
 ## Boolean operators need parentheses
 
@@ -120,15 +120,15 @@ bt.col("y")) < 30` and will not do what you want.
 The surface is deliberately small, and a few operations sit somewhere other than where
 you might reach first:
 
-- `collect()` returns a pyarrow Table. To get a pandas DataFrame, call `.to_pandas()` on
+- {py:meth}`collect() <batcher.Dataset.collect>` returns a pyarrow Table. To get a pandas DataFrame, call {py:meth}`.to_pandas() <batcher.Dataset.to_pandas>` on
   that Table, not on the Dataset.
 - `distinct()` and `unique()` are the same operator under two names, so use whichever
   spelling your background makes natural.
-- `ds.sql(query)` binds the current dataset as the table `self`. The top-level
+- {py:meth}`ds.sql(query) <batcher.Dataset.sql>` binds the current dataset as the table `self`. The top-level
   {py:obj}`bt.sql <batcher.sql>` is what you want when a query names more than one table.
-- `ds.cast`, `ds.fill_null`, and `ds.drop_nulls` work over whole columns. When you want
+- {py:meth}`ds.cast <batcher.Dataset.cast>`, {py:meth}`ds.fill_null <batcher.Dataset.fill_null>`, and {py:meth}`ds.drop_nulls <batcher.Dataset.drop_nulls>` work over whole columns. When you want
   the same thing on one derived value, the expression methods do it:
-  `ds.with_columns(x=bt.col("x").cast("float64"))`.
+  {py:meth}`ds.with_columns(x=bt.col("x").cast("float64")) <batcher.Dataset.with_columns>`.
 
 ```python
 table = ds.collect()
@@ -138,7 +138,7 @@ print(type(table).__module__, type(table).__name__)
 
 ## Catching errors by type
 
-Every Batcher failure subclasses `bt.BatcherError`, so one `except` catches them all
+Every Batcher failure subclasses {py:exc}`bt.BatcherError <batcher.BatcherError>`, so one `except` catches them all
 without importing anything internal:
 
 ```python
@@ -154,22 +154,22 @@ reachable as `bt.<Name>`:
 
 | Type | Catch it for | Also a |
 |------|--------------|--------|
-| `bt.PlanError` | an invalid plan or schema, raised eagerly at build time | `ValueError` |
-| `bt.ColumnNotFoundError` | a reference to a column that isn't there (carries `.column`) | `KeyError` |
-| `bt.ConfigError` | an out-of-range or inconsistent configuration value | `ValueError` |
-| `bt.MissingDependencyError` | an optional extra that isn't installed (carries `.install`) | `ImportError` |
-| `bt.AccessDeniedError` | a governed table or column the principal can't read | `PermissionError` |
-| `bt.ExecutionError` | an operator failing at runtime in the engine | |
-| `bt.OptimizationError` | the optimizer failing to produce a physical plan | |
-| `bt.CompileError` | JIT compilation failing (the interpreter still runs) | |
-| `bt.ResourceError` | the resource manager unable to grant memory or credit | |
-| `bt.IOError` | a source or sink failing to read, write, list, or open | |
-| `bt.FormatError` | an unknown format, or a file malformed for its format | |
-| `bt.CommitError` | an atomic write commit failing (a concurrent-writer conflict) | |
-| `bt.SchemaError` | schemas that can't be reconciled across files or against an expected one | |
-| `bt.DataQualityError` | a `ds.dq...fail()` expectation with violating rows (carries the counts) | `ValueError` |
-| `bt.BackendError` | a specific execution backend failing | |
-| `bt.TransportError` | the distributed data plane (shared memory / Flight) failing | |
+| {py:exc}`bt.PlanError <batcher.PlanError>` | an invalid plan or schema, raised eagerly at build time | `ValueError` |
+| {py:exc}`bt.ColumnNotFoundError <batcher.ColumnNotFoundError>` | a reference to a column that isn't there (carries `.column`) | `KeyError` |
+| {py:exc}`bt.ConfigError <batcher.ConfigError>` | an out-of-range or inconsistent configuration value | `ValueError` |
+| {py:exc}`bt.MissingDependencyError <batcher.MissingDependencyError>` | an optional extra that isn't installed (carries `.install`) | `ImportError` |
+| {py:exc}`bt.AccessDeniedError <batcher.AccessDeniedError>` | a governed table or column the principal can't read | `PermissionError` |
+| {py:exc}`bt.ExecutionError <batcher.ExecutionError>` | an operator failing at runtime in the engine | |
+| {py:exc}`bt.OptimizationError <batcher.OptimizationError>` | the optimizer failing to produce a physical plan | |
+| {py:exc}`bt.CompileError <batcher.CompileError>` | JIT compilation failing (the interpreter still runs) | |
+| {py:exc}`bt.ResourceError <batcher.ResourceError>` | the resource manager unable to grant memory or credit | |
+| {py:exc}`bt.IOError <batcher.IOError>` | a source or sink failing to read, write, list, or open | |
+| {py:exc}`bt.FormatError <batcher.FormatError>` | an unknown format, or a file malformed for its format | |
+| {py:exc}`bt.CommitError <batcher.CommitError>` | an atomic write commit failing (a concurrent-writer conflict) | |
+| {py:exc}`bt.SchemaError <batcher.SchemaError>` | schemas that can't be reconciled across files or against an expected one | |
+| {py:exc}`bt.DataQualityError <batcher.DataQualityError>` | a `ds.dq...fail()` expectation with violating rows (carries the counts) | `ValueError` |
+| {py:exc}`bt.BackendError <batcher.BackendError>` | a specific execution backend failing | |
+| {py:exc}`bt.TransportError <batcher.TransportError>` | the distributed data plane (shared memory / Flight) failing | |
 
 Because several also subclass a builtin, existing `except ValueError` /
 `except ImportError` handlers keep working unchanged.
@@ -189,7 +189,7 @@ print(bt.running_queries())
 # []
 ```
 
-Each terminal operation registers one id for its duration, so `running_queries()` is empty between queries. From a second thread, `bt.cancel_query(query_id)` asks that one to stop and returns whether it was still running:
+Each terminal operation registers one id for its duration, so {py:func}`running_queries() <batcher.running_queries>` is empty between queries. From a second thread, {py:func}`bt.cancel_query(query_id) <batcher.cancel_query>` asks that one to stop and returns whether it was still running:
 
 ```python
 import batcher as bt
@@ -227,7 +227,7 @@ out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 - {doc}`Data quality </user-guide/trust/data-quality>`: turn "the answer looks wrong" into an assertion that
   fails loudly, with the offending rows quarantined.
 - {doc}`Observability </user-guide/operate/running/observability>`: the event stream, the progress reporter, and
-  `bt.start_ui()` for watching a running query.
+  {py:func}`bt.start_ui() <batcher.start_ui>` for watching a running query.
 - {doc}`Spilling </architecture/deep-dives/memory/spilling>`: what `spill=True` actually does, and why a spilled
   query gets slower rather than dying.
 - {doc}`Distributed fault tolerance </architecture/fault-tolerance>`: diagnosing a

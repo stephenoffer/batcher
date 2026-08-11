@@ -300,7 +300,7 @@ mod tests {
     /// identical to the bloom-off run, for every left-driven join type.
     #[test]
     fn sharded_build_bloom_never_drops_a_match() {
-        use crate::join::hash_join_indices_impl;
+        use crate::join::{hash_join_indices_impl, BLOOM_MIN_BUILD_ROWS};
         // 40k distinct build keys (each once) -> shards, and every probe key is present so
         // any false-negative bloom rejection would delete a real match.
         let build: Vec<Option<i64>> = (0..40_000i64).map(Some).collect();
@@ -316,12 +316,24 @@ mod tests {
             JoinType::Semi,
             JoinType::Anti,
         ] {
-            let with =
-                hash_join_indices_impl(&keys(probe.clone()), &keys(build.clone()), jt, true, 0.01)
-                    .unwrap();
-            let without =
-                hash_join_indices_impl(&keys(probe.clone()), &keys(build.clone()), jt, false, 0.01)
-                    .unwrap();
+            let with = hash_join_indices_impl(
+                &keys(probe.clone()),
+                &keys(build.clone()),
+                jt,
+                true,
+                0.01,
+                BLOOM_MIN_BUILD_ROWS,
+            )
+            .unwrap();
+            let without = hash_join_indices_impl(
+                &keys(probe.clone()),
+                &keys(build.clone()),
+                jt,
+                false,
+                0.01,
+                BLOOM_MIN_BUILD_ROWS,
+            )
+            .unwrap();
             let mut a = pairs(&with);
             let mut b = pairs(&without);
             a.sort();

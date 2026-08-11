@@ -391,6 +391,10 @@ from batcher.plan.functions.regression import (
     regr_syy,
 )
 from batcher.plan.functions.scalar import arctan2, cut
+
+# The rigid-body family, spliced for the same reason. See `plan/functions/spatial/`.
+from batcher.plan.functions.spatial import *  # noqa: F403
+from batcher.plan.functions.spatial import __all__ as _SPATIAL_ALL
 from batcher.plan.functions.statistics import (
     arg_max,
     arg_min,
@@ -794,4 +798,4 @@ __all__ = [
 # names in a sorted block after the curated one — globally unsorted, so the gate went red the
 # moment they landed. Sorting here keeps the splice a one-liner without the curated list
 # having to restate names it deliberately does not spell out.
-__all__ = sorted(__all__ + _GEO_ALL)
+__all__ = sorted(__all__ + _GEO_ALL + _SPATIAL_ALL)

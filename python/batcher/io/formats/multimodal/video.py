@@ -17,7 +17,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.multimodal.media import MediaSource
 
@@ -61,10 +61,4 @@ class VideoSource(MediaSource):
 
 def _av() -> Any:
     """The PyAV module, or a typed error pointing at the ``video`` extra."""
-    try:
-        import av
-    except ImportError as exc:
-        raise BackendError(
-            "reading video needs the video extra: pip install 'batcher-engine[video]'"
-        ) from exc
-    return av
+    return require("av", feature="Video support", provides="PyAV", extra="video")

@@ -40,7 +40,7 @@ def test_resolve_adaptive_learned_router_cold_and_warm(monkeypatch):
     assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is False
 
     # Above the floor, a history where staging measured far cheaper turns it on.
-    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 1)
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
     sig = plan_signature(ds._plan)
     for _ in range(4):
         record_adaptive_route(hub, sig, "staged", 10.0)
@@ -66,7 +66,7 @@ def test_the_staged_arm_is_not_offered_when_it_could_only_lose(monkeypatch):
     right = bt.from_arrow(pa.table({"k": [1, 2], "w": [9, 8]}))
     ds = left.join(right, on="k")  # both operands are scans: exact sizes, nothing to learn
     hub = _hub()
-    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 1)
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
     sig = plan_signature(ds._plan)
     # A history that would otherwise be decisive for staging.
     for _ in range(4):
@@ -98,9 +98,9 @@ def test_the_size_floor_binds_the_learned_router_too(monkeypatch):
         record_adaptive_route(hub, sig, "one_shot", 1000.0)
 
     # The very same history that turns staging on above the floor is ignored below it.
-    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 1)
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
     assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is True
-    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_INPUT_ROWS", 20_000_000)
+    monkeypatch.setattr(gating, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 20_000_000)
     assert resolve_adaptive("auto", ds._plan, ds._sources, hub) is False
 
 

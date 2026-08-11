@@ -36,8 +36,8 @@ __all__ = ["SPILL_DEVICE_FACTOR", "SPILL_DEVICE_FACTOR_DEFAULT", "spill_device_f
 # caller and the surface diff see no change.
 
 
-def spill_device_factor() -> float:
-    """How much a spilled byte costs on this machine's spill device, relative to local flash.
+def spill_device_factor(storage_class: str = "") -> float:
+    """How much a spilled byte costs on the spill device, relative to local flash.
 
     Read from the device backing the directory the engine will actually spill to, which is
     the same three-step resolution the spill paths themselves use: the configured
@@ -45,6 +45,12 @@ def spill_device_factor() -> float:
     only the first and last of those would price a spill against the container's overlay while
     it lands on the node's NVMe — a factor of ten in the wrong direction on exactly the
     machines where an out-of-core plan is worth ranking carefully.
+
+    **Whose device, though.** Resolving it in this process describes the *driver*, and on a
+    cluster the driver spills nothing: the workers do, to their own volumes. A driver on local
+    NVMe planning for workers on a network volume under-states a spilled byte tenfold, in the
+    one term that decides whether an out-of-core plan is acceptable at all. A caller with a
+    `HardwareProfile` passes the binding worker's measured class instead.
 
     Cheap enough for the planning path: the device probe behind it memoizes per resolved
     directory, so this costs one `stat` the first time a process plans a spilling query and a
@@ -57,9 +63,17 @@ def spill_device_factor() -> float:
             >>> spill_device_factor() >= 1.0
             True
 
+    Args:
+        storage_class: The measured device class of the node that will spill, from
+            `HardwareProfile.storage_class`. `""` — what every caller without a profile
+            passes — resolves this process's own spill directory, which is exactly right
+            single-node and is what this always did.
+
     Returns:
         The cost multiplier for spilled bytes, at least 1.0.
     """
+    if storage_class:
+        return SPILL_DEVICE_FACTOR.get(storage_class, SPILL_DEVICE_FACTOR_DEFAULT)
     from batcher._internal.site import local_scratch_root
 
     spill_dir = active_config().memory.spill_dir or local_scratch_root() or tempfile.gettempdir()

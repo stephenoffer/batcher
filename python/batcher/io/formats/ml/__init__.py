@@ -1,11 +1,16 @@
 """ML / array formats (NumPy, TFRecord, WebDataset, HDF5, Zarr) + training shards
-+ the fixed-shape-tensor column type shared across the ML data path."""
++ the fixed- and variable-shape tensor column types shared across the ML data path."""
 
 from __future__ import annotations
 
 from batcher.io.formats.ml.hdf5 import HDF5Source
 from batcher.io.formats.ml.numpy import NumpySource
 from batcher.io.formats.ml.point_cloud import PointCloudSource
+from batcher.io.formats.ml.ragged import (
+    is_ragged_tensor_column,
+    ragged_to_numpy,
+    to_ragged_tensor_column,
+)
 from batcher.io.formats.ml.shards import ShardIndex, ShardReader, read_shard_index, write_shards
 from batcher.io.formats.ml.tensor import is_tensor_column, tensor_type, to_tensor_column
 from batcher.io.formats.ml.tfrecord import TFRecordSource
@@ -21,9 +26,12 @@ __all__ = [
     "TFRecordSource",
     "WebDatasetSource",
     "ZarrSource",
+    "is_ragged_tensor_column",
     "is_tensor_column",
+    "ragged_to_numpy",
     "read_shard_index",
     "tensor_type",
+    "to_ragged_tensor_column",
     "to_tensor_column",
     "write_shards",
 ]

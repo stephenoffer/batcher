@@ -25,7 +25,6 @@ from batcher.kyber.rules.normalize.fold import ConstantFolding, fold_constants
 from batcher.kyber.rules.normalize.predicates import (
     boolean_case_to_predicate,
     constant_group_key_removed,
-    intersect_in_lists,
     self_comparison_to_null_check,
 )
 from batcher.kyber.rules.normalize.ranges import (
@@ -44,7 +43,6 @@ __all__ = [
     "constant_group_key_removed",
     "date_trunc_to_range",
     "fold_constants",
-    "intersect_in_lists",
     "like_prefix_to_range",
     "or_to_in_and_range",
     "self_comparison_to_null_check",

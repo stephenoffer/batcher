@@ -12,8 +12,10 @@ from batcher._internal.errors import FormatError
 from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
 from batcher.io.base import FileSink, FileSource
+from batcher.io.base._bad_rows import bad_row_handler
 from batcher.io.base._options import BASE_SOURCE_OPTIONS, OptionSpec
 from batcher.io.formats.base import SINKS, SOURCES
+from batcher.io.formats.semistructured.json_tolerance import read_json_records
 from batcher.io.splits import FileSplit, LineRangeSplit, Split
 
 __all__ = ["JSONSink", "JSONSource"]
@@ -31,7 +33,8 @@ _JSON_READ_OPTIONS = OptionSpec(
     # `lines` is canonical rather than ignored because its *value* decides whether the file
     # is even readable: `lines=False` names a JSON-array file, a different format. It is
     # validated in `__init__` and never reaches the base.
-    canonical=("lines",),
+    canonical=("lines", "on_bad_lines"),
+    aliases={"on_bad_rows": "on_bad_lines"},
     ignored={
         "typ": "Batcher always produces a table, never a Series.",
         "precise_float": (
@@ -39,6 +42,18 @@ _JSON_READ_OPTIONS = OptionSpec(
         ),
     },
     unsupported={
+        "mode": (
+            "Spark's read mode has no single Batcher spelling because it conflates two "
+            "independent decisions. Pass on_bad_lines='skip' for DROPMALFORMED and "
+            "on_bad_lines='error' (the default) for FAILFAST. PERMISSIVE, which keeps a "
+            "malformed record and parks its text in a corrupt-record column, has no "
+            "equivalent."
+        ),
+        "ignore_errors": (
+            "Polars folds two behaviors into this flag. Pass on_bad_lines='skip' to drop "
+            "records that are not valid JSON, and declare the column with schema= if what "
+            "you want is for a value that does not fit the inferred type to survive."
+        ),
         "orient": (
             "Batcher reads newline-delimited JSON (one object per line), the only orient "
             "that streams and splits. Convert an array-of-objects file first, e.g. "
@@ -141,7 +156,7 @@ class JSONSource(FileSource):
     suffix = ".json"
     format_name = "json"
 
-    __slots__ = ()
+    __slots__ = ("_on_bad_lines",)
 
     def __init__(self, path: Any, **kwargs: Any) -> None:
         """Open an NDJSON source, accepting the pandas/Polars JSON reader vocabulary."""
@@ -150,6 +165,11 @@ class JSONSource(FileSource):
         # `on_error`, `schema_mode`, `files`, `columns`, `n_rows` — really are forwarded.
         base_kwargs = _JSON_READ_OPTIONS.resolve(kwargs)
         lines = base_kwargs.pop("lines", True)
+        self._on_bad_lines = str(base_kwargs.pop("on_bad_lines", "error"))
+        # Validated here, not at the first bad record: under `on_error='skip'` a late raise
+        # is swallowed as an unreadable file, so a misspelled tolerance flag would turn into
+        # silent whole-corpus loss.
+        bad_row_handler(self._on_bad_lines)
         if not lines:
             raise FormatError(
                 "json: lines=False names a JSON-array file (a single '[...]' document), "
@@ -175,19 +195,37 @@ class JSONSource(FileSource):
             self._fs, self._files(), has_header=False, total_bytes=byte_total
         )
 
-    def _read_schema(self, fh: IO[Any]) -> pa.Schema:
-        import pyarrow.json as pajson
+    def _reader_kwargs(self) -> dict[str, object]:
+        """The base kwargs plus this source's bad-record mode.
 
-        return pajson.read_json(fh).schema
+        Emitted only when it differs from the default, so a strict read's split kwargs (and
+        therefore its `identity()`) are byte-identical to what they were before tolerance
+        existed. Without this a tolerated read stayed tolerant on the driver and reverted to
+        fail-fast on every worker — the shape of defect that passes every local test.
+        """
+        extra: dict[str, object] = {}
+        if self._on_bad_lines != "error":
+            extra["on_bad_lines"] = self._on_bad_lines
+        return {**super()._reader_kwargs(), **extra}
+
+    def _policy(self, path: str = "", *, observe: bool = True):
+        """This source's bad-record policy, or None when a bad record must abort the read."""
+        return bad_row_handler(
+            self._on_bad_lines, path or self._path, format_name="json", observe=observe
+        )
+
+    def _read_schema(self, fh: IO[Any]) -> pa.Schema:
+        # `observe=False`: inference parses the same records the read is about to, so
+        # counting here would report every dropped record twice.
+        return read_json_records(fh, None, self._policy(observe=False)).schema
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
-        import pyarrow.json as pajson
 
         if projection is not None:
             parse_options = self._projection_parse_options(projection)
             if parse_options is not None:
                 try:
-                    return pajson.read_json(fh, parse_options=parse_options).to_batches()
+                    return read_json_records(fh, parse_options, self._policy()).to_batches()
                 except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
                     # The explicit schema could not parse this file, but free inference
                     # might (a value the unified schema does not describe). Rewind and take
@@ -198,7 +236,7 @@ class JSONSource(FileSource):
                     if not _rewind(fh):
                         raise
 
-        table = pajson.read_json(fh)
+        table = read_json_records(fh, None, self._policy())
         if projection is not None:
             table = table.select(projection)
         return table.to_batches()
@@ -229,16 +267,13 @@ class JSONSource(FileSource):
         if parse_options is None:
             yield from super()._iter_file(path, projection)
             return
-        import io as _io
-
-        import pyarrow.json as pajson
 
         produced = False
         with self._fs.open(path) as fh:
             for window in _newline_chunks(fh, _JSON_STREAM_CHUNK_BYTES):
                 if not window.strip():
                     continue
-                table = pajson.read_json(_io.BytesIO(window), parse_options=parse_options)
+                table = read_json_records(window, parse_options, self._policy(path))
                 if not table.num_rows:
                     continue
                 produced = True
@@ -310,7 +345,7 @@ class JSONSource(FileSource):
         if size <= chunk:
             return [FileSplit(self.format_name, path, kwargs)]
         return [
-            LineRangeSplit(self.format_name, path, start, min(start + chunk, size))
+            LineRangeSplit(self.format_name, path, start, min(start + chunk, size), kwargs)
             for start in range(0, size, chunk)
         ]
 
@@ -334,7 +369,7 @@ class JSONSink(FileSink):
     suffix = ".json"
     format_name = "json"
 
-    __slots__ = ()
+    __slots__ = ("_on_bad_lines",)
 
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
         # A per-row `json.dumps` over `to_pylist()` is catastrophically slow (~35x behind a

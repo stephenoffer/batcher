@@ -107,23 +107,60 @@ def test_the_protobuf_reader_streams_and_reads_through_one_loop():
     assert "_batches_from" in stream
 
 
-@pytest.mark.parametrize("module", ["msgpack", "webdataset"])
-def test_the_inference_bound_readers_deliberately_do_not_stream(module):
-    """MessagePack must see every record before it can type any of them, and a WebDataset
-    shard's schema comes from the union of member extensions across the whole shard. Both
-    would produce batches that fail to concatenate if split, so materializing is the
-    correct behavior — pinned so a later "optimization" does not quietly break typing."""
-    import importlib
-    import inspect
+def test_the_msgpack_reader_deliberately_does_not_stream():
+    """MessagePack must see every record before it can type any of them: 16,384 integers
+    followed by a null tail infer `int64` then `null`, and the two batches then fail to
+    concatenate. Materializing is the correct behavior — pinned so a later "optimization"
+    does not quietly break typing."""
 
-    pkg = "semistructured" if module == "msgpack" else "ml"
-    mod = importlib.import_module(f"batcher.io.formats.{pkg}.{module}")
-    cls = next(
-        obj
-        for _n, obj in vars(mod).items()
-        if inspect.isclass(obj) and hasattr(obj, "_read_file") and obj.__module__ == mod.__name__
-    )
-    assert "_iter_file" not in vars(cls), (
-        f"{cls.__name__} gained a streaming reader; its schema is inferred across the whole "
+    from batcher.io.formats.semistructured import msgpack
+
+    assert "_iter_file" not in vars(msgpack.MsgpackSource), (
+        "MsgpackSource gained a streaming reader; its schema is inferred across the whole "
         "file, so split batches would disagree on types"
     )
+
+
+def test_the_webdataset_reader_streams_batches_that_all_share_one_schema(tmp_path):
+    """WebDataset streams, and every batch carries the *source's* schema.
+
+    This reader used to be pinned as deliberately non-streaming alongside MessagePack, on
+    the reasoning that a shard's column set is the union of its member extensions and split
+    batches would therefore disagree. That reasoning does not apply here, and the difference
+    is worth stating: MessagePack has to *decode every record* to type it, whereas a
+    WebDataset shard's columns are given by member **names** alone, which `_read_schema`
+    already reads from the tar headers without touching a payload. So the union is known
+    before the first byte of data is read, and every batch can be built against it.
+
+    Pinning the absence of `_iter_file` pinned the proxy; this pins the property that
+    mattered — one schema across every batch, so they concatenate — which is what made
+    streaming safe to add. A 268 MB shard was one batch, 1.84 s to the first row, at 587 MB
+    resident; it is now bounded by the batch budget.
+    """
+    import io
+    import tarfile
+
+    import pyarrow as pa
+
+    import batcher.io.formats.ml.webdataset as wds
+
+    path = tmp_path / "shard.tar"
+    with tarfile.open(path, "w") as tar:
+        for i in range(400):
+            for ext in ("jpg", "cls"):
+                info = tarfile.TarInfo(f"s{i:05d}.{ext}")
+                info.size = 64
+                tar.addfile(info, io.BytesIO(b"p" * 64))
+
+    original = wds._BATCH_PAYLOAD_BYTES
+    wds._BATCH_PAYLOAD_BYTES = 4096  # force many batches out of a small shard
+    try:
+        batches = list(wds.WebDatasetSource(str(path)).iter_batches())
+    finally:
+        wds._BATCH_PAYLOAD_BYTES = original
+
+    assert len(batches) > 1, "expected the shard to stream as several batches"
+    assert len({b.schema for b in batches}) == 1, "batches must agree on one schema"
+    table = pa.Table.from_batches(batches)  # the concatenation the old pin protected
+    assert table.num_rows == 400
+    assert table.schema.names == ["__key__", "jpg", "cls"]

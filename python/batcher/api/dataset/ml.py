@@ -528,7 +528,6 @@ def _row_adapter(fn: Callable, cols: tuple[str, ...] | None, max_concurrency: in
     import inspect
 
     from batcher.api.dataset.callbacks import (
-        _DEFAULT_ROW_CONCURRENCY,
         _AsyncRowFlatMap,
         _AsyncRowMap,
         _RowFlatMap,
@@ -536,13 +535,31 @@ def _row_adapter(fn: Callable, cols: tuple[str, ...] | None, max_concurrency: in
     )
 
     if inspect.iscoroutinefunction(fn):
-        if max_concurrency < 0:
-            from batcher._internal.errors import PlanError
-
-            raise PlanError(f"max_concurrency must be >= 0, got {max_concurrency}")
-        limit = max_concurrency or _DEFAULT_ROW_CONCURRENCY
+        limit = _row_concurrency(max_concurrency)
         return (_AsyncRowFlatMap if flat else _AsyncRowMap)(fn, cols, limit)
     return (_RowFlatMap if flat else _RowMap)(fn, cols)
+
+
+def _row_concurrency(max_concurrency: int) -> int:
+    """The in-flight await bound for an async row callback, validated."""
+    from batcher.api.dataset.callbacks import _DEFAULT_ROW_CONCURRENCY
+
+    if max_concurrency < 0:
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(f"max_concurrency must be >= 0, got {max_concurrency}")
+    return max_concurrency or _DEFAULT_ROW_CONCURRENCY
+
+
+def _row_filter_adapter(fn: Callable, max_concurrency: int, read: tuple[str, ...] | None):
+    """Pick the per-row predicate adapter for `filter`: async-concurrent or plain."""
+    import inspect
+
+    from batcher.api.dataset.callbacks import _AsyncRowFilter, _RowFilter
+
+    if inspect.iscoroutinefunction(fn):
+        return _AsyncRowFilter(fn, read, _row_concurrency(max_concurrency))
+    return _RowFilter(fn, read)
 
 
 def _bind_fn(
@@ -820,7 +837,7 @@ class DatasetML:
         per-batch calls concurrently within a worker — parallel by default, not
         single-threaded; an explicit int wins. `multiprocessing=True` runs them across
         *processes* (a CPU-bound pure-Python `fn`); it falls back to threads for a
-        class/factory or GPU `fn` or a non-pyarrow `batch_format`. `num_gpus` reserves
+        class/factory or GPU `fn`. `num_gpus` reserves
         GPUs per distributed worker; `concurrency` sizes the distributed actor pool
         (default ``"auto"``: one actor per GPU) — an `int`, or a ``(min, max)`` tuple.
         `accelerator_type` pins GPU actors to a model (a `ray.util.accelerators` name
@@ -859,12 +876,12 @@ class DatasetML:
         batch, reloading the model each time — the single most common Ray Data
         inference foot-gun. Pass a class so the model loads once per worker.
 
-        `multiprocessing=True` uses a `spawn`-based process pool, so the `fn` must be
-        importable (picklable) and the **calling code must be import-safe** — a script
-        that runs the pipeline at module top level needs an ``if __name__ ==
-        "__main__":`` guard, or each spawned worker re-imports and re-runs it. A
-        non-picklable `fn` (lambda/closure), a class/factory `fn`, a GPU `fn`, or a
-        non-``pyarrow`` `batch_format` silently falls back to threads.
+        `multiprocessing=True` uses a `spawn`-based process pool, so the **calling code
+        must be import-safe** — a script that runs the pipeline at module top level needs
+        an ``if __name__ == "__main__":`` guard, or each spawned worker re-imports and
+        re-runs it. A lambda or a closure is fine as long as `cloudpickle` is installed,
+        which is how it reaches a worker that cannot import it by name; without that, and
+        for a class/factory `fn` or a GPU `fn`, the stage falls back to threads and warns.
 
         Under `distributed=True`, a partition whose worker is **preempted** (a spot
         node reclaimed mid-batch) is reassigned and **recomputed** from its durable
@@ -1004,10 +1021,12 @@ class DatasetML:
         fn: Callable,
         *,
         batch_size: int | None = None,
+        input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         concurrency: int | tuple[int, int] | None = None,
         max_concurrency: int = 0,
+        max_errored_rows: int = 0,
     ) -> Dataset:
         """Apply a per-row Python function ``fn(row_dict) -> row_dict`` (Ray Data ``map``).
 
@@ -1016,6 +1035,11 @@ class DatasetML:
         Prefer the vectorized `map_batches` (whole Arrow batch) when you can express
         the work over columns — it is far faster.
 
+        `input_columns` matters more here than anywhere else. A row callback pays for every
+        column twice — once to read it off disk, once to build it into a Python object per
+        row — so an undeclared stage over a wide table decodes and boxes columns the callback
+        never looks at. Declaring the ones it reads lets projection pushdown prune the scan.
+
         Pass an ``async def`` `fn` for an I/O-bound per-row call (a per-row LLM / API /
         vector-DB request): each batch's rows are awaited concurrently, up to
         `max_concurrency` at a time, instead of one at a time.
@@ -1023,10 +1047,14 @@ class DatasetML:
         Args:
             fn: A ``row_dict -> row_dict`` function (or ``async def``) applied per row.
             batch_size: Rebatch to this many rows before processing.
+            input_columns: The columns `fn` reads, so projection pushdown can prune the scan.
+                Omitting a column the callback reads is a correctness bug, not a slow query:
+                the pruned column is missing from the row dict.
             output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
+            max_errored_rows: Rows a raising `fn` may drop per worker before failing.
 
         Returns:
             A new lazy `Dataset` with `fn` applied to every row.
@@ -1044,9 +1072,11 @@ class DatasetML:
         return self.map_batches(
             _row_adapter(fn, cols, max_concurrency, flat=False),
             batch_size=batch_size,
+            input_columns=input_columns,
             output_columns=output_columns,
             num_workers=num_workers,
             concurrency=concurrency,
+            max_errored_rows=max_errored_rows,
         )
 
     def flat_map(
@@ -1054,10 +1084,12 @@ class DatasetML:
         fn: Callable,
         *,
         batch_size: int | None = None,
+        input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         concurrency: int | tuple[int, int] | None = None,
         max_concurrency: int = 0,
+        max_errored_rows: int = 0,
     ) -> Dataset:
         """Apply ``fn(row_dict) -> iterable[row_dict]`` and flatten (Ray Data ``flat_map``).
 
@@ -1068,10 +1100,14 @@ class DatasetML:
         Args:
             fn: A ``row_dict -> iterable[row_dict]`` function (or ``async def``) applied per row.
             batch_size: Rebatch to this many rows before processing.
+            input_columns: The columns `fn` reads, so projection pushdown can prune the scan.
+                Omitting a column the callback reads is a correctness bug, not a slow query:
+                the pruned column is missing from the row dict.
             output_columns: The result schema when `fn` changes the columns.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
+            max_errored_rows: Rows a raising `fn` may drop per worker before failing.
 
         Returns:
             A new lazy `Dataset` with the flattened per-row outputs.
@@ -1089,10 +1125,96 @@ class DatasetML:
         return self.map_batches(
             _row_adapter(fn, cols, max_concurrency, flat=True),
             batch_size=batch_size,
+            input_columns=input_columns,
             output_columns=output_columns,
             num_workers=num_workers,
             concurrency=concurrency,
+            max_errored_rows=max_errored_rows,
         )
+
+    def filter(
+        self,
+        fn: Callable,
+        *,
+        batch_size: int | None = None,
+        input_columns: list[str] | None = None,
+        num_workers: int | str = "auto",
+        concurrency: int | tuple[int, int] | None = None,
+        max_concurrency: int = 0,
+        max_errored_rows: int = 0,
+    ) -> Dataset:
+        """Keep the rows for which ``fn(row_dict)`` is true (Ray Data ``filter``).
+
+        The escape hatch for a predicate the expression language cannot say — a call into a
+        library, a model's verdict, a lookup against something outside the query.
+        {py:meth}`ds.filter <batcher.Dataset.filter>` takes an `Expr` and stays vectorized in
+        Rust; **prefer it whenever the condition can be written as one**, because this form
+        builds a Python dict per row and the optimizer cannot see through it.
+
+        The predicate's answers become an Arrow boolean mask, so every surviving row keeps its
+        exact type and no value round-trips through Python. That, and the fact that dropping
+        rows changes no column, is why this needs no `output_columns` and why a later
+        expression filter can still be pushed below the stage.
+
+        **Declaring `input_columns` also narrows the dict the predicate receives**, which is
+        where most of the cost of a row predicate goes: boxing one column of a ten-column
+        batch into Python measured 14x faster than boxing all ten. It is safe here in a way it
+        would not be for `map`, because the output is the input masked — narrowing what the
+        predicate saw cannot drop a column from the result. Reading an undeclared column
+        raises rather than working by accident.
+
+        Pass an ``async def`` `fn` for an I/O-bound per-row check (a per-row API or vector-DB
+        lookup): each batch's rows are awaited concurrently, up to `max_concurrency` at a
+        time, instead of one at a time.
+
+        Args:
+            fn: A ``row_dict -> bool`` function (or ``async def``) evaluated per row.
+            batch_size: Rebatch to this many rows before processing.
+            input_columns: The columns `fn` reads. Prunes the scan, and narrows the dict the
+                predicate is handed to exactly these columns — reading an undeclared one
+                raises.
+            num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
+            concurrency: Size of the distributed actor pool; an int or ``(min, max)``.
+            max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
+            max_errored_rows: Rows a raising predicate may drop per worker before failing.
+
+        Returns:
+            A new lazy `Dataset` holding only the rows the predicate kept.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4]})
+                >>> ds.ml.filter(lambda row: row["x"] % 2 == 0).to_pydict()
+                {'x': [2, 4]}
+        """
+        _validate_fn(fn)  # the row adapter is callable, so validate the user's fn before wrapping
+        read = tuple(input_columns) if input_columns is not None else None
+        return self.map_batches(
+            _row_filter_adapter(fn, max_concurrency, read),
+            batch_size=batch_size,
+            input_columns=input_columns,
+            preserves_columns=self._preserved_columns(),
+            num_workers=num_workers,
+            concurrency=concurrency,
+            max_errored_rows=max_errored_rows,
+        )
+
+    def _preserved_columns(self) -> list[str] | None:
+        """Every column of the input, which a row filter passes through untouched.
+
+        Declaring them lets Kyber push a later expression `Filter` *below* this stage, so the
+        cheap vectorized predicate runs before the expensive Python one instead of after it.
+        The claim is safe in a way it is not for `map`: this adapter only ever drops rows, so
+        no declared column can be rewritten under a pushed predicate. Pure plan analysis, so
+        it never touches IO; an un-inferable schema simply declares nothing.
+        """
+        with contextlib.suppress(Exception):
+            columns = self._ds._plan.available_columns()
+            if columns:
+                return list(columns)
+        return None
 
     def infer(
         self,
@@ -1112,6 +1234,11 @@ class DatasetML:
         model_kwargs: dict | None = None,
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
+        max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Run batch model inference over the dataset (ML/multimodal path).
 
@@ -1153,6 +1280,11 @@ class DatasetML:
                 e.g. ``{"trust_remote_code": True}``.
             accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
             model_memory_gb: The model's footprint, for memory budgeting.
+            max_errored_rows: Rows a raising model may drop per worker before failing.
+            timeout: Wall-clock ceiling (seconds) for one model call; 0 = no timeout.
+            max_retries: Times to retry a batch whose model raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new lazy `Dataset` with the prediction column(s) appended.
@@ -1201,6 +1333,11 @@ class DatasetML:
                 concurrency=concurrency,
                 accelerator_type=accelerator_type,
                 model_memory_gb=model_memory_gb,
+                max_errored_rows=max_errored_rows,
+                timeout=timeout,
+                max_retries=max_retries,
+                retry_backoff=retry_backoff,
+                retry_on=retry_on,
             )
         _reject_model_id_only(
             "infer",
@@ -1224,6 +1361,11 @@ class DatasetML:
             batch_format=batch_format,
             accelerator_type=accelerator_type,
             model_memory_gb=model_memory_gb,
+            max_errored_rows=max_errored_rows,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_on=retry_on,
         )
 
     def predict(
@@ -1246,6 +1388,11 @@ class DatasetML:
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
         options: dict[str, object] | None = None,
+        max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Score a fitted **tabular** model over the dataset (XGBoost, LightGBM, sklearn, …).
 
@@ -1293,6 +1440,11 @@ class DatasetML:
             accelerator_type: Pin GPU actors to a device model.
             model_memory_gb: The model's footprint, for memory budgeting.
             options: Extra framework keywords, e.g. ``{"iteration_range": (0, 50)}``.
+            max_errored_rows: Rows a raising model may drop per worker before failing.
+            timeout: Wall-clock ceiling (seconds) for one model call; 0 = no timeout.
+            max_retries: Times to retry a batch whose model raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new lazy `Dataset` with the prediction column(s) appended.
@@ -1354,6 +1506,11 @@ class DatasetML:
             concurrency=concurrency,
             accelerator_type=accelerator_type,
             model_memory_gb=model_memory_gb,
+            max_errored_rows=max_errored_rows,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_on=retry_on,
         )
 
     def evaluate(
@@ -1388,6 +1545,9 @@ class DatasetML:
             y_pred: The hard-prediction column (a label, or a value for regression).
             y_score: The predicted probability of the positive class, for a binary task.
             task: ``"binary"``, ``"multiclass"``, ``"regression"``, or ``"auto"``.
+                ``"auto"`` reads it off `y_true`: a float label is a regression, and an
+                integer, string or boolean one is a classification with as many classes as
+                it has distinct values.
             metrics: The metric names to compute; the task's default set when omitted.
             positive: The label value that counts as the positive class.
             threshold: The cutoff turning `y_score` into a hard prediction.
@@ -2734,6 +2894,11 @@ class DatasetML:
         concurrency: int | tuple[int, int] | None = None,
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
+        max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Run offline LLM text generation over the dataset, appending `output_column`.
 
@@ -2785,6 +2950,11 @@ class DatasetML:
             concurrency: Size of the distributed actor pool.
             accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
             model_memory_gb: The model's footprint, for memory budgeting.
+            max_errored_rows: Rows a raising engine may drop per worker before failing.
+            timeout: Wall-clock ceiling (seconds) for one engine call; 0 = no timeout.
+            max_retries: Times to retry a batch whose engine call raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new `Dataset` with the generated column(s) appended.
@@ -2839,6 +3009,11 @@ class DatasetML:
             concurrency=concurrency,
             accelerator_type=accelerator_type,
             model_memory_gb=model_memory_gb,
+            max_errored_rows=max_errored_rows,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_on=retry_on,
         )
 
     def extract(
@@ -2855,6 +3030,11 @@ class DatasetML:
         concurrency: int | tuple[int, int] | None = None,
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
+        max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Extract declared, **typed** columns from unstructured text with an LLM.
 
@@ -2892,6 +3072,11 @@ class DatasetML:
             concurrency: Size of the distributed actor pool.
             accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
             model_memory_gb: The model's footprint, for memory budgeting.
+            max_errored_rows: Rows a raising engine may drop per worker before failing.
+            timeout: Wall-clock ceiling (seconds) for one engine call; 0 = no timeout.
+            max_retries: Times to retry a batch whose engine raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new lazy `Dataset` with one typed column appended per `schema` field.
@@ -2938,6 +3123,11 @@ class DatasetML:
             concurrency=concurrency,
             accelerator_type=accelerator_type,
             model_memory_gb=model_memory_gb,
+            max_errored_rows=max_errored_rows,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_on=retry_on,
         )
 
     def classify(
@@ -2955,6 +3145,11 @@ class DatasetML:
         concurrency: int | tuple[int, int] | None = None,
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
+        max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Label each row with exactly one of `labels`, using an LLM.
 
@@ -2984,6 +3179,11 @@ class DatasetML:
             concurrency: Size of the distributed actor pool.
             accelerator_type: Pin GPU actors to a model (e.g. ``"NVIDIA_A100"``).
             model_memory_gb: The model's footprint, for memory budgeting.
+            max_errored_rows: Rows a raising engine may drop per worker before failing.
+            timeout: Wall-clock ceiling (seconds) for one engine call; 0 = no timeout.
+            max_retries: Times to retry a batch whose engine raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new lazy `Dataset` with the label column appended.
@@ -3030,6 +3230,11 @@ class DatasetML:
             concurrency=concurrency,
             accelerator_type=accelerator_type,
             model_memory_gb=model_memory_gb,
+            max_errored_rows=max_errored_rows,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_on=retry_on,
         )
 
     def embed(
@@ -3050,6 +3255,11 @@ class DatasetML:
         normalize: bool = False,
         fp16: bool = False,
         output_type: str = "tensor",
+        max_errored_rows: int = 0,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Compute embeddings over the dataset — `infer` shaped for embedding models.
 
@@ -3090,6 +3300,11 @@ class DatasetML:
             fp16: Run the encoder in half precision on GPU; ignored on CPU.
             output_type: ``"tensor"`` (default) or ``"fixed_size_list"``, which is what
                 Lance ANN indexing expects.
+            max_errored_rows: Rows a raising encoder may drop per worker before failing.
+            timeout: Wall-clock ceiling (seconds) for one encoder call; 0 = no timeout.
+            max_retries: Times to retry a batch whose encoder raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new lazy `Dataset` with the embedding column(s) appended.
@@ -3139,6 +3354,11 @@ class DatasetML:
                 concurrency=concurrency,
                 accelerator_type=accelerator_type,
                 model_memory_gb=model_memory_gb,
+                max_errored_rows=max_errored_rows,
+                timeout=timeout,
+                max_retries=max_retries,
+                retry_backoff=retry_backoff,
+                retry_on=retry_on,
             )
         _reject_model_id_only(
             "embed",
@@ -3162,6 +3382,11 @@ class DatasetML:
             batch_format=batch_format,
             accelerator_type=accelerator_type,
             model_memory_gb=model_memory_gb,
+            max_errored_rows=max_errored_rows,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_on=retry_on,
         )
 
     def download(

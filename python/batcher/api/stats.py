@@ -12,10 +12,11 @@ is a fact, not a guess.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from batcher._internal.mathx import safe_div
+from batcher.plan.profile import QueryUsage
 
 if TYPE_CHECKING:
     from batcher.plan.profile import QueryProfile
@@ -30,7 +31,14 @@ class OpStat:
     The measured fields (`rows_in`/`rows_out`/`elapsed_ms`/`result_bytes`/`spilled`/
     `backend`) are joined to Kyber's planned `est_rows`/`provenance`, so each operator
     carries both what was estimated and what happened (`est_error`). `result_bytes` is the
-    operator's *output* size, not peak working set — read `spilled` for memory pressure.
+    operator's *output* size, not peak working set — read `spill_bytes` for how much went to
+    disk and `RunStats.usage` for what the run cost the machine.
+
+    The hardware fields (`cpu_ms`, `peak_rss_bytes`, `io_read_bytes`, `io_write_bytes`) are
+    only measured on an executor where each operator owns an exclusive wall interval. The
+    streaming executor interleaves its operators and reports `0` for them, and by the
+    engine's convention **`0` means unmeasured, not zero** — `RunStats.usage` is the reading
+    that holds on every tier.
     """
 
     op_id: int
@@ -44,6 +52,18 @@ class OpStat:
     est_rows: float = float("nan")
     provenance: str = ""
     cpu_util: float = 0.0
+    #: CPU milliseconds summed across this operator's worker threads.
+    cpu_ms: float = 0.0
+    #: Worker threads the operator ran across — the denominator behind `cpu_util`.
+    threads: int = 0
+    #: Logical bytes the operator routed to disk. `0` when it did not spill.
+    spill_bytes: int = 0
+    #: Growth in the process's resident set during this operator, in bytes.
+    peak_rss_bytes: int = 0
+    #: Bytes that reached a block device on read, page-cache hits excluded.
+    io_read_bytes: int = 0
+    #: Bytes that reached a block device on write, spill writes included.
+    io_write_bytes: int = 0
 
     @property
     def selectivity(self) -> float:
@@ -70,7 +90,7 @@ class OpStat:
                 >>> ds = bt.from_pydict({"a": [1, 2, 3]}).filter(bt.col("a") > 1)
                 >>> _ = ds.collect()
                 >>> sorted(ds.stats().ops[0].to_dict())[:3]
-                ['backend', 'cpu_util', 'elapsed_ms']
+                ['backend', 'cpu_ms', 'cpu_util']
 
         Returns:
             A dict of this operator's fields plus `selectivity` and `est_error`.
@@ -87,6 +107,12 @@ class OpStat:
             "est_rows": self.est_rows,
             "provenance": self.provenance,
             "cpu_util": self.cpu_util,
+            "cpu_ms": self.cpu_ms,
+            "threads": self.threads,
+            "spill_bytes": self.spill_bytes,
+            "peak_rss_bytes": self.peak_rss_bytes,
+            "io_read_bytes": self.io_read_bytes,
+            "io_write_bytes": self.io_write_bytes,
             "selectivity": self.selectivity,
             "est_error": self.est_error,
         }
@@ -110,6 +136,12 @@ class RunStats:
     #: to be *read*, and reading it is the skill every performance guide is written to
     #: teach; these are that reading, done. Empty for a healthy run.
     findings: tuple[dict[str, object], ...] = ()
+    #: What the run cost the machine — CPU milliseconds, resident-set growth, page faults,
+    #: real block-device bytes — measured across the whole execution rather than per
+    #: operator. The per-operator hardware fields hold only on a materializing executor;
+    #: this one holds on every tier, including the streaming default, and is summed across
+    #: workers on a distributed run.
+    usage: QueryUsage = field(default_factory=QueryUsage)
 
     @classmethod
     def from_profile(cls, profile: QueryProfile) -> RunStats:
@@ -140,6 +172,12 @@ class RunStats:
                 est_rows=o.est_rows,
                 provenance=o.provenance,
                 cpu_util=o.cpu_util,
+                cpu_ms=o.cpu_ms,
+                threads=o.threads,
+                spill_bytes=o.spill_bytes,
+                peak_rss_bytes=o.peak_rss_bytes,
+                io_read_bytes=o.io_read_bytes,
+                io_write_bytes=o.io_write_bytes,
             )
             for o in measured
         )
@@ -148,6 +186,7 @@ class RunStats:
             total_ms=profile.total_ms,
             rows=profile.rows,
             findings=tuple(_findings(profile)),
+            usage=profile.usage,
         )
 
     @property
@@ -211,6 +250,15 @@ class RunStats:
             f", peak output {self.peak_memory_bytes / 1e6:.1f} MB{spill}",
             self.bottleneck_summary(),
         ]
+        # Only when the platform reported it. A line reading "0.0 cores busy" on a host that
+        # cannot measure CPU time would say the query was idle, which is the opposite of
+        # "unmeasured" and exactly the misreading the zero convention exists to prevent.
+        if self.usage.measured:
+            lines.append(
+                f"machine: {self.usage.cpu_ms:.1f} ms CPU"
+                f" ({self.usage.cores_busy:.1f} core(s) busy)"
+                f", {self.usage.peak_rss_bytes / 1e6:.1f} MB resident growth"
+            )
         actionable = [f for f in self.findings if f.get("severity") in ("critical", "warning")]
         if actionable:
             lines.append(f"findings: {'; '.join(str(f.get('title')) for f in actionable)}")
@@ -231,6 +279,8 @@ class RunStats:
                 >>> _ = ds.collect()
                 >>> sorted(ds.stats().to_dict())[:4]
                 ['bottleneck', 'ops', 'peak_memory_bytes', 'rows_in']
+                >>> sorted(ds.stats().to_dict()["usage"])[:3]
+                ['cores_busy', 'cpu_ms', 'invol_ctx_switches']
 
         Returns:
             A dict of run totals, with the per-operator detail under ``"ops"``.
@@ -244,6 +294,7 @@ class RunStats:
             "spilled": self.spilled,
             "spill_count": self.spill_count,
             "bottleneck": bottleneck.kind if bottleneck is not None else None,
+            "usage": self.usage.to_dict(),
             "ops": [o.to_dict() for o in self.ops],
         }
 
@@ -285,9 +336,20 @@ class RunStats:
         Notebooks call this automatically, so `ds.stats()` in a cell renders a real table
         instead of a monospace blob. Spilled operators are flagged in their own column so
         memory pressure is visible at a glance.
+
+        Every cell is escaped. An operator id or a summary line can carry a column name, and
+        a column name comes out of a file — so the only safe assumption about any of it is
+        that a person did not write it.
         """
+        import html
+
+        style = "text-align:right;padding:2px 8px"
+
+        def cell(value: object, tag: str) -> str:
+            return f"<{tag} style='{style}'>{html.escape(str(value))}</{tag}>"
+
         head = "".join(
-            f"<th style='text-align:right;padding:2px 8px'>{c}</th>"
+            cell(c, "th")
             for c in ("op", "kind", "rows in", "rows out", "ms", "out KB", "backend", "spill")
         )
         rows = []
@@ -302,12 +364,8 @@ class RunStats:
                 o.backend,
                 "yes" if o.spilled else "",
             )
-            rows.append(
-                "<tr>"
-                + "".join(f"<td style='text-align:right;padding:2px 8px'>{c}</td>" for c in cells)
-                + "</tr>"
-            )
-        caption = self.summary().replace("\n", "<br>")
+            rows.append("<tr>" + "".join(cell(c, "td") for c in cells) + "</tr>")
+        caption = html.escape(self.summary()).replace("\n", "<br>")
         return (
             "<table style='border-collapse:collapse;font-family:monospace;font-size:90%'>"
             f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"

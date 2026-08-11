@@ -7,14 +7,14 @@ reading, filtering, joining, and feature engineering runs in the engine, so PyTo
 sees ready batches.
 
 Two entry points on the `.ml` accessor turn a dataset straight into tensor batches, so
-most training loops never write a `Dataset` or `DataLoader` wrapper of their own.
+most training loops never write a {py:class}`Dataset <batcher.Dataset>` or `DataLoader` wrapper of their own.
 
-`ds.ml.iter_torch_batches(...)` is the bounded-memory streaming path. It consumes
-`iter_batches()` incrementally and yields `{column: tensor}` dicts, handling the device
+{py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` is the bounded-memory streaming path. It consumes
+{py:meth}`iter_batches() <batcher.Dataset.iter_batches>` incrementally and yields `{column: tensor}` dicts, handling the device
 transfer and the prefetch, with an optional local shuffle. Use it for single-process
 training and for larger-than-memory or streaming sources.
 
-`ds.ml.stream_loader(...)` returns a `torch.utils.data.IterableDataset` for
+{py:meth}`ds.ml.stream_loader(...) <batcher.api.dataset.ml.DatasetML.stream_loader>` returns a `torch.utils.data.IterableDataset` for
 *distributed* training under DDP, FSDP, or DeepSpeed, with a deterministic, balanced,
 resumable global sample order across ranks. {doc}`Streaming for training </ml/inference/streaming>`
 covers it.
@@ -25,7 +25,7 @@ A training loop on Batcher follows the same three steps every time:
 
 1. Build and shape the dataset with the DataFrame API and `map_batches`.
 1. Stream batches with `iter_batches()`, or directly as tensors with
-   `iter_torch_batches`.
+   {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`.
 1. Convert each Arrow batch to tensors inside an `IterableDataset` or directly in
    the loop.
 
@@ -149,11 +149,11 @@ for features, labels in loader:
 
 The wrapper above is boilerplate, and Batcher ships it. Three converters sit over *any*
 iterable of Arrow batches rather than over a `Dataset`, so they work wherever the batches
-come from, whether `iter_batches()`, a reader, or the output of `InferencePool` or
+come from, whether `iter_batches()`, a reader, or the output of {py:class}`InferencePool <batcher.ml.InferencePool>` or
 `run_pipeline`. Use them when you drive the loop yourself. Use
 `ds.ml.iter_torch_batches` when you want tensors straight out of a dataset.
 
-`to_numpy_batches(batches, columns=...)` is the base of the other two. It yields one
+{py:meth}`to_numpy_batches(batches, columns=...) <batcher.api.dataset.ml.DatasetML.to_numpy_batches>` is the base of the other two. It yields one
 `{column: ndarray}` dict per batch, with numeric non-null columns converted zero-copy. A
 tensor column, or a fixed-size list of numbers, comes back with its real `(n, width...)`
 shape rather than an object array, so an embedding or image column feeds a model as a
@@ -273,12 +273,12 @@ Four details of this path surprise people often enough to state outright:
 - `iter_torch_batches` returns CPU 64-bit tensors as-is, but downcasts 64-bit columns
   to 32-bit when targeting Apple MPS, which has no 64-bit dtype, so `device="auto"`
   works on a dev box without a crash.
-- For inference rather than training, use `ds.ml.infer`. See
+- For inference rather than training, use {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>`. See
   {doc}`Inference </ml/inference/inference>`.
 
 ## See also
 
 - {doc}`Streaming </ml/inference/streaming>`: the `iter_batches()` contract and distributed
-  `stream_loader`.
+  {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>`.
 - {doc}`GPU scheduling </ml/inference/gpu>`: run transforms on GPU workers.
 - {doc}`The ML accessor </api/models/ml>`: `map_batches` / `infer` / `embed`.

@@ -26,17 +26,19 @@ from collections.abc import Callable
 
 import pyarrow as pa
 
+from batcher.kyber.rules.leaf_rewrite import EXPR_NODES
 from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_rewrite import (
     contained_types,
     map_node_expressions,
     transform_expr_up,
 )
-from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
+from batcher.plan.logical import Filter, LogicalPlan, Project
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type
 
 __all__ = [
+    "SchemaNode",
     "is_date",
     "is_float",
     "is_integer",
@@ -44,6 +46,7 @@ __all__ = [
     "is_timestamp",
     "node_schema",
     "nullable",
+    "register_schema_leaf_rule",
     "schema_rule",
 ]
 
@@ -53,7 +56,6 @@ __all__ = [
 #: evaluates its expressions against its *input's* schema, whether those are a predicate, a
 #: projection, a group key, a sort key, or a window frame's partitioning. `Scan` has no
 #: input, and `Join` carries no expressions through that path.
-_EXPR_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 
 def node_schema(node: LogicalPlan) -> SchemaRef | None:
@@ -65,7 +67,7 @@ def node_schema(node: LogicalPlan) -> SchemaRef | None:
     Returns:
         The input schema, or ``None`` when it cannot be inferred.
     """
-    if not isinstance(node, _EXPR_NODES):
+    if not isinstance(node, EXPR_NODES):
         return None
     try:
         return node.input.available_schema()
@@ -211,3 +213,62 @@ def schema_rule(
     if new is node:
         return None
     return new if new.to_ir() != node.to_ir() else None
+
+
+#: The plan nodes a schema-guarded rule visits, as a type alias for annotating the `node`
+#: parameter of one. The same fact as `register_schema_leaf_rule`'s `matches` default, and
+#: stated once so the two cannot drift: a rule annotated for a node the helper does not visit
+#: (or the reverse) type-checks and silently never fires. Three `extra` rule modules each
+#: declared their own `_Node` for this.
+SchemaNode = Filter | Project
+
+
+def register_schema_leaf_rule(
+    name: str,
+    leaf,
+    *,
+    expr_matches: tuple[type, ...],
+    expr_ops: tuple[str, ...] | None = None,
+    carries: tuple[type, ...] | None = None,
+    matches: tuple[type, ...] = (Filter, Project),
+):
+    """Register a schema-dependent `leaf(expr, schema) -> Expr` as a normalize-phase rule.
+
+    The schema-guarded counterpart to `leaf_rewrite.register_leaf_rule`, and the same story:
+    six rule modules each wrote out the same `node_rule(...)` call, differing only in the
+    rule's name, its leaf, and the operator it declares.
+
+    `matches` is `(Filter, Project)` rather than every expression-bearing node because a
+    schema-guarded rule needs an input schema to resolve, and `carries` defaults to
+    `expr_matches` because the types the leaf can rewrite are exactly the types worth
+    resolving a schema for. Both were the value every caller passed.
+
+    Args:
+        name: The rule's registry name, unique across the optimizer.
+        leaf: The rewrite, receiving each sub-expression and its input schema.
+        expr_matches: Expression node types the leaf can rewrite.
+        expr_ops: Operator tags the leaf can rewrite, or `None` for every operator. Declare
+            an operator's **mirror** too wherever the leaf normalizes the computed side to
+            the left, or the rule silently stops firing on the flipped spelling.
+        carries: Types whose presence justifies resolving the schema; defaults to
+            `expr_matches`. See `schema_rule` for why this guard is load-bearing.
+        matches: Plan node types to visit.
+
+    Returns:
+        Whatever the registry's `add` returns.
+    """
+    from batcher.kyber.registry import DEFAULT_REGISTRY
+    from batcher.kyber.rule import Phase, node_rule
+
+    guard = expr_matches if carries is None else carries
+    return DEFAULT_REGISTRY.add(
+        node_rule(
+            name,
+            Phase.NORMALIZE,
+            lambda node, _ctx, _leaf=leaf: schema_rule(node, _leaf, carries=guard),
+            matches=matches,
+            expr_schema_fn=leaf,
+            expr_matches=expr_matches,
+            expr_ops=expr_ops,
+        )
+    )

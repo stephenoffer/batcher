@@ -134,6 +134,18 @@ class _TritonServingClient:
         if not ready(self._model, model_version=self._version):
             raise BackendError(f"triton model {self._model!r} is not ready")
 
+    def close(self) -> None:
+        """Release the Triton connection (an HTTP pool, or a gRPC channel).
+
+        `serving_udf` calls this when the worker is done, through the same optional-`close`
+        teardown contract the rest of the engine uses. Without it the pool or channel was
+        reclaimed only whenever the garbage collector reached it, so a script running two
+        serving stages back to back held both generations of connections at once.
+        """
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
+
     def batch_window(self) -> int | None:
         """The `max_batch_size` this model declares, or `None` when it declares none.
 

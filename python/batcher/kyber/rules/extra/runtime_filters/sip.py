@@ -322,7 +322,16 @@ def prune_asof_right_by_on_bound(node: AsofJoin, ctx: OptimizerContext) -> Logic
     Bounds are valid at any provenance (a row-shrinking operator only narrows the true range, so
     the recorded bound still contains every left value), and the filter fires only when the right
     side actually extends past it — otherwise it would be pure per-row cost.
+
+    A ``"nearest"`` join gets **no** bound, and the distinction is load-bearing rather than
+    conservative: it may take its match from either side, so a right row above the largest
+    `left.on` is still the forward candidate for that left row, and one below the smallest is
+    still the backward candidate for that one. Neither end is prunable. Reading the direction as
+    "backward, or else forward" silently pushed the forward bound onto a nearest join and deleted
+    exactly the rows it should have matched.
     """
+    if node.direction not in ("backward", "forward"):
+        return None
     left = ctx.estimator.estimate(node.left).column(node.left_on)
     right = ctx.estimator.estimate(node.right).column(node.right_on)
     backward = node.direction == "backward"

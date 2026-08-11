@@ -1,6 +1,6 @@
-"""The default SQL catalog: `bt.sql` and `bt.register_function`.
+"""The default SQL catalog: `bt.sql`, `bt.register_function` and `bt.register_model`.
 
-A process-global `Session` backs both, so ``CREATE TABLE AS`` in one call is
+A process-global `Session` backs all three, so ``CREATE TABLE AS`` in one call is
 visible to the next. `bt.Session` is the public handle for an isolated catalog.
 """
 
@@ -13,7 +13,7 @@ from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
 from batcher.api.sql_session import Session
 
-__all__ = ["register_function", "sql"]
+__all__ = ["register_function", "register_model", "sql"]
 
 # The process-global default SQL session, backing the module-level `sql` /
 # `register_function` below. It is intentionally private: `bt.sql(...)` is the one
@@ -134,3 +134,32 @@ def register_function(name: str, fn: Callable, **options: Any) -> None:
             {'y': [2, 4, 6]}
     """
     _catalog.register_function(name, fn, **options)
+
+
+def register_model(name: str, model: Any) -> None:
+    """Register a fitted model that `bt.sql` can score with ``ML_PREDICT`` (default session).
+
+    Registers on the default catalog; see `Session.register_model`. A query can also name a
+    saved model by quoted path without registering anything. For an isolated registry use
+    `bt.Session`.
+
+    Args:
+        name: The SQL name the model is scored by.
+        model: A fitted model object, or a path/URI to a saved one.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml import LinearRegression
+            >>> train = bt.from_pydict({"x": [1.0, 2.0, 3.0], "y": [2.0, 4.0, 6.0]})
+            >>> fitted = LinearRegression(features=["x"], target="y").fit(train)
+            >>> bt.register_model("doubler", fitted)
+            >>> scored = bt.sql(
+            ...     "SELECT x, prediction FROM ML_PREDICT(t, doubler) ORDER BY x",
+            ...     t=bt.from_pydict({"x": [5.0]}),
+            ... )
+            >>> [round(v, 6) for v in scored.to_pydict()["prediction"]]
+            [10.0]
+    """
+    _catalog.register_model(name, model)

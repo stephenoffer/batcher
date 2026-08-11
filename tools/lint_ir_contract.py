@@ -41,6 +41,7 @@ PAIRS: list[tuple[str, str, str]] = [
     ("bc-expr/src/lib.rs", "ListFunc", "batcher.plan.expr_ir.fn_names:LIST_FNS"),
     ("bc-expr/src/lib.rs", "DateFunc", "batcher.plan.expr_ir.fn_names:DATE_FNS"),
     ("bc-expr/src/lib.rs", "GeoFunc", "batcher.plan.expr_ir.fn_names:GEO_FNS"),
+    ("bc-expr/src/lib.rs", "SpatialFunc", "batcher.plan.expr_ir.fn_names:SPATIAL_FNS"),
     ("bc-expr/src/lib.rs", "Math2Func", "batcher.plan.expr_ir.fn_names:Math2Fn"),
     ("bc-expr/src/lib.rs", "MapFunc", "batcher.plan.expr_ir.fn_names:MapFn"),
     ("bc-expr/src/lib.rs", "ListSetOp", "batcher.plan.expr_ir.fn_names:ListSetFn"),

@@ -9,6 +9,9 @@ by what a benchmark measures:
   Arrow (or bound as lazy native scans via ``table_uris`` at large scale).
 - :mod:`sources.corpora` — the file corpora whose *reading* is the measurement: the
   three parquet scan layouts and the JPEG image corpus.
+- :mod:`sources.job` — the Join Order Benchmark's IMDb database, the one *real* database
+  here: fetched from the archive its reference implementation distributes and converted to
+  parquet once, with the column types read from the schema shipped inside that archive.
 
 Import from ``sources`` directly; the split is an implementation detail.
 """
@@ -26,6 +29,13 @@ from sources.corpora import (
     ScanCorpus,
     image_corpus,
     scan_corpora,
+)
+from sources.job import (
+    JOB_BASE,
+    JOB_LOCAL,
+    JOB_TABLES,
+    ensure_job_data,
+    job_tables,
 )
 from sources.tables import (
     CLICKBENCH_BASE,
@@ -46,6 +56,9 @@ __all__ = [
     "IMAGES_BASE",
     "IMAGE_COUNTS",
     "IMAGE_NATIVE_SIZE",
+    "JOB_BASE",
+    "JOB_LOCAL",
+    "JOB_TABLES",
     "SCAN_BASE",
     "SCAN_LAYOUTS",
     "SCAN_SIZES",
@@ -56,7 +69,9 @@ __all__ = [
     "TPCH_TABLES",
     "ImageCorpus",
     "ScanCorpus",
+    "ensure_job_data",
     "image_corpus",
+    "job_tables",
     "load_tables",
     "scan_corpora",
     "scan_rename",

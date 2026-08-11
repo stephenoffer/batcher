@@ -153,3 +153,41 @@ def test_token_spend_of_an_empty_corpus_is_not_an_error():
 def test_token_spend_rejects_a_negative_price():
     with pytest.raises(PlanError):
         bt.token_spend("pt", "ct", input_price=-1.0, output_price=1.0)
+
+
+def test_a_vision_request_charges_its_images_against_the_token_quota():
+    """Counting only the text under-charged a vision batch by ~1400 tokens a row.
+
+    An image is most of a vision request's input, so a limiter blind to it let the batch run
+    far over the tokens-per-minute quota and the 429 it exists to prevent arrived anyway.
+    Both wire shapes are covered: Anthropic spells `image`, OpenAI `image_url`.
+    """
+    from batcher.ml.llm.engines.limits import _estimated_tokens
+
+    text_only = {"max_tokens": 100, "messages": [{"role": "user", "content": "hello there"}]}
+    assert _estimated_tokens("hello there", text_only) < 200
+
+    for kind in ("image", "image_url"):
+        vision = {
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": [{"type": kind}, {"type": "text", "text": "hi"}]}
+            ],
+        }
+        assert _estimated_tokens("hi", vision) > 1000
+
+    two = {
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": [{"type": "image"}, {"type": "image"}]},
+        ],
+    }
+    one = {"max_tokens": 100, "messages": [{"role": "user", "content": [{"type": "image"}]}]}
+    assert _estimated_tokens("", two) - _estimated_tokens("", one) > 1000
+
+
+def test_a_body_without_messages_still_estimates():
+    """The completions wire shape carries `prompt`, not `messages`."""
+    from batcher.ml.llm.engines.limits import _estimated_tokens
+
+    assert _estimated_tokens("hi", {"max_tokens": 5, "prompt": "hi"}) == 5

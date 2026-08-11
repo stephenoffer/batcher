@@ -179,21 +179,19 @@ def _hoist_one(tr, ds, call):
 
 def _apply_table_function(tr, anon, rf):
     """Apply a registered table function ``f(t)`` (``SELECT * FROM f(t)``)."""
+    from batcher._sql.parser.table_functions import relation_argument
+
     if len(anon.expressions) != 1:
         raise PlanError(f"table function {rf.name!r} takes exactly one table argument")
-    arg = anon.expressions[0]
-    if isinstance(arg, exp.Subquery):
-        src = tr.statement(arg.this)
-    elif isinstance(arg, (exp.Select, exp.Union)):
-        src = tr.statement(arg)
-    elif isinstance(arg, exp.Column):
-        if arg.name not in tr._registry:
-            raise PlanError(f"unknown table {arg.name!r}; registered: {list(tr._registry)}")
-        src = tr._registry[arg.name]
-    else:
-        raise PlanError(f"table function {rf.name!r} argument must be a table name or subquery")
+    # Shared with the built-in table functions rather than restated: a registered function's
+    # relation argument and a built-in's are the same argument, and a second copy of the rule
+    # is how one of them ends up accepting a spelling the other rejects.
+    src = relation_argument(tr, anon.expressions[0], f"table function {rf.name!r}")
 
     out_cols = list(rf.output_columns) if rf.output_columns is not None else None
     if rf.per_row:
-        return src.ml.map(rf.fn, output_columns=out_cols)
+        # The per-row form used to drop `rf.config` on the floor, so a `batch_size` or
+        # `num_workers` given at registration was accepted and never applied. Registration
+        # now validates the keys against `ml.map`, so forwarding them is safe.
+        return src.ml.map(rf.fn, output_columns=out_cols, **rf.config)
     return src.ml.map_batches(rf.fn, output_columns=out_cols, **rf.config)

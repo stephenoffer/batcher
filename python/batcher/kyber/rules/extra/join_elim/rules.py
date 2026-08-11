@@ -75,7 +75,13 @@ def eliminate_left_join_under_distinct(
     null-extends *right*-only rows, which would add an all-null left tuple that the left
     input does not contain. Fires only when the projection reads no column of the
     null-supplying side; idempotent (the result holds no `Join`).
+
+    Whole-row dedup only. The argument is that the join changes only *multiplicities* and the
+    dedup erases those — true of a set operation, not of a keyed dedup, which picks one row per
+    key from whatever multiset it is given.
     """
+    if node.keys:
+        return None
     proj = node.input
     if not isinstance(proj, Project):
         return None

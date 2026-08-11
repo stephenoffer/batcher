@@ -58,6 +58,7 @@ Dedup, interval joins, keyed state, union.
 :hidden:
 
 reading-data
+reading-databases
 writing-data
 custom-connectors
 cloud-storage

@@ -8,6 +8,7 @@ plausible in a result set.
 
 from __future__ import annotations
 
+import pyarrow as pa
 import pytest
 
 import batcher as bt
@@ -164,3 +165,43 @@ def test_a_non_list_embedding_column_is_rejected():
     udf = mmr_rerank_udf(embedding_column="emb", score_column="score", k=2)
     with pytest.raises(PlanError, match="as a list"):
         scalar.ml.map_batches(udf).collect()
+
+
+def test_mismatched_per_candidate_lists_are_named_rather_than_broadcast() -> None:
+    """Grouping the embeddings and the scores apart leaves the two lists out of step.
+
+    A different filter on either side, or a join that dropped a candidate, does it. Left to
+    NumPy it surfaced as "operands could not be broadcast together with shapes (2,) (3,)",
+    which names neither the columns, nor the row, nor the fix.
+    """
+    udf = mmr_rerank_udf(embedding_column="e", score_column="s", k=2)()
+    batch = pa.RecordBatch.from_pydict(
+        {"e": [[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]], "s": [[0.9, 0.5]]}
+    )
+    with pytest.raises(PlanError, match=r"row 0 has 3 candidate vectors in 'e' but 2 scores"):
+        udf(batch)
+
+
+def test_a_short_rerank_column_is_named_rather_than_an_index_error() -> None:
+    udf = mmr_rerank_udf(embedding_column="e", score_column="s", rerank_columns=("doc",), k=3)()
+    batch = pa.RecordBatch.from_pydict(
+        {
+            "e": [[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]],
+            "s": [[0.9, 0.5, 0.1]],
+            "doc": [["a", "b"]],
+        }
+    )
+    with pytest.raises(PlanError, match=r"row 0 of 'doc' has 2 values"):
+        udf(batch)
+
+
+def test_aligned_per_candidate_lists_still_rerank() -> None:
+    udf = mmr_rerank_udf(embedding_column="e", score_column="s", rerank_columns=("doc",), k=2)()
+    batch = pa.RecordBatch.from_pydict(
+        {
+            "e": [[[1.0, 0.0], [0.99, 0.01], [0.0, 1.0]]],
+            "s": [[0.9, 0.89, 0.5]],
+            "doc": [["twin a", "twin b", "different"]],
+        }
+    )
+    assert udf(batch).column("doc").to_pylist() == [["twin a", "different"]]

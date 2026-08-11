@@ -23,7 +23,7 @@ import pytest
 
 import batcher as bt
 from batcher.kyber.stats import StatsEstimator
-from batcher.plan.stats import Provenance
+from batcher.plan.stats import Provenance, SortOrder
 
 
 def _ds(n: int = 1_000):
@@ -78,7 +78,7 @@ def test_row_id_counter_is_not_invented_under_an_estimated_count():
 def test_row_id_records_its_own_ordering_only_when_the_child_has_none():
     ds = _ds()
     est = _est(ds)
-    assert est.estimate(ds.with_row_index("i")._plan).sorted_by == ("i",)
+    assert est.estimate(ds.with_row_index("i")._plan).sorted_by == (SortOrder("i"),)
     sorted_child = ds.sort("x").with_row_index("i")
     assert est.estimate(sorted_child._plan).sorted_by == est.estimate(ds.sort("x")._plan).sorted_by
 

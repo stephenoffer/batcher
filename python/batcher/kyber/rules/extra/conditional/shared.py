@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 from batcher._internal.mathx import is_nan
 
@@ -51,12 +52,13 @@ from batcher.plan.expr_ir import (
     NullIf,
 )
 from batcher.plan.expr_ir.core import IsInf, IsNan
-from batcher.plan.logical import Filter, Project
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type
 
+if TYPE_CHECKING:
+    from batcher.kyber.rules.exprs.guards import SchemaNode
+
 # The nodes these rules rewrite: `_rewrite_node` walks every expression a Filter/Project carries.
-_Node = Filter | Project
 
 # Nodes whose result is BOOLEAN whatever their input is.
 _BOOL_NODES = (Not, IsNull, IsNotNull, IsNan, IsInf, InList)
@@ -168,11 +170,11 @@ def _droppable(
 
 
 def _rewrite_typed(
-    node: _Node,
+    node: SchemaNode,
     leaf: Callable[..., Expr],
     *,
     carries: tuple[type, ...],
-) -> _Node | None:
+) -> SchemaNode | None:
     """The node-local form of a conditional leaf, run schema-free and then schema-aware.
 
     Every leaf in this family takes an optional `schema`, so this applies the *same* function

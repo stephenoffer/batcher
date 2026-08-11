@@ -1,8 +1,8 @@
 # Preprocessors API
 
 `batcher.ml.preprocessors` holds the fit/transform feature-engineering estimators. Each
-one `fit`s over a `Dataset` to learn its statistics, then `transform`s any `Dataset` with
-them, and `Chain` composes several into one pipeline.
+one `fit`s over a {py:class}`Dataset <batcher.Dataset>` to learn its statistics, then `transform`s any {py:class}`Dataset <batcher.Dataset>` with
+them, and {py:class}`Chain <batcher.ml.preprocessors.Chain>` composes several into one pipeline.
 
 This page is the reference. For how they fit into a training workflow, read
 {doc}`/ml/preparing/preprocessors/index`.

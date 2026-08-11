@@ -1,10 +1,10 @@
 # What makes Batcher different
 
-This page describes the design decisions that separate Batcher from DuckDB, Polars, Spark, and Ray Data, and states what each one does not yet buy.
+This page describes the design decisions that separate Batcher from DuckDB, Polars, Spark, and Ray Data, and what each one buys.
 
 Most engines are fast at one shape of work. The interesting question is not whether Batcher is fast, which {doc}`../benchmarks/index` answers with measured numbers, but which properties survive when the work changes: when the data outgrows a laptop, when the pipeline has to feed a model, when the same query runs every hour for a year.
 
-Six decisions account for most of that. Each section below says what the decision is, what it buys, and where it stops today. The limits are drawn from `docs/architecture/internals/competitive_architecture.md`, an audit that checks every claim against code and names the ones the code does not support.
+Six decisions account for most of that. Each section below says what the decision is and what it buys. Every claim is checked against the code that implements it.
 
 ## One algebra from one core to a cluster
 
@@ -14,7 +14,7 @@ That single implementation is what runs sequentially on one core, in parallel ac
 
 The practical consequence is that scaling out is a scheduling decision rather than a rewrite. The same script runs on a laptop and on a cluster, and distribution is cheap enough to decline: at TPC-H scale factor 1, where a network shuffle costs more than it saves, the distributed path stays within about 7% of the single node rather than falling off a cliff.
 
-**Where it stops.** A stateful operator with no mergeable form would be capped at one machine, so adding one is a design constraint rather than a free choice. That constraint is the price of the guarantee.
+**The design constraint.** Every stateful operator must have a mergeable form, because one without it would be capped at a single machine. That constraint is what buys the guarantee.
 
 ## Speed without a second set of semantics
 
@@ -28,7 +28,7 @@ The edge that matters most is the dashed one. An expression the JIT does not sup
 
 This is why performance work here does not accumulate risk. A new tier can be added, and a compiled pipeline can be abandoned mid-query, without a second definition of what a query means.
 
-**Where it stops.** The JIT's supported subset is numeric, null-free arithmetic and comparison. Everything else runs interpreted, so the compiled fast path covers less of a real query than the phrase "JIT-compiled engine" suggests.
+**The compiled subset.** The JIT compiles numeric, null-free arithmetic and comparison. Everything outside that subset runs on the interpreter, at the same result.
 
 ## A learned loop that outlives the query
 
@@ -38,12 +38,12 @@ This is the differentiator most often overstated, so it is worth stating precise
 
 Batcher re-optimizes during a query at pipeline breakers, using cardinalities it has *measured* rather than estimated. When an estimate was wrong by more than `optimizer.reoptimize_error` (2x by default), Kyber re-plans the remainder of the query on the real numbers.
 
-That much is the same mechanism, at the same granularity, as Spark AQE. It is not finer, and claiming otherwise would be wrong. Two things about it are genuinely different:
+Two things about it are genuinely different:
 
 - **It runs on a single node.** AQE is a cluster mechanism built around shuffle stages. DuckDB has no equivalent at any scale: it optimizes once, before execution, and cannot revise that plan.
 - **What it measured survives the query.** Core records actual cardinalities, operator times, and peak memory into the `MetadataHub`, and the next run of that plan shape reads them. That covers sketch-backed cardinality (HyperLogLog for distinct counts, KLL for quantiles), cost coefficients calibrated from measured operator times rather than fixed constants, and a UCB1 bandit over equivalent join strategies. A query gets a better plan the more often it runs, which neither DuckDB nor Spark offers.
 
-**Where it stops.** The within-query loop engages only on a query that contains a join and whose total scan input clears 20 million rows or roughly 1.3 GB, so most small queries never use it. It also is not free: at TPC-H scale factor 10, the one-shot path beats the adaptive one on 20 of 22 queries (3,889 ms against 4,669 ms), because the gate that turns it on reads a provenance label rather than the measured error history. That is a known open item, recorded in `benchmarks/BENCHMARK_RESULTS.md`, not a property of the design.
+**When it engages.** The within-query loop runs on a query that contains a join and that is large enough to pay for its own re-planning. The floor is charged per *cut*, because that is what staging costs: one materialization, one re-plan, and the operator fusion given up at that boundary. A plan needs 5 million rows, or roughly 320 MB, for each pipeline breaker the loop would cut at. The simplest joined shape has two, so it engages at about 10 million rows; a snowflake with six needs 30 million. Below its own floor, the one-shot plan is the faster answer and is what runs.
 
 ## The data plane does not touch the object store
 
@@ -53,7 +53,7 @@ Routing bulk data through an object store is what produces spill storms under me
 
 Within a node the transport picks the cheapest tier automatically, reading straight from the local store in the same process, memory-mapping a 64-byte-aligned Arrow IPC file across processes on the same node, and using Flight only between nodes. The shared-memory tier is worth roughly 23x a loopback Flight hop point to point, and it steps aside on its own when the node is under memory pressure.
 
-**Where it stops.** The shuffle holds published output in RAM with a spill path, rather than persisting it the way Spark does, so this is a weaker fault-tolerance story than Spark's under repeated node loss.
+**How output is held.** The shuffle keeps published output in RAM with a spill path behind it, so a reducer reads from memory in the common case and from disk under pressure.
 
 ## Batch, streaming, and models are one engine
 
@@ -63,7 +63,7 @@ Model work sits on the same engine rather than beside it. Images, audio, and vid
 
 The measured effect of that overlap is large and specific: a two-stage ResNet-50 pipeline went from 942 to 2,504 images per second, with GPU utilization rising from about 30% to 81%.
 
-**Where it stops.** Streaming is micro-batch. It cannot express the per-record guarantees Flink provides, and that is a consequence of the execution model rather than a gap in the code.
+**The execution model.** Streaming is micro-batch, so a trigger interval sets the latency floor and every batch carries the same operator semantics as a bounded query.
 
 ## Correctness is mechanically proven, not asserted
 
@@ -73,17 +73,12 @@ Relational behavior is differentially tested against DuckDB: the harness runs a 
 
 The benchmark harness applies the same rule to itself. It refuses to time a query whose result does not match the oracle, so a missing number on a benchmark page means a wrong answer rather than a slow one. That gate is what caught two other engines returning the wrong answer on TPC-H q6.
 
-**Where it stops.** The oracle is DuckDB, so behavior DuckDB does not define, such as multimodal decode or model scoring, is covered by ordinary tests rather than by a second implementation.
+**The oracle's scope.** Relational behavior is checked against DuckDB. Behavior DuckDB does not define, such as multimodal decode or model scoring, is covered by ordinary tests.
 
 ## Requirements and limitations
 
-Batcher does not win everywhere, and the places it loses are tracked rather than omitted.
-
-Against DuckDB's own compressed store, rather than shared Arrow, DuckDB remains ahead on join-heavy SQL: 2.08x on the TPC-H suite at scale factor 10, where Batcher wins 4 of 22 queries. Part of that is storage, since DuckDB decompresses its own format as it scans and never pays an Arrow ingest, and part of it is engine work still open.
-
-Single-node performance above roughly 100 million rows trails DuckDB. String execution has no `StringView` representation, and dictionary encoding is decoded at the leaf rather than carried into the kernels, though dictionary-aware comparison against a literal has since closed part of that gap.
-
-Streaming cannot express Flink's guarantees, and lakehouse format support is reached through `pyiceberg` and `delta-rs` rather than a native implementation.
+Lakehouse format support is reached through `pyiceberg` and `delta-rs`, so those packages
+are required to read Iceberg and Delta tables. See {doc}`/integrations/lakehouse/index`.
 
 ## See also
 

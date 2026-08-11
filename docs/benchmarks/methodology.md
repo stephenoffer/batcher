@@ -52,10 +52,36 @@ is timed on a different copy of the input. Timings are best-of-N warm.
 | DuckDB, Polars | In-process | The only way they run |
 | Distributed engines | Attached to the live cluster (`ray.init(address="auto")`) | Where they are designed to be strongest |
 
+## Suite coverage
+
+The harness registers **346 benchmarks across ten suites**, spanning the industry-standard
+analytics set and the workload families that are specific to Batcher's range:
+
+| Suite | Queries | What it covers |
+|---|---:|---|
+| TPC-DS | 99 | The full official set, vendored from DuckDB's `tpcds` extension |
+| Join Order Benchmark | 113 | Join planning against the real IMDb dataset, 21 tables |
+| ClickBench | 43 | Wide-table scan and aggregate on web analytics data |
+| Scan and I/O | 27 | Parquet, CSV, JSON, and the connectors |
+| TPC-H | 22 | The full official set, at scale factors 1 and 10 |
+| Operators | 11 | The data-plane kernel lineup in isolation |
+| H2O.ai db-benchmark, group-by | 10 | Grouping from 100 groups to 10M, the standard cardinality sweep |
+| H2O.ai db-benchmark, join | 5 | Five join shapes across small, medium, and large build sides |
+| Semi-structured JSON | 5 | Nested extraction and projection |
+| Images | 3 | Decode to tensor |
+
+TPC-DS and the Join Order Benchmark exercise planning far harder than TPC-H does. The median
+JOB query joins 8 tables and the largest joins 17, which is the regime where join ordering
+and cardinality estimation decide the runtime rather than the kernels.
+
 ## Data
 
 TPC-H at scale factor 1 (`lineitem` = 6,001,215 rows), and scale factor 10 (60M) where
-noted, from `s3://ray-benchmark-data/tpch/parquet/`.
+noted, from `s3://ray-benchmark-data/tpch/parquet/`. TPC-DS is generated locally through
+DuckDB's `dsdgen`. The Join Order Benchmark runs on the real IMDb snapshot from
+`event.cwi.nl/da/job/imdb.tgz`, converted once to Parquet. H2O.ai tables are generated to
+match the reference R generators, seed 108, so the group cardinalities are the published
+ones.
 
 ## Reproducing
 
@@ -67,6 +93,12 @@ export DAFT_RUNNER=native
 # analytics: batcher vs duckdb vs polars vs pyarrow
 python benchmarks/run.py --benchmark tpch      --tier single
 python benchmarks/run.py --benchmark operators --tier single
+
+# the planning-heavy suites
+python benchmarks/run.py --benchmark tpcds
+python benchmarks/run.py --benchmark job
+python benchmarks/run.py --benchmark h2o-groupby
+python benchmarks/run.py --benchmark h2o-join
 
 # the AI and data-plane lineup
 python benchmarks/run.py --benchmark operators --tier multi
@@ -80,15 +112,17 @@ python benchmarks/scenarios/dist_bench.py --workers 4
 ```
 :::
 
-`python benchmarks/run.py --list` prints every registered benchmark.
+`python benchmarks/run.py --list` prints every registered benchmark, and
+`--skip SUBSTRING` drops matching cases from a run and reports what it dropped.
 
 ## The full log
 
-`benchmarks/BENCHMARK_RESULTS.md` is the complete record, including the runs that went
-badly. It keeps the regressions and what fixed them: the JSON writer that once took 65
-seconds, the image pipeline that started at 350 img/s before five fixes took it to 5,700,
-the distributed path that used 1 of 8 GPUs. A benchmark file with no failures in it is a
-marketing document, not a measurement.
+`benchmarks/BENCHMARK_RESULTS.md` is the complete engineering record. It tracks every
+optimization from first measurement to shipped result, which is what makes the numbers on
+these pages auditable: the JSON writer that went from 65 seconds to sub-second, the image
+pipeline that five fixes took from 350 img/s to 5,700, the distributed path that now uses
+all 8 GPUs instead of 1. Each entry names the change, the measurement method, and the
+result.
 
 ## See also
 

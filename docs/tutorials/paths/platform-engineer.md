@@ -8,7 +8,7 @@ its budget.
 
 1. {doc}`Getting started </getting-started/index>`: install and verify the build.
 1. {doc}`Installation </getting-started/installation>`: packaging and extras.
-1. {doc}`Configuration </configuration/index>`: the `Config` model and precedence.
+1. {doc}`Configuration </configuration/index>`: the {py:class}`Config <batcher.Config>` model and precedence.
 1. {doc}`Configuration options </configuration/options>`: every field and default.
 1. {doc}`Environment variables </configuration/environment>`: `BATCHER_*` and
    `BATCHER_CONFIG_FILE`.
@@ -39,7 +39,7 @@ print(out)
 
 ## Example: defaults from the environment
 
-`Config.from_env` overlays `BATCHER_*` variables onto a base config. That is how a
+{py:meth}`Config.from_env <batcher.Config.from_env>` overlays `BATCHER_*` variables onto a base config. That is how a
 deployment injects settings without touching code.
 
 ```python

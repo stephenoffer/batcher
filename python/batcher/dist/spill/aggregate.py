@@ -22,7 +22,6 @@ ordering/binary breakers that share it live in `dist.spill_breakers` (sort/join/
 from __future__ import annotations
 
 import json
-import shutil
 
 import pyarrow as pa
 
@@ -30,11 +29,19 @@ from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source, _single_source
 from batcher.dist.executors.plan_analysis import empty_result_table
+from batcher.dist.spill.buckets import (
+    GRACE_DEPTH,
+    GRACE_SUB_BUCKETS,
+    BucketWriters,
+    over_envelope,
+    read_reserved_bucket,
+    regrace,
+    spill_scratch,
+    split_salt,
+)
 from batcher.dist.spill.scratch import (
     _fd_safe,
     _iter_spill_morsels,
-    _make_store,
-    _work_dir,
     map_projection,
 )
 from batcher.io.source import Source
@@ -109,6 +116,13 @@ def spill_collect(
     # `COUNT(DISTINCT)` the planner lowers to `DISTINCT → COUNT`) failing fast under a tight
     # memory envelope instead of completing out-of-core, which it must at PB scale.
     if isinstance(plan, Distinct):
+        # A *keyed* dedup is not a group-by over every column — its surviving row carries
+        # columns the key does not determine — so the equivalence below does not hold for it
+        # and building it anyway silently returns a whole-row DISTINCT (every row of a table
+        # with no duplicate rows). Decline: the engine's own grace path
+        # (`bc_interp::distinct_on_spill`) reduces it out of core under the same envelope.
+        if plan.keys:
+            return None
         # Same multi-source guard: a `DISTINCT` over a `Union` (a set-op shape) can't ride the
         # single-source spill path — decline to the in-memory engine.
         if not _single_source(plan.input):
@@ -138,12 +152,12 @@ def spill_collect(
             if br.supports_spilling_window(plan):
                 gen = br.stream_spilling_window(plan, sources, num_partitions)
             else:
-                from batcher.dist.window_stream import (
+                from batcher.dist.global_window import (
                     stream_spilling_global_window,
-                    supports_streaming_global_window,
+                    supports_ordered_bucket_offsets,
                 )
 
-                if supports_streaming_global_window(plan):
+                if supports_ordered_bucket_offsets(plan):
                     gen = stream_spilling_global_window(plan, sources, num_partitions)
             if gen is not None:
                 batches = list(gen)
@@ -199,13 +213,9 @@ def execute_spilling_aggregate(
     map_ir = json.dumps(map_plan.to_ir())
     source = sources[source_id]
 
-    work_dir, owns_dir = _work_dir(spill_dir, "batcher_spill_")
-    store = _make_store(work_dir)
-    writers: dict[int, object] = {}
-    handles: dict[int, object] = {}
-
-    try:
+    with spill_scratch("batcher_spill_", spill_dir) as store:
         # --- partition phase: stream source, partial-aggregate, spill by key ---
+        writers = BucketWriters(store, "bucket")
         for batch in _iter_spill_morsels(source, map_projection(agg, source_id)):
             mapped = nat.execute_plan(map_ir, [[batch]], cfg_json)
             if not mapped:
@@ -213,31 +223,20 @@ def execute_spilling_aggregate(
             partial = nat.partial_aggregate(group_keys_json, aggregates_json, mapped)
             # One bucket (global aggregate, or num_partitions=1) needs no shuffle.
             if n_buckets == 1:
-                buckets = [[partial]]
+                writers.write(0, partial)
             else:
-                buckets = nat.partition_batches([partial], key_idx, n_buckets)
-            for b, part_batches in enumerate(buckets):
-                for pb in part_batches:
-                    if pb.num_rows == 0:
-                        continue
-                    w = writers.get(b)
-                    if w is None:
-                        w = store.writer(f"bucket_{b}")
-                        writers[b] = w
-                    w.write(pb)
-        for b, w in writers.items():
-            handles[b] = w.close()
+                writers.add(nat.partition_batches([partial], key_idx, n_buckets))
+        handles = writers.close()
 
         # --- reduce phase: combine+finalize one bucket at a time, recursing into
         # any bucket too large to fit (skew) ------------------------------------
         out: list[pa.RecordBatch] = []
-        key_idx_groups = list(range(n_keys))
         for b in range(n_buckets):
             handle = handles.get(b)
             if handle is None:
                 continue  # bucket received no rows
             _reduce_agg_bucket(
-                store, handle, group_keys_json, aggregates_json, nat, key_idx_groups, n_keys, out, 0
+                store, handle, group_keys_json, aggregates_json, nat, key_idx, n_keys, out, 0
             )
 
         if out:
@@ -259,15 +258,6 @@ def execute_spilling_aggregate(
                 [nat.combine_finalize(group_keys_json, aggregates_json, [partial])]
             )
         return _empty_table(agg)
-    finally:
-        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
-        # open (a partition phase abandoned by an exception) and deletes both tiers' files
-        # — the `rmtree` only ever reached the *local* one, so a failed query that had
-        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
-        # with nothing recording that they existed.
-        store.cleanup()
-        if owns_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _empty_table(agg: Aggregate) -> pa.Table:
@@ -277,98 +267,49 @@ def _empty_table(agg: Aggregate) -> pa.Table:
     return empty_result_table(agg, names)
 
 
-# Max grace-recursion depth. Past it, re-partitioning has stopped helping: a bucket still
-# over budget after this many secondary hashes is dominated by group state that *no* hash of
-# the group key can separate — every row of a group hashes together by construction. Such a
-# bucket is finalized in memory, and that is a genuine ceiling: a single group whose state
-# exceeds RAM cannot be reduced out of core by partitioning, because partitioning is the
-# only tool the mergeable algebra gives us here.
-#
-# Routing this case to `combine_finalize_spilling` was tried and reverted. It grace-partitions
-# by the same group key, so it cannot split what this recursion already could not: measured
-# over 86 buckets that reached the floor over budget, peak RSS was identical (716 MB either
-# way) and it added a re-read and re-write of every one. Lifting this ceiling needs a
-# per-group spillable state in `bc-runtime`, not another partitioning pass.
-_MAX_SPILL_RECURSION = 3
-_SUB_BUCKETS = 8
-
-
-def _split_salt(depth: int) -> int:
-    """The re-partition salt for recursion `depth`.
-
-    Non-zero -- 0 is the unsalted, cluster-wide bucket assignment, which a *shuffle* must
-    agree on and a *local* re-split must not reuse -- and distinct per level, so keys that
-    collided at one level spread at the next instead of re-colliding identically.
-    """
-    return (0x9E3779B97F4A7C15 * (depth + 1)) % (1 << 64) | 1
+# Named here because the skew test and this module's own reduce read them; the values, the
+# reasoning behind the depth bound, and the salt are `dist.spill.buckets`' — every breaker
+# graces the same way, and three of them used to say so separately.
+_MAX_SPILL_RECURSION = GRACE_DEPTH
+_SUB_BUCKETS = GRACE_SUB_BUCKETS
+_split_salt = split_salt
 
 
 def _reduce_agg_bucket(store, handle, gk, aj, nat, key_idx, n_keys, out, depth):
     """Reduce one spilled aggregate bucket, recursing into it if it is too large.
 
-    A bucket within budget (or a keyless global aggregate, or at the recursion
-    floor) is combined+finalized directly. An over-large bucket is re-partitioned by
-    a secondary hash of the group key into `_SUB_BUCKETS` sub-buckets — streamed, so
-    the whole bucket is never resident — and each sub-bucket is reduced recursively.
-    Every group's partial rows hash together, so per-sub-bucket finalize is exact
-    (N13: skew degrades gracefully instead of OOMing the reduce).
+    A bucket within budget (or a keyless global aggregate, or at the recursion floor) is
+    combined+finalized directly. An over-large bucket is re-partitioned by a secondary hash
+    of the group key into `_SUB_BUCKETS` sub-buckets — streamed, so the whole bucket is
+    never resident — and each sub-bucket is reduced recursively. Every group's partial rows
+    hash together, so per-sub-bucket finalize is exact: skew degrades gracefully instead of
+    OOMing the reduce.
+
+    A *global* aggregate has one group and no key to re-hash, so it is never split however
+    large it gets — the ceiling `GRACE_DEPTH` documents, arriving immediately.
     """
-    bucket_max = active_config().memory.spill_bucket_max_bytes
-    # Budget against the bucket's *uncompressed* (in-memory) size — reading it back
-    # decompresses into RAM. `handle.nbytes` is the on-disk compressed size, which for a
-    # compressible bucket (many repeated group keys/values) can be far smaller than the
-    # resident footprint, so using it would let an over-large bucket skip re-spill recursion
-    # and OOM `combine_finalize`. `logical_nbytes` is the size `combine_finalize` actually pays.
-    resident = handle.logical_nbytes or handle.nbytes
-    if n_keys == 0 or resident <= bucket_max or depth >= _MAX_SPILL_RECURSION:
-        # `read_reserved` accounts the resident footprint against the process-wide buffer
-        # pool for the duration of the read. Reading a bucket back is the one step of
-        # spilling that can undo it — the state went to disk because it did not fit — and
-        # nothing was checking the envelope before pulling it in again, so a concurrent
-        # query sizing its own state saw headroom this reduce was already using.
-        with store.read_reserved(handle) as stream:
-            partials = list(stream)
-        if partials:
-            out.append(nat.combine_finalize(gk, aj, partials))
-        # This bucket is finished, and every group key hashes to exactly one bucket, so
-        # nothing will read it again. Giving its disk back here bounds peak *scratch* to
-        # the buckets still outstanding rather than to the whole spilled state — the disk
-        # analogue of the credit window, and the difference between a PB-scale aggregate
-        # needing room for its largest bucket and needing room for all of them at once.
-        store.release(handle)
+    if n_keys and over_envelope(handle, depth, max_depth=_MAX_SPILL_RECURSION):
+        subs = regrace(
+            nat,
+            store,
+            handle,
+            key_idx,
+            _split_salt(depth),
+            f"{handle.path.rsplit('/', 1)[-1]}_d{depth}",
+            n_sub=_SUB_BUCKETS,
+        )
+        for sb in range(_SUB_BUCKETS):
+            h = subs.get(sb)
+            if h is not None:
+                _reduce_agg_bucket(store, h, gk, aj, nat, key_idx, n_keys, out, depth + 1)
         return
 
-    sub_writers: dict[int, object] = {}
-    sub_handles: dict[int, object] = {}
-    # A **salted** re-partition, and the salt is the whole point. The parent bucket count and
-    # `_SUB_BUCKETS` are both powers of two, and bucket assignment reads the low hash bits at a
-    # power-of-two count -- so an unsalted re-partition of a 16-way bucket into 8 sub-buckets
-    # sends every row to `bucket & 7`. One sub-bucket, always, at every level: the recursion
-    # rewrote and re-read the whole bucket three times and changed nothing, then combined the
-    # over-large bucket anyway. (That is what the "peak RSS was identical either way"
-    # measurement recorded above was actually measuring.) The salt varies by depth and never
-    # by row, so equal keys still co-locate and each sub-bucket stays an exact partial reduce.
-    salt = _split_salt(depth)
-    for batch in store.read_stream(handle):
-        for sb, parts in enumerate(
-            nat.partition_batches_salted([batch], key_idx, _SUB_BUCKETS, salt)
-        ):
-            for pb in parts:
-                if pb.num_rows == 0:
-                    continue
-                w = sub_writers.get(sb)
-                if w is None:
-                    w = store.writer(f"{handle.path.rsplit('/', 1)[-1]}_d{depth}_s{sb}")
-                    sub_writers[sb] = w
-                w.write(pb)
-    for sb, w in sub_writers.items():
-        sub_handles[sb] = w.close()
-    # The parent has been fully re-partitioned into the sub-buckets, so its own file is
-    # dead weight from here on — and it is the *largest* file in the recursion, since every
-    # sub-bucket is a fraction of it. Holding it while the sub-buckets are reduced is what
-    # makes grace recursion cost more disk at each level instead of the same.
+    partials = read_reserved_bucket(store, handle)
+    if partials:
+        out.append(nat.combine_finalize(gk, aj, partials))
+    # This bucket is finished, and every group key hashes to exactly one bucket, so nothing
+    # will read it again. Giving its disk back here bounds peak *scratch* to the buckets
+    # still outstanding rather than to the whole spilled state — the disk analogue of the
+    # credit window, and the difference between a PB-scale aggregate needing room for its
+    # largest bucket and needing room for all of them at once.
     store.release(handle)
-    for sb in range(_SUB_BUCKETS):
-        h = sub_handles.get(sb)
-        if h is not None:
-            _reduce_agg_bucket(store, h, gk, aj, nat, key_idx, n_keys, out, depth + 1)

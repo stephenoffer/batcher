@@ -167,6 +167,11 @@ def n_classes(model: Any) -> int | None:
 #: `estimators` at import; `get_adapter` is the only supported way to read it.
 FRAMEWORKS: dict[str, TabularAdapter] = {}
 
+#: The estimator entry points that make an unrecognized object scoreable as scikit-learn, in
+#: `method=` order (`raw` calls `decision_function`). Any one of them is enough — see
+#: `detect_framework`.
+_DUCK_TYPED_SCORERS = ("predict", "predict_proba", "decision_function", "transform")
+
 
 def register(adapter: TabularAdapter) -> TabularAdapter:
     """Add `adapter` to the framework registry and return it (used at module scope)."""
@@ -248,13 +253,16 @@ def detect_framework(model: Any) -> str:
     for adapter in FRAMEWORKS.values():
         if adapter.owns(model):
             return adapter.name
-    # A duck-typed estimator (a custom class with `predict`) is the scikit-learn contract,
-    # so accept it rather than refusing a model that would work.
-    if hasattr(model, "predict"):
+    # A duck-typed estimator is the scikit-learn contract, so accept it rather than refusing a
+    # model that would work. Every entry point the sklearn adapter can actually call counts, not
+    # `predict` alone: a probability calibrator, a one-class scorer and a fitted transformer are
+    # each scoreable via `method=`, and gating on `predict` refused all three at the door — the
+    # error even told the caller to pass `framework="sklearn"`, which then worked.
+    if any(hasattr(model, name) for name in _DUCK_TYPED_SCORERS):
         return "sklearn"
     raise PlanError(
-        f"cannot tell which ML framework {type(model).__name__} belongs to, and it has no "
-        f"predict() method. Pass framework= explicitly (one of {sorted(FRAMEWORKS)})."
+        f"cannot tell which ML framework {type(model).__name__} belongs to, and it has none of "
+        f"{list(_DUCK_TYPED_SCORERS)}. Pass framework= explicitly (one of {sorted(FRAMEWORKS)})."
     )
 
 

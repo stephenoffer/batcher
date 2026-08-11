@@ -46,6 +46,17 @@ pub(crate) fn radix_sort_indices(values: &ArrayRef, opts: SortOptions) -> Option
         }
     }
 
+    // Already in order — a constant key, a time-ordered scan, a re-sort by the key the data is
+    // already clustered on — means the permutation is the identity, because a stable sort leaves
+    // an ordered input alone. Checking costs one comparison per row when it holds and, since
+    // `all` short-circuits, about two when it does not; the eight counting passes it replaces
+    // cost far more than that even on a key whose bytes are constant enough to skip most of them.
+    // Restricted to a null-free column so the identity claim covers the whole output rather than
+    // the live rows alone.
+    if nulls.is_none() && is_ordered(&keys, opts.descending) {
+        return Some(UInt32Array::from(live_idx));
+    }
+
     let live_sorted = lsd_radix(live_idx, &keys, opts.descending);
 
     let mut out: Vec<u32> = Vec::with_capacity(n);
@@ -133,6 +144,116 @@ fn ordered_keys(values: &ArrayRef) -> Option<Vec<u64>> {
     Some(keys)
 }
 
+/// The `k` best **non-null** row indices of a fixed-width key, in sorted order, or `None` for a
+/// type with no order-preserving `u64` encoding.
+///
+/// The same encoding [`ordered_keys`] builds for the radix, fed to a bounded heap instead of a
+/// counting sort: ranking is what a `LIMIT` needs and ordering the other `n - k` rows is what it
+/// does not. Reads the value buffer once, sequentially, and touches the heap only for a row that
+/// beats the worst kept so far.
+///
+/// Unlike the radix this does **not** decline on a NaN or on a large float column. Both of those
+/// limits are properties of the counting sort — an unrepresentable numeric position and a random
+/// scatter that leaves cache — and neither applies to a sequential scan against a heap. See
+/// [`float_rank`] for why a NaN needs no special case here.
+pub(super) fn top_k_live(values: &ArrayRef, descending: bool, k: usize) -> Option<Vec<u32>> {
+    let ranks = ranks(values, descending)?;
+    Some(super::heap_select_k(values.len(), values.nulls(), k, |i| {
+        ranks[i]
+    }))
+}
+
+/// An order-preserving `u64` per row: ordering these integers orders the rows, exactly as a
+/// stable sort under `descending` would. `None` for a type with no such encoding.
+///
+/// Null slots carry whatever their (unread) payload encodes to; every caller places nulls
+/// itself, because null ordering is `nulls_first`'s business rather than the key's.
+pub(super) fn ranks(values: &ArrayRef, descending: bool) -> Option<Vec<u64>> {
+    let n = values.len();
+    // One arm per concrete primitive: this path exists to read a typed values slice
+    // sequentially, which a `dyn Array` accessor would give up.
+    macro_rules! encode {
+        ($arr:ty, $conv:expr) => {{
+            let a = values.as_any().downcast_ref::<$arr>()?;
+            let v = a.values();
+            let conv = $conv;
+            let mut out = Vec::with_capacity(n);
+            out.extend((0..n).map(|i| {
+                let r: u64 = conv(v[i]);
+                if descending {
+                    !r
+                } else {
+                    r
+                }
+            }));
+            Some(out)
+        }};
+    }
+    // Signed widen to `i64` then flip the sign bit; unsigned widen directly; floats take the
+    // order-preserving bit transform. Identical rankings to [`ordered_keys`], by construction.
+    macro_rules! signed {
+        ($arr:ty, $t:ty) => {
+            encode!($arr, |x: $t| ((x as i64) as u64) ^ (1u64 << 63))
+        };
+    }
+    macro_rules! unsigned {
+        ($arr:ty, $t:ty) => {
+            encode!($arr, |x: $t| x as u64)
+        };
+    }
+    match values.data_type() {
+        DataType::Int8 => signed!(Int8Array, i8),
+        DataType::Int16 => signed!(Int16Array, i16),
+        DataType::Int32 => signed!(Int32Array, i32),
+        DataType::Int64 => signed!(Int64Array, i64),
+        DataType::UInt8 => unsigned!(UInt8Array, u8),
+        DataType::UInt16 => unsigned!(UInt16Array, u16),
+        DataType::UInt32 => unsigned!(UInt32Array, u32),
+        DataType::UInt64 => unsigned!(UInt64Array, u64),
+        DataType::Float32 => encode!(Float32Array, |x: f32| float_rank(x as f64)),
+        DataType::Float64 => encode!(Float64Array, float_rank),
+        DataType::Date32 => signed!(Date32Array, i32),
+        DataType::Date64 => signed!(Date64Array, i64),
+        DataType::Timestamp(TimeUnit::Second, _) => signed!(TimestampSecondArray, i64),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => signed!(TimestampMillisecondArray, i64),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => signed!(TimestampMicrosecondArray, i64),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => signed!(TimestampNanosecondArray, i64),
+        _ => None,
+    }
+}
+
+/// An order-preserving `u64` for a float: ordering these integers is exactly `f64::total_cmp`.
+///
+/// Negatives bit-invert, non-negatives flip only the sign bit. That is the standard IEEE-754
+/// total-order transform, and it needs no NaN case because it *is* total: a negative NaN inverts
+/// below `-∞` and a positive one lands above `+∞`, which is where `total_cmp` puts them and
+/// therefore where arrow's comparison sort does. (The counting sort declines on a NaN instead,
+/// but for a reason that belongs to the counting sort — see [`ordered_keys`].) Sort keys reaching
+/// here have normally been through `bc_arrow::canon_float_array` already, which collapses every
+/// NaN to the positive quiet one and `-0.0` to `0.0`; agreeing with `total_cmp` on the raw bits
+/// means the ranking is right either way.
+#[inline]
+fn float_rank(v: f64) -> u64 {
+    let b = v.to_bits();
+    if b >> 63 == 1 {
+        !b
+    } else {
+        b | (1u64 << 63)
+    }
+}
+
+/// Whether the order-preserving keys are already non-decreasing (non-increasing for
+/// `descending`), i.e. the sort has nothing to do.
+fn is_ordered(keys: &[u64], descending: bool) -> bool {
+    keys.windows(2).all(|w| {
+        if descending {
+            w[0] >= w[1]
+        } else {
+            w[0] <= w[1]
+        }
+    })
+}
+
 /// Stable least-significant-byte-first radix sort of `idx` by `keys[idx]`. Eight
 /// 256-bucket counting-sort passes (one per byte of the u64 key); a pass whose byte
 /// is constant across the input is skipped. `descending` inverts the key so an
@@ -172,6 +293,43 @@ fn lsd_radix(mut idx: Vec<u32>, keys: &[u64], descending: bool) -> Vec<u32> {
         std::mem::swap(&mut idx, &mut buf);
     }
     idx
+}
+
+#[cfg(test)]
+mod ordered_shortcut_tests {
+    use std::sync::Arc;
+
+    use arrow::compute::{sort_to_indices, take};
+
+    use super::*;
+
+    /// An already-ordered key must radix to the identity, and that has to be checked against
+    /// arrow's own sort rather than against `0..n` — the claim is that the permutation is
+    /// unchanged, and only the comparison sort can say what the permutation should be.
+    #[test]
+    fn an_ordered_column_radixes_to_itself() {
+        let ascending: ArrayRef = Arc::new(Int64Array::from((0..5_000i64).collect::<Vec<_>>()));
+        let constant: ArrayRef = Arc::new(Int64Array::from(vec![7i64; 5_000]));
+        let descending_vals: ArrayRef =
+            Arc::new(Int64Array::from((0..5_000i64).rev().collect::<Vec<_>>()));
+        let mut unordered: Vec<i64> = (0..5_000i64).collect();
+        unordered.swap(0, 4_999);
+        let unordered: ArrayRef = Arc::new(Int64Array::from(unordered));
+
+        for values in [ascending, constant, descending_vals, unordered] {
+            for descending in [false, true] {
+                let opts = SortOptions {
+                    descending,
+                    nulls_first: false,
+                };
+                let got = radix_sort_indices(&values, opts).expect("Int64 is radix-sortable");
+                let want = sort_to_indices(values.as_ref(), Some(opts), None).unwrap();
+                let g = take(values.as_ref(), &got, None).unwrap();
+                let w = take(values.as_ref(), &want, None).unwrap();
+                assert_eq!(g.as_ref(), w.as_ref(), "descending={descending}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

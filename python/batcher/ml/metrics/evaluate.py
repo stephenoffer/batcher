@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher._internal.logging import note_suppressed
 from batcher.ml.metrics import ranked
 from batcher.plan.functions import metrics as agg_metrics
 
@@ -69,6 +70,12 @@ _RANK_METRICS: dict[str, Callable[..., Any]] = {
     "gini": ranked.gini_coefficient,
 }
 
+
+def _needs_score(name: str) -> bool:
+    """Whether `name` can only be computed from a probability, not a hard prediction."""
+    return name in _SCORE_METRICS or name in _RANK_METRICS
+
+
 #: The metrics reported for each task when none are named, in report order.
 METRIC_SETS: dict[str, tuple[str, ...]] = {
     "regression": tuple(_REGRESSION),
@@ -107,8 +114,26 @@ _MULTICLASS_AVERAGES = (
 )
 
 
-def _resolve_task(task: str, y_pred: str | None, y_score: str | None) -> str:
-    """Pick the task from what the caller supplied, or validate the one they named."""
+def _resolve_task(
+    task: str,
+    y_pred: str | None,
+    y_score: str | None,
+    ds: Dataset | None = None,
+    y_true: str | None = None,
+    max_classes: int = 100,
+) -> str:
+    """Pick the task from the labels, or validate the one the caller named.
+
+    `"auto"` used to answer from the *argument list* alone: a `y_score` meant binary and a
+    `y_pred` meant regression, whatever the labels held. So the most ordinary call there is
+    — ``evaluate("label", y_pred="prediction")`` over a 0/1 classification — reported RMSE,
+    MAE and R². Those are real numbers, computed correctly, answering a question nobody
+    asked, and nothing in the result says so.
+
+    The labels decide it now: a float label column is a regression, and an integer, string
+    or boolean one is a classification with as many classes as it has distinct values. That
+    is one cheap pass over a single column, and only on the `auto` path.
+    """
     if task != "auto":
         if task not in METRIC_SETS:
             from batcher._internal.errors import suggestion
@@ -117,11 +142,46 @@ def _resolve_task(task: str, y_pred: str | None, y_score: str | None) -> str:
             tail = f" {hint}" if hint else ""
             raise PlanError(f"task must be one of {sorted(METRIC_SETS)}, got {task!r}.{tail}")
         return task
-    if y_score is not None:
+    if y_pred is None and y_score is None:
+        raise PlanError(
+            "evaluate() needs y_pred= (a prediction column) or y_score= (a probability)"
+        )
+    if y_pred is None:
+        return "binary"  # a score with no hard prediction is the binary shape by construction
+    inferred = _infer_task_from_labels(ds, y_true, max_classes)
+    return inferred if inferred is not None else "regression"
+
+
+def _infer_task_from_labels(ds: Dataset | None, y_true: str | None, max_classes: int) -> str | None:
+    """The task `y_true`'s own values imply, or `None` when they cannot be read.
+
+    Returning `None` rather than guessing keeps the previous behaviour for a caller whose
+    dataset cannot answer (an un-inferable schema, an unreadable source): the task falls
+    back to regression exactly as before, so this can only ever add information.
+    """
+    if ds is None or y_true is None:
+        return None
+    try:
+        import pyarrow as pa
+
+        from batcher.plan.expr_ir.constructors import col
+
+        dtype = ds.schema.field(y_true).type
+        if pa.types.is_floating(dtype) or pa.types.is_decimal(dtype):
+            return "regression"  # a continuous label is a regression, however few values it has
+        if not (
+            pa.types.is_integer(dtype) or pa.types.is_boolean(dtype) or pa.types.is_string(dtype)
+        ):
+            return None
+        classes = ds.select(**{"__bt_label": col(y_true)}).distinct().count()
+    except Exception as exc:  # pragma: no cover - inference must never break the report
+        note_suppressed("ml", "infer the evaluation task from the labels", exc)
+        return None
+    if classes <= 1:
+        return None  # degenerate; leave the caller's own default rather than inventing one
+    if classes == 2:
         return "binary"
-    if y_pred is not None:
-        return "regression"
-    raise PlanError("evaluate() needs y_pred= (a prediction column) or y_score= (a probability)")
+    return "multiclass" if classes <= max_classes else "regression"
 
 
 def evaluate(
@@ -164,8 +224,14 @@ def evaluate(
         y_true: The label column.
         y_pred: The hard-prediction column (a label, or a value for regression).
         y_score: The predicted probability of the positive class, for a binary task.
-        task: ``"binary"``, ``"multiclass"``, ``"regression"``, or ``"auto"``.
-        metrics: The metric names to compute; the task's default set when omitted.
+        task: ``"binary"``, ``"multiclass"``, ``"regression"``, or ``"auto"``. ``"auto"``
+            reads it off `y_true`: a float label is a regression, and an integer, string or
+            boolean one is a classification with as many classes as it has distinct values
+            (above `max_classes`, a regression again).
+        metrics: The metric names to compute. Omitted, the task's default set is used,
+            minus any metric that needs a probability when no `y_score` was given -- so a
+            binary report over hard predictions is the six label-only metrics rather than
+            an error. A metric named here explicitly still raises if it cannot be computed.
         positive: The label value that counts as the positive class.
         threshold: The cutoff turning `y_score` into a hard prediction.
         by: Column(s) to report a separate row of metrics for.
@@ -190,8 +256,18 @@ def evaluate(
     """
     from batcher.plan.expr_ir.constructors import col, lit, when
 
-    resolved = _resolve_task(task, y_pred, y_score)
-    requested = list(metrics) if metrics is not None else list(METRIC_SETS[resolved])
+    resolved = _resolve_task(task, y_pred, y_score, ds, y_true, max_classes)
+    if metrics is not None:
+        requested = list(metrics)
+    else:
+        # A metric the caller *named* and cannot have still raises, naming it — that error is
+        # actionable. But the task's **default** set is not a request, and four of the ten
+        # binary defaults need a probability: with hard predictions alone, the canonical
+        # `evaluate("y", y_pred="p", task="binary")` raised instead of reporting the six
+        # metrics it had everything for.
+        requested = [
+            name for name in METRIC_SETS[resolved] if y_score is not None or not _needs_score(name)
+        ]
     _validate_metrics(requested)
     groups = ranked._group_keys(by)
 

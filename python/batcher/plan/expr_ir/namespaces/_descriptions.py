@@ -293,6 +293,17 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("xs").list.sort()).to_pydict()\n'
         "        {'r': [[1, 2, 3]]}"
     ),
+    "sort_desc": (
+        "Each list sorted descending, nulls last (\u2192 list).\n\n"
+        "Not the reverse of :meth:`sort`: ascending puts nulls last, so reversing would\n"
+        "move them to the front. DuckDB's ``list_reverse_sort`` leaves them at the back.\n\n"
+        "Examples:\n"
+        "    .. doctest::\n\n"
+        "        >>> import batcher as bt\n"
+        '        >>> ds = bt.from_pydict({"xs": [[3, 1, None, 2]]})\n'
+        '        >>> ds.select(r=bt.col("xs").list.sort_desc()).to_pydict()\n'
+        "        {'r': [[3, 2, 1, None]]}"
+    ),
     "product": (
         "The product of the elements of each list.\n\n"
         "Examples:\n"

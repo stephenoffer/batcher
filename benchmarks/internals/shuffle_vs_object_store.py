@@ -88,10 +88,21 @@ def _bench_carbonite_local(partitions):
     return elapsed, fetched, session.locality_ratio
 
 
-def main() -> None:
-    n_partitions = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-    n_batches = int(sys.argv[2]) if len(sys.argv) > 2 else 64
+def main(n_partitions: int = 8, n_batches: int = 64) -> int:
+    """Run the transfer comparison and print the table.
 
+    Takes its sizes as arguments rather than reading ``sys.argv``. It used to do the
+    latter, which worked when the file was run directly and broke the moment `run.py`
+    dispatched it as a library: `sys.argv[1]` was then `--benchmark`, and
+    `--benchmark shuffle` died in `int()` before moving a byte.
+
+    Args:
+        n_partitions: Shuffle partitions to move.
+        n_batches: Record batches per partition.
+
+    Returns:
+        A process exit code, so the caller in `run.py` can return it directly.
+    """
     partitions = [_partition(n_batches, seed=i) for i in range(n_partitions)]
     total_bytes = _nbytes(partitions)
     expected = _checksum(partitions)
@@ -111,13 +122,27 @@ def main() -> None:
                 best_t, best_out, extra = t, out, rest
         return best_t, best_out, extra
 
-    ray.init(
-        num_cpus=4,
-        include_dashboard=False,
-        logging_level="ERROR",
-        ignore_reinit_error=True,
-        runtime_env={"pip": None},  # drop the workspace's unresolvable inherited pip env
-    )
+    # Pin 4 CPUs so the three transfer modes are compared on the same machine shape. Ray
+    # rejects that pin outright when it attaches to an *existing* cluster rather than
+    # starting one — which is what happens anywhere a cluster is already up (Ray discovers
+    # it from `RAY_ADDRESS` or `/tmp/ray/ray_current_cluster`), and it killed
+    # `--benchmark shuffle` before it moved a byte. Fall back to the cluster's own shape and
+    # say so, because a 4-CPU number and a whole-cluster number are not comparable.
+    init_kwargs = {
+        "include_dashboard": False,
+        "logging_level": "ERROR",
+        "ignore_reinit_error": True,
+        "runtime_env": {"pip": None},  # drop the workspace's unresolvable inherited pip env
+    }
+    try:
+        ray.init(num_cpus=4, **init_kwargs)
+        print("ray: local instance, 4 CPUs\n")
+    except ValueError:
+        ray.init(**init_kwargs)
+        print(
+            "ray: attached to an existing cluster (CPU pin dropped; not comparable to a\n"
+            "     pinned 4-CPU run — restart against a private cluster for that)\n"
+        )
     try:
         ray_t, _, _ = best_of(lambda p: (*_bench_ray_object_store(p), None))
         net_t, _, net_rest = best_of(_bench_carbonite_network)
@@ -142,7 +167,8 @@ def main() -> None:
         "mergeable partial/combine/finalize keeps that bound independent of cluster "
         "size, so the design holds from one node to tens of thousands."
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(*(int(a) for a in sys.argv[1:3])))

@@ -27,7 +27,8 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError, IOError, PlanError
+from batcher._internal.errors import IOError, PlanError
+from batcher._internal.optional import require
 from batcher.io.formats.streaming.sinks import STREAM_SINKS
 
 __all__ = ["KafkaStreamSink"]
@@ -43,13 +44,13 @@ _PAYLOAD_TYPES = ("binary", "large_binary", "string", "large_string")
 
 def _import_producer() -> Any:
     """Import ``confluent_kafka.Producer`` or raise a guiding ``BackendError``."""
-    try:
-        from confluent_kafka import Producer
-    except ImportError as exc:
-        raise BackendError(
-            "writing to Kafka needs the kafka extra: pip install 'batcher-engine[kafka]'"
-        ) from exc
-    return Producer
+    return require(
+        "confluent_kafka",
+        "Producer",
+        feature="Kafka support",
+        provides="confluent-kafka",
+        extra="kafka",
+    )
 
 
 def _payload_column(table: pa.Table, name: str) -> list[bytes | None]:

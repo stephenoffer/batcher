@@ -25,14 +25,28 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
-from batcher.plan.logical import Limit, LogicalPlan, RowId, Union
+from batcher.plan.logical import Distinct, Limit, LogicalPlan, RowId, Union
+from batcher.plan.stats import Provenance
 
 __all__ = [
     "drop_redundant_limit",
     "empty_limit_past_cardinality",
+    "fuse_limit_into_distinct",
     "push_limit_through_row_index",
     "push_offset_limit_into_union",
 ]
+
+#: How much of the input the early exit should be expected to read before it is worth taking.
+#:
+#: The exit pays when `k` distinct rows turn up in a short prefix, which needs `k` to be small
+#: against the key's distinct count — roughly `rows_read ≈ rows x k / ndv`. At a tenth, a
+#: `LIMIT 5` fires on a key with 50+ distinct values and is expected to read a tenth of the
+#: input or less.
+#:
+#: The floor matters more than the ceiling. On a *low*-cardinality key the whole-column dedup
+#: is already 4.9x DuckDB, because `agg::group::assign`'s dense direct-map deduplicates the
+#: column faster than an early exit can be reached; firing there would hand that back.
+_DISTINCT_LIMIT_NDV_RATIO = 10.0
 
 
 @rule(
@@ -125,3 +139,66 @@ def push_offset_limit_into_union(node: Limit, _ctx: OptimizerContext) -> Logical
         capped = tuple(Limit(i, cap, 0) for i in inner.inputs)
         return Limit(Union(capped, distinct=False), node.n, node.offset)
     return None
+
+
+@rule(
+    name="fuse_limit_into_distinct",
+    phase=Phase.REWRITE,
+    matches=(Limit,),
+    category=RuleCategory.REWRITE,
+)
+def fuse_limit_into_distinct(node: Limit, ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Limit(Distinct(x), n, offset)` → the same, with the dedup capped at `offset + n`.
+
+    A `DISTINCT` under a `LIMIT` otherwise deduplicates its whole input before the limit
+    throws nearly all of it away. That is asymptotic rather than a constant factor: on a
+    high-cardinality key the dedup does work proportional to the *input* to answer a question
+    about `k` rows, measured at 0.15x DuckDB on 16M rows and widening with scale. Capping the
+    operator lets it stop as soon as `offset + n` distinct rows exist. DuckDB fuses the same
+    pair (`PhysicalLimitedDistinct`).
+
+    The cap is `offset + n`, not `n`: the outer limit still takes its window from the capped
+    prefix, exactly as the distributed limit path splits the pair.
+
+    **This changes which rows come back, deliberately.** `SELECT DISTINCT ... LIMIT k` with no
+    `ORDER BY` leaves the choice of `k` to the engine, and today Batcher's answer is whichever
+    `k` the parallel dedup's bucket order happens to put first — so it already varies with the
+    shard count. The capped operator keeps the first `k` in *input* order, which is stable
+    across single-node, parallel and distributed. Both are valid answers to an under-determined
+    query; only one of them is the same answer on one node and on many, which invariant #7
+    requires. So this rule makes the result *more* determined, not less.
+
+    Fires only on a whole-column `DISTINCT` (a keyed one's survivor can be replaced by a later
+    row, so no prefix settles it) whose key is estimated high-cardinality enough for the exit
+    to pay — see `_DISTINCT_LIMIT_NDV_RATIO`. Idempotent: the rewritten `Distinct` carries a
+    limit, which the guard below rejects.
+    """
+    inner = node.input
+    if (
+        node.n <= 0
+        or ctx is None
+        or not isinstance(inner, Distinct)
+        or inner.keys
+        or inner.limit is not None
+    ):
+        return None
+    cap = node.offset + node.n
+    # `estimate(inner)` is the dedup's *output* count — the key's distinct combinations — which
+    # is the quantity that decides whether a short prefix can hold `cap` of them.
+    stats = ctx.estimator.estimate(inner)
+    # Only a *measured* low count declines here. The estimator's fallback for an unmeasured
+    # column is half the input row count, which reads as high-cardinality for any relation
+    # bigger than `2 x cap x ratio` — so treating the fallback as evidence would fire the rule
+    # on precisely the low-cardinality key this gate exists to protect. Treating it as a
+    # refusal is no better: an in-memory source carries no per-column ndv at all, so the rule
+    # would never fire on one.
+    #
+    # Neither, then. `DEFAULT` provenance is documented as "an unconstrained guess", so it is
+    # not evidence in either direction, and the decision moves to where the evidence is: the
+    # operator reads a bounded prefix and abandons the early exit if `k` distinct rows have not
+    # appeared (`PREFIX_PROBE_MORSELS` in `stream/breaker.rs`). That makes this gate a way to
+    # skip a probe that is already known to be pointless, not the thing keeping the exit safe.
+    if stats.provenance is not Provenance.DEFAULT and stats.rows < cap * _DISTINCT_LIMIT_NDV_RATIO:
+        return None
+    capped = Distinct(inner.input, inner.keys, inner.order, limit=cap)
+    return Limit(capped, node.n, node.offset)

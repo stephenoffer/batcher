@@ -8,7 +8,7 @@ in thirty seconds.
 ## Chunk with overlap
 
 A document is longer than the embedding model's context, so it has to be cut.
-`.str.chunk(size, overlap)` slices text into fixed-size windows as a `List<Utf8>`, and
+{py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` slices text into fixed-size windows as a `List<Utf8>`, and
 `explode` turns that into one row per chunk. Sizes are in characters, and a boundary never
 splits a codepoint.
 
@@ -134,7 +134,7 @@ hits = vector_search("s3://bucket/chunks.lance", query_vector, column="embedding
 
 | Retrieval path | What it costs per query | Reach for it when |
 | --- | --- | --- |
-| `.list.dot` + `top_k` in the engine | a scan of the candidate rows | the candidates are already narrowed: one tenant, one product, a reranking pass |
+| {py:meth}`.list.dot <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>` + `top_k` in the engine | a scan of the candidate rows | the candidates are already narrowed: one tenant, one product, a reranking pass |
 | `build_vector_index` + `vector_search` over Lance | an ANN lookup | the corpus is large enough that a scan per query is not a retrieval system |
 
 Below the index-is-worth-it threshold (a per-tenant index, a reranking pass, a candidate set
@@ -228,7 +228,7 @@ same paragraph and the model will pick one at random.
   end to end.
 - {doc}`Embeddings </ml/retrieval/embeddings>`: encoders, normalization, and the distance kernels.
 - {doc}`Multimodal </ml/preparing/multimodal/index>`: `build_vector_index`, `vector_search`, and the
-  `.list` distance expressions.
-- {doc}`ML API reference </api/models/ml>`: `str.chunk`, `ds.ml.embed`, `ds.ml.generate`.
+  {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` distance expressions.
+- {doc}`ML API reference </api/models/ml>`: `str.chunk`, {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`, {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: the throughput figures quoted above.
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how the vectors are stored and shipped.

@@ -145,3 +145,58 @@ def test_a_barrier_with_nothing_finished_reports_each_window(monkeypatch, caplog
     assert "0/2 tasks finished" in warnings[0].getMessage()
     # It names the cluster's own view, which is what distinguishes "slow" from "starved".
     assert "cluster CPU 96/96 in use" in warnings[0].getMessage()
+
+
+# --- "N of M done", while the stage runs ---------------------------------------------
+#
+# This barrier is the only place on the distributed path that holds both halves of that
+# question: the slot that just landed and the width of the fan-out. The `PARTITION` event
+# it publishes had a consumer (`observe.InferenceProgress`, the `partitions` counter) and no
+# publisher, so a long distributed stage reported nothing at all until it returned.
+
+
+def test_each_landed_slot_is_announced_with_the_barrier_width(monkeypatch):
+    from batcher._internal import events
+
+    seen: list[events.Event] = []
+    saved = events._subscribers
+    events._subscribers = (seen.append,)
+    try:
+        fake = _FakeRay({0: 1, 1: 1, 2: 2}, step=1.0)
+        assert _run_barrier(monkeypatch, fake, [0, 1, 2]) == [
+            "result-0",
+            "result-1",
+            "result-2",
+        ]
+    finally:
+        events._subscribers = saved
+
+    partitions = [e for e in seen if e.kind == events.PARTITION]
+    assert len(partitions) == 3, "one event per slot, as it lands"
+    # `total` is the width, so "2 of 3" is answerable from any single event rather than by
+    # counting how many have arrived.
+    assert {e.fields["total"] for e in partitions} == {3}
+    assert sorted(e.fields["slot"] for e in partitions) == [0, 1, 2]
+
+
+def test_the_stage_label_travels_with_the_partition_event(monkeypatch):
+    import sys
+    import time
+
+    from batcher._internal import events
+    from batcher.carbonite.resilience import gather_with_backups
+
+    seen: list[events.Event] = []
+    saved = events._subscribers
+    events._subscribers = (seen.append,)
+    try:
+        fake = _FakeRay({0: 1}, step=1.0)
+        monkeypatch.setitem(sys.modules, "ray", fake)
+        monkeypatch.setattr(time, "monotonic", fake.now)
+        gather_with_backups([0], lambda i: i, stage="aggregate.map")
+    finally:
+        events._subscribers = saved
+
+    # Without a label every stage of a query reports into one bucket, and "which stage is
+    # slow" is exactly the question the count exists to answer.
+    assert [e.name for e in seen if e.kind == events.PARTITION] == ["aggregate.map"]

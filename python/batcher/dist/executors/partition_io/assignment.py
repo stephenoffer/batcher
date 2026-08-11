@@ -21,12 +21,24 @@ tolerance, so a skewed intermediate keeps its parallelism.
 
 from __future__ import annotations
 
+import heapq
+import os
 from collections.abc import Callable, Sequence
 from typing import TypeVar
 
 from batcher._internal.mathx import ceil_div
 
-__all__ = ["assign_splits", "balance_with_affinity", "has_affinity"]
+__all__ = ["assign_splits", "balance_with_affinity", "has_affinity", "split_weights"]
+
+# Split count past which a weight that is not already known is taken as 1 rather than
+# asked for. `FileSplit.row_count()` rebuilds a single-file reader and reads that file's
+# footer, so weighing a million whole-file splits is a million metadata round trips on the
+# driver — the exact cost `FileSource.splits` stops planning sub-file splits to avoid
+# (`_MAX_FOOTER_PLAN_FILES`), paid again one layer up while the whole cluster idles. Past
+# this many splits there is ample parallelism for equal-count packing to balance well, and
+# splits that already carry their count (row-group splits, shuffle buckets) keep using it
+# at any scale. Same default and the same reasoning as the footer-planning cap.
+_MAX_WEIGHED_SPLITS = max(1, int(os.environ.get("BATCHER_MAX_WEIGHED_SPLITS", "10000")))
 
 # How much heavier the busiest worker may get, relative to an even share, before locality
 # is judged to have cost more parallelism than it saved network. At 2.0 a worker may carry
@@ -43,14 +55,26 @@ def _balance(splits: list[S], workers: int) -> list[list[S]]:
 
     Splits with an unknown row count are weighted as 1 so they spread evenly.
     Largest-first assignment keeps the per-worker load roughly equal.
+
+    Weights are computed once (`split_weights`) rather than per comparison: this used to ask
+    each split for its row count twice, and for a whole-file split that question is a
+    footer read, so assigning N files cost 2N metadata round trips before a worker started.
+    The least-loaded worker comes off a heap for the same reason — a linear scan per split
+    is O(splits x workers), which is the driver's whole prologue on a wide fleet. Measured
+    with an already-known weight (so the footer reads are not even in it): 50,000 splits
+    across 256 workers, 2.70 s -> 0.13 s; 200,000 across 1,024, 27.90 s -> 0.45 s. That is
+    time the entire cluster spends idle.
     """
     groups: list[list[S]] = [[] for _ in range(workers)]
-    loads = [0] * workers
-    ordered = sorted(splits, key=lambda s: s.row_count() or 0, reverse=True)
-    for s in ordered:
-        i = min(range(workers), key=lambda w: loads[w])
-        groups[i].append(s)
-        loads[i] += s.row_count() or 1
+    if workers <= 0 or not splits:
+        return groups
+    weights = split_weights(splits)
+    # (load, worker): ties break on the lower worker index, as the linear scan did.
+    heap = [(0, w) for w in range(workers)]
+    for i in sorted(range(len(splits)), key=lambda i: weights[i], reverse=True):
+        load, w = heapq.heappop(heap)
+        groups[w].append(splits[i])
+        heapq.heappush(heap, (load + weights[i], w))
     return groups
 
 
@@ -67,11 +91,12 @@ def _contiguous(splits: list[S], workers: int) -> list[list[S]]:
     groups: list[list[S]] = [[] for _ in range(workers)]
     if workers <= 0 or not splits:
         return groups
-    target = max(1, ceil_div(sum(s.row_count() or 1 for s in splits), workers))  # ceil per group
+    weights = split_weights(splits)
+    target = max(1, ceil_div(sum(weights), workers))  # ceil per group
     w, load = 0, 0
-    for s in splits:
+    for s, weight in zip(splits, weights, strict=True):
         groups[w].append(s)
-        load += s.row_count() or 1
+        load += weight
         if load >= target and w < workers - 1:
             w, load = w + 1, 0
     return groups
@@ -127,13 +152,56 @@ def _split_affinity(split: object) -> str | None:
     return fn() or None
 
 
-def _weight(split: object) -> int:
-    """A split's load weight — its row count, or 1 when unknown (as `_balance` weights it)."""
+def _known_weight(split: object) -> int | None:
+    """A split's row count if it already carries one, without asking it to find out.
+
+    A row-group split, a shuffle bucket, and an IPC intermediate all record their exact
+    count when they are built. A whole-file split does not, and asking it means opening
+    that file's footer — which is the difference between a free weight and a network round
+    trip, and the reason this is a separate question from `_weight`.
+    """
     rows = getattr(split, "rows", None)
-    if rows is None:
+    return rows if isinstance(rows, int) else None
+
+
+def _weight(split: object) -> int:
+    """A split's load weight — its row count, or 1 when unknown (as `_balance` weights it).
+
+    A split whose count costs a **sweep of its whole subtree** is weighed as unknown rather
+    than asked. The cap above bounds how many splits may each pay one metadata round trip;
+    it cannot bound a split whose single question costs a round trip per file *behind* it.
+    `PartitionDirSplit` is that shape — it stands for a whole Hive partition directory, and
+    `row_count()` re-lists that subtree and opens every footer in it. Weighing forty of them
+    over a thousand-file table measured 130 ms of driver time locally, and it scales with the
+    **table**, not the split count: a date-partitioned petabyte would sweep every file in it
+    on the driver, during assignment, which is the entire cost the distributed-listing reader
+    exists to remove.
+
+    There is nothing cheaper to weigh them by — the driver has only the directory names — so
+    they pack by equal count, exactly as `split_weights` does for every split above its cap.
+    """
+    rows = _known_weight(split)
+    if rows is None and not getattr(split, "row_count_needs_a_sweep", False):
         count = getattr(split, "row_count", None)
         rows = count() if callable(count) else None
     return rows or 1
+
+
+def split_weights(splits: Sequence[object]) -> list[int]:
+    """Every split's load weight, each computed at most once.
+
+    Shared with `descriptor_rows`, which sizes a task's CPU share by its data and used to
+    ask the same expensive question a second time.
+
+    Above `_MAX_WEIGHED_SPLITS` a weight that is not already known is taken as 1 instead of
+    being read off storage: at that scale the metadata reads dominate the driver and
+    equal-count packing balances a large file set well enough. Splits that carry their own
+    count are still weighed exactly, at any scale, because that costs nothing.
+    """
+    known = [_known_weight(s) for s in splits]
+    if len(splits) > _MAX_WEIGHED_SPLITS:
+        return [w or 1 for w in known]
+    return [(w if w is not None else _weight(s)) or 1 for s, w in zip(splits, known, strict=True)]
 
 
 def balance_with_affinity(
@@ -170,17 +238,25 @@ def balance_with_affinity(
     home = {addr: i for i, addr in enumerate(worker_addrs[:workers]) if addr}
     groups: list[list[S]] = [[] for _ in range(workers)]
     loads = [0] * workers
+    # Weight and locate each split exactly once. Both questions can cost a round trip
+    # (`_weight` a footer read, `affinity()` a lookup), and the comprehensions below used
+    # to ask each of them twice per split on the driver's critical path.
+    weights = split_weights(splits)
+    placed = [home.get(_split_affinity(s) or "") for s in splits]
     # Resident splits first, so a homeless split fills whichever worker locality left
     # lightest rather than displacing a split that had a home.
-    resident = [(s, home[a]) for s in splits if (a := _split_affinity(s)) in home]
-    homeless = [s for s in splits if _split_affinity(s) not in home]
-    for s, i in resident:
-        groups[i].append(s)
-        loads[i] += _weight(s)
-    for s in sorted(homeless, key=_weight, reverse=True):
-        i = min(range(workers), key=lambda w: loads[w])
-        groups[i].append(s)
-        loads[i] += _weight(s)
+    for s, i, weight in zip(splits, placed, weights, strict=True):
+        if i is not None:
+            groups[i].append(s)
+            loads[i] += weight
+    homeless = [(i, weights[i]) for i, home_of in enumerate(placed) if home_of is None]
+    heap = [(loads[w], w) for w in range(workers)]
+    heapq.heapify(heap)
+    for i, weight in sorted(homeless, key=lambda pair: pair[1], reverse=True):
+        load, w = heapq.heappop(heap)
+        groups[w].append(splits[i])
+        loads[w] += weight
+        heapq.heappush(heap, (load + weight, w))
 
     total = sum(loads)
     if total and max(loads) > _IMBALANCE_TOLERANCE * (total / workers):

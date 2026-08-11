@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from batcher.plan.types import logical_bytes
+
 if TYPE_CHECKING:
     from batcher.plan.source_stats import SourceStatistics
     from batcher.plan.stats import ColumnStat
@@ -271,7 +273,13 @@ def _avg_bytes_of(col: pa.ChunkedArray | pa.Array) -> float | None:
     if pa.types.is_dictionary(col.type):
         return _dictionary_width(col)
     rows = len(col)
-    return float(col.nbytes) / rows if rows else None
+    if not rows:
+        return None
+    # `logical_bytes`, not `col.nbytes`: the latter raises on a `string_view` column --
+    # what a modern Parquet reader, DuckDB, Polars or a Velox-backed producer hands over
+    # -- and that raised out of statistics collection and killed the *query*, so any
+    # pipeline over one failed before the engine ever saw a row.
+    return float(logical_bytes(col)) / rows
 
 
 def column_cheap_stat(build: ColumnBuilder, name: str) -> ColumnStat | None:

@@ -38,9 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Expr, InList, IsNotNull, IsNull, ListJoin, Not
 from batcher.plan.expr_ir.core import Binary, IsInf, IsNan, Math2Expr, MathExpr
 from batcher.plan.expr_ir.func_nodes import (
@@ -59,7 +57,6 @@ from batcher.plan.expr_ir.func_nodes import (
     WindowStart,
 )
 from batcher.plan.ir_tags import COMPARISON_OPS
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = [
     "NULL_STRICTNESS_BINARY_RULES",
@@ -70,7 +67,6 @@ __all__ = [
 ]
 
 # Plan nodes that carry expressions a null test can appear in.
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 #: Unary math functions whose result is null exactly when the argument is null.
 #: `MATH_FNS` minus `factorial` (raises on a negative argument) and `bit_count`
@@ -240,16 +236,7 @@ def _unary_leaf(
 def _register_unary(family: str, operand: Callable[[Expr], Expr | None], *, positive: bool):
     leaf = _unary_leaf(operand, positive=positive)
     name = f"is_null_through_{family}" if positive else f"is_not_null_through_{family}"
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=(IsNull,) if positive else (IsNotNull,),
-        )
-    )
+    return register_leaf_rule(name, leaf, expr_matches=(IsNull,) if positive else (IsNotNull,))
 
 
 #: `f(x) IS [NOT] NULL -> x IS [NOT] NULL` for every null-strict, total unary family:
@@ -316,16 +303,7 @@ def _binary_leaf(ops: frozenset[str], *, positive: bool) -> Callable[[Expr], Exp
 def _register_binary(family: str, ops: frozenset[str], *, positive: bool):
     leaf = _binary_leaf(ops, positive=positive)
     name = f"is_null_through_{family}" if positive else f"is_not_null_through_{family}"
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=(IsNull,) if positive else (IsNotNull,),
-        )
-    )
+    return register_leaf_rule(name, leaf, expr_matches=(IsNull,) if positive else (IsNotNull,))
 
 
 #: `a ⊕ b IS NULL -> a IS NULL OR b IS NULL` (and the `IS NOT NULL` / `AND` dual) for

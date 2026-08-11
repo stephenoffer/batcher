@@ -2,7 +2,7 @@
 
 Exact deduplication on a web crawl barely moves the number. The duplicates are not
 byte-identical: they are the same article behind a different header, the same product page
-with a changed timestamp, the same README vendored into forty repositories. `distinct()`
+with a changed timestamp, the same README vendored into forty repositories. {py:meth}`distinct() <batcher.Dataset.distinct>`
 keeps all of them, the model sees the same text a dozen times, and the memorization it
 buys shows up as a suspiciously good held-out score.
 
@@ -51,7 +51,7 @@ The punctuation-only twin is gone.
 :::
 ::::
 
-`drop_near_duplicates` keeps one representative per cluster (the row minimal among its
+{py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` keeps one representative per cluster (the row minimal among its
 near-duplicates) and drops the rest. The case-changed row survives here because character
 shingles are case-sensitive; lowercase the column first if you want it collapsed too. That
 is a choice you make, not a default that quietly makes it for you.
@@ -59,7 +59,7 @@ is a choice you make, not a default that quietly makes it for you.
 ## See the pairs before you delete anything
 
 :::{tip}
-`near_duplicates` returns the matched pairs with their estimated Jaccard similarity, so you
+{py:meth}`near_duplicates <batcher.api.dataset.ml.DatasetML.near_duplicates>` returns the matched pairs with their estimated Jaccard similarity, so you
 can look at what a threshold is about to remove before you remove it. Run this once on a
 sample. A threshold that looks reasonable in a paper often eats an entire legitimate
 category of your corpus.
@@ -115,11 +115,11 @@ print(titles.ml.near_duplicates("text", threshold=0.7, ngram=3, key="doc_id").co
 ## Matching a short field against a reference value
 
 MinHash/LSH clusters a *column* against itself. When you instead need to score each row
-against one **known** string, reach for the edit metrics on `.str`. That covers deduping a
+against one **known** string, reach for the edit metrics on {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`. That covers deduping a
 name column against a canonical spelling, or resolving records to a reference list.
-`.str.jaro_similarity` and `.str.jaro_winkler_similarity` return a `[0, 1]` score, and
-Jaro-Winkler weights a shared prefix, which is what you want for names. `.str.levenshtein`
-gives the raw edit distance, and `.str.damerau_levenshtein` counts a swapped-letter typo as
+{py:meth}`.str.jaro_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_similarity>` and {py:meth}`.str.jaro_winkler_similarity <batcher.plan.expr_ir.namespaces.strings._StrNamespace.jaro_winkler_similarity>` return a `[0, 1]` score, and
+Jaro-Winkler weights a shared prefix, which is what you want for names. {py:meth}`.str.levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>`
+gives the raw edit distance, and {py:meth}`.str.damerau_levenshtein <batcher.plan.expr_ir.namespaces.strings._StrNamespace.damerau_levenshtein>` counts a swapped-letter typo as
 a single edit:
 
 ```python
@@ -185,14 +185,14 @@ special dedup engine and no driver-side set of hashes. That matters at the scale
 this pass is worth doing, which is the only scale where it is worth doing.
 
 For dedup on *meaning* rather than on words (two descriptions of the same product, written
-independently), `ds.ml.similarity_join` is the same two-stage recipe over embeddings:
+independently), {py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` is the same two-stage recipe over embeddings:
 SimHash bands the candidates, exact cosine verifies them. See
 {doc}`preprocessors </ml/preparing/preprocessors/index>`.
 
 ## See also
 
 - {doc}`Train/test split </cookbook/ml/pipelines/features/train-test-split>`: dedup first, then split, in that order.
-- {doc}`Text embeddings </cookbook/ml/pipelines/text/text-embeddings>`: the embedding half of `similarity_join`.
+- {doc}`Text embeddings </cookbook/ml/pipelines/text/text-embeddings>`: the embedding half of {py:meth}`similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>`.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: MinHash, SimHash, and the LSH banding math.
 - {doc}`Embeddings </ml/retrieval/embeddings>`: the encoder that makes semantic dedup possible.
 - {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: the exact-match surface, and

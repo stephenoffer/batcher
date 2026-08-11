@@ -27,13 +27,6 @@ pub enum InterpError {
     EmptyJoinInput,
 
     #[error(
-        "value-based RANGE window frames (`RANGE <n> PRECEDING/FOLLOWING`) are not yet \
-         supported; they need typed order-key arithmetic. Use ROWS units for a \
-         physical-row frame, or a peer RANGE bound (CURRENT ROW / UNBOUNDED)"
-    )]
-    ValueBasedRangeFrame,
-
-    #[error(
         "pipeline breaker cannot materialize column {column:?}: its {bytes} bytes of \
          variable-width data exceed the {limit}-byte limit of a 32-bit-offset Arrow array"
     )]
@@ -45,6 +38,9 @@ pub enum InterpError {
 
     #[error("join output references unknown column: {0}")]
     UnknownJoinColumn(String),
+
+    #[error("distinct key references unknown column: {0}")]
+    DistinctUnknownColumn(String),
 
     #[error("unnest references unknown column: {0}")]
     UnnestUnknownColumn(String),

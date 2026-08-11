@@ -46,6 +46,17 @@ enum FusedAcc<'a> {
         sums: Vec<f64>,
         valid: Vec<bool>,
     },
+    /// `sum` over a no-null `Int64` column: scatter-add straight from the values slice with
+    /// no per-row validity branch and no per-row `valid` write, since every group is non-empty
+    /// and therefore all-valid. The exact counterpart of `SumF64NoNull`, and of the no-null arm
+    /// `accum::sum_acc` has had all along — this module's docstring claims to reproduce
+    /// "the no-null fast paths" and, for `Int64` alone, did not. Integer `sum` is the most
+    /// common aggregate in every suite the engine is measured on, so fusing two of them made
+    /// each *slower per row* than not fusing at all.
+    SumI64NoNull {
+        v: &'a [i64],
+        sums: Vec<i64>,
+    },
     /// `sum` over `Int64` with **checked** add — a wrap would be a wrong answer.
     SumI64 {
         v: &'a Int64Array,
@@ -99,44 +110,100 @@ enum FusedAcc<'a> {
     },
 }
 
+/// Run one accumulator arm's body over a block of rows, resolving the group id per row.
+///
+/// The whole point of the arms below: the `match` that selects an arm happens **once per
+/// block**, not once per row, so each arm's body compiles to a tight monomorphic loop over
+/// `start..end` with the concrete array type in hand. Writing the loop inside every arm by
+/// hand would be the same code twelve times, and the twelfth would eventually differ from the
+/// first.
+macro_rules! block_loop {
+    ($ids:expr, $start:expr, $end:expr, |$i:ident, $g:ident| $body:block) => {
+        for $i in $start..$end {
+            let $g = $ids[$i] as usize;
+            $body
+        }
+    };
+}
+
 impl FusedAcc<'_> {
-    /// Apply row `i` (group `g`) to this accumulator. Infallible except `SumI64`,
-    /// whose `checked_add` propagates [`RuntimeError::SumOverflow`].
+    /// Apply rows `start..end` (whose group ids are `ids[start..end]`) to this accumulator.
+    /// Infallible except `SumI64`/`SumDecimal`, whose `checked_add` propagates
+    /// [`RuntimeError::SumOverflow`].
+    ///
+    /// Takes a *block* rather than a row because the enum dispatch is otherwise the operator.
+    /// The driver used to call a per-row `update`, so a three-aggregate group-by over 10M rows
+    /// paid **30M** `match`es on top of the arithmetic — measured at ~1.5 ns per row per
+    /// aggregate against DuckDB's ~0.29, which was most of a low-cardinality group-by's cost
+    /// (2.49x DuckDB on a single `sum` into 100 groups, 3.55x on three).
+    ///
+    /// **Bit-identical to the per-row form**, and for the same reason the module docstring
+    /// gives: accumulators never alias, and each still sees every row exactly once in
+    /// increasing `i`. Only the interleaving *between* accumulators changes, which no
+    /// accumulator can observe.
     #[inline]
-    fn update(&mut self, i: usize, g: usize) -> Result<(), RuntimeError> {
+    fn update_block(&mut self, ids: &[u32], start: usize, end: usize) -> Result<(), RuntimeError> {
         match self {
-            FusedAcc::SumF64NoNull { v, sums } => sums[g] += v[i],
-            FusedAcc::SumF64 { v, sums, valid } => {
-                if v.is_valid(i) {
-                    sums[g] += v.value(i);
-                    valid[g] = true;
+            // The two no-null sums walk *zipped slices* rather than indexing by `i`. Both
+            // slices are bounds-checked once, at the slicing, instead of twice per row, which
+            // is what lets the loop body reduce to a load, an indexed add and a store. Every
+            // other arm has to index, because it consults a validity bitmap by position.
+            FusedAcc::SumF64NoNull { v, sums } => {
+                for (&gid, &x) in ids[start..end].iter().zip(&v[start..end]) {
+                    sums[gid as usize] += x;
                 }
+            }
+            FusedAcc::SumI64NoNull { v, sums } => {
+                for (&gid, &x) in ids[start..end].iter().zip(&v[start..end]) {
+                    let slot = &mut sums[gid as usize];
+                    // Checked throughout, exactly as `accum::sum_acc` is: a silent i64 wrap
+                    // would be a wrong answer. It costs a not-taken branch, not a fast path.
+                    *slot = slot.checked_add(x).ok_or(RuntimeError::SumOverflow)?;
+                }
+            }
+            FusedAcc::SumF64 { v, sums, valid } => {
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        sums[g] += v.value(i);
+                        valid[g] = true;
+                    }
+                })
             }
             FusedAcc::SumI64 { v, sums, valid } => {
-                if v.is_valid(i) {
-                    let slot = &mut sums[g];
-                    *slot = slot
-                        .checked_add(v.value(i))
-                        .ok_or(RuntimeError::SumOverflow)?;
-                    valid[g] = true;
-                }
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        let slot = &mut sums[g];
+                        *slot = slot
+                            .checked_add(v.value(i))
+                            .ok_or(RuntimeError::SumOverflow)?;
+                        valid[g] = true;
+                    }
+                })
             }
             FusedAcc::SumDecimal { v, sums, valid, .. } => {
-                if v.is_valid(i) {
-                    // checked_add: a decimal SUM past i128 range errors, not wraps (as the
-                    // i64 SumInt arm above does).
-                    sums[g] = sums[g]
-                        .checked_add(v.value(i))
-                        .ok_or(RuntimeError::SumOverflow)?;
-                    valid[g] = true;
-                }
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        // checked_add: a decimal SUM past i128 range errors, not wraps (as the
+                        // i64 SumInt arm above does).
+                        sums[g] = sums[g]
+                            .checked_add(v.value(i))
+                            .ok_or(RuntimeError::SumOverflow)?;
+                        valid[g] = true;
+                    }
+                })
             }
-            FusedAcc::CountStar { counts } => counts[g] += 1,
-            FusedAcc::CountNoNull { counts } => counts[g] += 1,
-            FusedAcc::CountNull { v, counts } => {
-                if v.is_valid(i) {
+            FusedAcc::CountStar { counts } | FusedAcc::CountNoNull { counts } => {
+                block_loop!(ids, start, end, |i, g| {
+                    let _ = i;
                     counts[g] += 1;
-                }
+                })
+            }
+            FusedAcc::CountNull { v, counts } => {
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        counts[g] += 1;
+                    }
+                })
             }
             FusedAcc::MinMaxI64 {
                 v,
@@ -144,13 +211,15 @@ impl FusedAcc<'_> {
                 valid,
                 is_min,
             } => {
-                if v.is_valid(i) {
-                    let val = v.value(i);
-                    if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
-                        cur[g] = val;
-                        valid[g] = true;
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        let val = v.value(i);
+                        if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
+                            cur[g] = val;
+                            valid[g] = true;
+                        }
                     }
-                }
+                })
             }
             FusedAcc::MinMaxF64 {
                 v,
@@ -158,22 +227,25 @@ impl FusedAcc<'_> {
                 valid,
                 is_min,
             } => {
-                if v.is_valid(i) {
-                    let val = v.value(i);
-                    // Same total order the per-call `minmax_acc` uses (`crate::keys`), not raw
-                    // IEEE `<`/`>` — otherwise NaN never wins here and the fused path disagrees
-                    // with the per-call path, which `fused_minmax_nan_matches_per_call` pins.
-                    let ord = crate::keys::float_total_cmp(val, cur[g]);
-                    let wins = if *is_min {
-                        ord == std::cmp::Ordering::Less
-                    } else {
-                        ord == std::cmp::Ordering::Greater
-                    };
-                    if !valid[g] || wins {
-                        cur[g] = val;
-                        valid[g] = true;
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        let val = v.value(i);
+                        // Same total order the per-call `minmax_acc` uses (`crate::keys`), not
+                        // raw IEEE `<`/`>` — otherwise NaN never wins here and the fused path
+                        // disagrees with the per-call path, which
+                        // `fused_minmax_nan_matches_per_call` pins.
+                        let ord = crate::keys::float_total_cmp(val, cur[g]);
+                        let wins = if *is_min {
+                            ord == std::cmp::Ordering::Less
+                        } else {
+                            ord == std::cmp::Ordering::Greater
+                        };
+                        if !valid[g] || wins {
+                            cur[g] = val;
+                            valid[g] = true;
+                        }
                     }
-                }
+                })
             }
             FusedAcc::MinMaxDecimal {
                 v,
@@ -182,25 +254,31 @@ impl FusedAcc<'_> {
                 is_min,
                 ..
             } => {
-                if v.is_valid(i) {
-                    let val = v.value(i);
-                    if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
-                        cur[g] = val;
-                        valid[g] = true;
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        let val = v.value(i);
+                        if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
+                            cur[g] = val;
+                            valid[g] = true;
+                        }
                     }
-                }
+                })
             }
             FusedAcc::MinMaxStr { v, cur, is_min } => {
-                if v.is_valid(i) {
-                    let val = v.value(i);
-                    let replace = match &cur[g] {
-                        None => true,
-                        Some(c) => (*is_min && val < c.as_str()) || (!*is_min && val > c.as_str()),
-                    };
-                    if replace {
-                        cur[g] = Some(val.to_string());
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        let val = v.value(i);
+                        let replace = match &cur[g] {
+                            None => true,
+                            Some(c) => {
+                                (*is_min && val < c.as_str()) || (!*is_min && val > c.as_str())
+                            }
+                        };
+                        if replace {
+                            cur[g] = Some(val.to_string());
+                        }
                     }
-                }
+                })
             }
         }
         Ok(())
@@ -213,6 +291,10 @@ impl FusedAcc<'_> {
             FusedAcc::SumF64NoNull { sums, .. } => {
                 let n = sums.len();
                 Arc::new(masked_f64(sums, vec![true; n]))
+            }
+            FusedAcc::SumI64NoNull { sums, .. } => {
+                let n = sums.len();
+                Arc::new(masked_i64(sums, vec![true; n]))
             }
             FusedAcc::SumF64 { sums, valid, .. } => Arc::new(masked_f64(sums, valid)),
             FusedAcc::SumI64 { sums, valid, .. } => Arc::new(masked_i64(sums, valid)),
@@ -308,11 +390,21 @@ fn sum_acc(values: &ArrayRef, num_groups: usize) -> Option<FusedAcc<'_>> {
                 }
             }
         }
-        DataType::Int64 => FusedAcc::SumI64 {
-            v: values.as_primitive::<Int64Type>(),
-            sums: vec![0; num_groups],
-            valid: vec![false; num_groups],
-        },
+        DataType::Int64 => {
+            let v = values.as_primitive::<Int64Type>();
+            if v.null_count() == 0 {
+                FusedAcc::SumI64NoNull {
+                    v: v.values(),
+                    sums: vec![0; num_groups],
+                }
+            } else {
+                FusedAcc::SumI64 {
+                    v,
+                    sums: vec![0; num_groups],
+                    valid: vec![false; num_groups],
+                }
+            }
+        }
         DataType::Decimal128(p, s) => FusedAcc::SumDecimal {
             v: values.as_primitive::<Decimal128Type>(),
             sums: vec![0; num_groups],
@@ -359,6 +451,14 @@ fn minmax_acc(values: &ArrayRef, num_groups: usize, is_min: bool) -> Option<Fuse
 /// the proven per-call path (no `group_ids`-reuse win to gain).
 const FUSE_THRESHOLD: usize = 2;
 
+/// Rows per block in the fused scan. 8,192 `u32` group ids is 32 KiB — an L1-sized working
+/// set, so every accumulator in a block sweeps the *same* ids out of cache. Big enough that
+/// the per-block enum dispatch is amortized to nothing (one `match` per 8,192 rows), small
+/// enough that the ids do not fall out of L1 before the last accumulator reads them. Half a
+/// morsel (`bc_arrow` uses 16,384 rows), so a morsel is exactly two blocks and a short final
+/// block is the common case rather than a special one.
+const FUSE_BLOCK_ROWS: usize = 8_192;
+
 /// Run one scatter-add pass over `group_ids` for every fusable call, writing each
 /// fused call's state column(s) into `out[idx]` (positions match `calls`); leaves
 /// non-fusable calls' slots `None` for the per-call path. A no-op (out untouched)
@@ -396,11 +496,16 @@ pub(super) fn run_fused(
         return Ok(()); // not enough actually fused (e.g. unsupported dtypes)
     }
 
-    // The single fused scan: `group_ids` (and the row walk) read exactly once.
-    for (i, &gid) in group_ids.iter().enumerate() {
-        let g = gid as usize;
+    // The fused scan, blocked: each accumulator sweeps one cache-resident block of
+    // `group_ids` with its own tight monomorphic loop, then the next accumulator sweeps the
+    // same block. That keeps both properties rather than trading one for the other — the
+    // enum dispatch is paid per *block* instead of per row (see `update_block`), and
+    // `group_ids` still stays hot rather than being streamed from DRAM once per aggregate,
+    // which is what a plain accumulator-outer loop would do.
+    for start in (0..group_ids.len()).step_by(FUSE_BLOCK_ROWS) {
+        let end = (start + FUSE_BLOCK_ROWS).min(group_ids.len());
         for acc in accs.iter_mut() {
-            acc.update(i, g)?;
+            acc.update_block(group_ids, start, end)?;
         }
     }
 
@@ -560,6 +665,49 @@ mod tests {
                 "bit-exact f64 sum"
             );
         }
+    }
+
+    /// The `Int64` counterpart of `fused_f64_sum_nonull_matches`, and the test whose absence
+    /// let the two paths drift: `accum::sum_acc` has had a no-null integer fast path all along
+    /// and the fused arm did not, so fusing two integer sums was *slower per row* than not
+    /// fusing. Nothing failed — the answers agreed — which is exactly why only a test that
+    /// exercises this shape keeps the arm from being dropped again.
+    #[test]
+    fn fused_i64_sum_nonull_matches_per_call() {
+        let i: ArrayRef = Arc::new(Int64Array::from(vec![10i64, -20, 5, 7, 0, -3]));
+        let group_ids = [0u32, 1, 0, 2, 1, 2];
+        let calls = vec![
+            AggCall::new(AggFunc::Sum, Some(i.clone())),
+            AggCall::new(AggFunc::Sum, Some(i.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+        ];
+        let want = per_call(&calls, &group_ids, 3);
+        let got = fused(&calls, &group_ids, 3);
+        for (w, g) in want.iter().zip(&got) {
+            assert_cols_eq(w, g);
+        }
+        // And the validity the no-null arm asserts rather than accumulates: every group is
+        // non-empty, so every sum is non-null.
+        let sums = got[0][0].as_primitive::<Int64Type>();
+        assert_eq!(sums.null_count(), 0, "a no-null input yields no null sums");
+    }
+
+    /// A nullable `Int64` column must still take the validity-tracking arm, so a group whose
+    /// every row is null comes back null rather than as a zero the no-null arm would assert.
+    #[test]
+    fn fused_i64_sum_with_nulls_keeps_group_validity() {
+        let i: ArrayRef = Arc::new(Int64Array::from(vec![Some(4i64), None, Some(6), None]));
+        let group_ids = [0u32, 1, 0, 1];
+        let calls = vec![
+            AggCall::new(AggFunc::Sum, Some(i.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+        ];
+        let want = per_call(&calls, &group_ids, 2);
+        let got = fused(&calls, &group_ids, 2);
+        assert_cols_eq(&want[0], &got[0]);
+        let sums = got[0][0].as_primitive::<Int64Type>();
+        assert_eq!(sums.value(0), 10);
+        assert!(sums.is_null(1), "an all-null group sums to null, not 0");
     }
 
     #[test]

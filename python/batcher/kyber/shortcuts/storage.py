@@ -14,6 +14,13 @@ not describe itself is worse than no total at all.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TypeVar
+
+from batcher.plan.stats import SortOrder, as_sort_orders
+
+#: One element of a prefix `_common_prefix` intersects — a partition key name or an
+#: ordering key. Both are compared by equality and nothing else, so one function serves.
+_Key = TypeVar("_Key", str, SortOrder)
 
 __all__ = [
     "bytes_per_row",
@@ -116,23 +123,26 @@ def is_partitioned(stats: SourceStats) -> bool:
     return bool(partition_keys(stats))
 
 
-def sorted_by(stats: SourceStats) -> tuple[str, ...]:
-    """The ascending, nulls-last ordering shared by **every** source, in order.
+def sorted_by(stats: SourceStats) -> tuple[SortOrder, ...]:
+    """The ordering shared by **every** source, in order, direction included.
 
     The same prefix-intersection rule as `partition_keys`: an ordering only one input
-    maintains is not an ordering of the scan.
+    maintains is not an ordering of the scan. Two sources sorted by the same column in
+    opposite directions agree on nothing, and the differing key ends the prefix.
     """
-    declared = [tuple(getattr(stat, "sorted_by", ()) or ()) for stat in stats if stat is not None]
+    declared = [
+        as_sort_orders(getattr(stat, "sorted_by", ()) or ()) for stat in stats if stat is not None
+    ]
     if not declared or len(declared) != len(stats):
         return ()
     return _common_prefix(declared)
 
 
-def _common_prefix(sequences: list[tuple[str, ...]]) -> tuple[str, ...]:
-    """The longest leading run of names every sequence agrees on."""
+def _common_prefix(sequences: list[tuple[_Key, ...]]) -> tuple[_Key, ...]:
+    """The longest leading run of keys every sequence agrees on."""
     if not sequences:
         return ()
-    prefix: list[str] = []
+    prefix: list[_Key] = []
     for position in zip(*sequences, strict=False):
         first = position[0]
         if any(name != first for name in position):

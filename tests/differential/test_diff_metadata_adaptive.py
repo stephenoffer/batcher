@@ -136,6 +136,38 @@ def test_distinct_over_unique_key_with_nulls(duck):
     assert_same(ds.distinct().collect(), duck.sql("SELECT DISTINCT * FROM u2"))
 
 
+def test_a_keyed_distinct_survives_a_unique_column_outside_its_keys(duck):
+    """`DISTINCT ON (k)` is not made redundant by some *other* column being unique.
+
+    The two tests above are whole-row `DISTINCT`, where any unique column proves every row
+    already differs. `DISTINCT ON (keys)` collapses rows that agree on the keys however much
+    they differ elsewhere, so a unique column outside the keys is not evidence of anything —
+    it is the opposite, and dropping the operator on it deletes the dedup.
+
+    This is reachable through the ordinary CDC idiom rather than a contrived plan:
+    `with_row_index` mints a column that is unique by construction and EXACT, and
+    `.distinct(subset=[key], keep="last", order_by=<that index>)` is how "last row wins by
+    arrival order" is spelled. The rule fired on the row index and returned every row.
+    """
+    t = pa.table({"id": [7, 7, 7], "v": ["a", "b", "c"]})
+    duck.register("u3", t)
+    # A plain source: nothing declares `id` unique (it is not — every row shares key 7).
+    # The only unique column is the one `with_row_index` mints, which is exactly the shape
+    # that must NOT license dropping a dedup keyed on `id`.
+    keyed = (
+        bt.from_arrow(t)
+        .with_row_index("arrived")
+        .distinct(subset=["id"], keep="last", order_by="arrived")
+    )
+    assert not _absent(keyed, Distinct), "the keyed dedup was optimized away"
+    assert_same(
+        keyed.select("id", "v").collect(),
+        duck.sql(
+            "SELECT id, v FROM u3 QUALIFY row_number() OVER (PARTITION BY id ORDER BY v DESC) = 1"
+        ),
+    )
+
+
 # --- prune_filter_col_comparison -----------------------------------------------
 
 

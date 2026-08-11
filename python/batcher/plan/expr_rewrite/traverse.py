@@ -53,12 +53,14 @@ from batcher.plan.expr_ir.func_nodes import (
     ListZip,
     MakeTemporal,
     MapFunc,
+    SpatialFunc,
     Strftime,
     Strptime,
     WindowBuckets,
     WindowStart,
 )
-from batcher.plan.expr_ir.image import ImageFunc
+from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
+from batcher.plan.expr_ir.namespaces.sequence import SeqFunc
 from batcher.plan.expr_ir.nodes import HashRows, MakeStruct, Sequence
 from batcher.plan.expr_ir.video import VideoFunc
 
@@ -106,13 +108,21 @@ _EXPR_KIDS: dict[type, Callable[[Any], tuple[Expr, ...]]] = {
     StructField: lambda e: (e.input,),
     ListJoin: lambda e: (e.input,),
     StrFunc: lambda e: (e.input,),
+    SeqFunc: lambda e: (e.input,),
     ImageFunc: lambda e: (e.input,),
+    # All five, not just `input`. A crop window is *data* — the whole point of this node
+    # is that a detector's predicted box varies per row — so `x`/`y`/`width`/`height`
+    # reference the outer relation's columns exactly as `input` does. Omitting them made
+    # the optimizer blind to those columns, and `select(box).select(crop(box))` died in
+    # `merge_projections` with a `ColumnNotFoundError` naming the box columns.
+    ImageCrop: lambda e: (e.input, e.x, e.y, e.width, e.height),
     Coalesce: lambda e: tuple(e.inputs),
     Greatest: lambda e: tuple(e.inputs),
     HashRows: lambda e: tuple(e.inputs),
     Least: lambda e: tuple(e.inputs),
     Array: lambda e: tuple(e.elements),
     GeoFunc: lambda e: tuple(e.args),
+    SpatialFunc: lambda e: tuple(e.args),
     MakeTemporal: lambda e: tuple(e.args),
     NullIf: lambda e: (e.left, e.right),
     Math2Expr: lambda e: (e.left, e.right),
@@ -167,13 +177,28 @@ _EXPR_REBUILD: dict[type, Callable[[Any, tuple[Expr, ...]], Expr]] = {
         start=e.start,
         length=e.length,
     ),
+    # The two `k`s here are unrelated: the lambda's `k` is this table's rebuilt-children
+    # tuple, and the keyword `k=` is the node's own k-mer length.
+    SeqFunc: lambda e, k: SeqFunc(
+        e.fn,
+        k[0],
+        k=e.k,
+        window=e.window,
+        frame=e.frame,
+        offset=e.offset,
+        alphabet=e.alphabet,
+        pattern=e.pattern,
+        to_stop=e.to_stop,
+    ),
     ImageFunc: lambda e, k: ImageFunc(e.fn, k[0], width=e.width, height=e.height),
+    ImageCrop: lambda _e, k: ImageCrop(k[0], k[1], k[2], k[3], k[4]),
     Coalesce: lambda _e, k: Coalesce(list(k)),
     Greatest: lambda _e, k: Greatest(list(k)),
     HashRows: lambda e, k: HashRows(list(k), e.seed),
     Least: lambda _e, k: Least(list(k)),
     Array: lambda _e, k: Array(list(k)),
     GeoFunc: lambda e, k: GeoFunc(e.fn, list(k)),
+    SpatialFunc: lambda e, k: SpatialFunc(e.fn, list(k)),
     MakeTemporal: lambda e, k: MakeTemporal(e.fn, list(k)),
     NullIf: lambda _e, k: NullIf(k[0], k[1]),
     Math2Expr: lambda e, k: Math2Expr(e.fn, k[0], k[1]),

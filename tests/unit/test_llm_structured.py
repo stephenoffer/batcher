@@ -13,6 +13,9 @@ is not the model — it is everything Batcher promises *around* it:
 
 from __future__ import annotations
 
+import datetime
+import json
+
 import pyarrow as pa
 import pytest
 
@@ -151,6 +154,71 @@ def test_an_empty_or_unknown_schema_is_rejected():
         ds.ml.extract(_const_engine("{}"), schema={}, prompt_column="q")
     with pytest.raises(PlanError, match="unknown dtype"):
         ds.ml.extract(_const_engine("{}"), schema={"v": "complex128"}, prompt_column="q")
+
+
+def test_a_date_field_is_extracted_from_the_iso_string_a_model_emits():
+    """A model asked for a date answers with an ISO string; nothing else is on offer.
+
+    Every temporal and binary field used to come back null for every row — after the
+    generation was already paid for, with a schema that looked exactly right.
+    """
+    engine = _const_engine(
+        '{"d": "2024-01-05", "ts": "2024-01-05T10:30:00", "t": "10:30:00", "raw": "bytes"}'
+    )
+    got = (
+        bt.from_pydict({"q": ["x"]})
+        .ml.extract(
+            engine,
+            schema={"d": "date32", "ts": "timestamp", "t": "time64", "raw": "binary"},
+            prompt_column="q",
+        )
+        .to_pydict()
+    )
+    assert got["d"] == [datetime.date(2024, 1, 5)]
+    assert got["ts"] == [datetime.datetime(2024, 1, 5, 10, 30)]
+    assert got["t"] == [datetime.time(10, 30)]
+    assert got["raw"] == [b"bytes"]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "answer", "expected"),
+    [
+        ("date32", "2024-01-05T10:30:00", datetime.date(2024, 1, 5)),  # datetime -> date
+        ("timestamp", "2024-01-05", datetime.datetime(2024, 1, 5, 0, 0)),  # date -> datetime
+        ("time64", "2024-01-05T10:30:00", datetime.time(10, 30)),  # datetime -> time
+        ("date32", "sometime last spring", None),  # still degrades per row
+    ],
+)
+def test_a_temporal_answer_of_the_wrong_shape_is_normalized_or_nulled(dtype, answer, expected):
+    engine = _const_engine(json.dumps({"v": answer}))
+    got = bt.from_pydict({"q": ["x"]}).ml.extract(engine, schema={"v": dtype}, prompt_column="q")
+    assert got.to_pydict()["v"] == [expected]
+
+
+def test_a_large_string_field_is_not_silently_nulled():
+    engine = _const_engine('{"s": "hello"}')
+    got = bt.from_pydict({"q": ["x"]}).ml.extract(
+        engine, schema={"s": "large_string"}, prompt_column="q"
+    )
+    assert got.to_pydict()["s"] == ["hello"]
+
+
+def test_a_half_precision_field_does_not_crash_the_batch():
+    """`pa.array([1.5], type=pa.float16())` rejects a Python float, so this *raised*."""
+    engine = _const_engine('{"v": 1.5}')
+    got = bt.from_pydict({"q": ["x"]}).ml.extract(
+        engine, schema={"v": "float16"}, prompt_column="q"
+    )
+    assert got.to_pydict()["v"] == [1.5]
+
+
+@pytest.mark.parametrize("dtype", ["duration", "interval", "null"])
+def test_a_dtype_no_model_output_can_fill_is_rejected_up_front(dtype):
+    """Rejecting beats an all-null column: the generation is paid for either way."""
+    with pytest.raises(PlanError, match="cannot be extracted"):
+        bt.from_pydict({"q": ["x"]}).ml.extract(
+            _const_engine("{}"), schema={"v": dtype}, prompt_column="q"
+        )
 
 
 # --- json_schema ----------------------------------------------------------------------
@@ -308,3 +376,33 @@ def test_classify_accepts_image_column_param():
     # Wiring check: the param exists and lowers without error on the text path.
     out = ds.ml.classify(_const_engine("yes"), labels=["yes", "no"], prompt_column="q")
     assert out.to_pydict()["label"] == ["yes"]
+
+
+@pytest.mark.parametrize(
+    ("run", "reply"),
+    [
+        (lambda ds, e: ds.ml.generate(e, prompt_column="q"), "yes"),
+        (
+            lambda ds, e: ds.ml.extract(e, schema={"response": "string"}, prompt_column="q"),
+            '{"response": "yes"}',
+        ),
+        (
+            lambda ds, e: ds.ml.classify(
+                e, labels=["yes"], prompt_column="q", output_column="response"
+            ),
+            "yes",
+        ),
+    ],
+    ids=["generate", "extract", "classify"],
+)
+def test_writing_into_a_column_the_batch_already_has_replaces_it(run, reply):
+    """Arrow permits duplicate field names, so appending produced two columns of one name.
+
+    `to_pydict()` then keeps the last, every expression resolves the first, and nothing
+    raises. Re-running a generation into the column you read — or a second pass over the
+    default `response` — is the ordinary way to hit it.
+    """
+    ds = bt.from_pydict({"q": ["x"], "response": ["stale"]})
+    out = run(ds, _const_engine(reply))
+    assert out.schema.names == ["q", "response"]
+    assert out.to_pydict()["response"] == ["yes"]

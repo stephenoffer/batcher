@@ -61,7 +61,7 @@ Batcher fixes it with no user action) · **P** partial · **G** genuine gap.
 | rag-pipelines §"Embedding dimension mismatch between indexing and query" | The index is built with one model and the query embedded with another; the two sides differ only by a number nobody looks at | **D** | The engine already refused, but as a `RuntimeError` from inside a Rust kernel ("string function list.CosineSimilarity: list dimensions must be equal") after the whole scan. Both widths are in the schema whenever the vectors came from `ds.ml.embed` (which emits `fixed_size_list`), so `similarity_join` now refuses at build time with a typed `PlanError` naming both widths and the actual cause — two different embedding models. A plain `list` column declares no width and is still left to the engine's per-row check. |
 | batch-embeddings | Embedding vectors must be L2-normalized for cosine similarity; whether the *endpoint* already did it varies by provider, and getting it wrong ranks by magnitude as well as direction | **D** | `openai_embedding_encoder` defaults to `normalize=False` because OpenAI returns unit vectors — but the same request shape is spoken by Azure, Together, and vLLM's embedding server, and **vLLM does not normalize**. Rather than guess a default per provider, the first batch's norm is measured and a mismatch warns. Found by auditing why two sibling encoders had opposite `normalize` defaults. |
 | memory §"Single giant row" | Marked **Unconditional**: "a single row larger than available task memory causes an unrecoverable OOM regardless of any other tuning... a hard architectural constraint, not a guideline". Safe ceiling ~10 MB, and the user is expected to know it | **P** | Byte-adaptive batching shrinks the chunk as rows widen, which handles the wide-row case Ray needs `target_max_block_size` for — but it bottoms out at one row, because rows are atomic. Both sizing paths now warn once at that dead end, naming the measured row width and the fact that the remaining fix is in the data (carry a handle, decode later). Batcher cannot remove the constraint; it can stop the user meeting it as an unexplained OOM. |
-| multimodal §"`ArrowTypeError` when writing variable-size tensors" / G4 | Mixed-resolution images produce arrays of differing shape, which Arrow has no type for. Ray hits the same wall (`ArrowVariableShapedTensorArray`, ray#49883/#50229) | **P** | Batcher cannot represent them either — that is G4, still open. What changed is the diagnosis: the generic advice said "convert it to an ndarray", which the caller had already done. A ragged column is now detected and named — "different shapes ((2, 2) and (3, 3)) — the mixed-resolution case" — with the two remedies that exist (resize/pad to a common shape, or keep encoded bytes and decode downstream). Found by running the guides' own symptom against the fix from earlier this session. |
+| multimodal §"`ArrowTypeError` when writing variable-size tensors" / G4 | Mixed-resolution images produce arrays of differing shape, which Arrow has no type for. Ray hits the same wall (`ArrowVariableShapedTensorArray`, ray#49883/#50229) | **A** | Carried, not refused. `io/formats/ml/ragged.py` stores each row as its own buffer plus its own shape and dtype, and the conversion paths reach for it automatically — a `map_batches` returning mixed-resolution arrays, or a `from_pydict` given them, both produce a variable-shape tensor column, and `to_numpy` decodes it back to per-row arrays. It is a plain struct, so the engine needed no change to carry it through a filter, a shuffle, or a Parquet write. `data` is a binary buffer rather than a list of elements because the FFI widens narrow numerics, which would have cost a `uint8` image eight bytes a pixel. |
 | transforms §"Arrow Pickled Object Type" | A UDF returning PIL Images / torch tensors / custom objects gets a **pickle-backed** column: "10-100x slower than Arrow for inter-operator transfer", found by eyeballing `ds.schema()` for `object` | **A/D** | Batcher refuses rather than pickling — the column never enters the engine, so the slowdown is unreachable. It used to refuse with a raw `pyarrow.lib.ArrowInvalid` naming neither the column nor the fix; it now raises a typed `PlanError` naming the column, its element type, and the one-line remedy (`.cpu().numpy()` for a torch tensor, `np.asarray` for a PIL Image). |
 | data-008, data-009 | `map()` where `map_batches()` belongs — row-at-a-time Python, 10-100x slower, "the most common performance mistake" | **P** | The vectorized spelling is the documented default and expressions are the primary surface, but `ds.map` exists and a docstring preference is not a signal. A run that spends real time in a per-row stage now says so (`per-row-map`), which required teaching the profile to tell `MapRows` from `MapBatches` — the engine sees one operator for both. |
 | data-001, data-002 | Column pruning at read time: the guides' highest-impact IO fix, applied by hand with `columns=` | **D/P** | Kyber prunes automatically as a plan rewrite over the whole tree. The one exception is an opaque `map_batches`, which forces a full read; that case now warns at the call site naming `input_columns`, because it is the only fix and it cannot be inferred. |
@@ -147,6 +147,127 @@ Two things this table should **not** be read as saying. First, it is a compariso
 holds the benchmark verdicts, including the ones Batcher loses. Second, several of these are
 Batcher wins that only pay off if the relevant default is on, which is exactly the failure this
 audit was written to catch.
+
+## What changed in the scheduling pass (2026-08-06)
+
+Five changes, all in the *placement and diagnosis* half of the Ray integration. Each one
+either closed a case where a query hangs or runs badly with nothing anywhere saying why, or a
+case where the standard Ray node labels carried an answer Batcher was not reading.
+
+**A pending request now says why it is pending.** `ray.wait` cannot tell a task queued behind a
+busy cluster from one asking for more CPUs than any node has, and the second never finishes.
+Both used to be reported the same way — "it has waited a while, go run `ray status`" — so the
+worst failure mode in the distributed path was also the least legible.
+`capacity.describe_pending_demand` compares the ask against the live topology and returns one
+of three answers: unsatisfiable (naming the *binding resource* and the widest node's figure,
+because a reader told only "no node can host this" compares the cores they can see and
+concludes the engine is wrong), short of capacity (the three numbers, since a gang needs
+everything at once and a barrier does not), or nothing. It is attached to the map and inference
+barrier's stall warning and to the placement-group timeout, which used to fall back to default
+scheduling in silence — and the tasks it falls back to ask for the same resources the bundles
+did, so the query would then hang at a barrier that has no deadline.
+
+**Honest scope:** the *shuffle* barrier (`gather_with_backups`) still prints the unresolved
+warning. Its loop is Carbonite's, the topology reader is `dist`'s, and Carbonite must not import
+`dist` — so closing it means either threading a diagnoser through ten call sites in contested
+files or moving the scheduling-envelope `ContextVar` down into `plan`. The second is the right
+shape and is open work; a one-entry registry to bridge the layers would not be.
+
+**A shuffle fleet is reserved inside one availability zone when one can hold it.** A shuffle
+moves nearly all of its bytes worker to worker, and every cloud prices and delays those bytes
+by the zone boundary they cross. The corpus is unusually emphatic about the size of this: cross-AZ
+transfer "can exceed 40% of total AWS spend" and is listed at "up to 48% of AWS bill", field-
+validated at Torc Robotics, with 20-40% added latency on synchronous workloads
+(`foundations/infra/platform/cluster-and-infra-optimization.md`,
+`foundations/infra/platform/anyscale-infrastructure.md`). Its own mitigation is
+`STRICT_ZONAL_PACK`, which is an **Anyscale compute-config placement strategy, not a Ray one** —
+`VALID_PLACEMENT_GROUP_STRATEGIES` in Ray 2.56 is `{PACK, SPREAD, STRICT_PACK, STRICT_SPREAD}`.
+So it is a provisioning-time fix, available only to whoever configures the cluster, and the
+corpus itself names the case where it is unavailable: `foundations/infra/compute/autoscaling-and-spot.md`
+says to *always* enable cross-zone autoscaling for H100/H200 because single-AZ deployments
+"frequently fail to provision". A fleet spread evenly
+over three zones sends about two thirds of its shuffle across that boundary for nothing, since
+the bundles are interchangeable. `capacity.preferred_fleet_zone` picks the zone with the most
+*free* capacity that can host the whole fleet and pins the bundles there with
+`bundle_label_selector`. No-op on a single-zone cluster, on unlabelled nodes, and whenever no
+one zone has room; and because the pin is on the bundles rather than the tasks, a group that
+cannot form is abandoned at the existing timeout rather than leaving tasks pending forever.
+`distributed.zone_aware_placement` (default on, placement-only, result-identical) turns it off
+for a fleet whose zone diversity is bought deliberately.
+
+**A shuffle replica avoids the primary's *failure domain*, not just its node.** The copy has
+always gone to another node; a spot reclamation takes an instance group, so on the fleet
+`resilience="spot"` turns replication on for, the second copy went away in the same wave as the
+first. `assign_replica_hosts` now ranks a non-preemptible candidate above a preemptible one,
+below the off-node rule and above the load tie-break. Spot is read from `ray.io/market-type`
+*and* the Karpenter, EKS, and GKE capacity labels, because a KubeRay fleet is labelled by
+whichever provisioner brought the node up. Preference, never exclusion: an all-spot or
+unlabelled fleet places exactly as before.
+
+**The distributed scheduling decisions reach the dashboard.** `FanoutTrace` documented its own
+gap: the bus attributes events by a `query_id` minted in `api`, `observe.store` silently drops
+any event naming no live query, and `dist` must not import `api` to learn the id — so the
+single most useful distributed diagnostic ("why did the job use a tenth of the cluster")
+existed only as a log line. `events.query_scope`, set by the conductor around execution, puts
+the id in layer 0 where both can reach it. The fan-out chain and the fleet placement (strategy,
+bundle count, zone) now appear in `explain(analyze=True)` beside Kyber's and Carbonite's.
+
+**The placement phase stopped re-reading the cluster.** The topology snapshot collapsed the
+`ray.nodes()` reads and left the per-node *free CPU* read live, and `node_classes` goes through
+it on every call — from five places in the placement phase. Measured: five `node_classes()`
+calls inside a scope, **10.6 ms → 0.1 ms**.
+
+Also fixed while in the area: `_apply_autoscale_floor` used `if resources: ... elif gpus:`, so
+naming a custom accelerator *replaced* the GPU bundles instead of joining them. A job with a
+GPU stage and a TPU stage asked the autoscaler for one of the two and waited out the window for
+the other. And `dist/executor.py`'s two fan-out sizers swallowed a topology read with no
+`note_suppressed`, so the failure that halves a large cluster's fan-out left nothing to
+attribute it to — beside a `FanoutTrace` whose entire purpose is answering that question.
+
+### Open: `ml/gpu.py` rounds device fractions off its own ladder
+
+`_internal/device_share.py` exists because "five different files had each written their own
+answer", and its `PACK_QUANTA = (0.25, 0.5, 1.0)` ladder is there because Ray packs by *summing*
+requests, so arbitrary fractions strand slivers no task fits into. Kyber, Carbonite and `dist`
+all go through `pack_fraction`. **`ml/gpu.py` does not**: `recommend_gpu_fraction` and
+`recommend_num_gpus` return `round(1.0 / n, 2)` for arbitrary `n` (four call sites), which yields
+`0.33`, `0.17`, `0.14`.
+
+Two independent sources say that is the wrong shape.
+`foundations/core/scheduling-and-resources.md` — "use values that divide evenly into 1.0 (0.25,
+0.5)" — and the canonical `resources/canonical-params/model-to-gpu-matrix.md`, which prices
+every model in the corpus at `0.1`, `0.25`, `0.5` or `1` and never at a non-dividing value. More
+to the point, it is the exact failure `device_share`'s own docstring describes: "a stage packed
+at `0.25` by the optimizer and admitted at `0.2` by the resource manager is not a rounding
+difference; it is five tenants on a device sized for four."
+
+Not fixed here, because changing device packing is a device-tier behaviour change and
+`.claude/rules/device-tier.md` requires a recorded `gpu_shadow_verify` run on real hardware,
+which this pass had none of. The fix is to route those four sites through
+`device_share.quantize_fraction`. (Batcher's floor of `0.25` against the matrix's `0.1` is a
+*deliberate* difference, argued in `PACK_QUANTA`'s comment on CUDA-context and copy-engine
+contention — do not "fix" that one to match.)
+
+### Open, with the discovery already paid for: CPU-fleet isolation without cluster setup
+
+`heterogeneous_node_isolation` keeps a relational fleet off accelerator nodes, and it is
+default-off **and** requires the operator to advertise a `cpu_node` custom resource on every
+CPU node. By this document's own bar that is a capability nobody gets. Ray's label selectors
+can express it against labels Ray sets by itself, and the syntax was verified on a live 2.56
+cluster rather than read off the documentation:
+
+| Selector | Result |
+|---|---|
+| `{"ray.io/accelerator-type": "!GPU"}` on an **unlabelled** node | matches — an absent label counts as not-equal |
+| `{"ray.io/market-type": "on-demand"}` (control) | matches |
+| `{"ray.io/accelerator-type": "!"}` | **`ValueError`** — a bare `!` is not a valid value |
+
+So the form is `!in(...)` over the accelerator models the live fleet actually advertises,
+which `scaling.node_classes` already carries per node — not `"!"`, and not `"!GPU"`, since no
+node is ever labelled with the literal string `GPU`. Applied to `bundle_label_selector` it
+inherits the same benign failure mode as the zone pin. It is not built here because it cannot
+be verified end to end on a CPU-only cluster, and shipping an unexercised scheduling
+constraint is how a fleet becomes unplaceable.
 
 ## What changed in the observability pass (2026-07-27)
 
@@ -346,12 +467,23 @@ and G2 were closed in this pass; G6 was found while working them. G3–G5 remain
 Batcher does **not** win every shape today — `competitive_architecture.md` holds the
 benchmark verdicts, including the losses.
 
-### G1. Straggler handling — speculation is now on; task granularity is still ≈ node
+### G1. Straggler handling — speculation is on, and the map task unit is no longer ≈ node
 
-Batcher's coarse scheduling unit avoids Ray's Raylet-saturation family (C1–C3) but inherits
-the opposite problem: **a straggler's entire partition must be redone**, and skew cannot be
-diluted by over-partitioning the way Spark does with 10k–100k tasks per stage. That half is
-unchanged and is the real remaining work.
+Batcher's coarse scheduling unit avoided Ray's Raylet-saturation family (C1–C3) by inheriting
+the opposite problem: a straggler's *entire* partition had to be redone.
+
+**Closed this pass for the Flight shuffles.** The map stage cuts its input into `workers x
+map_partition_multiplier` partitions (4x by default) and `map_barrier` deals them out as actors
+go idle, with exactly `workers` in flight. A slow worker takes fewer partitions rather than
+holding the barrier open on a full one, and a dead worker's share is re-dealt across survivors.
+The count is bounded by the splits the source actually has, so a small input is unaffected, and
+`map_partition_multiplier = 1` pins the old unit. Aggregate, join, sort and window all take it;
+the disk transport and the non-shuffle map fan-out do not.
+
+The *other* half of the Spark argument — that fine partitions dilute skew — does not follow and
+should not be written down as though it does. Map partitions divide the input; a shuffle's
+imbalance lives in its hash buckets, and a single dominant key is indivisible however fine the
+hash. That one is salting's job (G6), not this.
 
 **Closed this pass:** `speculation_max_backups` now defaults to **1**. Ray Data has *no*
 straggler mitigation of any kind — no speculative execution, no task re-launch — so its
@@ -366,9 +498,12 @@ This matters specifically for AI workloads because the guides identify **variabl
 as the dominant straggler source** — one 500-page PDF among tweets, one long video among
 clips, uneven prompt lengths in LLM batch.
 
-**Deliberately still off: `skew_join_salt`.** Do not flip it as "another default-off
-capability." See G6 — there is a live correctness hazard behind it, and turning it on would
-ship a silent wrong answer.
+**`skew_join_salt = 0` is not "off"** and must not be described as an unflipped default-off
+capability — that reading is what the config comment used to invite, and it is wrong twice
+over. Salting already engages on *measured* skew at 0 (G6), so there is nothing to flip; and
+what does happen at 0 is guarded by `salting_is_safe`, which is the hazard G6 describes. The
+knob is a fan-out: a positive value forces the pre-pass and pins the fan-out, and a negative
+value is the off switch for pinning the plain co-partition shuffle.
 
 ### G2. Shuffle replication — **wired for the flat reduce** (was: not wired at all)
 
@@ -393,8 +528,20 @@ are **retired when it is recomputed** — a stale replica holds the old epoch's 
 unregistered ticket reads back as an *empty bucket rather than an error*, so falling back to
 one would silently drop that mapper's rows.
 
-**Still open:** a wide shuffle (`workers > fan_in`) reduces through the combiner tree, which
-does not thread replicas yet and still degrades to recompute.
+**Also closed:** a wide shuffle reduces through the combiner tree, whose *interior* levels were
+single-copy at any replication factor — one lost combiner discarded every level built so far and
+restarted from the leaves, which is the recompute leaf replication exists to avoid, reintroduced
+one level up. `dist/shuffle_replication.py::replicate_interior_outputs` now copies each level's
+merged partials off-node before the next level is built on them, and `_tree_reduce` threads the
+acked addresses into the next level's positional fallbacks. It is the cheapest copy in the
+shuffle — a level's output is `fan_in` partials already merged into one — and it needs no epoch
+fence, because an interior ticket cannot outlive the attempt that made it (every level's
+fallbacks are built inside one `_tree_reduce` call and no reference escapes it).
+
+Honest scope: `test_shuffle_replication.py` pins that the interior copies are *placed and acked*,
+which is the defect that existed. It does not kill a worker between combiner levels — the fault
+hooks fire before and after the map barrier, not mid-tree — so "an interior replica served a
+loss" rests on `_combine_sources`' positional fallback rather than on an end-to-end test.
 
 ### G6. Skew salting could silently split a group — guard added, and it must stay
 
@@ -418,7 +565,37 @@ be validated in a single-node dev environment." An integration test written here
 or without the guard, which is worse than none — so the invariant is pinned where it can
 actually be checked, and this paragraph is the note that it deserves a cluster test.
 
-### G3. Single split point, no per-stage autoscaling
+### G3. Single split point, no per-stage autoscaling — **both halves now closed**
+
+**The N-stage split landed** (`dist/streaming/relay.py` plus
+`plan_analysis.split_into_resource_stages`): the chain is cut at *every* resource boundary, so
+two chained models get a pool each and a CPU postprocess no longer runs on the GPU actor. The
+paragraph below describing "exactly one boundary" is the state before that, kept because the
+measured argument for the placement is still the argument.
+
+**Per-stage autoscaling landed with this pass, and it started as a behaviour bug rather than a
+missing feature.** `concurrency=(min, max)` is documented in four places as "the pool autoscales
+to the backlog", and on the `_drive_actor_pool` path it does. The streaming pipeline resolved the
+same spec *statically* — `_resolve_pool_size` clamps the partition count into the range — so the
+identical public argument meant "autoscale" on one path and "a fixed pool sized from a number you
+never wrote" on the other, and a stage that fell behind stayed behind for the whole query.
+`consumers.consumer_pool_bounds` now returns `(start, ceiling)` and `schedule._rescale_stages`
+grows a stage whose post-dispatch backlog could not be placed, reusing `map._autoscale_action` so
+the two paths cannot drift. A plain int or an absent spec yields `start == ceiling`, which the
+scheduler reads as "do not scale" — so nothing that was not asking for autoscaling changes.
+
+It grows and deliberately does not shrink, which is the opposite of the actor-pool path. There
+`pending` is a partition queue that only drains, so a reap at the tail is safe; here the backlog
+rises and falls morsel by morsel, and the same rule would reap an actor the moment a stage caught
+up and respawn it on the next morsel — each of those actors holding a *loaded model* whose reload
+costs tens of seconds against a fraction of a second of idling. Growth also has no correctness
+hazard where a reap does: a relay's published morsels live on its own Flight server, so killing
+one that still holds any voids a subtree and forces a replay.
+
+Pinned in `tests/unit/test_stream_schedule_algebra.py` (a backlogged stage grows, the ceiling is
+respected, a fixed stage is untouched, and a grown pipeline delivers the identical row multiset)
+and `tests/unit/test_stream_pipeline_split.py` (the bounds themselves). Both run against the
+deterministic stand-in scheduler, so they need no cluster.
 
 **Narrower than it reads.** Checked against the guides' own four-stage shape
 (`extract` CPU → `chunk` CPU → `embed` GPU → `write` CPU): the single split groups both CPU
@@ -435,15 +612,27 @@ three different resource classes (`extract` CPU-heavy → `chunk` CPU-light → 
 `write`), and reports **~86% cost reduction and ~69% faster** end-to-end from getting that
 placement right versus an all-GPU cluster.
 
-### G4. No variable-shape tensor type; no GPU residency across operators
+### G4. ~~No variable-shape tensor type~~ — **closed**; no GPU residency across operators
 
-Ray Data and Daft both have a variable-shape tensor type; Batcher does not. Mixed-resolution
-image batches are the common case in multimodal preprocessing, and the guides log repeated
-Ray failures there too (`ArrowVariableShapedTensorArray`, ray#49883/#50229) — so this is a
-shared weakness rather than a Batcher-specific one, but Batcher does not currently win it.
+**Closed.** `io/formats/ml/ragged.py` carries mixed-resolution arrays as one column, and the
+conversion paths reach for it automatically: a `map_batches` returning arrays of differing
+shape, and a `from_pydict` given the same, both produce a variable-shape tensor column instead
+of failing. `to_numpy` and `batch_format="numpy"` decode it back to per-row arrays.
 
-Separately, data round-trips to host memory between operators; it never stays resident on the
-GPU. Ray has the same limitation (its GPU object store is RFC-only, ray#51173).
+The layout is a plain `struct<data: binary, shape: list<int32>, dtype: string>`, and both
+halves of that are load-bearing. It is ordinary Arrow, so it crosses the FFI, writes to
+Parquet, and passes through every operator **with no engine change, no IR tag, and no
+wire-contract change**. And `data` is a *binary buffer* rather than a list of elements because
+the boundary widens narrow numerics: a `list<uint8>` image column arrives as `list<int64>`,
+eight bytes per pixel, for the one workload the type exists to carry.
+
+What it deliberately does not do is present a ragged column to torch as a tensor. Rows of
+differing shape have no stacked form, so the bridges hand back per-row arrays rather than
+silently padding.
+
+Still open in this item: data round-trips to host memory between operators; it never stays
+resident on the GPU. Ray has the same limitation (its GPU object store is RFC-only,
+ray#51173).
 
 ### G5. Small-file / metadata cost — **measured, and Batcher loses**
 

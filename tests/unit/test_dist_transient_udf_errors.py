@@ -64,3 +64,36 @@ def test_the_chain_walk_terminates_on_a_reference_cycle():
     a.__cause__ = b
     b.__cause__ = a
     assert _is_transient_udf_error(a) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # What a busy model endpoint says instead of a status code. An inference stage is
+        # the main consumer of this taxonomy, and failing a multi-hour job on a phrase the
+        # next attempt would have served is the outcome the retry exists to avoid.
+        "APIError: The server is overloaded or not ready yet",
+        "Model meta-llama/Llama-2-7b is currently loading; estimated time 20s",
+        "429 Client Error: Too Many Requests for url: https://api-inference.example/x",
+        "RateLimitError: Rate limit reached for gpt-4",
+    ],
+)
+def test_a_busy_model_endpoint_is_retryable(message):
+    from batcher.carbonite.resilience import is_retryable
+
+    assert is_retryable(Exception(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "TypeError: unsupported operand type(s) for +: 'int' and 'str'",
+        "KeyError: 'image'",
+        "AssertionError: shape mismatch",
+        "ValueError: could not broadcast input array",
+    ],
+)
+def test_a_deterministic_udf_bug_is_never_retried(message):
+    from batcher.carbonite.resilience import is_retryable
+
+    assert not is_retryable(Exception(message))

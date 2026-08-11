@@ -16,7 +16,7 @@ pub(crate) mod video;
 mod speech;
 
 pub(crate) use audio::eval_audio;
-pub(crate) use image::eval_image;
+pub(crate) use image::{eval_image, eval_image_crop, Bounds};
 pub(crate) use video::{eval_video, VideoArgs};
 
 /// Below this row count, decode serially: a handful of clips isn't worth rayon's

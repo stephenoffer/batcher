@@ -1,11 +1,11 @@
 # Dataset
 
-A `Dataset` is a lazy, immutable handle to a query plan. Every transformation
+A {py:class}`Dataset <batcher.Dataset>` is a lazy, immutable handle to a query plan. Every transformation
 returns a new `Dataset` and runs no work. Execution happens only when you call a
 terminal operation such as `collect`, `to_pydict`, or `write.parquet`.
 
 This page is the full reference: how to construct a dataset, every transformation
-method, every terminal method, and the `GroupBy` builder.
+method, every terminal method, and the {py:class}`GroupBy <batcher.GroupBy>` builder.
 
 ## Construction
 
@@ -59,29 +59,31 @@ Each method returns a new `Dataset`. They chain.
 | Method | Effect |
 | --- | --- |
 | `.filter(predicate)` | Keep rows where the boolean expression is true. |
-| `.select(*names, **derived)` | Choose existing columns by name and derive new ones as keywords. |
-| `.with_columns(**named)` | Add or replace columns, keeping the rest. |
-| `.with_column(name, expr)` | Add or replace a single column. |
+| {py:meth}`.select(*names, **derived) <batcher.Dataset.select>` | Choose existing columns by name and derive new ones as keywords. |
+| {py:meth}`.with_columns(**named) <batcher.Dataset.with_columns>` | Add or replace columns, keeping the rest. |
+| {py:meth}`.with_column(name, expr) <batcher.Dataset.with_column>` | Add or replace a single column. |
 | `.drop(*names)` | Remove columns. |
 | `.rename(mapping)` | Rename columns via `{"old": "new"}`. |
 | `.sort(*by, descending=False, nulls_first=False)` | Order rows. `by` is a name or expression. |
-| `.limit(n, offset=0)` | Take `n` rows after skipping `offset`. |
+| {py:meth}`.limit(n, offset=0) <batcher.Dataset.limit>` | Take `n` rows after skipping `offset`. |
 | `.head(n=5)` | Take the first `n` rows. |
 | `.tail(n=5)` | Take the last `n` rows (executes a `count` first). |
-| `.sample(fraction=None, *, n=None, seed=None)` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. |
-| `.distinct()` | Drop duplicate rows. |
+| {py:meth}`.sample(fraction=None, *, n=None, seed=None) <batcher.Dataset.sample>` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. |
+| {py:meth}`.split_at_indices(indices) <batcher.Dataset.split_at_indices>` | Cut into consecutive row ranges at the given positions (Ray Data's spelling). Every part stays lazy. |
+| {py:meth}`.split_proportionately(proportions) <batcher.Dataset.split_proportionately>` | Cut into parts holding the given row fractions, with exact sizes (executes a `count` first). |
+| {py:meth}`.distinct() <batcher.Dataset.distinct>` | Drop duplicate rows. |
 | `.union(*others, distinct=False)` | Concatenate datasets; set `distinct=True` to dedupe. |
 | `.intersect(other)` | Rows present in both. |
-| `.except_(other)` | Rows in this dataset but not the other. |
+| {py:meth}`.except_(other) <batcher.Dataset.except_>` | Rows in this dataset but not the other. |
 | `.join(other, ...)` | Relational join (see below). |
-| `.window(...)` | Per-row windowed columns (see below). |
-| `.group_by(*keys, **derived)` | Start a grouped aggregation (returns `GroupBy`). |
+| {py:meth}`.window(...) <batcher.Dataset.window>` | Per-row windowed columns (see below). |
+| {py:meth}`.group_by(*keys, **derived) <batcher.Dataset.group_by>` | Start a grouped aggregation (returns `GroupBy`). |
 | `.rollup(*keys)` | Aggregate at every prefix of `keys` plus the grand total (SQL `ROLLUP`). |
 | `.cube(*keys)` | Aggregate at every subset of `keys` (SQL `CUBE`). |
-| `.grouping_sets(*sets)` | Aggregate at exactly the levels given (SQL `GROUPING SETS`). |
+| {py:meth}`.grouping_sets(*sets) <batcher.Dataset.grouping_sets>` | Aggregate at exactly the levels given (SQL `GROUPING SETS`). |
 | `.map_batches(fn, ...)` | Apply a Python function to whole Arrow batches. |
-| `.offload_blobs(column="bytes", ...)` | Move a large-payload column to a content-addressed store, leaving URI handles ({doc}`blob-by-reference </ml/preparing/multimodal/index>`). |
-| `.materialize_blobs(...)` | Read offloaded payloads back from their handles (inverse of `offload_blobs`). |
+| {py:meth}`.offload_blobs(column="bytes", ...) <batcher.Dataset.offload_blobs>` | Move a large-payload column to a content-addressed store, leaving URI handles ({doc}`blob-by-reference </ml/preparing/multimodal/index>`). |
+| {py:meth}`.materialize_blobs(...) <batcher.Dataset.materialize_blobs>` | Read offloaded payloads back from their handles (inverse of {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>`). |
 | `.repartition(num_files=None, *, by=None, target_size_mb=None)` | Set how the next `write` lays out files (data unchanged). |
 
 ### filter
@@ -94,7 +96,7 @@ print(ds.filter(bt.col("price") >= 30.0).to_pydict())
 ### select and with_columns
 
 `select` chooses the full output: positional arguments must be existing column
-names, and keyword arguments derive new named columns. `with_columns` adds or
+names, and keyword arguments derive new named columns. {py:meth}`with_columns <batcher.Dataset.with_columns>` adds or
 replaces columns and keeps everything else.
 
 ```python
@@ -180,7 +182,7 @@ print(joined.to_pydict())
 
 ### window
 
-`window(partition_by=(), order_by=(), functions={...}, frame=None)` adds columns
+{py:meth}`window(partition_by=(), order_by=(), functions={...}, frame=None) <batcher.Dataset.window>` adds columns
 without collapsing rows. `functions` maps an output name to a spec:
 
 - Ranking (needs `order_by`): `"row_number"`, `"rank"`, `"dense_rank"`.
@@ -235,7 +237,7 @@ ds.repartition(by="dt").write("out/")
 
 ## GroupBy
 
-`group_by(*keys, **derived)` returns a `GroupBy`. Finalize it with
+{py:meth}`group_by(*keys, **derived) <batcher.Dataset.group_by>` returns a `GroupBy`. Finalize it with
 `agg(**named_aggregates)`, where each keyword names an output column and its value
 is an aggregate expression. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`; column aggregates such as
 `.sum()` and `.mean()` are methods on an expression. There is no `.alias` on an
@@ -264,8 +266,8 @@ full aggregate function set.
 ### Subtotals: rollup, cube and grouping sets
 
 A subtotal report needs the same aggregate at several grouping levels at once.
-`rollup(*keys)` aggregates at every prefix of the keys and then the grand total,
-`cube(*keys)` at every subset, and `grouping_sets(*sets)` at exactly the levels you
+{py:meth}`rollup(*keys) <batcher.Dataset.rollup>` aggregates at every prefix of the keys and then the grand total,
+{py:meth}`cube(*keys) <batcher.Dataset.cube>` at every subset, and {py:meth}`grouping_sets(*sets) <batcher.Dataset.grouping_sets>` at exactly the levels you
 name (`[]` is the grand total). Each returns a builder you finish with `.agg(...)`,
 and each is the DataFrame spelling of the SQL clause of the same name. The two
 front-ends produce identical rows. A key that is not part of a level reads as NULL,
@@ -283,17 +285,20 @@ A terminal operation executes the plan.
 
 | Method | Returns |
 | --- | --- |
-| `.collect(distributed=False, num_workers=None, spill=False, num_partitions=16, adaptive=False, transport="disk")` | A pyarrow `Table`. |
-| `.to_pydict()` | A `dict[str, list]`. |
-| `.to_pylist()` | A `list[dict]`, one dict per row. |
+| {py:meth}`.collect(distributed=False, num_workers=None, spill=False, num_partitions=16, adaptive=False, transport="disk") <batcher.Dataset.collect>` | A pyarrow `Table`. |
+| {py:meth}`.to_pydict() <batcher.Dataset.to_pydict>` | A `dict[str, list]`. |
+| {py:meth}`.to_pylist() <batcher.Dataset.to_pylist>` | A `list[dict]`, one dict per row. |
 | `.count()` | Row count as an `int`. |
 | `.min(column)`, `.max(column)`, `.sum(column)`, `.mean(column)`, `.std(column)`, `.var(column)`, `.n_unique(column)` | A single-column reduction as a scalar (nulls ignored). |
 | `.median(column)` / `.quantile(column, q)` | The exact median / `q`-quantile as a scalar. |
+| {py:meth}`.product(column) <batcher.Dataset.product>` / {py:meth}`.mode(column) <batcher.Dataset.mode>` | The product of the values / the most frequent value. |
+| {py:meth}`.skewness(column) <batcher.Dataset.skewness>` / {py:meth}`.kurtosis(column) <batcher.Dataset.kurtosis>` / {py:meth}`.mad(column) <batcher.Dataset.mad>` | Shape and spread: lopsidedness, tail weight, and the outlier-tolerant mean absolute deviation. |
+| {py:meth}`.any(column) <batcher.Dataset.any>` / {py:meth}`.all(column) <batcher.Dataset.all>` | Reduce a boolean column (SQL `BOOL_OR` / `BOOL_AND`); an empty column is `None`, not `False`/`True`. |
 | `.corr(x, y)` / `.cov(x, y, ddof=1)` | Pearson correlation / covariance of two columns. |
-| `.iter_batches(batch_size=None)` | An iterator of pyarrow `RecordBatch`es. |
+| {py:meth}`.iter_batches(batch_size=None) <batcher.Dataset.iter_batches>` | An iterator of pyarrow `RecordBatch`es. |
 | `.explain()` | The plan as a `str`. |
-| `.show(limit=10)` | Prints a preview; returns `None`. |
-| `.write(path, fmt=None, partition_by=None, distributed=False, num_workers=None, **kw)` | A `WriteManifest`. |
+| {py:meth}`.show(limit=10) <batcher.Dataset.show>` | Prints a preview; returns `None`. |
+| {py:obj}`.write(path, fmt=None, partition_by=None, distributed=False, num_workers=None, **kw) <batcher.Dataset.write>` | A {py:class}`WriteManifest <batcher.io.WriteManifest>`. |
 | `.write.parquet(path, compression="zstd", **kw)` | A `WriteManifest`. |
 | `.write.csv(path, **kw)`, `.write.json(path, **kw)` | A `WriteManifest`. |
 
@@ -309,7 +314,7 @@ print(ds.count())
 # 6
 ```
 
-`iter_batches` streams results, choosing the execution mode automatically: a
+{py:meth}`iter_batches <batcher.Dataset.iter_batches>` streams results, choosing the execution mode automatically: a
 breaker-free pipeline is consumed as batches are produced (bounded memory), while
 plans that must materialize do so first.
 
@@ -346,7 +351,7 @@ print(ds.columns)
 ## Interoperability
 
 A `Dataset` implements the Arrow **PyCapsule stream interface**
-(`__arrow_c_stream__`), so any library that speaks the Arrow C Data Interface consumes one directly. There's no `to_arrow()` call, no copy, and no conversion through Python objects.
+(`__arrow_c_stream__`), so any library that speaks the Arrow C Data Interface consumes one directly. There's no {py:meth}`to_arrow() <batcher.Dataset.to_arrow>` call, no copy, and no conversion through Python objects.
 
 ```python
 # docs: skip
@@ -363,12 +368,12 @@ The stream is **lazy**: batches are pulled from the plan as the consumer reads t
 a result larger than memory streams into DuckDB rather than landing in it first. Because
 the consumer's iteration is what drives execution, this is a terminal operation.
 
-`collect()` returns a pyarrow `Table` when you want the whole result in hand, and
-`to_pandas()` / `to_arrow()` are there for the direct conversions.
+{py:meth}`collect() <batcher.Dataset.collect>` returns a pyarrow `Table` when you want the whole result in hand, and
+{py:meth}`to_pandas() <batcher.Dataset.to_pandas>` / {py:meth}`to_arrow() <batcher.Dataset.to_arrow>` are there for the direct conversions.
 
 ## Reshaping
 
-`explode(col)` turns a list column into one row per element (SQL `UNNEST`).
+{py:meth}`explode(col) <batcher.Dataset.explode>` turns a list column into one row per element (SQL `UNNEST`).
 `unnest(col)` is the struct counterpart. It expands a struct column's fields into top-level columns in place, matching Polars `unnest` and Spark `select("s.*")`:
 
 ```python
@@ -382,11 +387,11 @@ print(ds.unnest("s").columns)
 
 ## Descriptive statistics
 
-`describe()` returns a small summary `Dataset` (pandas/Polars-style): a `statistic`
+{py:meth}`describe() <batcher.Dataset.describe>` returns a small summary `Dataset` (pandas/Polars-style): a `statistic`
 label column and one column per input column. Numeric columns report count /
 null_count / mean / std / min / quartiles / max; non-numeric columns report count
 and null_count only. It **executes** the query (the summary is the result). Pass
-`percentiles=` to choose the quantile rows. `null_count()` is the lazy per-column
+`percentiles=` to choose the quantile rows. {py:meth}`null_count() <batcher.Dataset.null_count>` is the lazy per-column
 null tally (it lowers to one aggregate, so nothing runs until a terminal op).
 
 ```python
@@ -396,7 +401,7 @@ print(ds.null_count().to_pydict())
 # {'g': [0], 'x': [0]}
 ```
 
-`profile()` is the quick "what does this column look like" check before a load: it
+{py:meth}`profile() <batcher.Dataset.profile>` is the quick "what does this column look like" check before a load: it
 **executes** and returns one row per column with `count`, `null_count`,
 `null_fraction`, and `approx_distinct` (HyperLogLog cardinality).
 
@@ -406,7 +411,7 @@ Two accessors hang off a `Dataset` for validation and dimension maintenance:
 
 | Accessor | Purpose |
 | --- | --- |
-| `.dq` | Data-quality expectations. Constraint methods accumulate (returning a new `DatasetDQ`); a terminal method (`fail` / `drop` / `quarantine` / `validate`) applies them. |
+| `.dq` | Data-quality expectations. Constraint methods accumulate (returning a new {py:class}`DatasetDQ <batcher.api.dataset.dq.DatasetDQ>`); a terminal method (`fail` / `drop` / `quarantine` / `validate`) applies them. |
 | `.scd` | Dimension maintenance. `type1` / `type2` / `type3` take an incoming snapshot (natural keys + attributes); `apply_changes` takes a CDC change feed, with deletes, redeliveries, and out-of-order rows. |
 
 ## See also

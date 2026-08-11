@@ -119,6 +119,7 @@ class _Job:
     pool_pending: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
     skipped_total: int = 0
+    malformed_rows_total: int = 0
     #: Fault-tolerance actions by `RECOVERY` discriminator (bounded by `RECOVERY_EVENTS`);
     #: `workers_lost` counts rather than lists, since ids are unbounded over a long run.
     recovery: dict[str, int] = field(default_factory=dict)
@@ -219,6 +220,10 @@ class InferenceProgress:
             reason = "other"
         job.skipped[reason] = job.skipped.get(reason, 0) + count
 
+    def _on_malformed(self, job: _Job, event: events.Event) -> None:
+        """Tally rows dropped inside a file that read fine, kept apart from whole inputs."""
+        job.malformed_rows_total += int(event.fields.get("count", 0))
+
     def _on_recovery(self, job: _Job, event: events.Event) -> None:
         """Tally one fault-tolerance action, so recovery is not mistaken for slowness.
 
@@ -304,7 +309,11 @@ class InferenceProgress:
                     for device, g in job.gpus.items()
                 },
                 "pool": {"size": job.pool_size, "pending": job.pool_pending},
-                "skipped": {"total": job.skipped_total, "by_reason": dict(job.skipped)},
+                "skipped": {
+                    "total": job.skipped_total,
+                    "by_reason": dict(job.skipped),
+                    "malformed_rows_total": job.malformed_rows_total,
+                },
                 "recovery": {"events": dict(job.recovery), "workers_lost": job.workers_lost},
                 "diagnostics": self._diagnostics(job),
             }
@@ -343,7 +352,9 @@ class InferenceProgress:
             if job.pool_size:
                 parts.append(f"{job.pool_size} actors")
             if job.skipped_total:
-                parts.append(f"{_count(job.skipped_total)} skipped")
+                parts.append(f"{_count(job.skipped_total)} files skipped")
+            if job.malformed_rows_total:
+                parts.append(f"{_count(job.malformed_rows_total)} bad rows")
             # In the status line, not only the metrics: this is the moment a reader asks
             # why the job is slow, and worker loss is the answer.
             if job.workers_lost:
@@ -423,9 +434,22 @@ class InferenceProgress:
             out.append(
                 _finding(
                     "warning",
-                    "skipped_rows",
-                    f"{job.skipped_total} rows were skipped under on_read_error='skip' — "
-                    f"silent data loss.",
+                    "skipped_files",
+                    f"{job.skipped_total} unreadable input(s) were dropped under "
+                    f"on_error='skip'. How many rows they held is exactly what is unknown, "
+                    f"so the result is short by an unmeasured amount. "
+                    f"Call source.corrupt_files() for the paths.",
+                )
+            )
+        if job.malformed_rows_total:
+            out.append(
+                _finding(
+                    "warning",
+                    "malformed_rows",
+                    f"{job.malformed_rows_total} row(s) were dropped under "
+                    f"on_bad_lines='skip'/'warn' because their field count disagreed with "
+                    f"the header. The files themselves read fine, so this is the producer "
+                    f"upstream, not the storage.",
                 )
             )
         order = {"critical": 0, "warning": 1, "info": 2}
@@ -440,6 +464,7 @@ _INGEST: dict[str, Callable[[InferenceProgress, _Job, events.Event], None]] = {
     events.INFER: InferenceProgress._on_infer,
     events.GPU: InferenceProgress._on_gpu,
     events.SKIPPED: InferenceProgress._on_skipped,
+    events.MALFORMED: InferenceProgress._on_malformed,
     events.POOL: InferenceProgress._on_pool,
     events.RECOVERY: InferenceProgress._on_recovery,
 }

@@ -34,16 +34,21 @@ __all__ = [
 def widened_type(dtype: pa.DataType):
     """The type the engine would present `dtype` as, or `None` when it presents it unchanged.
 
-    The FFI boundary normalizes every integer width — signed and unsigned, `uint64` included —
-    to `int64`, and every narrow float to `double`. A query over an `int32` column therefore
-    returns `int64` from the engine, and every test and every downstream consumer is written
-    against that.
-
-    The translator reads Arrow *without* crossing that boundary, so left alone it hands back
-    the source's own width. That is not a wrong number, but it is a wrong column, and it is
+    The translator reads Arrow *without* crossing the FFI boundary, so left alone it hands back
+    the source's own type. That is not a wrong number, but it is a wrong column, and it is
     worst exactly where this backend is used: a sharded fan-out concatenates its shards'
-    partials, and a shard that fell back to the CPU engine contributes `int64` beside a device
-    shard's `int32`.
+    partials, and a shard that fell back to the CPU engine contributes the engine's type beside
+    a device shard's raw one.
+
+    What the boundary does is **not restated here**. `plan.types.widen` is the mirror of
+    `bc_py::normalize_to` the whole control plane already answers `Dataset.schema` from, and
+    this used to hold a narrower second copy of it — narrow ints and narrow floats only. The
+    two disagreed on the three arms the copy was missing, and every disagreement was a wrong
+    column on a device: a `dictionary`, which is what Parquet emits natively for a
+    low-cardinality string, stayed dictionary-encoded through the device where the engine
+    decodes it to `string`; a `large_string` stayed large; and a narrow numeric *nested* inside
+    a struct or list stayed narrow at that depth. Deriving the answer from the one definition
+    is what keeps the device's columns and the engine's the same columns.
 
     Args:
         dtype: The source column's Arrow type.
@@ -51,13 +56,10 @@ def widened_type(dtype: pa.DataType):
     Returns:
         The widened Arrow type, or `None` when `dtype` already is what the engine would show.
     """
-    import pyarrow as pa
+    from batcher.plan.types import widen
 
-    if pa.types.is_integer(dtype) and dtype != pa.int64():
-        return pa.int64()
-    if pa.types.is_floating(dtype) and dtype != pa.float64():
-        return pa.float64()
-    return None
+    target = widen(dtype)
+    return None if target == dtype else target
 
 
 def widen_narrow(table: pa.Table) -> pa.Table:

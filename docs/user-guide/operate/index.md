@@ -29,6 +29,7 @@ come and go.
 | {doc}`Caching results <tuning/caching>` | Reuse a result instead of recomputing the plan |
 | {doc}`Reading query plans <tuning/explain-plans>` | The plan and the measured profile, and how to find the expensive operator |
 | {doc}`Best practices <tuning/best-practices>` | Patterns for pipelines that stay fast |
+| {doc}`Reading a very large table <tuning/large-tables>` | Plan-time pruning, sampled estimates, and how the work is divided |
 | {doc}`Observability <running/observability>` | Progress, structured logs, and the web dashboard |
 | {doc}`Troubleshooting <running/troubleshooting>` | The common failures, by symptom |
 | {doc}`GPU fleets <running/gpu-fleets>` | Power budgets, fabric-aware placement, device health, residency |

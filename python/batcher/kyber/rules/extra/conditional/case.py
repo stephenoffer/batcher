@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
@@ -18,7 +19,6 @@ from batcher.kyber.rules.extra.conditional.shared import (
     _is_null_lit,
     _is_true_lit,
     _lit_class,
-    _Node,
     _pure,
     _rewrite_typed,
 )
@@ -33,6 +33,9 @@ from batcher.plan.expr_ir import (
 )
 from batcher.plan.logical import Filter, LogicalPlan, Project
 from batcher.plan.schema import SchemaRef
+
+if TYPE_CHECKING:
+    from batcher.kyber.rules.exprs.guards import SchemaNode
 
 
 def _drop_unreachable(expr: Expr, schema: SchemaRef | None = None) -> Expr:
@@ -53,7 +56,7 @@ def _drop_unreachable(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     expr_schema=_drop_unreachable,
     expr_matches=(Case,),
 )
-def case_drop_unreachable_branches(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def case_drop_unreachable_branches(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Delete a `WHEN` whose condition is the literal FALSE: a branch fires only where its condition
     is TRUE, so it fires on no row and contributes nothing but its type. (A constant-NULL condition
     is just as dead — NULL selects no rows either — but no NULL *literal* exists here.) The branch
@@ -88,7 +91,7 @@ def _first_true(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     expr_schema=_first_true,
     expr_matches=(Case,),
 )
-def case_first_true_branch_wins(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def case_first_true_branch_wins(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """A `WHEN` whose condition is the literal TRUE becomes the `ELSE`, and every branch after it
     (plus the old `ELSE`) is deleted: it fires on every row that got past the earlier branches, so
     its result *is* the default and nothing below it is reachable. Only a literal TRUE qualifies —
@@ -113,7 +116,7 @@ def _all_same_result(expr: Expr) -> Expr:
     expr=_all_same_result,
     expr_matches=(Case,),
 )
-def case_all_branches_same_result(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def case_all_branches_same_result(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Every arm (each `then` *and* the `otherwise`) is the same expression → that expression.
     Whichever branch a row selects it yields the same value, so the conditional *is* that value; and
     since every arm has the identical type, the join that types the CASE is that type too. The
@@ -134,7 +137,7 @@ def _no_branches(expr: Expr) -> Expr:
     expr=_no_branches,
     expr_matches=(Case,),
 )
-def case_no_branches_to_else(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def case_no_branches_to_else(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """A `CASE` with no `WHEN` branches left is its `ELSE`: with nothing to select, every row falls
     through to the default, and the type join over one arm is its own type. This is the collapse the
     other CASE rules feed — once they delete the last unreachable branch, the husk disappears."""
@@ -166,7 +169,7 @@ def _dedup_conditions(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     expr_schema=_dedup_conditions,
     expr_matches=(Case,),
 )
-def case_drop_duplicate_conditions(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def case_drop_duplicate_conditions(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Delete a `WHEN` whose condition repeats an earlier branch's. Wherever the later condition is
     TRUE the earlier (structurally identical, and required to be pure, hence equal-valued) one was
     TRUE too — and first-true-wins already fired it — so the repeat is unreachable. Its result is
@@ -192,7 +195,7 @@ def _case_to_coalesce(expr: Expr) -> Expr:
     expr=_case_to_coalesce,
     expr_matches=(Case, IsNotNull, IsNull),
 )
-def case_to_coalesce(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def case_to_coalesce(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`CASE WHEN x IS NOT NULL THEN x ELSE y END` → `coalesce(x, y)`, and the mirrored
     `CASE WHEN x IS NULL THEN y ELSE x END`. Both compute "x unless it is null, then y":
     `IS NOT NULL` is total (never NULL), so the branch fires on exactly the non-null rows — exactly
@@ -222,7 +225,7 @@ def _nullif_distinct_literals(expr: Expr) -> Expr:
     expr=_nullif_distinct_literals,
     expr_matches=(Lit, NullIf),
 )
-def nullif_distinct_literals(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def nullif_distinct_literals(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`NULLIF(a, b)` over two *distinct* literals of one type → `a`. NULLIF nulls its left operand
     exactly where `left = right`; two unequal constants are never equal, so the result is `a` on
     every row. Guarded three ways: one type class for both (so the result type stays `a`'s, not the
@@ -248,7 +251,7 @@ def _coalesce_flatten(expr: Expr) -> Expr:
     expr=_coalesce_flatten,
     expr_matches=(Coalesce,),
 )
-def coalesce_flatten_nested(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def coalesce_flatten_nested(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, coalesce(b, c))` → `coalesce(a, b, c)`. "First non-null" is associative: the
     nested call is null exactly when `b` and `c` are both null, which is exactly when the flat form
     moves past them. No argument is added or removed, so the type join and the error behavior are
@@ -282,7 +285,7 @@ def _coalesce_drop_unreachable(expr: Expr, schema: SchemaRef | None = None) -> E
     expr_matches=(Coalesce, Lit),
 )
 def coalesce_drop_nulls_after_first_non_null(
-    node: _Node, _ctx: OptimizerContext
+    node: SchemaNode, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
     """Delete a `COALESCE` argument that is a constant NULL, and truncate everything after the first
     constant non-NULL. A provably-null argument is skipped on every row and can never be the answer;
@@ -305,7 +308,7 @@ def _coalesce_single(expr: Expr) -> Expr:
     expr=_coalesce_single,
     expr_matches=(Coalesce,),
 )
-def coalesce_single_arg(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def coalesce_single_arg(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(x)` → `x`. The first non-null of one argument is that argument (a null `x` yields
     null either way), and the type join over one arm is that arm's type — the collapse the other
     COALESCE rules feed once they have removed the redundant arguments."""
@@ -331,7 +334,7 @@ def _coalesce_dedup(expr: Expr) -> Expr:
     expr=_coalesce_dedup,
     expr_matches=(Coalesce,),
 )
-def coalesce_dedup_args(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def coalesce_dedup_args(node: SchemaNode, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`coalesce(a, a, b)` → `coalesce(a, b)` — drop an argument identical to the one before it.
     COALESCE only advances past an argument that evaluated to null, so the repeat is reached only in
     the rows where it is *itself* null: it can never be the answer. The surviving twin has the same

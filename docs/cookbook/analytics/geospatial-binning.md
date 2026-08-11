@@ -128,7 +128,7 @@ print(sql_hot.to_pydict())
 Same cells, same counts. The tail order differs only because the SQL breaks the
 three-way tie at one pickup on `lat_bin`, which the DataFrame `sort` leaves alone.
 
-`concat_ws` folds the pair of integers into one string cell id, and `bin * CELL` recovers
+{py:func}`concat_ws <batcher.concat_ws>` folds the pair of integers into one string cell id, and `bin * CELL` recovers
 the cell's south-west corner for plotting:
 
 ```python
@@ -189,7 +189,7 @@ you care about.
 - {doc}`Basket analysis </cookbook/analytics/inference/basket-analysis>`: another recipe whose difficulty is entirely in
   choosing a key that groups.
 - {doc}`Filtering </user-guide/transform/rows/filtering>`: `between`, and how predicates reach the scan.
-- {doc}`Aggregations </user-guide/analyze/aggregations>`: the `group_by` the grid feeds.
+- {doc}`Aggregations </user-guide/analyze/aggregations>`: the {py:meth}`group_by <batcher.Dataset.group_by>` the grid feeds.
 - {doc}`Expressions API </api/relational/expressions>`: `floor`, `concat_ws`, `width_bucket`.
 - {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: what the hash shuffle
   on the cell key actually does.

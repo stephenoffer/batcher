@@ -13,6 +13,7 @@ bc-runtime.workspace = true
 bc-codegen.workspace = true
 bc-resource.workspace = true
 arrow.workspace = true
+ahash.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 libc.workspace = true

@@ -42,6 +42,8 @@ from batcher.carbonite.policies import (
     credit_ceiling,
     learned_channel_morsel_bytes,
     load_shuffle_window,
+    measured_bdp_window,
+    shuffle_window_is_stable,
 )
 from batcher.carbonite.policies.cpu_budget import effective_core_budget
 from batcher.carbonite.policies.morsel import (
@@ -74,6 +76,18 @@ _SPILL_BYTES_PER_PARTITION = SPILL_BYTES_PER_PARTITION
 _MIN_SPILL_PARTITIONS = MIN_SPILL_PARTITIONS
 _MAX_SPILL_PARTITIONS = MAX_SPILL_PARTITIONS
 _SPILL_COMPRESS_ABOVE = SPILL_COMPRESS_ABOVE
+
+
+def _memory_share(config: Config) -> float:
+    """This query's entitlement to the memory envelope, from live admission occupancy.
+
+    Read through the process limiter rather than passed in, because the manager is built at
+    several points in a run and only one of them holds the slot. `1.0` — and so no change
+    to any budget — whenever `execution.max_concurrent_queries` is 0, which is the default.
+    """
+    from batcher.carbonite.policies.concurrency import process_limiter
+
+    return process_limiter(config).memory_share()
 
 
 class ResourceManager:
@@ -110,8 +124,15 @@ class ResourceManager:
         # Sample the query's memory envelope ONCE so admission, spill, and reserve
         # all reason about the same figure (no live-RAM drift between decisions).
         self._envelope = self._pressure.envelope_bytes()
+        # And divide it by the queries actually running, the way the concurrency limiter
+        # already divides the cores. Without this, N concurrent queries each size their
+        # spill decision against the whole envelope and all N take the in-memory path.
+        # `1.0` — and therefore no change at all — whenever concurrency is unbounded, which
+        # is the default. See `policies.concurrency.query_memory_share`.
+        self._share = _memory_share(self._config)
+        self._query_envelope = int(self._envelope * self._share)
         self._ctx = ResourceContext(
-            config=self._config, envelope_bytes=self._envelope, memory_model=self._mem_model
+            config=self._config, envelope_bytes=self._query_envelope, memory_model=self._mem_model
         )
         self._admission = admission or BudgetingAdmission()
         self._flow_control = flow_control or StaticCreditFlowControl()
@@ -119,7 +140,13 @@ class ResourceManager:
         self._scheduling = scheduling or DefaultSchedulingPolicy()
         # Every out-of-core decision, sized off one peak (cached per plan) and one budget.
         self._spill = SpillAdvisor(
-            self._config, self._ctx, self._memory, self._mem_model, self._pressure, self._envelope
+            self._config,
+            self._ctx,
+            self._memory,
+            self._mem_model,
+            self._pressure,
+            self._envelope,
+            self._share,
         )
 
     def validate(self, plan: PhysicalPlan) -> FeasibilityVerdict:
@@ -233,10 +260,21 @@ class ResourceManager:
         # Thread the learned wide-row width so AIMD's ceiling keeps the same byte bound the
         # static grant enforces — a wide-row channel must not grow its window past
         # `credit_byte_budget` just because it took the adaptive path.
+        #
+        # The bandwidth-delay product is the measured answer to the question slow start
+        # searches for, so a process that has already moved bytes hands it over instead of
+        # making the next channel re-discover it. `None` on a cold process leaves the search in
+        # place. Only the *starting* window moves; the control law and the ceiling are
+        # unchanged, so this cannot alter a result.
         return AIMDFlowControl(
             self._config,
             initial_window=initial,
+            # A window past runs disagreed about is still the best guess available, but it has
+            # not earned the right to switch slow start off. See `shuffle_window_is_stable`.
+            initial_window_stable=signature is None
+            or shuffle_window_is_stable(self._hub, signature),
             effective_morsel_bytes=learned_channel_morsel_bytes(self._ctx),
+            bdp_window=measured_bdp_window(self._config),
         )
 
     def recommend_morsel_target(
@@ -347,15 +385,27 @@ class ResourceManager:
         """
         from batcher.carbonite.cache import current_result_cache
         from batcher.carbonite.memory.kernel import kernel_stats
-        from batcher.carbonite.memory.pool import current_process_pool
+        from batcher.carbonite.memory.pool import current_process_pool, engine_pool_stats
+        from batcher.carbonite.policies.concurrency import process_limiter
+        from batcher.carbonite.spill.disk import scratch_disk_stats
 
         level = self._pressure.classify()
         out: dict[str, object] = {
             "pressure_level": level.name,
             "envelope_bytes": self._envelope,
+            # The two budget figures are this query's *share*, so without the share itself a
+            # reader cannot tell a small envelope from a busy machine — which are opposite
+            # problems with opposite fixes (add RAM, or admit fewer queries).
+            "memory_share": self._share,
+            "query_envelope_bytes": self._query_envelope,
             "soft_budget_bytes": self._spill.soft_budget(),
             "hard_budget_bytes": self._spill.hard_budget(),
             "headroom_bytes": self._pressure.headroom_bytes(),
+            "admission": process_limiter(self._config).stats(),
+            # The volume a spill would land on. Carbonite reported memory in detail and disk
+            # not at all, so a query that spilled slowly — or died of ENOSPC — carried nothing
+            # about the disk it spilled to. Two cached `statvfs` calls.
+            "scratch_disk": scratch_disk_stats(),
             # The kernel's own verdict, which the byte accounting cannot supply: a query that
             # spilled with an empty pool and no cache was throttled at `memory.high` or is in a
             # cgroup already carrying an OOM kill. Empty off Linux.
@@ -364,6 +414,15 @@ class ResourceManager:
         pool = current_process_pool()
         if pool is not None:
             out["pool"] = pool.stats()
+        # The *other* pool. `pool` above is the one the control plane constructed and
+        # charges its coarse per-query reservations to; the engine charges operator state
+        # and the Flight transit buffers to a process-wide pool of its own, and on a real
+        # query that is the larger footprint by far. Reported side by side because the pair
+        # is the diagnosis: a query that spilled with Carbonite's pool nearly empty and the
+        # engine's at its limit was bound by an estimate that was too low, not by the box.
+        engine = engine_pool_stats()
+        if engine is not None:
+            out["engine_pool"] = engine
         cache = current_result_cache()
         if cache is not None:
             out["result_cache"] = cache.stats()
@@ -371,6 +430,38 @@ class ResourceManager:
         if flap is not None:
             out["pressure_flap_rate"] = flap
         return out
+
+    def publish_stats(self) -> None:
+        """Put this manager's reading on the event bus, so the metrics export can see it.
+
+        `stats` answers "what did the envelope do" for one caller holding one manager.
+        Every process-wide consumer — the Prometheus exposition, the dashboard, a log
+        line — reaches the engine only through the bus, so without this the whole memory
+        and spill picture stopped at whoever happened to hold the object.
+
+        Published as three groups rather than one, because the reading covers three
+        different concerns and a metrics backend names series by what they measure: memory
+        (the envelope, its budgets, the pools, the kernel's own limits), admission (slots,
+        queue depth, sheds), and the result cache. One group would name the cache's hit rate
+        `batcher_memory_result_cache_hit_rate`, which is not what it measures.
+
+        A no-op when nothing is listening, which is the default: the reading itself is not
+        free (it walks the pool's accounting and consults the kernel), so a process
+        exporting no metrics must not pay for it.
+
+        Returns:
+            None.
+        """
+        from batcher._internal import events
+
+        if not events.listening():
+            return
+        stats = self.stats()
+        for group in ("admission", "result_cache"):
+            reading = stats.pop(group, None)
+            if reading is not None:
+                events.publish(events.RESOURCE, name=group, stats=reading)
+        events.publish(events.RESOURCE, name="memory", stats=stats)
 
     def input_exceeds_budget(self, input_bytes: int) -> bool:
         """Whether reading the sources whole would not fit the memory envelope.
@@ -424,9 +515,21 @@ class ResourceManager:
         return self._spill.compression(plan)
 
     def _hard_budget(self) -> int:
-        """Bytes a query may hold before it must spill — the one figure the spill gate and
-        the reservation share, so the two can never disagree."""
+        """Bytes *this query* may hold before it must spill — the one figure the spill gate
+        and the scheduling grant share, so the two can never disagree."""
         return self._spill.hard_budget()
+
+    def _pool_budget(self) -> int:
+        """The **process-wide** envelope the shared buffer pool is sized to.
+
+        Deliberately not `_hard_budget`, which is this query's *share* of it. The pool is
+        one object serving every concurrent query and the transfer layer, so sizing it to a
+        share would shrink the envelope out from under reservations Carbonite had already
+        granted — and would do it differently depending on which query happened to call
+        `reserve` last. The share bounds what a query plans to hold; the pool bounds what
+        the process may hold, and those are different budgets.
+        """
+        return int(self._envelope * self._config.memory.hard_limit)
 
     @contextmanager
     def admit(self) -> Iterator[object]:
@@ -488,7 +591,7 @@ class ResourceManager:
         """
         from batcher.carbonite.cache import current_result_cache
 
-        pool = process_pool(self._hard_budget())
+        pool = process_pool(self._pool_budget())
         cache = current_result_cache()
         if cache is not None:
             cache.on_pressure(self._pressure.classify())

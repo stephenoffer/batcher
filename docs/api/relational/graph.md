@@ -2,7 +2,7 @@
 
 Graph analytics and graph-ML features over an edge table. Import from `batcher.graph`.
 
-A graph here is a `Dataset` of edges, and every algorithm is a sequence of joins and
+A graph here is a {py:class}`Dataset <batcher.Dataset>` of edges, and every algorithm is a sequence of joins and
 aggregations over it. A join is a join, so PageRank over a billion edges distributes
 across a Ray cluster and spills under memory pressure using the machinery any other query
 uses. There is no second execution path and no graph-shaped index to build first.
@@ -46,7 +46,7 @@ pairs; each takes a blocking key, and choosing it is the engineering.
 
 ## Degree
 
-The cheapest thing you can ask a graph, and usually the first. One `group_by` over the edge list. Note that on a symmetrized graph `degree` counts each edge twice, so `out_degree` is the neighbour count there.
+The cheapest thing you can ask a graph, and usually the first. One {py:meth}`group_by <batcher.Dataset.group_by>` over the edge list. Note that on a symmetrized graph `degree` counts each edge twice, so `out_degree` is the neighbour count there.
 
 ```{eval-rst}
 .. autosummary::

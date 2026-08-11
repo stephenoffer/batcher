@@ -62,10 +62,10 @@ Run any of these directly with `python examples/<name>.py`:
 - `feature_engineering.py` scales columns, buckets them, encodes categories, imputes
   what is missing, all with expressions.
 - `preprocessors.py` builds the same features from fit/transform preprocessor objects
-  and `Chain`.
+  and {py:class}`Chain <batcher.ml.preprocessors.Chain>`.
 - `timeseries.py` covers date-part extraction and resampling, plus period-over-period
   change.
-- `window_functions.py` ranks rows and computes rolling aggregates with `.over(...)`.
+- `window_functions.py` ranks rows and computes rolling aggregates with {py:meth}`.over(...) <batcher.AggExpr.over>`.
 - `sql.py` asks the same questions in SQL, composed with the DataFrame API.
 
 

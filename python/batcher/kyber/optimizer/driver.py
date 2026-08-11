@@ -42,6 +42,34 @@ __all__: list[str] = []
 
 # Confluent rewrite phases iterate to a fixpoint (bounded by `_fixpoint_bound`, which caps
 # pathological non-convergence); every other phase makes a single decision and runs once.
+#
+# **SELECTION is deliberately absent, and the empty-relation rules deliberately are not in it.**
+# That phase used to hold both kinds of rule at once: ones that *produce* the canonical empty
+# marker `Limit(_, 0)` (`zonemap_prune_filter`, `empty_sample_n`,
+# `empty_on_impossible_null_check`) and ones that *consume* one (`project_over_empty`,
+# `aggregate_over_empty`, `window_over_empty`, `propagate_empty_relation`). Run once and unfused
+# -- one bottom-up traversal per rule, in registration order -- a marker emitted by a producer
+# registered after its consumer was never picked up, and there was no next iteration to catch it.
+# The same logical emptiness then collapsed or did not purely on nesting order:
+# `Aggregate(Project(Filter(false)))` reached `Limit 0` at the root while
+# `Project(Aggregate(Filter(false)))` stalled one level short.
+#
+# Those eleven rules now live in FUSION, which iterates, and SELECTION keeps only the three
+# genuine physical choices (`adaptive_build_side`, `split_expensive_filter`,
+# `size_gpu_map_batches`). Splitting them that way rather than simply adding SELECTION here is
+# what the phase's own semantics require: `build_side_rule` must run **exactly once**. It is not
+# idempotent *as a decision* -- on a second pass it re-derives from the join it already swapped,
+# sees the small side correctly on the right, and records `swapped=False` over the
+# `swapped=True` that describes what actually happened. The plan stays right; the
+# `BuildSideDecision` telemetry feeding explain and the learned broadcast crossover does not, and
+# `test_build_side_after_swap` catches it.
+#
+# Two prerequisites had to be fixed before the empty rules could iterate anywhere.
+# `adaptive_build_side` rebuilt the whole join tree on every pass, so the O(1) identity check
+# could never fire; it now shares structure. And the family was not confluent -- nothing
+# collapsed a *nested* marker, so the hoisting rules stacked `Limit(0)` on `Limit(0)`
+# indefinitely, a fourteen-deep tower on TPC-DS q4 growing by one per pass;
+# `propagate_empty_relation` now folds that pair.
 _FIXPOINT_PHASES = frozenset({Phase.NORMALIZE, Phase.REWRITE, Phase.PUSHDOWN, Phase.FUSION})
 
 # Headroom above the plan's depth for rules whose convergence isn't purely depth-linear

@@ -2,7 +2,7 @@
 
 This page lists every reader and writer, then the connector types behind them. For the transformations that sit between a read and a write, see {doc}`Dataset </api/relational/dataset>`.
 
-Readers hang off {py:obj}`bt.read <batcher.read>` and return a lazy `Dataset`. Writers hang off `ds.write` and are terminal, so they execute the plan and return a `WriteManifest`. {py:obj}`bt.read(path, format=None, **opts) <batcher.read>` infers the format from the path, and the dedicated readers below are explicit. Some connectors need an optional dependency. The "Extra" column gives the install name for `pip install 'batcher-engine[<extra>]'`.
+Readers hang off {py:obj}`bt.read <batcher.read>` and return a lazy {py:class}`Dataset <batcher.Dataset>`. Writers hang off {py:obj}`ds.write <batcher.Dataset.write>` and are terminal, so they execute the plan and return a `WriteManifest`. {py:obj}`bt.read(path, format=None, **opts) <batcher.read>` infers the format from the path, and the dedicated readers below are explicit. Some connectors need an optional dependency. The "Extra" column gives the install name for `pip install 'batcher-engine[<extra>]'`.
 
 ## Readers
 
@@ -14,24 +14,29 @@ These read one file, a directory, or a glob from local disk or object storage:
 
 | Reader | Reads | Extra |
 | --- | --- | --- |
-| `bt.read.parquet(path)` | a Parquet file, directory, or glob | |
-| `bt.read.parquet_dataset(path)` | a (Hive-)partitioned Parquet dataset directory | |
-| `bt.read.csv(path)` | a CSV file, directory, or glob | |
-| `bt.read.json(path)` | newline-delimited JSON | |
-| `bt.read.orc(path)` | ORC file(s) | |
-| `bt.read.arrow(path)` | Arrow/Feather IPC file(s) | |
-| `bt.read.avro(path)` | Avro file(s) | `avro` |
-| `bt.read.excel(path)` | Excel workbook(s) | `excel` |
-| `bt.read.xml(path)` | XML file(s) | `xml` |
-| `bt.read.text(path, mode="line")` | text file(s) as rows (`mode="line"` or `"file"`) | |
-| `bt.read.binary(path)` | whole files as `{uri, bytes, size, mime}` rows | |
-| `bt.read.warc(path)` | web-archive (WARC) file(s), one row per record; `.warc.gz` read transparently | |
-| `bt.read.numpy(path)` | NumPy `.npy` / `.npz` file(s) | |
-| `bt.read.hdf5(path)` | HDF5 file(s) | `hdf5` |
-| `bt.read.zarr(path)` | a Zarr store | `zarr` |
-| `bt.read.logs(path, pattern=None)` | line-delimited logs; `pattern=` for grok extraction | |
-| `bt.read.files_incremental(path)` | incrementally discover new files under `path` | |
-| `bt.read.table(name)` | any registered non-file source by name (escape hatch) | |
+| {py:meth}`bt.read.parquet(path) <batcher.api.io_namespace.reader.Reader.parquet>` | a Parquet file, directory, or glob | |
+| {py:meth}`bt.read.parquet_dataset(path) <batcher.api.io_namespace.reader.Reader.parquet_dataset>` | a (Hive-)partitioned Parquet dataset directory | |
+| {py:meth}`bt.read.csv(path) <batcher.api.io_namespace.reader.Reader.csv>` | a CSV file, directory, or glob | |
+| {py:meth}`bt.read.json(path) <batcher.api.io_namespace.reader.Reader.json>` | newline-delimited JSON | |
+| {py:meth}`bt.read.orc(path) <batcher.api.io_namespace.reader.Reader.orc>` | ORC file(s) | |
+| {py:meth}`bt.read.arrow(path) <batcher.api.io_namespace.reader.Reader.arrow>` | Arrow/Feather IPC file(s) | |
+| {py:meth}`bt.read.avro(path) <batcher.api.io_namespace.reader.Reader.avro>` | Avro file(s) | `avro` |
+| {py:meth}`bt.read.excel(path) <batcher.api.io_namespace.reader.Reader.excel>` | Excel workbook(s) | `excel` |
+| {py:meth}`bt.read.fasta(path) <batcher.api.io_namespace.reader.Reader.fasta>` | FASTA file(s) as `{id, description, sequence}`; `.fa`/`.faa`/`.fna`/`.ffn` too | |
+| {py:meth}`bt.read.fastq(path) <batcher.api.io_namespace.reader.Reader.fastq>` | FASTQ read(s) as `{id, description, sequence, quality}`; `.fq` too | |
+| {py:meth}`bt.read.bed(path) <batcher.api.io_namespace.reader.Reader.bed>` | BED intervals, columns named for the file's width (0-based, half-open) | |
+| {py:meth}`bt.read.gff(path) <batcher.api.io_namespace.reader.Reader.gff>` | GFF3 / GTF annotations, nine columns (1-based, inclusive) | |
+| {py:meth}`bt.read.vcf(path) <batcher.api.io_namespace.reader.Reader.vcf>` | VCF variants, sample columns named by the file's header | |
+| {py:meth}`bt.read.xml(path) <batcher.api.io_namespace.reader.Reader.xml>` | XML file(s) | `xml` |
+| {py:meth}`bt.read.text(path, mode="line") <batcher.api.io_namespace.reader.Reader.text>` | text file(s) as rows (`mode="line"` or `"file"`) | |
+| {py:meth}`bt.read.binary(path) <batcher.api.io_namespace.reader.Reader.binary>` | whole files as `{uri, bytes, size, mime}` rows | |
+| {py:meth}`bt.read.warc(path) <batcher.api.io_namespace.reader.Reader.warc>` | web-archive (WARC) file(s), one row per record; `.warc.gz` read transparently | |
+| {py:meth}`bt.read.numpy(path) <batcher.api.io_namespace.reader.Reader.numpy>` | NumPy `.npy` / `.npz` file(s) | |
+| {py:meth}`bt.read.hdf5(path) <batcher.api.io_namespace.reader.Reader.hdf5>` | HDF5 file(s) | `hdf5` |
+| {py:meth}`bt.read.zarr(path) <batcher.api.io_namespace.reader.Reader.zarr>` | a Zarr store | `zarr` |
+| {py:meth}`bt.read.logs(path, pattern=None) <batcher.api.io_namespace.reader.Reader.logs>` | line-delimited logs; `pattern=` for grok extraction | |
+| {py:meth}`bt.read.files_incremental(path) <batcher.api.io_namespace.reader.Reader.files_incremental>` | incrementally discover new files under `path` | |
+| {py:meth}`bt.read.table(name) <batcher.api.io_namespace.reader.Reader.table>` | any registered non-file source by name (escape hatch) | |
 
 ### Lakehouse tables
 
@@ -39,12 +44,12 @@ These read a transactional table through its metadata layer, so a read sees one 
 
 | Reader | Reads | Extra |
 | --- | --- | --- |
-| `bt.read.delta(path, version=, timestamp=)` | a Delta Lake table (time travel) | |
-| `bt.read.iceberg(table, catalog=, snapshot_id=)` | an Iceberg table | |
-| `bt.read.hudi(path)` | an Apache Hudi table (read-only) | |
-| `bt.read.lance(path)` | a Lance dataset | `lance` |
-| `bt.read.databricks(table)` | a Databricks / Unity Catalog table (→ Delta) | |
-| `bt.read.delta_sharing(url)` | a Delta Sharing table by profile URL | |
+| {py:meth}`bt.read.delta(path, version=, timestamp=) <batcher.api.io_namespace.reader.Reader.delta>` | a Delta Lake table (time travel) | |
+| {py:meth}`bt.read.iceberg(table, catalog=, snapshot_id=) <batcher.api.io_namespace.reader.Reader.iceberg>` | an Iceberg table | |
+| {py:meth}`bt.read.hudi(path) <batcher.api.io_namespace.reader.Reader.hudi>` | an Apache Hudi table (read-only) | |
+| {py:meth}`bt.read.lance(path) <batcher.api.io_namespace.reader.Reader.lance>` | a Lance dataset | `lance` |
+| {py:meth}`bt.read.databricks(table) <batcher.api.io_namespace.reader.Reader.databricks>` | a Databricks / Unity Catalog table (→ Delta) | |
+| {py:meth}`bt.read.delta_sharing(url) <batcher.api.io_namespace.reader.Reader.delta_sharing>` | a Delta Sharing table by profile URL | |
 
 ### Warehouses and databases
 
@@ -52,10 +57,10 @@ These submit a query to an external engine and stream the Arrow result back:
 
 | Reader | Reads |
 | --- | --- |
-| `bt.read.sql(query, uri=)` | ADBC / FlightSQL in a single submission (or `table=` for a whole table) |
-| `bt.read.snowflake(query, connection_kwargs=)` | a Snowflake query (parallel result-chunk fetch) |
-| `bt.read.bigquery(...)` | BigQuery via the Storage Read API (parallel Arrow streams) |
-| `bt.read.clickhouse(query)` | a ClickHouse query (Arrow-native) |
+| {py:meth}`bt.read.sql(query, uri=) <batcher.api.io_namespace.reader.Reader.sql>` | ADBC / FlightSQL in a single submission (or `table=` for a whole table) |
+| {py:meth}`bt.read.snowflake(query, connection_kwargs=) <batcher.api.io_namespace.reader.Reader.snowflake>` | a Snowflake query (parallel result-chunk fetch) |
+| {py:meth}`bt.read.bigquery(...) <batcher.api.io_namespace.reader.Reader.bigquery>` | BigQuery via the Storage Read API (parallel Arrow streams) |
+| {py:meth}`bt.read.clickhouse(query) <batcher.api.io_namespace.reader.Reader.clickhouse>` | a ClickHouse query (Arrow-native) |
 
 ### NoSQL
 
@@ -63,10 +68,10 @@ Each of these splits the keyspace so the collection reads in parallel:
 
 | Reader | Reads |
 | --- | --- |
-| `bt.read.mongo(...)` | a MongoDB collection (Arrow-native via pymongoarrow) |
-| `bt.read.cassandra(...)` | Cassandra / Scylla via token-range splits |
-| `bt.read.dynamodb(...)` | DynamoDB via native parallel scan segments |
-| `bt.read.elasticsearch(...)` | Elasticsearch via ES\|QL Arrow / sliced scroll |
+| {py:meth}`bt.read.mongo(...) <batcher.api.io_namespace.reader.Reader.mongo>` | a MongoDB collection (Arrow-native via pymongoarrow) |
+| {py:meth}`bt.read.cassandra(...) <batcher.api.io_namespace.reader.Reader.cassandra>` | Cassandra / Scylla via token-range splits |
+| {py:meth}`bt.read.dynamodb(...) <batcher.api.io_namespace.reader.Reader.dynamodb>` | DynamoDB via native parallel scan segments |
+| {py:meth}`bt.read.elasticsearch(...) <batcher.api.io_namespace.reader.Reader.elasticsearch>` | Elasticsearch via ES\|QL Arrow / sliced scroll |
 
 ### Streaming
 
@@ -74,11 +79,11 @@ These return an unbounded `Dataset`. See {doc}`streaming </user-guide/moving-dat
 
 | Reader | Reads |
 | --- | --- |
-| `bt.read.kafka(topic)` | a Kafka topic as an unbounded streaming source |
-| `bt.read.kinesis(stream_name)` | an AWS Kinesis stream as an unbounded source |
-| `bt.read.pulsar(topic)` | an Apache Pulsar topic as an unbounded source |
-| `bt.read.pubsub(subscription)` | a Google Cloud Pub/Sub subscription as an unbounded source |
-| `bt.read.eventhubs(hub)` | an Azure Event Hubs stream as an unbounded source |
+| {py:meth}`bt.read.kafka(topic) <batcher.api.io_namespace.reader.Reader.kafka>` | a Kafka topic as an unbounded streaming source |
+| {py:meth}`bt.read.kinesis(stream_name) <batcher.api.io_namespace.reader.Reader.kinesis>` | an AWS Kinesis stream as an unbounded source |
+| {py:meth}`bt.read.pulsar(topic) <batcher.api.io_namespace.reader.Reader.pulsar>` | an Apache Pulsar topic as an unbounded source |
+| {py:meth}`bt.read.pubsub(subscription) <batcher.api.io_namespace.reader.Reader.pubsub>` | a Google Cloud Pub/Sub subscription as an unbounded source |
+| {py:meth}`bt.read.eventhubs(hub) <batcher.api.io_namespace.reader.Reader.eventhubs>` | an Azure Event Hubs stream as an unbounded source |
 
 ### Multimodal and ML formats
 
@@ -86,11 +91,11 @@ These read media and document files as rows of bytes plus metadata, decoding onl
 
 | Reader | Reads | Extra |
 | --- | --- | --- |
-| `bt.read.images(path, decode=False)` | images (uri/bytes/size/mime + header meta) | `image` |
-| `bt.read.audio(path, decode=False)` | audio files (+ `waveform` when decoded) | `audio` |
-| `bt.read.video(path, decode=False)` | video files (+ frames when decoded) | `video` |
-| `bt.read.documents(path)` | PDF document(s) as text rows | `pdf` |
-| `bt.read.webdataset(path)` | WebDataset `.tar` shard(s) | |
+| {py:meth}`bt.read.images(path, decode=False) <batcher.api.io_namespace.reader.Reader.images>` | images (uri/bytes/size/mime + header meta) | `image` |
+| {py:meth}`bt.read.audio(path, decode=False) <batcher.api.io_namespace.reader.Reader.audio>` | audio files (+ `waveform` when decoded) | `audio` |
+| {py:meth}`bt.read.video(path, decode=False) <batcher.api.io_namespace.reader.Reader.video>` | video files (+ frames when decoded) | `video` |
+| {py:meth}`bt.read.documents(path) <batcher.api.io_namespace.reader.Reader.documents>` | PDF document(s) as text rows | `pdf` |
+| {py:meth}`bt.read.webdataset(path) <batcher.api.io_namespace.reader.Reader.webdataset>` | WebDataset `.tar` shard(s) | |
 
 ## Writers
 
@@ -102,13 +107,13 @@ These write one file per output partition:
 
 | Writer | Writes | Extra |
 | --- | --- | --- |
-| `ds.write.parquet(path, compression="zstd")` | Parquet | |
-| `ds.write.csv(path)` | CSV | |
-| `ds.write.json(path)` | newline-delimited JSON | |
-| `ds.write.orc(path)` | ORC | |
-| `ds.write.arrow(path)` | Arrow/Feather IPC | |
-| `ds.write.avro(path)` | Avro | `avro` |
-| `ds.write.msgpack(path)` | MessagePack | |
+| {py:meth}`ds.write.parquet(path, compression="zstd") <batcher.api.io_namespace.writer.Writer.parquet>` | Parquet | |
+| {py:meth}`ds.write.csv(path) <batcher.api.io_namespace.writer.Writer.csv>` | CSV | |
+| {py:meth}`ds.write.json(path) <batcher.api.io_namespace.writer.Writer.json>` | newline-delimited JSON | |
+| {py:meth}`ds.write.orc(path) <batcher.api.io_namespace.writer.Writer.orc>` | ORC | |
+| {py:meth}`ds.write.arrow(path) <batcher.api.io_namespace.writer.Writer.arrow>` | Arrow/Feather IPC | |
+| {py:meth}`ds.write.avro(path) <batcher.api.io_namespace.writer.Writer.avro>` | Avro | `avro` |
+| {py:meth}`ds.write.msgpack(path) <batcher.api.io_namespace.writer.Writer.msgpack>` | MessagePack | |
 
 ### Lakehouse tables
 
@@ -116,12 +121,12 @@ These commit through the table's transaction log rather than writing loose files
 
 | Writer | Writes | Extra |
 | --- | --- | --- |
-| `ds.write.delta(path)` | a Delta Lake table (one transactional commit) | |
-| `ds.write.iceberg(table, mode="append")` | an Iceberg table (`append` / `overwrite`) | |
-| `ds.write.hudi(path, mode="append")` | an Apache Hudi table | |
-| `ds.write.lance(path)` | a Lance dataset | `lance` |
-| `ds.write.merge(target, on=)` | upsert (`MERGE INTO`) this dataset into an existing `target`, keyed on `on` | |
-| `ds.write.merge_into(target, on=)` | the full `MERGE INTO`: ordered `WHEN` clauses, each writing its own columns | |
+| {py:meth}`ds.write.delta(path) <batcher.api.io_namespace.writer.Writer.delta>` | a Delta Lake table (one transactional commit) | |
+| {py:meth}`ds.write.iceberg(table, mode="append") <batcher.api.io_namespace.writer.Writer.iceberg>` | an Iceberg table (`append` / `overwrite`) | |
+| {py:meth}`ds.write.hudi(path, mode="append") <batcher.api.io_namespace.writer.Writer.hudi>` | an Apache Hudi table | |
+| {py:meth}`ds.write.lance(path) <batcher.api.io_namespace.writer.Writer.lance>` | a Lance dataset | `lance` |
+| {py:meth}`ds.write.merge(target, on=) <batcher.api.io_namespace.writer.Writer.merge>` | upsert (`MERGE INTO`) this dataset into an existing `target`, keyed on `on` | |
+| {py:meth}`ds.write.merge_into(target, on=) <batcher.api.io_namespace.writer.Writer.merge_into>` | the full `MERGE INTO`: ordered `WHEN` clauses, each writing its own columns | |
 
 ### Merge clauses
 
@@ -145,9 +150,9 @@ These load the result into an external system:
 
 | Writer | Writes |
 | --- | --- |
-| `ds.write.snowflake(table, connection_kwargs=)` | a Snowflake table |
-| `ds.write.sql(table, driver=, db_kwargs=)` | a database table via ADBC / FlightSQL |
-| `ds.write.mongo(...)` | a MongoDB collection |
+| {py:meth}`ds.write.snowflake(table, connection_kwargs=) <batcher.api.io_namespace.writer.Writer.snowflake>` | a Snowflake table |
+| {py:meth}`ds.write.sql(table, driver=, db_kwargs=) <batcher.api.io_namespace.writer.Writer.sql>` | a database table via ADBC / FlightSQL |
+| {py:meth}`ds.write.mongo(...) <batcher.api.io_namespace.writer.Writer.mongo>` | a MongoDB collection |
 
 ## The connector surface
 

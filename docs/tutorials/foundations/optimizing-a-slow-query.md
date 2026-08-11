@@ -21,7 +21,7 @@ and the filter, and the optimizer cannot see through it.
 | Rows the fee arithmetic touches | **200,000** | **20,000** |
 | Predicate pushdown | Blocked: the UDF is opaque | The filter runs *below* the projection |
 | `project` backend | No per-operator metrics at all | **`interp+jit`**, compiled once, reused per morsel |
-| `stats()` / `explain(analyze=True)` | Raises `BackendError` | A full per-operator report |
+| `stats()` / `explain(analyze=True)` | Raises {py:exc}`BackendError <batcher.BackendError>` | A full per-operator report |
 | The answer | Correct | Identical |
 
 Both versions are right. One of them does ten times the arithmetic to get there, and will
@@ -70,7 +70,7 @@ Correct answer. Now find out what it cost.
 
 ## 2. Profile it, and read what is missing
 
-`ds.stats()` runs the query and reports what the engine *measured* per operator. A
+{py:meth}`ds.stats() <batcher.Dataset.stats>` runs the query and reports what the engine *measured* per operator. A
 `map_batches` stage is measured too, so the bottleneck is named:
 
 ```python
@@ -150,7 +150,7 @@ about to be wrong by three orders of magnitude. Hold that thought.
 
 ## 5. Measure it
 
-`stats()` executes the query and reports what the engine measured, operator by operator.
+{py:meth}`stats() <batcher.Dataset.stats>` executes the query and reports what the engine measured, operator by operator.
 
 ```python
 run = fast.stats()

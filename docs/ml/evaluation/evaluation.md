@@ -4,17 +4,17 @@ This page describes how to score predictions against labels in Batcher, and how 
 
 ## Why metrics are expressions here
 
-Every metric on this page is an `Expr`, not a function that takes two arrays. That one decision is what makes the surface different from `sklearn.metrics`:
+Every metric on this page is an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, not a function that takes two arrays. That one decision is what makes the surface different from `sklearn.metrics`:
 
 - The metrics run **in the engine**, so evaluating a billion scored rows never materializes them on a driver.
 - Asking for ten metrics costs what asking for one costs, because they reduce to the same aggregate pass.
-- They compose with `group_by`, so "what is the F1 *per country, per month*" is the same query with a grouping added. That is the question a model review actually asks, and the one a driver-side call cannot answer at scale.
+- They compose with {py:meth}`group_by <batcher.Dataset.group_by>`, so "what is the F1 *per country, per month*" is the same query with a grouping added. That is the question a model review actually asks, and the one a driver-side call cannot answer at scale.
 
 The exceptions are the metrics that need a global ordering rather than a per-row quantity: ROC AUC, average precision, and the KS statistic. Those are Dataset functions built on a window rank, and each adds one sort.
 
 ## One call for a whole task
 
-`ds.ml.evaluate` runs a task's default metric set:
+{py:meth}`ds.ml.evaluate <batcher.api.dataset.ml.DatasetML.evaluate>` runs a task's default metric set:
 
 ```python
 import batcher as bt
@@ -39,7 +39,7 @@ print(ds.ml.evaluate("y", y_score="score", metrics=["precision", "recall", "f1"]
 
 ## The same metrics per segment
 
-Add `by=` and the result is a `Dataset` with one row per group rather than a dict:
+Add `by=` and the result is a {py:class}`Dataset <batcher.Dataset>` with one row per group rather than a dict:
 
 ```python
 ds = bt.from_pydict(
@@ -71,12 +71,12 @@ The full vocabulary:
 | Regression error | `mse`, `rmse`, `normalized_rmse`, `mae`, `medae`, `max_error`, `mean_bias`, `mean_percentage_error` |
 | Relative error | `mape`, `smape`, `wape`, `msle`, `rmsle` |
 | Fit | `r2`, `explained_variance` |
-| Robust objectives | `huber_loss`, `pinball_loss` |
-| Confusion counts | `true_positives`, `false_positives`, `false_negatives`, `true_negatives` |
+| Robust objectives | {py:func}`huber_loss <batcher.huber_loss>`, {py:func}`pinball_loss <batcher.pinball_loss>` |
+| Confusion counts | {py:func}`true_positives <batcher.true_positives>`, {py:func}`false_positives <batcher.false_positives>`, {py:func}`false_negatives <batcher.false_negatives>`, {py:func}`true_negatives <batcher.true_negatives>` |
 | Rates | `accuracy`, `precision`, `recall`, `specificity`, `false_positive_rate`, `false_negative_rate`, `negative_predictive_value`, `prevalence` |
-| Balanced | `f1_score`, `fbeta_score`, `balanced_accuracy`, `matthews_corrcoef`, `cohen_kappa` |
-| Calibration | `log_loss`, `brier_score` |
-| Multi-label | `hamming_loss` (the fraction of label cells predicted wrong) |
+| Balanced | {py:func}`f1_score <batcher.f1_score>`, {py:func}`fbeta_score <batcher.fbeta_score>`, {py:func}`balanced_accuracy <batcher.balanced_accuracy>`, {py:func}`matthews_corrcoef <batcher.matthews_corrcoef>`, {py:func}`cohen_kappa <batcher.cohen_kappa>` |
+| Calibration | {py:func}`log_loss <batcher.log_loss>`, {py:func}`brier_score <batcher.brier_score>` |
+| Multi-label | {py:func}`hamming_loss <batcher.hamming_loss>` (the fraction of label cells predicted wrong) |
 | Diagnostic-test | `jaccard_score`, `false_discovery_rate`, `false_omission_rate`, `positive_likelihood_ratio`, `negative_likelihood_ratio`, `diagnostic_odds_ratio`, `informedness`, `markedness`, `fowlkes_mallows_index`, `geometric_mean_score`, `prevalence_threshold` |
 
 Every one of them is checked against `sklearn.metrics` at 1e-12 in the test suite, so the definitions are the ones you expect.
@@ -95,7 +95,7 @@ A few of these exist specifically because the obvious choice misleads, and it is
 
 `log_loss` and `brier_score` are the only metrics here that score *calibration*. A model that ranks perfectly but predicts probabilities twice as large as the truth looks excellent on AUC and fails the moment a prediction is multiplied by a dollar amount.
 
-`hinge_loss` and `squared_hinge_loss` score a raw decision function rather than a probability, which is the margin a support-vector machine or a linear classifier produces. They are zero once a point is correctly classified with room to spare and grow with how far a point sits on the wrong side, which is the objective those models optimize.
+{py:func}`hinge_loss <batcher.hinge_loss>` and {py:func}`squared_hinge_loss <batcher.squared_hinge_loss>` score a raw decision function rather than a probability, which is the margin a support-vector machine or a linear classifier produces. They are zero once a point is correctly classified with room to spare and grow with how far a point sits on the wrong side, which is the objective those models optimize.
 
 ## Diagnostic tables
 
@@ -131,7 +131,7 @@ ds = bt.from_pydict({"y": ["a", "a", "b", "c"], "p": ["a", "b", "b", "c"]})
 print(classification_report(ds, "y", "p").sort("class").to_pydict()["f1"])
 ```
 
-`evaluate(task="multiclass")` adds the two ways of averaging those per-class numbers, and
+{py:meth}`evaluate(task="multiclass") <batcher.api.dataset.ml.DatasetML.evaluate>` adds the two ways of averaging those per-class numbers, and
 reporting only one of them is how a model that ignores the minority class passes review.
 The **macro** average weights every class equally, so a rare class the model ignores drags
 it down. The **weighted** average weights by support, so it tracks accuracy and a rare class
@@ -218,9 +218,9 @@ from. None of these is a verdict, because a gap can be justified. An unmeasured 
 ## Agreement, not just correlation
 
 A correlation says two series move together; it says nothing about whether they are *equal*. A
-prediction that is always half the truth correlates perfectly and is useless. `bt.concordance_correlation`
+prediction that is always half the truth correlates perfectly and is useless. {py:func}`bt.concordance_correlation <batcher.concordance_correlation>`
 (Lin's CCC) penalises a correlation by how far the means and variances differ;
-`bt.nash_sutcliffe_efficiency` and `bt.kling_gupta_efficiency` are the hydrology efficiency
+{py:func}`bt.nash_sutcliffe_efficiency <batcher.nash_sutcliffe_efficiency>` and {py:func}`bt.kling_gupta_efficiency <batcher.kling_gupta_efficiency>` are the hydrology efficiency
 scores that decompose agreement into correlation, bias, and variability.
 
 ```python
@@ -309,7 +309,7 @@ ds = bt.from_pydict({"y": [0.0, 2.0, 5.0], "p": [1.0, 2.0, 4.0]})
 print(round(ds.agg(m=bt.poisson_deviance("y", "p")).to_pydict()["m"][0], 4))
 ```
 
-`bt.gamma_deviance` handles a positive, right-skewed target (a claim size, a duration). `bt.tweedie_deviance(y, p, power=...)` spans the whole family: 1 is Poisson, 2 is gamma, and a
+{py:func}`bt.gamma_deviance <batcher.gamma_deviance>` handles a positive, right-skewed target (a claim size, a duration). {py:func}`bt.tweedie_deviance(y, p, power=...) <batcher.tweedie_deviance>` spans the whole family: 1 is Poisson, 2 is gamma, and a
 power in ``(1, 2)`` is the compound distribution that describes insurance pure premium.
 `d2_tweedie_score` (in `batcher.ml.metrics`) is the deviance-explained score, R² for a count
 model. `d2_absolute_error_score` and `d2_pinball_score` are the same idea on the L1 and quantile
@@ -338,7 +338,7 @@ That is the honest number for a recommender where the top-1 label being wrong is
 
 ## Baselines
 
-A score means nothing without a floor to read it against. `batcher.ml.dummy.DummyRegressor` (predict the target's mean or median) and `DummyClassifier` (predict the majority class) are that floor: fit and score them on the same split, and a real model has to clear them to have earned its complexity. On an imbalanced target the dummy classifier is the number a high accuracy is quietly matching.
+A score means nothing without a floor to read it against. {py:class}`batcher.ml.dummy.DummyRegressor <batcher.ml.dummy.DummyRegressor>` (predict the target's mean or median) and {py:class}`DummyClassifier <batcher.ml.dummy.DummyClassifier>` (predict the majority class) are that floor: fit and score them on the same split, and a real model has to clear them to have earned its complexity. On an imbalanced target the dummy classifier is the number a high accuracy is quietly matching.
 
 ```python
 import batcher as bt

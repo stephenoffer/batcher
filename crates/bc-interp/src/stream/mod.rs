@@ -65,7 +65,7 @@ mod runtime_filter;
 pub use parallel::{
     execute_streaming_parallel, execute_streaming_parallel_metered,
     execute_streaming_parallel_metered_or_hand_off, execute_streaming_parallel_or_hand_off,
-    streaming_parallelizes,
+    materializing_aggregate_is_faster, streaming_parallelizes,
 };
 
 use breaker::{drain, exec_breaker};

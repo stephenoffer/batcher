@@ -7,11 +7,12 @@ breaker with two inputs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import PlanError
+from batcher._internal.errors import PlanError, require_float
 from batcher.plan.ir_tags import ORDERING_COMPARISONS, Op
 from batcher.plan.logical.base import LogicalPlan, _reject_duplicate_aliases
 from batcher.plan.schema import SchemaRef
@@ -23,6 +24,8 @@ __all__ = [
     "RangeCondition",
     "RangeJoin",
     "WatermarkStreamJoin",
+    "align_join_key_types",
+    "asof_tolerance",
 ]
 
 
@@ -63,21 +66,94 @@ def _validate_key_types(
     left_keys: tuple[str, ...],
     right_keys: tuple[str, ...],
 ) -> None:
-    """Reject a join whose key columns have mismatched types.
+    """Reject a join whose key columns have types with no common supertype.
 
-    The engine's row-encoder compares keys byte-for-byte and requires each paired
-    key to have the *same* Arrow type (it does not coerce ``Int64`` against
-    ``Float64`` or ``Utf8``). Without this check a mismatch surfaces only at
-    execution as an opaque ``RowConverter column schema mismatch`` — so we validate
-    at build time when both sides' schemas are known, and stay silent otherwise.
+    The engine's row-encoder compares keys byte-for-byte and requires each paired key to
+    have the *same* Arrow type. A mismatch that the promotion lattice **can** reconcile is
+    handled before this runs, by `align_join_key_types`, which casts both sides up. What
+    reaches here is a pair with no lossless common type at all — an `int64` key against a
+    `string` one — which is a data-contract error, not something to coerce.
+
+    Validated at build time when both sides' schemas are known, and silent otherwise, so
+    the failure names the two columns instead of surfacing at execution as an opaque
+    ``RowConverter column schema mismatch``.
     """
     pairs = _paired_key_types(left, right, left_keys, right_keys)
     for lk, rk, lt, rt in pairs:
         if not lt.equals(rt):
             raise PlanError(
-                f"join key type mismatch: left {lk!r} is {lt} but right {rk!r} is {rt}; "
-                f"cast one side so the keys share a type"
+                f"join key type mismatch: left {lk!r} is {lt} but right {rk!r} is {rt}, "
+                f"and there is no type that holds both without losing data; cast one side "
+                f"explicitly so the keys share a type"
             )
+
+
+def align_join_key_types(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    left_keys: tuple[str, ...],
+    right_keys: tuple[str, ...],
+) -> tuple[LogicalPlan, LogicalPlan]:
+    """Cast each side's join keys up to the pair's common supertype, where one exists.
+
+    A join's row encoder needs the two key columns to have the *identical* Arrow type, and
+    two sources rarely agree: a fact table's ``decimal(10,2)`` against a dimension's
+    ``decimal(12,4)``, a `timestamp[ms]` file against a `timestamp[us]` one, an all-null
+    column from an empty partition. Every one of those is the same number or the same
+    instant on both sides, and every one of them used to be rejected outright with "cast
+    one side so the keys share a type" — a correct diagnosis of the encoder's requirement,
+    and an unhelpful answer to a join DuckDB simply runs.
+
+    This inserts the cast the error message used to ask the user for, choosing the target
+    from the same `promote` lattice that decides a union's output type, so a join and a
+    union of the same two columns agree. Nothing is narrowed: both sides move *up* to a
+    type that holds either, so no key value can change and no match can be gained or lost.
+
+    Pairs the lattice cannot reconcile are left exactly as they are, so
+    `_validate_key_types` still raises for them on the node it builds.
+
+    Args:
+        left: The left input plan.
+        right: The right input plan.
+        left_keys: The left key column names.
+        right_keys: The right key column names, positionally paired with `left_keys`.
+
+    Returns:
+        The two plans, each wrapped in a projection casting its keys where needed, or
+        returned untouched when every pair already agrees.
+    """
+    from batcher.plan.expr_ir import Col
+    from batcher.plan.logical.relational import Project, Projection
+    from batcher.plan.types import dtype_name, promote
+
+    left_casts: dict[str, str] = {}
+    right_casts: dict[str, str] = {}
+    for lk, rk, lt, rt in _paired_key_types(left, right, left_keys, right_keys):
+        if lt.equals(rt):
+            continue
+        common = promote(lt, rt)
+        if common is None:
+            continue  # no lossless common type — `_validate_key_types` reports it
+        name = dtype_name(common)
+        if name is None:
+            continue  # a nested common type the cast vocabulary cannot spell
+        if not lt.equals(common):
+            left_casts[lk] = name
+        if not rt.equals(common):
+            right_casts[rk] = name
+
+    def _apply(plan: LogicalPlan, casts: dict[str, str]) -> LogicalPlan:
+        if not casts:
+            return plan
+        # Rebuild every column so the projection is a pure in-place retype: the key keeps
+        # its name and position, and nothing else about the relation changes.
+        items = tuple(
+            Projection(c, Col(c).cast(casts[c]) if c in casts else Col(c))
+            for c in plan.available_columns()
+        )
+        return Project(plan, items)
+
+    return _apply(left, left_casts), _apply(right, right_casts)
 
 
 def _paired_key_types(
@@ -116,7 +192,46 @@ JOIN_TYPES = frozenset({"inner", "left", "right", "full", "semi", "anti"})
 JOIN_STRATEGIES = frozenset({"hash", "broadcast", "sort_merge"})
 
 # The nearest-match directions an ASOF join may search in.
-ASOF_DIRECTIONS = frozenset({"backward", "forward"})
+ASOF_DIRECTIONS = frozenset({"backward", "forward", "nearest"})
+
+
+def asof_tolerance(value: int | float | str | timedelta | None) -> float | None:
+    """Normalize an ASOF `tolerance` to the number the engine compares against.
+
+    A plain number is already in the `on` key's own units and passes through. A duration
+    -- a string such as ``"5m"`` or a `datetime.timedelta` -- becomes **microseconds**,
+    which is the unit the engine normalizes every temporal key to, so one tolerance works
+    against a `Timestamp` of any resolution and against a `Date` alike.
+
+    The duration syntax is `plan.functions.temporal`'s, so ``"1h30m"`` means here exactly
+    what it means when sizing an event-time window. Calendar units (months, years) are
+    rejected there and stay rejected here: a tolerance has to be a fixed length to be
+    comparable against a key difference.
+
+    Args:
+        value: The tolerance as the caller spelled it, or ``None`` for uncapped.
+
+    Returns:
+        The tolerance in the key's units (microseconds for a duration), or ``None``.
+
+    Raises:
+        PlanError: If the value is negative, or is a duration that is not a fixed length.
+    """
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        micros = value / timedelta(microseconds=1)
+        if micros < 0:
+            raise PlanError(f"asof_join tolerance must be non-negative, got {value!r}")
+        return float(micros)
+    if isinstance(value, str):
+        from batcher.plan.functions.temporal import _duration_micros
+
+        return float(_duration_micros(value, arg="asof_join tolerance"))
+    tol = require_float(value, func="join_asof", arg="tolerance")
+    if tol < 0:
+        raise PlanError(f"asof_join tolerance must be non-negative, got {value!r}")
+    return tol
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,16 +271,30 @@ class Join(LogicalPlan):
         # materialized to a name-keyed structure.
         _reject_duplicate_aliases([o.alias for o in self.output], what="join output")
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the two inputs.
+
+        Four places in `dist/` emit this node with per-task scans substituted — the shuffle
+        executor, the Flight shuffle, the broadcast path and the spilling path — and each of
+        them used to restate the field list. Two of the four had already drifted: they
+        omitted `strategy`, so a planner-chosen `broadcast` or `sort_merge` silently reverted
+        to `hash` on those paths. See `AsofJoin.shape_ir` for the same seam and the same
+        reason.
+        """
         return {
             "op": Op.HASH_JOIN,
-            "left": self.left.to_ir(),
-            "right": self.right.to_ir(),
             "left_keys": list(self.left_keys),
             "right_keys": list(self.right_keys),
             "join_type": self.join_type,
             "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in self.output],
             "strategy": self.strategy,
+        }
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            **self.shape_ir(),
+            "left": self.left.to_ir(),
+            "right": self.right.to_ir(),
         }
 
     def available_columns(self) -> list[str]:
@@ -226,8 +355,19 @@ class AsofJoin(LogicalPlan):
 
     Each left row is matched to the right row whose `on` key is nearest in
     `direction` (``"backward"``: largest right.on ≤ left.on; ``"forward"``: smallest
-    ≥), within the same `by` group (exact equality). Left-style: every left row is
-    emitted, with null right columns when unmatched. A pipeline breaker.
+    ≥; ``"nearest"``: whichever of the two is closer, backward on a tie), within the
+    same `by` group (exact equality). Left-style: every left row is emitted, with null
+    right columns when unmatched. A pipeline breaker.
+
+    `tolerance` caps the distance between the two keys, in the key's own units and in
+    microseconds for a temporal key. Beyond it the left row is unmatched rather than
+    carrying a stale value. It and ``"nearest"`` both need a numeric or temporal `on`
+    key, because both subtract two keys.
+
+    `allow_exact_matches` decides whether a right row whose key *equals* the left row's may
+    be the match. Setting it false is pandas' strict form, and is how a backtest avoids
+    look-ahead bias: a quote stamped at the same instant as the trade is information the
+    trade did not have.
     """
 
     left: LogicalPlan
@@ -236,8 +376,12 @@ class AsofJoin(LogicalPlan):
     right_on: str
     left_by: tuple[str, ...]
     right_by: tuple[str, ...]
-    direction: str  # "backward" | "forward"
+    direction: str  # one of ASOF_DIRECTIONS
     output: tuple[JoinOutputCol, ...]
+    #: Max distance between the matched keys; `None` = uncapped.
+    tolerance: float | None = None
+    #: Whether a right row whose `on` key equals the left row's may be the match.
+    allow_exact_matches: bool = True
 
     def __post_init__(self) -> None:
         left_cols = set(self.left.available_columns())
@@ -251,18 +395,34 @@ class AsofJoin(LogicalPlan):
         if self.direction not in ASOF_DIRECTIONS:
             allowed = sorted(ASOF_DIRECTIONS)
             raise PlanError(f"asof_join direction must be one of {allowed}, got {self.direction!r}")
+        if self.tolerance is not None and not self.tolerance >= 0:
+            raise PlanError(f"asof_join tolerance must be non-negative, got {self.tolerance!r}")
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the two inputs.
+
+        Split out because the distributed planner emits the same node with per-task scans
+        substituted for its children (`dist.executor`), and restating the field list there
+        is how a new field silently stops crossing the cluster: a `tolerance` honoured
+        single-node and dropped distributed is a wrong answer, not an error.
+        """
         return {
             "op": Op.ASOF_JOIN,
-            "left": self.left.to_ir(),
-            "right": self.right.to_ir(),
             "left_on": self.left_on,
             "right_on": self.right_on,
             "left_by": list(self.left_by),
             "right_by": list(self.right_by),
-            "backward": self.direction == "backward",
+            "direction": self.direction,
+            "tolerance": self.tolerance,
+            "allow_exact_matches": self.allow_exact_matches,
             "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in self.output],
+        }
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            **self.shape_ir(),
+            "left": self.left.to_ir(),
+            "right": self.right.to_ir(),
         }
 
     def available_columns(self) -> list[str]:
@@ -333,17 +493,23 @@ class RangeJoin(LogicalPlan):
         )
         _reject_duplicate_aliases([o.alias for o in self.output], what="range join output")
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the two inputs — see `AsofJoin.shape_ir` for why."""
         return {
             "op": Op.RANGE_JOIN,
-            "left": self.left.to_ir(),
-            "right": self.right.to_ir(),
             "conditions": [
                 {"left_key": c.left_key, "right_key": c.right_key, "op": c.op}
                 for c in self.conditions
             ],
             "join_type": self.join_type,
             "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in self.output],
+        }
+
+    def to_ir(self) -> dict[str, Any]:
+        return {
+            **self.shape_ir(),
+            "left": self.left.to_ir(),
+            "right": self.right.to_ir(),
         }
 
     def available_columns(self) -> list[str]:

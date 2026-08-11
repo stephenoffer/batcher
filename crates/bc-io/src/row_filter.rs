@@ -52,7 +52,6 @@ use arrow::array::{
 use arrow::compute::kernels::{boolean, cmp};
 use arrow::datatypes::{DataType, Schema};
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
-use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::SchemaDescriptor;
@@ -341,7 +340,7 @@ pub(crate) fn estimate(
 /// Call only with a `cols` from [`plan`] and after [`worth_it`] has approved the measured
 /// selectivity — this function does no gating of its own.
 pub(crate) fn build(pred: &Pred, cols: &[String], descr: &SchemaDescriptor) -> RowFilter {
-    let mask = ProjectionMask::columns(descr, cols.iter().map(|s| s.as_str()));
+    let mask = crate::projection::exact_columns(descr, cols.iter().map(|s| s.as_str()));
     let owned = pred.clone();
     let f = ArrowPredicateFn::new(mask, move |batch: RecordBatch| Ok(mask_of(&owned, &batch)));
     RowFilter::new(vec![Box::new(f)])

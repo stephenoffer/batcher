@@ -150,6 +150,12 @@ def eval_math(ir, df, be, eval_expr):
         neg = (x < 0).fillna(False).astype("int64")
         return (pos - neg).astype(be.dtype(_float64())).where(x.notna(), None)
     if fn == "round":
+        if be.is_integer(x):
+            # Rounding an integer to zero digits is the identity, and the engine says so —
+            # the same rule `eval_math2` follows for `round(x, digits)` through `_round_int`.
+            # The float path below returns the right number in the wrong column, and loses
+            # every value above 2^53 on the way past.
+            return _round_int(x, 0)
         return round_half_away(x, 0, be)
     if fn == "abs" and be.is_integer(x):
         # The one unary function whose result keeps an integer input's type. Both libraries'

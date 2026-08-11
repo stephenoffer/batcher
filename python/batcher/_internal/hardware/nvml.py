@@ -229,6 +229,30 @@ def _decode(value) -> str:
     return value.decode() if isinstance(value, bytes) else str(value or "")
 
 
+#: The enum values `device_telemetry` passes, resolved by name with the documented value as the
+#: fallback. `_THROTTLE_BITS` already argues the case — read by name so a release that renumbers
+#: cannot silently mislabel — and then four selectors were passed as bare integers anyway. A
+#: renumbering there is worse than a mislabel: the calls still succeed and return a *different
+#: device property*, so the fleet would report, say, a memory clock as its graphics clock, or a
+#: correctable ECC count as the uncorrectable one that quarantines a board.
+#:
+#: The fallback is what the value has been across every NVML release, so a binding too old to
+#: publish the constant behaves exactly as it did before.
+_ENUMS: dict[str, int] = {
+    "NVML_TEMPERATURE_GPU": 0,
+    "NVML_CLOCK_GRAPHICS": 0,
+    "NVML_MEMORY_ERROR_TYPE_UNCORRECTED": 1,
+    "NVML_VOLATILE_ECC": 0,
+    "NVML_TEMPERATURE_THRESHOLD_SLOWDOWN": 1,
+}
+
+
+def _enum(nv, name: str) -> int:
+    """One NVML enum value, by name, falling back to its long-standing documented value."""
+    value = getattr(nv, name, None)
+    return int(value) if isinstance(value, int) else _ENUMS[name]
+
+
 def device_telemetry() -> tuple[DeviceTelemetry, ...]:
     """Live readings for every device on this host, in NVML index order.
 
@@ -243,6 +267,11 @@ def device_telemetry() -> tuple[DeviceTelemetry, ...]:
     if nv is None:
         return ()
     count = _device_count(nv)
+    temp_gpu = _enum(nv, "NVML_TEMPERATURE_GPU")
+    clock_graphics = _enum(nv, "NVML_CLOCK_GRAPHICS")
+    ecc_uncorrected = _enum(nv, "NVML_MEMORY_ERROR_TYPE_UNCORRECTED")
+    ecc_volatile = _enum(nv, "NVML_VOLATILE_ECC")
+    threshold_slowdown = _enum(nv, "NVML_TEMPERATURE_THRESHOLD_SLOWDOWN")
     out: list[DeviceTelemetry] = []
     for index in range(count):
         handle = _read(lambda i=index: nv.nvmlDeviceGetHandleByIndex(i), None)
@@ -259,21 +288,37 @@ def device_telemetry() -> tuple[DeviceTelemetry, ...]:
                 power_limit_watts=(
                     _read(lambda h=handle: nv.nvmlDeviceGetEnforcedPowerLimit(h), 0) / 1000.0
                 ),
-                temperature_c=float(_read(lambda h=handle: nv.nvmlDeviceGetTemperature(h, 0), 0)),
+                temperature_c=float(
+                    _read(lambda h=handle: nv.nvmlDeviceGetTemperature(h, temp_gpu), 0)
+                ),
                 sm_utilization=(getattr(util, "gpu", 0) or 0) / 100.0,
                 memory_utilization=(getattr(util, "memory", 0) or 0) / 100.0,
                 memory_used_bytes=int(getattr(mem, "used", 0) or 0),
                 memory_total_bytes=int(getattr(mem, "total", 0) or 0),
                 ecc_uncorrected=int(
-                    _read(lambda h=handle: nv.nvmlDeviceGetTotalEccErrors(h, 1, 0), 0) or 0
+                    _read(
+                        lambda h=handle: nv.nvmlDeviceGetTotalEccErrors(
+                            h, ecc_uncorrected, ecc_volatile
+                        ),
+                        0,
+                    )
+                    or 0
                 ),
                 throttle_reasons=_throttle_reasons(nv, handle),
-                graphics_clock_mhz=int(_read(lambda h=handle: nv.nvmlDeviceGetClockInfo(h, 0), 0)),
-                # `NVML_TEMPERATURE_THRESHOLD_SLOWDOWN` (1): the point the driver itself starts
+                graphics_clock_mhz=int(
+                    _read(lambda h=handle: nv.nvmlDeviceGetClockInfo(h, clock_graphics), 0)
+                ),
+                # `NVML_TEMPERATURE_THRESHOLD_SLOWDOWN`: the point the driver itself starts
                 # clamping at, which is the only threshold that means the same thing on every
                 # part in a mixed fleet.
                 slowdown_temperature_c=float(
-                    _read(lambda h=handle: nv.nvmlDeviceGetTemperatureThreshold(h, 1), 0) or 0
+                    _read(
+                        lambda h=handle: nv.nvmlDeviceGetTemperatureThreshold(
+                            h, threshold_slowdown
+                        ),
+                        0,
+                    )
+                    or 0
                 ),
             )
         )
@@ -300,29 +345,42 @@ def _device_count(nv) -> int:
             return 0
 
 
-def total_power_watts() -> float:
+def total_power_watts(sample: tuple[DeviceTelemetry, ...] | None = None) -> float:
     """Sum of every local device's instantaneous draw, or `0.0` when unreadable.
 
     The measured counterpart of `plan.energy.fleet_power_watts`: what a node is actually
     pulling, against what its hardware was budgeted to pull.
 
+    Args:
+        sample: A reading already taken, to derive this view from instead of probing again.
+            `None` — the default, and what every caller had — takes its own.
+
     Returns:
         Watts across all local devices.
     """
-    return sum(d.power_watts for d in device_telemetry())
+    return sum(d.power_watts for d in (device_telemetry() if sample is None else sample))
 
 
-def throttled_devices() -> tuple[DeviceTelemetry, ...]:
+def throttled_devices(
+    sample: tuple[DeviceTelemetry, ...] | None = None,
+) -> tuple[DeviceTelemetry, ...]:
     """Devices whose clocks the driver is currently clamping.
 
     A throttled device is the failure mode that looks like a performance regression: the job
     still completes and still returns the right answer, at a fraction of the rate, and nothing
     in the job's own timings says why.
 
+    Args:
+        sample: A reading already taken, to derive this view from instead of probing again.
+            A report that wants the draw, the throttled set, and the raw readings otherwise
+            sweeps every device three times — thirteen NVML calls per device per sweep — and
+            gets three readings taken at three different instants, so its own numbers need not
+            agree with each other. `None` keeps the pre-existing behavior of probing.
+
     Returns:
         The throttled subset of `device_telemetry`, empty when none or when unreadable.
     """
-    return tuple(d for d in device_telemetry() if d.throttled)
+    return tuple(d for d in (device_telemetry() if sample is None else sample) if d.throttled)
 
 
 def device_processes(index: int) -> tuple[tuple[int, int], ...]:

@@ -640,6 +640,9 @@ mod tests {
     fn a_breaker_probe_side_keeps_the_filter_at_its_own_output() {
         let plan = RelOp::Distinct {
             input: Box::new(scan(0)),
+            keys: Vec::new(),
+            order: Vec::new(),
+            limit: None,
         };
         let (target, name) = sink_target(&plan, "k");
         assert!(matches!(target, RelOp::Distinct { .. }));

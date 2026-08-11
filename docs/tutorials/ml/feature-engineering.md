@@ -15,7 +15,7 @@ PyTorch, so it is shown but not executed.
 run.
 :::
 
-A preprocessor is an object, not a `Dataset` method, for one reason: `fit` learns
+A preprocessor is an object, not a {py:class}`Dataset <batcher.Dataset>` method, for one reason: `fit` learns
 state (a mean, a category set, bin edges) that has to be *reused* on held-out data.
 `fit` runs one mergeable aggregate in the engine; `transform` is a lazy column rewrite.
 Nothing here touches a row in Python.
@@ -130,7 +130,7 @@ print([round(v, 3) for v in scaled_train.to_pydict()["age"]])
 ```
 
 The two imputed ages (`33.0`) both land on the same standardized value, just below the
-mean. `MinMaxScaler`, `MaxAbsScaler`, and `RobustScaler` are drop-in alternatives with
+mean. {py:class}`MinMaxScaler <batcher.ml.preprocessors.MinMaxScaler>`, {py:class}`MaxAbsScaler <batcher.ml.preprocessors.MaxAbsScaler>`, and {py:class}`RobustScaler <batcher.ml.preprocessors.RobustScaler>` are drop-in alternatives with
 the same `fit`/`transform` contract.
 
 ## Encode the categorical column
@@ -213,7 +213,7 @@ replaying them, in order, over every split: four or five chances to fit on the w
 frame and leak test statistics without ever failing.
 {py:obj}`Chain <batcher.ml.preprocessors.Chain>` is that loop written once. `fit` threads
 each step's output into the next; `transform` replays the fitted steps in order. A
-`Chain` is itself a `Preprocessor`, so it nests.
+`Chain` is itself a {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>`, so it nests.
 
 ```python
 from batcher.ml.preprocessors import Chain

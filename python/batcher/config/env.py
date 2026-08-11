@@ -42,11 +42,21 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_REMOTE_READ_CONCURRENCY": "in-flight object-store range requests",
     "BATCHER_READ_RETRY_ATTEMPTS": "retries for a failed source read",
     "BATCHER_READ_RETRY_BACKOFF_S": "base backoff between source read retries",
+    "BATCHER_REMOTE_WRITE_CONCURRENCY": "in-flight object-store PUTs during a write",
+    "BATCHER_PARTITION_WARN_THRESHOLD": "partition directories in one shard before a warning",
+    "BATCHER_MAX_WEIGHED_SPLITS": "split count past which an unknown weight is taken as 1",
     "BATCHER_WRITE_RETRY_ATTEMPTS": "retries for a failed sink write",
     "BATCHER_WRITE_RETRY_BACKOFF_S": "base backoff between sink write retries",
     "BATCHER_JSON_CHUNK_BYTES": "JSON reader chunk size",
     "BATCHER_NATIVE_STREAM_MAX_DEPTH": "native Parquet stream prefetch depth",
     "BATCHER_NATIVE_WINDOW_BYTES": "native Parquet decode window",
+    "BATCHER_FOOTER_CACHE_ROW_GROUPS": "row groups held in the split planner's footer cache",
+    "BATCHER_ORC_STRIPE_BYTES": "target bytes per ORC stripe read",
+    # --- streaming file readers, bounded by payload bytes rather than rows ----------
+    # A row in these formats is a whole image or array, so a row count bounds nothing that
+    # matters; these are the byte budgets that actually cap a batch.
+    "BATCHER_NUMPY_CHUNK_BYTES": "bytes per chunk streamed off a memory-mapped .npy",
+    "BATCHER_WEBDATASET_BATCH_BYTES": "payload bytes per WebDataset batch",
     # --- distributed scan / scheduling ---------------------------------------------
     "BATCHER_SPLIT_TARGET_BYTES": "target bytes per scan split",
     "BATCHER_SCAN_PREFETCH": "scan-task prefetch depth",

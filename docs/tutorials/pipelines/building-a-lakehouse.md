@@ -58,7 +58,7 @@ print(bt.read.parquet(raw).count())
 ## 3. Silver: a transactional curated table
 
 Silver is where the table becomes trustworthy: filtered, typed, deduplicated, and
-transactional. `ds.write.delta(uri, mode="overwrite")` commits the whole dataset as one
+transactional. {py:meth}`ds.write.delta(uri, mode="overwrite") <batcher.api.io_namespace.writer.Writer.delta>` commits the whole dataset as one
 Delta transaction, so a reader either sees the old table or the new one, never half of
 either.
 

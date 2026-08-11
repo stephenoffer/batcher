@@ -33,6 +33,24 @@ const PARALLEL_SORT_MIN_ROWS: usize = 1 << 17;
 /// while staying a negligible fraction of a large sort.
 const SAMPLE_TARGET: usize = 8192;
 
+/// One routed range: the rows it owns, and whether its key was *proved* constant.
+///
+/// The flag is what [`split_constant_ranges`] learned and used to throw away. It proves the
+/// range's sort permutation is the identity — every row ties on the single sort key, ties
+/// resolve to input order, and `bucket_indices` built the range in ascending input order — so
+/// the per-range worker can skip gathering the key column and sorting it. That is not a
+/// micro-optimization on this shape: it is the whole per-range cost. `ORDER BY <a 7-value
+/// string>` splits into `parts` constant pieces that between them cover **every row of the
+/// column**, so gathering their keys is a full `take` of a 6 M-row `Utf8` array — offsets,
+/// data buffer and all — performed only for `sort_indices_of` to hand back `0..n` unchanged.
+///
+/// Set only on the single-key path (`keys.len() == 1`). With two keys a range constant in the
+/// leading key still has to sort by the second, so the identity does not follow.
+struct Range {
+    idx: Vec<u32>,
+    constant: bool,
+}
+
 /// Parallel single-node full sort by sample-sort.
 ///
 /// Returns `None` (caller uses the serial `sort_batch`) unless it applies: a full sort (no
@@ -159,29 +177,77 @@ pub(crate) fn parallel_sort_batch(
     // ordered, every core gets an even share, and no final reverse is needed (the encoding
     // already carries the leading key's direction).
     //
-    // A **single** low-cardinality key has the same problem and no fallback: seven distinct
-    // values cut at most seven ranges however many are asked for. Extending this to one key
-    // needs the composite to carry a trailing row index (otherwise it ties for every row and
-    // routes identically), which is sound — `(keys…, row index)` is exactly the order this
-    // sort produces — but it is a *performance* change, and it is not landed here because it
-    // could not be measured: on this machine the same benchmark case swung 110 ms to 580 ms
-    // run to run under other sessions' load, on both the old and the new code. See
-    // `competitor_technique_review.md` item 9.
-    let fair_share = batch.num_rows() / parts;
+    // A **single** low-cardinality key has the same problem and cannot use that fallback: with
+    // one key the composite encoding ties for every row in a range, so it would route them all
+    // back together. It has a cheaper answer instead. A range whose key is *constant* is
+    // already in its final order — every row ties, and ties resolve to input order, which is
+    // exactly the order `bucket_indices` handed it — so it can be cut at any point and the
+    // pieces, concatenated in order, reproduce it exactly. [`split_constant_ranges`] does that,
+    // turning "seven ranges on ninety-six cores" into `parts` even ones.
+    //
+    // Note what this does and does not fix. The per-range *sort* was never the cost on this
+    // shape: `already_ordered` settles a constant range in one pass, so the ranges were cheap
+    // and merely too few. The **payload gather** is the cost, and it is per-range — so
+    // splitting is what puts it on every core.
+    //
+    // The two branches trigger at different thresholds, deliberately. The composite re-route
+    // pays for a whole row encoding of every key, so it wants real skew (3x) before it is
+    // worth it. Splitting costs one short-circuiting scan of a range that is *already* too big
+    // for one core, so it pays as soon as a range exceeds a fair share — and it has to, because
+    // the failure here is not skew at all: twenty-five evenly-sized ranges on ninety-six cores
+    // are perfectly balanced and still leave seventy-one cores idle. A 3x skew test cannot see
+    // that, and the shape is exactly `ORDER BY <a 25-value column>`.
+    let fair_share = (batch.num_rows() / parts).max(1);
     let max_bucket = buckets.iter().map(Vec::len).max().unwrap_or(0);
-    if keys.len() > 1 && max_bucket > fair_share.saturating_mul(3).max(1) {
-        if let Some(cp) = composite_part_of(&key_arrays, keys, parts)? {
+    let split_single_key = keys.len() == 1 && max_bucket > fair_share;
+    // The composite encoding, kept when the re-route uses it: a range then sorts by comparing
+    // rows of *this* encoding instead of building a second one over its own key gather.
+    let mut composite_rows: Option<arrow::row::Rows> = None;
+    if keys.len() > 1 && max_bucket > fair_share.saturating_mul(3) {
+        if let Some((cp, rows)) = composite_part_of(&key_arrays, keys, parts)? {
             buckets = bc_runtime::shuffle::bucket_indices(&cp, parts);
             reverse = false;
+            composite_rows = Some(rows);
         }
     }
+    let ranges: Vec<Range> = if split_single_key {
+        split_constant_ranges(buckets, key, fair_share, reverse)
+    } else {
+        buckets
+            .into_iter()
+            .map(|idx| Range {
+                idx,
+                constant: false,
+            })
+            .collect()
+    };
 
     // Each range sorts independently: gather only its *key* columns (one or two narrow
     // arrays), sort those, then map the range-local permutation back through the range's
-    // row indices and gather the payload once.
-    let mut sorted: Vec<RecordBatch> = buckets
+    // row indices and gather the payload once. A range `split_constant_ranges` proved
+    // constant skips both — its permutation is the identity (see [`Range`]) — and goes
+    // straight to the one payload gather every range pays.
+    let mut sorted: Vec<RecordBatch> = ranges
         .par_iter()
-        .map(|idx| -> Result<RecordBatch, InterpError> {
+        .map(|range| -> Result<RecordBatch, InterpError> {
+            let idx = &range.idx;
+            if range.constant {
+                return Ok(bc_runtime::shuffle::gather_rows(batch, idx)?);
+            }
+            // Composite re-route: the routing encoding already orders these rows, so sort the
+            // range's row numbers by it directly. Ties on the whole encoded key are rows equal
+            // on every sort key, and they break on the input row number — the same input order
+            // `stable_lexsort_indices` resolves them to, which is why `sort_unstable_by` is
+            // safe here (a unique final key makes the comparator a total order).
+            if let Some(rows) = composite_rows.as_ref() {
+                let mut order = idx.clone();
+                order.sort_unstable_by(|&a, &b| {
+                    rows.row(a as usize)
+                        .cmp(&rows.row(b as usize))
+                        .then(a.cmp(&b))
+                });
+                return Ok(bc_runtime::shuffle::gather_rows(batch, &order)?);
+            }
             let take_idx = UInt32Array::from(idx.clone());
             let range_keys: Vec<ArrayRef> = key_arrays
                 .iter()
@@ -201,6 +267,110 @@ pub(crate) fn parallel_sort_batch(
     Ok(Some(sorted))
 }
 
+/// Whether every row of `idx` carries the same string key, so the range is already in its
+/// final order and may be cut anywhere — and, on the single-key path, sorted by the identity
+/// permutation rather than sorted at all (see [`Range`]).
+///
+/// Restricted to the string key types on purpose. This exists for the shape the goal of the
+/// whole module keeps running into — `ORDER BY <a column with seven values>` — and a
+/// low-cardinality *fixed-width* key does not have the problem in the same way: its ranges
+/// radix-sort in `O(n)` and its values are compared without touching a second buffer. Widening
+/// this to every type means a `make_comparator` dynamic dispatch per row to answer a question
+/// only the string case is asking.
+///
+/// A range of nulls counts as constant: routing groups nulls together, and they are all equal
+/// to each other for ordering, so the same cut-anywhere argument applies.
+///
+/// **The scan is parallel, and that is not a micro-optimization.** The `false` answer costs
+/// two comparisons (`all` short-circuits), but the `true` answer — the one this is asked for —
+/// has to read every row of the range, and the ranges it is asked about are by definition
+/// oversized. Serially that is a fresh single-threaded pass over most of the column, added to
+/// a sort whose every other phase is already spread across the cores: routing, bucketing and
+/// the per-range work all run under rayon. Measured serially it cost more than the imbalance
+/// it was there to fix, which made the whole optimization a regression on the exact shape it
+/// targets.
+fn constant_range(key: &ArrayRef, idx: &[u32]) -> bool {
+    fn all_equal<O: OffsetSizeTrait + Sync>(a: &GenericStringArray<O>, idx: &[u32]) -> bool {
+        let Some(&first) = idx.first() else {
+            return true;
+        };
+        if a.is_null(first as usize) {
+            return idx.par_iter().all(|&i| a.is_null(i as usize));
+        }
+        let head = a.value(first as usize);
+        idx.par_iter()
+            .all(|&i| !a.is_null(i as usize) && a.value(i as usize) == head)
+    }
+    match key.data_type() {
+        DataType::Utf8 => key
+            .as_any()
+            .downcast_ref::<GenericStringArray<i32>>()
+            .is_some_and(|a| all_equal(a, idx)),
+        DataType::LargeUtf8 => key
+            .as_any()
+            .downcast_ref::<GenericStringArray<i64>>()
+            .is_some_and(|a| all_equal(a, idx)),
+        _ => false,
+    }
+}
+
+/// Cut every constant-key range longer than `target` into contiguous pieces, so a key with
+/// fewer distinct values than there are cores still spreads across them.
+///
+/// The pieces stay in input order and stay adjacent, so concatenating them reproduces the
+/// range they came from — that is the whole correctness argument, and it holds only because
+/// the range is constant (see [`constant_range`]) and because `bucket_indices` builds each
+/// range in ascending input order.
+///
+/// `reverse` is whether the caller is about to reverse the whole range list for a descending
+/// sort. A range's pieces must come out of that in input order, because ties resolve to input
+/// order in **both** directions — descending inverts the key comparison, never the tie-break —
+/// so they are emitted backwards here precisely so the caller's reverse puts them back.
+fn split_constant_ranges(
+    buckets: Vec<Vec<u32>>,
+    key: &ArrayRef,
+    target: usize,
+    reverse: bool,
+) -> Vec<Range> {
+    let mut out: Vec<Range> = Vec::with_capacity(buckets.len());
+    for bucket in buckets {
+        // A bucket small enough to be one core's share is left whole — but it may still be
+        // constant, and saying so is free here (the scan short-circuits on the second row of
+        // a non-constant one) while saving the worker a key gather it would otherwise pay.
+        // Only ranges *proved* constant carry the flag; an unchecked one is merely sorted the
+        // ordinary way, so a wrong `false` costs speed and never correctness.
+        if bucket.len() <= target {
+            let constant = constant_range(key, &bucket);
+            out.push(Range {
+                idx: bucket,
+                constant,
+            });
+            continue;
+        }
+        if !constant_range(key, &bucket) {
+            out.push(Range {
+                idx: bucket,
+                constant: false,
+            });
+            continue;
+        }
+        let pieces = bucket.len().div_ceil(target);
+        let size = bucket.len().div_ceil(pieces);
+        let mut chunks: Vec<Range> = bucket
+            .chunks(size)
+            .map(|c| Range {
+                idx: c.to_vec(),
+                constant: true,
+            })
+            .collect();
+        if reverse {
+            chunks.reverse();
+        }
+        out.append(&mut chunks);
+    }
+    out
+}
+
 /// Range-route every row by the **full composite sort key**, for when the leading key alone is
 /// too low-cardinality to separate `parts` balanced ranges.
 ///
@@ -211,11 +381,18 @@ pub(crate) fn parallel_sort_batch(
 /// out in ascending composite order (the final sorted order — the caller must NOT reverse).
 /// rows equal on the whole key always land together. `None` when there is too little data to
 /// sample, leaving the caller on its leading-key routing.
+/// Returns the per-row partition **and the encoding it routed by**, because the per-range
+/// sort wants exactly that encoding and would otherwise build a second one. A `RowConverter`
+/// pass over every row of every key is the dominant cost of a multi-key sort — the encoding
+/// is the sort — so paying for it twice roughly doubles the work. `Rows::row(i)` compares
+/// byte-lexicographically and its order *is* the multi-key order (each key's direction and
+/// nulls placement are baked in, which is the same property the routing relies on), so a
+/// range sorts by comparing rows of this encoding with no re-encode and no key gather.
 fn composite_part_of(
     key_arrays: &[ArrayRef],
     keys: &[SortKey],
     parts: usize,
-) -> Result<Option<Vec<u32>>, InterpError> {
+) -> Result<Option<(Vec<u32>, arrow::row::Rows)>, InterpError> {
     use arrow::compute::SortOptions;
     use arrow::row::{RowConverter, SortField};
 
@@ -248,15 +425,14 @@ fn composite_part_of(
         .map(|j| sample[(j * m / parts).min(m - 1)].to_vec())
         .collect();
 
-    Ok(Some(
-        (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let r = rows.row(i).data();
-                bounds.partition_point(|b| b.as_slice() <= r) as u32
-            })
-            .collect(),
-    ))
+    let part_of: Vec<u32> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let r = rows.row(i).data();
+            bounds.partition_point(|b| b.as_slice() <= r) as u32
+        })
+        .collect();
+    Ok(Some((part_of, rows)))
 }
 
 /// Sample `parts-1` ascending f64 quantile boundaries from a float key column. Returns
@@ -475,6 +651,145 @@ mod tests {
         assert_matches_serial(&b, &key(true, true));
     }
 
+    /// Sorting a range by the *routing* encoding must equal the serial oracle across every
+    /// combination of direction and nulls placement.
+    ///
+    /// The reuse rests on the encoding carrying each key's `descending`/`nulls_first` itself,
+    /// which is the same property the routing depends on — so the way it could be wrong is a
+    /// mismatch between the `SortField` options `composite_part_of` encodes with and the
+    /// `SortOptions` the per-range sort would have used. Nulls in both keys and all four
+    /// direction pairings is what makes such a mismatch show up as a reordered relation
+    /// rather than a coincidentally-equal one.
+    #[test]
+    fn composite_encoding_reuse_matches_serial_under_every_direction() {
+        let n = 200_000usize;
+        let mut s: u64 = 11;
+        let (mut flags, mut price) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for i in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            flags.push(if i % 7 == 0 {
+                None
+            } else {
+                Some(["A", "N", "R"][(s >> 33) as usize % 3])
+            });
+            price.push(if i % 11 == 0 {
+                None
+            } else {
+                Some(((s >> 20) % 1000) as i64)
+            });
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("p", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(flags)) as ArrayRef,
+                Arc::new(Int64Array::from(price)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        for lead_desc in [false, true] {
+            for second_desc in [false, true] {
+                for nulls_first in [false, true] {
+                    let keys = vec![
+                        SortKey {
+                            expr: Expr::Col { name: "s".into() },
+                            descending: lead_desc,
+                            nulls_first,
+                        },
+                        SortKey {
+                            expr: Expr::Col { name: "p".into() },
+                            descending: second_desc,
+                            nulls_first,
+                        },
+                    ];
+                    assert_matches_serial(&batch, &keys);
+                }
+            }
+        }
+    }
+
+    /// The constant-range shortcut ([`Range::constant`]) must produce the serial oracle's
+    /// relation, not merely a correctly *ordered* one.
+    ///
+    /// This is the shape that takes it: a single low-cardinality string key, whose oversized
+    /// buckets `split_constant_ranges` proves constant and cuts, and whose pieces then skip
+    /// the key gather and the per-range sort entirely. Every row of the column ends up in
+    /// such a piece, so if the identity permutation were the wrong answer the result would be
+    /// wrong for the whole relation rather than at an edge. Payloads are distinct and
+    /// ascending, so the oracle comparison sees tie order — an order-independent check would
+    /// pass on a shuffled result, which is exactly the bug this shortcut could introduce.
+    #[test]
+    fn constant_ranges_take_identity_and_match_serial() {
+        let n = 1 << 19;
+        let modes = ["AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK"];
+        let vals: Vec<Option<&str>> = (0..n).map(|i| Some(modes[i % modes.len()])).collect();
+        let b = str_batch(vals, (0..n as i64).collect());
+        assert_matches_serial(&b, &key(false, false));
+        assert_matches_serial(&b, &key(true, false));
+    }
+
+    /// The same shortcut with nulls in the key: a null range is constant too (all nulls are
+    /// equal for ordering), so it takes the identity path and must still land where
+    /// `nulls_first` says, in input order, under both directions.
+    #[test]
+    fn constant_null_range_takes_identity_and_matches_serial() {
+        let n = 1 << 19;
+        // Seven distinct values, as above: fewer and `sample_boundaries_str` cannot cut
+        // `parts` boundaries at all, so the sample-sort declines and the test would prove
+        // nothing about the shortcut.
+        let modes = ["AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK"];
+        // The null period must be coprime with the boundary sampler's stride (a power of two
+        // here). At `i % 4` every sampled index is a multiple of 4 and therefore null, the
+        // sample comes back empty, and the sample-sort declines — the test would then be
+        // asserting nothing while looking like it passed.
+        let vals: Vec<Option<&str>> = (0..n)
+            .map(|i| {
+                if i % 5 == 0 {
+                    None
+                } else {
+                    Some(modes[i % modes.len()])
+                }
+            })
+            .collect();
+        let b = str_batch(vals, (0..n as i64).collect());
+        for k in [
+            key(false, false),
+            key(false, true),
+            key(true, false),
+            key(true, true),
+        ] {
+            assert_matches_serial(&b, &k);
+        }
+    }
+
+    /// A range proved constant is exactly the one whose sort permutation is the identity.
+    /// Pinning that directly, rather than only through the end-to-end oracle, is what keeps
+    /// the shortcut honest if `split_constant_ranges` is ever widened to a key type where the
+    /// argument does not hold.
+    #[test]
+    fn split_marks_only_proved_constant_ranges() {
+        let key_arr: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("a"),
+            Some("a"),
+            Some("a"),
+            Some("b"),
+            Some("c"),
+        ]));
+        // One oversized constant bucket (cut into pieces, all marked), and one mixed bucket
+        // (left whole, unmarked).
+        let out = split_constant_ranges(vec![vec![0, 1, 2, 3], vec![4, 5]], &key_arr, 2, false);
+        let constant: Vec<bool> = out.iter().map(|r| r.constant).collect();
+        let idx: Vec<Vec<u32>> = out.iter().map(|r| r.idx.clone()).collect();
+        assert_eq!(idx, vec![vec![0, 1], vec![2, 3], vec![4, 5]]);
+        assert_eq!(constant, vec![true, true, false]);
+    }
+
     #[test]
     fn string_sample_sort_is_stable_on_ties() {
         // One distinct-ish key repeated: equal keys must keep input order (payload
@@ -624,6 +939,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A single low-cardinality string key must still produce exactly the serial oracle's
+    /// relation once its oversized ranges are cut into pieces — in both directions, and with
+    /// nulls, which form a constant range of their own.
+    ///
+    /// The descending case is the one that can actually break: the caller reverses the range
+    /// list, so pieces emitted in input order would come back reversed and rows tied on the key
+    /// would leave in the wrong order. That is invisible to an order-independent comparison,
+    /// which is why this asserts full batch equality against `sort_batch`.
+    ///
+    /// **The split only engages above 7 cores**, because the trigger is
+    /// `max_bucket > rows/parts` and seven values fill seven buckets — so it needs `parts > 7`.
+    /// On a smaller machine this still asserts the right answer, but through the unsplit path.
+    /// [`oversized_constant_ranges_are_actually_split`] is the machine-independent proof that
+    /// the splitting itself is exercised; without it, a low-core CI box would run this test
+    /// green while never touching the code it was written for.
+    #[test]
+    fn a_split_low_cardinality_string_key_matches_serial() {
+        let n = 1 << 19;
+        let shipmodes = ["AIR", "RAIL", "TRUCK", "MAIL", "SHIP", "FOB", "REG AIR"];
+        for with_nulls in [false, true] {
+            let vals: Vec<Option<&str>> = (0..n)
+                .map(|i| {
+                    if with_nulls && i % 11 == 0 {
+                        None
+                    } else {
+                        Some(shipmodes[(i * 7 + i / 5) % shipmodes.len()])
+                    }
+                })
+                .collect();
+            let b = str_batch(vals, (0..n as i64).collect());
+            for descending in [false, true] {
+                for nulls_first in [false, true] {
+                    let keys = key(descending, nulls_first);
+                    let want = sort_batch(&b, &keys, None).unwrap();
+                    let ranges = parallel_sort_batch(&b, &keys, None)
+                        .unwrap()
+                        .expect("sample-sort should engage on a 512 K-row string key");
+                    assert_eq!(
+                        want,
+                        concat_ranges(&b.schema(), ranges),
+                        "nulls={with_nulls} desc={descending} nulls_first={nulls_first}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The split must actually happen, or the test above passes on the unsplit path and proves
+    /// nothing about the code it exists to cover.
+    ///
+    /// Seven distinct values over `parts` ranges cannot fill more than seven of them, so the
+    /// unsplit routing is guaranteed to be skewed — the assertion is that the balancer reacts.
+    #[test]
+    fn oversized_constant_ranges_are_actually_split() {
+        let idx: Vec<Vec<u32>> = vec![(0..1000u32).collect(), (1000..1010u32).collect()];
+        let key: ArrayRef = Arc::new(StringArray::from(
+            (0..1010)
+                .map(|i| if i < 1000 { "a" } else { "b" })
+                .collect::<Vec<_>>(),
+        ));
+
+        let split = split_constant_ranges(idx.clone(), &key, 100, false);
+        assert_eq!(
+            split.len(),
+            11,
+            "1000 rows at a target of 100, plus the tail"
+        );
+        assert_eq!(
+            split
+                .iter()
+                .flat_map(|r| r.idx.iter().copied())
+                .collect::<Vec<u32>>(),
+            (0..1010u32).collect::<Vec<u32>>(),
+            "the pieces must concatenate back to the original row order"
+        );
+
+        // Reversed, the pieces of one range come out backwards so the caller's reverse of the
+        // whole list restores them.
+        let split = split_constant_ranges(idx.clone(), &key, 100, true);
+        let mut flat: Vec<Range> = split;
+        flat.reverse();
+        let head: Vec<u32> = flat
+            .iter()
+            .skip(1)
+            .flat_map(|r| r.idx.iter().copied())
+            .collect();
+        assert_eq!(
+            head,
+            (0..1000u32).collect::<Vec<u32>>(),
+            "after the caller's reverse, the split range is back in input order"
+        );
+
+        // A range that is not constant must never be cut, whatever its size.
+        let mixed: ArrayRef = Arc::new(StringArray::from(
+            (0..1010)
+                .map(|i| if i % 2 == 0 { "a" } else { "b" })
+                .collect::<Vec<_>>(),
+        ));
+        assert_eq!(
+            split_constant_ranges(idx, &mixed, 100, false).len(),
+            2,
+            "a range holding two distinct values has no cut point"
+        );
     }
 
     #[test]

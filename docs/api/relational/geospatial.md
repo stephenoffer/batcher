@@ -7,7 +7,7 @@ A geometry column is **WKB in a Binary column**. That is the encoding GeoParquet
 PostGIS and DuckDB spatial all store, so a column round-trips through any of them
 unconverted. A
 geometry that will not parse yields null rather than raising, because one corrupt row in
-a hundred million must not abort a scan; `st_is_valid_reason` names every bad row and
+a hundred million must not abort a scan; {py:func}`st_is_valid_reason <batcher.st_is_valid_reason>` names every bad row and
 why. A query bug, such as a negative radius or an unsupported EPSG code, does raise.
 
 To learn these rather than look them up, start with
@@ -19,7 +19,7 @@ To learn these rather than look them up, start with
 
 ## Reading and writing geometry
 
-Crossing between the WKB a geometry column holds and the text encodings people and other systems use. You rarely need `st_geom_from_text`: every function here accepts a text column directly and detects WKT, EWKT, GeoJSON or hex WKB by content.
+Crossing between the WKB a geometry column holds and the text encodings people and other systems use. You rarely need {py:func}`st_geom_from_text <batcher.st_geom_from_text>`: every function here accepts a text column directly and detects WKT, EWKT, GeoJSON or hex WKB by content.
 
 ```{eval-rst}
 .. autosummary::
@@ -40,7 +40,7 @@ Crossing between the WKB a geometry column holds and the text encodings people a
 
 ## Building and deriving geometry
 
-Turning coordinate columns into geometries, and reducing a geometry to a simpler shape. `st_envelope` and `st_convex_hull` are the two rungs of a filter ladder: the box is exact to compute and is what an index stores, the hull is tighter but costs a sort.
+Turning coordinate columns into geometries, and reducing a geometry to a simpler shape. {py:func}`st_envelope <batcher.st_envelope>` and {py:func}`st_convex_hull <batcher.st_convex_hull>` are the two rungs of a filter ladder: the box is exact to compute and is what an index stores, the hull is tighter but costs a sort.
 
 ```{eval-rst}
 .. autosummary::
@@ -64,7 +64,7 @@ Turning coordinate columns into geometries, and reducing a geometry to a simpler
 
 ## Ordinates, bounds and counts
 
-The cheap functions. `st_xmin` and its three siblings are the ones to know: materialize them once beside the geometry and every later region filter becomes four Float64 comparisons that push down to the scan.
+The cheap functions. {py:func}`st_xmin <batcher.st_xmin>` and its three siblings are the ones to know: materialize them once beside the geometry and every later region filter becomes four Float64 comparisons that push down to the scan.
 
 ```{eval-rst}
 .. autosummary::
@@ -163,7 +163,7 @@ The OGC predicates, which are the join conditions and filter clauses of spatial 
 
 ## Moving, normalizing and reprojecting
 
-Affine transforms that cannot invalidate a geometry, normalizations for a column that arrived with different conventions, and `st_transform`, which is how a measurement becomes metres.
+Affine transforms that cannot invalidate a geometry, normalizations for a column that arrived with different conventions, and {py:func}`st_transform <batcher.st_transform>`, which is how a measurement becomes metres.
 
 ```{eval-rst}
 .. autosummary::

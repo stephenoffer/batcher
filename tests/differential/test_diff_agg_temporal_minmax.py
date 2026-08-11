@@ -82,9 +82,9 @@ def test_temporal_min_preserves_timezone(duck):
             "g": ["a", "a", "b"],
             "v": pa.array(
                 [
-                    datetime.datetime(2020, 1, 1, 5, tzinfo=datetime.timezone.utc),
-                    datetime.datetime(2020, 1, 1, 2, tzinfo=datetime.timezone.utc),
-                    datetime.datetime(2019, 6, 6, tzinfo=datetime.timezone.utc),
+                    datetime.datetime(2020, 1, 1, 5, tzinfo=datetime.UTC),
+                    datetime.datetime(2020, 1, 1, 2, tzinfo=datetime.UTC),
+                    datetime.datetime(2019, 6, 6, tzinfo=datetime.UTC),
                 ],
                 type=tz,
             ),

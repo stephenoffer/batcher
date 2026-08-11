@@ -16,8 +16,16 @@ Two properties are the whole design.
 **Bounded state.** A key's state lives until its TTL expires. Without one, the operator
 retains a row per key seen since the query started — correct, and a leak measured in days
 on any real key space. The TTL is checked once per micro-batch against the *engine's*
-clock rather than per key on a timer, so expiry costs one pass over the state, not a
-thread.
+clock rather than per key on a timer, so there is no timer thread.
+
+That check costs **O(keys expired)**, not O(keys retained), and the difference is what
+decides whether the operator has a scale ceiling. A trigger that touches ten keys used to
+walk all of them three times over — once to find the stale ones, twice more to size the
+retained bytes for the budget and the metrics — so a ten-million-key space paid thirty
+million dict steps per second to expire nothing. Insertion order *is* touch order here
+(a touched key is reinserted, and the clock is held non-decreasing), so expiry walks the
+stale prefix and stops at the first live key, and the byte estimate is a running maximum
+rather than a scan.
 
 **Checkpointable state.** State is a flat mapping of scalars, so the whole key space
 serializes as one Arrow `RecordBatch` — the same thing `_AggFold` hands the `StateStore`.
@@ -58,7 +66,19 @@ _KEY = "__bt_state_key"
 class KeyedStateFold:
     """Per-key user state, folded across micro-batches and expired by a TTL."""
 
-    __slots__ = ("_cap", "_cfg", "_dropped", "_fn", "_input_ir", "_keys", "_nat", "_state", "_ttl")
+    __slots__ = (
+        "_cap",
+        "_cfg",
+        "_clock",
+        "_dropped",
+        "_fn",
+        "_input_ir",
+        "_keys",
+        "_nat",
+        "_state",
+        "_ttl",
+        "_widest",
+    )
 
     def __init__(self, node: TransformWithState) -> None:
         self._nat = engine()
@@ -69,10 +89,20 @@ class KeyedStateFold:
         # Constant for the query, so read and serialize it once rather than per micro-batch
         # (the same hoist `_AggFold` makes, and for the same reason).
         self._cfg = active_config().engine_config_json()
-        #: ``{key_tuple: (state_mapping, last_touched_micros)}``.
+        #: ``{key_tuple: (state_mapping, last_touched_micros)}``, in **last-touched order**.
+        #: A touched key is removed and reinserted so it moves to the end, which is what lets
+        #: `_expire` stop at the first key that is still live instead of walking the rest.
         self._state: dict[tuple, tuple[dict[str, Any], int]] = {}
         self._cap = active_config().memory.streaming_state_budget_bytes()
         self._dropped = 0
+        #: The most state fields any key has held. A running maximum rather than a scan, so
+        #: the budget check is O(1); it never falls when a wide key is forgotten, which
+        #: over-estimates the footprint and is the safe direction for a cap.
+        self._widest = 0
+        #: The last stamp handed out, held non-decreasing. `time.time()` can step backwards
+        #: (an NTP correction), and a key stamped into the future would sit at the head of
+        #: the order and stop expiry for every key behind it.
+        self._clock = 0
 
     # --- the fold ---------------------------------------------------------
     def push(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
@@ -95,14 +125,17 @@ class KeyedStateFold:
             return self._expire()
         rows = self._nat.execute_plan(self._input_ir, [[batch]], self._cfg)
         out: list[pa.RecordBatch] = []
-        now = _now_micros()
+        now = self._tick()
         for key, group in _group_by(rows, self._keys):
             previous = self._state.get(key)
             produced, new_state = self._fn(key, group, previous[0] if previous else None)
-            if new_state is None:
-                self._state.pop(key, None)
-            else:
-                self._state[key] = (_check_state(new_state, key), now)
+            # Removed either way: a forgotten key is gone, and a retained one has to be
+            # *reinserted* to move to the end of the last-touched order `_expire` reads.
+            self._state.pop(key, None)
+            if new_state is not None:
+                checked = _check_state(new_state, key)
+                self._widest = max(self._widest, len(checked))
+                self._state[key] = (checked, now)
             emitted = _as_batch(produced)
             if emitted is not None and emitted.num_rows:
                 out.append(emitted)
@@ -110,17 +143,39 @@ class KeyedStateFold:
         self._check_bounded()
         return out
 
+    def _tick(self) -> int:
+        """The stamp for this micro-batch, never earlier than the one before it.
+
+        `time.time()` is not monotonic — an NTP correction steps it backwards — and one
+        backwards step would file a key ahead of keys touched before it. `_expire` reads the
+        dict's order as touch order and stops at the first live key, so a single
+        out-of-order entry near the head would pin every stale key behind it forever.
+        """
+        self._clock = max(self._clock, _now_micros())
+        return self._clock
+
     def _expire(self) -> list[pa.RecordBatch]:
         """Forget every key untouched for longer than the TTL.
+
+        Walks the **stale prefix only**. Keys sit in last-touched order (`push` reinserts a
+        touched key at the end and `_tick` keeps the stamps non-decreasing), so the first key
+        that is still live proves every key after it is too, and the scan stops there. That
+        is the difference between paying for what expires and paying for what is retained:
+        a trigger that expires nothing out of ten million keys does one dict step.
 
         Returns an empty list — expiry emits nothing. It is a list so the caller can
         `extend` it unconditionally, and so a future event-time expiry that *does* emit
         (Spark's `GroupState` timeout callback) is a change to this function alone.
         """
+        self._dropped = 0
         if self._ttl <= 0 or not self._state:
             return []
-        cutoff = _now_micros() - self._ttl
-        stale = [key for key, (_, touched) in self._state.items() if touched < cutoff]
+        cutoff = self._tick() - self._ttl
+        stale = []
+        for key, (_, touched) in self._state.items():
+            if touched >= cutoff:
+                break  # and so is everything behind it — the order guarantees it
+            stale.append(key)
         for key in stale:
             del self._state[key]
         self._dropped = len(stale)
@@ -152,11 +207,16 @@ class KeyedStateFold:
         undercounts it by the size of everything it points at. Charging a flat per-entry
         cost plus the key and value counts tracks the shape that actually grows — the
         number of keys — which is what the budget is defending against.
+
+        The field count is the running maximum `push` maintains, not a scan of every value.
+        This is called twice per micro-batch (the budget check and the metrics), so a scan
+        here was two full walks of the key space per trigger to compute a number that
+        changes only when a key holds more fields than any key ever has.
         """
         if not self._state:
             return 0
         per_field = 64  # a boxed scalar plus its dict slot, rounded up
-        fields = 1 + max(len(v[0]) for v in self._state.values())
+        fields = 1 + self._widest
         return len(self._state) * (per_field * (fields + len(self._keys)))
 
     def metrics(self) -> StateOperatorProgress:
@@ -187,17 +247,29 @@ class KeyedStateFold:
         return pa.record_batch(columns)
 
     def restore(self, state: pa.RecordBatch) -> None:
-        """Rebuild the key space from a checkpoint snapshot."""
+        """Rebuild the key space from a checkpoint snapshot.
+
+        The snapshot's row order is the last-touched order `state()` wrote it in, and
+        rebuilding in that order is what keeps `_expire`'s early stop correct across a
+        restart. The derived counters are rebuilt with it: a restored `_widest` of zero
+        would report a near-empty footprint and leave the state budget unenforced until
+        some key happened to be touched.
+        """
         self._state = {}
+        self._widest = 0
         if state is None or state.num_rows == 0:
             return
         names = [n for n in state.schema.names if n not in (_KEY, _TOUCHED)]
         keys = state.column(_KEY).to_pylist()
         touched = state.column(_TOUCHED).to_pylist()
         values = {name: state.column(name).to_pylist() for name in names}
-        for i, raw in enumerate(keys):
-            key = tuple(json.loads(raw))
-            self._state[key] = ({n: values[n][i] for n in names}, int(touched[i]))
+        ordered = sorted(range(len(keys)), key=lambda i: int(touched[i]))
+        for i in ordered:
+            key = tuple(json.loads(keys[i]))
+            fields = {n: values[n][i] for n in names}
+            self._widest = max(self._widest, len(fields))
+            self._state[key] = (fields, int(touched[i]))
+        self._clock = max(self._clock, int(touched[ordered[-1]]))
 
 
 def _now_micros() -> int:

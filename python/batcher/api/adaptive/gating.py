@@ -11,7 +11,8 @@ means the gate stays pure and unit-testable without executing a query.
 from __future__ import annotations
 
 from batcher._internal.logging import note_suppressed
-from batcher.api.adaptive.plan_surgery import joins, walk
+from batcher.api.adaptive.plan_surgery import BREAKERS, joins, walk
+from batcher.api.source_stats import build_estimator
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Scan, is_streamable
 from batcher.plan.stats import Provenance
@@ -94,11 +95,25 @@ def resolve_adaptive(
 def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     """Whether the query is big enough for stage-by-stage re-optimization to pay at all.
 
-    A join, and total scan input clearing either `_ADAPTIVE_MIN_INPUT_ROWS` **or**
-    `_ADAPTIVE_MIN_INPUT_BYTES`. Both read EXACT source row counts, so this separates scales
-    without depending on the guessed operand size the rest of the gate is about; the byte
-    term additionally reads the scan's width, which is a property of the schema and of the
-    source's own measurements rather than of an estimate.
+    A join, and total scan input clearing either the row floor **or** the byte floor. Both
+    read EXACT source row counts, so this separates scales without depending on the guessed
+    operand size the rest of the gate is about; the byte term additionally reads the scan's
+    width, which is a property of the schema and of the source's own measurements rather
+    than of an estimate.
+
+    The floor is **per stage**, not per query, and that is the whole point of it. What
+    staging costs is not a constant of the query, it is a constant of each *cut*: one
+    materialize, one re-plan, and the operator fusion and streaming width given up at that
+    boundary. A plan with one breaker-produced operand pays that once; a snowflake with six
+    pays it six times. A single flat number cannot separate those, so it was set high enough
+    for the worst of them — which is why adaptivity was off for essentially every query
+    below 20M rows, including the cheap two-breaker shapes where it costs almost nothing.
+
+    Scaling the floor by the number of breakers the loop would cut at fixes both ends: a
+    two-breaker plan now qualifies at half the old floor, and a six-breaker plan needs half
+    again more than the old floor before it is allowed to try — which is the direction the
+    measured sf10 regressions point (q8 4.1x, q17 6.3x, q9 3.3x, q3 3.1x are all
+    many-breaker shapes; see `resolve_adaptive`).
 
     Args:
         plan: The logical plan being routed.
@@ -110,9 +125,28 @@ def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     """
     if not joins(plan):
         return False
-    estimator = _build_estimator(sources, hub)
+    estimator = build_estimator(sources, hub)
     rows, in_bytes = _total_input_size(plan, estimator)
-    return rows >= _ADAPTIVE_MIN_INPUT_ROWS or in_bytes >= _ADAPTIVE_MIN_INPUT_BYTES
+    stages = _stage_count(plan)
+    return (
+        rows >= _ADAPTIVE_MIN_ROWS_PER_STAGE * stages
+        or in_bytes >= _ADAPTIVE_MIN_BYTES_PER_STAGE * stages
+    )
+
+
+def _stage_count(plan: LogicalPlan) -> int:
+    """How many stages the loop would cut `plan` into — its pipeline-breaker count.
+
+    `staging` runs one breaker per stage (`lowest_breaker`, then splice, then repeat), so
+    the breaker count is what the per-stage cost multiplies. It is an upper bound rather
+    than the exact number: the loop skips a breaker whose output size is already known
+    exactly, which measured as 17 of 51 across the TPC-H shapes. Erring high is the safe
+    direction here — it asks a complicated plan to be larger before staging it — and the
+    exact count is not available without running the loop, which is the thing being decided.
+
+    Never below 1, so the floor is a floor even for a plan the walk finds nothing in.
+    """
+    return max(1, sum(1 for node in walk(plan) if isinstance(node, BREAKERS)))
 
 
 def _learned_adaptive_route(plan: LogicalPlan, hub) -> str | None:
@@ -142,17 +176,37 @@ def record_adaptive_route(hub, plan: LogicalPlan, staged: bool, wall_ms: float) 
         note_suppressed("api", "record adaptive-routing outcome", exc)
 
 
-# Below this total input-row count, stage-by-stage re-optimization is not worth its
-# cost. Adaptive re-opt trades a per-stage materialize + re-plan (~20-40ms of control
-# plane) for a better downstream join/build-side choice — a win only when the data is
-# large enough that a mis-estimated plan would cost *more* than that overhead. At
-# interactive / dev scale (a few million rows, the whole query well under a second) the
-# one-shot plan is already fast and the re-plan is pure overhead. The gate reads EXACT
-# source row counts, so it separates scales cleanly (TPC-H sf1≈9M off, sf10≈90M on)
-# without ever depending on the guessed operand size it is trying to protect against.
-_ADAPTIVE_MIN_INPUT_ROWS = 20_000_000
+# Input rows required *per stage the loop would cut* before stage-by-stage re-optimization
+# is worth its cost. Adaptive re-opt trades a per-stage materialize + re-plan (~20-40 ms of
+# control plane, plus the fusion and streaming width given up at that boundary) for a better
+# downstream join/build-side choice — a win only when the data is large enough that a
+# mis-estimated plan would cost *more* than that overhead.
+#
+# This was a flat 20,000,000 for the whole query, and the flatness was the defect rather
+# than the number. One cut costs about a thirtieth of what a query over 10M rows costs; six
+# cuts cost six times that. A single threshold has to be set for the worst shape it will see,
+# so it was, and the consequence was that the loop never engaged on anything below 20M rows
+# — the great majority of queries, including the cheap two-breaker shapes where a cut is
+# nearly free. "The adaptive moat is off for most queries" was a fair description.
+#
+# The per-stage number is chosen to hold the old floor **fixed at the shape it was
+# calibrated on**. Every regression recorded against staging — q8 4.1x, q17 6.3x, q9 3.3x,
+# q3 3.1x at sf10 — is a many-breaker query, so 20M was in effect the right answer for a
+# four-cut plan. 4 x 5M is that same 20M. What changes is everything either side of it:
+#
+#   breakers   old floor   new floor
+#   2          20M          10M      <- the cheap shape, now reachable
+#   4          20M          20M      <- unchanged, the calibration point
+#   6          20M          30M      <- the shapes that measurably lost, now stricter
+#
+# The floor still reads EXACT source row counts, so it separates scales without ever
+# depending on the guessed operand size it is there to protect against. And it remains only
+# one of several conditions: `_adaptive_would_help` still requires a join with a
+# breaker-produced operand whose size is genuinely unknown, and above the floor the learned
+# route bandit measures both arms and can turn staging back off for a shape where it loses.
+_ADAPTIVE_MIN_ROWS_PER_STAGE = 5_000_000
 
-# ...and the same floor stated in bytes, because a row count assumes a row width.
+# ...and the same per-stage floor stated in bytes, because a row count assumes a row width.
 #
 # The rationale above is about *work*: re-optimization pays when a mis-estimated plan would
 # cost more than the ~20-40 ms re-plan. Rows are a proxy for work, and the proxy holds only
@@ -162,13 +216,10 @@ _ADAPTIVE_MIN_INPUT_ROWS = 20_000_000
 # it OFF for. The single most expensive query class in the engine was the one class the
 # adaptive loop never ran on.
 #
-# Derived from the two existing knobs rather than added as a third, so there is one place
-# that says how big "big" is; and the two gates are combined with OR, so a narrow query
-# clears exactly the floor it always did and nothing that used the one-shot route is moved
-# off it. The size floor is also only one of several conditions — `_adaptive_would_help`
-# still requires a join with a breaker-produced operand whose size is genuinely unknown — so
-# a trivial wide pipeline does not qualify merely by being wide.
-_ADAPTIVE_MIN_INPUT_BYTES = 20_000_000 * 64
+# Derived from the row floor rather than added as a second independent knob, so there is one
+# place that says how big "big" is; and the two gates are combined with OR, so a query clears
+# whichever of the two suits its shape.
+_ADAPTIVE_MIN_BYTES_PER_STAGE = _ADAPTIVE_MIN_ROWS_PER_STAGE * 64
 
 
 def _total_input_size(plan: LogicalPlan, estimator) -> tuple[float, float]:
@@ -228,7 +279,7 @@ def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     plan_joins = joins(plan)
     if not plan_joins:
         return False
-    estimator = _build_estimator(sources, hub)
+    estimator = build_estimator(sources, hub)
     return any(
         not is_streamable(operand)
         and estimator.estimate(operand).provenance >= Provenance.DEFAULT
@@ -252,23 +303,6 @@ def _estimate_has_held_up(operand: LogicalPlan, hub) -> bool:
         return False
 
 
-def _build_estimator(sources: list[Source], hub):
-    """A `CardinalityEstimator` configured exactly as Kyber's, for the confidence gate."""
-    from batcher.api.orchestration import collect_source_stats
-    from batcher.config import active_config
-    from batcher.kyber import load_learned_stats
-    from batcher.kyber.cardinality import CardinalityEstimator
-
-    cfg = active_config()
-    learned = load_learned_stats(hub) if hub is not None else {}
-    return CardinalityEstimator(
-        sources,
-        learned,
-        cfg.optimizer.cardinality,
-        source_stats=collect_source_stats(sources, hub),
-    )
-
-
 def _estimate_rows(node: LogicalPlan, sources: list[Source], hub) -> int:
     """The optimizer's pre-execution row estimate for `node` over `sources` (0 on error).
 
@@ -276,7 +310,7 @@ def _estimate_rows(node: LogicalPlan, sources: list[Source], hub) -> int:
     (which include any exact-sized intermediates spliced in by earlier stages).
     """
     try:
-        return int(_build_estimator(sources, hub).estimate(node).rows)
+        return int(build_estimator(sources, hub).estimate(node).rows)
     except Exception:
         return 0
 

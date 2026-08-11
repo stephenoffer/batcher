@@ -136,7 +136,7 @@ NaN is *larger than every number*, so it sorts last in ascending order and first
 descending order, immediately before the nulls in both. A `head(10)` over a descending
 float sort therefore returns ten NaN rows the moment your data has ten of them, and the
 result looks exactly like a working query. If NaN in your data means "no measurement"
-rather than a real value, convert it before you sort: `.fill_nan(...)` replaces IEEE
+rather than a real value, convert it before you sort: {py:meth}`.fill_nan(...) <batcher.plan.expr_ir.core.Expr.fill_nan>` replaces IEEE
 NaN, which `.fill_null(...)` never touches.
 :::
 
@@ -165,14 +165,14 @@ print(ds.top_k(2, by="score").select("name", "score").to_pydict())
 for the bottom `k`. The same rule applies to `limit`: the optimizer can push a limit into a
 sort, but it cannot push one into a sort you wrote as a separate materialized step.
 
-Sorting to make a *later* operator cheaper is usually wasted too. A `group_by` hashes,
+Sorting to make a *later* operator cheaper is usually wasted too. A {py:meth}`group_by <batcher.Dataset.group_by>` hashes,
 it does not need sorted input, and a `join` builds a hash table. Sort at the end, once,
 for presentation or for the file layout you are writing.
 
 ## Sorting large results: spill
 
 A sort that does not fit in the memory budget spills sorted runs to disk and merges
-them. This is on by default under `collect(spill=True)` and the out-of-core path, and
+them. This is on by default under {py:meth}`collect(spill=True) <batcher.Dataset.collect>` and the out-of-core path, and
 the merged result is exactly the in-memory result: same order, same rows.
 
 ```python

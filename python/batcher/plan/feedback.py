@@ -40,6 +40,20 @@ CONTENDED_PREEMPTIONS_PER_CORE_SECOND = 200.0
 # core-second is milliseconds of stall per second — but non-zero, so first-touch never trips it.
 PAGING_FAULTS_PER_CORE_SECOND = 5.0
 
+# Share of CFS periods throttled above which the cgroup's quota is judged to be *binding* —
+# the box clamping the query rather than the query not wanting the cores.
+#
+# A container that brushes its quota occasionally is ordinary and is not evidence of anything:
+# a bursty operator exhausts a 100 ms slice now and then on a box with cores to spare. Sustained
+# above this share, the quota is what is limiting the work, and every conclusion drawn from the
+# resulting idle cores is backwards.
+#
+# Deliberately well below a half. The action this gates is *conservative* — it suppresses a
+# learned CPU share and keeps the static prior — so being early costs one family's tuning,
+# while being late costs the shrink spiral, which is self-reinforcing and cannot recover on
+# its own.
+THROTTLED_PERIOD_SHARE = 0.10
+
 
 def cpu_utilization(
     cpu_ns: float, elapsed_ns: float, threads: int, wall_span_ns: float = 0.0
@@ -190,6 +204,23 @@ class OperatorFeedback:
     # Bytes actually written to a block device, spill included. The measured counterpart to
     # `spill_bytes`, which is the volume the operator *decided* to route to disk.
     io_write_bytes: int = 0
+    # Share of CFS periods in which this process's cgroup was throttled — the CPU's answer to
+    # "was my compute clamped", and the one form of clamping the two counters above cannot see.
+    #
+    # A quota-throttled container is dequeued at the *end of a period*, so at the default
+    # 100 ms period it yields on the order of ten involuntary switches per core-second against
+    # a `CONTENDED_PREEMPTIONS_PER_CORE_SECOND` threshold of two hundred, and it faults not at
+    # all. A container clamped to a third of its quota therefore measured as a *quiet* box,
+    # which is the reading that feeds the shrink spiral `oversubscribed` exists to break.
+    #
+    # `0.0` means "not throttled, or not measurable" — the two are deliberately not
+    # distinguished, because both are equally weak grounds for calling the box contended.
+    cpu_throttled_ratio: float = 0.0
+    # Hardware thermal-throttle events the CPU counted while this row's work ran — the silicon
+    # clamping *itself* because it was too hot, which is a different clamp from the quota above
+    # and is invisible to it. `0` on any virtualized host, where the counters are not exposed
+    # at all, so this signal is bare-metal-only by construction and says nothing in the cloud.
+    cpu_thermal_events: int = 0
     # The fingerprint of the machine that measured this row (`_internal.hardware.fingerprint`).
     # Every field above measured in machine units — times, bytes, faults, switches — is a
     # statement about *this hardware*, and none of them transfers to a different one. Without
@@ -230,7 +261,7 @@ def oversubscribed(rows: Iterable[Mapping[str, Any]]) -> bool:
     contention again. Nothing in the measurement can break the cycle, because every step of it
     looks like a family that needed fewer cores.
 
-    Two independent measurements say "the box, not the family", and either is sufficient:
+    Three independent measurements say "the box, not the family", and any one is sufficient:
 
     * **Preemption.** An involuntary context switch is the scheduler taking a CPU away, which
       happens only when another runnable thread wants it. The *median* rate is used rather than
@@ -241,6 +272,22 @@ def oversubscribed(rows: Iterable[Mapping[str, Any]]) -> bool:
       with them, so this is the one condition under which the shrink is unambiguously wrong. A
       single such fault in a whole history is noise (a first-touch of a mapped file), so this
       asks for a material rate rather than a nonzero count.
+    * **Quota throttling.** The cgroup's CFS quota being *binding*, which neither of the others
+      can see. Throttling dequeues a thread once per period, so at the default 100 ms period it
+      yields on the order of ten involuntary switches per core-second against a threshold of two
+      hundred, and it causes no faults at all. A container clamped to a third of its quota
+      therefore reads as a perfectly quiet box on both signals above while every core it is
+      owed sits idle by decree — the exact reading that starts the spiral. It is also the
+      *common* case: under a container orchestrator the quota, not the silicon, is usually what
+      clamps a CPU. The median across the history is used, for the same reason preemption uses
+      one: a single throttled run inside an otherwise clear history is not a regime.
+    * **Thermal throttling.** The silicon clamping *itself* because it is too hot, counted by
+      the CPU's own `thermal_throttle` counters. The quota signal cannot see it (a thermally
+      clamped core is running, just slowly, and never exhausts a period it was not given), and
+      the preemption signal cannot either (nothing is preempting it). Bare-metal only: a
+      virtualized guest is not shown the counters, so this reads zero in the cloud and the
+      quota signal above is the one that carries there. A *median* over zero is again what
+      keeps one hot minute from latching the family.
 
     Args:
         rows: Stored feedback rows for one operator family.
@@ -250,12 +297,26 @@ def oversubscribed(rows: Iterable[Mapping[str, Any]]) -> bool:
         `False` when nothing was measured, which keeps every caller's prior behavior.
     """
     rates: list[float] = []
+    throttled: list[float] = []
+    thermal: list[float] = []
     faulting_core_seconds = 0.0
     faults = 0.0
     for row in rows:
         elapsed_ms = float(row.get("t_op_ms", 0.0) or 0.0)
         threads = int(row.get("threads", 0) or 0)
         core_seconds = (elapsed_ms / 1000.0) * max(0, threads)
+        # Collected before the thread-count gate below: a throttled cgroup is a fact about the
+        # box, so it is evidence whether or not the engine that measured the row reported how
+        # many threads the operator ran on.
+        #
+        # Every row contributes, zeros included. A zero is a real reading — "this run was not
+        # throttled" — and dropping them would take the median over the throttled runs alone,
+        # so a single clamped run inside an otherwise clear history would latch the family.
+        # That is exactly what the median is here to prevent. A history where nothing ever
+        # reported the field is all zeros, whose median is zero, which is the "no evidence"
+        # answer this should give.
+        throttled.append(float(row.get("cpu_throttled_ratio", 0.0) or 0.0))
+        thermal.append(float(row.get("cpu_thermal_events", 0) or 0))
         if core_seconds <= 0.0:
             continue  # an older engine that reported no thread count: no evidence either way
         rates.append(
@@ -263,6 +324,10 @@ def oversubscribed(rows: Iterable[Mapping[str, Any]]) -> bool:
         )
         faults += float(row.get("major_faults", 0) or 0)
         faulting_core_seconds += core_seconds
+    if throttled and median(throttled) > THROTTLED_PERIOD_SHARE:
+        return True
+    if thermal and median(thermal) > 0.0:
+        return True
     if not rates:
         return False
     if median(rates) > CONTENDED_PREEMPTIONS_PER_CORE_SECOND:

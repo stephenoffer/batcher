@@ -65,7 +65,7 @@ raw = bt.from_arrow(pa.Table.from_batches([poll]))
 ```
 
 The decode: cast the bytes to a string, pull the fields out with JSON paths, keep the
-broker coordinates you care about. No Python per row: these are `Expr`s, and they run
+broker coordinates you care about. No Python per row: these are {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`s, and they run
 in Rust.
 
 ```python
@@ -99,7 +99,7 @@ print(clicks.to_pydict())
 :::{tab-item} A live topic
 
 Point it at Kafka and nothing in the transformation changes. The source becomes
-unbounded, so `collect()` is refused and the terminal is a streaming write:
+unbounded, so {py:meth}`collect() <batcher.Dataset.collect>` is refused and the terminal is a streaming write:
 
 ```python
 # docs: skip
@@ -130,10 +130,10 @@ The cadence is the one you will change most often:
 
 | Trigger | Cadence | Reach for it when |
 | --- | --- | --- |
-| `bt.Trigger.processing_time("30 seconds")` | a micro-batch on a wall-clock interval | the job is always on; this is the default cadence |
-| `bt.Trigger.available_now()` | drains everything available, then stops | the job is a cron-style incremental batch, or a backfill |
-| `bt.Trigger.once()` | one micro-batch of available data, then stops | you want a single step, for a test or a manual catch-up |
-| `bt.Trigger.continuous("1 second")` | back-to-back micro-batches, checkpointing on the interval | latency is the whole point, and the pipeline is stateless |
+| {py:meth}`bt.Trigger.processing_time("30 seconds") <batcher.Trigger.processing_time>` | a micro-batch on a wall-clock interval | the job is always on; this is the default cadence |
+| {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>` | drains everything available, then stops | the job is a cron-style incremental batch, or a backfill |
+| {py:meth}`bt.Trigger.once() <batcher.Trigger.once>` | all currently-available data, then stops | a ported Spark job; new code should say `available_now()`, which is the same execution |
+| {py:meth}`bt.Trigger.continuous("1 second") <batcher.Trigger.continuous>` | back-to-back micro-batches, checkpointing on the interval | latency is the whole point, and the pipeline is stateless |
 
 :::{dropdown} How the Kafka source behaves: offsets, splits, and that `timestamp` column
 
@@ -148,7 +148,7 @@ you should extract it explicitly.
 ## Prove the restart behavior without a broker
 
 You do not need Kafka to exercise the "what happens on the second run" question. The
-incremental file source (`files_incremental`, the Auto Loader analog) is unbounded in
+incremental file source ({py:meth}`files_incremental <batcher.api.io_namespace.reader.Reader.files_incremental>`, the Auto Loader analog) is unbounded in
 exactly the same way, and it keeps a durable seen-file store in `state_dir`. Drop a file
 in, drain it, drop another file in, drain again. The second run only sees the new file:
 
@@ -188,7 +188,7 @@ print(bt.read_memory("bronze_pass2").to_pydict())
 # {'user': ['u3'], 'amount': [9]}
 ```
 
-`Trigger.available_now()` drains what is there and stops. That is the trigger you want
+{py:meth}`Trigger.available_now() <batcher.Trigger.available_now>` drains what is there and stops. That is the trigger you want
 for a cron-style incremental batch: same code as the always-on job, different cadence.
 
 ## Rough edges, stated plainly

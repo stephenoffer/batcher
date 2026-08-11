@@ -83,7 +83,9 @@ def _engine_config_json(values: tuple[object, ...]) -> str:
 
 @functools.lru_cache(maxsize=128)
 def _engine_config_json_budgeted(
-    values: tuple[object, ...], budgets: tuple[tuple[int, int], ...]
+    values: tuple[object, ...],
+    budgets: tuple[tuple[int, int], ...],
+    prefer_materializing_aggregate: bool = False,
 ) -> str:
     """`_engine_config_json` plus per-operator spill budgets, memoized on both parts.
 
@@ -94,6 +96,8 @@ def _engine_config_json_budgeted(
     """
     payload = dict(zip(_ENGINE_CONFIG_FIELDS, values, strict=True))
     payload["op_budgets"] = {str(op_id): budget for op_id, budget in budgets}
+    if prefer_materializing_aggregate:
+        payload["prefer_materializing_aggregate"] = True
     return json.dumps(payload)
 
 
@@ -153,6 +157,36 @@ class ExecutionConfig:
     # shrinks once the live `PressureMonitor` reports ELEVATED or worse. Set to False to
     # pin the static target regardless of pressure.
     adaptive_morsel_sizing: bool = True
+    #: Skip the conductor's per-query orchestration for plans that provably do not need it:
+    #: run Kyber (through its plan cache) and the engine, and nothing else.
+    #:
+    #: On a small query the orchestration, not the engine, is the cost. Measured at 10,000
+    #: rows with the event log off: `collect()` 1.935 ms, of which `execute_plan` plus the
+    #: Arrow table build is **0.360 ms** — the other 82% is admission, adaptive morsel
+    #: sizing, pressure classification, the resource decision, profile assembly, the event
+    #: bus, and the learned-stats close-out. DuckDB answers the same query in 0.780 ms, so
+    #: the skipped work is the whole of the gap and then some.
+    #:
+    #: **Result-invariant**: the fast path runs the same optimized plan through the same
+    #: `core.execute_local` the ordinary path calls, so it returns the same rows, names and
+    #: types. What it gives up is *adaptivity and observability*, which is why it is off by
+    #: default and narrowly gated (`api/orchestration/fast_path.py::eligible`) to plans that
+    #: cannot need them: small, in-memory, single-node, no UDF, no spill.
+    #:
+    #: The real cost is the **cross-query learned-stats loop** — a query answered on this
+    #: path teaches Kyber nothing, so a repeatedly-issued small query never sharpens its own
+    #: estimates. Leave this off if you rely on learned selectivity or cardinality; turn it
+    #: on for a latency-sensitive serving path where the plan shape is already known good.
+    #: (The *intra*-query adaptive loop is already off below 20M rows, so only the
+    #: cross-query half is at stake.)
+    #:
+    #: This flag also gates the **prepared-execution cache**
+    #: (`api/orchestration/prepared.py`), which memoizes a query's whole derivation so a
+    #: *re-issued* one is a dict lookup plus the engine call. That is where most of the
+    #: measured win now is: over five small shapes at 1,000 rows, per-query control-plane
+    #: overhead falls **25x** (5.30 ms to 0.21 ms in total) and end-to-end latency **7.3x**.
+    #: The cache inherits this gate and this trade wholesale — it never widens either.
+    fast_path: bool = False
     # Fuse runs of linear, per-morsel streaming operators (Filter/Project) into a single
     # pass over the input's morsels in the parallel executor, instead of one rayon
     # dispatch + intermediate buffer per operator. Result-invariant (same rows, same
@@ -413,9 +447,10 @@ class StreamingConfig:
     """Cadence and bookkeeping for a long-running streaming query.
 
     These govern the micro-batch *loop*, not what it computes: how long an idle stream
-    waits before looking for data again, and how much progress history a query handle
-    keeps. The memory a streaming operator's state may hold is `MemoryConfig`'s
-    `streaming_state_max_bytes`, not here.
+    waits before looking for data again, how much progress history a query handle keeps,
+    and how long a silent partition holds the event-time watermark back. The memory a
+    streaming operator's state may hold is `MemoryConfig`'s `streaming_state_max_bytes`,
+    not here.
 
     Examples:
         .. doctest::
@@ -437,6 +472,52 @@ class StreamingConfig:
     # cadence produces three million of them; Spark's `recentProgress` is bounded the
     # same way (`spark.sql.streaming.numRecentProgressUpdates`, default 100).
     progress_history: int = 100
+    # Processing-time seconds a stream partition may deliver nothing before it stops
+    # holding the event-time watermark back (Flink's `WatermarkStrategy.withIdleness`).
+    #
+    # The watermark is the *minimum* over per-partition event-time maxima, because that is
+    # the strongest claim a multi-partition stream can actually support. A minimum has one
+    # failure mode: a partition that goes silent — an empty Kafka partition, a shard with no
+    # writers — pins the watermark forever, so no window ever closes and the retained state
+    # grows until the memory cap fires. Idleness is the release valve, and it is a real
+    # trade rather than a free fix: a partition idle for longer than this finds the rows it
+    # eventually delivers ruled late. Raise it when a partition is legitimately bursty;
+    # set it to zero (or below) to disable idleness entirely and get the fully conservative
+    # watermark that never advances past a silent partition.
+    watermark_idle_timeout_seconds: float = 60.0
+    # Derive each trigger's admission cap from the query's own measured throughput, instead
+    # of holding it at whatever `max_offsets_per_trigger` was hand-set to (Spark's
+    # `spark.streaming.backpressure.enabled`).
+    #
+    # A micro-batch that overruns its interval leaves the next one starting late against a
+    # larger backlog, which overruns by more; the divergence compounds and ends not in a slow
+    # query but in the epoch that no longer fits in memory. A static cap bounds that, but it
+    # has to be set for the worst trigger the query will ever see, so it throttles every other
+    # one and goes stale as soon as the cluster, the data, or the plan changes.
+    #
+    # Off by default, as it is in Spark, and it only ever *lowers* a source's configured
+    # limit. An admission cap changes how much of a stream a trigger reads, never what the
+    # query computes from it, so it cannot change a result. See
+    # `carbonite.policies.rate_control`.
+    backpressure_enabled: bool = False
+    # PID weights, with Spark's names and Spark's defaults so an operator's existing tuning
+    # advice carries over verbatim (`spark.streaming.backpressure.pid.*`).
+    #
+    # The integral term is the one worth understanding before changing: it is what removes
+    # *steady-state* error. A purely proportional controller settles at a rate slightly above
+    # what the query can sustain and then stays permanently a little behind — which is the
+    # compounding case this exists to prevent, arrived at more slowly.
+    backpressure_pid_proportional: float = 1.0
+    backpressure_pid_integral: float = 0.2
+    backpressure_pid_derivative: float = 0.0
+    # Floor on the derived rate, in rows per second (Spark's `pid.minRate`). A controller that
+    # can reach zero can stall a query permanently: a trigger admitting nothing publishes no
+    # progress record, and a controller with no progress never revises the cap that stalled it.
+    backpressure_min_rate: float = 100.0
+    # An operator's own ceiling on the derived cap, in rows per trigger. `0` leaves the
+    # estimator unbounded above, which is the useful default because the source's configured
+    # limit already bounds it — this is for pinning a hard maximum independently of the source.
+    backpressure_max_rows_per_trigger: int = 0
 
     def __post_init__(self) -> None:
         """Reject a cadence or history that cannot mean anything."""
@@ -449,6 +530,33 @@ class StreamingConfig:
             raise ValueError(
                 f"streaming.progress_history must be >= 1, got {self.progress_history}"
             )
+        # A floor at or below zero is the one setting that can stall a stream permanently: a
+        # trigger admitting nothing publishes no progress record, and a controller with no
+        # progress never revises the cap that stalled it. Rejected rather than clamped,
+        # because unlike a transient tunable this one cannot recover on its own.
+        if self.backpressure_min_rate <= 0:
+            raise ValueError(
+                f"streaming.backpressure_min_rate must be > 0, got "
+                f"{self.backpressure_min_rate}: a floor of zero lets the rate controller "
+                "throttle a stream to a standstill it cannot measure its way out of"
+            )
+        if self.backpressure_max_rows_per_trigger < 0:
+            raise ValueError(
+                "streaming.backpressure_max_rows_per_trigger must be >= 0 (0 = unbounded), "
+                f"got {self.backpressure_max_rows_per_trigger}"
+            )
+        # Negative weights inject positive feedback: the controller would answer an overrun
+        # by admitting *more*, which is the runaway the whole mechanism exists to prevent.
+        for name, weight in (
+            ("proportional", self.backpressure_pid_proportional),
+            ("integral", self.backpressure_pid_integral),
+            ("derivative", self.backpressure_pid_derivative),
+        ):
+            if weight < 0:
+                raise ValueError(
+                    f"streaming.backpressure_pid_{name} must be >= 0, got {weight}: a "
+                    "negative weight makes the controller speed up when it falls behind"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -653,6 +761,13 @@ class OptimizerConfig:
     # a split must beat before it is taken, so marginal rewrites are left alone.
     filter_split_materialize_cost: float = 1.0
     filter_split_min_gain: float = 1.25
+    # Plan-level common-subplan elimination (`kyber.common_subplan`): the largest
+    # materialized result worth holding so a subplan appearing more than once in a query
+    # is executed once. A repeated subtree costs a full extra execution — a `GROUP BY`
+    # feeding both operands of a join runs twice — and reuse trades that for holding the
+    # result until the query ends, so the budget is the whole gate. Sized like
+    # `memory.result_cache_max_bytes` and for the same reason; `0` turns the rewrite off.
+    common_subplan_max_bytes: int = 256 * 1024 * 1024  # 256 MiB
     # Build-side byte threshold below which a join is broadcast (the right side is
     # replicated to every worker) rather than shuffled — Spark's
     # autoBroadcastJoinThreshold. Both the planner's *estimate*-based decision and the
@@ -1191,8 +1306,21 @@ class DistributedConfig:
     # transport-classified transient errors once that classification lands.
     # `actor_max_restarts` lets a crashed compute actor (the map/inference pool)
     # respawn, and `actor_max_task_retries` reruns its in-flight call on the respawned
-    # actor. 0 anywhere keeps Ray's no-retry/no-restart default. These do not touch the
-    # Flight shuffle-server actors, whose loss is handled by the recompute loop.
+    # actor. These do not touch the Flight shuffle-server actors, whose loss is handled by
+    # the recompute loop.
+    #
+    # **`task_max_retries` is not a count of preemption retries, and `0` is not "one fewer
+    # retry".** Ray's rule is a step function, not a dial: with a *non-zero* value, system
+    # errors — spot preemption, worker crash, node loss — are retried **indefinitely** and do
+    # not decrement the count, which bounds only *application* errors (and only when
+    # `retry_on_transient` turns `retry_exceptions` on). With **`0`, the task is not retryable
+    # at all** and dies permanently on the first preemption. So `2` here means "unlimited
+    # preemption retries, two application retries", and the one edit that silently removes
+    # every spot protection on this path is setting it to zero. Ray's own default is 3; the
+    # `spot` resilience profile raises this to 4 alongside `actor_max_restarts`, which is what
+    # the field guidance asks for (`../optimization-guides`,
+    # `foundations/core/scheduling-and-resources.md`, "Spot Instance Preemption and Task Retry
+    # Semantics").
     task_max_retries: int = 2
     retry_on_transient: bool = True
     actor_max_restarts: int = 1
@@ -1280,18 +1408,31 @@ class DistributedConfig:
     autoscale_startup_grace_s: float = 12.0
     # Skew-aware join salting for a huge x huge hot key. When a single join key is
     # dominated by a few "hot" values, those rows otherwise co-partition onto one
-    # reducer and overload it (memory + the output explosion + a straggler). With
-    # salting on, a pre-pass detects the hot values (Misra-Gries) and the shuffle
-    # spreads each hot key's probe rows across `skew_join_salt` reducers while
-    # replicating its build rows to all of them — so the hot key's work fans across
-    # the cluster instead of one node. 0 (default) disables it: the shuffle is the
-    # plain co-partition and single-node==distributed is bit-identical. Single-key,
-    # left-driven (inner/left/semi/anti) joins only; other shapes fall back to plain.
-    # Opt-in because the detection pre-pass re-scans both inputs — worth it only for a
-    # known-skewed huge join, where it prevents a reducer OOM / straggler.
+    # reducer and overload it (memory + the output explosion + a straggler). Salting
+    # spreads each hot key's probe rows across several reducers while replicating its
+    # build rows to all of them, so the hot key's work fans across the cluster instead
+    # of landing on one node. Single-key, left-driven (inner/left/semi/anti) joins whose
+    # reducer does not finalize a fused aggregate; every other shape falls back to the
+    # plain co-partition (`dist/skew.py::salting_preserves_result` is the guard, and it
+    # is a correctness guard, not a preference — see its docstring).
+    #
+    # **This is the fan-out, not an on/off switch, and 0 does not mean off.** Salting is
+    # result-preserving, so it engages on *measured* skew whatever this says:
+    # `dist/skew.py::resolve_hot_keys` takes the hot values from the set learned for this
+    # join shape on a previous run, else from the column statistics Kyber already holds,
+    # else from a Misra-Gries pre-pass — which it runs on its own above
+    # `_DETECT_MIN_INPUT_ROWS`, because past that size one pass costs ~4% on a join that
+    # turns out uniform against 5.8x for an undetected 40% hot key. The fan-out is then
+    # sized from the key's measured share (`salt_factor`).
+    #
+    # So the values are: a positive number FORCES the pre-pass and pins the fan-out to it
+    # (for a join you already know is skewed and do not want to pay discovery on); `0`
+    # (default) leaves both to the measurement; and a NEGATIVE number is the actual off
+    # switch, for pinning the plain co-partition shuffle.
     skew_join_salt: int = 0
     # A value is "hot" when it exceeds this fraction of a side's rows. Lower → more
-    # keys salted. Only consulted when `skew_join_salt > 0`.
+    # keys salted. Also the conservative floor for sizing the fan-out when the hottest
+    # value's true share was never measured.
     skew_join_fraction: float = 0.10
     # Runtime bloom-filter join reduction (sideways information passing). A shuffle
     # join builds a bloom over the small (build/right) side's keys and uses it to drop
@@ -1385,11 +1526,13 @@ class DistributedConfig:
     # profile raises it for a churning cluster. Only consulted when `persistent_fleet` is on.
     fleet_max_attempts: int = 2
     # Streaming heterogeneous inference pipeline. When on, a linear `map_batches` chain
-    # that crosses a resource-class boundary (a CPU preprocess stage feeding a GPU /
-    # load-once inference stage) is split into per-stage actor pools that stream
-    # partitions stage→stage over Arrow Flight, so the CPU and GPU stages OVERLAP (the
-    # GPU runs partition k while the CPU prepares k+1) instead of one actor running the
-    # whole chain per partition. **On by default**: the non-overlapped path leaves the GPU
+    # is split at EVERY resource-class boundary into per-stage actor pools that stream
+    # partitions stage→stage over Arrow Flight, so the stages OVERLAP (a model runs
+    # partition k while the stage below prepares k+1) instead of one actor running the
+    # whole chain per partition. A chain with two models gets a pool each rather than
+    # both in one actor sharing a device, and a postprocess after inference gets its own
+    # CPU pool rather than spending device time on host work. **On by default**: the
+    # non-overlapped path leaves the GPU
     # idle for the whole CPU decode/preprocess of every partition — the single largest
     # avoidable cost in a batch-inference pipeline, and the pathology the Ray guides spend
     # their GPU-utilization chapter telling users to hand-tune around. Overlapping it is a
@@ -1398,7 +1541,7 @@ class DistributedConfig:
     # identical sub-plan through `core.execute_with_udfs`, which is what
     # `test_stream_inference.py::test_streaming_pipeline_equals_single_node` (and the
     # three-stage and non-overlapped-map variants) pin. A chain with no resource-class
-    # boundary to split at (`split_at_first_pool_boundary` → None) falls back to the
+    # boundary to split at (`split_into_resource_stages` → None) falls back to the
     # embarrassingly-parallel map, so a homogeneous pipeline is unaffected.
     # Set False to pin the old non-overlapped scheduling.
     stream_inference: bool = True
@@ -1616,14 +1759,44 @@ class DistributedConfig:
     max_shuffle_partitions: int = 2048
     # CEILING on shuffle buckets per worker, as a multiple of the worker count — not a
     # target. One bucket per worker is the floor and the cold-start shape; this bounds how
-    # far a *measured* shuffle volume may raise it above that. Buckets above the floor buy
-    # skew tolerance (with one bucket per worker, a key group carrying twice the average
-    # carries it for the whole query, and there is no second bucket on that worker to
-    # average it against — the reason Spark sizes partitions independently of executor
-    # count) and lower per-reducer memory. They are not free: the exchange opens
-    # `mappers x reducers` streams, so every extra multiple is another round of Flight
-    # fetches per mapper. 1 pins the count at one bucket per worker.
+    # far a *measured* shuffle volume may raise it above that. What buckets above the floor
+    # buy is lower per-reducer memory and finer work units.
+    #
+    # They do **not** buy skew tolerance, and it is worth being precise about that because
+    # the Spark-style "many partitions per executor" argument is usually stated as though
+    # they do. A hash bucket is the unit a key cannot be split below, so a single dominant
+    # key is indivisible however many buckets there are: measured on 12.5M rows with 40% of
+    # them on one key, max/mean bucket load is 3.8 at 8 buckets and **51.8 at 128** — the
+    # hot bucket does not shrink, only the mean does. Splitting one key's work needs salting
+    # (`dist/skew.py`), not a finer hash. Buckets do flatten a *wide* hot band, but hashing
+    # already flattens that: the same measurement over 50k moderately hot keys is 1.01.
+    #
+    # They are not free either: the exchange opens `mappers x reducers` streams, so every
+    # extra multiple is another round of Flight fetches per mapper. 1 pins the count at one
+    # bucket per worker.
     shuffle_partition_multiplier: int = 4
+    # CEILING on map partitions per worker — the shuffle's **task granularity**, as a
+    # multiple of the worker count. The reduce-side multiplier above sizes hash buckets;
+    # this sizes the units the *input* is cut into, which is what decides how much work a
+    # straggler holds and how much a preemption loses.
+    #
+    # At 1 the task unit is a node's share of the input, and both costs are charged whole: a
+    # worker running at half speed still holds a full partition and the map barrier waits on
+    # it, and a worker that dies loses a full partition that one survivor then replays end to
+    # end. Above 1, `map_barrier` deals partitions out as actors go idle, so a slow worker
+    # takes fewer of them and a dead worker's remaining partitions spread across every
+    # survivor. This is the Spark "many tasks per executor" argument, and it is the half of
+    # it that actually holds — the other half, that fine partitions dilute skew, does not:
+    # skew lives in the hash buckets, not in the input split (see `shuffle_partition_multiplier`).
+    #
+    # A ceiling rather than a target. A source that cannot yield this many splits produces
+    # fewer partitions instead of empty tasks, so a small input is unaffected, and an
+    # in-memory (driver-resident) source stays at one partition per worker because shipping
+    # it in more pieces buys no recovery — the driver still holds it. The cost above the
+    # floor is that the exchange opens `mappers x reducers` streams and this multiplies the
+    # first factor, so it is bounded by `max_shuffle_partitions` like the second. 1 pins the
+    # old one-partition-per-worker unit.
+    map_partition_multiplier: int = 4
     # Submit-ahead cap on concurrent map/inference partition tasks (`gather_map_results`).
     # Seeding Ray with every partition at once floods the scheduler / object store at high
     # fan-out (the "too many pending tasks" anti-pattern). `0` (default) derives the window
@@ -1665,6 +1838,33 @@ class DistributedConfig:
     heterogeneous_node_isolation: bool = False
     # The custom resource CPU-only nodes advertise for `heterogeneous_node_isolation`.
     cpu_node_resource: str = "cpu_node"
+    # Reserve a shuffle fleet's placement group inside ONE availability zone when the cluster
+    # spans several and one of them can host the whole fleet.
+    #
+    # A shuffle moves nearly all of its bytes worker to worker, and every cloud prices and
+    # delays those bytes by whether the two workers share a zone. Anyscale's field engineering
+    # puts cross-AZ transfer above 40% of total AWS spend on distributed workloads and at
+    # 20-40% added latency on synchronous ones, which makes this a first-order cost item rather
+    # than a rounding one. A fleet spread evenly over three zones sends about two thirds of its
+    # shuffle across that boundary, for nothing — the bundles are interchangeable, so a fleet
+    # that fits in one zone can simply be placed in one.
+    #
+    # A single-AZ compute config (`STRICT_ZONAL_PACK` on Anyscale) is the better fix where the
+    # operator controls provisioning: it removes the traffic instead of routing around it, and
+    # covers the head node too. This is the runtime answer for the fleet that cannot do that —
+    # an accelerator cluster whose instance types are scarce enough that cross-zone autoscaling
+    # is the only way to get capacity, and which therefore spans zones regardless.
+    #
+    # On by default because it is placement-only (result-identical), it is applied to the
+    # bundles rather than the tasks — so a group that cannot form is abandoned at the existing
+    # timeout and the stage falls back to default scheduling, where a pin on the tasks would
+    # leave them pending forever — and it is a no-op on every cluster that cannot benefit: one
+    # zone, unlabelled nodes, or no single zone with room for the fleet. The zone chosen is the
+    # one with the most free capacity that can host it (`capacity.preferred_fleet_zone`).
+    #
+    # Set False to let the fleet spread across zones, which is the right call when zone
+    # diversity is being bought deliberately for availability rather than paid for by accident.
+    zone_aware_placement: bool = True
     # Submit-ahead depth per GPU/inference actor — how many partitions an actor may have in
     # flight at once. `2` (default) double-buffers: one partition executes on the device while
     # the next is dispatched/gathered, so the GPU stays fed across that round-trip instead of
@@ -1950,6 +2150,26 @@ class ObservabilityConfig:
         return VERBOSITY_LEVELS[_verbosity_rank(self.verbosity)].native_level
 
 
+def _check_overrides(caller: str, kind: type, overrides: dict) -> None:
+    """Reject an override that is not a field of `kind`, naming the caller.
+
+    `dataclasses.replace` already refuses, but as ``TypeError: TenantConfig.__init__() got an
+    unexpected keyword argument`` — a class the user did not mention, from a function they did
+    not call. A misspelled tunable is the whole reason anyone reads this message.
+    """
+    unknown = sorted(set(overrides) - {f.name for f in dataclasses.fields(kind)})
+    if not unknown:
+        return
+    from batcher._internal.errors import ConfigError
+
+    raise ConfigError(
+        f"{caller}(): {unknown} " + ("is not a" if len(unknown) == 1 else "are not") + f" "
+        f"{kind.__name__} field{'' if len(unknown) == 1 else 's'}.",
+        available=tuple(sorted(f.name for f in dataclasses.fields(kind))),
+        available_label="Available settings",
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """The complete engine configuration — every tunable in one frozen object.
@@ -2013,7 +2233,11 @@ class Config:
 
         Returns:
             A new Config with the given sections replaced; the original is unchanged.
+
+        Raises:
+            ConfigError: If a keyword does not name a config section.
         """
+        _check_overrides("Config.replace", Config, section_overrides)
         return replace(self, **section_overrides)  # type: ignore[arg-type]
 
     def engine_config_json(self) -> str:
@@ -2048,7 +2272,9 @@ class Config:
         """
         return _engine_config_json(self._engine_config_values())
 
-    def engine_config_json_with(self, op_budgets: dict[int, int]) -> str:
+    def engine_config_json_with(
+        self, op_budgets: dict[int, int], *, prefer_materializing_aggregate: bool = False
+    ) -> str:
         """`engine_config_json` plus Kyber's per-operator spill budgets.
 
         `op_budgets` maps a pre-order `op_id` to its byte envelope
@@ -2071,15 +2297,21 @@ class Config:
 
         Args:
             op_budgets: Per-operator byte envelopes keyed by pre-order ``op_id``.
+            prefer_materializing_aggregate: Kyber's verdict that this plan's grouped
+                aggregate is cheaper materialized than streamed, taken from the estimated
+                group count only the control plane has. A hint the engine may decline: it
+                re-checks the plan shape and ANDs in its own memory-affordability test.
 
         Returns:
             A JSON string extending `engine_config_json` with the per-operator
             budgets; an empty map reproduces `engine_config_json` exactly.
         """
-        if not op_budgets:
+        if not op_budgets and not prefer_materializing_aggregate:
             return self.engine_config_json()
         return _engine_config_json_budgeted(
-            self._engine_config_values(), tuple(sorted(op_budgets.items()))
+            self._engine_config_values(),
+            tuple(sorted(op_budgets.items())),
+            prefer_materializing_aggregate,
         )
 
     def _engine_config_values(self) -> tuple[object, ...]:
@@ -2500,22 +2732,56 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
     return replace(obj, **updates) if updates else obj
 
 
+#: The last `(input, output)` pair `_resolved` produced, matched by *identity*. One slot,
+#: because the access pattern it exists for is one config object resolved over and over:
+#: `api.orchestration.with_auto_config` wraps every terminal op in a `config_context` over
+#: the object `resolve_auto_config` memoizes, so a `collect()` loop resolves the *same*
+#: object on every query. Re-deriving it costs 8.4 us, 88% of which is
+#: `detect_spot_environment` reading ten environment variables to re-answer a question
+#: about the machine.
+#:
+#: Keyed on identity, never on value: a `Config` is frozen, so the same object cannot have
+#: changed, and any edit to a config builds a new object and misses. What the memo does
+#: assume is that the *environment* behind `detect_spot_environment` has not moved while a
+#: single config object is being reused — a node does not become preemptible mid-process,
+#: and a test that exports a spot variable builds a fresh `Config` (or calls
+#: `reset_resolution_memo`) and so re-detects.
+_RESOLUTION_MEMO: tuple[Config, Config] | None = None
+
+
+def reset_resolution_memo() -> None:
+    """Forget the memoized resolution, so the next `_resolved` re-reads the environment."""
+    global _RESOLUTION_MEMO
+    _RESOLUTION_MEMO = None
+
+
 def _resolved(cfg: Config) -> Config:
     """Auto-select the spot profile on a preemptible node, apply the resilience profile,
     auto-enable the bounded autoscale wait on an autoscaling cluster, then validate — the
     single resolution chokepoint every config entry point shares so auto-detection, the
     profile, and range checks run in lockstep regardless of how the config was built. A
-    user-chosen `resilience` / `autoscale_wait_s` is never overridden (explicit wins)."""
+    user-chosen `resilience` / `autoscale_wait_s` is never overridden (explicit wins).
+
+    Memoized on the input's identity; see `_RESOLUTION_MEMO` for why that is sound and for
+    the one assumption it makes.
+    """
+    global _RESOLUTION_MEMO
     from batcher.config.profiles import (
         apply_resilience_profile,
         detect_spot_environment,
         resolve_autoscale_wait,
     )
 
+    memo = _RESOLUTION_MEMO
+    if memo is not None and memo[0] is cfg:
+        return memo[1]
+    original = cfg
     if cfg.distributed.resilience == "default" and detect_spot_environment():
         cfg = cfg.replace(distributed=replace(cfg.distributed, resilience="spot"))
     cfg = resolve_autoscale_wait(apply_resilience_profile(cfg))
-    return cfg.validate()
+    out = cfg.validate()
+    _RESOLUTION_MEMO = (original, out)
+    return out
 
 
 # Active-config plumbing -------------------------------------------------------
@@ -2608,8 +2874,12 @@ def tenant(tenant_id: str, **overrides: object) -> Iterator[Config]:
 
     Yields:
         The `Config` in effect inside the block.
+
+    Raises:
+        ConfigError: If an override is not a `TenantConfig` field.
     """
     current = active_config()
+    _check_overrides("tenant", TenantConfig, overrides)
     scoped = current.replace(
         tenant=dataclasses.replace(current.tenant, tenant_id=tenant_id, **overrides)
     )

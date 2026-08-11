@@ -35,6 +35,7 @@ from collections.abc import Callable
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.exprs.guards import SchemaNode
 
 # The sibling families' helpers, imported rather than re-implemented (copy-paste is the one
 # wrong way to share): `_key` (structural identity), `_rewrite_node` (leaf Expr rule → rebuilt
@@ -86,7 +87,6 @@ _ROW_PRESERVING = (Filter, Sort, Limit, Sample, Distinct)
 #: input: the columns declared NOT NULL, and the schema (`None` when not inferable) the
 #: arm-deleting rules need to prove the type survives.
 _EXPR_NODES = (Filter, Project)
-_Node = Filter | Project
 _Leaf = Callable[[Expr], Expr]
 _LeafFactory = Callable[[frozenset[str], SchemaRef | None], _Leaf]
 
@@ -143,7 +143,7 @@ def _never_null(expr: Expr, non_null: frozenset[str]) -> bool:
     return False
 
 
-def _rewrite_with_nullability(node: _Node, make_leaf: _LeafFactory) -> LogicalPlan | None:
+def _rewrite_with_nullability(node: SchemaNode, make_leaf: _LeafFactory) -> LogicalPlan | None:
     """Apply a nullability-parameterized leaf rewrite to every expression in `node`.
 
     The judgement is made against the node's *input* — which is where the node's expressions
@@ -191,7 +191,9 @@ def _drop_is_null(non_null: frozenset[str], _schema: SchemaRef | None) -> _Leaf:
     matches=_EXPR_NODES,
     expr_matches=(IsNull,),
 )
-def drop_is_null_on_non_nullable_column(node: _Node, _ctx: OptimizerContext) -> LogicalPlan | None:
+def drop_is_null_on_non_nullable_column(
+    node: SchemaNode, _ctx: OptimizerContext
+) -> LogicalPlan | None:
     """`x IS NULL` → `FALSE` when `x` provably never yields NULL (a NOT NULL column, a
     literal, or anything built from them by a null-propagating operator).
 
@@ -220,7 +222,7 @@ def _drop_is_not_null(non_null: frozenset[str], _schema: SchemaRef | None) -> _L
     expr_matches=(IsNotNull,),
 )
 def drop_is_not_null_on_non_nullable_column(
-    node: _Node, _ctx: OptimizerContext
+    node: SchemaNode, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
     """`x IS NOT NULL` → `TRUE` when `x` provably never yields NULL — the dual of
     `drop_is_null_on_non_nullable_column`, sound in a `Project` for the same reason.
@@ -255,7 +257,7 @@ def _coalesce_first_non_null(non_null: frozenset[str], schema: SchemaRef | None)
     expr_matches=(Coalesce,),
 )
 def drop_coalesce_of_non_nullable_first_arg(
-    node: _Node, _ctx: OptimizerContext
+    node: SchemaNode, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
     """`coalesce(x, …)` → `x` when `x` provably never yields NULL.
 
@@ -290,7 +292,7 @@ def _coalesce_truncate(non_null: frozenset[str], schema: SchemaRef | None) -> _L
     expr_matches=(Coalesce,),
 )
 def drop_coalesce_args_after_non_nullable(
-    node: _Node, _ctx: OptimizerContext
+    node: SchemaNode, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
     """`coalesce(a, b, c)` → `coalesce(a, b)` when `b` provably never yields NULL.
 
@@ -348,7 +350,7 @@ def _null_safe_comparison(non_null: frozenset[str], _schema: SchemaRef | None) -
     expr_ops=("or",),
 )
 def simplify_null_safe_comparison_on_non_nullable(
-    node: _Node, _ctx: OptimizerContext
+    node: SchemaNode, _ctx: OptimizerContext
 ) -> LogicalPlan | None:
     """`a IS NOT DISTINCT FROM b` → `a = b` when both operands provably never yield NULL.
 

@@ -114,8 +114,9 @@ def cache_key(
     if source_ids is None:
         return None
     # Injectivity: the first nine fields are all `|`-free (a fixed `kind`, three hex digests,
-    # three integers, and two comma-joined numeric vectors), so a `|`-split recovers them and
-    # everything after the ninth `|` is the source component. That component is
+    # three integers, and two comma-joined vectors whose free-form members are sanitized to an
+    # alphanumeric alphabet by `_sanitized`), so a `|`-split recovers them and everything after
+    # the ninth `|` is the source component. That component is
     # `repr(source_ids)` — unambiguous for a list of strings even when a source identity (a
     # file path) contains `|` or `,`, which a naive delimiter-join would let collide two
     # different source sets onto one key.
@@ -184,8 +185,24 @@ def _hardware_key(hardware: Any) -> str:
     Folded into the key because a plan is now a function of the hardware too: the same query
     planned against a 16 MiB-L3 driver and 64 MiB-L3 cluster workers picks a different broadcast
     threshold, so reusing the driver's cached plan for the cluster run would ship the wrong one.
-    Keyed only on the fields that actually steer a decision (`|`-free integers), so an
-    unchanged machine keeps hitting its cached plan.
+    Keyed only on the fields that actually steer a decision, so an unchanged machine keeps
+    hitting its cached plan. Three of those are **not** numbers, and leaving them out was a
+    silent hole: each is independent of every scalar here, so two profiles differing only in
+    one of them produced an identical key and one fleet's plan was served to the other.
+
+    * `storage_class` prices a spilled byte (`kyber.storage_cost`), across a **thirtyfold**
+      range. Two fleets identical in cores, RAM, cache, VRAM and worker count — one on local
+      NVMe, one on a network volume — shared a key, so whichever planned first decided for
+      both whether an out-of-core plan was acceptable at all.
+    * `accelerator_type` steers the device-tier decisions in `kyber.gpu.policy`: the host-link
+      efficiency and the MIG profile a small model is packed into. VRAM alone does not imply
+      either, which is exactly why the field exists separately from `gpu_memory_bytes`.
+    * `fingerprint` selects *which* learned cost coefficients and CPU shares the optimizer
+      loaded (`optimizer.facade` passes it to `calibrate` and `load_cpu_utilization`). Two
+      fleets of the same shape and different silicon — a Graviton fleet and an x86 one at the
+      same core count and RAM — read different coefficients and rank plans differently, and
+      `_calibration_epoch` cannot see the difference because it keys on the hub's version
+      rather than on whose measurements were read.
 
     The fleet's **shape** is keyed too, and by structure rather than by identity. Thirty-two
     devices on four nodes and thirty-two on thirty-two produce identical values for every scalar
@@ -201,7 +218,21 @@ def _hardware_key(hardware: Any) -> str:
     scalars = (
         f"{h.cpu_cores},{h.memory_bytes},{h.l3_cache_bytes},{h.gpu_memory_bytes},{h.worker_count}"
     )
-    return f"{scalars},{_cluster_key(getattr(h, 'cluster', None))}"
+    # Sanitized to the key's alphabet rather than trusted: these three are the only free-form
+    # strings in the whole key, and a `,` or `|` arriving in a device model from a node label
+    # nobody controls would make two different profiles' keys ambiguous under the `|`-split
+    # this function's contract promises.
+    identity = ",".join(
+        _sanitized(getattr(h, name, ""))
+        for name in ("storage_class", "accelerator_type", "fingerprint")
+    )
+    return f"{scalars},{identity},{_cluster_key(getattr(h, 'cluster', None))}"
+
+
+def _sanitized(value: Any) -> str:
+    """A free-form field reduced to the key's delimiter-free alphabet, `"-"` when empty."""
+    text = str(value or "")
+    return "".join(c if (c.isalnum() or c in "._") else "_" for c in text) or "-"
 
 
 def _cluster_key(cluster: Any) -> str:
@@ -249,7 +280,79 @@ def _calibration_epoch(hub: Any) -> str:
         return "-"
     from batcher.kyber import calibration, cpu_shares
 
-    return f"{calibration.refit_version(hub)},{cpu_shares.refit_version(hub)}"
+    coeffs = _bucketed(calibration.live_coefficients(hub))
+    shares = _bucketed(cpu_shares.live_shares(hub))
+    return f"{coeffs},{shares}"
+
+
+def _bucketed(fit: object) -> str:
+    """A coefficient set as half-octave buckets, so drift does not move the key.
+
+    The same device as `_read_cost_key`, applied to the fit itself instead of to *when* it was
+    made, and for a sharper reason. A refit-version epoch is only stable while refits are
+    rare; the throttle counts feedback rows, so a query recording more operators than
+    `calibration._RECALIBRATE_AFTER` in one execution refits on **every** execution and the
+    epoch advances every execution. The key then never repeats and the memo cannot hit, which
+    is not a small loss: measured on tpcds-q83, `hit=0 / miss=1` on every run of an identical
+    query, 190 ms of re-optimization against 20 ms in the engine; on tpcds-q80 the epoch
+    climbed by 76 per run forever. Fingerprinting the *values* is stable by construction —
+    it moves when a coefficient crosses a bucket and not when a refit merely happened.
+
+    Buckets are ``round(log2(v) * _READ_COST_BUCKETS)``, so a coefficient must move ~40% to
+    change the key — the same threshold, and the same trade, the read-cost factors take: keyed
+    on the raw value the memo would miss on every query, keyed on nothing a plan would freeze
+    at whichever coefficients were in force when it was first cached.
+    """
+    if fit is None:
+        return "-"
+    values: list[tuple[str, float]]
+    if isinstance(fit, dict):
+        values = sorted((str(k), float(v)) for k, v in fit.items())
+    else:
+        import dataclasses
+
+        values = sorted(
+            (f.name, float(getattr(fit, f.name)))
+            for f in dataclasses.fields(fit)
+            if isinstance(getattr(fit, f.name), (int, float))
+            and not isinstance(getattr(fit, f.name), bool)
+        )
+    return ";".join(
+        f"{n}:{round(math.log2(v) * _READ_COST_BUCKETS) if v > 0.0 else 0}" for n, v in values
+    )
+
+
+# Digest memo for `_source_stats_key`, keyed by the statistics object's identity.
+#
+# The entry **retains the object it is keyed on**, which is what makes an `id()` key sound
+# here: CPython reuses the address of a freed object immediately, so an id-keyed memo that
+# does not hold a reference can serve one relation's digest for another's — and this digest
+# gates zone-map pruning, so that is a wrong answer rather than a worse plan. Holding the key
+# object alive makes the id unique for as long as the entry exists.
+#
+# `SourceStatistics` is `frozen=True, slots=True` with no `__weakref__`, so it can neither be
+# weak-referenced nor carry a cached attribute; an id map that owns its keys is the remaining
+# option. Bounded and cleared wholesale like `_CONFIG_KEY_CACHE`, so the retention cannot grow
+# without limit — a dropped entry costs one recomputation, never a wrong key.
+_STATS_DIGEST_CACHE: dict[int, tuple[object, str]] = {}
+_STATS_DIGEST_CACHE_MAX = 256
+#: Digest of a source that reported no statistics at all. Fixed-width, like a real digest, so
+#: the concatenation in `_source_stats_key` stays positional and therefore injective.
+_NO_STATS_DIGEST = "0" * 16
+
+
+def _stats_digest(stats: object) -> str:
+    """A fixed-width hex digest of one source's `SourceStatistics`, memoized by identity."""
+    if stats is None:
+        return _NO_STATS_DIGEST
+    cached = _STATS_DIGEST_CACHE.get(id(stats))
+    if cached is not None and cached[0] is stats:
+        return cached[1]
+    digest = hashlib.blake2b(repr(stats).encode(), digest_size=8).hexdigest()
+    if len(_STATS_DIGEST_CACHE) >= _STATS_DIGEST_CACHE_MAX:
+        _STATS_DIGEST_CACHE.clear()
+    _STATS_DIGEST_CACHE[id(stats)] = (stats, digest)
+    return digest
 
 
 def _source_stats_key(source_stats: list | None) -> str:
@@ -264,10 +367,16 @@ def _source_stats_key(source_stats: list | None) -> str:
     module's `_source_keys` docstring warns about, entering by the other door.
 
     Folded in as a hex digest so it stays `|`-free and the key's injectivity argument holds.
+
+    Memoized per statistics *object*, because building the digest is `repr` of every column's
+    `ColumnStat` — a Python-level dataclass `__repr__` per column, each spelling out two or
+    three `Provenance` enum members — and the conductor hands the same objects back on every
+    execution of a query. On ClickBench's 105-column `hits` that repr was the single largest
+    item in a `collect()` that the engine finishes in a fifth of the time.
     """
     if not source_stats:
         return "-"
-    return hashlib.blake2b(repr(tuple(source_stats)).encode(), digest_size=8).hexdigest()
+    return "".join(_stats_digest(s) for s in source_stats)
 
 
 # The optimizer config is stable for the life of an active `Config`, but its `repr` (the
@@ -332,16 +441,29 @@ def _source_keys(sources: list | None) -> list[str] | None:
 # a 100% "change" — but no plan reads them as a value; they weight the averages beside them.
 # Comparing them would make every write look material and defeat the memo entirely (measured:
 # 6 hits in 8 identical runs became 0).
-# The OLS sufficient statistics (`sx`/`sy`/`sxx`/`sxy`, from `learned_tuning.crossover`) and
-# the bandit arm accumulators (`sum`/`sumsq`, from `record_arm`) belong here for the same
-# reason `n` does: every one of them grows monotonically with each observation, so comparing
-# them raw made *every* join run look material and flushed the whole plan cache — the exact
-# "6 hits in 8 identical runs became 0" regression this list was created to fix, still live
-# for the accumulators sitting beside the counter that was fixed. What a plan actually reads
-# is their per-observation quotient, compared via `_DERIVED_RATIOS` below. (`xmin`/`xmax` stay
-# compared directly: they are bounds, not accumulators, and move only on a genuinely new
-# extreme — which does change the fit's applicable range.)
-_BOOKKEEPING_FIELDS = frozenset({"n_obs", "n", "sx", "sy", "sxx", "sxy", "sum", "sumsq"})
+# The OLS co-moments (`m2x`/`m2y`/`cxy`, from `kyber.ols`) and the bandit arm's squared-error
+# accumulator (`m2`, from `record_arm`) belong here for the same reason `n` does: each grows
+# with every observation, so comparing them raw makes *every* join run look material and
+# flushes the whole plan cache. What a plan actually reads is a quotient of them, compared via
+# `_DERIVED_RATIOS` below. (`xmin`/`xmax` stay compared directly: they are bounds, not
+# accumulators, and move only on a genuinely new extreme — which does change the fit's
+# applicable range. `mx`/`my`/`mean` stay compared directly too: those *are* the decision.)
+#
+# **This list is keyed on field names, so it goes stale silently when a writer changes shape,
+# and it had.** `kyber.ols` was rewritten from power sums (`sx`/`sy`/`sxx`/`sxy`) to a centered
+# Welford form, and `record_arm` from `sum`/`sumsq` to a discounted Welford `(n, mean, m2)` —
+# and this list still named the retired fields, so none of the live accumulators was recognized
+# and the "6 hits in 8 identical runs became 0" regression it exists to prevent was fully back.
+# Measured on TPC-H at scale 1: **seven of the twenty-two queries never hit the plan cache at
+# all** (q4, q12, q13, q14, q15, q19, q22), and they were exactly the queries whose control
+# plane dominated their wall clock — q19 spent 73% of 40 ms re-optimizing, q15 85% of 9 ms.
+# In the traces the bandit's `mean` was *bit-identical* between runs while `m2` drifted, so the
+# decision had not moved and the memo was flushed anyway.
+#
+# Anything added to `kyber.ols` or `bandit._welford_update` has to be classified here too;
+# `tests/unit/test_plan_cache_accumulators.py` fails if a writer emits a field this file has
+# never heard of, so the next rename cannot repeat this quietly.
+_BOOKKEEPING_FIELDS = frozenset({"n_obs", "n", "m2", "m2x", "m2y", "cxy"})
 
 # Pairs whose *ratio* is a decision even though both fields are bookkeeping. A bandit arm is
 # the canonical case: `record_arm` writes only accumulators, so with each of them listed above
@@ -352,15 +474,17 @@ _BOOKKEEPING_FIELDS = frozenset({"n_obs", "n", "sx", "sy", "sxx", "sxy", "sum", 
 # 1 -> 2 is a 100% "change") and defeat the memo, so the ratio — the number a plan actually
 # reads — is what gets compared.
 _DERIVED_RATIOS: tuple[tuple[str, str], ...] = (
-    ("sum", "n"),  # a bandit arm's mean reward — what `ucb1_best_arm` ranks by
-    ("sumsq", "n"),  # its second moment, which the UCB confidence width reads
-    # The OLS fit's per-observation moments. `_fit`'s intercept and slope are functions of
-    # exactly these, so when none of them has moved materially neither has the crossover the
-    # plan was chosen under — and when one has, the plan is genuinely stale.
-    ("sx", "n"),
-    ("sy", "n"),
-    ("sxx", "n"),
-    ("sxy", "n"),
+    # The bandit's per-observation variance, which `ucb1_best_arm`'s UCB-V radius reads. Its
+    # `mean` is compared directly, being the value the arms are ranked by.
+    ("m2", "n"),
+    # The OLS fit. `fit_ols`'s slope is `cxy / m2x`, and its R² gate factors exactly into these
+    # two quotients: `cxy**2 / (m2x*m2y) == (cxy/m2x) * (cxy/m2y)`. So when neither has moved
+    # materially, neither the slope nor the fit's credibility has, and the crossover the plan
+    # was chosen under is unchanged. (`m2y/n` — the response variance — is deliberately *not*
+    # here: an observation landing exactly on the fitted line moves it, while moving no term of
+    # the fit, so comparing it invalidates on a sample that confirms the model.)
+    ("cxy", "m2x"),
+    ("cxy", "m2y"),
 )
 
 

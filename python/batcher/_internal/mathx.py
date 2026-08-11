@@ -16,6 +16,8 @@ the inline form it replaces, so a call-site migration is behavior-preserving.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
+from statistics import median
 from typing import TypeVar, overload
 
 _Number = TypeVar("_Number", int, float)
@@ -26,6 +28,7 @@ __all__ = [
     "clamp",
     "clamp01",
     "clamp_factor",
+    "is_concentrated",
     "is_nan",
     "safe_div",
 ]
@@ -99,3 +102,30 @@ def blend(prior: float, observed: float, alpha: float) -> float:
     decay used when an estimate must converge from cold. `alpha` is in ``[0, 1]``.
     """
     return alpha * observed + (1.0 - alpha) * prior
+
+
+def is_concentrated(xs: Sequence[float], max_rel_spread: float) -> bool:
+    """Whether `xs` cluster tightly enough that their centre means something.
+
+    A confidence gate for a learned value fitted from repeated observations. One sample is
+    trivially concentrated; otherwise the full spread must sit within `max_rel_spread` of the
+    median. Constant samples always pass, and a non-positive median (nothing measured) passes
+    rather than blocking, so the gate can only ever *withhold* a value it has reason to doubt.
+
+    It exists because a mean is only a summary when the thing summarized is one thing. Two
+    populations accidentally sharing a key — the same operator shape measured over two very
+    different relations, say — average to a number that is wrong for both and is *worse* than
+    the structural estimate it replaces. A wide spread is the signature of that, whatever
+    caused it.
+
+    Args:
+        xs: The observations.
+        max_rel_spread: Permitted `(max - min)` as a multiple of the median.
+
+    Returns:
+        `True` when the samples are concentrated enough to summarize.
+    """
+    if len(xs) <= 1:
+        return True
+    mid = median(xs)
+    return mid <= 0.0 or (max(xs) - min(xs)) <= max_rel_spread * mid

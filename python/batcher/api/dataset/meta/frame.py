@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher.api.dataset.meta._facts import MetaBase, answer
 from batcher.kyber.shortcuts import distinct, ordering, rows
+from batcher.plan.stats import SortOrder
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -318,11 +319,13 @@ class DatasetMeta(MetaBase):
                 return known
         return self._is_key_by_execution(names)
 
-    def sorted_by(self) -> tuple[str, ...]:
-        """The columns the result is *known* to be ascending, nulls-last ordered by.
+    def sorted_by(self) -> tuple[SortOrder, ...]:
+        """The ordering the result is *known* to be in, direction included.
 
         Empty means "no recorded ordering", which is not the same as "unordered" — only a
-        declared, order-preserved sort is tracked. A sort on this prefix is a no-op.
+        declared, order-preserved sort is tracked. A sort on this prefix is a no-op. Each
+        key is a `SortOrder` naming the column, whether it descends, and where its nulls
+        sit, so a descending order is reported as faithfully as an ascending one.
 
         Returns:
             The recorded sort prefix.
@@ -333,11 +336,13 @@ class DatasetMeta(MetaBase):
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [3, 1, 2]}).meta.sorted_by()
                 ()
+                >>> bt.from_pydict({"x": [3, 1, 2]}).sort("x", descending=True).meta.sorted_by()
+                (SortOrder(column='x', descending=True, nulls_first=False),)
         """
         known = self.ask(ordering.sorted_columns)
         return () if known is None else known
 
-    def is_known_sorted_by(self, columns: str | Sequence[str]) -> bool:
+    def is_known_sorted_by(self, columns: str | Sequence[SortOrder | str]) -> bool:
         """Whether the result is already known to be sorted by `columns` — so a sort can be skipped.
 
         Deliberately one-sided: ``True`` proves the ordering holds, ``False`` only means it is
@@ -346,7 +351,8 @@ class DatasetMeta(MetaBase):
         property of the plan, not of the data.
 
         Args:
-            columns: The ordering to test, as a prefix.
+            columns: The ordering to test, as a prefix. A bare column name means ascending,
+                nulls-last; pass a `SortOrder` to ask about a descending ordering.
 
         Returns:
             ``True`` if the recorded ordering starts with `columns`.
@@ -357,9 +363,12 @@ class DatasetMeta(MetaBase):
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [3, 1, 2]}).meta.is_known_sorted_by("x")
                 False
+                >>> bt.from_pydict({"x": [3, 1, 2]}).sort("x").meta.is_known_sorted_by("x")
+                True
         """
-        names = (columns,) if isinstance(columns, str) else tuple(columns)
-        return self.ask(ordering.is_sorted_by, self.require_columns(names)) is True
+        keys = (columns,) if isinstance(columns, str) else tuple(columns)
+        self.require_columns(tuple(k if isinstance(k, str) else k.column for k in keys))
+        return self.ask(ordering.is_sorted_by, keys) is True
 
     def explain(self) -> dict[str, Any]:
         """What the metadata actually knows — the answer to "why wasn't that free?".

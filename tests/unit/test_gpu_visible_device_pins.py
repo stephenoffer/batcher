@@ -105,3 +105,39 @@ def test_the_driver_lookup_is_not_reached_for_an_ordinal_pin(monkeypatch, device
 
     monkeypatch.setattr("batcher._internal.hardware.devices.scope.visible_device_indices", _boom)
     assert [d["name"] for d in accelerators._visible_devices(devices)] == ["gpu1"]
+
+
+@pytest.mark.parametrize("masked", ["-1", "none", "void"])
+def test_an_explicit_no_device_pin_does_not_hand_over_the_whole_node(masked):
+    """`-1` is CUDA's own documented "no devices", and what a framework or CI script writes.
+
+    `_resolve` truncates at the first entry naming no live device and falls back to the whole
+    host when *nothing* resolved — the right reading of a value it does not understand. `-1` is
+    not a digit, not a UUID and not a MIG handle, so it resolved to nothing and took that
+    fallback: a process explicitly denied every device was told it owned all four, and the pool
+    sized itself, attributed telemetry and picked a NUMA affinity accordingly.
+
+    Note the truncation rule already handled `-1` correctly *anywhere but first* — only the
+    leading position hit the fallback, which is the position anything disabling the GPU writes.
+    """
+    from batcher._internal.hardware.devices import scope
+
+    telemetry = [_Telemetry(index=i, uuid=f"GPU-{i}") for i in range(4)]
+    assert scope._resolve(masked, telemetry) == ()
+
+
+def test_a_trailing_no_device_entry_still_truncates(devices):
+    """`"0,-1,1"` exposes exactly one device, as the CUDA runtime does — the pre-existing
+    behavior, which the leading-position fix must not disturb."""
+    from batcher._internal.hardware.devices import scope
+
+    telemetry = [_Telemetry(index=i, uuid=f"GPU-{i}") for i in range(4)]
+    assert scope._resolve("0,-1,1", telemetry) == (0,)
+
+
+class _Telemetry:
+    """The two fields `_resolve` reads off a probed device."""
+
+    def __init__(self, index: int, uuid: str) -> None:
+        self.index = index
+        self.uuid = uuid

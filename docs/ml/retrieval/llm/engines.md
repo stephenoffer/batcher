@@ -11,7 +11,7 @@ a single time.
 
 Keeping the contract that small is what makes the backends interchangeable. A local vLLM
 engine holding weights on a GPU and a remote OpenAI-compatible HTTP endpoint both
-satisfy it, so `ds.ml.generate`, `llm_generate`, and `llm_udf` take either without
+satisfy it, so {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`, `llm_generate`, and `llm_udf` take either without
 knowing which they got. It is also why the stub above works. A lambda returning a lambda
 is a legal `EngineFactory`, which is how you test a generation pipeline with no GPU.
 
@@ -171,7 +171,7 @@ card and a measured 30-50% throughput loss on a PCIe-only one such as an L4 or a
 because every forward all-reduces across the group. Batcher warns when the degree is above one
 on a PCIe-only card, and separately when a card that *supports* NVLink has its links reported
 down, which is a node fault rather than a setting: the group looks free on paper while every
-collective runs over PCIe. Check `bt.accelerators()` and drain the node if the links do not
+collective runs over PCIe. Check {py:func}`bt.accelerators() <batcher.accelerators>` and drain the node if the links do not
 come back.
 
 None of these change the degree. The penalty is hardware-specific and the fix differs per
@@ -223,7 +223,7 @@ captions = llm_generate(
 
 ## Text embeddings
 
-`ds.ml.embed` with a sentence-transformers model id embeds a text `column`, loading
+{py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` with a sentence-transformers model id embeds a text `column`, loading
 the model once per worker and scheduling it across GPU actors. It is the
 retrieval-pipeline companion to {doc}`vector search </ml/retrieval/vector-search>`. It appends one
 fixed-width vector column named by `output_column` and keeps the dataset lazy.
@@ -241,7 +241,7 @@ vectors.write.lance("s3://bucket/vectors.lance")
 ```
 
 For a model Batcher does not wrap directly, `ds.ml.embed` also takes any load-once
-callable or class that maps a batch to vectors, and `ds.ml.infer` does the same for
+callable or class that maps a batch to vectors, and {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` does the same for
 general model scoring. Both accept `concurrency`, `num_gpus`, and `batch_size` the
 same way.
 

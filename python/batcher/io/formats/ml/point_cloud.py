@@ -140,7 +140,20 @@ class PointCloudSource(FileSource):
             table = table.select(projection)
         return table.to_batches()
 
-    def _read_schema(self, fh: IO[Any]) -> pa.Schema:
+    def _file_schema(self, path: str) -> pa.Schema:
+        """The schema of one file, choosing the parser by the *path's* suffix.
+
+        The base class hands `_read_schema` a handle and nothing else, which leaves the
+        format to be guessed from the leading bytes. That guess is sound for PCD and PLY —
+        both open with an ASCII magic — and unsound for a raw `.bin`, whose first byte is
+        the low mantissa byte of a coordinate and is therefore uniform: about one sweep in
+        256 begins with `#`, which reads as a PCD comment, and schema inference then fails
+        on a file that reads perfectly well. The path is available here, so use it.
+        """
+        with self._open(path) as fh:
+            return self._read_schema(fh, ext=os.path.splitext(path)[1].lower())
+
+    def _read_schema(self, fh: IO[Any], *, ext: str | None = None) -> pa.Schema:
         """The column names and types, from the file's header rather than its points.
 
         This used to parse the whole file and keep only the field names. A point cloud is
@@ -160,20 +173,20 @@ class PointCloudSource(FileSource):
             The Arrow schema of the rows this source produces for that file.
         """
         head = fh.read(_HEADER_PEEK)
-        schema = self._header_schema(head)
+        schema = self._header_schema(head, ext=ext)
         if schema is None:
             # `head` is already consumed, so continue from where the peek stopped rather
             # than re-reading it — seeking is not available on every filesystem handle.
-            schema = self._parse(head + fh.read(), None).schema
+            schema = self._parse(head + fh.read(), None, ext=ext).schema
         # The per-file reads append a `frame` column (see `_parse`); the schema, parsed
         # without a path, must carry it too or normalization would drop it.
         if self._frame_col is not None:
             schema = schema.append(pa.field(self._frame_col, pa.string()))
         return schema
 
-    def _header_schema(self, head: bytes) -> pa.Schema | None:
+    def _header_schema(self, head: bytes, *, ext: str | None = None) -> pa.Schema | None:
         """The schema from `head` alone, or `None` when the header needs more bytes."""
-        kind = _sniff(head)
+        kind = ext if ext in _SUFFIXES else _sniff(head)
         if kind == ".bin":
             # A raw buffer carries no header, so the layout is the constructor's — which
             # means the schema of a `.bin` sweep costs no file access at all.
@@ -198,8 +211,8 @@ class PointCloudSource(FileSource):
         except Exception:
             return None
 
-    def _parse(self, data: bytes, path: str | None) -> pa.Table:
-        ext = os.path.splitext(path)[1].lower() if path else _sniff(data)
+    def _parse(self, data: bytes, path: str | None, *, ext: str | None = None) -> pa.Table:
+        ext = ext or (os.path.splitext(path)[1].lower() if path else _sniff(data))
         if ext == ".ply":
             columns = _parse_ply(data)
         elif ext == ".pcd":
@@ -257,13 +270,18 @@ def _parse_pcd(data: bytes) -> dict[str, np.ndarray]:
     sizes = [int(s) for s in fields["SIZE"].split()]
     types = fields["TYPE"].split()
     counts = [int(c) for c in fields.get("COUNT", " ".join("1" * len(names))).split()]
-    n_points = int(fields["POINTS"]) if "POINTS" in fields else int(fields["WIDTH"])
+    n_points = _pcd_declared_count(fields)
     data_kind = fields["DATA"].strip().lower()
 
     if any(c != 1 for c in counts):
         raise BackendError("PCD fields with COUNT > 1 are not supported")
     if data_kind == "ascii":
         table = np.loadtxt(body.splitlines(), dtype=np.float64, ndmin=2)
+        # Truncate to the declared count, which the `binary` branch below already does by
+        # slicing the buffer. Without it the two encodings disagree about the same file,
+        # and — worse — `row_count()` answers from the header while a collect answers from
+        # the body, so `ds.count()` and `len(ds.collect())` differ with nothing raised.
+        table = table[:n_points]
         return {name: table[:, i] for i, name in enumerate(names)}
     if data_kind == "binary":
         dt = np.dtype(
@@ -320,11 +338,31 @@ def _parse_ply(data: bytes) -> dict[str, np.ndarray]:
     return {name: rec[name] for name in names}
 
 
+def _pcd_declared_count(fields: dict[str, str]) -> int:
+    """How many points a PCD header declares.
+
+    ``POINTS`` when the writer emitted it, else ``WIDTH * HEIGHT``. The height is the part
+    that matters: an *organized* cloud — what a depth camera produces, and what a PCD with
+    ``HEIGHT > 1`` means — lays its points out as a grid, so taking ``WIDTH`` alone reads
+    one row of the image and silently discards the rest. On a 640x480 frame that is 99.8%
+    of the data, dropped with nothing raised.
+    """
+    if "POINTS" in fields:
+        return int(fields["POINTS"])
+    return int(fields["WIDTH"]) * int(fields.get("HEIGHT", "1"))
+
+
 def _pcd_point_count(head: bytes) -> int | None:
+    """The point count from a PCD header, for `row_count()` — or None if not all here."""
+    fields: dict[str, str] = {}
     for line in head.decode("ascii", "replace").splitlines():
-        if line.upper().startswith("POINTS"):
-            return int(line.split()[1])
-    return None
+        parts = line.split()
+        if parts:
+            fields[parts[0].upper()] = " ".join(parts[1:])
+    try:
+        return _pcd_declared_count(fields)
+    except (KeyError, ValueError):
+        return None
 
 
 def _ply_point_count(head: bytes) -> int | None:

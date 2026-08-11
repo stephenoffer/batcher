@@ -123,10 +123,10 @@ Check it directly:
 
 ```python
 print(str(customers.dq.unique("customer_id").validate()))
-# ValidationReport(violations: unique(customer_id)=1)
+# ValidationReport(violations: unique(customer_id)=2)
 ```
 
-One duplicated key. Collapse the dimension to one row per key before joining, and be
+Two rows sharing one key. Collapse the dimension to one row per key before joining, and be
 deliberate about which row survives:
 
 ```python
@@ -185,7 +185,7 @@ enters. Do not scatter casts through the pipeline.
 ## When the key is "nearest", not "equal"
 
 The FX rate table has a row when the rate changed, not a row per day. An equi-join on the
-date matches nothing. `join_asof` matches each fact to the nearest earlier rate:
+date matches nothing. {py:meth}`join_asof <batcher.Dataset.join_asof>` matches each fact to the nearest earlier rate:
 
 ```python
 fx = bt.from_pydict(
@@ -227,7 +227,7 @@ from a bad guess still paid for the start.
 
 ## See also
 
-- {doc}`Quality gates </cookbook/data-engineering/maintenance/quality-gates>`: `foreign_key` as a pre-join contract.
+- {doc}`Quality gates </cookbook/data-engineering/maintenance/quality-gates>`: {py:meth}`foreign_key <batcher.api.dataset.dq.DatasetDQ.foreign_key>` as a pre-join contract.
 - {doc}`Slowly changing dimensions </cookbook/data-engineering/modeling/slowly-changing-dimensions>`: joining to the version of
   the dimension that was current at the time.
 - {doc}`Schema evolution </cookbook/data-engineering/modeling/schema-evolution>`: where the key's type quietly changed.

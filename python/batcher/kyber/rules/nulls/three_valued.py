@@ -34,7 +34,7 @@ from batcher.kyber.rule import Phase
 # these are re-imports of already-loaded modules and cannot move any rule's registration.
 from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.nullability import _replaceable
-from batcher.kyber.rules.leaf_rewrite import rewrite_node, safe_expr
+from batcher.kyber.rules.leaf_rewrite import EXPR_NODES, rewrite_node, safe_expr
 from batcher.plan.expr_ir import (
     Array,
     Case,
@@ -50,7 +50,7 @@ from batcher.plan.expr_ir import (
 from batcher.plan.expr_ir.core import Binary
 from batcher.plan.expr_ir.nodes import HashRows, MakeStruct
 from batcher.plan.expr_rewrite import combine_conjuncts, combine_disjuncts, expr_key
-from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
+from batcher.plan.logical import LogicalPlan
 
 __all__ = [
     "drop_coalesce_args_after_never_null",
@@ -67,8 +67,6 @@ __all__ = [
     "null_check_contradiction_to_false",
     "null_check_tautology_to_true",
 ]
-
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 
 def never_null(expr: Expr) -> bool:
@@ -120,7 +118,7 @@ def _is_null_never_null(expr: Expr) -> Expr:
 @rule(
     name="is_null_of_never_null_to_false",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_is_null_never_null,
     expr_matches=(IsNull,),
 )
@@ -143,7 +141,7 @@ def _is_not_null_never_null(expr: Expr) -> Expr:
 @rule(
     name="is_not_null_of_never_null_to_true",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_is_not_null_never_null,
     expr_matches=(IsNotNull,),
 )
@@ -181,7 +179,7 @@ def _coalesce_never_null(expr: Expr, schema) -> Expr:
 @rule(
     name="drop_coalesce_of_never_null_first_arg",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_schema=_coalesce_never_null,
     expr_matches=(Coalesce,),
 )
@@ -215,7 +213,7 @@ def _coalesce_truncate(expr: Expr, schema) -> Expr:
 @rule(
     name="drop_coalesce_args_after_never_null",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_schema=_coalesce_truncate,
     expr_matches=(Coalesce,),
 )
@@ -253,7 +251,7 @@ def _null_tautology(expr: Expr) -> Expr:
 @rule(
     name="null_check_tautology_to_true",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_null_tautology,
     expr_matches=(Binary,),
     expr_ops=("or",),
@@ -280,7 +278,7 @@ def _null_contradiction(expr: Expr) -> Expr:
 @rule(
     name="null_check_contradiction_to_false",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_null_contradiction,
     expr_matches=(Binary,),
     expr_ops=("and",),
@@ -317,7 +315,7 @@ def _case_is_not_null(expr: Expr) -> Expr:
 @rule(
     name="is_null_through_case_branches",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_case_is_null,
     expr_matches=(IsNull,),
 )
@@ -338,7 +336,7 @@ def is_null_through_case_branches(node: LogicalPlan, _ctx) -> LogicalPlan | None
 @rule(
     name="is_not_null_through_case_branches",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_case_is_not_null,
     expr_matches=(IsNotNull,),
 )
@@ -382,7 +380,7 @@ def _least_is_not_null(expr: Expr) -> Expr:
 @rule(
     name="is_null_of_greatest_to_all_null",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_greatest_is_null,
     expr_matches=(IsNull,),
 )
@@ -400,7 +398,7 @@ def is_null_of_greatest_to_all_null(node: LogicalPlan, _ctx) -> LogicalPlan | No
 @rule(
     name="is_not_null_of_greatest_to_any_not_null",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_greatest_is_not_null,
     expr_matches=(IsNotNull,),
 )
@@ -414,7 +412,7 @@ def is_not_null_of_greatest_to_any_not_null(node: LogicalPlan, _ctx) -> LogicalP
 @rule(
     name="is_null_of_least_to_all_null",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_least_is_null,
     expr_matches=(IsNull,),
 )
@@ -427,7 +425,7 @@ def is_null_of_least_to_all_null(node: LogicalPlan, _ctx) -> LogicalPlan | None:
 @rule(
     name="is_not_null_of_least_to_any_not_null",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_least_is_not_null,
     expr_matches=(IsNotNull,),
 )

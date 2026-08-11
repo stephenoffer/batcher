@@ -7,12 +7,12 @@ than Python loops.
 
 ## Fuzzy deduplication
 
-Exact deduplication is `distinct()`. On a web-scale training corpus it barely helps,
+Exact deduplication is {py:meth}`distinct() <batcher.Dataset.distinct>`. On a web-scale training corpus it barely helps,
 because the duplicates are the same article behind a different header, or the same page
 with a changed timestamp. Removing *those* is the single biggest win in preprocessing an
 LLM pretraining set.
 
-`ds.ml.near_duplicates` finds the pairs, and `ds.ml.drop_near_duplicates` removes them,
+{py:meth}`ds.ml.near_duplicates <batcher.api.dataset.ml.DatasetML.near_duplicates>` finds the pairs, and {py:meth}`ds.ml.drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` removes them,
 keeping one representative per cluster.
 
 ```python
@@ -43,8 +43,8 @@ so they run wherever a join runs.
 
 MinHash answers "are these two documents made of the same words". It says nothing about
 two rows that *mean* the same thing in different words. That is a question for embeddings,
-and `ds.ml.similarity_join` is the same two-stage recipe with the signature swapped:
-`.list.simhash` replaces `str.minhash`, and the verification is the **exact**
+and {py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` is the same two-stage recipe with the signature swapped:
+{py:meth}`.list.simhash <batcher.plan.expr_ir.namespaces.collections._ListNamespace.simhash>` replaces `str.minhash`, and the verification is the **exact**
 `list.cosine_similarity` over the original vectors.
 
 ```python
@@ -80,5 +80,5 @@ candidate set up quadratically.
 ## See also
 
 - {doc}`/user-guide/transform/rows/distinct-and-dedup`: exact and keyed deduplication.
-- {doc}`/ml/retrieval/embeddings`: producing the vectors `similarity_join` matches on.
+- {doc}`/ml/retrieval/embeddings`: producing the vectors {py:meth}`similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` matches on.
 - {doc}`/ml/preparing/preprocessors/index`: the rest of the preprocessor family.

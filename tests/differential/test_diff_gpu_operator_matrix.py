@@ -50,8 +50,40 @@ from batcher.core.gpu_plan.execute import run_chain  # noqa: E402
 #: reached through `gpu_join_spec`/`gpu_union_spec` and not through `gpu_plan_ops`. Listed so a
 #: newly-declining operator shows up as a failure here instead of quietly joining them.
 STRUCTURAL = frozenset(
-    {"scan", "union", "join_inner", "join_left", "join_outer", "join_semi", "join_anti"}
+    {
+        "scan",
+        "union",
+        "join_inner",
+        "join_left",
+        "join_outer",
+        "join_semi",
+        "join_anti",
+        # The byte-keyed twins of the four joins above. A join's *key type* does not change
+        # which route it takes: `gpu_join_spec` translates all four on a string key exactly
+        # as it does on an integer one (verified directly), so these are structural like
+        # their integer counterparts rather than declines to be recorded in `DECLINED`.
+        "join_inner_str",
+        "join_left_str",
+        "join_semi_str",
+        "join_anti_str",
+    }
 )
+
+#: Operators the device tier **declines outright**, with the reason. Deliberately a separate
+#: set from `STRUCTURAL`: those are translated, just reached by another route, while these are
+#: not translated at all. `.claude/rules/device-tier.md` requires a decline to be recorded with
+#: a reason rather than discovered, and the assertion below is what makes the record binding.
+_KEYED_DEDUP = (
+    "keyed dedup: which row survives per key IS the answer, so matching the CPU engine means "
+    "restating its `min` — null placement and float identity included — against another "
+    "library, which the device contract says must be proven on real hardware before it ships"
+)
+DECLINED: dict[str, str] = {
+    "dedup_keyed_first": _KEYED_DEDUP,
+    "dedup_keyed_last": _KEYED_DEDUP,
+    "dedup_keyed_float": _KEYED_DEDUP,
+    "dedup_keyed_multi": _KEYED_DEDUP,
+}
 
 
 def _backends() -> list[str]:
@@ -88,7 +120,7 @@ def _translated(op: str, shape: str, be: DfBackend):
     return be.to_arrow(run_chain(table, spec[1], be)), dataset.collect()
 
 
-@pytest.mark.parametrize("op", sorted(set(UNORDERED_OPS) - STRUCTURAL))
+@pytest.mark.parametrize("op", sorted(set(UNORDERED_OPS) - STRUCTURAL - set(DECLINED)))
 @pytest.mark.parametrize("shape", sorted(INPUTS))
 def test_the_device_translation_matches_the_engine(op, shape, be):
     """Same rows *and* same column types as the CPU engine, on every edge-case input.
@@ -109,7 +141,12 @@ def test_the_device_translation_matches_the_engine(op, shape, be):
 
 
 @pytest.mark.parametrize(
-    "op", sorted(o for o, (_b, sql) in UNORDERED_OPS.items() if sql and o not in STRUCTURAL)
+    "op",
+    sorted(
+        o
+        for o, (_b, sql) in UNORDERED_OPS.items()
+        if sql and o not in STRUCTURAL and o not in DECLINED
+    ),
 )
 @pytest.mark.parametrize("shape", sorted(INPUTS))
 def test_the_device_translation_matches_duckdb(duck, op, shape, be):
@@ -134,7 +171,10 @@ def test_the_structural_shapes_are_the_only_ones_the_chain_matcher_declines():
         for op in UNORDERED_OPS
         if gpu_plan_ops(UNORDERED_OPS[op][0](bt.from_arrow(INPUTS["base"]))._plan) is None
     }
-    assert declined == STRUCTURAL, (
-        f"chain-matcher declines changed: newly declined {sorted(declined - STRUCTURAL)}, "
-        f"newly translated {sorted(STRUCTURAL - declined)}"
+    expected = STRUCTURAL | set(DECLINED)
+    assert declined == expected, (
+        f"chain-matcher declines changed: newly declined {sorted(declined - expected)}, "
+        f"newly translated {sorted(expected - declined)}. A new decline is not a bug on its "
+        f"own — it may be the right call — but it must be recorded in `DECLINED` with the "
+        f"reason, per `.claude/rules/device-tier.md`."
     )

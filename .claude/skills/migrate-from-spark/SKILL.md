@@ -47,10 +47,18 @@ reference.
 | `df.count()` / `.show()` | `ds.count()` / `ds.show()` | |
 | `df.toLocalIterator()` | `ds.iter_batches()` | streams Arrow batches |
 | `df.write.mode("append").parquet(p)` | `ds.write(p, mode="append")` | Spark `SaveMode` parity |
+| `spark.read.option("mode", "DROPMALFORMED")` | `bt.read.csv(p, on_bad_lines="skip")` | also on `read.json`; `FAILFAST` is the default |
 | `MERGE INTO` | `ds.write.delta(uri, merge_on=["id"])` | one transactional call |
 
 ## Conceptual shifts that actually bite
 
+- **The read `mode` option splits in two.** Spark's `mode` conflates "this file is
+  unreadable" with "this record is malformed", which in Batcher are `on_error=` and
+  `on_bad_lines=` respectively. `DROPMALFORMED` is `on_bad_lines="skip"`; `FAILFAST` is the
+  default. `PERMISSIVE` has no equivalent, because there is no corrupt-record column — a
+  record that parses but does not fit the inferred type is answered by `schema=`, not by
+  parking its text in a string column. Passing `mode=` raises with that translation rather
+  than being ignored.
 - **No `SparkSession`, no cluster.** The engine runs in-process. Delete the session
   builder, the `spark.stop()`, and every `spark.conf.set(...)`; configuration lives in
   `bt.Config` / `bt.set_config` / `bt.config_context`. Going distributed is a *keyword*,
@@ -64,6 +72,8 @@ reference.
   Collapse `for c in cols: df = df.withColumn(...)` into one `ds.with_columns(**exprs)`.
 - **Save modes carry over, `partitionBy` becomes a keyword.**
   `ds.write(path, mode="overwrite"|"error"|"ignore"|"append", partition_by=[...])`.
+  Spark's `partitionOverwriteMode="dynamic"` is a session conf with no Batcher equivalent;
+  it is `mode="overwrite_partitions"` on the write itself (`"dynamic"` is accepted too).
   `append` is lakehouse sinks only (delta/iceberg). `resume=True` makes a re-run skip
   committed shards, and `max_rows_per_file=` bounds file size.
 - **UDFs are batch-first.** There is no `pandas_udf` decorator and no per-row JVM
@@ -74,7 +84,11 @@ reference.
   `spark.sql.shuffle.partitions`. Partition count is chosen from measured cardinalities
   by the optimizer; `ds.repartition(...)` controls *output* file layout (`num_files=`,
   `by=`, `target_size_mb=`), and `ds.shuffle(seed=...)` is a row shuffle, not a
-  redistribution hint. Ray, when used, schedules tasks only — batches move over Arrow
+  redistribution hint. **`repartition(by=...)` is not Spark's `repartition($"col")`**: it
+  Hive-partitions the *output directory* (Spark's `partitionBy`), it does not co-locate
+  rows by key. To get Spark's co-location before a partitioned write, use
+  `write(..., sort_by=[the partition columns])`, which makes the plan reduce through a
+  breaker so each key lands in one file. Ray, when used, schedules tasks only — batches move over Arrow
   Flight, never the object store.
 - **`explain()` is a string, and `analyze=True` actually runs.** For "where did the time
   go", `ds.stats()` reports measured rows/time/bytes/spill per operator plus the

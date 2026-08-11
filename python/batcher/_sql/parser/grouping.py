@@ -29,13 +29,18 @@ from batcher.plan.expr_ir import AggExpr, Expr, col
 from batcher.plan.expr_ir.selectors import expand_selectors, has_selector
 
 
-def _expand_star(tr, star, visible: list[str]) -> dict[str, Expr]:
+def _expand_star(
+    tr, star, visible: list[str], physical: dict[str, str] | None = None
+) -> dict[str, Expr]:
     """Expand `SELECT *` with DuckDB's star modifiers into name -> expression.
 
     Supports `EXCLUDE`/`EXCEPT (cols)` (drop columns), `REPLACE (expr AS c)`
     (substitute a column's expression, keeping its position), and `RENAME (c AS d)`
     (rename in place). A modifier this translator cannot express is rejected rather
     than silently dropped — ignoring one would return the wrong columns.
+
+    `physical` maps a name in `visible` to the column actually carrying it in the joined
+    relation, for a qualified `x.*` whose columns the join disambiguator renamed.
     """
     if star.args.get("ilike") is not None:
         raise PlanError(
@@ -64,27 +69,80 @@ def _expand_star(tr, star, visible: list[str]) -> dict[str, Expr]:
             continue
         # REPLACE keeps the column's name and position, swapping its expression.
         # RENAME keeps the expression, swapping the output name.
-        out[renamed.get(c, c)] = tr._scalar(replaced[c]) if c in replaced else col(c)
+        source = physical.get(c, c) if physical else c
+        out[renamed.get(c, c)] = tr._scalar(replaced[c]) if c in replaced else col(source)
     return out
 
 
-def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
+def _star_source(tr, projection) -> dict[str, str] | None:
+    """For a qualified `x.*`, x's own columns mapped to the columns now carrying them.
+
+    A join renames colliding columns to `alias__col` (`core_utils._disambiguate_columns`),
+    which recorded per select node what each source contributed. Without that lookup a
+    qualified star expanded to *every* column of the joined relation, under the
+    disambiguated names — so `SELECT x.*, small.id4 AS small_id4 FROM x JOIN small
+    USING (id1)` returned `x__id4` and `small__id4` where SQL requires x's `id4` alone.
+
+    Returns `None` when the star should keep expanding to everything: an unqualified `*`,
+    a single-table query (where x's columns *are* every column), or a source the join
+    disambiguator could not enumerate — an inline subquery, whose columns are not known
+    until it is translated. (A CTE *is* enumerable: it is in the table registry.)
+    """
+    if not projection.table:
+        return None
+    return tr._star_sources.get(id(projection.parent), {}).get(projection.table)
+
+
+def _unique_name(name: str, taken: dict[str, Expr]) -> str:
+    """`name`, or the first free `name_1`, `name_2`, ... if it is already claimed.
+
+    SQL lets a SELECT list emit the same output name twice (`SELECT t.id, u.id`, or the
+    `t.*, u.*` of a join on a shared key), but a `Dataset` is name-keyed and rejects a
+    duplicate. Keying the projection map on the raw name instead made the *second* item
+    overwrite the first, so the query silently returned one column where SQL asks for
+    two. Suffixing matches what DuckDB itself does whenever it has to make result names
+    unique, so a caller reading `id_1` sees the same name the oracle produces.
+    """
+    if name not in taken:
+        return name
+    i = 1
+    while f"{name}_{i}" in taken:
+        i += 1
+    return f"{name}_{i}"
+
+
+def _put(named: dict[str, Expr], name: str, expr: Expr) -> None:
+    """Add one projection under a name no earlier projection has claimed."""
+    named[_unique_name(name, named)] = expr
+
+
+def _projection_map(tr, ds: Dataset, projections, star_cols=None) -> dict[str, Expr]:
+    """Build the SELECT list's output name -> expression map.
+
+    `star_cols` is the column list `*` expands to, when it differs from the relation's
+    current columns — a window pass has already added its output columns to `ds`, and a
+    star must expand what the query selects *from*, not what this same SELECT list is
+    about to produce.
+    """
+    star_visible = list(ds.columns) if star_cols is None else list(star_cols)
     named: dict[str, Expr] = {}
     for p in projections:
-        # `SELECT *` (Star) or `SELECT t.*` (a Column wrapping a Star) → keep
-        # all current columns. (Qualified `t.*` expands to every column; in a
-        # single-table query that is exactly t's columns.)
+        # `SELECT *` (Star) or `SELECT t.*` (a Column wrapping a Star).
         if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)):
             star = p if isinstance(p, exp.Star) else p.this
             # Internal columns materialized by UDF hoisting (`__bc_…`) are an
             # implementation detail and must never leak through `*`.
-            visible = [c for c in ds.columns if not c.startswith("__bc_")]
-            named.update(_expand_star(tr, star, visible))
+            visible = [c for c in star_visible if not c.startswith("__bc_")]
+            physical = _star_source(tr, p) if isinstance(p, exp.Column) else None
+            if physical is not None:
+                visible = list(physical)
+            for name, expr in _expand_star(tr, star, visible, physical).items():
+                _put(named, name, expr)
             continue
         alias = _alias_of(p)
         if tr._is_window(p):
             # The window pass already materialized this column under `alias`.
-            named[alias] = col(alias)
+            _put(named, alias, col(alias))
             continue
         expr = tr._scalar(_unwrap_alias(p))
         if has_selector(expr):
@@ -92,9 +150,10 @@ def _projection_map(tr, ds: Dataset, projections) -> dict[str, Expr]:
             # function) expands to one output per matched column, named by that column
             # — reusing the DataFrame selector engine.
             visible = [c for c in ds.columns if not c.startswith("__bc_")]
-            named.update(expand_selectors(expr, visible, ds._plan.available_schema()))
+            for name, sel in expand_selectors(expr, visible, ds._plan.available_schema()):
+                _put(named, name, sel)
         else:
-            named[alias] = expr
+            _put(named, alias, expr)
     return named
 
 
@@ -112,6 +171,29 @@ def _is_group_agg(a) -> bool:
     if isinstance(a.parent, exp.Window):
         return False
     return a.find_ancestor(exp.Subquery) is None
+
+
+#: Aggregates a warehouse user reaches for that Batcher deliberately does not carry, and the
+#: spelling that does the job. Each entry is a *design* refusal rather than a missing kernel,
+#: so the message names the alternative instead of promising the function later.
+#:
+#: `first`/`last` are the important pair. DuckDB defines them as the first/last row in an
+#: unspecified order, so two runs of the same query may disagree — and a plan that is
+#: morsel-parallel and may span nodes makes that far more visible than a single-threaded scan
+#: does. Batcher's own `Expr.first(order_by=...)` requires the ordering that makes the answer
+#: mean something; `any_value` is the honest spelling when it genuinely does not matter.
+_AGG_ADVICE: dict[str, str] = {
+    "first": (
+        ". Batcher has no scan-order aggregate: the row a parallel scan reaches first is not "
+        "defined. Use any_value(x) when any row will do, or min_by/arg_min(x, ordering) when "
+        "a particular one is meant"
+    ),
+    "last": (
+        ". Batcher has no scan-order aggregate: the row a parallel scan reaches last is not "
+        "defined. Use any_value(x) when any row will do, or max_by/arg_max(x, ordering) when "
+        "a particular one is meant"
+    ),
+}
 
 
 def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=None) -> tuple:
@@ -237,8 +319,14 @@ def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=
     # relation. Their aggregate arguments are now materialized columns, so point them
     # at those columns and let the ordinary window pass compute them here.
     if windows:
-        from batcher._sql.parser.windowing import rewrite_aggs_in_windows
+        from batcher._sql.parser.windowing import (
+            rewrite_aggs_in_windows,
+            rewrite_group_keys_in_windows,
+        )
 
+        # Derived group keys first: they are matched by SQL text, and rewriting an
+        # aggregate inside one would change the text `group_expr_alias` is keyed on.
+        rewrite_group_keys_in_windows(windows, group_expr_alias)
         rewrite_aggs_in_windows(tr, windows)
         ds = tr._window(ds, windows)
 
@@ -251,13 +339,13 @@ def _aggregate(tr, ds: Dataset, projections, group, having, windows=None, order=
         inner = _unwrap_alias(p)
         if tr._is_window(p):
             # Already materialized under `out` by the window pass above.
-            named[out] = col(out)
+            _put(named, out, col(out))
         elif isinstance(inner, exp.Column) and inner.name in group_cols:
-            named[out] = col(inner.name)
+            _put(named, out, col(inner.name))
         elif inner.sql() in group_expr_alias:
-            named[out] = col(group_expr_alias[inner.sql()])
+            _put(named, out, col(group_expr_alias[inner.sql()]))
         else:
-            named[out] = tr._scalar(inner)
+            _put(named, out, tr._scalar(inner))
     # The *unprojected* relation is returned with its projection map so the caller can
     # sort before projecting: SQL resolves an ORDER BY term against the select-list
     # aliases AND the columns underneath them, and projecting first destroys the latter.
@@ -272,8 +360,9 @@ def _distinct_on(tr, ds: Dataset, projections, order, on_exprs) -> Dataset:
     Postgres/DuckDB semantics: for each set of rows sharing the ``DISTINCT ON`` key
     expressions, keep the first row in ``ORDER BY`` order, then order the survivors by
     the same ``ORDER BY``. Reuses ``Dataset.distinct(subset, keep="first", order_by=…)``
-    (a ``row_number()`` window under the hood) rather than a full-row dedup. The key and
-    sort expressions are materialized as internal ``__bc_`` columns first so they stay
+    — one mergeable reduction, the same operator the DataFrame spelling builds, so the two
+    front-ends cannot drift into different plans for the same query. The key and sort
+    expressions are materialized as internal ``__bc_`` columns first so they stay
     resolvable even when absent from the SELECT list, and never leak through ``SELECT *``.
     """
     on_cols: list[str] = []
@@ -382,7 +471,7 @@ def _agg(tr, node) -> AggExpr | Expr:
         return AggExpr("list_agg", tr._scalar(arg))
     mapped = _AGG_FUNCS.get(fname)
     if mapped is None:
-        raise NotImplementedError(f"unsupported aggregate: {fname}")
+        raise NotImplementedError(f"unsupported aggregate: {fname}{_AGG_ADVICE.get(fname, '')}")
     arg = node.this
     if isinstance(arg, exp.Distinct):
         # `MIN(DISTINCT x)` / `MAX(DISTINCT x)` — dedup is a no-op for the extrema, so

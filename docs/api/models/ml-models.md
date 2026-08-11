@@ -4,13 +4,13 @@ This page is the reference for the model half of `batcher.ml`: the tabular infer
 plane, the estimators that fit inside the engine, the metrics that need a global
 ordering, and the selection and interpretation helpers.
 
-The single-pass metric *expressions* such as `bt.rmse` and `bt.f1_score` live in
+The single-pass metric *expressions* such as {py:func}`bt.rmse <batcher.rmse>` and {py:func}`bt.f1_score <batcher.f1_score>` live in
 {doc}`/api/relational/expressions` instead, because they are ordinary aggregates.
 
 ## Tabular models
 
 `batcher.ml.tabular` is the classical-ML inference plane behind
-{meth}`~batcher.Dataset.ml.predict`: it assembles Arrow columns into the dense matrix an
+{py:meth}`ds.ml.predict() <batcher.api.dataset.ml.DatasetML.predict>`: it assembles Arrow columns into the dense matrix an
 XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX model expects, and wraps the model as a
 load-once class UDF. See the {doc}`tabular models guide </ml/inference/tabular-models>`.
 
@@ -115,8 +115,8 @@ aggregate.
    :members:
 ```
 
-`batcher.ml.discriminant` adds the Gaussian classifiers: `LinearDiscriminantAnalysis` shares one
-covariance across classes (linear boundaries), and `QuadraticDiscriminantAnalysis` gives each class
+`batcher.ml.discriminant` adds the Gaussian classifiers: {py:class}`LinearDiscriminantAnalysis <batcher.ml.discriminant.LinearDiscriminantAnalysis>` shares one
+covariance across classes (linear boundaries), and {py:class}`QuadraticDiscriminantAnalysis <batcher.ml.discriminant.QuadraticDiscriminantAnalysis>` gives each class
 its own (quadratic boundaries).
 
 ```{eval-rst}
@@ -139,6 +139,22 @@ model per class and predicts whichever scores highest.
 .. currentmodule:: batcher.ml.multiclass
 
 .. autoclass:: OneVsRestClassifier
+   :members:
+```
+
+`batcher.ml.compose` turns a classifier's raw scores into probabilities you can act on.
+A model that separates classes well can still be badly calibrated, meaning a score of 0.9
+does not happen nine times in ten, which matters the moment a threshold carries a cost.
+{py:class}`CalibratedClassifierCV <batcher.ml.compose.calibration.CalibratedClassifierCV>`
+fits the classifier on each cross-validation fold, learns the score-to-probability mapping
+on the fold it held out, and averages those mappings. Fitting the calibration on data the
+model trained on learns the overconfidence it shows on rows it memorized, which is not the
+overconfidence it shows in production.
+
+```{eval-rst}
+.. currentmodule:: batcher.ml.compose.calibration
+
+.. autoclass:: CalibratedClassifierCV
    :members:
 ```
 
@@ -242,7 +258,7 @@ a single streaming pass.
 ```
 
 Score a clustering against a reference labeling with `batcher.ml.metrics`, each computed from one
-`group_by` contingency table.
+{py:meth}`group_by <batcher.Dataset.group_by>` contingency table.
 
 ```{eval-rst}
 .. currentmodule:: batcher.ml.metrics

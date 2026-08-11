@@ -120,8 +120,7 @@ def test_window_eviction_is_skipped_when_no_window_can_have_closed():
         .agg(s=bt.col("v").sum())
         ._plan
     )
-    alias, width = _window_key(plan)
-    fold = _WindowedAggFold(plan, alias, width)
+    fold = _WindowedAggFold(plan, _window_key(plan))
 
     # `_evicted_through` advances exactly when a sweep runs, so counting its changes counts
     # the sweeps without patching a `__slots__` object.
@@ -156,13 +155,13 @@ def test_a_restored_fold_sweeps_on_its_next_push():
         .agg(s=bt.col("v").sum())
         ._plan
     )
-    alias, width = _window_key(plan)
-    fold = _WindowedAggFold(plan, alias, width)
+    key = _window_key(plan)
+    fold = _WindowedAggFold(plan, key)
     fold.push(pa.record_batch({"t": [base], "v": [1]}))
     fold.push(pa.record_batch({"t": [base + dt.timedelta(minutes=5)], "v": [1]}))
     state = fold.state()
 
-    revived = _WindowedAggFold(plan, alias, width)
+    revived = _WindowedAggFold(plan, key)
     revived.restore(state)
     assert revived._evicted_through is None
 

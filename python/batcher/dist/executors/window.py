@@ -7,26 +7,19 @@ all reducers is identical to single-node execution. Unlike the aggregate shuffle
 (which moves partial *state*), this moves the raw rows and reuses the *same* hash
 partitioner so a partition is never split across reducers.
 
+That decomposition is `keyed_shuffle.keyed_row_shuffle`, shared with the keyed dedup, which
+shuffles by key the same way and differs only in pre-reducing on the map side. This module is
+what a window puts into it: its partition keys as the shuffle key, its raw rows as the map
+plan, and itself as the reduce plan.
+
 Restricted to windows whose partition keys are plain columns and whose input is a
 breaker-free single source; anything else falls back to single-node.
 """
 
 from __future__ import annotations
 
-import json
-
-import pyarrow as pa
-
-from batcher._internal.native import engine
-from batcher.dist.executors.partition_io import _apply_above, _partition_source
-from batcher.dist.executors.plan_analysis import _relabel_single_source
-from batcher.dist.executors.ray_runtime import (
-    _ensure_ray,
-    _rmtree,
-    engine_config_json,
-    record_worker_metrics,
-    shuffle_partitions,
-)
+from batcher.dist.executors.keyed_shuffle import keyed_row_shuffle, scan_rooted_ir
+from batcher.dist.executors.plan_analysis import _relabel_single_source, empty_result_table
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Window
 
@@ -37,108 +30,32 @@ def _distributed_window(
     sources: list[Source],
     workers: int,
     hub=None,
-) -> pa.Table:
-    """Run `window` across `workers` by hash-shuffling rows by its partition keys."""
-    from batcher.carbonite.resilience import gather_with_backups
-    from batcher.dist.executors.ray_runtime import speculation_policy
+    metrics_out=None,
+    *,
+    materialize: bool = True,
+):
+    """Run `window` across `workers` by hash-shuffling rows by its partition keys.
 
-    _ensure_ray(workers)
-    cfg_json = engine_config_json()  # driver config → shipped to workers
-
+    `materialize=False` hands the reducers' output back as a `MaterializedSource` instead
+    of collecting it. A window emits one row per input row, so the collect is the whole
+    relation through the driver — the shuffle underneath has supported keeping it in place
+    all along (`keyed_row_shuffle`), and this is what connects the two. Only honored when
+    nothing is stacked `above`, so the caller must handle either return type."""
     # Partition-key column positions in the window input's output (caller guarantees
     # every partition key is a plain `Col`).
     cols = window.input.available_columns()
-    pk_indices = [cols.index(k.name) for k in window.partition_keys]
-
+    key_indices = [cols.index(k.name) for k in window.partition_keys]
     map_plan, source_id = _relabel_single_source(window.input)
-    map_ir = json.dumps(map_plan.to_ir())
-    # The reduce runs the window over its bucket (a single in-memory source 0).
-    win_ir = window.to_ir()
-    win_ir["input"] = {"op": "scan", "source_id": 0}
-    win_json = json.dumps(win_ir)
-    n_reducers = shuffle_partitions(workers)
-
-    from batcher.dist.shuffle_io import distributed_work_dir
-
-    work_dir = distributed_work_dir("batcher_winshuffle_")
-    try:
-        partitions = _partition_source(sources[source_id], workers, work_dir)
-        pol = speculation_policy()
-
-        # Each task is a pure function of its partition file, so a straggler can be
-        # backed up (deterministic → identical output); `gather_with_backups` is a
-        # plain barrier when speculation is disabled (the default) — matching the
-        # resilience wrapper every other disk-shuffle operator uses.
-        def _map_for(mid: int):
-            return _map_task.remote(
-                map_ir, json.dumps(pk_indices), partitions[mid], n_reducers, work_dir, mid, cfg_json
-            )
-
-        map_results = gather_with_backups(
-            [_map_for(mid) for mid in range(len(partitions))], _map_for, pol
-        )
-        shuffle_paths = [paths for paths, _metrics in map_results]  # [mapper][reducer] = path
-        record_worker_metrics(hub, (m for _paths, m in map_results))
-
-        def _reduce_for(r: int):
-            return _reduce_task.remote(
-                win_json, [paths[r] for paths in shuffle_paths], work_dir, r, cfg_json
-            )
-
-        reduce_results = gather_with_backups(
-            [_reduce_for(r) for r in range(n_reducers)], _reduce_for, pol
-        )
-        result_paths = [path for path, _metrics in reduce_results]
-        # The reduce runs the window operator over a whole partition — the breaker whose
-        # measured time and peak bytes the cost model and memory model are fit from.
-        record_worker_metrics(hub, (m for _path, m in reduce_results))
-
-        from batcher.dist.shuffle_io import read_ipc
-
-        out_batches: list[pa.RecordBatch] = []
-        for p in result_paths:
-            if p is not None:
-                out_batches.extend(read_ipc(p))
-    finally:
-        _rmtree(work_dir)
-
-    table = (
-        pa.Table.from_batches(out_batches)
-        if out_batches
-        else pa.table({c: [] for c in window.available_columns()})
+    return keyed_row_shuffle(
+        above,
+        map_plan=map_plan,
+        reduce_ir=scan_rooted_ir(window),
+        key_indices=key_indices,
+        out_schema=empty_result_table(window, window.available_columns()).schema,
+        source=sources[source_id],
+        workers=workers,
+        hub=hub,
+        tag="win",
+        metrics_out=metrics_out,
+        materialize=materialize,
     )
-    return table if not above else _apply_above(above, table)
-
-
-def _map_task(map_ir, pk_indices_json, part_path, n_reducers, work_dir, mapper_id, engine_config):
-
-    nat = engine()
-    from batcher.dist.executors.partition_io import read_partition
-    from batcher.dist.executors.ray_runtime import execute_metered
-    from batcher.dist.shuffle_io import write_shuffle_buckets
-
-    rows, metrics_json = execute_metered(map_ir, [read_partition(part_path)], engine_config)
-    pk_indices = json.loads(pk_indices_json)
-    buckets = nat.partition_batches(rows, pk_indices, n_reducers)
-    return write_shuffle_buckets(buckets, work_dir, "wm", mapper_id), metrics_json
-
-
-def _reduce_task(win_json, input_paths, work_dir, reducer_id, engine_config):
-    import os as _os
-
-    from batcher.dist.executors.ray_runtime import execute_metered
-    from batcher.dist.shuffle_io import read_ipc, write_ipc
-
-    batches: list = []
-    for path in input_paths:
-        batches.extend(read_ipc(path))
-    if not batches:
-        return (None, "")
-    # The whole window partition for every key in this bucket is present, so the
-    # window operator computes the same values it would single-node.
-    result, metrics_json = execute_metered(win_json, [batches], engine_config)
-    if not result or sum(b.num_rows for b in result) == 0:
-        return (None, metrics_json)
-    path = _os.path.join(work_dir, f"winreduce_{reducer_id}.arrow")
-    write_ipc(result, path)
-    return (path, metrics_json)

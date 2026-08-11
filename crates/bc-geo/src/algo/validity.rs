@@ -10,7 +10,7 @@
 //! single location, the position it happens at. A boolean alone tells you a row is bad;
 //! a reason tells you which vertex to fix.
 
-use crate::algo::primitive::{on_segment, segments_intersect, PointRing};
+use crate::algo::primitive::{on_segment, segments_cross_properly, segments_intersect, PointRing};
 use crate::algo::relate::point_in_polygon;
 use crate::types::{is_closed, Coord, Geometry, LineString, Polygon};
 use crate::Geom;
@@ -45,7 +45,11 @@ pub fn is_ring(g: &Geometry) -> bool {
 pub fn is_simple(g: &Geometry) -> bool {
     match g {
         Geometry::LineString(l) => !self_intersects(l),
-        Geometry::MultiLineString(ls) => ls.iter().all(|l| !self_intersects(l)),
+        Geometry::MultiLineString(ls) => {
+            ls.iter().all(|l| !self_intersects(l))
+                && (0..ls.len())
+                    .all(|i| ((i + 1)..ls.len()).all(|j| !chains_meet_improperly(&ls[i], &ls[j])))
+        }
         Geometry::MultiPoint(ps) => {
             let pts: Vec<Coord> = ps.iter().flatten().copied().collect();
             !pts.iter()
@@ -55,6 +59,58 @@ pub fn is_simple(g: &Geometry) -> bool {
         Geometry::GeometryCollection(gs) => gs.iter().all(is_simple),
         _ => true,
     }
+}
+
+/// True when two *different* chains of a MULTILINESTRING meet anywhere other than at a
+/// position that is a boundary point of both.
+///
+/// OGC simplicity is a property of the whole collection, not of its members one at a
+/// time: two perfectly simple chains that cross each other make the multi-line
+/// non-simple. Checking members in isolation reports such a collection as simple, which
+/// is the same answer it gives for two disjoint chains.
+///
+/// A closed chain has no boundary at all, so *any* contact with another member is
+/// improper for it.
+fn chains_meet_improperly(a: &LineString, b: &LineString) -> bool {
+    if a.len() < 2 || b.len() < 2 {
+        return false;
+    }
+    let ends_a: &[Coord] = if is_closed(a) {
+        &[]
+    } else {
+        &[a[0], a[a.len() - 1]]
+    };
+    let ends_b: &[Coord] = if is_closed(b) {
+        &[]
+    } else {
+        &[b[0], b[b.len() - 1]]
+    };
+    let is_end = |p: Coord, ends: &[Coord]| ends.iter().any(|e| e.x == p.x && e.y == p.y);
+    for s in a.windows(2) {
+        for t in b.windows(2) {
+            if !segments_intersect(s[0], s[1], t[0], t[1]) {
+                continue;
+            }
+            // A transversal crossing is interior to both segments, so it can never be a
+            // chain endpoint. Decided from orientations, since the crossing point itself
+            // is not exactly representable.
+            if segments_cross_properly(s[0], s[1], t[0], t[1]) {
+                return true;
+            }
+            // Otherwise the contact is at one or more of the four vertices. Every shared
+            // position must be a boundary point of both chains; a collinear overlap
+            // contributes two such positions, at least one of which is interior.
+            for p in [s[0], s[1], t[0], t[1]] {
+                if on_segment(p, s[0], s[1])
+                    && on_segment(p, t[0], t[1])
+                    && !(is_end(p, ends_a) && is_end(p, ends_b))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// True when two non-adjacent segments of the chain meet.
@@ -347,5 +403,27 @@ mod tests {
         let mut geom = g("POINT(1 2)");
         geom.geometry = Geometry::Point(Some(Coord::new(f64::NAN, 2.0)));
         assert!(validity_reason(&geom).unwrap().contains("non-finite"));
+    }
+
+    #[test]
+    fn a_multilinestring_whose_members_cross_is_not_simple() {
+        // Each chain is simple on its own; the collection is not, because they cross.
+        let g = read_wkt(
+            "MULTILINESTRING((-31.666 31.623, -23.108 -38.653), (-41.143 -19.156, 10.818 -22.207))",
+        )
+        .expect("wkt");
+        assert!(!is_simple(&g.geometry));
+    }
+
+    #[test]
+    fn multilinestring_members_may_meet_at_shared_endpoints() {
+        let g = read_wkt("MULTILINESTRING((0 0, 5 5), (5 5, 10 0))").expect("wkt");
+        assert!(is_simple(&g.geometry));
+    }
+
+    #[test]
+    fn disjoint_multilinestring_members_stay_simple() {
+        let g = read_wkt("MULTILINESTRING((0 0, 1 1), (10 10, 11 11))").expect("wkt");
+        assert!(is_simple(&g.geometry));
     }
 }

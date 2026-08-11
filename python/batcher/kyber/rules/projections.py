@@ -428,7 +428,13 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         # The exploded `column` is always needed (it sets the row count); other
         # downstream needs pass through, with `alias` mapping back to `column`.
         child = _rewrite(node.input, _unnest_child_need(node, need))
-        return node if child is node.input else Unnest(child, node.column, node.alias)
+        # `replace`, not `Unnest(child, column, alias)`: the positional rebuild carried
+        # three of the node's five fields, so pruning a column anywhere under an *outer*
+        # explode silently reset `outer` to its default and dropped every row kept only by
+        # it — `explode(outer=True).select(...)` returned the rows with a non-empty list
+        # and nothing else. `index_alias` was lost the same way. Both are wrong answers
+        # rather than errors, and neither is visible in the unoptimized plan.
+        return node if child is node.input else dataclasses.replace(node, input=child)
     if isinstance(node, Unpivot):
         # Unpivot's child must produce the index + melted `on` columns; the output's
         # variable/value columns are synthesized here, not read from the child.
@@ -455,9 +461,23 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
         child = _rewrite(node.input, set(need))
         return node if child is node.input else Limit(child, node.n, node.offset)
     if isinstance(node, Distinct):
-        # Distinct uses every column, so its child needs them all.
-        child = _rewrite(node.input, set(node.input.available_columns()))
-        return node if child is node.input else Distinct(child)
+        # A whole-row DISTINCT reads every column, so its child needs them all — dropping one
+        # changes which rows are duplicates.
+        #
+        # A *keyed* dedup is the opposite: only the key and ordering columns decide anything,
+        # and every other column is payload the node just carries. So its child needs what is
+        # needed above plus those, which is what lets a `distinct(["user_id"]).select("user_id")`
+        # over a 200-column table read two columns instead of 200. Pruning a *key* column would
+        # change the answer, and pruning an *ordering* column would change which row survives,
+        # so both are added back unconditionally.
+        if node.keys:
+            child_need = set(need) | set(node.keys)
+            for key in node.order:
+                child_need |= referenced_columns(key.expr)
+        else:
+            child_need = set(node.input.available_columns())
+        child = _rewrite(node.input, child_need)
+        return node if child is node.input else dataclasses.replace(node, input=child)
     if isinstance(node, Union):
         inputs = tuple(_rewrite(i, set(i.available_columns())) for i in node.inputs)
         if all(a is b for a, b in zip(inputs, node.inputs, strict=True)):
@@ -510,6 +530,8 @@ def _rewrite(node: LogicalPlan, need: set[str]) -> LogicalPlan:
             node.right_by,
             node.direction,
             node.output,
+            node.tolerance,
+            node.allow_exact_matches,
         )
     if isinstance(node, RangeJoin):
         # Each child needs its condition keys plus the output columns drawn from that
@@ -592,17 +614,57 @@ def required_predicates_per_source(plan: LogicalPlan) -> dict[int, dict]:
     `Filter`, so recording the predicate here never changes results — at worst the
     source ignores it. Filters separated from the scan by other operators are not
     pushed (conservative), and multiple stacked filters over one scan are AND-combined.
+
+    **One source can be scanned more than once, and then no single scan's predicate
+    speaks for it.** The map is keyed by `source_id` because that is what
+    `resolve_sources` reads a source by, but a predicate is a property of a *scan*. Two
+    scans of one source therefore have to be reconciled here rather than overwriting one
+    another, and overwriting is what this did: the last scan visited won, and every row the
+    other scan needed but that predicate excluded was never read. The `Filter` the engine
+    keeps cannot put them back — it only removes rows.
+
+    That is not a hypothetical binding. `api.subplan_reuse._one_id_per_source` deliberately
+    points every binding of one source object at a single index, which is what makes a
+    repeated subplan *visible* to common-subplan elimination — so the collision is created
+    by an optimization, on ordinary shapes. It cost `MERGE INTO` its unmatched target rows:
+    the composed merge unions `semi(target, src)` with `anti(target, src)`, both branches
+    scanning the one target, and the surviving predicate pruned away the rows the anti branch
+    existed to keep. A silent partial table overwrite, from a plan that looked right at every level.
+
+    So a source is pre-filtered only by something true of **every** scan of it: the
+    disjunction of their predicates, and nothing at all if any scan of it is unfiltered.
+    Both are supersets of what each individual scan needs, which is the property source-side
+    pushdown has to have.
     """
-    acc: dict[int, dict] = {}
+    acc: dict[int, list[Expr] | None] = {}
     _collect_scan_predicates(plan, None, acc)
-    return acc
+    out: dict[int, dict] = {}
+    for source_id, preds in acc.items():
+        if not preds:
+            continue  # `None`: some scan of this source reads it unfiltered
+        combined = preds[0]
+        for extra in preds[1:]:
+            combined = _or(combined, extra)
+        out[source_id] = combined.to_ir()
+    return out
 
 
-def _collect_scan_predicates(node: LogicalPlan, pending: Expr | None, acc: dict[int, dict]) -> None:
-    """Walk down carrying the predicate of an immediately-enclosing `Filter`."""
+def _collect_scan_predicates(
+    node: LogicalPlan, pending: Expr | None, acc: dict[int, list[Expr] | None]
+) -> None:
+    """Walk down carrying the predicate of an immediately-enclosing `Filter`.
+
+    Records one entry per *scan*, not per source: `None` marks a source some scan reads
+    unfiltered, which no other scan's predicate may narrow. See
+    `required_predicates_per_source` for why that distinction is load-bearing.
+    """
     if isinstance(node, Scan):
-        if pending is not None:
-            acc[node.source_id] = pending.to_ir()
+        if pending is None:
+            acc[node.source_id] = None
+            return
+        seen = acc.get(node.source_id, [])
+        if seen is not None:
+            acc[node.source_id] = [*seen, pending]
         return
     if isinstance(node, Filter):
         combined = node.predicate if pending is None else _and(pending, node.predicate)
@@ -618,6 +680,18 @@ def _and(left: Expr, right: Expr) -> Expr:
     from batcher.plan.expr_ir import Binary
 
     return Binary("and", left, right)
+
+
+def _or(left: Expr, right: Expr) -> Expr:
+    """Widen two scans' predicates into one every scan of the shared source can live with.
+
+    A disjunction is the weakest predicate implied by each side, so it can only read *more*
+    rows than either scan needs — which is the direction source-side pushdown is allowed to
+    be wrong in, since the engine's own `Filter` still runs above it.
+    """
+    from batcher.plan.expr_ir import Binary
+
+    return Binary("or", left, right)
 
 
 def _children(node: LogicalPlan) -> tuple[LogicalPlan, ...]:
@@ -678,7 +752,18 @@ def _visit(node: LogicalPlan, need: set[str], acc: dict[int, list[str]]) -> None
         _visit(node.input, set(need), acc)
 
     elif isinstance(node, Distinct):
-        _visit(node.input, set(node.input.available_columns()), acc)
+        # Mirrors `_rewrite`'s arm, and must: this walk decides what each *source* reads, so
+        # the two disagreeing means either an under-read (a missing column at execution) or —
+        # the case here before — a plan that prunes the payload out of the operator tree while
+        # still reading it off disk. A whole-row dedup needs every column; a keyed one needs
+        # what is consumed above plus its key and ordering columns.
+        if node.keys:
+            child_need = set(need) | set(node.keys)
+            for key in node.order:
+                child_need |= referenced_columns(key.expr)
+        else:
+            child_need = set(node.input.available_columns())
+        _visit(node.input, child_need, acc)
 
     elif isinstance(node, Union):
         for inp in node.inputs:

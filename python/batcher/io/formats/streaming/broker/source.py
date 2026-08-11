@@ -46,6 +46,15 @@ class BrokerSource(ABC):
     #: Per-partition offsets carry forward, so a fresh poll loop resumes where the last one
     #: stopped rather than replaying the topic. See `io.source.continues_across_passes`.
     continues_across_passes = True
+    #: Every polled batch carries which partition each message came from, so an event-time
+    #: watermark over this source can be the *minimum* over per-partition maxima rather than
+    #: one global maximum. Without the attribution the fastest partition sets the watermark
+    #: for the whole topic and the slower ones' rows are dropped as late — the exact reason
+    #: these two columns are named here instead of being an internal detail of the schema.
+    #: `topic` rides along because a subscription may span topics whose partition ids
+    #: collide, and two different partitions sharing one key would take a minimum over the
+    #: wrong set.
+    watermark_partition_columns = ("topic", "partition")
 
     #: Payload bytes one poll may accumulate before it stops early, whatever `poll_size` says.
     #:
@@ -63,13 +72,14 @@ class BrokerSource(ABC):
     DEFAULT_POLL_BYTES = 128 << 20
 
     __slots__ = (
+        "_admission_limit",
+        "_configured_poll_size",
         "_include_headers",
         "_options",
         "_positions",
         "_resume_from",
         "_should_stop",
         "poll_bytes",
-        "poll_size",
         "topic",
     )
 
@@ -120,7 +130,10 @@ class BrokerSource(ABC):
         # leaves the column null rather than refusing the option.
         self._include_headers = include_headers
         self.topic = topic
-        self.poll_size = poll_size
+        # What the operator asked for. The live `poll_size` below holds it under whatever the
+        # rate controller has narrowed this trigger to — see `set_admission_limit`.
+        self._configured_poll_size = poll_size
+        self._admission_limit: int | None = None
         self.poll_bytes = self.DEFAULT_POLL_BYTES if poll_bytes is None else poll_bytes
         self._options = options
         # The latest position delivered per partition this run (offset or native
@@ -132,6 +145,40 @@ class BrokerSource(ABC):
         self._resume_from: dict[int, Any] = {}
         # Set by a driver that can be stopped; consulted between polls. See `set_stop_signal`.
         self._should_stop: Any = None
+
+    @property
+    def poll_size(self) -> int:
+        """Messages one poll may take — the configured size, held under any live rate limit.
+
+        A property rather than a plain attribute so every broker subclass is throttled by the
+        one they already read. Kafka, Kinesis, Pulsar, Pub/Sub and Event Hubs each bound their
+        own poll by `poll_size`, so narrowing it here reaches all five without a line in any
+        of them.
+
+        Returns:
+            The effective per-poll message count, never below 1.
+        """
+        if self._admission_limit is None:
+            return self._configured_poll_size
+        return max(1, min(self._configured_poll_size, self._admission_limit))
+
+    def set_admission_limit(self, max_rows: int | None) -> None:
+        """Narrow this trigger's poll to `max_rows` messages, or `None` to lift the narrowing.
+
+        The `io.source.RateLimited` seam a streaming rate controller acts through. One poll is
+        one micro-batch for a broker source, so a row cap and a poll size are the same bound —
+        which is why `max_offsets_per_trigger` is accepted as an exact synonym for
+        `poll_size` rather than as an approximation of it.
+
+        **Only ever narrows.** The configured `poll_size` remains the ceiling, so a controller
+        cannot hand a source more than its operator allowed. An admission cap changes how much
+        of a stream a trigger reads, never what the query computes from the rows it read, so
+        this can never change a result.
+
+        Args:
+            max_rows: The cap, or `None` to read up to the configured `poll_size` again.
+        """
+        self._admission_limit = None if max_rows is None or max_rows < 1 else int(max_rows)
 
     def set_stop_signal(self, should_stop: Any) -> None:
         """Register a predicate the poll loop checks between polls, ending the stream.
@@ -329,6 +376,24 @@ class BrokerSource(ABC):
         ``AFTER_SEQUENCE_NUMBER``) overrides this to drive the client directly.
         Intentionally a no-op beyond the ``_resume_from`` already set by ``seek``.
         """
+
+    def watermark_partitions(self) -> list[tuple[str, int]]:
+        """The ``(topic, partition)`` pairs this source expects to read from.
+
+        Answers the startup question a per-partition watermark otherwise gets wrong: until
+        partition 1 delivers its first message, a minimum over "partitions seen so far" is a
+        minimum over partition 0, which over-claims event time and rules partition 1's first
+        rows late. Declaring the assigned set holds the watermark back until every partition
+        has spoken or gone idle.
+
+        Same discovery `splits` uses, so a broker that can enumerate partitions for parallel
+        reads can enumerate them for this. `io.source.watermark_partitions` treats a failure
+        as "cannot enumerate", so a broker that will not answer still starts the query.
+
+        Returns:
+            One ``(topic, partition)`` pair per partition backing the topic.
+        """
+        return [(self.topic, p) for p in self._discover_partitions()]
 
     def splits(self, target_size: int | None = None) -> list[Split]:  # noqa: ARG002
         """One :class:`BrokerSplit` per partition/shard (offset-locator only)."""

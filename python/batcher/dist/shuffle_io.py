@@ -8,9 +8,11 @@ bounded by memory.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from collections.abc import Iterable
+from typing import NamedTuple
 
 import pyarrow as pa
 
@@ -20,7 +22,9 @@ from batcher._internal.paths import open_private, private_dir
 __all__ = [
     "distributed_work_dir",
     "read_ipc",
+    "reduce_envelope",
     "shared_scratch_root",
+    "shuffle_ipc_options",
     "write_ipc",
     "write_ipc_round_robin",
     "write_shuffle_buckets",
@@ -99,6 +103,127 @@ def distributed_work_dir(prefix: str) -> str:
     return tempfile.mkdtemp(prefix=prefix)
 
 
+class ReduceEnvelope(NamedTuple):
+    """The spill terms a shuffle reducer was shipped, read from its worker engine config.
+
+    Four reduce paths need these and each read them for itself: the disk aggregate's
+    interior combine and its reducer, the disk join's reducer, and the Flight worker's
+    bounded reduce. Three spellings of one `json.loads` over a wire contract, on the two
+    transports that are supposed to be the same algebra with a different sink — so a change
+    to the shipped config's shape had four places to reach and no way to notice a miss.
+
+    `budget` of `0` means unbounded: the reduce takes its in-memory fold. A positive budget
+    is what routes it through the out-of-core one instead.
+    """
+
+    budget: int
+    spill_dir: str | None
+    compression: str | None
+
+
+def reduce_envelope(engine_config: str | None) -> ReduceEnvelope:
+    """Read the reducer's spill envelope out of a shipped engine config.
+
+    Args:
+        engine_config: The worker's engine config JSON, as shipped by
+            `dist.executors.ray_runtime.engine_config_json`. Empty or `None` means no
+            envelope was shipped.
+
+    Returns:
+        The envelope. `ReduceEnvelope(0, None, None)` when nothing was shipped, which every
+        caller reads as "unbounded".
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.dist.shuffle_io import reduce_envelope
+            >>> reduce_envelope('{"memory_budget_bytes": 4096}').budget
+            4096
+            >>> reduce_envelope("").budget
+            0
+    """
+    if not engine_config:
+        return ReduceEnvelope(0, None, None)
+    cfg = json.loads(engine_config)
+    return ReduceEnvelope(
+        int(cfg.get("memory_budget_bytes", 0) or 0),
+        cfg.get("spill_dir"),
+        cfg.get("spill_compression"),
+    )
+
+
+def shuffle_ipc_options(path: str) -> pa.ipc.IpcWriteOptions | None:
+    """Arrow-IPC write options for a shuffle file at `path`, or `None` for uncompressed.
+
+    The disk shuffle has the same two tiers the spill store has, and the same answer for
+    each. A scratch dir under a **cluster-shared mount** is a network filesystem: every
+    byte a mapper writes crosses the wire twice (once to the mount, once back to the
+    reducer), so a cheap codec always pays there — the identical trade
+    :func:`~batcher.carbonite.spill.disk.remote_ipc_options` makes for the remote spill
+    tier, reused rather than restated. A node-local scratch dir is fast disk, so it honors
+    the configured ``MemoryConfig.spill_compression`` and stays uncompressed under the
+    ``"auto"`` default.
+
+    The Flight transport has compressed its wire since it existed
+    (``DistributedConfig.flight_compression``); the disk transport did not, so the one
+    shuffle that runs over a network filesystem was the one shuffle sending raw bytes.
+
+    Reads need no counterpart: an Arrow IPC message records its own codec, so
+    :func:`read_ipc` decompresses whatever it is handed and a file written by an older
+    build still reads.
+
+    Args:
+        path: Where the shuffle file will be written. Only its location is read, so the
+            decision costs a string comparison and no I/O.
+
+    Returns:
+        The write options to pass to ``pa.ipc.new_stream``, or `None` to write
+        uncompressed.
+    """
+    from batcher.carbonite.spill import disk
+
+    # `active_config()` is the driver's only inside the driver: a Ray worker sees its own
+    # process default (see `ray_runtime.lifecycle.engine_config_json`). That is why the
+    # shared-mount branch reads no config at all — the branch where compression matters
+    # decides from the path alone and so agrees on every node. The local branch's default
+    # (`"auto"`) is uncompressed either way, so config drift can only change an explicitly
+    # set codec on node-local scratch, where the codec is worth the least.
+    if _on_shared_mount(path):
+        return disk.remote_ipc_options(active_compression())
+    return disk.ipc_options(active_compression())
+
+
+def active_compression() -> str | None:
+    """The configured spill/shuffle codec name, ``"auto"``, or `None`."""
+    from batcher.config import active_config
+
+    return active_config().memory.spill_compression
+
+
+def _on_shared_mount(path: str) -> bool:
+    """Whether `path` lives under a cluster-shared (network) mount.
+
+    Compares against the same `_SHARED_MOUNTS` roots :func:`shared_scratch_root` picks
+    from, plus an explicitly configured `MemoryConfig.spill_dir` — which is documented as
+    *operator-configured shared scratch*, so a shuffle placed there is crossing a network
+    for the same reason.
+    """
+    from batcher.config import active_config
+
+    roots = [*_SHARED_MOUNTS]
+    spill_dir = active_config().memory.spill_dir
+    if spill_dir:
+        roots.append(spill_dir)
+    try:
+        real = os.path.realpath(path)
+    except OSError:  # pragma: no cover - realpath on a path we are about to create
+        real = path
+    return any(
+        real == os.path.realpath(root) or real.startswith(os.path.realpath(root) + os.sep)
+        for root in roots
+    )
+
+
 def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
     """Write record batches to an Arrow IPC stream file. Returns `path`."""
     if not batches:
@@ -108,7 +233,7 @@ def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
         )
     with (
         pa.PythonFile(open_private(path), mode="w") as sink,
-        pa.ipc.new_stream(sink, batches[0].schema) as writer,
+        pa.ipc.new_stream(sink, batches[0].schema, options=shuffle_ipc_options(path)) as writer,
     ):
         for b in batches:
             writer.write_batch(b)
@@ -170,7 +295,7 @@ def write_ipc_round_robin(
         # Owner-only, like every other shuffle artifact: these files hold the query's rows
         # on a scratch path that may be a shared cluster mount.
         sinks[j] = pa.PythonFile(open_private(paths[j]), mode="w")
-        writers[j] = pa.ipc.new_stream(sinks[j], sch)
+        writers[j] = pa.ipc.new_stream(sinks[j], sch, options=shuffle_ipc_options(paths[j]))
 
     try:
         for i, b in enumerate(batches):

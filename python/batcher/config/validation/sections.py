@@ -227,7 +227,9 @@ def _check_distributed_faults(d: DistributedConfig) -> None:
         f"got {d.resilience!r}",
     )
     _check(
-        d.skew_join_salt >= 0, f"distributed.skew_join_salt must be >= 0, got {d.skew_join_salt}"
+        d.skew_join_salt >= -1,
+        f"distributed.skew_join_salt must be >= -1 (-1 = never salt, 0 = salt on measured "
+        f"skew, >0 = force this fan-out), got {d.skew_join_salt}",
     )
     _check(
         0.0 <= d.skew_join_fraction <= 1.0,
@@ -263,6 +265,11 @@ def _check_distributed_placement(d: DistributedConfig) -> None:
         d.object_store_memory_bytes is None or d.object_store_memory_bytes > 0,
         f"distributed.object_store_memory_bytes must be positive or None, "
         f"got {d.object_store_memory_bytes}",
+    )
+    _check(
+        d.map_partition_multiplier >= 1,
+        f"distributed.map_partition_multiplier must be >= 1 (1 = one partition per worker), "
+        f"got {d.map_partition_multiplier}",
     )
     _check(
         d.max_pending_tasks >= 0,

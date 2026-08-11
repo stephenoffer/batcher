@@ -90,6 +90,21 @@ def eval_str(ir, df, be, eval_expr):
         return x.str.slice(begin, max(start + int(ir["length"]) - 1, 0))
     if fn in REGEX_FNS:
         return eval_regex(fn, x, ir, be)
+    if fn == "word_count":
+        # `word_count` reaches the device as its own tag because the engine made it a native
+        # single-pass scan instead of `regexp_count(r"\S+")`. The two are the same function —
+        # a word is a maximal run of non-whitespace either way — so the translation is that
+        # same count, routed through `eval_regex` rather than spelled here.
+        #
+        # Routing it matters more than it looks: `eval_regex` is where the pattern is checked
+        # for portability and where the column is checked against `RESTRICTED_ALPHABET`, and
+        # `\s` genuinely disagrees between the engine's Rust and the backends' RE2 (a vertical
+        # tab is whitespace to one and not the other). Counting it directly here would answer
+        # on text where this tier is supposed to decline, which is a wrong number rather than
+        # a fallback. The four ratio functions built on this — `avg_word_length`,
+        # `avg_sentence_length`, `digit_to_word_ratio`, `symbol_to_word_ratio` — inherit both
+        # the translation and the gate.
+        return eval_regex("regexp_count", x, {**ir, "pattern": r"\S+"}, be)
     if fn in ("trim", "l_trim", "r_trim"):
         # The `pattern` is the *set of characters* to strip, and dropping it silently stripped
         # whitespace instead: `strip_chars("ax")` returned the string untouched wherever it had

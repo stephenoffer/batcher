@@ -10,24 +10,24 @@ use arrow::compute::kernels::boolean;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{is_not_null, is_null};
 
-use crate::eval::binary::{
-    as_bool, coerce_numeric, eval_binary, try_dict_compare, try_scalar_binary,
-};
+use crate::eval::binary::{eval_binary, try_dict_compare, try_scalar_binary};
 use crate::eval::cast::cast_expr;
+use crate::eval::coerce::{as_bool, coerce_numeric};
 use crate::eval::generate::eval_sequence;
 use crate::eval::geo::eval_geo;
 use crate::eval::in_list::eval_in_list;
 use crate::eval::list::{
     eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_get, eval_list_join,
-    eval_list_position, eval_make_struct, eval_struct_field, rebuild_list, require_list,
+    eval_list_position, eval_make_struct, rebuild_list, require_list,
 };
 use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip};
-use crate::eval::map::eval_map;
+use crate::eval::map::{eval_map, eval_struct_field};
 use crate::eval::math::{
     eval_coalesce, eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2,
 };
 use crate::eval::media::image::ImageArgs;
 use crate::eval::media::{eval_audio, eval_image, eval_image_crop, eval_video, Bounds};
+use crate::eval::spatial::eval_spatial;
 use crate::eval::str::{eval_str, try_dict_str};
 use crate::eval::temporal::date::{
     eval_date, eval_date_offset, eval_date_trunc, eval_strftime, eval_strptime,
@@ -257,6 +257,32 @@ impl Expr {
                     },
                 )
             }
+            Expr::Seq {
+                func,
+                input,
+                k,
+                window,
+                frame,
+                offset,
+                alphabet,
+                pattern,
+                to_stop,
+            } => {
+                let arr = input.eval(batch)?;
+                crate::eval::seq::eval_seq(
+                    *func,
+                    &arr,
+                    crate::eval::seq::SeqArgs {
+                        k: *k,
+                        window: *window,
+                        frame: *frame,
+                        offset: *offset,
+                        alphabet: alphabet.as_deref(),
+                        pattern: pattern.as_deref(),
+                        to_stop: *to_stop,
+                    },
+                )
+            }
             Expr::Coalesce { inputs } => eval_coalesce(inputs, batch),
             Expr::InList { input, set } => {
                 // Read a `Col` input directly (keeping any dictionary encoding) so the
@@ -362,6 +388,7 @@ impl Expr {
             // `GeoFunc::arity` before evaluating anything, so a malformed IR document
             // fails naming the function instead of panicking on a missing index.
             Expr::Geo { func, args } => eval_geo(*func, args, batch),
+            Expr::Spatial { func, args } => eval_spatial(*func, args, batch),
             Expr::DateTrunc { input, unit } => {
                 let arr = input.eval(batch)?;
                 eval_date_trunc(&arr, unit)

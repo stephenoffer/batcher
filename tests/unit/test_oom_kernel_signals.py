@@ -319,3 +319,85 @@ class TestOomHistoryForcesSpill:
         cfg = Config(memory=MemoryConfig(max_memory_bytes=1 << 40))
         with config_context(cfg):
             assert ResourceManager(cfg).spill_reason(self._unsized_plan()) is None
+
+
+class TestTheLimitScanIsSampledNotReRead:
+    """`_tightest` reopens `memory.high` at *every* level of the ancestry, and
+    `cgroup_high_bytes` is a public reader that reaches it without going through the
+    sampled snapshot. On the per-query path (`probe.effective_limit_bytes` ->
+    `_engine_used_fraction`) that made a point lookup perform 16.4 of its 21.1 cgroup
+    reads re-reading one static file. These pin the window and its escape hatch.
+    """
+
+    @staticmethod
+    def _counting_reader(monkeypatch, counter: list[int]):
+        """Wrap the byte reader so a test can count the files a scan actually opens."""
+        original = kernel.read_cgroup_bytes
+
+        def counted(path: str):
+            counter[0] += 1
+            return original(path)
+
+        monkeypatch.setattr(kernel, "read_cgroup_bytes", counted)
+
+    def test_a_repeated_scan_inside_the_window_reads_no_files(self, monkeypatch, tmp_path):
+        """The whole point: the second caller deciding about the same query is answered
+        from the first one's reading rather than reopening the hierarchy."""
+        _fake_cgroup(monkeypatch, tmp_path, {"memory.high": str(4 * _GIB)})
+        reads = [0]
+        self._counting_reader(monkeypatch, reads)
+
+        assert kernel.cgroup_high_bytes() == 4 * _GIB
+        after_first = reads[0]
+        assert after_first > 0, "the first scan must actually read the hierarchy"
+
+        for _ in range(10):
+            assert kernel.cgroup_high_bytes() == 4 * _GIB
+        assert reads[0] == after_first, "a cached scan must not reopen a single file"
+
+    def test_the_cached_value_is_the_tightest_not_the_first_seen(self, monkeypatch, tmp_path):
+        """A limit binds from anywhere in the ancestry, so the memo must hold the `min`
+        across levels. Caching the root's reading would raise the effective ceiling above
+        what the kernel enforces -- budgeting a query into an OOM."""
+        root = tmp_path / "root"
+        own = root / "leaf"
+        own.mkdir(parents=True)
+        (root / "memory.high").write_text(str(8 * _GIB))
+        (own / "memory.high").write_text(str(2 * _GIB))
+        monkeypatch.setattr(kernel, "cgroup_v2_dirs", lambda: (str(root), str(own)))
+
+        assert kernel.cgroup_high_bytes() == 2 * _GIB
+        assert kernel.cgroup_high_bytes() == 2 * _GIB, "the cached answer must still be the min"
+
+    def test_an_unlimited_cgroup_caches_its_absence(self, monkeypatch, tmp_path):
+        """`None` is the common answer (bare metal, most containers) and is cached like any
+        other, so the hosts that can never benefit from the scan do not keep paying for it."""
+        _fake_cgroup(monkeypatch, tmp_path, {"memory.max": str(8 * _GIB)})
+        reads = [0]
+        self._counting_reader(monkeypatch, reads)
+
+        assert kernel.cgroup_high_bytes() is None
+        after_first = reads[0]
+        assert kernel.cgroup_high_bytes() is None
+        assert reads[0] == after_first
+
+    def test_a_reset_makes_a_rewritten_limit_visible(self, monkeypatch, tmp_path):
+        """The escape hatch every test in this file depends on. Without it a suite that
+        rewrites `memory.high` would be answered from the previous test's file."""
+        _fake_cgroup(monkeypatch, tmp_path, {"memory.high": str(4 * _GIB)})
+        assert kernel.cgroup_high_bytes() == 4 * _GIB
+
+        _fake_cgroup(monkeypatch, tmp_path, {"memory.high": str(1 * _GIB)}, leaf="second")
+        kernel.reset_kernel_sampling()
+        assert kernel.cgroup_high_bytes() == 1 * _GIB
+
+    def test_the_sampled_snapshot_still_agrees_with_the_direct_reader(self, monkeypatch, tmp_path):
+        """Two readers of one file must not disagree: `kernel_memory_state` carries `high`
+        in its snapshot while `cgroup_high_bytes` now answers from the scan memo, and a
+        budget built from one and checked against the other would be incoherent."""
+        _fake_cgroup(
+            monkeypatch,
+            tmp_path,
+            {"memory.max": str(8 * _GIB), "memory.high": str(4 * _GIB)},
+        )
+        assert kernel.cgroup_high_bytes() == kernel.kernel_memory_state().high_bytes

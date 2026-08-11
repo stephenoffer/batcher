@@ -24,7 +24,7 @@ Batcher raises typed exceptions, so a failure names what went wrong and what to 
 .. autoexception:: TransportError
 ```
 
-`BatcherError` is the root every other Batcher error subclasses, so catching it covers them all. Several also subclass a builtin so existing handlers keep working: `PlanError`, `ConfigError`, and `DataQualityError` are each a `ValueError`; `ColumnNotFoundError` is a `KeyError` and carries the missing `.column`; `MissingDependencyError` is an `ImportError` and carries the `.install` hint for the extra to install; `AccessDeniedError` is a `PermissionError`.
+{py:exc}`BatcherError <batcher.BatcherError>` is the root every other Batcher error subclasses, so catching it covers them all. Several also subclass a builtin so existing handlers keep working: {py:exc}`PlanError <batcher.PlanError>`, {py:exc}`ConfigError <batcher.ConfigError>`, and {py:exc}`DataQualityError <batcher.DataQualityError>` are each a `ValueError`; {py:exc}`ColumnNotFoundError <batcher.ColumnNotFoundError>` is a `KeyError` and carries the missing `.column`; {py:exc}`MissingDependencyError <batcher.MissingDependencyError>` is an `ImportError` and carries the `.install` hint for the extra to install; {py:exc}`AccessDeniedError <batcher.AccessDeniedError>` is a `PermissionError`.
 
 In practice you handle them with `try` and `except`, usually catching the base type.
 
@@ -49,15 +49,15 @@ can catch a specific type when you want to react differently.
 | Error | Raised when |
 | --- | --- |
 | `PlanError` | The plan or schema is invalid (an unknown column, a type mismatch). Raised at build time, before execution. |
-| `ExecutionError` | An operator fails at runtime inside the engine. |
-| `OptimizationError` | The optimizer cannot produce a valid physical plan. |
-| `CompileError` | JIT compilation of a pipeline fails. The interpreter remains as a fallback, so this is rare. |
-| `ResourceError` | The resource manager cannot satisfy a memory or credit request. |
+| {py:exc}`ExecutionError <batcher.ExecutionError>` | An operator fails at runtime inside the engine. |
+| {py:exc}`OptimizationError <batcher.OptimizationError>` | The optimizer cannot produce a valid physical plan. |
+| {py:exc}`CompileError <batcher.CompileError>` | JIT compilation of a pipeline fails. The interpreter remains as a fallback, so this is rare. |
+| {py:exc}`ResourceError <batcher.ResourceError>` | The resource manager cannot satisfy a memory or credit request. |
 | `BackpressureAbort` | Execution is aborted because backpressure could not be relieved. |
-| `IOError` | A source or sink fails to read, write, list, or open a path. |
+| {py:exc}`IOError <batcher.IOError>` | A source or sink fails to read, write, list, or open a path. |
 | `DataQualityError` | A `ds.dq...fail()` expectation has violating rows. Carries the per-constraint counts. |
 | `AccessDeniedError` | A principal may select no column of a governed table. A *column* it cannot select is instead absent, surfacing as `PlanError`. |
-| `FormatError`, `BackendError`, `CommitError`, `TransportError` | Lower-level IO, backend, write-commit, and shuffle failures. |
+| {py:exc}`FormatError <batcher.FormatError>`, {py:exc}`BackendError <batcher.BackendError>`, {py:exc}`CommitError <batcher.CommitError>`, {py:exc}`TransportError <batcher.TransportError>` | Lower-level IO, backend, write-commit, and shuffle failures. |
 
 `PlanError` is the one most user code encounters, because it's raised eagerly when you build an invalid plan rather than when you execute it.
 
@@ -79,7 +79,7 @@ except bt.BatcherError as exc:
 # query failed: projection 'missing' references unknown column(s) ['missing']; available: ['a']
 ```
 
-Catching `bt.BatcherError` covers every Batcher-specific failure while letting unrelated exceptions propagate, such as a bug in your own batch function.
+Catching {py:exc}`bt.BatcherError <batcher.BatcherError>` covers every Batcher-specific failure while letting unrelated exceptions propagate, such as a bug in your own batch function.
 
 ## See also
 

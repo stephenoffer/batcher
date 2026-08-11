@@ -1,9 +1,9 @@
 # Query lifecycle
 
-A `collect()` has to cross a language boundary. On one side is a Python object graph you built by chaining method calls. On the other is native code that must not call back into Python for a single row. The lifecycle is the sequence that gets from one to the other, exactly once per execution, and brings measurements back.
+A {py:meth}`collect() <batcher.Dataset.collect>` has to cross a language boundary. On one side is a Python object graph you built by chaining method calls. On the other is native code that must not call back into Python for a single row. The lifecycle is the sequence that gets from one to the other, exactly once per execution, and brings measurements back.
 
 Nothing happens until a terminal call. `filter`, `select`, `join`, `group_by` each return a
-new `Dataset` wrapping a new `LogicalPlan`. No data is read; no expression is evaluated.
+new {py:class}`Dataset <batcher.Dataset>` wrapping a new `LogicalPlan`. No data is read; no expression is evaluated.
 That deferral is what makes whole-query optimization possible: by the time the engine runs
 anything, it has seen the entire computation.
 
@@ -187,7 +187,7 @@ reading path through the control plane:
 | The contract loop | `python/batcher/api/orchestration/run.py` |
 | Metadata shortcut | `python/batcher/api/terminal/metadata_answer/` |
 | Logical plan + `to_ir()` | `python/batcher/plan/logical/`, `python/batcher/plan/ir_tags.py` |
-| Physical plan + `to_json()` | `python/batcher/plan/physical.py` |
+| Physical plan + {py:meth}`to_json() <batcher.Dataset.to_json>` | `python/batcher/plan/physical.py` |
 | Core's call into the engine | `python/batcher/core/executor.py` |
 | The FFI boundary | `crates/bc-py/src/lib.rs` |
 | The executor | `crates/bc-interp/src/lib.rs` (sequential), `par.rs` (multi-core) |

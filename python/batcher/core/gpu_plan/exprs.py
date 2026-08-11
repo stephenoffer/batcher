@@ -218,8 +218,25 @@ def _extreme(ir, df, be, *, want_max: bool):
 
 
 def _in_list(ir, df, be):
+    """``x IN (set)``, propagating the null the libraries' `isin` swallows.
+
+    Both backends answer **False** for a null element; SQL three-valued logic (and the
+    engine) answer **NULL**. The difference is invisible under a bare ``IN`` — a filter
+    drops the row on False and on NULL alike — and wrong under ``NOT IN``, where the
+    negation turns that False into True and *keeps* a row the engine drops. The set itself
+    never holds a null: `Expr.is_in` folds only the non-null members into this node and ORs
+    the null member's always-null disjunct on top.
+
+    The `astype` is load-bearing. `isin` answers in the library's *non-nullable* boolean, and
+    masking that upcasts the column to `object`, where a later `~` raises on the `None` rather
+    than propagating it. Casting to the Arrow-backed boolean first keeps a real null mask.
+    """
+    import pyarrow as pa
+
     values = [literal_value(v) for v in ir["set"]]
-    return be.column(eval_expr(ir["input"], df, be), df).isin(values)
+    x = be.column(eval_expr(ir["input"], df, be), df)
+    hit = x.isin(values).astype(be.dtype(pa.bool_()))
+    return hit.where(x.notna(), None)
 
 
 def _list(ir, df, be: DfBackend):
@@ -363,9 +380,12 @@ DECLINED_EXPRS: dict[str, str] = {
     # happens in `bc-expr::eval::{media,geo}`; there is no dataframe-library equivalent to
     # translate onto, and approximating one is exactly what this package refuses to do.
     "image": "media decode is a Rust kernel (`bc-expr::eval::media::image`)",
+    "image_crop": "media decode is a Rust kernel (`bc-expr::eval::media::image`)",
+    "seq": "biological-sequence kernels are Rust (`bc-expr::eval::seq`)",
     "audio": "media decode is a Rust kernel (`bc-expr::eval::media::audio`)",
     "video": "media decode is a Rust kernel (`bc-expr::eval::media`)",
     "geo": "geometry is a Rust kernel (`bc-geo` + `bc-expr::eval::geo`)",
+    "spatial": "rigid-body math is a Rust kernel (`bc-spatial` + `bc-expr::eval::spatial`)",
     # Not translated. Listed rather than absent so adding one is a decision with a date on it.
     "array": "not translated",
     "convert_timezone": "not translated",

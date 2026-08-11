@@ -223,16 +223,45 @@ it is opt-in because it needs `pynvml` on every worker).
 - **Epoch fencing** makes recompute safe: reducers accept only the current epoch and discard
   batches from a zombie producer, so a recomputed partition cannot be double-counted.
   `shuffle_replication=1` (the `spot` profile raises it to 2) puts each mapper's buckets on
-  peers so a lost worker costs a re-fetch instead of a recompute round. Dead peers are
-  detected by `flight_idle_timeout_s=60.0` (+ optional `flight_keepalive_s`).
-- Stragglers: speculation is **off** by default (`speculation_max_backups=0`);
-  `speculation_straggler_factor=1.5`, `speculation_min_finished_frac=0.75`.
+  peers so a lost worker costs a re-fetch instead of a recompute round. The copy goes to
+  another node, and — when the market labels say so — to a node that is not spot, because a
+  reclamation takes an instance group rather than a machine. Dead peers are detected by
+  `flight_idle_timeout_s=60.0` (+ optional `flight_keepalive_s`).
+- Stragglers: speculation is **on** with one backup by default (`speculation_max_backups=1`);
+  `speculation_straggler_factor=1.5`, `speculation_min_finished_frac=0.75`. Set it to `0` to
+  turn it off.
 - `resilience="spot"` hardens all of the above as a bundle for a churning cluster — prefer
   it to tuning six knobs by hand. A preemptible environment is auto-detected and switched to
   `"spot"` when `resilience` is left at `"default"`; explicit overrides still win.
 - Bad input files: `distributed.on_read_error` is `"error"` (fail fast) or `"skip"`.
-- Autoscaling is requested and then waited for, bounded by `placement_timeout_s=60.0`. Jobs
-  that consistently run on too few workers usually hit that timeout.
+- Autoscaling is requested and then waited for, bounded by `autoscale_wait_s` (`"auto"`:
+  a bounded wait on an autoscaling cluster, off on a fixed one), with early exits after
+  `autoscale_stall_s=90` of flat capacity or `autoscale_startup_grace_s=12` of no growth at
+  all. Jobs that consistently run on too few workers hit one of those, **not**
+  `placement_timeout_s=60.0`, which bounds the gang reservation made *after* the fan-out is
+  chosen.
+- **A map or inference stage that has produced nothing for two minutes now says why.** The
+  engine compares the pending ask against the live topology and reports one of: no node can
+  host one task (naming the binding resource and the widest node's figure — waiting cannot fix
+  this), the cluster is short of free capacity (the three numbers; another job is holding it),
+  or nothing at all. A placement group that times out logs the same diagnosis instead of
+  falling back silently. If you are diagnosing a hung distributed job, that warning is the
+  first thing to read. The *shuffle* barrier still prints the older, unresolved warning.
+
+## Where the fleet lands
+
+Placement is decided per query and is result-identical, so it is a cost and latency question
+rather than a correctness one. Two behaviours are worth knowing:
+
+- **One availability zone when the fleet fits in one.** A shuffle moves nearly all its bytes
+  worker to worker, and cross-zone bytes are billed in both directions. The engine reserves
+  the fleet's bundles in the zone with the most free capacity that can host it, and does
+  nothing on a single-zone cluster, on unlabelled nodes, or when no one zone has room. Turn it
+  off with `distributed.zone_aware_placement=False` if the zone spread is deliberate.
+- **The fan-out and the placement are recorded as decisions.** `ds.explain(analyze=True)` and
+  the dashboard show the narrowing chain ("fan-out 8 -> 6: cluster_fill 40, clamp 6") and the
+  reservation ("reserved 8 bundle(s) SPREAD in us-west-2b"). That is the answer to "why did my
+  job use a tenth of the cluster", and it is the first place to look before tuning anything.
 
 ## Pre-flight checklist
 

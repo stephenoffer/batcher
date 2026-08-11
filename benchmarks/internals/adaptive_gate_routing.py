@@ -30,6 +30,7 @@ import batcher as bt
 from batcher.api.adaptive import gating as gate
 from batcher.api.adaptive import resolve_adaptive
 from batcher.api.adaptive.plan_surgery import joins
+from batcher.api.source_stats import build_estimator
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
 from batcher.metadata.backends import InProcessBackend
@@ -40,7 +41,7 @@ from suites.standard.tpch import QUERIES
 # The size floor is a separate gate and would short-circuit every shape at this scale.
 # Lowering it isolates the confidence gate, exactly as tests/unit/test_adaptive_resolution
 # does, so the counts below are about evidence and not about table size.
-gate._ADAPTIVE_MIN_INPUT_ROWS = 1
+gate._ADAPTIVE_MIN_ROWS_PER_STAGE = 1
 
 _SCALE = 0.05  # enough rows that operands are estimated rather than known exactly
 
@@ -92,7 +93,7 @@ def _stage_waste(session) -> tuple[int, int, int]:
     def counting(target, srcs, hub, *args, **kwargs):
         counts["stages"] += 1
         try:
-            estimate = gate._build_estimator(srcs, hub).estimate(target)
+            estimate = build_estimator(srcs, hub).estimate(target)
             if estimate.provenance < Provenance.DEFAULT:
                 counts["exact"] += 1
         except Exception:
@@ -110,6 +111,37 @@ def _stage_waste(session) -> tuple[int, int, int]:
     finally:
         staging._run_stage = original
     return counts["queries"], counts["stages"], counts["exact"]
+
+
+def _floor_reach(session) -> list[tuple[str, int, float, bool, bool]]:
+    """Per query: its breaker count, its input rows, and which floors it clears.
+
+    The size floor used to be a flat 20M rows for the whole query; it is now 5M for each
+    pipeline breaker the loop would cut at. This reports the two side by side, in counts
+    and row totals rather than wall time, so the comparison holds on a loaded machine.
+
+    Read it as: how many shapes the per-stage rule newly *admits* (the cheap two-breaker
+    ones the flat floor priced as if they were snowflakes), and how many it newly
+    *refuses* (the many-breaker ones every recorded staging regression came from).
+    """
+    from batcher.api.source_stats import build_estimator
+
+    out: list[tuple[str, int, float, bool, bool]] = []
+    for query, sql in QUERIES.items():
+        try:
+            ds = session.sql(sql)
+        except Exception:
+            continue
+        if not joins(ds._plan):
+            continue
+        rows, _bytes = gate._total_input_size(ds._plan, build_estimator(ds._sources, None))
+        stages = gate._stage_count(ds._plan)
+        out.append((query, stages, rows, rows >= _OLD_FLAT_FLOOR, rows >= 5_000_000 * stages))
+    return out
+
+
+#: The flat floor the per-stage rule replaced, quoted so the comparison is explicit.
+_OLD_FLAT_FLOOR = 20_000_000
 
 
 def main() -> None:
@@ -157,6 +189,19 @@ def main() -> None:
     print(f"queries executed adaptively:              {queries}")
     print(f"breaker stages executed:                  {stages}")
     print(f"  already exactly sized (measure nothing): {exact}")
+
+    reach = _floor_reach(session)
+    admitted = [q for q, _s, _r, old, new in reach if new and not old]
+    refused = [q for q, _s, _r, old, new in reach if old and not new]
+    print()
+    print(f"joined shapes measured:                   {len(reach)}")
+    print(f"cleared the old flat 20M floor:           {sum(1 for r in reach if r[3])}")
+    print(f"clear the per-stage floor:                {sum(1 for r in reach if r[4])}")
+    print(f"  newly admitted (cheap, few breakers):   {len(admitted)} {sorted(admitted)}")
+    print(f"  newly refused (many breakers):          {len(refused)} {sorted(refused)}")
+    print("  breakers per shape:")
+    for query, n_stages, rows, _old, _new in sorted(reach, key=lambda r: -r[1])[:8]:
+        print(f"    {query:6s} breakers={n_stages:2d} input_rows={rows:>12,.0f}")
 
 
 if __name__ == "__main__":

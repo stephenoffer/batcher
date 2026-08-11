@@ -20,7 +20,7 @@ is a decision, not a default.
 
 ## Type 2: versions, not values
 
-`ds.scd.type2` maintains the dimension from an incoming snapshot. You give it the natural
+{py:meth}`ds.scd.type2 <batcher.api.dataset.scd.DatasetSCD.type2>` maintains the dimension from an incoming snapshot. You give it the natural
 key, the attributes whose change starts a new version, and the effective date of the
 batch:
 
@@ -130,7 +130,7 @@ Mechanically this is an equi-join on the key followed by a range filter, not a n
 interval join. The optimizer pushes the filter down, but the join still produces one row
 per (fact, version) pair before the filter cuts it. For a dimension with a handful of
 versions per key that is nothing. For a key with hundreds of versions, reach for
-`join_asof` on the effective date instead, which matches each fact to the nearest earlier
+{py:meth}`join_asof <batcher.Dataset.join_asof>` on the effective date instead, which matches each fact to the nearest earlier
 version directly.
 
 ## Type 1 and type 3
@@ -205,7 +205,7 @@ set deliberately, because it is the one thing here you cannot fix retroactively.
 - {doc}`CDC pipeline </cookbook/data-engineering/ingest/cdc-pipeline>`: when the source is a change feed, not a snapshot.
 - {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: joining facts to dimensions in general.
 - {doc}`Deduplication </cookbook/data-engineering/maintenance/deduplication>`: getting to one row per key before the load.
-- {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: the `ds.scd` reference.
+- {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`: the {py:obj}`ds.scd <batcher.Dataset.scd>` reference.
 - {doc}`Joins </user-guide/analyze/joins>`: the equi-join plus range filter, and `join_asof`.
 - {doc}`Delta Lake </integrations/lakehouse/delta-lake>`: a real transaction around the commit.
 - {doc}`Dataset API </api/relational/dataset>`: `type1`, `type2`, `type3`, `apply_changes`.

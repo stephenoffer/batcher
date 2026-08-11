@@ -45,6 +45,11 @@ type PathResult = (Vec<usize>, Vec<ArrayRef>, Vec<ArrayRef>);
 /// `Histogram`, whose bounded path is private to `quantile_spill`, and `ListAgg`,
 /// whose output *is* the value list).
 fn bounded_value_list(func: AggFunc) -> bool {
+    // `NLength`/`LCount`/`AuN` are deliberately absent, and their absence is correct rather
+    // than an oversight. The bounded path here works by rank selection, which answers "the
+    // k-th value" without holding the list; a contiguity statistic needs the *total* and then
+    // a walk down the sorted order weighted by value, which is not a rank query. They fall
+    // back to the grace path, which is slower and right.
     matches!(
         func,
         AggFunc::Median | AggFunc::Quantile | AggFunc::CountDistinct | AggFunc::Mode

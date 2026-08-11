@@ -20,4 +20,4 @@ python examples/expressions/temporal_business_days.py
 - {doc}`/cookbook/expressions/nested/structs_and_maps`: nested records without flattening the table.
 - {doc}`/cookbook/expressions/temporal/temporal_differences`: durations between two timestamp columns, and shifting a timestamp.
 - {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
-- {doc}`/api/relational/expressions`: the complete `Expr` reference.
+- {doc}`/api/relational/expressions`: the complete {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` reference.

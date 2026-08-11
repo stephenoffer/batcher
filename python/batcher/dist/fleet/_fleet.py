@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import logging
 import threading
 
 from batcher._internal.errors import ResourceError
+from batcher._internal.logging import note_suppressed
 from batcher.dist.fleet.plan_id import active_query_scopes, adopt_plan_id, query_shuffle_scope
 
 __all__ = [
@@ -47,6 +49,12 @@ __all__ = [
 _FLEET: contextvars.ContextVar[ShuffleFleet | None] = contextvars.ContextVar(
     "batcher_shuffle_fleet", default=None
 )
+
+# How many of `_SESSION_LEASES` are query-scoped (`session_fleet_lease`) rather than held
+# by a running operator or by a published intermediate. Counted separately because the two
+# kinds mean opposite things for resizing: see `_session_fleet_resizable`. Guarded by
+# `_SESSION_LOCK`, like `_SESSION_LEASES` itself.
+_SESSION_QUERY_LEASES = 0
 
 
 def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: int | None = None):
@@ -97,10 +105,12 @@ def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: 
                         ray.kill(a)  # a straggler that never came up — reclaim its slot
             actors = [a for a, ref in zip(actors, addr_refs, strict=True) if ref in ready_set]
             addr_refs = ready
+            _warn_degraded_fleet(len(actors), workers, timeout)
         if not actors:  # nothing came up at all — a real, actionable failure, not a hang
             raise ResourceError(
-                f"no distributed worker became available within {timeout:.0f}s "
-                "(cluster over-subscribed or unschedulable); retry or reduce num_workers"
+                f"no distributed worker became available within {timeout:.0f}s: "
+                f"{_fleet_demand_reason() or 'the cluster is over-subscribed or unschedulable'}"
+                "; retry or reduce num_workers"
             )
         addrs = list(ray.get(addr_refs))
         ok = True
@@ -113,6 +123,55 @@ def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: 
             release_placement(pg)
 
 
+def _fleet_demand_reason() -> str | None:
+    """Why the fleet's workers could not be placed, in the ask's own terms, or `None`.
+
+    "The cluster is over-subscribed or unschedulable" names both possibilities and
+    distinguishes neither, which is the wrong half of the answer to give someone whose query
+    just failed: the two have opposite fixes. Asking a worker for more cores than any node
+    has is settled by changing the grant; a cluster somebody else is holding is settled by
+    waiting or by looking at who. The topology already knows which one it is.
+    """
+    try:
+        from batcher.dist.executors.ray_runtime.capacity import Demand, describe_pending_demand
+        from batcher.dist.executors.ray_runtime.scheduling import current_envelope
+
+        return describe_pending_demand(Demand.from_envelope(current_envelope()))
+    except Exception as exc:  # pragma: no cover - a diagnosis never replaces the failure
+        note_suppressed("dist", "diagnose the unplaceable fleet", exc)
+        return None
+
+
+def _warn_degraded_fleet(placed: int, wanted: int, timeout: float) -> None:
+    """Say so when a fleet comes up narrower than it asked for.
+
+    This is the most expensive silent degradation on the distributed path and it left no
+    trace at all: the stragglers are killed, the survivors serve the query, and — on the
+    session-cached path — the rest of the session too. Measured on an 8-worker distributed
+    join that came up with 2: **0.6 s becomes 16 s**, with nothing anywhere to connect the
+    two. A query that runs at a quarter of its width should not have to be inferred from a
+    stopwatch.
+
+    Best-effort: reporting a degradation must not turn it into a failure.
+    """
+    if placed >= wanted:
+        return
+    try:
+        from batcher._internal.logging import get_logger, log_kv
+
+        log_kv(
+            get_logger("dist"),
+            logging.WARNING,
+            "shuffle fleet came up narrower than requested; the query runs at reduced width",
+            placed=placed,
+            requested=wanted,
+            waited_s=round(timeout * 2, 1),
+            reason=_fleet_demand_reason() or "workers did not advertise in time",
+        )
+    except Exception as exc:  # pragma: no cover - observation must never fail a spawn
+        note_suppressed("dist", "report the degraded fleet", exc)
+
+
 class ShuffleFleet:
     """One placement group + `_FlightWorker` fleet reused across a query's stages.
 
@@ -122,9 +181,18 @@ class ShuffleFleet:
     teardown point — the adaptive loop calls it once, in its `finally`.
     """
 
-    __slots__ = ("actors", "addrs", "cfg_json", "credits", "pg", "plan_id")
+    __slots__ = ("actors", "addrs", "cfg_json", "credits", "num_cpus", "pg", "plan_id")
 
-    def __init__(self, actors, pg, addrs, credits: int, cfg_json: str, plan_id: int) -> None:
+    def __init__(
+        self,
+        actors,
+        pg,
+        addrs,
+        credits: int,
+        cfg_json: str,
+        plan_id: int,
+        num_cpus: float = 0.0,
+    ) -> None:
         self.actors = actors
         self.pg = pg
         self.addrs = addrs
@@ -133,6 +201,11 @@ class ShuffleFleet:
         # The query's shuffle plan id, set on the driver whenever this fleet is
         # borrowed so every borrowing operator's tickets fence to this query.
         self.plan_id = plan_id
+        # The per-worker core grant these actors hold. Recorded because worker *count* alone
+        # cannot tell a healthy fleet from a degenerate one: 175 one-core workers and 16
+        # sixteen-core workers occupy the same cluster, and only the second can use it. See
+        # `_fleet_is_too_thin`.
+        self.num_cpus = num_cpus
 
     @property
     def workers(self) -> int:
@@ -146,7 +219,7 @@ class ShuffleFleet:
 
         plan_id = new_plan_id()
         actors, pg, addrs = _spawn_fleet_with_addrs(workers, credits, cfg_json, plan_id)
-        return cls(actors, pg, addrs, credits, cfg_json, plan_id)
+        return cls(actors, pg, addrs, credits, cfg_json, plan_id, _wanted_grant())
 
     def cleanup(self) -> None:
         """Kill the fleet's actors and release its placement group (idempotent)."""
@@ -176,6 +249,54 @@ _SESSION_TIMER: threading.Timer | None = None
 # is every large distributed join, and which surfaced as a mid-query `ActorDiedError`
 # ("killed by ray.kill") from the shuffle's own recovery path.
 _SESSION_LEASES = 0
+
+
+def _wanted_grant() -> float:
+    """The per-worker core grant the caller's scheduling envelope asks for, or 0 if unknown.
+
+    `execute_distributed` has already resolved the fan-out and installed it as the ambient
+    envelope by the time a fleet is spawned or borrowed, so this is the sizing decision for
+    *this* query rather than a second guess at it. 0 means "no envelope", which every
+    comparison below treats as "do not judge".
+    """
+    try:
+        from batcher.dist.executors.ray_runtime import current_envelope
+
+        env = current_envelope()
+        return float(env.num_cpus) if env is not None else 0.0
+    except Exception as exc:
+        note_suppressed("dist", "read the scheduling envelope's worker grant", exc)
+        return 0.0
+
+
+#: How much thinner than the current sizing a cached fleet may be before it is respawned.
+#:
+#: A cached fleet is normally kept: respawning costs 1-2s and the whole point of the session
+#: fleet is to skip that. But `dist.executor._placeable_grant` sizes the grant from *free*
+#: capacity so the gang can be placed, and when a query's own map tasks (or the previous
+#: fleet) already hold the cores it thins all the way to one core per worker. That fleet then
+#: occupies the cluster, so the next sizing sees no free capacity either and thins again —
+#: and because `_acquire_session_fleet` only ever respawned a fleet that was too *narrow*, a
+#: 175-worker one-core fleet is never narrower than a 16-worker request and the process stays
+#: on one-core workers for the rest of its life. Measured: TPC-H sf10 distributed went from
+#: 27s for all 22 queries to over 20 minutes reaching q9.
+#:
+#: Half is deliberately loose. The comparison is against a grant that is itself derived from
+#: live capacity, so it wobbles by a core or two between queries for reasons that are not a
+#: pathology; respawning on that would trade the ratchet for churn. A factor of two only
+#: fires on the collapse this exists to catch.
+_FLEET_THINNESS_TOLERANCE = 0.5
+
+
+def _fleet_is_too_thin(fleet: ShuffleFleet, wanted: float) -> bool:
+    """Whether `fleet`'s per-worker grant has collapsed far below what this query wants.
+
+    Both figures must be known and positive: a fleet spawned before the grant was recorded,
+    or a query with no envelope, is left alone rather than respawned on a guess.
+    """
+    return bool(
+        fleet.num_cpus > 0 and wanted > 0 and fleet.num_cpus < wanted * _FLEET_THINNESS_TOLERANCE
+    )
 
 
 def _session_fleet_alive(fleet: ShuffleFleet) -> bool:
@@ -232,6 +353,35 @@ def _regrant_fleet(fleet: ShuffleFleet, credits: int, cfg_json: str) -> None:
     fleet.cfg_json = cfg_json
 
 
+def _session_fleet_resizable() -> bool:
+    """Whether the cached session fleet may be torn down and respawned right now.
+
+    Not every lease means the same thing. An **operator** lease (`acquire_fleet`) says a
+    shuffle is running over these actors right now, and a lease still held after an
+    operator returns says it left a `FlightMaterializedSource` published on them; both die
+    with a respawn. A **query-scope** lease (`session_fleet_lease`) says only that a staged
+    query intends to use the fleet across its stages — it is taken by
+    `api.adaptive.staging` *before* the first stage runs, when nothing has been published.
+
+    Testing the raw count conflated the two, and the query-scope lease is the common case:
+    by the time a staged query's first operator asked for a fleet, the counter it had
+    incremented itself was already 1, so the too-narrow/too-thin test could never fire. A
+    staged query therefore inherited whatever fan-out the first query of the process
+    happened to create, for the life of the process — a 2-worker fleet serving an 8-worker
+    query, with no way back up. Since the grant also collapses to one core per worker
+    against a busy cluster (`_placeable_grant`), that is how a process gets permanently
+    stuck on a degenerate fleet: exactly the state `_fleet_is_too_thin` detects and was
+    then unable to act on.
+
+    So the fleet is resizable when every outstanding lease is query-scoped and at most one
+    query holds it — nobody is mid-shuffle, and nothing is published that a respawn would
+    destroy. An unleased fleet satisfies this trivially, which is the historical rule.
+    """
+    from batcher.dist.fleet.plan_id import active_query_scopes
+
+    return _SESSION_LEASES <= _SESSION_QUERY_LEASES and active_query_scopes() <= 1
+
+
 def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> ShuffleFleet:
     """Get the warm session fleet, spawning (or respawning it) as needed.
 
@@ -268,8 +418,15 @@ def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> Shuffle
             with contextlib.suppress(Exception):
                 _SESSION.cleanup()
             _SESSION = None
-        # Too narrow for this query, and nobody is mid-shuffle over it → respawn wider.
-        if _SESSION is not None and _SESSION_LEASES == 0 and len(_SESSION.actors) < workers:
+        # Too narrow *or too thin* for this query, and nobody is mid-shuffle over it →
+        # respawn. Width alone was the whole test, which is what let the one-core collapse
+        # in `_FLEET_THINNESS_TOLERANCE` persist for the life of the process: a fleet with
+        # ten times the workers at a sixteenth of the cores each is never "too narrow".
+        if (
+            _SESSION is not None
+            and _session_fleet_resizable()
+            and (len(_SESSION.actors) < workers or _fleet_is_too_thin(_SESSION, _wanted_grant()))
+        ):
             with contextlib.suppress(Exception):
                 _SESSION.cleanup()
             _SESSION = None
@@ -316,18 +473,26 @@ def session_fleet_lease():
     This is also where the query's shuffle **plan id** is minted: the one scope that means
     "one query", and while the fleet under it may be shared with other pipelines, the id
     must not be.
+
+    This lease is counted in `_SESSION_QUERY_LEASES` as well, because it must not veto the
+    fleet resize it is held *across*: a query that finds the cached fleet too narrow has to
+    be able to respawn it on its first acquire, and this lease is its own. See
+    `_session_fleet_resizable`.
     """
-    global _SESSION_LEASES, _SESSION_TIMER
+    global _SESSION_LEASES, _SESSION_QUERY_LEASES, _SESSION_TIMER
 
     with _SESSION_LOCK:
         if _SESSION_TIMER is not None:
             _SESSION_TIMER.cancel()
             _SESSION_TIMER = None
         _SESSION_LEASES += 1
+        _SESSION_QUERY_LEASES += 1
     try:
         with query_shuffle_scope():  # the fence, and the one place a query is counted
             yield
     finally:
+        with _SESSION_LOCK:
+            _SESSION_QUERY_LEASES = max(0, _SESSION_QUERY_LEASES - 1)
         release_session_lease()
 
 

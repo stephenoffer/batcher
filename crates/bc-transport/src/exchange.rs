@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow_flight::{FlightData, FlightDescriptor};
@@ -288,7 +289,11 @@ impl ShuffleExchange {
         token: Option<&str>,
     ) -> TransportResult<Vec<RecordBatch>> {
         let mut client = FlightClient::connect(addr).await?;
-        credit_exchange(&mut client, ticket, credits, token).await
+        // The un-pooled path connects fresh per fetch, so its duration is dominated by the
+        // handshake rather than by the flow. It feeds no counters, and the starvation clock
+        // goes with them.
+        let (batches, ..) = credit_exchange(&mut client, ticket, credits, token).await?;
+        Ok(batches)
     }
 
     /// Fetch a remote partition from `(addr, ticket)` over a credit-gated
@@ -305,7 +310,8 @@ impl ShuffleExchange {
         credits: u32,
     ) -> TransportResult<Vec<RecordBatch>> {
         let mut client = FlightClient::connect(addr).await?;
-        credit_exchange(&mut client, ticket, credits, None).await
+        let (batches, ..) = credit_exchange(&mut client, ticket, credits, None).await?;
+        Ok(batches)
     }
 }
 
@@ -338,7 +344,7 @@ pub(crate) async fn credit_exchange(
     ticket: &ShuffleTicket,
     credits: u32,
     token: Option<&str>,
-) -> TransportResult<Vec<RecordBatch>> {
+) -> TransportResult<(Vec<RecordBatch>, Duration, Duration)> {
     credit_exchange_shard(client, ticket, credits, token, 0, 1).await
 }
 
@@ -350,6 +356,10 @@ pub(crate) async fn credit_exchange(
 /// past the per-flow NIC cap. The union of all shards is the whole bucket; order within
 /// the bucket is not preserved (the reducer re-orders/combines downstream, exactly as it
 /// already must across sources).
+///
+/// Returns the batches alongside the time the consumer spent **blocked awaiting the next
+/// batch** — the credit window's own feedback signal. See [`crate::peers`] for why a
+/// throughput counter alone cannot tell a controller whether a wider window would help.
 pub(crate) async fn credit_exchange_shard(
     client: &mut FlightClient,
     ticket: &ShuffleTicket,
@@ -357,9 +367,12 @@ pub(crate) async fn credit_exchange_shard(
     token: Option<&str>,
     shard: u32,
     nshards: u32,
-) -> TransportResult<Vec<RecordBatch>> {
+) -> TransportResult<(Vec<RecordBatch>, Duration, Duration)> {
     match credit_exchange_inner(client, ticket, credits, token, shard, nshards).await {
-        Err(ref e) if is_ticket_not_found(e) => Ok(Vec::new()),
+        // An unpublished ticket is the expected empty-bucket case, and it measures nothing:
+        // reporting its round trip as starvation would tell the controller to widen a window
+        // that carried no rows.
+        Err(ref e) if is_ticket_not_found(e) => Ok((Vec::new(), Duration::ZERO, Duration::ZERO)),
         other => other,
     }
 }
@@ -371,7 +384,7 @@ async fn credit_exchange_inner(
     token: Option<&str>,
     shard: u32,
     nshards: u32,
-) -> TransportResult<Vec<RecordBatch>> {
+) -> TransportResult<(Vec<RecordBatch>, Duration, Duration)> {
     let credits = credits.max(1);
     let ticket_str = ticket.to_string();
 
@@ -423,18 +436,43 @@ async fn credit_exchange_inner(
     // after every batch the moment the accumulator crosses the low watermark, and the
     // watermark is <= half the window, so a blocked producer is always released by the
     // slots the consumer is still draining (see the crate's flow-control tests).
+    let started = std::time::Instant::now();
     let refill_at = (credits / 2).max(1);
     let mut pending: u32 = 0;
     let mut batches = Vec::new();
+    // How long this consumer sat with nothing to do, waiting for the producer. Accumulated
+    // across the whole stream and handed back so the credit controller can ask the only
+    // question that decides a window's width: was the wire ever the thing we were waiting on?
+    // Near zero means the producer stayed ahead and more credits buy buffering rather than
+    // throughput; a large share means the window is below the channel's bandwidth-delay
+    // product and widening it will fill the link.
+    let mut starved = Duration::ZERO;
+    // Time from issuing the request to the first frame coming back: one full round trip, and
+    // the sample the `RTprop` min-filter is built from. Measured here rather than inferred
+    // because this is the only place both ends of it are visible.
+    let mut first_response = Duration::ZERO;
+    let mut seen_first = false;
     loop {
         // Idle timeout: a hung/dead peer must not block the reducer forever.
         // The bound is between batches, not on the whole transfer, so a large but
         // healthy partition is never cut off mid-stream. Configurable per process
         // (Carbonite); a timeout is a *retryable* fault (recompute + re-fetch).
         let idle = crate::fetch_idle_timeout();
+        let waiting = std::time::Instant::now();
         let next = tokio::time::timeout(idle, response.try_next()).await;
+        // Charged whether or not a batch arrives, but *not* on the timeout path: a dead peer's
+        // full idle budget is a fault, and folding it in would report the channel as starved
+        // for a minute and grow every window in the shuffle in response to a crash.
         let batch = match next {
-            Ok(res) => res?,
+            Ok(res) => {
+                let waited = waiting.elapsed();
+                starved += waited;
+                if !seen_first {
+                    seen_first = true;
+                    first_response = started.elapsed();
+                }
+                res?
+            }
             Err(_) => return Err(TransportError::IdleTimeout(idle)),
         };
         let Some(batch) = batch else { break };
@@ -458,7 +496,7 @@ async fn credit_exchange_inner(
             pending = 0;
         }
     }
-    Ok(batches)
+    Ok((batches, starved, first_response))
 }
 
 /// A lazily-grown set of gRPC channels to one peer, striping concurrent fetches
@@ -607,9 +645,9 @@ impl ClientPool {
         let out = self
             .fetch_once_with_retry(addr, ticket, credits, token)
             .await;
-        if let Ok(batches) = out.as_ref() {
+        if let Ok((batches, starved, first)) = out.as_ref() {
             let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-            crate::record_fetch(addr, bytes as u64, started.elapsed());
+            crate::record_fetch(addr, bytes as u64, started.elapsed(), *starved, *first);
         }
         if out.is_err() {
             // Every failure path lands here, including a first `acquire` that could not
@@ -617,7 +655,7 @@ impl ClientPool {
             // the one that still leaves an entry behind. See `forget_unreachable`.
             self.forget_unreachable(addr).await;
         }
-        out
+        out.map(|(batches, ..)| batches)
     }
 
     /// One pooled fetch, redialing once if the cached connections turn out to be stale.
@@ -627,7 +665,7 @@ impl ClientPool {
         ticket: &ShuffleTicket,
         credits: u32,
         token: Option<&str>,
-    ) -> TransportResult<Vec<RecordBatch>> {
+    ) -> TransportResult<(Vec<RecordBatch>, Duration, Duration)> {
         let channel = self.channel(addr).await?;
         let mut client = FlightClient::from_channel(channel);
         match credit_exchange(&mut client, ticket, credits, token).await {
@@ -716,11 +754,11 @@ impl ClientPool {
             let started = std::time::Instant::now();
             let out =
                 credit_exchange_shard(&mut client, ticket, per_shard, token, shard, stripe).await;
-            if let Ok(batches) = out.as_ref() {
+            if let Ok((batches, starved, first)) = out.as_ref() {
                 let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
-                crate::record_fetch(addr, bytes as u64, started.elapsed());
+                crate::record_fetch(addr, bytes as u64, started.elapsed(), *starved, *first);
             }
-            out
+            out.map(|(batches, ..)| batches)
         });
         let shards = futures::future::try_join_all(fetches).await?;
         Ok(shards.into_iter().flatten().collect())

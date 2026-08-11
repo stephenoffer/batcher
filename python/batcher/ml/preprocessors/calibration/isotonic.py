@@ -26,8 +26,28 @@ from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
+    from batcher.plan.expr_ir import Expr
 
 __all__ = ["IsotonicCalibrator", "pool_adjacent_violators"]
+
+
+def _balanced_sum(terms: list[Expr]) -> Expr:
+    """Add `terms` as a balanced tree, `log2(n)` levels deep rather than `n`.
+
+    The arithmetic twin of `plan.expr_rewrite.combine_conjuncts`, and here for the same
+    reason: every pass over an `Expr` in the data plane descends it one stack frame per
+    level, so a left-deep sum of `n_bins` indicators is a stack overflow rather than an
+    error. Only ever called on **integer** terms, where addition is exactly associative and
+    the tree's shape therefore cannot change a value.
+    """
+    if not terms:
+        return lit(0)
+    while len(terms) > 1:
+        terms = [
+            terms[i] + terms[i + 1] if i + 1 < len(terms) else terms[i]
+            for i in range(0, len(terms), 2)
+        ]
+    return terms[0]
 
 
 def pool_adjacent_violators(values: list[float], weights: list[float]) -> list[float]:
@@ -169,10 +189,12 @@ class IsotonicCalibrator(Preprocessor):
         ).filter(col("__bt_score").is_not_null())
         cuts = self._cut_points(prepared)
         # The bucket index is a sum of threshold indicators — one vectorized expression
-        # rather than a search per row, the same shape `QuantileTransformer` uses.
-        bucket = lit(0)
-        for cut in cuts:
-            bucket = bucket + (col("__bt_score") > lit(cut)).cast("int64")
+        # rather than a search per row, the same shape `QuantileTransformer` uses. Summed
+        # as a balanced tree, not a left-deep chain: there is one term per cut, `n_bins`
+        # defaults to 100, and a 100-deep `Expr` used to exhaust the data plane's stack and
+        # take the process down with SIGSEGV. Int64 addition is exactly associative, so the
+        # tree's shape cannot move a bucket index.
+        bucket = _balanced_sum([(col("__bt_score") > lit(cut)).cast("int64") for cut in cuts])
         grouped = (
             prepared.with_columns(__bt_bin=bucket)
             .group_by("__bt_bin")

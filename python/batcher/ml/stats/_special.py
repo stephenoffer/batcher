@@ -16,11 +16,25 @@ functions in the tests; SciPy is the oracle, never a runtime dependency.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
-__all__ = ["chi2_sf", "f_sf", "normal_two_sided_p", "students_t_two_sided_p"]
+__all__ = [
+    "chi2_ppf",
+    "chi2_sf",
+    "f_ppf",
+    "f_sf",
+    "normal_sf",
+    "normal_two_sided_p",
+    "students_t_ppf",
+    "students_t_sf",
+    "students_t_two_sided_p",
+]
 
 _EPS = 3.0e-16
 _FPMIN = 1.0e-300
+#: Where a quantile search gives up and reports an infinite quantile. Past this the
+#: bracketing loop is chasing a tail probability that has already underflowed to zero.
+_MAX_QUANTILE = 1.0e12
 
 
 def _betacf(a: float, b: float, x: float) -> float:
@@ -138,3 +152,83 @@ def chi2_sf(x: float, df: float) -> float:
     if x <= 0.0:
         return 1.0
     return _gammainc_upper(0.5 * df, 0.5 * x)
+
+
+def students_t_sf(t: float, df: float) -> float:
+    """The one-sided upper tail ``P(T >= t)`` for a Student's t with `df` degrees of freedom.
+
+    The two-sided function above cannot answer a directional question: it folds the sign
+    away, so a test with an `alternative` of "greater" or "less" reading `p / 2` off it is
+    wrong for exactly the half of the parameter space where the effect points the other way.
+    """
+    if df <= 0:
+        return math.nan
+    half = 0.5 * students_t_two_sided_p(t, df)
+    return half if t >= 0.0 else 1.0 - half
+
+
+def normal_sf(z: float) -> float:
+    """The one-sided upper tail ``P(Z >= z)`` for a standard normal."""
+    return 0.5 * math.erfc(z / math.sqrt(2.0))
+
+
+def _invert_decreasing(sf: Callable[[float], float], target: float, hi_start: float) -> float:
+    """The ``x >= 0`` where a decreasing survival function `sf` crosses `target`.
+
+    Bracket by doubling from `hi_start`, then bisect. Bisection rather than Newton because
+    these survival functions have no closed-form derivative here and a continued fraction is
+    a poor thing to differentiate numerically; the cost is irrelevant, since a quantile is
+    computed once per test on the driver, never per row.
+    """
+    lo, hi = 0.0, hi_start
+    while sf(hi) > target:
+        lo = hi
+        hi *= 2.0
+        if hi > _MAX_QUANTILE:
+            return math.inf
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mid <= lo or mid >= hi:  # the bracket is down to adjacent floats
+            break
+        if sf(mid) > target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def students_t_ppf(p: float, df: float) -> float:
+    """The Student's t quantile: the ``t`` with ``P(T <= t) == p``, for `df` degrees of freedom."""
+    if df <= 0 or not 0.0 <= p <= 1.0:
+        return math.nan
+    if p == 0.0:
+        return -math.inf
+    if p == 1.0:
+        return math.inf
+    if p < 0.5:
+        return -students_t_ppf(1.0 - p, df)
+    # `p >= 0.5` puts the quantile at or above zero, which is where `_invert_decreasing`
+    # searches; the upper tail there is `1 - p`.
+    return _invert_decreasing(lambda t: students_t_sf(t, df), 1.0 - p, 1.0)
+
+
+def chi2_ppf(p: float, df: float) -> float:
+    """The chi-squared quantile: the ``x`` with ``P(X <= x) == p``, for `df` degrees of freedom."""
+    if df <= 0 or not 0.0 <= p <= 1.0:
+        return math.nan
+    if p == 0.0:
+        return 0.0
+    if p == 1.0:
+        return math.inf
+    return _invert_decreasing(lambda x: chi2_sf(x, df), 1.0 - p, max(df, 1.0))
+
+
+def f_ppf(p: float, df1: float, df2: float) -> float:
+    """The F quantile: the ``x`` with ``P(X <= x) == p``, for ``(df1, df2)`` degrees of freedom."""
+    if df1 <= 0 or df2 <= 0 or not 0.0 <= p <= 1.0:
+        return math.nan
+    if p == 0.0:
+        return 0.0
+    if p == 1.0:
+        return math.inf
+    return _invert_decreasing(lambda x: f_sf(x, df1, df2), 1.0 - p, 1.0)

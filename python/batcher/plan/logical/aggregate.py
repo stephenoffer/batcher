@@ -12,11 +12,13 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher.plan.expr_ir import AggExpr, Expr
+from batcher._internal.errors import PlanError
+from batcher.plan.expr_ir import AggExpr
 from batcher.plan.ir_specs import aggregates_ir, group_keys_ir, sort_keys_ir
-from batcher.plan.ir_tags import Op
+from batcher.plan.ir_tags import AGG_FNS, Op
 from batcher.plan.logical.base import (
     LogicalPlan,
+    SortKeySpec,
     _reject_duplicate_aliases,
     _validate_refs,
     available_column_set,
@@ -29,13 +31,21 @@ from batcher.plan.types import infer_type, widen
 __all__ = ["Aggregate", "AggregateSpec", "Sort", "SortKeySpec"]
 
 # Aggregate function → output-type category (the engine's result types).
-_AGG_INT = frozenset({"count", "count_distinct", "count_star", "approx_count_distinct"})
+_AGG_INT = frozenset(
+    # `l_count` is a number of contigs, so Int64 — reporting it as a float would be the
+    # same mistake as a fractional row count.
+    {"count", "count_distinct", "count_star", "approx_count_distinct", "l_count"}
+)
 _AGG_FLOAT = frozenset(
     {
         "mean",
         "median",
         "quantile",
         "approx_quantile",
+        # Contiguity lengths: `n_length` is a contig length and `aun` a base-weighted mean,
+        # both Float64 whatever the input length column's type.
+        "n_length",
+        "aun",
         "stddev",
         "var",
         "corr",
@@ -49,6 +59,9 @@ _AGG_FLOAT = frozenset(
     }
 )
 _AGG_BOOL = frozenset({"bool_and", "bool_or"})
+# `l_count` is a number of contigs, so Int64 — reporting it as a float would be the
+# same mistake as a fractional row count. `n_length`/`aun` are lengths and land in
+# `_AGG_FLOAT` beside the other length-valued statistics.
 _AGG_INPUT = frozenset({"min", "max", "mode", "arg_min", "arg_max"})  # preserve input type
 _AGG_WIDEN_INPUT = frozenset({"sum", "bit_and", "bit_or", "bit_xor"})  # widen(input)
 
@@ -96,6 +109,11 @@ class Aggregate(LogicalPlan):
         for key in self.group_keys:
             _validate_refs(key.expr, available, what=f"group_by key {key.alias!r}")
         for spec in self.aggregates:
+            if spec.agg.func not in AGG_FNS:
+                raise PlanError(
+                    f"unknown aggregate function {spec.agg.func!r} for {spec.alias!r}; "
+                    f"expected one of the tags in plan/ir_tags.py::AGG_FNS"
+                )
             if spec.agg.input is not None:
                 _validate_refs(spec.agg.input, available, what=f"aggregate {spec.alias!r}")
         _reject_duplicate_aliases(
@@ -128,15 +146,6 @@ class Aggregate(LogicalPlan):
 
 
 @dataclass(frozen=True, slots=True)
-class SortKeySpec:
-    """One sort key: an expression and its ordering."""
-
-    expr: Expr
-    descending: bool = False
-    nulls_first: bool = False
-
-
-@dataclass(frozen=True, slots=True)
 class Sort(LogicalPlan):
     """Order rows by sort keys. Preserves the input schema.
 
@@ -154,13 +163,23 @@ class Sort(LogicalPlan):
         for key in self.keys:
             _validate_refs(key.expr, available, what="sort key")
 
-    def to_ir(self) -> dict[str, Any]:
+    def shape_ir(self) -> dict[str, Any]:
+        """Every IR field but the input — see `Join.shape_ir` for why this seam exists.
+
+        Four places rebuild a `sort` node with a per-task scan substituted: the shuffle
+        sort, both Flight sort paths, and the streaming top-N driver (which also overrides
+        `limit`, since its per-batch trim is not the plan's). They were each restating the
+        field list; the keys at least went through the shared `sort_keys_ir`, so only a new
+        field on `Sort` could drift — which is exactly how `Join` lost `strategy`.
+        """
         return {
             "op": Op.SORT,
-            "input": self.input.to_ir(),
             "keys": sort_keys_ir(self.keys),
             "limit": self.limit,
         }
+
+    def to_ir(self) -> dict[str, Any]:
+        return {**self.shape_ir(), "input": self.input.to_ir()}
 
     def available_columns(self) -> list[str]:
         return self.input.available_columns()

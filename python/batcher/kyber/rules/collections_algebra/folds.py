@@ -27,9 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Array, Col, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import (
     ListContains,
@@ -38,7 +36,6 @@ from batcher.plan.expr_ir.func_nodes import (
     ListPosition,
     ListTransform,
 )
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = [
     "LIST_LITERAL_FOLD_RULES",
@@ -46,7 +43,6 @@ __all__ = [
     "drop_identity_list_transform",
 ]
 
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 #: The name `element()` lowers to inside a `list_transform` / `list_filter` body.
 _ELEMENT = "element"
@@ -157,16 +153,7 @@ def _fold_position(expr: Expr) -> Expr:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], expr_matches: tuple[type, ...]):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=expr_matches,
-        )
-    )
+    return register_leaf_rule(name, leaf, expr_matches=expr_matches)
 
 
 #: Eleven folds over a literal `ARRAY[...]`: the six exact reductions, the three

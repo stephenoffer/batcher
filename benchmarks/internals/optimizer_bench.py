@@ -61,7 +61,7 @@ def _noop_rules(count: int) -> list:
     ]
 
 
-def main() -> None:
+def main() -> int:
     base_rules = DEFAULT_REGISTRY.rules()
     print(f"{len(base_rules)} built-in rules\n")
 
@@ -111,6 +111,8 @@ def _bench_repeated_planning() -> None:
         best = min(best, (time.perf_counter() - t0) / 2000 * 1e6)
     print(f"  cache-hit planning: {best:.2f} us/call")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

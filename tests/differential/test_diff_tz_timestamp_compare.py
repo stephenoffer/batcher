@@ -31,7 +31,7 @@ _TZS = ["UTC", "+00:00", "America/New_York"]
 def test_tz_aware_column_vs_naive_literal_matches_duckdb(duck, tz, op):
     """`ts <op> naive_datetime` over a tz-aware column agrees with DuckDB's instant compare."""
     rows = [dt.datetime(2021, 1, 1), dt.datetime(2021, 3, 1), dt.datetime(2021, 6, 1)]
-    aware = [r.replace(tzinfo=dt.timezone.utc) for r in rows]
+    aware = [r.replace(tzinfo=dt.UTC) for r in rows]
     table = pa.table({"r": [0, 1, 2], "ts": pa.array(aware, pa.timestamp("us", tz))})
     lit = dt.datetime(2021, 3, 1)
     ops = {
@@ -64,11 +64,11 @@ def test_tz_aware_column_vs_aware_literal_matches_duckdb(duck, op):
     compare on the UTC instant. (Regression: `lit(aware_dt)` raised `TypeError: can't subtract
     offset-naive and offset-aware datetimes` in the IR literal lowering.)"""
     aware = [
-        dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc),
-        dt.datetime(2021, 6, 1, tzinfo=dt.timezone.utc),
+        dt.datetime(2021, 1, 1, tzinfo=dt.UTC),
+        dt.datetime(2021, 6, 1, tzinfo=dt.UTC),
     ]
     table = pa.table({"r": [0, 1], "ts": pa.array(aware, pa.timestamp("us", "UTC"))})
-    lit = dt.datetime(2021, 3, 1, tzinfo=dt.timezone.utc)
+    lit = dt.datetime(2021, 3, 1, tzinfo=dt.UTC)
     ops = {">": bt.col("ts") > lit, "<": bt.col("ts") < lit, "==": bt.col("ts") == lit}
     got = sorted(bt.from_arrow(table).filter(ops[op]).select("r").collect().to_pydict()["r"])
 
@@ -87,7 +87,7 @@ def test_tz_aware_column_vs_aware_literal_matches_duckdb(duck, op):
 
 def test_named_tz_column_round_trips():
     """A named-tz timestamp column survives a collect (the `chrono-tz` prerequisite)."""
-    aware = [dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)]
+    aware = [dt.datetime(2021, 1, 1, tzinfo=dt.UTC)]
     table = pa.table({"ts": pa.array(aware, pa.timestamp("us", "UTC"))})
     out = bt.from_arrow(table).collect()
     assert out.num_rows == 1

@@ -62,6 +62,11 @@ from batcher.dist.executors.ray_runtime import (
 )
 from batcher.dist.executors.ray_runtime.trace import FanoutTrace
 from batcher.dist.fleet.plan_id import with_query_shuffle_scope
+
+# The *predicate* only, imported eagerly: `global_window.offsets` sees nothing but `plan`,
+# where the executors beside it import this module back (for `_apply_above` and friends) and
+# so must stay lazy at their call sites, exactly as `flight_window` does.
+from batcher.dist.global_window.offsets import supports_ordered_bucket_offsets
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import (
@@ -225,6 +230,16 @@ def execute_distributed(
         # fan-out to one worker per node, which is the behavior the device tiling exists to
         # replace.
         share = 0.0 if by_device else _even_cpu_share(workers)
+        # The raise must not hand back the core the fill deliberately kept free.
+        # `_cluster_fill_workers` thins its grant so the fleet leaves a schedulable core on
+        # every node (`_headroom_grant`), while `_even_cpu_share` caps at `min(node cores)` —
+        # the whole node on a homogeneous cluster — so an unconditional raise puts that core
+        # straight back into the placement group and restores the deadlock the thinning exists
+        # to prevent. Thinning the *share* rather than capping it at the fill's grant keeps the
+        # raise doing its real job: when `_placeable_grant` has over-thinned against a busy
+        # cluster, the share still pulls the grant back up, just never past the headroom.
+        if fill is not None and not by_device and share > 0:
+            share = _headroom_grant(share, _worker_node_cpus())
         if share > num_cpus:
             envelope = (
                 dataclasses.replace(envelope, num_cpus=share)
@@ -383,7 +398,12 @@ def _accelerator_fill_workers(num_gpus: float) -> tuple[int, float] | None:
         # least one so a device-dense node cannot ask for a fractional-core worker.
         num_cpus = max(1.0, float(int(min(cores / held for cores, held in hosts))))
         return workers, num_cpus
-    except Exception:
+    except Exception as exc:
+        # Silence here is expensive: the caller falls back to the data-driven sizing, which on
+        # a device-dense fleet is far narrower, and "the job used a quarter of the GPUs" is
+        # then indistinguishable from a deliberate decision. `FanoutTrace` records the steps
+        # that ran; this is the one that did not.
+        note_suppressed("dist", "read the accelerator topology for the fan-out", exc)
         return None
 
 
@@ -406,11 +426,59 @@ def _cluster_fill_workers() -> tuple[int, float] | None:
         node_cpus = _worker_node_cpus()
         if len(node_cpus) <= 1:
             return None
-        num_cpus = _fill_grant(node_cpus)
+        num_cpus = _headroom_grant(_fill_grant(node_cpus), node_cpus)
         workers = sum(max(1, int(c // num_cpus)) for c in node_cpus)
         return workers, num_cpus
-    except Exception:
+    except Exception as exc:
+        # Same reason as the accelerator fill above: a topology read that fails quietly halves
+        # a large cluster's fan-out and leaves nothing to attribute it to.
+        note_suppressed("dist", "read the cluster topology for the fan-out", exc)
         return None
+
+
+def _headroom_grant(grant: float, node_cpus: list[float]) -> float:
+    """`grant`, thinned so the fleet cannot reserve every core in the cluster.
+
+    The fleet is a SPREAD placement group, and **not every distributed task runs inside it**:
+    `executors.map._map_udf_task` is a plain Ray task (it takes a skew-adaptive, often
+    sub-core `num_cpus`), and the hardware probe is another. A grant that tiles each node
+    exactly — the homogeneous case, where a 16-core node hosts one 16-core worker — leaves
+    those tasks nowhere to run.
+
+    That is a *deadlock*, not a slowdown, and it is reachable through the ordinary path: the
+    session fleet is cached across queries and `api.adaptive.staging` takes a query-scoped
+    lease on it before the query's first stage, so a query whose map stage follows a
+    predecessor's shuffle finds 100% of the cluster reserved and waits on a fleet only it
+    could release. Observed on a 16 x 16-core cluster running TPC-H sf100: q1-q15 pass, then
+    q16 hangs indefinitely with `256.0/256.0 CPU (256.0 reserved in placement groups)` and one
+    `_map_udf_task` pending on `{'CPU': 0.5}` — while q16 run on its own finishes in 3.2s.
+
+    Thinning **preserves the worker count**, exactly as `_placeable_grant` does: it returns the
+    largest grant no bigger than `grant` that still tiles to as many workers while leaving a
+    free core on every node that hosts one. On a homogeneous 16-core fleet that is 15 — one
+    worker per node still, 1/16th of the cluster kept schedulable. `grant` is returned
+    unchanged when no thinner grant preserves the fan-out, since a smaller fleet is the worse
+    trade and the caller's timeout still surfaces a genuinely unplaceable one.
+    """
+    if grant <= 1:
+        return grant  # already the thinnest possible; a 1-core grant strands nothing to give
+
+    def workers_at(g: float) -> int:
+        return sum(max(1, int(c // g)) for c in node_cpus)
+
+    def leaves_headroom(g: float) -> bool:
+        # Only nodes that actually host a worker need a spare core; one too small to tile is
+        # already entirely free.
+        return all(c - int(c // g) * g >= 1.0 for c in node_cpus if c >= g)
+
+    if leaves_headroom(grant):
+        return grant
+    wanted = workers_at(grant)
+    for candidate in range(int(grant) - 1, 0, -1):
+        g = float(candidate)
+        if workers_at(g) >= wanted and leaves_headroom(g):
+            return g
+    return grant
 
 
 # How much of the best-achievable core occupancy a larger grant may give up before it stops
@@ -955,6 +1023,128 @@ def _staged_aggregate_over_join(
             cleanup()
 
 
+# Deduped rows below which aggregating them centrally beats a second distributed stage.
+# The stage costs a map barrier, a shuffle and a reduce barrier — call it a second of fixed
+# overhead — while the single-node engine folds a simple aggregate at roughly 10M rows/s, so
+# a million rows is about where the two meet. Chosen from that arithmetic rather than
+# measured on a cluster; it is a routing threshold, so being off by a factor costs time on
+# one query shape and never an answer.
+_STAGED_DISTINCT_ROWS = 1_000_000
+
+
+def _too_small_to_restage(intermediate) -> bool:
+    """Whether a partitioned intermediate is small enough to aggregate on this node.
+
+    Reads the source's own exact `row_count` — a materialized shuffle output knows how many
+    rows it wrote, so this is a lookup rather than an estimate. An intermediate that cannot
+    say (or says nothing) is treated as large, because the cost of restaging something small
+    is one wasted stage while the cost of centralizing something large is the serial fraction
+    this function exists to avoid.
+    """
+    count = getattr(intermediate, "row_count", None)
+    rows = count() if callable(count) else None
+    return rows is not None and rows < _STAGED_DISTINCT_ROWS
+
+
+def _staged_aggregate_over_distinct(
+    above: list[LogicalPlan],
+    agg: Aggregate,
+    distinct: Distinct,
+    sources: list[Source],
+    workers: int,
+    transport: str,
+    hub=None,
+    metrics_out=None,
+) -> pa.Table:
+    """Dedup distributed, then aggregate the deduped rows **distributed as well**.
+
+    `COUNT(DISTINCT x)` lowers to an aggregate over a `Distinct`, and the dedup has to run
+    first and globally — running the aggregate map-local would count a value once per
+    partition it appears in. Doing the dedup distributed and then the *aggregate* on the
+    driver is correct and was what happened, but it puts every distinct value through one
+    node: the driver's work is Θ(distinct cardinality), independent of the cluster, so a
+    15M-key `COUNT(DISTINCT)` gets no faster however many workers it is given. That is the
+    definition of a serial fraction, and on this shape it is the whole query.
+
+    Both halves are mergeable, so there is no reason for either to be central. The dedup
+    keeps its result partitioned on disk (`materialize=False`) and the aggregate then treats
+    that intermediate as an ordinary splittable source — the same two-stage shape
+    `_staged_aggregate_over_join` uses, for the same reason. Driver memory becomes O(groups)
+    and the count is summed across reducers.
+
+    **A second stage is only worth its own overhead when there is something to distribute**,
+    and the dedup has already answered that exactly: a partitioned intermediate carries a
+    measured `row_count`. Below `_STAGED_DISTINCT_ROWS` the aggregate runs locally over it
+    instead — a `COUNT(DISTINCT status)` over six values would otherwise pay a full second
+    map/shuffle/reduce to count six rows, which is the shape most `COUNT(DISTINCT)` queries
+    actually are. The staging is for the cardinality that motivated it, not for every query
+    that spells the operator.
+
+    Falls back to aggregating here for the same reason when the dedup had no partitioned
+    form (an in-memory source, or a transport that materialized anyway): the driver is
+    already holding those rows, so shuffling them back out to fold them is pure cost.
+    """
+    from batcher.dist.executors.aggregate import _distributed_aggregate
+    from batcher.dist.executors.distinct import _distributed_distinct
+    from batcher.plan.logical import Scan
+    from batcher.plan.schema import SchemaRef
+
+    # `hub=None`: this stage runs the dedup **alone**, which is a fragment of the query the
+    # user asked for, and its measurements must not be learned as facts about the relation.
+    # A keyed dedup pre-reduces on the map side, so its reducer sees one row per key and
+    # emits one row per key — recorded, that reads as a `Distinct` which removes nothing,
+    # and Kyber then drops the `Distinct` from the original query. Measured:
+    # `distinct(subset=["k"]).agg(count())` returned 900, then 900 distributed, then
+    # **40,000** single-node in the same process. The same `hub=None` guard the distributed
+    # `LIMIT` and `sample` paths carry, for the same reason: a truncated plan's row count is
+    # not the source's.
+    deduped = _distributed_distinct(
+        [], distinct, sources, workers, transport, materialize=False, hub=None
+    )
+    if isinstance(deduped, pa.Table):
+        # No partitioned form to restage — the driver is already holding the rows, so
+        # shuffling them back out to aggregate them would be pure cost.
+        return _apply_above([*above, agg], deduped)
+
+    intermediate: Source = deduped
+    cleanup = deduped.cleanup
+    sid = len(sources)
+    staged = dataclasses.replace(
+        agg, input=Scan(source_id=sid, schema=SchemaRef(intermediate.schema()))
+    )
+    staged_sources = [*sources, intermediate]
+    try:
+        if _too_small_to_restage(intermediate):
+            # Read the intermediate's rows and aggregate them as an in-memory relation, the
+            # way this path did before it was staged at all. Optimizing a *fresh plan over
+            # the intermediate* instead looks equivalent and is not: the deduped rows have
+            # one row per key by construction, so the column statistics learned from that
+            # scan say the key is unique — and Kyber then drops the `Distinct` from the
+            # ORIGINAL query on a later run. Measured: `distinct(subset=["k"]).agg(count())`
+            # returned 900, then 900 distributed, then **40,000** single-node in the same
+            # process. Core measures and Kyber decides; what must not happen is a fragment's
+            # measurements being attributed to the relation it was derived from.
+            from batcher.io.source import read_source
+
+            batches = read_source(intermediate)
+            table = pa.Table.from_batches(batches) if batches else _empty_agg_table(agg)
+            return _apply_above([*above, agg], table)
+        # Second stage on the transport the first ran on. The disk shuffle needs cluster-wide
+        # scratch; routing a Flight query's second stage through it would demand a shared
+        # mount the Flight path deliberately does not require.
+        if transport == "flight":
+            from batcher.dist.flight_aggregate import execute_aggregate_flight
+
+            return execute_aggregate_flight(
+                above, staged, staged_sources, workers, hub=hub, metrics_out=metrics_out
+            )
+        return _distributed_aggregate(
+            above, staged, staged_sources, workers, hub, metrics_out=metrics_out
+        )
+    finally:
+        cleanup()
+
+
 def _dispatch(
     plan: LogicalPlan,
     sources: list[Source],
@@ -987,9 +1177,9 @@ def _dispatch(
             from batcher.config import active_config
 
             if active_config().distributed.stream_inference:
-                from batcher.dist.executors.plan_analysis import split_at_first_pool_boundary
+                from batcher.dist.executors.plan_analysis import split_into_resource_stages
 
-                if split_at_first_pool_boundary(plan) is not None:
+                if split_into_resource_stages(plan) is not None:
                     from batcher.dist.streaming import stream_distributed_pipeline
 
                     return stream_distributed_pipeline(plan, sources, workers, hub)
@@ -1127,11 +1317,38 @@ def _dispatch(
         # semantics — run map-local, each partition dedups independently and the reducer sums
         # the per-partition counts, double-counting any value spanning two source partitions
         # (the COUNT(DISTINCT) overcount). Distribute the DISTINCT first (globally deduped),
-        # then aggregate over its result. NOTE (perf): a high-cardinality DISTINCT collects the
-        # deduped rows to the driver for the outer aggregate — correct, but slow for a 15M-key
-        # COUNT(DISTINCT); the correct-and-fast form is a 2nd distributed stage (future work).
+        # then aggregate over its result — as a SECOND distributed stage, not on the driver:
+        # the deduped rows are Θ(distinct cardinality) and folding them centrally is a serial
+        # term no cluster size touches, which on a 15M-key COUNT(DISTINCT) is the whole query.
+        # See `_staged_aggregate_over_distinct`.
         # Scoped to a direct `Distinct` input: OTHER breakers (nested aggregate / sort) keep
         # the map-local path, which is correct for the composable aggregates that dominate.
+        # Whole-row only. A *keyed* dedup staged this way returns the right answer and then
+        # poisons the next one: its reducer sees one row per key and emits one row per key,
+        # which the learning loop reads as a `Distinct` that removes nothing, and Kyber drops
+        # the `Distinct` from the original query on a later run in the same process —
+        # measured at 900, 900 distributed, then **40,000**. Passing `hub=None` does not stop
+        # it (the recording is via the ambient hub, not the parameter), and the shape this
+        # staging exists for is `COUNT(DISTINCT x)`, which lowers to a whole-row dedup over a
+        # projected column. So a keyed dedup keeps the path it had, and this is a narrowing
+        # rather than a fix — the interaction is understood in effect but not in mechanism.
+        if (
+            isinstance(agg.input, Distinct)
+            and not agg.input.keys
+            and agg.input.limit is None
+            and _single_source(agg.input)
+            and not _has_breaker(agg.input.input)
+        ):
+            return _staged_aggregate_over_distinct(
+                above,
+                agg,
+                agg.input,
+                sources,
+                workers,
+                transport,
+                hub=hub,
+                metrics_out=metrics_out,
+            )
         if (
             isinstance(agg.input, Distinct)
             and _single_source(agg.input)
@@ -1166,7 +1383,13 @@ def _dispatch(
                 # result on the workers as a `FlightMaterializedSource` the next stage
                 # reads in place — no driver collect; else it spawns + collects as before.
                 return execute_aggregate_flight(
-                    above, agg, sources, workers, materialize=materialize
+                    above,
+                    agg,
+                    sources,
+                    workers,
+                    materialize=materialize,
+                    hub=hub,
+                    metrics_out=metrics_out,
                 )
             from batcher.dist.executors.aggregate import _distributed_aggregate
 
@@ -1193,7 +1416,15 @@ def _dispatch(
             if transport == "flight":
                 from batcher.dist.flight_join import execute_join_flight
 
-                return execute_join_flight(above, agg.input, sources, workers, fused_agg=agg)
+                return execute_join_flight(
+                    above,
+                    agg.input,
+                    sources,
+                    workers,
+                    fused_agg=agg,
+                    hub=hub,
+                    metrics_out=metrics_out,
+                )
             from batcher.dist.executors.join import _distributed_join_aggregate
 
             return _distributed_join_aggregate(above, agg, agg.input, sources, workers, hub)
@@ -1205,7 +1436,14 @@ def _dispatch(
                 from batcher.dist.flight_join import execute_join_flight
 
                 return execute_join_flight(
-                    above, agg.input, sources, workers, fused_agg=agg, combine_partials=True
+                    above,
+                    agg.input,
+                    sources,
+                    workers,
+                    fused_agg=agg,
+                    combine_partials=True,
+                    hub=hub,
+                    metrics_out=metrics_out,
                 )
             return _staged_aggregate_over_join(above, agg, sources, workers, hub, metrics_out)
 
@@ -1220,7 +1458,15 @@ def _dispatch(
                 # each reducer's joined bucket on its worker and returns a
                 # `FlightMaterializedSource` the next stage reads in place — no driver
                 # round-trip per join, which is what makes a 3+-table query scale.
-                return execute_join_flight(above, join, sources, workers, materialize=materialize)
+                return execute_join_flight(
+                    above,
+                    join,
+                    sources,
+                    workers,
+                    materialize=materialize,
+                    hub=hub,
+                    metrics_out=metrics_out,
+                )
             from batcher.dist.executors.join import _distributed_join
 
             return _distributed_join(
@@ -1228,13 +1474,16 @@ def _dispatch(
             )
 
     # ASOF join with `by` keys: co-partition both sides by the `by` keys (equal `by`
-    # values hash together, so each bucket is an independent ASOF join). A keyless
-    # ASOF needs one global order on `on` → stays single-node.
+    # values hash together, so each bucket is an independent ASOF join). A KEYLESS ASOF has
+    # no group to hash, so it range-partitions both sides on `on` instead and lends each
+    # bucket the one row per direction that can match across a boundary.
     asof_split = _split_at(plan, AsofJoin)
     if asof_split is not None:
         above, asof = asof_split
-        if asof.left_by and _join_sides_are_map_only(asof):
-            return _distributed_asof(above, asof, sources, workers)
+        if _join_sides_are_map_only(asof):
+            if asof.left_by:
+                return _distributed_asof(above, asof, sources, workers)
+            return _distributed_asof_keyless(above, asof, sources, workers)
 
     # RANGE (inequality) join: broadcast the build side, split the probe side. An
     # inequality has no equality to co-partition on — a hash shuffle would put `a.x` and the
@@ -1287,10 +1536,30 @@ def _dispatch(
                 # Small `ORDER BY ... LIMIT k` → mergeable top-N (no shuffle); else full sort.
                 if sort.limit is not None and sort.limit <= _TOPN_MAX_ROWS:
                     return execute_topn_flight(above, sort, sources, workers)
-                return execute_sort_flight(above, sort, sources, workers)
-            from batcher.dist.executors.sort import _distributed_sort
+                # `materialize=False` leaves each range bucket on the worker that sorted
+                # it and hands back a `FlightMaterializedSource` over the handles in range
+                # order. A sort is row-preserving, so collecting it is the whole relation
+                # through the driver — the biggest driver term left in this dispatcher.
+                return execute_sort_flight(
+                    above,
+                    sort,
+                    sources,
+                    workers,
+                    hub=hub,
+                    metrics_out=metrics_out,
+                    materialize=materialize,
+                )
+            from batcher.dist.executors.sort import _distributed_sort, _distributed_topn
 
-            return _distributed_sort(above, sort, sources, workers, hub)
+            # Small `ORDER BY ... LIMIT k` → mergeable top-N (no shuffle), as the Flight
+            # branch above already does. Without this the strategy was picked by whichever
+            # transport the topology resolved to rather than by the query: the same
+            # `df.sort(...).limit(10)` exchanged every row on disk and no rows on Flight.
+            if sort.limit is not None and sort.limit <= _TOPN_MAX_ROWS:
+                return _distributed_topn(above, sort, sources, workers)
+            return _distributed_sort(
+                above, sort, sources, workers, hub, metrics_out, materialize=materialize
+            )
 
     # DISTINCT over a breaker-free single source: dedup via the aggregate shuffle.
     distinct_split = _split_at(plan, Distinct)
@@ -1314,15 +1583,25 @@ def _dispatch(
     # keys so each partition is computed whole on one reducer. A computed partition key
     # (`partition_by=[col("v") % 4]`) is materialized into a hidden column first, exactly
     # as the sort hoists a computed leading key, because the shuffle reads keys by column.
-    # A window with NO partition keys has nothing to shuffle on; when it is also
-    # order-free it is a whole-relation aggregate broadcast, which distributes (an
-    # *ordered* global window needs one global row order and still has no path).
+    # A window with NO partition keys has nothing to *hash* on, but it still has a seam: when
+    # it is order-free it is a whole-relation aggregate broadcast, and when it is ordered it
+    # splits by the order instead — range-partition into ordered buckets, window each, then
+    # shift each by the prior buckets' contribution (`dist/global_window/`). Both keep the
+    # ordered global window off the one-node cliff it used to raise on.
     window_split = _split_at(plan, Window)
     if window_split is not None:
         above, window = window_split
         if _single_source(window.input) and not _has_breaker(window.input):
             if _is_broadcastable_global_window(window):
                 return _distributed_global_window(above, window, sources, workers, transport)
+            if not window.partition_keys and supports_ordered_bucket_offsets(window):
+                if transport == "flight":
+                    from batcher.dist.global_window import execute_global_window_flight
+
+                    return execute_global_window_flight(above, window, sources, workers)
+                from batcher.dist.global_window import execute_global_window_disk
+
+                return execute_global_window_disk(above, window, sources, workers, hub)
             if window.partition_keys:
                 hoisted = _hoist_computed_window_keys(window)
                 if hoisted is not None:
@@ -1331,10 +1610,23 @@ def _dispatch(
                 if transport == "flight":
                     from batcher.dist.flight_window import execute_window_flight
 
-                    return execute_window_flight(above, window, sources, workers)
+                    # `materialize=False` leaves each windowed bucket on its worker: a
+                    # window emits a row per input row, so collecting it is the whole
+                    # relation through the driver.
+                    return execute_window_flight(
+                        above,
+                        window,
+                        sources,
+                        workers,
+                        hub=hub,
+                        metrics_out=metrics_out,
+                        materialize=materialize,
+                    )
                 from batcher.dist.executors.window import _distributed_window
 
-                return _distributed_window(above, window, sources, workers, hub)
+                return _distributed_window(
+                    above, window, sources, workers, hub, metrics_out, materialize=materialize
+                )
 
     # UNION: distribute each branch independently, then concatenate (+ dedup).
     union_split = _split_at(plan, Union)
@@ -1370,66 +1662,191 @@ def _stage_map_prefix(
     materialization. The breaker then sees an ordinary splittable Parquet source and takes the
     route it always had, so it needs no map-awareness of its own.
 
-    Restricted to a **linear** prefix under a single-input breaker: a join has two operands and
-    replacing one of them is a different rewrite, so it stays unrouted. Order is preserved
-    where it is observable, because the scratch is read back as a source and the breaker above
-    imposes its own order; a bare `limit` over a UDF is the one shape that would depend on the
-    write order, and it is handled by the ordinary `Limit` path only when there is no UDF.
+    Order is preserved where it is observable, because the scratch is read back as a source
+    and the breaker above imposes its own order; a bare `limit` over a UDF is the one shape
+    that would depend on the write order, and it is handled by the ordinary `Limit` path only
+    when there is no UDF.
+
+    The walk down to the map pipeline follows `plan.visitor.children` rather than a `.input`
+    attribute, so it stops at the first node with more than one operand and hands that shape
+    to `_stage_map_operands` — which stages each operand that is a UDF pipeline. Before that,
+    `map_batches(...).join(other)` (and a union of two inference branches) had no distributed
+    path at all: the walk hit a node with no `.input` and gave up, so the most ordinary shape
+    in a batch-inference job — embed a table, then join the embeddings to something — raised
+    on distributed data.
     """
-    import dataclasses
-
     from batcher.core.udf import has_map_batches
+    from batcher.plan.visitor import children, with_children
 
-    # Walk down single-input nodes to the map pipeline. A `Join`/`Union` has no `.input`, so
-    # the walk stops there and the shape is declined.
+    # Walk down single-operand nodes to the map pipeline.
     chain: list[LogicalPlan] = []
     node = plan
     while not _is_linear_map_pipeline(node):
-        if not hasattr(node, "input"):
-            return None
+        kids = children(node)
+        if len(kids) != 1:
+            return _stage_map_operands(plan, sources, workers, transport, hub)
         chain.append(node)
-        node = node.input
+        node = kids[0]
     if not chain or not has_map_batches(node) or not _single_source(node):
         return None
-    sid = next(iter(scanned_source_ids(node)))
-    if sid >= len(sources) or not _is_splittable_source(sources[sid]):
+    if not _stageable_pipeline(node, sources):
         return None  # nothing to fan out; the single-node fallback is the right plan
     _require_shared_scratch("a map_batches pipeline feeding this operator")
 
-    from batcher.dist.executors.map import _distributed_map
     from batcher.dist.shuffle_io import distributed_work_dir
-    from batcher.io.formats.structured.parquet import ParquetSource
-    from batcher.plan.schema import SchemaRef
 
     work_dir = distributed_work_dir("batcher_mapstage_")
     try:
-        _distributed_map(
-            node,
-            sources,
-            workers,
-            hub,
-            write_spec={
-                "fmt": "parquet",
-                "sink_kwargs": None,
-                "path": work_dir,
-                "partition_by": None,
-            },
-        )
-        staged = ParquetSource(work_dir)
-        try:
-            schema = SchemaRef.from_arrow(staged.schema())
-        except Exception:
+        landed = _land_map_stage(node, sources, workers, hub, work_dir, len(sources))
+        if landed is None:
             # Every partition was empty, so no file carries a schema. The result is empty
             # whatever the breaker is, and the plan's own schema is the honest one to return.
             return empty_result_table(plan, plan.available_columns())
+        scan, staged = landed
         # Re-root the chain on a scan of the staged output. `materialize=True`: the scratch is
         # removed below, so a partitioned intermediate pointing into it must not escape.
-        rebuilt: LogicalPlan = Scan(len(sources), schema)
+        rebuilt: LogicalPlan = scan
         for above in reversed(chain):
-            rebuilt = dataclasses.replace(above, input=rebuilt)
+            rebuilt = with_children(above, [rebuilt])
         return _dispatch(rebuilt, [*sources, staged], workers, transport, hub, materialize=True)
     finally:
         _rmtree(work_dir)
+
+
+def _stageable_pipeline(node: LogicalPlan, sources: list[Source]) -> bool:
+    """Whether `node` is a UDF pipeline worth landing on scratch as its own stage.
+
+    It has to read exactly one source, and that source has to be splittable — otherwise
+    there is nothing to fan out and the single-node fallback is already the right plan.
+    """
+    if not _single_source(node):
+        return False
+    sid = next(iter(scanned_source_ids(node)))
+    return sid < len(sources) and _is_splittable_source(sources[sid])
+
+
+def _land_map_stage(
+    node: LogicalPlan,
+    sources: list[Source],
+    workers: int,
+    hub,
+    work_dir: str,
+    source_id: int,
+) -> tuple[LogicalPlan, Source] | None:
+    """Run `node` as its own distributed stage onto `work_dir`, and read it back as a scan.
+
+    The single half of the staging both callers share: fan the UDF pipeline across the
+    cluster with a Parquet `write_spec` so no worker ships rows to the driver, then re-open
+    the scratch as an ordinary splittable source the next stage scans.
+
+    Args:
+        node: The single-source UDF pipeline to run.
+        sources: The ambient source list `node`'s scans index into.
+        workers: The fan-out for this stage.
+        hub: The metadata hub, for the map stage's measured cardinalities.
+        work_dir: Cluster-shared scratch the stage's output lands in. Caller-owned.
+        source_id: The index the returned source will occupy in the rebuilt source list.
+
+    Returns:
+        The `(Scan, Source)` pair reading the staged output, or `None` when every partition
+        was empty and no file carries a schema.
+    """
+    from batcher.dist.executors.map import _distributed_map
+    from batcher.io.formats.structured.parquet import ParquetSource
+    from batcher.plan.schema import SchemaRef
+
+    _distributed_map(
+        node,
+        sources,
+        workers,
+        hub,
+        write_spec={
+            "fmt": "parquet",
+            "sink_kwargs": None,
+            "path": work_dir,
+            "partition_by": None,
+        },
+    )
+    staged = ParquetSource(work_dir)
+    try:
+        schema = SchemaRef.from_arrow(staged.schema())
+    except Exception:
+        return None
+    return Scan(source_id, schema), staged
+
+
+def _stage_map_operands(
+    plan: LogicalPlan, sources: list[Source], workers: int, transport: str, hub=None
+):
+    """Stage each UDF operand of a multi-operand breaker, then dispatch the breaker over them.
+
+    The two-sided twin of `_stage_map_prefix`. `map_batches(...).join(other)` — embed a
+    table, then join the embeddings to something — and a union of two inference branches
+    both bottom out at a node with more than one operand, which the single-input walk cannot
+    rewrite. Here each operand that contains a UDF is run as its own distributed stage onto
+    its own scratch dir and replaced by a scan of the result; operands with no UDF are left
+    exactly as they are, so a join of an inference branch against a plain Parquet table
+    stages only the branch. The breaker itself is then dispatched normally, which is what
+    gives it the shuffle, broadcast, skew handling and spill every other join gets.
+
+    This is a rewrite, not a second join implementation: after the staging, what
+    `_dispatch` sees is the ordinary shape it already routes.
+
+    Returns the result table, or `None` when the shape does not qualify — a UDF operand
+    that is not a single-source linear pipeline, or one whose staged output turned out
+    empty. An empty operand is declined rather than folded to an empty result because a
+    breaker is not uniformly empty-preserving: an outer join with an empty right side still
+    emits every left row, so returning "empty" there would be a wrong answer rather than a
+    missing route.
+    """
+    from batcher.core.udf import has_map_batches
+    from batcher.plan.visitor import children, with_children
+
+    chain: list[LogicalPlan] = []
+    node = plan
+    while True:
+        kids = children(node)
+        if len(kids) != 1:
+            break
+        chain.append(node)
+        node = kids[0]
+    operands = children(node)
+    if len(operands) < 2:
+        return None
+    if not any(has_map_batches(k) for k in operands):
+        return None
+    for k in operands:
+        if has_map_batches(k) and not (
+            _is_linear_map_pipeline(k) and _stageable_pipeline(k, sources)
+        ):
+            return None
+    _require_shared_scratch("a map_batches pipeline feeding this operator")
+
+    from batcher.dist.shuffle_io import distributed_work_dir
+
+    work_dirs: list[str] = []
+    try:
+        staged_sources = list(sources)
+        rebuilt_operands: list[LogicalPlan] = []
+        for k in operands:
+            if not has_map_batches(k):
+                rebuilt_operands.append(k)
+                continue
+            work_dir = distributed_work_dir("batcher_mapstage_")
+            work_dirs.append(work_dir)
+            landed = _land_map_stage(k, staged_sources, workers, hub, work_dir, len(staged_sources))
+            if landed is None:
+                return None
+            scan, staged = landed
+            rebuilt_operands.append(scan)
+            staged_sources.append(staged)
+        rebuilt: LogicalPlan = with_children(node, rebuilt_operands)
+        for above in reversed(chain):
+            rebuilt = with_children(above, [rebuilt])
+        return _dispatch(rebuilt, staged_sources, workers, transport, hub, materialize=True)
+    finally:
+        for work_dir in work_dirs:
+            _rmtree(work_dir)
 
 
 def _unsupported(plan: LogicalPlan, sources: list[Source], reason: str):
@@ -1554,17 +1971,12 @@ def _require_shared_scratch(op: str) -> None:
 
 def _asof_reducer_ir(asof: AsofJoin) -> dict:
     """IR for the per-bucket ASOF join of a left input (source 0) and right input
-    (source 1). Mirrors `AsofJoin.to_ir()` but substitutes the per-task scans."""
+    (source 1). The node's own `shape_ir()` with the per-task scans substituted, so a new
+    ASOF field crosses the cluster without anyone remembering to add it here."""
     return {
-        "op": "asof_join",
+        **asof.shape_ir(),
         "left": {"op": "scan", "source_id": 0},
         "right": {"op": "scan", "source_id": 1},
-        "left_on": asof.left_on,
-        "right_on": asof.right_on,
-        "left_by": list(asof.left_by),
-        "right_by": list(asof.right_by),
-        "backward": asof.direction == "backward",
-        "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in asof.output],
     }
 
 
@@ -1651,6 +2063,365 @@ def _distributed_asof(
     return result if not above else _apply_above(above, result)
 
 
+# --- Keyless ASOF join (range-partition both sides on the `on` key) ------------
+# The `by`-keyed ASOF above co-partitions by hash, because an ASOF match only ever pairs
+# rows inside one `by` group. A KEYLESS ASOF has no such group: any left row may match any
+# right row, and which one it matches is decided by a global order on `on`. Hashing is
+# therefore not merely unbalanced, it is wrong.
+#
+# Range partitioning is the shape that works, and it is the same one the distributed sort
+# already uses: cut `on` into ordered intervals from a sampled quantile grid, and send both
+# sides through the *same* boundaries. Bucket `r` then holds every left row and every right
+# row whose key lies in interval `r`, so a match that lives inside the interval is already
+# local.
+#
+# What is left is the match that does not. A left row in bucket `r` can match a right row in
+# an earlier bucket (`backward`) or a later one (`forward`) — and the gap is unbounded, so no
+# fixed overlap covers it. Exactly one row per direction does: intervals are ordered, so
+# among all right rows below the bucket the only one that can ever be the backward match is
+# the LARGEST, and among all above it the only forward candidate is the SMALLEST. Carrying
+# those two rows into the bucket makes each reducer's ASOF exact, and costs O(buckets) rows
+# rather than O(rows).
+#
+# The extremes are measured where the rows already are — inside the right side's range task,
+# which has the bucket in hand — so the carry costs no extra pass over the data.
+
+
+def _asof_range_task(
+    map_ir,
+    key_name,
+    boundaries,
+    n_buckets,
+    part_path,
+    work_dir,
+    tag,
+    mapper_id,
+    engine_config,
+    extremes=False,
+    fallback_schema=None,
+):
+    """Range-partition one side of a keyless ASOF by its `on` key, into `n_buckets` files.
+
+    The sort's `_range_task` does the same partitioning and is not reused, because the two
+    tasks differ in what they *return*, not in how they partition: the shared per-row work
+    is `bucketize`, which both call. A sort's version additionally carries the skew split and
+    the descending / nulls-first ordering a `Sort` node owns; an ASOF key is always ascending
+    and never split, and it needs the one thing a sort never asks for — each bucket's extreme
+    rows, which is what lets a reducer see the match that landed in someone else's bucket.
+
+    With `extremes`, a second tiny file is written holding at most two rows per bucket (the
+    smallest and largest `on` in that bucket, from this mapper's rows), tagged with their
+    bucket in a ``__bt_asof_bucket`` column. The driver folds those across mappers into the
+    per-bucket carry. Measuring them here is what keeps the carry free: the bucket is already
+    materialized in this task, so nothing re-reads it.
+
+    `fallback_schema` is this side's statically known Arrow schema, used for the empty
+    files a mapper that read no rows still has to publish.
+
+    Returns `(bucket_paths, extremes_path_or_None, metrics_json)`.
+    """
+    import os as _os
+
+    from batcher.dist.executors.partition_io import bucketize, read_partition
+    from batcher.dist.executors.ray_runtime import execute_metered
+    from batcher.dist.shuffle_io import write_ipc
+
+    rows, metrics_json = execute_metered(map_ir, [read_partition(part_path)], engine_config)
+    # A mapper that returned no batch at all has no schema of its own, and the empty bucket
+    # files it publishes would then carry no columns — which the reducer reports as "join
+    # over an empty input side (no input schema)" rather than as an empty join, and an ASOF
+    # reducer meets an empty right bucket routinely (the right side is the sparse one, and
+    # `_join_reduce_task` deliberately does not short-circuit a left-style join). The engine
+    # returns a zero-row batch that still carries its schema, so this is a backstop rather
+    # than the common path; the driver knows the schema statically, so the backstop is free.
+    schema = rows[0].schema if rows else (fallback_schema or pa.schema([]))
+    # Ascending, nulls last: an ASOF key is ordered one way only, and a null key matches
+    # nothing on either side, so which end it lands on cannot change a row.
+    buckets = bucketize(rows, key_name, boundaries, n_buckets, False, False)
+    paths = []
+    for r in range(n_buckets):
+        path = _os.path.join(work_dir, f"{tag}m{mapper_id}_r{r}.arrow")
+        # An empty bucket still gets a schema-only file so every mapper publishes exactly
+        # `n_buckets` paths and the reducer can index by bucket.
+        batches = buckets[r] or [pa.RecordBatch.from_pylist([], schema=schema)]
+        write_ipc(batches, path)
+        paths.append(path)
+    if not extremes:
+        return paths, None, metrics_json
+    ext = _bucket_extremes(buckets, key_name)
+    if ext is None:
+        return paths, None, metrics_json
+    ext_path = _os.path.join(work_dir, f"{tag}ext{mapper_id}.arrow")
+    write_ipc(ext.to_batches(), ext_path)
+    return paths, ext_path, metrics_json
+
+
+#: The column a carry row's bucket index rides in, between the range task that measures it
+#: and the driver that folds it. Prefixed so it cannot collide with a user column, and
+#: dropped before the row is ever handed to the reducer.
+_ASOF_BUCKET = "__bt_asof_bucket"
+
+
+def _bucket_extremes(buckets: list[list[pa.RecordBatch]], key_name: str) -> pa.Table | None:
+    """The smallest- and largest-key row of each non-empty bucket, tagged with its bucket.
+
+    Two rows per bucket at most, so the result is O(buckets) regardless of how many rows the
+    mapper held. Nulls are ignored (``min_max`` skips them), which is what we want: a null
+    `on` key matches nothing, so a null row is never anyone's nearest match.
+
+    **Which row of a tie group** is not a detail. When several rows share the extreme key,
+    the engine's ASOF picks the one nearest the probe in sorted order — the LAST of the group
+    for a backward match and the FIRST for a forward one (measured, not assumed:
+    ``tests/unit/test_dist_asof_keyless.py`` pins it). So the max carries its group's last row
+    and the min carries its group's first, and a bucket whose keys are all equal contributes
+    both. Keeping an arbitrary member instead returned a neighbouring row's payload — the
+    right key, the wrong value, and nothing to distinguish it from a correct answer.
+    """
+    import pyarrow.compute as pc
+
+    keep: list[pa.Table] = []
+
+    def _tag(row: pa.Table, r: int) -> pa.Table:
+        return row.append_column(_ASOF_BUCKET, pa.array([r], pa.int32()))
+
+    for r, bucket in enumerate(buckets):
+        if not bucket:
+            continue
+        table = pa.Table.from_batches(bucket)
+        column = table.column(key_name)
+        span = pc.min_max(column)
+        low, high = span["min"], span["max"]
+        if not low.is_valid:
+            continue  # every key in this bucket is null
+        low_group = table.filter(pc.equal(column, low))
+        keep.append(_tag(low_group.slice(0, 1), r))
+        high_group = low_group if high == low else table.filter(pc.equal(column, high))
+        if high != low or high_group.num_rows > 1:
+            keep.append(_tag(high_group.slice(high_group.num_rows - 1, 1), r))
+    if not keep:
+        return None
+    return pa.concat_tables(keep)
+
+
+def _asof_carry_rows(
+    extremes: list[pa.Table], n_buckets: int, direction: str, key_name: str
+) -> list[pa.Table | None]:
+    """Fold per-mapper bucket extremes into the row each reducer must be lent.
+
+    `extremes[i]` is one mapper's tagged extreme rows. For every bucket this computes the
+    single largest key strictly below it (`backward`), the single smallest strictly above it
+    (`forward`), or both (`nearest`) — which is exactly the set of out-of-bucket rows that
+    can win an ASOF match, because the buckets are ordered intervals.
+
+    Args:
+        extremes: The per-mapper extreme-row tables, `__bt_asof_bucket` still attached.
+        n_buckets: How many range buckets the sides were partitioned into.
+        direction: The ASOF direction, deciding which side's carry is needed.
+        key_name: The right side's `on` column.
+
+    Returns:
+        One table per bucket holding its carry rows (tag column dropped), or `None` where
+        the bucket needs none.
+    """
+    import pyarrow.compute as pc
+
+    out: list[pa.Table | None] = [None] * n_buckets
+    if not extremes:
+        return out
+    tagged = pa.concat_tables(extremes)
+    if tagged.num_rows == 0:
+        return out
+    plain = tagged.drop_columns([_ASOF_BUCKET])
+    bucket_of = tagged.column(_ASOF_BUCKET)
+
+    def _pick(mask, best: str) -> pa.Table | None:
+        """The one row of `plain` where `mask` holds whose key is the `best` one.
+
+        Ties are broken the way the engine breaks them (see `_bucket_extremes`): the last
+        candidate for a `max` (backward), the first for a `min` (forward). Candidates arrive
+        in mapper order, which is the order the reducer concatenates the mappers' bucket
+        files in, so the two agree.
+        """
+        rows = plain.filter(mask)
+        if rows.num_rows == 0:
+            return None
+        span = pc.min_max(rows.column(key_name))[best]
+        if not span.is_valid:
+            return None
+        tied = rows.filter(pc.equal(rows.column(key_name), span))
+        return tied.slice(tied.num_rows - 1, 1) if best == "max" else tied.slice(0, 1)
+
+    wants_backward = direction in ("backward", "nearest")
+    wants_forward = direction in ("forward", "nearest")
+    for r in range(n_buckets):
+        parts = []
+        if wants_backward:
+            below = _pick(pc.less(bucket_of, r), "max")
+            if below is not None:
+                parts.append(below)
+        if wants_forward:
+            above = _pick(pc.greater(bucket_of, r), "min")
+            if above is not None:
+                parts.append(above)
+        if parts:
+            out[r] = pa.concat_tables(parts)
+    return out
+
+
+def _side_schema(plan: LogicalPlan) -> pa.Schema | None:
+    """One side's statically known Arrow schema, or `None` when the plan cannot infer it.
+
+    `LogicalPlan.available_schema` is the engine's own type analysis, so this asks it rather
+    than reading a row — which is the point: it answers for a side that turns out to be
+    empty, which is exactly when a mapper has no schema to publish.
+    """
+    schema = plan.available_schema()
+    return schema.arrow if schema is not None else None
+
+
+def _distributed_asof_keyless(
+    above: list[LogicalPlan], asof: AsofJoin, sources: list[Source], workers: int
+) -> pa.Table:
+    """Range-partition both sides on `on` and ASOF-join each interval, with a carried row.
+
+    The keyless twin of `_distributed_asof`. See the module comment above for why the
+    boundaries plus one carry row per direction make each bucket's join exact.
+    """
+    import os
+
+    from batcher.carbonite.resilience import gather_with_backups
+    from batcher.dist.executors.join import _join_reduce_task
+    from batcher.dist.executors.partition_io import merge_boundaries, sample_probs
+    from batcher.dist.executors.ray_runtime import speculation_policy
+    from batcher.dist.executors.sort import _sample_task
+    from batcher.dist.shuffle_io import distributed_work_dir, read_ipc, write_ipc
+
+    _ensure_ray(workers)
+    _require_shared_scratch("keyless asof_join")
+    cfg_json = engine_config_json()
+
+    left_plan, left_sid = _relabel_single_source(asof.left)
+    right_plan, right_sid = _relabel_single_source(asof.right)
+    left_ir = json.dumps(left_plan.to_ir())
+    right_ir = json.dumps(right_plan.to_ir())
+    asof_ir = json.dumps(_asof_reducer_ir(asof))
+    left_proj, left_pred = source_pushdown(left_plan, 0)
+    right_proj, right_pred = source_pushdown(right_plan, 0)
+
+    work_dir = distributed_work_dir("batcher_asofk_")
+    try:
+        left_parts = _partition_source(
+            sources[left_sid], workers, work_dir, tag="L", projection=left_proj, predicate=left_pred
+        )
+        right_parts = _partition_source(
+            sources[right_sid],
+            workers,
+            work_dir,
+            tag="R",
+            projection=right_proj,
+            predicate=right_pred,
+        )
+        pol = speculation_policy()
+        n_buckets = max(1, workers)
+
+        # Sample the LEFT key, because the left side decides the output's row count: an ASOF
+        # is left-style, so every left row emits exactly one output row and balancing the
+        # left is balancing the reducers' work.
+        probs = sample_probs(n_buckets, len(left_parts))
+
+        def _sample_for(i: int):
+            return _sample_task.remote(left_ir, asof.left_on, probs, left_parts[i], cfg_json)
+
+        grids = gather_with_backups(
+            [_sample_for(i) for i in range(len(left_parts))], _sample_for, pol
+        )
+        boundaries = merge_boundaries(grids, n_buckets)
+
+        left_schema = _side_schema(left_plan)
+        right_schema = _side_schema(right_plan)
+
+        def _left_range_for(i: int):
+            return _asof_range_task.remote(
+                left_ir,
+                asof.left_on,
+                boundaries,
+                n_buckets,
+                left_parts[i],
+                work_dir,
+                "L",
+                i,
+                cfg_json,
+                False,
+                left_schema,
+            )
+
+        def _right_range_for(i: int):
+            return _asof_range_task.remote(
+                right_ir,
+                asof.right_on,
+                boundaries,
+                n_buckets,
+                right_parts[i],
+                work_dir,
+                "R",
+                i,
+                cfg_json,
+                True,
+                right_schema,
+            )
+
+        left_out = gather_with_backups(
+            [_left_range_for(i) for i in range(len(left_parts))], _left_range_for, pol
+        )
+        right_out = gather_with_backups(
+            [_right_range_for(i) for i in range(len(right_parts))], _right_range_for, pol
+        )
+        left_paths = [entry[0] for entry in left_out]
+        right_paths = [entry[0] for entry in right_out]
+
+        extremes = [
+            pa.Table.from_batches(read_ipc(entry[1])) for entry in right_out if entry[1] is not None
+        ]
+        carries = _asof_carry_rows(
+            [t for t in extremes if t.num_rows], n_buckets, asof.direction, asof.right_on
+        )
+        carry_paths: list[str | None] = [None] * n_buckets
+        for r, carry in enumerate(carries):
+            if carry is not None and carry.num_rows:
+                carry_paths[r] = write_ipc(
+                    carry.to_batches(), os.path.join(work_dir, f"Rcarry_{r}.arrow")
+                )
+
+        def _reduce_for(r: int):
+            l_inputs = [paths[r] for paths in left_paths]
+            r_inputs = [paths[r] for paths in right_paths]
+            if carry_paths[r] is not None:
+                r_inputs = [*r_inputs, carry_paths[r]]
+            return _join_reduce_task.remote(asof_ir, l_inputs, r_inputs, work_dir, r, cfg_json)
+
+        result_paths = gather_with_backups(
+            [_reduce_for(r) for r in range(n_buckets)], _reduce_for, pol
+        )
+
+        # Buckets are ordered intervals, so concatenating them in bucket order returns the
+        # rows in `on` order. That is a permutation of the single-node result rather than a
+        # match for it — a single-node ASOF emits rows in LEFT INPUT order — exactly as the
+        # `by`-keyed path's hash buckets already are, and as every distributed join is.
+        batches: list[pa.RecordBatch] = []
+        for entry in result_paths:
+            path = entry[0]
+            if path is not None:
+                batches.extend(read_ipc(path))
+    finally:
+        _rmtree(work_dir)
+
+    if not batches:
+        result = empty_result_table(asof, [o.alias for o in asof.output])
+    else:
+        result = pa.Table.from_batches(batches)
+    return result if not above else _apply_above(above, result)
+
+
 # --- RANGE (inequality) join (broadcast the build side) ------------------------
 # Also here rather than in the `executors` subpackage, which is at its file-count ceiling.
 # Unlike every other join, an inequality has no equality to co-partition on: hashing `a.x`
@@ -1661,16 +2432,12 @@ def _distributed_asof(
 
 def _range_join_reducer_ir(rj: RangeJoin) -> dict:
     """IR for the per-task range join of a left chunk (source 0) against the full right
-    (source 1). Mirrors `RangeJoin.to_ir()` but substitutes the per-task scans."""
+    (source 1). The node's own `shape_ir()` with the per-task scans substituted, so a new
+    field crosses the cluster without anyone remembering to add it here."""
     return {
-        "op": "range_join",
+        **rj.shape_ir(),
         "left": {"op": "scan", "source_id": 0},
         "right": {"op": "scan", "source_id": 1},
-        "conditions": [
-            {"left_key": c.left_key, "right_key": c.right_key, "op": c.op} for c in rj.conditions
-        ],
-        "join_type": rj.join_type,
-        "output": [{"side": o.side, "name": o.name, "alias": o.alias} for o in rj.output],
     }
 
 

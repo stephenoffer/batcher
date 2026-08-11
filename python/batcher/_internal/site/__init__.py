@@ -61,6 +61,7 @@ from batcher._internal.site.scratch import (
     local_scratch_root,
     reset_scratch_probe,
     scratch_volumes,
+    spill_scratch_dir,
 )
 
 __all__ = [
@@ -87,6 +88,7 @@ __all__ = [
     "shm_root",
     "site_profile",
     "site_summary",
+    "spill_scratch_dir",
     "usable_shm",
     "use_node_local_model_cache",
 ]

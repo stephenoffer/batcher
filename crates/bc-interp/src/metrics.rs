@@ -186,19 +186,95 @@ pub struct OpMetric {
     pub hw: HwCounters,
 }
 
-/// All per-operator metrics gathered during one plan execution.
+/// What one whole execution cost the machine, measured across the executor as a unit.
+///
+/// The per-operator [`HwCounters`] above are only sound on a tier where each operator owns
+/// an exclusive wall interval — the materializing executors do, so they report real numbers,
+/// and the streaming executor does not, so it reports zeros and says so. That leaves the
+/// *default* tier for most queries with no CPU, memory or disk accounting at all, which is
+/// the half of "why was this slow" that timings cannot answer.
+///
+/// This is the measurement that is sound on every tier, because the attribution problem is
+/// the operator boundary and not the counters: the OS reports process-wide totals, and the
+/// delta across a whole execution belongs to that execution whatever the operators inside it
+/// did. It is the same figure Spark reports per task, and it is measured once per query at
+/// the FFI boundary — two `getrusage` calls, no per-operator bookkeeping.
+///
+/// Every field is `0` where the platform cannot report it, and `0` means **unmeasured**.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct QueryMetrics {
+    /// Wall-clock nanoseconds the executor was running. The denominator for a query-level
+    /// utilization figure, and distinct from any operator's `elapsed_ns`.
+    pub wall_ns: u64,
+    /// CPU-time nanoseconds (user + system) consumed across every worker thread. Divided by
+    /// `wall_ns x threads` it gives the parallelism the query *actually* achieved — the one
+    /// number that separates a query that saturated the box from one that ran a wide plan on
+    /// one core.
+    pub cpu_ns: u64,
+    /// Growth in the process's peak resident set during the execution, from `ru_maxrss`.
+    /// Ground truth for how much physical memory the query forced resident, which the
+    /// Arrow-size estimates cannot see (scratch, fragmentation, off-pool buffers).
+    pub peak_rss_bytes: u64,
+    /// Faults, preemption, and real block-device I/O for the execution as a whole.
+    #[serde(flatten)]
+    pub hw: HwCounters,
+}
+
+/// A whole-execution measurement in progress. Start it before the executor runs.
+///
+/// Public where [`Stopwatch`] is not, because this one is meant to be driven from outside
+/// the crate: `bc-py` wraps the executor call with it, which is the one place that sees every
+/// tier and every hand-off between them.
+pub struct QueryStopwatch(Stopwatch);
+
+impl Default for QueryStopwatch {
+    fn default() -> Self {
+        Self::start()
+    }
+}
+
+impl QueryStopwatch {
+    /// Capture the wall clock and every OS counter now.
+    pub fn start() -> Self {
+        Self(Stopwatch::start())
+    }
+
+    /// The deltas since [`start`](Self::start).
+    pub fn finish(self) -> QueryMetrics {
+        let wall_ns = self.0.elapsed_ns();
+        let (cpu_ns, peak_rss_bytes, hw) = self.0.measure();
+        QueryMetrics {
+            wall_ns,
+            cpu_ns,
+            peak_rss_bytes,
+            hw,
+        }
+    }
+}
+
+/// All metrics gathered during one plan execution: per operator, and for the whole run.
 ///
 /// Built up as the interpreter walks the plan; serialized to JSON at the FFI
 /// boundary so it can ride back alongside the (still zero-copy) result batches.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ExecMetrics {
     pub ops: Vec<OpMetric>,
+    /// The whole execution's resource consumption. All zeros unless a caller attached a
+    /// measurement with [`ExecMetrics::with_query`] — the executors themselves do not, because
+    /// the boundary worth measuring is outside them, where the tier hand-offs have settled.
+    pub query: QueryMetrics,
 }
 
 impl ExecMetrics {
     /// Append one operator's metric.
     pub fn record(&mut self, m: OpMetric) {
         self.ops.push(m);
+    }
+
+    /// Attach the whole-execution measurement, consuming the stopwatch that took it.
+    pub fn with_query(mut self, sw: QueryStopwatch) -> Self {
+        self.query = sw.finish();
+        self
     }
 
     /// Serialize to the JSON document the FFI returns to the control plane.
@@ -317,6 +393,49 @@ mod tests {
             let (cpu_ns, _, _) = sw.measure();
             assert!(cpu_ns > 0, "a busy span must register CPU time on unix");
         }
+    }
+
+    /// The whole-execution measurement holds on every tier, so it must report a wall
+    /// interval and CPU time for a busy span regardless of what any operator recorded.
+    /// This is the one reading the streaming executor can supply, and it is the reason the
+    /// default tier reports any resource consumption at all.
+    #[test]
+    fn query_stopwatch_measures_a_busy_span() {
+        let watch = QueryStopwatch::start();
+        let mut acc: u64 = 0;
+        for i in 0..50_000_000u64 {
+            acc = acc.wrapping_add(i).wrapping_mul(2_654_435_761);
+        }
+        std::hint::black_box(acc);
+        let q = watch.finish();
+        assert!(q.wall_ns > 0, "wall time must advance");
+        if cfg!(unix) {
+            assert!(q.cpu_ns > 0, "a busy span must register CPU time on unix");
+        }
+    }
+
+    /// An unattached document reports the whole-execution block as all zeros, which the
+    /// control plane reads as "unmeasured" — never as "this query consumed nothing".
+    #[test]
+    fn exec_metrics_serializes_a_query_block_even_when_unattached() {
+        let json = ExecMetrics::default().to_json();
+        assert!(json.contains("\"query\""), "{json}");
+        assert!(json.contains("\"cpu_ns\":0"), "{json}");
+    }
+
+    /// The attached block rides back in the same document as the operator list, so one FFI
+    /// return carries both and the control plane parses one thing.
+    #[test]
+    fn attaching_a_measurement_fills_the_query_block() {
+        let watch = QueryStopwatch::start();
+        let mut acc: u64 = 0;
+        for i in 0..5_000_000u64 {
+            acc = acc.wrapping_add(i);
+        }
+        std::hint::black_box(acc);
+        let m = ExecMetrics::default().with_query(watch);
+        assert!(m.query.wall_ns > 0);
+        assert!(m.to_json().contains("\"wall_ns\":"));
     }
 
     /// `measure` reads every counter from one coherent snapshot — the paired reader the

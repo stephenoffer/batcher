@@ -47,6 +47,7 @@ __all__ = [
     "read_total_disk_bytes",
     "remote_ipc_options",
     "reset_disk_sampling",
+    "scratch_disk_stats",
     "total_disk_bytes",
 ]
 
@@ -264,6 +265,40 @@ def disk_pressure(path: str) -> DiskPressure:
     if total > 0 and free < total * _ELEVATED_FREE_FRACTION:
         return DiskPressure.ELEVATED
     return DiskPressure.NORMAL
+
+
+def scratch_disk_stats() -> dict[str, int | str]:
+    """One reading of the volume a spill would land on, for telemetry and `explain`.
+
+    Carbonite reports memory in detail and reported disk not at all, so a query that spilled
+    slowly — or failed with `ENOSPC` — carried nothing in its profile about the volume it
+    spilled to. The disk ladder exists (`DiskPressure`) and only the spill store consulted
+    it, which means the one component that could act on a filling volume was also the only
+    one that could see it.
+
+    Cheap: two `statvfs` calls behind the same TTL cache the store reads through, so adding
+    it to a per-query snapshot costs nothing measurable.
+
+    Returns:
+        The resolved scratch `path`, its measured `pressure` level, and `free_bytes` /
+        `total_bytes` (`-1` for either the volume cannot report). Never raises — a probe that
+        fails yields `UNKNOWN` and `-1`, which is honestly distinct from a healthy reading.
+    """
+    from batcher._internal.site import spill_scratch_dir
+
+    try:
+        path = spill_scratch_dir()
+        free = free_disk_bytes(path)
+        total = total_disk_bytes(path)
+        return {
+            "path": path,
+            "pressure": disk_pressure(path).name,
+            "free_bytes": -1 if free is None else free,
+            "total_bytes": -1 if total is None else total,
+        }
+    except Exception as exc:  # pragma: no cover - a probe must never break a query
+        note_suppressed("carbonite", "read the scratch volume", exc)
+        return {"path": "", "pressure": "UNKNOWN", "free_bytes": -1, "total_bytes": -1}
 
 
 def clamp_to_free_disk(local_dir: str, budget: int | None) -> int | None:

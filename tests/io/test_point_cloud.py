@@ -113,3 +113,91 @@ def test_row_count_from_header_without_loading(tmp_path):
 
     _write_bin(str(tmp_path / "b.bin"))
     assert PointCloudSource(str(tmp_path / "b.bin")).row_count() == 2
+
+
+def _write_organized_pcd(path: str, width: int, height: int, *, points_line: bool) -> None:
+    """An *organized* cloud — the grid layout a depth camera writes.
+
+    `points_line` chooses whether the writer emitted the optional ``POINTS`` field. Many
+    do not, and the count then has to come from ``WIDTH * HEIGHT``.
+    """
+    header = (
+        "# .PCD v0.7 - Point Cloud Data\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\n"
+        f"TYPE F F F\nCOUNT 1 1 1\nWIDTH {width}\nHEIGHT {height}\n"
+        + (f"POINTS {width * height}\n" if points_line else "")
+        + "VIEWPOINT 0 0 0 1 0 0 0\nDATA binary\n"
+    )
+    pts = np.arange(width * height * 3, dtype="<f4")
+    with open(path, "wb") as fh:
+        fh.write(header.encode())
+        fh.write(pts.tobytes())
+
+
+@pytest.mark.parametrize("points_line", [True, False])
+def test_organized_cloud_keeps_every_row_of_the_grid(tmp_path, points_line):
+    """A cloud with ``HEIGHT > 1`` has ``WIDTH * HEIGHT`` points, not ``WIDTH``.
+
+    Reading ``WIDTH`` alone takes the first row of the depth image and discards the rest,
+    which on a 640x480 frame is 99.8% of the data — dropped silently, because a shorter
+    point cloud is a perfectly well-formed point cloud.
+    """
+    path = str(tmp_path / "organized.pcd")
+    _write_organized_pcd(path, 4, 3, points_line=points_line)
+
+    ds = bt.read.point_cloud(path)
+    assert len(ds.to_pydict()["x"]) == 12
+    # And the metadata path must agree with the data path.
+    assert ds.count() == 12
+    assert PointCloudSource(path).row_count() == 12
+
+
+def test_ascii_body_is_truncated_to_the_declared_count(tmp_path):
+    """``POINTS`` bounds an ascii body exactly as it bounds a binary one.
+
+    Without this the two encodings disagree about the same file, and `row_count()` (which
+    reads the header) disagrees with a collect (which read every line) — so `ds.count()`
+    and `len(ds.collect())` differ, with nothing raised.
+    """
+    path = tmp_path / "extra.pcd"
+    header = (
+        "# .PCD v0.7\nVERSION 0.7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\n"
+        "COUNT 1 1 1\nWIDTH 2\nHEIGHT 1\nPOINTS 2\nDATA ascii\n"
+    )
+    path.write_text(header + "1 1 1\n2 2 2\n3 3 3\n")
+
+    ds = bt.read.point_cloud(str(path))
+    rows = ds.to_pydict()
+    assert len(rows["x"]) == 2
+    assert rows["x"] == [1.0, 2.0]
+    assert ds.count() == len(rows["x"])
+
+
+def test_a_raw_bin_whose_first_byte_looks_like_a_comment_still_reads(tmp_path):
+    """Format detection uses the path's suffix, not a guess at the leading bytes.
+
+    A raw `.bin` sweep is float data: its first byte is the low mantissa byte of a
+    coordinate, so it is uniform, and roughly one file in 256 starts with `#` — which a
+    content sniff reads as a PCD comment line. Schema inference then fails on a file that
+    parses perfectly well.
+    """
+    path = tmp_path / "hash_first.bin"
+    pts = _PTS.copy()
+    raw = bytearray(pts.tobytes())
+    raw[0] = ord("#")  # the exact byte a PCD comment starts with
+    path.write_bytes(bytes(raw))
+
+    ds = bt.read.point_cloud(str(path))
+    assert [f.name for f in ds.schema] == ["x", "y", "z", "intensity", "frame"]
+    assert len(ds.to_pydict()["x"]) == 2
+
+
+def test_a_raw_bin_containing_the_pcd_magic_still_reads(tmp_path):
+    """The same, for the other branch of the sniff: `.PCD` appearing in the first bytes."""
+    path = tmp_path / "magic.bin"
+    raw = bytearray(_PTS.tobytes())
+    raw[4:8] = b".PCD"
+    path.write_bytes(bytes(raw))
+
+    ds = bt.read.point_cloud(str(path))
+    assert [f.name for f in ds.schema] == ["x", "y", "z", "intensity", "frame"]
+    assert len(ds.to_pydict()["x"]) == 2

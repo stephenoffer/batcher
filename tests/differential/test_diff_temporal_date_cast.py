@@ -77,8 +77,8 @@ def tzt(duck):
         {
             "ts": pa.array(
                 [
-                    dt.datetime(2024, 1, 1, 2, tzinfo=dt.timezone.utc),
-                    dt.datetime(2024, 1, 1, 20, tzinfo=dt.timezone.utc),
+                    dt.datetime(2024, 1, 1, 2, tzinfo=dt.UTC),
+                    dt.datetime(2024, 1, 1, 20, tzinfo=dt.UTC),
                     None,
                 ],
                 pa.timestamp("us", tz="UTC"),

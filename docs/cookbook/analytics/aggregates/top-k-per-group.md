@@ -46,7 +46,7 @@ fifty thousand SKUs it is the whole afternoon.
 
 ## Rank inside the partition, then filter
 
-One window, one filter, one scan. `row_number()` numbers the rows within each partition
+One window, one filter, one scan. {py:func}`row_number() <batcher.row_number>` numbers the rows within each partition
 in the order you give it, and keeping `rn <= k` keeps the top k of every group at once.
 
 The SQL tab needs a subquery, because a window cannot appear in a `WHERE` clause: the
@@ -144,7 +144,7 @@ print(tied.to_pydict())
 ```
 
 Seven rows, because `toys` has a two-way tie for second and both members come back.
-`dense_rank` is the third option: it also ties, but it does not leave gaps after a tie, so
+{py:func}`dense_rank <batcher.dense_rank>` is the third option: it also ties, but it does not leave gaps after a tie, so
 `rk <= 2` means "the top two distinct revenue values" rather than "the top two positions".
 
 Three functions, three different questions:

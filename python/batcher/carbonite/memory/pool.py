@@ -24,9 +24,72 @@ from batcher._internal.native import engine_or_none
 __all__ = [
     "BufferPool",
     "current_process_pool",
+    "engine_pool_stats",
+    "engine_pool_utilization",
     "process_pool",
     "reset_process_pool",
 ]
+
+
+def engine_pool_stats() -> dict[str, int | float] | None:
+    """What the **data plane's** process-wide pool is holding, or `None` if none exists.
+
+    There are two pools, and this is the other one. `BufferPool` below wraps a
+    `MemoryPool` the control plane constructs, and charges its own coarse per-query
+    reservations to it. The engine constructs a *separate* process-wide pool inside
+    `execute_plan` and charges operator state and the Flight transit buffers to that — and
+    those are most of the footprint on exactly the queries anyone asks about. Neither
+    counter could see the other, so the control plane's pressure reading could only infer
+    the engine's memory from process RSS.
+
+    Reading rather than merging is deliberate. Carbonite reserves a plan's estimated peak
+    for the duration of execution and the engine then reserves the same operator's actual
+    bytes; one shared counter would charge both and spill a query at half its budget.
+
+    Returns:
+        The engine pool's accounting, or `None` when no query has run under a memory budget
+        in this process (or the extension is not built). `None` is distinct from a dict of
+        zeros, which would assert something about a pool that has never existed.
+    """
+    reader = _engine_pool_reader()
+    return None if reader is None else reader()
+
+
+#: "Not looked up yet", distinct from a lookup that found nothing.
+_UNRESOLVED = object()
+#: The resolved `_native.engine_pool_stats`, or `None` when the extension is absent or
+#: predates it.
+_ENGINE_READER: object = _UNRESOLVED
+
+
+def _engine_pool_reader():
+    """The engine-pool accessor, resolved once.
+
+    Which extension is loaded cannot change within a process, but the pressure monitor asks
+    for this reading on every classification — once per query, and once per AIMD round on
+    every shuffle channel. Re-importing the module and re-`getattr`ing through it each time
+    is most of the call's cost on a build that does not have the function at all, which is
+    precisely the build that gains nothing from asking.
+    """
+    global _ENGINE_READER
+    if _ENGINE_READER is _UNRESOLVED:
+        mod = engine_or_none()
+        _ENGINE_READER = getattr(mod, "engine_pool_stats", None) if mod is not None else None
+    return _ENGINE_READER
+
+
+def engine_pool_utilization() -> float | None:
+    """`used / limit` in the data plane's pool right now, or `None` when it has no envelope.
+
+    The one figure the pressure monitor needs from the other pool. A zero limit reads as
+    `None` rather than `1.0`: an unbounded engine pool governs nothing, and reporting it as
+    full would pin every pressure reading at CRITICAL for a process that opted out of the
+    budget entirely.
+    """
+    stats = engine_pool_stats()
+    if not stats or not stats.get("limit_bytes"):
+        return None
+    return float(stats["utilization"])
 
 
 class _FallbackPool:
@@ -153,31 +216,45 @@ class BufferPool:
         """The high-water mark of concurrently-reserved bytes over this pool's life — the
         measured memory pressure (`peak_used / limit`) the workload actually hit.
 
-        Prefers the **engine's own** high-water mark when the compiled pool reports one.
-        The control plane only sees the reservations it makes itself; the data plane also
-        reserves for operator state and the Flight transit buffers, and those are most of
-        the footprint on exactly the queries whose peak anyone wants to know.
+        **This pool's** peak, and only this pool's. The wrapped `MemoryPool` is one the
+        control plane constructed, so its counters cover the coarse per-query reservations
+        Carbonite makes and nothing else. Operator state and the Flight transit buffers are
+        charged to a *different* process-wide pool inside the engine; read that one through
+        `engine_pool_stats`, which `ResourceManager.stats` reports beside this.
+
+        (The two are deliberately not summed into one figure. Carbonite reserves a plan's
+        estimated peak and the engine then reserves the same operator's actual bytes, so a
+        sum double-counts every query — and a `max` across pools with different limits is
+        not a quantity at all.)
         """
         return max(self._peak_used, int(getattr(self._pool, "peak_used", 0) or 0))
 
     @property
     def denied(self) -> int:
-        """Reservations refused for lack of headroom.
+        """Reservations **this pool** refused for lack of headroom.
 
-        The **max** of the control plane's own count and the engine's, not their sum: the
-        engine's counter already includes every denial the control plane caused, so adding
-        them would double-count each one and report twice the refusals that happened.
-        Taking the max keeps the figure right whichever side saw more — the engine denies
-        reservations the control plane never makes (operator state, transit buffers), and
-        it reports nothing at all when the extension is not built.
+        The max of the control plane's own count and the wrapped pool's, not their sum: a
+        refusal Carbonite made is recorded on both sides, so adding them reports twice the
+        refusals that happened.
+
+        Denials in the engine's own pool — an operator that could not reserve its hash
+        table — are counted there, not here. `engine_pool_stats()["denied"]` is that
+        figure, and it is the one that says a query spilled because the *envelope* was
+        binding rather than because Carbonite's estimate was.
         """
         return max(self._denied, int(getattr(self._pool, "denied", 0) or 0))
 
     @property
     def spill_requests(self) -> int:
-        """Times the engine's cooperative path made an operator spill to grant a
-        reservation — how often other operators paid for this query's memory. `0` without
-        the compiled engine, which has no cooperative path to count."""
+        """Times the cooperative path made a consumer spill to grant a reservation.
+
+        Effectively always `0` here. The cooperative path's only registered consumer is the
+        Flight shuffle store, which registers with the **engine's** process-wide pool, and
+        the control plane never reserves cooperatively anyway. The number worth reading is
+        `engine_pool_stats()["spill_requests"]`, which says how often other operators had
+        to pay for a query's memory; this one is kept so the two pools report the same
+        shape.
+        """
         return int(getattr(self._pool, "spill_requests", 0) or 0)
 
     @property
@@ -286,9 +363,18 @@ def process_pool(limit_bytes: int) -> BufferPool:
                 pool.set_limit(limit_bytes)
                 _pending_shrink = None
             else:
-                # Busy: hold the smallest requested shrink so it lands the moment the
-                # envelope is free, rather than being forgotten.
-                _pending_shrink = min(_pending_shrink or limit_bytes, limit_bytes)
+                # Busy: remember *this* request so it lands the moment the envelope is
+                # free. The latest reconcile wins, rather than the smallest ever seen.
+                #
+                # Taking the `min` of the pending figure and this one looked conservative
+                # and was the opposite. A single small caller — a unit test, a deliberately
+                # tiny `config_context`, one cheap query — pinned the pending figure at its
+                # budget forever, because nothing but a *growth* past the live limit ever
+                # cleared it. Every later reconcile then made it smaller or left it alone,
+                # so the first moment the pool went idle the process-wide envelope
+                # collapsed to that stale figure and stayed there: every subsequent query
+                # spilled against a budget the machine had not had for hours.
+                _pending_shrink = limit_bytes
         elif _pending_shrink is not None and pool.used == 0:
             pool.set_limit(_pending_shrink)
             _pending_shrink = None

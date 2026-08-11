@@ -8,6 +8,8 @@ per-row shape. ``.npz`` archives expose one column per stored array.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterator
 from typing import IO, Any
 
 import pyarrow as pa
@@ -18,6 +20,11 @@ from batcher.io.formats.base import SOURCES
 from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["NumpySource"]
+
+# Bytes of array data a streamed chunk may hold. Bounds the read window; the batches
+# handed on are re-cut to the configured morsel by `FileSource._normalize`, so this is
+# about resident memory rather than about batch shape.
+_CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_NUMPY_CHUNK_BYTES", str(64 << 20))))
 
 
 def _np() -> Any:
@@ -110,6 +117,62 @@ class NumpySource(FileSource):
         # the way out, for every format at once — capping it a second time here would be
         # the same rule in two places, which is how the two drift.
         return table.to_batches()
+
+    def _iter_file(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """Stream a ``.npy`` in row chunks off a memory map, rather than loading it whole.
+
+        Without this the base falls back to `_read_file`, which calls `np.load` — so the
+        entire array is resident before the first row reaches the consumer, and resident
+        *again* as Arrow during the conversion. Measured on a 1.57 GB array: **1,545 MB**
+        peak and **1.58 s** before the first batch, for a read that then emitted 12,000
+        morsels. `_read_schema` already documents this hazard for the schema path ("a 200 GB
+        `.npy` therefore had to hold 200 GB"); the read itself still paid it.
+
+        A memory map turns that into a bounded window: each chunk is copied out of the map,
+        converted, and released. The map only helps where the bytes are addressable as a
+        local file, so a remote path — and an ``.npz`` archive, which is a zip and has no
+        array to map — falls back to the whole-file load, exactly as before.
+
+        Args:
+            path: The array file to stream.
+            projection: Columns the scan must produce. All columns when omitted.
+
+        Yields:
+            One `RecordBatch` per chunk of rows, in file order.
+        """
+        array = self._mapped(path)
+        if array is None:
+            yield from super()._iter_file(path, projection)
+            return
+        np = _np()
+        row_bytes = max(1, int(array.dtype.itemsize) * int(np.prod(array.shape[1:], dtype=int)))
+        rows = max(1, _CHUNK_BYTES // row_bytes)
+        for start in range(0, len(array), rows):
+            # `ascontiguousarray` copies the window out of the map, so the batch does not
+            # keep the mapping alive and the next chunk's pages can be reclaimed.
+            table = pa.table(
+                {"data": _array_to_arrow(np.ascontiguousarray(array[start : start + rows]))}
+            )
+            if projection is not None:
+                table = table.select(projection)
+            yield from table.to_batches()
+
+    def _mapped(self, path: str) -> Any | None:
+        """`path` as a memory-mapped array, or None when it cannot be mapped.
+
+        Best-effort by design: anything that is not a plain local ``.npy`` — an ``.npz``
+        archive, an object-store path, a header this numpy will not map — returns None and
+        the caller reads the file the original way rather than failing.
+        """
+        from batcher.io._concurrent import is_local_path
+
+        if not is_local_path(path) or not path.endswith(".npy"):
+            return None
+        try:
+            local = self._fs._p(path) if hasattr(self._fs, "_p") else path
+            return _np().load(local, mmap_mode="r", allow_pickle=False)
+        except Exception:
+            return None
 
     def _file_row_count(self, path: str) -> int | None:
         from batcher.io.stats.free_counts import npy_header_rows

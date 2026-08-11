@@ -19,9 +19,10 @@
 //! wholly inside or wholly outside and one point decides it. No sampling tolerance is
 //! involved, and no overlay is needed.
 
-use crate::algo::primitive::{on_segment, segments_intersect, PointRing};
+use crate::algo::primitive::{on_segment, segments_cross_properly, segments_intersect, PointRing};
 use crate::algo::relate::{
     interior_point, linear_parts, point_in_geometry, point_in_polygon, probe_points,
+    segment_midpoints,
 };
 use crate::types::{Coord, Geometry};
 use crate::Geom;
@@ -255,6 +256,64 @@ pub fn interiors_intersect(a: &Geom, b: &Geom) -> bool {
     if dimension(ga) == 2 && dimension(gb) == 2 {
         return probe_a.iter().any(|p| in_interior(*p, gb))
             || probe_b.iter().any(|p| in_interior(*p, ga));
+    }
+    // A chain running through the other geometry's interior. The witness is a midpoint of
+    // a noded piece of that chain, which lies in its own geometry's interior *by
+    // construction* — so only the other side is located. Re-deriving the first side with
+    // `in_interior` is what this used to do and what made it wrong: the midpoint is
+    // computed as `a + t * (b - a)` and lands a rounding error off its own segment, where
+    // the exact collinearity test then refuses to find it.
+    if chain_midpoints(ga, gb)
+        .into_iter()
+        .any(|p| in_interior(p, gb))
+        || chain_midpoints(gb, ga)
+            .into_iter()
+            .any(|p| in_interior(p, ga))
+    {
+        return true;
+    }
+    // Two chains that cross transversally meet in their interiors, but no *point* in the
+    // witness set can prove it. The crossing point is computed as `p1 + t * r` in floating
+    // point, so it lands off both lines by a rounding error, and `in_interior` locates it
+    // with an exact orientation test that then reports it on neither. Decide the case from
+    // the orientations directly instead, which never constructs the point at all.
+    chains_cross_transversally(ga, gb)
+}
+
+/// Midpoints of `g`'s linear chains, split at every crossing with `against`.
+///
+/// Each one is strictly interior to a piece that crosses nothing, so it is both in `g`'s
+/// interior (it is inside a segment, never a chain endpoint) and wholly on one side of
+/// `against`. Polygon rings are excluded: a ring is boundary, so its midpoints prove
+/// nothing about an areal interior.
+fn chain_midpoints(g: &Geometry, against: &Geometry) -> Vec<Coord> {
+    let mut out = Vec::new();
+    for l in linear_parts(g) {
+        for w in l.windows(2) {
+            out.extend(segment_midpoints(w[0], w[1], against));
+        }
+    }
+    out
+}
+
+/// True when a segment of one geometry's *linear* parts strictly crosses a segment of the
+/// other's, with no endpoint of either lying on the other.
+///
+/// A strict crossing is interior to both segments, hence interior to both chains: the
+/// meeting point is not a vertex, so it cannot be a chain endpoint. Polygon rings are
+/// excluded because a ring is boundary rather than interior; those cases are already
+/// decided by the areal passes above.
+fn chains_cross_transversally(a: &Geometry, b: &Geometry) -> bool {
+    for la in linear_parts(a) {
+        for lb in linear_parts(b) {
+            for s in la.windows(2) {
+                for t in lb.windows(2) {
+                    if segments_cross_properly(s[0], s[1], t[0], t[1]) {
+                        return true;
+                    }
+                }
+            }
+        }
     }
     false
 }
@@ -515,5 +574,42 @@ mod tests {
         assert!(!covers(&a, &e));
         assert!(!contains(&a, &e));
         assert!(geom_equals(&e, &g("LINESTRING EMPTY")));
+    }
+
+    #[test]
+    fn lines_crossing_at_an_unrepresentable_point_cross_rather_than_touch() {
+        // The crossing lands at coordinates no float holds exactly, so locating it after
+        // the fact reports it on neither line. Decided from orientations instead.
+        let a = g("LINESTRING(-14.339 -32.624, -13.405 -12.962, -4.133 16.252)");
+        let b = g("LINESTRING(32.201 -5.404, -45.074 -2.123, -12.729 33.561, -30.697 -10.86)");
+        assert!(intersects(&a, &b));
+        assert!(interiors_intersect(&a, &b));
+        assert!(crosses(&a, &b));
+        assert!(!touches(&a, &b));
+    }
+
+    #[test]
+    fn lines_meeting_at_an_endpoint_touch_rather_than_cross() {
+        let a = g("LINESTRING(0 0, 10 10)");
+        let b = g("LINESTRING(5 5, 10 0)");
+        assert!(touches(&a, &b));
+        assert!(!crosses(&a, &b));
+    }
+
+    #[test]
+    fn a_line_through_a_polygon_crosses_it() {
+        let poly = g("POLYGON((-2.604 -7.88, -6.138 -1.76, -13.204 -1.76, -16.738 -7.88, -13.204 -14, -6.138 -14, -2.604 -7.88))");
+        let line = g("LINESTRING(-11.671 -13.371, -7.733 3.32, 21.737 -11.769)");
+        assert!(interiors_intersect(&poly, &line));
+        assert!(crosses(&poly, &line));
+        assert!(!touches(&poly, &line));
+    }
+
+    #[test]
+    fn a_line_along_a_polygon_edge_touches_rather_than_crosses() {
+        let poly = g("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))");
+        let line = g("LINESTRING(0 0, 4 0)");
+        assert!(touches(&poly, &line));
+        assert!(!crosses(&poly, &line));
     }
 }

@@ -20,4 +20,4 @@ python examples/expressions/temporal_differences.py
 - {doc}`/cookbook/expressions/temporal/temporal_business_days`: weekend and business-day predicates, and formatting a timestamp for output.
 - {doc}`/cookbook/expressions/temporal/temporal_parts`: pulling calendar parts out of a timestamp column.
 - {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
-- {doc}`/api/relational/expressions`: the complete `Expr` reference.
+- {doc}`/api/relational/expressions`: the complete {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` reference.

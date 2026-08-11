@@ -15,15 +15,15 @@ consumer, and picking the wrong one is what puts Python back on the hot path:
 
 | Situation | Reach for |
 | --- | --- |
-| Anything, in Arrow, no framework | `ds.iter_batches()` |
-| Single-process PyTorch training | `ds.ml.iter_torch_batches(...)` |
-| Multi-rank DDP/FSDP over a bounded corpus | `ds.ml.stream_loader(...)` |
-| Corpus larger than RAM | `batcher.ml.shard_stream_loader(...)` |
-| Unbounded / streaming source, no global length | `batcher.ml.streaming_split(...)` |
-| A batch iterator you already have, and torch tensors | `batcher.ml.to_torch_iterable(...)` |
-| NumPy, no torch | `batcher.ml.to_numpy_batches(...)` |
-| TensorFlow | `batcher.ml.to_tf_dataset(...)` |
-| The whole result in memory as NumPy / JAX arrays | `ds.to_numpy()` / `ds.to_jax()` |
+| Anything, in Arrow, no framework | {py:meth}`ds.iter_batches() <batcher.Dataset.iter_batches>` |
+| Single-process PyTorch training | {py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` |
+| Multi-rank DDP/FSDP over a bounded corpus | {py:meth}`ds.ml.stream_loader(...) <batcher.api.dataset.ml.DatasetML.stream_loader>` |
+| Corpus larger than RAM | {py:func}`batcher.ml.shard_stream_loader(...) <batcher.ml.shard_stream_loader>` |
+| Unbounded / streaming source, no global length | {py:func}`batcher.ml.streaming_split(...) <batcher.ml.streaming_split>` |
+| A batch iterator you already have, and torch tensors | {py:func}`batcher.ml.to_torch_iterable(...) <batcher.ml.to_torch_iterable>` |
+| NumPy, no torch | {py:func}`batcher.ml.to_numpy_batches(...) <batcher.ml.to_numpy_batches>` |
+| TensorFlow | {py:func}`batcher.ml.to_tf_dataset(...) <batcher.ml.to_tf_dataset>` |
+| The whole result in memory as NumPy / JAX arrays | {py:meth}`ds.to_numpy() <batcher.Dataset.to_numpy>` / {py:meth}`ds.to_jax() <batcher.Dataset.to_jax>` |
 
 `ds.to_numpy()` and `ds.to_jax()` materialize the *entire* result as a
 `{column: array}` dict, where a tensor or embedding column comes back shaped
@@ -31,8 +31,8 @@ consumer, and picking the wrong one is what puts Python back on the hot path:
 streaming loader.
 
 The three that get confused with each other are worth stating plainly.
-`iter_torch_batches` is the single-process loop, and it owns the read, the device
-transfer, and the batching. `stream_loader` is the multi-rank one, and it owns the
+{py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` is the single-process loop, and it owns the read, the device
+transfer, and the batching. {py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` is the multi-rank one, and it owns the
 *shard*, which is why nothing else may. `to_torch_iterable` owns nothing at all. It is a
 converter you hand an existing batch iterator, for a pipeline you assembled yourself.
 
@@ -60,7 +60,7 @@ for batch in ds.iter_batches(batch_size=2):
 ```
 
 A breaker-free pipeline is delivered incrementally. A plan that must materialize, such as
-one containing a sort or a global aggregate, does that first. So `iter_batches` over a
+one containing a sort or a global aggregate, does that first. So {py:meth}`iter_batches <batcher.Dataset.iter_batches>` over a
 filter-and-project chain streams a 10 TB source in bounded memory, and over a sort it does
 not. That is a property of the plan, not of the loader.
 
@@ -165,7 +165,7 @@ dropped, so every rank yields the same count and none of them stalls the all-red
 
 ## Framework converters
 
-The converters take a batch iterator and yield framework-native batches. `to_numpy_batches`
+The converters take a batch iterator and yield framework-native batches. {py:meth}`to_numpy_batches <batcher.api.dataset.ml.DatasetML.to_numpy_batches>`
 is the NumPy one:
 
 ```python

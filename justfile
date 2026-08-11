@@ -80,6 +80,14 @@ lint-structure:
 lint-ir-contract:
     python tools/lint_ir_contract.py
 
+# Which optimizer rules ever actually fire, over a real corpus. A registered rule can be
+# dead and still green: its unit tests call the function directly, so a rule waiting for a
+# shape the optimizer never builds passes everything. This runs the differential suite with
+# every rule counted and names the ones nothing triggered. Diagnostic, not a gate — a
+# never-fired rule may just be outside the corpus, so the output is a list to review.
+rule-coverage path="tests/differential":
+    python tools/rule_coverage.py {{path}}
+
 # The daily agentic self-improvement loop: agents review the codebase, make narrow verified
 # improvements in isolated worktrees, and leave branches + a report for review. Nothing is
 # merged automatically and your working tree is never touched. See tools/agentic/README.md.
@@ -179,12 +187,20 @@ install-hooks:
     ln -sf ../../tools/git-hooks/pre-commit .git/hooks/pre-commit
     @echo "pre-commit hook installed (lint-structure, lint-duplication, lint-guardrails, ruff, lint-layers)"
 
+# Regenerate the example-library tables in docs/examples/ from the scripts themselves.
+# The prose on those pages is hand-written; the 500-row tables are not, and a list of 500
+# rows maintained by hand is wrong within a week. `docs` runs this in --check mode, so a
+# new example that no page claims fails the build rather than going undocumented.
+example-library:
+    python tools/example_library.py
+
 # Build the documentation site. Warnings are errors, so an orphan page or a
 # broken cross-reference fails the build. The doctest builder runs first, so a
 # docstring `.. doctest::` example that disagrees with the engine fails here (the
 # markdown code blocks under docs/ are executed separately by `just test-py`,
 # tests/docs/test_doc_examples.py). Both need the engine built first.
 docs:
+    python tools/example_library.py --check
     sphinx-build -b doctest docs docs/_build/doctest
     sphinx-build -b html -E -W --keep-going docs docs/_build/html
     @echo "docs built -> docs/_build/html/index.html"
@@ -207,9 +223,24 @@ bench-tpch args="":
 bench-clickbench args="":
     python benchmarks/run.py --benchmark clickbench {{args}}
 
-# Run the TPC-DS subset suite.
+# Run the full TPC-DS 99-query suite.
 bench-tpcds args="":
     python benchmarks/run.py --benchmark tpcds {{args}}
+
+# Run the Join Order Benchmark (113 queries over the real IMDb database).
+# Downloads ~1.2 GiB on the first run, so it is excluded from `bench-all`.
+bench-job args="":
+    python benchmarks/run.py --benchmark job {{args}}
+
+# Run the H2O.ai db-benchmark groupby task (its 10 questions).
+# Defaults to the benchmark's own 1e7-row tier, so it is excluded from `bench-all`.
+bench-h2o-groupby args="":
+    python benchmarks/run.py --benchmark h2o-groupby {{args}}
+
+# Run the H2O.ai db-benchmark join task (its 5 questions, three RHS sizes).
+# Defaults to the benchmark's own 1e7-row tier, so it is excluded from `bench-all`.
+bench-h2o-join args="":
+    python benchmarks/run.py --benchmark h2o-join {{args}}
 
 # Run the operator-mix (single relational ops; includes PyArrow + Ray Data).
 bench-ops args="":
@@ -229,7 +260,8 @@ bench-images args="":
 bench-multi args="":
     python benchmarks/run.py --benchmark all --tier multi {{args}}
 
-# Run every dataset on the default single-node lineup.
+# Run every dataset on the default single-node lineup, except the five opt-in ones
+# (scan, images, job, h2o-groupby, h2o-join) that each have their own recipe above.
 bench-all args="":
     python benchmarks/run.py --benchmark all {{args}}
 

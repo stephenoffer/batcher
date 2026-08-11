@@ -135,3 +135,70 @@ def test_a_primary_on_an_unknown_worker_does_not_break_placement() -> None:
     """A primary index past the fleet is stale metadata, not a reason to raise."""
     out = assign_replica_hosts({0: 99}, ["n1", "n2"], factor=2)
     assert set(out[0]) <= {0, 1}
+
+
+# --- spot capacity as a failure domain ---------------------------------------------------
+
+
+def test_a_replica_prefers_durable_capacity_over_a_second_spot_node():
+    """A spot reclamation takes an instance group, not a machine.
+
+    Placing the only spare copy on a second spot node satisfies the off-node rule and buys
+    nothing: both go away in the same wave. That is the fleet the `spot` resilience profile
+    turns replication on for, so it is the fleet the ranking has to get right.
+    """
+    from batcher.carbonite.resilience.replication import assign_replica_hosts
+
+    nodes = ["n0", "n1", "n2"]  # worker i on node i
+    out = assign_replica_hosts({0: 0}, nodes, factor=2, preemptible=frozenset({0, 1}))
+    assert out[0] == [2], "the on-demand worker must hold the copy"
+
+
+def test_the_off_node_rule_still_outranks_the_market_preference():
+    """A same-node copy is useless outright; a same-market copy is merely correlated.
+
+    So an on-demand worker on the primary's own node must not beat a spot worker elsewhere.
+    """
+    from batcher.carbonite.resilience.replication import assign_replica_hosts
+
+    nodes = ["n0", "n0", "n1"]  # workers 0 and 1 share a node
+    out = assign_replica_hosts({0: 0}, nodes, factor=2, preemptible=frozenset({2}))
+    assert out[0] == [2]
+
+
+def test_an_all_spot_fleet_places_its_copies_as_before():
+    """Preferring durable capacity must never mean placing no copy at all.
+
+    On a fleet that is entirely spot every candidate ranks the same, so the placement falls
+    back to the off-node and least-loaded rules unchanged.
+    """
+    from batcher.carbonite.resilience.replication import assign_replica_hosts
+
+    nodes = ["n0", "n1", "n2", "n3"]
+    spot = frozenset(range(4))
+    assert assign_replica_hosts({0: 0, 1: 1}, nodes, factor=2, preemptible=spot) == (
+        assign_replica_hosts({0: 0, 1: 1}, nodes, factor=2)
+    )
+
+
+def test_an_unlabelled_fleet_is_placed_exactly_as_it_was():
+    """No market labels means no evidence, and no evidence must change nothing."""
+    from batcher.carbonite.resilience.replication import assign_replica_hosts
+
+    nodes = ["n0", "n1", "n2", "n3"]
+    assert assign_replica_hosts({0: 0, 1: 1, 2: 2}, nodes, factor=2, preemptible=frozenset()) == (
+        assign_replica_hosts({0: 0, 1: 1, 2: 2}, nodes, factor=2)
+    )
+
+
+def test_spot_ranks_below_the_off_node_rule_and_above_load():
+    """The three-way order, pinned so a later tweak cannot quietly reorder it.
+
+    Worker 1 is idle but spot; worker 2 carries a primary but is on-demand. On-demand wins,
+    because an evenly spread set of copies that all vanish together is not a spread set.
+    """
+    from batcher.carbonite.resilience.replication import assign_replica_hosts
+
+    nodes = ["n0", "n1", "n2"]
+    out = assign_replica_hosts({0: 0, 1: 2}, nodes, factor=2, preemptible=frozenset({1}))
+    assert out[0] == [2]

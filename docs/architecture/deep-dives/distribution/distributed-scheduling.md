@@ -74,6 +74,12 @@ Per-task CPU is adaptive rather than a flat `1.0`. `dist/executors/map.py::_adap
 
 Measured at sf10 on the 8-node cluster, a UDF-plus-aggregate pipeline went from 1.89 s to 0.88 s, and cluster utilization rose from 9% to 52% mean across 9 nodes.
 
+A Flight shuffle's *map* stage sizes itself separately, because what it is choosing is a unit of recovery as much as a unit of work. `dist/executors/ray_runtime/reducers.py::map_partitions` cuts the input into `workers x distributed.map_partition_multiplier` partitions, four times the worker count by default, and `map_barrier` hands them to actors as they go idle with exactly `workers` tasks in flight. One partition per worker, the older shape, makes the task unit a node's whole share of the input, so a worker running at half speed holds the barrier open on a full partition and a worker that dies loses a full partition for one survivor to replay. Neither cost is about data volume. Both are about the unit being indivisible.
+
+The count is a ceiling. `partition_descriptors` returns the smaller of it and the splits the source actually has, so a ten-row-group input on an eight-worker cluster gives ten partitions rather than thirty-two mostly-empty tasks, and an in-memory source stays at one per worker because its batches are already driver-resident. A join maps both sides through one barrier under a single source id, so it pads the shorter side's list with no-op partitions rather than re-planning the larger side's splits.
+
+Finer map partitions do not dilute skew, which is the usual reason given for many-tasks-per-executor. They divide the *input*, and a shuffle's imbalance lives in its hash buckets. That is the next section.
+
 ## Skew
 
 Two mechanisms handle skew, and they're separate.
@@ -82,7 +88,9 @@ Scan splits are balanced up front. Parquet `splits()` returns one split per row 
 
 Join skew is different, because it's a property of the key distribution and you can't see it in the file layout. `dist/executors/join.py::_detect_hot_keys` runs a Misra-Gries heavy-hitters pass per partition using `nat.heavy_hitters`, which is backed by `bc-sketches`, and a value is hot when its summed count clears `distributed.skew_join_fraction` (0.10) of the rows. Hot keys are then salted. `nat.salted_partition_batches` fans the probe-side hot rows across `salt` reducers and *replicates* the build-side hot rows to all of them. Cold keys hash exactly as before, so the joined relation is unchanged.
 
-The detection pass costs a scan, so it runs only when you opt in through `distributed.skew_join_salt`, which defaults to 0. What makes it pay for itself is that the result is learned. `dist/skew.py` fingerprints the join shape with `join_skew_key`, a hash of both side IRs, the keys, and the join type, and persists the hot-key list in the `MetadataHub`. A shape with learned hot keys salts automatically on the next run, with no pre-pass. An empty learned list means "measured, not skewed", which is distinct from never-measured, so a non-skewed shape never re-runs the probe.
+The detection pass costs a scan, so `dist/skew.py::resolve_hot_keys` asks the cheap sources first: the set learned for this join shape on a previous run, then the column statistics Kyber already holds, and only then the pre-pass. It runs the pre-pass on its own once the join's estimated input clears about 8.4M rows, because past that size one pass costs around 4% on a join that turns out uniform while an undetected 40% hot key costs 5.8x. `distributed.skew_join_salt` is the fan-out rather than a switch: 0, the default, leaves both the decision and the fan-out to the measurement; a positive value forces the pre-pass and pins the fan-out; a negative value never salts.
+
+What makes the pass pay for itself is that its result is learned. `dist/skew.py` fingerprints the join shape with `join_skew_key`, a hash of both side IRs, the keys, and the join type, and persists the hot-key list in the `MetadataHub`. A shape with learned hot keys salts with no pre-pass at all on the next run. An empty learned list means "measured, not skewed", which is distinct from never-measured, so a non-skewed shape never re-runs the probe.
 
 :::{warning}
 Salting is result-preserving only when each reducer's output is concatenated. `salting_is_safe` refuses it for a fused join-plus-aggregate, where the reducer finalizes its bucket locally. Salted reducers would each finalize a *partial* group and the union would carry several half-summed rows for the hot key. Nothing raises. The query returns a wrong answer.
@@ -95,8 +103,50 @@ The driver composes the stages. For a distributed aggregate (`dist/executors/agg
 Some shapes avoid the shuffle entirely. A shuffle join co-partitions both sides by the join key, so when a group-by's keys include the join key every group lies entirely within one bucket and each reducer's bucket is already complete. `_distributed_join_aggregate` gives the reducer an IR of `aggregate(hash_join(...))` and there's no second exchange. That exchange elimination took a distributed join-then-aggregate from 71.6 s to 1.75 s, because the old path collected the whole join to the driver.
 
 :::{warning}
-Some shapes shouldn't distribute at all. When a plan has no distributed path and any source it actually reads is splittable, `_unsupported` raises a `PlanError` rather than quietly running the query on the driver. The silent fallback is how the join and UDF cliffs hid for as long as they did. A query that says `distributed=True` and runs on one node is a perf cliff and an OOM risk wearing a correct result. When every source is in-memory or non-splittable there's no distributed data to speak of, so one node is the correct plan rather than a fallback.
+Some shapes shouldn't distribute at all. When a plan has no distributed path and any source it actually reads is splittable, `_unsupported` raises a {py:exc}`PlanError <batcher.PlanError>` rather than quietly running the query on the driver. The silent fallback is how the join and UDF cliffs hid for as long as they did. A query that says `distributed=True` and runs on one node is a perf cliff and an OOM risk wearing a correct result. When every source is in-memory or non-splittable there's no distributed data to speak of, so one node is the correct plan rather than a fallback.
 :::
+
+## Staging a UDF so the operator above it can shuffle
+
+A `map_batches` pipeline is opaque. It runs in Python, it has no engine IR, and no shuffle can
+see through it, so a breaker sitting on top of one has nothing to co-partition. Batcher deals
+with that by cutting the query in two rather than by giving the breaker a second
+implementation: the UDF pipeline runs as its own distributed stage, lands its output as
+Parquet on cluster-shared scratch, and the breaker is then dispatched over a plain scan of
+that scratch. What runs afterwards is the ordinary distributed operator, with the shuffle,
+the broadcast decision, the skew handling and the spill it always had.
+
+The staging follows the plan's operands rather than a single chain, and that is what makes it
+cover the shape most inference jobs actually have. Embedding a table and then joining the
+embeddings to something bottoms out at a node with two operands, and so does a union of two
+inference branches. Each operand that contains a UDF is staged on its own; operands with no
+UDF are left exactly as they are, so a join of an inference branch against a plain Parquet
+table stages only the branch. `map_batches(...).join(other).group_by(...)` then reaches the
+fused join-aggregate reducer, the same one a join over two tables reaches.
+
+An operand whose staged output turns out empty is declined rather than folded away. A breaker
+is not uniformly empty-preserving — an outer join with an empty right side still emits every
+left row — so "empty" there would be a wrong answer rather than a missing route.
+
+## What never reaches the driver
+
+Composing the stages is not the same as carrying their data, and the executor keeps those apart. A stage can be asked to leave its result where it was computed rather than hand it back, and every breaker that has a shuffle honors that: an aggregate, a `distinct`, a hash join, a sort, and a partitioned window all publish one bucket per reducer and return handles instead of rows. On the disk transport a handle is an Arrow IPC file and the relation is a `MaterializedSource`; on the Flight transport the bucket stays resident on the actor that produced it and the relation is a `FlightMaterializedSource`, which the next stage's workers fetch shared-nothing, straight from the holding actor.
+
+Three things consume that. The adaptive executor scans one stage's buckets as the next stage's input, so a multi-join query never round-trips an intermediate through one process. {py:meth}`iter_batches(distributed=True) <batcher.Dataset.iter_batches>` reads one bucket at a time, so peak driver memory is a single reducer's output rather than the whole result. And an unpartitioned distributed write hands the buckets to the workers to write, so only file locators travel back.
+
+Whether the buckets can stay put is a property of the operator's result, not of its cost. The distinction that matters is how large the result is relative to the input:
+
+| Operator | Result size | Bucket order |
+|---|---|---|
+| `group_by` / `agg` | one row per group | irrelevant, the result is a multiset |
+| `distinct` | one row per distinct key | irrelevant |
+| Hash join | can exceed either input | irrelevant |
+| Window | one row per input row | irrelevant |
+| Sort | one row per input row | **is the answer** |
+
+The sort is the one where the ordering is carried by the layout itself. Its buckets are *ranges* of the leading key, globally ordered against one another, which is what lets the ordinary path concatenate them with no merge step. Keeping them in place preserves the same fact: the handles are listed in range order (reversed for a descending sort), and reading them in sequence is the sorted relation. Nothing re-sorts and nothing merges.
+
+Two shapes decline and collect instead, both for the same reason. There is no partitioned form of what they are being asked for. An operator stacked above the breaker (`sort(...).filter(...)` that Kyber could not push down) has to be applied to something, and a sort carrying a `limit` has to slice an assembled result to select among the rows tied at the cut.
 
 ## Cost, and when not to use it
 
@@ -123,7 +173,7 @@ path anyway costs about 7%.
 :::
 ::::
 
-The warm session fleet (`distributed.reuse_session_fleet`, on by default) exists because spawning and tearing down the Flight fleet per `collect()` cost about 1.5 s of a roughly 3 s query. It's health-checked and idle-auto-released after `session_fleet_idle_s` (30 s).
+The warm session fleet (`distributed.reuse_session_fleet`, on by default) exists because spawning and tearing down the Flight fleet per {py:meth}`collect() <batcher.Dataset.collect>` cost about 1.5 s of a roughly 3 s query. It's health-checked and idle-auto-released after `session_fleet_idle_s` (30 s).
 
 ## Code map
 

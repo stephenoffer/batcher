@@ -252,8 +252,13 @@ def test_float_key_identity_is_the_same_across_every_operator():
 
 
 def test_distinct_on_float_key_folds_negative_zero(duck):
-    """`distinct(subset)` lowers to `row_number() OVER (PARTITION BY subset ...)`; the window
-    partition grouping must fold `-0.0`/`0.0` (and all NaNs) like GROUP BY does."""
+    """`distinct(subset)` hashes its key, so the key grouping must fold `-0.0`/`0.0` (and all
+    NaNs) exactly as GROUP BY does.
+
+    This used to say "lowers to `row_number() OVER (PARTITION BY subset ...)`" and assert the
+    *window's* partition grouping. The operator is a hash reduction now and the window is gone,
+    but the property is the same one and belongs to the same place — key identity — so the test
+    stands and only its explanation changed."""
     table = pa.table(
         {
             "f": pa.array([0.0, -0.0, 0.0, float("nan"), float("nan")], pa.float64()),

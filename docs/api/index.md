@@ -1,6 +1,6 @@
 # API reference
 
-The API is small and lazy. A `Dataset` is a handle to a plan: you chain expression-based operations onto it, and nothing runs until a terminal call returns Arrow or writes to a sink. Everything reachable from `import batcher as bt` is documented here.
+The API is small and lazy. A {py:class}`Dataset <batcher.Dataset>` is a handle to a plan: you chain expression-based operations onto it, and nothing runs until a terminal call returns Arrow or writes to a sink. Everything reachable from `import batcher as bt` is documented here.
 
 ## Three ways in
 

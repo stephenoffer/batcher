@@ -356,93 +356,126 @@ def show_accelerators() -> None:
             >>> import batcher as bt
             >>> bt.show_accelerators()  # doctest: +SKIP
     """
-    from batcher.observe import format_device_table
-
     report = accelerators()
     print(f"backend: {report['backend']}")
+    _print_devices(report)
+    _print_site(report)
+    for finding in report.get("container", []):
+        print(f"container: {finding}")
+    _print_fabric(report)
+    _print_fleet(report)
+    _print_problems()
+    _print_power(report)
+
+
+def _print_devices(report: dict) -> None:
+    """The local device table, plus any device the driver is clamping or failing silently."""
+    from batcher.observe import format_device_table
+
     devices = report["devices"]
     if not devices:
         print("devices: none visible to this process")
-    else:
-        print(format_device_table())
-        for row in devices:
-            if "power_watts" not in row:
-                print(f"gpu {row['index']}  {row['name']}  (no live telemetry)")
-        _show_silent_faults(devices)
+        return
+    print(format_device_table())
+    for row in devices:
+        if "power_watts" not in row:
+            print(f"gpu {row['index']}  {row['name']}  (no live telemetry)")
+    _show_silent_faults(devices)
+
+
+def _print_site(report: dict) -> None:
+    """Where this process is running: provider, instance shape, scheduler, local scratch."""
     site = report.get("site")
-    if site:
-        line = f"site: {site['provider']}"
-        if site.get("instance_type"):
-            line += f" {site['instance_type']}"
-        if site.get("region"):
-            line += f" in {site['region']}"
-        if site.get("virtualized"):
-            # Worth saying: in a VM an empty fabric or device probe has not proved the host
-            # has none, it has proved the hypervisor did not pass one through.
-            line += " (virtual machine)"
-        print(f"{line}, scheduled by {site['scheduler']}")
-        if site.get("scratch_dir"):
-            print(f"      local scratch {site['scratch_dir']}")
-    for finding in report.get("container", []):
-        print(f"container: {finding}")
+    if not site:
+        return
+    line = f"site: {site['provider']}"
+    if site.get("instance_type"):
+        line += f" {site['instance_type']}"
+    if site.get("region"):
+        line += f" in {site['region']}"
+    if site.get("virtualized"):
+        # Worth saying: in a VM an empty fabric or device probe has not proved the host
+        # has none, it has proved the hypervisor did not pass one through.
+        line += " (virtual machine)"
+    print(f"{line}, scheduled by {site['scheduler']}")
+    if site.get("scratch_dir"):
+        print(f"      local scratch {site['scratch_dir']}")
+
+
+def _print_fabric(report: dict) -> None:
+    """The interconnect: RDMA or Ethernet, NVLink, and what it did to the plan ranking."""
     fabric = report.get("fabric")
-    if fabric:
-        rdma = fabric.get("rdma")
-        if rdma:
-            layers = ", ".join(f"{n} x {k}" for k, n in sorted(rdma["link_layers"].items()))
-            print(
-                f"fabric: {rdma['active_ports']}/{rdma['ports']} RDMA port(s) up "
-                f"({rdma['bandwidth_gbps']:.0f} Gb/s, {layers or 'unreported'})"
-            )
-        ethernet = fabric.get("ethernet")
-        if ethernet:
-            print(
-                f"fabric: no RDMA; {ethernet['up']}/{ethernet['interfaces']} Ethernet link(s) "
-                f"up ({ethernet['total_gbps']:.0f} Gb/s via {ethernet['fastest']})"
-            )
-        nvlink = fabric.get("nvlink")
-        if nvlink:
-            print(
-                f"        NVLink {nvlink['active_links']}/{nvlink['links']} link(s) up "
-                f"across {nvlink['devices']} device(s)"
-            )
-        cost = fabric.get("cost") or {}
-        if cost.get("derived_net_weight") is not None:
-            # What the measurement did to the plan ranking. Two clusters producing different
-            # plans for the same query is otherwise unexplained by anything printed here.
-            print(
-                f"        a shuffled byte is priced at {cost['net_weight']:.1f}x a local one "
-                f"(measured, against the default 2.0)"
-            )
-    fleet = report.get("fleet")
-    if fleet:
-        models = ", ".join(fleet["device_models"]) or "unlabelled"
+    if not fabric:
+        return
+    rdma = fabric.get("rdma")
+    if rdma:
+        layers = ", ".join(f"{n} x {k}" for k, n in sorted(rdma["link_layers"].items()))
         print(
-            f"fleet: {fleet['gpus']} device(s) on {fleet['gpu_nodes']} node(s), "
-            f"widest fabric domain {fleet['largest_domain']}, models {models}"
+            f"fabric: {rdma['active_ports']}/{rdma['ports']} RDMA port(s) up "
+            f"({rdma['bandwidth_gbps']:.0f} Gb/s, {layers or 'unreported'})"
         )
-        if fleet["racks"] or fleet["power_zones"]:
-            print(f"       {fleet['racks']} rack(s), {fleet['power_zones']} power zone(s)")
-        health = fleet.get("health")
-        if health:
-            unhealthy = health["unhealthy"]
-            print(f"       health: {len(unhealthy)} of {health['nodes_probed']} node(s) degraded")
-            for node in unhealthy:
-                reasons = ", ".join(node["reasons"]) or "degraded link"
-                print(f"       node {node['node_id'][:12]}: {reasons}")
+    ethernet = fabric.get("ethernet")
+    if ethernet:
+        print(
+            f"fabric: no RDMA; {ethernet['up']}/{ethernet['interfaces']} Ethernet link(s) "
+            f"up ({ethernet['total_gbps']:.0f} Gb/s via {ethernet['fastest']})"
+        )
+    nvlink = fabric.get("nvlink")
+    if nvlink:
+        print(
+            f"        NVLink {nvlink['active_links']}/{nvlink['links']} link(s) up "
+            f"across {nvlink['devices']} device(s)"
+        )
+    cost = fabric.get("cost") or {}
+    if cost.get("derived_net_weight") is not None:
+        # What the measurement did to the plan ranking. Two clusters producing different
+        # plans for the same query is otherwise unexplained by anything printed here.
+        print(
+            f"        a shuffled byte is priced at {cost['net_weight']:.1f}x a local one "
+            f"(measured, against the default 2.0)"
+        )
+
+
+def _print_fleet(report: dict) -> None:
+    """The cluster's devices, how they are laid out, and which nodes are degraded."""
+    fleet = report.get("fleet")
+    if not fleet:
+        return
+    models = ", ".join(fleet["device_models"]) or "unlabelled"
+    print(
+        f"fleet: {fleet['gpus']} device(s) on {fleet['gpu_nodes']} node(s), "
+        f"widest fabric domain {fleet['largest_domain']}, models {models}"
+    )
+    if fleet["racks"] or fleet["power_zones"]:
+        print(f"       {fleet['racks']} rack(s), {fleet['power_zones']} power zone(s)")
+    health = fleet.get("health")
+    if not health:
+        return
+    unhealthy = health["unhealthy"]
+    print(f"       health: {len(unhealthy)} of {health['nodes_probed']} node(s) degraded")
+    for node in unhealthy:
+        reasons = ", ".join(node["reasons"]) or "degraded link"
+        print(f"       node {node['node_id'][:12]}: {reasons}")
+
+
+def _print_problems() -> None:
+    """The closing summary, because a reader who scrolled past a device table wants the
+    count and the list, not to have reconstructed it from the lines above."""
     problems = accelerator_problems()
-    if problems:
-        # The closing summary, because a reader who scrolled past a device table wants the
-        # count and the list, not to have reconstructed it from the lines above.
-        print(f"problems: {len(problems)}")
-        for problem in problems:
-            print(f"  - {problem}")
+    if not problems:
+        return
+    print(f"problems: {len(problems)}")
+    for problem in problems:
+        print(f"  - {problem}")
+
+
+def _print_power(report: dict) -> None:
+    """The power envelope, in total and per zone at full load."""
     power = report["power"]
-    if power:
-        parts = [
-            f"{k.replace('_', ' ')} {v}" for k, v in sorted(power.items()) if k != "by_zone_watts"
-        ]
-        if parts:
-            print("power: " + ", ".join(parts))
-        for zone, watts in sorted(power.get("by_zone_watts", {}).items()):
-            print(f"       zone {zone}: {watts} W at full load")
+    if not power:
+        return
+    parts = [f"{k.replace('_', ' ')} {v}" for k, v in sorted(power.items()) if k != "by_zone_watts"]
+    if parts:
+        print("power: " + ", ".join(parts))
+    for zone, watts in sorted(power.get("by_zone_watts", {}).items()):
+        print(f"       zone {zone}: {watts} W at full load")

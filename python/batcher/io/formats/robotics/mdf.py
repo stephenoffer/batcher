@@ -223,11 +223,22 @@ def _epoch_nanos(start: Any) -> int:
     A naive `start_time` is read as UTC rather than local time: a fleet's measurements are
     compared across time zones, and guessing the recorder's zone would shift a drive by
     hours with nothing in the data to reveal it.
+
+    Computed with integer `timedelta` arithmetic rather than `start.timestamp() * 1e9`.
+    That product is a `float64` holding ~1.7e18, and the spacing of `float64` up there is
+    **256 ns** — so the multiplication quantizes the measurement's origin to a 256 ns
+    grid, which shifts every sample in the file by the same error. It is small, but this
+    column exists precisely so an MDF measurement can be as-of joined against a
+    nanosecond-stamped MCAP log from the same drive, and there is no reason to spend
+    precision the format did not lose. `timedelta` carries microseconds exactly, which is
+    all a `datetime` has.
     """
     import datetime as dt
 
     if start is None:
         return 0
     if start.tzinfo is None:
-        start = start.replace(tzinfo=dt.timezone.utc)
-    return int(start.timestamp() * _NANOS_PER_SECOND)
+        start = start.replace(tzinfo=dt.UTC)
+    delta = start - dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
+    seconds = delta.days * 86_400 + delta.seconds
+    return seconds * _NANOS_PER_SECOND + delta.microseconds * 1_000

@@ -73,7 +73,24 @@ def _record_scalar(
 def record_join_sides(
     hub: MetadataHub | None, signature: str, left_rows: float, right_rows: float
 ) -> None:
-    """Record a join's measured left/right input sizes, keyed by signature."""
+    """Record a join's measured left/right input sizes, keyed by signature.
+
+    Written **without** advancing the learned generation, which is the same exemption
+    `bandit.record_arm` documents as `invalidates_plans=False` and for the same reason: a
+    memoized plan can only be stale with respect to a value some plan *reads*, and nothing
+    reads this one. `learned_build_sides` has no caller in the optimizer — only tests — so
+    every write here was flushing the whole plan cache to record a number no rewrite consults.
+
+    That was not a small leak. These are smoothed measurements of the same two row counts, so
+    they drift a few percent on every run and never converge; `is_material_change` therefore
+    fired forever. Measured on TPC-H at scale 1, this write alone kept **six of the twenty-two
+    queries from ever hitting the plan cache** (q4, q12, q13, q14, q19, q22), which is why q19
+    spent 73% of its wall clock re-optimizing a plan it had already optimized four times.
+
+    If a rule is ever written that reads `learned_build_sides`, this must go back to
+    `plan_cache.record_write`: at that point a moved measurement really can leave a memoized
+    plan building the wrong side.
+    """
     if hub is None:
         return
     try:
@@ -83,7 +100,7 @@ def record_join_sides(
             prior = entry.get(field)
             entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
         entry["n_obs"] = n + 1
-        plan_cache.record_write(hub, scoped(_NS_SIDES), signature, entry)
+        hub.put_keyed_param(scoped(_NS_SIDES), signature, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record join sides", exc)
 

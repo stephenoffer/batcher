@@ -26,14 +26,17 @@ from batcher.plan.profile.stages import (
     metered,
     stage_kind,
 )
-from batcher.plan.profile.types import Decision, OpProfile, QueryProfile
+from batcher.plan.profile.types import Decision, OpProfile, QueryProfile, QueryUsage
+from batcher.plan.profile.usage import UsageStopwatch
 
 __all__ = [
     "Decision",
     "OpProfile",
     "ProfileCollector",
     "QueryProfile",
+    "QueryUsage",
     "StageRecorder",
+    "UsageStopwatch",
     "build_op_profiles",
     "logical_op_ids",
     "logical_preorder",

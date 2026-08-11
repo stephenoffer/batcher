@@ -266,12 +266,21 @@ def cluster_tmp_dir(tmp_path_factory):
 
     Same contract and same reason; separate only because `tmp_path_factory` is
     session-scoped and a function-scoped fixture cannot be consumed from one.
+
+    The directory is named per **xdist worker**, which the sibling above gets for free by
+    naming itself after the test. Under `-n N` there are N worker *processes*, each with its
+    own pytest session, so a single fixed name gave all of them one directory — and the first
+    one to finish ran this teardown's `rmtree` on a corpus the others were still reading. It
+    surfaced as `FileNotFoundError` on someone else's parquet, from inside a distributed sort,
+    which reads exactly like an engine defect and is not one. Isolated per worker, the
+    teardown can only ever remove that worker's own files.
     """
     base = _shared_base()
     if base is None:
         yield tmp_path_factory.mktemp("cluster")
         return
-    scratch = base / "batcher-tests-session"
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    scratch = base / f"batcher-tests-session-{_safe_dirname(worker)}"
     scratch.mkdir(parents=True, exist_ok=True)
     yield scratch
     shutil.rmtree(scratch, ignore_errors=True)

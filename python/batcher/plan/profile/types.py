@@ -14,7 +14,128 @@ from batcher._internal.hardware import hardware_profile
 from batcher._internal.mathx import safe_div
 from batcher.plan.feedback import CONTENDED_PREEMPTIONS_PER_CORE_SECOND, preemption_rate
 
-__all__ = ["Decision", "OpProfile", "QueryProfile"]
+__all__ = ["Decision", "OpProfile", "QueryProfile", "QueryUsage"]
+
+
+@dataclass(frozen=True, slots=True)
+class QueryUsage:
+    """What one run cost the machine, measured across the whole execution.
+
+    The per-operator counters on `OpProfile` are only sound on an executor where each
+    operator owns an exclusive wall interval. The streaming executor — the default tier for
+    most queries — interleaves its operators, so it reports zeros there and says so, which
+    left the common case with no CPU, memory, or disk accounting at all. This is the
+    measurement that holds on every tier, because the attribution problem is the operator
+    boundary and not the counters: the OS reports process-wide totals, and the delta across
+    one execution belongs to that execution whatever happened inside it.
+
+    Every field is `0` when the platform could not report it, and by the engine's convention
+    **`0` means unmeasured, not zero** — do not read a zero `io_read_bytes` as "read nothing".
+    """
+
+    #: Wall-clock milliseconds the engine was executing, excluding planning and admission.
+    wall_ms: float = 0.0
+    #: CPU milliseconds (user + system) summed across every worker thread.
+    cpu_ms: float = 0.0
+    #: Growth in the process's peak resident set during the run, in bytes.
+    peak_rss_bytes: int = 0
+    #: Page faults served from memory — first touch of newly committed pages.
+    minor_faults: int = 0
+    #: Page faults that required disk I/O. Any meaningful count means the box was paging
+    #: against the query, which looks exactly like slow compute from the inside.
+    major_faults: int = 0
+    #: Times the run gave up a CPU to wait on something (I/O, a lock, a queue).
+    vol_ctx_switches: int = 0
+    #: Times the scheduler took a CPU away — contention for cores the process was told it had.
+    invol_ctx_switches: int = 0
+    #: Bytes that actually reached a block device on read, page-cache hits excluded.
+    io_read_bytes: int = 0
+    #: Bytes that actually reached a block device on write, spill writes included.
+    io_write_bytes: int = 0
+
+    @property
+    def cores_busy(self) -> float:
+        """Mean cores kept busy over the run — ``cpu_ms / wall_ms``.
+
+        The single number that separates a query which saturated the box from one that ran a
+        wide plan on one core, and the one figure a per-operator utilization ratio cannot be
+        summed into. `0.0` when either term is unmeasured.
+        """
+        return safe_div(self.cpu_ms, self.wall_ms)
+
+    @property
+    def measured(self) -> bool:
+        """Whether the platform reported anything at all for this run."""
+        return self.wall_ms > 0 or self.cpu_ms > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """The usage as a flat, JSON-encodable dict, with `cores_busy` derived."""
+        return {
+            "wall_ms": self.wall_ms,
+            "cpu_ms": self.cpu_ms,
+            "cores_busy": self.cores_busy,
+            "peak_rss_bytes": self.peak_rss_bytes,
+            "minor_faults": self.minor_faults,
+            "major_faults": self.major_faults,
+            "vol_ctx_switches": self.vol_ctx_switches,
+            "invol_ctx_switches": self.invol_ctx_switches,
+            "io_read_bytes": self.io_read_bytes,
+            "io_write_bytes": self.io_write_bytes,
+        }
+
+    @classmethod
+    def from_metrics(cls, doc: dict[str, Any] | None) -> QueryUsage:
+        """Build from the engine's `ExecMetrics.query` block (nanoseconds → milliseconds).
+
+        Tolerant of an absent or partial block, so a profile assembled against an engine
+        build that predates the measurement degrades to all-zero rather than raising.
+
+        Args:
+            doc: The ``query`` object from an `ExecMetrics` document, or `None`.
+
+        Returns:
+            The usage, all-zero when nothing was reported.
+        """
+        if not doc:
+            return cls()
+        return cls(
+            wall_ms=float(doc.get("wall_ns", 0)) / 1e6,
+            cpu_ms=float(doc.get("cpu_ns", 0)) / 1e6,
+            peak_rss_bytes=int(doc.get("peak_rss_bytes", 0)),
+            minor_faults=int(doc.get("minor_faults", 0)),
+            major_faults=int(doc.get("major_faults", 0)),
+            vol_ctx_switches=int(doc.get("vol_ctx_switches", 0)),
+            invol_ctx_switches=int(doc.get("invol_ctx_switches", 0)),
+            io_read_bytes=int(doc.get("io_read_bytes", 0)),
+            io_write_bytes=int(doc.get("io_write_bytes", 0)),
+        )
+
+    def merged(self, other: QueryUsage) -> QueryUsage:
+        """This usage plus `other` — how several workers' readings become one run's.
+
+        Sums everything except the resident-set high-water, which is a *level* per process:
+        summing peaks across workers would report memory no single machine ever held, so the
+        largest is carried instead. Wall time sums too, which is deliberate — across W
+        workers it is the run's total occupancy, and dividing `cpu_ms` by it still gives the
+        mean cores busy per worker.
+
+        Args:
+            other: The reading to fold in.
+
+        Returns:
+            A new `QueryUsage`.
+        """
+        return QueryUsage(
+            wall_ms=self.wall_ms + other.wall_ms,
+            cpu_ms=self.cpu_ms + other.cpu_ms,
+            peak_rss_bytes=max(self.peak_rss_bytes, other.peak_rss_bytes),
+            minor_faults=self.minor_faults + other.minor_faults,
+            major_faults=self.major_faults + other.major_faults,
+            vol_ctx_switches=self.vol_ctx_switches + other.vol_ctx_switches,
+            invol_ctx_switches=self.invol_ctx_switches + other.invol_ctx_switches,
+            io_read_bytes=self.io_read_bytes + other.io_read_bytes,
+            io_write_bytes=self.io_write_bytes + other.io_write_bytes,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +185,12 @@ class OpProfile:
     rows_in: int = 0
     rows_out: int = 0
     elapsed_ms: float = 0.0
+    # CPU milliseconds summed across every worker thread this operator ran on — the
+    # numerator `cpu_util` divides. Kept as its own field rather than left implicit in the
+    # ratio because a ratio cannot be summed: totalling CPU across a query, or across a
+    # fleet, needs the quantity and not its normalization. `0` when the platform cannot
+    # report process CPU time, which by the engine's convention means unmeasured.
+    cpu_ms: float = 0.0
     # Size of the operator's *output* (Arrow result-array bytes) — NOT its peak working
     # set. A spilling operator can show a tiny `result_bytes` while having processed far
     # more. The engine reports the true peak separately (`OpMetric.peak_bytes`: a breaker's
@@ -147,6 +274,7 @@ class OpProfile:
             "rows_in": self.rows_in,
             "rows_out": self.rows_out,
             "elapsed_ms": self.elapsed_ms,
+            "cpu_ms": self.cpu_ms,
             "result_bytes": self.result_bytes,
             "spilled": self.spilled,
             "spill_bytes": self.spill_bytes,
@@ -194,6 +322,10 @@ class QueryProfile:
     # Distributed map sub-plan operators (a separate op-id space from the driver tree,
     # so kept apart rather than joined). Populated only for the distributed aggregate path.
     worker_ops: tuple[OpProfile, ...] = ()
+    # What the run cost the machine, measured across the execution as a whole rather than
+    # per operator — the only such measurement that is sound on the streaming tier, which is
+    # where most queries run. Summed across workers on a distributed run.
+    usage: QueryUsage = field(default_factory=QueryUsage)
 
     @property
     def machine(self) -> str:
@@ -234,13 +366,34 @@ class QueryProfile:
         return max(measured, key=lambda o: o.elapsed_ms, default=None)
 
     def cpu_utilization_overall(self) -> float:
-        """Wall-time-weighted mean per-core CPU utilization across measured ops, in [0, 1].
+        """Per-core CPU utilization for the whole run, in [0, 1].
 
-        The single number for "did this run keep the cores busy?" — each operator's measured
-        per-core busy fraction weighted by the wall time it held, so a brief idle op doesn't
-        drag down a long saturated one. `0.0` when no operator recorded CPU time (all
-        sub-millisecond, or an engine that reports none).
+        The single number for "did this run keep the cores busy?". Taken from the
+        **query-level** `usage` measurement (`cores_busy / threads`) whenever the engine
+        reported one, and only from the wall-time-weighted mean of the per-operator figures
+        otherwise. `0.0` when nothing measured CPU time.
+
+        Preferring `usage` is not a refinement, it is the difference between a number and a
+        constant. The per-operator ratio is only sound on an executor where each operator
+        owns an exclusive wall interval; the streaming executor — the default tier — reports
+        `cpu_ns` as busy time summed over the units of work that ran the operator, and
+        `wall_span_ns` as the interval they spanned. When an operator is *one* unit that
+        parallelizes internally with rayon (every hash aggregate, join and sort), those two
+        are the same quantity, and `cpu_ns / (wall_span_ns x threads)` collapses to exactly
+        `1 / threads` — the very fabricated constant `stream::meter` set `cpu_ns = 0` to stop
+        reporting. Measured here: a 16 M-row group-by on 15 cores, at a true 13.5 cores busy,
+        printed `cpu utilization: 7% of cores ... CPU idle — not CPU-limited`, confidently
+        backwards, while `usage.cores_busy` in the same document read 12.3.
+
+        `QueryUsage` has no such attribution problem, because the attribution problem *is*
+        the operator boundary: the OS reports process-wide totals and the delta across one
+        execution belongs to that execution whatever ran inside it.
         """
+        threads = max((o.threads for o in self.ops if o.threads > 0), default=0)
+        if self.usage.measured and threads > 0:
+            busy = self.usage.cores_busy
+            if busy > 0.0:
+                return min(1.0, busy / threads)
         measured = [o for o in self.ops if o.measured and o.cpu_util > 0.0 and o.elapsed_ms > 0.0]
         total = sum(o.elapsed_ms for o in measured)
         if total <= 0.0:
@@ -284,8 +437,16 @@ class QueryProfile:
         # fraction is I/O- or launch-bound whatever the operator kind (a cached scan is not
         # I/O-bound; a stalled join can be memory-bound). Fall back to the kind heuristic when
         # CPU time was not measured (a sub-millisecond op, or an older engine).
-        if b.cpu_util > 0:
-            kind = "I/O/launch-bound" if b.cpu_util < 0.5 else f"compute-bound ({b.kind})"
+        #
+        # `cpu_utilization_overall()` rather than `b.cpu_util`, for the reason spelled out
+        # there: on the streaming tier an operator that parallelizes internally reports a
+        # per-op ratio pinned at `1 / threads`, so reading it here labelled every hash
+        # aggregate, join and sort "I/O/launch-bound" — the diagnosis a reader is most likely
+        # to act on, and the opposite of the truth. The bottleneck *dominates* the run by
+        # construction (it is the longest operator), so the run-level figure describes it.
+        util = self.cpu_utilization_overall()
+        if util > 0:
+            kind = "I/O/launch-bound" if util < 0.5 else f"compute-bound ({b.kind})"
         else:
             kind = "I/O-bound (read dominates)" if b.kind == "scan" else f"compute-bound ({b.kind})"
         spill = f" — SPILLED {human_bytes(self.total_spill_bytes)} to disk" if self.spilled else ""
@@ -377,6 +538,7 @@ class QueryProfile:
             "total_spill_bytes": self.total_spill_bytes,
             "carbonite_summary": self.carbonite_summary,
             "machine": self.machine,
+            "usage": self.usage.to_dict(),
             "ops": [o.to_dict() for o in self.ops],
             "worker_ops": [o.to_dict() for o in self.worker_ops],
             "decisions": [d.to_dict() for d in self.decisions],

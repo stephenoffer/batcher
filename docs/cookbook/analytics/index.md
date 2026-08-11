@@ -10,7 +10,7 @@ Every recipe here runs on a small table you can read, so you can see the answer 
 it by eye. The same code runs on a billion rows.
 
 :::{tip}
-Most of these pages carry the main query twice, as a DataFrame chain and as `bt.sql(...)`.
+Most of these pages carry the main query twice, as a DataFrame chain and as {py:func}`bt.sql(...) <batcher.sql>`.
 They are two spellings of one logical plan rather than two implementations, so pick
 whichever reads better for the question you are asking.
 :::

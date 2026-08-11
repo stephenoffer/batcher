@@ -12,7 +12,13 @@ import json
 import pytest
 
 from batcher.plan.logical import Filter, Scan
-from batcher.plan.profile import OpProfile, QueryProfile, build_op_profiles, walk_ir
+from batcher.plan.profile import (
+    OpProfile,
+    QueryProfile,
+    QueryUsage,
+    build_op_profiles,
+    walk_ir,
+)
 from batcher.plan.schema import SchemaRef
 from batcher.plan.visitor import walk
 
@@ -242,3 +248,52 @@ def test_utilization_summary_grades_against_saturation_target():
     bare = QueryProfile(ops=(), total_ms=0.0, rows=0, measured=True)
     assert bare.utilization_summary() == ""
     assert "cpu_utilization" in hot.to_dict() and hot.to_dict()["cpu_utilization"] > 0.9
+
+
+def test_query_level_usage_overrides_the_streaming_tiers_1_over_threads_constant():
+    """The run-level `usage` decides utilization, not the per-operator ratio.
+
+    Regression for a diagnosis that was confidently backwards. On the streaming tier an
+    operator that parallelizes internally with rayon (every hash aggregate, join, sort) is
+    *one* unit of work, so `stream::meter` reports its busy time and its wall span as the
+    same quantity and `cpu_ns / (wall_span_ns x threads)` degenerates to exactly
+    `1 / threads`. Measured on a 16 M-row group-by holding 15 cores at a true 13.5 busy,
+    `explain(analyze=True)` printed `cpu utilization: 7% ... CPU idle — not CPU-limited`
+    while the `usage` block in the same document read `cores_busy: 12.34`.
+
+    The numbers below are that run.
+    """
+    op = OpProfile(
+        op_id=0,
+        kind="aggregate",
+        depth=0,
+        measured=True,
+        rows_in=16_000_000,
+        rows_out=6_919_358,
+        elapsed_ms=657.034041,
+        cpu_ms=657.034041,  # == elapsed: busy time, not getrusage CPU
+        cpu_util=1.0 / 15.0,  # the fabricated constant
+        threads=15,
+    )
+    usage = QueryUsage(wall_ms=657.237089, cpu_ms=8111.603)
+    p = QueryProfile(ops=(op,), total_ms=657.0, rows=6_919_358, measured=True, usage=usage)
+
+    assert usage.cores_busy == pytest.approx(12.34, abs=0.01)
+    assert p.cpu_utilization_overall() == pytest.approx(12.341973902206242 / 15)
+    summary = p.utilization_summary()
+    assert "cpu utilization: 82%" in summary
+    assert "CPU idle" not in summary
+    # The bottleneck line reads the same run-level figure, so it stops calling a
+    # 13-core-busy aggregate I/O-bound.
+    assert "compute-bound (aggregate)" in p.bottleneck_summary()
+
+
+def test_per_operator_utilization_still_answers_when_usage_is_unmeasured():
+    """An engine that reports no query-level usage keeps the wall-weighted per-op mean."""
+    ops = (
+        OpProfile(op_id=0, kind="filter", depth=0, measured=True, elapsed_ms=100.0, cpu_util=0.95),
+        OpProfile(op_id=1, kind="filter", depth=0, measured=True, elapsed_ms=1.0, cpu_util=0.1),
+    )
+    p = QueryProfile(ops=ops, total_ms=101.0, rows=1, measured=True)
+    assert not p.usage.measured
+    assert p.cpu_utilization_overall() == pytest.approx((0.95 * 100 + 0.1 * 1) / 101.0)

@@ -47,7 +47,27 @@ to make them stop the run.
 
 ## B. Wrong results
 
-Shrink, then bisect. Never debug a wrong answer at full scale.
+**First, if the symptom is "fewer rows than expected", ask whether the engine dropped them
+on purpose.** It is the one wrong answer that shrinking cannot reproduce, because the rows
+that vanish are the malformed ones and a shrunk input rarely contains any. Three tolerance
+flags delete rows by design, and all three report it:
+
+```python
+from batcher.observe import metrics
+metrics.start_metrics()
+ds.to_pydict()
+snap = metrics.metrics_snapshot()["skipped"]
+snap["total"]                     # whole inputs dropped by on_error="skip"
+snap["malformed_rows_total"]      # rows dropped by on_bad_lines= or max_errored_rows=
+snap["malformed_rows_by_source"]  # {"csv": 12, "map_batches": 3} — which one did it
+```
+
+A non-zero `total` also means the row count is short by an *unmeasured* amount: an
+unreadable file's row count is exactly what could not be read. `source.corrupt_files()`
+names the paths. Only once all three read zero is the answer wrong for a reason worth
+bisecting.
+
+Then shrink, then bisect. Never debug a wrong answer at full scale.
 
 1. **Shrink the input** until the wrong row still appears — target tens of rows, in a
    literal `bt.from_pydict({...})`. Deterministic and pasteable is the goal.
@@ -113,11 +133,24 @@ with config_context(Config().replace(memory=MemoryConfig(max_memory_bytes=2 << 3
   `"auto"`; `spill_bucket_max_bytes` is 128 MiB compressed.
 - `memory.unbounded_memory=True` opts *out* of spilling — a way to confirm spill itself
   is implicated, not a fix.
-- A hang under distributed is usually **credit starvation**: a consumer stopped draining,
-  so producers block at 0 credits and never abort. `flow_control.default_credits` is 16
-  batch slots, ceiling `default_credits x credit_ceiling_factor` (64), also clamped by
-  `credit_byte_budget` (256 MiB) / `execution.morsel_bytes`. Raising credits masks the
-  symptom; find the stalled consumer.
+- **A distributed hang: read the log before touching credits.** There are two hangs and they
+  look identical from outside. The first is *scheduling*: the tasks were never placed, because
+  they ask for more than any node has or because another job holds the cluster. The engine says
+  so after two minutes on the map and inference barrier, and immediately when a placement group
+  times out — `no node can host one task: this stage asks for 32 CPU per task and the widest of
+  8 node(s) is short on CPU (16 available, 32 needed)`, or `the cluster is short of free
+  capacity: 16 outstanding at 8 CPU each … 15 CPU free between them`. Neither is fixed by
+  anything on this page: the first needs a smaller grant, the second needs the co-tenant to
+  finish. `ray status` corroborates both. Check also whether the fleet came up narrower than it
+  asked for (`shuffle fleet came up narrower than requested`) and which cluster the process
+  actually attached to (`attached to Ray … nodes=1` on a job you meant to distribute is the
+  whole answer).
+- The second is **credit starvation**, and only then are the knobs below relevant: a consumer
+  stopped draining, so producers block at 0 credits and never abort.
+  `flow_control.default_credits` is 16 batch slots, ceiling
+  `default_credits x credit_ceiling_factor` (64), also clamped by `credit_byte_budget`
+  (256 MiB) / `execution.morsel_bytes`. Raising credits masks the symptom; find the stalled
+  consumer.
 - `BackpressureAbort` is the *good* outcome — it means the deadlock was detected.
 
 Turn on logging before guessing. There is **no `RUST_LOG` or `BATCHER_DEBUG`** in this

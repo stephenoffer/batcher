@@ -115,10 +115,11 @@ def test_production_window_bounds_producer_memory():
     # the production-window memory bound, independent of partition size.
     from batcher.config import Config, DistributedConfig, FlowControlConfig
     from batcher.dist.executors.partition_io import partition_descriptors
-    from batcher.dist.executors.plan_analysis import split_at_first_pool_boundary
+    from batcher.dist.executors.plan_analysis import split_into_resource_stages
     from batcher.dist.executors.ray_runtime import _ensure_ray
     from batcher.dist.flight_worker import new_plan_id
-    from batcher.dist.streaming.pipeline import _ProducerActor, _run_streamed
+    from batcher.dist.streaming.pipeline import run_streamed
+    from batcher.dist.streaming.producers import ProducerActor
     from batcher.io.source import InMemorySource
 
     credits = 2
@@ -129,17 +130,17 @@ def test_production_window_bounds_producer_memory():
     with config_context(cfg):
         ds = bt.from_pydict({"id": list(range(120)), "x": list(range(120))})
         plan = ds.ml.map_batches(_double).ml.map_batches(_AddOne)._plan
-        cpu_stage, gpu_stage = split_at_first_pool_boundary(plan)
+        cpu_stage, gpu_stage = split_into_resource_stages(plan)
         _ensure_ray(1)
         from batcher.dist.executors.map import _MapActor
 
         # Force many small morsels (one row each) so a 120-row partition is 120 morsels.
         src = InMemorySource([_one_row(i) for i in range(120)])
         partitions = partition_descriptors(src, 1)
-        producer = _ProducerActor.remote(cpu_stage.sub_plan, credits)
+        producer = ProducerActor.remote(cpu_stage.sub_plan, credits)
         consumer = _MapActor.remote(gpu_stage.sub_plan)
         try:
-            results = _run_streamed([producer], [consumer], partitions, new_plan_id(), credits)
+            results = run_streamed([[producer], [consumer]], partitions, new_plan_id(), credits)
             peak = ray.get(producer.peak_retained.remote())
         finally:
             ray.kill(producer)
@@ -200,7 +201,7 @@ class _DyingProducer:
 def _stage_setup(rows: int, credits: int):
     from batcher.config import Config, DistributedConfig, FlowControlConfig
     from batcher.dist.executors.partition_io import partition_descriptors
-    from batcher.dist.executors.plan_analysis import split_at_first_pool_boundary
+    from batcher.dist.executors.plan_analysis import split_into_resource_stages
     from batcher.dist.executors.ray_runtime import _ensure_ray
     from batcher.io.source import InMemorySource
 
@@ -212,7 +213,7 @@ def _stage_setup(rows: int, credits: int):
     ctx.__enter__()
     ds = bt.from_pydict({"id": list(range(rows)), "x": list(range(rows))})
     plan = ds.ml.map_batches(_double).ml.map_batches(_AddOne)._plan
-    cpu_stage, gpu_stage = split_at_first_pool_boundary(plan)
+    cpu_stage, gpu_stage = split_into_resource_stages(plan)
     _ensure_ray(1)
     src = InMemorySource([_one_row(i) for i in range(rows)])
     partitions = partition_descriptors(src, 1)
@@ -228,11 +229,12 @@ def test_streamed_recovers_from_consumer_preemption():
     # so every row still lands with the correct value.
     from batcher.dist.executors.map import _MapActor
     from batcher.dist.flight_worker import new_plan_id
-    from batcher.dist.streaming.pipeline import _ProducerActor, _run_streamed
+    from batcher.dist.streaming.pipeline import run_streamed
+    from batcher.dist.streaming.producers import ProducerActor
 
     rows, credits = 40, 2
     ctx, cpu_stage, gpu_stage, partitions = _stage_setup(rows, credits)
-    producer = _ProducerActor.remote(cpu_stage.sub_plan, credits)
+    producer = ProducerActor.remote(cpu_stage.sub_plan, credits)
     dying = _DyingConsumer.remote()
     alive = {producer, dying}
 
@@ -242,19 +244,17 @@ def test_streamed_recovers_from_consumer_preemption():
         return a
 
     def spawn_producer():
-        a = _ProducerActor.remote(cpu_stage.sub_plan, credits)
+        a = ProducerActor.remote(cpu_stage.sub_plan, credits)
         alive.add(a)
         return a
 
     try:
-        results = _run_streamed(
-            [producer],
-            [dying],
+        results = run_streamed(
+            [[producer], [dying]],
             partitions,
             new_plan_id(),
             credits,
-            spawn_producer=spawn_producer,
-            spawn_consumer=spawn_consumer,
+            spawn=[spawn_producer, spawn_consumer],
             alive=alive,
         )
         assert _collect_ys(results) == [i * 2 + 1 for i in range(rows)]
@@ -270,7 +270,8 @@ def test_streamed_recovers_from_producer_preemption():
     # spawned replacement and reproduces every morsel deterministically.
     from batcher.dist.executors.map import _MapActor
     from batcher.dist.flight_worker import new_plan_id
-    from batcher.dist.streaming.pipeline import _ProducerActor, _run_streamed
+    from batcher.dist.streaming.pipeline import run_streamed
+    from batcher.dist.streaming.producers import ProducerActor
 
     rows, credits = 40, 2
     ctx, cpu_stage, gpu_stage, partitions = _stage_setup(rows, credits)
@@ -284,19 +285,17 @@ def test_streamed_recovers_from_producer_preemption():
         return a
 
     def spawn_producer():
-        a = _ProducerActor.remote(cpu_stage.sub_plan, credits)
+        a = ProducerActor.remote(cpu_stage.sub_plan, credits)
         alive.add(a)
         return a
 
     try:
-        results = _run_streamed(
-            [dying],
-            [consumer],
+        results = run_streamed(
+            [[dying], [consumer]],
             partitions,
             new_plan_id(),
             credits,
-            spawn_producer=spawn_producer,
-            spawn_consumer=spawn_consumer,
+            spawn=[spawn_producer, spawn_consumer],
             alive=alive,
         )
         assert _collect_ys(results) == [i * 2 + 1 for i in range(rows)]
@@ -305,3 +304,128 @@ def test_streamed_recovers_from_producer_preemption():
             with contextlib.suppress(Exception):
                 ray.kill(actor)
         ctx.__exit__(None, None, None)
+
+
+class _Rerank:
+    """A second load-once model, so a chain has two pool stages rather than one.
+
+    Its own class, not a second instance of `_AddOne`: the split gives every pool-class stage
+    its own pool, and a chain of two models is the shape that used to put both in one actor —
+    where they shared a device and took turns instead of overlapping.
+    """
+
+    def __call__(self, batch):
+        d = batch.to_pydict()
+        d["r"] = [v * 10 for v in d["y"]]
+        return d
+
+
+def test_two_models_and_a_postprocess_run_as_four_stages():
+    """CPU → model → model → CPU: four pools, and the same rows as one machine computes.
+
+    The old single cut made this two stages — a CPU producer and one actor holding both
+    models *and* the postprocess. The result was already correct then; what it was not was
+    overlapped, and the sizing of the two models was one number.
+    """
+    from batcher.dist.executors.plan_analysis import split_into_resource_stages
+
+    out = bt.from_pydict({"id": list(range(160)), "x": list(range(160))})
+    out = out.ml.map_batches(_double).ml.map_batches(_AddOne)
+    out = out.ml.map_batches(_Rerank).ml.map_batches(_postprocess)
+    stages = split_into_resource_stages(out._plan)
+    assert [s.wants_pool for s in stages] == [False, True, True, False]
+
+    single = out.collect().sort_by("id").to_pydict()
+    with _streaming():
+        dist = out.collect(distributed=True, num_workers=3).sort_by("id").to_pydict()
+    assert single == dist
+    assert dist["r"] == [(i * 2 + 1) * 10 for i in range(160)]
+    assert dist["z"] == [i * 2 + 1 + 100 for i in range(160)]
+
+
+def test_a_relay_stage_recovers_from_preemption():
+    """A middle stage lost mid-morsel: its input is still held below, so it replays there.
+
+    This is the property the "hold a morsel until its subtree is done" rule buys. Without it
+    the relay's input would already have been released and the only repair left would be
+    re-reading the whole partition — and worse, a replay that produced *new* morsel paths
+    would leave the results it had already recorded behind as duplicates.
+    """
+    from batcher.dist.executors.map import _MapActor
+    from batcher.dist.flight_worker import new_plan_id
+    from batcher.dist.streaming.pipeline import run_streamed
+    from batcher.dist.streaming.producers import ProducerActor
+    from batcher.dist.streaming.relay import RelayActor
+
+    rows, credits = 40, 2
+    ctx, stages, partitions = _three_stage_setup(rows, credits)
+    cpu_stage, mid_stage, top_stage = stages
+    producer = ProducerActor.remote(cpu_stage.sub_plan, credits)
+    dying = _DyingRelay.remote()
+    consumer = _MapActor.remote(top_stage.sub_plan)
+    alive = {producer, dying, consumer}
+
+    def spawn_relay():
+        a = RelayActor.remote(mid_stage.sub_plan, credits, 0)
+        alive.add(a)
+        return a
+
+    try:
+        results = run_streamed(
+            [[producer], [dying], [consumer]],
+            partitions,
+            new_plan_id(),
+            credits,
+            spawn=[None, spawn_relay, None],
+            alive=alive,
+        )
+        got = sorted(
+            v for _k, out in results.items() if out for b in out for v in b.to_pydict()["r"]
+        )
+        assert got == [(i * 2 + 1) * 10 for i in range(rows)]
+    finally:
+        for actor in alive:
+            with contextlib.suppress(Exception):
+                ray.kill(actor)
+        ctx.__exit__(None, None, None)
+
+
+@ray.remote
+class _DyingRelay:
+    """A middle stage that always fails its fetch — a preempted relay node."""
+
+    def addr(self):
+        return "dead"
+
+    def consume(self, up_addr, up_ticket, plan_id, stage_id, morsel):
+        raise RuntimeError("simulated relay preemption")
+
+    def release(self, ticket):
+        return None
+
+    def node_host(self):
+        return "dead"
+
+    def gpu_stats(self):
+        return None
+
+
+def _three_stage_setup(rows: int, credits: int):
+    from batcher.config import Config, DistributedConfig, FlowControlConfig
+    from batcher.dist.executors.partition_io import partition_descriptors
+    from batcher.dist.executors.plan_analysis import split_into_resource_stages
+    from batcher.dist.executors.ray_runtime import _ensure_ray
+    from batcher.io.source import InMemorySource
+
+    cfg = Config().replace(
+        distributed=DistributedConfig(stream_inference=True),
+        flow_control=FlowControlConfig(default_credits=credits),
+    )
+    ctx = config_context(cfg)
+    ctx.__enter__()
+    ds = bt.from_pydict({"id": list(range(rows)), "x": list(range(rows))})
+    plan = ds.ml.map_batches(_double).ml.map_batches(_AddOne).ml.map_batches(_Rerank)._plan
+    stages = split_into_resource_stages(plan)
+    _ensure_ray(1)
+    src = InMemorySource([_one_row(i) for i in range(rows)])
+    return ctx, stages, partition_descriptors(src, 1)

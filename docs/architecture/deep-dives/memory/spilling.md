@@ -198,7 +198,7 @@ pyarrow, so spilling never fails on a missing optional codec.
 The tier is chosen lazily on the first batch, so an empty bucket opens no file.
 
 A missing spill file, such as on a spot node whose scratch disk was reclaimed, maps to a
-retryable `ResourceError`, so the distributed recovery loop recomputes the partition
+retryable {py:exc}`ResourceError <batcher.ResourceError>`, so the distributed recovery loop recomputes the partition
 instead of crashing.
 
 ## Observing it
@@ -227,8 +227,10 @@ once per merge pass, so a very large sort with a small fan-in pays multiple pass
 `sort_merge_fanin` reduces passes at the cost of more concurrent open files and more
 resident merge buffers.
 
-Recursion is bounded at depth 4 in Rust (`MAX_DEPTH`) and 3 on the distributed spill path
-(`dist/spill.py::_MAX_SPILL_RECURSION`).
+Recursion is bounded at depth 4 in Rust (`MAX_DEPTH`) and 3 on the out-of-core spill path
+(`dist/spill/buckets.py::GRACE_DEPTH`). That bound is one value for every breaker that
+grace-splits, so the aggregate, the join and the partitioned window all stop re-partitioning
+at the same depth.
 
 :::{warning}
 A key set so skewed that one group's state exceeds the budget on its own can't be partitioned
@@ -239,8 +241,8 @@ of 3.0. If you see that warning, the fix is upstream of the aggregate, not in th
 configuration.
 :::
 
-On the distributed spill path, `dist/spill.py::_fd_safe` caps the bucket count at 1024
-(`_FD_SAFE_PARTITIONS`) so a wide fan-out doesn't exhaust the process file-descriptor
+On the out-of-core spill path, `dist/spill/scratch.py::_fd_safe` caps the bucket count at
+1024 (`_FD_SAFE_PARTITIONS`) so a wide fan-out doesn't exhaust the process file-descriptor
 limit.
 
 ## See also

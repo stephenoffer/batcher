@@ -20,6 +20,7 @@ from batcher.plan.expr_ir.fn_names import (
     KEYED_STR_FNS,
     LIST_FNS,
     MAKE_TEMPORAL_FNS,
+    SPATIAL_FNS,
     STR_FNS,
     ListBinaryFn,
     ListSetFn,
@@ -126,6 +127,31 @@ class GeoFunc(IRNode):
 
     def __repr__(self) -> str:
         """Render as the call the user wrote: ``st_area(col('g'))``."""
+        return f"{self.fn}({', '.join(repr(a) for a in self.args)})"
+
+
+@expr_node
+class SpatialFunc(IRNode):
+    """A rigid-body function over an argument list. Built by `plan.functions.spatial`.
+
+    Shaped like `GeoFunc` and for the same reason: at the wire level the whole family
+    is a name and an ordered argument list, and the arities run from three to ten. The
+    engine checks the count against `bc_expr::SpatialFunc::arity`; the Python
+    constructors each build a fixed list, so a user cannot write a mismatch.
+
+    Every argument and every result is a plain number, so unlike a geometry this node
+    introduces no new physical type at all. A coordinate-frame transform is an ordinary
+    `Float64` projection, which is what lets it be pushed down, spilled and shuffled
+    like any other arithmetic.
+    """
+
+    tag = ExprTag.SPATIAL
+    vocab = SPATIAL_FNS
+    fn: str = scalar()
+    args: list[Expr] = children()
+
+    def __repr__(self) -> str:
+        """Render as the call the user wrote: ``quat_to_yaw(col('qx'), ...)``."""
         return f"{self.fn}({', '.join(repr(a) for a in self.args)})"
 
 

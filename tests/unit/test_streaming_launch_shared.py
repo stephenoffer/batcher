@@ -125,7 +125,17 @@ def test_launcher_and_iter_batches_produce_the_same_rows(build):
 
 
 def test_launcher_leaves_a_map_batches_pipeline_unpushed():
-    """A `map_batches` UDF is opaque to Kyber, so both paths read every column."""
+    """A `map_batches` UDF is opaque to Kyber, so both paths read every column.
+
+    Asserted as *which columns arrive, in which order*, not as "the projection argument is
+    `None`". The dispatch path now asks Kyber what the pipeline needs — which is how a UDF
+    that *does* declare `input_columns` stops decoding the columns it never reads — and for an
+    undeclared `fn` Kyber's answer is the source's whole schema in source order. That is the
+    same read; only the spelling of the argument changed. Pinning the spelling made a
+    behaviour-preserving change look like a regression, and it was also the weaker check:
+    `(None, None)` cannot see a projection that silently *reorders* the columns an opaque UDF
+    receives, which this can.
+    """
     ds = bt.from_arrow(pa.Table.from_batches(_batches())).map_batches(lambda b: b)
     run_batch, projection, predicate = _build_run_batch(ds._plan, list(ds._sources))
     assert projection is None
@@ -133,8 +143,13 @@ def test_launcher_leaves_a_map_batches_pipeline_unpushed():
     assert run_batch is not None
 
     dispatch_source = _SpySource(_batches())
+    every_column = list(dispatch_source.schema().names)
     list(_iter_streaming(ds._plan, [dispatch_source], None))
-    assert all(call == (None, None) for call in dispatch_source.calls)
+
+    assert dispatch_source.calls, "the dispatch path never read the source"
+    for read_projection, read_predicate in dispatch_source.calls:
+        assert read_projection is None or read_projection == every_column
+        assert read_predicate is None
 
 
 # --- (2) the two Distinct -> Aggregate derivations must agree -----------------------

@@ -130,11 +130,11 @@ def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
             return None
         # One buffered batch needs no copy; a run is compacted into a single 0-offset
         # batch so the engine sees one contiguous chunk, not a chain of tiny ones.
-        out = (
-            pending[0]
-            if len(pending) == 1
-            else pa.Table.from_batches(pending).combine_chunks().to_batches()[0]
-        )
+        # `concat_batches` rather than `combine_chunks().to_batches()[0]`: the latter
+        # splits at the 32-bit offset limit, so a flush holding more than 2 GiB of string
+        # or binary data — a spilled multimodal or embedding column — came back as several
+        # batches and taking the first silently dropped every row after it.
+        out = pending[0] if len(pending) == 1 else pa.concat_batches(pending)
         pending.clear()
         pending_bytes = 0
         return out

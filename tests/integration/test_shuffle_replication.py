@@ -144,10 +144,8 @@ def test_unreplicated_same_kill_does_recompute(monkeypatch):
 
 @pytest.mark.parametrize("killed", [{1}, {0, 2}])
 def test_replicated_tree_reduce_survives_worker_loss(killed):
-    # The wide-shuffle path: 4 workers over fan_in 2 builds a 2-level combiner tree.
-    # Replicas are only available at the LEAF level (an interior combiner's output lives
-    # on one node and is never copied), so this asserts the mixed case is still correct —
-    # some sources served from a replica, any interior loss still recomputed.
+    # The wide-shuffle path: 4 workers over fan_in 2 builds a 2-level combiner tree, whose
+    # leaves and interior levels both carry replicas now (see the test below).
     from batcher.dist.flight_aggregate import execute_aggregate_flight
 
     expected = _agg().collect()
@@ -171,6 +169,68 @@ def test_tree_reduce_without_replication_still_correct():
             [], ds._plan, ds._sources, workers=4, _fault_inject={1}
         )
     assert _norm(recovered) == _norm(expected)
+
+
+def test_the_combiner_tree_replicates_its_interior_levels(monkeypatch):
+    """A tree's interior partials get an off-node copy, like its leaves.
+
+    They did not, at any replication factor. An interior combiner's merged partial lived on
+    exactly one node, so losing that node threw away every level built so far and restarted
+    the tree from the leaves — the recompute leaf replication exists to avoid, reintroduced
+    one level up. `shuffle_replication=2` bought a wide shuffle strictly less than it bought
+    a narrow one, which is backwards: the wide shuffle is the one running on more nodes.
+
+    Scope, stated plainly: this pins that the copies are **placed and acked**, which is the
+    defect that existed (the interior was wired to nothing). It does not kill a worker
+    mid-tree — the fault hooks fire before and after the map barrier, not between combiner
+    levels — so "the interior replica *served* a loss" is asserted by construction from
+    `_combine_sources`' positional fallback, not end to end here.
+    """
+    import batcher.dist.flight_aggregate as agg_mod
+    from batcher.dist.flight_aggregate import execute_aggregate_flight
+
+    levels: list[tuple[int, int]] = []
+    real = agg_mod.replicate_interior_outputs
+
+    def _spy(actors, outputs, workers, dead, probe=None):
+        out = real(actors, outputs, workers, dead, probe)
+        levels.append((len(outputs), 0 if out is None else sum(len(f) for f in out)))
+        return out
+
+    monkeypatch.setattr(agg_mod, "replicate_interior_outputs", _spy)
+
+    expected = _agg().collect()
+    ds = _agg()
+    with _replicated_tree():
+        got = execute_aggregate_flight([], ds._plan, ds._sources, workers=4)
+
+    assert _norm(got) == _norm(expected)
+    assert levels, "fan_in 2 over 4 workers must build at least one interior level"
+    for published, copies in levels:
+        assert copies >= published, f"{published} interior partials but only {copies} copies"
+
+
+def test_the_interior_is_not_replicated_when_replication_is_off(monkeypatch):
+    # The control. Without it the test above would pass on a `replicate_interior_outputs`
+    # that ignored the config and copied unconditionally, which is a cost nobody asked for.
+    import batcher.dist.flight_aggregate as agg_mod
+    from batcher.dist.flight_aggregate import execute_aggregate_flight
+
+    levels: list[int] = []
+    real = agg_mod.replicate_interior_outputs
+
+    def _spy(actors, outputs, workers, dead, probe=None):
+        out = real(actors, outputs, workers, dead, probe)
+        levels.append(0 if out is None else sum(len(f) for f in out))
+        return out
+
+    monkeypatch.setattr(agg_mod, "replicate_interior_outputs", _spy)
+
+    ds = _agg()
+    with _replicated_tree(factor=1):
+        execute_aggregate_flight([], ds._plan, ds._sources, workers=4)
+
+    assert levels and all(c == 0 for c in levels)
 
 
 def test_factor_one_places_no_replicas():

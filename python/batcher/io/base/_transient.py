@@ -60,6 +60,28 @@ _TRANSIENT_MARKERS = (
     "503 server error",
     "504 server error",
     "429 client error",
+    # The same conditions as the phrases above, spelled the way the SDKs actually raise
+    # them: an object store reports a machine-readable *error code*, and those codes are
+    # CamelCase with no spaces (`InternalError`, `ServiceUnavailable`, `ServerBusy`),
+    # which no spaced phrase can match once the message is lowercased. Eight of the
+    # fifteen retryable failures the three major stores produce fell through this gap —
+    # and falling through does not merely skip a retry: `ErrorPolicy` then records the
+    # blip as a *corrupt file*, so under `on_error="skip"` a healthy object's rows were
+    # silently dropped, which is the exact outcome this module exists to prevent.
+    "internalerror",
+    "serviceunavailable",
+    "serverbusy",
+    "backenderror",
+    "ratelimitexceeded",
+    "requestlimitexceeded",
+    "operationtimedout",
+    "requesttimeout",
+    "toomanyrequests",
+    "temporaryfailure",
+    "connectionerror",
+    # Prose forms two backends use instead of a code.
+    "could not connect to the endpoint",
+    "try again",
 )
 
 # Message substrings that veto a retry even when a transient marker also matched. A

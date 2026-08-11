@@ -106,6 +106,29 @@ def _has_comment(text: str) -> bool:
     return "#" in text
 
 
+def _owner_of(tree: ast.Module) -> dict[int, str]:
+    """Map ``id(node)`` to the dotted name of the innermost function or class enclosing it.
+
+    This is what lets `SILENT_ALLOW` be keyed by symbol instead of by line. Innermost wins,
+    so a handler in a nested helper is keyed on the helper rather than on its parent — a
+    waiver stays as narrow as the site it was written for.
+    """
+    owner: dict[int, str] = {}
+
+    def walk(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}.{child.name}" if prefix else child.name
+                for sub in ast.walk(child):
+                    owner[id(sub)] = name
+                walk(child, name)
+            else:
+                walk(child, prefix)
+
+    walk(tree, "")
+    return owner
+
+
 def detect_swallowed(ctx: Context) -> Iterator[Finding]:
     """`except` handlers that hide a failure instead of handling it.
 
@@ -129,8 +152,10 @@ def detect_swallowed(ctx: Context) -> Iterator[Finding]:
       with the error you did, and turns it into a plausible wrong answer. A blast-radius
       warning rather than a silence one, so it is reported last and lowest.
     """
+    seen_keys: set[str] = set()
     for path, tree in ctx.modules.items():
         source = ctx.sources[path].split("\n")
+        owner = _owner_of(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
                 continue
@@ -138,7 +163,9 @@ def detect_swallowed(ctx: Context) -> Iterator[Finding]:
             for handler in node.handlers:
                 if not _handler_is_silent(handler):
                     continue
-                if f"{_rel(path)}:{handler.lineno}" in SILENT_ALLOW:
+                key = f"{_rel(path)}::{owner.get(id(handler), '<module>')}"
+                seen_keys.add(key)
+                if key in SILENT_ALLOW:
                     continue
                 broad = _is_broad(handler)
                 text = _handler_text(source, handler)
@@ -176,6 +203,24 @@ def detect_swallowed(ctx: Context) -> Iterator[Finding]:
                         "call that can actually fail, or catch the specific error",
                     )
 
+    # A waiver that matches nothing is worse than no waiver: the site it was written for
+    # comes back as an unexplained finding while the ledger still claims it is handled.
+    # Report it rather than skipping it, so drift costs one line of output instead of a
+    # re-investigation. This is the failure the line-numbered keys actually had.
+    for key in sorted(set(SILENT_ALLOW) - seen_keys):
+        rel, sep, symbol = key.partition("::")
+        # A key with no `::` is the retired line-numbered form, which is exactly the drift
+        # this reports; name the whole key rather than a symbol that parses out empty.
+        target = f"`{symbol}`" if sep and symbol else f"`{key}` (not a file::symbol key)"
+        yield Finding(
+            "stale-waiver",
+            "high",
+            rel,
+            0,
+            f"SILENT_ALLOW waives {target} but no silent handler there matches it — the "
+            "code moved or was fixed; re-key the entry or delete it",
+        )
+
 
 def _effective_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
     body = list(node.body)
@@ -184,8 +229,43 @@ def _effective_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.st
     return body
 
 
+def _overridden_hooks(ctx: Context) -> dict[str, set[str]]:
+    """Map each base-class name to the methods a subclass of it implements for real.
+
+    A base method with a trivial body that a subclass overloads is the template-method
+    pattern, not an unkept promise: `CountVectorizer._weights` returns None because plain
+    counts have no per-feature multiplier, and `TfidfVectorizer` returns the IDF vector.
+    Its sibling hooks were already excused for returning `-> str | None`, so flagging this
+    one turned on the annotation (`-> Any`) rather than on anything about the code.
+
+    Bases are matched by *name*, which is all that is available without resolving imports.
+    That can over-match two unrelated classes sharing a base name; the population it filters
+    is documented-single-trivial-statement methods, which is small enough that the trade is
+    worth the false negative it risks.
+    """
+    subclasses: dict[str, set[str]] = defaultdict(set)
+    for tree in ctx.modules.values():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            real = {
+                m.name
+                for m in node.body
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and len(_effective_body(m)) > 1
+            }
+            if not real:
+                continue
+            for base in node.bases:
+                name = getattr(base, "id", getattr(base, "attr", ""))
+                if name:
+                    subclasses[name] |= real
+    return subclasses
+
+
 def detect_stub(ctx: Context) -> Iterator[Finding]:
     """Documented functions whose body does nothing — a promise with no implementation."""
+    hooks = _overridden_hooks(ctx)
     for path, tree in ctx.modules.items():
         for parent in ast.walk(tree):
             if not isinstance(parent, ast.Module | ast.ClassDef):
@@ -199,6 +279,8 @@ def detect_stub(ctx: Context) -> Iterator[Finding]:
                     continue
                 if abstract or "abstractmethod" in _decorator_names(node):
                     continue
+                if isinstance(parent, ast.ClassDef) and node.name in hooks.get(parent.name, ()):
+                    continue  # a base hook a subclass implements for real
                 if not ast.get_docstring(node):
                     continue
                 body = _effective_body(node)

@@ -16,7 +16,7 @@ import contextlib
 import json
 from collections.abc import Iterator
 
-from batcher._internal.errors import MissingDependencyError
+from batcher._internal.optional import require
 from batcher.metadata.store import Key, decode_key, encode_key, require_uri
 
 __all__ = ["ObjectStorageBackend"]
@@ -52,12 +52,12 @@ class ObjectStorageBackend:
             MissingDependencyError: If `fsspec` is not installed.
         """
         uri = require_uri("object_storage", uri, example="s3://bucket/prefix")
-        try:
-            import fsspec
-        except ImportError as exc:  # pragma: no cover - exercised only without the extra
-            raise MissingDependencyError.of(
-                feature="The object_storage metadata backend", provides="fsspec", extra="cloud"
-            ) from exc
+        fsspec = require(
+            "fsspec",
+            feature="The object_storage metadata backend",
+            provides="fsspec",
+            extra="cloud",
+        )
 
         self._uri = uri
         self._fs, self._root = fsspec.core.url_to_fs(uri)

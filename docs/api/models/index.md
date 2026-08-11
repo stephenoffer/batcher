@@ -5,7 +5,7 @@ Everything that fits a model or scores one, from the `.ml` accessor down to the 
 | Page | Covers |
 |---|---|
 | {doc}`/api/models/ml` | The `.ml` accessor, plus the LLM, serving, loader, and vector surfaces |
-| {doc}`/api/models/preprocessors` | The fit/transform estimators and `Chain` |
+| {doc}`/api/models/preprocessors` | The fit/transform estimators and {py:class}`Chain <batcher.ml.preprocessors.Chain>` |
 | {doc}`/api/models/ml-models` | Tabular scoring, plus the in-engine estimators |
 | {doc}`/api/models/metrics` | Scoring and statistical aggregates |
 | {doc}`/api/models/ml-statistics` | Drift, fairness, resampling, and cross-validation |

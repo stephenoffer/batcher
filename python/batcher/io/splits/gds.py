@@ -164,11 +164,13 @@ def gds_eligible(path: str) -> GdsEligibility:
         is remote. An unrecognized filesystem is reported ineligible with reason
         `"filesystem"`, which is the conservative direction.
     """
+    from batcher.io.filesystem import local_path
+
     if _is_remote(path):
         return GdsEligibility(False, "remote")
     if not cufile_available():
         return GdsEligibility(False, "no_cufile")
-    local = path[7:] if path.lower().startswith("file://") else path
+    local = local_path(path)
     kind = filesystem_type(local)
     if not kind:
         return GdsEligibility(False, "missing")

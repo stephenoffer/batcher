@@ -158,11 +158,17 @@ def _column_to_numpy(column: pa.Array) -> np.ndarray:
     columns convert as before (zero-copy where possible)."""
     import pyarrow as pa
 
+    from batcher.io.formats.ml.ragged import is_ragged_tensor_column, ragged_to_numpy
     from batcher.io.formats.ml.tensor import is_tensor_column
 
     arr = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
     if is_tensor_column(arr):
         return arr.to_numpy_ndarray()  # (n, *shape), shape from the tensor type
+    if is_ragged_tensor_column(arr):
+        # Rows of differing shape have no stacked form, so this is an object array of real
+        # per-row `ndarray`s. Without it the caller received the raw `{data, shape}` dicts
+        # and had to reassemble the arrays the engine had just taken apart.
+        return ragged_to_numpy(arr)
     if pa.types.is_fixed_size_list(arr.type) and pa.types.is_primitive(arr.type.value_type):
         w = arr.type.list_size
         n = len(arr)
@@ -173,4 +179,54 @@ def _column_to_numpy(column: pa.Array) -> np.ndarray:
         child = arr.values.slice(arr.offset * w, n * w).to_numpy(zero_copy_only=False)
         if child.dtype.kind in "biufc":  # numeric child → (n, W); else fall through
             return child.reshape(n, w)
+    matrix = uniform_list_to_matrix(arr)
+    if matrix is not None:
+        return matrix
     return arr.to_numpy(zero_copy_only=False)
+
+
+def uniform_list_to_matrix(array: pa.Array) -> np.ndarray | None:
+    """An `(n, W)` array when every row of a numeric list column is `W` wide, else `None`.
+
+    The same feature matrix `FixedSizeList` carries, stored as a plain `List<T>` — which is
+    what `from_pydict`, a Parquet or JSON read, and `collect_list` all produce. Only the
+    fixed-size spelling was recognized, so an embedding column built any of those ordinary
+    ways became an object array of per-row lists: dropped from every torch batch, with no
+    error and no warning, so a training loop simply never saw its features.
+
+    A list column *can* hold a rectangle and usually does — an embedding is 384 or 1536 wide
+    on every row, it just carries a type that does not say so. The widths come off the
+    offsets, so proving rectangularity is one vectorized subtraction over `n + 1` integers
+    rather than a pass over the data.
+
+    A genuinely ragged column, or one with nulls, returns `None` and is handled exactly as
+    before. Nulls are excluded deliberately: a null row's span is empty, so nothing here
+    could place it in the matrix without sliding every later row up under the wrong label —
+    the misalignment the fixed-size path's offset slice exists to prevent.
+
+    Args:
+        array: The Arrow column to reshape.
+
+    Returns:
+        The `(n, W)` array, or `None` when the column is not a numeric uniform-width list.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    dtype = array.type
+    if not (pa.types.is_list(dtype) or pa.types.is_large_list(dtype)):
+        return None
+    if not pa.types.is_primitive(dtype.value_type) or array.null_count:
+        return None
+    offsets = np.asarray(array.offsets, dtype=np.int64)
+    if offsets.size < 2:
+        return None  # an empty column has no width to agree on
+    widths = np.diff(offsets)
+    width = int(widths[0])
+    if width <= 0 or not bool((widths == width).all()):
+        return None  # ragged: no rectangular form exists
+    rows = len(array)
+    child = array.values.slice(int(offsets[0]), rows * width).to_numpy(zero_copy_only=False)
+    if child.dtype.kind not in "biufc":
+        return None
+    return child.reshape(rows, width)
