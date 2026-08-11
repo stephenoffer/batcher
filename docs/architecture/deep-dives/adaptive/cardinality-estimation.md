@@ -74,7 +74,7 @@ cardinality came from a prior run.
 ## Cold start: Selinger
 
 With nothing measured, the estimator falls back to constants that have been the industry's
-answer since System R. They live in `CardinalityConfig`:
+answer since System R. They live in {py:class}`CardinalityConfig <batcher.config.config.CardinalityConfig>`:
 
 ```python
 # docs: skip
@@ -205,7 +205,7 @@ A distinct count is the one statistic that has to be tracked apart from the rest
 A Parquet footer gives exact min, max, and null counts but never a trustworthy distinct count,
 so the only NDV such a column can carry is an HLL estimate. When a `ColumnStat` carried a single
 provenance for the whole bundle, attaching that estimate to an otherwise `EXACT` column tagged
-the NDV `EXACT` too, which would let an approximate count answer a `count_distinct`.
+the NDV `EXACT` too, which would let an approximate count answer a {py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`.
 
 :::{important}
 `ColumnStat.ndv_provenance` carries the distinct count's *own* tag, separately from the bundle's

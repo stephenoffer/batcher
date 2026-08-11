@@ -172,17 +172,35 @@ sequence to compare against and replaying an *old insert* resurrects it. Feed ba
 sequence order; treat a full replay of a feed containing deletes as a rebuild, not a resume.
 Like `type1`, it is a copy-on-write overwrite — single-writer only.
 
-To *produce* a feed, read one. `bt.read.read_change_feed(uri, starting_version=0)` yields
-row-level changes as an **unbounded** source. The table needs
-`delta.enableChangeDataFeed = true`, which must be set when the table is created — the
-Batcher Delta sink takes no `configuration=` passthrough.
+To *produce* a feed, read one. The table needs `delta.enableChangeDataFeed = true`, set with
+`table_properties=` on any write — when the write creates the table, or as an alter on an
+existing one. CDF is not retroactive, so set it before the commits you want to read back.
 
 ```python
-ds = bt.read.read_change_feed(uri, starting_version=0)
-ds.is_streaming   # True
-ds.columns        # ['id', 'v', '_change_type', '_commit_version', '_commit_timestamp']
+ds.write.delta(uri, table_properties={"delta.enableChangeDataFeed": "true"})
+```
+
+**Name a bound and the feed is a bounded relation; name none and it is a stream.** The
+bounded form is what an incremental job wants, because an unbounded source cannot be
+collected, counted, or joined.
+
+```python
+# Bounded: a closed window you can merge into a target, and re-run identically after a crash.
+changes = bt.read.read_change_feed(uri, starting_version=last + 1, ending_version=latest)
+changes.is_streaming   # False
+changes.count()        # works
+# `starting_timestamp=` / `ending_timestamp=` bound by time instead; both take a datetime,
+# a date, 'YYYY-MM-DD', or 'YYYY-MM-DD HH:MM:SS' (naive values are the driver's local time).
+
+# Unbounded: no bound named, for a continuous query.
+stream = bt.read.read_change_feed(uri, starting_version=0)
+stream.is_streaming    # True
+stream.columns  # ['id', 'v', '_change_type', '_commit_version', '_commit_timestamp']
 # _change_type ∈ insert / update_preimage / update_postimage / delete
 ```
+
+Record the version you processed, read the next window from there, merge, then advance the
+watermark — bounding both ends is what makes the step re-runnable.
 
 `bt.read.delta(uri, stream=True, starting_version=n)` is the same source without the
 row-level change columns.
@@ -243,7 +261,11 @@ On a **transactional** table compaction is itself a transaction: old files are r
 *from the log* but left on storage, so every existing version still reads and time travel
 survives. `z_order=` narrows each file's min/max bounds, multiplying what the next query
 skips from the log alone. On a **plain directory** there is no log, so it is read →
-repartition → write → remove the replaced parts (single-writer only).
+repartition → write → remove the replaced parts (single-writer only). An existing Hive
+layout is carried forward — compaction changes file *sizes*, not how the table is
+organized — and `sort_by=[cols]` is the plain-directory answer to `z_order`. A partitioned
+directory in a format whose reader cannot recover partition columns from the layout
+(anything but Parquet) is refused rather than flattened.
 
 Compaction never deletes. `bt.vacuum` is the only thing that does, and it **defaults to a
 dry run** returning the list it *would* remove. The retention window is the safety

@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from sqlglot import expressions as exp
 
-from batcher._sql.parser.core_utils import _has_aggregate, _join_and, _split_and
+from batcher._sql.parser.core_utils import (
+    _factor_common_conjuncts,
+    _has_aggregate,
+    _join_and,
+    _split_and,
+)
 from batcher._sql.parser.subquery.correlation import (
     _correlation_pair,
     _is_plain_column,
@@ -27,6 +32,16 @@ from batcher.plan.expr_ir import col, lit
 #: keying the cleanup on the prefix rather than threading a list keeps it correct for a
 #: nested SELECT, whose own markers are cleared by its own pass.
 EXISTS_MARKER_PREFIX = "__exists_"
+
+#: The same, for the columns `_in_marker` adds: the probe value, the joined key and the
+#: match bit. Three names rather than one because an `IN` marker has to materialize the
+#: outer expression it probes with, which `EXISTS` does not.
+IN_MARKER_PREFIX = "__in_"
+
+#: Every synthesized column an under-OR subquery marker leaves on the relation. `clauses.py`
+#: drops these once the residual predicate reading them has been applied — one tuple so a
+#: new marker kind cannot be added without the cleanup following it.
+MARKER_PREFIXES = (EXISTS_MARKER_PREFIX, IN_MARKER_PREFIX)
 
 
 def _apply_subquery_predicates(tr, ds: Dataset, pred):
@@ -112,44 +127,75 @@ def _is_column_equality(pred) -> bool:
 
 
 def _will_markerize(pred) -> bool:
-    """Whether folding `pred` will build an existence marker (and so a LEFT JOIN on `ds`).
+    """Whether folding `pred` will build a subquery marker (and so a LEFT JOIN on `ds`).
 
-    True for a predicate that *contains* an `EXISTS` without *being* one — the shape
-    `_apply_single_predicate` sends to `_exists_marker`. A bare `EXISTS`/`NOT EXISTS` becomes
-    a semi/anti join instead and needs no reordering, which is why it is excluded here.
+    True for a predicate that *contains* an `EXISTS` or an `IN (SELECT …)` without *being*
+    one — the shape `_apply_single_predicate` sends to `_exists_marker` / `_in_marker`. A
+    bare one becomes a semi/anti join instead and needs no reordering, which is why it is
+    excluded here.
     """
-    if isinstance(pred, exp.Exists):
+    pred = _unparenthesize(pred)
+    bare = pred.this if isinstance(pred, exp.Not) else pred
+    bare = _unparenthesize(bare)
+    if isinstance(bare, exp.Exists) or _is_in_subquery(bare):
         return False
-    if isinstance(pred, exp.Not) and isinstance(pred.this, exp.Exists):
-        return False
-    return any(True for _ in pred.find_all(exp.Exists))
+    return any(True for _ in pred.find_all(exp.Exists)) or any(
+        _is_in_subquery(n) for n in pred.find_all(exp.In)
+    )
+
+
+def _unparenthesize(node):
+    """`node` with any purely-grouping parentheses peeled off.
+
+    Parentheses carry no meaning of their own, but every shape test below is an
+    `isinstance` on the node itself — so ``NOT (x IN (SELECT ...))`` arrived as
+    `Not(Paren(In(...)))`, matched nothing, and was refused as "an IN subquery combined
+    with OR or other predicates", while the identical ``NOT x IN (SELECT ...)`` and
+    ``x NOT IN (SELECT ...)`` both worked. Writing the parentheses is not a different query.
+    """
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
 
 
 def _apply_single_predicate(tr, ds: Dataset, pred):
     """Fold one WHERE leaf: an IN/EXISTS subquery becomes a join (no residual);
     anything else is returned unchanged as a residual for a normal ``filter``."""
+    pred = _unparenthesize(pred)
     # A bare IN-subquery / EXISTS predicate becomes a join (no residual).
     if _is_in_subquery(pred):
         return _apply_in_subquery(tr, ds, pred, negate=False), None
-    if isinstance(pred, exp.Not) and _is_in_subquery(pred.this):
-        return _apply_in_subquery(tr, ds, pred.this, negate=True), None
+    inner = _unparenthesize(pred.this) if isinstance(pred, exp.Not) else None
+    if inner is not None and _is_in_subquery(inner):
+        return _apply_in_subquery(tr, ds, inner, negate=True), None
     if isinstance(pred, exp.Exists):
         return _apply_exists(tr, ds, pred, negate=False), None
-    if isinstance(pred, exp.Not) and isinstance(pred.this, exp.Exists):
-        return _apply_exists(tr, ds, pred.this, negate=True), None
+    if inner is not None and isinstance(inner, exp.Exists):
+        return _apply_exists(tr, ds, inner, negate=True), None
 
     # An `EXISTS` buried under OR cannot become a join — the join would drop rows the OR
     # should keep — but it *can* become a boolean column and be evaluated in place. That is
     # Spark's ExistenceJoin; see `_exists_marker`. Done before the refusal below so the
     # shapes it handles stop being refusals.
-    if any(True for _ in pred.find_all(exp.Exists)):
+    #
+    # An `IN` subquery under OR goes the same way, through `_in_marker` — which carries the
+    # three-valued answer the earlier boolean-only attempt could not, and probes on a
+    # synthesized column so the inner relation cannot capture the outer name. Both of those
+    # were the recorded reasons `IN` was excluded here; see `_in_marker`.
+    if any(True for _ in pred.find_all(exp.Exists)) or any(
+        _is_in_subquery(n) for n in pred.find_all(exp.In)
+    ):
         rewritten = pred.copy()
         ok = True
-        for found in list(rewritten.find_all(exp.Exists)):
+        for found in list(rewritten.find_all(exp.Exists, exp.In)):
+            if isinstance(found, exp.In) and not _is_in_subquery(found):
+                continue  # `x IN (1, 2, 3)` is an ordinary predicate
             parent, negated = found.parent, False
             if isinstance(parent, exp.Not):
                 found, negated = parent, True
-            marked = _exists_marker(tr, ds, found.this if negated else found, negate=negated)
+            subject = found.this if negated else found
+            marker = _exists_marker if isinstance(subject, exp.Exists) else _in_marker
+            marked = marker(tr, ds, subject, negate=negated)
             if marked is None:
                 ok = False
                 break
@@ -378,6 +424,84 @@ def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
     return ds, (exp.Not(this=ast) if negate else ast)
 
 
+def _in_marker(tr, ds: Dataset, node, *, negate: bool):
+    """`x IN (SELECT c …)` as a boolean *column*, for a predicate that cannot become a join.
+
+    The `IN` counterpart to `_exists_marker`, and it has to answer the two objections that
+    kept it from existing. Both are recorded in `_apply_single_predicate`, and neither is
+    waved away here:
+
+    * **Three-valued logic.** ``x IN (…)`` is NULL — not FALSE — when `x` is NULL, or when
+      the set holds a NULL and nothing matches. A bare existence bit cannot carry that, so
+      this builds the full three-way answer instead: matched ⇒ TRUE, else NULL when either
+      null source applies, else FALSE. Whether the set holds a NULL is one extra probe of
+      the (uncorrelated) inner relation, decided before the marker is built.
+    * **Name capture.** The earlier attempt rewrote to ``EXISTS (SELECT 1 FROM S WHERE
+      c = x)`` and wrote `x` as the user spelled it; for the ordinary
+      ``category IN (SELECT category FROM vip)`` that unqualified name rebound to the
+      *inner* relation, the predicate became ``category = category``, and every row
+      matched. Here the outer value is materialized into a synthesized ``__in<n>_v``
+      column and the inner key aliased to ``__in<n>_k``, so neither side can capture the
+      other regardless of what the two relations call their columns.
+
+    Only the **uncorrelated** single-column form is handled; anything else returns None and
+    the caller reports the original refusal. TPC-DS q45 is the uncorrelated form.
+
+    Args:
+        tr: The translator, used to plan the inner SELECT.
+        ds: The outer relation the marker is attached to.
+        node: The `In` AST node.
+        negate: True for `NOT IN`.
+
+    Returns:
+        `(ds, ast)` — the relation carrying the marker and the AST to substitute for the
+        `IN` node — or None when the shape is not markerizable.
+    """
+    target = node.this
+    if isinstance(target, exp.Tuple):
+        return None  # a row-value IN has no single probe column
+    inner = _in_subquery_select(node).copy()  # detach from the outer AST scope
+    try:
+        _reject_correlated(inner)
+    except NotImplementedError:
+        return None
+
+    n = getattr(tr, "_in_marker_n", 0)
+    tr._in_marker_n = n + 1
+    probe = f"{IN_MARKER_PREFIX}{n}_v"
+    key = f"{IN_MARKER_PREFIX}{n}_k"
+    marker = f"{IN_MARKER_PREFIX}{n}_m"
+
+    inner_ds = tr.statement(inner)
+    if len(inner_ds.columns) != 1:
+        return None
+    inner_ds = inner_ds.rename({inner_ds.columns[0]: key})
+    # Does the set hold a NULL? It decides whether an unmatched row is FALSE or NULL, and
+    # for an uncorrelated set it is one answer for the whole query. `limit(1)` stops at the
+    # first one rather than scanning the relation.
+    set_has_null = inner_ds.filter(col(key).is_null()).limit(1).collect().num_rows > 0
+
+    values = inner_ds.filter(col(key).is_not_null()).distinct().with_columns(**{marker: lit(True)})
+    ds = ds.with_columns(**{probe: tr._scalar(target)})
+    ds = ds.join(values, left_on=[probe], right_on=[key], how="left")
+    if key in ds.columns:
+        ds = ds.drop(key)
+    # Matched ⇒ the tag survives; unmatched ⇒ the left join null-extends it. Collapsing that
+    # to a real boolean here keeps the substituted AST a plain column reference.
+    ds = ds.with_columns(**{marker: col(marker).is_not_null()})
+
+    # `NULLIF(TRUE, TRUE)` is a *boolean* NULL. A bare `NULL` would lower to an Int64 one
+    # and clash with the CASE's boolean branches.
+    null_bool = exp.Nullif(this=exp.true(), expression=exp.true())
+    case = exp.case().when(exp.column(marker), exp.true())
+    if set_has_null:
+        ast = case.else_(null_bool)
+    else:
+        probe_is_null = exp.Is(this=exp.column(probe), expression=exp.Null())
+        ast = case.when(probe_is_null, null_bool).else_(exp.false())
+    return ds, exp.Paren(this=exp.Not(this=ast) if negate else ast)
+
+
 def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     """EXISTS / NOT EXISTS, correlated or not.
 
@@ -456,7 +580,9 @@ def _decorrelate_scalar_subqueries(tr, ds: Dataset, roots, outer_node=None) -> D
             where = inner.args.get("where")
             corr, local_preds = [], []
             if where is not None:
-                for leaf in _split_and(where.this):
+                # A correlation repeated inside every arm of an `OR` is still a correlation;
+                # factoring it back out is what lets it be seen at all (TPC-DS q41).
+                for leaf in _split_and(_factor_common_conjuncts(where.this)):
                     pair = _correlation_pair(leaf, local, local_cols)
                     (corr if pair is not None else local_preds).append(pair or leaf)
             if not corr:

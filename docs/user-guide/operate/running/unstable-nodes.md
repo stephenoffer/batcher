@@ -46,7 +46,7 @@ expires into probation rather than into a permanent verdict, and a success is wh
 
 ## Check the fleet before you trust it
 
-`bt.accelerator_problems()` returns everything wrong with this node and its cluster as a list
+{py:func}`bt.accelerator_problems() <batcher.accelerator_problems>` returns everything wrong with this node and its cluster as a list
 of complete sentences, so a failing deployment check can be pasted into an alert without a
 lookup table.
 
@@ -63,7 +63,7 @@ can see and the repair each condemned device needs.
 
 An empty list is not the same as a healthy fleet. Inside a container without the host kernel
 log, and on a node without `pynvml`, nothing can be read and nothing is reported. Use
-`bt.accelerators()` when you need to tell "nothing is wrong" from "nothing could be checked".
+{py:func}`bt.accelerators() <batcher.accelerators>` when you need to tell "nothing is wrong" from "nothing could be checked".
 
 ## Set the collective timeout
 

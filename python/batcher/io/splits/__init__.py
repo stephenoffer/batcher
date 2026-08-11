@@ -10,8 +10,8 @@ reproduces today's whole-source read.
 Splits intentionally mirror the `Source` read surface (`schema`/`read`/
 `iter_batches`/`row_count`/`identity`) so a worker treats a split exactly like a
 source. The contract and the whole-source fallback live in `base`; the file-locator
-splits in `file`; the Parquet row-group split, its footer cache, and the shared
-dataset fragment index in `parquet`.
+splits in `file`; the line-delimited byte range in `text`; the Parquet row-group
+split, its footer cache, and the shared dataset fragment index in `parquet`.
 """
 
 from __future__ import annotations
@@ -21,7 +21,9 @@ from batcher.io.splits.file import (
     FileSplit,
     IpcFileSplit,
     LineRangeSplit,
+    MultiFileSplit,
     NormalizedFileSplit,
+    pack_files,
     read_aligned_range,
 )
 from batcher.io.splits.parquet import (
@@ -30,16 +32,21 @@ from batcher.io.splits.parquet import (
     pack_row_groups,
     parquet_row_group_splits,
 )
+from batcher.io.splits.text import TextRangeSplit, line_range_splits
 
 __all__ = [
     "FileSplit",
     "IpcFileSplit",
     "LineRangeSplit",
+    "MultiFileSplit",
     "NormalizedFileSplit",
     "RowGroupSplit",
     "Split",
+    "TextRangeSplit",
     "WholeSourceSplit",
     "fragment_index",
+    "line_range_splits",
+    "pack_files",
     "pack_row_groups",
     "parquet_row_group_splits",
     "read_aligned_range",

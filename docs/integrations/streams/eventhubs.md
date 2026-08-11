@@ -1,11 +1,11 @@
 # Event Hubs
 
-`bt.read.eventhubs(hub)` consumes an Azure Event Hub as an unbounded `Dataset` over the AMQP
+{py:meth}`bt.read.eventhubs(hub) <batcher.api.io_namespace.reader.Reader.eventhubs>` consumes an Azure Event Hub as an unbounded {py:class}`Dataset <batcher.Dataset>` over the AMQP
 client. Read only. Batcher has no Event Hubs sink.
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.eventhubs(hub)`, or `bt.read.kafka` against port 9093 |
+| **Read** | {py:meth}`bt.read.eventhubs(hub) <batcher.api.io_namespace.reader.Reader.eventhubs>`, or {py:meth}`bt.read.kafka <batcher.api.io_namespace.reader.Reader.kafka>` against port 9093 |
 | **Write** | Not supported |
 | **Extra** | `pip install 'batcher-engine[eventhubs]'` |
 | **Parallelism** | One split per partition, fixed at hub creation |
@@ -134,7 +134,7 @@ See {doc}`/user-guide/moving-data/streaming`.
 
 ## How it parallelizes
 
-A `Source` divides into `Split`s, and each split is a unit of read parallelism. The split here
+A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>`s, and each split is a unit of read parallelism. The split here
 is the partition: `splits()` calls `get_partition_ids()` and returns one split per partition,
 each rebuilt on its worker scoped to that one id.
 
@@ -157,7 +157,7 @@ Live with it one of three ways:
    checkpointed seek both work.
 1. Make the sink idempotent and let the replay wash out. A Delta sink with a stable
    `query_name` commits one transaction per micro-batch and recognizes a replayed batch, and
-   `drop_duplicates_within_watermark` handles the rest.
+   {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` handles the rest.
 1. Set `starting_position` on restart from a position you tracked yourself. Workable, but you
    are now doing the checkpoint's job by hand.
 
@@ -187,8 +187,8 @@ q.await_termination()
 The checkpoint directory is SQLite plus Arrow IPC on a real filesystem, not an `abfss://` URI.
 It buys you sink-side idempotency, not source-side resume, for the reason above.
 
-`collect()` raises `PlanError` on an unbounded source. Use `iter_batches()`, a triggered write,
-or `bt.Trigger.available_now()`.
+{py:meth}`collect() <batcher.Dataset.collect>` raises {py:exc}`PlanError <batcher.PlanError>` on an unbounded source. Use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a triggered write,
+or {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>`.
 
 ## Failure modes worth knowing
 

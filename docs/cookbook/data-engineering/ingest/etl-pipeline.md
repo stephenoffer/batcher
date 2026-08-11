@@ -2,7 +2,7 @@
 
 A complete extract-transform-load, small enough to read in one sitting: raw records
 in, deduplicated and rolled up, Parquet out. Every block runs as written. Swap
-`from_pydict` for `bt.read(...)` and the same code scales to files or object storage.
+{py:func}`from_pydict <batcher.from_pydict>` for {py:obj}`bt.read(...) <batcher.read>` and the same code scales to files or object storage.
 
 ## Extract
 
@@ -28,7 +28,7 @@ print(raw.count())
 ## Transform
 
 Deduplicate to one row per `id` (keeping the earliest by `ts`), normalize the key,
-and fill the missing region. Each step returns a new lazy `Dataset`; nothing runs
+and fill the missing region. Each step returns a new lazy {py:class}`Dataset <batcher.Dataset>`; nothing runs
 yet.
 
 ```python
@@ -72,7 +72,7 @@ print(back.count())
 Only the endpoints change when the data grows. Read with
 `bt.read("s3://bucket/raw/*.parquet")` and write with
 `rollup.write.parquet("s3://bucket/curated/", partition_by=["region"])`; add
-`collect(distributed=True)` to spread the work across a cluster. The transform in
+{py:meth}`collect(distributed=True) <batcher.Dataset.collect>` to spread the work across a cluster. The transform in
 between is untouched.
 
 ## See also

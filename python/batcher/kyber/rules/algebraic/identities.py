@@ -13,6 +13,8 @@ cost — so they carry no risk of changing results, only of removing redundant w
 
 from __future__ import annotations
 
+import dataclasses
+
 from batcher._internal.mathx import clamp
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
@@ -31,12 +33,14 @@ from batcher.plan.logical import (
     Limit,
     LogicalPlan,
     Project,
+    Sample,
     Sort,
     Union,
 )
 from batcher.plan.stats import Provenance
 
 __all__ = [
+    "collapse_full_key_distinct",
     "combine_limits",
     "constant_propagation",
     "eliminate_sort_before_aggregate",
@@ -69,22 +73,23 @@ def push_distinct_into_union(node: Distinct, ctx: OptimizerContext) -> LogicalPl
     new_inputs = []
     changed = False
     for branch in inner.inputs:
-        if not isinstance(branch, Distinct | Aggregate) and _dedup_shrinks(ctx, branch):
-            new_inputs.append(Distinct(branch))
+        early = Distinct(branch, node.keys, node.order)
+        if not isinstance(branch, Distinct | Aggregate) and _dedup_shrinks(ctx, branch, early):
+            new_inputs.append(early)
             changed = True
         else:
             new_inputs.append(branch)
     if not changed:
         return None
-    return Distinct(Union(tuple(new_inputs), distinct=False))
+    return Distinct(Union(tuple(new_inputs), distinct=False), node.keys, node.order)
 
 
-def _dedup_shrinks(ctx: OptimizerContext, branch: LogicalPlan) -> bool:
+def _dedup_shrinks(ctx: OptimizerContext, branch: LogicalPlan, deduped_branch: Distinct) -> bool:
     """Whether learned statistics show `branch` has enough duplicate rows that
     deduplicating it early is worthwhile (≥10% fewer rows) — so `push_distinct_into_union`
     only fires on real evidence, never a guess."""
     rows = ctx.estimator.estimate(branch).rows
-    deduped = ctx.estimator.estimate(Distinct(branch))
+    deduped = ctx.estimator.estimate(deduped_branch)
     return deduped.provenance == Provenance.LEARNED and deduped.rows <= rows * 0.9
 
 
@@ -126,27 +131,59 @@ _ORDER_INSENSITIVE_AGGS = frozenset(
 )
 
 
+def _sort_under_order_indifferent(input_: LogicalPlan) -> LogicalPlan | None:
+    """`input_` with a dead `Sort` removed, or None if there is no removable sort.
+
+    The aggregate above this is the only consumer, and its output order is unspecified, so
+    a sort anywhere below is dead — **provided** nothing between the two can see the order.
+    An intervening `Sample` cannot: a row is kept by a stable seeded hash of its *values*,
+    so the sampled multiset is identical whatever order the rows arrive in. That is the
+    argument the deleted `eliminate_sort_before_sample` made, and it is sound here (where
+    the order is genuinely unobservable) and unsound there (where it was the user's
+    output).
+
+    A `Sort` carrying a `limit` is a top-N and stays: it selects *which* rows survive, so
+    removing it changes the multiset the aggregate sees.
+
+    Args:
+        input_: The aggregate's input.
+
+    Returns:
+        The rewritten input, or None when nothing can be removed.
+    """
+    if isinstance(input_, Sort):
+        return None if input_.limit is not None else input_.input
+    if isinstance(input_, Sample):
+        rewritten = _sort_under_order_indifferent(input_.input)
+        return None if rewritten is None else dataclasses.replace(input_, input=rewritten)
+    return None
+
+
 @rule(name="eliminate_sort_before_aggregate", phase=Phase.NORMALIZE, matches=(Aggregate,))
 def eliminate_sort_before_aggregate(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`Aggregate(Sort(x))` → `Aggregate(x)` when every aggregate is order-independent.
 
-    A sort feeding directly into a group-by is wasted work — but only for aggregates whose
-    value cannot see the row order (`_ORDER_INSENSITIVE_AGGS`). `list_agg` collects in
-    arrival order, and `arg_min`/`arg_max`/`mode` break ties by it, so for those the sort
-    is load-bearing and must survive.
+    A sort feeding into a group-by is wasted work — but only for aggregates whose value
+    cannot see the row order (`_ORDER_INSENSITIVE_AGGS`). `list_agg` collects in arrival
+    order, and `arg_min`/`arg_max`/`mode` break ties by it, so for those the sort is
+    load-bearing and must survive.
+
+    The sort need not be *directly* beneath: an intervening `Sample` selects rows by a hash
+    of their values and so cannot observe the order either, and `Aggregate(Sample(Sort(x)))`
+    is the shape a sampled aggregation actually takes.
 
     Skipped when the sort carries a `limit` (a top-N changes *which* rows are aggregated),
     and when any aggregate carries a secondary `input2` order key.
     """
-    inner = node.input
-    if not isinstance(inner, Sort) or inner.limit is not None:
-        return None
     if any(
         spec.agg.func not in _ORDER_INSENSITIVE_AGGS or spec.agg.input2 is not None
         for spec in node.aggregates
     ):
         return None
-    return Aggregate(inner.input, node.group_keys, node.aggregates)
+    rewritten = _sort_under_order_indifferent(node.input)
+    if rewritten is None:
+        return None
+    return Aggregate(rewritten, node.group_keys, node.aggregates)
 
 
 @rule(name="constant_propagation", phase=Phase.NORMALIZE, matches=(Filter,))
@@ -256,17 +293,73 @@ def remove_redundant_distinct(node: Distinct, ctx: OptimizerContext) -> LogicalP
     - `Distinct(x)` where `x` provably has ≤ 1 row — a 0/1-row relation cannot hold
        a duplicate, so the dedup is pure overhead (e.g. `DISTINCT` over a scalar
        aggregate). Gated on an EXACT row count so an estimate can never wrongly drop it.
+    - `Distinct(x, keys=K)` where `K` is provably a **key** of `x` — unique and never
+       null — so no two rows share a `K` and the dedup removes nothing. This is the one
+       case that can delete the operator outright rather than merge it, and it is the
+       common shape of a defensive `distinct(["id"])` written over a table that already
+       has `id` as its primary key. Gated on `is_key`, which needs an exact distinct
+       count *and* an exact null count: a unique-but-nullable key still collapses its
+       null rows, and an estimated ndv could drop a dedup that was doing work.
+
+    Only the last case applies to a keyed dedup. The first three would be wrong for one:
+    the inner relation being duplicate-*free* says nothing about it being free of duplicate
+    **keys**, so `distinct(["k"])` over an aggregate grouped by `(k, other)` genuinely has
+    work to do. That is a wrong answer rather than a slower plan, and nothing about the
+    plan's shape reveals it.
     """
     inner = node.input
-    if isinstance(inner, (Distinct, Aggregate)):
-        return inner
-    if isinstance(inner, Union) and inner.distinct:
+    if not node.keys:
+        if isinstance(inner, (Distinct, Aggregate)):
+            return inner
+        if isinstance(inner, Union) and inner.distinct:
+            return inner
+    # An identical keyed dedup is still idempotent: same key, same ordering, same survivor.
+    if (
+        node.keys
+        and isinstance(inner, Distinct)
+        and inner.keys == node.keys
+        and inner.order == node.order
+    ):
         return inner
     if ctx is not None:
         stats = ctx.estimator.estimate(inner)
         if stats.rows <= 1 and stats.provenance.is_exact:
             return inner
+        if node.keys and _a_key_column_is_unique(stats, node.keys):
+            return inner
     return None
+
+
+def _a_key_column_is_unique(stats, keys: tuple[str, ...]) -> bool:
+    """Whether some column of `keys` is provably a key of the relation `stats` describes.
+
+    One suffices: if `k` alone is unique and never null then no two rows agree on `k`, so
+    they cannot agree on a *superset* of it either. Asking about one column at a time is also
+    the only question the statistics can answer exactly — a per-column ndv says nothing
+    exact about a composite's distinct count, which is why `combine_ndv` exists and damps.
+    """
+    from batcher.kyber.shortcuts.distinct import is_key
+    from batcher.kyber.shortcuts.facts import facts_from_relstats
+
+    facts = facts_from_relstats(stats)
+    return any(is_key(facts, k) for k in keys)
+
+
+@rule(name="collapse_full_key_distinct", phase=Phase.REWRITE, matches=(Distinct,))
+def collapse_full_key_distinct(node: Distinct, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Distinct(x, keys=every column)` → `Distinct(x)` — the whole-row form of itself.
+
+    When the key covers every column there is no payload, so nothing distinguishes the rows
+    that collapse and no ordering can pick between them: the two forms return the same
+    relation. The whole-row form is the cheaper one to execute. It reaches a presence-bitmap
+    pass over a dense integer column and a single-pass hash-partitioned dedup, and it emits
+    the group representatives the hash table already holds instead of gathering whole rows by
+    index. `unique()` with an explicit column list over a narrow frame is how this shape
+    arrives, and `select` pruning can create it too.
+    """
+    if not node.keys or set(node.keys) != set(node.input.available_columns()):
+        return None
+    return Distinct(node.input)
 
 
 @rule(

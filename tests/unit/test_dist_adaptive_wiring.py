@@ -41,14 +41,22 @@ def _record(kind: str, *, n_input: int = 0, t_ms: float = 0.0) -> None:
 # --- shuffle_partitions: learned fan-out through the default hub --------------------------
 
 
-def test_shuffle_partitions_cold_keeps_worker_fanout():
-    assert shuffle_partitions(8) == 8  # cold store — unchanged
+def test_shuffle_partitions_cold_is_one_bucket_per_worker():
+    # Cold store: no measured volume to raise the count, so every worker gets one bucket
+    # and no more — full reduce parallelism at the smallest stream count.
+    assert shuffle_partitions(8) == 8
 
 
-def test_shuffle_partitions_trims_for_a_small_learned_shuffle():
+def test_shuffle_partitions_does_not_trim_below_the_worker_count():
+    """A small measured volume no longer strands workers.
+
+    It used to trim to 1, which bounds each reducer's memory and also hands the entire
+    reduce to a single worker — the shape that made the reduce phase slower the more
+    workers were added.
+    """
     for _ in range(4):
         _record("aggregate", n_input=1_000)  # tiny measured shuffle volume
-    assert shuffle_partitions(64) == 1  # learned: one full bucket suffices
+    assert shuffle_partitions(64) == 64
 
 
 # --- speculation_policy: learned straggler factor ----------------------------------------

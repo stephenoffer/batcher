@@ -75,7 +75,7 @@ DIR_ALLOW: dict[str, str] = {
         "ml/tabular already are — this entry is debt, not a design"
     ),
     "python/batcher/kyber": (
-        "OVER BUDGET AND TRACKED: 18 modules against a cap of 12. The learned-adaptive family "
+        "OVER BUDGET AND TRACKED: 21 modules against a cap of 12. The learned-adaptive family "
         "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
         "to lift out; this entry is debt, not a design"
     ),
@@ -101,7 +101,13 @@ CRATE_SRC_GLOB = "crates/*/src"
 # (thin builders + .str/.dt/... accessors), so the public-method *warning* is muted
 # for them. They are still bound by the hard file-size limit.
 FLUENT_BUILDERS = {"Expr", "Dataset", "GroupBy", "CaseBuilder", "Reader", "Writer"}
-_ACCESSOR_RE = re.compile(r"Namespace$")
+# Two naming conventions, one pattern. The expression accessors are `_StrNamespace` /
+# `_DtNamespace`; the Dataset accessors are `DatasetML` / `DatasetDQ` / `DatasetSCD` /
+# `DatasetMeta`, every one of them bound as a property on `Dataset` (`ds.ml`, `ds.dq`).
+# Matching only the first spelling told `DatasetML` to "push breadth to namespace
+# accessors" when it *is* the namespace accessor breadth was already pushed to — advice
+# with nowhere to go. `Dataset` itself is covered by FLUENT_BUILDERS above.
+_ACCESSOR_RE = re.compile(r"Namespace$|^Dataset")
 
 # Justified, visible exemptions from the hard file-size check only: path -> reason.
 # Add an entry only with a one-line reason, and only when an invariant genuinely
@@ -127,6 +133,7 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # tags stay in the crate's lib.rs, so the wire contract lives in exactly one place.
     # The evaluation bodies are already extracted to `eval/`.
     "crates/bc-expr/src/lib.rs": "the one Expr enum + serde wire tags; a seam rust-engine.md forbids cutting",
+    "crates/bc-ir/src/lib.rs": "the one RelOp enum + serde tags; the same seam as bc-expr",
     # Dataset is the canonical wide fluent builder (rust-engine/maintainability rules
     # name it as legitimately wide); its heavy method bodies are already extracted to
     # dataset/_build.py, leaving thin methods + docstrings that shouldn't be cut.
@@ -272,7 +279,7 @@ STRUCTURE_ALLOW: dict[str, str] = {
     # paths over one shared partition+order scaffold. Like the executor hubs, splitting the
     # arms scatters the frame/partition logic that must agree across paths; the runtime
     # state already lives in sibling `window_frame`/`window_partition_agg` files.
-    "crates/bc-runtime/src/window.rs": "window per-function dispatch; frame/partition scaffold shared across paths",
+    "crates/bc-runtime/src/window/mod.rs": "window per-function dispatch; frame/partition scaffold shared across paths",
     # The canonical shuffle/partition primitive: hash + range partitioning, the parallel
     # counting-sort scatter, and the null/NaN/−0.0 routing that EVERY hash path derives key
     # identity from. It is the one place co-partitioning is defined; splitting it risks two
@@ -407,10 +414,17 @@ def check_python_file(path: Path) -> None:
         except SyntaxError as e:
             fail(f"{rel}: syntax error: {e}")
             return
+        # A module-level `__getattr__`/`__dir__` is a PEP 562 hook: Python only consults it
+        # on the module whose attribute access it intercepts, so "move it to a module" is
+        # not a thing that can be done. Both uses here are the thin dispatch the rule wants
+        # anyway — `batcher/__init__` turns a failed `bt.<name>` into migration guidance,
+        # and `dist/global_window/__init__` defers a submodule import that would otherwise
+        # put a 0.44 s `import ray` on every local `collect()`.
         logic = [
             d.name
             for d in tree.body
             if isinstance(d, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+            and d.name not in ("__getattr__", "__dir__")
         ]
         if logic:
             warn(f"{rel}: __init__.py defines {logic} — prefer re-exports, move logic to a module")
@@ -530,8 +544,25 @@ def stale_allowlist_entries() -> list[str]:
         if path.suffix == ".rs":
             if rust_code_lines(path.read_text()) <= RUST_HARD:
                 stale.append(f"{rel}: now within the {RUST_HARD}-line Rust limit")
-        elif len(path.read_text().splitlines()) <= PY_HARD:
-            stale.append(f"{rel}: now within the {PY_HARD}-line Python limit")
+            continue
+
+        try:
+            n = python_code_lines(path.read_text())
+        except SyntaxError:
+            continue  # mid-edit by another session; not judgeable this run
+
+        # Judge the entry against the limit it actually exempts. An `__init__.py` is
+        # allowlisted against the re-export ceiling, never the module ceiling, so testing
+        # it against PY_HARD called every one of them stale the moment it dropped under
+        # 500 — which a 120-line ceiling guarantees it already is. That reported seven
+        # live exemptions as deletable, and deleting them would have failed the gate
+        # seven times over. Counting raw lines rather than code lines was the second half
+        # of the same bug: `check_python_file` excludes docstrings and this did not.
+        limit, label = (
+            (INIT_MAX, "__init__.py") if path.name == "__init__.py" else (PY_HARD, "Python")
+        )
+        if n <= limit:
+            stale.append(f"{rel}: now within the {limit}-line {label} limit")
 
     for rel, _reason in DIR_ALLOW.items():
         path = Path(rel)

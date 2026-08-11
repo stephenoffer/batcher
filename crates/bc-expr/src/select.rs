@@ -58,7 +58,7 @@ use arrow::compute::kernels::boolean;
 use arrow::compute::take;
 use arrow::datatypes::{Field, Schema};
 
-use crate::eval::binary::as_bool;
+use crate::eval::coerce::as_bool;
 use crate::{Expr, ExprError};
 
 /// Cost (in [`Expr::eval_cost`] units) at or below which a conjunct counts as cheap.

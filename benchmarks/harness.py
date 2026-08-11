@@ -13,7 +13,12 @@ over Arrow, because a row-wise one costs more than the queries it is gating.
 
 from __future__ import annotations
 
+import json
 import math
+import re
+import signal
+import subprocess
+import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -26,12 +31,15 @@ import pyarrow.compute as pc
 __all__ = [
     "FLOAT_ATOL",
     "FLOAT_RTOL",
+    "RESULT_PREFIX",
     "CompareResult",
     "EngineResult",
     "bench",
     "compare",
+    "emit_result",
     "print_table",
     "results_match",
+    "run_isolated",
 ]
 
 
@@ -77,23 +85,56 @@ def _widen(a: str, b: str) -> str:
     return _STR
 
 
+# A derived column with no alias has no name in the query, so each engine invents one, and
+# they disagree in ways that are pure spelling: DuckDB qualifies a built-in with its catalog
+# and quotes it (``main."substring"(s_city, 1, 30)`` against ``substring(s_city, 1, 30)``) and
+# parenthesizes sub-expressions it did not have to (``round((a / b), 2)`` against
+# ``round(a / b, 2)``, ``((cast(a) / cast(b)) * 100)`` against ``cast(a) / cast(b) * 100``).
+#
+# `column_classes` already lowercased names for exactly this reason — the engines disagree on
+# a generated name's *case* — but that covered only one of the three ways they disagree, so
+# TPC-DS q2, q61, q79 and q85 were each reported as a correctness FAILURE over data that
+# matched. Squeezing out the catalog prefix, the quotes, the whitespace and the parentheses
+# leaves the one thing both engines do agree on, and a genuinely different column set still
+# fails: two columns that squeeze to one name are two spellings of the same expression, and
+# if they were not, the values would then disagree and the row would fail anyway.
+_CATALOG_PREFIX = re.compile(r"\bmain\.")
+_DROPPED_PUNCTUATION = str.maketrans("", "", ' "()')
+
+
+def canonical_column_name(name: str) -> str:
+    """The name a column is compared under, with each engine's spelling squeezed out."""
+    return _CATALOG_PREFIX.sub("", name.lower()).translate(_DROPPED_PUNCTUATION)
+
+
+def canonical_names(table: pa.Table) -> list[str]:
+    """`table`'s column names canonicalized, or merely lowercased if that would collide.
+
+    Two columns of one result squeezing to the same name would silently drop one of them from
+    the comparison, which is the one outcome worse than the false failure this fixes. The
+    lowercased fallback is exactly the behaviour that preceded canonicalization.
+    """
+    canonical = [canonical_column_name(n) for n in table.column_names]
+    if len(set(canonical)) != len(canonical):
+        return [n.lower() for n in table.column_names]
+    return canonical
+
+
 def column_classes(tables: list[pa.Table]) -> dict[str, str]:
     """The comparison class of every column, reconciled across all engines' outputs.
 
-    Columns are keyed by lowercased name: SQL identifiers are case-insensitive and the
-    engines disagree on the case of a *derived* column's generated name (DuckDB folds
-    ``avg(UserID)`` to ``avg(userid)``), which is not a difference in the data.
+    Columns are keyed by `canonical_column_name`: SQL identifiers are case-insensitive, and
+    for a *derived* column the engines invent different names for the same expression.
 
     Args:
         tables: Every engine's result for one query.
 
     Returns:
-        Lowercased column name mapped to its comparison class.
+        Canonical column name mapped to its comparison class.
     """
     classes: dict[str, str] = {}
     for table in tables:
-        for name, col_field in zip(table.column_names, table.schema, strict=True):
-            key = name.lower()
+        for key, col_field in zip(canonical_names(table), table.schema, strict=True):
             cls = _class_of(col_field.type)
             classes[key] = _widen(classes[key], cls) if key in classes else cls
     return classes
@@ -137,8 +178,8 @@ def to_rowset(table: pa.Table, classes: dict[str, str]) -> RowSet:
     Returns:
         The canonicalized, sorted rowset.
     """
-    names = sorted(table.column_names, key=str.lower)
-    canon = pa.table({n.lower(): _canon_column(table.column(n), classes[n.lower()]) for n in names})
+    keyed = sorted(zip(canonical_names(table), table.column_names, strict=True))
+    canon = pa.table({key: _canon_column(table.column(n), classes[key]) for key, n in keyed})
     if canon.num_rows > 1 and canon.num_columns:
         keys = [(n, "ascending") for n in canon.column_names]
         canon = canon.sort_by(keys)
@@ -220,8 +261,8 @@ def results_match(reference: pa.Table, other: pa.Table) -> tuple[bool, str]:
     Returns:
         ``(True, "ok")`` when the two are equal as row multisets, else ``(False, why)``.
     """
-    ref_names = sorted(n.lower() for n in reference.column_names)
-    oth_names = sorted(n.lower() for n in other.column_names)
+    ref_names = sorted(canonical_names(reference))
+    oth_names = sorted(canonical_names(other))
     if ref_names != oth_names:
         return False, (
             f"column mismatch: {sorted(reference.column_names)} vs {sorted(other.column_names)}"
@@ -321,7 +362,7 @@ def compare(
     # (not once per comparison) and every engine is held to the same comparison class.
     if outputs:
         ref_engine = _reference_engine(outputs)
-        names = {engine: sorted(n.lower() for n in t.column_names) for engine, t in outputs.items()}
+        names = {engine: sorted(canonical_names(t)) for engine, t in outputs.items()}
         classes = column_classes(
             [t for engine, t in outputs.items() if names[engine] == names[ref_engine]]
         )
@@ -433,3 +474,128 @@ def print_table(results: list[CompareResult], engines: list[str]) -> None:
         print()
         for r in notes:
             print(f"[{r.status}] {r.name}: {r.note}")
+
+
+# --------------------------------------------------------------------------- #
+# Per-case process isolation, so a query that kills the process costs one row
+# --------------------------------------------------------------------------- #
+#
+# ``compare()`` catches an exception per engine, so a query that *raises* is already one
+# ``ERROR`` row in a table that still reports every other query. Nothing catches a signal.
+# A query the OOM killer takes, or one that aborts inside a native kernel, ends the whole
+# runner — and with it every result after it, including the ones already computed.
+#
+# That is not a hypothetical failure mode here. On the Join Order Benchmark a per-query
+# survey found 24 of the first 85 queries dying by ``SIGKILL`` rather than raising, spread
+# through the suite rather than clustered, so no ``--skip`` list makes a full run reachable
+# and the suite reports nothing instead of the three quarters that work.
+#
+# `run_isolated` runs each case in its own subprocess. The child does exactly what the
+# in-process loop would do for that one case and prints its ``CompareResult`` as JSON; the
+# parent reads it back. A child that dies without printing one becomes a ``KILLED`` row
+# carrying the signal that killed it, which is the same shape ``ERROR`` already has and
+# reports the same fact the survey had to reconstruct by hand.
+#
+# Two properties are deliberate:
+#
+# **Isolation is per case, not per engine.** The comparison is the unit of meaning — a
+# timing without the oracle's answer beside it is not a result — so a child runs the whole
+# lineup for one query.
+#
+# **There is no timeout.** A wall clock cannot distinguish a hang from a query that is
+# merely slow, and this suite has both: TPC-DS q72 legitimately takes ~30 s single-node and
+# scale-factor runs take minutes. Marking a slow-but-correct query as failed would be a
+# worse error than the one this module fixes, so a hang still needs ``--skip`` or a human.
+
+#: Marks the one stdout line a child uses to hand its result back. A prefix rather than
+#: "parse the last line" because the engines print freely and a native library may write
+#: to the same stream after the result is known.
+RESULT_PREFIX = "__BENCH_RESULT__ "
+
+
+def emit_result(result: CompareResult) -> None:
+    """Print `result` on the wire the parent reads. Called in the child."""
+    payload = {
+        "name": result.name,
+        "status": result.status,
+        "note": result.note,
+        "engines": {
+            name: {"ms": er.ms, "error": er.error, "correct": er.correct}
+            for name, er in result.engines.items()
+        },
+    }
+    print(RESULT_PREFIX + json.dumps(payload), flush=True)
+
+
+def _parse_result(line: str) -> CompareResult:
+    """Rebuild a `CompareResult` from the child's wire line."""
+    payload = json.loads(line[len(RESULT_PREFIX) :])
+    result = CompareResult(
+        name=payload["name"], status=payload["status"], note=payload.get("note", "")
+    )
+    for name, er in payload.get("engines", {}).items():
+        result.engines[name] = EngineResult(
+            ms=er.get("ms"), error=er.get("error"), correct=er.get("correct")
+        )
+    return result
+
+
+def _child_argv(case: str) -> list[str]:
+    """This process's command line, aimed at exactly one case.
+
+    Rebuilt from ``sys.argv`` rather than from the parsed namespace so every flag the
+    parent was given — engines, scale, source, memory cap, spill dir — reaches the child
+    without this module having to know the CLI. Only ``--isolate`` is dropped, or the
+    child would recurse.
+    """
+    argv = [a for a in sys.argv[1:] if a != "--isolate"]
+    return [sys.executable, sys.argv[0], *argv, "--isolate-case", case]
+
+
+def _death(returncode: int) -> str:
+    """Describe how a child that printed no result died."""
+    if returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:  # pragma: no cover - an unknown signal number
+            name = f"signal {-returncode}"
+        return f"killed by {name}"
+    return f"exited {returncode} without a result"
+
+
+def run_isolated(case_names: list[str]) -> list[CompareResult]:
+    """Run each named case in its own subprocess and collect the results.
+
+    A child that dies without printing a result yields a ``KILLED`` row rather than
+    ending the run. The child's own output is forwarded on failure only, because that
+    is where the traceback or the allocator's last words are, and forwarding it always
+    would bury the table.
+
+    Args:
+        case_names: Case names to run, in report order. The caller has already applied
+            ``--family`` / ``--only`` / ``--skip``, so every name here is meant to run.
+
+    Returns:
+        One result per name, in the same order.
+    """
+    results: list[CompareResult] = []
+    for i, case in enumerate(case_names, start=1):
+        print(f"[{i}/{len(case_names)}] {case} ...", flush=True)
+        proc = subprocess.run(
+            _child_argv(case),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(RESULT_PREFIX)), None)
+        if line is None:
+            note = _death(proc.returncode)
+            print(f"    {note}", flush=True)
+            tail = (proc.stdout + proc.stderr).strip().splitlines()[-12:]
+            for entry in tail:
+                print(f"    | {entry}", flush=True)
+            results.append(CompareResult(name=case, status="KILLED", note=note))
+            continue
+        results.append(_parse_result(line))
+    print()
+    return results

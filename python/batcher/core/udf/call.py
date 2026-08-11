@@ -17,7 +17,38 @@ from typing import Any
 
 import pyarrow as pa
 
-__all__: list[str] = []
+__all__: list[str] = ["shared_error_budget"]
+
+# The `max_errored_rows` allowances, one shared list per (`fn` identity, allowance) per
+# worker process — see `shared_error_budget`. It lives here, at the per-batch boundary every
+# path funnels through, because two of those paths need it and cannot see each other:
+# `strategy` (threads, on the driver) and `processes._child_call` (inside a pool worker).
+_ERROR_BUDGETS: dict[tuple[str, int], list[int]] = {}
+_BUDGET_LOCK = threading.Lock()
+
+
+def shared_error_budget(key: str, allowance: int) -> list[int]:
+    """The ``[remaining, dropped]`` budget shared by every call to `key`'s UDF in this process.
+
+    The public contract says `max_errored_rows` is "per worker". The code did not mean that:
+    a fresh ``[allowance]`` was built per invocation, so each partition, each streaming
+    window, and each execution path a single query routes through got its OWN full allowance
+    — the real bound grew with parallelism, which is the reverse of what a budget is for.
+    One list per (`fn`, allowance) pair per process makes the code mean the documented thing.
+
+    It is deliberately NOT global across workers: a cluster-wide counter would need a round
+    trip per dropped row on the hot path. So the honest cluster bound is
+    ``workers x max_errored_rows``, and that is what the public docstring says.
+
+    Args:
+        key: A stable identity for the UDF, shared by every path that runs it.
+        allowance: The stage's `max_errored_rows`.
+
+    Returns:
+        The mutable budget list `_resilient_call` draws down.
+    """
+    with _BUDGET_LOCK:
+        return _ERROR_BUDGETS.setdefault((key, allowance), [allowance])
 
 
 def _resilient_call(
@@ -42,42 +73,61 @@ def _resilient_call(
     one-element list unchanged. Each drop also publishes to the observability bus with the
     running count and the error text, so a running job reports the loss as it happens rather
     than at the end."""
-    from batcher.ml.inference import _empty_cuda_cache, _is_cuda_oom
-
     try:
         return _coerce_udf_result(call(sub))
     except Exception as exc:
+        # Imported here, not at the top of the function: this is the only branch that needs
+        # it, and on a clean batch the lookup — and the ML/torch import behind it — is work
+        # every single call was paying for an error path it never took.
+        from batcher.ml.inference import _empty_cuda_cache, _is_cuda_oom
+
         oom = is_gpu and _is_cuda_oom(exc)
         if oom:
             _empty_cuda_cache()
         if sub.num_rows <= 1:
-            if oom or budget[0] <= 0:
+            if oom or not _claim_dropped_row(budget, exc):
                 raise  # genuine single-row over-allocation, or the error budget is spent
-            budget[0] -= 1
-            _record_dropped_row(budget, exc)
             return []  # drop the one corrupt row and carry on
         mid = sub.num_rows // 2
         left = _resilient_call(call, sub.slice(0, mid), budget, is_gpu)
         return left + _resilient_call(call, sub.slice(mid), budget, is_gpu)
 
 
-#: Guards the drop counter. `_resilient_call` runs under a `ThreadPoolExecutor` on the
-#: `execute` path, so several threads can drop a row at the same instant; without this
-#: the read-modify-write would lose counts and the lazy append could run twice. Taken
-#: only on the (rare) drop path, so the clean path stays lock-free.
+#: Guards the whole allowance. `_resilient_call` runs under a `ThreadPoolExecutor` on the
+#: `execute` path, so several threads can drop a row at the same instant; without this the
+#: read-modify-write would lose counts and the lazy append could run twice. Taken only on the
+#: (rare) drop path, so the clean path stays lock-free.
 _DROP_LOCK = threading.Lock()
 
 
-def _record_dropped_row(budget: list[int], exc: Exception) -> None:
-    """Count a dropped row into `budget[1]` and announce it on the event bus.
+def _claim_dropped_row(budget: list[int], exc: Exception) -> bool:
+    """Take one row off the shared allowance, reporting whether it was still there.
 
-    Only the exception's type and message are reported, never the row's values: the row
-    that failed is frequently the one carrying malformed or sensitive data, and an
-    observability sink is not an appropriate place to leak it.
+    The **check and the decrement are one atomic step**, which is the whole point. They used
+    to straddle the lock — `budget[0] <= 0` was read, and `budget[0] -= 1` applied, with only
+    the *counter* update inside it. Two threads reaching the last allowance both saw it, both
+    took it, and the stage dropped more rows than `max_errored_rows` permits. A budget that
+    parallelism can overshoot is not a budget, and the overshoot is silent by construction:
+    the rows are gone and the count that would have shown it is the one that was raced.
+
+    Only the exception's type and message are reported, never the row's values: the row that
+    failed is frequently the one carrying malformed or sensitive data, and an observability
+    sink is not an appropriate place to leak it.
+
+    Args:
+        budget: The shared ``[remaining, dropped]`` list (see `shared_error_budget`).
+        exc: The failure that made this row undroppable-in-place.
+
+    Returns:
+        True when a drop was granted; False when the allowance is spent and the caller
+        must re-raise.
     """
-    from batcher._internal.events import LOG, publish
+    from batcher._internal.events import LOG, MALFORMED, publish
 
     with _DROP_LOCK:
+        if budget[0] <= 0:
+            return False
+        budget[0] -= 1
         if len(budget) < 2:
             budget.append(0)
         budget[1] += 1
@@ -90,6 +140,20 @@ def _record_dropped_row(budget: list[int], exc: Exception) -> None:
         remaining_budget=remaining,
         error=f"{type(exc).__name__}: {exc}",
     )
+    # Also as a *countable* drop, not only as a log line. The `LOG` event above carries the
+    # running total in a field, which `observe` folds into a per-level log count and nothing
+    # else — so the one number a fleet needs to alert on ("how many rows did this job throw
+    # away?") existed on the bus and reached no metric. `MALFORMED` is the same unit the IO
+    # readers publish for a record they could not parse, and `source` is what tells the two
+    # apart, so one series answers the question across the whole pipeline.
+    publish(
+        MALFORMED,
+        name="map_batches",
+        count=1,
+        reason=type(exc).__name__,
+        source="map_batches",
+    )
+    return True
 
 
 def _formatted(fn: Any, fmt: str) -> Any:
@@ -256,115 +320,97 @@ def _check_declared_columns(batches: list[pa.RecordBatch], op: Any) -> None:
 
 
 def _tensorize_columns(result: dict) -> dict:
-    """Turn any multi-dimensional NumPy value into a fixed-shape-tensor column.
+    """Turn a multi-dimensional NumPy value into a tensor column, fixed- or variable-shape.
 
     A `map_batches` `fn` (image decode, embedding, feature-map) commonly returns a
     ``(B, *shape)`` NumPy array per column — the Ray Data tensor-block shape.
     ``from_pydict`` can't build a column from a >1-D array, so multi-dim values are
     converted to the canonical ``arrow.fixed_shape_tensor`` column (`to_tensor_column`),
-    which round-trips zero-copy through the FFI with its shape intact. 1-D arrays, lists,
-    and Arrow arrays pass through untouched, so scalar/label columns are unchanged. This
-    keeps the tensor path identical single-node and distributed, for every modality.
+    which round-trips zero-copy through the FFI with its shape intact.
+
+    A **list of arrays of differing shape** — the mixed-resolution decode, and the one shape
+    the canonical type cannot express — becomes a variable-shape tensor column instead
+    (`ragged_from_values`). That case used to be the multimodal path's first hard stop: it
+    could not be typed at all, and the only advice was to resize before the engine saw it.
+
+    1-D arrays, lists, and Arrow arrays pass through untouched, so scalar/label columns are
+    unchanged. This keeps the tensor path identical single-node and distributed, for every
+    modality.
     """
     import numpy as np
 
-    from batcher.io.formats.ml.tensor import to_tensor_column
+    from batcher.io.formats.ml.ragged import ragged_from_values
+    from batcher.io.formats.ml.tensor import tensor_from_values, to_tensor_column
 
     converted: dict = {}
     for name, value in result.items():
         if isinstance(value, np.ndarray) and value.ndim >= 2:
             converted[name] = to_tensor_column(value)
-        else:
-            converted[name] = value
+            continue
+        # A NumPy *object* array counts as a sequence of arrays here, not as one array. It is
+        # exactly what `batch_format="numpy"` hands a `fn` for a variable-shape tensor column,
+        # so an identity `fn` over one returned a value the tensor path did not recognize and
+        # Arrow could not type — the round trip failed on the column the round trip is for.
+        listed = list(value) if isinstance(value, np.ndarray) and value.dtype == object else value
+        if isinstance(listed, list | tuple):
+            tensor = tensor_from_values(listed) or ragged_from_values(listed)
+            converted[name] = value if tensor is None else tensor
+            continue
+        converted[name] = value
     return converted
-
-
-#: Type-specific fixes for the object kinds that most often reach Arrow un-converted. The
-#: field guides name PIL Images and torch tensors as the top two causes, and both have a
-#: one-line answer — but pyarrow's message mentions neither the column nor the remedy.
-_UNCONVERTIBLE_HINTS = (
-    ("torch", "Tensor", "call `.cpu().numpy()` on it — a NumPy array becomes a tensor column"),
-    ("PIL", "Image", "convert it with `np.asarray(img)`, or keep the encoded bytes instead"),
-    ("pandas", "DataFrame", "return its columns individually rather than the frame object"),
-)
 
 
 def _raise_unconvertible_column(columns: dict, cause: Exception) -> None:
     """Re-raise a failed batch conversion as a typed error naming the column and the fix.
 
-    A UDF that returns PIL Images, torch tensors, or any custom object hands Arrow a value
-    it cannot type. pyarrow's own message quotes the offending *value* and its class, but
-    names neither the column it came from nor `map_batches` nor what to do — and for a
-    multimodal pipeline that is exactly the error a user hits first.
+    A UDF that returns PIL Images, torch tensors, UUIDs, enum members, or any custom object
+    hands Arrow a value it cannot type. pyarrow's own message quotes the offending *value*
+    and its class, but names neither the column it came from nor `map_batches` nor what to do
+    — and for a multimodal or Python-object pipeline that is exactly the error a user hits
+    first.
 
     Ray Data has the opposite failure here and it is worse: it silently falls back to a
     pickle-backed object column, which the field guides flag as a 10-100x slowdown on every
     downstream transfer and expect the user to catch by eyeballing `ds.schema()`. Failing
     loudly is the right call; failing loudly *and* unhelpfully is not.
 
-    The offending column is found by converting each one alone, which only ever runs on the
-    error path.
+    The diagnosis itself lives in `interop.diagnostics`, shared with the constructors on the
+    other side of the boundary — the same value is just as unconvertible on the way in.
     """
     from batcher._internal.errors import PlanError
+    from batcher.interop.diagnostics import describe_unconvertible, find_unconvertible_column
 
+    name = find_unconvertible_column(columns)
+    if name is None:
+        ragged = _uneven_lengths(columns)
+        if ragged is not None:
+            raise PlanError(
+                f"map_batches returned columns of different lengths ({ragged}). Every column "
+                f"of a batch has one row count; a column built from a filtered or partial "
+                f"result is the usual cause."
+            ) from cause
+        raise PlanError(f"map_batches returned a batch Arrow cannot represent: {cause}") from cause
+    raise PlanError(
+        f"map_batches returned a batch where {describe_unconvertible(name, columns[name])} "
+        f"Every column crossing the engine boundary must be an Arrow type; an opaque Python "
+        f"object would otherwise be pickled, which is far slower for every stage downstream."
+    ) from cause
+
+
+def _uneven_lengths(columns: dict) -> str | None:
+    """``"a=2, b=1"`` when a returned dict's columns disagree on length, else `None`.
+
+    pyarrow reports the mismatch as ``Arrays were not all the same length: 1 vs 2``, which
+    for a twenty-column result says only that two of them differ. Naming each column and its
+    length points at the one that is short — usually the one built from a filtered or partial
+    result while its siblings came straight off the input.
+    """
+    lengths: dict[str, int] = {}
     for name, value in columns.items():
         try:
-            pa.array(value) if not isinstance(value, pa.Array | pa.ChunkedArray) else value
-        except Exception:
-            raise PlanError(
-                f"map_batches returned column {name!r} that Arrow cannot represent "
-                f"({_sample_type(value)}). {_fix_for(value)} "
-                f"Every column crossing the engine boundary must be an Arrow type; an "
-                f"opaque Python object would otherwise be pickled, which is far slower for "
-                f"every stage downstream."
-            ) from cause
-    raise PlanError(f"map_batches returned a batch Arrow cannot represent: {cause}") from cause
-
-
-def _sample_type(value: object) -> str:
-    """``"a list of PIL.Image"``-style description of what a column actually holds."""
-    try:
-        first = next(iter(value))  # type: ignore[call-overload]
-    except Exception:
-        return f"a {type(value).__name__}"
-    return f"a sequence of {type(first).__module__}.{type(first).__name__}"
-
-
-def _fix_for(value: object) -> str:
-    """The one-line remedy for this column's element type, or a generic one."""
-    ragged = _ragged_shapes(value)
-    if ragged is not None:
-        return (
-            f"The arrays have different shapes ({ragged}), so there is no one tensor type "
-            f"that fits them — the mixed-resolution case. Resize or pad them to a common "
-            f"shape, or keep the encoded bytes and decode downstream."
-        )
-    try:
-        first = next(iter(value))  # type: ignore[call-overload]
-    except Exception:
-        first = value
-    module, name = type(first).__module__, type(first).__name__
-    for mod, cls, fix in _UNCONVERTIBLE_HINTS:
-        if module.split(".")[0] == mod and name == cls:
-            return f"For a {mod}.{cls}, {fix}."
-    return "Convert it to an Arrow-native type (a number, string, bytes, list, or ndarray)."
-
-
-def _ragged_shapes(value: object) -> str | None:
-    """``"(2, 2) and (3, 3)"`` when a column holds NumPy arrays of differing shape.
-
-    Arrow has no variable-shape tensor type, so a column of mixed-resolution arrays cannot
-    be typed at all — and the generic "convert it to an ndarray" advice is actively wrong
-    there, because the caller already passed ndarrays. Naming the two shapes is the whole
-    diagnosis: it is the mixed-resolution image case the multimodal guides flag.
-    """
-    try:
-        import numpy as np
-
-        shapes = {a.shape for a in value if isinstance(a, np.ndarray)}  # type: ignore[union-attr]
-    except Exception:
+            lengths[name] = len(value)
+        except TypeError:
+            return None  # a scalar among the columns is a different mistake
+    if len(set(lengths.values())) < 2:
         return None
-    if len(shapes) < 2:
-        return None
-    listed = sorted(shapes, key=str)[:2]
-    return " and ".join(str(s) for s in listed)
+    return ", ".join(f"{name}={n}" for name, n in lengths.items())

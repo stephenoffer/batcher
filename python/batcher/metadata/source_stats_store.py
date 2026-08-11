@@ -20,7 +20,7 @@ from typing import Any
 from batcher._internal.logging import note_suppressed
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.source_stats import SourceStatistics
-from batcher.plan.stats import ColumnStat, Provenance
+from batcher.plan.stats import ColumnStat, Provenance, SortOrder, as_sort_orders
 
 __all__ = ["load_source_stats", "save_source_stats"]
 
@@ -70,7 +70,7 @@ def _encode(stats: SourceStatistics) -> dict[str, Any]:
         # `sorted_by` drives redundant-sort removal: it reaches `RelStats.sorted_by` through
         # `to_relstats`, and without it a Batcher-written footerless source (CSV/JSON) loses
         # its ordering on reload and re-sorts data that is already sorted.
-        "sorted_by": list(stats.sorted_by),
+        "sorted_by": [_encode_sort_key(k) for k in as_sort_orders(stats.sorted_by)],
         # `partition_keys` is round-tripped for `ds.meta.storage`, and **not** for pruning —
         # a claim this comment used to make. Hive partition pruning happens in the reader:
         # the pushed predicate goes to `pyarrow.dataset`, which skips fragments by partition
@@ -79,6 +79,29 @@ def _encode(stats: SourceStatistics) -> dict[str, Any]:
         "partition_keys": list(stats.partition_keys),
         "columns": columns,
     }
+
+
+def _encode_sort_key(key: SortOrder) -> str | dict[str, Any]:
+    """One ordering key, as the bare column name when it is plain ascending, nulls-last.
+
+    The compact form is the overwhelmingly common one and is exactly what earlier stores
+    wrote, so a store written now stays readable by the same reader that read those — and
+    the round trip does not inflate every entry to carry two defaults.
+    """
+    if not key.descending and not key.nulls_first:
+        return key.column
+    return {"column": key.column, "descending": key.descending, "nulls_first": key.nulls_first}
+
+
+def _decode_sort_key(blob: str | dict[str, Any]) -> SortOrder:
+    """One ordering key from either encoding — a bare name, or the explicit object."""
+    if isinstance(blob, str):
+        return SortOrder(blob)
+    return SortOrder(
+        str(blob["column"]),
+        bool(blob.get("descending", False)),
+        bool(blob.get("nulls_first", False)),
+    )
 
 
 def _encode_column(col: ColumnStat) -> dict[str, Any]:
@@ -115,7 +138,7 @@ def _decode(blob: dict[str, Any]) -> SourceStatistics | None:
             row_count=blob.get("row_count"),
             byte_size=blob.get("byte_size"),
             columns=columns,
-            sorted_by=tuple(blob.get("sorted_by", ())),
+            sorted_by=tuple(_decode_sort_key(k) for k in blob.get("sorted_by", ())),
             partition_keys=tuple(blob.get("partition_keys", ())),
             exact_rows=bool(blob.get("exact_rows", True)),
             content_byte_size=bool(blob.get("content_byte_size", False)),

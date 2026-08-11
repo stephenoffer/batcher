@@ -138,10 +138,11 @@ def _aggregate_resident_bytes(
     """An aggregate's (or `DISTINCT`'s) resident state, which is **not** its groups when the
     key is wide.
 
-    `DISTINCT` takes the same rule because it *is* an all-columns group-by, run by the same
-    `partial -> combine` path over the same per-morsel tables. Measured on a 24 M-row
-    `distinct(k)` under a 537 MB envelope: budgeted at its 2 M distinct rows (16 MB) it stayed
-    in memory and peaked at 1.6 GB.
+    `DISTINCT` takes the same rule because it is the same shape: the whole-row form *is* an
+    all-columns group-by, and the keyed form reduces per morsel to one representative row per
+    key, so both hold per-morsel tables of full-width rows rather than only their groups.
+    Measured on a 24 M-row `distinct(k)` under a 537 MB envelope: budgeted at its 2 M distinct
+    rows (16 MB) it stayed in memory and peaked at 1.6 GB.
 
     The parallel aggregate is `partial -> combine -> finalize`: every morsel builds its own
     group table and all of them are live when `combine` merges them. So what it holds is the
@@ -267,7 +268,28 @@ def _fanout(node: LogicalPlan, estimator) -> float:
     return max(1.0, out_rows / in_rows)
 
 
-def _desired_parallelism(in_rows: float, width: float, target_rows: int, target_bytes: int) -> int:
+def _task_memory_budget(hardware, config: Config) -> float:
+    """Bytes one task may hold before the node it lands on is over its envelope, `0` if unknown.
+
+    The same envelope Carbonite admits against — the worker's usable RAM times the configured
+    hard limit — so Kyber's fan-out and Carbonite's admission are sized against one number
+    rather than two that can disagree. `0` when no profile was supplied, which is every caller
+    that had none before and leaves the fan-out exactly as it was.
+    """
+    memory = float(getattr(hardware, "memory_bytes", 0) or 0)
+    if memory <= 0.0:
+        return 0.0
+    return memory * config.memory.hard_limit
+
+
+def _desired_parallelism(
+    in_rows: float,
+    width: float,
+    target_rows: int,
+    target_bytes: int,
+    state_bytes: float = 0.0,
+    task_memory_bytes: float = 0.0,
+) -> int:
     """Tasks a breaker wants, from the rows it shuffles **and** how wide they are.
 
     A row target alone assumes a row width, and the shipped `target_rows_per_task` of four
@@ -295,22 +317,42 @@ def _desired_parallelism(in_rows: float, width: float, target_rows: int, target_
     counted only rows. So the two answers to "how many tasks" disagreed on exactly the data
     the documented one was written for.
 
-    The two demands combine with `max`, never `min`: the byte term can only ask for *more*
-    parallelism, so a relation no wider than the flat default gets exactly the fan-out it
-    got before and no structured plan is re-shaped by this.
+    A third demand comes from what the operator *holds*, which neither row nor input-byte
+    term can express. Both of those describe the data flowing **in**; a breaker's resident
+    state is a different quantity, and for the hash operators it is the one that OOMs. A
+    `GROUP BY user_id` over a narrow two-column input is small by rows and smaller by input
+    bytes, and holds one entry per distinct user — a hundred million of them, in one task,
+    because nothing in the fan-out ever looked at the state. The rows/bytes terms cannot see
+    it: the input is exactly as wide and as numerous as a two-group aggregate's.
+
+    So the state term asks for enough tasks that each one's *partition* of that state fits the
+    envelope the node will admit it against. It is the mergeable algebra's own argument —
+    `partial → combine → finalize` is what makes a partitioned state bounded — applied to
+    choosing how many partitions.
+
+    The three demands combine with `max`, never `min`: every term can only ask for *more*
+    parallelism, so a relation no wider than the flat default with no measurable state gets
+    exactly the fan-out it got before and no structured plan is re-shaped by this.
 
     Args:
         in_rows: Rows the breaker shuffles (its input volume, not its output).
         width: Estimated bytes per row.
         target_rows: `optimizer.target_rows_per_task`.
         target_bytes: `optimizer.target_bytes_per_task`.
+        state_bytes: The operator's resident state (its `m_max_bytes` envelope), or `0` when
+            it is unknown or the operator streams. `0` contributes no demand.
+        task_memory_bytes: What one task may hold, from `_task_memory_budget`. `0` — no
+            hardware profile — contributes no demand, which is the prior behavior.
 
     Returns:
         The desired task count, at least 1.
     """
     by_rows = math.ceil(in_rows / max(1, target_rows))
     by_bytes = math.ceil(in_rows * max(0.0, width) / max(1, target_bytes))
-    return max(1, by_rows, by_bytes)
+    by_state = 0
+    if state_bytes > 0.0 and task_memory_bytes > 0.0:
+        by_state = math.ceil(state_bytes / task_memory_bytes)
+    return max(1, by_rows, by_bytes, by_state)
 
 
 def _cpu_share(
@@ -359,6 +401,9 @@ def annotate_ops(
     morsel_bytes = max(1, config.execution.morsel_bytes)
     target_rows = max(1, config.optimizer.target_rows_per_task)
     target_bytes = max(1, config.optimizer.target_bytes_per_task)
+    # What one task may hold on the node it will land on. `0` with no hardware profile, which
+    # contributes no fan-out demand and leaves every existing caller's sizing unchanged.
+    task_memory = _task_memory_budget(hardware, config)
     fc = config.flow_control
     credit_ceiling = max(1, fc.default_credits * fc.credit_ceiling_factor)
     cpu_heavy = config.execution.cpus_per_task
@@ -416,7 +461,10 @@ def annotate_ops(
                 usable = [r for r in child_rows if 0.0 <= r < unknown_rows]
                 in_rows = sum(usable) if len(usable) == len(child_rows) else rows
                 in_rows = in_rows or rows
-                n_par = _desired_parallelism(in_rows, width, target_rows, target_bytes)
+                # `mem` is what this operator *holds*, which neither input-derived term can see.
+                n_par = _desired_parallelism(
+                    in_rows, width, target_rows, target_bytes, float(mem), task_memory
+                )
                 # PACK or SPREAD. A shuffle small enough to keep node-local prefers PACK —
                 # co-locating a handful of workers avoids a cross-node exchange that buys
                 # nothing — and that is a *network* threshold (`locality_max_bytes`),

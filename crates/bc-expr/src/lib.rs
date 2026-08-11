@@ -24,8 +24,10 @@ use serde::Deserialize;
 mod analyze;
 mod error;
 mod select;
+mod supertype;
 pub use error::ExprError;
 pub use select::ConjunctOrder;
+pub use supertype::common_supertype;
 
 /// What a payload's leading bytes say it is, or `None` when nothing recognizes them.
 ///
@@ -231,6 +233,47 @@ pub enum Expr {
         /// output, not the row.
         #[serde(default)]
         second: Option<Box<Expr>>,
+    },
+
+    /// A biological-sequence op over a Utf8 (nucleotide, protein, or FASTQ-quality)
+    /// sub-expression — the `.seq` namespace.
+    ///
+    /// Its own variant rather than more `StrFunc` arms because the argument shape is genuinely
+    /// different: a `.str` function carries a pattern and a window, while these carry a k-mer
+    /// length, a reading frame, an ASCII quality offset, and an alphabet. Folding them into
+    /// `Str` would have meant six more `Option` slots on the wire shape every string function
+    /// already pays for.
+    ///
+    /// Every field is `#[serde(default)]`, so each function's IR carries only the arguments it
+    /// actually uses.
+    Seq {
+        #[serde(rename = "fn")]
+        func: SeqFunc,
+        input: Box<Expr>,
+        /// `kmers`/`canonical_kmers`/`minimizers`: the k-mer length.
+        #[serde(default)]
+        k: Option<i64>,
+        /// `minimizers`: how many consecutive k-mers one window spans.
+        #[serde(default)]
+        window: Option<i64>,
+        /// `translate`: the reading frame, 0, 1, or 2.
+        #[serde(default)]
+        frame: Option<i64>,
+        /// `phred_quality`/`mean_quality`/`expected_errors`: the FASTQ ASCII offset (33 for
+        /// Sanger and Illumina 1.8+, 64 for the older Illumina pipelines). Stated rather than
+        /// sniffed — the two ranges overlap, so the bytes carry no reliable signal and a wrong
+        /// guess shifts every score by 31.
+        #[serde(default)]
+        offset: Option<i64>,
+        /// `molecular_weight`/`is_valid`: which alphabet the column is written in.
+        #[serde(default)]
+        alphabet: Option<String>,
+        /// `find_motif`/`count_motif`: the IUPAC-degenerate pattern.
+        #[serde(default)]
+        pattern: Option<String>,
+        /// `translate`: stop at the first stop codon rather than running to the end.
+        #[serde(default)]
+        to_stop: bool,
     },
 
     /// First non-null among the sub-expressions, per row (SQL COALESCE).
@@ -478,6 +521,24 @@ pub enum Expr {
     Geo {
         #[serde(rename = "fn")]
         func: GeoFunc,
+        args: Vec<Expr>,
+    },
+
+    /// A rigid-body (SE(3)) function over numeric sub-expressions.
+    ///
+    /// Shaped like `Geo` and for the same reason — a name and an ordered argument list
+    /// covers a whole family whose arities run from three to ten, and the count is
+    /// checked against `SpatialFunc::arity` at evaluation.
+    ///
+    /// Unlike `Geo` this variant needs no new physical type at all: every argument and
+    /// every result is a plain `Float64`, because a robotics log already stores poses
+    /// and point clouds as scalar columns (`x`, `y`, `z`, `qx`, …). That is what lets a
+    /// coordinate-frame transform be an ordinary projection — pushed down, spilled,
+    /// shuffled and JIT-adjacent like any other arithmetic. See `bc_spatial` for the
+    /// conventions and the mathematics.
+    Spatial {
+        #[serde(rename = "fn")]
+        func: SpatialFunc,
         args: Vec<Expr>,
     },
 }
@@ -865,6 +926,191 @@ impl GeoFunc {
     }
 }
 
+/// The rigid-body function vocabulary — rotations and poses in three dimensions.
+///
+/// Every one of these takes `Float64` arguments and returns `Float64`, and the Python
+/// `fn` strings in `plan/expr_ir/fn_names.py::SPATIAL_FNS` are these serde tags exactly.
+///
+/// # Why one function per output component
+///
+/// Rotating a point produces three numbers, and the name says which one:
+/// `quat_rotate_x`, `quat_rotate_y`, `quat_rotate_z`. A single node returning a struct
+/// or a fixed-size list would be one evaluation instead of three, and it would also put
+/// a composite type in the middle of every pipeline that then has to be taken apart
+/// again before a filter or a join key can touch it. Scalar in, scalar out keeps a
+/// coordinate transform in the same class as `a * b + c`: projectable, pushable, and
+/// spillable with no unpacking. It is the same choice `geohash_decode_lon` /
+/// `geohash_decode_lat` already made.
+///
+/// The cost is real and is not claimed away: the three component functions each
+/// normalize the quaternion and each build the same two cross products, so a full
+/// transform does that work three times where a struct-returning node would do it once.
+/// What buys it back is a column layout the rest of the engine already knows how to
+/// move, and a plan of three nodes rather than the forty an equivalent arithmetic tree
+/// expands to.
+///
+/// Whether the fused kernel is also *faster* than that arithmetic tree is a separate
+/// question and is **not** settled here: the kernel is a scalar row loop and the tree is
+/// a chain of vectorized arrow kernels. `benchmarks/scenarios/sweep_transform.py` is the
+/// measurement, and it needs a release build to mean anything.
+///
+/// # Conventions
+///
+/// Quaternion arguments are always four separate values in `(x, y, z, w)` order, scalar
+/// last. Poses are seven, translation first. See the `bc_spatial` crate documentation
+/// for the full convention table and why each was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpatialFunc {
+    // --- Quaternion properties (4 args: qx, qy, qz, qw) ---------------------
+    /// `quat_norm(qx, qy, qz, qw)` — the four-component length. One for a rotation;
+    /// how far a logged quaternion has drifted from that is worth being able to ask.
+    QuatNorm,
+    /// `quat_normalize_x(...)` — the X component of the same rotation, unit length.
+    QuatNormalizeX,
+    /// `quat_normalize_y(...)`.
+    QuatNormalizeY,
+    /// `quat_normalize_z(...)`.
+    QuatNormalizeZ,
+    /// `quat_normalize_w(...)`.
+    QuatNormalizeW,
+    /// `quat_inverse_x(...)` — the X component of the inverse rotation.
+    QuatInverseX,
+    /// `quat_inverse_y(...)`.
+    QuatInverseY,
+    /// `quat_inverse_z(...)`.
+    QuatInverseZ,
+    /// `quat_inverse_w(...)`.
+    QuatInverseW,
+    /// `quat_angle(qx, qy, qz, qw)` — the rotation's magnitude in radians, on `[0, pi]`.
+    QuatAngle,
+    /// `quat_to_roll(...)` — rotation about X, in radians.
+    QuatToRoll,
+    /// `quat_to_pitch(...)` — rotation about Y, in radians.
+    QuatToPitch,
+    /// `quat_to_yaw(...)` — rotation about Z, in radians. The heading, and the one of
+    /// the three a map-matching or planning query actually asks for.
+    QuatToYaw,
+
+    // --- Euler to quaternion (3 args: roll, pitch, yaw) ---------------------
+    /// `quat_from_euler_x(roll, pitch, yaw)`.
+    QuatFromEulerX,
+    /// `quat_from_euler_y(roll, pitch, yaw)`.
+    QuatFromEulerY,
+    /// `quat_from_euler_z(roll, pitch, yaw)`.
+    QuatFromEulerZ,
+    /// `quat_from_euler_w(roll, pitch, yaw)`.
+    QuatFromEulerW,
+
+    // --- Rotation matrix to quaternion (9 args: row-major m00..m22) ---------
+    /// `quat_from_rotmat_x(m00, m01, m02, m10, m11, m12, m20, m21, m22)`.
+    QuatFromRotmatX,
+    /// `quat_from_rotmat_y(...)`.
+    QuatFromRotmatY,
+    /// `quat_from_rotmat_z(...)`.
+    QuatFromRotmatZ,
+    /// `quat_from_rotmat_w(...)`.
+    QuatFromRotmatW,
+
+    // --- Quaternion composition (8 args: a then b, four each) ---------------
+    /// `quat_multiply_x(ax, ay, az, aw, bx, by, bz, bw)` — the X component of `a * b`,
+    /// the rotation that applies `b` first and then `a`.
+    QuatMultiplyX,
+    /// `quat_multiply_y(...)`.
+    QuatMultiplyY,
+    /// `quat_multiply_z(...)`.
+    QuatMultiplyZ,
+    /// `quat_multiply_w(...)`.
+    QuatMultiplyW,
+    /// `quat_angular_distance(ax, ay, az, aw, bx, by, bz, bw)` — the geodesic angle
+    /// between two rotations, in radians on `[0, pi]`. The honest error metric for an
+    /// orientation estimate; a component-wise difference is not, because `q` and `-q`
+    /// are the same rotation.
+    QuatAngularDistance,
+
+    // --- Interpolation (9 args: a, b, t) ------------------------------------
+    /// `quat_slerp_x(ax, ay, az, aw, bx, by, bz, bw, t)` — spherical interpolation,
+    /// `a` at `t = 0` and `b` at `t = 1`, extrapolating outside that range.
+    QuatSlerpX,
+    /// `quat_slerp_y(...)`.
+    QuatSlerpY,
+    /// `quat_slerp_z(...)`.
+    QuatSlerpZ,
+    /// `quat_slerp_w(...)`.
+    QuatSlerpW,
+
+    // --- Rotating a vector (7 args: qx, qy, qz, qw, px, py, pz) -------------
+    /// `quat_rotate_x(qx, qy, qz, qw, px, py, pz)` — the X component of the rotated
+    /// vector. Rotation only: use the `se3_*` functions when there is a translation too.
+    QuatRotateX,
+    /// `quat_rotate_y(...)`.
+    QuatRotateY,
+    /// `quat_rotate_z(...)`.
+    QuatRotateZ,
+    /// `quat_inverse_rotate_x(...)` — rotated by the inverse, the direction a
+    /// world-frame vector travels to reach a body frame.
+    QuatInverseRotateX,
+    /// `quat_inverse_rotate_y(...)`.
+    QuatInverseRotateY,
+    /// `quat_inverse_rotate_z(...)`.
+    QuatInverseRotateZ,
+
+    // --- Pose application (10 args: tx, ty, tz, qx, qy, qz, qw, px, py, pz) -
+    /// `se3_transform_x(tx, ty, tz, qx, qy, qz, qw, px, py, pz)` — the X coordinate of
+    /// `point` moved out of the pose's frame and into its parent. Rotate, then
+    /// translate. The single most-run function in this family: it is what turns a lidar
+    /// return into a world-frame point.
+    Se3TransformX,
+    /// `se3_transform_y(...)`.
+    Se3TransformY,
+    /// `se3_transform_z(...)`.
+    Se3TransformZ,
+    /// `se3_inverse_transform_x(...)` — the X coordinate of a parent-frame point
+    /// expressed in the pose's own frame. Subtract, then rotate by the inverse.
+    Se3InverseTransformX,
+    /// `se3_inverse_transform_y(...)`.
+    Se3InverseTransformY,
+    /// `se3_inverse_transform_z(...)`.
+    Se3InverseTransformZ,
+}
+
+impl SpatialFunc {
+    /// The number of arguments this function takes.
+    ///
+    /// Checked at evaluation for the same reason `GeoFunc::arity` is: the JSON IR
+    /// carries an argument *list*, so serde can prove it is a list of expressions and
+    /// only this table knows how long it should be.
+    pub fn arity(self) -> usize {
+        use SpatialFunc::*;
+        match self {
+            // Euler angles in.
+            QuatFromEulerX | QuatFromEulerY | QuatFromEulerZ | QuatFromEulerW => 3,
+
+            // One quaternion.
+            QuatNorm | QuatNormalizeX | QuatNormalizeY | QuatNormalizeZ | QuatNormalizeW
+            | QuatInverseX | QuatInverseY | QuatInverseZ | QuatInverseW | QuatAngle
+            | QuatToRoll | QuatToPitch | QuatToYaw => 4,
+
+            // One quaternion and one vector.
+            QuatRotateX | QuatRotateY | QuatRotateZ | QuatInverseRotateX | QuatInverseRotateY
+            | QuatInverseRotateZ => 7,
+
+            // Two quaternions.
+            QuatMultiplyX | QuatMultiplyY | QuatMultiplyZ | QuatMultiplyW | QuatAngularDistance => {
+                8
+            }
+
+            // Two quaternions and a parameter, or a 3x3 matrix.
+            QuatSlerpX | QuatSlerpY | QuatSlerpZ | QuatSlerpW | QuatFromRotmatX
+            | QuatFromRotmatY | QuatFromRotmatZ | QuatFromRotmatW => 9,
+
+            // A pose and a point.
+            Se3TransformX | Se3TransformY | Se3TransformZ | Se3InverseTransformX
+            | Se3InverseTransformY | Se3InverseTransformZ => 10,
+        }
+    }
+}
+
 /// Pairwise list reductions over two equal-length numeric `List` columns (→ Float64).
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1128,6 +1374,79 @@ pub enum VideoFunc {
     FrameAt,
 }
 
+/// Biological-sequence operations for the `.seq` namespace. Wire tags are snake_case (the
+/// contract with the Python `.seq` namespace).
+///
+/// The alphabet is ASCII by construction, so every kernel indexes byte tables rather than
+/// decoding UTF-8. Case is **preserved** by the transforms and **folded** by the measures:
+/// lowercase is how a reference genome marks soft-masked repeats, so upper-casing in a
+/// transform would destroy the mask while respecting it in a measure would report a
+/// repeat-rich contig as mostly-unknown.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeqFunc {
+    /// `complement()` → the base-for-base IUPAC complement, case preserved (→ Utf8).
+    Complement,
+    /// `reverse_complement()` → the complement read 3'→5', which is what the other strand
+    /// says (→ Utf8). The single most-used operation in genomics.
+    ReverseComplement,
+    /// `transcribe()` → DNA to RNA, T→U, case preserved (→ Utf8).
+    Transcribe,
+    /// `back_transcribe()` → RNA to DNA, U→T, case preserved (→ Utf8).
+    BackTranscribe,
+    /// `gc_content()` → the (G+C) fraction of the *unambiguous* bases (→ Float64). `N` is
+    /// excluded from the denominator rather than counted as non-GC, so a gap does not read as
+    /// an AT-rich region. Null when the row has no unambiguous base.
+    GcContent,
+    /// `gc_skew()` → `(G−C)/(G+C)` (→ Float64), whose sign flips at a bacterial chromosome's
+    /// replication origin and terminus. Null when the row has no G or C.
+    GcSkew,
+    /// `base_counts()` → struct `{a, c, g, t, u, n, other}` of Int64 counts, case-folded.
+    BaseCounts,
+    /// `translate(frame, to_stop)` → the protein encoded in reading frame `frame`, NCBI
+    /// genetic code table 1 (→ Utf8). Ambiguous codons yield `X`, stops yield `*`, and a
+    /// trailing partial codon is dropped rather than padded.
+    Translate,
+    /// `kmers(k)` → `List<Utf8>` of every length-`k` window, step 1, upper-cased.
+    Kmers,
+    /// `canonical_kmers(k)` → `List<Utf8>` of each window folded with its reverse complement
+    /// (the lexicographic minimum), so a read and its other-strand copy agree.
+    CanonicalKmers,
+    /// `minimizers(k, window)` → `List<Utf8>`: the smallest canonical k-mer of each window of
+    /// `window` consecutive k-mers, consecutive repeats collapsed. The seed-and-extend sketch.
+    Minimizers,
+    /// `melting_temp()` → duplex melting temperature in °C (→ Float64), SantaLucia (1998)
+    /// nearest-neighbour at 50 mM Na⁺ and 500 nM strand. Null for anything but pure ACGT.
+    MeltingTemp,
+    /// `molecular_weight(alphabet)` → average molecular weight in daltons (→ Float64), for a
+    /// **single** strand of `dna`/`rna` or a `protein` chain.
+    MolecularWeight,
+    /// `gravy()` → the Kyte-Doolittle grand average of hydropathy (→ Float64). Positive is
+    /// hydrophobic, negative hydrophilic.
+    Gravy,
+    /// `isoelectric_point()` → the pH at which the peptide carries no net charge (→ Float64),
+    /// solved by bisection over the Bjellqvist pKa set.
+    IsoelectricPoint,
+    /// `phred_quality(offset)` → `List<Int32>` of per-base FASTQ quality scores.
+    PhredQuality,
+    /// `mean_quality(offset)` → the arithmetic mean Phred score (→ Float64) — the "average
+    /// quality" every FASTQ tool reports.
+    MeanQuality,
+    /// `expected_errors(offset)` → `Σ 10^(−Q/10)`, the expected number of miscalled bases in
+    /// the read (→ Float64). The `fastq_maxee` filter, and additive where a mean is not.
+    ExpectedErrors,
+    /// `find_motif(pattern)` → `List<Int64>` of 1-based start positions of every (possibly
+    /// overlapping) match of an IUPAC-degenerate motif.
+    FindMotif,
+    /// `count_motif(pattern)` → how many such matches the sequence contains (→ Int64).
+    CountMotif,
+    /// `max_homopolymer()` → the length of the longest single-base run (→ Int64), the
+    /// nanopore and PacBio error signature a variant filter thresholds on.
+    MaxHomopolymer,
+    /// `is_valid(alphabet)` → whether every character is in the named alphabet (→ Boolean).
+    IsValid,
+}
+
 /// Map-column accessors (over an Arrow `Map` column). Wire tags are snake_case (the
 /// contract with the Python `.map` namespace).
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1163,6 +1482,12 @@ pub enum ListFunc {
     NUnique,
     /// Sort each row's list ascending → `List` (same element type).
     Sort,
+    /// Sort each row's list descending → `List` (same element type), nulls **last**.
+    ///
+    /// Not `reverse(sort(x))`: ascending puts nulls last, so reversing moves them to the
+    /// front, where DuckDB's `list_reverse_sort` leaves them at the back. The null
+    /// placement is the whole reason this is its own kernel rather than a composition.
+    SortDesc,
     /// Reverse each row's list → `List` (same element type).
     Reverse,
     /// Product of (non-null) elements → Float64; empty/null row → null.
@@ -1365,6 +1690,53 @@ pub enum StrFunc {
     /// One pass, one allocation. `eval/str/squad.rs` documents how the five steps reduce to a
     /// scan over word and non-word runs, and pins the result against the composition.
     SquadNormalize,
+
+    // --- Per-document text quality (the LLM pretraining-corpus filters) ---------------
+    //
+    // The Gopher (Rae et al. 2021), C4, and RefinedWeb heuristics, as *per-row* measures.
+    // `plan/functions/metrics/text/` already scores the same properties across a corpus as
+    // aggregates; these answer "which documents do I drop", which a filter needs and an
+    // aggregate cannot express. Each ratio is in `[0, 1]`, and null where the document has
+    // nothing to measure — an empty extraction must not pass a threshold by scoring 0.
+    /// `word_count()` → whitespace-separated word count. → Int64.
+    WordCount,
+    /// `mean_word_length()` → mean word length in characters. Gopher keeps `[3, 10]`;
+    /// below is a token list, above is usually a base64 blob or a URL dump. → Float64.
+    MeanWordLength,
+    /// `symbol_ratio()` → `(# + …) / words`. Gopher drops above 0.1: a stripped heading
+    /// structure, or a listing page whose entries were truncated for display. → Float64.
+    SymbolRatio,
+    /// `alpha_word_ratio()` → the fraction of words containing a letter. Gopher drops below
+    /// 0.8, which is a table that lost its structure. → Float64.
+    AlphaWordRatio,
+    /// `stopword_count()` → how many of Gopher's eight stop words appear, counted
+    /// **distinctly**. Fewer than two is a keyword list, not prose. → Int64.
+    StopwordCount,
+    /// `bullet_line_ratio()` → the fraction of lines starting with a bullet. Gopher drops
+    /// above 0.9 — a navigation menu. → Float64.
+    BulletLineRatio,
+    /// `ellipsis_line_ratio()` → the fraction of lines ending in an ellipsis. Gopher drops
+    /// above 0.3 — a listing page of fixed-width teasers. → Float64.
+    EllipsisLineRatio,
+    /// `duplicate_line_ratio()` → the fraction of *characters* in repeated lines. Weighed by
+    /// characters, following Gopher: one repeated footer and fifty repeated one-word lines
+    /// are different documents that a line count cannot separate. → Float64.
+    DuplicateLineRatio,
+    /// `duplicate_paragraph_ratio()` → the same, over blank-line-separated paragraphs.
+    /// → Float64.
+    DuplicateParagraphRatio,
+    /// `top_ngram_ratio(n)` → the fraction of characters covered by the single most frequent
+    /// word n-gram (`n` rides the `length` slot). Gopher applies it for n of 2-4; it finds
+    /// keyword-stuffed SEO pages and templated listings. → Float64.
+    TopNgramRatio,
+    /// `duplicate_ngram_ratio(n)` → the fraction of characters covered by *every* n-gram
+    /// appearing more than once. Gopher applies it for n of 5-10; unlike `TopNgramRatio` it
+    /// catches a page assembled from several boilerplate blocks. → Float64.
+    DuplicateNgramRatio,
+    /// `char_entropy()` → Shannon entropy of the character distribution, in bits. The
+    /// gibberish and encoded-blob detector: prose sits near 4-5 bits, a base64 blob above,
+    /// a repeated character at 0. The one measure here that is not Gopher's. → Float64.
+    CharEntropy,
     /// True where `pattern` (a regex) matches anywhere in the string. → Boolean.
     RegexpMatches,
     /// Replace the first match of regex `pattern` with `replacement`. → Utf8.

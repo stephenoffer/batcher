@@ -9,7 +9,7 @@ Every page embeds a complete, self-contained script from the [`examples/io/`](ht
 | {doc}`parquet_roundtrip` | Writing and reading Parquet, with partitioning and column pruning |
 | {doc}`text_formats` | CSV, JSON, and Arrow IPC round trips |
 | {doc}`save_modes` | What happens when the target already exists, and what a manifest records |
-| {doc}`streaming_reads` | `iter_batches`, limits, and lazy metadata, in bounded memory |
+| {doc}`streaming_reads` | {py:meth}`iter_batches <batcher.Dataset.iter_batches>`, limits, and lazy metadata, in bounded memory |
 | {doc}`arrow_interop` | Moving data in and out of other frameworks, zero-copy where possible |
 | {doc}`sources_and_sinks` | Which formats exist, and the objects behind them |
 

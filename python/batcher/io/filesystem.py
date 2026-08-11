@@ -42,6 +42,9 @@ __all__ = [
     "FileSystem",
     "LocalFileSystem",
     "get_file_cache",
+    "local_path",
+    "prune_empty_dirs",
+    "require_success_marker",
     "resolve_filesystem",
 ]
 
@@ -116,9 +119,41 @@ class LocalFileSystem(_ArrowFileSystem):
         super().__init__(pafs.LocalFileSystem(), "", atomic_rename=True)
 
 
+def local_path(path: str) -> str:
+    """Strip any ``file:`` scheme from `path`, leaving the plain filesystem path.
+
+    Args:
+        path: A local path, with or without a ``file:`` scheme.
+
+    Returns:
+        The path a local filesystem API can open.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.filesystem import local_path
+            >>> local_path("file:///tmp/x"), local_path("file:/tmp/x"), local_path("/tmp/x")
+            ('/tmp/x', '/tmp/x', '/tmp/x')
+    """
+    return path[len(_local_prefix(path)) :]
+
+
 def _local_prefix(path: str) -> str:
-    """The ``file://`` prefix to strip for a local path (``""`` for a bare path)."""
-    return "file://" if path.startswith("file://") else ""
+    """The ``file:`` prefix to strip for a local path (``""`` for a bare path).
+
+    Both RFC 8089 spellings count. ``file:///tmp/x`` carries an empty authority;
+    ``file:/tmp/x`` omits the authority entirely, and that second form is not an
+    exotic one — it is what ``java.net.URI`` normalizes to, so it is what Hadoop's
+    `Path`, a Spark listing, and every Java-stack log and manifest print. Recognizing
+    only ``file://`` meant pasting a path out of a Spark job rejected it, from inside
+    pyarrow (``Expected a local filesystem path, got a URI``) rather than from here.
+
+    A prefix is claimed only when a ``/`` follows, so a *relative* path that merely
+    contains a colon is still read as the filename it is.
+    """
+    if path.startswith("file://"):
+        return "file://"
+    return "file:" if path.startswith("file:/") else ""
 
 
 def resolve_filesystem(
@@ -409,4 +444,77 @@ def _fsspec_backed(scheme: str, path: str) -> FileSystem:
     prefix = path[: len(path) - len(stripped)] if path.endswith(stripped) else ""
     return _ArrowFileSystem(
         fs, prefix, atomic_rename=protocol not in _OBJECT_STORE_SCHEMES, strip_query=False
+    )
+
+
+def prune_empty_dirs(fs: FileSystem, root: str) -> None:
+    """Remove directories under `root` that a rewrite emptied, deepest first.
+
+    Rewriting a table from one partitioning to another deletes the stale data files but
+    leaves their ``dt=x`` directories standing, so the tree then advertises two partition
+    schemes at once and nothing reading the layout can say what the table is partitioned
+    by. `root` itself is never a candidate — the output directory must survive its own
+    rewrite even if the result is empty.
+
+    Args:
+        fs: The filesystem to prune on.
+        root: The output root whose *children* are examined.
+
+    Examples:
+        .. doctest::
+
+            >>> import tempfile, os
+            >>> from batcher.io.filesystem import prune_empty_dirs, resolve_filesystem
+            >>> root = tempfile.mkdtemp()
+            >>> os.makedirs(os.path.join(root, "dt=x"))
+            >>> prune_empty_dirs(resolve_filesystem(root), root)
+            >>> os.listdir(root)
+            []
+    """
+    import contextlib
+
+    # Best-effort: the data is already durable by the time this runs, so a filesystem that
+    # refuses to list or delete a directory (a read-only mount, a store with no directory
+    # concept) must not turn a finished write into a failure.
+    with contextlib.suppress(Exception):
+        for child in fs.list_dirs(root):
+            prune_empty_dirs(fs, child)
+            fs.remove_empty_dir(child)
+
+
+def require_success_marker(path: str) -> None:
+    """Raise unless `path` is a single file or a directory marked as completely written.
+
+    Every data file is published atomically, so none is ever half-written — but a run that
+    died at 90% leaves a directory of *valid* files that reads back cleanly and silently
+    short. That is the one failure per-file atomicity cannot cover, which is why
+    `FileSink.commit` publishes a ``_SUCCESS`` marker only after every shard's manifest has
+    been merged. This is the half that reads it.
+
+    Checked on the path rather than inside a reader, so it composes with whichever reader
+    the format and layout resolve to.
+
+    Args:
+        path: The location about to be read.
+
+    Raises:
+        IOError: If `path` is a directory with no ``_SUCCESS`` marker.
+
+    Examples:
+        .. doctest::
+
+            >>> import tempfile
+            >>> from batcher.io.filesystem import require_success_marker
+            >>> require_success_marker(tempfile.mkdtemp() + "/never-written.parquet")
+    """
+    fs = resolve_filesystem(path)
+    if not fs.is_dir(path):
+        return  # a single file is complete or absent; there is nothing to mark
+    if fs.exists(f"{path.rstrip('/')}/_SUCCESS"):
+        return
+    raise IOError(
+        f"{path!r} has no _SUCCESS marker, so the write that produced it did not finish "
+        "(or was not written by a job that marks completion). Reading it would return "
+        "however many files exist, silently short. Re-run the producing job, or drop "
+        "require_success=True to read it as-is."
     )

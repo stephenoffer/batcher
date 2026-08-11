@@ -25,12 +25,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_ir.func_nodes import ListContains, ListFunc, ListTransform
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = [
     "LIST_CONTAINS_THROUGH_REORDER_RULES",
@@ -38,7 +35,6 @@ __all__ = [
     "list_len_through_list_transform",
 ]
 
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 #: List calls that permute or deduplicate the elements without changing the *set* of
 #: values present. A membership test commutes with all three.
@@ -59,16 +55,7 @@ def _contains_leaf(fn: str) -> Callable[[Expr], Expr]:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], expr_matches: tuple[type, ...]):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=expr_matches,
-        )
-    )
+    return register_leaf_rule(name, leaf, expr_matches=expr_matches)
 
 
 #: `list_contains(list_sort(x), v)` / `list_reverse` / `list_unique` -> `list_contains(x, v)`.

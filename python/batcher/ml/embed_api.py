@@ -19,22 +19,19 @@ call site.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from batcher.ml.embed import _check_output_type, _to_embedding_column
+from batcher.ml.embed import (
+    _append_embedding_column,
+    _check_output_type,
+    _text_cell,
+    _to_embedding_column,
+)
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
 __all__ = ["openai_embedding_encoder", "tei_encoder"]
-
-
-def _append_embedding_column(batch: Any, output_column: str, col: Any) -> Any:
-    """Append (or replace) `output_column` on `batch` — the shared write-back step."""
-    if output_column in batch.schema.names:
-        idx = batch.schema.get_field_index(output_column)
-        return batch.set_column(idx, output_column, col)
-    return batch.append_column(output_column, col)
 
 
 def _chunks(items: list, size: int) -> list[list]:
@@ -121,6 +118,16 @@ class _ApiEncoder:
         self._max_batch = max(1, max_batch)
         self._pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
 
+    def close(self) -> None:
+        """Release the request pool when the worker is done with it.
+
+        `close` is the teardown contract `core.udf.lifecycle` and `InferencePool` already
+        look for on a load-once class UDF. Without it, `concurrency` threads outlived every
+        encoder that was built — one set per worker, per `collect()`, for the life of the
+        process. Best-effort by the same contract: the rows are already produced.
+        """
+        self._pool.shutdown(wait=False)
+
     def _embed_chunk(self, texts: list[str]) -> list[Sequence[float]]:
         raise NotImplementedError
 
@@ -141,8 +148,7 @@ class _ApiEncoder:
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         # A null (or non-string) cell becomes an empty string so every row still yields a
         # vector aligned to it; filter nulls upstream if a real embedding is required.
-        raw = batch.column(self._text_column).to_pylist()
-        texts = ["" if v is None else str(v) for v in raw]
+        texts = [_text_cell(v) for v in batch.column(self._text_column).to_pylist()]
         vectors = self._embed_all(texts)
         if not self._normalize:
             _warn_if_not_unit_norm(vectors)

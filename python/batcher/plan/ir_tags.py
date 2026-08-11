@@ -93,10 +93,12 @@ class ExprTag:
     MAKE_TEMPORAL: Final = "make_temporal"
     MAP: Final = "map"
     GEO: Final = "geo"
+    SPATIAL: Final = "spatial"
     IMAGE: Final = "image"
     IMAGE_CROP: Final = "image_crop"
     AUDIO: Final = "audio"
     VIDEO: Final = "video"
+    SEQ: Final = "seq"
 
 
 # The `Binary` comparison operators, mirroring the Rust `BinaryOp` serde tags.
@@ -110,6 +112,19 @@ class ExprTag:
 #
 # A rule that genuinely wants a *subset* takes `ORDERING_COMPARISONS` or names its own for
 # what it is; what it must not do is redefine "the comparisons" to mean something narrower.
+#: Microseconds in a day — the conversion between the IR's *day* offsets and its
+#: *timestamp* unit. The engine's timestamps are microseconds (`timestamp[us]`), while
+#: `DateOffset` and a `datetime.timedelta` both count whole days separately, so every
+#: place that turns one into the other multiplies by this.
+#:
+#: It lives here because it was written out six times under four names — `_DAY_MICROS`,
+#: `_MICROS_PER_DAY`, `_DAY_US`, and three bare literals — across `plan`, `kyber` and
+#: `core`. Two of those are subsystems that MUST NOT import each other
+#: (`.claude/rules/architecture.md`), so copy-paste was the only way they could share it,
+#: and copy-paste is exactly the wrong way: the neutral `plan` layer is the one both may
+#: read from. Same reason `_median` should not have been pasted into three subsystems.
+MICROS_PER_DAY: Final = 86_400_000_000
+
 COMPARISON_OPS: Final = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 #: The same six in a FIXED order, for the callers that *generate* something per operator —
 #: Kyber registers one rule per comparison, and registration order is run order. Iterating the
@@ -182,7 +197,13 @@ WINDOW_FILL: Final = frozenset({"forward_fill", "backward_fill"})
 WINDOW_VALUE: Final = (
     frozenset({"first_value", "last_value", "lag", "lead", "nth_value"}) | WINDOW_FILL
 )
-WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE
+# The whole-prefix recurrences (`bc_runtime::window::series`). Each row's answer is a
+# function of the entire ordered prefix carried in a running state, which is why none of
+# them takes a frame — there is no subset of rows to aggregate — and why all of them
+# require an ORDER BY, exactly as the fills do.
+WINDOW_EWM: Final = frozenset({"ewm_mean", "ewm_var", "ewm_std"})
+WINDOW_SERIES: Final = WINDOW_EWM | frozenset({"interpolate", "rle_id"})
+WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES
 # Functions that honour an explicit frame: the reducing aggregates, plus the
 # positional value functions that pick the frame's first/last/nth row. `lag`/`lead`
 # and the fills carry no frame (theirs is fixed by their own offset / nullness).
@@ -219,6 +240,9 @@ AGG_FNS: Final = frozenset(
         "entropy", "histogram", "kahan_sum", "kurtosis", "kurtosis_pop", "list_agg",
         "mad", "max", "mean", "median", "min", "mode", "product", "quantile",
         "quantile_disc", "skewness", "stddev", "sum", "var",
+        # Assembly contiguity. `n_length`/`l_count` carry their fraction in `param`, as
+        # `quantile` does; `n50`/`n90`/`l50` are the public spellings over them.
+        "n_length", "l_count", "aun",
     }
 )  # fmt: skip
 

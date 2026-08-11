@@ -15,7 +15,7 @@ Every page embeds a complete, self-contained script from the [`examples/governan
 ## See also
 
 - {doc}`/user-guide/trust/governance`: the guide, including grants and the audit trail.
-- {doc}`/api/operations/governance`: `SecurityCatalog`, `Principal`, and the policy objects.
+- {doc}`/api/operations/governance`: {py:class}`SecurityCatalog <batcher.SecurityCatalog>`, {py:class}`Principal <batcher.Principal>`, and the policy objects.
 - {doc}`/user-guide/trust/secrets`: passing keys and credentials by reference.
 - {doc}`/user-guide/trust/hardening`: what to change before production, and what Batcher does not enforce.
 

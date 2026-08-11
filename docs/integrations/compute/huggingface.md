@@ -1,8 +1,8 @@
 # Hugging Face
 
 Two separate integrations share a name. The **datasets** side is ingestion: a `datasets.Dataset` is
-an Arrow table underneath, so `bt.from_huggingface` takes that table directly and no data is
-converted. The **models** side is inference: `ds.ml.infer` and `ds.ml.embed` take a Hub model id
+an Arrow table underneath, so {py:func}`bt.from_huggingface <batcher.from_huggingface>` takes that table directly and no data is
+converted. The **models** side is inference: {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` take a Hub model id
 and load it once per worker.
 
 Ingestion needs `pip install 'batcher-engine[huggingface]'`. The model paths need `transformers` or
@@ -10,11 +10,11 @@ Ingestion needs `pip install 'batcher-engine[huggingface]'`. The model paths nee
 
 | | |
 | --- | --- |
-| **Datasets in** | `bt.from_huggingface(hf)`, or `bt.read.parquet("hf://...")` |
+| **Datasets in** | {py:func}`bt.from_huggingface(hf) <batcher.from_huggingface>`, or {py:meth}`bt.read.parquet("hf://...") <batcher.api.io_namespace.reader.Reader.parquet>` |
 | **Models** | `ds.ml.infer(model_id, ...)`, `ds.ml.embed(model_id, ...)` |
 | **Write** | Not supported. Batcher does not push datasets to the Hub. |
 | **Extra** | `pip install 'batcher-engine[huggingface]'`; `transformers` or `batcher-engine[st]` for models |
-| **Parallelism** | `from_huggingface` is one in-memory source. `hf://` Parquet splits per row group. |
+| **Parallelism** | {py:func}`from_huggingface <batcher.from_huggingface>` is one in-memory source. `hf://` Parquet splits per row group. |
 
 ## Datasets in
 
@@ -30,7 +30,7 @@ print(reviews.filter(bt.col("label") == 1).count())
 
 `from_huggingface` reaches for the dataset's underlying `pa.Table` (`hf.data.table`) and wraps it
 as an in-memory source. That is genuinely zero-copy: the same buffers, no re-encoding. It is
-exactly what `bt.from_arrow` does with a table you already have, which is how the path can be
+exactly what {py:func}`bt.from_arrow <batcher.from_arrow>` does with a table you already have, which is how the path can be
 demonstrated without the Hub:
 
 ```python
@@ -148,7 +148,7 @@ point of `num_gpus` + `concurrency`, and it is what keeps the GPUs fed rather th
 scan.
 
 :::{dropdown} A Hugging Face tokenizer as a Batcher preprocessor
-A Hugging Face tokenizer drops into the preprocessor family, since `Tokenizer` accepts anything
+A Hugging Face tokenizer drops into the preprocessor family, since {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` accepts anything
 with `.encode`:
 
 ```python
@@ -172,7 +172,7 @@ the whole thing. If you wanted streaming, you did not get it. Read the Parquet f
 
 **Nested and non-Arrow-native features.** Image, Audio, and `ClassLabel` features are Arrow structs
 of paths or bytes, not decoded tensors. They arrive as structs, and decoding is a `map_batches`
-stage (or `bt.read.images` if you have the paths). Nothing decodes implicitly.
+stage (or {py:meth}`bt.read.images <batcher.api.io_namespace.reader.Reader.images>` if you have the paths). Nothing decodes implicitly.
 
 **A model id per worker is a download per worker.** The first batch on a cold cluster pulls the
 weights on every worker. Pre-bake the model into the image or warm the HF cache on a shared volume;

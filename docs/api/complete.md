@@ -61,6 +61,7 @@ register SQL functions or sessions.
    await_any_termination
    reset_terminated
    register_function
+   register_model
    udf
    compact
    vacuum
@@ -252,7 +253,7 @@ Column-level lineage is reached from the dataset itself: :meth:{py:meth}`batcher
 
 ### Expression accessors
 
-These are the typed namespaces reached as `col("x").str`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>`, and {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>`. Multimodal columns add {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>`, and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>`.
+These are the typed namespaces reached as `col("x").str`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>`, and {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>`. Multimodal columns add {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>`, and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>`; biological sequence columns add {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>`.
 
 ```{eval-rst}
 .. autoclass:: batcher.plan.expr_ir.namespaces.strings._StrNamespace
@@ -290,6 +291,10 @@ These are the typed namespaces reached as `col("x").str`, {py:class}`.dt <batche
 .. autoclass:: batcher.plan.expr_ir.video._VideoNamespace
    :members:
    :member-order: bysource
+
+.. autoclass:: batcher.plan.expr_ir.namespaces.sequence._SeqNamespace
+   :members:
+   :member-order: bysource
 ```
 
 ## Reading and writing
@@ -321,6 +326,10 @@ and slowly-changing-dimension workflows.
    :member-order: bysource
 
 .. autoclass:: batcher.api.dataset.dq.ValidationReport
+   :members:
+   :member-order: bysource
+
+.. autoclass:: batcher.api.dataset.dq.ConstraintResult
    :members:
    :member-order: bysource
 

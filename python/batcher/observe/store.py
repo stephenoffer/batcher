@@ -49,7 +49,15 @@ DEFAULT_MAX_LOGS = 2000
 #: did — partition completion, GPU load, inference throughput, dropped rows, actor pool
 #: size. They are folded by `InferenceProgress`, not by the query record.
 _LIVE_KINDS = frozenset(
-    {events.PARTITION, events.GPU, events.INFER, events.SKIPPED, events.POOL, events.RECOVERY}
+    {
+        events.PARTITION,
+        events.GPU,
+        events.INFER,
+        events.SKIPPED,
+        events.MALFORMED,
+        events.POOL,
+        events.RECOVERY,
+    }
 )
 
 
@@ -65,6 +73,12 @@ class StageRecord:
     spilled: bool = False
     done: bool = False
     started_ts: float = 0.0
+    #: CPU milliseconds summed across this operator's worker threads. `0` on an executor
+    #: that cannot attribute OS counters to one operator — see `plan.profile.QueryUsage`.
+    cpu_ms: float = 0.0
+    #: Logical bytes the operator routed to disk. The magnitude behind `spilled`, which
+    #: cannot tell a 1 GB spill from a 100 GB one.
+    spill_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,7 +87,9 @@ class StageRecord:
             "est_rows": self.est_rows,
             "rows_out": self.rows_out,
             "elapsed_ms": self.elapsed_ms,
+            "cpu_ms": self.cpu_ms,
             "spilled": self.spilled,
+            "spill_bytes": self.spill_bytes,
             "done": self.done,
         }
 
@@ -261,11 +277,20 @@ class ActivityStore:
                 started_ts=event.ts,
             )
         elif event.kind == events.STAGE_END:
+            # Worker stages are numbered against the map sub-plan, a different op-id space
+            # from the driver tree this timeline shows. Their ids collide with the driver's,
+            # so folding them in here would overwrite a driver stage's numbers with an
+            # unrelated operator's — the cumulative metrics export wants them, this view
+            # does not.
+            if fields.get("scope", "driver") != "driver":
+                return
             stage = record.stages.get(int(fields.get("op_id", 0)))
             if stage is not None:
                 stage.rows_out = int(fields.get("rows_out", stage.rows_out))
                 stage.elapsed_ms = float(fields.get("elapsed_ms", 0.0))
+                stage.cpu_ms = float(fields.get("cpu_ms", 0.0) or 0.0)
                 stage.spilled = bool(fields.get("spilled", False))
+                stage.spill_bytes = int(fields.get("spill_bytes", 0) or 0)
                 stage.done = True
         elif event.kind == events.PROGRESS:
             record.rows_seen += int(fields.get("rows", 0))

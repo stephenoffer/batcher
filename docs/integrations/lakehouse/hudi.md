@@ -1,7 +1,7 @@
 # Apache Hudi
 
-**Hudi is read-only in Batcher.** There is no writer. `bt.read.hudi(path)` gives you a lazy
-`Dataset` over a Hudi table; `ds.write.hudi(...)` raises immediately and tells you why. Writing
+**Hudi is read-only in Batcher.** There is no writer. {py:meth}`bt.read.hudi(path) <batcher.api.io_namespace.reader.Reader.hudi>` gives you a lazy
+{py:class}`Dataset <batcher.Dataset>` over a Hudi table; {py:meth}`ds.write.hudi(...) <batcher.api.io_namespace.writer.Writer.hudi>` raises immediately and tells you why. Writing
 Hudi means the Spark or Flink write stack: the commit protocol, the timeline, the index, the
 compaction service. None of that belongs in a Rust/Arrow data plane. Reading is served by hudi-rs
 (`pip install 'batcher-engine[hudi]'`).
@@ -9,9 +9,9 @@ compaction service. None of that belongs in a Rust/Arrow data plane. Reading is 
 | | |
 | --- | --- |
 | **Read** | `bt.read.hudi(path)`, with `as_of_instant=` |
-| **Write** | Not supported. `ds.write.hudi(...)` raises `BackendError`. |
+| **Write** | Not supported. `ds.write.hudi(...)` raises {py:exc}`BackendError <batcher.BackendError>`. |
 | **Extra** | `pip install 'batcher-engine[hudi]'` |
-| **Parallelism** | None at the source. `splits()` returns a single `WholeSourceSplit`. |
+| **Parallelism** | None at the source. `splits()` returns a single {py:class}`WholeSourceSplit <batcher.io.WholeSourceSplit>`. |
 | **Pushdown** | An AND of column-vs-literal comparisons, as hudi-rs filter tuples |
 | **Incremental** | `HudiSource.read_incremental(start, end)` |
 
@@ -83,7 +83,7 @@ snapshot = bt.read.hudi("s3://lake/hudi/events", as_of_instant="2024030112000000
 
 To read only what changed between two instants, which is the incremental query a downstream
 medallion stage wants, go through the source directly. It returns an Arrow table, so wrap it with
-`bt.from_arrow` to keep working in the engine.
+{py:func}`bt.from_arrow <batcher.from_arrow>` to keep working in the engine.
 
 ```python
 # docs: skip
@@ -130,7 +130,7 @@ downstream runs morsel-parallel across cores and across the cluster.
 
 For a table that is a small dimension or a filtered slice, that is fine. For a multi-terabyte fact
 table, it is a real bottleneck, and the fix is upstream. Read the table's underlying Parquet with
-`bt.read.parquet_dataset`, which does split per file, if and only if you can guarantee the layout
+{py:meth}`bt.read.parquet_dataset <batcher.api.io_namespace.reader.Reader.parquet_dataset>`, which does split per file, if and only if you can guarantee the layout
 is copy-on-write with no pending log files. That guarantee is the catch, so measure before you take
 it.
 

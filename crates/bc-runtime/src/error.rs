@@ -15,6 +15,12 @@ pub enum RuntimeError {
     #[error("integer SUM overflowed i64; cast the column to a wider type first")]
     SumOverflow,
 
+    #[error(
+        "a {dtype} column reached {bytes} bytes, past Arrow's 2 GiB limit for 32-bit string \
+         offsets; cast the column to large_string (or large_binary) so its offsets are 64-bit"
+    )]
+    ByteOffsetOverflow { dtype: String, bytes: usize },
+
     #[error("window function {func} is not supported for column type {dtype}")]
     UnsupportedWindow { func: String, dtype: String },
 
@@ -23,6 +29,24 @@ pub enum RuntimeError {
 
     #[error("window function {func} requires order keys")]
     WindowRequiresOrder { func: String },
+
+    #[error(
+        "ASOF tolerance and direction='nearest' need a numeric or temporal `on` key \
+         to measure a distance, but the key is {dtype}"
+    )]
+    AsofKeyNotMeasurable { dtype: String },
+
+    #[error(
+        "a RANGE window frame with an offset needs exactly one ORDER BY key to measure \
+         the offset against, got {got}"
+    )]
+    RangeFrameNeedsOneOrderKey { got: usize },
+
+    #[error(
+        "a RANGE window frame with an offset needs a numeric or temporal ORDER BY key \
+         to measure the offset against, but the key is {dtype}"
+    )]
+    RangeFrameKeyNotMeasurable { dtype: String },
 
     #[error("malformed spilled partial: expected {expected} columns, got {got}")]
     MalformedPartial { expected: usize, got: usize },

@@ -12,10 +12,19 @@ from typing import Protocol, runtime_checkable
 
 import pyarrow as pa
 
+from batcher._internal.errors import FormatError
 from batcher.io.formats import SINKS, CSVSink, JSONSink, ParquetSink
 from batcher.io.manifest import WriteManifest, WrittenFile
 
-__all__ = ["SINKS", "CSVSink", "JSONSink", "ParquetSink", "Sink", "table_sink_kwargs"]
+__all__ = [
+    "SINKS",
+    "CSVSink",
+    "JSONSink",
+    "ParquetSink",
+    "Sink",
+    "check_write_options",
+    "table_sink_kwargs",
+]
 
 
 def table_sink_kwargs(fmt: str, path: str) -> dict[str, object]:
@@ -44,6 +53,93 @@ def table_sink_kwargs(fmt: str, path: str) -> dict[str, object]:
     import uuid
 
     return {"identifier": path, "write_token": uuid.uuid4().hex[:12]}
+
+
+def check_write_options(fmt: str, opts: dict[str, object]) -> None:
+    """Reject a write keyword the sink for `fmt` does not accept, by name.
+
+    Reading a mistyped option already fails with the format, the misspelling and a
+    "did you mean" (`OptionSpec` on the way in, `FileSource` for the base keywords).
+    Writing one did not: it travelled all the way down and surfaced as
+    ``DeltaSink.__init__() got an unexpected keyword argument 'schema_mode'`` — an error
+    naming a class the caller never typed and cannot import, with no hint that the option
+    they wanted is spelled `merge_schema`. `table_sink_kwargs` above records the same
+    failure from the other side.
+
+    Two things make checking here rather than at each construction site worth it. There
+    are seven construction sites (batch, streaming, distributed, per-worker), so a check
+    at any one of them leaves the rest raw. And a distributed write builds its sink
+    *inside a Ray worker*, so the `TypeError` arrived as a remote-task traceback after the
+    cluster had already been provisioned — for a typo knowable before any of it started.
+
+    A `**kwargs` in the signature means two opposite things, and the distinction is what
+    decides whether a name can be judged here at all:
+
+    * On a `FileSink` subclass it is the **forwarding idiom** — ``super().__init__(**kwargs)``
+      passing `filesystem=` / `storage_options=` up, as the base's own comment requires. The
+      accepted set is then exactly the union over the constructor chain, so it is knowable,
+      and reading only the leaf's signature is what let a misspelled `compression` through.
+    * On a connector-backed sink it is genuine **passthrough** of open-ended driver
+      keywords, which are not knowable here. Those are skipped, mirroring
+      `OptionSpec(passthrough=True)` on the read side.
+
+    Args:
+        fmt: The registered sink format the write is going to.
+        opts: The write keywords the caller passed, already stripped of the ones the
+            writer itself consumes.
+
+    Raises:
+        FormatError: If a keyword matches no parameter of the sink's constructor chain.
+    """
+    import inspect
+
+    from batcher._internal.errors import unknown_value
+    from batcher.io.base.sink import FileSink
+
+    sink_cls = SINKS.get(fmt)
+    if not isinstance(sink_cls, type):
+        return
+    # A sink that declares its own write vocabulary knows more than a signature does — it
+    # knows the aliases (`sep` for `delimiter`) and the deliberately-absent options and why.
+    # Defer to it, which also moves its error to the same early point as everyone else's.
+    spec = getattr(sink_cls, "write_spec", None)
+    if spec is not None:
+        spec.resolve(dict(opts))
+        return
+    names: set[str] = set()
+    forwards = False
+    for klass in sink_cls.__mro__:
+        if klass is object:
+            # `object.__init__` is `(self, /, *args, **kwargs)`, so counting it would read
+            # every sink as an open-ended passthrough and check nothing at all.
+            break
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            params = inspect.signature(init).parameters
+        except (TypeError, ValueError):  # unintrospectable — judge no name against it
+            return
+        names.update(
+            n
+            for n, p in params.items()
+            if n != "self"
+            and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        )
+        forwards |= any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if forwards and not issubclass(sink_cls, FileSink):
+        return  # open-ended driver keywords: not this layer's to judge
+    accepted = tuple(sorted(names))
+    for key in opts:
+        if key not in accepted:
+            raise unknown_value(
+                FormatError,
+                f"{fmt} write option",
+                key,
+                accepted,
+                label="Accepted options",
+                hint="see the writer's docstring for what each option does.",
+            )
 
 
 @runtime_checkable

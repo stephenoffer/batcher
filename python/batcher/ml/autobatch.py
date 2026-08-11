@@ -210,9 +210,14 @@ class ThroughputController:
             self._stale = 0
             self._best_throughput = t
             self._best_size = self._cur
-            # Persist the new plateau so the next run warm-starts here (best-effort, no-op
-            # unless a hub + signature was supplied).
-            record_batch_size(self._hub, self._signature, round(self._cur))
+            # Persist the size the run will actually use, not the raw internal target. After
+            # an out-of-memory the two diverge: `current()` clamps to the ceiling while
+            # `_cur` keeps being multiplied by `grow` on every improving observation, so it
+            # runs away above a size already proven to fail. Recording that runaway value
+            # handed the *next* run a warm start well above the ceiling this run learned —
+            # measured at 5316 rows after an OOM at 1000 pinned the ceiling to 700. It is
+            # the same trap `best_size` documents; this path simply bypassed it.
+            record_batch_size(self._hub, self._signature, self.current())
             # Predictive VRAM guard: a multiplicative grow scales the batch — and
             # roughly VRAM — by `grow`, which could overshoot the cap in a *single*
             # step before the reactive shrink (above) ever sees it. So only grow when
@@ -220,7 +225,14 @@ class ThroughputController:
             # current (best) size, the safe ceiling. This makes the climb OOM-safe by
             # construction rather than relying on catching the OOM after the fact.
             if vram_fraction is None or vram_fraction * self._grow <= self._vram_cap:
+                # Bounded by the OOM ceiling as well as `max_rows`, so the internal target
+                # cannot run away above the size the device has already refused. Left
+                # unbounded it climbed indefinitely while `current()` held flat at the
+                # ceiling, which also poisoned `_best_size` — the value the plateau settles
+                # back to — with a size that was never actually run.
                 self._cur = min(float(self._max), self._cur * self._grow)
+                if self._oom_ceiling is not None:
+                    self._cur = min(self._cur, self._oom_ceiling)
         elif self._best_size is not None:
             # Plateaued or regressed: settle back at the best size observed. But a *durable*
             # regression (a co-tenant landed, sequences got longer, a slower shard) makes

@@ -27,6 +27,7 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import pyarrow as pa
@@ -34,6 +35,7 @@ import pyarrow as pa
 from batcher._internal.errors import BackendError
 from batcher._internal.logging import note_suppressed
 from batcher._internal.optional import require
+from batcher.io.formats.lakehouse._time import normalize_timestamp
 
 __all__ = ["DeltaSnapshot", "open_snapshot", "require_deltalake"]
 
@@ -344,7 +346,7 @@ def open_snapshot(
     table_uri: str,
     *,
     version: int | None = None,
-    timestamp: str | None = None,
+    timestamp: str | datetime | None = None,
     storage_options: dict[str, str] | None = None,
 ) -> DeltaSnapshot:
     """Open (or reuse) the snapshot for a Delta table at a version/timestamp.
@@ -413,10 +415,16 @@ def open_snapshot(
 def _open_table(
     table_uri: str,
     version: int | None,
-    timestamp: str | None,
+    timestamp: str | datetime | None,
     storage_options: dict[str, str] | None,
 ) -> Any:
     deltalake = require_deltalake()
+    # Normalized *before* the try: delta-rs wants a fully-qualified RFC-3339 instant and
+    # rejects every other spelling. A malformed timestamp is the caller's argument, not a
+    # failure to reach the table, so it must not be reported as one — wrapping it in
+    # "failed to open Delta table" buries the one sentence that says how to fix it.
+    if timestamp is not None:
+        timestamp = normalize_timestamp(timestamp, argument="timestamp")
     try:
         table = deltalake.DeltaTable(table_uri, version=version, storage_options=storage_options)
         if timestamp is not None:

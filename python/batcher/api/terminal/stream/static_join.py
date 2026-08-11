@@ -135,9 +135,8 @@ def stream_static_join(
     Yields:
         The joined rows, one micro-batch's worth at a time.
     """
-    from batcher import core, kyber
     from batcher.api.session import from_arrow
-    from batcher.api.terminal.stream.dispatch import _iter_batches
+    from batcher.api.terminal.stream.dispatch import _iter_batches, _iter_streaming
     from batcher.plan.logical import remap_sources
     from batcher.plan.visitor import scanned_source_ids
 
@@ -161,45 +160,43 @@ def stream_static_join(
         else pa.Table.from_batches([], schema=_static_schema(static_plan))
     )
 
+    # The stream side goes through the same breaker-free router the stateless streaming
+    # path uses, rather than a private optimize-and-execute loop. That is what makes a
+    # `map_batches` beneath the join work: the UDF is Python and cannot be lowered, so
+    # asking Kyber for a `PhysicalPlan` of a plan containing one raised
+    # `NotImplementedError: map_batches is executed in Python, not lowered to the engine
+    # IR` -- scoring a stream and then enriching it from a dimension is an obvious pipeline
+    # and it could not run at all. `_iter_streaming` pushes the projection and predicate
+    # down exactly as the private loop did, so nothing is given up for it.
     stream_ids = sorted(scanned_source_ids(stream_plan))
     stream_source = sources[stream_ids[0]]
     stream_local = remap_sources(stream_plan, -stream_ids[0])
-    hub = core.default_hub()
-    optimized = kyber.optimize(stream_local, sources=[stream_source], hub=hub)
-
-    from batcher.io.source import iter_source
 
     static_ds = from_arrow(static_table)
-    for raw in iter_source(
-        stream_source, optimized.source_projections.get(0), optimized.source_predicates.get(0)
-    ):
-        if raw.num_rows == 0:
+    aliases = [o.alias for o in plan.output]
+    for produced in _iter_streaming(stream_local, [stream_source], None):
+        if produced.num_rows == 0:
             continue
-        for produced in core.execute_local(optimized, [[raw]], feedback=hub):
-            if produced.num_rows == 0:
-                continue
-            batch_ds = from_arrow(pa.Table.from_batches([produced]))
-            left_ds = batch_ds if streaming_side == "left" else static_ds
-            right_ds = static_ds if streaming_side == "left" else batch_ds
-            joined = left_ds.join(
-                right_ds,
-                left_on=list(plan.left_keys),
-                right_on=list(plan.right_keys),
-                how=plan.join_type,
-            ).collect()
-            if joined.num_rows == 0:
-                continue
-            # The declared output aliases, so the rows match the plan's schema exactly —
-            # the join above is rebuilt from two fresh relations and would otherwise be
-            # free to name its columns differently from what the plan promised.
-            aliases = [o.alias for o in plan.output]
-            present = [a for a in aliases if a in joined.column_names]
-            shaped = joined.select(present) if present else joined
-            yield from (
-                shaped.to_batches()
-                if batch_size is None
-                else shaped.to_batches(max_chunksize=batch_size)
-            )
+        batch_ds = from_arrow(pa.Table.from_batches([produced]))
+        left_ds = batch_ds if streaming_side == "left" else static_ds
+        right_ds = static_ds if streaming_side == "left" else batch_ds
+        joined = left_ds.join(
+            right_ds,
+            left_on=list(plan.left_keys),
+            right_on=list(plan.right_keys),
+            how=plan.join_type,
+        ).collect()
+        if joined.num_rows == 0:
+            continue
+        # The declared output aliases, so the rows match the plan's schema exactly — the
+        # join above is rebuilt from two fresh relations and would otherwise be free to
+        # name its columns differently from what the plan promised.
+        present = [a for a in aliases if a in joined.column_names]
+        shaped = joined.select(present) if present else joined
+        if batch_size is None:
+            yield from shaped.to_batches()
+        else:
+            yield from shaped.to_batches(max_chunksize=batch_size)
 
 
 def _static_schema(static_plan: LogicalPlan) -> pa.Schema:

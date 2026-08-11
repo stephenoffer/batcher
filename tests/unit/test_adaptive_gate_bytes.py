@@ -1,12 +1,15 @@
 """The adaptive size floor is about *work*, and a row count assumes a row width.
 
-`_ADAPTIVE_MIN_INPUT_ROWS` exists because stage-by-stage re-optimization trades a ~20-40 ms
+`_ADAPTIVE_MIN_ROWS_PER_STAGE` exists because stage-by-stage re-optimization trades a ~20-40 ms
 re-plan for a better downstream join choice, which only pays once a mis-estimated plan would
 cost more than that. Rows are a proxy for work, and the proxy holds only while a row is the
 ~64 bytes `optimizer.row_bytes` assumes. Across the modality range it inverts at both ends:
 20M rows of two `int64` keys is 320 MB and cleared the floor, while 1M rows of decoded
 224x224x3 images is 150 GB and did not — so the most expensive query class in the engine was
 the one class the adaptive loop never ran on.
+
+The floor is charged **per stage the loop would cut**, so these tests multiply by the plan's
+breaker count; `test_adaptive_stage_floor.py` covers that scaling on its own.
 """
 
 from __future__ import annotations
@@ -17,12 +20,12 @@ import pytest
 
 import batcher as bt
 from batcher.api.adaptive.gating import (
-    _ADAPTIVE_MIN_INPUT_BYTES,
-    _ADAPTIVE_MIN_INPUT_ROWS,
-    _build_estimator,
+    _ADAPTIVE_MIN_BYTES_PER_STAGE,
+    _ADAPTIVE_MIN_ROWS_PER_STAGE,
     _large_enough,
     _total_input_size,
 )
+from batcher.api.source_stats import build_estimator
 
 pytestmark = pytest.mark.unit
 
@@ -41,9 +44,9 @@ def _tensor_join(rows: int = 8, shape=(224, 224, 3)):
 
 
 def test_the_two_floors_describe_the_same_size():
-    # Derived from the existing knobs rather than added as a third, so there is one place
-    # that says how big "big" is.
-    assert _ADAPTIVE_MIN_INPUT_BYTES == _ADAPTIVE_MIN_INPUT_ROWS * 64
+    # Derived from the row floor rather than added as a second independent knob, so there is
+    # one place that says how big "big" is.
+    assert _ADAPTIVE_MIN_BYTES_PER_STAGE == _ADAPTIVE_MIN_ROWS_PER_STAGE * 64
 
 
 def test_a_small_narrow_query_still_does_not_qualify():
@@ -54,7 +57,7 @@ def test_a_small_narrow_query_still_does_not_qualify():
 
 def test_the_size_probe_reports_bytes_as_well_as_rows():
     ds = _tensor_join(rows=8)
-    estimator = _build_estimator(ds._sources, None)
+    estimator = build_estimator(ds._sources, None)
     rows, nbytes = _total_input_size(ds._plan, estimator)
     assert rows > 0
     # The image scan dominates: 8 rows at 147 KiB each is far more than 8 rows at 64 B.
@@ -64,12 +67,12 @@ def test_the_size_probe_reports_bytes_as_well_as_rows():
 def test_a_wide_query_clears_the_floor_on_bytes_alone():
     # 224x224x3 uint8 is 147 KiB per row, so it takes about 8,900 rows to reach the byte
     # floor -- three orders of magnitude below the row floor, which is the whole point.
-    needed = int(_ADAPTIVE_MIN_INPUT_BYTES / (224 * 224 * 3)) + 64
+    needed = int(_ADAPTIVE_MIN_BYTES_PER_STAGE / (224 * 224 * 3)) + 64
     ds = _tensor_join(rows=needed)
-    estimator = _build_estimator(ds._sources, None)
+    estimator = build_estimator(ds._sources, None)
     rows, nbytes = _total_input_size(ds._plan, estimator)
-    assert rows < _ADAPTIVE_MIN_INPUT_ROWS  # nowhere near the row floor
-    assert nbytes >= _ADAPTIVE_MIN_INPUT_BYTES
+    assert rows < _ADAPTIVE_MIN_ROWS_PER_STAGE  # nowhere near the row floor
+    assert nbytes >= _ADAPTIVE_MIN_BYTES_PER_STAGE
     assert _large_enough(ds._plan, ds._sources, None) is True
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
@@ -22,9 +22,66 @@ __all__ = [
     "FileSplit",
     "IpcFileSplit",
     "LineRangeSplit",
+    "MultiFileSplit",
     "NormalizedFileSplit",
+    "pack_files",
     "read_aligned_range",
 ]
+
+
+def pack_files(sizes: list[int], target_bytes: int, min_runs: int) -> list[tuple[int, int]]:
+    """Group adjacent files into ``[start, stop)`` runs of roughly `target_bytes` each.
+
+    One split per file is the right unit when files are large and few. It is the wrong one
+    when they are small and many: every split is a scheduled task, a serialized locator, and
+    a worker round trip, so a directory of a million 4 KB files becomes a million tasks whose
+    overhead dwarfs the bytes they move. Packing them by size is what makes that corpus read
+    like the few gigabytes it actually is. This is the same lever as Spark's
+    ``maxPartitionBytes`` over its ``FilePartition``.
+
+    A file is never *divided* here — only grouped — so a run always holds at least one file
+    however large it is, and a dataset of big files packs to one file per run, unchanged.
+
+    `min_runs` is the floor that keeps packing from destroying parallelism, and it binds at
+    ``min(min_runs, len(sizes))`` — never more runs than there are files, but never fewer
+    than the files could have supplied. Grouping eight 10 MB files under a 128 MiB target
+    would otherwise yield a single task and idle every core but one, and grouping *two* tiny
+    files would halve a two-file read for no reason at all. The consequence worth stating:
+    a dataset with no more files than the floor packs to exactly one file per run, so
+    grouping only ever engages once files outnumber the parallelism available to read them
+    — which is the only situation it was introduced for.
+
+    Args:
+        sizes: Each file's size in bytes, in the order the files will be read.
+        target_bytes: Rough bytes to aim for per run.
+        min_runs: The parallelism floor, capped at the file count.
+
+    Returns:
+        The ``[start, stop)`` index ranges covering `sizes` exactly once, in order.
+    """
+    if not sizes:
+        return []
+    floor = min(min_runs, len(sizes))
+    runs = _pack(sizes, max(1, target_bytes))
+    if len(runs) < floor:
+        runs = _pack(sizes, max(1, sum(sizes) // floor))
+    return runs
+
+
+def _pack(sizes: list[int], target: int) -> list[tuple[int, int]]:
+    """`sizes` as ``[start, stop)`` runs, each at least one file and about `target` bytes."""
+    runs: list[tuple[int, int]] = []
+    start = 0
+    acc = 0
+    for i, size in enumerate(sizes):
+        # `i > start` keeps a run non-empty: a single file larger than the target is its
+        # own run rather than being split, which this packing cannot do.
+        if i > start and acc + size > target:
+            runs.append((start, i))
+            start, acc = i, 0
+        acc += size
+    runs.append((start, len(sizes)))
+    return runs
 
 
 def read_aligned_range(path: str, start: int, end: int) -> bytes:
@@ -217,6 +274,111 @@ class FileSplit:
 
 
 @dataclass(frozen=True, slots=True)
+class MultiFileSplit:
+    """A **run of whole files** read by one task, rebuilt on the worker per file.
+
+    The unit that lets a small-file corpus scale. `FileSplit` is one file per task, which
+    is correct and is the wrong granularity once files outnumber workers by orders of
+    magnitude: at a million 4 KB files it is a million scheduled tasks, a million pickled
+    locators, and a million worker round trips to move four gigabytes. `pack_files` groups
+    adjacent files by size and this reads a group, so the task count tracks the *bytes* in
+    the dataset rather than the number of objects it happens to be stored in.
+
+    Carries the same ``(format_name, kwargs)`` a `FileSplit` does and rebuilds a single-file
+    reader per path through the registry, so it needs nothing from a format that a
+    one-file split does not already need — every format that can be a `FileSplit` can be
+    part of a `MultiFileSplit`.
+
+    `rows` is the group's exact row count when the planner already knew it for free; it is
+    `None` otherwise and is never computed by opening the files, which would reintroduce
+    the per-file round trip the grouping exists to remove.
+    """
+
+    format_name: str
+    paths: tuple[str, ...]
+    kwargs: dict[str, object] = field(default_factory=dict)
+    rows: int | None = None
+
+    def _reader(self, path: str) -> Source:
+        from batcher.io.formats.base import SOURCES
+
+        return SOURCES.get(self.format_name)(path, **self.kwargs)
+
+    def schema(self) -> pa.Schema:
+        """The group's schema, from its first file.
+
+        Returns:
+            The Arrow schema every file in this group conforms to.
+        """
+        return self._reader(self.paths[0]).schema()
+
+    def read(
+        self, projection: list[str] | None = None, predicate: dict | None = None
+    ) -> list[pa.RecordBatch]:
+        """Read every file in the group, concurrently on a remote store.
+
+        A group exists because its files are small, and a small remote file is almost all
+        latency — so reading them one after another inside the task would trade the
+        scheduler round trips away only to pay them again as serialized GETs.
+        `read_each_file` owns that policy: concurrent for an object store, serial for local
+        disk, where a read is a syscall and a pool costs more than it saves.
+
+        Args:
+            projection: Columns to read. All columns when omitted.
+            predicate: A filter the format may apply during the read. The engine re-checks
+                it regardless, so ignoring it is still correct.
+
+        Returns:
+            Every file's batches, in file order.
+        """
+        from batcher.io._concurrent import read_each_file
+        from batcher.io.source import read_source
+
+        per_file = read_each_file(
+            None,
+            list(self.paths),
+            lambda _fs, path: read_source(self._reader(path), projection, predicate),
+        )
+        return [batch for batches in per_file for batch in batches]
+
+    def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        """Stream the group's files one after another, in order.
+
+        Deliberately serial, unlike `read`: this is the bounded-memory path, and reading
+        several files at once here would hold several files' decoded batches at once, which
+        is the thing the caller chose this method to avoid.
+
+        Args:
+            projection: Columns to read. All columns when omitted.
+
+        Returns:
+            An iterator over the group's batches, file by file.
+        """
+        for path in self.paths:
+            yield from self._reader(path).iter_batches(projection)
+
+    def row_count(self) -> int | None:
+        """The group's exact rows when the planner captured them, else None.
+
+        Returns:
+            The row count, or None when it was not known without opening the files.
+        """
+        return self.rows
+
+    def identity(self) -> str:
+        """The ``format:first-path+count`` key naming this group.
+
+        The first path and the file count identify it exactly: groups are disjoint runs of
+        one ordered file list, so no two can begin at the same file. Naming every member
+        would put a million paths in a statistics key.
+
+        Returns:
+            A key that distinguishes this group from the source's others.
+        """
+        return f"{self.format_name}:{self.paths[0]}+{len(self.paths)}"
+
+
+@dataclass(frozen=True, slots=True)
 class NormalizedFileSplit:
     """One whole file, reshaped on the worker to a schema unified across all of them.
 
@@ -345,13 +507,25 @@ class LineRangeSplit:
     path: str
     start: int
     end: int
+    #: The source's constructor keywords, carried for the same reason `FileSplit` carries
+    #: them: a worker rebuilds the reader from the split alone, so anything omitted reverts
+    #: to its default *on the distributed path only*. Only the whole-file `FileSplit`
+    #: branches used to pass them, so a JSON file merely large enough to subdivide silently
+    #: lost `on_error=`, `on_bad_lines=`, `filesystem=` and `storage_options=` — a tolerated
+    #: read became fail-fast, and an explicitly configured store became whatever the
+    #: worker's environment resolved.
+    options: dict[str, Any] | None = None
+
+    def _source(self):
+        """The reader this range belongs to, rebuilt with the options it was given."""
+        from batcher.io.formats.base import SOURCES
+
+        return SOURCES.get(self.format_name)(self.path, **(self.options or {}))
 
     def _aligned_bytes(self) -> bytes:
         return read_aligned_range(self.path, self.start, self.end)
 
     def _table(self, projection: list[str] | None) -> pa.Table:
-        import io
-
         import pyarrow.json as pajson
 
         schema = self.schema()
@@ -369,13 +543,20 @@ class LineRangeSplit:
         # the same schema the source advertises; `ignore` keeps a truly-unexpected
         # field from re-introducing per-range drift. Mirrors `CSVRangeSplit`.
         parse = pajson.ParseOptions(explicit_schema=schema, unexpected_field_behavior="ignore")
-        table = pajson.read_json(io.BytesIO(buf), parse_options=parse)
+        from batcher.io.formats.semistructured.json_tolerance import read_json_records
+
+        table = read_json_records(buf, parse, self._policy())
         return table.select(projection) if projection is not None else table
 
-    def schema(self) -> pa.Schema:
-        from batcher.io.formats.base import SOURCES
+    def _policy(self):
+        """This range's bad-record policy, so a stray line costs a line and not the range."""
+        from batcher.io.base._bad_rows import bad_row_handler
 
-        return SOURCES.get(self.format_name)(self.path).schema()
+        mode = str((self.options or {}).get("on_bad_lines", "error"))
+        return bad_row_handler(mode, self.path, format_name=self.format_name)
+
+    def schema(self) -> pa.Schema:
+        return self._source().schema()
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         return self._table(projection).to_batches()

@@ -27,7 +27,13 @@ use crate::error::RuntimeError;
 
 mod accum;
 mod argextreme;
+mod finalize;
+
+// The finalize dispatch lives in its own module; re-exported so every
+// caller's `agg::finalize(..)` is unchanged by the move.
+pub use finalize::finalize;
 mod distinct;
+mod distinct_on;
 mod fused;
 mod group;
 mod hll;
@@ -45,8 +51,10 @@ use distinct::{
     bucket_values_into_list, distinct_state, finalize_count_distinct, flatten_list_state,
     merge_distinct,
 };
-pub use distinct::{distinct_batch, distinct_dense};
+pub use distinct::{distinct_dense, distinct_parts, distinct_prefix, DistinctPrefix};
+pub use distinct_on::{distinct_on, distinct_on_parts, OrderKey};
 pub(crate) use group::assign_groups;
+pub use group::concat_disjoint;
 use hll::{approx_distinct_state, finalize_approx_distinct, merge_approx_distinct};
 use median::{
     finalize_entropy, finalize_histogram, finalize_list_agg, finalize_mad, finalize_median,
@@ -106,6 +114,14 @@ pub enum AggFunc {
     /// `mode` — the most frequent value per group (same list state as `Median`).
     /// Ties broken by the smallest value, so it is deterministic / mergeable.
     Mode,
+    /// `n50`/`n90` — assembly-contiguity *length* at permille `p`. See `agg::assembly` for
+    /// what these mean and why they are not quantiles. All three share `Median`'s value-list
+    /// state, so they merge for free.
+    NLength(u16),
+    /// `l50`/`l90` — the *count* of pieces reaching permille `p`. → Int64.
+    LCount(u16),
+    /// `aun` — the area under the Nx curve, `Σ(l²)/Σ(l)`. Threshold-free, takes no param.
+    AuN,
     /// `arg_min` — the value at the row with the minimum ordering key (two-input;
     /// 2-column state). Key ties break to the smallest value (mergeable).
     ArgMin,
@@ -189,6 +205,13 @@ impl AggFunc {
             AggFunc::ApproxCountDistinct => "approx_count_distinct",
             AggFunc::ApproxQuantile(_) => "approx_quantile",
             AggFunc::Mode => "mode",
+            AggFunc::NLength(500) => "n50",
+            AggFunc::NLength(900) => "n90",
+            AggFunc::NLength(_) => "nx",
+            AggFunc::LCount(500) => "l50",
+            AggFunc::LCount(900) => "l90",
+            AggFunc::LCount(_) => "lx",
+            AggFunc::AuN => "aun",
             AggFunc::ArgMin => "arg_min",
             AggFunc::ArgMax => "arg_max",
             AggFunc::Product => "product",
@@ -435,32 +458,6 @@ fn coerce_null_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, Ru
     Ok(Some(out))
 }
 
-/// Partial rows each radix partition needs before the parallel regroup earns its setup.
-///
-/// The crossover is a function of rows *per partition*, not of the total: the parallel path's
-/// overhead is per-partition (a bucket list, a gather, a hash table, an output array), while
-/// the serial path's is per-row and single-threaded. Measured on a 92-core box over
-/// ClickBench `hits` (min-of-5 wall, whole query):
-///
-/// | partial rows | serial | parallel |
-/// |--------------|-------:|---------:|
-/// | 14 k (`GROUP BY RegionID`)   | 2.5 ms  | 5.2 ms |
-/// | 23 k (`GROUP BY SearchPhrase`)| 7.0 ms | 5.5 ms |
-/// | 35 k (`GROUP BY Title`)      | 16.0 ms | 12.4 ms |
-/// | 182 k (`GROUP BY URL`, filtered) | 49.3 ms | 15.1 ms |
-///
-/// The turn is just under 23 k there — `92 × 256` — and the 182 k row is why this matters: a
-/// fixed 200 k threshold left a string group-by *just* under it on the serial merge, paying
-/// 38 ms of single-threaded `assign_groups` for work the parallel path does in 5.
-const MIN_ROWS_PER_RADIX_PARTITION: usize = 256;
-
-/// Radix partitions a `combine` fans out over: one per core, so the independent
-/// group-and-merge tasks fill the pool. The 512 ceiling caps per-partition setup on huge
-/// boxes; the floor of 2 keeps the path meaningful on a single-core one.
-fn radix_partitions() -> usize {
-    rayon::current_num_threads().clamp(2, 512)
-}
-
 /// The partial-row count above which `combine` regroups in parallel (hash-radix), resolving
 /// `0` — the configured default — to the machine-derived crossover.
 ///
@@ -470,7 +467,7 @@ pub fn radix_parallel_threshold(configured: usize) -> usize {
     if configured > 0 {
         configured
     } else {
-        radix_partitions().saturating_mul(MIN_ROWS_PER_RADIX_PARTITION)
+        group::radix_parallel_default()
     }
 }
 
@@ -534,7 +531,14 @@ fn accumulate(
         AggFunc::Var | AggFunc::Stddev => {
             var_state(require(values, func)?, group_ids, num_groups, func)?
         }
-        AggFunc::Median | AggFunc::Quantile(_) | AggFunc::Mode | AggFunc::Histogram => {
+        AggFunc::Median
+        | AggFunc::Quantile(_)
+        | AggFunc::Mode
+        | AggFunc::Histogram
+        // The contiguity statistics differ from `Median` only in their finalize.
+        | AggFunc::NLength(_)
+        | AggFunc::LCount(_)
+        | AggFunc::AuN => {
             vec![median_state(require(values, func)?, group_ids, num_groups)?]
         }
         // `array_agg`/`list_agg` KEEPS null elements (SQL semantics), unlike the
@@ -621,6 +625,33 @@ pub fn combine_with(
     funcs: &[AggFunc],
     radix_parallel_threshold: usize,
 ) -> Result<Partial, RuntimeError> {
+    combine_sized(parts, funcs, radix_parallel_threshold, 0)
+}
+
+/// [`combine_with`] told how many groups the merge is expected to produce.
+///
+/// The regroup's width wants to be a function of that count — each partition's group table
+/// should stay cache-resident — but the count is not knowable *inside* `combine`: it is
+/// exactly what the merge computes, and the cheap proxies for it (total partial rows, the
+/// largest partial) are wrong by 10-70x in opposite directions at the two ends of the range.
+/// One caller does know: the executor sampled this aggregate's morsels to choose its shape,
+/// and `bc_interp::agg_par` inverts that sample into a group-count estimate accurate to
+/// within a few percent. This is the parameter that carries it down.
+///
+/// The width matters, and no single flat value serves both ends of the range: one per core
+/// is the best setting at 10 k groups and **1.35x off** at 6.3 M. A flat 4x oversubscription
+/// measured 1.2-1.6x on the high-cardinality shapes and 0.85-0.90x on the low ones in a
+/// whole-query A/B, consistently, over six paired rounds. The measured table is on
+/// `group::radix_partitions`, which turns this count into the width.
+///
+/// `estimated_groups == 0` means "not known", and keeps one partition per core — so every
+/// caller that does not measure is byte-for-byte unchanged.
+pub fn combine_sized(
+    parts: &[Partial],
+    funcs: &[AggFunc],
+    radix_parallel_threshold: usize,
+    estimated_groups: usize,
+) -> Result<Partial, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
     let radix_parallel_threshold = self::radix_parallel_threshold(radix_parallel_threshold);
 
@@ -646,7 +677,7 @@ pub fn combine_with(
     // is pure overhead on a small/single group), and only that path needs the partials
     // concatenated at all.
     if total_rows > radix_parallel_threshold && n_keys > 0 {
-        let partitions = radix_partitions();
+        let partitions = group::radix_partitions(estimated_groups);
         let (group_columns, states) = group::combine_radix(parts, funcs, total_rows, partitions)?;
         return Ok(Partial {
             group_columns,
@@ -707,7 +738,7 @@ pub fn combine_partitioned(
     if parts.len() == 1 || n_keys == 0 || total_rows <= radix_parallel_threshold {
         return Ok(vec![combine_with(parts, funcs, radix_parallel_threshold)?]);
     }
-    let per = group::combine_radix_parts(parts, funcs, total_rows, radix_partitions())?;
+    let per = group::combine_radix_parts(parts, funcs, total_rows, group::radix_partitions(0))?;
     Ok(per
         .into_iter()
         .filter(|(g, _)| g.first().is_none_or(|c| !c.is_empty()))
@@ -747,51 +778,6 @@ fn finalize_kahan(sums: &ArrayRef, comps: &ArrayRef) -> Result<Vec<ArrayRef>, Ru
         .map(|i| (!s.is_null(i)).then(|| s.value(i) + c.value(i)))
         .collect();
     Ok(vec![Arc::new(out)])
-}
-
-/// Step 3: turn merged state into output columns.
-pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, RuntimeError> {
-    let mut out = Vec::with_capacity(funcs.len());
-    for (a, &func) in funcs.iter().enumerate() {
-        let state = &p.states[a];
-        out.push(match func {
-            AggFunc::Mean => finalize_mean(&state[0], &state[1])?,
-            AggFunc::Var => finalize_var(&state[0], &state[1], &state[2], false)?,
-            AggFunc::Stddev => finalize_var(&state[0], &state[1], &state[2], true)?,
-            // The distinct-set state's per-group list length IS the distinct count.
-            AggFunc::CountDistinct => finalize_count_distinct(&state[0]),
-            AggFunc::Median => finalize_median(&state[0])?,
-            AggFunc::Quantile(permille) => finalize_quantile(&state[0], permille as f64 / 1000.0)?,
-            // array_agg: the collected per-group list IS the result, except a non-null
-            // *empty* list (an aggregate over zero rows) becomes NULL to match DuckDB.
-            AggFunc::ListAgg => finalize_list_agg(&state[0])?,
-            AggFunc::ApproxCountDistinct => finalize_approx_distinct(&state[0]),
-            AggFunc::ApproxQuantile(permille) => {
-                finalize_approx_quantile(&state[0], permille as f64 / 1000.0)
-            }
-            AggFunc::Mode => finalize_mode(&state[0])?,
-            // arg_min/arg_max: the value is state column 1 (column 0 is the key).
-            AggFunc::ArgMin | AggFunc::ArgMax => state[1].clone(),
-            AggFunc::CovarPop => finalize_covar(state, false)?,
-            AggFunc::CovarSamp => finalize_covar(state, true)?,
-            AggFunc::Corr => finalize_corr(state)?,
-            AggFunc::Skewness => finalize_skewness(state)?,
-            AggFunc::Kurtosis => finalize_kurtosis(state)?,
-            AggFunc::Histogram => finalize_histogram(&state[0])?,
-            AggFunc::Entropy => finalize_entropy(&state[0])?,
-            AggFunc::Mad => finalize_mad(&state[0])?,
-            AggFunc::QuantileDisc(permille) => {
-                finalize_quantile_disc(&state[0], permille as f64 / 1000.0)?
-            }
-            AggFunc::ApproxTopK(k) => finalize_top_k(&state[0], k as usize)?,
-            AggFunc::KurtosisPop => finalize_kurtosis_pop(state)?,
-            // The compensation is added back exactly once, at the end.
-            AggFunc::KahanSum => finalize_kahan(&state[0], &state[1])?.remove(0),
-            // All other functions' state IS their output.
-            _ => state[0].clone(),
-        });
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -1232,6 +1218,93 @@ mod tests {
             }
         }
         assert_eq!(got, want);
+    }
+
+    /// `concat_disjoint` is the shortcut `combine` cannot take, so it must agree with
+    /// `combine` on exactly the input it is licensed for: partials produced by *partitioning*
+    /// one relation, where no key can appear in two of them. This composes the two — split by
+    /// key with `combine_partitioned`, then glue with `concat_disjoint` — and asserts the
+    /// result is the relation `combine` returns. That composition is what
+    /// `dist::partial_aggregate` and the partitioned single-node aggregate both run.
+    #[test]
+    fn concat_disjoint_equals_combine_on_key_disjoint_partials() {
+        let n = 4_000usize;
+        let keys: ArrayRef = Arc::new(StringArray::from(
+            (0..n).map(|i| format!("k{}", i % 97)).collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n as i64).map(|i| i % 13).collect::<Vec<_>>(),
+        ));
+        let chunk = 250;
+        let partials: Vec<Partial> = (0..n / chunk)
+            .map(|c| {
+                let (k, v) = (keys.slice(c * chunk, chunk), vals.slice(c * chunk, chunk));
+                partial(std::slice::from_ref(&k), &calls(&v), chunk).unwrap()
+            })
+            .collect();
+
+        let merged = combine(&partials, &FUNCS).unwrap();
+        let want = to_map(
+            &merged.group_columns[0],
+            &finalize(&FUNCS, &merged).unwrap(),
+        );
+
+        let disjoint = combine_partitioned(&partials, &FUNCS, 1).unwrap();
+        assert!(disjoint.len() > 1, "the partitioned path did not engage");
+        let glued = concat_disjoint(&disjoint).unwrap();
+        let got = to_map(&glued.group_columns[0], &finalize(&FUNCS, &glued).unwrap());
+        assert_eq!(got, want);
+    }
+
+    /// A single partial is returned unchanged — the identity `combine([p]) ≡ p` that lets the
+    /// caller take this path without a special case for an unpartitioned input.
+    #[test]
+    fn concat_disjoint_of_one_partial_is_that_partial() {
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "a"]));
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+        let p = partial(std::slice::from_ref(&keys), &calls(&vals), 3).unwrap();
+        let glued = concat_disjoint(std::slice::from_ref(&p)).unwrap();
+        assert_eq!(
+            to_map(&glued.group_columns[0], &finalize(&FUNCS, &glued).unwrap()),
+            to_map(&p.group_columns[0], &finalize(&FUNCS, &p).unwrap()),
+        );
+    }
+
+    /// The regroup's width is a *performance* input, so the property that matters is that no
+    /// width changes the relation. An unmeasured caller (`0`) and a measured one must agree
+    /// with each other and with the serial merge.
+    #[test]
+    fn combine_is_the_same_relation_at_every_width() {
+        let n = 4_000usize;
+        let keys: ArrayRef = Arc::new(StringArray::from(
+            (0..n).map(|i| format!("k{}", i % 97)).collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n as i64).map(|i| i % 13).collect::<Vec<_>>(),
+        ));
+        let chunk = 250;
+        let partials: Vec<Partial> = (0..n / chunk)
+            .map(|c| {
+                let (k, v) = (keys.slice(c * chunk, chunk), vals.slice(c * chunk, chunk));
+                partial(std::slice::from_ref(&k), &calls(&v), chunk).unwrap()
+            })
+            .collect();
+
+        let serial = combine_with(&partials, &FUNCS, usize::MAX).unwrap();
+        let want = to_map(
+            &serial.group_columns[0],
+            &finalize(&FUNCS, &serial).unwrap(),
+        );
+        // 0 = "not measured" (one per core), then estimates spanning every clamp of the width
+        // rule: below the divisor, around it, and far past the ceiling.
+        for groups in [0usize, 1, 97, 32_768, 1_000_000, 100_000_000] {
+            let got = combine_sized(&partials, &FUNCS, 1, groups).unwrap();
+            assert_eq!(
+                to_map(&got.group_columns[0], &finalize(&FUNCS, &got).unwrap()),
+                want,
+                "estimate {groups} changed the relation"
+            );
+        }
     }
 
     #[test]
@@ -1684,5 +1757,58 @@ mod tests {
         // And the counts must have merged, not split.
         let sums = finalize(&[AggFunc::Sum], &radix).unwrap();
         assert_eq!(sums[0].as_primitive::<Int64Type>().value(0), 2);
+    }
+
+    /// The radix-parallel `combine` must equal the serial one when a composite key column
+    /// holds a NULL in *some* partial — including for the rows that are not themselves null.
+    ///
+    /// Regression, the twin of the float case above and found the same way. `hash_keys`'
+    /// multi-column fast paths are gated on `null_count() == 0`, which is a property of the
+    /// **column**, not of the row being hashed — and `hash_partial_keys` hashed each partial
+    /// separately. So a null-free partial folded its keys raw while a partial holding one null
+    /// anywhere in any key column went through arrow's row encoder; the two encodings have
+    /// nothing to do with each other, the same key reached two radix buckets, and the buckets
+    /// concat on the key-disjoint premise. `("a", 1)` below is present in both partials, is
+    /// null in neither, and came out as two groups.
+    ///
+    /// Measured end to end before the fix: TPC-DS q98's five-column grouping at sf1 returned
+    /// **2,581 rows for 2,521 groups**, and its `DISTINCT` spelling the same. Nothing errored.
+    #[test]
+    fn radix_combine_folds_a_key_present_in_a_null_free_and_a_null_bearing_partial() {
+        let part_for = |k: Option<&str>, v: Option<i64>| {
+            let s: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), k]));
+            let n: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), v]));
+            let one: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1]));
+            partial(&[s, n], &[AggCall::new(AggFunc::Sum, Some(one))], 2).unwrap()
+        };
+        // Both partials hold ("a", 1). The first is null-free; the second carries a null in
+        // each key column, which is what flips its encoder.
+        let parts = [part_for(Some("b"), Some(2)), part_for(None, None)];
+
+        let serial = combine_with(&parts, &[AggFunc::Sum], usize::MAX).unwrap();
+        let radix = combine_with(&parts, &[AggFunc::Sum], 1).unwrap();
+        assert_eq!(
+            serial.group_columns[0].len(),
+            3,
+            "serial combine sees ('a',1), ('b',2) and (null,null)"
+        );
+        assert_eq!(
+            radix.group_columns[0].len(),
+            serial.group_columns[0].len(),
+            "radix combine must not split a key across two encodings"
+        );
+        // ('a', 1) appears once in each partial, so its merged count is 2 — not two groups of 1.
+        let sums = finalize(&[AggFunc::Sum], &radix).unwrap();
+        let keys = radix.group_columns[0].as_string::<i32>();
+        let nums = radix.group_columns[1].as_primitive::<Int64Type>();
+        let totals = sums[0].as_primitive::<Int64Type>();
+        let a1 = (0..keys.len())
+            .find(|&i| keys.is_valid(i) && keys.value(i) == "a" && nums.value(i) == 1)
+            .expect("('a', 1) must be a group");
+        assert_eq!(
+            totals.value(a1),
+            2,
+            "('a', 1) must merge across the partials"
+        );
     }
 }

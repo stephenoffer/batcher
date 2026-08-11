@@ -25,18 +25,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns as _require
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
+    from batcher.ml._estimator import Predictor, Scorer
 
 __all__ = ["partial_dependence", "permutation_importance"]
-
-# Predict is a callable taking a Dataset and returning a Dataset with a prediction column.
-Predictor = "Callable[[Dataset], Dataset]"
-# Metric is a callable taking (dataset, y_true, y_pred) and returning a float — lower is
-# better by convention, so an importance is the *rise* in the metric under permutation.
-Metric = "Callable[[Dataset, str, str], float]"
 
 
 def permutation_importance(
@@ -46,7 +42,7 @@ def permutation_importance(
     *,
     y_true: str,
     prediction: str = "prediction",
-    metric: Metric | None = None,
+    metric: Scorer | None = None,
     n_repeats: int = 3,
     seed: int = 0,
 ) -> Dataset:
@@ -226,14 +222,3 @@ def _rmse(ds: Dataset, y_true: str, y_pred: str) -> float:
     row = ds.agg(__bt_e=bt.rmse(y_true, y_pred)).collect()
     value = row.column("__bt_e")[0].as_py() if row.num_rows else None
     return float("inf") if value is None else float(value)
-
-
-def _require(ds: Dataset, *names: str) -> None:
-    """Raise a `ColumnNotFoundError` naming the closest real column for any missing name."""
-    for name in names:
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )

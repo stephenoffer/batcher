@@ -195,7 +195,7 @@ def test_a_warm_store_still_gets_the_concurrent_peak():
     from batcher.carbonite.memory.estimator import learned_plan_peak
 
     class _Doubling:
-        def blend_peak(self, kind, planned):
+        def blend_peak(self, kind, planned, row_size=None):
             return planned * 2
 
     a, b, c, d = _fact(50_000), _dim(400), _dim(300), _dim(200)

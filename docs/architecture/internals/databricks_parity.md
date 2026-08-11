@@ -86,7 +86,9 @@ should state the distinction precisely:
 > available single-node) and learns across queries (which neither Spark nor Photon does).
 > Photon adapts *kernels* per batch on data characteristics, which Batcher does not do.
 
-Batcher has a partial analogue — `try_dict_compare` (19.6x on a low-cardinality filter) and the
+Batcher has a partial analogue — `try_dict_compare` (a kernel-level 19.6x on a
+low-cardinality filter, but see the caveat in `competitive_architecture.md`: no dictionary
+reaches the engine from Python on a live path, so no query obtains it today) and the
 JIT's four null-handling paths incl. a per-batch Kleene fallback (`bc-codegen/src/lib.rs:186`)
 — but no null-free/sparsity/ASCII kernel specialization as a systematic layer.
 
@@ -131,7 +133,7 @@ so this gap is Spark's, not Databricks'. Compare against Databricks-on.
 | **Dynamic filter pushdown into scans** | **DPP** (3.0) + **Databricks DFP** — prunes on **non-partition** columns via Delta per-file min/max | **Absent.** No runtime-produced filter ever reaches a Parquet reader; `sink_runtime_filter_to_source` referenced (`evidence.py:26`) but **never implemented** | **Gap — the largest optimizer gap** |
 | Join elimination via constraints | `RELY` UNIQUE constraints, DAIS 2026, Photon-only | join-elimination rules exist in REWRITE phase | **Parity** |
 | Post-shuffle partition coalescing | AQE `coalescePartitions`, default-on | **Absent** — reducer counts sized a priori | **Gap** |
-| Skew join handling | AQE: `size > 5× median AND > 256MB`, replicate non-skewed side, default-on | 3-tier detection + salt-probe/replicate-build — but `skew_join_salt=0` **default-off**, and **absent from the Flight transport** | **Gap — see §5** |
+| Skew join handling | AQE: `size > 5× median AND > 256MB`, replicate non-skewed side, default-on | 3-tier detection + salt-probe/replicate-build, on **both** transports, engaging on measured skew at the default `skew_join_salt=0` | **Parity**, different detection |
 
 ### The dynamic-filter gap, stated precisely
 
@@ -250,10 +252,9 @@ Three gaps, one of which is serious:
    that matters. An attempt to wire skew salting through
    Flight was made and reverted on 2026-07-18 — see the P0 entry in §7 for why, including a
    test-ordering dependence that must be fixed before any such change can be trusted.
-3. **Defaults ship the capability off.** `skew_join_salt=0` (correctly — see the P0 hazard
-   below; it now has a `salting_is_safe` guard), `persistent_fleet=False`,
-   TLS off, adaptive off below 20M rows
-   (`_ADAPTIVE_MIN_INPUT_ROWS`, `api/adaptive/gating.py` — a module constant, **not** a config field).
+3. **Defaults ship the capability off.** `persistent_fleet=False`,
+   TLS off, adaptive off below 5M input rows per pipeline breaker the loop would cut at
+   (`_ADAPTIVE_MIN_ROWS_PER_STAGE`, `api/adaptive/gating.py` — a module constant, **not** a config field).
 
 That last pattern — real code behind a default-off flag — is the single largest discrepancy
 between what this codebase contains and what a user actually gets. Databricks' equivalents
@@ -267,16 +268,19 @@ between what this codebase contains and what a user actually gets. Databricks' e
 - **`speculation_max_backups` defaults to 1.** One straggler backup per barrier, gated on
   both a learned straggler factor and a minimum finished fraction. Ray Data has no straggler
   mitigation at all.
-- **`shuffle_replication` is wired** for the flat aggregate reduce
-  (`dist/shuffle_replication.py`), so the `spot` profile's factor of 2 now actually buys
-  re-fetch recovery instead of silently getting recompute. The combiner-tree path is still
-  unwired.
+- **`shuffle_replication` is wired** for every Flight shuffle (`dist/shuffle_replication.py`),
+  so the `spot` profile's factor of 2 now actually buys re-fetch recovery instead of silently
+  getting recompute. Including the combiner tree's *interior* levels, which were single-copy at
+  any factor: one lost combiner used to discard every level built so far.
 
 The question to ask of each remaining entry is: *is the default-off protecting against a real
-risk, or only against the absence of a benchmark?* For `skew_join_salt` the answer turned out
-to be **a real risk** — it can silently split a group under a finalizing reducer (P0 §1), so
-it correctly stays off, and the hazard now has a `salting_is_safe` guard rather than only a
-warning in this document.
+risk, or only against the absence of a benchmark?* `skew_join_salt` is no longer one of them,
+and the way it left the list is worth keeping: the answer was **a real risk** — salting can
+silently split a group under a finalizing reducer (P0 §1) — so what shipped was the
+`salting_is_safe` guard, not a flipped flag. With the hazard closed by construction, hot keys
+could be taken from measurement (learned set, then column statistics, then a self-funding
+pre-pass above ~8.4M rows) and `0` stopped meaning off. The knob is now the fan-out, and a
+*negative* value is the off switch.
 
 ---
 

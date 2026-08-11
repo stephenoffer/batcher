@@ -29,7 +29,7 @@ Each of those is an ordinary call. Each one, on this data, costs a metadata roun
 instead of a scan. Nothing in that snippet mentions metadata, and that is the point.
 
 The rest of this page explains **when** it fires, so you can tell why something was slow.
-It then covers `ds.meta`, an *optional* introspection namespace for asking the metadata
+It then covers {py:obj}`ds.meta <batcher.Dataset.meta>`, an *optional* introspection namespace for asking the metadata
 layer directly. You will rarely need it. Reach for it when you want to know what the engine
 knows, or to ask something the ordinary API has no spelling for, such as "would this join
 match anything?" or "how many files am I about to open?".
@@ -48,7 +48,7 @@ is invisible to you, because the answers are identical. Only the cost moves.
 So you never have to decide whether a shortcut is "safe here". It degrades to the query you
 would have written anyway.
 
-The one exception is deliberately named: everything under `ds.meta.approx` is **approximate
+The one exception is deliberately named: everything under {py:obj}`ds.meta.approx <batcher.api.dataset.meta.frame.DatasetMeta.approx>` is **approximate
 and never executes**. It answers from a sketch or returns `None`. More on that below.
 
 ## What the ordinary API gets for free
@@ -57,15 +57,15 @@ These are the calls people already write. Nothing here needs `ds.meta`.
 
 | you write | what it costs, when the metadata is there |
 |---|---|
-| `ds.count()`, `len(ds)`, `ds.is_empty()`, `ds.has_rows` | a recorded row count |
-| `ds.min(c)`, `ds.max(c)` | a footer bound |
-| `ds.n_null(c)`, `ds.has_nulls(c)`, `ds.all_null(c)`, `ds.null_count()` | a footer null count |
-| `ds.filter(p)` where `p` is refuted by the bounds | the files go unread |
+| {py:meth}`ds.count() <batcher.Dataset.count>`, `len(ds)`, {py:meth}`ds.is_empty() <batcher.Dataset.is_empty>`, {py:obj}`ds.has_rows <batcher.Dataset.has_rows>` | a recorded row count |
+| {py:meth}`ds.min(c) <batcher.Dataset.min>`, {py:meth}`ds.max(c) <batcher.Dataset.max>` | a footer bound |
+| {py:meth}`ds.n_null(c) <batcher.Dataset.n_null>`, {py:meth}`ds.has_nulls(c) <batcher.Dataset.has_nulls>`, {py:meth}`ds.all_null(c) <batcher.Dataset.all_null>`, {py:meth}`ds.null_count() <batcher.Dataset.null_count>` | a footer null count |
+| {py:meth}`ds.filter(p) <batcher.Dataset.filter>` where `p` is refuted by the bounds | the files go unread |
 | `ds.filter(p).count()` where `p` is `IS NULL` / out of range | the null count, or zero |
-| `ds.drop_nulls(c)` / `ds.fill_null(...)` on a column with no nulls | a no-op |
-| `ds.limit(n)` with `n` at or above the row count | a no-op |
-| `ds.join(other, on=k)` whose key ranges are **disjoint** | no build, no probe, no shuffle |
-| `ds.dq.not_null(...).fail()`, `.drop()`, or `.validate()` on a contract that holds | three numbers |
+| {py:meth}`ds.drop_nulls(c) <batcher.Dataset.drop_nulls>` / {py:meth}`ds.fill_null(...) <batcher.Dataset.fill_null>` on a column with no nulls | a no-op |
+| {py:meth}`ds.limit(n) <batcher.Dataset.limit>` with `n` at or above the row count | a no-op |
+| {py:meth}`ds.join(other, on=k) <batcher.Dataset.join>` whose key ranges are **disjoint** | no build, no probe, no shuffle |
+| {py:meth}`ds.dq.not_null(...).fail() <batcher.api.dataset.dq.DatasetDQ.not_null>`, `.drop()`, or `.validate()` on a contract that holds | three numbers |
 
 The last two are the ones that change what a query costs rather than shaving it. A join whose
 key ranges cannot overlap emits nothing, which is provable from four numbers with neither
@@ -105,7 +105,7 @@ A filter is what usually takes the shortcut away. A footer's minimum is the smal
 *in the file*; once you filter the file, it is only a bound on the smallest surviving value,
 and a bound is not an answer. Joins, computed columns, and `map_batches` do the same.
 
-`ds.meta.explain()` tells you exactly what is known, and is the fastest way to see why
+{py:meth}`ds.meta.explain() <batcher.api.dataset.meta.frame.DatasetMeta.explain>` tells you exactly what is known, and is the fastest way to see why
 something fell back to a scan. It reports the exact row count (or `None`), the estimate, the
 recorded ordering, and per column every facet provable without a scan.
 
@@ -119,7 +119,7 @@ assert report["columns"]["amount"]["min"] == 3.25
 
 `shape` gives you `(rows, columns)`. `count_where` counts a filter's survivors, often for
 free, since `col IS NULL` is a recorded null count and a comparison above the recorded
-maximum is provably zero. `is_empty_where`, `any_match`, `none_match`, and `all_match` are
+maximum is provably zero. {py:meth}`is_empty_where <batcher.api.dataset.meta.frame.DatasetMeta.is_empty_where>`, {py:meth}`any_match <batcher.api.dataset.meta.frame.DatasetMeta.any_match>`, {py:meth}`none_match <batcher.api.dataset.meta.frame.DatasetMeta.none_match>`, and {py:meth}`all_match <batcher.api.dataset.meta.frame.DatasetMeta.all_match>` are
 the boolean forms, and `none_match` is the one a pruning decision reads best as.
 
 ```python
@@ -131,9 +131,9 @@ assert ds.meta.any_match(bt.col("amount") > 50)
 assert ds.meta.is_empty_where(bt.col("amount") > 1_000_000)
 ```
 
-`is_key` checks a candidate primary key (unique *and* never null), for one column or a
-composite. `sorted_by` reports the ordering the data is already known to carry, and
-`is_known_sorted_by` tells you whether a sort would be a no-op. Both are one-sided: they
+{py:meth}`is_key <batcher.api.dataset.meta.frame.DatasetMeta.is_key>` checks a candidate primary key (unique *and* never null), for one column or a
+composite. {py:meth}`sorted_by <batcher.api.dataset.meta.frame.DatasetMeta.sorted_by>` reports the ordering the data is already known to carry, and
+{py:meth}`is_known_sorted_by <batcher.api.dataset.meta.frame.DatasetMeta.is_known_sorted_by>` tells you whether a sort would be a no-op. Both are one-sided: they
 report what is *recorded*, never guessing that unrecorded means unsorted.
 
 ```python
@@ -146,7 +146,7 @@ assert ds.meta.is_known_sorted_by("day") is False
 
 ## One column at a time with `ds.meta.col(...)`
 
-`ds.meta.col(name)` narrows the namespace to a single column. Every method below is
+{py:meth}`ds.meta.col(name) <batcher.api.dataset.meta.frame.DatasetMeta.col>` narrows the namespace to a single column. Every method below is
 answered from a recorded statistic when there is one, and from a query when there is not.
 
 ```python
@@ -353,14 +353,14 @@ source already knows a column's width, so `is_measured` reads `True` there while
 distinct-count sketch is still absent. Test the value you are about to use rather than the
 column as a whole.
 
-If you need an approximate quantile *now*, use the `Dataset` terminals `ds.approx_median`,
-`ds.approx_quantile`, and `ds.approx_n_unique`. They consult the same learned sketches first
+If you need an approximate quantile *now*, use the {py:class}`Dataset <batcher.Dataset>` terminals {py:meth}`ds.approx_median <batcher.Dataset.approx_median>`,
+{py:meth}`ds.approx_quantile <batcher.Dataset.approx_quantile>`, and {py:meth}`ds.approx_n_unique <batcher.Dataset.approx_n_unique>`. They consult the same learned sketches first
 and then stream one if there is none. `ds.meta.approx` is the free-or-nothing probe.
 
 ## Where this comes from
 
 `ds.meta` is the user-facing half of Batcher's metadata-first design. The other half is
-invisible: `ds.count()`, `ds.min()`, `ds.n_unique()`, and the optimizer's own pruning all
+invisible: {py:meth}`ds.count() <batcher.Dataset.count>`, {py:meth}`ds.min() <batcher.Dataset.min>`, {py:meth}`ds.n_unique() <batcher.Dataset.n_unique>`, and the optimizer's own pruning all
 consult the same statistics before executing. The `meta` namespace opens that layer up and
 lets you ask it directly. Crucially, it also lets you ask things no SQL terminal has a
 spelling for, such as "would this join match anything?" or "how many files am I about to
@@ -377,7 +377,7 @@ after a transform chain returns in 0.05 ms because nothing is scanned.
 - {doc}`/user-guide/operate/tuning/explain-plans`: confirm that a predicate reached the scan, and that pruning
   actually happened.
 - {doc}`/user-guide/trust/data-quality`: turn the `ds.meta.col(...).check` probes here into enforced
-  contracts with `ds.dq`.
+  contracts with {py:obj}`ds.dq <batcher.Dataset.dq>`.
 - {doc}`/user-guide/operate/tuning/performance`: the other levers when a query is slower than its metadata suggests
   it should be.
 - {doc}`/user-guide/moving-data/reading-data`: where footer statistics come from, per format.

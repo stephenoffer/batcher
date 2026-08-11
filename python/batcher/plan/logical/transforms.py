@@ -10,6 +10,7 @@ away again, which is what gives an expression-keyed sort or window a distributed
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 
 import pyarrow as pa
@@ -32,6 +33,7 @@ from batcher.plan.logical.reshape import Unnest, Unpivot
 from batcher.plan.schema import placeholder_schema
 
 __all__ = [
+    "constant_column_literal",
     "empty_result_schema",
     "hoist_computed_keys",
     "is_cartesian_key_pair",
@@ -130,6 +132,26 @@ def constant_column_value(plan: LogicalPlan, column: str) -> object:
     return _NOT_CONSTANT
 
 
+def constant_column_literal(plan: LogicalPlan, column: str) -> Lit | None:
+    """The literal `column` provably holds in every output row, or None if not provable.
+
+    The public form of the same proof [`is_cartesian_key_pair`] runs, for a caller that
+    needs the *value* rather than the comparison: join reordering rebuilds a comma join's
+    subtree from its leaves, and a synthetic constant column (the `__cross_key` a cross
+    join lowers to) has no leaf to be traced back to — it is reproduced from its literal
+    instead. Returns None for anything not provably constant, never a guess.
+
+    Args:
+        plan: The plan whose output `column` belongs to.
+        column: The output column name.
+
+    Returns:
+        A `Lit` holding the proven value, or None.
+    """
+    value = constant_column_value(plan, column)
+    return None if value is _NOT_CONSTANT else Lit(value)
+
+
 def remap_sources(plan: LogicalPlan, offset: int) -> LogicalPlan:
     """Return a copy of `plan` with every `Scan.source_id` shifted by `offset`.
 
@@ -144,7 +166,9 @@ def remap_sources(plan: LogicalPlan, offset: int) -> LogicalPlan:
 
     def shift(node: LogicalPlan) -> LogicalPlan:
         if isinstance(node, Scan):
-            return Scan(node.source_id + offset, node.schema)
+            # `replace`, not a fresh `Scan`: the source key is this scan's identity and
+            # rebuilding without it would silently return the plan to the collided key.
+            return dataclasses.replace(node, source_id=node.source_id + offset)
         return node
 
     return transform_up(plan, shift)

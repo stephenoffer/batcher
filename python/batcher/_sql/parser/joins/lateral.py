@@ -13,9 +13,10 @@ from sqlglot import expressions as exp
 from batcher._internal.errors import PlanError
 from batcher._sql.parser.core_utils import _alias_of, _unwrap_alias
 from batcher.api.dataset import Dataset
+from batcher.plan.expr_ir import col
 from batcher.plan.schema import suggest_columns
 
-__all__ = ["is_true_literal", "lateral_select", "lateral_unnest"]
+__all__ = ["is_true_literal", "lateral_select", "lateral_unnest", "select_unnest"]
 
 
 def lateral_select(tr, ds: Dataset, lateral) -> Dataset:
@@ -61,6 +62,12 @@ def lateral_select(tr, ds: Dataset, lateral) -> Dataset:
     return ds.with_columns(**named)
 
 
+#: What DuckDB names the element column of an `UNNEST` written without an `AS u(x)` column
+#: list. Kept as a named constant because it is a *wire* name a user's `SELECT unnest` reads,
+#: not an internal one.
+_DUCKDB_UNNEST_COLUMN = "unnest"
+
+
 def lateral_unnest(ds: Dataset, join) -> Dataset:
     """`UNNEST(<list column>) AS alias(name)` in the FROM clause → `Dataset.explode`.
 
@@ -103,11 +110,19 @@ def lateral_unnest(ds: Dataset, join) -> Dataset:
         raise PlanError(
             f"UNNEST: unknown column {column!r}; available: {known}{suggest_columns(column, known)}"
         )
-    # `AS u(x)` names the element column `x`. Without the column list the element keeps
-    # the source column's name, which is what DuckDB does for `UNNEST(xs)`.
+    # `AS u(x)` names the element column `x`. **Without** a column list the element is
+    # named `unnest`, which is what DuckDB calls it — and the list column stays in scope
+    # either way.
+    #
+    # This used to give the element the *source* column's name and expand it in place, on
+    # the stated belief that DuckDB did the same. It does not: `SELECT * FROM t,
+    # UNNEST(arr)` returns `id, arr (the list), unnest (the element)` where Batcher
+    # returned `id, arr (the element)` — one column fewer, with `arr` holding a different
+    # type. Every existing test named its columns rather than starring, so a query that
+    # asked for the shape SQL defines got a different relation and no error.
     alias = unnest.args.get("alias")
     cols = getattr(alias, "columns", None) if alias is not None else None
-    out_name = cols[0].name if cols else column
+    out_name = cols[0].name if cols else _DUCKDB_UNNEST_COLUMN
     # `WITH ORDINALITY` names an extra position column. sqlglot puts its name in
     # `offset` (or `True` for the bare form, whose conventional name is `ordinality`).
     ordinality = unnest.args.get("offset")
@@ -119,19 +134,86 @@ def lateral_unnest(ds: Dataset, join) -> Dataset:
                 f"UNNEST ordinality column {index_name!r} collides with an existing "
                 f"column: {list(ds.columns)}"
             )
-    out = ds.explode(
-        column,
-        alias=out_name if out_name != column else None,
-        outer=outer,
-        index=index_name,
+    # An unnest in the FROM clause *adds* a relation; it does not consume the list column,
+    # which stays in scope and repeats once per element. `explode(alias=...)` *renames* the
+    # column it expands, so copy the list to the element name and expand the copy, leaving
+    # the original where SQL says it is.
+    if out_name in ds.columns:
+        raise PlanError(
+            f"UNNEST element column {out_name!r} collides with an existing column: "
+            f"{list(ds.columns)}; name it with `AS u(<name>)`"
+        )
+    out = ds.with_columns(**{out_name: col(column)}).explode(
+        out_name, outer=outer, index=index_name
     )
     if index_name is not None:
         # SQL ordinality is 1-based; `explode(index=)` is 0-based (matching Batcher's own
         # `with_row_index`). Shift here so the SQL surface keeps SQL's convention.
-        from batcher.plan.expr_ir import col
-
         out = out.with_columns(**{index_name: col(index_name) + 1})
     return out
+
+
+def select_unnest(tr, ds: Dataset, projections) -> Dataset:
+    """``SELECT unnest(xs)`` — an unnest written in the SELECT list rather than the FROM.
+
+    DuckDB's shorthand for ``FROM t, UNNEST(t.xs) AS u(x)``, and the spelling most SQL in
+    the wild uses. It reached the scalar path as an unhandled node and raised
+    ``unsupported SQL expression: Explode``.
+
+    It expands the *current* relation, so it is applied after WHERE (which SQL evaluates
+    first) and before the projection, which then reads an ordinary column. Anything
+    wrapped around it — ``unnest(xs) * 2`` — is evaluated per element by the projection,
+    exactly as SQL specifies.
+
+    Several unnests in one SELECT list *zip* rather than multiply in DuckDB, which
+    `explode` cannot express, so that is rejected rather than answered with a cross
+    product.
+
+    Args:
+        tr: The translator, for lowering a non-column argument.
+        ds: The relation the SELECT reads.
+        projections: The SELECT list; `Explode` nodes are replaced in place.
+
+    Returns:
+        `ds` expanded once per unnest, or `ds` unchanged when there is none.
+    """
+    found = [(p, e) for p in projections for e in p.find_all(exp.Explode)]
+    if not found:
+        return ds
+    if len(found) > 1:
+        raise NotImplementedError(
+            f"{len(found)} UNNEST calls in one SELECT list are not supported — SQL zips "
+            "them into one relation, which `explode` cannot express; unnest one list per "
+            "query, or use FROM t, UNNEST(...) for each"
+        )
+    projection, explode = found[0]
+    # Read the output name before the rewrite: an un-aliased `unnest(xs)` is named after
+    # the expression as written, and replacing the node first would name it after the
+    # internal column instead.
+    # `_alias_of` renders an un-aliased item with sqlglot's default dialect, which spells
+    # this node `EXPLODE(xs)`; the name every other engine (and DuckDB, the oracle) uses
+    # is `unnest(xs)`.
+    out_name = (
+        explode.sql(dialect="duckdb").lower() if projection is explode else _alias_of(projection)
+    )
+    source = explode.this
+    if isinstance(source, exp.Column) and source.name in ds.columns:
+        column = source.name
+    else:
+        column = f"__bc_unnest{tr._win_arg_n}"
+        tr._win_arg_n += 1
+        ds = ds.with_columns(**{column: tr._scalar(source)})
+    if projection is explode:
+        # The whole select item is the unnest, so replacing the node *is* replacing the
+        # item — and it has to carry the item's name with it. Re-wrapping afterwards would
+        # act on a node already detached from the tree, and the column silently took the
+        # source list's name (`xs`) instead of `unnest(xs)`.
+        projection.replace(exp.alias_(exp.column(column), out_name))
+    else:
+        explode.replace(exp.column(column))
+        if not isinstance(projection, exp.Alias):
+            projection.replace(exp.alias_(projection.copy(), out_name))
+    return ds.explode(column)
 
 
 def is_true_literal(node) -> bool:

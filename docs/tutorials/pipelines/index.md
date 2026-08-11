@@ -1,7 +1,7 @@
 # Data pipelines
 
 These tutorials build a working data pipeline end to end. They assume you can already write
-a `Dataset` chain, which {doc}`/tutorials/foundations/index` covers, and they are independent
+a {py:class}`Dataset <batcher.Dataset>` chain, which {doc}`/tutorials/foundations/index` covers, and they are independent
 of each other, so take the one that matches what you are building.
 
 | Tutorial | What you build |

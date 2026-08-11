@@ -104,9 +104,9 @@ def test_calibration_is_cached_until_new_feedback():
     scans = [0]
     raw = hub.op_stats_by_kind
 
-    def counting():
+    def counting(hw_fingerprint=None):
         scans[0] += 1
-        return raw()
+        return raw(hw_fingerprint)
 
     hub.op_stats_by_kind = counting  # type: ignore[method-assign]
 

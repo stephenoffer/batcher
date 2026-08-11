@@ -25,10 +25,17 @@ from batcher._sql.parser import (
     subquery,
     windowing,
 )
-from batcher._sql.parser.core_utils import _alias_of, _disambiguate_columns, _has_aggregate
+from batcher._sql.parser.core_utils import (
+    _alias_of,
+    _disambiguate_columns,
+    _has_aggregate,
+    _row_window,
+    _unwrap_alias,
+)
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
-from batcher.plan.expr_ir import AggExpr, Expr
+from batcher.plan.expr_ir import AggExpr, Expr, col
+from batcher.plan.types import dtype_name
 
 __all__ = ["sql", "translate_ast"]
 
@@ -38,26 +45,40 @@ def sql(
     *,
     dialect: str = "duckdb",
     functions: dict[str, Any] | None = None,
+    models: dict[str, Any] | None = None,
     **tables: Dataset | pa.Table,
 ) -> Dataset:
-    """Parse `query` in `dialect` and translate it against the named tables/functions.
+    """Parse `query` in `dialect` and translate it against the named tables/functions/models.
 
     A parse failure is re-raised as `PlanError` with a plain-text message; see
     `batcher._internal.sql_errors.parse_sql`.
     """
-    return translate_ast(parse_sql(query, dialect=dialect), functions=functions, **tables)
+    return translate_ast(
+        parse_sql(query, dialect=dialect), functions=functions, models=models, **tables
+    )
 
 
 def translate_ast(
-    ast: Any, *, functions: dict[str, Any] | None = None, **tables: Dataset | pa.Table
+    ast: Any,
+    *,
+    functions: dict[str, Any] | None = None,
+    models: dict[str, Any] | None = None,
+    **tables: Dataset | pa.Table,
 ) -> Dataset:
     """Translate an already-parsed sqlglot statement into a lazy `Dataset`.
 
     The string entry point (`sql`) and the session DDL path (which has parsed the
     statement to dispatch ``CREATE``/``DROP``) share this one translator entry.
+
+    `models` is the catalog `ML_PREDICT(t, m)` resolves a model name against; a query that
+    scores by path instead needs none.
     """
     registry = {name: _as_dataset(t) for name, t in tables.items()}
-    return _Translator(registry, functions or {}).statement(ast)
+    # Normalize the quantified comparisons into the `IN`/`NOT IN` they are defined as before
+    # anything reads the tree, so every clause sees one spelling of set membership rather
+    # than each having to learn a second.
+    subquery.normalize_quantified(ast)
+    return _Translator(registry, functions or {}, models or {}).statement(ast)
 
 
 # Iteration cap for a recursive CTE. A wrong or missing stop condition would otherwise
@@ -108,6 +129,66 @@ def _align_setop_columns(left: Dataset, right: Dataset) -> Dataset:
     return right.rename(mapping) if mapping else right
 
 
+def _bare_null_positions(node) -> set[int]:
+    """Output positions a set-operation branch fills with an untyped bare ``NULL``.
+
+    A nested set operation contributes a position only when *every* branch under it is a
+    bare NULL there, since one typed branch already fixes the column's type for the rest.
+    """
+    if isinstance(node, exp.Subquery):
+        return _bare_null_positions(node.this)
+    if isinstance(node, (exp.Union, exp.Intersect, exp.Except)):
+        return _bare_null_positions(node.this) & _bare_null_positions(node.expression)
+    if not isinstance(node, exp.Select):
+        return set()
+    return {i for i, p in enumerate(node.expressions) if isinstance(_unwrap_alias(p), exp.Null)}
+
+
+def _type_untyped_nulls(left: Dataset, right: Dataset, node) -> tuple[Dataset, Dataset]:
+    """Give a bare ``NULL`` branch column the type the sibling branch supplies.
+
+    SQL leaves a bare ``NULL`` untyped and lets the set operation decide, so
+    ``SELECT s_state ... UNION ALL SELECT NULL AS s_state ...`` is a `Utf8` column in both
+    branches. Batcher's IR has no untyped null — a bare ``NULL`` lowers to ``nullif(1, 1)``,
+    which is an `Int64` one — so the pair reached the engine as `Utf8` against `Int64`,
+    a genuinely irreconcilable mismatch that failed the whole query. TPC-DS q27 and q36
+    are that shape, and it is the ordinary spelling of a hand-written rollup.
+
+    The type is read off the sibling branch rather than guessed, and only a *bare* NULL is
+    retyped: a column that merely happens to be all-null keeps whatever type it was
+    declared with, and a real `Utf8`/`Int64` clash still raises.
+
+    Args:
+        left: The left branch, already translated.
+        right: The right branch, with its columns aligned to `left`'s names.
+        node: The set-operation node, for its branches' select lists.
+
+    Returns:
+        The two branches, with any bare-NULL column cast to its sibling's type.
+    """
+    left_nulls = _bare_null_positions(node.this)
+    right_nulls = _bare_null_positions(node.expression)
+    # Symmetric difference: a position both sides leave untyped has nothing to adopt, and
+    # a position neither leaves untyped needs no help.
+    if not (left_nulls ^ right_nulls):
+        return left, right
+    lt, rt = left.schema.types, right.schema.types
+    recast_left: dict[str, Expr] = {}
+    recast_right: dict[str, Expr] = {}
+    for i, name in enumerate(left.columns):
+        if lt[i] == rt[i] or (i in left_nulls) == (i in right_nulls):
+            continue
+        into, target = (recast_left, rt[i]) if i in left_nulls else (recast_right, lt[i])
+        named = dtype_name(target)
+        if named is not None:  # a nested/extension type the cast grammar cannot spell
+            into[name] = col(name).cast(named)
+    if recast_left:
+        left = left.with_columns(**recast_left)
+    if recast_right:
+        right = right.with_columns(**recast_right)
+    return left, right
+
+
 def _as_dataset(t: Dataset | pa.Table) -> Dataset:
     if isinstance(t, Dataset):
         return t
@@ -117,9 +198,19 @@ def _as_dataset(t: Dataset | pa.Table) -> Dataset:
 
 
 class _Translator:
-    def __init__(self, registry: dict[str, Dataset], functions: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        registry: dict[str, Dataset],
+        functions: dict[str, Any],
+        models: dict[str, Any] | None = None,
+    ) -> None:
         self._registry = registry
         self._functions = functions
+        # Fitted models `ML_PREDICT` can name. Separate from `_functions` because a model is
+        # not callable from an expression: it is scored over a whole relation, in a stage the
+        # engine schedules, and giving it its own catalog is what keeps that distinction in
+        # the surface rather than in a convention.
+        self._models = models or {}
         self._agg_map: dict[str, tuple[str, AggExpr]] | None = None
         # Per select node (by id), which joined-relation column each source contributed:
         # `{alias: {bare column -> column now carrying it}}`. Written by
@@ -128,6 +219,7 @@ class _Translator:
         self._agg_n = 0
         self._scalar_sub_n = 0
         self._udf_n = 0
+        self._win_arg_n = 0
 
     def _cte_dataset(self, root, cte) -> Dataset:
         """The `Dataset` a CTE binds to — *materialized* when it is referenced more than once.
@@ -264,6 +356,8 @@ class _Translator:
             # or an operand whose columns merely differ in name (`... id ... UNION
             # ... dept_id ...`) is wrongly rejected as "identical columns" required.
             right = _align_setop_columns(left, right)
+            # A bare `NULL` in one branch has no type of its own; it takes the sibling's.
+            left, right = _type_untyped_nulls(left, right, node)
             distinct = bool(node.args.get("distinct"))
             if isinstance(node, exp.Union):
                 ds = left.union(right, distinct=distinct)
@@ -277,6 +371,12 @@ class _Translator:
             return self._apply_setop_tail(node, ds)
         if isinstance(node, exp.Select):
             return self.select(node)
+        if isinstance(node, exp.Subquery):
+            # A parenthesized query is that query, plus whatever ORDER BY / LIMIT the
+            # parentheses themselves carry. Writing the branches of a set operation in
+            # parentheses is ordinary SQL — TPC-DS q87 chains three of them with EXCEPT —
+            # and reaching this point used to mean the whole statement was refused.
+            return self._apply_setop_tail(node, self.statement(node.this))
         if isinstance(node, exp.Values):
             # A bare `VALUES (..), (..)` statement is an inline literal relation.
             return from_clause._values_table(node)
@@ -314,8 +414,6 @@ class _Translator:
 
     def _apply_setop_tail(self, node, ds: Dataset) -> Dataset:
         """Apply a trailing ORDER BY / LIMIT / OFFSET on a set-operation result."""
-        import sys
-
         order = node.args.get("order")
         if order is not None:
             # Positional ORDER BY (`ORDER BY 1`) resolves against the leftmost
@@ -327,8 +425,7 @@ class _Translator:
         limit = node.args.get("limit")
         offset = node.args.get("offset")
         if limit is not None or offset is not None:
-            skip = int(offset.expression.this) if offset is not None else 0
-            n = int(limit.expression.this) if limit is not None else sys.maxsize
+            n, skip = _row_window(limit, offset)
             ds = ds.limit(n, offset=skip)
         return ds
 
@@ -368,8 +465,8 @@ class _Translator:
     def _grouping_sets_union(self, node, group) -> Dataset:
         return grouping_sets._grouping_sets_union(self, node, group)
 
-    def _projection_map(self, ds: Dataset, projections) -> dict[str, Expr]:
-        return grouping._projection_map(self, ds, projections)
+    def _projection_map(self, ds: Dataset, projections, star_cols=None) -> dict[str, Expr]:
+        return grouping._projection_map(self, ds, projections, star_cols)
 
     def _aggregate(
         self, ds: Dataset, projections, group, having, windows=None, order=None
@@ -379,7 +476,7 @@ class _Translator:
     def _distinct_on(self, ds: Dataset, projections, order, on_exprs) -> Dataset:
         return grouping._distinct_on(self, ds, projections, order, on_exprs)
 
-    # --- window functions (windowing.py) -----------------------------------
+    # --- window functions (windowing/) -----------------------------------
     def _is_window(self, p) -> bool:
         return windowing._is_window(p)
 
@@ -387,6 +484,7 @@ class _Translator:
         windowing._inline_named_windows(node)
 
     def _window(self, ds: Dataset, projections) -> Dataset:
+        ds = windowing.hoist_window_args(self, ds, projections)
         return windowing._window(ds, projections)
 
     # --- scalar expressions (expressions/) ---------------------------------

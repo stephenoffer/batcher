@@ -213,3 +213,57 @@ def test_an_apu_reports_no_host_link_to_cross() -> None:
     spec = device_spec("AMD_INSTINCT_MI300A")
     assert spec.host_link == "coherent"
     assert spec.host_link_gbps == 0.0
+
+
+# --- Parts a real fleet is built from, that used to read as unknown ---------------------------
+
+
+def test_grace_hopper_is_not_charged_a_pcie_crossing():
+    """A coherent CPU-GPU package has no host link to cross. Charged the PCIe rate instead,
+    `host_transfer_seconds` prices a batch handed to a GH200 at nine times its real cost — and
+    that term is exactly what decides whether a scan-shaped stage is worth moving to a device
+    at all, so the part designed to make the copy free was the one refused for the copy."""
+    spec = device_spec("GH200")
+    assert spec is not None and spec.memory_gib == 96
+    assert spec.host_link == "nvlink-c2c"
+    assert spec.host_link_gbps > 400.0
+
+
+def test_export_restricted_parts_do_not_inherit_the_unrestricted_fabric():
+    """An H800 is an H100 die with the vendor fabric cut to 400 GB/s. Aliasing it onto the
+    H100 row would place a tensor-parallel collective on bandwidth the device does not have —
+    which is the whole reason it needs a row rather than an alias."""
+    h800, h100 = device_spec("H800"), device_spec("H100")
+    assert h800 is not None and h100 is not None
+    assert h800.memory_gib == h100.memory_gib == 80
+    assert h800.nvlink_gbps == 400.0 and h100.nvlink_gbps == 900.0
+
+
+def test_a_multi_gpu_board_reports_memory_per_device():
+    """The A16 is one board carrying four independent GPUs. Ray counts the devices and a shard
+    must fit one of them, so the board's 64 GiB would tell a sizing decision it had four times
+    the memory any single device can hold."""
+    assert device_spec("A16").memory_gib == 16
+
+
+@pytest.mark.parametrize(
+    ("label", "gib"),
+    [
+        ("B300", 288),
+        ("GB300", 288),
+        ("A800", 80),
+        ("L20", 48),
+        ("A2", 16),
+        ("AMD-Instinct-MI100", 32),
+        ("AMD_INSTINCT_MI355X", 288),
+        ("TPU-V7X", 192),
+        ("Intel-GPU-Max-1350", 96),
+        ("RTX_PRO_6000_BLACKWELL", 96),
+    ],
+)
+def test_recently_shipped_parts_carry_their_memory(label, gib):
+    """Each of these was previously unknown, which every VRAM-sized decision degrades to its
+    default for — silently, because unknown is a legitimate answer."""
+    spec = device_spec(label)
+    assert spec is not None, f"{label} is still unrecognized"
+    assert spec.memory_gib == gib

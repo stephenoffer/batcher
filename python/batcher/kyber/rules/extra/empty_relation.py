@@ -14,8 +14,17 @@ This module adds the two missing pieces:
 
 Every rule is unconditionally semantics-preserving (result multiset unchanged) and
 idempotent (it strips the inner empty rather than re-wrapping, so it never re-matches its
-own output). A global (keyless) aggregate is deliberately excluded — it emits one row
-(COUNT 0, others NULL) over empty input, so it is not empty.
+own output).
+
+A global (keyless) aggregate is deliberately excluded — it emits one row (COUNT 0, others
+NULL) over empty input, so it is not empty.
+
+These live in the **FUSION** phase, not SELECTION, and that placement is load-bearing. The
+family is a *producer/consumer* set — some rules emit the marker, others fold it upward — so
+it needs a phase that iterates. Run once, a marker emitted by a producer registered after its
+consumer is simply lost, and the same emptiness then collapses or does not purely on nesting
+order. SELECTION cannot be that phase because `build_side_rule` must decide exactly once, so
+the pure rewrites live here and the physical choices stay there.
 """
 
 from __future__ import annotations
@@ -51,7 +60,7 @@ def _empty_input(node: LogicalPlan) -> LogicalPlan | None:
 
 @rule(
     name="filter_false_to_empty",
-    phase=Phase.SELECTION,
+    phase=Phase.FUSION,
     matches=(Filter,),
     category=RuleCategory.REWRITE,
 )
@@ -69,7 +78,7 @@ def filter_false_to_empty(node: Filter, _ctx: OptimizerContext) -> LogicalPlan |
 
 @rule(
     name="project_over_empty",
-    phase=Phase.SELECTION,
+    phase=Phase.FUSION,
     matches=(Project,),
     category=RuleCategory.REWRITE,
 )
@@ -87,7 +96,7 @@ def project_over_empty(node: Project, _ctx: OptimizerContext) -> LogicalPlan | N
 
 @rule(
     name="aggregate_over_empty",
-    phase=Phase.SELECTION,
+    phase=Phase.FUSION,
     matches=(Aggregate,),
     category=RuleCategory.REWRITE,
 )
@@ -108,7 +117,7 @@ def aggregate_over_empty(node: Aggregate, _ctx: OptimizerContext) -> LogicalPlan
 
 @rule(
     name="window_over_empty",
-    phase=Phase.SELECTION,
+    phase=Phase.FUSION,
     matches=(Window,),
     category=RuleCategory.REWRITE,
 )

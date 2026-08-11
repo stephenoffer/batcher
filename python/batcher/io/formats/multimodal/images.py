@@ -16,7 +16,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.multimodal.media import MediaSource
 
@@ -50,10 +50,4 @@ class ImageSource(MediaSource):
 
 def _pil_image() -> Any:
     """The PIL.Image module, or a typed error pointing at the ``image`` extra."""
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise BackendError(
-            "reading images needs the image extra: pip install 'batcher-engine[image]'"
-        ) from exc
-    return Image
+    return require("PIL", "Image", feature="Image support", provides="Pillow", extra="image")

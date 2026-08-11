@@ -258,7 +258,7 @@ does not silently stop evaluating the day a container loses its driver mount.
 ## See also
 
 - {doc}`/user-guide/operate/running/gpu-fleets`: sizing, power budgets, health, and placement.
-- {doc}`/user-guide/operate/running/observability`: the metrics endpoint these series join.
+- {doc}`/user-guide/operate/running/metrics`: the metrics endpoint these series join.
 - {doc}`/user-guide/operate/tuning/performance`: the levers when the answer *is* in the plan.
 - {doc}`/ml/inference/gpu`: choosing devices and batch sizes from the pipeline side.
 - {doc}`/configuration/options`: every accelerator field with its default and unit.

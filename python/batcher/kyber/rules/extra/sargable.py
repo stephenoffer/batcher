@@ -42,10 +42,11 @@ from collections.abc import Callable
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, node_rule
+from batcher.kyber.rules.leaf_rewrite import EXPR_NODES
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.ir_tags import COMPARISON_FLIP
-from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
+from batcher.plan.logical import LogicalPlan
 from batcher.plan.visitor import transform_up
 
 __all__ = [
@@ -313,7 +314,6 @@ def _reduce_bitxor(expr: Expr) -> Binary | None:
 #: returns `Scan`, `Join`, `Distinct`, `Union`, `Limit`, and `MapBatches` untouched. So
 #: naming them here is not a narrowing: it is the same set the whole-plan pass already
 #: reached, stated explicitly.
-_EXPR_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 
 def _node_pass(leaf: ExprRule):
@@ -343,7 +343,7 @@ for _name, _leaf, _ops in (
             _name,
             Phase.NORMALIZE,
             _node_pass(_leaf),
-            matches=_EXPR_NODES,
+            matches=EXPR_NODES,
             expr_fn=_leaf,
             expr_matches=(Binary,),
             expr_ops=_ops,

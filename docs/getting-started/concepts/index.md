@@ -11,7 +11,7 @@ of the four ideas below.
 :::{grid-item-card} {octicon}`stack;1.1em` Lazy, immutable datasets
 :link: lazy
 :link-type: doc
-A `Dataset` is a handle to a plan; nothing runs until a terminal operation.
+A {py:class}`Dataset <batcher.Dataset>` is a handle to a plan; nothing runs until a terminal operation.
 :::
 
 :::{grid-item-card} {octicon}`code;1.1em` Expressions run in Rust
@@ -41,7 +41,7 @@ The optimizer re-plans mid-query on measured row counts, not static guesses.
   {doc}`Joins </user-guide/analyze/joins>`, and
   {doc}`Window functions </user-guide/analyze/window-functions>`: the verbs, once a dataset exists.
 - {doc}`../../architecture/index`: the same split, at the level of the whole system.
-- {doc}`/architecture/deep-dives/query/query-lifecycle`: what actually happens between `collect()` and
+- {doc}`/architecture/deep-dives/query/query-lifecycle`: what actually happens between {py:meth}`collect() <batcher.Dataset.collect>` and
   the Arrow batches coming back.
 - {doc}`/user-guide/operate/tuning/explain-plans`: reading the plan these concepts describe.
 

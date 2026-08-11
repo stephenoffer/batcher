@@ -1,8 +1,8 @@
 # Configuration recipes
 
-This page collects worked `Config` recipes for common deployment goals.
+This page collects worked {py:class}`Config <batcher.Config>` recipes for common deployment goals.
 
-Batcher has no built-in named profiles and no `apply_profile`. A profile here is a `Config` object you build for a goal and activate with `set_config` or `config_context`. Each recipe derives from `Config()` with `dataclasses.replace` on the sections it changes, leaving every other field at its tuned default.
+Batcher has no built-in named profiles and no `apply_profile`. A profile here is a `Config` object you build for a goal and activate with {py:func}`set_config <batcher.set_config>` or {py:func}`config_context <batcher.config_context>`. Each recipe derives from `Config()` with `dataclasses.replace` on the sections it changes, leaving every other field at its tuned default.
 
 ```python
 import dataclasses
@@ -186,7 +186,7 @@ print(saturating.distributed.autoscale_wait_s)
 # 300.0
 ```
 
-To pin the fan-out instead and skip the wait entirely, pass `num_workers=` to the terminal call, such as `ds.collect(num_workers=16)`. That's a call parameter, not a `Config` field.
+To pin the fan-out instead and skip the wait entirely, pass `num_workers=` to the terminal call, such as {py:meth}`ds.collect(num_workers=16) <batcher.Dataset.collect>`. That's a call parameter, not a `Config` field.
 
 ## Reusing a recipe
 

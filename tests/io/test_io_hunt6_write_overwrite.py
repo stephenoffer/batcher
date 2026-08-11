@@ -67,3 +67,20 @@ def test_resume_overwrite_keeps_existing_files(tmp_path):
     )
     after = sorted(p.name for p in (tmp_path / "tbl").iterdir())
     assert before == after
+
+
+def test_overwrite_with_new_partition_columns_removes_the_old_directories(tmp_path):
+    """A repartitioning overwrite must not leave the previous scheme's directories.
+
+    Deleting the stale data files is not enough: the empty ``dt=`` directories stay, the
+    tree then advertises two partition schemes at once, and nothing reading the layout can
+    say what the table is partitioned by.
+    """
+    out = str(tmp_path / "t")
+    ds = bt.from_pydict({"dt": ["x", "y"], "g": ["a", "a"], "v": [1, 2]})
+    ds.write.parquet(out, partition_by=["dt"])
+    assert sorted(p.name for p in (tmp_path / "t").glob("*=*")) == ["dt=x", "dt=y"]
+
+    ds.write.parquet(out, partition_by=["g"])
+    assert sorted(p.name for p in (tmp_path / "t").glob("*=*")) == ["g=a"]
+    assert bt.read.parquet(out).count() == 2

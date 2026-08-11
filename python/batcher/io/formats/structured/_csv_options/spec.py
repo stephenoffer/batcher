@@ -20,6 +20,20 @@ _NO_COMMENT = (
     "parse the comment lines as data rows. Strip the comments before reading, or pass "
     "skip_rows= if they are a fixed leading block."
 )
+_SPARK_MODE = (
+    "Spark's read mode has no single Batcher spelling because it conflates two independent "
+    "decisions. Pass on_bad_lines='skip' for DROPMALFORMED and on_bad_lines='error' (the "
+    "default) for FAILFAST. PERMISSIVE, which keeps a malformed row and parks its text in a "
+    "corrupt-record column, has no equivalent."
+)
+_POLARS_IGNORE_ERRORS = (
+    "Polars folds two behaviors into this flag. Pass on_bad_lines='skip' to drop rows with "
+    "the wrong field count, and declare the column as a string with schema= if what you want "
+    "is for an unconvertible value to survive the read."
+)
+_DEPRECATED_BAD_LINES = (
+    "pandas retired these flags in 2.0. Use on_bad_lines='error', 'warn', or 'skip'."
+)
 _NO_QUOTE_CHAR = (
     "Arrow's CSV writer always quotes with '\"'. There is no way to change it, and "
     "ignoring this would emit output the option says it would not."
@@ -46,8 +60,10 @@ READ_SPEC = OptionSpec(
         "false_values",
         "decimal_point",
         "try_parse_dates",
+        "on_bad_lines",
     ),
     aliases={
+        "on_bad_rows": "on_bad_lines",
         "sep": "delimiter",
         "separator": "delimiter",
         "quotechar": "quote_char",
@@ -65,6 +81,10 @@ READ_SPEC = OptionSpec(
     },
     unsupported={
         "index_col": NO_INDEX,
+        "mode": _SPARK_MODE,
+        "ignore_errors": _POLARS_IGNORE_ERRORS,
+        "error_bad_lines": _DEPRECATED_BAD_LINES,
+        "warn_bad_lines": _DEPRECATED_BAD_LINES,
         "comment": _NO_COMMENT,
         "comment_prefix": _NO_COMMENT,
         "skipfooter": (

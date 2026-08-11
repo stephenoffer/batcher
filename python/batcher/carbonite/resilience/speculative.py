@@ -147,6 +147,7 @@ def gather_with_backups(
     poll_seconds: float = 0.5,
     on_failure: Callable[[int, Any, Exception], Any] | None = None,
     doomed_slots: Callable[[], frozenset[int]] | None = None,
+    stage: str = "",
 ) -> list[Any]:
     """Gather `len(refs)` Ray results, launching backups for stragglers.
 
@@ -169,6 +170,12 @@ def gather_with_backups(
     `stragglers_to_backup`). Polled rather than passed once because a drain notice arrives
     *during* the barrier — that is the whole point of it — so a set captured at entry would
     be empty in every case worth acting on.
+
+    `stage` labels the `PARTITION` event published as each slot lands. This barrier is the
+    one place on the distributed path that knows both how many partitions a stage has and
+    how many have finished, which makes it the only place "N of M done" can be answered
+    *while* the stage runs rather than once it returns. Callers that leave it empty still
+    get the count; they just cannot be told apart from another stage in the same query.
     """
     import time
 
@@ -221,6 +228,16 @@ def gather_with_backups(
             try:
                 result_of[i] = ray.get(r)  # first copy to finish wins
                 finished_times[i] = now - started[i]
+                # One partition of this stage is done. Published here rather than at each
+                # call site because this is the only place that holds both halves of "N of
+                # M": the slot that just landed and the width of the barrier.
+                events.publish(
+                    events.PARTITION,
+                    name=stage or "stage",
+                    total=n,
+                    slot=i,
+                    elapsed_s=round(finished_times[i], 3),
+                )
                 if i in backed_up and r is not refs[i]:
                     # The backup beat the original. Worth its own event: a fleet whose
                     # backups routinely win is a fleet with a sick node, and that reads as
@@ -289,14 +306,23 @@ def _poll_doomed(doomed_slots: Callable[[], frozenset[int]] | None) -> frozenset
         return frozenset()
 
 
-def warn_barrier_stalled(waited_s: float, tasks: int) -> None:
+def warn_barrier_stalled(waited_s: float, tasks: int, diagnosis: str | None = None) -> None:
     """Report a barrier that has waited `waited_s` with zero of `tasks` finished.
 
     Names Ray's own view of the cluster, because the actionable distinction is not visible
     from here: tasks that are *running slowly* and tasks that are *pending because nothing
-    will ever free the CPUs they asked for* look identical to `ray.wait`. `Pending Demands`
-    against a fully-reserved CPU total is the signature of the second, and it is what tells
-    a reader to stop waiting and look at who else holds the node.
+    will ever free the CPUs they asked for* look identical to `ray.wait`.
+
+    `diagnosis` is that distinction already resolved, and it is passed in rather than
+    computed here because the topology reader lives in `dist` — a layer Carbonite must not
+    import. When the caller has one, it replaces the "go run `ray status` and interpret it"
+    fallback with the answer that reading would have produced. The fallback stays for the
+    callers that have no envelope to describe.
+
+    Args:
+        waited_s: Seconds the barrier has waited with nothing finished.
+        tasks: Tasks outstanding at the barrier.
+        diagnosis: A resolved reason from `capacity.describe_pending_demand`, or `None`.
     """
     detail = ""
     try:
@@ -307,6 +333,15 @@ def warn_barrier_stalled(waited_s: float, tasks: int) -> None:
         detail = f" cluster CPU {total - free:.0f}/{total:.0f} in use"
     except Exception:  # a diagnostic must never be the thing that fails the query
         pass
+    if diagnosis:
+        _LOG.warning(
+            "distributed barrier has waited %.0fs with 0/%d tasks finished%s; %s",
+            waited_s,
+            tasks,
+            detail,
+            diagnosis,
+        )
+        return
     _LOG.warning(
         "distributed barrier has waited %.0fs with 0/%d tasks finished%s; "
         "if `ray status` shows Pending Demands against a fully-reserved CPU total, the "

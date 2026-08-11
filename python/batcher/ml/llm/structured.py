@@ -65,7 +65,35 @@ def _resolve_schema(schema: dict[str, str]) -> dict[str, pa.DataType]:
         raise PlanError(
             f"extract(): unknown dtype(s) {sorted(unknown)}; use one of {sorted(CAST_DTYPES)}"
         )
+    # A dtype `_coerce` cannot produce is rejected here rather than yielding an all-null
+    # column, which is the worst possible outcome: the generation is already paid for, the
+    # schema looks right, and nothing anywhere says the field was never extracted.
+    uncoercible = sorted({d for d in schema.values() if not _is_extractable(DTYPE_REGISTRY[d])})
+    if uncoercible:
+        raise PlanError(
+            f"extract(): dtype(s) {uncoercible} cannot be extracted from a model's JSON "
+            "output. Declare a string/number/bool/date/time/timestamp/binary field instead, "
+            "and cast it afterwards if you need another type."
+        )
     return {name: DTYPE_REGISTRY[dtype] for name, dtype in schema.items()}
+
+
+def _is_extractable(arrow_type: pa.DataType) -> bool:
+    """Whether `_coerce` can produce a value of `arrow_type` from parsed JSON."""
+    import pyarrow as pa
+
+    return bool(
+        pa.types.is_boolean(arrow_type)
+        or pa.types.is_integer(arrow_type)
+        or pa.types.is_floating(arrow_type)
+        or pa.types.is_string(arrow_type)
+        or pa.types.is_large_string(arrow_type)
+        or pa.types.is_binary(arrow_type)
+        or pa.types.is_large_binary(arrow_type)
+        or pa.types.is_date(arrow_type)
+        or pa.types.is_time(arrow_type)
+        or pa.types.is_timestamp(arrow_type)
+    )
 
 
 def json_schema(schema: dict[str, str]) -> dict:
@@ -124,11 +152,80 @@ def _coerce(value: object, arrow_type: pa.DataType) -> object | None:
         if pa.types.is_integer(arrow_type):
             return _coerce_integer(value)
         if pa.types.is_floating(arrow_type):
-            return float(value) if not isinstance(value, bool) else None
-        if pa.types.is_string(arrow_type):
+            if isinstance(value, bool):
+                return None
+            # `pa.array([1.5], type=pa.float16())` rejects a Python float outright with
+            # "Expected np.float16 instance", so a half-precision field did not degrade to
+            # null like every other mismatch here — it raised and failed the whole batch.
+            if pa.types.is_float16(arrow_type):
+                import numpy as np
+
+                return np.float16(value)
+            return float(value)
+        if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
             return value if isinstance(value, str) else json.dumps(value)
+        if pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
+            return value if isinstance(value, bytes) else str(value).encode()
+        if pa.types.is_temporal(arrow_type):
+            return _coerce_temporal(value, arrow_type)
     except (TypeError, ValueError):
         return None
+    return None
+
+
+def _coerce_temporal(value: object, arrow_type: pa.DataType) -> object | None:
+    """Coerce one parsed JSON value to a date / time / timestamp, or null.
+
+    A model asked for a date answers with an ISO string, because that is what dates look
+    like in the text it was trained on — never with a `datetime` object, which JSON cannot
+    carry anyway. Without this every temporal field of an extraction came back null for
+    every row, after the generation had already been paid for.
+    """
+    import datetime as dt
+
+    import pyarrow as pa
+
+    if isinstance(value, (dt.date, dt.time)):  # dt.datetime is a dt.date
+        parsed: object = value
+    elif isinstance(value, str):
+        parsed = _parse_iso(value.strip(), arrow_type)
+    else:
+        return None
+    if parsed is None:
+        return None
+    # A `date` where a timestamp is declared (and the reverse) is the ordinary mismatch: the
+    # model answered "2024-01-05" for a field the schema types as a timestamp. Normalize
+    # rather than null, since the value the model gave is unambiguous.
+    if pa.types.is_date(arrow_type) and isinstance(parsed, dt.datetime):
+        return parsed.date()
+    if pa.types.is_timestamp(arrow_type) and not isinstance(parsed, dt.datetime):
+        if isinstance(parsed, dt.date):
+            return dt.datetime(parsed.year, parsed.month, parsed.day)
+        return None
+    if pa.types.is_time(arrow_type) and not isinstance(parsed, dt.time):
+        return parsed.time() if isinstance(parsed, dt.datetime) else None
+    return parsed
+
+
+def _parse_iso(text: str, arrow_type: pa.DataType) -> object | None:
+    """An ISO-8601 date, time, or datetime out of `text`, or `None` when it is neither.
+
+    ``fromisoformat`` accepts a trailing ``Z`` from Python 3.11 on, which is the spelling a
+    model emits most often, so no pre-processing is needed beyond the strip the caller did.
+    """
+    import datetime as dt
+
+    import pyarrow as pa
+
+    if pa.types.is_time(arrow_type):
+        parsers = (dt.time.fromisoformat, dt.datetime.fromisoformat)
+    else:
+        parsers = (dt.datetime.fromisoformat, dt.date.fromisoformat)
+    for parse in parsers:
+        try:
+            return parse(text)
+        except ValueError:
+            continue
     return None
 
 
@@ -210,6 +307,7 @@ def _extract_batch(
     import pyarrow as pa
 
     from batcher.ml.llm.requests import GenerateSpec, _build_requests
+    from batcher.ml.tabular.features import append_columns
 
     spec = GenerateSpec(
         prompt_column=prompt_column or "",
@@ -229,15 +327,17 @@ def _extract_batch(
         obj = _loads_lenient(out)
         parsed.append(obj if isinstance(obj, dict) else {})
 
-    arrays = [batch.column(i) for i in range(batch.num_columns)]
-    names = list(batch.schema.names)
-    for name, arrow_type in fields.items():
+    extracted = {
         # The declared type, always — never inferred from what this batch happened to
         # contain. That is what keeps every batch's schema identical.
-        values = [_coerce(row.get(name), arrow_type) for row in parsed]
-        arrays.append(pa.array(values, type=arrow_type))
-        names.append(name)
-    return pa.RecordBatch.from_arrays(arrays, names=names)
+        name: pa.array([_coerce(row.get(name), arrow_type) for row in parsed], type=arrow_type)
+        for name, arrow_type in fields.items()
+    }
+    # `append_columns` **replaces** a field name the batch already carries; building the
+    # batch by hand appended it, and Arrow permits duplicate field names — so extracting
+    # into a column you already have produced two of one name that `to_pydict()` and every
+    # expression disagree about.
+    return append_columns(batch, extracted)
 
 
 def llm_extract_udf(
@@ -409,6 +509,7 @@ def _classify_batch(
     import pyarrow as pa
 
     from batcher.ml.llm.requests import GenerateSpec, _build_requests
+    from batcher.ml.tabular.features import append_columns
 
     spec = GenerateSpec(
         prompt_column=prompt_column or "",
@@ -421,6 +522,6 @@ def _classify_batch(
         suffix = "\n\n" + _CLASSIFY_INSTRUCTION.format(labels=", ".join(labels))
         requests = _apply_instruction(requests, suffix)
     resolved = [_match_label(o, lookup) for o in _dispatch_sorted(engine, requests)]
-    arrays = [batch.column(i) for i in range(batch.num_columns)]
-    arrays.append(pa.array(resolved, type=pa.string()))
-    return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, output_column])
+    # Replaces rather than appends when the batch already has `output_column` — see
+    # `_extract_batch` for why a duplicate Arrow field name is the silent outcome.
+    return append_columns(batch, {output_column: pa.array(resolved, type=pa.string())})

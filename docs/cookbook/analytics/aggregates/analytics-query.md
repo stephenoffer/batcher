@@ -51,7 +51,7 @@ print(by_name.to_pydict())
 ## Window
 
 A running total within each region, ordered by amount. Any aggregate becomes a window
-function once you hang `.over(...)` off it, with the partition and the ordering given as
+function once you hang {py:meth}`.over(...) <batcher.AggExpr.over>` off it, with the partition and the ordering given as
 keyword arguments rather than a separate window object to declare first.
 
 ```python
@@ -75,7 +75,7 @@ print(ranked.to_pydict()["position"])
 
 ## The same query in SQL
 
-SQL builds the identical plan and hands back a lazy `Dataset`, so the two spellings
+SQL builds the identical plan and hands back a lazy {py:class}`Dataset <batcher.Dataset>`, so the two spellings
 mix freely.
 
 ```python
@@ -91,8 +91,8 @@ print(out.to_pydict())
 
 Three edits turn this into a real query, and each one is a single line:
 
-1. Swap `from_pydict` for {doc}`a reader </user-guide/moving-data/reading-data>`, such as
-   `bt.read.parquet("s3://bucket/orders/")`. Nothing below it changes.
+1. Swap {py:func}`from_pydict <batcher.from_pydict>` for {doc}`a reader </user-guide/moving-data/reading-data>`, such as
+   {py:meth}`bt.read.parquet("s3://bucket/orders/") <batcher.api.io_namespace.reader.Reader.parquet>`. Nothing below it changes.
 1. Add a `filter` before the `group_by`. The optimizer pushes it toward the scan, so a
    partitioned or statistics-carrying source skips files rather than reading them. Confirm
    it did with {doc}`ds.explain() </user-guide/operate/tuning/explain-plans>`.

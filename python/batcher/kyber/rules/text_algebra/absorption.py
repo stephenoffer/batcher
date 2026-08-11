@@ -24,17 +24,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc
 from batcher.plan.expr_rewrite import expr_key
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["STRING_ABSORPTION_RULES"]
 
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 #: For each matching predicate family, the relation "`strong` implies `weak`" between two
 #: patterns. A prefix predicate is stronger the longer its pattern is; a substring
@@ -129,19 +125,9 @@ def _equality_leaf(*, conjunction: bool) -> Callable[[Expr], Expr]:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], connective: str):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=(Binary,),
-            # Each rule is built for one connective and returns its input for the other, so
-            # the index names it exactly rather than the whole `Binary` type.
-            expr_ops=(connective,),
-        )
-    )
+    # Each rule is built for one connective and returns its input for the other, so the index
+    # names it exactly rather than the whole `Binary` type.
+    return register_leaf_rule(name, leaf, expr_matches=(Binary,), expr_ops=(connective,))
 
 
 _NAMES = {

@@ -105,21 +105,32 @@ def _has_row_limiter(node: LogicalPlan) -> bool:
 
 
 def _has_rank_reduction(node: LogicalPlan) -> bool:
-    """Whether the subtree performs per-partition top-N row reduction (QUALIFY / distinct-subset).
+    """Whether the subtree keeps only some rows per key (a keyed dedup / QUALIFY top-N).
 
-    ``distinct(subset)`` and a ``QUALIFY <rank> <= k`` lower to `Filter(<rank> <= k)` over a
-    `Window` with a single ranking function (`row_number`/`rank`/`dense_rank`); the
-    `qualify_to_partition_topn` rule then fuses the pair into a row-dropping `rank_limit`
-    window. Either shape (pre- or post-fusion) drops rows, so whole-relation column stats no
-    longer describe the output. Detecting a `rank_limit` window, or the un-fused shape of a
-    `Filter` whose predicate reads a ranking `Window`'s output, forces execution.
+    Two shapes do this. A **keyed** `Distinct` keeps one row per key, so a non-key column
+    ends up holding a subset of its values and the whole-relation min/max/null-count no
+    longer describes the output. A ``QUALIFY <rank> <= k`` lowers to `Filter(<rank> <= k)`
+    over a `Window` with a single ranking function (`row_number`/`rank`/`dense_rank`), which
+    the `qualify_to_partition_topn` rule then fuses into a row-dropping `rank_limit` window;
+    either form of that pair (pre- or post-fusion) drops rows the same way.
+
+    A **whole-row** `Distinct` is not here and must not be: it preserves the value set of
+    every column, so min/max stay answerable from the source statistics (only the null count
+    goes, which its own stats already drop).
+
+    `distinct(subset)` used to be a `Filter` over a ranking `Window` and so was caught by the
+    second shape alone. It is now its own operator, and nothing about the window shape would
+    have found it — the answer would have come back from the footer statistic, without
+    executing and without an error.
     """
     from batcher.plan.expr_ir.walk import referenced_columns
     from batcher.plan.ir_tags import WINDOW_RANKING
-    from batcher.plan.logical import Filter, Window
+    from batcher.plan.logical import Distinct, Filter, Window
     from batcher.plan.visitor import children
 
     def visit(n: LogicalPlan, filtered_cols: frozenset[str]) -> bool:
+        if isinstance(n, Distinct) and n.keys:
+            return True
         if isinstance(n, Window):
             if n.rank_limit is not None:
                 return True

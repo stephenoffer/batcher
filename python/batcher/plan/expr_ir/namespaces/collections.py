@@ -1659,6 +1659,7 @@ _LIST_FUNCS = {
     "mean": "mean",
     "n_unique": "n_unique",
     "sort": "sort",  # → list
+    "sort_desc": "sort_desc",  # → list, descending, nulls last
     "reverse": "reverse",  # → list
     "product": "product",
     "std": "std",

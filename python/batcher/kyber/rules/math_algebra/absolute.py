@@ -33,19 +33,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.exprs.guards import is_integer, schema_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.exprs.guards import is_integer, register_schema_leaf_rule
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.core import MathExpr
 from batcher.plan.ir_tags import COMPARISON_FLIP
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 from batcher.plan.schema import SchemaRef
 
 __all__ = ["ABS_RANGE_RULES", "SIGN_INTEGER_RULES"]
 
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 _INT64_MAX = 2**63 - 1
 
 #: Comparisons whose operands may be swapped by flipping the operator, so each rule below
@@ -122,16 +118,10 @@ def _abs_leaf(op_wanted: str) -> Callable[[Expr], Expr]:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], op: str):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=(Binary,),
-            expr_ops=(op, COMPARISON_FLIP[op]),
-        )
+    # `op` and its mirror: the leaf normalizes the computed side to the left, so a `lt` leaf
+    # is reached by a `gt` node with the literal on the left.
+    return register_leaf_rule(
+        name, leaf, expr_matches=(Binary,), expr_ops=(op, COMPARISON_FLIP[op])
     )
 
 
@@ -216,17 +206,11 @@ _SIGN_NAMES = {
 
 
 def _register_sign_integer(key: tuple[str, int]):
-    leaf = _sign_integer_leaf(key)
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            _SIGN_NAMES[key],
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: schema_rule(node, _leaf, carries=(Binary,)),
-            matches=(Filter, Project),
-            expr_schema_fn=leaf,
-            expr_matches=(Binary,),
-            expr_ops=(key[0], COMPARISON_FLIP[key[0]]),
-        )
+    return register_schema_leaf_rule(
+        _SIGN_NAMES[key],
+        _sign_integer_leaf(key),
+        expr_matches=(Binary,),
+        expr_ops=(key[0], COMPARISON_FLIP[key[0]]),
     )
 
 

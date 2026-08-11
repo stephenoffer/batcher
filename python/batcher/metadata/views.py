@@ -8,11 +8,19 @@ the hub's own, which is being the façade over a backend, so it lives here.
 Two views, and the difference between them is the whole point:
 
 * **by kind** buckets rows by operator family for the models fitted in *machine units* —
-  nanoseconds per row, bytes per group, utilization. It is restricted to rows measured on this
-  machine class, because none of those quantities transfers to different hardware.
+  nanoseconds per row, bytes per group, utilization. It is bucketed **per machine class**,
+  because none of those quantities transfers to different hardware.
 * **with signature** keeps rows in chronological order for cardinality correction, and is
   restricted to nothing, because a query's selectivity is a property of the data and is the
   same on every machine.
+
+The by-kind view is bucketed by fingerprint rather than *filtered* to the local one, and the
+difference is not cosmetic. Filtering answers only "what did this process measure", and the
+process that asks is the driver, which on a cluster runs none of the work: every worker row
+arrived correctly attributed and was then dropped, so cost calibration and the CPU-share loop
+learned nothing at all from a distributed run whose workers were a different machine class from
+the driver. Bucketing keeps each class's rows separate — which is the property that mattered —
+while letting a consumer name the class it is planning *for*. See `MetadataHub.op_stats_by_kind`.
 
 Both are bounded. Each consumer reduces a view to a median or a regression coefficient, so the
 newest few thousand rows decide the fit and older ones only cost memory and parse time; without
@@ -27,7 +35,6 @@ from collections.abc import Iterable
 from typing import Any
 
 from batcher._internal.logging import get_logger
-from batcher.metadata.hardware_scope import measured_here
 
 __all__ = [
     "PER_KIND_MAX",
@@ -108,7 +115,7 @@ def trimmed(rows: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
 
 def build_views(
     scanned: Iterable[tuple[Any, bytes]],
-) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, list[dict[str, Any]]]], list[dict[str, Any]]]:
     """Both views from **one** pass over the backend scan.
 
     The two views are read together — Kyber calibrates cost from the by-kind buckets and
@@ -117,32 +124,41 @@ def build_views(
     `json.loads` over every stored row twice. The parse is the expensive half (a persisted
     store holds tens of thousands of rows), and it produces the same objects both times.
 
-    The two filters stay exactly as they were, and the difference between them is load-bearing:
-    the by-kind buckets keep only rows measured on **this machine class**, because everything
-    fitted from them is in machine units, while the signed history keeps rows from anywhere,
-    because cardinality is a property of the data. A row can therefore land in both, one, or
-    neither. Rows that land in both are *shared*, not copied — every consumer of these views
-    reads them, so aliasing costs nothing and halves the memory a long history occupies.
+    The two groupings differ, and the difference is load-bearing: the by-kind buckets are
+    separated **per machine class**, because everything fitted from them is in machine units,
+    while the signed history keeps rows from anywhere, because cardinality is a property of the
+    data. A row can therefore land in both, one, or neither. Rows that land in both are
+    *shared*, not copied — every consumer of these views reads them, so aliasing costs nothing
+    and halves the memory a long history occupies.
+
+    A row with **no** fingerprint is in no machine's bucket. That is deliberate: "measured on an
+    unknown machine" is not evidence about any particular one, and adopting such rows into
+    whichever class asked first would reinstate exactly the blend `hardware_scope` exists to
+    prevent. Such rows (written before the field existed) age out of the store, and the models
+    re-converge within a few runs because every query contributes feedback.
 
     Args:
         scanned: `(key, value)` pairs from a backend scan of the `op_stats` table.
 
     Returns:
-        `(by_kind, signed)` — the bucketed machine-scoped view and the chronological
-        signature-carrying view, each bounded exactly as its single-view builder bounds it.
+        `(by_fingerprint, signed)` — the per-machine-class bucketed view (`{fingerprint:
+        {kind: rows}}`) and the chronological signature-carrying view, each bounded exactly as
+        its single-view builder bounds it.
     """
-    buckets: dict[str, list[dict[str, Any]]] = {}
+    by_fp: dict[str, dict[str, list[dict[str, Any]]]] = {}
     ordered: list[tuple[int, dict[str, Any]]] = []
     for key, row in _rows(scanned):
-        if measured_here(row):
-            buckets.setdefault(row.get("kind", ""), []).append(row)
+        machine = str(row.get("hw_fingerprint", "") or "")
+        if machine:
+            by_fp.setdefault(machine, {}).setdefault(row.get("kind", ""), []).append(row)
         if row.get("signature"):
             try:
                 seq = int(key[1]) if len(key) > 1 else 0
             except (TypeError, ValueError):
                 seq = 0
             ordered.append((seq, row))
-    for bucket in buckets.values():
-        trimmed(bucket, PER_KIND_MAX)
+    for buckets in by_fp.values():
+        for bucket in buckets.values():
+            trimmed(bucket, PER_KIND_MAX)
     ordered.sort(key=lambda pair: pair[0])
-    return buckets, [row for _seq, row in ordered[-SIGNED_HISTORY_MAX:]]
+    return by_fp, [row for _seq, row in ordered[-SIGNED_HISTORY_MAX:]]

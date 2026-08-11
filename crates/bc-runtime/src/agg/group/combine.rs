@@ -8,20 +8,18 @@
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::compute::interleave;
 use arrow::datatypes::{
-    ArrowPrimitiveType, BinaryType, DataType, Int16Type, Int32Type, Int64Type, Int8Type,
-    LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
+    ArrowPrimitiveType, DataType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+    UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow::row::{RowConverter, SortField};
 use rayon::prelude::*;
 
 use super::assign::assign_groups;
-use super::{NULL_HASH, SEED};
+use super::hash::hash_partial_keys;
 use crate::agg::{
     accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_covar,
     merge_distinct, merge_median, merge_moments, merge_welford, AggFunc, Partial,
 };
 use crate::error::RuntimeError;
-use crate::keys::canon_f64;
 
 /// One merged radix partition: its group-key columns, and per aggregate its state columns.
 type MergedPartition = (Vec<ArrayRef>, Vec<Vec<ArrayRef>>);
@@ -273,243 +271,6 @@ pub(crate) fn combine_radix_parts(
     Ok(per)
 }
 
-/// [`hash_keys`] over the partials' key columns, flattened in partial order.
-///
-/// Equal keys must hash equally for the bucketing to co-locate them, and [`hash_keys`] is a
-/// pure function of a row's key *values* — so hashing each partial separately and laying the
-/// results end to end gives exactly the vector hashing their concatenation would, without
-/// building that concatenation. Partials are hashed across cores; each one's own hash is
-/// already internally parallel, and rayon composes the two.
-fn hash_partial_keys(parts: &[Partial], total_rows: usize) -> Result<Vec<u64>, RuntimeError> {
-    let per: Vec<Vec<u64>> = parts
-        .par_iter()
-        .map(|p| {
-            let rows = p.group_columns.first().map_or(0, |c| c.len());
-            hash_keys(&p.group_columns, rows)
-        })
-        .collect::<Result<_, _>>()?;
-    let mut out = Vec::with_capacity(total_rows);
-    for h in per {
-        out.extend_from_slice(&h);
-    }
-    Ok(out)
-}
-
-/// Per-row key hash for bucketing — a single primitive-int or byte key hashes its native
-/// values directly (no row encoding); everything else goes through arrow's row encoding.
-/// Nulls hash to a fixed sentinel so they co-locate (and thus form one group).
-fn hash_keys(group_keys: &[ArrayRef], num_rows: usize) -> Result<Vec<u64>, RuntimeError> {
-    // Canonicalize float keys ONCE, up front — the same shape `bucket_of_rows` uses — so
-    // every path below (typed fast path, mixed fold, or `RowConverter` fallback) buckets on
-    // the bits `assign_groups` grouped by. Stating the policy per-encoder is what let the
-    // `RowConverter` fallback drift: arrow's row format is deliberately non-canonical for
-    // floats, so a group whose representative is `-0.0` in one partial and `0.0` in another
-    // (legal — `assign_groups` takes reps from the original column) hashed into different
-    // radix buckets, and buckets merge by plain `concat` on the "key-disjoint" assumption,
-    // so the two were never reconciled: two output groups where the oracle returns one.
-    // Differing NaN payloads split the same way. It reached the fallback for any composite
-    // key mixing a float with a non-`is_hashable_mixed` type, any composite key with a
-    // nullable column, and any float nested in a `List`/`Struct` — and only above
-    // `RADIX_PARALLEL_THRESHOLD`, so no small test could see it.
-    let canon = crate::keys::canonicalize_float_keys(group_keys);
-    let group_keys: &[ArrayRef] = canon.as_deref().unwrap_or(group_keys);
-    if group_keys.len() == 1 {
-        let arr = &group_keys[0];
-        match arr.data_type() {
-            DataType::Int8 => return Ok(hash_primitive::<Int8Type>(arr, num_rows)),
-            DataType::Int16 => return Ok(hash_primitive::<Int16Type>(arr, num_rows)),
-            DataType::Int32 => return Ok(hash_primitive::<Int32Type>(arr, num_rows)),
-            DataType::Int64 => return Ok(hash_primitive::<Int64Type>(arr, num_rows)),
-            DataType::UInt8 => return Ok(hash_primitive::<UInt8Type>(arr, num_rows)),
-            DataType::UInt16 => return Ok(hash_primitive::<UInt16Type>(arr, num_rows)),
-            DataType::UInt32 => return Ok(hash_primitive::<UInt32Type>(arr, num_rows)),
-            DataType::UInt64 => return Ok(hash_primitive::<UInt64Type>(arr, num_rows)),
-            DataType::Utf8 => return Ok(hash_bytes::<Utf8Type>(arr, num_rows)),
-            DataType::LargeUtf8 => return Ok(hash_bytes::<LargeUtf8Type>(arr, num_rows)),
-            DataType::Binary => return Ok(hash_bytes::<BinaryType>(arr, num_rows)),
-            DataType::LargeBinary => return Ok(hash_bytes::<LargeBinaryType>(arr, num_rows)),
-            // Float bucketing MUST use the same canonical bits `assign` groups by, or a `-0.0`
-            // and a `0.0` (one group) would land in different radix partitions and never merge.
-            DataType::Float64 => return Ok(hash_f64_canon(arr, num_rows)),
-            _ => {}
-        }
-    }
-    // Multi-column all-`Int64` (null-free) fast path: fold each column's raw `i64` into
-    // one hasher per row, skipping the `RowConverter` encode the general path runs. This
-    // is the composite-int-key regroup (e.g. DISTINCT `(l_orderkey, l_suppkey)`); narrow
-    // ints normalize to `Int64` at the FFI boundary. Bucketing only needs equal keys to
-    // hash equally, which this preserves — so the merged relation is unchanged.
-    if group_keys.len() >= 2
-        && group_keys
-            .iter()
-            .all(|a| a.data_type() == &DataType::Int64 && a.null_count() == 0)
-    {
-        use std::hash::{BuildHasher, Hasher};
-        let cols: Vec<&arrow::array::Int64Array> = group_keys
-            .iter()
-            .map(|a| a.as_primitive::<Int64Type>())
-            .collect();
-        return Ok((0..num_rows)
-            .into_par_iter()
-            .map(|i| {
-                let mut h = SEED.build_hasher();
-                for c in &cols {
-                    h.write_i64(c.value(i));
-                }
-                h.finish()
-            })
-            .collect());
-    }
-    // Multi-column MIXED Int64 / string / binary (null-free) fast path: fold each column's raw
-    // value into one hasher per row, in parallel, skipping the `RowConverter` — whose
-    // `convert_columns` is a serial per-row byte encode. That encode is the entire cost of a
-    // `COUNT(DISTINCT id) GROUP BY flag` combine, which regroups tens of millions of
-    // `(flag, id)` partial rows (measured: the DISTINCT ran at ~12% CPU / ~1s, all in this
-    // encode). Equal null-free rows fold the same bytes in the same order, so they bucket
-    // identically. Nullable keys keep the `RowConverter` (it co-locates nulls into one group).
-    if group_keys.len() >= 2
-        && group_keys
-            .iter()
-            .all(|a| a.null_count() == 0 && is_hashable_mixed(a.data_type()))
-    {
-        return Ok(hash_mixed(group_keys, num_rows));
-    }
-    let fields: Vec<SortField> = group_keys
-        .iter()
-        .map(|a| SortField::new(a.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(group_keys)?;
-    Ok((0..num_rows)
-        .into_par_iter()
-        .map(|i| SEED.hash_one(rows.row(i)))
-        .collect())
-}
-
-/// Types the null-free mixed-key fast hash handles directly (no `RowConverter`).
-fn is_hashable_mixed(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Int64
-            | DataType::Float64
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
-    )
-}
-
-/// One key column, downcast once, feeding its per-row raw value to a hasher.
-enum MixedCol<'a> {
-    Int(&'a [i64]),
-    Float(&'a [f64]),
-    Str32(&'a arrow::array::GenericStringArray<i32>),
-    Str64(&'a arrow::array::GenericStringArray<i64>),
-    Bin32(&'a arrow::array::GenericBinaryArray<i32>),
-    Bin64(&'a arrow::array::GenericBinaryArray<i64>),
-}
-
-impl MixedCol<'_> {
-    #[inline]
-    fn write<H: std::hash::Hasher>(&self, h: &mut H, i: usize) {
-        match self {
-            MixedCol::Int(v) => h.write_i64(v[i]),
-            MixedCol::Float(v) => h.write_u64(canon_f64(v[i])),
-            MixedCol::Str32(a) => h.write(a.value(i).as_bytes()),
-            MixedCol::Str64(a) => h.write(a.value(i).as_bytes()),
-            MixedCol::Bin32(a) => h.write(a.value(i)),
-            MixedCol::Bin64(a) => h.write(a.value(i)),
-        }
-    }
-}
-
-/// Per-row hash of a null-free mixed Int64/string/binary composite key, in parallel — the
-/// `RowConverter`-free bucketing hash for the high-cardinality DISTINCT / many-group combine.
-/// Caller has checked every column is null-free and [`is_hashable_mixed`].
-fn hash_mixed(group_keys: &[ArrayRef], num_rows: usize) -> Vec<u64> {
-    use std::hash::{BuildHasher, Hasher};
-    let cols: Vec<MixedCol> = group_keys
-        .iter()
-        .map(|k| match k.data_type() {
-            DataType::Int64 => MixedCol::Int(k.as_primitive::<Int64Type>().values()),
-            DataType::Float64 => {
-                MixedCol::Float(k.as_primitive::<arrow::datatypes::Float64Type>().values())
-            }
-            DataType::Utf8 => MixedCol::Str32(k.as_string::<i32>()),
-            DataType::LargeUtf8 => MixedCol::Str64(k.as_string::<i64>()),
-            DataType::Binary => MixedCol::Bin32(k.as_binary::<i32>()),
-            DataType::LargeBinary => MixedCol::Bin64(k.as_binary::<i64>()),
-            _ => unreachable!("caller gated on is_hashable_mixed"),
-        })
-        .collect();
-    (0..num_rows)
-        .into_par_iter()
-        .map(|i| {
-            let mut h = SEED.build_hasher();
-            for c in &cols {
-                c.write(&mut h, i);
-            }
-            h.finish()
-        })
-        .collect()
-}
-
-/// Per-row hash of a single `Float64` key over its canonical bits (nulls → `NULL_HASH`), so a
-/// float key buckets exactly as `assign` groups it. See [`canon_f64`].
-fn hash_f64_canon(arr: &ArrayRef, num_rows: usize) -> Vec<u64> {
-    let a = arr.as_primitive::<arrow::datatypes::Float64Type>();
-    let nulls = a.nulls();
-    let values = a.values();
-    (0..num_rows)
-        .into_par_iter()
-        .map(|i| {
-            if nulls.map(|n| n.is_null(i)).unwrap_or(false) {
-                NULL_HASH
-            } else {
-                SEED.hash_one(canon_f64(values[i]))
-            }
-        })
-        .collect()
-}
-
-fn hash_primitive<T>(arr: &ArrayRef, num_rows: usize) -> Vec<u64>
-where
-    T: ArrowPrimitiveType,
-    T::Native: std::hash::Hash + Sync,
-{
-    let a = arr.as_primitive::<T>();
-    let nulls = a.nulls();
-    let values = a.values();
-    (0..num_rows)
-        .into_par_iter()
-        .map(|i| {
-            if nulls.map(|n| n.is_null(i)).unwrap_or(false) {
-                NULL_HASH
-            } else {
-                SEED.hash_one(values[i])
-            }
-        })
-        .collect()
-}
-
-fn hash_bytes<T>(arr: &ArrayRef, num_rows: usize) -> Vec<u64>
-where
-    T: arrow::array::types::ByteArrayType,
-    for<'a> &'a T::Native: std::hash::Hash,
-{
-    let a = arr.as_bytes::<T>();
-    (0..num_rows)
-        .into_par_iter()
-        .map(|i| {
-            if a.is_null(i) {
-                NULL_HASH
-            } else {
-                SEED.hash_one(a.value(i))
-            }
-        })
-        .collect()
-}
-
 /// Concatenate a sequence of arrays (the per-partition outputs) into one.
 ///
 /// Through [`crate::gather::concat_columns`], not arrow's `concat` directly: a
@@ -540,6 +301,11 @@ pub(crate) fn merge_state(
         | AggFunc::Quantile(_)
         | AggFunc::ListAgg
         | AggFunc::Mode
+        // The contiguity statistics carry `Median`'s value list, so they merge by the same
+        // concatenation. This arm *is* their mergeability.
+        | AggFunc::NLength(_)
+        | AggFunc::LCount(_)
+        | AggFunc::AuN
         | AggFunc::Histogram
         | AggFunc::Entropy
         | AggFunc::Mad
@@ -646,4 +412,124 @@ fn merge_kahan(
         ))
     };
     vec![mask(out_sum), mask(out_comp)]
+}
+
+/// Partial rows each radix partition needs before the parallel regroup earns its setup.
+///
+/// The crossover is a function of rows *per partition*, not of the total: the parallel path's
+/// overhead is per-partition (a bucket list, a gather, a hash table, an output array), while
+/// the serial path's is per-row and single-threaded. Measured on a 92-core box over
+/// ClickBench `hits` (min-of-5 wall, whole query):
+///
+/// | partial rows | serial | parallel |
+/// |--------------|-------:|---------:|
+/// | 14 k (`GROUP BY RegionID`)   | 2.5 ms  | 5.2 ms |
+/// | 23 k (`GROUP BY SearchPhrase`)| 7.0 ms | 5.5 ms |
+/// | 35 k (`GROUP BY Title`)      | 16.0 ms | 12.4 ms |
+/// | 182 k (`GROUP BY URL`, filtered) | 49.3 ms | 15.1 ms |
+///
+/// The turn is just under 23 k there — `92 × 256` — and the 182 k row is why this matters: a
+/// fixed 200 k threshold left a string group-by *just* under it on the serial merge, paying
+/// 38 ms of single-threaded `assign_groups` for work the parallel path does in 5.
+const MIN_ROWS_PER_RADIX_PARTITION: usize = 256;
+
+/// Radix partitions a `combine` fans out over, sized by the group count the merge is
+/// expected to produce.
+///
+/// One partition per core is the floor — the independent group-and-merge tasks must fill the
+/// pool — and it is also the right answer for most aggregates, because their group tables
+/// already fit in cache. It is the wrong answer for the ones that do not: past a few hundred
+/// thousand groups per partition every probe misses, and splitting finer is worth up to 1.35x
+/// (see the table on `crate::agg::combine_sized`).
+///
+/// **A flat width cannot serve both ends, and trying was measured.** Oversubscribing 4x
+/// unconditionally read as 1.2-1.6x on high-cardinality shapes and **0.85-0.90x** on low ones
+/// in a whole-query A/B, consistently, over six paired rounds. So the width is a function of
+/// the estimate the executor measured rather than of the machine alone; dividing by
+/// `GROUPS_PER_RADIX_PARTITION` lands on the measured best or within a few percent at every
+/// cardinality in that table, and — because the divisor is far above any small aggregate's
+/// group count — leaves everything below ~500 k groups on a 16-core box at exactly the
+/// one-per-core width it had before.
+///
+/// `estimated_groups == 0` means the caller did not measure; that keeps one per core.
+///
+/// The 512 ceiling caps per-partition setup on huge boxes; the floor of 2 keeps the path
+/// meaningful on a single-core one.
+pub(crate) fn radix_partitions(estimated_groups: usize) -> usize {
+    let per_core = rayon::current_num_threads().clamp(2, 512);
+    estimated_groups
+        .div_ceil(GROUPS_PER_RADIX_PARTITION)
+        .clamp(per_core, RADIX_PARTITIONS_MAX)
+        .next_power_of_two()
+        .min(RADIX_PARTITIONS_MAX)
+}
+
+/// Groups one radix partition may hold before its table stops being cache-resident. Shared in
+/// spirit with `bc_interp::agg_par::GROUPS_PER_PARTITION` (the partition path's twin) and
+/// calibrated the same way — the two paths gather differently, so the numbers are measured
+/// separately rather than assumed equal.
+const GROUPS_PER_RADIX_PARTITION: usize = 32_768;
+
+/// Ceiling on the regroup width: every measured cardinality regresses past this.
+const RADIX_PARTITIONS_MAX: usize = 512;
+
+/// The machine-derived partial-row count above which `combine` regroups in parallel: enough
+/// rows to keep one-per-core partitions busy. Resolved here, beside the width it is expressed
+/// in, so the two cannot drift.
+pub(crate) fn radix_parallel_default() -> usize {
+    // Expressed in one-per-core partitions deliberately: the question the threshold asks is
+    // "are there enough rows to keep the pool busy?", which is about the core count, not
+    // about the cache-sized width the regroup then runs at. Tying it to `radix_partitions`
+    // would let a wide, high-cardinality merge silently raise its own crossover.
+    rayon::current_num_threads()
+        .clamp(2, 512)
+        .saturating_mul(MIN_ROWS_PER_RADIX_PARTITION)
+}
+
+/// [`combine`] for partials the caller **knows** hold disjoint key sets — a concatenation,
+/// with no regroup.
+///
+/// `combine` cannot assume disjointness: any two partials may share a key, so it must hash
+/// every row to find out. When the partials came from a hash *partitioning* of one relation
+/// they provably cannot, and the merge is then exactly "put the rows together" — every group
+/// already appears in exactly one input, so there is nothing to reduce. That turns an O(rows)
+/// hash-and-gather into a `memcpy` per column.
+///
+/// # Correctness precondition
+///
+/// **The caller guarantees that no group key appears in two of `parts`.** This is not
+/// checkable here at any sensible cost, and violating it does not error — it emits the same
+/// key twice, so a `SUM` splits across two output rows. Only pass partials produced by
+/// partitioning one relation on the *whole* group key (`agg_par::partitioned_partials`,
+/// `combine_radix_parts`). When in doubt, call [`combine`]: it is slower and always right.
+///
+/// The relation returned is the one `combine` would return, in a different group order —
+/// which is unspecified for a hash aggregate, as it already is across worker counts.
+pub fn concat_disjoint(parts: &[Partial]) -> Result<Partial, RuntimeError> {
+    assert!(
+        !parts.is_empty(),
+        "concat_disjoint requires at least one partial"
+    );
+    if parts.len() == 1 {
+        let p = &parts[0];
+        return Ok(Partial {
+            group_columns: p.group_columns.clone(),
+            states: p.states.clone(),
+        });
+    }
+    let group_columns: Vec<ArrayRef> = (0..parts[0].group_columns.len())
+        .into_par_iter()
+        .map(|k| concat_col(parts.iter().map(|p| &p.group_columns[k])))
+        .collect::<Result<_, _>>()?;
+    let states: Vec<Vec<ArrayRef>> = (0..parts[0].states.len())
+        .map(|a| {
+            (0..parts[0].states[a].len())
+                .map(|c| concat_col(parts.iter().map(|p| &p.states[a][c])))
+                .collect::<Result<_, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Partial {
+        group_columns,
+        states,
+    })
 }

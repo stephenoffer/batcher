@@ -192,8 +192,8 @@ def gpu_devices_absent() -> bool:
     Returns:
         True only if a real probe is certain to find nothing.
     """
-    if os.environ.get("CUDA_VISIBLE_DEVICES", None) == "":
-        return True  # the user masked every device; nothing to find
+    if _devices_masked_off():
+        return True  # the runtime or the user masked every device; nothing to find
     if not sys.platform.startswith("linux"):
         return False  # no authoritative node to check — make the caller probe for real
     # Numbered *device* nodes, not the driver's control node: a GPU-less machine built from a
@@ -209,6 +209,30 @@ def gpu_devices_absent() -> bool:
     if any(glob.glob(pattern) for pattern in _ACCELERATOR_DEVICE_GLOBS):
         return False
     return not any(os.path.exists(p) for p in ("/dev/kfd", "/dev/dxg"))
+
+
+#: Values of `CUDA_VISIBLE_DEVICES` (and its AMD equivalents) that mean "no device at all".
+#: The empty string is the spelling this module already honored; `-1` is the one CUDA itself
+#: documents and the one every framework and CI script actually writes, and it was read as an
+#: ordinal list, so a run explicitly asked to stay off the GPU still paid the ~2 s `import
+#: torch` to be told there was nothing to accelerate — and still enumerated the node's devices
+#: through NVML afterwards.
+_NO_DEVICES = frozenset({"", "-1", "none", "void"})
+
+#: The container-runtime variable, which is set *before* the process starts and decides which
+#: devices the NVIDIA container toolkit injects. `none` and `void` are its documented ways of
+#: saying "inject nothing", and a container started that way has no device nodes to find —
+#: reading it lets the cheap negative answer without touching the filesystem.
+_CONTAINER_VISIBLE_VAR = "NVIDIA_VISIBLE_DEVICES"
+
+
+def _devices_masked_off() -> bool:
+    """Whether an environment variable has definitively hidden every accelerator."""
+    for var in (*_VISIBLE_DEVICE_VARS, _CONTAINER_VISIBLE_VAR):
+        raw = os.environ.get(var)
+        if raw is not None and raw.strip().lower() in _NO_DEVICES:
+            return True
+    return False
 
 
 def accelerator_backend() -> str:
@@ -395,6 +419,14 @@ def _visible_devices(devices: list[dict[str, object]]) -> list[dict[str, object]
     raw = next((os.environ[v] for v in _VISIBLE_DEVICE_VARS if v in os.environ), None)
     if raw is None:
         return devices
+    if raw.strip().lower() in _NO_DEVICES:
+        # `-1` is CUDA's own documented "no devices", and it is what a framework or a CI script
+        # writes to keep a run off the GPU. Only the empty string was recognized, so `-1` fell
+        # through the ordinal parse (it is not `isdigit`), failed to resolve as a UUID, and hit
+        # the "could not resolve" fallback — which returns EVERY device on the node. A pod
+        # explicitly denied the GPU was therefore reported as owning all eight of them, and the
+        # pool sized itself accordingly.
+        return []
     tokens = [t.strip() for t in raw.split(",") if t.strip()]
     if not tokens:
         return []  # explicitly empty: the runtime hid every device

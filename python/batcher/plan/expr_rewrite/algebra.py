@@ -71,16 +71,26 @@ def split_disjuncts(expr: Expr) -> list[Expr]:
 
 
 def combine_disjuncts(exprs: list[Expr]) -> Expr:
-    """Combine a non-empty list of expressions into a left-deep `OR` chain.
+    """Combine a non-empty list of expressions into a **balanced** `OR` tree.
 
-    The inverse of `split_disjuncts`; raises on an empty list (no neutral disjunct
-    exists without inventing a literal)."""
+    The inverse of `split_disjuncts`, and balanced for exactly the reason
+    `combine_conjuncts` is: depth O(log n) rather than O(n), so a long disjunction never
+    nests deep enough to exhaust the data plane's stack when the IR is walked there. This
+    twin was left-deep while its `AND` sibling was balanced, and the callers that can go
+    long are the ones that build one disjunct per *value* — `runtime_filters.evidence`
+    emits `col = v` per surviving key, `setops_extra` one predicate per row of a small
+    side. `OR` is associative + commutative in Kleene logic, so balancing preserves the
+    expression exactly (the disjuncts' left-to-right order is kept).
+
+    Raises on an empty list (no neutral disjunct exists without inventing a literal)."""
     if not exprs:
         raise ValueError("combine_disjuncts requires at least one expression")
-    out = exprs[0]
-    for e in exprs[1:]:
-        out = Binary("or", out, e)
-    return out
+    while len(exprs) > 1:
+        exprs = [
+            Binary("or", exprs[i], exprs[i + 1]) if i + 1 < len(exprs) else exprs[i]
+            for i in range(0, len(exprs), 2)
+        ]
+    return exprs[0]
 
 
 def substitute_columns(expr: Expr, mapping: dict[str, Expr]) -> Expr:

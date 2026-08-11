@@ -23,17 +23,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc
 from batcher.plan.ir_tags import COMPARISON_FLIP
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["LENGTH_EMPTINESS_RULES", "PAD_COLLAPSE_RULES"]
 
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 #: The three length functions, all of which are zero exactly for the empty string.
 #: `len` counts characters, `octet_length` bytes, `bit_length` bits — the *scale* differs
@@ -99,17 +95,7 @@ def _register(
     expr_matches: tuple[type, ...],
     expr_ops: tuple[str, ...] | None = None,
 ):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=expr_matches,
-            expr_ops=expr_ops,
-        )
-    )
+    return register_leaf_rule(name, leaf, expr_matches=expr_matches, expr_ops=expr_ops)
 
 
 def _emptiness_keys(fn: str) -> list[tuple[str, int]]:

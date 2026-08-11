@@ -16,7 +16,7 @@ the table.
 :::{grid-item-card} {octicon}`code;1.1em` The column language
 :link: /user-guide/transform/columns/index
 :link-type: doc
-`Expr`, the typed accessor namespaces, the type system, and the batch UDF for when an
+{py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, the typed accessor namespaces, the type system, and the batch UDF for when an
 expression genuinely cannot say it.
 :::
 ::::
@@ -31,7 +31,8 @@ expression genuinely cannot say it.
 | {doc}`Distinct and deduplication <rows/distinct-and-dedup>` | Exact, keyed, and near-duplicate removal |
 | {doc}`Sampling and splitting <rows/sampling>` | Reproducible samples and train/test splits |
 | {doc}`Expressions <columns/expressions>` | The composable column language: operators, conditionals, nulls, math |
-| {doc}`Expression accessors <columns/expression-accessors>` | `.str`, `.dt`, `.list`, `.struct`, and `.json` |
+| {doc}`Expression accessors <columns/expression-accessors>` | {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`, and {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>` |
+| {doc}`The sequence accessor <columns/sequence-accessor>` | {py:class}`.seq <batcher.plan.expr_ir.namespaces.sequence._SeqNamespace>`: DNA, RNA, protein, and FASTQ-quality columns |
 | {doc}`Expression recipes <columns/expression-recipes>` | Porting, feature engineering, and text-corpus curation |
 | {doc}`The type system <columns/type-system>` | Arrow types, boundary widening, casts, nulls |
 | {doc}`User-defined functions <columns/udfs>` | Your Python over whole Arrow batches |
@@ -39,7 +40,7 @@ expression genuinely cannot say it.
 ## See also
 
 - {doc}`/user-guide/analyze/index`: grouping, joining, and windowing the rows you kept.
-- {doc}`/cookbook/expressions/index`: the column language as 34 runnable pages.
+- {doc}`/cookbook/expressions/index`: the column language as 39 runnable pages.
 
 ```{toctree}
 :hidden:

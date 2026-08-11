@@ -271,6 +271,21 @@ def already_committed(path: str, app_txn: tuple[str, int] | None, storage_option
     return last is not None and last >= version
 
 
+def _set_table_properties(table: Any, properties: dict[str, str] | None) -> None:
+    """Apply `properties` to an existing table, skipping the ones already in force.
+
+    Comparing first is what keeps a repeated write from appending an identical `metaData`
+    commit to the log on every run: the properties are usually passed unconditionally by a
+    pipeline that just wants them set, and a no-op `ALTER` still costs a version.
+    """
+    if not properties:
+        return
+    current = table.metadata().configuration
+    pending = {k: v for k, v in properties.items() if current.get(k) != v}
+    if pending:
+        table.alter.set_table_properties(pending)
+
+
 def commit_add_actions(
     manifest: WriteManifest,
     path: str,
@@ -281,6 +296,7 @@ def commit_add_actions(
     merge_schema: bool = False,
     storage_options: dict[str, str] | None = None,
     app_txn: tuple[str, int] | None = None,
+    table_properties: dict[str, str] | None = None,
 ) -> None:
     """Commit the manifest's already-written data files as one Delta transaction.
 
@@ -301,6 +317,9 @@ def commit_add_actions(
         storage_options: Cloud storage options for delta-rs.
         app_txn: Optional ``(app_id, version)`` recorded as a Delta `txn` action, making
             the commit idempotent under replay.
+        table_properties: Delta table properties (Spark's ``TBLPROPERTIES``) to set — on
+            the ``metaData`` action when this commit creates the table, or as an
+            ``ALTER TABLE SET TBLPROPERTIES`` when it already exists.
 
     Raises:
         CommitError: If the commit conflicts with a concurrent writer, or fails.
@@ -339,11 +358,18 @@ def commit_add_actions(
                 actions,
                 mode="error",
                 partition_by=partition_by or [],
+                configuration=table_properties,
                 storage_options=storage_options,
                 commit_properties=properties,
             )
             return
         table = deltalake.DeltaTable(path, storage_options=storage_options)
+        # On an existing table the properties are a separate commit, exactly as
+        # `ALTER TABLE ... SET TBLPROPERTIES` is. Applied before the data commit so a
+        # property that changes how the data commit is *recorded* — enabling the change
+        # data feed is the one that matters — is already in force for it, rather than
+        # taking effect one write late.
+        _set_table_properties(table, table_properties)
         _reconcile_schema(table, schema, merge_schema=merge_schema)
         table.create_write_transaction(
             actions,

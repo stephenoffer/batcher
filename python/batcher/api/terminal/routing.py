@@ -165,7 +165,24 @@ def _resolve_distributed(
         if sources is None:
             return True
         rows = _estimated_input_rows(sources)
-        return rows is None or rows >= min_rows
+        if rows is not None:
+            return rows >= min_rows
+        # Unknown size. The rule is "distribute, staying safe for large data" — but that is
+        # a bet about *throughput*, and it is only available when the workers can reach the
+        # data at all. A bare filesystem path may be this node's own disk, and shipping the
+        # scan there fails outright (`path ... does not exist` from a worker on another
+        # machine) rather than running slowly.
+        #
+        # The two conditions coincide exactly on the formats that have no cheap row count:
+        # CSV, JSON, text and the bioinformatics readers all report `None` here, while
+        # Parquet answers from its footer and so never reaches this line. So on a
+        # Ray-connected process `bt.read.csv("/tmp/x.csv").collect()` — with no
+        # `distributed=` argument anywhere — died on a three-row file. Staying single-node
+        # costs a throughput bet that may not have paid; distributing costs the query.
+        #
+        # An explicit `distributed=True` still wins, above: a caller who knows the path is
+        # on a shared mount can say so, and that is the one thing this cannot infer.
+        return not any(getattr(s, "node_local", False) for s in sources)
     except Exception as e:
         # "Auto" is a best-effort *routing* decision, so any failure here degrades to the
         # always-correct single-node answer rather than failing the query. But the failure

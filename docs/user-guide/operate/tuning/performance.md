@@ -3,8 +3,8 @@
 Batcher is built to stay fast on a laptop and survive on a cluster. The levers a
 user actually reaches for are few: cache a result you reuse, size the morsels, give
 the engine a memory budget so it spills instead of dying, and read back what the
-query did. Every knob lives on one frozen `Config`, applied process-wide with
-`set_config` or scoped to a block with `config_context`.
+query did. Every knob lives on one frozen {py:class}`Config <batcher.Config>`, applied process-wide with
+{py:func}`set_config <batcher.set_config>` or scoped to a block with {py:func}`config_context <batcher.config_context>`.
 
 This page is about making *your* query faster. For how Batcher compares against DuckDB,
 Polars, and Daft, see the {doc}`benchmarks </benchmarks/index>`, which carry the
@@ -113,6 +113,37 @@ Or set `BATCHER_OBSERVABILITY_EVENT_LOG=false` in the environment before
 the process starts. Turning it off changes no result, only whether the profile is
 archived to disk.
 
+### The small-query fast path
+
+On a query that returns in about a millisecond, the orchestration *is* the cost. Measured on
+a filter over 10,000 in-memory rows with the event log already off, the engine call and the
+Arrow table build together account for roughly a fifth of the query; the rest is admission,
+morsel sizing, pressure classification, and the learned-stats close-out.
+
+`execution.fast_path` skips all of that for plans that provably don't need it. The plan is
+still optimized, through the same plan cache, and runs through the same engine call, so the
+result is identical. It is off by default:
+
+```python
+fast = current.replace(execution=dataclasses.replace(current.execution, fast_path=True))
+with config_context(fast):
+    print(events.filter(bt.col("amount") > 5).count())
+# 4
+```
+
+The path is taken only when the query is single-node, on the CPU backend, reads sources that
+are already in memory, contains no `map_batches` UDF, and stays under a row and plan-node
+cap. Anything else silently takes the ordinary path, so turning the flag on is always safe.
+
+```{warning}
+The fast path gives up the **write** side of the cross-query learning loop. A query answered
+on it records no measured cardinality, selectivity, or column statistics, so it never
+sharpens the estimates the optimizer uses next time. Reading learned statistics is
+unaffected, so plan *quality* is the same on the first run. Use it for a latency-sensitive
+serving path where the plan shape is already known good; leave it off while a workload is
+still teaching the optimizer.
+```
+
 ## Morsel-driven execution
 
 The engine's unit of work is a *morsel*: a small Arrow `RecordBatch`, 16,384 rows by
@@ -145,7 +176,7 @@ Every cost estimate is a guess until the query runs. At a pipeline breaker, mean
 sort, an aggregate, or a join build, the engine has *measured* the real size of what it
 just processed. When an estimate was off by more than `optimizer.reoptimize_error`, which
 defaults to 2x, it re-plans the rest of the query on the measured numbers before
-continuing. This is the part static optimizers cannot match. `collect(adaptive=...)`
+continuing. This is the part static optimizers cannot match. {py:meth}`collect(adaptive=...) <batcher.Dataset.collect>`
 controls it: `"auto"` (the default) turns it on only when a join's input size is a
 pure estimate, and `True`/`False` force it. The result is identical whichever way it
 runs.
@@ -218,7 +249,7 @@ mixed fleet, so the slower convergence has an explanation.
 Changing the machine resets the learning for that machine class. Adding memory, attaching a
 GPU, or moving from a spinning disk to NVMe all produce a different fingerprint, and the
 engine starts from its priors rather than from measurements of hardware that no longer exists.
-The fingerprint is in `bt.start_ui()`'s system panel if you need to confirm which class a node
+The fingerprint is in {py:func}`bt.start_ui() <batcher.start_ui>`'s system panel if you need to confirm which class a node
 belongs to.
 
 Statistics about the *data* are deliberately not scoped this way. Distinct counts, quantiles,
@@ -388,7 +419,7 @@ print(run.bottleneck is not None)
 ```
 
 For a quick per-column read of the data itself (counts, null fraction, approximate
-distinct count) before a load, `profile()` executes a one-row-per-column summary.
+distinct count) before a load, {py:meth}`profile() <batcher.Dataset.profile>` executes a one-row-per-column summary.
 
 ```python
 print(events.profile().columns)

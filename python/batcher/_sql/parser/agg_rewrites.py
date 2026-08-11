@@ -29,10 +29,38 @@ from batcher.plan.expr_ir import AggExpr, col
 __all__ = ["rewrite_distinct_aggs", "sort_for_ordered_aggs"]
 
 # Plain aggregates that survive pre-aggregation, as {level-1 partial: level-2 combine}.
-# `count` is the interesting one: a group's total is the SUM of its sub-groups' counts,
-# not their count. Anything absent here (mean, stddev, quantile, ...) has no single-column
-# mergeable partial and is rejected rather than approximated.
-_DECOMPOSABLE = {"count": "sum", "count_star": "sum", "sum": "sum", "min": "min", "max": "max"}
+#
+# The condition is that the aggregate has a **single-column mergeable partial**: the level-1
+# value computed per sub-group can be combined into the group's true answer by one aggregate
+# over one column. `count` is the interesting one, and the reason this is a map rather than a
+# set: a group's total is the SUM of its sub-groups' counts, not their count.
+#
+# The rest combine with *themselves*, because level 1 partitions the group's rows — every row
+# lands in exactly one sub-group — and each of these operations is associative and commutative
+# over that partition. `min`/`max`/`sum`/`product` and the bitwise folds are associative
+# outright; `bit_xor` needs the partition to be exact (a row counted twice would cancel) and it
+# is; `bool_and`/`bool_or` are idempotent as well, so they hold regardless. `any_value` holds
+# because any value of any sub-group is a value of the group, which is all it promises.
+# NULL handling needs no special case: a sub-group with nothing to aggregate yields NULL and
+# the level-2 aggregate skips it, exactly as the one-level form skips the same rows.
+#
+# Anything absent here — `mean`, `stddev`, `var`, the quantiles, `count_distinct` — has no
+# single-column partial (a mean needs a sum *and* a count) and is rejected rather than
+# approximated.
+_DECOMPOSABLE = {
+    "count": "sum",
+    "count_star": "sum",
+    "sum": "sum",
+    "min": "min",
+    "max": "max",
+    "any_value": "any_value",
+    "bool_and": "bool_and",
+    "bool_or": "bool_or",
+    "bit_and": "bit_and",
+    "bit_or": "bit_or",
+    "bit_xor": "bit_xor",
+    "product": "product",
+}
 
 
 def rewrite_distinct_aggs(

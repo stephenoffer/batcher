@@ -147,11 +147,11 @@ print(bt.read.parquet_dataset(lake).sort("day", "revenue").to_pydict())
 ```
 
 The partition column is not in the payload (it lives in the directory name, and
-`parquet_dataset` recovers it on read). Two caveats, both real: the rewrite is not atomic,
+{py:meth}`parquet_dataset <batcher.api.io_namespace.reader.Reader.parquet_dataset>` recovers it on read). Two caveats, both real: the rewrite is not atomic,
 so a concurrent reader can catch it mid-swap. It also only replaces the part files it
 writes, so if the old partition had more parts than the new one, the leftovers are still
-there and still readable. `repartition(num_files=1)` above keeps that from biting, and
-`bt.compact` (see {doc}`file compaction </cookbook/data-engineering/maintenance/file-compaction>`) cleans up after a write that did
+there and still readable. {py:meth}`repartition(num_files=1) <batcher.Dataset.repartition>` above keeps that from biting, and
+{py:func}`bt.compact <batcher.compact>` (see {doc}`file compaction </cookbook/data-engineering/maintenance/file-compaction>`) cleans up after a write that did
 not.
 
 If a backfill can run against a table while anyone is reading it, use Delta and take the

@@ -9,32 +9,50 @@ then a terminal action:
 - ``.drop()`` — return only the rows that satisfy every constraint.
 - ``.quarantine()`` — return ``(clean, rejected)`` so bad rows route to a
   dead-letter sink instead of failing the pipeline.
-- ``.validate()`` — a `ValidationReport` of per-constraint violation counts.
+- ``.annotate()`` — keep every row and add a column naming what it failed.
+- ``.validate()`` — a `ValidationReport` of per-constraint results.
 
-A constraint is just a boolean `Expr` that is TRUE for a valid row (plus the
-group-level uniqueness check, which lowers to a window count). Everything lowers to
-existing relational ops (FILTER, a keyless AGGREGATE for the report, ``count() OVER
-(PARTITION BY keys)`` for uniqueness) — no new IR, and the valid/invalid split is a
-provably total partition (validity is forced to a non-null boolean, so
-``valid ⊎ invalid == input``).
+A constraint is a boolean `Expr` that is TRUE for a valid row, plus three kinds that need
+more than an expression: uniqueness (a window count), referential integrity (a join against
+the reference keys), and the relation-level checks (one aggregate over the whole table).
+Everything lowers to existing relational ops — FILTER, a keyless AGGREGATE, ``count() OVER
+(PARTITION BY keys)``, a LEFT JOIN — so there is no new IR, no separate distributed
+semantics, and the valid/invalid split is a provably total partition (validity is forced to
+a non-null boolean, so ``valid ⊎ invalid == input``).
 
-**NULL is not a violation.** Value constraints (`in_range`/`matches`/`accepted_values`)
-and `foreign_key` all treat NULL as valid, so they compose independently and a column
-that is merely *optional* does not fail every check written against it — the
-dbt/Great-Expectations convention, and SQL's own for a foreign key. Forbid nulls
-explicitly with `not_null`.
+**NULL is not a violation.** Value constraints (`in_range`/`matches`/`accepted_values` and
+the rest) and the referential checks all treat NULL as valid, so they compose independently
+and a column that is merely *optional* does not fail every check written against it — the
+dbt/Great-Expectations convention, and SQL's own for a foreign key. Forbid nulls explicitly
+with `not_null`.
+
+**Every constraint carries a tolerance and a severity.** ``mostly=0.99`` passes the
+constraint while 1% of rows violate it; ``severity="warn"`` reports a violation without
+enforcing it anywhere. Both are declared per constraint, so one chain can mix a hard gate
+with a rule that is still being trialled.
 """
 
 from __future__ import annotations
 
 from batcher.api.dataset.dq.accessor import DatasetDQ
-from batcher.api.dataset.dq.constraints import Constraint, RowConstraint, UniqueConstraint
-from batcher.api.dataset.dq.report import ValidationReport
+from batcher.api.dataset.dq.constraints import (
+    AggregateConstraint,
+    Constraint,
+    ReferenceConstraint,
+    RowConstraint,
+    SchemaConstraint,
+    UniqueConstraint,
+)
+from batcher.api.dataset.dq.report import ConstraintResult, ValidationReport
 
 __all__ = [
+    "AggregateConstraint",
     "Constraint",
+    "ConstraintResult",
     "DatasetDQ",
+    "ReferenceConstraint",
     "RowConstraint",
+    "SchemaConstraint",
     "UniqueConstraint",
     "ValidationReport",
 ]

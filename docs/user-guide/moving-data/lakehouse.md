@@ -25,7 +25,7 @@ work = tempfile.mkdtemp()
 
 ## Write a Delta table
 
-`ds.write.delta(uri, mode=...)` commits the dataset to a Delta table. `mode` is
+{py:meth}`ds.write.delta(uri, mode=...) <batcher.api.io_namespace.writer.Writer.delta>` commits the dataset to a Delta table. `mode` is
 `"overwrite"` (replace the table) or `"append"` (add a new version). Each call is
 one transaction, so the table is always readable.
 
@@ -42,7 +42,7 @@ print(bt.read.delta(table_uri).sort("id").to_pydict())
 
 ## Read and time-travel
 
-`bt.read.delta(uri)` reads the latest version. Pass `version=` (or `timestamp=`) to
+{py:meth}`bt.read.delta(uri) <batcher.api.io_namespace.reader.Reader.delta>` reads the latest version. Pass `version=` (or `timestamp=`) to
 read the table as it was at an earlier commit. The first write above is version `0`.
 
 ```python
@@ -70,10 +70,10 @@ wholesale (a backfill, an idempotent reload), use `replace_where` instead.
 ### The general form: `merge_into`
 
 `merge_on` is the two-clause shorthand: update what matched, insert the rest. When you
-need the whole statement, `ds.write.merge_into(target, on=...)` opens an ordered list of
+need the whole statement, {py:meth}`ds.write.merge_into(target, on=...) <batcher.api.io_namespace.writer.Writer.merge_into>` opens an ordered list of
 `WHEN` clauses, each with its own condition and its own set of columns to write.
 
-Inside a clause, refer to the two sides explicitly with `source_col` and `target_col`:
+Inside a clause, refer to the two sides explicitly with {py:func}`source_col <batcher.source_col>` and {py:func}`target_col <batcher.target_col>`:
 `source_col("x")` reads the incoming row, `target_col("x")` reads the row already in the
 table. That is what lets a clause compare the two, so you can skip a write when nothing
 actually changed, or accumulate instead of overwrite.
@@ -130,7 +130,7 @@ here, and on Delta tables.
 
 ## Slowly changing dimensions
 
-The `ds.scd` accessor maintains dimension tables from an incoming snapshot. The
+The {py:obj}`ds.scd <batcher.Dataset.scd>` accessor maintains dimension tables from an incoming snapshot. The
 dataset is the new snapshot, meaning natural keys plus attributes, and the method writes
 the reconciled dimension to `target`. These compose existing operators, with no special
 engine path, and they write to any file target, Parquet here, or to a Delta table.
@@ -196,7 +196,7 @@ A change-data-capture connector (Debezium, a Delta change feed, a Snowflake stre
 does not give you that. It gives you the stream of what *happened*: inserts, updates
 and deletes, delivered more than once and out of order.
 
-`ds.scd.apply_changes` consumes that feed directly (Delta Live Tables spells the same
+{py:meth}`ds.scd.apply_changes <batcher.api.dataset.scd.DatasetSCD.apply_changes>` consumes that feed directly (Delta Live Tables spells the same
 thing `APPLY CHANGES INTO ... STORED AS SCD TYPE 1`):
 
 ```python

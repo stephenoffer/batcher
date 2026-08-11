@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pickle
+import weakref
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import pyarrow as pa
@@ -30,7 +31,7 @@ from batcher.core.udf.isolation import (
     shard_directory,
 )
 
-__all__ = ["run_map_processes", "shutdown_pool"]
+__all__ = ["dispatchable", "run_map_processes", "shutdown_pool"]
 
 
 def _pool_context():
@@ -132,11 +133,38 @@ def _call_shard(payload: tuple) -> list:
     RAM-backed Arrow shard zero-copy and reads its batches in place. Processing the whole
     shard per task (rather than one batch per task) amortizes the map/open over all the
     shard's batches — the per-task open would otherwise dominate a moderate-input map.
+
+    `budget_key` and `allowance` carry the stage's `max_errored_rows` policy into the child.
+    Without them this path ignored the allowance entirely, so whether a corrupt row was
+    dropped or killed the query depended on a *scheduling* decision the user never made —
+    the strategy probe's threads-vs-processes verdict. The budget is per child process, which
+    is exactly what the public contract already promises ("per worker").
     """
-    fn, path, fmt = payload
+    fn, path, fmt, budget_key, allowance = payload
+    call = _child_call(fn, fmt, budget_key, allowance)
     with pa.memory_map(path, "rb") as src:
         reader = pa.ipc.open_file(src)
-        return [_apply_fn(fn, reader.get_batch(i), fmt) for i in range(reader.num_record_batches)]
+        return [call(reader.get_batch(i)) for i in range(reader.num_record_batches)]
+
+
+def _child_call(fn: object, fmt: str, budget_key: str | None, allowance: int):
+    """The per-batch callable a worker runs: `fn` plus the dirty-row tolerance, if any.
+
+    With no allowance this is the raw call and the child behaves exactly as before. With one,
+    a failing batch is bisected to isolate the offending rows through the same
+    `call._resilient_call` the thread path uses, so both paths drop the same rows and publish
+    the same events. Retry/timeout is deliberately *not* applied here: see `resilience`.
+    """
+    if allowance <= 0:
+        return lambda batch: _apply_fn(fn, batch, fmt)
+    from batcher.core.udf.call import _resilient_call, shared_error_budget
+
+    budget = shared_error_budget(budget_key or "process-pool", allowance)
+
+    def _call(batch: pa.RecordBatch) -> object:
+        return _resilient_call(lambda b: _apply_fn(fn, b, fmt), batch, budget, False)
+
+    return _call
 
 
 _SHM_COUNTER = 0
@@ -185,7 +213,13 @@ def _input_shards(batches: list[pa.RecordBatch], nshards: int) -> tuple[list[str
 
 
 def run_map_processes(
-    fn: object, batches: list[pa.RecordBatch], num_workers: int, batch_format: str
+    fn: object,
+    batches: list[pa.RecordBatch],
+    num_workers: int,
+    batch_format: str,
+    *,
+    budget_key: str | None = None,
+    max_errored_rows: int = 0,
 ) -> list[object]:
     """Apply `fn` to each batch across the warm process pool, preserving input order.
 
@@ -195,6 +229,18 @@ def run_map_processes(
     cost that otherwise loses a large string-heavy map to a plasma-backed engine). Only the
     `fn` and a shard path cross to the child; the results cross back over the pool. The pool
     is process-wide and reused, so there is no per-call startup cost.
+
+    Args:
+        fn: The per-batch callable, already built.
+        batches: The stage's input batches, in order.
+        num_workers: Upper bound on worker processes.
+        batch_format: The object `fn` receives and returns.
+        budget_key: Stable identity of the `fn`, so a child's error budget is shared across
+            every shard and every call it runs.
+        max_errored_rows: The stage's dirty-row allowance, applied per worker process.
+
+    Returns:
+        One result per input batch, in input order.
     """
     from batcher.config import active_config
 
@@ -204,13 +250,21 @@ def run_map_processes(
 
     n_procs = max(1, min(num_workers, len(batches), available_cpu_count()))
     pool = _persistent_pool(n_procs, isolation)
+    wire_fn = dispatchable(fn)
+    if wire_fn is None:  # the strategy should have kept us on threads; be loud, not wrong
+        raise ExecutionError(
+            "a map_batches fn cannot be sent to a worker process (it is neither picklable "
+            "nor cloudpickle-serializable).",
+            hint="Install `cloudpickle`, or pass a module-level function or a class.",
+        )
     paths, _size = _input_shards(batches, n_procs)
     try:
         # One task per shard (not per batch): the worker opens its mmap once and returns
         # all its results, so a moderate-input map isn't dominated by per-batch opens. Flat
         # in shard order == original batch order (shards are contiguous batch ranges).
         kwargs = {"timeout": timeout} if timeout > 0 else {}
-        per_shard = pool.map(_call_shard, [(fn, p, batch_format) for p in paths], **kwargs)
+        tasks = [(wire_fn, p, batch_format, budget_key, max_errored_rows) for p in paths]
+        per_shard = pool.map(_call_shard, tasks, **kwargs)
         return [r for shard in per_shard for r in shard]
     except TimeoutError as exc:
         # A wedged UDF used to hang the query forever with no error and no signal. The
@@ -253,10 +307,10 @@ def warn_if_closure_is_fat(size: int) -> None:
 
     **What it cannot see.** `pickle` serializes a module-level function *by reference*, so a
     plain `def` that reads a large global pickles to a few bytes and is not flagged — Ray
-    catches that case only because cloudpickle serializes globals by value. A closure over
-    large data is not flagged either, for a blunter reason: it fails to pickle at all, and
-    is rejected before reaching here. So this covers what the process path can actually
-    carry, and is deliberately not extended to a serializer that path does not use.
+    catches that case only because cloudpickle serializes globals by value, and the
+    by-reference attempt here succeeds first. A closure over large data *is* flagged, but
+    only where `cloudpickle` is installed: without it the closure cannot cross at all and
+    the stage stays on threads, where nothing is shipped and there is nothing to warn about.
 
     The size comes from a pickle that had to happen anyway, so this measures nothing new.
 
@@ -281,22 +335,115 @@ def warn_if_closure_is_fat(size: int) -> None:
     )
 
 
+def _cloudpickle():
+    """The `cloudpickle` module, or `None` when it is not installed.
+
+    An optional dependency on purpose. Everything the engine itself ships across a process
+    boundary is picklable by reference; cloudpickle only widens what a *user's* `fn` may be,
+    so an install without it keeps every behaviour it had.
+    """
+    try:
+        import cloudpickle
+
+        return cloudpickle
+    except ImportError:
+        return None
+
+
+def _load_by_value(blob: bytes) -> object:
+    """Rebuild a by-value callable in the worker. Module-level so `pickle` can name it."""
+    import cloudpickle
+
+    return cloudpickle.loads(blob)
+
+
+class _ByValueFn:
+    """A callable that crosses to a worker **by value**, carrying its own serialized form.
+
+    `pickle` sends a function by *reference* — module plus qualified name — which a lambda, a
+    closure, or a class defined inside a function has no usable form of, so those simply
+    refuse to pickle. That refusal is what used to bar the single most common spelling of a
+    UDF from the process pool: ``ds.map_batches(lambda b: ...)`` stayed on threads and a
+    GIL-bound body therefore ran on one core, however many were free. Ray, Dask, and Spark
+    all reach for `cloudpickle` here, and so does this: the blob is built once on the driver
+    and shipped with each dispatch, and the worker unpickles the real callable.
+
+    Calling it locally runs the original object, so the driver-side probe and any thread
+    fallback see the `fn` the user wrote, not a round-tripped copy of it.
+    """
+
+    __slots__ = ("_blob", "_fn")
+
+    def __init__(self, fn: object, blob: bytes) -> None:
+        self._fn = fn
+        self._blob = blob
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        return self._fn(*args, **kwargs)  # type: ignore[operator]
+
+    def __reduce__(self) -> tuple:
+        return (_load_by_value, (self._blob,))
+
+
+def dispatchable(fn: object) -> object | None:
+    """`fn` in the form a worker process can receive, or `None` when it cannot cross.
+
+    Plain `pickle` is tried first, because a module-level function or a picklable callable
+    object crosses by reference for a handful of bytes and needs nothing else. Only when that
+    fails does the callable get serialized by value with `cloudpickle`, which is what admits
+    lambdas and closures. Without `cloudpickle` installed the answer is `None` and the caller
+    keeps the `fn` on threads, exactly as before.
+
+    Args:
+        fn: The callable a process worker would have to receive.
+
+    Returns:
+        The object to put in the dispatch payload, or None if the `fn` cannot be sent.
+    """
+    try:
+        payload = pickle.dumps(fn)
+    except Exception:
+        payload = None
+    if payload is not None:
+        warn_if_closure_is_fat(len(payload))
+        return fn
+    cp = _cloudpickle()
+    if cp is None:
+        return None
+    try:
+        blob = cp.dumps(fn)
+    except Exception:
+        return None
+    warn_if_closure_is_fat(len(blob))
+    return _ByValueFn(fn, blob)
+
+
+#: Answers already computed, keyed weakly by the callable so a `fn` that goes out of scope
+#: takes its entry with it. The question is asked once per stage *invocation* — per partition,
+#: per streamed window — and answering it means serializing the callable, so a UDF carrying a
+#: lookup table was dumping megabytes each time purely to return a boolean.
+_DISPATCHABLE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
 def is_picklable(obj: object) -> bool:
-    """Whether `obj` survives `pickle` — and, for free, whether it is suspiciously large.
+    """Whether `obj` can be sent to a worker process — and, for free, whether it is large.
 
     Lives here rather than beside the strategy that calls it because both halves are
-    process-pool facts: only the process path pickles the callable, and the size
+    process-pool facts: only the process path serializes the callable, and the size
     `warn_if_closure_is_fat` judges comes out of that same dump.
 
     Args:
         obj: The callable a process worker would have to receive.
 
     Returns:
-        True when it pickles.
+        True when it can cross the process boundary.
     """
     try:
-        payload = pickle.dumps(obj)
-    except Exception:
-        return False
-    warn_if_closure_is_fat(len(payload))
-    return True
+        cached = _DISPATCHABLE.get(obj)
+    except TypeError:  # not weak-referenceable (a builtin, say) — answer without caching
+        return dispatchable(obj) is not None
+    if cached is None:
+        cached = dispatchable(obj) is not None
+        with contextlib.suppress(TypeError):
+            _DISPATCHABLE[obj] = cached
+    return cached

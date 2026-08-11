@@ -18,9 +18,9 @@ import json
 
 import pyarrow as pa
 
-from batcher._internal import events
 from batcher._internal.logging import note_suppressed
 from batcher.carbonite import ResourceManager
+from batcher.carbonite.resilience import SourcePlacement
 from batcher.dist.adaptive_sizing import aggregate_reducer_count, record_aggregate_cardinality
 from batcher.dist.executor import (
     _apply_above,
@@ -31,13 +31,21 @@ from batcher.dist.executor import (
 from batcher.dist.executors.partition_io import consumer_pushdown, partition_descriptors
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    gather_in_windows,
     map_barrier,
+    map_partitions,
     release_placement,
     shuffle_partitions,
 )
 from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_worker import _ticket, current_plan_id
-from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
+from batcher.dist.reduction import chunks
+from batcher.dist.shuffle_replication import (
+    placement_probe,
+    replicate_interior_outputs,
+    replicate_shuffle_output,
+    retire_replicas,
+)
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import Aggregate, LogicalPlan
@@ -92,6 +100,8 @@ def execute_aggregate_flight(
     *,
     materialize: bool = True,
     _fault_inject_map: set[int] | None = None,
+    hub=None,
+    metrics_out=None,
 ):
     """Distributed aggregation over a Flight shuffle, resilient to worker loss.
 
@@ -112,6 +122,7 @@ def execute_aggregate_flight(
     """
     import ray
 
+    from batcher.dist.executors.ray_runtime.metering import drain_worker_metrics
     from batcher.dist.fleet import acquire_fleet, release_session_lease
 
     _ensure_ray(workers)
@@ -141,7 +152,13 @@ def execute_aggregate_flight(
 
     borrows_session = current_fleet() is None
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, credits, cfg_json)
-    n_reducers = 1 if n_keys == 0 else aggregate_reducer_count(agg, shuffle_partitions(workers))
+    # `workers` is the floor: a bucket is reduced by one worker, so fewer buckets than
+    # workers idles the rest for the whole reduce phase (see `aggregate_reducer_count`).
+    n_reducers = (
+        1
+        if n_keys == 0
+        else aggregate_reducer_count(agg, shuffle_partitions(workers), workers, sources)
+    )
 
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
     try:
@@ -163,13 +180,22 @@ def execute_aggregate_flight(
         # `consumer_pushdown` re-parents the aggregate so Kyber's analysis sees what the
         # reducers actually read.
         projection, predicate = consumer_pushdown(agg, map_plan)
+        # More map partitions than workers when the source has the splits to fill them, so
+        # the task unit is a fraction of a node's share rather than all of it: a slow worker
+        # takes fewer partitions and a dead one loses less. `len(partitions)` — not
+        # `workers` — is the source count from here on.
         partitions = partition_descriptors(
             sources[sid],
             workers,
             projection=projection,
             predicate=predicate,
             worker_addrs=fleet_addrs,
+            max_partitions=map_partitions(workers),
         )
+        n_sources = len(partitions)
+        # Filled in by the barrier: with the assignment dynamic, which sources a worker's
+        # death loses is no longer "the one with its id".
+        placement = SourcePlacement(workers)
 
         if _fault_inject_map:  # test hook: kill before the barrier, so nothing publishes
             for i in _fault_inject_map:
@@ -195,7 +221,7 @@ def execute_aggregate_flight(
         # four at 8, on the same data.
         stage_base = next_stage_base(_TREE_STAGE_BLOCK)
         addrs, dead = map_barrier(
-            workers,
+            n_sources,
             lambda host, src: actors[host].map_publish.remote(
                 map_ir,
                 gk,
@@ -208,6 +234,8 @@ def execute_aggregate_flight(
                 current_plan_id(),
                 stage_base,
             ),
+            workers=workers,
+            placement=placement,
         )
 
         # Placed HERE, as soon as the buckets exist and before anything can take a worker
@@ -230,6 +258,16 @@ def execute_aggregate_flight(
         # concentrates, so its fetches become same-node hits. None ⇒ default round-robin.
         reducer_hosts = _locality_reducer_hosts(actors, n_reducers, workers, fleet_addrs)
         reduce_args = (actors, addrs, partitions, map_ir, gk, aj, n_keys, n_reducers, workers)
+        # Keyed on WORKERS, not on the leaf count, and that distinction only became visible
+        # when the map stage was allowed to over-partition. What the tree bounds is how many
+        # *peers* a node reads from, and several sources on one worker are one peer serving
+        # one Flight server; the flat reduce is already bounded in the other two senses that
+        # matter, holding one merged partial and at most `shuffle_fetch_fan_in` fetches in
+        # flight however many mappers there are. Keying it on sources instead reads as the
+        # more literal choice and is a bad trade: at a 4x multiplier every fleet past two
+        # workers would cross a fan-in of 8, so nearly every aggregate would take the tree —
+        # and the tree cannot leave its result on the actors, so the adaptive path would lose
+        # the `FlightMaterializedSource` hand-off and collect through the driver instead.
         if workers > fan_in:
             batches = _tree_reduce_with_recovery(
                 actors,
@@ -245,6 +283,7 @@ def execute_aggregate_flight(
                 dead,
                 replicas,
                 stage_base,
+                placement,
             )
         else:
             # `on_actors`: keep the result on the workers — each reducer publishes its
@@ -258,6 +297,7 @@ def execute_aggregate_flight(
                 dead=dead,
                 replicas=replicas,
                 stage_base=stage_base,
+                placement=placement,
             )
             if on_actors:
                 from batcher.dist.fleet import FlightMaterializedSource
@@ -272,6 +312,11 @@ def execute_aggregate_flight(
                 return FlightMaterializedSource(handles, schema, src_actors, src_pg)
             batches = out
     finally:
+        # Collect what the workers measured, before anything below can kill them. Nothing
+        # subscribes to the event bus inside a Ray worker, so the measurements have to be
+        # pulled; this is the one point every exit path passes through with the actors
+        # still alive.
+        drain_worker_metrics(actors, hub, metrics_out)
         # The teardown `acquire_fleet` deserves, on the branch it actually took.
         #
         # Hand-rolling it covered only the fleet this call *spawned*, so the lease it took on
@@ -368,6 +413,7 @@ def _reduce_with_recovery(
     dead=None,
     replicas=None,
     stage_base=0,
+    placement=None,
 ):
     """Run the reduce stage under Carbonite recompute-on-worker-loss recovery.
 
@@ -413,8 +459,9 @@ def _reduce_with_recovery(
     # Where each source's latest map output lives. Identity until a recompute relocates a
     # source, after which the source id and its host are different numbers — and it is the
     # HOST that dies. `map_barrier` keeps the same mapping for the same reason
-    # (`ray_runtime/policies.py::_on_lost`).
-    placement = SourcePlacement(workers)
+    # (`ray_runtime/policies.py::_on_lost`), and hands the map stage's own assignment over
+    # in `placement`: with more sources than workers the identity never held to begin with.
+    placement = SourcePlacement(workers) if placement is None else placement
 
     # A reducer that returns "ok" fetched *all* its sources completely, so its result
     # is final and deterministic — cache it across recovery rounds (keyed by reducer
@@ -426,10 +473,16 @@ def _reduce_with_recovery(
 
     def _host_for(r: int, avoid: set[int]) -> int:
         # The locality-aware host when given (a reducer placed near its data), else the
-        # default `reducer r → actor r`; a dead/avoided host falls back to any survivor.
-        # `avoid` lets a straggler's backup land on a *different* live worker than the
-        # slow original (so the backup can actually win the race).
-        h = reducer_hosts[r] if reducer_hosts is not None else r
+        # default round-robin `reducer r → actor r % workers`; a dead/avoided host falls
+        # back to any survivor. `avoid` lets a straggler's backup land on a *different*
+        # live worker than the slow original (so the backup can actually win the race).
+        #
+        # The modulo is what lets a shuffle have MORE buckets than workers. Indexing
+        # `actors[r]` directly capped the reducer count at the worker count, which is what
+        # made every bucket's skew a straggler with no way to average it out — see
+        # `shuffle_partitions`. `assign_reducer_hosts` already round-robins the same way,
+        # so the locality branch needed no change.
+        h = reducer_hosts[r] if reducer_hosts is not None else r % workers
         return h if h not in dead and h not in avoid else _pick_live(avoid)
 
     def attempt():
@@ -525,10 +578,13 @@ def _reduce_with_recovery(
     # a survivor *before* it is reclaimed, so a known-imminent loss costs no recovery
     # round (and no idle-timeout stall on a hung-but-draining peer). Best-effort — a
     # failure here just falls through to the reactive recompute the loop already does.
+    # `draining_workers` names WORKERS; `recompute` takes SOURCES. Equal numbers only while
+    # each worker holds exactly the source with its own id, so translate through the
+    # placement rather than through the coincidence.
     proactive = draining_workers(actors, workers)
     if proactive:
         with contextlib.suppress(Exception):
-            recompute(proactive)
+            recompute({src for host in proactive for src in placement.sources_on(host)})
 
     finals = ShuffleRecovery(recovery_policy(), label="aggregate").run(attempt, recompute)
     if materialize:
@@ -540,11 +596,11 @@ def _reduce_with_recovery(
 def _tree_reduce(
     actors, leaf_addrs, n_reducers, gk, aj, fan_in, workers, dead=None, replicas=None, stage_base=0
 ):
-    """Combine each bucket's `workers` leaf partials into one via a combiner tree.
+    """Combine each bucket's leaf partials — one per map source — into one via a combiner tree.
 
     Each round groups a bucket's current partials into chunks of `fan_in`, and a
     *live* worker combines each chunk (at most `fan_in` fetches) and republishes the
-    merged partial. After log_fan_in(workers) rounds one partial per bucket remains,
+    merged partial. After log_fan_in(sources) rounds one partial per bucket remains,
     which is finalized. No node ever reads from more than `fan_in` upstreams, so
     per-node fan-in stays bounded as the cluster grows to many thousands. Workers in
     `dead` are never assigned combine work (their leaf inputs are expected to have
@@ -552,65 +608,91 @@ def _tree_reduce(
     finalized batches. Raises if a combine touches a lost worker, so the caller's
     recovery loop can recompute and retry.
     """
-    import ray
-
     dead = dead or set()
     live = [i for i in range(workers) if i not in dead]
+    # Leaves are per SOURCE; combiners are per WORKER. The two counts are equal only when
+    # the map stage runs one partition per worker.
+    n_sources = len(leaf_addrs)
 
     # frontier[r]: the (addr, ticket) sources currently holding bucket r's partials.
     frontier = {
-        r: [(leaf_addrs[src], _ticket(stage_base, src, r)) for src in range(workers)]
+        r: [(leaf_addrs[src], _ticket(stage_base, src, r)) for src in range(n_sources)]
         for r in range(n_reducers)
     }
     # fallbacks[r][i]: replica addresses for frontier[r][i], carried POSITIONALLY alongside
     # the frontier because `gather_combine` indexes replicas by source position, not by
-    # worker id. Only the leaf level has any: an interior combiner's output is published on
-    # a single node and is never replicated, so it contributes an empty list and a loss
-    # there still costs a recompute round.
+    # worker id. Every level has them — the leaves from the map stage's replication, the
+    # interior ones placed per level below.
     fallbacks = {
         r: [
             list(replicas[src]) if replicas and src < len(replicas) else []
-            for src in range(workers)
+            for src in range(n_sources)
         ]
         for r in range(n_reducers)
     }
     # Interior levels live *inside* this aggregate's reserved block, above its map stage.
     stage = stage_base + 1
+    # Probed once and reused for every level: the fleet's node map and quarantine list do
+    # not move inside one attempt, and re-probing would charge two driver fan-outs per level
+    # to learn the same thing.
+    probe = placement_probe(actors, workers)
     while any(len(srcs) > fan_in for srcs in frontier.values()):
         tasks, next_frontier, assign = [], {r: [] for r in range(n_reducers)}, 0
         next_fallbacks: dict[int, list[list[str]]] = {r: [] for r in range(n_reducers)}
         for r in range(n_reducers):
-            srcs = frontier[r]
-            for i in range(0, len(srcs), fan_in):
-                chunk = srcs[i : i + fan_in]
-                chunk_reps = fallbacks[r][i : i + fan_in]
+            # `chunks` rather than an inline stride: the bracketing of a mergeable reduce is
+            # the disk shuffle's arithmetic too (`executors.aggregate._tree_combine_buckets`),
+            # and the two transports must chunk a frontier the same way or a level's fan-out
+            # means something different depending on how the bytes happen to move.
+            for chunk, chunk_reps in zip(
+                chunks(frontier[r], fan_in), chunks(fallbacks[r], fan_in), strict=True
+            ):
                 if len(chunk) == 1:
                     next_frontier[r].append(chunk[0])  # nothing to combine yet
                     next_fallbacks[r].append(chunk_reps[0])  # its replicas carry forward
                     continue
                 tasks.append(
-                    (r, live[assign % len(live)], chunk, _ticket(stage, assign, r), chunk_reps)
+                    (
+                        r,
+                        live[assign % len(live)],
+                        list(chunk),
+                        _ticket(stage, assign, r),
+                        list(chunk_reps),
+                    )
                 )
                 assign += 1
-        new_addrs = ray.get(
-            [
-                actors[combiner].combine_publish.remote(gk, aj, chunk, out_ticket, chunk_reps)
-                for (_r, combiner, chunk, out_ticket, chunk_reps) in tasks
-            ]
+        # Windowed rather than launched whole: this level is `n_reducers x
+        # ceil(sources / fan_in)` tasks, a product of two fan-outs, so at the reducer ceiling
+        # it is six figures of simultaneously-pending tasks for one level of one aggregate.
+        new_addrs = gather_in_windows(
+            lambda t: actors[t[1]].combine_publish.remote(gk, aj, t[2], t[3], t[4]),
+            tasks,
+            workers,
         )
-        for (r, _combiner, _chunk, out_ticket, _reps), addr in zip(tasks, new_addrs, strict=True):
+        # Copy this level's merged partials off-node before building the next level on top
+        # of them. Without it the tree's interior was single-copy at any replication factor,
+        # so one lost combiner discarded every level built so far — the recompute the leaf
+        # replicas exist to avoid, one level up. `None` (replication off, or nothing placed)
+        # leaves each output with an empty fallback list, which is the previous behavior.
+        level = [
+            (addr, out_ticket)
+            for (_r, _c, _chunk, out_ticket, _reps), addr in zip(tasks, new_addrs, strict=True)
+        ]
+        level_reps = replicate_interior_outputs(actors, level, workers, dead, probe)
+        for i, ((r, _combiner, _chunk, out_ticket, _reps), addr) in enumerate(
+            zip(tasks, new_addrs, strict=True)
+        ):
             next_frontier[r].append((addr, out_ticket))
-            next_fallbacks[r].append([])  # a combined partial exists on one node only
+            next_fallbacks[r].append(list(level_reps[i]) if level_reps else [])
         frontier, fallbacks, stage = next_frontier, next_fallbacks, stage + 1
 
     # Final level: each bucket has <= fan_in sources — one combine+finalize per bucket.
-    finals = ray.get(
-        [
-            actors[live[r % len(live)]].combine_finalize_fetch.remote(
-                gk, aj, frontier[r], fallbacks[r]
-            )
-            for r in range(n_reducers)
-        ]
+    finals = gather_in_windows(
+        lambda r: actors[live[r % len(live)]].combine_finalize_fetch.remote(
+            gk, aj, frontier[r], fallbacks[r]
+        ),
+        list(range(n_reducers)),
+        workers,
     )
     return [b for b in finals if b is not None and b.num_rows > 0]
 
@@ -629,24 +711,32 @@ def _tree_reduce_with_recovery(
     dead=None,
     replicas=None,
     stage_base=0,
+    placement=None,
 ):
     """Run the tree reduce under Carbonite recompute-on-worker-loss recovery.
 
-    A lost worker takes its leaf partial (and any interior partials it held) with
-    it. Recovery regenerates the lost leaf partition from its source (still on disk)
+    A lost worker takes its leaf partials (and any interior partials it held) with
+    it. Recovery regenerates the lost leaf partitions from their sources (still on disk)
     onto a surviving worker and restarts the tree, which rebuilds every interior
     partial fresh — so a single bounded-fan-in mechanism is also fault-tolerant. `dead`
     seeds the workers the map barrier already lost, so the tree never assigns them work.
+
+    `placement` says which sources a dead worker was holding. Recovery is driven by worker
+    death, and the two are the same number only when the map stage ran one partition per
+    worker — with several per worker, recomputing "the source with the dead worker's id"
+    regenerates one arbitrary partition and leaves the rest of that worker's leaves
+    unreachable, which the retry then rediscovers until the budget runs out.
     """
     import ray
 
-    from batcher.carbonite.resilience import ShuffleRecovery
+    from batcher.carbonite.resilience import ShuffleRecovery, SourcePlacement
     from batcher.dist.executors.ray_runtime import (
         is_recoverable_task_failure,
         recovery_policy,
     )
 
     dead: set[int] = set(dead or ())
+    placement = SourcePlacement(workers) if placement is None else placement
 
     def _detect_dead():
         # Ping every live actor *concurrently* (one ray.get over all refs), not one
@@ -685,24 +775,19 @@ def _tree_reduce_with_recovery(
             return None, (dead - before or {-1})  # -1: force a retry even if nothing new
 
     def recompute(failed):
-        for src in (s for s in failed if isinstance(s, int) and s >= 0):
+        # `failed` carries the WORKERS just discovered dead; what has to be regenerated is
+        # every source each of them was holding.
+        hosts = [h for h in failed if isinstance(h, int) and h >= 0]
+        lost = {src for host in hosts for src in placement.sources_on(host)}
+        for src in sorted(lost):
             # Retire this source's replicas before republishing it — the same epoch
             # invariant the flat path enforces (see `dist/shuffle_replication.py`): a
             # stale replica's ticket reads back as an EMPTY bucket, not an error, so
             # falling back to it would silently drop this mapper's rows. The tree
             # republishes at the leaf, so the recomputed primary is the only valid copy.
-            if replicas is not None and src < len(replicas):
-                if replicas[src]:
-                    events.publish(
-                        events.RECOVERY,
-                        name="aggregate",
-                        event="replica_retired",
-                        shuffle="aggregate",
-                        src=src,
-                        replicas=len(replicas[src]),
-                    )
-                replicas[src] = []
+            retire_replicas(replicas, src, placement.host_of(src), "aggregate")
             target = next(j for j in range(workers) if j not in dead)
+            placement.relocate(src, target)
             leaf_addrs[src] = ray.get(
                 actors[target].map_publish.remote(
                     map_ir,

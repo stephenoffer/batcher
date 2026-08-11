@@ -83,7 +83,7 @@ class AttributeIn:
             >>> from batcher.governance import AttributeIn, Principal
             >>> analyst = Principal("ana", roles={"analyst"}, attrs={"regions": "EU,US"})
             >>> AttributeIn("region", "regions")(analyst)
-            ((col('region') == lit('EU')) | (col('region') == lit('US')))
+            col('region').is_in(['EU', 'US'])
     """
 
     column: str

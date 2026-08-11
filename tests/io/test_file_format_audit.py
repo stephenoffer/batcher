@@ -59,7 +59,15 @@ def test_json_iter_batches_decodes_in_bounded_windows(tmp_path, monkeypatch):
     real = pajson.read_json
 
     def spy(source, *args, **kwargs):
-        seen.append(len(source.getvalue()) if hasattr(source, "getvalue") else size)
+        # The reader may be a `BytesIO` or a zero-copy `pa.BufferReader`; both answer how
+        # many bytes this decode was given. Anything else falls back to the whole file, so
+        # an unrecognized reader fails the assertion rather than passing it by default.
+        if hasattr(source, "getvalue"):
+            seen.append(len(source.getvalue()))
+        elif hasattr(source, "size"):
+            seen.append(source.size())
+        else:
+            seen.append(size)
         return real(source, *args, **kwargs)
 
     monkeypatch.setattr("batcher.io.formats.semistructured.json._JSON_STREAM_CHUNK_BYTES", 1 << 16)

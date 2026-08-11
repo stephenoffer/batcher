@@ -66,7 +66,10 @@ _UNARY_STR = {
     "to_base64": "base64",
     "from_base64": "from_base64",
     "octet_length": "octet_length",
-    "strlen": "len",
+    # DuckDB's `strlen` counts **bytes**, not characters — `strlen('Ünicode')` is 8 where
+    # `length('Ünicode')` is 7. Mapping it onto `len` made the two synonyms, which they
+    # are only for ASCII.
+    "strlen": "octet_length",
     "ord": "ascii",
     "crc32": "crc32",
     "initcap": "initcap",
@@ -90,9 +93,15 @@ _UNARY_STR = {
 }
 
 # `f(m)` → a `.map` method. `map_keys` reaches the typed dispatch; `map_values` does not.
+# `map_entries` is here because the kernel already answered DuckDB's shape exactly — a list
+# of `{key, value}` structs, in insertion order, with those two field names — and only the
+# SQL name was missing. Unlike `map_extract` below, no adjustment is involved: the two
+# results are equal element for element, which is what makes this a wiring fix rather than
+# a semantic one.
 _UNARY_MAP = {
     "map_values": "values",
     "map_keys": "keys",
+    "map_entries": "entries",
     "cardinality": "len",
 }
 
@@ -167,8 +176,21 @@ _ARITH = {
     "divide": "floordiv",
     "fdiv": "truediv",
     "mod": "mod",
-    "fmod": "mod",
 }
+
+
+def _floored_mod(a: Expr, b: Expr) -> Expr:
+    """DuckDB `fmod`: the remainder carrying the *divisor's* sign, as a double.
+
+    Written as `a - b * floor(a / b)` rather than as a dedicated opcode because that
+    expression already reproduces every edge DuckDB has: a zero divisor makes `a / b`
+    infinite and `b * floor(...)` a NaN, which is what DuckDB returns there; a null
+    operand propagates through the arithmetic; and the double division fixes the result
+    type for integer operands, which DuckDB also widens to DOUBLE.
+    """
+    left, right = a.cast("float64"), b.cast("float64")
+    return left - right * (left / right).floor()
+
 
 # `f(a, b)` → a two-argument top-level builder.
 _BINARY_FN = {
@@ -183,6 +205,11 @@ _BINARY_FN = {
     # Spark's `try_mod` returns null on a zero divisor where `mod` raises; the engine's
     # `%` already yields null there, so the two spellings coincide.
     "try_mod": lambda a, b: a.mod(b),
+    # `fmod` is *not* a spelling of `mod`, despite the name. DuckDB's takes the sign of
+    # the divisor (`fmod(-2.25, 4) = 1.75`) where `mod` takes the sign of the dividend
+    # (`-2.25`), and it returns NaN on a zero divisor where `mod` returns null. Mapping
+    # it onto `mod` agreed with DuckDB only when both operands shared a sign.
+    "fmod": _floored_mod,
 }
 
 # `f(a, b, c)` → a three-argument builder over the translated operands.

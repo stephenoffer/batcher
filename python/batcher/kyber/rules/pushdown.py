@@ -21,8 +21,9 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.stats.constants import constant_value
 from batcher.kyber.stats.selectivity import comparison_col_side
-from batcher.plan.expr_ir import Binary, Col, Expr, referenced_columns, remap_columns
+from batcher.plan.expr_ir import Binary, Col, Expr, Lit, referenced_columns, remap_columns
 from batcher.plan.expr_rewrite import (
     combine_conjuncts,
     expr_key,
@@ -49,6 +50,7 @@ from batcher.plan.visitor import transform_up
 
 __all__ = [
     "derive_join_keys",
+    "infer_join_predicate_from_constant_key",
     "infer_join_predicates",
     "push_filter_through_aggregate",
     "push_filter_through_sort",
@@ -246,6 +248,88 @@ def infer_join_predicates(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
         right_cons = _column_constraints(node.right, rk)
         if right_cons:
             new_left, added = _add_inferred(new_left, lk, right_cons, rk)
+            changed = changed or added
+    if not changed:
+        return None
+    return Join(
+        new_left,
+        new_right,
+        node.left_keys,
+        node.right_keys,
+        node.join_type,
+        node.output,
+        node.strategy,
+    )
+
+
+@rule(name="infer_join_predicate_from_constant_key", phase=Phase.PUSHDOWN, matches=(Join,))
+def infer_join_predicate_from_constant_key(node: Join, ctx: OptimizerContext) -> LogicalPlan | None:
+    """Mirror a key constant the *statistics* prove, not one the plan spells out.
+
+    `infer_join_predicates` above mirrors a `key OP literal` constraint it can read off the
+    other side's `Filter`. That covers the star-schema shape where the dimension is filtered
+    syntactically, and misses the one where the same fact is only visible in the data: a
+    dimension reduced to a single key value by an aggregate, a semi-join, or simply a source
+    whose footer already reports `min == max` for that column. Nothing in the plan text says
+    `region = 'EU'`, so nothing gets mirrored, and the fact-table scan reads every row group.
+
+    Databricks reach the same rewrite from the other direction — their AQE re-optimizes at a
+    stage boundary, notices a completed stage holds one row, folds the join condition to a
+    constant and pushes it into the other scan to prune files ("Adaptive and Robust Query
+    Execution for Lakehouses at Scale", VLDB 2024, §5.2). This is the static half of that,
+    available whenever the estimator can already *prove* the constant rather than having to
+    run the stage to find out.
+
+    Sound for the same reason the syntactic sibling is, and restricted the same way. On an
+    inner join the keys are equal on every surviving row, so if one side's key is provably the
+    single value `v`, every matched row on the other side has that key equal to `v` too, and
+    a row failing `key = v` could never have matched. Rows with a null key are dropped by the
+    added equality and by the equi-join alike. An outer join's preserved side keeps its
+    unmatched rows, so the constraint does not transfer and the rule declines.
+
+    `constant_value` is the shared proof — EXACT provenance, `min == max`, no nulls — so this
+    rule and the aggregate folds that rely on it cannot disagree about what "constant" means.
+    A NaN bound fails `min == max` by construction, which is the answer we want.
+    """
+    if node.join_type != "inner":
+        return None
+    new_left, new_right = node.left, node.right
+    changed = False
+    for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
+        # Skip the `__cross_key` pseudo-edge a comma/cross join lowers to. Both sides *are*
+        # the same constant there, so this rule would happily "infer" it onto each side — a
+        # predicate that prunes nothing, since it is true of every row by construction. Worse,
+        # the extra `Filter` hides the shape `eliminate_cross_join_of_single_row` matches on,
+        # so a genuine rewrite stops firing; `test_cross_join_of_single_row_eliminated` caught
+        # exactly that. A real key pair is never constant on both sides.
+        if is_cartesian_key_pair(node.left, lk, node.right, rk):
+            continue
+        for source, source_key, target, target_key, to_left in (
+            (node.left, lk, node.right, rk, False),
+            (node.right, rk, node.left, lk, True),
+        ):
+            value = constant_value(ctx.estimator.estimate(source).columns.get(source_key))
+            if value is None:
+                continue
+            # Don't mirror a constant the target side's own statistics already prove. The
+            # predicate would prune nothing there — and `drop_filter_conjunct_implied_by_zonemap`
+            # exists precisely to delete a conjunct the zone map implies, so this rule would add
+            # it, that rule would remove it, and the phase would never reach a fixpoint. It does
+            # not: a one-row relation equi-joined to itself cycles
+            # `infer → push → merge → drop → infer`, burning the whole `fixpoint_iterations`
+            # budget on every such query and logging "phase did not reach a fixpoint" each time.
+            # Results stayed correct — every rule is semantics-preserving — but the plan a query
+            # got depended on the iteration cap. Same reasoning as the `is_cartesian_key_pair`
+            # skip above, and it uses the same `constant_value` proof so the two rules cannot
+            # disagree about what "constant" means. A *different* proven constant is left alone:
+            # that predicate is a contradiction, not a tautology, and saying so is useful.
+            if constant_value(ctx.estimator.estimate(target).columns.get(target_key)) == value:
+                continue
+            equality = [Binary("eq", Col(source_key), Lit(value))]
+            if to_left:
+                new_left, added = _add_inferred(new_left, target_key, equality, source_key)
+            else:
+                new_right, added = _add_inferred(new_right, target_key, equality, source_key)
             changed = changed or added
     if not changed:
         return None

@@ -24,18 +24,15 @@ for a long-lived service that would rather report per-interval numbers itself.
 from __future__ import annotations
 
 import threading
-import time
-from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
 from batcher._internal import events
-from batcher.observe.accelerators.diagnosis import window_snapshot
 from batcher.observe.accelerators.gauges import accelerator_gauges
+from batcher.observe.collector import _Collector
 from batcher.observe.node_metrics import (
     NODE_CONDITION_HELP,
     device_gauges,
-    node_conditions,
 )
 
 __all__ = [
@@ -45,189 +42,6 @@ __all__ = [
     "start_metrics",
     "stop_metrics",
 ]
-
-# Duration buckets in milliseconds, Prometheus-style cumulative histogram boundaries.
-# Chosen to straddle Batcher's stated range: sub-millisecond planning through multi-minute
-# distributed jobs, roughly one bucket per half order of magnitude.
-_BUCKETS_MS: tuple[float, ...] = (1, 5, 10, 50, 100, 500, 1_000, 5_000, 30_000, 300_000)
-
-
-class _Collector:
-    """Folds bus events into counters. One instance per process, guarded by one lock."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.reset()
-
-    def reset(self) -> None:
-        """Zero every counter and restart the uptime clock."""
-        with self._lock:
-            self._started = time.time()
-            self.queries_total = 0
-            self.queries_failed = 0
-            self.rows_out_total = 0
-            self.rows_scanned_total = 0
-            self.bytes_scanned_total = 0
-            self.spills_total = 0
-            self.query_ms_total = 0.0
-            self.query_ms_max = 0.0
-            self._buckets: dict[float, int] = dict.fromkeys(_BUCKETS_MS, 0)
-            self._op_count: dict[str, int] = defaultdict(int)
-            self._op_ms: dict[str, float] = defaultdict(float)
-            self._op_rows: dict[str, int] = defaultdict(int)
-            self._log_counts: dict[str, int] = defaultdict(int)
-            # Distributed / inference counters. These are cumulative like the rest, so a
-            # scraper differences them for rates; the live per-stage view is the separate
-            # `InferenceProgress` store. Cardinality is bounded by hardware (GPU devices) and
-            # by the plan (skip reasons), never by run length, so a 12-hour job holds these
-            # flat.
-            self.partitions_done_total = 0
-            self.skipped_total = 0
-            # Fault tolerance. These were invisible before: the engine recovers from
-            # worker loss transparently, so a query that survived two deaths and one
-            # that was simply slow looked identical from outside.
-            self._recovery_events: dict[str, int] = defaultdict(int)
-            self.infer_batches_total = 0
-            self.infer_rows_total = 0
-            self.infer_latency_ms_total = 0.0
-            self.infer_blocked_ms_total = 0.0
-            self._skipped_by_reason: dict[str, int] = defaultdict(int)
-            self._gpu: dict[str, dict[str, float]] = {}
-            self.gpu_util_pct_max = 0.0
-
-    def handle(self, event: events.Event) -> None:
-        """Fold one event in. Hot path: a dict lookup and a few adds, no allocation."""
-        kind = event.kind
-        fields = event.fields
-        with self._lock:
-            if kind == events.QUERY_END:
-                self._end_query(fields)
-            elif kind == events.STAGE_END:
-                name = event.name or "unknown"
-                self._op_count[name] += 1
-                self._op_ms[name] += float(fields.get("elapsed_ms", 0.0))
-                self._op_rows[name] += int(fields.get("rows_out", 0))
-                if fields.get("spilled"):
-                    self.spills_total += 1
-            elif kind == events.PROGRESS:
-                self.rows_scanned_total += int(fields.get("rows", 0))
-                self.bytes_scanned_total += int(fields.get("bytes", 0))
-            elif kind == events.LOG:
-                self._log_counts[str(fields.get("level", "INFO"))] += 1
-            elif kind == events.PARTITION:
-                self.partitions_done_total += 1
-            elif kind == events.INFER:
-                self.infer_batches_total += 1
-                self.infer_rows_total += int(fields.get("rows", 0))
-                self.infer_latency_ms_total += float(fields.get("latency_ms", 0.0))
-                self.infer_blocked_ms_total += float(fields.get("blocked_ms", 0.0))
-            elif kind == events.SKIPPED:
-                count = int(fields.get("count", 0))
-                self.skipped_total += count
-                reason = str(fields.get("reason", "read_error"))
-                # Fold an unseen reason into "other" once the map is full, so a per-row unique
-                # reason cannot grow it without bound over a long run.
-                if reason not in self._skipped_by_reason and len(self._skipped_by_reason) >= 64:
-                    reason = "other"
-                self._skipped_by_reason[reason] += count
-            elif kind == events.GPU:
-                self._record_gpu(fields)
-            elif kind == events.RECOVERY:
-                # Keyed by the `event` discriminator, so one series distinguishes a
-                # recompute from a speculative backup from a retired replica. Bounded by
-                # `RECOVERY_EVENTS`, so it cannot grow.
-                self._recovery_events[str(fields.get("event", "unknown"))] += 1
-
-    def _record_gpu(self, fields: dict[str, Any]) -> None:
-        """Fold one GPU sample in as a per-device gauge. Assumes the lock is held."""
-        device = str(fields.get("device", fields.get("actor", "gpu0")))
-        util = float(fields.get("util_pct", 0.0))
-        self.gpu_util_pct_max = max(self.gpu_util_pct_max, util)
-        self._gpu[device] = {
-            "util_pct": util,
-            "mem_used_bytes": float(fields.get("mem_used_bytes", 0)),
-            "mem_total_bytes": float(fields.get("mem_total_bytes", 0)),
-        }
-
-    def _end_query(self, fields: dict[str, Any]) -> None:
-        """Record a finished query. Assumes the lock is held."""
-        self.queries_total += 1
-        if not fields.get("ok", True):
-            self.queries_failed += 1
-        self.rows_out_total += int(fields.get("rows", 0))
-        elapsed = float(fields.get("total_ms", 0.0))
-        self.query_ms_total += elapsed
-        self.query_ms_max = max(self.query_ms_max, elapsed)
-        for edge in _BUCKETS_MS:
-            if elapsed <= edge:
-                self._buckets[edge] += 1
-
-    def snapshot(self) -> dict[str, Any]:
-        """A consistent, deep-copied view of every counter. Assumes nothing about callers."""
-        with self._lock:
-            ok = self.queries_total - self.queries_failed
-            return {
-                "uptime_seconds": time.time() - self._started,
-                "queries": {
-                    "total": self.queries_total,
-                    "succeeded": ok,
-                    "failed": self.queries_failed,
-                    "duration_ms_total": self.query_ms_total,
-                    "duration_ms_max": self.query_ms_max,
-                    "duration_ms_mean": (
-                        self.query_ms_total / self.queries_total if self.queries_total else 0.0
-                    ),
-                    # String keys, because the snapshot is served as JSON and JSON object
-                    # keys are strings: an int-keyed dict came back from `json.loads` with
-                    # string keys, so a consumer that read its own snapshot back saw a
-                    # different shape than the one it was handed.
-                    "duration_ms_buckets": {str(edge): n for edge, n in self._buckets.items()},
-                },
-                "rows": {
-                    "scanned_total": self.rows_scanned_total,
-                    "out_total": self.rows_out_total,
-                },
-                "bytes": {"scanned_total": self.bytes_scanned_total},
-                "spills": {"total": self.spills_total},
-                "operators": {
-                    name: {
-                        "count": count,
-                        "elapsed_ms_total": self._op_ms[name],
-                        "rows_out_total": self._op_rows[name],
-                    }
-                    for name, count in sorted(self._op_count.items())
-                },
-                "logs": dict(sorted(self._log_counts.items())),
-                "partitions": {"done_total": self.partitions_done_total},
-                "recovery": dict(self._recovery_events),
-                "skipped": {
-                    "total": self.skipped_total,
-                    "by_reason": dict(sorted(self._skipped_by_reason.items())),
-                },
-                "inference": {
-                    "batches_total": self.infer_batches_total,
-                    "rows_total": self.infer_rows_total,
-                    "latency_ms_total": self.infer_latency_ms_total,
-                    "latency_ms_mean": (
-                        self.infer_latency_ms_total / self.infer_batches_total
-                        if self.infer_batches_total
-                        else 0.0
-                    ),
-                    "blocked_ms_total": self.infer_blocked_ms_total,
-                },
-                "gpu": {
-                    "util_pct_max": self.gpu_util_pct_max,
-                    "devices": {device: dict(stats) for device, stats in sorted(self._gpu.items())},
-                    # The sampled *window*, which the per-device gauges above cannot express:
-                    # they are instantaneous by design, and a consumer stitching a series out
-                    # of repeated snapshots still cannot tell a steadily half-fed device from
-                    # one alternating between saturated and idle. Empty and flagged unsampled
-                    # unless sampling was turned on, so nothing here invents a quiet fleet.
-                    "window": window_snapshot(),
-                },
-                "node": node_conditions(),
-            }
-
 
 _collector = _Collector()
 _detach: Callable[[], None] | None = None
@@ -294,11 +108,39 @@ def metrics_snapshot() -> dict[str, Any]:
     differences successive snapshots to get rates. The first call starts collection, so
     call `start_metrics` at startup if the first scrape should cover earlier queries.
 
-    The top-level keys are ``uptime_seconds``, ``queries`` (counts plus a duration
-    histogram), ``rows``, ``bytes``, ``spills``, ``operators`` (per operator kind), ``logs``
-    (records per level), and ``recovery``. A distributed or batch-inference job adds
-    ``partitions``, ``skipped`` (dropped rows under ``on_read_error="skip"``), ``inference``
+    The top-level keys are ``uptime_seconds``, ``queries`` (counts, a live ``active`` gauge,
+    a duration histogram, and failures broken out by exception type), ``rows``, ``bytes``,
+    ``spills`` (count and volume), ``operators`` (per operator kind), ``logs``
+    (records per level), ``data_quality`` (constraint results, in total and per constraint), and
+    ``recovery``. A distributed or batch-inference job adds
+    ``partitions``, ``skipped`` (inputs dropped under ``on_error="skip"`` — unreadable files
+    or splits, not rows: an unreadable file's row count is exactly what is unknown), ``inference``
     (batches, rows, and latency), and ``gpu`` (peak plus per-device utilization and VRAM).
+
+    ``cpu``, ``memory``, and ``io`` are what the query cost the *machine*, summed from the
+    per-operator measurements the engine already takes: CPU milliseconds across every worker
+    thread, resident-set high-water, page faults, involuntary context switches (contention
+    for cores this process was told it had), and real block-device bytes with page-cache
+    hits excluded. ``backends`` splits operators by which tier ran the per-row work
+    (``interp``, ``jit``, ``interp+jit``), which is the only way to see the JIT silently
+    falling back.
+
+    ``writes`` is the counterpart of ``rows``/``bytes``: what the job *produced* — files,
+    rows, and bytes on storage — overall and per sink format. Its bytes are the size after
+    encoding and compression, so they are deliberately not comparable with the Arrow
+    in-memory ``bytes.scanned_total``.
+
+    ``streaming`` carries one entry per continuous query, keyed by its name: micro-batches
+    and rows as counters, and throughput, retained state, and ``behind_by_ms`` — how much
+    longer the last micro-batch took than its trigger cadence — as levels. Empty until a
+    stream has completed a batch, which is the one section that stays absent rather than
+    zeroed: a zero here would be indistinguishable from a stopped query.
+
+    ``resources`` is the level rather than the total: Carbonite's buffer-pool envelope and
+    its high-water mark, the spill store's per-tier bytes and free disk, the result cache's
+    hit rate, the admission limiter's queue depth. These are **gauges** — each reading
+    replaces the last — so differencing them gives noise, not a rate. The section is empty
+    until a query has completed under a resource manager.
 
     ``node`` carries the hardware conditions worth alerting on rather than counting: devices
     on a degraded host link, devices whose memory is failing, an NVLink fabric that is down,
@@ -315,8 +157,10 @@ def metrics_snapshot() -> dict[str, Any]:
             >>> from batcher.observe import metrics_snapshot
             >>> snap = metrics_snapshot()
             >>> sorted(snap)  # doctest: +NORMALIZE_WHITESPACE
-            ['bytes', 'gpu', 'inference', 'logs', 'node', 'operators', 'partitions',
-             'queries', 'recovery', 'rows', 'skipped', 'spills', 'uptime_seconds']
+            ['backends', 'bytes', 'cpu', 'data_quality', 'gpu', 'inference', 'io', 'logs',
+             'memory', 'node', 'operators', 'partitions', 'queries', 'recovery',
+             'resources', 'rows', 'skipped', 'spills', 'streaming', 'uptime_seconds',
+             'writes']
             >>> snap["queries"]["total"] >= 0
             True
 
@@ -325,6 +169,16 @@ def metrics_snapshot() -> dict[str, Any]:
     """
     start_metrics()
     return _collector.snapshot()
+
+
+def _escape_label(value: str) -> str:
+    """Escape a label value for the Prometheus text format.
+
+    Constraint names carry the characters the format reserves — a regex constraint's name
+    embeds the pattern, quotes and backslashes included — and an unescaped one produces a
+    line no scraper can parse, silently dropping the whole exposition.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
 
 
 def prometheus_text() -> str:
@@ -359,10 +213,20 @@ def prometheus_text() -> str:
     counter("uptime_seconds", snap["uptime_seconds"], "Seconds since metrics started", "gauge")
     counter("queries_total", snap["queries"]["total"], "Queries executed")
     counter("queries_failed_total", snap["queries"]["failed"], "Queries that raised")
+    counter("queries_active", snap["queries"]["active"], "Queries executing right now", "gauge")
     counter("rows_scanned_total", snap["rows"]["scanned_total"], "Rows read from sources")
     counter("rows_out_total", snap["rows"]["out_total"], "Rows returned to callers")
     counter("bytes_scanned_total", snap["bytes"]["scanned_total"], "Bytes read from sources")
+    counter("rows_streamed_total", snap["rows"]["streamed_total"], "Rows delivered by iter_batches")
+    counter(
+        "bytes_streamed_total", snap["bytes"]["streamed_total"], "Bytes delivered by iter_batches"
+    )
     counter("spills_total", snap["spills"]["total"], "Operator spills to disk")
+    if snap["queries"]["failed_by_error"]:
+        out.append("# HELP batcher_query_errors_total Failed queries by exception type")
+        out.append("# TYPE batcher_query_errors_total counter")
+        for error, count in snap["queries"]["failed_by_error"].items():
+            out.append(f'batcher_query_errors_total{{error="{_escape_label(error)}"}} {count}')
 
     out.append("# HELP batcher_query_duration_ms Query wall time in milliseconds")
     out.append("# TYPE batcher_query_duration_ms histogram")
@@ -374,17 +238,58 @@ def prometheus_text() -> str:
     out.append(f"batcher_query_duration_ms_sum {snap['queries']['duration_ms_total']}")
     out.append(f"batcher_query_duration_ms_count {snap['queries']['total']}")
 
-    if snap["operators"]:
-        out.append("# HELP batcher_operator_elapsed_ms_total Operator wall time by kind")
-        out.append("# TYPE batcher_operator_elapsed_ms_total counter")
-        for name, stats in snap["operators"].items():
-            label = f'{{kind="{name}"}}'
-            out.append(f"batcher_operator_elapsed_ms_total{label} {stats['elapsed_ms_total']}")
+    # The per-operator series and the process-wide work totals — CPU, spill volume, real
+    # block-device I/O, faults, preemption — all of which the engine already measured per
+    # operator and the exposition used to drop on the floor.
+    out.extend(_collector.work.render())
+    # Carbonite's envelopes: the buffer pool, the spill store's tiers, the result cache, the
+    # admission queue, the shuffle session's locality and credit window.
+    out.extend(_collector.resources.render())
+    # Per-query streaming series, absent entirely until a stream has run a micro-batch.
+    out.extend(_collector.streams.render())
+    # What the job produced: files, rows and bytes on storage, overall and per sink format.
+    out.extend(_collector.writes.render())
 
     counter(
         "partitions_done_total", snap["partitions"]["done_total"], "Distributed partitions done"
     )
-    counter("skipped_total", snap["skipped"]["total"], "Rows dropped under on_read_error=skip")
+    counter(
+        "skipped_total",
+        snap["skipped"]["total"],
+        "Unreadable files or splits dropped under on_error=skip",
+    )
+    counter(
+        "malformed_rows_total",
+        snap["skipped"]["malformed_rows_total"],
+        "Rows the job dropped: unparseable records (on_bad_lines) and UDF failures "
+        "(max_errored_rows)",
+    )
+    if snap["skipped"]["malformed_rows_by_source"]:
+        out.append(
+            "# HELP batcher_malformed_rows_by_source_total Dropped rows by what dropped them"
+        )
+        out.append("# TYPE batcher_malformed_rows_by_source_total counter")
+        for source, dropped in snap["skipped"]["malformed_rows_by_source"].items():
+            out.append(
+                f'batcher_malformed_rows_by_source_total{{source="{_escape_label(source)}"}} '
+                f"{dropped}"
+            )
+
+    counter("dq_checks_total", snap["data_quality"]["checks_total"], "Data-quality checks run")
+    counter(
+        "dq_failed_total", snap["data_quality"]["failed_total"], "Data-quality checks that failed"
+    )
+    counter(
+        "dq_violations_total",
+        snap["data_quality"]["violations_total"],
+        "Rows violating a data-quality constraint",
+    )
+    if snap["data_quality"]["by_constraint"]:
+        out.append("# HELP batcher_dq_constraint_violations_total Violations by constraint")
+        out.append("# TYPE batcher_dq_constraint_violations_total counter")
+        for name, stats in snap["data_quality"]["by_constraint"].items():
+            label = f'{{constraint="{_escape_label(name)}"}}'
+            out.append(f"batcher_dq_constraint_violations_total{label} {stats['violations']}")
 
     if snap["recovery"]:
         out.append("# HELP batcher_recovery_total Fault-tolerance actions by kind")

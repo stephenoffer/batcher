@@ -110,8 +110,8 @@ prints it once per call site and a process that filtered warnings never sees it.
 an inline key still travels verbatim in the serialized IR, into `explain(format="json")`
 and the plan fingerprint, and out to every worker the plan is shipped to.
 
-Set `BATCHER_REQUIRE_KEY_REFS=1` to refuse inline keys outright. `aes_encrypt`,
-`aes_decrypt`, and `hmac_sha256` then raise `PlanError` at plan-build time unless the key
+Set `BATCHER_REQUIRE_KEY_REFS=1` to refuse inline keys outright. {py:func}`aes_encrypt <batcher.aes_encrypt>`,
+{py:func}`aes_decrypt <batcher.aes_decrypt>`, and {py:func}`hmac_sha256 <batcher.hmac_sha256>` then raise {py:exc}`PlanError <batcher.PlanError>` at plan-build time unless the key
 is an `env:` or `file:` reference. Set it in the pod spec or node environment for the whole
 deployment, and leave it unset in notebooks and tests, where an inline key is legitimate.
 

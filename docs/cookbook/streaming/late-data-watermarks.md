@@ -17,9 +17,16 @@ reconciliation ticket.
 
 ## What the watermark is
 
-The watermark is a single number: `max(event_time observed) - lateness`. It is a claim
-that no event older than this will be accepted. It advances only when event time advances,
-and it never goes backward.
+The watermark is a single number, and it is a claim: no event older than this will be
+accepted. It advances only when event time advances, and it never goes backward.
+
+The number comes from the stream's **slowest partition**, not from the stream as a whole.
+Batcher tracks the highest event time each partition has delivered and takes the minimum,
+less the lateness. That matters because a maximum would be a claim the stream cannot
+support: a Kafka topic whose partition 0 has reached 10:00 says nothing about partition 1,
+which may still be replaying 09:00, and treating 10:00 as the frontier makes every row
+partition 1 then delivers late. A source that cannot say which partition a row came from is
+one partition, where the minimum and the maximum agree.
 
 It does two things, and they are the same thing seen from either side:
 
@@ -120,11 +127,19 @@ lateness. The max is not: one pathological device should not hold every window o
 
 Two failure shapes to keep in mind:
 
-**A stalled watermark.** Event time advances on the *maximum* event time seen. If a
-partition goes idle, or a source stops producing, nothing advances, so no window closes and
-state grows. Batcher does not let that end in an OOM: retained state is checked against
-`memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>` names the column whose watermark
-is not advancing. Read it as a diagnosis, not a budget request.
+**A stalled watermark.** The frontier is the minimum over partitions, so one silent
+partition holds the whole stream back: no window closes and state grows. Batcher releases a
+partition that has delivered nothing for `streaming.watermark_idle_timeout_seconds` (60 by
+default), which is the same trade Flink's `withIdleness` makes and is worth making on
+purpose. Raise it when a partition is legitimately bursty and you would rather wait than
+drop its rows; set it to zero to keep the fully conservative frontier that never advances
+past a silent partition.
+
+If nothing advances anyway — every partition idle, or a source that stopped producing —
+Batcher does not let it end in an OOM: retained state is checked against
+`memory.streaming_state_max_bytes` and a {py:exc}`ResourceError <batcher.ResourceError>`
+names the column whose watermark is not advancing. Read it as a diagnosis, not a budget
+request.
 
 **A clock from the future.** One device with a badly-set clock emits an event stamped next
 Tuesday. `max(event_time)` jumps to next Tuesday, the watermark jumps with it, and every
@@ -184,11 +199,15 @@ your producer's retry behavior, not only to your window latency.
 ## What you don't get
 
 :::{important}
-There is no late-data side output. A dropped row is not routed anywhere, and
-{py:class}`StreamingQueryProgress <batcher.StreamingQueryProgress>` reports `num_input_rows` and `num_output_rows` but no late-row
-count. If losing a straggler is unacceptable for your use case, the honest options are: set
-a lateness that actually covers your lag distribution; or land raw events and recompute the
-affected windows in a batch job, which is a reconciliation pipeline, not a streaming one.
+There is no late-data side output. A dropped row is counted but not routed anywhere: each
+{py:class}`StateOperatorProgress <batcher.StateOperatorProgress>` in a micro-batch's
+`state_operators` carries `num_late_inputs_dropped` and the `watermark_micros` it was
+measured against, so you can see stragglers being lost, and you cannot get them back. If
+losing one is unacceptable for your use case, the honest options are: set a lateness that
+actually covers your lag distribution; raise
+`streaming.watermark_idle_timeout_seconds` if the loss is a bursty partition being treated
+as idle; or land raw events and recompute the affected windows in a batch job, which is a
+reconciliation pipeline, not a streaming one.
 :::
 
 ## See also

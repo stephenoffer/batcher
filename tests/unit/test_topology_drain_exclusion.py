@@ -18,6 +18,18 @@ import pytest
 
 from batcher.dist.executors.ray_runtime import scaling
 
+# Import the real Ray **before** any test can stub it. Several tests below put a fake into
+# `sys.modules` under `ray` or `ray._private.state`; monkeypatch's teardown then *removes*
+# the entry rather than restoring one, because there was nothing there to restore. That
+# leaves the package half-present, and the next genuine `import ray` re-enters
+# `ray/__init__` while `sys.modules["ray"]` already exists — Ray's own initialization then
+# fails on itself ("partially initialized module 'ray' has no attribute '_private'").
+#
+# Importing it here makes every stub below a temporary override of a fully-imported module,
+# which is what monkeypatch's restore semantics assume. The symptom without this was a
+# class that passed in isolation and failed inside its own file.
+ray = pytest.importorskip("ray")
+
 pytestmark = pytest.mark.unit
 
 
@@ -152,7 +164,8 @@ class TestDrainReadsAreCached:
         """Count real GCS calls. Patches the accessor *object*, not `sys.modules`: the
         module under test does `import ray._private.state as ray_state`, which binds the
         parent package's real attribute once `ray._private` is imported, so a sys.modules
-        entry is ignored."""
+        entry is ignored. The module-level `import ray` is what makes that safe here —
+        see the note at the top of this file."""
         import ray._private.state as ray_state
 
         reads: list[int] = []

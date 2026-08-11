@@ -433,3 +433,68 @@ def test_a_rank_metric_without_a_score_column_says_so(binary) -> None:
 def test_the_dataset_accessor_reaches_the_same_evaluation(binary) -> None:
     _, _, _, ds = binary
     assert ds.ml.evaluate("y", y_score="s") == evaluate(ds, "y", y_score="s")
+
+
+# --- the task the labels imply, not the one the argument list implied ------------------
+
+
+def test_auto_scores_a_binary_classification_as_a_classification() -> None:
+    """`evaluate("y", y_pred="p")` on 0/1 labels used to report RMSE, MAE and R2.
+
+    `auto` answered from the *argument list* alone — a `y_score` meant binary, a `y_pred`
+    meant regression, whatever the labels held. So the most ordinary call there is scored a
+    classification as a regression: real numbers, computed correctly, answering a question
+    nobody asked, with nothing in the result to say so.
+    """
+    ds = bt.from_pydict({"y": [1, 0, 1, 0], "p": [1, 0, 0, 1]})
+    report = evaluate(ds, "y", y_pred="p")
+
+    assert "accuracy" in report
+    assert "rmse" not in report
+    assert report["accuracy"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ([1.0, 2.0, 3.0, 4.0], "rmse"),  # a float label is a regression however few values
+        ([1, 0, 1, 0], "accuracy"),  # two integer classes -> binary
+        ([True, False, True, False], "accuracy"),  # booleans too
+        (["a", "b", "a", "b"], "accuracy"),  # and strings
+        ([0, 1, 2, 1], "macro_f1"),  # three classes -> multiclass
+    ],
+)
+def test_auto_reads_the_task_off_the_label_column(labels, expected) -> None:
+    ds = bt.from_pydict({"y": labels, "p": labels})
+    assert expected in evaluate(ds, "y", y_pred="p", positive=labels[0])
+
+
+def test_a_high_cardinality_integer_label_stays_a_regression() -> None:
+    """An id-like integer column is not a 200-class problem."""
+    ds = bt.from_pydict({"y": list(range(200)), "p": list(range(200))})
+    assert "rmse" in evaluate(ds, "y", y_pred="p")
+
+
+def test_binary_without_a_score_reports_the_metrics_it_can() -> None:
+    """Four of the ten binary defaults need a probability, so this raised outright.
+
+    A metric the caller *names* and cannot have still raises, naming it. But a default set
+    is not a request: with hard predictions alone the report is the six metrics that only
+    need labels.
+    """
+    ds = bt.from_pydict({"y": [1, 0, 1, 0], "p": [1, 0, 0, 1]})
+    report = evaluate(ds, "y", y_pred="p", task="binary")
+
+    assert set(report) == {"accuracy", "precision", "recall", "f1", "balanced_accuracy", "mcc"}
+
+
+def test_a_score_metric_the_caller_named_still_raises() -> None:
+    ds = bt.from_pydict({"y": [1, 0, 1, 0], "p": [1, 0, 0, 1]})
+    with pytest.raises(PlanError, match="needs y_score"):
+        evaluate(ds, "y", y_pred="p", metrics=["roc_auc"])
+
+
+def test_a_score_restores_the_full_binary_set() -> None:
+    ds = bt.from_pydict({"y": [1, 0, 1, 0], "p": [1, 0, 0, 1], "s": [0.9, 0.1, 0.4, 0.6]})
+    report = evaluate(ds, "y", y_pred="p", y_score="s", task="binary")
+    assert set(report) == set(METRIC_SETS["binary"])

@@ -41,10 +41,10 @@ The features come in four shapes, and each has its own way of leaking:
 
 | Feature | Operator | What goes wrong |
 | --- | --- | --- |
-| Per-user counts and rates | `group_by().agg(...)` | computed over the label window too, so the count knows the future |
-| "Time since last event", "previous item" | `ds.window(...)` with `lag` | the first event's null filled with 0, which claims the user acted today |
+| Per-user counts and rates | {py:meth}`group_by().agg(...) <batcher.Dataset.group_by>` | computed over the label window too, so the count knows the future |
+| "Time since last event", "previous item" | {py:meth}`ds.window(...) <batcher.Dataset.window>` with `lag` | the first event's null filled with 0, which claims the user acted today |
 | Per-item history | `group_by("item_id")` + a `left` join | an inner join, which deletes the cold-start rows you most need |
-| Item tags | `MultiHotEncoder` | refit at serving time, which shifts every column index |
+| Item tags | {py:class}`MultiHotEncoder <batcher.ml.preprocessors.MultiHotEncoder>` | refit at serving time, which shifts every column index |
 
 ## Aggregate features per user
 
@@ -204,7 +204,7 @@ generalization to a new user and measuring memorization of an old one. See
 - {doc}`Joins </user-guide/analyze/joins>`: left, anti, and cross joins, and what each one costs.
 - {doc}`Preprocessors </ml/preparing/preprocessors/index>`: `MultiHotEncoder` and the rest of the estimators.
 - {doc}`Data loaders </ml/training/data-loaders>`: getting the finished rows into a training loop.
-- {doc}`ML API reference </api/models/ml>`: `ds.ml.train_test_split` and the `batcher.ml` estimators.
+- {doc}`ML API reference </api/models/ml>`: {py:meth}`ds.ml.train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` and the `batcher.ml` estimators.
 - {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`: why these aggregates give the
   same answer on one core and on a cluster.
 - {doc}`Sessionization </cookbook/analytics/behavior/sessionization>`: the window-function recipe this one borrows

@@ -22,6 +22,7 @@ from collections.abc import Callable
 from time import perf_counter, time
 from typing import TYPE_CHECKING
 
+from batcher._internal.concurrency import start_context_thread
 from batcher.plan.streaming import (
     SinkProgress,
     SourceProgress,
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     from batcher.core.streaming_query.processors import MicroBatchProcessor
     from batcher.core.streaming_runner import MicroBatchRunner
     from batcher.io.source import Source
+    from batcher.plan.streaming.rate import RateController
 
 __all__ = ["StreamingQueryEngine"]
 
@@ -64,6 +66,10 @@ def _describe(obj: object) -> str:
         try:
             return str(identity())
         except Exception:
+            # Not silence — the fall-through to the class name below *is* the documented
+            # answer. This only labels a progress record, so a source whose `identity()`
+            # raises (a broker option it cannot render, say) must still produce a query
+            # that runs; degrading the label is the whole point of having a fallback.
             pass
     return type(obj).__name__
 
@@ -84,6 +90,7 @@ class StreamingQueryEngine:
         runner_factory: Callable[[Callable[[], bool]], MicroBatchRunner] | None = None,
         projection: list[str] | None = None,
         predicate: dict | None = None,
+        rate_controller: RateController | None = None,
     ) -> None:
         from batcher.core.streaming_runner import LocalRunner
 
@@ -94,6 +101,11 @@ class StreamingQueryEngine:
         self._trigger = trigger
         self._output_mode = output_mode
         self._checkpoint = checkpoint
+        # Adaptive ingestion backpressure, injected by the conductor because the policy is
+        # Carbonite's and `core` must not import it. `None` (the default) leaves the source's
+        # configured per-trigger cap governing, exactly as before. Core measures and applies;
+        # it does not decide the rate.
+        self._rate_controller = rate_controller
         self._stop = threading.Event()
         # How a micro-batch actually runs. Default: on this thread. The conductor injects
         # the Ray fan-out for `distributed=True` — `core` never imports `dist`. The factory
@@ -131,10 +143,25 @@ class StreamingQueryEngine:
         self._recover()
         if self._sink is not None:
             self._sink.open()  # a distributed runner owns its sinks (one per worker)
-        self._thread = threading.Thread(
-            target=self._run, name=f"batcher-stream-{self._name}", daemon=True
+        # The loop runs under a *snapshot of the caller's context*, not a fresh one.
+        #
+        # `threading.Thread` does not copy context variables, and the control plane keeps
+        # everything that answers "what does this query think the machine looks like" in
+        # one: the active `Config`, the cancellation scope, the machine-scoping key the
+        # learned statistics are filed under, the shuffle fleet. A bare thread target reads
+        # every one of them at its *default*, so a `config_context` wrapped around
+        # `write_stream(...)` governed the setup this method does and then silently stopped
+        # applying the moment the loop started — a pinned `max_memory_bytes` reverted to the
+        # static 8 GiB fallback, an adjusted morsel size reverted to 16,384 rows, and a
+        # spill directory reverted to the system tempdir, all without an error anywhere.
+        #
+        # Copying at `start()` also gives the right *lifetime*. A streaming query outlives
+        # the `with config_context(...)` block that launched it, so the config it runs under
+        # has to be frozen at launch rather than read live — which is what a snapshot is,
+        # and what Spark does with a query's configuration for the same reason.
+        self._thread = start_context_thread(
+            self._run, name=f"batcher-stream-{self._name}", daemon=True
         )
-        self._thread.start()
         # After the thread is running, so a listener that inspects the query sees a live
         # one. Before this existed the start of a query was the one event nothing could
         # observe: polling `recent_progress` can only ever see batches that already ran.
@@ -422,8 +449,34 @@ class StreamingQueryEngine:
         )
         self._progress.append(progress)
         notify_query_progress(self._name, progress)
+        self._apply_rate_limit(progress)
         self._batches += 1
         return True
+
+    def _apply_rate_limit(self, progress: StreamingQueryProgress) -> None:
+        """Pace the *next* trigger from what this one measured.
+
+        A micro-batch that overruns its interval leaves the next one starting late against a
+        larger backlog, which overruns by more. The divergence compounds, and it ends not in a
+        slow query but in the epoch that no longer fits in memory. The controller reads this
+        batch's throughput and how far past its cadence it ran, and narrows what the source
+        may hand over next time.
+
+        Applied after the progress record is published, so a listener always sees the batch
+        that *caused* a throttle before the throttle takes effect.
+
+        Silent about a source it cannot pace: a file or in-memory source has no per-trigger
+        admission to narrow, and the query runs at its configured cap as it always did.
+        """
+        if self._rate_controller is None:
+            return
+        from batcher.io.source import is_rate_limited
+
+        if not is_rate_limited(self._source):
+            return
+        limit = self._rate_controller.next_limit(progress)
+        if limit is not None:
+            self._source.set_admission_limit(limit.max_rows)
 
     def _state_metrics(self) -> tuple[StateOperatorProgress, ...]:
         """What the runner's stateful operators are holding, if it has any.

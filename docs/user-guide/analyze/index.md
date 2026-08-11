@@ -17,6 +17,12 @@ Group and summarize; pivot; roll up.
 Inner, outer, semi, anti, as-of.
 :::
 
+:::{grid-item-card} {octicon}`clock;1.1em` Time series
+:link: /user-guide/analyze/time-series
+:link-type: doc
+Bucketing, gap filling, smoothing, as-of alignment.
+:::
+
 :::{grid-item-card} {octicon}`versions;1.1em` Window functions
 :link: /user-guide/analyze/window-functions
 :link-type: doc
@@ -35,6 +41,12 @@ Long to wide and back.
 Geometry, spatial joins, projections, and grid keys.
 :::
 
+:::{grid-item-card} {octicon}`rocket;1.1em` Robotics and AV
+:link: /user-guide/analyze/robotics
+:link-type: doc
+Coordinate frames, poses, sensor alignment, point clouds.
+:::
+
 :::{grid-item-card} {octicon}`share-android;1.1em` Graphs
 :link: /user-guide/analyze/graphs
 :link-type: doc
@@ -50,7 +62,7 @@ Full SQL that lowers to the same engine.
 :::{grid-item-card} {octicon}`zap;1.1em` Metadata shortcuts
 :link: /user-guide/analyze/metadata-shortcuts
 :link-type: doc
-Answer from the footer instead of the data, with `ds.meta`.
+Answer from the footer instead of the data, with {py:obj}`ds.meta <batcher.Dataset.meta>`.
 :::
 ::::
 
@@ -59,9 +71,11 @@ Answer from the footer instead of the data, with `ds.meta`.
 
 aggregations
 joins
+time-series
 window-functions
 pivoting
 geospatial
+robotics
 graphs
 sql
 metadata-shortcuts

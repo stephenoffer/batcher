@@ -24,7 +24,7 @@ see the whole relation before it can emit anything.
 ::::{tab-set}
 :::{tab-item} A fraction (streams)
 
-`sample(fraction)` keeps each row whose hash falls under the fraction. No breaker, no
+{py:meth}`sample(fraction) <batcher.Dataset.sample>` keeps each row whose hash falls under the fraction. No breaker, no
 materialization, so it works on an unbounded source.
 
 ```python
@@ -60,7 +60,7 @@ print(a == b, len(a))
 ```
 
 With `seed=None` (the default) a fresh seed is baked in when the plan is *built*, not
-when it runs, so the two `collect()` calls on one sampled dataset still agree with each
+when it runs, so the two {py:meth}`collect() <batcher.Dataset.collect>` calls on one sampled dataset still agree with each
 other. Pass a seed explicitly if the sample has to reproduce across processes.
 
 ## Sampling is not a shuffle
@@ -68,7 +68,7 @@ other. Pass a seed explicitly if the sample has to reproduce across processes.
 `sample(n=10)` gives you ten rows chosen by hash, which means the choice is stable but
 the *order* is arbitrary. It is not "ten random rows re-drawn each call", and it is not
 a permutation. If what you want is a random ordering, add a random column and sort by it.
-`with_random(name, seed=)` is a deterministic per-row uniform draw.
+{py:meth}`with_random(name, seed=) <batcher.Dataset.with_random>` is a deterministic per-row uniform draw.
 
 ```python
 shuffled = ds.with_random("r", seed=3).sort("r").head(3)
@@ -81,7 +81,7 @@ of a pipeline, not before a 10 TB scan.
 
 ## Train/test splits
 
-`train_test_split` is the split you want for modeling: the two parts are disjoint,
+{py:meth}`train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` is the split you want for modeling: the two parts are disjoint,
 they cover every row, and neither materializes. Each is a row-wise filter, so both stay
 lazy.
 
@@ -99,7 +99,7 @@ should. Hashing a stable identifier instead keeps a row on the side it started o
 the other columns change.
 :::
 
-`random_split` is the n-way generalization.
+{py:meth}`random_split <batcher.api.dataset.ml.DatasetML.random_split>` is the n-way generalization.
 
 ```python
 tr, val, te = ds.ml.random_split([0.7, 0.15, 0.15], seed=42, key="value")
@@ -109,6 +109,40 @@ print(tr.count(), val.count(), te.count())
 
 Sizes are binomial around the requested fractions, for the same reason `sample(0.5)`
 was not exactly 500. Disjointness and coverage are exact. The sizes are not.
+
+## Positional splits
+
+Everything above assigns a row by hashing it. {py:meth}`split_at_indices <batcher.Dataset.split_at_indices>` and {py:meth}`split_proportionately <batcher.Dataset.split_proportionately>` do the other thing: they cut the relation at row *positions*, so the parts are consecutive ranges and their sizes are exact. This is Ray Data's spelling, and it is what you want for a chronological holdout or for handing consecutive shards to workers.
+
+```python
+head, mid, tail = ds.split_at_indices([100, 900])
+print([head.count(), mid.count(), tail.count()])
+# [100, 800, 100]
+```
+
+`split_proportionately` computes those cuts from a fraction instead, so the sizes come out exact rather than binomial. Compare it against `random_split` above, which asked for the same three fractions.
+
+```python
+tr, val, te = ds.split_proportionately([0.7, 0.15])
+print([tr.count(), val.count(), te.count()])
+# [700, 150, 150]
+```
+
+The fractions name every part but the last, which takes the remainder, so they must sum to less than 1.
+
+:::{important}
+A position only means something once you have defined an order. Sort first, or the cut lands wherever the scan happened to put the rows.
+
+```python
+newest = ds.sort("value", descending=True).split_at_indices([3])[0]
+print(newest.select("value").to_pydict())
+# {'value': [999, 998, 997]}
+```
+:::
+
+Both stay lazy, which is the difference from Ray Data's versions: nothing is materialized, and a pipeline that consumes one part never computes the others. The cost is the mirror image. Each part reads the input again, so call {py:meth}`cache() <batcher.Dataset.cache>` first when the source is expensive and you intend to collect them all.
+
+For modeling, prefer the hash-based splits. A positional split puts whatever sits at the front of the file in one part, and that is rarely independent of the label.
 
 ## Stratified sampling
 
@@ -137,6 +171,7 @@ Sample when you want *rows*. Sketch when you want a *number*. The decision table
 | Rows to eyeball, or a dev fixture | `sample(fraction)` | streams, no breaker |
 | An exact row count out | `sample(n=...)` | ranks by hash, so it breaks |
 | Disjoint modeling splits | `ml.train_test_split` / `ml.random_split` | row-wise filters, both stay lazy |
+| Consecutive ranges with exact sizes | `split_at_indices` / `split_proportionately` | cuts by position, so sort first |
 | A random *ordering* | `with_random(...)` then `sort` | a full breaker, so use it on the small side |
 | A distinct count or a quantile | `approx_n_unique` / `approx_quantile` | one pass, mergeable, no sampling error to reason about |
 :::

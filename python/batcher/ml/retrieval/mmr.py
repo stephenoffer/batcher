@@ -207,6 +207,25 @@ def _require_grouped_candidates(batch: pa.RecordBatch, embedding_column: str) ->
     )
 
 
+def _take(candidates: list | None, chosen: list[int], name: str, row: int) -> list | None:
+    """The chosen candidates of one row's per-candidate list, or null when the row is null.
+
+    A per-candidate column shorter than the embedding column would index past its end, and
+    a bare `IndexError` from inside a comprehension names neither the column nor the row.
+    The lists are per-candidate *by declaration* (`rerank_columns`), so a mismatch is the
+    caller having grouped them apart, and that is what the message says.
+    """
+    if candidates is None:
+        return None
+    if chosen and max(chosen) >= len(candidates):
+        raise PlanError(
+            f"mmr_rerank: row {row} of {name!r} has {len(candidates)} values but the row has "
+            f"{max(chosen) + 1} or more candidates. Every per-candidate column must line up "
+            "one-for-one with the embedding column; group them in the same aggregation."
+        )
+    return [candidates[i] for i in chosen]
+
+
 def _rerank_batch(
     batch: pa.RecordBatch,
     *,
@@ -232,10 +251,22 @@ def _rerank_batch(
     )
 
     picks: list[list[int]] = []
-    for row_vectors, row_scores in zip(embeddings, scores, strict=True):
+    for row, (row_vectors, row_scores) in enumerate(zip(embeddings, scores, strict=True)):
         if not row_vectors:
             picks.append([])
             continue
+        if row_scores is not None and len(row_scores) != len(row_vectors):
+            # Grouping the embeddings and the scores separately — a different filter on
+            # either side, a join that dropped a candidate — leaves the two lists out of
+            # step for that query. Left to NumPy it surfaced as "operands could not be
+            # broadcast together with shapes (2,) (3,)", which names neither the columns,
+            # nor the row, nor the fix.
+            raise PlanError(
+                f"mmr_rerank: row {row} has {len(row_vectors)} candidate vectors in "
+                f"{embedding_column!r} but {len(row_scores)} scores in {score_column!r}. "
+                "Each row's per-candidate lists must line up one-for-one; group them in "
+                "the same aggregation so a dropped candidate drops from both."
+            )
         matrix = _unit_rows(np.asarray(row_vectors, dtype=np.float64))
         if row_scores is None:
             # No score column: the candidates' existing order is the ranking, so a
@@ -260,8 +291,8 @@ def _rerank_batch(
             arrays.append(
                 pa.array(
                     [
-                        None if row is None else [row[i] for i in chosen]
-                        for row, chosen in zip(values, picks, strict=True)
+                        _take(candidates, chosen, name, row)
+                        for row, (candidates, chosen) in enumerate(zip(values, picks, strict=True))
                     ],
                     type=column.type,
                 )

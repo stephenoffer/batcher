@@ -22,6 +22,7 @@ from batcher.plan.expr_ir.func_nodes import (
     Strftime,
 )
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
+from batcher.plan.ir_tags import MICROS_PER_DAY
 
 # Offset-string units → (months, days, micros) contribution per unit count. `mo`
 # must precede `m` in the regex so "mo" parses as months, not minutes.
@@ -70,6 +71,52 @@ def parse_offset(by: str) -> tuple[int, int, int]:
             f"invalid offset {by!r}; use counts with units y/mo/w/d/h/m/s, e.g. '1mo15d'"
         )
     return months, days, micros
+
+
+#: How far `ceil`/`round` advance to reach the next boundary of each unit. Only units with
+#: a step `offset_by` can express appear: the calendar ones (`1mo`, `1y`) are exact because
+#: `offset_by` does calendar arithmetic, so "the next month" is the next month rather than
+#: thirty days. Sub-second units are absent because `offset_by` has no sub-second step —
+#: `truncate` alone already reaches them.
+_UNIT_STEP: dict[str, str] = {
+    "second": "1s",
+    "minute": "1m",
+    "hour": "1h",
+    "day": "1d",
+    "week": "1w",
+    "month": "1mo",
+    "quarter": "3mo",
+    "year": "1y",
+}
+
+
+def _step_offset(unit: str, func: str) -> str:
+    """The `offset_by` step that reaches the next `unit` boundary, or raise."""
+    step = _UNIT_STEP.get(unit.lower())
+    if step is None:
+        raise PlanError(
+            f".dt.{func}({unit!r}) is not supported; use one of "
+            f"{sorted(_UNIT_STEP)} (.dt.truncate reaches the finer units)"
+        )
+    return step
+
+
+_CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?$")
+
+
+def _clock_micros(value: str, arg: str) -> int:
+    """A ``HH:MM``/``HH:MM:SS[.ffffff]`` clock time as microseconds since midnight."""
+    match = _CLOCK_RE.match(value.strip()) if isinstance(value, str) else None
+    if match is None:
+        raise PlanError(
+            f"is_between_time() {arg} must be a clock time like '09:30' or '09:30:00', "
+            f"got {value!r}"
+        )
+    hh, mm, ss, frac = match.group(1), match.group(2), match.group(3) or "0", match.group(4) or ""
+    if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59 and 0 <= int(ss) <= 59):
+        raise PlanError(f"is_between_time() {arg} is not a valid clock time: {value!r}")
+    micros = (int(hh) * 3600 + int(mm) * 60 + int(ss)) * 1_000_000
+    return micros + int(frac.ljust(6, "0") or 0)
 
 
 class _DtNamespace:
@@ -253,7 +300,14 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.epoch_ms()).to_pydict()
                 {'r': [1609459200000]}
         """
-        return (self._micros() // 1000).cast("int64")
+        # Truncated toward zero, not floored: DuckDB's `epoch_ms` reports
+        # `1969-12-31 23:59:59.999999` as 0 milliseconds, where `//` (floor division)
+        # answered -1. The two agree on every instant at or after the epoch, which is why
+        # the difference only ever showed up on historical data.
+        micros = self._micros()
+        return (micros // 1000 + (((micros % 1000) != 0) & (micros < 0)).cast("int64")).cast(
+            "int64"
+        )
 
     def epoch_us(self) -> Expr:
         """Microseconds since the Unix epoch as an integer (DuckDB ``epoch_us``, → Int64).
@@ -294,6 +348,21 @@ class _DtNamespace:
         """
         return self._micros() * 1000
 
+    def _subsecond_micros(self) -> Expr:
+        """Microseconds past the whole second, always in ``[0, 999999]``.
+
+        Two corrections over the obvious ``self._e.cast("int64") % 1_000_000``, and each was
+        wrong on its own axis. The engine's ``%`` is the *truncated* remainder, which takes
+        the sign of the dividend — and a pre-1970 instant has a negative epoch, so
+        ``1969-07-20 20:17:40.000001`` reported **-999999** microseconds past the second and
+        ``.999999`` reported ``-1``, while `hour`/`minute`/`second` all read correctly. And
+        the raw integer of a ``Date32`` is a *day* count, so a date column produced a
+        six-digit number out of its day index; `_micros` is the accessor that normalizes
+        that, and it exists for exactly this reason.
+        """
+        micros = self._micros()
+        return (micros % 1_000_000 + 1_000_000) % 1_000_000
+
     def millisecond(self) -> Expr:
         """The millisecond-of-second component, 0-999 (Polars ``dt.millisecond``, → Int64).
 
@@ -309,7 +378,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.millisecond()).to_pydict()
                 {'r': [123]}
         """
-        return (self._e.cast("int64") % 1_000_000 // 1000).cast("int64")
+        return (self._subsecond_micros() // 1000).cast("int64")
 
     def microsecond(self) -> Expr:
         """The microsecond-of-second component, 0-999999 (Polars ``dt.microsecond``, → Int64).
@@ -326,7 +395,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.microsecond()).to_pydict()
                 {'r': [123456]}
         """
-        return self._e.cast("int64") % 1_000_000
+        return self._subsecond_micros()
 
     def nanosecond(self) -> Expr:
         """The nanosecond-of-second component, 0-999999000 (Polars ``dt.nanosecond``, → Int64).
@@ -345,7 +414,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.nanosecond()).to_pydict()
                 {'r': [123456000]}
         """
-        return (self._e.cast("int64") % 1_000_000) * 1000
+        return self._subsecond_micros() * 1000
 
     # --- Polars-compatible spellings (delegate to the SQL-named accessors) ----------
 
@@ -577,7 +646,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("a").dt.days_between(bt.col("b"))).to_pydict()
                 {'r': [2]}
         """
-        return self._delta_units(other, 86_400_000_000)
+        return self._delta_units(other, MICROS_PER_DAY)
 
     def weeks_between(self, other: Expr) -> Expr:
         """Whole 7-day weeks from `other` to this timestamp (negative if `other` is later).
@@ -599,7 +668,7 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("a").dt.weeks_between(bt.col("b"))).to_pydict()
                 {'r': [6]}
         """
-        return self._delta_units(other, 7 * 86_400_000_000)
+        return self._delta_units(other, 7 * MICROS_PER_DAY)
 
     def quarter_end(self) -> Expr:
         """Last day of the calendar quarter at midnight — the close of the quarter.
@@ -741,6 +810,172 @@ class _DtNamespace:
                 {'r': [datetime.datetime(2024, 2, 15, 13, 0)]}
         """
         return self.truncate(unit)
+
+    def ceil(self, unit: str) -> Expr:
+        """Round **up** to the start of the next `unit` — pandas ``dt.ceil``.
+
+        The mirror of :meth:`floor`: an instant already on a boundary stays put, and any
+        other advances to the next one. Use it to close a half-open bucket — the end of the
+        hour a reading belongs to — where `floor` gives its start.
+
+        Composed from `truncate` and `offset_by`, so it adds no engine surface and inherits
+        their calendar correctness: rounding February 15th up to a month gives March 1st,
+        not "thirty days later".
+
+        Args:
+            unit: The granularity to round up to. One of ``second``, ``minute``, ``hour``,
+                ``day``, ``week``, ``month``, ``quarter``, ``year``.
+
+        Returns:
+            A Timestamp expression at the start of the next `unit`, or unchanged if it is
+            already there.
+
+        Raises:
+            PlanError: If `unit` has no fixed step to advance by.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
+                >>> ds.select(r=bt.col("d").dt.ceil("hour")).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 15, 14, 0)]}
+
+                >>> on_the_hour = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 0)]})
+                >>> on_the_hour.select(r=bt.col("d").dt.ceil("hour")).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 15, 13, 0)]}
+        """
+        floor = self.truncate(unit)
+        step = _step_offset(unit, "ceil")
+        # `truncate` returns a Timestamp while the input may be a Date or a text column, so
+        # compare through the epoch rather than directly: `d == floor` would be a
+        # cross-type comparison for exactly the inputs a user is most likely to pass.
+        return (
+            when(floor.dt.epoch_us() == self.epoch_us())
+            .then(floor)
+            .otherwise(floor.dt.offset_by(step))
+        )
+
+    def round(self, unit: str) -> Expr:
+        """Round to the **nearest** `unit` boundary — pandas ``dt.round``.
+
+        An instant exactly half way rounds **up**, the everyday reading of "round to the
+        nearest hour". (pandas breaks that tie to the even boundary instead; the difference
+        shows only for an instant landing precisely on a half-boundary.) Where :meth:`floor`
+        and :meth:`ceil` bias every value one way, this is the one to bucket by when the bias
+        would accumulate — plotting a downsampled series, or aligning two feeds sampled off
+        each other's grid.
+
+        Composed from `truncate` and `offset_by` over the microsecond epoch, so a calendar
+        unit rounds by real elapsed time: a date in mid-February is nearer to March 1st than
+        to February 1st, and rounds there.
+
+        Args:
+            unit: The granularity to round to. One of ``second``, ``minute``, ``hour``,
+                ``day``, ``week``, ``month``, ``quarter``, ``year``.
+
+        Returns:
+            A Timestamp expression at the nearer `unit` boundary.
+
+        Raises:
+            PlanError: If `unit` has no fixed step to advance by.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 45)]})
+                >>> ds.select(r=bt.col("d").dt.round("hour")).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 15, 14, 0)]}
+
+                >>> early = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 13, 10)]})
+                >>> early.select(r=bt.col("d").dt.round("hour")).to_pydict()
+                {'r': [datetime.datetime(2024, 2, 15, 13, 0)]}
+        """
+        floor = self.truncate(unit)
+        nxt = floor.dt.offset_by(_step_offset(unit, "round"))
+        here, below, above = self.epoch_us(), floor.dt.epoch_us(), nxt.dt.epoch_us()
+        # Strict `<`, so an exact half-way instant falls to the `otherwise` branch and
+        # rounds up. Comparing elapsed microseconds is what makes a calendar unit round by
+        # real distance: mid-February is nearer to March than to February.
+        return when((here - below) < (above - here)).then(floor).otherwise(nxt)
+
+    def time_of_day(self) -> Expr:
+        """Microseconds since midnight — the clock time, with the date discarded.
+
+        The handle for "when in the day did this happen": how far into the trading session a
+        trade landed, whether a reading came from the night shift, how a weekday's load curve
+        compares across weeks. Comparing timestamps directly cannot answer any of those,
+        because the date dominates the ordering.
+
+        Composed from `truncate` and the microsecond epoch, so it adds no engine surface and
+        needs no timezone of its own: it is the clock time in whatever zone the column is
+        already expressed in.
+
+        Returns:
+            An Int64 expression of microseconds since the day's midnight, always in
+            ``[0, 86_400_000_000)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 15, 9, 30)]})
+                >>> ds.select(r=bt.col("d").dt.time_of_day() // 1_000_000).to_pydict()
+                {'r': [34200]}
+        """
+        return self.epoch_us() - self.truncate("day").dt.epoch_us()
+
+    def is_between_time(self, start: str, end: str) -> Expr:
+        """True where the clock time falls in ``[start, end]`` — pandas ``between_time``.
+
+        The filter a session-bounded query needs: market hours, a night shift, a maintenance
+        window. `start` and `end` are ``"HH:MM"`` or ``"HH:MM:SS"`` clock times, and the date
+        is ignored entirely.
+
+        **A window that wraps past midnight is handled**, and that is the reason this exists
+        rather than a bare comparison: ``is_between_time("22:00", "02:00")`` means the four
+        hours around midnight, where ``hour() >= 22 and hour() <= 2`` is empty. Getting that
+        wrong returns no rows rather than an error, which is why it is worth having in one
+        tested place.
+
+        Both endpoints are inclusive, matching pandas' default.
+
+        Args:
+            start: The first clock time in the window, ``"HH:MM"`` or ``"HH:MM:SS"``.
+            end: The last clock time in the window; may be earlier than `start` to wrap
+                past midnight.
+
+        Returns:
+            A Boolean expression, true inside the window.
+
+        Raises:
+            PlanError: If a bound is not a valid ``HH:MM``/``HH:MM:SS`` clock time.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"d": [dt.datetime(2024, 2, 15, 9, 30), dt.datetime(2024, 2, 15, 20, 0)]}
+                ... )
+                >>> ds.select(open=bt.col("d").dt.is_between_time("09:00", "17:00")).to_pydict()
+                {'open': [True, False]}
+
+                >>> # A window that wraps past midnight keeps the late evening.
+                >>> ds.select(night=bt.col("d").dt.is_between_time("22:00", "10:00")).to_pydict()
+                {'night': [True, False]}
+        """
+        lo, hi = _clock_micros(start, "start"), _clock_micros(end, "end")
+        now = self.time_of_day()
+        if lo <= hi:
+            return (now >= lit(lo)) & (now <= lit(hi))
+        # A wrapping window is the union of "after start today" and "before end today".
+        return (now >= lit(lo)) | (now <= lit(hi))
 
     # --- calendar feature flags (the date features a model actually consumes) -------
 

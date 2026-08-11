@@ -9,9 +9,9 @@ retrieval.
 ## Clean the text first
 
 Scraped text carries markup, and a tokenizer will happily spend its context on
-`<script>` bodies and `&nbsp;`. `.str.strip_html()` extracts the prose (it drops script
+`<script>` bodies and `&nbsp;`. {py:meth}`.str.strip_html() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.strip_html>` extracts the prose (it drops script
 and style contents, decodes entities, and separates block elements), and
-`.str.normalize_whitespace()` collapses what is left. Both run in the engine, so this
+{py:meth}`.str.normalize_whitespace() <batcher.plan.expr_ir.namespaces.strings._StrNamespace.normalize_whitespace>` collapses what is left. Both run in the engine, so this
 costs a scan, not a Python loop.
 
 ```python
@@ -118,7 +118,7 @@ file reads all 41 unless you project first.
 ## Normalize once, at write time
 
 Cosine similarity is a dot product divided by two magnitudes. On unit-length vectors
-those magnitudes are 1, so a normalized corpus retrieves with the cheaper `.list.dot`
+those magnitudes are 1, so a normalized corpus retrieves with the cheaper {py:meth}`.list.dot <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>`
 kernel and ranks identically. Normalizing at query time instead pays for it on every
 search, forever.
 
@@ -181,7 +181,7 @@ print(hits.to_pydict()["id"])
 # [1, 4]
 ```
 
-`.list.cosine_distance(q)` is the equivalent for a corpus you have *not* normalized; it
+{py:meth}`.list.cosine_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` is the equivalent for a corpus you have *not* normalized; it
 sorts ascending (0 is identical). Reach for it in a reranking pass over a small candidate
 set, where the extra kernel cost is irrelevant.
 
@@ -224,8 +224,8 @@ Three ways to score, and the corpus size decides which:
 - {doc}`Embeddings </ml/retrieval/embeddings>` and {doc}`vector search </ml/retrieval/vector-search>`: the
   encoder surface and the index it feeds.
 - {doc}`Inference </ml/inference/inference>`: the pool and stage-overlap mechanics.
-- {doc}`Multimodal </ml/preparing/multimodal/index>`: the `.list` vector expressions in full.
-- {doc}`ML API reference </api/models/ml>`: `ds.ml.embed`, `build_vector_index`, `vector_search`.
+- {doc}`Multimodal </ml/preparing/multimodal/index>`: the {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` vector expressions in full.
+- {doc}`ML API reference </api/models/ml>`: {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`, `build_vector_index`, `vector_search`.
 - {doc}`AI and GPU benchmarks </benchmarks/results/ai-and-gpu>`: where the 33,611 text/s on text
   embeddings comes from.
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how a vector column is laid out.

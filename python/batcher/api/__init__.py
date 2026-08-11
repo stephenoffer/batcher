@@ -121,3 +121,10 @@ __all__ = [
     *_functions.__all__,
     *_session.__all__,
 ]
+
+# `concat` is declared by both `functions` (the SQL string form) and `session` (the
+# dataset-stacking form that also dispatches to it), so the concatenation above lists it
+# twice. One name, one entry: a duplicate makes `len(bt.__all__)` a lie, and any tool that
+# walks the surface — the docs coverage check, a stub generator, `from batcher import *` —
+# does the work for it twice. Order is preserved, so the surface itself is unchanged.
+__all__ = list(dict.fromkeys(__all__))

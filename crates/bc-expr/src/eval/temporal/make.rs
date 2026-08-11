@@ -36,16 +36,27 @@ fn ymd_to_days(y: i64, m: i64, d: i64) -> Option<i32> {
 }
 
 /// Microseconds from the Unix epoch to `y-m-d h:mi:s`, or `None` if it does not exist.
-fn ymdhms_to_micros(y: i64, m: i64, d: i64, h: i64, mi: i64, s: i64) -> Option<i64> {
+///
+/// The seconds field is a float because DuckDB's `make_timestamp` takes one:
+/// `make_timestamp(2021, 1, 1, 0, 0, 0.5)` is half a second past midnight. Casting it to
+/// an integer first, as every other field is, silently dropped the fraction and returned
+/// midnight — a wrong instant with no error anywhere.
+fn ymdhms_to_micros(y: i64, m: i64, d: i64, h: i64, mi: i64, s: f64) -> Option<i64> {
     let days = i64::from(ymd_to_days(y, m, d)?);
-    if !(0..24).contains(&h) || !(0..60).contains(&mi) || !(0..60).contains(&s) {
+    if !(0..24).contains(&h)
+        || !(0..60).contains(&mi)
+        || !s.is_finite()
+        || !(0.0..60.0).contains(&s)
+    {
         return None;
     }
     // Leap seconds are not representable in Arrow's timestamp, so second 60 is rejected
     // above rather than folded into the next minute.
+    let micros = (s * 1_000_000.0).round() as i64;
     days.checked_mul(86_400)?
-        .checked_add(h * 3_600 + mi * 60 + s)?
-        .checked_mul(1_000_000)
+        .checked_add(h * 3_600 + mi * 60)?
+        .checked_mul(1_000_000)?
+        .checked_add(micros)
 }
 
 /// The number of arguments `func` takes. Stated here rather than at each call site so the
@@ -86,6 +97,17 @@ pub(crate) fn eval_make_temporal(
         let c = cols[j];
         (!c.is_null(i)).then(|| c.value(i))
     };
+    // The seconds field keeps its fraction, so it is read from a Float64 view of the
+    // original argument rather than from the Int64 one every other field uses.
+    let seconds: Option<ArrayRef> = match func {
+        MakeTemporalFunc::MakeTimestamp => Some(cast(&args[5], &DataType::Float64)?),
+        _ => None,
+    };
+    let second_at = |i: usize| -> Option<f64> {
+        let a = seconds.as_ref()?;
+        let c = a.as_primitive::<arrow::datatypes::Float64Type>();
+        (!c.is_null(i)).then(|| c.value(i))
+    };
 
     Ok(match func {
         MakeTemporalFunc::MakeDate => Arc::new(
@@ -102,7 +124,7 @@ pub(crate) fn eval_make_temporal(
                         value_at(2, i)?,
                         value_at(3, i)?,
                         value_at(4, i)?,
-                        value_at(5, i)?,
+                        second_at(i)?,
                     )
                 })
                 .collect::<TimestampMicrosecondArray>(),

@@ -127,6 +127,19 @@ def llm_udf(
         def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
             return _generate_batch(self._engine, batch, spec)
 
+        def close(self) -> None:
+            """Release the engine when the worker is done with it.
+
+            `close` is the teardown contract `core.udf.lifecycle` and `InferencePool` look
+            for, and they look for it on *this* object — so an engine holding a request
+            thread pool (the OpenAI and Anthropic ones do) or a loaded model never heard
+            about it, and its threads outlived every worker that was built. Best-effort by
+            the same contract: the rows are already produced.
+            """
+            close = getattr(self._engine, "close", None)
+            if callable(close):
+                close()
+
     return _LlmGenerate
 
 
@@ -281,7 +294,7 @@ def _generate_batch(
     `_length_sorted_order`), so the appended columns line up with the caller's rows
     exactly as they did before.
     """
-    import pyarrow as pa
+    from batcher.ml.tabular.features import append_columns
 
     if spec is None:
         spec = GenerateSpec(**spec_kwargs)
@@ -307,12 +320,15 @@ def _generate_batch(
     outputs = _fan_out(unique_outputs, inverse)
     row_reported = _row_reported(engine, reported, order, inverse, spec)
 
-    arrays = [batch.column(i) for i in range(batch.num_columns)]
-    arrays.append(_output_column(outputs, spec))
+    arrays = [_output_column(outputs, spec)]
     # Everything is already in row order (order un-applied, uniques fanned out), so the
     # column builders un-permute nothing: pass order=None.
     arrays += _reported_columns(engine, outputs, None, row_reported, spec)
-    return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, *spec.appended_columns])
+    # `append_columns` **replaces** a name the batch already carries. Building the batch by
+    # hand appended it instead, and Arrow permits duplicate field names — so re-generating
+    # into the column you read, or a second pass over the default `response`, produced two
+    # columns of one name that `to_pydict()` and every expression disagree about.
+    return append_columns(batch, dict(zip(spec.appended_columns, arrays, strict=True)))
 
 
 def _dedup_requests(requests: list) -> tuple[list, list[int]]:
@@ -398,7 +414,11 @@ def _output_column(outputs: list, spec: GenerateSpec) -> Any:
 
     if spec.parse_json:
         return pa.array([_safe_json(o) for o in outputs])
-    return pa.array([str(o) for o in outputs], type=pa.string())
+    # A row the engine could not generate for stays **null**. `str(None)` renders the
+    # four-letter word "None", which is a plausible-looking generation that no downstream
+    # filter can tell from a real one — the same trap `requests._cell` guards on the input
+    # side, and the reason `parse_json` and every reported column already null out.
+    return pa.array([None if o is None else str(o) for o in outputs], type=pa.string())
 
 
 def _reported_columns(

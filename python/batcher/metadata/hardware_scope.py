@@ -46,24 +46,77 @@ models are fitted from per-operator feedback that every query produces.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+import contextlib
+import contextvars
+from collections.abc import Iterator
 
 from batcher._internal.hardware import fingerprint
 
-__all__ = ["measured_here", "scoped", "scoped_key"]
+__all__ = ["planning_for", "scoped", "scoped_key"]
+
+# The machine class the enclosing scope is planning *for*, when that is not this process.
+#
+# Ambient rather than threaded, and deliberately: the hazard this exists to remove is a
+# **read and a write disagreeing**, and a parameter carried through twenty signatures is
+# exactly how they come to disagree. The bandit's arm is written by `api.tuning.decisions`
+# after a run and read by `kyber.rules.selection` while planning the next one; if those two
+# resolve the class independently — say by asking the cluster twice, across an autoscale —
+# the value is filed under a key nothing will ever read, and every learned quantity silently
+# stops accruing. Inside one scope there is one answer by construction.
+#
+# `dist.executors.ray_runtime.scaling._TOPOLOGY` is the same pattern for the same reason.
+_PLANNING_FOR: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "batcher_planning_for_machine", default=""
+)
+
+
+@contextlib.contextmanager
+def planning_for(hw_fingerprint: str) -> Iterator[None]:
+    """Key machine-scoped learned state to `hw_fingerprint` for the enclosing scope.
+
+    Wrap the span that both **plans** a run and **records** its outcome, so the two cannot
+    key the same learned value differently. The conductor does this around a distributed
+    run, naming the workers' machine class; single-node runs pass `""` and everything
+    resolves to this process exactly as before.
+
+    Args:
+        hw_fingerprint: The class to key by, from `HardwareProfile.fingerprint`. `""` is a
+            no-op, which is what a single-node run and an unprobeable fleet both pass.
+
+    Yields:
+        Nothing; the scope is the effect.
+    """
+    if not hw_fingerprint:
+        yield
+        return
+    token = _PLANNING_FOR.set(hw_fingerprint)
+    try:
+        yield
+    finally:
+        _PLANNING_FOR.reset(token)
+
 
 # Separator between a namespace and its hardware fingerprint. `@` reads as "measured on" and
 # appears in no existing namespace, so a scoped name can never collide with an unscoped one.
 _SEPARATOR = "@"
 
 
-def scoped(namespace: str) -> str:
-    """`namespace` qualified by this machine's hardware fingerprint.
+def scoped(namespace: str, hw_fingerprint: str = "") -> str:
+    """`namespace` qualified by a hardware fingerprint — by default this machine's.
 
     Use for any namespace whose stored values are measured in machine units — times, bytes,
     device capacities, or sizes chosen against them. Do not use for data statistics, which
     describe the data and transfer across machines unchanged.
+
+    **Whose machine is not always this one.** A value written and read on the process that
+    *executed* the work is correctly keyed by the local fingerprint, and that covers the UDF,
+    autobatch and device-utilization loops. It does not cover the loops that run on the
+    **driver** about work done on the **workers** — the join-strategy bandit, the broadcast and
+    sort-merge crossovers, the build-side priors. Those are self-consistent under the local key
+    (nothing is dropped, unlike the `op_stats` view this mirrors) but they name the wrong
+    machine: a fleet that autoscales from one worker type to another files both under one key,
+    and two drivers of different classes against identical workers fragment what should be one
+    model. Such a caller passes the class it is planning *for*.
 
     Examples:
         .. doctest::
@@ -75,15 +128,18 @@ def scoped(namespace: str) -> str:
 
     Args:
         namespace: The unscoped namespace name.
+        hw_fingerprint: The machine class to key by, from `HardwareProfile.fingerprint`.
+            `""` — the default, and what every caller measuring its own machine passes —
+            falls back to the enclosing `planning_for` scope, then to this process's class.
 
     Returns:
-        The namespace qualified with this machine class's fingerprint.
+        The namespace qualified with that machine class's fingerprint.
     """
-    return f"{namespace}{_SEPARATOR}{fingerprint()}"
+    return f"{namespace}{_SEPARATOR}{hw_fingerprint or _PLANNING_FOR.get() or fingerprint()}"
 
 
-def scoped_key(key: str) -> str:
-    """`key` qualified by this machine's hardware fingerprint.
+def scoped_key(key: str, hw_fingerprint: str = "") -> str:
+    """`key` qualified by a hardware fingerprint — by default the one in force for this scope.
 
     The per-key counterpart of `scoped`, for a store whose namespace is already carrying
     another dimension and where splitting the namespace would fragment an index that other
@@ -91,32 +147,22 @@ def scoped_key(key: str) -> str:
     machine's entries contiguous, which makes them cheap to load together and easy to drop
     when a machine class goes away.
 
+    **Resolves the machine class exactly as `scoped` does**, through the enclosing
+    `planning_for` scope before falling back to this process. It did not, and that was the one
+    way the two spellings of the same idea could disagree: a value written with `scoped_key`
+    inside a distributed run was filed under the *driver's* class while everything written with
+    `scoped` in the same scope was filed under the *workers'*, so a read that used either
+    spelling found nothing the other had stored. The whole reason `planning_for` is ambient
+    rather than threaded is to make a read and a write agree by construction, and a second
+    entry point that ignored it defeated that for its callers.
+
     Args:
         key: The unscoped key.
+        hw_fingerprint: The machine class to key by, from `HardwareProfile.fingerprint`.
+            `""` — the default — falls back to the enclosing `planning_for` scope, then to this
+            process's class.
 
     Returns:
-        The key qualified with this machine class's fingerprint.
+        The key qualified with that machine class's fingerprint.
     """
-    return f"{key}{_SEPARATOR}{fingerprint()}"
-
-
-def measured_here(row: Mapping[str, Any]) -> bool:
-    """Whether a stored feedback row was measured on this machine class.
-
-    The predicate behind the `op_stats_by_kind` filter. A row carries the fingerprint of the
-    machine that measured it, which for a distributed worker's row is the *worker's* rather
-    than the driver's.
-
-    A row with no fingerprint — one written before the field existed — is **not** ours. That
-    is deliberate: "measured on an unknown machine" is not evidence about this one, and
-    adopting it would reinstate exactly the blend this module removes, on the first run after
-    an upgrade. Such rows age out of the store and the models re-converge within a few runs,
-    because every query contributes feedback.
-
-    Args:
-        row: A stored feedback row.
-
-    Returns:
-        `True` when this machine class measured it.
-    """
-    return row.get("hw_fingerprint", "") == fingerprint()
+    return f"{key}{_SEPARATOR}{hw_fingerprint or _PLANNING_FOR.get() or fingerprint()}"

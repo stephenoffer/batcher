@@ -11,24 +11,82 @@ use indexmap::IndexMap;
 
 use super::{null_mask, JoinIndices};
 use crate::error::RuntimeError;
+use crate::measure::NumericKeys;
+
+/// Which side of the left key an ASOF match may come from.
+///
+/// `Backward` (the default everywhere: pandas, Polars, DuckDB) takes the last known value
+/// at or before the left row — the "what was the price when this trade happened" reading.
+/// `Forward` takes the first value at or after it. `Nearest` takes whichever of the two is
+/// closer, breaking an exact tie toward the backward one, matching pandas'
+/// `direction="nearest"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsofDirection {
+    Backward,
+    Forward,
+    Nearest,
+}
+
+/// Everything about an ASOF match beyond the keys themselves.
+///
+/// Bundled rather than passed as three more positional arguments, because the three
+/// interact: `Nearest` and a `tolerance` both need a measurable key, and
+/// `allow_exact_matches` moves the boundary both directions search from.
+#[derive(Debug, Clone, Copy)]
+pub struct AsofSpec {
+    pub direction: AsofDirection,
+    /// Cap on the distance between the matched keys, in the key's own units and in
+    /// microseconds for a temporal key. `None` = uncapped.
+    pub tolerance: Option<f64>,
+    /// Whether a right row whose key *equals* the left row's may be the match.
+    ///
+    /// `false` is the strict form pandas spells `allow_exact_matches=False`: a backward
+    /// join then takes the last row strictly *before* the left key. It is what keeps a
+    /// backtest honest — a quote stamped at the same instant as the trade is information
+    /// the trade did not have, and matching it is look-ahead bias that inflates every
+    /// result downstream without ever looking like a bug.
+    pub allow_exact_matches: bool,
+}
+
+impl Default for AsofSpec {
+    fn default() -> Self {
+        AsofSpec {
+            direction: AsofDirection::Backward,
+            tolerance: None,
+            allow_exact_matches: true,
+        }
+    }
+}
 
 /// Compute ASOF (nearest-match) join indices. Every left row is emitted (left-style);
 /// it is matched to the right row whose `on` key is nearest *in `direction`* within
 /// the same `by` group (exact `by` equality). Unmatched left rows get a null right
 /// index (arrow `take` then yields null), exactly like a left outer join.
 ///
-/// `backward = true` picks the largest right.on ≤ left.on; `false` picks the smallest
-/// right.on ≥ left.on. Keys are arrow row-encoded, so `on` (order-preserving) and
-/// `by` (equality) work for any type. Rows with a null `on` never match. As with the
-/// equi-join primitive, partitioning both sides by `by` makes a global ASOF equal the
-/// union of per-partition ASOFs — the seam the distributed path can use.
+/// [`AsofDirection`] chooses which side of the left key a match may come from. Keys are
+/// arrow row-encoded, so `on` (order-preserving) and `by` (equality) work for any type.
+/// Rows with a null `on` never match. As with the equi-join primitive, partitioning both
+/// sides by `by` makes a global ASOF equal the union of per-partition ASOFs — the seam
+/// the distributed path can use.
+///
+/// `tolerance` caps how far apart the two keys may be, in the key's own units and in
+/// **microseconds** for any temporal key. Beyond it the left row is unmatched rather than
+/// matched to a stale value, which is the difference between "the quote at the time of the
+/// trade" and "some quote from three days earlier". It requires a numeric or temporal `on`
+/// key, as does `Nearest`, because both have to subtract two keys; a non-numeric key with
+/// either errors rather than silently ignoring the request.
 pub fn asof_join_indices(
     left_on: &ArrayRef,
     right_on: &ArrayRef,
     left_by: &[ArrayRef],
     right_by: &[ArrayRef],
-    backward: bool,
+    spec: AsofSpec,
 ) -> Result<JoinIndices, RuntimeError> {
+    let AsofSpec {
+        direction,
+        tolerance,
+        allow_exact_matches,
+    } = spec;
     let n_left = left_on.len();
     let n_right = right_on.len();
 
@@ -45,6 +103,24 @@ pub fn asof_join_indices(
     let ron_canon = crate::keys::canonicalize_float_keys(std::slice::from_ref(right_on));
     let left_on: &ArrayRef = lon_canon.as_deref().map_or(left_on, |c| &c[0]);
     let right_on: &ArrayRef = ron_canon.as_deref().map_or(right_on, |c| &c[0]);
+
+    // A distance is needed only to enforce a tolerance or to choose between the two
+    // `Nearest` candidates; a plain backward/forward search reads only the ordering.
+    let needs_distance = tolerance.is_some() || direction == AsofDirection::Nearest;
+    let (left_num, right_num) = if needs_distance {
+        let l = NumericKeys::read(left_on)?;
+        let r = NumericKeys::read(right_on)?;
+        match (l, r) {
+            (Some(l), Some(r)) => (Some(l), Some(r)),
+            _ => {
+                return Err(RuntimeError::AsofKeyNotMeasurable {
+                    dtype: left_on.data_type().to_string(),
+                })
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     // One shared converter so left/right `on` encodings are mutually order-comparable.
     let on_conv = RowConverter::new(vec![SortField::new(right_on.data_type().clone())])?;
@@ -116,14 +192,47 @@ pub fn asof_join_indices(
             .map_or_else(Vec::new, |e| e.row(i).as_ref().to_vec());
         let target = left_on_enc.row(i);
         let matched = groups.get(&key).and_then(|g| {
-            if backward {
-                // largest on ≤ target
-                let pp = g.partition_point(|(on, _)| on.row() <= target);
+            // The two candidates either side of the left key. `back` is the last row at or
+            // before it and `fwd` the first at or after it, so an exact match is *both* —
+            // which is why a tie under `Nearest` resolves to the same row either way.
+            // `allow_exact_matches` moves the boundary: with it, an equal key is the last
+            // row `back` may take and the first `fwd` may take; without it, both must step
+            // past the whole run of equal keys.
+            let back = {
+                let pp = match allow_exact_matches {
+                    true => g.partition_point(|(on, _)| on.row() <= target),
+                    false => g.partition_point(|(on, _)| on.row() < target),
+                };
                 (pp > 0).then(|| g[pp - 1].1)
-            } else {
-                // smallest on ≥ target
-                let pp = g.partition_point(|(on, _)| on.row() < target);
+            };
+            let fwd = {
+                let pp = match allow_exact_matches {
+                    true => g.partition_point(|(on, _)| on.row() < target),
+                    false => g.partition_point(|(on, _)| on.row() <= target),
+                };
                 (pp < g.len()).then(|| g[pp].1)
+            };
+            // `dist` is only ever `None` for a key with no distance, which `needs_distance`
+            // has already rejected — so an unwrap-shaped default here would be unreachable
+            // rather than lenient. Treating it as "infinitely far" keeps that unreachable.
+            let dist = |j: u32| -> f64 {
+                match (&left_num, &right_num) {
+                    (Some(l), Some(r)) => l.distance(i, r, j as usize).unwrap_or(f64::INFINITY),
+                    _ => f64::INFINITY,
+                }
+            };
+            let chosen = match direction {
+                AsofDirection::Backward => back,
+                AsofDirection::Forward => fwd,
+                // Ties go backward, matching pandas' `direction="nearest"`.
+                AsofDirection::Nearest => match (back, fwd) {
+                    (Some(b), Some(f)) => Some(if dist(f) < dist(b) { f } else { b }),
+                    (b, f) => b.or(f),
+                },
+            }?;
+            match tolerance {
+                Some(tol) if dist(chosen) > tol => None,
+                _ => Some(chosen),
             }
         });
         right_idx.push(matched);
@@ -163,7 +272,14 @@ mod tests {
         let right_on = i64s(vec![Some(5), Some(5), Some(25)]);
         let right_by = vec![strs(vec![None, Some("A"), None])];
 
-        let idx = asof_join_indices(&left_on, &right_on, &left_by, &right_by, true).unwrap();
+        let idx = asof_join_indices(
+            &left_on,
+            &right_on,
+            &left_by,
+            &right_by,
+            AsofSpec::default(),
+        )
+        .unwrap();
         let right: Vec<Option<u32>> = (0..idx.right.len())
             .map(|i| idx.right.is_valid(i).then(|| idx.right.value(i)))
             .collect();
@@ -194,7 +310,7 @@ mod tests {
             &f64s(vec![Some(0.0)]),
             &[],
             &[],
-            true,
+            AsofSpec::default(),
         )
         .unwrap();
         assert_eq!(
@@ -209,7 +325,10 @@ mod tests {
             &f64s(vec![Some(-0.0)]),
             &[],
             &[],
-            false,
+            AsofSpec {
+                direction: AsofDirection::Forward,
+                ..AsofSpec::default()
+            },
         )
         .unwrap();
         assert_eq!(
@@ -226,7 +345,7 @@ mod tests {
             &f64s(vec![Some(nan2)]),
             &[],
             &[],
-            true,
+            AsofSpec::default(),
         )
         .unwrap();
         assert_eq!(asof_right(&idx), vec![Some(0)], "NaN must match NaN");
@@ -247,14 +366,18 @@ mod tests {
 
     /// Independent brute-force ASOF reference. Mirrors the documented rule and tie-break:
     /// backward = the (max on ≤ target, then max original-row) right match within the `by`
-    /// group; forward = the (min on ≥ target, then min original-row). A null `on` or any
-    /// null `by` (either side) matches nothing. Returns the chosen right row per left row.
+    /// group; forward = the (min on ≥ target, then min original-row); nearest = the smallest
+    /// |on − target|, preferring the backward candidate on a tie. `tolerance` drops any
+    /// candidate further than that from the target. A null `on` or any null `by` (either
+    /// side) matches nothing. Returns the chosen right row per left row.
     fn brute_asof(
         left_on: &[Option<i64>],
         right_on: &[Option<i64>],
         left_by: &[Vec<Option<i64>>],
         right_by: &[Vec<Option<i64>>],
-        backward: bool,
+        direction: AsofDirection,
+        tolerance: Option<u64>,
+        allow_exact: bool,
     ) -> Vec<Option<u32>> {
         // Any null in a `by` column means the row has no group at all, so the whole key
         // is `None` rather than a key with a hole in it.
@@ -265,49 +388,59 @@ mod tests {
             .map(|i| {
                 let lon = left_on[i]?;
                 let lby = by_of(left_by, i)?;
-                let mut best: Option<(i64, u32)> = None;
-                for (j, right) in right_on.iter().enumerate() {
-                    let Some(ron) = *right else { continue };
-                    let rby = match by_of(right_by, j) {
-                        Some(k) => k,
-                        None => continue,
-                    };
-                    if rby != lby {
-                        continue;
-                    }
-                    let ok = if backward { ron <= lon } else { ron >= lon };
-                    if !ok {
-                        continue;
-                    }
-                    best = Some(match best {
-                        None => (ron, j as u32),
-                        Some((bon, bj)) => {
-                            if backward {
-                                // max on, then max row
-                                if (ron, j as u32) > (bon, bj) {
-                                    (ron, j as u32)
-                                } else {
-                                    (bon, bj)
-                                }
-                            } else {
-                                // min on, then min row
-                                if (ron, j as u32) < (bon, bj) {
-                                    (ron, j as u32)
-                                } else {
-                                    (bon, bj)
-                                }
-                            }
+                // Every right row that could match this left row at all.
+                let candidates: Vec<(i64, u32)> = (0..right_on.len())
+                    .filter_map(|j| {
+                        let ron = right_on[j]?;
+                        if by_of(right_by, j)? != lby {
+                            return None;
                         }
-                    });
-                }
-                best.map(|(_, j)| j)
+                        if tolerance.is_some_and(|t| (ron - lon).unsigned_abs() > t) {
+                            return None;
+                        }
+                        Some((ron, j as u32))
+                    })
+                    .collect();
+                // The two sides, each under its own documented tie-break: backward takes
+                // the largest `on` at or below the target and, among equals, the latest
+                // row; forward takes the smallest at or above and, among equals, the
+                // earliest. Building them separately keeps the reference a statement of
+                // the rule rather than a second copy of the binary search.
+                let backward = candidates
+                    .iter()
+                    .filter(|(on, _)| if allow_exact { *on <= lon } else { *on < lon })
+                    .max_by_key(|(on, row)| (*on, *row))
+                    .copied();
+                let forward = candidates
+                    .iter()
+                    .filter(|(on, _)| if allow_exact { *on >= lon } else { *on > lon })
+                    .min_by_key(|(on, row)| (*on, *row))
+                    .copied();
+                let chosen = match direction {
+                    AsofDirection::Backward => backward,
+                    AsofDirection::Forward => forward,
+                    // Ties prefer the backward candidate (pandas' `direction="nearest"`).
+                    AsofDirection::Nearest => match (backward, forward) {
+                        (Some(b), Some(f)) => {
+                            Some(if (f.0 - lon).unsigned_abs() < (b.0 - lon).unsigned_abs() {
+                                f
+                            } else {
+                                b
+                            })
+                        }
+                        (b, f) => b.or(f),
+                    },
+                };
+                chosen.map(|(_, j)| j)
             })
             .collect()
     }
 
-    /// Fuzz ASOF against the brute-force reference across random inputs: both directions,
-    /// 0/1/2 `by` columns, nulls in `on` and `by`, heavy ties on `on`, empty sides, and
-    /// unsorted input (the impl must sort each group itself).
+    /// Fuzz ASOF against the brute-force reference across random inputs: all three
+    /// directions crossed with eight (tolerance, allow-exact) combinations, 0/1/2 `by` columns, nulls in `on` and `by`,
+    /// heavy ties on `on`, empty sides, and unsorted input (the impl must sort each group
+    /// itself). The reference searches every right row and ranks the candidates, so it
+    /// shares no code with the kernel's binary search.
     #[test]
     fn fuzz_asof_matches_brute_force() {
         let mut rng = Rng(0xA50F_1234);
@@ -339,21 +472,48 @@ mod tests {
             let left_by: Vec<ArrayRef> = lby_v.iter().map(|c| i64s(c.clone())).collect();
             let right_by: Vec<ArrayRef> = rby_v.iter().map(|c| i64s(c.clone())).collect();
 
-            for backward in [true, false] {
-                let idx =
-                    asof_join_indices(&left_on, &right_on, &left_by, &right_by, backward).unwrap();
-                let got: Vec<Option<u32>> = (0..idx.right.len())
-                    .map(|i| idx.right.is_valid(i).then(|| idx.right.value(i)))
-                    .collect();
-                let want = brute_asof(&lon, &ron, &lby_v, &rby_v, backward);
-                // The chosen right row is unambiguous under our tie-break, so compare exactly.
-                assert_eq!(
-                    got, want,
-                    "asof mismatch backward={backward}\n lon={lon:?} ron={ron:?}\n lby={lby_v:?} rby={rby_v:?}"
-                );
-                // Left indices must always be the identity 0..nl (left-style).
-                let lidx: Vec<u32> = (0..idx.left.len()).map(|i| idx.left.value(i)).collect();
-                assert_eq!(lidx, (0..nl as u32).collect::<Vec<_>>());
+            for direction in [
+                AsofDirection::Backward,
+                AsofDirection::Forward,
+                AsofDirection::Nearest,
+            ] {
+                // `on` values span [-2, 2], so these tolerances cover "nothing matches",
+                // the interesting middle, and "the tolerance never binds".
+                for (tol, exact) in [
+                    (None, true),
+                    (Some(0u64), true),
+                    (Some(1), true),
+                    (Some(2), true),
+                    (Some(100), true),
+                    (None, false),
+                    (Some(1), false),
+                    (Some(100), false),
+                ] {
+                    let idx = asof_join_indices(
+                        &left_on,
+                        &right_on,
+                        &left_by,
+                        &right_by,
+                        AsofSpec {
+                            direction,
+                            tolerance: tol.map(|t| t as f64),
+                            allow_exact_matches: exact,
+                        },
+                    )
+                    .unwrap();
+                    let got: Vec<Option<u32>> = (0..idx.right.len())
+                        .map(|i| idx.right.is_valid(i).then(|| idx.right.value(i)))
+                        .collect();
+                    let want = brute_asof(&lon, &ron, &lby_v, &rby_v, direction, tol, exact);
+                    // The chosen right row is unambiguous under our tie-break, so compare exactly.
+                    assert_eq!(
+                        got, want,
+                        "asof mismatch direction={direction:?} tol={tol:?} exact={exact}\n lon={lon:?} ron={ron:?}\n lby={lby_v:?} rby={rby_v:?}"
+                    );
+                    // Left indices must always be the identity 0..nl (left-style).
+                    let lidx: Vec<u32> = (0..idx.left.len()).map(|i| idx.left.value(i)).collect();
+                    assert_eq!(lidx, (0..nl as u32).collect::<Vec<_>>());
+                }
             }
         }
     }
@@ -367,7 +527,14 @@ mod tests {
         let right_on = i64s(vec![Some(5), Some(5)]);
         let right_by = vec![strs(vec![Some("A"), Some("A")]), i64s(vec![Some(1), None])];
 
-        let idx = asof_join_indices(&left_on, &right_on, &left_by, &right_by, true).unwrap();
+        let idx = asof_join_indices(
+            &left_on,
+            &right_on,
+            &left_by,
+            &right_by,
+            AsofSpec::default(),
+        )
+        .unwrap();
         let right: Vec<Option<u32>> = (0..idx.right.len())
             .map(|i| idx.right.is_valid(i).then(|| idx.right.value(i)))
             .collect();

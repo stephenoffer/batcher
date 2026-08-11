@@ -630,7 +630,7 @@ possible at all.
 
 Third, keep SQL. It remains the right language for a relational question, so the same
 engine accepts it through \texttt{bt.sql} and a session catalog, parses it to the same
-\texttt{LogicalPlan}, and puts it through the same 375 rules. Vector search shows the
+\texttt{LogicalPlan}, and puts it through the same 725 rules. Vector search shows the
 two surfaces meeting: \texttt{ORDER BY list\_cosine\_similarity(emb, [...]) LIMIT k}
 is an ordinary SQL query, and it runs the same kernel the Python accessor calls.
 Neither surface wraps the other, because both lower to one plan.
@@ -709,7 +709,7 @@ which tier ran depends only on whether the expression happened to compile.
  & \textbf{\sys{}} & DuckDB & Polars & Spark & Ray Data & Daft \\
 \midrule
 Single-node / distributed & \win one algebra & single-node & single-node & two paths & two paths & two paths \\
-Optimizer & \win 375 rules, bushy DP & rules + DP & rules & Catalyst & n/a & rules \\
+Optimizer & \win 725 rules, bushy DP & rules + DP & rules & Catalyst & n/a & rules \\
 Cardinality from & \win sketches + measured & table stats & estimates & table stats & n/a & estimates \\
 Cost model & \win refit from runtime & static & static & static & n/a & static \\
 Physical strategy & \win bandit over past runs & heuristic & heuristic & heuristic & n/a & heuristic \\
@@ -775,7 +775,7 @@ shuffles, which \sys{} keeps and brackets with a clock on either side
 % ===========================================================================
 
 
-\subsection{375 rules, and what makes them safe}
+\subsection{725 rules, and what makes them safe}
 
 Seven phases run in a fixed order. The rewrite phases iterate to a fixpoint because
 their rules are confluent; the cost-based and physical phases run once, because they
@@ -787,7 +787,7 @@ A rule set this size is safe only if each rule preserves results and no two
 interfere, and \kyber{} proves both mechanically. Each rule carries a plan-shape unit
 test and a differential test against DuckDB across nulls, empties and the type edges,
 and the set as a whole is property-tested: a generator builds a random table and a
-random valid pipeline and asserts that the result under all 375 rules equals the
+random valid pipeline and asserts that the result under all 725 rules equals the
 result under none. The same suite proves confluence and termination, so the rules
 provably do not oscillate.
 
@@ -919,11 +919,25 @@ The executor pulls small batches through linear runs of operators and materializ
 only at pipeline breakers, in the style of morsel-driven
 parallelism~\cite{leis2014morsel}. Six operator-level results came out of that model,
 each verified against the sequential oracle before it was timed: a short-circuiting
-conjunctive filter (1.5--5.7$\times$), dictionary-native comparison (19.6$\times$), a
-runtime filter sunk across joins (1.9$\times$), a deterministic parallel join map
-(1.8$\times$), a bounded join fan-out ($18\times$ less memory), and a real
-inequality-join operator (up to $900\times$). Individually they are unremarkable.
-Three points about them are not.
+conjunctive filter (1.5--5.7$\times$), a parallel \texttt{UNION ALL}
+(up to $24.5\times$), a runtime filter sunk across joins (1.9$\times$), a
+deterministic parallel join map (1.8$\times$), a bounded join fan-out ($18\times$ less
+memory), and a real inequality-join operator (up to $900\times$). Individually they are
+unremarkable. Three points about them are not.
+
+\paragraph{The union result is a lesson about where parallelism is lost.} A
+\texttt{UNION ALL}'s branches are independent, so a serial loop over them looks like it
+forfeits only their overlap --- a bounded factor equal to the branch count. It forfeits
+much more. A union root has no single driving relation to slice, so the whole query
+declines to shard and \emph{every branch also loses its own internal parallelism}.
+Measured on TPC-DS q22's five grouping levels over a three-table join, one level alone
+runs at $63.6$ cores in $106$\,ms while the five unioned ran at $5.8$ cores in
+$2{,}624$\,ms --- the same $15.1$\,s of CPU spread over a ninth of the machine, and
+$8\times$ the sum of the parts. Running the branches across the pool takes q22 from
+$5{,}036$\,ms to $206$\,ms ($24.5\times$), q18 $11.2\times$ and q14 $6.2\times$, and
+moves TPC-DS from $1.57\times$ to $1.28\times$ DuckDB's geometric mean. The general
+form of the lesson is that a plan-shape predicate which disables sharding costs the
+subtree's parallelism, not just the node's.
 
 \paragraph{Two rewrites that are correct by construction.} Most optimizations are
 justified by testing: apply the fast path, compare against the slow one, ship it when
@@ -971,7 +985,7 @@ the smaller sizes become $1.6$--$2.0\times$ wins.
 Baseline & geomean $b/x$ & wins & & geomean $b/x$ & wins & Note \\
 \midrule
 DuckDB (native compressed store) & 1.02$\times$ & 12/22 & & \loss 1.49$\times$ & \loss 3/22 & compressed store \\
-DuckDB (same Arrow input)        & --- & --- & & \win \textbf{0.53}$\times$ & \win \textbf{21/22} & like-for-like$^*$ \\
+DuckDB (same Arrow input)        & \win \textbf{0.34}$\times$ & \win \textbf{22/22} & & \win \textbf{0.53}$\times$ & \win \textbf{21/22} & like-for-like$^*$ \\
 Polars~\cite{polars}             & \win \textbf{0.55}$\times$ & \win 19/22 & & \win \textbf{0.45}$\times$ & \win 17/22 & \\
 Daft~\cite{daft}                 & \win \textbf{0.48}$\times$ & \win 18/20 & & \win \textbf{0.52}$\times$ & 13/20 & wrong answers on q6, q15$^\dagger$ \\
 Spark~\cite{armbrust2015sparksql}& 0.041$\times$ & 22/22 & & 0.074$\times$ & 22/22 & reads Parquet in timed region$^\ddagger$ \\
@@ -983,7 +997,11 @@ $\text{\sys{}}_{ms}/x_{ms}$: \textbf{below 1.00 means \sys{} is faster.} Suite
 totals (ms), sf1 / sf10: \sys{} 618 / 4{,}491; DuckDB 616 / 2{,}353; Polars
 1{,}256 / 10{,}624; Daft 1{,}224 / 9{,}261; Spark 14{,}555 / 57{,}781.
 $^*$Separate run: DuckDB executing the same zero-copy Arrow \sys{} is given, not a
-compressed store it was allowed to build first; 4{,}453 vs 8{,}436\,ms.
+compressed store it was allowed to build first; sf1 563 vs 1{,}581\,ms, sf10 4{,}453 vs
+8{,}436\,ms. Both arms must be timed on an otherwise idle machine: DuckDB-on-Arrow
+degrades far more than \sys{} under CPU contention, and a run sharing the box with a
+test suite inflated this ratio by roughly ten times (q17 read 1{,}033\,ms against 83\,ms
+idle) --- an error in \sys{}'s favour, which is the direction that gets published.
 $^\dagger$Daft covers the 20 queries it can express; \sys{} agrees with DuckDB on 22
 of 22 at both scales. $^\ddagger$Spark reads Parquet inside the timed region where
 the other four receive an in-memory Arrow handle, so its ratio is overstated. Ray
@@ -1087,7 +1105,7 @@ for a repeated shape. End to end over twelve never-seen shapes at $n=10^4$, \sys
 runs at $0.80\times$ DuckDB on a cold filter and $0.27\times$ on a cold
 \texttt{count(*)} over one. DuckDB pays a first-query cost too, and ours is the
 smaller. This is where a Python control plane could have been disqualifying and is
-not: $375$ rules over seven phases iterated to a fixpoint cost single-digit
+not: $725$ rules over seven phases iterated to a fixpoint cost single-digit
 milliseconds because nothing in them is per-row.
 
 \subsection{Scaling out}

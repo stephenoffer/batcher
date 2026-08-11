@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from sqlglot import expressions as exp
 
-from batcher.plan.expr_ir import Expr
+from batcher.plan.expr_ir import Expr, coalesce, lit, nullif, when
 
 
 def json_path(node) -> str:
@@ -93,9 +93,29 @@ def json_function(tr, node) -> Expr | None:
         needle = _const_str_arg(args[1], "json_contains()", "value")
         return tr._scalar(args[0]).json.contains(needle)
     if name == "json_valid":
-        # A document is valid JSON exactly when the root has a JSON type; the kernel
-        # answers null for text it cannot parse, which is the same test.
-        return tr._scalar(args[0]).json.type_of().is_not_null()
+        # A document is valid JSON exactly when the root has a JSON type, and the kernel
+        # answers null for text it cannot parse — so `type_of() IS NOT NULL` is the test.
+        #
+        # It is not the whole test, because the kernel answers null for *two* reasons and
+        # they need different answers: unparseable text is FALSE, but a NULL document is
+        # NULL, the way every SQL predicate propagates its input's nullness. Reading both
+        # as FALSE made a NULL row report as *invalid JSON* rather than unknown, so
+        # `WHERE NOT json_valid(j)` — how you isolate bad documents — returned every NULL
+        # row alongside the genuinely malformed ones. Same query, no error, wrong row set.
+        doc = tr._scalar(args[0])
+        valid = doc.json.type_of().is_not_null()
+        return when(doc.is_null()).then(nullif(lit(True), lit(True))).otherwise(valid)
+
+    if name == "json_array_length" and len(args) == 1:
+        # A document that parses but is not an array has length 0, not null: DuckDB
+        # answers 0 for `{"a":1}`, `"s"` and `5` alike. The kernel returns null for those
+        # *and* for a document it cannot parse *and* for a null input, so the three are
+        # separated by asking the root's type first — null type means unparseable or
+        # null, which stays null, and anything else that is not an array coalesces to 0.
+        doc = tr._scalar(args[0])
+        parsed = doc.json.type_of().is_not_null()
+        length = coalesce(doc.json.array_length(), lit(0))
+        return when(parsed).then(length).otherwise(nullif(lit(0), lit(0)))
 
     method = _JSON_PATH_FNS.get(name)
     if method is None:

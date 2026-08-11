@@ -225,3 +225,35 @@ def test_an_unprobeable_cluster_reports_unknown_rather_than_a_guess(monkeypatch)
         ),
     )
     assert probe.cluster_l3_cache_bytes() == 1 << 20
+
+
+def test_scoped_key_follows_the_planning_scope_like_scoped_does():
+    """The two spellings of one idea must resolve the machine class identically.
+
+    `scoped_key` read this process's fingerprint unconditionally, so a value written with it
+    inside a distributed run was filed under the *driver's* class while everything written with
+    `scoped` in the same scope was filed under the *workers'*. A read using either spelling
+    then found nothing the other had stored — and the whole reason `planning_for` is ambient
+    rather than threaded is to make a read and a write agree by construction.
+    """
+    from batcher.metadata.hardware_scope import planning_for, scoped, scoped_key
+
+    with planning_for("deadbeef1234"):
+        assert scoped("kyber.cost").endswith("@deadbeef1234")
+        assert scoped_key("join:7").endswith("@deadbeef1234")
+
+
+def test_an_explicit_class_still_overrides_the_scope():
+    from batcher.metadata.hardware_scope import planning_for, scoped_key
+
+    with planning_for("deadbeef1234"):
+        assert scoped_key("join:7", "0123456789ab").endswith("@0123456789ab")
+
+
+def test_outside_a_scope_both_fall_back_to_this_process():
+    from batcher._internal.hardware import fingerprint
+    from batcher.metadata.hardware_scope import scoped, scoped_key
+
+    local = fingerprint()
+    assert scoped("kyber.cost") == f"kyber.cost@{local}"
+    assert scoped_key("join:7") == f"join:7@{local}"

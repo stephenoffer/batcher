@@ -34,7 +34,7 @@ import pyarrow as pa
 
 from batcher._internal.native import engine
 
-__all__ = ["execute_metered", "record_worker_metrics"]
+__all__ = ["drain_worker_metrics", "execute_metered", "record_worker_metrics"]
 
 
 def execute_metered(
@@ -66,7 +66,7 @@ def execute_metered(
 
 
 def _stamped_with_this_worker(metrics_json: str) -> str:
-    """Tag every op in a metrics document with the fingerprint of the node that ran it.
+    """Tag every op in a metrics document with the hardware state of the node that ran it.
 
     A worker's measurements — times, bytes, faults — describe the *worker's* hardware, but
     they are recorded into the hub on the driver, which is frequently a different machine and
@@ -82,18 +82,32 @@ def _stamped_with_this_worker(metrics_json: str) -> str:
     Args:
         metrics_json: The raw `ExecMetrics` document from this worker's engine.
 
+    The worker's CPU *clamp* travels the same way and for the same reason. Whether a cgroup's
+    quota is binding is a property of the container the work ran in, and on a cluster that is
+    the worker's container, never the driver's. A driver reading its own (unthrottled) counters
+    on a worker's behalf would report a quiet box for a fleet being clamped to a third of its
+    quota — which is the reading that makes `plan.feedback.oversubscribed` shrink the very
+    reservations that are already starved.
+
     Returns:
-        The document with `hw_fingerprint` set on every op, or the original on any failure.
+        The document with `hw_fingerprint` and `cpu_throttled_ratio` set on every op, or the
+        original on any failure.
     """
     if not metrics_json:
         return metrics_json
     from batcher._internal.hardware import fingerprint
+    from batcher._internal.hardware.cgroup import cgroup_throttled_ratio
+    from batcher._internal.hardware.cpu import cpu_thermal_events
 
     try:
         doc = json.loads(metrics_json)
         here = fingerprint()
+        throttled = cgroup_throttled_ratio() or 0.0
+        thermal = cpu_thermal_events()
         for op in doc.get("ops", []):
             op["hw_fingerprint"] = here
+            op["cpu_throttled_ratio"] = throttled
+            op["cpu_thermal_events"] = thermal
         return json.dumps(doc)
     except (ValueError, TypeError, AttributeError):
         return metrics_json
@@ -102,7 +116,7 @@ def _stamped_with_this_worker(metrics_json: str) -> str:
 def record_worker_metrics(
     hub: Any,
     metrics_jsons: Iterable[str],
-    metrics_out: list[list[dict[str, Any]]] | None = None,
+    metrics_out: list[dict[str, Any]] | None = None,
 ) -> None:
     """Fold distributed workers' sub-plan metrics into the hub (driver side).
 
@@ -115,7 +129,12 @@ def record_worker_metrics(
     Args:
         hub: The `FeedbackSink` to record into, or `None` to only fill `metrics_out`.
         metrics_jsons: Raw `ExecMetrics` documents, one per worker task; `""` is skipped.
-        metrics_out: When given, each worker's parsed op-list is appended to it.
+        metrics_out: When given, each worker's parsed `ExecMetrics` **document** is appended
+            to it — not just its op-list. The document also carries the ``query`` block, the
+            whole-execution CPU / memory / disk reading, and a worker's share of that is only
+            recoverable here: it is measured per task, so dropping it on the driver is the
+            difference between a distributed run reporting what it cost the cluster and
+            reporting nothing at all.
     """
     from batcher.config import active_config
 
@@ -129,4 +148,47 @@ def record_worker_metrics(
             core.record_exec_metrics(hub, metrics_json, morsel_rows)
         if metrics_out is not None:
             with contextlib.suppress(ValueError, TypeError):
-                metrics_out.append(json.loads(metrics_json).get("ops", []))
+                metrics_out.append(json.loads(metrics_json))
+
+
+def drain_worker_metrics(actors: Iterable[Any], hub: Any, metrics_out: Any = None) -> None:
+    """Pull each Flight worker's `ExecMetrics` documents and fold them in (driver side).
+
+    The disk-shuffle routes hand their metrics back as a task result, because a task
+    returns once and its value travels with it. A Flight worker is a long-lived actor
+    whose methods return addresses, tickets and paths — so its measurements have to be
+    *drained* instead, which is what this does after the barrier.
+
+    Pulled rather than pushed because nothing subscribes to the event bus inside a Ray
+    worker: a measurement published there is delivered to no one. One extra round trip per
+    stage, carrying a few kilobytes of JSON, against a shuffle that has just moved the data.
+
+    Best-effort in every direction. An actor that has died, an engine without the drain
+    method, a malformed document — each costs its own contribution and nothing else. The
+    stage's rows are already computed by the time this runs, and no statistic is worth
+    failing a finished query for.
+
+    Args:
+        actors: The Flight worker handles this stage ran on.
+        hub: The `FeedbackSink` to record into, or `None` to only fill `metrics_out`.
+        metrics_out: When given, each worker's parsed document is appended to it for the
+            conductor's `QueryProfile`.
+    """
+    if hub is None and metrics_out is None:
+        return
+    import ray
+
+    pending = []
+    for actor in actors:
+        drain = getattr(actor, "drain_metrics", None)
+        if drain is None:  # an actor from an engine that predates the drain
+            continue
+        with contextlib.suppress(Exception):
+            pending.append(drain.remote())
+    if not pending:
+        return
+    documents: list[str] = []
+    for ref in pending:
+        with contextlib.suppress(Exception):  # a worker that died after its work landed
+            documents.extend(ray.get(ref) or [])
+    record_worker_metrics(hub, documents, metrics_out)

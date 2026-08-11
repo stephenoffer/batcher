@@ -31,9 +31,9 @@ print(spec.memory_gib, spec.tdp_watts, spec.nvlink_domain, spec.mig_slices)
 
 ## See what the fleet looks like
 
-`bt.accelerators()` reports what this process and its cluster can see: the local devices with
+{py:func}`bt.accelerators() <batcher.accelerators>` reports what this process and its cluster can see: the local devices with
 their nameplate figures and any live readings, the cluster's shape, and the power envelope.
-`bt.show_accelerators()` prints the same thing for a human. Keys are present only when their
+{py:func}`bt.show_accelerators() <batcher.show_accelerators>` prints the same thing for a human. Keys are present only when their
 source could answer, so a CPU-only host reports a backend and an empty device list rather than
 a page of zeros.
 
@@ -119,7 +119,7 @@ because clamping it would mean inventing the watts it draws.
 ## Report what a run cost
 
 Energy is recorded per stage, and the report is where a GPU-hour becomes actionable. Wrap the
-work in `bt.measure_energy()` and every accelerator stage inside records what it drew:
+work in {py:func}`bt.measure_energy() <batcher.measure_energy>` and every accelerator stage inside records what it drew:
 
 ```python
 import batcher as bt
@@ -275,7 +275,7 @@ print(plan.profile.name, plan.instances_per_device, plan.devices_needed)
 ```
 
 Fourteen small workers land on two devices rather than fourteen. Set `prefer_mig=False` on
-`AcceleratorConfig` to keep whole devices instead. Creating the instances themselves is a
+{py:class}`AcceleratorConfig <batcher.config.AcceleratorConfig>` to keep whole devices instead. Creating the instances themselves is a
 privileged driver operation your platform performs at provisioning time; Batcher plans against
 them and never reconfigures a device.
 
@@ -391,9 +391,9 @@ print(verdict.allowed, verdict.enforced)
 ```
 
 The mode is one of `RESIDENCY_MODES`. Start at `advisory`, which returns a failing
-`ResidencyVerdict` your logs record while the job proceeds, so you can find every violating
+{py:class}`ResidencyVerdict <batcher.governance.ResidencyVerdict>` your logs record while the job proceeds, so you can find every violating
 placement in a real workload before anything blocks. Move to `strict` once the log is clean;
-refusals then raise `AccessDeniedError` with the obligation named.
+refusals then raise {py:exc}`AccessDeniedError <batcher.AccessDeniedError>` with the obligation named.
 
 A job reading several datasets may run only where all of them may:
 
@@ -451,4 +451,4 @@ that is merely busy.
 - {doc}`/configuration/options`: every accelerator field with its default and unit.
 - {doc}`/api/operations/governance`: the residency reference.
 - {doc}`/architecture/deep-dives/distribution/distributed-scheduling`: how a stage becomes tasks on a cluster.
-- {doc}`/user-guide/operate/running/observability`: the metrics sink the `energy.*` rows land in.
+- {doc}`/user-guide/operate/running/metrics`: the metrics sink the `energy.*` rows land in.

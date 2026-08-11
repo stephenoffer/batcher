@@ -15,7 +15,7 @@
 
 use arrow::datatypes::{DataType, Schema};
 
-use crate::{BinaryOp, Expr, StrFunc};
+use crate::{BinaryOp, Expr, SeqFunc, StrFunc};
 
 /// True when `expr` is a bare column reference whose values are already UTF-8, so
 /// reading it as a string involves no per-row conversion that could reject a value.
@@ -172,6 +172,12 @@ impl Expr {
             // predicate on rows a cheaper conjunct already rejected. Classifying it
             // fallible keeps it on the far side of that reordering.
             | Expr::Geo { .. }
+            // A rigid-body function raises only on a caller error too (a non-numeric
+            // column in a coordinate slot), so the same argument applies to it. It is
+            // far cheaper than a geo call, but "cheap enough to reorder" is not the
+            // question this predicate answers, and grouping it with its nearest
+            // neighbour keeps the classification conservative.
+            | Expr::Spatial { .. }
             | Expr::Image { .. }
             | Expr::ImageCrop { .. }
             | Expr::Audio { .. }
@@ -211,6 +217,13 @@ impl Expr {
             | Expr::ListJoin { .. }
             | Expr::WindowStart { .. }
             | Expr::WindowBuckets { .. }
+            // A `.seq` op raises on a caller error (an unmatchable motif, an unknown
+            // alphabet, an out-of-range `k` or reading frame) rather than on a row's value,
+            // so it would qualify as schema-driven. It is grouped fallible anyway for the
+            // same reason `Geo` is: a k-mer or minimizer scan is among the most expensive
+            // things an expression can do per row, and short-circuiting exists precisely to
+            // keep that work behind the cheaper conjuncts that reject rows first.
+            | Expr::Seq { .. }
             | Expr::ListBinary { .. } => false,
         }
     }
@@ -267,6 +280,18 @@ impl Expr {
             | Expr::ImageCrop { .. }
             | Expr::Audio { .. }
             | Expr::Video { .. } => 100_000,
+            // A sequence op is a pass over the row's bases, so it scales with sequence
+            // length the way a regex does — well above the default but nowhere near a media
+            // decode. The two that allocate per k-mer are an order beyond the rest, which is
+            // what keeps a `count_motif(...) > 0` conjunct ahead of a `kmers(...)` one.
+            Expr::Seq { func, input, .. } => {
+                let own: u32 = match func {
+                    SeqFunc::Kmers | SeqFunc::CanonicalKmers | SeqFunc::Minimizers => 2_000,
+                    SeqFunc::IsoelectricPoint => 500,
+                    _ => 60,
+                };
+                own.saturating_add(input.eval_cost())
+            }
             _ => 50,
         }
     }
@@ -354,7 +379,8 @@ impl Expr {
             | Expr::DateOffset { input, .. }
             | Expr::ListJoin { input, .. }
             | Expr::WindowStart { input, .. }
-            | Expr::WindowBuckets { input, .. } => visit(input),
+            | Expr::WindowBuckets { input, .. }
+            | Expr::Seq { input, .. } => visit(input),
 
             // Two-child nodes.
             Expr::Binary { left, right, .. }
@@ -387,6 +413,7 @@ impl Expr {
             | Expr::Least { inputs } => inputs.iter().for_each(visit),
             Expr::Array { elements } => elements.iter().for_each(visit),
             Expr::Geo { args, .. } => args.iter().for_each(visit),
+            Expr::Spatial { args, .. } => args.iter().for_each(visit),
             Expr::MakeTemporal { args, .. } => args.iter().for_each(visit),
             Expr::MakeStruct { fields } => fields.iter().for_each(|f| visit(&f.value)),
             Expr::Case {

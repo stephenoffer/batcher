@@ -187,13 +187,30 @@ def drop_distinct_when_unique(node: Distinct, ctx: OptimizerContext) -> LogicalP
     if not stats.rows_exact:
         return None
     rows = stats.rows
-    for stat in stats.columns.values():
-        if stat.provenance is Provenance.EXACT and stat.ndv is not None and stat.ndv >= rows:
+    # Which columns' uniqueness would make *this* `Distinct` a no-op. For a whole-row
+    # `DISTINCT` any unique column does it: no two rows can agree everywhere if they
+    # disagree somewhere. For `DISTINCT ON (keys)` only a unique column **among the keys**
+    # does, because that form collapses rows agreeing on the keys however much they differ
+    # elsewhere — a unique column outside them is not evidence, it is the opposite.
+    #
+    # Reading every column for both forms is how `with_row_index(...).distinct(subset=[k],
+    # keep="last", order_by=<the index>)` lost its dedup entirely: `with_row_index` mints a
+    # column that is unique by construction and EXACT, so this rule fired on it and returned
+    # the input untouched. That is the standard CDC idiom for "last row wins by arrival",
+    # and it silently kept every row — the surviving `merge` then raised a cardinality
+    # violation, which is the lucky outcome; a plain `collect()` just returned the duplicates.
+    candidates = (
+        stats.columns.values()
+        if not node.keys
+        else [stats.columns[k] for k in node.keys if k in stats.columns]
+    )
+    for stat in candidates:
+        if stat.ndv_is_exact and stat.ndv is not None and stat.ndv >= rows:
             return node.input
     return None
 
 
-@rule(name="prune_filter_col_comparison", phase=Phase.SELECTION, matches=(Filter,))
+@rule(name="prune_filter_col_comparison", phase=Phase.FUSION, matches=(Filter,))
 def prune_filter_col_comparison(node: Filter, ctx: OptimizerContext) -> LogicalPlan | None:
     """Decide a `col OP col` filter from the two columns' EXACT bounds.
 

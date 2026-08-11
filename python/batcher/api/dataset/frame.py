@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
+from datetime import timedelta
+from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import pyarrow as pa
@@ -95,6 +97,8 @@ from batcher.plan.logical import (
     Sort,
     SortKeySpec,
     Union,
+    align_join_key_types,
+    asof_tolerance,
     remap_sources,
 )
 from batcher.plan.schema import suggest_columns
@@ -364,17 +368,42 @@ class Dataset:
         return f"Dataset(columns={self.columns})"
 
     def _repr_html_(self) -> str:
-        """Notebook display: the lazy plan's output columns (no execution).
+        """Notebook display: the lazy plan's output columns and types (no execution).
 
         A `Dataset` is lazy and possibly unbounded, so the rich repr shows the schema
         rather than silently running the query; call `show()`/`collect()` for data.
+
+        Every name is HTML-escaped. Column names are *data* — they come out of a CSV header,
+        a JSON key, or a database catalog — and a notebook renders this string as markup, so
+        an unescaped name is a document written by whoever produced the file.
         """
-        cols = "".join(f"<th>{c}</th>" for c in self.columns)
+        import html
+
+        names = self.columns
+        types = self._html_types(names)
+        head = "".join(f"<th>{html.escape(str(c))}</th>" for c in names)
+        row = "".join(f"<td><code>{html.escape(t)}</code></td>" for t in types)
         return (
             "<div><strong>Dataset</strong> "
-            f"<em>(lazy, {len(self.columns)} columns — call .show() to preview)</em>"
-            f"<table><thead><tr>{cols}</tr></thead></table></div>"
+            f"<em>(lazy, {len(names)} columns — call .show() to preview)</em>"
+            f"<table><thead><tr>{head}</tr></thead><tbody><tr>{row}</tr></tbody></table></div>"
         )
+
+    def _html_types(self, names: list[str]) -> list[str]:
+        """The column types for the notebook repr, or blanks when they cannot be inferred.
+
+        Pure plan analysis with no execution, and best-effort: a source whose schema is only
+        knowable by reading it must not be read by a *repr*. An unknown type shows as an
+        em-dash rather than making the whole repr fail.
+        """
+        try:
+            schema = self._plan.available_schema()
+            if schema is None:
+                return ["—"] * len(names)
+            arrow = schema.arrow
+            return [str(arrow.field(n).type) if n in arrow.names else "—" for n in names]
+        except Exception:  # a repr must never raise; an unknown schema is not an error
+            return ["—"] * len(names)
 
     @overload
     def __getitem__(self, key: str) -> Expr: ...
@@ -792,7 +821,9 @@ class Dataset:
             if not isinstance(cond, Expr):
                 raise PlanError(
                     "filter() requires an expression, e.g. col('x') > 0; got "
-                    f"{type(cond).__name__}. A SQL string goes to ds.sql(...) instead."
+                    f"{type(cond).__name__}. A SQL string goes to ds.sql(...) instead, and a "
+                    f"Python predicate the expression language cannot say goes to "
+                    f"ds.ml.filter(fn), which runs it per row."
                 )
         combined = conditions[0]
         for cond in conditions[1:]:
@@ -986,7 +1017,7 @@ class Dataset:
         self,
         *,
         partition_by: list[str | Expr] = (),
-        order_by: list[str | tuple[str, bool] | Expr] = (),
+        order_by: list[str | tuple[str, bool] | tuple[str, bool, bool] | Expr] = (),
         functions: dict[str, str | tuple[str, str]],
         frame: tuple[int | None, int | None] | None = None,
     ) -> Dataset:
@@ -994,6 +1025,9 @@ class Dataset:
 
         Rows are partitioned by `partition_by` (empty → one partition) and ordered
         by `order_by` (column names, ``(name, descending)`` tuples, or expressions).
+        A third element places the nulls, ``(name, descending, nulls_first)``; without
+        it nulls sort last, as SQL's ``ORDER BY`` does. Where the nulls sit changes
+        rankings and, under a running frame, which rows the frame contains.
         Each `functions` entry maps an output name to a ranking function
         (``"row_number"``/``"rank"``/``"dense_rank"``, no input, needs `order_by`)
         or an aggregate (``("sum"|"mean"|"min"|"max"|"count", "col")``; ``"avg"`` is
@@ -1341,10 +1375,12 @@ class Dataset:
         self,
         fn: Callable,
         *,
+        input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         batch_size: int | None = None,
         num_workers: int | str = "auto",
         max_concurrency: int = 0,
+        max_errored_rows: int = 0,
     ) -> Dataset:
         """Apply a per-row function ``fn(row) -> row`` (Ray Data ``map``).
 
@@ -1354,10 +1390,12 @@ class Dataset:
 
         Args:
             fn: A callable (or ``async def``) mapping one row dict to a new row dict.
+            input_columns: The columns `fn` reads, so the scan can be pruned to them.
             output_columns: The output column names when `fn` changes the schema.
             batch_size: Rebatch to this many rows before processing.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
+            max_errored_rows: Rows a raising `fn` may drop per worker before failing.
 
         Returns:
             A new `Dataset` of the mapped rows.
@@ -1372,20 +1410,24 @@ class Dataset:
         """
         return self.ml.map(
             fn,
+            input_columns=input_columns,
             output_columns=output_columns,
             batch_size=batch_size,
             num_workers=num_workers,
             max_concurrency=max_concurrency,
+            max_errored_rows=max_errored_rows,
         )
 
     def flat_map(
         self,
         fn: Callable,
         *,
+        input_columns: list[str] | None = None,
         output_columns: list[str] | None = None,
         batch_size: int | None = None,
         num_workers: int | str = "auto",
         max_concurrency: int = 0,
+        max_errored_rows: int = 0,
     ) -> Dataset:
         """Apply a per-row function ``fn(row) -> iterable[row]`` and flatten.
 
@@ -1394,10 +1436,12 @@ class Dataset:
 
         Args:
             fn: A callable (or ``async def``) mapping one row dict to an iterable of row dicts.
+            input_columns: The columns `fn` reads, so the scan can be pruned to them.
             output_columns: The output column names when `fn` changes the schema.
             batch_size: Rebatch to this many rows before processing.
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
+            max_errored_rows: Rows a raising `fn` may drop per worker before failing.
 
         Returns:
             A new `Dataset` of the flattened rows.
@@ -1412,10 +1456,12 @@ class Dataset:
         """
         return self.ml.flat_map(
             fn,
+            input_columns=input_columns,
             output_columns=output_columns,
             batch_size=batch_size,
             num_workers=num_workers,
             max_concurrency=max_concurrency,
+            max_errored_rows=max_errored_rows,
         )
 
     def sql(self, query: str, *, table_name: str = "self", dialect: str | None = None) -> Dataset:
@@ -1607,14 +1653,18 @@ class Dataset:
         """Remove duplicate rows.
 
         With no `subset`, DISTINCT over all columns. With `subset`, keep one row per
-        distinct key combination: `keep="first"`/`"last"` picks the first/last row in
-        `order_by` order (required for first/last); `keep="any"` keeps an arbitrary
-        deterministic row. Lowers to ``row_number() OVER (PARTITION BY subset
-        ORDER BY ...)`` + filter — no new IR.
+        distinct key combination, carrying every other column: `keep="first"`/`"last"`
+        picks the row that is first/last in `order_by` order (required for those modes);
+        `keep="any"` picks an arbitrary one. Either way this is one mergeable reduction —
+        a single hash pass over the key, no sort and no rank column — so it stays bounded
+        under spill and pre-reduces on each worker before a distributed shuffle.
 
         Args:
             subset: Columns defining the key; ``None`` deduplicates over all columns.
             keep: Which row to keep per key — ``"any"``, ``"first"``, or ``"last"``.
+                ``"any"`` does not say *which* row, and the one you get may differ between
+                runs and between a single-node and a distributed run; pass `order_by` with
+                ``"first"``/``"last"`` when the surviving row's other columns matter.
             order_by: The order defining first/last (required for those `keep` modes).
 
         Returns:
@@ -1627,6 +1677,12 @@ class Dataset:
                 >>> ds = bt.from_pydict({"x": [1, 1, 2, 2, 3]})
                 >>> ds.distinct().sort("x").to_pydict()
                 {'x': [1, 2, 3]}
+
+                >>> events = bt.from_pydict(
+                ...     {"user": ["a", "b", "a"], "ts": [3, 1, 1], "page": ["x", "y", "z"]}
+                ... )
+                >>> events.distinct(["user"], keep="first", order_by="ts").sort("user").to_pydict()
+                {'user': ['a', 'b'], 'ts': [1, 1], 'page': ['z', 'y']}
         """
         if subset is None:
             return self._derive(Distinct(self._plan))
@@ -2196,6 +2252,17 @@ class Dataset:
         the `n` smallest-hash rows (a breaker). Pass exactly one of `fraction`/`n`.
         With `seed=None` a fresh seed is baked at plan-build.
 
+        **Duplicate rows are sampled together, so the selection unit is the distinct
+        row, not the row.** Hashing values is what buys partition-independence, and its
+        price is that identical rows hash identically and are therefore all kept or all
+        dropped. On a projection with few distinct values the result stops resembling a
+        sample: 10,000 rows holding two distinct values return 0 rows at
+        ``fraction=0.1`` and 5,000 at every fraction from ``0.25`` to ``0.9``, and
+        ``n=1000`` returns a thousand copies of one value. Sample *before* narrowing to
+        a low-cardinality projection, or keep a distinguishing column (a key) alongside
+        the one you are sampling; both restore a row-level sample. This is a real
+        limitation of the current sampler rather than a subtlety of the API.
+
         The positional argument reads the way both neighbouring libraries spell it:
         an `int` is a row count (``sample(100)``, as in Polars) and a `float` is a
         fraction (``sample(0.1)``). `frac` and `random_state` are accepted as the
@@ -2474,6 +2541,15 @@ class Dataset:
                 >>> a.union(b).to_pydict()
                 {'x': [1, 2, 3, 4]}
         """
+        # Sources are concatenated, never merged by identity, and that is a measured trade
+        # rather than an oversight. Merging them lets plan-level CSE see two branches over one
+        # relation as the same computation (TPC-DS q77's plan goes from 0 repeated subtrees to
+        # 75) -- but `stream::parallel::streaming_parallelizes` refuses to shard a plan whose
+        # source is read more than once, so the merge *also* takes the whole query off the
+        # parallel union path. Measured both ways on 2026-08-08: merging gained q80 1.6x and
+        # q5 1.3x, and cost q22 2.0x, q18 2.9x and q14 2.0x -- a net loss, and a loss
+        # concentrated in the queries the parallel union had just fixed. Making both work
+        # wants CSE to weigh the parallelism it forfeits, which is a cost-model change.
         plans: list[LogicalPlan] = [self._plan]
         sources = list(self._sources)
         for other in others:
@@ -2702,6 +2778,145 @@ class Dataset:
         idx = "__bc_gather_idx"
         keep = (Col(idx) >= offset) & ((Col(idx) - offset) % n == 0)
         return self.with_row_index(idx).filter(keep).drop(idx)
+
+    def split_at_indices(self, indices: list[int]) -> list[Dataset]:
+        """Split into consecutive row ranges at `indices` (Ray Data ``split_at_indices``).
+
+        ``ds.split_at_indices([2, 5])`` returns three datasets holding rows ``[0, 2)``,
+        ``[2, 5)`` and ``[5, n)``. The boundaries are row *positions*, so put a `sort`
+        first if they are to mean anything stable. An index past the end gives an empty
+        part rather than an error, and a repeated index gives an empty part between the
+        two — both matching ``numpy.split``.
+
+        Unlike Ray Data's version this **materializes nothing**: every part is a row-index
+        filter over the same plan and stays lazy until its own terminal op, so a pipeline
+        that only ever consumes one part never pays for the rest. The cost is the mirror
+        image, and worth knowing before collecting them all: each part reads the input
+        again. Call `cache` first when the source is expensive and every part is wanted.
+
+        Args:
+            indices: Split positions, non-negative and non-decreasing.
+
+        Returns:
+            ``len(indices) + 1`` datasets, in row order.
+
+        Raises:
+            PlanError: If `indices` is empty, negative, or not non-decreasing.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> first, middle, last = bt.range(0, 10).split_at_indices([2, 5])
+                >>> first.to_pydict()["value"]
+                [0, 1]
+                >>> middle.to_pydict()["value"]
+                [2, 3, 4]
+                >>> last.to_pydict()["value"]
+                [5, 6, 7, 8, 9]
+        """
+        if not indices:
+            raise PlanError(
+                "split_at_indices(): indices must not be empty — one index splits into two parts"
+            )
+        cuts = [require_int(i, func="split_at_indices", arg="indices", minimum=0) for i in indices]
+        if any(hi < lo for lo, hi in pairwise(cuts)):
+            raise PlanError(
+                f"split_at_indices(): indices must be non-decreasing, got {cuts} — "
+                "each one starts the next part where the previous ended"
+            )
+        # Escaped against a real column of the same name, the way `cross_join` escapes its
+        # key. `tail` and `gather_every` raise on that collision instead; it is worth avoiding
+        # here because this method hands back several datasets, so the failure would surface
+        # far from the call that caused it.
+        idx = "__bc_split_idx"
+        taken = set(self.columns)
+        while idx in taken:
+            idx += "_"
+        parts: list[Dataset] = []
+        for lo, hi in zip([0, *cuts], [*cuts, None], strict=True):
+            keep = None if lo == 0 else Col(idx) >= lo
+            if hi is not None:
+                upper = Col(idx) < hi
+                keep = upper if keep is None else keep & upper
+            # The trailing part of a `[0]` split is the whole dataset, with no row to drop.
+            parts.append(self if keep is None else self.with_row_index(idx).filter(keep).drop(idx))
+        return parts
+
+    def split_proportionately(self, proportions: list[float]) -> list[Dataset]:
+        """Split into parts holding the given row fractions (Ray Data ``split_proportionately``).
+
+        ``ds.split_proportionately([0.2, 0.5])`` returns three datasets holding 20%, 50%
+        and the remaining 30% of the rows. The proportions name every part but the last,
+        which takes the remainder — which is why they must sum to less than 1.
+
+        Like `tail`, this needs to know how many rows there are, so it **executes a
+        `count` eagerly** (often answered from metadata with no scan) before building the
+        lazy plans. The parts themselves stay lazy, exactly as `split_at_indices` returns
+        them.
+
+        Every part is guaranteed at least one row: boundaries that would collide are
+        nudged apart, as Ray Data does, and `PlanError` is raised when even that cannot
+        give each part a row.
+
+        This splits by *position*. For a train/test split prefer `ds.ml.train_test_split`,
+        which assigns each row by a hash of its own values, so the split is reproducible
+        and identical however the data is partitioned.
+
+        Args:
+            proportions: The fraction of rows in each part but the last. Each must be
+                greater than 0, and together they must sum to less than 1.
+
+        Returns:
+            ``len(proportions) + 1`` datasets, in row order.
+
+        Raises:
+            PlanError: If `proportions` is empty, holds a non-positive value, sums to 1
+                or more, or cannot give every part at least one row.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> a, b, c = bt.range(0, 10).split_proportionately([0.2, 0.5])
+                >>> [a.count(), b.count(), c.count()]
+                [2, 5, 3]
+        """
+        if not proportions:
+            raise PlanError(
+                "split_proportionately(): proportions must not be empty — one proportion "
+                "splits into two parts"
+            )
+        fractions = [
+            require_float(p, func="split_proportionately", arg="proportions") for p in proportions
+        ]
+        if any(p <= 0 for p in fractions):
+            raise PlanError(
+                f"split_proportionately(): every proportion must be > 0, got {fractions}"
+            )
+        if sum(fractions) >= 1:
+            raise PlanError(
+                "split_proportionately(): proportions must sum to less than 1, because the "
+                f"last part takes the remainder — got {fractions} summing to {sum(fractions)}"
+            )
+        total = self.count()
+        cuts = [int(total * c) for c in accumulate(fractions)]
+        # Walk backwards nudging colliding boundaries apart so no part comes out empty.
+        # Backwards because a collision is resolved by moving the *earlier* cut down: moving
+        # the later one up would push it into the part after it and cascade the other way.
+        subtract = 0
+        for i in range(len(cuts) - 2, -1, -1):
+            cuts[i] -= subtract
+            if cuts[i] == cuts[i + 1]:
+                subtract += 1
+                cuts[i] -= 1
+        if any(c <= 0 for c in cuts):
+            raise PlanError(
+                f"split_proportionately(): {len(fractions) + 1} non-empty parts need at least "
+                f"that many rows, and {fractions} over {total} row(s) cannot give each one — "
+                "use fewer parts, or split_at_indices() to allow empty ones"
+            )
+        return self.split_at_indices(cuts)
 
     def reverse(self) -> Dataset:
         """Reverse the row order — Polars ``reverse``.
@@ -4336,7 +4551,16 @@ class Dataset:
         right_plan = remap_sources(other._plan, offset)
         combined_sources = self._sources + other._sources
 
-        node = Join(self._plan, right_plan, tuple(left_keys), tuple(right_keys), how, tuple(output))
+        # Two sources rarely agree on a key's exact type — `decimal(10,2)` against
+        # `decimal(12,4)`, `timestamp[ms]` against `timestamp[us]` — while the row encoder
+        # the join builds needs them identical. Widen both sides to the pair's common
+        # supertype first, so the join runs on the same pairs a union would reconcile.
+        # Types with no common supertype are left alone and `Join` rejects them.
+        left_plan, right_plan = align_join_key_types(
+            self._plan, right_plan, tuple(left_keys), tuple(right_keys)
+        )
+
+        node = Join(left_plan, right_plan, tuple(left_keys), tuple(right_keys), how, tuple(output))
         if how != "full":
             return Dataset(node, combined_sources)
 
@@ -4456,15 +4680,28 @@ class Dataset:
         left_by: str | list[str] | None = None,
         right_by: str | list[str] | None = None,
         direction: str = "backward",
+        tolerance: int | float | str | timedelta | None = None,
+        allow_exact_matches: bool = True,
         suffix: str = "_right",
     ) -> Dataset:
         """ASOF (nearest-match) join — match each left row to the nearest right row.
 
         The match is on the right row whose `on` key is nearest (`direction`:
-        ``"backward"`` ≤, ``"forward"`` ≥), within the same `by` group (exact).
-        Left-style: every left row is kept (null right columns when unmatched). Both
-        sides should be sorted on `on` within `by` for the intended semantics. Specify
-        keys via `on`/`by` (shared) or `*_on`/`*_by`.
+        ``"backward"`` ≤, ``"forward"`` ≥, ``"nearest"`` either way), within the same
+        `by` group (exact). Left-style: every left row is kept (null right columns when
+        unmatched). Both sides should be sorted on `on` within `by` for the intended
+        semantics. Specify keys via `on`/`by` (shared) or `*_on`/`*_by`.
+
+        Pass `allow_exact_matches=False` for the strict form: a right row stamped at
+        exactly the left row's instant is then ignored. In a backtest that row is
+        information the trade did not have, and matching it is look-ahead bias that
+        inflates every result downstream without ever looking like a bug.
+
+        Pass `tolerance` to cap how stale a match may be. Without it a trade at noon
+        matches a quote from three days earlier without complaint, because that quote
+        really is the nearest one preceding it; with it, the left row is left unmatched
+        instead. Give a duration (``"5m"``, or a `datetime.timedelta`) for a timestamp or
+        date key, and a plain number for a numeric key.
 
         Args:
             other: The right-hand dataset to match against.
@@ -4474,11 +4711,22 @@ class Dataset:
             by: Shared exact-match grouping column(s).
             left_by: The left grouping column(s), when the names differ.
             right_by: The right grouping column(s), when the names differ.
-            direction: ``"backward"`` (≤) or ``"forward"`` (≥) nearest match.
+            direction: ``"backward"`` (≤), ``"forward"`` (≥), or ``"nearest"`` (the
+                closer of the two, backward on an exact tie).
+            tolerance: Largest allowed distance between the matched keys. A number is in
+                the key's own units; a duration string or `datetime.timedelta` is for a
+                temporal key. ``None`` (the default) never rejects a match.
+            allow_exact_matches: Whether a right row whose key *equals* the left row's may
+                be the match. Set it false for the strict form, where a backward join takes
+                the last row strictly before the left key.
             suffix: Suffix appended to right columns whose names collide.
 
         Returns:
             A new `Dataset` with each left row matched to its nearest right row.
+
+        Raises:
+            PlanError: If no match key is given, `direction` is not one of the three, or
+                `tolerance` is negative or unparseable.
 
         Examples:
             .. doctest::
@@ -4488,6 +4736,24 @@ class Dataset:
                 >>> right = bt.from_pydict({"t": [2, 6], "w": ["x", "y"]})
                 >>> left.join_asof(right, on="t").to_pydict()
                 {'t': [1, 5, 10], 'v': ['a', 'b', 'c'], 'w': [None, 'x', 'y']}
+
+                >>> # Row `c` at t=10 is 4 away from the nearest quote, so a tolerance of
+                >>> # 3 leaves it unmatched rather than carrying a stale value.
+                >>> left.join_asof(right, on="t", tolerance=3).to_pydict()
+                {'t': [1, 5, 10], 'v': ['a', 'b', 'c'], 'w': [None, 'x', None]}
+
+                >>> # "nearest" may look forward: `a` at t=1 takes the quote at t=2, and
+                >>> # `b` at t=5 takes the one at t=6 rather than the one at t=2.
+                >>> left.join_asof(right, on="t", direction="nearest").to_pydict()
+                {'t': [1, 5, 10], 'v': ['a', 'b', 'c'], 'w': ['x', 'y', 'y']}
+
+                >>> # Strict matching ignores a right row stamped at the same instant —
+                >>> # the difference between a backtest and look-ahead bias.
+                >>> same = bt.from_pydict({"t": [5], "w": ["same"]})
+                >>> left.join_asof(same, on="t").to_pydict()["w"]
+                [None, 'same', 'same']
+                >>> left.join_asof(same, on="t", allow_exact_matches=False).to_pydict()["w"]
+                [None, None, 'same']
         """
         l_on, r_on = left_on or on, right_on or on
         if l_on is None or r_on is None:
@@ -4497,7 +4763,16 @@ class Dataset:
         output = _asof_output(self.columns, other.columns, r_on, r_by, suffix)
         right_plan = remap_sources(other._plan, len(self._sources))
         node = AsofJoin(
-            self._plan, right_plan, l_on, r_on, tuple(l_by), tuple(r_by), direction, tuple(output)
+            self._plan,
+            right_plan,
+            l_on,
+            r_on,
+            tuple(l_by),
+            tuple(r_by),
+            direction,
+            tuple(output),
+            asof_tolerance(tolerance),
+            bool(allow_exact_matches),
         )
         return Dataset(node, self._sources + other._sources)
 
@@ -5097,6 +5372,173 @@ class Dataset:
         """
         self._require_column(column, "std")
         return self._exec_scalar(Col(column).std())
+
+    def product(self, column: str) -> Any:
+        """The product of `column` (SQL ``PRODUCT``), ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. An empty or all-null column yields
+        ``None`` (matching `sum`), not ``1``. Reach for it for compounded growth — a
+        chain of period returns multiplies rather than adds.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The product, or ``None`` for an empty/all-null column.
+
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0]}).product("x")
+                24.0
+        """
+        self._require_column(column, "product")
+        return self._exec_scalar(Col(column).product())
+
+    def mode(self, column: str) -> Any:
+        """The most frequent value in `column`, ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. A tie is broken by the engine's
+        grouping order, so treat the answer as *a* mode rather than *the* mode when the
+        column has several.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The most frequent value, or ``None`` for an empty/all-null column.
+
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1, 2, 2, 3]}).mode("x")
+                2
+        """
+        self._require_column(column, "mode")
+        return self._exec_scalar(Col(column).mode())
+
+    def skewness(self, column: str) -> Any:
+        """The sample skewness of `column` — how lopsided its distribution is.
+
+        A scalar terminal; runs one aggregate pass. Positive means a long right tail,
+        negative a long left one, and zero a symmetric distribution. Fewer than three
+        non-null values leaves it undefined.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The sample skewness, or ``None`` when undefined.
+
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1.0, 2.0, 2.0, 3.0, 10.0]}).skewness("x")
+                2.0286991020803327
+        """
+        self._require_column(column, "skewness")
+        return self._exec_scalar(Col(column).skewness())
+
+    def kurtosis(self, column: str) -> Any:
+        """The sample excess kurtosis of `column` — how heavy its tails are.
+
+        A scalar terminal; runs one aggregate pass. Zero is the normal distribution's
+        tail weight, positive means heavier tails (more outliers), negative lighter.
+        Fewer than four non-null values leaves it undefined.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The sample excess kurtosis, or ``None`` when undefined.
+
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1.0, 2.0, 2.0, 3.0, 10.0]}).kurtosis("x")
+                4.272146531742893
+        """
+        self._require_column(column, "kurtosis")
+        return self._exec_scalar(Col(column).kurtosis())
+
+    def mad(self, column: str) -> Any:
+        """The mean absolute deviation of `column` from its mean, ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. Unlike the standard deviation it
+        does not square the deviations, so one far-out value moves it far less — which
+        is why it is the spread to reach for when outliers are expected rather than
+        exceptional.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            The mean absolute deviation, or ``None`` for an empty/all-null column.
+
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"x": [1.0, 2.0, 2.0, 3.0]}).mad("x")
+                0.5
+        """
+        self._require_column(column, "mad")
+        return self._exec_scalar(Col(column).mad())
+
+    def any(self, column: str) -> Any:
+        """Whether any value in a boolean `column` is true (SQL ``BOOL_OR``), ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. An empty or all-null column yields
+        ``None`` rather than ``False``, because "no rows" is not evidence of absence.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            ``True`` if any value is true, ``False`` if none is, ``None`` when empty.
+
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"flag": [False, True, False]}).any("flag")
+                True
+        """
+        self._require_column(column, "any")
+        return self._exec_scalar(Col(column).bool_or())
+
+    def all(self, column: str) -> Any:
+        """Whether every value in a boolean `column` is true (SQL ``BOOL_AND``), ignoring nulls.
+
+        A scalar terminal; runs one aggregate pass. An empty or all-null column yields
+        ``None`` rather than ``True``, so a vacuous truth never passes for a checked one.
+
+        Args:
+            column: The column to reduce.
+
+        Returns:
+            ``True`` if every value is true, ``False`` otherwise, ``None`` when empty.
+
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.from_pydict({"flag": [True, True, False]}).all("flag")
+                False
+        """
+        self._require_column(column, "all")
+        return self._exec_scalar(Col(column).bool_and())
 
     def var(self, column: str) -> Any:
         """The sample variance of `column` (SQL ``VAR_SAMP``), ignoring nulls.
@@ -5796,12 +6238,67 @@ class Dataset:
 
         return to_tf(self, columns, batch_size)
 
+    def to_ray_dataset(
+        self,
+        *,
+        batch_size: int | None = None,
+        block_size_bytes: int | None = None,
+        distributed: bool | str = False,
+    ) -> Any:
+        """Execute and hand the result to Ray Data as a ``ray.data.Dataset`` (needs `ray`).
+
+        The return leg of :func:`batcher.from_ray_dataset`, so a Batcher query can feed a
+        Ray Train, Tune, or Serve stage without staging the result through storage. Output
+        batches are coalesced into blocks sized near Ray Data's own
+        ``target_max_block_size`` and put into the object store one block at a time, so the
+        driver holds one block rather than the whole result.
+
+        The blocks are produced on the driver, which is the right shape for a result that
+        has already been reduced (a model's training set, a scored table). For a result the
+        size of the input, write Parquet and hand Ray the path instead: that keeps the data
+        on the workers that produced it.
+
+        Args:
+            batch_size: Rows per engine batch before coalescing; ``None`` keeps engine batches.
+            block_size_bytes: Target bytes per Ray block; ``None`` reads Ray Data's own target.
+                Keep an override inside Ray Data's usable band of 1 MiB to 128 MiB.
+            distributed: Fan a top-level breaker across Ray workers (``True``/``"auto"``).
+
+        Returns:
+            A ``ray.data.Dataset`` over the result's Arrow blocks.
+
+        Raises:
+            BackendError: If ``ray`` is not installed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> ds.to_ray_dataset().count()  # doctest: +SKIP
+                3
+        """
+        from batcher.api.dataset._export import to_ray_dataset
+
+        return to_ray_dataset(
+            self,
+            batch_size=batch_size,
+            block_size_bytes=block_size_bytes,
+            distributed=distributed,
+        )
+
     def show(self, limit: int = 10) -> None:
         """Print a preview of the first `limit` result rows to stdout.
 
         A terminal operation for interactive use: it executes the plan (capped at
         `limit` rows) and prints the result, returning nothing. For programmatic
         access to the data use `to_pydict` / `to_pylist` / `collect`.
+
+        The `limit` is pushed into the *plan*, so previewing a billion-row source reads
+        only enough of it to fill the screen. The footer says "first N rows" only when the
+        preview actually filled its limit, so a complete result does not read as a partial
+        one. A value too long to fit, and a table too wide to fit, are both cut and marked
+        rather than allowed to wrap.
 
         Args:
             limit: Maximum number of rows to print.
@@ -5810,6 +6307,14 @@ class Dataset:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> bt.from_pydict({"x": [1, 2, 3]}).show()  # doctest: +SKIP
+                >>> bt.from_pydict({"city": ["oslo", "lima"], "temp": [-3.5, 21.0]}).show()
+                +--------+--------+
+                | city   | temp   |
+                | string | double |
+                +--------+--------+
+                | oslo   | -3.5   |
+                | lima   | 21.0   |
+                +--------+--------+
+                [2 rows x 2 columns]
         """
         _show(self._plan, self._sources, self.columns, limit)

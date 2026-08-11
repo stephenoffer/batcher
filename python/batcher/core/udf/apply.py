@@ -10,6 +10,8 @@ path (`stream`) reuse the same building blocks (`lifecycle`, `call`, `resilience
 
 from __future__ import annotations
 
+import contextlib
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
@@ -29,6 +31,65 @@ from batcher.core.udf.resilience import wrap_resilient
 from batcher.plan.logical import MapBatches
 
 __all__ = ["apply_udf", "rechunk"]
+
+# Idle dispatch pools, keyed by worker count, waiting to be leased again. A stage's per-batch
+# calls used to run on a `ThreadPoolExecutor` built and shut down *inside* `_run_sync_udf`,
+# which is fine when a stage runs once (a `collect`) and ruinous when it runs repeatedly — and
+# it does: `iter_batches` over a `map_batches` chain calls `execute_with_udfs` per *window*, so
+# a 16 M-row four-stage chain built 260 pools and spawned 1,677 threads, and
+# `ThreadPoolExecutor.__exit__` was 9.8 s of a 9.6 s profile. The same shape, measured in
+# isolation, is **4,352 ms against 147 ms** for a reused pool (30x). Streaming micro-batch
+# queries pay it per micro-batch, which is worse still.
+#
+# Leased rather than shared outright: a lease hands out a pool *exclusively*, so a stage still
+# gets exactly `num_workers` concurrent calls and two stages running at once get two pools —
+# identical concurrency to building one per call, which is what keeps this a scheduling change
+# and not a semantic one. Only the *idle* pools are reused.
+_IDLE_POOLS: dict[int, list[ThreadPoolExecutor]] = {}
+_POOLS_LOCK = threading.Lock()
+# Idle pools retained per distinct worker count. Two covers the ordinary nesting depth (a
+# stage's pool plus one held by a concurrently-running stage) without keeping a fleet of
+# parked threads alive for a query that has moved on; anything beyond it is shut down.
+_MAX_IDLE_POOLS = 2
+# ...and a bound on the *total*, because "two per width" is unbounded in the number of widths.
+# A width is a stage's `num_workers`, so one process normally sees one or two of them and this
+# never binds — but a long-lived server handling many differently-configured pipelines would
+# otherwise accumulate a parked pool per distinct value and never release one, which is the
+# same unbounded-growth shape the reuse is meant to fix, just slower.
+_MAX_IDLE_TOTAL = 4
+
+
+@contextlib.contextmanager
+def _leased_pool(workers: int):
+    """A `ThreadPoolExecutor` of `workers` threads, held exclusively for the block.
+
+    Reuses an idle pool of the same width when one is parked, else builds one; on exit the
+    pool is parked for the next lease (up to `_MAX_IDLE_POOLS`) instead of being torn down.
+    See `_IDLE_POOLS` for why. `concurrent.futures` registers its own interpreter-exit hook
+    that joins parked worker threads, so a retained pool cannot hang shutdown.
+    """
+    with _POOLS_LOCK:
+        idle = _IDLE_POOLS.get(workers)
+        pool = idle.pop() if idle else None
+    if pool is None:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="batcher-map")
+    try:
+        yield pool
+    except BaseException:
+        # A lease that ended in an exception may still have calls queued from its own
+        # `map`, so it is retired rather than parked: `shutdown(wait=True)` drains them
+        # exactly as the `with ThreadPoolExecutor(...)` block it replaces did, and no
+        # later lease inherits a pool with work already on it.
+        pool.shutdown(wait=True)
+        raise
+    else:
+        with _POOLS_LOCK:
+            parked = _IDLE_POOLS.setdefault(workers, [])
+            total = sum(len(v) for v in _IDLE_POOLS.values())
+            if len(parked) < _MAX_IDLE_POOLS and total < _MAX_IDLE_TOTAL:
+                parked.append(pool)
+                return
+        pool.shutdown(wait=False)
 
 
 def rechunk(batches: list[pa.RecordBatch], target: int) -> list[pa.RecordBatch]:
@@ -166,7 +227,12 @@ def _dispatch_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.Reco
             from batcher.core.udf.processes import run_map_processes
 
             results = run_map_processes(
-                build_udf_callable(op.fn), batches, op.num_workers, op.batch_format
+                build_udf_callable(op.fn),
+                batches,
+                op.num_workers,
+                op.batch_format,
+                budget_key=strat.budget_key(op),
+                max_errored_rows=op.max_errored_rows,
             )
         except Exception as exc:
             # A process pool can be unavailable for the whole session — e.g. a script
@@ -220,7 +286,7 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
                 return _resilient_call(call, b, budget, is_gpu)
 
             if strategy == "threads":
-                with ThreadPoolExecutor(max_workers=op.num_workers) as pool:
+                with _leased_pool(op.num_workers) as pool:
                     chunks = list(pool.map(_emit, batches))
             else:
                 chunks = [_emit(b) for b in batches]
@@ -231,7 +297,7 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
         if strategy == "threads":
             # ThreadPoolExecutor.map keeps input order; concurrency only helps when `fn`
             # releases the GIL (Rust/GPU/NumPy inference), which is the intended use.
-            with ThreadPoolExecutor(max_workers=op.num_workers) as pool:
+            with _leased_pool(op.num_workers) as pool:
                 results = list(pool.map(call, batches))
         else:
             results = [call(batch) for batch in batches]

@@ -12,6 +12,10 @@ bc-secrets.workspace = true
 # no third-party geometry stack, and it knows nothing about Arrow — this crate is the
 # seam between the two.
 bc-geo.workspace = true
+# Rotations and poses for the `Expr::Spatial` variant. Same shape as the `bc-geo` edge
+# above and for the same reason: the mathematics is pure and Arrow-free, and this crate
+# is the seam that gives it columns to run over.
+bc-spatial.workspace = true
 arrow.workspace = true
 serde.workspace = true
 thiserror.workspace = true

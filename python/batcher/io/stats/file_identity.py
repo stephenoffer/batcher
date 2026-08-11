@@ -21,11 +21,90 @@ that idea, extracted so every cache can share one definition of "the same file".
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from batcher.io._concurrent import is_local_path
 
-__all__ = ["file_identity", "files_version"]
+__all__ = ["FileMetaCache", "file_identity", "files_version"]
+
+
+class FileMetaCache:
+    """An LRU of per-file metadata, keyed by `file_identity` and bounded by **weight**.
+
+    The three caches in this layer that memoize a file's metadata — Parquet footers, ORC
+    footers, Parquet row counts — were each bounded differently and each bounded wrongly, so
+    they share this one implementation rather than three near-copies that can drift again:
+
+    - The Parquet footer cache was `lru_cache(maxsize=1024)` against a planner that reads up
+      to 10,000 footers in a single pass and then hands the *same* files to workers that read
+      them again. Nine of every ten entries were evicted before the pass that fetched them
+      had finished, so the cache returned almost nothing on the one workload guaranteed to
+      fill it.
+    - The row-count cache was a plain `dict` with no bound at all: a leak proportional to a
+      long-lived worker's entire scan history rather than to its working set.
+    - The ORC footer cache carried the same 1,024 as Parquet's, for entries three orders of
+      magnitude smaller.
+
+    Hence `weight`. Counting *entries* bounds the wrong quantity whenever entries differ in
+    size, and a `FileMetaData` is the extreme case: one row group of four columns against two
+    thousand row groups of three hundred is four orders of magnitude of resident memory under
+    an identical entry count. A caller that stores fixed-size records leaves the weight at 1
+    and gets a plain entry-bounded LRU; the footer cache weighs an entry by its row-group
+    count, which is what lets a million single-row-group files stay resident for what a few
+    thousand wide ones cost — exactly the shape a small-file corpus has.
+
+    Thread-safe: workers read splits of the same files concurrently.
+    """
+
+    __slots__ = ("_budget", "_entries", "_lock", "_used")
+
+    def __init__(self, budget: int) -> None:
+        """Create a cache holding up to `budget` total weight."""
+        self._entries: OrderedDict[Any, tuple[Any, int]] = OrderedDict()
+        self._budget = max(1, budget)
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def get(self, key: Any) -> Any | None:
+        """The value cached under `key`, marked most-recently-used, or None on a miss."""
+        with self._lock:
+            hit = self._entries.get(key)
+            if hit is None:
+                return None
+            self._entries.move_to_end(key)
+            return hit[0]
+
+    def put(self, key: Any, value: Any, weight: int = 1) -> None:
+        """Admit `value` under `key`, evicting least-recently-used entries to stay in budget.
+
+        The most-recently-admitted entry is never evicted, so a single item heavier than the
+        whole budget is still returned to the caller that just asked for it rather than being
+        dropped on the way in.
+        """
+        weight = max(1, weight)
+        with self._lock:
+            if key in self._entries:
+                self._entries.move_to_end(key)
+                return
+            self._entries[key] = (value, weight)
+            self._used += weight
+            while self._used > self._budget and len(self._entries) > 1:
+                _key, (_value, evicted) = self._entries.popitem(last=False)
+                self._used -= evicted
+
+    def clear(self) -> None:
+        """Drop every entry, for a test that needs a cold cache."""
+        with self._lock:
+            self._entries.clear()
+            self._used = 0
+
+    def __len__(self) -> int:
+        """How many entries are resident — the *count*, not the weight they occupy."""
+        with self._lock:
+            return len(self._entries)
+
 
 # What a cache stores when the file's identity cannot be established. Distinct from any
 # real token, so an unstattable file is never mistaken for a cache hit against another

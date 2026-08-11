@@ -93,6 +93,30 @@ def _numeric(value: object) -> float | int | Decimal | None:
     return None
 
 
+def _commensurable(*values: float | int | Decimal) -> tuple:
+    """`values` widened so arithmetic between any two of them is defined.
+
+    Python refuses `Decimal + float` (and every other mixed operator) rather than coercing,
+    so a DECIMAL column -- whose footer bounds arrive as `Decimal` -- against a float literal
+    raises `TypeError` out of the arithmetic below. That is not a hypothetical shape: it is
+    `l_quantity * 0.2`, and it made TPC-H q17 and TPC-DS q32/q92 fail to *plan*.
+
+    Widening to float is the right resolution and not merely the convenient one. These bounds
+    carry `Provenance.DEFAULT` -- they are an estimate feeding a selectivity interpolation, and
+    nothing downstream reads them as an exact decimal. `Decimal` against `int` is exact in
+    Python and is deliberately left alone, so the common integer case keeps its precision.
+
+    Args:
+        values: The numeric bounds and constant about to be combined.
+
+    Returns:
+        The values unchanged, or all of them as floats when the mix would not combine.
+    """
+    if any(isinstance(v, Decimal) for v in values) and any(isinstance(v, float) for v in values):
+        return tuple(float(v) for v in values)
+    return values
+
+
 def derived_projection_stat(expr: Expr, child: RelStats) -> ColumnStat | None:
     """The output `ColumnStat` of a monotonic `col OP literal` projection, or None.
 
@@ -126,6 +150,7 @@ def derived_projection_stat(expr: Expr, child: RelStats) -> ColumnStat | None:
     c = _numeric(lit.value)
     if lo is None or hi is None or c is None:
         return None
+    lo, hi, c = _commensurable(lo, hi, c)
     bounds = _transform_bounds(expr.op, lo, hi, c, col_on_left)
     if bounds is None:
         return None
@@ -145,7 +170,9 @@ def derived_projection_stat(expr: Expr, child: RelStats) -> ColumnStat | None:
         avg_bytes=src.avg_bytes,
         # `mean(a·x + b) = a·mean(x) + b`, exactly. The total sum needs the row count to
         # shift, which is not carried here, so it is left unknown.
-        mean=None if src.mean is None or scale is None else scale[0] * src.mean + scale[1],
+        # `float(src.mean)` rather than `src.mean`: `scale` is a float pair, and a DECIMAL
+        # column's mean arrives as a `Decimal`, which Python refuses to multiply by a float.
+        mean=None if src.mean is None or scale is None else scale[0] * float(src.mean) + scale[1],
     )
 
 

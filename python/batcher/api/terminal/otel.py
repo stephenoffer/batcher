@@ -82,6 +82,7 @@ def _emit(tracer: object, profile: QueryProfile) -> None:
         if bottleneck is not None:
             query_span.set_attribute("batcher.bottleneck.kind", bottleneck.kind)
             query_span.set_attribute("batcher.bottleneck.op_id", bottleneck.op_id)
+        _set_usage(query_span, profile.usage)
         for op in profile.ops:
             if op.measured:
                 _emit_op(tracer, op)
@@ -92,6 +93,29 @@ def _emit(tracer: object, profile: QueryProfile) -> None:
         # both surface the worker ops.
         for op in profile.worker_ops:
             _emit_op(tracer, op, scope="worker")
+
+
+def _set_usage(span: object, usage) -> None:
+    """Attach what the run cost the machine to the query span.
+
+    A trace waterfall shows *where* the time went and cannot show whether the box had the
+    cores to spend — the same plan reads identically at 1 core busy and at 30. These are the
+    attributes that separate the two, and a tracing backend can filter on them directly
+    (``batcher.cores_busy < 2`` finds every query that failed to parallelize).
+
+    Skipped entirely when the platform reported nothing, because a span carrying
+    ``cpu_ms = 0`` asserts the query used no CPU, which is a different claim from
+    "unmeasured" and the one a reader will act on.
+    """
+    if not usage.measured:
+        return
+    span.set_attribute("batcher.cpu_ms", usage.cpu_ms)  # type: ignore[attr-defined]
+    span.set_attribute("batcher.execution_ms", usage.wall_ms)  # type: ignore[attr-defined]
+    span.set_attribute("batcher.cores_busy", usage.cores_busy)  # type: ignore[attr-defined]
+    span.set_attribute("batcher.peak_rss_bytes", usage.peak_rss_bytes)  # type: ignore[attr-defined]
+    span.set_attribute("batcher.major_faults", usage.major_faults)  # type: ignore[attr-defined]
+    span.set_attribute("batcher.io_read_bytes", usage.io_read_bytes)  # type: ignore[attr-defined]
+    span.set_attribute("batcher.io_write_bytes", usage.io_write_bytes)  # type: ignore[attr-defined]
 
 
 def _emit_op(tracer: object, op, *, scope: str = "driver") -> None:
@@ -109,5 +133,12 @@ def _emit_op(tracer: object, op, *, scope: str = "driver") -> None:
         span.set_attribute("batcher.op.elapsed_ms", op.elapsed_ms)
         span.set_attribute("batcher.op.result_bytes", op.result_bytes)
         span.set_attribute("batcher.op.spilled", op.spilled)
+        # The magnitude, not just the fact: a 1 GB spill and a 100 GB one are the same
+        # boolean and very different incidents.
+        if op.spill_bytes:
+            span.set_attribute("batcher.op.spill_bytes", op.spill_bytes)
+        if op.cpu_ms:
+            span.set_attribute("batcher.op.cpu_ms", op.cpu_ms)
+            span.set_attribute("batcher.op.threads", op.threads)
         if op.backend:
             span.set_attribute("batcher.op.backend", op.backend)

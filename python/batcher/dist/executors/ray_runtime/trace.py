@@ -17,15 +17,15 @@ reports its other scheduling observation (`scheduling._report_collective_fabric`
 reaches the human formatter, the JSON formatter, and the web UI's typed log view from one
 call.
 
-Deliberately **not** published as a `plan.profile.Decision` on the event bus, which was the
-first attempt. The bus attributes every event to a `query_id`, and `observe.store` drops any
-event whose id does not match a live record — silently, by design, so a late event cannot
-resurrect an aged-out query as a ghost. The id it matches against is minted in `api`
-(`YYYYmmdd-HHMMSS-<pid>-<seq>`) and is unrelated to the `q-<uuid>` cancellation id `core`
-exposes ambiently, so `dist` cannot learn it without new plumbing from the conductor. A
-`Decision` published from here would therefore reach the bus and be discarded by the one
-consumer that matters. `to_decision()` is kept because it is the right shape for that path
-*if* the id is ever threaded down, and because it is what the tests assert against.
+It is **also** published as a `plan.profile.Decision` on the event bus, which took a second
+attempt to make work. The bus attributes every event to a `query_id`, and `observe.store`
+drops any event whose id does not match a live record — silently, by design, so a late event
+cannot resurrect an aged-out query as a ghost. The id is minted in `api` and `dist` must not
+import `api` to ask for it, so a `Decision` published from here reached the bus and was
+discarded by the one consumer that matters. `events.query_scope`, set by the conductor around
+execution, closes that: the id is ambient in layer 0, where both `api` and `dist` can reach
+it, and `publish` falls back to it. Outside a scope the id is empty and the event is
+engine-level, exactly as before — so nothing here depends on a conductor being present.
 
 Purely observational: nothing here decides anything, and a failure to record must never
 disturb the schedule it is describing.
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 
+from batcher._internal import events
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.plan.profile import Decision
 
@@ -101,7 +102,7 @@ class FanoutTrace:
         )
 
     def report(self) -> None:
-        """Record the chain on the `dist` logger. Never raises.
+        """Record the chain on the `dist` logger and the event bus. Never raises.
 
         An observation about a schedule that has already been decided must not be able to
         disturb it, so every failure here is swallowed the way the rest of the distributed
@@ -110,18 +111,23 @@ class FanoutTrace:
         Logged at INFO: a reader asking why a job used a tenth of the cluster should not
         have to have known to turn on debug logging *before* the run they are asking about.
         One record per distributed execution, so the cost is negligible.
+
+        The bus copy carries the ambient query id (`events.query_scope`), which is what puts
+        the chain in the dashboard's decision list beside Kyber's and Carbonite's instead of
+        only in a log file. It is a no-op when nothing is subscribed.
         """
         try:
+            steps = [
+                {"step": name, "workers": workers, "why": why} for name, workers, why in self._steps
+            ]
             log_kv(
                 get_logger("dist"),
                 logging.INFO,
                 "fan-out decided",
                 requested=self._start,
                 final=self.final,
-                steps=[
-                    {"step": name, "workers": workers, "why": why}
-                    for name, workers, why in self._steps
-                ],
+                steps=steps,
             )
+            events.publish(events.DECISION, **self.to_decision().to_dict())
         except Exception as exc:  # pragma: no cover - observation must never fail a query
             note_suppressed("dist", "report the fan-out trace", exc)

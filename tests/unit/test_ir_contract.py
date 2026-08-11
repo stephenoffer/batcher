@@ -36,6 +36,38 @@ def test_the_checker_would_notice_a_drift() -> None:
     assert rust - (rust - {"range_join"}) == {"range_join"}
 
 
+def test_frame_bound_kinds_cover_what_the_lowering_emits() -> None:
+    """`FRAME_BOUND_KINDS` is the wire vocabulary, so the only producer must stay inside it.
+
+    The parametrized test above proves the vocabulary equals Rust's `FrameBound`. That is
+    only half the contract: it says nothing about whether `_bound_ir` — the one function
+    that builds a frame edge — actually emits from it. Both halves, or the constant is a
+    claim rather than a check.
+    """
+    from batcher.plan.ir_tags import FRAME_BOUND_KINDS
+    from batcher.plan.logical.window import _bound_ir
+
+    emitted = {
+        _bound_ir(offset, preceding=preceding)["kind"]
+        for offset in (None, -2, 0, 3)
+        for preceding in (True, False)
+    }
+    assert emitted == FRAME_BOUND_KINDS
+
+
+def test_aggregate_rejects_a_function_the_engine_has_no_tag_for() -> None:
+    """A bad agg name fails in the control plane, naming the vocabulary, not at the FFI."""
+    import batcher as bt
+    from batcher._internal.errors import PlanError
+    from batcher.plan.expr_ir import AggExpr
+    from batcher.plan.logical.aggregate import Aggregate, AggregateSpec
+
+    ds = bt.from_pydict({"g": ["a"], "x": [1]})
+    spec = AggregateSpec(alias="bad", agg=AggExpr("avarage", bt.col("x")))
+    with pytest.raises(PlanError, match="unknown aggregate function"):
+        Aggregate(input=ds._plan, group_keys=(), aggregates=(spec,))
+
+
 def test_rust_variant_renames_are_honoured() -> None:
     """`#[serde(rename)]` wins over `rename_all`, or every renamed tag reads as drift."""
     expr = rust_tags("bc-expr/src/lib.rs", "Expr")

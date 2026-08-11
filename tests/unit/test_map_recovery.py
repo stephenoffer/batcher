@@ -269,3 +269,47 @@ def test_map_barrier_prefers_a_confirmed_live_host_for_relocation(monkeypatch):
     assert dead == {1}
     assert relocations == [0]  # the proven-live host, not the unproven worker 2
     assert len(addrs) == 3 and all(a is not None for a in addrs)
+
+
+def test_gather_hands_each_result_to_a_sink_and_retains_none(monkeypatch):
+    """A caller whose next step is a mergeable fold takes the results through `sink` instead
+    of the returned list. That is the difference between the driver holding one running state
+    and holding every partition's at once — and between folding during the barrier and
+    folding in a Θ(partitions) tail behind it."""
+    from batcher.dist.executors.ray_runtime import gather_map_results
+
+    install_fake_ray(monkeypatch)
+    seen: list = []
+
+    out = gather_map_results(
+        lambda idx: lambda i=idx: [f"r{i}"],
+        4,
+        RecoveryPolicy(max_attempts=1),
+        sink=lambda idx, value: seen.append((idx, value)),
+    )
+    assert sorted(seen) == [(i, [f"r{i}"]) for i in range(4)]
+    assert out == [None] * 4, "a sinking barrier must retain nothing"
+
+
+def test_a_sink_sees_a_resubmitted_partition_exactly_once(monkeypatch):
+    """A preempted partition is folded once, not twice. Double-counting here would inflate
+    a distributed sum by exactly one partition's worth and raise nothing."""
+    import collections
+
+    from batcher.dist.executors.ray_runtime import gather_map_results
+
+    RayError, _ = install_fake_ray(monkeypatch)
+    calls: collections.Counter = collections.Counter()
+    seen: list = []
+
+    def submit(idx):
+        calls[idx] += 1
+        if idx == 1 and calls[idx] == 1:
+            return lambda: _raise(RayError("preempted"))
+        return lambda i=idx: [f"r{i}"]
+
+    gather_map_results(
+        submit, 3, RecoveryPolicy(max_attempts=3), sink=lambda idx, v: seen.append(idx)
+    )
+    assert sorted(seen) == [0, 1, 2]
+    assert calls[1] == 2

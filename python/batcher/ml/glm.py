@@ -195,12 +195,20 @@ class TweedieRegressor:
             mu = eta.exp()
             weight = mu.pow(lit(2.0 - self.power))
             working = eta + (col(self.target) - mu) / mu
+            # Projected once, for the reason `_weighted_system` states at length: `weight`
+            # and `working` both embed `eta`, which is a sum over every feature, and there
+            # are `m + m(m+1)/2` aggregates below to embed them into. The parenthesization
+            # is preserved (`weight * working * terms[j]` is `(weight * working) * ...`), so
+            # the system is bit-identical to the inline form.
+            prepared = ds.with_columns(__bt_w=weight, __bt_wz=weight * working)
+            w = col("__bt_w")
+            wz = col("__bt_wz")
             aggregates = {}
             for j in range(m):
-                aggregates[f"b{j}"] = sum_(weight * working * terms[j])
+                aggregates[f"b{j}"] = sum_(wz * terms[j])
                 for k in range(j, m):
-                    aggregates[f"a{j}_{k}"] = sum_(weight * terms[j] * terms[k])
-            row = ds.agg(**aggregates).collect()
+                    aggregates[f"a{j}_{k}"] = sum_(w * terms[j] * terms[k])
+            row = prepared.agg(**aggregates).collect()
             matrix = np.zeros((m, m))
             rhs = np.zeros(m)
             for j in range(m):
@@ -578,12 +586,25 @@ def _weighted_system(ds: Dataset, terms: list, target, weight):
     from batcher.plan.functions.aggregate import sum as sum_
 
     m = len(terms)
+    # Project the weight (and the weighted target) once, then aggregate over the columns.
+    # `weight` is not a cheap leaf — for the Huber loss it is a `CASE` over a residual that
+    # embeds the whole linear predictor — and there are `m + m(m+1)/2` aggregates below, 252
+    # of them at 20 features. Written inline, each carried its own copy and the engine
+    # re-evaluated that predictor once per aggregate per row.
+    #
+    # The grouping is preserved exactly, so this is bit-identical rather than merely close:
+    # `weight * target * terms[j]` already parses as `(weight * target) * terms[j]`, and
+    # `weight * terms[j] * terms[k]` as `(weight * terms[j]) * terms[k]`. Float
+    # multiplication is not associative, so keeping those parenthesizations is the point.
+    prepared = ds.with_columns(__bt_w=weight, __bt_wy=weight * target)
+    w = col("__bt_w")
+    wy = col("__bt_wy")
     aggregates = {}
     for j in range(m):
-        aggregates[f"b{j}"] = sum_(weight * target * terms[j])
+        aggregates[f"b{j}"] = sum_(wy * terms[j])
         for k in range(j, m):
-            aggregates[f"a{j}_{k}"] = sum_(weight * terms[j] * terms[k])
-    row = ds.agg(**aggregates).collect()
+            aggregates[f"a{j}_{k}"] = sum_(w * terms[j] * terms[k])
+    row = prepared.agg(**aggregates).collect()
     matrix = np.zeros((m, m))
     rhs = np.zeros(m)
     for j in range(m):

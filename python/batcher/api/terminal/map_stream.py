@@ -13,10 +13,16 @@ from collections.abc import Callable, Iterator
 
 import pyarrow as pa
 
+from batcher.core.udf.sizing import _CPU_STREAM_BATCH_BYTES
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
 __all__ = ["max_map_workers", "peek_stream", "stream_map_aggregate", "stream_windowed"]
+
+# Resident-input budget for one streaming window. Reused from `core.udf.sizing`, which already
+# bounds the per-call chunk by the same figure and for the same reason, so the window and the
+# chunks it is cut into are governed by one number rather than two that can drift.
+_WINDOW_BYTES = _CPU_STREAM_BATCH_BYTES
 
 
 def stream_map_aggregate(
@@ -77,15 +83,33 @@ def stream_windowed(
     run_window: Callable[[list[pa.RecordBatch]], list[pa.RecordBatch]],
     target_rows: int,
     batch_size: int | None,
+    projection: list[str] | None = None,
 ) -> Iterator[pa.RecordBatch]:
-    """Stream `source` through `run_window` in windows of ~`target_rows` rows.
+    """Stream `source` through `run_window` in windows of ~`target_rows` rows or `_WINDOW_BYTES`.
 
-    Accumulates source batches until the window holds ~`target_rows` rows, applies the
-    (parallel) UDF pipeline to the whole window at once, and yields the results — so the
-    per-batch calls fan across the worker pool (the pipeline re-morselizes the window
-    internally) while driver memory stays bounded to one window (+ its output), never the
-    whole input. Sizing by rows (not batch count) keeps the bound stable whether the
-    source yields many small batches or a few large row-groups.
+    Accumulates source batches until the window holds ~`target_rows` rows **or**
+    `_WINDOW_BYTES` of data, applies the (parallel) UDF pipeline to the whole window at once,
+    and yields the results — so the per-batch calls fan across the worker pool (the pipeline
+    re-morselizes the window internally) while driver memory stays bounded to one window
+    (+ its output), never the whole input.
+
+    The byte bound is what makes that last clause true. A row count alone bounds nothing: the
+    same 245,760-row window is 5 MB of narrow numerics and **2 GB of 8 KB blobs**, and the
+    multimodal scan is exactly the shape whose rows are huge and whose consumer reached for
+    `iter_batches` *because* the data does not fit. It is the same argument
+    `core.udf.sizing._CPU_STREAM_BATCH_BYTES` already makes one level down, for the per-call
+    chunk; the window above it simply never got it, and this reuses that budget rather than
+    inventing a second one.
+
+    It cuts the other way too. Bounded in rows, a *narrow* window was far smaller than memory
+    required, so the fixed per-window cost (a plan walk, a re-chunk, a schema reconcile) was
+    paid tens of times more often than it needed to be — measured at **1.9x** on a four-stage
+    chain over 8 M narrow rows. Letting rows run to a generous cap and bytes do the bounding
+    fixes both ends with one rule.
+
+    `projection` is the column list Kyber decided the pipeline needs (`None` = every column,
+    which is what an undeclared `map_batches` requires). It narrows what is decoded per
+    window, so a wide source costs what the `fn` actually reads rather than what it stores.
     """
     from batcher.io.source import iter_source
 
@@ -108,15 +132,18 @@ def stream_windowed(
 
     buf: list[pa.RecordBatch] = []
     rows = 0
-    for batch in iter_source(source, None, None):
+    nbytes = 0
+    for batch in iter_source(source, projection, None):
         if batch.num_rows == 0:
             continue
         buf.append(batch)
         rows += batch.num_rows
-        if rows >= target_rows:
+        nbytes += batch.nbytes
+        if rows >= target_rows or nbytes >= _WINDOW_BYTES:
             yield from flush(buf)
             buf = []
             rows = 0
+            nbytes = 0
     if buf:
         yield from flush(buf)
 

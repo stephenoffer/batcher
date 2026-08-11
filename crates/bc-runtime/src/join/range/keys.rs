@@ -14,6 +14,10 @@ use arrow::row::{Row, RowConverter, Rows, SortField};
 use rayon::prelude::*;
 
 use crate::error::RuntimeError;
+// The order-preserving `u64` key form and its parallel-map helpers moved to the crate's
+// canonical key module: the window frame and ASOF paths need the same typed extraction, and
+// a second copy of a key encoding is exactly the divergence `keys.rs` exists to prevent.
+use crate::keys::{u64_order_keys, PARALLEL_MAP_MIN};
 
 /// Whether a key type can be range-joined through the row encoder.
 ///
@@ -71,89 +75,6 @@ pub(super) fn encode_axis(
     let l = converter.convert_columns(std::slice::from_ref(left))?;
     let r = converter.convert_columns(std::slice::from_ref(right))?;
     Ok((l, r))
-}
-
-/// An order-preserving `u64` for each value of a primitive key column, or `None` when the
-/// type has no such encoding.
-///
-/// The sorts are ~70% of a two-condition range join's time (`report_range_join_phases`), and
-/// almost all of that was comparator overhead rather than the sort itself: comparing two
-/// `arrow::row::Row`s is an indirect load plus a `memcmp`, against a register compare here.
-/// Null-keyed rows never reach this — they are excluded from the universe up front — so no
-/// null byte is needed and the whole key fits in the 64 bits.
-///
-/// Floats use the standard total-order transform, which lands exactly on this engine's float
-/// contract because [`canonicalize_float_keys`](crate::keys::canonicalize_float_keys) has
-/// already folded `-0.0` into `0.0` and every NaN into one positive quiet NaN: the transform
-/// then ranks that NaN above `+inf`, which is where the rest of the engine puts it.
-pub(super) fn u64_order_keys(arr: &ArrayRef, descending: bool) -> Option<Vec<u64>> {
-    use arrow::array::PrimitiveArray;
-    use arrow::datatypes::*;
-
-    #[inline]
-    fn signed(v: i64) -> u64 {
-        (v as u64) ^ (1u64 << 63)
-    }
-    #[inline]
-    fn float(bits: u64) -> u64 {
-        if bits >> 63 == 1 {
-            !bits
-        } else {
-            bits ^ (1u64 << 63)
-        }
-    }
-
-    macro_rules! prim {
-        ($ty:ty, $f:expr) => {{
-            let a = arr.as_any().downcast_ref::<PrimitiveArray<$ty>>()?;
-            #[allow(clippy::redundant_closure_call)]
-            Some(map_u64(a.values(), |v| $f(v)))
-        }};
-    }
-
-    let keys: Option<Vec<u64>> = match arr.data_type() {
-        DataType::Int8 => prim!(Int8Type, |v: i8| signed(v as i64)),
-        DataType::Int16 => prim!(Int16Type, |v: i16| signed(v as i64)),
-        DataType::Int32 => prim!(Int32Type, |v: i32| signed(v as i64)),
-        DataType::Int64 => prim!(Int64Type, signed),
-        DataType::UInt8 => prim!(UInt8Type, |v: u8| v as u64),
-        DataType::UInt16 => prim!(UInt16Type, |v: u16| v as u64),
-        DataType::UInt32 => prim!(UInt32Type, |v: u32| v as u64),
-        DataType::UInt64 => prim!(UInt64Type, |v: u64| v),
-        DataType::Float32 => prim!(Float32Type, |v: f32| float((v as f64).to_bits())),
-        DataType::Float64 => prim!(Float64Type, |v: f64| float(v.to_bits())),
-        DataType::Date32 => prim!(Date32Type, |v: i32| signed(v as i64)),
-        DataType::Date64 => prim!(Date64Type, signed),
-        DataType::Time32(TimeUnit::Second) => prim!(Time32SecondType, |v: i32| signed(v as i64)),
-        DataType::Time32(TimeUnit::Millisecond) => {
-            prim!(Time32MillisecondType, |v: i32| signed(v as i64))
-        }
-        DataType::Time64(TimeUnit::Microsecond) => prim!(Time64MicrosecondType, signed),
-        DataType::Time64(TimeUnit::Nanosecond) => prim!(Time64NanosecondType, signed),
-        DataType::Timestamp(TimeUnit::Second, _) => prim!(TimestampSecondType, signed),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => prim!(TimestampMillisecondType, signed),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => prim!(TimestampMicrosecondType, signed),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => prim!(TimestampNanosecondType, signed),
-        DataType::Duration(TimeUnit::Second) => prim!(DurationSecondType, signed),
-        DataType::Duration(TimeUnit::Millisecond) => prim!(DurationMillisecondType, signed),
-        DataType::Duration(TimeUnit::Microsecond) => prim!(DurationMicrosecondType, signed),
-        DataType::Duration(TimeUnit::Nanosecond) => prim!(DurationNanosecondType, signed),
-        _ => None,
-    };
-    keys.map(|mut k| {
-        if descending {
-            // Complementing an order-preserving key reverses the order, and it is elementwise,
-            // so it fans out on the same terms as the map above.
-            if k.len() >= PARALLEL_MAP_MIN {
-                k.par_iter_mut().for_each(|v| *v = !*v);
-            } else {
-                for v in &mut k {
-                    *v = !*v;
-                }
-            }
-        }
-        k
-    })
 }
 
 /// One axis's sortable form for the whole universe: left rows first, then right rows.
@@ -554,28 +475,6 @@ pub(super) fn dense_ranks(
 /// Below it the pool hand-off costs more than the sort saves; a few thousand encoded rows
 /// sort in well under the time it takes to schedule them.
 const PARALLEL_SORT_MIN_ROWS: usize = 32_768;
-
-/// Element floor above which an elementwise pass over the universe is worth handing to rayon.
-///
-/// The same trade as [`PARALLEL_SORT_MIN_ROWS`] and deliberately the same size, but it guards a
-/// *linear* pass rather than an `n log n` one, so it earns less per element and matters more
-/// that it does not fire early. This operator answers a 10,000-row join in under four
-/// milliseconds; a few hundred microseconds of pool hand-off would be visible there, while at
-/// five million rows a side these passes were 200 ms of a 900 ms join, on one core of 96.
-const PARALLEL_MAP_MIN: usize = 32_768;
-
-/// Map a slice elementwise into a fresh `Vec`, on rayon once it is large enough to pay.
-///
-/// `collect` from an indexed parallel iterator writes each element at the index it was read
-/// from, so the result is the sequential `map`'s output element for element. Every caller here
-/// passes a pure function of one value, which is what makes that equivalence hold.
-fn map_u64<T: Copy + Send + Sync>(src: &[T], f: impl Fn(T) -> u64 + Send + Sync) -> Vec<u64> {
-    if src.len() >= PARALLEL_MAP_MIN {
-        src.par_iter().map(|&v| f(v)).collect()
-    } else {
-        src.iter().map(|&v| f(v)).collect()
-    }
-}
 
 /// Gather `src[i]` for each `i` in `idx` into `dst`, on rayon once it is large enough to pay.
 ///

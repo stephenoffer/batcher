@@ -231,6 +231,8 @@ mod tests {
                 input: None,
                 offset: 1,
                 frame: None,
+                alpha: None,
+                half_life: None,
                 alias: "rn".into(),
             },
             WindowFunc {
@@ -238,6 +240,8 @@ mod tests {
                 input: Some(bc_expr::Expr::Col { name: "v".into() }),
                 offset: 1,
                 frame: None,
+                alpha: None,
+                half_life: None,
                 alias: "s".into(),
             },
         ];
@@ -282,6 +286,8 @@ mod tests {
                 input: None,
                 offset: 1,
                 frame: None,
+                alpha: None,
+                half_life: None,
                 alias: "rn".into(),
             },
             WindowFunc {
@@ -289,6 +295,8 @@ mod tests {
                 input: Some(bc_expr::Expr::Col { name: "v".into() }),
                 offset: 1,
                 frame: None,
+                alpha: None,
+                half_life: None,
                 alias: "s".into(),
             },
         ];

@@ -126,15 +126,34 @@ TPCH_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 TPCH_TABLES = tuple(TPCH_COLUMNS)
 
-# The tables the wired-up TPC-DS subset actually touches (so we only fetch those).
+# The full TPC-DS schema — all 24 tables `dsdgen` produces. The registered suite is the
+# whole 99-query benchmark, which reaches every one of them (all three sales channels,
+# their returns, and every dimension), so there is no subset left to fetch.
 TPCDS_TABLES = (
-    "store_sales",
-    "store_returns",
-    "date_dim",
-    "item",
+    "call_center",
+    "catalog_page",
+    "catalog_returns",
+    "catalog_sales",
     "customer",
     "customer_address",
+    "customer_demographics",
+    "date_dim",
+    "household_demographics",
+    "income_band",
+    "inventory",
+    "item",
+    "promotion",
+    "reason",
+    "ship_mode",
     "store",
+    "store_returns",
+    "store_sales",
+    "time_dim",
+    "warehouse",
+    "web_page",
+    "web_returns",
+    "web_sales",
+    "web_site",
 )
 
 
@@ -208,16 +227,31 @@ _CLICKBENCH_TIME_COLUMNS = ("EventTime", "ClientEventTime", "LocalEventTime")
 
 
 def _reconstruct_clickbench_temporals(table: pa.Table) -> pa.Table:
-    """Rebuild ClickBench's DATE / TIMESTAMP columns from their integer storage."""
+    """Rebuild ClickBench's DATE / TIMESTAMP columns from their integer storage.
+
+    Idempotent, because there are two supported layouts and only one of them stores these
+    as integers. The public ``hits_compatible`` parquet does; a **normalized local mirror**
+    (`tools/mirror_bench_data.py --dataset clickbench`, which scan mode requires) has
+    already converted them. Re-converting the second reads a timestamp as a *second* count
+    and overflows — `1373809127000000` out of bounds — which aborts the whole suite before
+    a single query runs, and reads as "the mirror is corrupt" rather than "it was already
+    right". A column that is already temporal is therefore left exactly as it is.
+    """
     for name in _CLICKBENCH_DATE_COLUMNS:
         if name in table.column_names:
-            days = pc.cast(table.column(name), pa.int32())
+            column = table.column(name)
+            if pa.types.is_date(column.type):
+                continue
+            days = pc.cast(column, pa.int32())
             table = table.set_column(
                 table.schema.get_field_index(name), name, pc.cast(days, pa.date32())
             )
     for name in _CLICKBENCH_TIME_COLUMNS:
         if name in table.column_names:
-            secs = pc.cast(table.column(name), pa.int64())
+            column = table.column(name)
+            if pa.types.is_timestamp(column.type):
+                continue
+            secs = pc.cast(column, pa.int64())
             stamps = pc.cast(secs, pa.timestamp("s"))
             table = table.set_column(
                 table.schema.get_field_index(name), name, pc.cast(stamps, pa.timestamp("us"))
@@ -368,4 +402,18 @@ def load_tables(benchmark: str, scale: float, source: str | None = None) -> dict
         from datagen import build_events
 
         return build_events(scale)
+    if benchmark == "job":
+        # The Join Order Benchmark's IMDb database — a real one, fetched and converted
+        # once. Lives in its own module because the fetch/extract/convert path is nothing
+        # like the others. See ``sources.job``.
+        from sources.job import job_tables
+
+        return job_tables(source)
+    if benchmark in ("h2o-groupby", "h2o-join"):
+        # The H2O.ai db-benchmark publishes generators rather than data — every leaderboard
+        # entry runs its own `groupby-datagen.R` / `join-datagen.R`. `datagen.h2o_tables`
+        # follows that spec, the same way TPC-DS above runs the spec's own `dsdgen`.
+        from datagen import build_groupby, build_join
+
+        return build_groupby(scale) if benchmark == "h2o-groupby" else build_join(scale)
     raise ValueError(f"unknown benchmark dataset: {benchmark!r}")

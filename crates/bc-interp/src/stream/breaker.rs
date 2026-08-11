@@ -33,6 +33,16 @@ use crate::InterpError;
 /// proportional to the machine rather than to the relation.
 const PAR_FOLD_MORSELS_PER_WORKER: usize = 2;
 
+/// How many morsels a limited `DISTINCT` reads before deciding its early exit will not pay.
+///
+/// The exit wins when `k` distinct rows turn up in a short prefix. When they have not by here,
+/// the key is low-cardinality relative to the limit, and the whole-column dense direct-map is
+/// the faster answer — measured at 4.9x DuckDB on that shape, which an unconditional early exit
+/// would hand back. Sixteen morsels is ~262,000 rows: long enough that a genuinely
+/// high-cardinality key has filled the prefix many times over, short enough that the wasted
+/// probe is a rounding error against the scan it saves.
+pub(super) const PREFIX_PROBE_MORSELS: usize = 16;
+
 /// Pull a stream to exhaustion.
 pub(super) fn drain(stream: Morsels<'_>) -> Result<Vec<RecordBatch>, InterpError> {
     stream.collect()
@@ -301,15 +311,124 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             Ok(out)
         }
 
-        // `DISTINCT` over all columns is a mergeable all-column group-by, so dedup it in
-        // parallel here rather than on the single-threaded oracle the deferred path below would
-        // use. Drain the input, and — exactly like the `Sort` breaker — give way to the spilling
-        // executor if the held input exceeds the envelope (that path dedups out of core); with no
-        // envelope (`budget == 0`, the common case) `check_budget` admits and the parallel dedup
-        // runs. Empty input defers so the oracle supplies the correctly-typed empty relation.
-        // Without this a 6M-row DISTINCT ran single-threaded — ~7x DuckDB.
-        RelOp::Distinct { input } => {
+        // Dedup is a mergeable reduction, so run it in parallel here rather than on the
+        // single-threaded oracle the deferred path below would use. Drain the input, and —
+        // exactly like the `Sort` breaker — give way to the spilling executor if the held input
+        // exceeds the envelope (that path dedups out of core); with no envelope (`budget == 0`,
+        // the common case) `check_budget` admits and the parallel dedup runs. Empty input defers
+        // so the oracle supplies the correctly-typed empty relation. Without this a 6M-row
+        // DISTINCT ran single-threaded — ~7x DuckDB.
+        RelOp::Distinct {
+            input,
+            keys,
+            order,
+            limit,
+        } => {
             let t = Instant::now();
+
+            // A whole-row `DISTINCT` under a fused `LIMIT k` stops as soon as `k` distinct rows
+            // exist, so it pulls a *prefix* of its input rather than draining it. That is the
+            // point of the fusion: the work becomes proportional to how far in the input has to
+            // be read to find `k` distinct rows, not to the input. It also needs no budget
+            // check, because `DistinctPrefix` never holds more than `k` rows and the morsels
+            // that fed it are dropped as they are consumed — this is the one breaker here that
+            // is not one.
+            //
+            // `DISTINCT ON` is excluded: `order` chooses which row survives per key, so a
+            // surviving row can be replaced by a later one and no prefix of the input
+            // determines the answer.
+            if let Some(k) = limit {
+                // `DISTINCT ON` with a limit goes to the oracle rather than the parallel dedup
+                // below. `ops::parallel_distinct_on` emits *bucket* order, not first-seen
+                // order, so truncating its output would keep a different `k` than the oracle
+                // does — the two tiers would disagree on the answer, which is invariant #6.
+                // Kyber only fuses a limit into a whole-row `DISTINCT`, so this arm costs
+                // nothing in practice; it exists so a hand-written plan cannot diverge.
+                if !keys.is_empty() {
+                    return exec_deferred_breaker(plan, ctx);
+                }
+                let mut stream = build_with(input, ctx)?;
+                let mut acc = bc_runtime::agg::DistinctPrefix::new(*k);
+                let mut probed: Vec<RecordBatch> = Vec::new();
+                let mut rows_in = 0usize;
+                let mut gave_up = false;
+                for batch in stream.by_ref() {
+                    let batch = batch?;
+                    rows_in += batch.num_rows();
+                    acc.push(&batch)?;
+                    if acc.is_satisfied() {
+                        break;
+                    }
+                    probed.push(batch);
+                    if probed.len() >= PREFIX_PROBE_MORSELS {
+                        gave_up = true;
+                        break;
+                    }
+                }
+                if !gave_up {
+                    // Either the prefix filled (the early exit, and the whole point) or the
+                    // input ran out first, in which case what it holds is every distinct row
+                    // and the limit was never binding. Both are the finished answer.
+                    //
+                    // Nothing pushed means an empty input: defer, so the oracle supplies the
+                    // correctly-typed empty relation exactly as the drained path below does.
+                    let Some(out) = acc.finish() else {
+                        return exec_deferred_breaker(plan, ctx);
+                    };
+                    let out = vec![out];
+                    if let (Some(m), Some(id)) = (ctx.meter, id) {
+                        m.breaker(
+                            id,
+                            rows_in as u64,
+                            0,
+                            0,
+                            &out,
+                            t.elapsed().as_nanos() as u64,
+                        );
+                    }
+                    return Ok(out);
+                }
+
+                // The probe window closed without `k` distinct rows, so the key is
+                // low-cardinality relative to the limit and the early exit is not going to pay.
+                // Measured rather than estimated, which matters: the planner's fallback for an
+                // unmeasured column is half the row count, and acting on that would fire the
+                // exit on exactly the shape where the dense direct-map already wins by 4.9x.
+                // This is the same shape `agg_par.rs` uses to pick an aggregate strategy on a
+                // measured reduction ratio.
+                //
+                // So: drain the rest and dedup the ordinary way. `parallel_distinct` emits
+                // bucket order, which is fine only while the limit cannot bind — when it turns
+                // out there are more than `k` distinct rows after all, the ordered prefix is
+                // recomputed over the input just drained, which is the one case that pays
+                // twice and is bounded by a single extra pass.
+                for batch in stream {
+                    let batch = batch?;
+                    rows_in += batch.num_rows();
+                    probed.push(batch);
+                }
+                let held = crate::batch_bytes(&probed);
+                let full = ops::parallel_distinct(&probed)?;
+                let distinct_rows: usize = full.iter().map(|b| b.num_rows()).sum();
+                let out = match distinct_rows > *k {
+                    false => full,
+                    true => bc_runtime::agg::distinct_prefix(&probed, *k)?
+                        .into_iter()
+                        .collect(),
+                };
+                if let (Some(m), Some(id)) = (ctx.meter, id) {
+                    m.breaker(
+                        id,
+                        rows_in as u64,
+                        0,
+                        held,
+                        &out,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                }
+                return Ok(out);
+            }
+
             let batches = drain_within_budget(
                 build_with(input, ctx)?,
                 ctx.budget,
@@ -320,7 +439,10 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             }
             let rows_in = crate::count_rows(&batches);
             let held = crate::batch_bytes(&batches);
-            let out = ops::parallel_distinct(&batches)?;
+            let out = match keys.is_empty() {
+                true => ops::parallel_distinct(&batches)?,
+                false => ops::parallel_distinct_on(&batches, keys, order)?,
+            };
             if let (Some(m), Some(id)) = (ctx.meter, id) {
                 m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
             }
@@ -446,7 +568,14 @@ fn rebuild_with_scan_children(plan: &RelOp, base: usize) -> Option<RelOp> {
         })
     };
     Some(match plan {
-        RelOp::Distinct { .. } => RelOp::Distinct { input: scan(0) },
+        RelOp::Distinct {
+            keys, order, limit, ..
+        } => RelOp::Distinct {
+            input: scan(0),
+            keys: keys.clone(),
+            order: order.clone(),
+            limit: *limit,
+        },
         RelOp::Window {
             partition_keys,
             order_keys,
@@ -481,7 +610,9 @@ fn rebuild_with_scan_children(plan: &RelOp, base: usize) -> Option<RelOp> {
             right_on,
             left_by,
             right_by,
-            backward,
+            direction,
+            tolerance,
+            allow_exact_matches,
             output,
             ..
         } => RelOp::AsofJoin {
@@ -491,7 +622,9 @@ fn rebuild_with_scan_children(plan: &RelOp, base: usize) -> Option<RelOp> {
             right_on: right_on.clone(),
             left_by: left_by.clone(),
             right_by: right_by.clone(),
-            backward: *backward,
+            direction: *direction,
+            tolerance: *tolerance,
+            allow_exact_matches: *allow_exact_matches,
             output: output.clone(),
         },
         _ => return None,

@@ -17,12 +17,18 @@ import batcher as bt
 from batcher.core import default_hub
 from batcher.core.udf import strategy as strat
 from batcher.metadata.hardware_scope import scoped
+from batcher.metadata.udf_stats import record_udf_row_seconds
 
 pytestmark = pytest.mark.unit
 
 
 def _double(b: pa.RecordBatch) -> pa.RecordBatch:
     """A vectorized (module-level, picklable) UDF — cheap per row, so it probes as *light*."""
+    return b.append_column("y", pc.multiply(b.column("x"), 2))
+
+
+def _heavy_marker(b: pa.RecordBatch) -> pa.RecordBatch:
+    """Identical work to `_double`; a second identity to seed a *heavy* measurement under."""
     return b.append_column("y", pc.multiply(b.column("x"), 2))
 
 
@@ -35,6 +41,17 @@ def _op_for(fn) -> object:
 def _clear_caches() -> None:
     strat._PROC_PROBE_CACHE.clear()
     strat._FN_ROW_SECONDS.clear()
+
+
+def _seed_row_cost(key: str, seconds: float) -> None:
+    """Seed the measured per-row cost where it now lives.
+
+    It moved out of Core's private `_LEARN_NS` entry into neutral `metadata.udf_stats`,
+    because Kyber's cost model spends the same number (`_measured_map_factor`) and a fact two
+    subsystems read cannot live inside one of them. The threads-vs-processes verdict stayed
+    private — which pool to dispatch on is Core's mechanism and nothing else's.
+    """
+    record_udf_row_seconds(default_hub(), key, seconds)
 
 
 # --- threads-vs-processes verdict is persisted / seeded ----------------------------------
@@ -71,24 +88,28 @@ def test_process_verdict_persisted_after_a_cold_probe():
 
 
 def test_learned_row_cost_changes_the_thread_batch_size():
-    op = _op_for(_double)
-    key = strat._fn_probe_key(op.fn)
+    """Two *different* callables, because the store smooths rather than overwrites.
+
+    Seeding one key twice would blend the second observation into the first (that is what
+    makes a single contended run unable to jerk the figure), so the "light" seed would read
+    back as half of the "heavy" one. Distinct `fn`s give each seed its own first observation,
+    which is also the situation being modelled: a heavy UDF and a light one.
+    """
+    heavy_op, light_op = _op_for(_heavy_marker), _op_for(_double)
     current = pa.table({"x": list(range(300_000))}).to_batches()
     morsel = 16_384
 
-    # Seeded HEAVY (per-row cost above the light threshold): the batch keeps the per-worker split
+    _clear_caches()
+    # HEAVY (per-row cost above the light threshold): the batch keeps the per-worker split
     # (floor stays at the morsel), so with many workers the target collapses toward the morsel.
-    _clear_caches()
-    default_hub().put_keyed_param(scoped(strat._LEARN_NS), key, {"row_secs": 1.0})
-    heavy = strat.thread_batch_target(
-        op, 4_000_000, num_workers=256, morsel=morsel, current=current
-    )
+    _seed_row_cost(strat._fn_probe_key(heavy_op.fn), 1.0)
+    _seed_row_cost(strat._fn_probe_key(light_op.fn), 1e-12)
 
-    # Cold: the trivial `fn` probes as LIGHT, so the target lifts to the measured optimum.
-    _clear_caches()
-    default_hub().put_keyed_param(scoped(strat._LEARN_NS), key, {})  # explicitly cold
+    heavy = strat.thread_batch_target(
+        heavy_op, 4_000_000, num_workers=256, morsel=morsel, current=current
+    )
     light = strat.thread_batch_target(
-        op, 4_000_000, num_workers=256, morsel=morsel, current=current
+        light_op, 4_000_000, num_workers=256, morsel=morsel, current=current
     )
 
     assert heavy < light  # the learned per-row cost steered the batch size
@@ -98,12 +119,13 @@ def test_learned_row_cost_changes_the_thread_batch_size():
 def test_learned_row_cost_is_persisted_after_measuring():
     op = _op_for(_double)
     key = strat._fn_probe_key(op.fn)
+    from batcher.metadata.udf_stats import load_udf_row_seconds
+
     _clear_caches()
-    default_hub().put_keyed_param(scoped(strat._LEARN_NS), key, {})
     current = pa.table({"x": list(range(300_000))}).to_batches()
     strat.thread_batch_target(op, 4_000_000, num_workers=8, morsel=16_384, current=current)
-    stored = default_hub().get_keyed_param(scoped(strat._LEARN_NS), key) or {}
-    assert isinstance(stored.get("row_secs"), (int, float))  # measured cost written back
+    stored = load_udf_row_seconds(default_hub(), key)
+    assert isinstance(stored, (int, float))  # measured cost written back
 
 
 # --- result-invariance: a warm vs cold policy gives identical output ---------------------
@@ -115,15 +137,11 @@ def test_batch_size_policy_is_result_invariant():
     key = strat._fn_probe_key(op.fn)
 
     _clear_caches()
-    default_hub().put_keyed_param(
-        scoped(strat._LEARN_NS), key, {"row_secs": 1.0}
-    )  # heavy → fine batches
+    _seed_row_cost(key, 1.0)  # heavy -> fine batches
     heavy = bt.from_arrow(t).ml.map_batches(_double).to_pydict()
 
     _clear_caches()
-    default_hub().put_keyed_param(
-        scoped(strat._LEARN_NS), key, {"row_secs": 1e-12}
-    )  # light → coarse
+    _seed_row_cost(key, 1e-12)  # light -> coarse
     light = bt.from_arrow(t).ml.map_batches(_double).to_pydict()
 
     assert heavy == light  # batch size only shards — byte-identical result

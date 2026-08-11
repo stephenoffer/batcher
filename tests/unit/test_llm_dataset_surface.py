@@ -317,3 +317,20 @@ def test_guided_grammar_completes_the_decoding_surface():
     assert _guided_decoding_kwargs(None, None, None, "root ::= 'a'") == {"grammar": "root ::= 'a'"}
     # choice still wins over grammar (documented precedence).
     assert _guided_decoding_kwargs(None, None, ["a"], "g") == {"choice": ["a"]}
+
+
+def test_a_row_the_engine_could_not_generate_for_stays_null():
+    """A `None` from the engine must not render as the four-letter string "None".
+
+    An engine that gives up on a row — a content filter, a per-row HTTP failure the engine
+    absorbed — reports it as `None`. Stringifying that produces a generation no downstream
+    filter can tell from a real one, which is exactly why the prompt side, `parse_json`, and
+    every reported column already null out instead.
+    """
+    from batcher.ml.llm.generate import _generate_batch
+    from batcher.ml.llm.requests import GenerateSpec
+
+    engine = lambda prompts: [None if p == "b" else p.upper() for p in prompts]  # noqa: E731
+    batch = pa.RecordBatch.from_pydict({"q": ["a", "b", "c"]})
+    out = _generate_batch(engine, batch, GenerateSpec(prompt_column="q"))
+    assert out.column("response").to_pylist() == ["A", None, "C"]

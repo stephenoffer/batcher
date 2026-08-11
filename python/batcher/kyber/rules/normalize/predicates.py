@@ -1,6 +1,6 @@
 """Boolean-predicate normalizations in the NORMALIZE phase.
 
-Four rewrites the reference optimizers carry and this one did not. Each takes a
+Three rewrites the reference optimizers carry and this one did not. Each takes a
 construct that is *correct but opaque* and gives it a shape the rest of Kyber can
 already act on, so the value is not the saved node — it is every downstream rule that
 was blind to the original spelling.
@@ -11,18 +11,23 @@ was blind to the original spelling.
 * `boolean_case_to_predicate` (DuckDB `case_simplification`) — `CASE WHEN c THEN true
   ELSE false END` is the branch condition itself. The swapped form is not, and the
   docstring says why.
-* `intersect_in_lists` (DuckDB `in_clause_simplification`) — two `IN` lists on one
-  column under an `AND` become their intersection, which is what bloom probing and
-  source pushdown actually send down.
 * `constant_group_key_removed` (DataFusion `eliminate_group_by_constant`) — a literal
   grouping key builds a one-entry hash table and forces a single-target shuffle; the
   key comes back as a projection so the schema is unchanged.
 
-The first three are null-sensitive, and the three-valued detail is the whole reason they
+The first two are null-sensitive, and the three-valued detail is the whole reason they
 are written out rather than lifted from the reference verbatim: each fires under a
 `Filter` and nowhere else, because that is the one context where NULL and FALSE are
 indistinguishable. `boolean_case_to_predicate` is narrower still and fires in only one
 of its two directions. See the individual docstrings.
+
+The `IN`-list intersection (DuckDB's `in_clause_simplification`) is deliberately *not*
+here. It lives in `extra/predicate_infer.py`, which handles it over an n-ary conjunction
+rather than a single `AND` pair and folds a disjoint pair to the empty relation. A second
+copy used to sit in this module under the same rule name, and because `RuleRegistry.add`
+treats a repeated name as a no-op, it never registered at all: whichever module imported
+first won, and the loser was dead code whose unit test asserted the opposite of what the
+optimizer actually does. `test_no_two_rules_share_a_name` now fails that outright.
 """
 
 from __future__ import annotations
@@ -30,15 +35,13 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, plan_rule
-from batcher.plan.expr_ir import Binary, Case, Col, Expr, InList, IsNotNull, Lit
-from batcher.plan.expr_rewrite import expr_key
+from batcher.plan.expr_ir import Binary, Case, Col, Expr, IsNotNull, Lit
 from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Projection
 from batcher.plan.visitor import transform_up
 
 __all__ = [
     "boolean_case_to_predicate",
     "constant_group_key_removed",
-    "intersect_in_lists",
     "self_comparison_to_null_check",
 ]
 
@@ -169,49 +172,6 @@ DEFAULT_REGISTRY.add(
         lambda plan, _ctx: boolean_case_to_predicate(plan),
     )
 )
-
-
-# --- `x IN (1,2,3) AND x IN (2,3,4)` → `x IN (2,3)` -------------------------
-
-
-@rule(name="intersect_in_lists", phase=Phase.NORMALIZE, matches=(Filter,))
-def intersect_in_lists(node: Filter, _ctx: OptimizerContext) -> LogicalPlan:
-    """Intersect two `IN` lists on the same column joined by `AND` (DuckDB's
-    `in_clause_simplification`).
-
-    Two `IN` lists on one column are a redundant pair: the row must be in both, so it
-    must be in the intersection, and every value outside it is probed for nothing. The
-    shape is common because it is what a view predicate ANDed with a user predicate
-    looks like after `or_equalities_to_in_list` has run on each half independently —
-    neither rule can see the other's output, so the intersection is left on the table.
-
-    Shrinking the list is worth more than the saved comparisons: the list is what bloom
-    probing and source pushdown send down, and a narrower one prunes more row groups.
-
-    Nullness is preserved because the intersection is non-empty by construction — the
-    rule declines the empty case. `x IN (1) AND x IN (2)` is FALSE for a non-null `x`
-    but NULL for a null one, so folding it to `Lit(False)` would be right under this
-    filter and wrong if the predicate is ever read as a value; the rewrite that is only
-    conditionally sound is the one not made.
-    """
-    rewritten = _intersect_conjoined_in_lists(node.predicate)
-    return node if rewritten is None else Filter(node.input, rewritten)
-
-
-def _intersect_conjoined_in_lists(expr: Expr) -> Expr | None:
-    if not (isinstance(expr, Binary) and expr.op == "and"):
-        return None
-    left, right = expr.left, expr.right
-    if not (isinstance(left, InList) and isinstance(right, InList)):
-        return None
-    if expr_key(left.input) != expr_key(right.input):
-        return None
-    # Order follows the left list so the rewrite is deterministic; `values` may hold
-    # unhashable literals, so membership is a scan rather than a set intersection.
-    kept = tuple(v for v in left.values if v in right.values)
-    if not kept or len(kept) == len(left.values):
-        return None  # empty (see the docstring) or already the intersection
-    return InList(left.input, kept)
 
 
 # --- `GROUP BY <constant>` → group by nothing -------------------------------

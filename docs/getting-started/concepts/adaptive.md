@@ -14,7 +14,8 @@ out of memory. Batcher corrects mid-flight.
 For comparison, DuckDB plans once, before execution. Spark AQE re-plans at stage
 boundaries, and so does Batcher: it's the same mechanism at the same granularity, with
 the difference that Batcher does it single-node too. The loop also stays off below
-20,000,000 input rows, so most queries never reach it.
+5,000,000 input rows for each pipeline breaker it would cut at, which is about 10,000,000
+rows for the simplest joined query, so most queries never reach it.
 
 The half with no equivalent elsewhere is what happens between runs. Batcher records what
 each query actually did into a sketch-backed store, so the next run plans against
@@ -29,7 +30,7 @@ plan, built for the large estimate, might pick a hash join sized for millions of
 and thrash. Batcher runs the filter, measures that only a few rows survived, and
 re-plans the join before it starts, often switching to a broadcast.
 
-The measured half of that loop is visible to you. `stats()` runs the query and reports
+The measured half of that loop is visible to you. {py:meth}`stats() <batcher.Dataset.stats>` runs the query and reports
 what each operator really did: row counts, time, peak memory. Those are the same numbers
 the engine feeds back into its next planning decision.
 

@@ -24,6 +24,7 @@ from batcher.api.terminal.stream.watermark._state import (
     _compact,
     _event_micros,
     _optimized_streaming_node,
+    _stream_tracker,
 )
 from batcher.io.source import Source
 
@@ -88,10 +89,17 @@ def stream_stream_join(
 
     state: dict = {"bufL": None, "bufR": None, "wmL": None, "wmR": None}
     counters = {"left": 0, "right": 0}
-
-    def micros(col):
-        hi = pc.max(col)
-        return _event_micros(hi).as_py() if hi.is_valid else None
+    # One tracker per *side*, because the two sides advance independently and the eviction
+    # rule already reasons across them (a left row is evictable on the right's watermark).
+    # Within a side the frontier is the minimum over that stream's partitions, which is the
+    # part a single `max` got wrong: a two-partition topic whose second partition lagged had
+    # its buffered rows evicted on the first partition's clock, so the pairs that would have
+    # matched were gone before their partner arrived — an inner join quietly missing rows,
+    # and an outer join emitting them null-padded as though nothing could ever match.
+    trackers = {
+        "left": _stream_tracker(sources[0], lateness),
+        "right": _stream_tracker(sources[1], lateness),
+    }
 
     def tag(table: pa.Table, *, left_side: bool) -> pa.Table:
         """Give each arriving row an id, and (for an outer join) an unmatched marker."""
@@ -196,14 +204,12 @@ def stream_stream_join(
                 # After the append, so the arriving rows learn about their own matches too.
                 state["bufL"] = mark_matched(state["bufL"], _LEFT_ID, left_hits)
                 state["bufR"] = mark_matched(state["bufR"], _RIGHT_ID, right_hits)
-            hi = micros(table.column(lt if left_side else rt))
+            tracker, partition_cols = trackers["left" if left_side else "right"]
+            tracker.observe(table, lt if left_side else rt, partition_cols)
             wk = "wmL" if left_side else "wmR"
-            advanced = False
-            if hi is not None:
-                cand = hi - lateness
-                previous = state[wk]
-                state[wk] = cand if previous is None else max(previous, cand)
-                advanced = state[wk] != previous
+            previous = state[wk]
+            state[wk] = tracker.watermark
+            advanced = state[wk] != previous
             # The side that just grew is always pruned; the other only when the watermark
             # that governs it actually moved.
             out.extend(

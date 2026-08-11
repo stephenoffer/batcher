@@ -38,6 +38,7 @@ MAGIC_PEEK_BYTES = 4096
 #: against it, and a literal repeated is a literal that will diverge.
 OCTET_STREAM = "application/octet-stream"
 
+
 def sniff_mime(path: str, data: bytes) -> str:
     """Best-effort MIME type from magic bytes, falling back to the extension.
 

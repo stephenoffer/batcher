@@ -57,15 +57,11 @@ class BudgetingAdmission:
             )
         soft = self._soft if self._soft is not None else ctx.config.memory.soft_limit
         envelope = int(available * soft)
-        # Cross-query admission: subtract what concurrent queries already hold
-        # against the shared buffer pool, so N queries that each individually fit the
-        # envelope are not all admitted into a collective OOM.
+        # Cross-query admission: subtract what concurrent queries already hold, so N
+        # queries that each individually fit the envelope are not all admitted into a
+        # collective OOM.
         if self._available is None:
-            from batcher.carbonite.memory.pool import current_process_pool
-
-            pool = current_process_pool()
-            if pool is not None:
-                envelope = max(0, envelope - pool.used)
+            envelope = max(0, envelope - _bytes_already_held())
         # The envelope can never be smaller than one morsel: the engine must hold at
         # least a single morsel to make any progress, and a *streaming* operator's whole
         # footprint is one morsel (`min(morsel_rows·width, morsel_bytes)`). Flooring here
@@ -109,6 +105,37 @@ class BudgetingAdmission:
             binding_op=None if binding is None else f"{binding.kind}#{int(binding.op_id)}",
             advisory=_rests_on_a_guess(plan, binding),
         )
+
+
+def _bytes_already_held() -> int:
+    """Bytes concurrent work is holding right now, across **both** buffer pools.
+
+    A process runs two `MemoryPool`s. Carbonite's own carries the coarse per-query
+    reservation the conductor takes for the duration of execution; the engine's carries the
+    operator state and the Flight transit buffers that reservation was an estimate *of*.
+    Admission read only the first, so it was blind to the actual footprint of whatever was
+    already running — which on a machine executing one large query is the entire number
+    worth subtracting.
+
+    The **max**, not the sum, for the same reason `BufferPool.denied` takes it: the two
+    counters describe the same neighbouring query from two sides, one as an estimate and one
+    as the bytes that estimate turned into. Adding them charges that neighbour twice and
+    refuses queries the box can hold.
+
+    Returns:
+        The larger of the two live readings, or `0` when neither pool exists (nothing has
+        run yet, so nothing is held).
+    """
+    from batcher.carbonite.memory.pool import current_process_pool, engine_pool_stats
+
+    held = 0
+    pool = current_process_pool()
+    if pool is not None:
+        held = pool.used
+    engine = engine_pool_stats()
+    if engine is not None:
+        held = max(held, int(engine["used_bytes"]))
+    return held
 
 
 def _rests_on_a_guess(plan: PhysicalPlan, binding) -> bool:

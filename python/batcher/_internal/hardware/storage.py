@@ -18,27 +18,44 @@ as "keep the configured default".
 from __future__ import annotations
 
 import functools
+import glob
 import os
 
 __all__ = [
+    "FLASH_SPILL_MBPS",
     "SPILL_DEVICE_FACTOR",
     "SPILL_DEVICE_FACTOR_DEFAULT",
     "device_class",
     "device_cost_factor",
 ]
 
-# Device-name prefixes that identify a class without any /sys lookup. Ordered longest-first so
-# a more specific prefix wins; `nvme` before `nbd` matters because both start the same way for
-# a two-character match.
+# Device-name prefixes that identify a class outright, with no `/sys` lookup and no backing
+# device to look through. No prefix here is a prefix of another, so the order is presentation
+# only. (`drbd` does not match `rbd`: these are tested with `startswith`, not as substrings.)
 _NAME_CLASSES: tuple[tuple[str, str], ...] = (
     ("nvme", "nvme"),
     ("nbd", "network"),
     ("rbd", "network"),
     ("drbd", "network"),
     ("loop", "loopback"),
-    ("md", "raid"),
-    ("dm-", "mapped"),
 )
+
+# Virtual devices that are a *view* of other devices rather than a medium of their own, and the
+# class to report when the devices underneath them cannot be resolved. Neither says anything
+# about speed on its own: an `md` RAID0 of four local NVMe and an `md` RAID1 of two iSCSI
+# targets are the same prefix and thirty times apart, and a `dm-` mapper sits over whatever LVM
+# was pointed at — which on a cloud instance is very often a network-attached volume.
+#
+# Reporting the prefix alone is what made that invisible. `mapped` and `raid` both carry the
+# default cost factor, so LVM over EBS — an ordinary, extremely common root-and-scratch layout
+# — was priced as local flash, understating a spilled byte tenfold in the one term that decides
+# whether an out-of-core plan is acceptable at all.
+_COMPOSITE_CLASSES: dict[str, str] = {"md": "raid", "dm-": "mapped"}
+
+# How far to follow `slaves/` before giving up. LVM over mdraid over partitions is three, and
+# nothing real is deeper; the bound is what makes a `/sys` tree with a cycle in it terminate
+# rather than hang a planning call.
+_SLAVE_DEPTH_MAX = 4
 
 
 def _sys_block_name(path: str) -> str:
@@ -86,6 +103,12 @@ def device_class(path: str) -> str:
     the class is an input to the hardware fingerprint, so it must be stable across reboots and
     across instances of the same shape, which a device name or serial number would not be.
 
+    A **composite** device (LVM's `dm-*`, mdraid's `md*`) is resolved through its `slaves/`
+    to what actually stores the bytes, and reported as the *slowest* class underneath it — the
+    binding direction, since a spill striped across one local NVMe and one network volume runs
+    at the network volume's rate. Only when the backing devices cannot be read does it fall
+    back to naming the mapper itself.
+
     Memoized per path, since a directory's backing device does not change under a running
     process and spill sizing asks on every admission decision.
 
@@ -101,13 +124,111 @@ def device_class(path: str) -> str:
         # spill target is a real configuration (and a trap — spilling to RAM relieves nothing),
         # so it is worth naming distinctly rather than folding into "unknown".
         return "memory" if os.path.exists("/sys/dev/block") else "unknown"
+    return _class_of_device(name, _SLAVE_DEPTH_MAX)
+
+
+#: Transports an NVMe namespace can be reached over that are **not** a local PCIe link. NVMe
+#: over Fabrics presents an ordinary `nvme0n1` whose bytes cross a network, so the device name
+#: — the one signal used before — reports the fastest class in the table for storage that
+#: belongs in the slowest. `pcie` is the local case and is deliberately absent.
+_NVME_FABRIC_TRANSPORTS = frozenset({"rdma", "tcp", "fc", "loop"})
+
+#: Substrings that appear in a SCSI device's `/sys` path only when the LUN is remote: an iSCSI
+#: session, or a Fibre Channel / FCoE remote port. Such a device answers `rotational = 0` and
+#: was therefore classified `ssd`, at a tenth of its real cost, on exactly the SAN-backed
+#: deployments where an out-of-core plan most needs pricing correctly.
+_REMOTE_SCSI_MARKERS = ("/session", "/rport-", "/fc_remote_ports")
+
+
+def _class_of_device(name: str, depth: int) -> str:
+    """The class of one `/sys/block` entry, following a composite device to its backing store."""
     for prefix, cls in _NAME_CLASSES:
         if name.startswith(prefix):
+            # An NVMe *name* is not evidence of an NVMe *link*: NVMe-oF namespaces are named
+            # identically to local ones. Ask the driver which transport this namespace uses.
+            if cls == "nvme" and _nvme_transport(name) in _NVME_FABRIC_TRANSPORTS:
+                return "network"
             return cls
+    for prefix, fallback in _COMPOSITE_CLASSES.items():
+        if name.startswith(prefix):
+            return _slowest_backing_class(name, depth) or fallback
+    if _is_remote_scsi(name):
+        return "network"
     rotational = _read_int(f"/sys/block/{name}/queue/rotational")
     if rotational is None:
         return "unknown"
     return "rotational" if rotational else "ssd"
+
+
+def _nvme_transport(name: str) -> str:
+    """The transport an NVMe namespace is reached over (``pcie``/``tcp``/``rdma``/``fc``).
+
+    `""` when the driver does not publish one, which every consumer reads as "assume local" —
+    the pre-existing answer, so a kernel too old to expose `transport` prices exactly as before.
+    """
+    try:
+        with open(f"/sys/block/{name}/device/transport") as f:
+            return f.read().strip().lower()
+    except OSError:
+        return ""
+
+
+def _is_remote_scsi(name: str) -> bool:
+    """Whether a SCSI block device is a remote LUN (iSCSI, Fibre Channel, FCoE).
+
+    Decided from where the device sits in the `/sys` device tree, which is a positive
+    identification rather than an inference from the name: a local SAS disk and an iSCSI LUN
+    are both `sd*` and both answer the same `rotational`, and only the path distinguishes them.
+    """
+    try:
+        resolved = os.path.realpath(f"/sys/block/{name}/device")
+    except OSError:
+        return False
+    return any(marker in resolved for marker in _REMOTE_SCSI_MARKERS)
+
+
+def _slowest_backing_class(name: str, depth: int) -> str:
+    """The costliest class among a composite device's backing devices, `""` when unresolvable.
+
+    The costliest rather than the commonest, because a stripe finishes at the rate of its
+    slowest member: an LVM volume group spanning local flash and a network disk delivers the
+    network disk's throughput for anything that touches both, which an external merge's
+    concurrent run reads reliably do.
+
+    An `unknown` member is skipped rather than treated as fast or slow — it carries no
+    measurement, and letting it win either way would turn one unreadable device into a verdict
+    about the whole array.
+    """
+    if depth <= 0:
+        return ""
+    try:
+        slaves = os.listdir(f"/sys/block/{name}/slaves")
+    except OSError:
+        return ""
+    classes = [
+        found
+        for slave in slaves
+        # A slave entry may be a partition (`nvme0n1p1`), whose queue attributes live on the
+        # disk; `_sys_block_name` handles that for a path, and here the parent is found by the
+        # same rule — a partition directory has no `slaves` and no `queue` of its own.
+        if (found := _class_of_device(_parent_disk(slave), depth - 1)) not in ("", "unknown")
+    ]
+    if not classes:
+        return ""
+    return max(classes, key=lambda c: SPILL_DEVICE_FACTOR.get(c, SPILL_DEVICE_FACTOR_DEFAULT))
+
+
+def _parent_disk(name: str) -> str:
+    """The whole-disk name backing a `/sys/block` entry, which may itself be a partition."""
+    if os.path.exists(f"/sys/block/{name}"):
+        return name
+    # A partition is not its own `/sys/block` entry; it lives under its disk. `sdb3` -> `sdb`,
+    # `nvme0n1p2` -> `nvme0n1`. Resolved through the tree rather than by string surgery, so a
+    # naming scheme this code has not seen degrades to "unknown" instead of to a wrong disk.
+    for disk in glob.glob("/sys/block/*"):
+        if os.path.isdir(os.path.join(disk, name)):
+            return os.path.basename(disk)
+    return name
 
 
 # What a byte written to a device class costs relative to one on local flash.
@@ -140,6 +261,21 @@ SPILL_DEVICE_FACTOR: dict[str, float] = {
 # *feasibility* question for whoever chose the directory, not a throughput one, and encoding
 # the warning as a fake bandwidth number would bury it where nobody reads.
 SPILL_DEVICE_FACTOR_DEFAULT = 1.0
+
+# The sustained sequential throughput, in MB/s, that factor `1.0` above *means*.
+#
+# This is not a new assumption. Every entry in the table is already a ratio against local
+# flash's bandwidth ("roughly a tenth", "an order of magnitude worse again"), so the anchor
+# has always existed — it was simply implicit, which made the ratios impossible to check
+# against a measurement. Naming it is what lets a *measured* spill rate be compared with what
+# a device class claims, so a misclassified device can be caught instead of silently
+# re-ranking every out-of-core plan on the machine.
+#
+# Deliberately conservative: a mid-range NVMe sustains well above this, so a device that
+# measures faster than the anchor is unambiguously flash-class rather than borderline. Being
+# conservative here only ever makes the measured correction *less* eager to fire, which is the
+# right direction for a figure that decides whether a plan may spill.
+FLASH_SPILL_MBPS = 1000.0
 
 
 def device_cost_factor(path: str) -> float:

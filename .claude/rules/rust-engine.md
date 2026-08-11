@@ -24,6 +24,13 @@ near-leaves (nothing but `bc-arrow`, the DAG's root, below them), pulled in wher
                   array-level work, which is what keeps every geometry algorithm unit-
                   testable without a `RecordBatch` and keeps a third-party geometry stack
                   out of the build.
+  bc-spatial   → bc-expr. Rotations, poses and the transforms between coordinate
+                  frames — the arithmetic a robotics or autonomous-driving log is read
+                  with. Deliberately Arrow-free for the same reason as `bc-geo`, and
+                  dependency-free besides: rigid-body maths is `f64` arithmetic and the
+                  standard library's transcendental functions, so a linear-algebra crate
+                  would put a matrix type into every build of the engine to hold twelve
+                  numbers. `bc-expr::eval::spatial` does the array-level work.
   bc-secrets   → bc-expr (resolves `env:`/`file:`/`cmd:` secret references, with a
                   TTL cache). Deliberately dependency-free: it sits under bc-expr,
                   which everything links, so a cloud SDK here would put tokio + a TLS

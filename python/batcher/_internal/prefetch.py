@@ -23,6 +23,8 @@ import threading
 from collections.abc import Iterator
 from typing import TypeVar
 
+from batcher._internal.concurrency import start_context_thread
+
 __all__ = ["prefetch"]
 
 T = TypeVar("T")
@@ -92,7 +94,12 @@ def prefetch(gen: Iterator[T], depth: int = 2) -> Iterator[T]:
                     close()
             _offer((None, done))
 
-    threading.Thread(target=_worker, daemon=True, name="batcher-prefetch").start()
+    # Under the caller's context, not a fresh one. `gen` is the *consumer's* work moved to
+    # another thread — an `iter_batches` over a source, a decode stage — so it must read the
+    # same `Config` the consumer does. A bare thread reads every context variable at its
+    # default, which quietly reverted the morsel size, the memory cap and the credential
+    # scope of everything pulled through here.
+    start_context_thread(_worker, name="batcher-prefetch", daemon=True)
     try:
         while True:
             error, item = q.get()

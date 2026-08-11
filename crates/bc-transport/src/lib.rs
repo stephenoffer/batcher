@@ -109,7 +109,8 @@ mod tls_test_certs;
 
 pub use exchange::{classify, ClientPool, FetchFault, ShuffleExchange};
 pub use peers::{
-    peer_transfers, record_fetch, record_retry, reset_peer_transfers, slowest_peer, PeerTransfer,
+    fleet_bdp_bytes, fleet_flow_totals, fleet_starved_ratio, peer_transfers, record_fetch,
+    record_retry, reset_peer_transfers, slowest_peer, PeerTransfer,
 };
 pub use shared::{clear_plan_shared, clear_shared, fetch_shared, publish_shared, shm_available};
 pub use ticket::ShuffleTicket;
@@ -1125,6 +1126,59 @@ mod tests {
             max_inflight >= WINDOW as i64,
             "the producer filled only {max_inflight} of {WINDOW} credits, so it never \
              parked — this test is not exercising the blocking path it exists for"
+        );
+    }
+
+    /// The starvation clock is a real component of a real fetch, not a synthetic figure.
+    ///
+    /// The per-peer counters are process-wide and these tests run concurrently, so this
+    /// asserts on *this* exchange's ephemeral address rather than on the fleet totals — and
+    /// never resets, which would delete another test's measurements.
+    #[tokio::test]
+    async fn a_pooled_fetch_records_a_starvation_clock_within_its_own_duration() {
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(41, 0, 0, 0, 0);
+        producer.publish(&ticket, seq_batches(0, 24)).await;
+
+        let pool = ClientPool::new();
+        let got = pool.fetch_secured(&addr, &ticket, 4, None).await.unwrap();
+        assert_eq!(got.len(), 24);
+
+        let mine = peer_transfers()
+            .into_iter()
+            .find(|(a, ..)| a == &addr)
+            .expect("the fetch registered its peer");
+        let (_, _, nanos, fetches, _, starved) = mine;
+        assert_eq!(fetches, 1);
+        assert!(nanos > 0, "a completed fetch took measurable time");
+        assert!(
+            starved <= nanos,
+            "waiting for data is part of the fetch, not extra to it: {starved} > {nanos}"
+        );
+    }
+
+    /// An unpublished ticket is the expected empty-bucket case, and it measures nothing.
+    ///
+    /// Charging its round trip as starvation would tell every controller in the shuffle to
+    /// widen a window that carried no rows.
+    #[tokio::test]
+    async fn an_empty_bucket_contributes_no_starvation() {
+        let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
+        let addr = producer.addr().to_string();
+        let ticket = ShuffleTicket::new(42, 0, 0, 0, 0);
+
+        let pool = ClientPool::new();
+        let got = pool.fetch_secured(&addr, &ticket, 4, None).await.unwrap();
+        assert!(got.is_empty(), "a mapper with no rows publishes no ticket");
+
+        let mine = peer_transfers()
+            .into_iter()
+            .find(|(a, ..)| a == &addr)
+            .expect("even an empty fetch registers its peer");
+        assert_eq!(
+            mine.5, 0,
+            "an empty bucket must not read as a starved channel"
         );
     }
 

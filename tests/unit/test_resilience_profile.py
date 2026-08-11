@@ -360,3 +360,59 @@ def test_spot_env_auto_applies_profile(monkeypatch):
     # Off a spot node, the default profile stands.
     monkeypatch.delenv("BATCHER_SPOT", raising=False)
     assert _resolved(Config()).distributed.resilience == "default"
+
+
+class TestTheResolutionMemo:
+    """`_resolved` is memoized on the input's identity, because `with_auto_config` resolves
+    the *same* config object on every terminal op and re-deriving it costs 8.4 us -- 88% of
+    which is `detect_spot_environment` re-reading ten environment variables to re-answer a
+    question about the machine. These tests pin what the memo may and may not change."""
+
+    def test_a_repeated_resolution_of_one_object_is_the_same_object(self):
+        from batcher.config import Config
+        from batcher.config.config import _resolved, reset_resolution_memo
+
+        reset_resolution_memo()
+        cfg = Config()
+        first = _resolved(cfg)
+        assert _resolved(cfg) is first, "the memo did not hit on an identical input"
+
+    def test_a_different_config_is_resolved_afresh(self, monkeypatch):
+        """The memo must not answer for a config it was not built from -- the failure mode
+        that would silently apply one config's resolution to another."""
+        from batcher.config import Config
+        from batcher.config.config import _resolved, reset_resolution_memo
+
+        reset_resolution_memo()
+        monkeypatch.delenv("BATCHER_SPOT", raising=False)
+        assert _resolved(Config()).distributed.resilience == "default"
+        monkeypatch.setenv("BATCHER_SPOT", "1")
+        # A *new* object, so the memo misses and the environment is read again.
+        assert _resolved(Config()).distributed.resilience == "spot"
+
+    def test_reset_forces_the_environment_to_be_read_again(self, monkeypatch):
+        """The documented escape hatch for the one thing the memo assumes: that the
+        environment behind spot detection has not moved while a single config object is
+        reused. A node does not become preemptible mid-process, but a test can."""
+        from batcher.config import Config
+        from batcher.config.config import _resolved, reset_resolution_memo
+
+        reset_resolution_memo()
+        monkeypatch.delenv("BATCHER_SPOT", raising=False)
+        cfg = Config()
+        assert _resolved(cfg).distributed.resilience == "default"
+        monkeypatch.setenv("BATCHER_SPOT", "1")
+        assert _resolved(cfg).distributed.resilience == "default"  # memoized, by design
+        reset_resolution_memo()
+        assert _resolved(cfg).distributed.resilience == "spot"
+
+    def test_the_memoized_result_is_a_validated_config(self):
+        """`_resolved` ends in `validate()`; a memo that returned the pre-validation config
+        would skip ~60 range checks on every query after the first."""
+        from batcher.config import Config
+        from batcher.config.config import _resolved, reset_resolution_memo
+
+        reset_resolution_memo()
+        cfg = Config()
+        assert _resolved(cfg).validate() is not None
+        assert _resolved(cfg) is _resolved(cfg)

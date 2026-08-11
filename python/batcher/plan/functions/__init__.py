@@ -74,6 +74,12 @@ from batcher.plan.functions.scalar import (
     width_bucket,
 )
 from batcher.plan.functions.security import aes_decrypt, aes_encrypt, hmac_sha256, mask
+
+# The rigid-body family re-exports through its own curated `__all__`, for the same
+# reason the geospatial one does: it is 57 names across five modules, and spelling them
+# out here *and* in `api/functions.py` would be 114 lines whose only job is to drift.
+from batcher.plan.functions.spatial import *  # noqa: F403
+from batcher.plan.functions.spatial import __all__ as _SPATIAL_ALL
 from batcher.plan.functions.string import (
     concat,
     concat_ws,
@@ -195,4 +201,4 @@ __all__ = [
 # names in a sorted block after the curated one, which is globally unsorted. Sorting here
 # keeps the splice a one-liner without the curated list restating names it deliberately
 # does not spell out.
-__all__ = sorted(__all__ + _GEO_ALL)
+__all__ = sorted(__all__ + _GEO_ALL + _SPATIAL_ALL)

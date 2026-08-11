@@ -105,3 +105,43 @@ def test_filtering_does_not_mutate_the_probe_result(monkeypatch) -> None:
 def test_no_devices_stays_no_devices(monkeypatch) -> None:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     assert _visible_devices([]) == []
+
+
+# --- The documented "no devices" spellings ----------------------------------------------------
+
+
+@pytest.mark.parametrize("masked", ["-1", "", "none", "void"])
+def test_a_masked_off_process_sees_no_devices(monkeypatch, masked):
+    """`-1` is CUDA's own documented "no devices" and what a framework or CI script writes.
+
+    Only the empty string was recognized, so `-1` fell through the ordinal parse (it is not
+    `isdigit`), failed to resolve as a UUID, and hit the "could not resolve" fallback — which
+    returns EVERY device on the node. A pod explicitly denied the GPU was reported as owning
+    all eight of them, and the pool sized itself accordingly.
+    """
+    from batcher._internal import accelerators as acc
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", masked)
+    devices = [{"index": i, "name": "NVIDIA H100", "memory_bytes": 80 << 30} for i in range(8)]
+    assert acc._visible_devices(devices) == []
+
+
+@pytest.mark.parametrize("var", ["CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"])
+def test_the_cheap_negative_honours_a_mask(monkeypatch, var):
+    """A run told to stay off the GPU must not pay the ~2 s `import torch` to discover that."""
+    from batcher._internal import accelerators as acc
+
+    for name in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(var, "-1" if var == "CUDA_VISIBLE_DEVICES" else "none")
+    acc.gpu_devices_absent.cache_clear()
+    assert acc.gpu_devices_absent() is True
+    acc.gpu_devices_absent.cache_clear()
+
+
+def test_an_ordinary_pin_is_unaffected(monkeypatch):
+    from batcher._internal import accelerators as acc
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+    devices = [{"index": i, "name": "NVIDIA H100", "memory_bytes": 80 << 30} for i in range(8)]
+    assert [d["index"] for d in acc._visible_devices(devices)] == [0, 1]

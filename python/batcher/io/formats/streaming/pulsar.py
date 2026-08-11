@@ -29,7 +29,7 @@ import base64
 import hashlib
 from typing import Any
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 
@@ -51,13 +51,7 @@ _ENTRY_ID_BITS = 32
 
 def _import_pulsar() -> Any:
     """Import the ``pulsar`` client module or raise a guiding ``BackendError``."""
-    try:
-        import pulsar
-    except ImportError as exc:
-        raise BackendError(
-            "reading from Pulsar needs the pulsar extra: pip install 'batcher-engine[pulsar]'"
-        ) from exc
-    return pulsar
+    return require("pulsar", feature="Pulsar support", provides="pulsar-client", extra="pulsar")
 
 
 @SOURCES.register("pulsar")

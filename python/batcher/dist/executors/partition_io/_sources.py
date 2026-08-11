@@ -24,7 +24,7 @@ import pickle
 
 import pyarrow as pa
 
-from batcher.dist.executors.partition_io.assignment import _balance, assign_splits
+from batcher.dist.executors.partition_io.assignment import assign_splits, has_affinity
 from batcher.dist.executors.scan_read import (
     _SCAN_PREFETCH,
     _SPLIT_TARGET_BYTES,
@@ -165,6 +165,7 @@ def _partition_source(
     tag: str = "P",
     projection: list[str] | None = None,
     predicate: dict | None = None,
+    preserve_order: bool = False,
 ) -> list[str]:
     """Assign a source's splits to `workers` partition files.
 
@@ -174,6 +175,15 @@ def _partition_source(
     to eager range-slicing into Arrow-IPC files (projection/predicate are applied
     once on the driver before slicing). Either kind is read back with
     `read_partition`.
+
+    `preserve_order` gives each partition a **contiguous, source-ordered run** of splits
+    instead of the load-balanced pick. An operator that keeps only *some* of the rows it
+    orders needs it: which of several rows tied at the cut survives is decided by input
+    order, so a partition holding non-adjacent splits selects a different tied row than
+    single-node does. Measured on 24 files with a 5,000-value key, `ORDER BY k LIMIT 137`
+    returned the right 137 *keys* either way and a different set of *rows* under the
+    balanced pick. It costs almost nothing here because `_contiguous` still fills each
+    group to an equal share of the total weight — it gives up reordering, not balance.
     """
     splits = _scan_splits(source, workers, predicate, projection)
     if len(splits) == 1 and isinstance(splits[0], WholeSourceSplit):
@@ -187,7 +197,7 @@ def _partition_source(
     meta = {"projection": projection, "predicate": predicate, "on_read_error": on_read_error}
     schema = source.schema()
     paths = []
-    for i, group in enumerate(_balance(splits, workers)):
+    for i, group in enumerate(assign_splits(splits, workers, preserve_order=preserve_order)):
         if group:
             path = os.path.join(work_dir, f"{tag}_part_{i}.splits")
             with open(path, "wb") as fh:
@@ -245,6 +255,7 @@ def partition_descriptors(
     predicate: dict | None = None,
     preserve_order: bool = False,
     worker_addrs: list[str] | None = None,
+    max_partitions: int | None = None,
 ) -> list[dict]:
     """Partition a source into `workers` in-memory descriptors — no shared filesystem.
 
@@ -271,6 +282,15 @@ def partition_descriptors(
     that process. Load-only balancing is kept for storage-backed splits (every worker is
     equidistant from object storage) and whenever locality would unbalance the stage.
 
+    `max_partitions` raises the descriptor count above `workers` — the shuffle's task
+    granularity, sized by `map_partitions`. It is a **ceiling, not a target**: the count is
+    the smaller of it and the number of splits the source actually has, so a ten-row-group
+    input on an eight-worker cluster yields ten partitions rather than thirty-two empty
+    tasks, and the returned length is the authority on how many there are. It applies only
+    to splittable sources; an in-memory one stays at `workers` because its batches are
+    already driver-resident, so cutting them finer buys neither a smaller recovery unit
+    (the driver still holds them) nor a smaller read (there is no read).
+
     Read back with `read_partition_descriptor`.
     """
     splits = _scan_splits(source, workers, predicate, projection)
@@ -293,41 +313,72 @@ def partition_descriptors(
         empty = pa.RecordBatch.from_pylist([], schema=proj_schema)
         return [{"batches": g or [empty]} for g in groups]
 
-    schema = source.schema()
     descriptors: list[dict] = []
+    # More partitions than workers only where there are splits to fill them. `assign_splits`
+    # would happily return empty groups, and each one still costs a task and a full set of
+    # empty bucket publishes — the cost of finer granularity with none of the benefit.
+    #
+    # And only where the splits are *homeless*. A split that declares an `affinity()` is
+    # already resident in a worker's process — the buckets of an intermediate a prior stage
+    # left on the fleet — and `balance_with_affinity` places it by matching that address
+    # against `worker_addrs[i]`, which only has an entry per worker. Asking it for more
+    # groups than there are workers makes it bail to the plain load-balancer, silently
+    # turning every zero-copy local read into a network fetch of bytes the reader already
+    # holds. It is the right trade anyway: a resident intermediate is not re-read from
+    # storage on recovery, so a finer partition of it buys none of what this is for.
+    n_parts = workers
+    if max_partitions is not None and not (worker_addrs and has_affinity(splits)):
+        n_parts = max(workers, min(max_partitions, len(splits)))
     for group in assign_splits(
-        splits, workers, preserve_order=preserve_order, worker_addrs=worker_addrs
+        splits, n_parts, preserve_order=preserve_order, worker_addrs=worker_addrs
     ):
         if group:
             descriptors.append({"splits": group, "projection": projection, "predicate": predicate})
         else:
             # Empty group: a schema-only batch keeps the per-worker shape uniform.
-            cols = projection or schema.names
-            empty_schema = pa.schema([schema.field(c) for c in cols])
-            descriptors.append({"batches": [pa.RecordBatch.from_pylist([], schema=empty_schema)]})
+            descriptors.append(empty_descriptor(source, projection))
     return descriptors
+
+
+def empty_descriptor(source: Source, projection: list[str] | None = None) -> dict:
+    """A partition descriptor holding no rows — one schema-only batch.
+
+    The shape a worker gets when the split assignment left it nothing, and what a caller
+    pads a short descriptor list with. A join is the case that needs the padding: it maps
+    both sides through one barrier under a single source id, so the two lists must be the
+    same length, and each side's partition count is bounded by *its own* splits. Padding the
+    smaller side costs a no-op task rather than a second split plan of the larger one.
+
+    Args:
+        source: The source the descriptor stands in for, for its schema.
+        projection: The columns the read was pushed down to, if any.
+
+    Returns:
+        A descriptor `read_partition_descriptor` returns one empty, correctly-typed batch for.
+    """
+    schema = source.schema()
+    cols = projection or schema.names
+    empty_schema = pa.schema([schema.field(c) for c in cols])
+    return {"batches": [pa.RecordBatch.from_pylist([], schema=empty_schema)]}
 
 
 def descriptor_rows(desc: dict) -> int:
     """Approximate row count of a partition descriptor — for skew-aware per-task sizing.
 
-    Splittable partitions sum their splits' footer-derived row counts (no I/O — the
-    count was captured when the split was built); in-memory partitions sum their batch
-    sizes. Used to give each distributed task a CPU share proportional to its data (a
+    Splittable partitions sum their splits' row counts; in-memory partitions sum their
+    batch sizes. Used to give each distributed task a CPU share proportional to its data (a
     heavier partition gets more cores, a tiny one a fraction), so per-task allocation
     tracks data skew that LPT balancing could not fully even out.
+
+    Weighed through `split_weights`, the same helper the assignment uses, so a whole-file
+    split — whose count is a *footer read*, not a captured field — is not asked a second
+    time here after assignment already asked, and is not asked at all once the split count
+    is large enough that the metadata round trips would dominate the driver.
     """
     if "splits" in desc:
-        total = 0
-        for s in desc["splits"]:
-            rows = getattr(s, "rows", None)
-            if rows is None and hasattr(s, "row_count"):
-                try:
-                    rows = s.row_count()
-                except Exception:
-                    rows = None
-            total += rows or 0
-        return total
+        from batcher.dist.executors.partition_io.assignment import split_weights
+
+        return sum(split_weights(desc["splits"]))
     return sum(b.num_rows for b in desc.get("batches", []))
 
 

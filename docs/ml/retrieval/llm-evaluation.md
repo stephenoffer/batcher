@@ -4,12 +4,12 @@ This page covers measuring generation quality: lexical-overlap scores against a 
 column, and the reference-free monitors a team watches when generation runs at scale.
 
 Every metric here is an expression that aggregates to a corpus score in one scan, so
-there is no Python loop over examples and every one of them composes with `group_by`.
+there is no Python loop over examples and every one of them composes with {py:meth}`group_by <batcher.Dataset.group_by>`.
 
 ## Scoring against a reference
 
 Evaluating generations is comparing a generated column to a gold column.
-`bt.exact_match` is the strict character-for-character rate. `bt.normalized_exact_match`
+{py:func}`bt.exact_match <batcher.exact_match>` is the strict character-for-character rate. {py:func}`bt.normalized_exact_match <batcher.normalized_exact_match>`
 applies SQuAD normalization first (lowercase, drop articles and punctuation), so casing and a
 trailing period do not count against a correct answer.
 
@@ -23,8 +23,8 @@ print(evals.agg(em=bt.normalized_exact_match("answer", "gold")).to_pydict())
 ```
 
 For free-form answers where neither exact match nor a single word is right, the token metrics
-compare the *sets* of words (repeats counted once): `bt.token_set_precision`, `bt.token_set_recall`,
-`bt.token_set_f1` (the balanced default), and `bt.token_set_jaccard`. `bt.length_ratio` reports how
+compare the *sets* of words (repeats counted once): {py:func}`bt.token_set_precision <batcher.token_set_precision>`, {py:func}`bt.token_set_recall <batcher.token_set_recall>`,
+{py:func}`bt.token_set_f1 <batcher.token_set_f1>` (the balanced default), and {py:func}`bt.token_set_jaccard <batcher.token_set_jaccard>`. {py:func}`bt.length_ratio <batcher.length_ratio>` reports how
 verbose the output is relative to the reference, which catches a model that systematically over- or
 under-generates. Every one composes with `group_by` to score per model, per prompt template, or per
 slice in the same pass.
@@ -42,9 +42,9 @@ These are set-based by design, so they are stable and fast rather than a multise
 each metric's docstring states this so it is never confused with one.
 
 The token-set metrics split on whitespace, which fails on a language that does not put spaces
-between words. `bt.char_ngram_f1` scores the overlap of *character* n-grams instead, the idea behind
+between words. {py:func}`bt.char_ngram_f1 <batcher.char_ngram_f1>` scores the overlap of *character* n-grams instead, the idea behind
 chrF, so it works on Chinese, Japanese, or heavily inflected output with no tokenizer.
-`bt.char_ngram_precision`, `bt.char_ngram_recall`, and `bt.char_ngram_jaccard` are the matching
+{py:func}`bt.char_ngram_precision <batcher.char_ngram_precision>`, {py:func}`bt.char_ngram_recall <batcher.char_ngram_recall>`, and {py:func}`bt.char_ngram_jaccard <batcher.char_ngram_jaccard>` are the matching
 directional and set-similarity views.
 
 ```python
@@ -60,8 +60,8 @@ blind spot has a cost: a model stuck emitting `cat cat cat cat` shares the word 
 its reference, so a set precision reads a perfect 1.0.
 
 The clipped metrics count occurrences instead, capping each n-gram at the number of times the
-reference actually contains it. `bt.ngram_precision` is BLEU's per-order term,
-`bt.ngram_recall` is ROUGE-N, and `bt.ngram_f1` balances the two. Pass `n` to choose the
+reference actually contains it. {py:func}`bt.ngram_precision <batcher.ngram_precision>` is BLEU's per-order term,
+{py:func}`bt.ngram_recall <batcher.ngram_recall>` is ROUGE-N, and {py:func}`bt.ngram_f1 <batcher.ngram_f1>` balances the two. Pass `n` to choose the
 order: unigrams measure content coverage, and higher orders measure whether the wording
 survived.
 
@@ -71,8 +71,8 @@ print(degenerate.agg(clipped=bt.ngram_precision("answer", "gold")).to_pydict())
 # {'clipped': [0.25]}
 ```
 
-`bt.bleu` combines the orders: the geometric mean of the clipped precisions for `1..max_n`,
-multiplied by `bt.brevity_penalty`, which is what stops a one-word answer from scoring
+{py:func}`bt.bleu <batcher.bleu>` combines the orders: the geometric mean of the clipped precisions for `1..max_n`,
+multiplied by {py:func}`bt.brevity_penalty <batcher.brevity_penalty>`, which is what stops a one-word answer from scoring
 perfectly on precision alone. It is unsmoothed, so an example sharing no 4-gram scores zero.
 Lower `max_n` for short-answer tasks rather than reading a column of zeros.
 
@@ -84,9 +84,9 @@ print(summaries.agg(bleu=bt.bleu("answer", "gold")).to_pydict())
 # {'bleu': [1.0]}
 ```
 
-Two more read the generation against itself or its source. `bt.distinct_ngram_ratio` is the
+Two more read the generation against itself or its source. {py:func}`bt.distinct_ngram_ratio <batcher.distinct_ngram_ratio>` is the
 phrase-level diversity score, which catches a model looping on a sentence long before
-`bt.distinct_token_ratio` moves. `bt.ngram_novelty` is the copying check: at `n=4` or higher,
+{py:func}`bt.distinct_token_ratio <batcher.distinct_token_ratio>` moves. {py:func}`bt.ngram_novelty <batcher.ngram_novelty>` is the copying check: at `n=4` or higher,
 a value near zero means the output is reproducing its retrieved context verbatim rather than
 writing from it.
 
@@ -106,7 +106,7 @@ print(rag.agg(novel=bt.ngram_novelty("answer", "context")).to_pydict())
 Every metric above compares bags. None of them can tell `the cat sat` from `sat cat the`, which
 matters for summarization: a summary using the right words in the wrong order is not a summary.
 
-`bt.rouge_l_precision`, `bt.rouge_l_recall`, and `bt.rouge_l_f1` score the longest *subsequence*
+{py:func}`bt.rouge_l_precision <batcher.rouge_l_precision>`, {py:func}`bt.rouge_l_recall <batcher.rouge_l_recall>`, and {py:func}`bt.rouge_l_f1 <batcher.rouge_l_f1>` score the longest *subsequence*
 the two texts share in order. The subsequence need not be contiguous, so an inserted word does
 not break the match, but a rearrangement does.
 
@@ -169,8 +169,8 @@ number, so they run over a million generations in one scan and break down per mo
 `group_by`.
 
 `bt.distinct_token_ratio` is the Distinct-1 diversity score, the cheap detector of a model
-degenerating into repetition. `bt.mean_output_tokens` tracks verbosity and sizes the token bill.
-`bt.empty_generation_rate`, `bt.refusal_rate`, and `bt.truncation_rate` are the three failure rates
+degenerating into repetition. {py:func}`bt.mean_output_tokens <batcher.mean_output_tokens>` tracks verbosity and sizes the token bill.
+{py:func}`bt.empty_generation_rate <batcher.empty_generation_rate>`, {py:func}`bt.refusal_rate <batcher.refusal_rate>`, and {py:func}`bt.truncation_rate <batcher.truncation_rate>` are the three failure rates
 worth a dashboard: silent empty outputs, declined answers, and responses that stop mid-sentence.
 
 ```python
@@ -198,8 +198,8 @@ They are lexical heuristics, so read them as monitors that catch a regression be
 ground-truth judgments of a single generation.
 
 Before a run rather than after it, the token aggregates size the bill and the capacity.
-`bt.total_token_estimate` sums the corpus token estimate for a cost number, `bt.token_budget_exceed_rate`
-is the fraction of rows that will overflow a given context window, and `bt.token_estimate_quantile`
+{py:func}`bt.total_token_estimate <batcher.total_token_estimate>` sums the corpus token estimate for a cost number, {py:func}`bt.token_budget_exceed_rate <batcher.token_budget_exceed_rate>`
+is the fraction of rows that will overflow a given context window, and {py:func}`bt.token_estimate_quantile <batcher.token_estimate_quantile>`
 is the length tail that sizes the window. All take either the prompt or the output column.
 
 ```python
@@ -213,7 +213,7 @@ print(
 # {'total': [12], 'over': [0.5]}
 ```
 
-After a run, `bt.token_spend` prices the *measured* usage columns `ds.ml.generate(usage=True)`
+After a run, {py:func}`bt.token_spend <batcher.token_spend>` prices the *measured* usage columns {py:meth}`ds.ml.generate(usage=True) <batcher.api.dataset.ml.DatasetML.generate>`
 appends, rather than an estimate, so it reconciles against an invoice. Prices are per million
 tokens, and input and output are separate because they are priced separately: output usually
 costs several times input, which is why a bill tracks generation length far more closely than
@@ -236,12 +236,12 @@ print(
 )
 ```
 
-A second set of monitors watches for output a model *should not* produce at scale. `bt.all_caps_rate`
-and `bt.repeated_punctuation_rate` catch shouting and degenerate punctuation, `bt.non_ascii_rate`
-flags encoding or language drift, `bt.url_rate` surfaces hallucinated links or prompt injection, and
-`bt.code_block_rate` catches a code block leaking into a prose task. `bt.long_output_rate` and
-`bt.short_output_rate` bound the length distribution, and `bt.mean_sentence_count` and
-`bt.mean_word_length` track structural and lexical drift.
+A second set of monitors watches for output a model *should not* produce at scale. {py:func}`bt.all_caps_rate <batcher.all_caps_rate>`
+and {py:func}`bt.repeated_punctuation_rate <batcher.repeated_punctuation_rate>` catch shouting and degenerate punctuation, {py:func}`bt.non_ascii_rate <batcher.non_ascii_rate>`
+flags encoding or language drift, {py:func}`bt.url_rate <batcher.url_rate>` surfaces hallucinated links or prompt injection, and
+{py:func}`bt.code_block_rate <batcher.code_block_rate>` catches a code block leaking into a prose task. {py:func}`bt.long_output_rate <batcher.long_output_rate>` and
+{py:func}`bt.short_output_rate <batcher.short_output_rate>` bound the length distribution, and {py:func}`bt.mean_sentence_count <batcher.mean_sentence_count>` and
+{py:func}`bt.mean_word_length <batcher.mean_word_length>` track structural and lexical drift.
 
 ```python
 outputs = bt.from_pydict(
@@ -261,24 +261,24 @@ print(
 Four further families of single-scan monitors cover the rest of what a generation-at-scale team
 watches, and all compose with `group_by`.
 
-For a RAG pipeline, compare the answer column against its retrieved context. `bt.answer_groundedness`
-is the share of the answer's tokens the context supports, `bt.context_utilization` the share of the
-context the answer drew on, `bt.unsupported_token_rate` the hallucination-proxy complement, and
-`bt.fully_grounded_rate` the fraction of answers entirely supported. `bt.citation_rate` tracks how
+For a RAG pipeline, compare the answer column against its retrieved context. {py:func}`bt.answer_groundedness <batcher.answer_groundedness>`
+is the share of the answer's tokens the context supports, {py:func}`bt.context_utilization <batcher.context_utilization>` the share of the
+context the answer drew on, {py:func}`bt.unsupported_token_rate <batcher.unsupported_token_rate>` the hallucination-proxy complement, and
+{py:func}`bt.fully_grounded_rate <batcher.fully_grounded_rate>` the fraction of answers entirely supported. {py:func}`bt.citation_rate <batcher.citation_rate>` tracks how
 often the model cited a source at all.
 
-For reading level, `bt.automated_readability_index` is the ARI grade, with `bt.mean_words_per_sentence`,
-`bt.mean_chars_per_word`, `bt.long_word_rate`, and `bt.mean_paragraph_count` as the complexity drivers
+For reading level, {py:func}`bt.automated_readability_index <batcher.automated_readability_index>` is the ARI grade, with {py:func}`bt.mean_words_per_sentence <batcher.mean_words_per_sentence>`,
+{py:func}`bt.mean_chars_per_word <batcher.mean_chars_per_word>`, {py:func}`bt.long_word_rate <batcher.long_word_rate>`, and {py:func}`bt.mean_paragraph_count <batcher.mean_paragraph_count>` as the complexity drivers
 behind it.
 
-For degeneration, `bt.distinct_char_ngram_ratio` and its complement `bt.char_repetition_rate` catch a
+For degeneration, {py:func}`bt.distinct_char_ngram_ratio <batcher.distinct_char_ngram_ratio>` and its complement {py:func}`bt.char_repetition_rate <batcher.char_repetition_rate>` catch a
 model looping at the character level, `bt.distinct_token_ratio` at the word level,
-`bt.repeated_line_rate` catches duplicated lines, and `bt.compression_ratio_proxy` is a cheap
+{py:func}`bt.repeated_line_rate <batcher.repeated_line_rate>` catches duplicated lines, and {py:func}`bt.compression_ratio_proxy <batcher.compression_ratio_proxy>` is a cheap
 gzip-style repetition score.
 
-For safety, `bt.email_rate`, `bt.phone_rate`, and `bt.pii_rate` flag leaked contact details,
-`bt.ssn_like_rate` and `bt.credit_card_like_rate` catch structured identifiers, and
-`bt.contains_any_rate` is a configurable blocklist monitor over a list of terms.
+For safety, {py:func}`bt.email_rate <batcher.email_rate>`, {py:func}`bt.phone_rate <batcher.phone_rate>`, and {py:func}`bt.pii_rate <batcher.pii_rate>` flag leaked contact details,
+{py:func}`bt.ssn_like_rate <batcher.ssn_like_rate>` and {py:func}`bt.credit_card_like_rate <batcher.credit_card_like_rate>` catch structured identifiers, and
+{py:func}`bt.contains_any_rate <batcher.contains_any_rate>` is a configurable blocklist monitor over a list of terms.
 
 ## Grading with a judge model
 
@@ -355,8 +355,8 @@ write, and anything in a retrieved document, a scraped page, or a support ticket
 model's context. An instruction sitting in a retrieved document looks the same to the model as
 one you wrote.
 
-`bt.instruction_override_rate` counts the texts carrying an attempt to replace your
-instructions, and `bt.jailbreak_marker_rate` the ones carrying a known jailbreak framing. Run
+{py:func}`bt.instruction_override_rate <batcher.instruction_override_rate>` counts the texts carrying an attempt to replace your
+instructions, and {py:func}`bt.jailbreak_marker_rate <batcher.jailbreak_marker_rate>` the ones carrying a known jailbreak framing. Run
 both over the input side, where an injection has to arrive to work.
 
 ```python
@@ -374,22 +374,22 @@ print(
 )
 ```
 
-`bt.hidden_unicode_rate` is the one worth wiring up first. Zero-width and bidirectional-override
+{py:func}`bt.hidden_unicode_rate <batcher.hidden_unicode_rate>` is the one worth wiring up first. Zero-width and bidirectional-override
 characters render as nothing, so an instruction written with them interleaved reaches the model
 while a human reviewing the document sees clean prose. A retrieved document has no legitimate use
 for them, so unlike the pattern monitors a non-zero rate is close to conclusive.
 
-`bt.encoded_payload_rate` finds the other way past a reviewer: a long unbroken base64 run whose
+{py:func}`bt.encoded_payload_rate <batcher.encoded_payload_rate>` finds the other way past a reviewer: a long unbroken base64 run whose
 contents the model decodes and follows.
 
-Where an agent turns text into actions, `bt.code_execution_rate` counts shell and interpreter
-calls, `bt.sql_injection_rate` the textbook query payloads, and `bt.unsafe_html_rate` the active
+Where an agent turns text into actions, {py:func}`bt.code_execution_rate <batcher.code_execution_rate>` counts shell and interpreter
+calls, {py:func}`bt.sql_injection_rate <batcher.sql_injection_rate>` the textbook query payloads, and {py:func}`bt.unsafe_html_rate <batcher.unsafe_html_rate>` the active
 markup you must not render. None of the three is automatically a violation — a coding assistant
 emits shell commands legitimately — so read them as a volume to review.
 
 ### Monitoring what left
 
-`bt.system_prompt_echo_rate` measures the outcome of a prompt-extraction attempt rather than the
+{py:func}`bt.system_prompt_echo_rate <batcher.system_prompt_echo_rate>` measures the outcome of a prompt-extraction attempt rather than the
 attempt: it counts generations that reproduce an `n`-token span of the system prompt verbatim.
 It is the companion to `bt.instruction_override_rate`, which counts what arrived.
 
@@ -404,26 +404,26 @@ print(runs.agg(leaked=bt.system_prompt_echo_rate("answer", "system")).to_pydict(
 # {'leaked': [0.5]}
 ```
 
-`bt.credential_leak_rate` recognizes the public API-token formats and `bt.private_key_rate` the
+{py:func}`bt.credential_leak_rate <batcher.credential_leak_rate>` recognizes the public API-token formats and {py:func}`bt.private_key_rate <batcher.private_key_rate>` the
 PEM and OpenSSH armor lines. Both are specific enough to alert on rather than review in batch.
-`bt.url_exfiltration_rate` and `bt.data_uri_rate` cover the delivery channels: a markdown image
+{py:func}`bt.url_exfiltration_rate <batcher.url_exfiltration_rate>` and {py:func}`bt.data_uri_rate <batcher.data_uri_rate>` cover the delivery channels: a markdown image
 whose URL encodes the conversation is fetched on render with no click, and a
 `data:text/html;base64,` URI is a page you did not write running in your origin.
 
 Every monitor in this section is a surface heuristic. They size a problem across a corpus and
 alert on a change; they are not what should stand between a retrieved document and a tool call.
 
-For formatting, `bt.heading_rate`, `bt.bullet_list_rate`, `bt.numbered_list_rate`,
-`bt.markdown_link_rate`, `bt.table_rate`, and `bt.code_block_present_rate` check whether the model
+For formatting, {py:func}`bt.heading_rate <batcher.heading_rate>`, {py:func}`bt.bullet_list_rate <batcher.bullet_list_rate>`, {py:func}`bt.numbered_list_rate <batcher.numbered_list_rate>`,
+{py:func}`bt.markdown_link_rate <batcher.markdown_link_rate>`, {py:func}`bt.table_rate <batcher.table_rate>`, and {py:func}`bt.code_block_present_rate <batcher.code_block_present_rate>` check whether the model
 produced the Markdown elements a task asked for.
 
-For tone, `bt.question_rate` catches a model deflecting an answer task with a question,
-`bt.exclamation_rate` and `bt.politeness_rate` track register, `bt.hedge_rate` flags uncertainty,
-`bt.first_person_rate` measures first-person voice, and `bt.contains_phrase_rate` is a configurable
+For tone, {py:func}`bt.question_rate <batcher.question_rate>` catches a model deflecting an answer task with a question,
+{py:func}`bt.exclamation_rate <batcher.exclamation_rate>` and {py:func}`bt.politeness_rate <batcher.politeness_rate>` track register, {py:func}`bt.hedge_rate <batcher.hedge_rate>` flags uncertainty,
+{py:func}`bt.first_person_rate <batcher.first_person_rate>` measures first-person voice, and {py:func}`bt.contains_phrase_rate <batcher.contains_phrase_rate>` is a configurable
 phrase monitor.
 
-For language, `bt.cjk_rate`, `bt.cyrillic_rate`, and `bt.arabic_rate` flag unexpected scripts,
-`bt.emoji_rate` catches emoji spam, and `bt.latin_only_rate` is the clean-ASCII-output rate.
+For language, {py:func}`bt.cjk_rate <batcher.cjk_rate>`, {py:func}`bt.cyrillic_rate <batcher.cyrillic_rate>`, and {py:func}`bt.arabic_rate <batcher.arabic_rate>` flag unexpected scripts,
+{py:func}`bt.emoji_rate <batcher.emoji_rate>` catches emoji spam, and {py:func}`bt.latin_only_rate <batcher.latin_only_rate>` is the clean-ASCII-output rate.
 
 ## See also
 

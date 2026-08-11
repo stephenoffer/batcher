@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from batcher.plan.logical import LogicalPlan
 
 __all__ = [
+    "consumer_pool_bounds",
     "consumer_pool_size",
     "probe_consumer_hosts",
     "record_consumer_feedback",
@@ -42,6 +43,45 @@ def consumer_pool_size(gpu_stage, workers: int, num_partitions: int) -> int:
     )
     size = _resolve_pool_size(gpu_stage.concurrency, num_partitions, default)
     return clamp(num_partitions, 1, size)
+
+
+def consumer_pool_bounds(stage, workers: int, num_partitions: int) -> tuple[int, int]:
+    """`(start, ceiling)` actor counts for a stage — what it opens with and may grow to.
+
+    `concurrency=(min, max)` is documented as "the pool autoscales to the backlog", and on
+    the `_drive_actor_pool` path it does: the pool opens at `min` and grows toward `max`
+    while work queues. The streaming pipeline resolved the same spec *statically*, to the
+    partition count clamped into the range, so the identical public argument meant two
+    different things depending on which path a plan happened to take — and on this one a
+    starved stage stayed starved for the whole query.
+
+    A plain int or an absent spec keeps today's behaviour exactly: `start == ceiling`, which
+    the scheduler reads as "do not scale". So only the spelling that *asks* for autoscaling
+    changes, and the pool it opens with is the `min` the user wrote rather than a size
+    derived from a partition count they never mentioned.
+
+    This is also the semantics Ray Data gives the same argument, which matters because users
+    arrive here with that expectation: "the `concurrency` parameter only imposes *limits* on
+    how many tasks/actors can run; actual scheduling is governed by `num_cpus` and `num_gpus`"
+    (`../optimization-guides`, `foundations/data/ray-data-optimization.md`). A range is a
+    bound the pool grows within as demand and capacity allow — not a target computed from the
+    input's shape.
+
+    Args:
+        stage: The resource stage, carrying its `concurrency` spec and accelerator ask.
+        workers: The worker count the run was sized for.
+        num_partitions: Input partitions, the ceiling on stage-0 parallelism.
+
+    Returns:
+        `(start, ceiling)`, both at least 1 and with `ceiling >= start`.
+    """
+    spec = getattr(stage, "concurrency", None)
+    fixed = consumer_pool_size(stage, workers, num_partitions)
+    if not isinstance(spec, tuple):
+        return fixed, fixed
+    lo, hi = int(spec[0]), int(spec[1])
+    ceiling = max(1, hi)
+    return clamp(lo, 1, ceiling), ceiling
 
 
 def record_consumer_feedback(consumers, plan: LogicalPlan, hub) -> None:

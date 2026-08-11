@@ -211,11 +211,27 @@ def _blender(model):
     def size_of(op) -> int:
         planned = int(op.bounds.m_max_bytes)
         try:
-            return int(model.blend_peak(getattr(op, "kind", ""), planned))
+            return int(model.blend_peak(getattr(op, "kind", ""), planned, _row_size(op)))
         except Exception:  # pragma: no cover - a memory guard never raises
             return planned
 
     return size_of
+
+
+def _row_size(op) -> float | None:
+    """The per-row width the plan sized this operator with, or `None` if it published none.
+
+    `annotate` publishes it precisely so a consumer never has to invert `m_max_bytes` by the
+    flat `optimizer.row_bytes` default — which is wrong by `row_size / row_bytes` for any
+    operator whose rows are not the assumed 64 bytes wide. `getattr` throughout because a
+    bare test double carrying only `bounds` is a supported shape here.
+    """
+    props = getattr(op, "properties", None)
+    width = getattr(props, "row_size", None) if props is not None else None
+    # NaN is `PlanProperties`'s *unset* default, not a width of zero.
+    if width is None or width != width or width <= 0:
+        return None
+    return float(width)
 
 
 def binding_operator(plan: PhysicalPlan):

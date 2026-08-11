@@ -279,14 +279,23 @@ fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
         // NOTE on "cooperatively". `try_reserve_cooperative` asks the largest *other*
         // registered `Spillable` to give memory back before failing the requester — Spark's
         // `MemoryConsumer` model, and the thing that stops a small operator dying while a
-        // large neighbour sits on the budget. **Nothing registers a consumer today**, so
-        // with an empty registry it is exactly `try_reserve` and the requester is always
-        // the one that spills, however little it holds and however much a neighbour does.
-        // The mechanism is real and tested; what is missing is a `Spillable` impl on the
-        // operators that own spillable state (the aggregate's hash table, the sort's runs),
-        // which is a `bc-runtime`/`bc-interp` change rather than a pool one. Until then
-        // this call is a no-op seam — accurate to say so here rather than describe the
-        // behaviour it will have.
+        // large neighbour sits on the budget.
+        //
+        // Exactly one consumer registers today, and it is the one that matters most on the
+        // path where this is reached: `bc_py::flight::ShuffleSpiller` puts the **published
+        // shuffle store** in the registry when a Flight server binds. That memory is
+        // finished work waiting to be collected, so writing it out stalls nobody and costs
+        // one re-read, and it is the memory the pool could not otherwise see at all.
+        //
+        // So the behaviour splits by deployment, and it is worth being exact about which
+        // you are reading. On a distributed worker the registry is non-empty and a breaker
+        // that cannot reserve makes the shuffle store yield first. On a **single-node**
+        // query no Flight server exists, the registry is empty, and this is precisely
+        // `try_reserve`: the requester is always the one that spills, however little it
+        // holds and however much a neighbour does. Closing that half needs a `Spillable`
+        // impl on the operators that own in-progress state (the aggregate's hash table, the
+        // sort's runs), which is harder than it looks — the pool may call `spill` from
+        // another thread, mid-`par_iter`, on state the owning operator is actively reading.
         Some(pool) => match pool.try_reserve_cooperative(estimate_bytes) {
             Ok(reservation) => Admit::InMemory(Some(reservation)),
             // Pool full (and, once consumers register, still full after they spilled):
@@ -437,6 +446,34 @@ fn max_useful_workers(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize
 /// letting concurrent queries each spawn `parallelism` threads. Width is the cache
 /// key because `current_num_threads()` drives the hash-shuffle bucket count, so a
 /// query must run on a pool of exactly the width it asked for.
+/// Stack reserved per worker thread.
+///
+/// The partner of [`bc_ir::MAX_PLAN_DEPTH`], and the two must be read together. That guard
+/// rejects a plan IR nesting past 512 levels so deserialization cannot walk off the stack —
+/// but it was calibrated against **parsing** (~3.2 KiB per level), and parsing is the cheap
+/// pass. `Expr` is a recursive enum, and `eval`, the analyses, and the compiler-generated
+/// `Drop` each descend it carrying Arrow arrays and match temporaries: measured on the debug
+/// profile, **~20 KiB per level, about six times parsing**.
+///
+/// So on rayon's 2 MiB default a worker *evaluated* only to ~84 levels and aborted by 104,
+/// while the guard happily admitted anything under 512. Everything in that window died on a
+/// **SIGSEGV** — which Rust turns into an uncatchable `SIGABRT`, and which a `_FlightWorker`
+/// actor reports as an opaque `ActorDiedError`. It was not a hypothetical window:
+/// `is_in` over 100 values (318 for `TfidfVectorizer(stop_words="english")`), an
+/// `IsotonicCalibrator` at its default 100 bins, and a 100-term arithmetic chain all landed
+/// in it.
+///
+/// 32 MiB carries evaluation to a measured 509 levels — past `MAX_PLAN_DEPTH`, so the guard
+/// is the binding constraint again and a too-deep plan raises `PlanTooDeepError` instead of
+/// killing the process. It is reserved address space, not resident memory: pages are touched
+/// only to the depth actually used, so a 96-worker pool costs ~3 GiB of virtual mapping and
+/// essentially no RSS.
+///
+/// **Raising `MAX_PLAN_DEPTH` without raising this re-opens the window.** The control plane
+/// also keeps its own trees shallow rather than relying on the headroom — `Expr.is_in` folds
+/// to `InList` instead of an n-deep `OR` chain, and the indicator sums fold balanced.
+const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
+
 pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
     static POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
     let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -446,7 +483,9 @@ pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpErr
     if let Some(pool) = guard.get(&width) {
         return Ok(Arc::clone(pool));
     }
-    let mut builder = rayon::ThreadPoolBuilder::new().num_threads(width);
+    let mut builder = rayon::ThreadPoolBuilder::new()
+        .num_threads(width)
+        .stack_size(WORKER_STACK_BYTES);
     // Experimental, opt-in CPU pinning (`BATCHER_PIN_THREADS=1`): pin each worker to a
     // distinct core for cache/NUMA locality on a big exclusive box. Result-invariant
     // (scheduling only), so the differential suite proves it changes nothing; off by
@@ -1212,7 +1251,9 @@ fn exec(
             right_on,
             left_by,
             right_by,
-            backward,
+            direction,
+            tolerance,
+            allow_exact_matches,
             output,
         } => {
             // ASOF is a sorted nearest-match within each `by` group. The inputs are
@@ -1249,7 +1290,16 @@ fn exec(
                     }
                 }
                 vec![ops::asof_join_batches(
-                    &left, &right, left_on, right_on, left_by, right_by, *backward, output,
+                    &left,
+                    &right,
+                    left_on,
+                    right_on,
+                    left_by,
+                    right_by,
+                    *direction,
+                    *tolerance,
+                    *allow_exact_matches,
+                    output,
                 )?]
             } else {
                 // Spill to a grace ASOF join when the larger side exceeds the budget
@@ -1266,7 +1316,16 @@ fn exec(
                         );
                         spilled = true;
                         spilling_asof_join(
-                            &left, &right, left_on, right_on, left_by, right_by, *backward, output,
+                            &left,
+                            &right,
+                            left_on,
+                            right_on,
+                            left_by,
+                            right_by,
+                            *direction,
+                            *tolerance,
+                            *allow_exact_matches,
+                            output,
                             sp,
                         )?
                     }
@@ -1280,8 +1339,16 @@ fn exec(
                             .into_par_iter()
                             .map(|i| {
                                 ops::asof_join_batches(
-                                    &lb[i], &rb[i], left_on, right_on, left_by, right_by,
-                                    *backward, output,
+                                    &lb[i],
+                                    &rb[i],
+                                    left_on,
+                                    right_on,
+                                    left_by,
+                                    right_by,
+                                    *direction,
+                                    *tolerance,
+                                    *allow_exact_matches,
+                                    output,
                                 )
                             })
                             .collect::<Result<Vec<_>, InterpError>>()?
@@ -1622,19 +1689,49 @@ fn exec(
             Ok(out)
         }
 
-        RelOp::Distinct { input } => {
+        RelOp::Distinct {
+            input,
+            keys,
+            order,
+            limit,
+        } => {
+            // A `DISTINCT ON` carrying a limit goes to the sequential oracle. This path's
+            // `distinct_on` is the spilling dedup and does not promise first-seen order, so
+            // truncating it could keep a different `k` than the oracle keeps — two tiers
+            // disagreeing on the answer, which is invariant #6. Kyber only fuses a limit into a
+            // whole-row `DISTINCT`, so this is unreachable in practice and exists so a
+            // hand-written plan cannot diverge.
+            if limit.is_some() && !keys.is_empty() {
+                return crate::execute(plan, sources);
+            }
             let parts = exec(input, sources, opts, m, ids)?;
             let rows_in = count_rows(&parts);
             // Captured before the input vector is consumed below.
             let in_bytes = batch_bytes(&parts);
             let t0 = Stopwatch::start();
-            let (batch, spilled, spill_vol) = distinct(&parts, opts, op_id)?;
-            // `distinct` returns one materialized batch; re-morselize it (zero-copy slices) so a
-            // downstream breaker (a COUNT(DISTINCT)'s outer GROUP BY, or a join) fans back out
-            // across cores instead of processing the whole relation on one thread. A single
-            // large distinct batch feeding an aggregate ran that aggregate at ~1% CPU
-            // (TPC-H Q16: the outer group-by over the deduped rows was 62% of the query, serial).
-            let out = ops::remorselize(vec![batch], opts.morsel_target());
+            // The limited whole-row case keeps the first `k` distinct rows in input order.
+            // `parts` is already materialized here, so unlike the streaming breaker this saves
+            // no input reads — it is here to agree with the oracle, not to be fast. The
+            // spilling `distinct` below emits bucket order, which truncation would scramble.
+            if let Some(k) = limit {
+                let out: Vec<RecordBatch> = bc_runtime::agg::distinct_prefix(&parts, *k)?
+                    .into_iter()
+                    .collect();
+                push_breaker_spilled(
+                    m, op_id, "distinct", rows_in, 0, in_bytes, &out, t0, false, 0, "interp",
+                );
+                return Ok(out);
+            }
+            let (batches, spilled, spill_vol) = match keys.is_empty() {
+                true => distinct(&parts, opts, op_id)?,
+                false => distinct_on(&parts, keys, order, opts, op_id)?,
+            };
+            // Re-morselize (zero-copy slices) so a downstream breaker — a COUNT(DISTINCT)'s
+            // outer GROUP BY, or a join — fans back out across cores instead of processing the
+            // whole relation on one thread. A single large distinct batch feeding an aggregate
+            // ran that aggregate at ~1% CPU (TPC-H Q16: the outer group-by over the deduped
+            // rows was 62% of the query, serial).
+            let out = ops::remorselize(batches, opts.morsel_target());
             push_breaker_spilled(
                 m, op_id, "distinct", rows_in, 0, in_bytes, &out, t0, spilled, spill_vol, "interp",
             );
@@ -1645,9 +1742,49 @@ fn exec(
             inputs,
             distinct: dedup,
         } => {
+            // Branches run **across the pool**, not one after another. They are independent
+            // plans — own scans, own joins, own aggregates — and a serial loop here was the
+            // materializing twin of the defect fixed in `stream::parallel`: measured on TPC-DS
+            // q22's five grouping levels, the union ran at 5.8 cores where one level alone runs
+            // at 63.6, and cost 8x the sum of its parts.
+            //
+            // The obstacle was never the data, it was `m`/`ids`: both are `&mut` and cannot
+            // cross threads. `IdGen::at` + `RelOp::node_count` already exist for exactly this
+            // (the fused join pipeline runs its build before its probe), so each branch gets the
+            // id range a pre-order walk would have handed it, and its metrics land in a scratch
+            // `ExecMetrics` that is merged back **in branch order**. Numbering and metrics are
+            // therefore identical to the serial loop's, which is what keeps them aligned with
+            // the control plane's `annotate_ops`.
             let mut all = Vec::new();
-            for inp in inputs {
-                all.extend(exec(inp, sources, opts, m, ids)?);
+            if inputs.len() > 1 && rayon::current_num_threads() > 1 {
+                // Pre-order: this `Union` took `op_id`, so branch k starts after every node of
+                // branches 0..k.
+                let mut starts = Vec::with_capacity(inputs.len());
+                let mut next = ids.peek();
+                for inp in inputs {
+                    starts.push(next);
+                    next += inp.node_count();
+                }
+                let per: Vec<(Vec<RecordBatch>, ExecMetrics)> = inputs
+                    .par_iter()
+                    .zip(starts)
+                    .map(|(inp, start)| {
+                        let mut sm = ExecMetrics::default();
+                        let mut sid = IdGen::at(start);
+                        exec(inp, sources, opts, &mut sm, &mut sid).map(|b| (b, sm))
+                    })
+                    .collect::<Result<_, _>>()?;
+                for (batches, sm) in per {
+                    all.extend(batches);
+                    for op in sm.ops {
+                        m.record(op);
+                    }
+                }
+                *ids = IdGen::at(next);
+            } else {
+                for inp in inputs {
+                    all.extend(exec(inp, sources, opts, m, ids)?);
+                }
             }
             // Promotable-but-different branch types (`int64 ∪ float64`) are coerced to the
             // union's advertised supertype before concat/dedup, matching DuckDB.
@@ -1660,8 +1797,7 @@ fn exec(
                 // A deduplicating UNION runs the full grace-capable `distinct` (materialize
                 // + hash + possible spill) — a breaker holding its input plus the deduped
                 // result — not the ~0-peak streaming op `push_metric` recorded.
-                let (batch, spilled, spill_vol) = distinct(&all, opts, op_id)?;
-                let out = vec![batch];
+                let (out, spilled, spill_vol) = distinct(&all, opts, op_id)?;
                 push_breaker_spilled(
                     m, op_id, "union", rows_in, 0, in_bytes, &out, t0, spilled, spill_vol, "interp",
                 );
@@ -2300,6 +2436,13 @@ fn needs_parts_for_spill(aggregates: &[AggregateItem]) -> bool {
                 | AggFunc::Quantile
                 | AggFunc::CountDistinct
                 | AggFunc::Mode
+                // The contiguity statistics hold a per-group value list exactly as `Median`
+                // does, so they need the same partitioning to stay bounded. Omitting them
+                // here compiles and passes every small test, and lets a grouped `n50` over a
+                // hot key grow its list until the process dies.
+                | AggFunc::NLength
+                | AggFunc::LCount
+                | AggFunc::AuN
                 | AggFunc::Histogram
                 | AggFunc::ListAgg
                 | AggFunc::ApproxCountDistinct
@@ -2946,44 +3089,36 @@ fn distinct(
     parts: &[RecordBatch],
     opts: &ExecOptions,
     op_id: u32,
-) -> Result<(RecordBatch, bool, u64), InterpError> {
+) -> Result<(Vec<RecordBatch>, bool, u64), InterpError> {
     if parts.is_empty() {
         return Err(InterpError::EmptyAggregateInput);
     }
     let schema = parts[0].schema();
 
-    // Single-pass fast path for a HIGH-cardinality, null-free, in-memory DISTINCT: hash
-    // each row once (partition by all columns, dedup per bucket) instead of the per-morsel
-    // `partial` + `combine` double-hash. Gated so it never regresses the other cases:
-    //   * high cardinality only — probed on the first morsel's distinct ratio; a
-    //     low-cardinality DISTINCT keeps `partial` (which collapses each morsel to a few
-    //     rows so `combine` is then trivial), avoiding a needless full-input shuffle.
-    //   * null-free key columns — the fast integer/byte partitioner hashes a null slot's
-    //     arbitrary raw value, which could split two equal null-bearing rows across buckets;
-    //     a nullable DISTINCT keeps the row-encoded `partial`/`combine` (nulls compare equal).
+    // Single-pass fast path for a HIGH-cardinality, in-memory DISTINCT: hash each row once
+    // (partition by all columns, dedup per bucket) instead of the per-morsel `partial` +
+    // `combine` double-hash. Gated so it never regresses the other cases:
+    //   * high cardinality only — probed on the first morsel's distinct ratio, which is
+    //     exactly what `partial` buys: below a 2x local collapse the per-morsel pass is a
+    //     whole extra hash of every row for nothing, and above it `combine` is then trivial.
+    //     Nothing here needs, or infers, the GLOBAL key cardinality.
     //   * in-memory — a spilling DISTINCT still streams through the grace `combine`.
     // A single dense integer column needs neither hash nor gather: `DISTINCT` over it is a
     // presence bitmap indexed by `value - min`, two linear passes and no partial state.
     // Declines (returning `None`) for anything wider, nullable, non-integer, or sparse.
     if let Some(out) = agg::distinct_dense(parts)? {
-        return Ok((out, false, 0));
+        return Ok((vec![out], false, 0));
     }
 
-    let ncols = schema.fields().len();
-    let no_nulls = ncols > 0
-        && parts
-            .iter()
-            .all(|b| (0..ncols).all(|c| b.column(c).null_count() == 0));
     let probe = ops::distinct_partial(&parts[0])?;
     let sample_rows = parts[0].num_rows();
     let sample_distinct = probe.group_columns.first().map_or(0, |a| a.len());
     let high_card = sample_rows > 0 && (sample_distinct as f64) >= 0.5 * sample_rows as f64;
-    if no_nulls && high_card {
+    if high_card {
         let bytes = batch_bytes(parts) as usize;
         if matches!(admit(opts, op_id, bytes), Admit::InMemory(_)) {
-            let batch = ops::materialize(parts)?;
             let p = rayon::current_num_threads().max(1);
-            let out = agg::distinct_batch(&batch, p)?;
+            let out = agg::distinct_parts(parts, p)?;
             return Ok((out, false, 0));
         }
     }
@@ -3013,10 +3148,62 @@ fn distinct(
         ),
     };
     Ok((
-        RecordBatch::try_new(schema, group_columns)?,
+        vec![RecordBatch::try_new(schema, group_columns)?],
         spilled,
         spill_vol,
     ))
+}
+
+/// Parallel `DISTINCT ON`: keep one whole row per dedup key, across cores.
+///
+/// Scheduling only — the reduction is `bc_runtime::agg::distinct_on`, the same function the
+/// sequential oracle calls and the same one the distributed map and reduce sides call. What is
+/// decided here is where it runs: over key-disjoint partitions in memory, or bucket by bucket
+/// through disk when the input does not fit the operator's envelope.
+///
+/// Returns `(reduced batches, spilled, spill_bytes)`, the batches narrowed back to the input's
+/// columns (an ordering the plan computed is compared on and then dropped).
+fn distinct_on(
+    parts: &[RecordBatch],
+    keys: &[String],
+    order: &[bc_ir::SortKey],
+    opts: &ExecOptions,
+    op_id: u32,
+) -> Result<(Vec<RecordBatch>, bool, u64), InterpError> {
+    let Some(first) = parts.first() else {
+        return Err(InterpError::EmptyAggregateInput);
+    };
+    let bytes = batch_bytes(parts) as usize;
+    if let Admit::InMemory(_reservation) = admit(opts, op_id, bytes) {
+        return Ok((ops::parallel_distinct_on(parts, keys, order)?, false, 0));
+    }
+    // Out of core. Widen here rather than inside the spill path so the ordering columns are
+    // already in the batches that go to disk, and a bucket read back needs no re-evaluation.
+    let ncols = first.num_columns();
+    let wide: Vec<RecordBatch> = parts
+        .par_iter()
+        .map(|b| ops::distinct_on_widen(b, keys, order).map(|(b, _, _)| b))
+        .collect::<Result<_, InterpError>>()?;
+    let (_, key_idx, ord) = ops::distinct_on_widen(first, keys, order)?;
+    let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
+    let budget = opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes);
+    let (out, spill_vol) = crate::distinct_on_spill::distinct_on_spilling(
+        &wide,
+        &key_idx,
+        &ord,
+        budget,
+        &global.dir,
+        global.codec,
+    )?;
+    if wide[0].num_columns() == ncols {
+        return Ok((out, true, spill_vol));
+    }
+    let keep: Vec<usize> = (0..ncols).collect();
+    let narrowed = out
+        .iter()
+        .map(|b| b.project(&keep))
+        .collect::<Result<_, _>>()?;
+    Ok((narrowed, true, spill_vol))
 }
 
 #[cfg(test)]
@@ -3551,6 +3738,8 @@ mod tests {
                     input: Some(Expr::Col { name: "v".into() }),
                     offset: 1,
                     frame: None,
+                    alpha: None,
+                    half_life: None,
                     alias: "s".into(),
                 }],
                 rank_limit: None,
@@ -4767,7 +4956,9 @@ mod tests {
             right_on: "ts".into(),
             left_by: vec!["sym".into()],
             right_by: vec!["sym".into()],
-            backward: true,
+            direction: bc_ir::AsofDirection::Backward,
+            tolerance: None,
+            allow_exact_matches: true,
             output: vec![
                 JoinOutputCol {
                     side: JoinSide::Left,
@@ -4877,6 +5068,8 @@ mod tests {
                     input: None,
                     offset: 1,
                     frame: None,
+                    alpha: None,
+                    half_life: None,
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -4884,6 +5077,8 @@ mod tests {
                     input: Some(Expr::Col { name: "v".into() }),
                     offset: 1,
                     frame: None,
+                    alpha: None,
+                    half_life: None,
                     alias: "s".into(),
                 },
             ],
@@ -4930,6 +5125,8 @@ mod tests {
                     input: None,
                     offset: 1,
                     frame: None,
+                    alpha: None,
+                    half_life: None,
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -4937,6 +5134,8 @@ mod tests {
                     input: Some(Expr::Col { name: "v".into() }),
                     offset: 1,
                     frame: None,
+                    alpha: None,
+                    half_life: None,
                     alias: "s".into(),
                 },
             ],
@@ -4994,6 +5193,8 @@ mod tests {
                 input: None,
                 offset: 1,
                 frame: None,
+                alpha: None,
+                half_life: None,
                 alias: "rn".into(),
             }],
             rank_limit: Some(2),
@@ -5064,6 +5265,9 @@ mod tests {
         // sequential oracle. memory_budget_bytes = 1 forces the spill branch.
         let plan = RelOp::Distinct {
             input: Box::new(RelOp::Scan { source_id: 0 }),
+            keys: Vec::new(),
+            order: Vec::new(),
+            limit: None,
         };
         let data = vec![
             batch(&[1, 2, 1, 3, 2, 1], &[10, 20, 10, 40, 20, 10]),
@@ -5146,7 +5350,9 @@ mod tests {
             right_on: "v".into(),
             left_by: vec!["k".into()],
             right_by: vec!["k".into()],
-            backward: true,
+            direction: bc_ir::AsofDirection::Backward,
+            tolerance: None,
+            allow_exact_matches: true,
             output: vec![
                 JoinOutputCol {
                     side: JoinSide::Left,
@@ -5198,7 +5404,9 @@ mod tests {
             right_on: "v".into(),
             left_by: vec!["k".into()],
             right_by: vec!["k".into()],
-            backward: true,
+            direction: bc_ir::AsofDirection::Backward,
+            tolerance: None,
+            allow_exact_matches: true,
             output: vec![
                 JoinOutputCol {
                     side: JoinSide::Left,
@@ -5272,7 +5480,9 @@ mod tests {
             right_on: "v".into(),
             left_by: vec!["k".into()],
             right_by: vec!["k".into()],
-            backward: true,
+            direction: bc_ir::AsofDirection::Backward,
+            tolerance: None,
+            allow_exact_matches: true,
             output: vec![
                 JoinOutputCol {
                     side: JoinSide::Left,
@@ -5322,7 +5532,9 @@ mod tests {
             right_on: "v".into(),
             left_by: vec![],
             right_by: vec![],
-            backward: true,
+            direction: bc_ir::AsofDirection::Backward,
+            tolerance: None,
+            allow_exact_matches: true,
             output: vec![JoinOutputCol {
                 side: JoinSide::Left,
                 name: "v".into(),
@@ -6225,6 +6437,8 @@ mod tests {
                 input: Some(Expr::Col { name: "v".into() }),
                 offset: 1,
                 frame: None,
+                alpha: None,
+                half_life: None,
                 alias: "s".into(),
             }],
             rank_limit: None,

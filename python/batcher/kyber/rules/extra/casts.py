@@ -63,11 +63,12 @@ from batcher.kyber.rule import Phase
 # re-implemented.
 from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.boolean_algebra import _rewrite_node
+from batcher.kyber.rules.leaf_rewrite import EXPR_NODES
 from batcher.plan.expr_ir import Binary, Case, Cast, Expr, IsNotNull, IsNull, Lit
 from batcher.plan.expr_ir.core import IsInf, IsNan
-from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
+from batcher.plan.logical import LogicalPlan
 from batcher.plan.schema import SchemaRef
-from batcher.plan.types import DTYPE_REGISTRY, infer_type
+from batcher.plan.types import DTYPE_REGISTRY, infer_type, resolve_dtype
 
 __all__ = [
     "canonicalize_cast_dtype_alias",
@@ -82,7 +83,6 @@ __all__ = [
 
 # Every node whose expressions these rules rewrite (each has a single `.input`, whose
 # schema types the expressions).
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 _INT64, _FLOAT64, _BOOL, _STRING = pa.int64(), pa.float64(), pa.bool_(), pa.string()
 # The engine's two numeric types after the FFI widens narrow numerics on input.
@@ -126,7 +126,7 @@ _INFALLIBLE: frozenset[tuple[pa.DataType, pa.DataType]] = frozenset(
 
 def _target(expr: Cast) -> pa.DataType | None:
     """The Arrow type a `Cast` produces (`None` for a dtype name we don't know)."""
-    return DTYPE_REGISTRY.get(expr.dtype)
+    return resolve_dtype(expr.dtype)
 
 
 def _source(expr: Cast, schema: SchemaRef | None) -> pa.DataType | None:
@@ -172,7 +172,7 @@ def _drop_identity_cast(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="drop_cast_to_inferred_type",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(Cast,),
     expr_schema=_drop_identity_cast,
 )
@@ -200,7 +200,7 @@ def _canonicalize_alias(expr: Expr) -> Expr:
 @rule(
     name="canonicalize_cast_dtype_alias",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_canonicalize_alias,
     expr_matches=(Cast,),
 )
@@ -234,7 +234,7 @@ def _fold_cast_lit(expr: Expr) -> Expr:
 @rule(
     name="fold_cast_of_literal",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_fold_cast_lit,
     expr_matches=(Cast, Lit),
 )
@@ -282,7 +282,7 @@ def _push_into_case(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="push_cast_into_case_literal_branches",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(Cast,),
     expr_schema=_push_into_case,
 )
@@ -329,7 +329,7 @@ def _try_to_strict(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="try_cast_to_strict_when_infallible",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(Cast,),
     expr_schema=_try_to_strict,
 )
@@ -361,7 +361,7 @@ def _drop_cast_in_null_check(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="drop_infallible_cast_in_null_check",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(IsNull, IsNotNull),
     expr_schema=_drop_cast_in_null_check,
 )
@@ -405,7 +405,7 @@ def _drop_concat_cast(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="drop_string_cast_in_concat",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(Binary,),
     expr_ops=("concat",),
     expr_schema=_drop_concat_cast,
@@ -436,7 +436,7 @@ def _drop_float_cast_in_predicate(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="drop_numeric_cast_in_float_predicate",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(IsNan, IsInf),
     expr_schema=_drop_float_cast_in_predicate,
 )

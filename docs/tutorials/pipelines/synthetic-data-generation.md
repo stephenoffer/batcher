@@ -72,7 +72,7 @@ print(by_region.to_pydict()["region"])
 ## numpy columns
 
 When numpy is available, vectorized column generation is faster and reads cleanly.
-Convert arrays to lists for `from_pydict`.
+Convert arrays to lists for {py:func}`from_pydict <batcher.from_pydict>`.
 
 ```python
 import numpy as np
@@ -124,7 +124,7 @@ carry. Match your case to a row:
 | Arbitrary size, no dependency beyond the standard library | `random`, seeded |
 | Arbitrary size, fast, and numeric | `numpy`, with `default_rng(seed)` |
 | To exercise a join | Two tables sharing a key, as above |
-| A file on disk instead of memory | Generate, then `ds.write.parquet(path)` |
+| A file on disk instead of memory | Generate, then {py:meth}`ds.write.parquet(path) <batcher.api.io_namespace.writer.Writer.parquet>` |
 
 :::{warning}
 Generated data is uniform, and real data is not. A pipeline that is fast on

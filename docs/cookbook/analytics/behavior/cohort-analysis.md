@@ -74,7 +74,7 @@ Follow `u1`'s three orders through both labellings and the difference is the who
 :::{tip}
 The cohort is `min(order_date)` **per user**, which is a window aggregate rather than a
 group aggregate. You want the label attached back to every row of that user instead of
-collapsed, and `.over(partition_by=["user"])` does exactly that.
+collapsed, and {py:meth}`.over(partition_by=["user"]) <batcher.AggExpr.over>` does exactly that.
 :::
 
 `month_idx` is the month as a single integer (`year * 12 + month`), so subtracting

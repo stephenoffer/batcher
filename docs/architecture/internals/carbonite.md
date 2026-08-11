@@ -20,7 +20,7 @@ reports what actually happened, which Kyber learns from on the next run.
 The `ResourceManager` is a thin orchestrator over four pluggable policies
 (admission, spill, flow control, and memory estimation) plus the memory subsystem:
 a buffer pool and a pressure monitor. Its job comes down to four decisions.
-`validate(plan)` answers whether a plan is feasible; when it does not fit, the
+{py:meth}`validate(plan) <batcher.api.dataset.dq.DatasetDQ.validate>` answers whether a plan is feasible; when it does not fit, the
 verdict carries a counter-offer for Kyber to re-plan around, such as a smaller credit
 window or a lower parallelism, rather than a flat rejection. `reserve(bytes)` accounts an
 allocation against the process-wide buffer pool with blocking semantics, so
@@ -91,6 +91,69 @@ tier is fixed when it opens: by the time the floor is crossed, several buckets c
 be streaming to a volume that cannot hold them. Set `memory.spill_remote_uri` to give them
 somewhere to go. Without it the local tier is all there is, and a full disk fails the
 query with a message naming the volume and the fix.
+
+Which volume that is has one answer, `site.spill_scratch_dir`: the configured
+`memory.spill_dir`, else the best measured node-local volume, else the system tempdir. Every
+layer that asks reads it, which matters because a second copy fails quietly. The hardware
+fingerprint that keys every learned spill threshold once described a container's overlay
+while the spill itself landed on the node's NVMe, merging two machine classes that behave
+nothing alike.
+
+The reading reaches the query profile alongside the memory figures, under the Carbonite
+resource decision's `scratch_disk` key: the resolved path, the measured pressure level, and
+free and total bytes. A probe that could not be taken reports `UNKNOWN` and `-1` rather than
+`NORMAL` and `0`, because "I could not measure this" and "this volume is empty" are
+different answers and only one of them is good news.
+
+### Concurrent queries divide the envelope
+
+The envelope is one process-wide figure, so a query that plans against all of it while
+others run has planned against memory it does not have. `execution.max_concurrent_queries`
+is what makes the division real: a query admitted while N are running compares its
+estimated peak against `1/N` of the envelope, which is Spark's `ExecutionMemoryPool` rule
+at query granularity. The concurrency limiter already divided the *cores* this way; the
+memory half is what stopped sixteen concurrent queries all reading as "fits" and all taking
+the in-memory path.
+
+The buffer pool keeps the whole envelope. What the share bounds is what a query *plans* to
+hold, not what the process may hold, and shrinking the pool would make a concurrent query's
+already-granted reservation retroactively unaffordable. A nested `collect()` inside a
+`map_batches` UDF takes no admission slot, so it cannot halve the budget of the query that
+is already paying for the machine. The default is unbounded concurrency, where the share is
+exactly 1 and nothing changes.
+
+`explain(analyze=True)` reports the share and the live occupancy beside the budgets, under
+the Carbonite resource decision's `memory_share` and `admission` keys.
+
+## Streaming is governed too
+
+A streaming query is a long-lived consumer of the same envelope, and it reaches Carbonite
+the same way a batch query does: through the config it is started under.
+
+`start_streaming_query` senses `memory.max_memory_bytes` from the live envelope, honoring a
+cgroup limit, and pins it for the query. That figure is what the data plane's spill backstop
+and every streaming operator's state cap derive from, so without it a streaming query ran on
+the static 8 GiB fallback -- a cap a 4 GiB container never reaches before the kernel kills
+it, and one that forces a 512 GiB host out of core a decade early.
+
+The micro-batch loop runs on its own thread, and a thread does not inherit context
+variables. So the loop takes a *snapshot* of the launching context, which both carries the
+sensed envelope across the thread boundary and gives it the right lifetime: a streaming
+query outlives the `config_context` block that started it, so its configuration is frozen at
+launch rather than read live. The snapshot applies to every streaming query, single-node or
+distributed, because both run on the same engine.
+
+Two limits worth knowing. The sensing does not yet reach the distributed launchers:
+`start_distributed_stream` and `start_distributed_stream_drain` are not wrapped, so a
+distributed streaming query still runs under whatever `max_memory_bytes` the caller set.
+Set it explicitly for a distributed stream until they are.
+
+And the streaming state cap is **per operator**, not per query. Each stateful streaming
+operator compares its retained state against the whole budget independently, so a pipeline
+with a windowed aggregate, a dedup, and a stream-stream join can hold three times the
+envelope with every check passing. Narrow the group keys, or set
+`memory.streaming_state_max_bytes` to a fraction of the envelope, when a query has more than
+one stateful operator.
 
 ## Flow control
 
@@ -223,6 +286,13 @@ embeddings, blob handles) keeps its true byte working set within budget. On a co
 store the model is an empty pass-through: every method defers to the plan estimate,
 so a first run is byte-for-byte the pre-learning behavior.
 
+The ratio only means something against the width the plan actually sized with, which Kyber
+publishes as `PlanProperties.row_size`. Rescaling against the flat `optimizer.row_bytes`
+default instead is wrong by `row_size / row_bytes` — one to two orders of magnitude on
+exactly the wide payloads the byte-true width exists to model. Measured: a 410 MB aggregate
+over 4 KiB rows read as 26 GB, so every envelope decision took the spill branch the moment
+that family was learned, and the learner made the plan worse the more it knew.
+
 ### Learned flow control
 
 The credit machinery learns the same way. `grant_credits(signature=…)` warm-starts a
@@ -259,7 +329,7 @@ cold `MetadataHub` reproduces the untuned behavior exactly.
 
 ## Tuning
 
-Carbonite reads its knobs from `Config`. Derive a new config to change one:
+Carbonite reads its knobs from {py:class}`Config <batcher.Config>`. Derive a new config to change one:
 
 ```python
 import dataclasses

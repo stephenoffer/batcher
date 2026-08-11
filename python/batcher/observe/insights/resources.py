@@ -56,8 +56,78 @@ __all__ = [
     "paging_operators",
     "preempted_operators",
     "spilled_operators",
+    "stale_core_budget",
     "stolen_cpu",
 ]
+
+#: How far the control plane's core count may differ from the engine's before it is reported.
+#: One core is ordinary rounding between a CFS quota and a thread count; a *factor* is a
+#: different machine. Expressed as a ratio so it means the same thing at 4 cores and at 128.
+_CORE_BUDGET_DRIFT = 1.5
+
+
+def stale_core_budget(
+    _profile: dict[str, Any], _ops: list[dict[str, Any]], _total_ms: float
+) -> list[Insight]:
+    """The control plane and the data plane disagree about how many cores this machine has.
+
+    Every hardware probe in `_internal.hardware` reads `/proc` and `/sys` from the *Python*
+    process and memoizes the answer, because a running process cannot normally see its own
+    machine change. One ordinary deployment breaks that assumption: **a cgroup applied after
+    the interpreter started**. A Ray worker's CPU quota lands on the actor once it is placed,
+    which is after `import batcher` — so anything already memoized describes a machine the
+    engine is no longer running on.
+
+    The engine detects its own hardware locally and reports it back, and the two figures were
+    never compared. That is the whole failure: when they diverge, the control plane sizes a
+    fan-out, a spill threshold and a per-task CPU share for a machine with (say) sixteen cores
+    while the data plane runs four, and every symptom of it — throttling, a fan-out that does
+    not help, timings that will not reproduce — points somewhere else. Nothing in a profile,
+    a log line, or an `EXPLAIN` said the two planes were describing different hardware.
+
+    Reported rather than corrected. The right correction depends on why they differ, and the
+    engine's figure is not automatically the one to adopt: it governs how the data plane sized
+    itself, but a plan already annotated against the other figure has been shipped. Saying so
+    lets an operator fix the cause, which is nearly always placement.
+
+    Args:
+        _profile: The query profile; unused, since this describes the machine, not the query.
+        _ops: The measured operators; unused for the same reason.
+        _total_ms: The query's wall time; unused for the same reason.
+
+    Returns:
+        One finding when the two planes disagree by more than `_CORE_BUDGET_DRIFT`, else `[]` —
+        including whenever the engine cannot report, which is a shrug and not agreement.
+    """
+    from batcher._internal.hardware import available_cpu_count, engine_hardware
+
+    engine_cores = int(engine_hardware().get("logical_cores", 0) or 0)
+    if engine_cores <= 0:
+        return []  # not built, or built before these entry points existed: no comparison to make
+    control_cores = available_cpu_count()
+    ratio = max(engine_cores, control_cores) / max(1, min(engine_cores, control_cores))
+    if ratio < _CORE_BUDGET_DRIFT:
+        return []
+    return [
+        Insight(
+            severity="warning",
+            rule="core-budget-mismatch",
+            title=f"Planned for {control_cores} cores, ran on {engine_cores}",
+            evidence=(
+                f"The control plane sized this query for {control_cores} usable core(s) while "
+                f"the engine process detected {engine_cores}. The usual cause is a cgroup CPU "
+                "quota applied to this process after the interpreter started — a Ray worker's "
+                "limit lands when the actor is placed, which is after the hardware probes have "
+                "already answered and been memoized."
+            ),
+            action=(
+                "Apply the CPU limit before the worker starts, or set the quota on the pod "
+                "rather than on the placed actor. Fan-out, spill thresholds and per-task CPU "
+                "shares were all sized against the larger figure."
+            ),
+            detail={"control_plane_cores": control_cores, "engine_cores": engine_cores},
+        )
+    ]
 
 
 def spilled_operators(
@@ -154,8 +224,15 @@ def stolen_cpu(util: float, contention: dict[str, float], detail: dict[str, Any]
                 detail=detail,
             )
         ]
-    load = contention.get("load_per_core")
+    # Judged on the HOST-scoped ratio, not the slice-relative one. `os.getloadavg()` counts
+    # runnable tasks across the whole machine and Linux publishes no per-cgroup equivalent, so
+    # `load_per_core` — that host-wide numerator over *this process's* cores — is 16.0 for a
+    # 4-core container on a half-idle 128-core host. This rule then told the user their box was
+    # sixteen times oversubscribed and to go find a quieter machine, about a machine that was
+    # 50% idle, on the single most common deployment shape there is.
+    load = contention.get("host_load_per_core", contention.get("load_per_core"))
     if load is not None and load >= _LOAD_CONTENDED:
+        share = contention.get("load_per_core")
         return [
             Insight(
                 severity="warning",
@@ -163,8 +240,14 @@ def stolen_cpu(util: float, contention: dict[str, float], detail: dict[str, Any]
                 title=f"Box oversubscribed ({load:.1f}x cores)",
                 evidence=(
                     f"CPU utilization was {util * 100:.0f}%, but the 1-minute run queue was "
-                    f"{load:.1f}x the available cores — other work on this machine was competing "
-                    "for them."
+                    f"{load:.1f}x this machine's cores — other work on it was competing for "
+                    "them."
+                    + (
+                        f" Relative to this process's own core budget the queue is "
+                        f"{share:.1f}x, so most of that work is not ours."
+                        if share is not None and share > load * 1.5
+                        else ""
+                    )
                 ),
                 action=(
                     "Re-measure on a quiet box before trusting this timing, or give the process "

@@ -19,7 +19,7 @@ once per worker instead of once per batch. The toy example needs nothing but
 
 ## The shape of a batch function
 
-`ds.ml.map_batches(fn)` applies `fn` to each Arrow `RecordBatch` and expects a
+{py:meth}`ds.ml.map_batches(fn) <batcher.api.dataset.ml.DatasetML.map_batches>` applies `fn` to each Arrow `RecordBatch` and expects a
 `RecordBatch` back. Here a trivial function scores each row by a column, standing in
 for a model's forward pass.
 
@@ -47,10 +47,10 @@ print(scored.to_pydict())
 ```
 
 :::{warning}
-The `.to_pylist()` here turns one batch's column into Python values for the toy computation.
+The {py:meth}`.to_pylist() <batcher.Dataset.to_pylist>` here turns one batch's column into Python values for the toy computation.
 Do not copy that into a real pipeline. It materializes every element as a Python object,
 which is exactly the per-row cost the batch interface exists to avoid. A real model consumes
-the Arrow buffers directly (`to_numpy`, or DLPack into torch) and no per-row Python work
+the Arrow buffers directly ({py:meth}`to_numpy <batcher.Dataset.to_numpy>`, or DLPack into torch) and no per-row Python work
 happens at all.
 :::
 
@@ -105,14 +105,14 @@ labeled.write.parquet("output/labeled.parquet")
 - `num_gpus`: fractional GPUs reserved per worker.
 - `concurrency`: number of parallel workers.
 
-The same accessor also offers `ds.ml.infer(model, ...)` and
-`ds.ml.embed(model, ...)` for the common inference and embedding cases. See the
+The same accessor also offers {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` and
+{py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` for the common inference and embedding cases. See the
 {doc}`ML guide </ml/index>` and {doc}`inference reference </ml/inference/inference>`.
 
 :::{tip}
 Leave `batch_size` unset unless you have measured a reason to set it. Adaptive batch sizing
 picks a VRAM-safe default and halves the batch on a CUDA OOM, which is why
-`ds.map_batches(Model, num_gpus=1)` with no knobs runs at 2,451 img/s and 82% GPU
+{py:meth}`ds.map_batches(Model, num_gpus=1) <batcher.Dataset.map_batches>` with no knobs runs at 2,451 img/s and 82% GPU
 utilization on the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>`, within 2% of the
 hand-tuned batch size.
 :::

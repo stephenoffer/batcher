@@ -189,15 +189,41 @@ def test_steady_blocked_time_is_not_flagged():
 # --- skipped rows -----------------------------------------------------------
 
 
-def test_skipped_rows_aggregate_and_warn():
+def test_skipped_files_aggregate_and_warn():
+    """`SKIPPED` counts whole unreadable inputs, and must say so.
+
+    The status line and the diagnostic both used to call them rows, and the diagnostic
+    named `on_read_error`, which is not an option this engine has. A reader chasing a short
+    result was told to look at the wrong flag for the wrong unit.
+    """
     store = InferenceProgress()
     store.handle(_event(events.SKIPPED, ts=1.0, count=5, reason="read_error"))
     store.handle(_event(events.SKIPPED, ts=2.0, count=3, reason="read_error"))
     snap = store.snapshot()
     assert snap["skipped"]["total"] == 8
     assert snap["skipped"]["by_reason"]["read_error"] == 8
-    assert "8 skipped" in store.render()
-    assert any(d["code"] == "skipped_rows" for d in store.diagnostics())
+    assert "8 files skipped" in store.render()
+    finding = next(d for d in store.diagnostics() if d["code"] == "skipped_files")
+    assert "on_error='skip'" in finding["message"]
+
+
+def test_malformed_rows_are_counted_apart_from_skipped_files():
+    """Rows dropped inside a readable file are a different unit and a different cause.
+
+    Folding them into one total would answer neither "how many files went missing" nor
+    "how many rows", and the two want different responses: an unreadable file is usually
+    infrastructure, a malformed record is usually the producer upstream.
+    """
+    store = InferenceProgress()
+    store.handle(_event(events.SKIPPED, ts=1.0, count=2, reason="read_error"))
+    store.handle(_event(events.MALFORMED, ts=2.0, count=3, source="csv"))
+    snap = store.snapshot()
+    assert snap["skipped"]["total"] == 2
+    assert snap["skipped"]["malformed_rows_total"] == 3
+    assert "2 files skipped" in store.render()
+    assert "3 bad rows" in store.render()
+    codes = {d["code"] for d in store.diagnostics()}
+    assert {"skipped_files", "malformed_rows"} <= codes
 
 
 # --- actor pool -------------------------------------------------------------
@@ -309,11 +335,23 @@ def test_attach_receives_bus_events_and_detach_stops():
 # --- the cumulative metrics surface -----------------------------------------
 
 
-def test_metrics_snapshot_folds_inference_events():
-    # `start_metrics` attaches the one collector idempotently; a manual subscribe would
-    # double-count if another test already attached it globally.
+@pytest.fixture
+def collecting():
+    """Attach the process collector for one test, and detach it afterwards.
+
+    The detach is the part that was missing. `start_metrics` attaches a bus sink and
+    leaves it attached for the life of the process, and *any* attached sink tells the
+    engine that per-query profiles are being consumed — so a later test asserting that a
+    disabled event log builds no collector failed, in a file that never mentions metrics.
+    """
     metrics.start_metrics()
     metrics.reset_metrics()
+    yield
+    metrics.stop_metrics()
+    metrics.reset_metrics()
+
+
+def test_metrics_snapshot_folds_inference_events(collecting):
     events.publish(events.PARTITION, query_id="q", name="infer", total=4, rows=100)
     events.publish(
         events.INFER, query_id="q", name="infer", rows=100, latency_ms=20.0, blocked_ms=3.0
@@ -335,15 +373,11 @@ def test_metrics_snapshot_folds_inference_events():
     assert snap["skipped"]["total"] == 7
     assert snap["gpu"]["util_pct_max"] == 80.0
     assert snap["gpu"]["devices"]["cuda:0"]["util_pct"] == 80.0
-    metrics.reset_metrics()
 
 
-def test_prometheus_text_exposes_inference_series():
-    metrics.start_metrics()
-    metrics.reset_metrics()
+def test_prometheus_text_exposes_inference_series(collecting):
     events.publish(events.SKIPPED, query_id="q", count=3, reason="read_error")
     events.publish(events.GPU, query_id="q", device="cuda:0", util_pct=42.0)
     text = metrics.prometheus_text()
     assert "batcher_skipped_total 3" in text
     assert 'batcher_gpu_utilization_percent{device="cuda:0"} 42.0' in text
-    metrics.reset_metrics()

@@ -43,6 +43,26 @@ argued more carefully here than in the pass it matches. Plus one item (10b) that
 error message once its competitor claim was actually run instead of recalled. An agent reading this document for work should start at the backlog, not
 at a competitor's file listing.
 
+**Status pass, 2026-08-06.** Two of those three openings are now built (10a and 10i), as is the
+low-cardinality half of item 9 and the one capability gap in 10h. **10f — a sorted-input
+aggregate, the memory-shaped one — is the last of the three still open**, and it remains the
+most interesting item here, because its win is bounded state rather than speed: it is the one
+shape that turns a spilling aggregate into a streaming one. What is left below it is either
+large and invasive (`StringView`), a boundary-crossing planner decision (dictionary survival,
+top-K to the scan), or waiting on a quiet box. See the backlog for the per-item evidence.
+
+**A fresh sweep the same day, into source no earlier pass had opened** — DuckDB's
+`src/function/window/` and `src/execution/operator/join/` — added 10j and 10k. Both are worth
+noting for *what kind* of finding they are, because it is not the kind the first nine items
+are. Neither is a technique to copy: DuckDB's window segment tree is **worse** than what
+`bc-runtime/src/window/frame/` already does, and its delimited joins turn out to cover shapes
+Batcher covers too. What the comparison surfaced instead were defects **inside Batcher**, at
+the seam between the SQL front-end and the engine — seven window aggregates the engine
+computes and SQL could not spell, and a frame silently dropped on three others, which is a
+**wrong answer** rather than a missing feature and which every gate passed. The lesson
+generalizes: reading a competitor's implementation of something Batcher already has is worth
+as much as reading one it lacks, because the comparison is what makes an internal gap visible.
+
 `competitive_architecture.md` is the *scorecard*: where Batcher wins and loses, and why.
 This document is the *parts list* behind it. It answers a narrower question: given the
 competitors' source, which specific mechanisms does Batcher not have, and which of them are
@@ -77,13 +97,15 @@ Ranked by value against the mandate, with the cheapest genuine win first.
 |---|---|---|---|---|
 | 1 | Short-circuiting conjunctive filter, conjuncts ordered by cost | DuckDB | **Landed** | 1.3x to 5.7x on multi-predicate filters |
 | 2 | German strings (`StringView`) end to end | DuckDB, Polars | Absent entirely | **Re-valued 2026-08-04**: the win is `take`/`filter` (3-13x), *not* comparison (parity) or sort (0.75-0.81x). Only pays scan-native; a boundary conversion loses at morsel size |
-| 10a | `DISTINCT`/`GROUP BY` + `LIMIT` stops once `k` groups exist | DuckDB | Absent — `RelOp::Distinct` carries no limit | **0.15x at 16M rows on a high-cardinality key, widening with scale.** The only *asymptotic* gap in this document |
-| 9 | A faster string `ORDER BY` | DuckDB | Loses; **magnitude unmeasured** — this machine's noise is 5.3x | Now tracked by `benchmarks/.../ordering.py`; three candidate fixes measured and rejected, two leads left |
-| 10i | Common **subplan** elimination (signature-matched, plan-level) | DuckDB | Absent — `rules/extra/cse.py` is expression-level only | Settles 10g: the technique is real and Kyber lacks it |
-| 10b | `row_number() OVER ()` with no `ORDER BY` | DuckDB, Polars (**Spark rejects it too**) | Raises — matching Spark; the capability exists as `with_row_index` | Small: SQL portability and an error message, not a capability gap |
+| 10a | `DISTINCT`/`GROUP BY` + `LIMIT` stops once `k` groups exist | DuckDB | **Landed** (`RelOp::Distinct { limit }` + `fuse_limit_into_distinct`) | Was the only *asymptotic* gap; now **13x over DuckDB** on the committed `op-distinct-limit` case |
+| 9 | A faster string `ORDER BY` | DuckDB | Loses; **magnitude unmeasured** — this machine's noise is 5.3x | Now tracked by `benchmarks/.../ordering.py`; the low-cardinality half **landed** as `split_constant_ranges`; one lead left (the adaptive-width key) |
+| 10i | Common **subplan** elimination (signature-matched, plan-level) | DuckDB | **Landed** (`kyber/common_subplan.py` + `api/subplan_reuse.py`) | 1.95x on a shared aggregate feeding both sides of a join |
+| 10b | `row_number() OVER ()` with no `ORDER BY` | DuckDB, Polars (**Spark rejects it too**) | **Done**: SQL lowers it to `with_row_index`; the DataFrame error now names that | Small: SQL portability and an error message, not a capability gap |
+| 10h | Ray Data's positional split family, and its names in the compat table | Ray Data | **Landed** (`split_at_indices` / `split_proportionately`, 63 guidance entries, a migration page) | The last *capability* gap the six-engine sweep found |
+| 10j | The window aggregate vocabulary, reached from SQL and framed honestly | DuckDB `src/function/window/` | **Fixed** — 7 aggregates were unreachable from SQL; 3 silently ignored an explicit frame | A **wrong answer** (running result returned for a framed query), plus 7 aggregates SQL could not spell. DuckDB's segment tree itself is **not** worth taking — see 10j |
 | 3 | Online adaptive reordering of filter conjuncts | DuckDB | **Landed** (`ConjunctOrder`) | Fixes the case a static cost model gets wrong |
 | 4 | Top-K heap threshold pushed down as a filter | DataFusion | **Half landed** (`TopNBound` skips morsels; nothing reaches the scan) | Large on `ORDER BY ... LIMIT k` over big inputs |
-| 5 | Skew detected from measured partition sizes, split automatically | Spark AQE | Machinery exists, off by default | Removes a config the user cannot be expected to set |
+| 5 | Skew detected from measured partition sizes, split automatically | Spark AQE | **Landed** — detection runs unasked above ~8.4 M rows and the fan-out is sized from the measured share; the residual is 10d (per-key, not per-written-partition) | Removes a config the user cannot be expected to set |
 | 6 | Dictionary encoding surviving past the leaf | DuckDB, Arrow | **Unreachable** — decoded at the FFI boundary, so the dict-native kernels never see a dictionary from Python | Compounds with 2 |
 | 7 | Adaptive morsel sizing as a pluggable strategy | Daft | Fixed 16,384 rows | Small, and mostly a latency story |
 | 8 | A range-join algorithm (IEJoin, or a binned rewrite) | DuckDB | **Landed**, and since re-tuned | **Largest single gap found**: 12–32x, and OOMs where DuckDB runs |
@@ -245,6 +267,40 @@ shape measured (27 chars: 150 MB against 198 MB), because the 16-byte descriptor
 row on top of the bytes. And conversion is not free: `cast(Utf8 -> Utf8View)` costs 60-88 ms
 per 4M rows and the reverse 44-187 ms.
 
+### The string group-by gap is real, and a wider integer pack does not close it (2026-08-07)
+
+The measurement that says this axis still matters, isolated so the key is the only variable.
+H2O db-benchmark group-by table, 1e7 rows, the identical `sum(v1)`, 100,000 groups either way:
+
+| key | bytes | Batcher | DuckDB | ratio |
+|---|---|---:|---:|---:|
+| `id6` (`int32`) | — | 26.0 ms | 31.6 ms | **0.82x** |
+| `id3` (`'id0000039083'`) | 12 | 54.5 ms | 32.0 ms | **1.70x** |
+
+Same cardinality, same aggregate, same everything but the key's type: the string key costs
+Batcher **2.1x** what the integer one does, while DuckDB pays the same either way. That single
+comparison accounts for most of Batcher's H2O group-by losses (q2 2.78x on two string keys,
+q7 2.04x, q3 1.39x — against wins on every integer-keyed case).
+
+`bc_runtime::agg::group::assign` already packs a null-free string of **≤ 7 bytes** into a `u64`
+and groups on the integer, which is why the 5-byte `id1` wins and the 12-byte `id3` does not.
+The obvious next step — widen the pack to an `i128` and cover 8-15 bytes, where most real
+categorical keys live — was built, measured, and **reverted: it is 1.13x slower** (`id3`
+49.7/53.0 ms -> 57.6/59.2 ms over two interleaved rounds, one tree, two `.so`s differing only
+in that change).
+
+Two costs swamp the saving, and both are properties of a wide key rather than of the
+implementation. The packing is a **second full pass** that materializes a 160 MB `Vec<i128>`
+the hash path never allocates. And `int_group_ids`' inline-key table goes from 4 bytes a slot
+to 20, so on a 100,000-group probe it loses more to cache misses than it gains by comparing
+registers instead of slices — the byte path is not naive, it already keeps each group's
+representative *slice* beside its id precisely so its comparison costs no indirection.
+
+So the gap is not about how many bytes fit in a register. It is the representation, which is
+what this item is about: a `StringView` leaf whose comparison never leaves the array that was
+scanned. The negative result is recorded on `pack_short_bytes` itself so the next reader finds
+it before rebuilding it.
+
 ### Converting at an operator boundary does not pay, and the crossover says why
 
 The cheap version of this — leave the schema alone, convert to a view inside one operator,
@@ -394,18 +450,28 @@ that is the mean of the *non-skewed* partitions, floored at the advisory partiti
 (`targetSize`, `:75`). It knows which sides may be split per join type
 (`canSplitLeftSide`, `canSplitRightSide`). None of this asks the user anything.
 
-Batcher has more learning machinery than Spark here and less default behaviour.
-`python/batcher/dist/skew.py` persists measured hot join keys so a repeated shape salts
-without re-running detection, and distinguishes "measured, not skewed" from "never
-measured". But `skew_join_salt` defaults to `0`
-(`python/batcher/config/config.py:998`), and the learned path is only consulted when it is
-positive. So out of the box a skewed distributed join is not mitigated, while a config
-field suggests otherwise.
+Batcher has more learning machinery than Spark here. `python/batcher/dist/skew.py`
+persists measured hot join keys so a repeated shape salts without re-running detection, and
+distinguishes "measured, not skewed" from "never measured" — a state Spark has no
+representation for, and the reason a shape known to be uniform never pays the pre-pass
+twice.
 
-The fix is not new machinery, it is a default: derive the salt from the measured partition
-size distribution the way Spark derives its threshold, using the sketches Kyber already
-consumes. This is the same finding `competitive_architecture.md` ceiling 6 records; what
-this pass adds is Spark's actual formula.
+**This entry recorded a gap that has since been closed, and the recommendation it made is
+no longer the work to do.** It read `skew_join_salt: int = 0` as "off" and concluded that
+out of the box a skewed distributed join is not mitigated. That is no longer what `0` means.
+`resolve_hot_keys` now takes the hot values from, cheapest first: the set learned for this
+join shape, else the column statistics Kyber already holds, else a Misra-Gries pre-pass that
+it runs **on its own initiative** above `_DETECT_MIN_INPUT_ROWS` (~8.4 M rows across both
+sides), because past that size one pass costs ~4% on a join that turns out uniform against
+5.8x for an undetected 40% hot key. The fan-out is then sized from the key's *measured*
+share by `salt_factor`, which is Spark's `f · P` overload argument derived rather than
+tabulated. The three values are: positive forces the pre-pass and pins the fan-out, `0`
+(the default) leaves both to the measurement, and **negative** is the off switch.
+
+So the default behaviour Spark's `OptimizeSkewedJoin` provides is present, and one thing
+Spark's is not: the decision is remembered across runs. What remains genuinely open is
+narrower than this section originally claimed — skew is detected per *join key*, not from
+the measured sizes of the partitions a shuffle just wrote, which is what entry 10d is about.
 
 ## 6. Dictionary survival past the leaf
 
@@ -809,6 +875,22 @@ is more setup than the other items here. The reason to rank it anyway is that th
 *memory* before speed. A sorted group-by has bounded state, so it is the one shape that
 converts a spilling aggregate into a streaming one.
 
+**Re-verified still open, 2026-08-06**, and it is now the last of the three openings this sweep
+found (10a and 10i are built). The greps, so the next reader does not repeat them:
+`grep -rniE "sorted_group|sorted_agg|adjacent_dedup|sorted_distinct|sorted_unique" crates/`
+returns **nothing**, and the only `sorted_by` consumers under `kyber/rules/` are
+`ordering.py`'s two sort-elimination rules (`sort_elimination_from_ordering`,
+`topn_over_sorted_input_to_limit`) — neither of which touches `Aggregate` or `Distinct`.
+
+Worth stating what building it costs, because it is larger than its position here suggests and
+the cost is mostly *contract*, not algorithm. The adjacency scan is easy; what it needs around
+it is a two-sided IR change in one commit (a flag on `Aggregate`/`Distinct` saying the input
+arrives ordered by the group keys), a **mergeable** form so the sorted path does not become a
+second semantics — invariant #7, and the exact shape of "a stateful operator that works
+single-node and silently caps at one machine" — and agreement across all three executors. So
+it wants a session that can run the distributed suite, which is the one thing a contended box
+cannot currently do.
+
 ### 10g. A caution about probing this optimizer with a stopwatch
 
 Two attempts to measure whether Batcher reuses a repeated *subplan* (as Polars' `multiplexer`
@@ -856,6 +938,109 @@ Polars, pandas and Spark names — `group_by_dynamic` is mapped there, `random_s
 Batcher's scorecard positions Ray Data as a primary competitor and claims 50-450x over it, so
 the porting surface for that specific audience being the unmapped one is a mismatch worth
 closing. It is a table entry, not an engine change.
+
+**Closed, 2026-08-06.** All three parts, and the porting surface turned out to be the larger
+half exactly as this entry predicted.
+
+- **The two methods** are `Dataset.split_at_indices(indices)` and
+  `Dataset.split_proportionately(proportions)`, matching Ray Data's names, validation and edge
+  cases (an index past the end gives an empty part, a repeated index gives an empty part
+  between the two, and the proportional form nudges colliding boundaries apart so no part comes
+  out empty). They add **no operator and no IR**: both lower to `with_row_index` plus a range
+  filter, the shape `tail` and `gather_every` already use, so they inherit streaming, spill and
+  distribution rather than re-earning them. They also improve on the original in the way the
+  architecture forces — Ray Data returns a `MaterializedDataset` and these stay lazy, so a
+  pipeline consuming one part never computes the others. Covered by
+  `tests/differential/test_diff_split_positional.py` (27 cases, DuckDB as the oracle via
+  `ORDER BY k LIMIT n OFFSET lo`, ordered comparisons throughout because an order-independent
+  one cannot see a boundary in the wrong place).
+- **The guidance table** now carries a `DATASET_RAY_DATA` family of 63 entries
+  (`_dataset_naming.py`), so a Ray Data name gets the Batcher spelling out of the traceback
+  instead of a bare `AttributeError`. `tests/unit/test_guidance_is_executable.py` holds every
+  suggestion to naming something that exists, and caught one invented method while these were
+  written, which is the whole reason that test exists.
+- **The docs** gained `docs/getting-started/migration/ray-data.md`, since the migration section
+  covered pandas, Polars, PySpark, DuckDB and Daft but not the competitor the scorecard ranks
+  highest. It leads on the difference that actually changes how a job is tuned: bulk Arrow
+  never enters the Ray object store, so there is no object store to size.
+
+### 10j. The window vocabulary — a capability that existed and could not be reached from SQL
+
+Added 2026-08-06, from a pass that deliberately went where the earlier ones had not. Items
+1-9 read the competitors' *execution mechanisms*, 10a-10h their *operator inventories*, and
+10i their *optimizer passes*. This one read DuckDB's `src/function/window/` — the window
+implementation — which no previous pass had opened.
+
+**What is there, and what it is not.** DuckDB gives framed window aggregates a segment tree
+(`window_segment_tree.cpp`), a merge-sort tree (`window_merge_sort_tree.cpp`) and a dedicated
+distinct aggregator (`window_distinct_aggregator.cpp`). **The segment tree is not worth
+taking**, and it is worth saying why so nobody takes it later: it is `O(log n)` per row over
+an arbitrary frame, and `bc-runtime/src/window/frame/` is already `O(1)` amortized, because
+SQL frame edges are both non-decreasing in row position, so the frame is a FIFO queue rather
+than an arbitrary range. `count`/`sum` keep a running accumulator, `min`/`max` a monotonic
+deque, and float `sum`/`avg` a two-stack `FifoSum` that never subtracts — which is *more*
+numerically careful than a segment tree, not less. Batcher wins this one on the algorithm.
+
+**What the comparison did turn up is a seam defect, in two directions.** Reading DuckDB's
+window function list against Batcher's produced a discrepancy inside Batcher rather than
+between the two:
+
+1. **Six window aggregates the engine computes were unreachable from SQL.**
+   `_sql/parser/windowing/translate.py::_window_func` mapped exactly five names
+   (`sum`/`avg`/`min`/`max`/`count`), so `bit_or(x) OVER (...)` failed with "unsupported
+   window function: **bitwiseoragg**" — sqlglot's node name for a typed aggregate, which only
+   the *aggregate* front-end translated. Nothing was missing but the mapping:
+   `WINDOW_AGGREGATES` lists all of them, the runtime computes them, and
+   `col("x").bit_or().over(...)` returned DuckDB's own values throughout. Fixed by making the
+   two five-name copies one table; `bit_and`, `bit_or`, `bit_xor`, `bool_and`, `bool_or`,
+   `stddev` and `variance` now match DuckDB in both the running and whole-partition forms.
+
+2. **A frame was silently dropped on three aggregates, which is a wrong answer rather than a
+   missing feature.** `api/dataset/_build.py` reduced the frame to `None` for anything outside
+   `WINDOW_FRAMEABLE`. That is correct for a function SQL gives no frame either (ranking,
+   `lag`/`lead`, the fills) and wrong for an aggregate, where SQL defines the framed result:
+   `window(frame=(-1, 0), functions={"w": ("stddev", "f")})` returned the **running** standard
+   deviation — DuckDB's answer to the query *without* the frame. `stddev`, `var` and
+   `count_distinct` are exactly the set in that gap, and they now raise.
+
+   This is the shape `CLAUDE.md` warns about and no mechanical check catches: the column that
+   comes back is a perfectly good number, so every gate stayed green and an order-independent
+   comparison could not have seen it. It was **pre-existing** — the line is unchanged at
+   `HEAD` — and reachable from the public DataFrame API, not only from SQL.
+
+`tests/differential/test_diff_window_agg_vocabulary.py` covers both, and includes a case
+asserting that each framed answer *differs* from its running one, because a frame test whose
+two answers coincide proves nothing — it caught two of its own cases doing exactly that.
+
+### 10k. Correlated `EXISTS` with a *mixed* equality-and-inequality correlation
+
+Added 2026-08-06, from reading DuckDB's `src/execution/operator/join/`, which no pass had
+enumerated. Its delimited joins (`physical_delim_join.cpp`, plus the left/right variants) are
+the machinery DuckDB decorrelates subqueries with, so the question they raise is what Batcher
+refuses.
+
+**Almost nothing, and the first draft of this entry was wrong about it.** "Correlated `EXISTS`
+is not supported" is what the error message says and what a single probe suggested; running
+the four shapes separately says otherwise:
+
+| correlation inside `EXISTS` | Batcher | matches DuckDB |
+|---|---|---|
+| equality only (`x.g = t1.g`) | works | yes |
+| `NOT EXISTS`, equality only | works | yes |
+| inequality only (`x.v > t1.v`) | works | yes |
+| **equality *and* inequality together** | **`NotImplementedError`** | — |
+
+So the gap is one shape, not a feature: `subquery/core.py::_apply_exists` decorrelates an
+equality correlation into a tagged left join, and `subquery/range.py` handles a pure
+inequality, but a predicate carrying both falls through to `_reject_correlated`. The fix is to
+keep the equalities as the join keys and apply the inequality as a residual predicate on the
+joined rows before the distinct — a semi-join with a residual, which is a real change to the
+join path rather than a parser edit, which is why it is recorded rather than built here.
+
+Recorded at this length for the same reason 10b is: the error message overstates the
+limitation, and a reader who trusted it would rebuild machinery that already exists. Correlated
+*scalar* subqueries and correlated `IN` both work too, and were also checked rather than
+assumed.
 
 ### 10i. The optimizer pass list — one real gap, and it settles 10g
 
@@ -914,6 +1099,57 @@ Both were on the shortlist of DuckDB operators worth taking, and both already ex
   `Project`'s outputs to one synthetic column. (Plan-level *subplan* reuse is a different
   question, and 10g explains why it is still open.)
 
+### 10j. Ray Compiled Graphs — measured, and ruled out for this data plane
+
+Ray's compiled graphs (`ray.dag` + `.experimental_compile()`) are the technique a Ray user asks
+about first, so the reason not to adopt them belongs on the record with a number attached rather
+than as an opinion.
+
+**What they buy, and why most of it is already banked.** A compiled graph pre-allocates the
+channels between a *fixed* set of actors, so a repeated call skips task submission, skips the
+object-store put/get, and can move GPU tensors over NCCL instead of host memory. Two of those
+three are things Batcher's design already does not pay: bulk Arrow moves worker-to-worker over
+Flight and never enters the object store (the A1–A14 row of the scorecard above), and every
+GPU fan-out task reads its own shard straight from storage and returns a *mergeable partial*,
+so there is no large intermediate to route. What is left is the task-submission latency of the
+small control messages — `(addr, ticket)` in, a published count out.
+
+**Measured on this cluster, Ray 2.56**, against the exact call shape the streaming pipeline's
+hottest hop uses (a tuple in, an int out, 2,000 calls, warm):
+
+| Path | Per call |
+|---|---|
+| Plain actor call | 822 µs |
+| Compiled graph | 546 µs |
+| Saving | 276 µs (34%) |
+
+**Why that is not worth taking.** The saving is real and it is small against what a hop
+actually does: a morsel is 16,384 rows, and the inference forward pass it triggers is tens to
+hundreds of milliseconds, so 276 µs is a fraction of a percent. Against it, a compiled graph
+requires a static actor set and a static topology, and the streaming scheduler's whole value is
+that neither is static — it re-deals a morsel to whichever actor went idle, replaces a preempted
+actor and replays its subtree, and (since this pass) grows a stage that falls behind. There is no
+partial adoption: compiling the hop freezes the assignment that makes all three possible.
+
+**The vendor's own field guidance says the same, on both counts.** Anyscale's
+`foundations/core/accelerated-dag.md` (`../optimization-guides`) carries a "When to Use" table
+whose two "No" rows are exactly this workload: *"Batch processing (steps > 100 ms) — No,
+scheduling overhead is negligible"* and *"Dynamic DAG structure (changes per request) — No,
+compilation overhead not amortized"*. Its "Yes" rows are the complement — sub-10 ms GPU steps
+and a fixed DAG at high QPS — which is a serving shape, not an analytics one. The same page
+lists the feature's open limitations as of Ray 2.54 (no NCCL broadcast, request blocking in
+multiples of the read timeout under network instability, no pinned memory for host/device
+copies), any one of which would be a new failure mode inside a path that currently recovers
+from preemption by construction.
+
+**Where it would be worth revisiting.** If a stage ever holds tensors resident on the device
+across operators — the open half of G4, which Ray has not solved either (its GPU object store is
+RFC-only, ray#51173) — then the NCCL transport becomes the point rather than the latency, and
+this decision should be re-taken against that. Until then the residual is a driver-side
+concurrency limit, not a per-call one: at ~822 µs and four control calls per morsel, one driver
+saturates at roughly 300 morsels/s, and the fix for *that* is fewer driver round trips rather
+than faster ones.
+
 ## Things Batcher already has, so do not "add" them
 
 Recorded because each is a technique a competitor is known for, and each is easy to
@@ -939,43 +1175,105 @@ mistake for a gap:
 Re-ordered 2026-07-29, after three items turned out to be already built. What is struck through
 is done; what remains is ordered by value against the mandate.
 
+**Status pass, 2026-08-06 — and it found the same drift a third time.** Every open item below
+was re-checked against the code rather than trusted. **Three of the six had been built since the
+last pass and were still listed as open** (items 3, 5 and 6), a fourth (item 4) was half-built in
+a way the entry did not describe, and the one capability gap the sweep found in 10h has now been
+closed. That is the third consecutive pass to find this document overstating what is left, which
+is worth more than any single entry: **re-check before building, and expect roughly half of what
+is written here to be done already.** Each corrected entry now names the type or file that
+implements it, so the next reader can settle it with one grep instead of one day.
+
 0. ~~A range-join algorithm (item 8).~~ **Landed**, and its follow-up re-tuned — see item 8 for
    why the block-decomposition step it named is a *distribution* prerequisite and not a
    single-node speed fix.
 1. ~~Online adaptive conjunct reordering (item 3).~~ **Landed** as `ConjunctOrder`, in a
    stronger form than DuckDB's (per-conjunct attribution rather than an aggregate hill-climb).
-2. **Preserve the dictionary across the FFI boundary (item 6).** Promoted to the top of the
+2. **Preserve the dictionary across the FFI boundary (item 6).** ~~Promoted to the top of the
    remaining work, because it is not an optimization to build — the kernels exist and are
-   tested. It is one decode, in `normalize_to`, standing between them and every real query.
-   Decode on egress instead of ingress; `plan/types/lattice.py::widen` needs no change. The
-   audit is every operator that builds an output batch from its input's schema.
-3. **The early exit for `DISTINCT`/`GROUP BY` under a `LIMIT` (item 10a).** The only
-   *asymptotic* gap the review has found, measured at 0.15x on 16M rows and widening with
-   scale — and, unlike everything below it, confirmable without a quiet box, because the row
-   count decides it rather than a timing margin. Gate it on Kyber's existing cardinality
-   estimate rather than firing unconditionally: on a *low*-cardinality key Batcher's dense
-   direct-map already beats DuckDB 4.9x, and an unconditional early exit gives that back.
-4. **`row_number() OVER ()` porting guidance (item 10b).** Demoted after the entry was
-   corrected: Spark rejects this too, for Batcher's own stated reason, and the capability
-   already exists as `with_row_index`. What is left is that a ported DuckDB/Polars-SQL query
-   fails with an error that does not name the alternative. An error-message change.
-5. **Common subplan elimination (item 10i).** DuckDB gives it a dedicated pass with
-   signature-based matching, which is evidence the technique earns its keep. Kyber has the
-   expression-level version only. Unmeasured in Batcher, and 10g explains why a stopwatch
-   will not measure it without a shape the shortcut machinery cannot answer.
-6. **The low-cardinality string sort (item 9).** The cause is structural rather than a
-   kernel, which is why it is here despite the magnitude being unmeasured: seven distinct
-   values give the sampled quantile boundaries nothing to cut on, so the sample-sort's ranges
-   come out lopsided however many are asked for. `sample_sort.rs` already solves exactly this
-   on the *multi-key* path — `composite_part_of` re-routes by the full composite key when
-   `max_bucket > 3 * fair_share` — and the single-key path has no equivalent fallback.
+   tested. It is one decode, in `normalize_to`, standing between them and every real query.~~
 
-   **The fix is written and was not landed, deliberately.** Extending that gate to one key
-   needs the composite to carry a trailing ascending row index, or it ties for every row and
-   routes identically; `(keys…, row index)` is exactly the order this sort produces, so
-   splitting a tie group across ranges is sound. It passed the serial oracle on every
-   shape. It is not landed because "no performance regressions" is a gate and this machine
-   could not measure it either way. Land it from a quiet box, with the benchmark above.
+   **Reframed 2026-08-06 to match item 6's own record, which this entry contradicted.** It is
+   *not* "one decode" any more: decode-on-egress was built end to end, measured, and
+   **reverted**, because it is 1.2-2.8x on shapes that *consume* the column and **0.63x on
+   `SELECT <a string column>`**, which is not a corner case. What remains is a **planner**
+   decision — preserve the encoding only when the plan consumes the column (filter, group-by,
+   join key) and decode at the leaf when it projects it — so this is a cost model, not a
+   boundary edit, and it should be ranked as one. The operator half is done and committed
+   (`bc-interp/tests/dictionary_operators.rs`).
+3. ~~The early exit for `DISTINCT`/`GROUP BY` under a `LIMIT` (item 10a).~~ **Landed**, end to
+   end, and verified 2026-08-06. `bc_ir::RelOp::Distinct` carries a `limit`; all three
+   executors honour it (`lib.rs`, `par.rs`, `stream/parallel.rs`), `bc_runtime::agg::distinct`
+   implements the early-stopping `DistinctPrefix`, `plan/logical/relational.py::Distinct`
+   lowers it, and `kyber/rules/extra/topn_limit.py::fuse_limit_into_distinct` fuses the pair.
+   Covered by `tests/differential/test_diff_distinct_limit.py`.
+
+   Two things the implementation settled that this entry had left open. It keeps **the first
+   `k` in input order** rather than an arbitrary `k`, because invariant #7 needs one node and
+   many to agree where DuckDB is free to take whichever `k` its threads reach first. And the
+   gating worry was unnecessary: the early exit is naturally conditional, since a key with
+   fewer than `k` distinct values never reaches the threshold and falls through to the dense
+   direct-map path that already beat DuckDB 4.9x.
+
+   **Now tracked by a benchmark case**, which it was not — the gap this document calls the
+   only asymptotic one had no case in the suite, which is exactly how item 9's gap stayed
+   invisible. The case is `op-distinct-limit` in `benchmarks/suites/operators/dedup.py`; note
+   that that file is itself uncommitted at the time of writing, so the case lands only when it
+   does. At scale 1 over 6M `lineitem` rows, correctness gate passed on all four engines:
+
+   | batcher | duckdb | polars | pyarrow |
+   |---|---|---|---|
+   | 3.1 ms | 40.4 ms (13x) | 68.6 ms (22x) | 198.1 ms (64x) |
+
+   The case counts the limited distinct rather than returning it, because `DISTINCT … LIMIT k`
+   does not say *which* `k` and the engines legitimately differ; counting is deterministic and
+   still makes every engine do the same work. Verified as a real early exit rather than a
+   metadata shortcut (the trap 10g warns about) by scaling the input: on a near-unique key the
+   time is flat at 2.9-5.7 ms from 2M to 32M rows, while on a 3-distinct-value key, where the
+   exit *cannot* fire, it scales 9.8 -> 12.1 -> 19.6 ms and returns 3.
+4. ~~`row_number() OVER ()` porting guidance (item 10b).~~ **Done**, and the entry understated
+   what already existed. The SQL path does not raise at all: `_sql/parser/windowing/translate.py`
+   lowers `row_number() OVER ()` to `with_row_index`, so a ported DuckDB or Polars query runs
+   and returns `[1, 2, 3]`. What remained was the *DataFrame* path, where
+   `bt.row_number().over()` still raised without naming the alternative; the error now does
+   (`plan/logical/window.py`). The hint is withheld when `partition_by` is set, because
+   `with_row_index` numbers the relation rather than each group, and offering it there would
+   trade a clear refusal for a wrong answer.
+5. ~~Common subplan elimination (item 10i).~~ **Landed** as `kyber/common_subplan.py` (decides
+   which repeated subplans are worth materializing) plus `api/subplan_reuse.py` (runs them and
+   splices the results back), keeping the decide/execute split `gating` and `staging` use.
+   Measured by its own module docstring at **1.95x** on a 4M-row `GROUP BY` feeding both
+   operands of a join, against a floor of "what computing the shared half once costs".
+6. ~~The low-cardinality string sort (item 9).~~ **Landed**, and in a stronger form than the
+   fix this entry described. `sample_sort.rs:191` gives the single-key path its own fallback,
+   `split_constant_ranges`, rather than extending the multi-key composite re-route. The two
+   trigger at different thresholds on purpose, and the reasoning recorded there is better than
+   the one here: the composite re-route waits for real skew (`3 * fair_share`) because it pays
+   for a whole row encoding, while splitting fires as soon as a range exceeds a fair share,
+   because **the failure is not skew at all** — twenty-five evenly-sized ranges on ninety-six
+   cores are perfectly balanced and still leave seventy-one cores idle, which a skew test
+   cannot see and which is exactly the shape `ORDER BY <a 25-value column>` produces.
+5a. **Correlated `EXISTS` with a mixed equality-and-inequality correlation (item 10k).** One
+   shape, precisely bounded: equality-only, inequality-only and `NOT EXISTS` all work and
+   match DuckDB, and only a predicate carrying *both* falls through to `_reject_correlated`.
+   Small and well-defined, but it needs a semi-join with a residual predicate rather than a
+   parser edit, which is why it sits here rather than being done alongside 10j.
+6a. **A sorted-input aggregate and adjacent dedup (item 10f).** **The highest-value item still
+   open, and it was missing from this list entirely** until 2026-08-06 — it was argued in
+   section 10f and then never written down as work, which is how the last of the sweep's three
+   genuine openings ended up ranked nowhere. Re-verified open: nothing in `crates/` implements
+   it and no Kyber rule rewrites `Aggregate`/`Distinct` on a sorted input.
+
+   It is first among the remaining because its win is **memory, not speed**: a sorted group-by
+   has `O(1)` state, so it is the one shape that turns a spilling aggregate into a streaming
+   one, and Polars ships four operators that consume the property
+   (`sorted_group_by`, `sorted_unique`, `is_first_distinct`, `merge_sorted`). Batcher already
+   tracks and propagates the property; nothing consumes it.
+
+   Sequence it behind a session that can run the distributed suite. The algorithm is a scan
+   over adjacent runs; the cost is the contract around it — a two-sided IR change in one
+   commit, and a mergeable form, without which it works perfectly on one node and silently
+   caps there.
 7. **An adaptive-width sort key for the per-range sort (item 9).** Proven
    permutation-identical and worth 1.69x on high-cardinality 27-char keys, but a *fixed*
    4-byte head loses 0.78-0.87x on two other shapes, so the width has to come from the sample

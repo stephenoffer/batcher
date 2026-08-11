@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from batcher._internal.errors import PlanError
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.rule import Phase, Rule, RuleCategory, node_rule
 from batcher.plan.logical import LogicalPlan
@@ -33,13 +34,55 @@ class RuleRegistry:
     def __init__(self) -> None:
         self._rules: list[Rule] = []
         self._names: set[str] = set()
+        self._by_name: dict[str, Rule] = {}
+        # The phase partition, built on demand and dropped by `add`. Held here rather than
+        # rebuilt per `Optimizer` because the *identity* of each phase's list is load-bearing
+        # downstream: `optimizer.expr_dispatch.expr_type_index` memoizes the expression-type
+        # inversion of a rule list on `id(rules)`, so a fresh list per query missed that memo
+        # every time and re-inverted ~700 rules across 7 phases on every query. Measured on a
+        # point-lookup shape: 7 of 8 lookups missed, and the 64-entry memo was thrashing.
+        self._phase_cache: dict[Phase, list[Rule]] | None = None
 
     def add(self, rule_obj: Rule) -> Rule:
-        """Register a rule. Names are unique — re-adding the same name is a no-op
-        (so importing a rule module twice is safe)."""
-        if rule_obj.name not in self._names:
-            self._rules.append(rule_obj)
-            self._names.add(rule_obj.name)
+        """Register a rule under its unique name.
+
+        Re-adding the *same* `Rule` object is a no-op, so importing a rule module twice is
+        safe. Registering a **different** rule under a name already taken raises, because
+        silently keeping the first one is indistinguishable from the second rule not
+        existing: it never runs, its tests still pass (they call the module function
+        directly, never the registry), and nothing reports it.
+
+        That is not hypothetical. Two unrelated implementations of `intersect_in_lists` --
+        one handling a single `AND` pair, one handling an n-ary conjunction and folding a
+        disjoint pair to the empty relation -- both claimed the name. Import order decided
+        which one shipped; the loser was dead code carrying a unit test that asserted the
+        *opposite* of the optimizer's actual behaviour and could never fail.
+
+        Args:
+            rule_obj: The rule to register.
+
+        Returns:
+            The rule, so a decorator or module-level `add(...)` can bind its result.
+
+        Raises:
+            PlanError: A different rule is already registered under this name.
+        """
+        existing = self._by_name.get(rule_obj.name)
+        if existing is not None:
+            if existing is rule_obj:
+                return rule_obj
+            raise PlanError(
+                f"two different rules are registered as {rule_obj.name!r}; a rule name is its "
+                "identity in explain, telemetry and the run-order snapshot, so the second "
+                "registration would be silently dropped and never run. Rename one, or delete "
+                "the redundant implementation."
+            )
+        self._rules.append(rule_obj)
+        self._names.add(rule_obj.name)
+        self._by_name[rule_obj.name] = rule_obj
+        # Registration order is run order, so a late `add` must be able to change a phase's
+        # sequence. Dropping the partition is what keeps `by_phase` honest about that.
+        self._phase_cache = None
         return rule_obj
 
     def rule(
@@ -83,6 +126,28 @@ class RuleRegistry:
     def rules(self) -> list[Rule]:
         """The registered rules, in registration order."""
         return list(self._rules)
+
+    def by_phase(self) -> dict[Phase, list[Rule]]:
+        """The registered rules partitioned by phase, in registration order within each.
+
+        Memoized, and the memo is dropped by `add`. The **identity** of each returned list
+        is part of the contract, not an implementation detail: the optimizer's expression
+        dispatch memoizes a rule list's type inversion on `id(rules)`, so handing out a
+        fresh list per query silently disables that memo. Every phase is present, mapping to
+        an empty list where no rule declared it, so a caller may index any `Phase` directly.
+
+        Returns:
+            A phase-to-rules mapping the caller must treat as read-only — it is shared with
+            every other caller and with the next query.
+        """
+        cached = self._phase_cache
+        if cached is not None:
+            return cached
+        by_phase: dict[Phase, list[Rule]] = {p: [] for p in Phase}
+        for rule_obj in self._rules:
+            by_phase[rule_obj.phase].append(rule_obj)
+        self._phase_cache = by_phase
+        return by_phase
 
 
 DEFAULT_REGISTRY = RuleRegistry()

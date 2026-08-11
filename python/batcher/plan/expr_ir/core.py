@@ -25,10 +25,11 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError, require_float, require_int
+from batcher._internal.mathx import is_nan
 from batcher.plan.expr_ir.compat import bind_compat_methods as _bind_compat_methods
 from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
-from batcher.plan.ir_tags import ExprTag
-from batcher.plan.types import CAST_DTYPES
+from batcher.plan.ir_tags import MICROS_PER_DAY, ExprTag
+from batcher.plan.types import CAST_DTYPES, canonical_dtype_name, resolve_dtype
 
 if TYPE_CHECKING:
     from batcher.plan.expr_ir.audio import _AudioNamespace
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
         _StrNamespace,
         _StructNamespace,
     )
+    from batcher.plan.expr_ir.namespaces.sequence import _SeqNamespace
     from batcher.plan.expr_ir.nodes import WindowExpr
     from batcher.plan.expr_ir.video import _VideoNamespace
 
@@ -155,7 +157,7 @@ class Expr:
     helpers (``cum_sum``, ``shift``, ``diff``, ``pct_change``, ``rank``,
     ``rolling_mean``, ``is_unique``), and the typed accessor namespaces (``.str``,
     ``.dt``, ``.list``, ``.struct``, ``.json``, ``.image``, ``.audio``, ``.video``,
-    ``.map``) that hold the per-type breadth.
+    ``.map``, ``.seq``) that hold the per-type breadth.
 
     Subclasses are the concrete IR nodes (``Lit``, ``Binary``, ``MathExpr``, …); user
     code constructs expressions through ``col``/``lit`` and these methods, not the
@@ -754,17 +756,23 @@ class Expr:
         return self._cast(dtype, try_cast=True)
 
     def _cast(self, dtype: str, *, try_cast: bool) -> Cast:
-        # Type names are matched case-insensitively: pandas spells these `"Int64"` /
-        # `"Float64"` and SQL `"BIGINT"`, and a case mismatch is a typo the user cannot
-        # see. The IR always carries the canonical lowercase name, so the wire contract
-        # is unaffected.
-        canonical = dtype.lower() if isinstance(dtype, str) else dtype
-        if canonical not in CAST_DTYPES:
+        # Type names are matched case-insensitively (pandas spells these `"Int64"`, SQL
+        # `"BIGINT"`, and a case mismatch is a typo the user cannot see), and the IR always
+        # carries the canonical form, so the wire contract is unaffected.
+        canonical = canonical_dtype_name(dtype) if isinstance(dtype, str) else dtype
+        # `resolve_dtype`, not `canonical in CAST_DTYPES`: the fixed names are only half
+        # the vocabulary, and membership-testing the set rejects every parametrized dtype
+        # (`decimal(12,4)`, `timestamp(ns)`) that the engine itself accepts.
+        if resolve_dtype(canonical) is None:
             import difflib
 
             hint = difflib.get_close_matches(canonical, sorted(CAST_DTYPES), n=2, cutoff=0.5)
             suffix = f"; did you mean {' or '.join(map(repr, hint))}?" if hint else ""
-            raise PlanError(f"unknown cast dtype {dtype!r}; valid: {sorted(CAST_DTYPES)}{suffix}")
+            raise PlanError(
+                f"unknown cast dtype {dtype!r}; valid: {sorted(CAST_DTYPES)}, or a "
+                f"parametrized name such as 'decimal(12,4)', 'timestamp(ns)', "
+                f"'timestamp(us, UTC)', 'time64(ns)', 'duration(s)'{suffix}"
+            )
         return Cast(self, canonical, try_cast=try_cast)
 
     def is_null(self) -> IsNull:
@@ -835,9 +843,7 @@ class Expr:
 
                 return nullif(lit(True), lit(True))
             return Lit(False)
-        expr: Expr = self == non_null[0]
-        for v in non_null[1:]:
-            expr = expr | (self == v)
+        expr = _membership_test(self, non_null)
         if has_null:
             from batcher.plan.expr_ir.constructors import lit, nullif
 
@@ -2907,6 +2913,26 @@ class Expr:
         """
         return _accessor("batcher.plan.expr_ir.video", "_VideoNamespace")(self)
 
+    @property
+    def seq(self) -> _SeqNamespace:
+        """Sequence accessor — genomics and proteomics ops on a text column.
+
+        Returns a namespace with ops such as ``.seq.reverse_complement()``,
+        ``.seq.gc_content()``, ``.seq.translate()``, ``.seq.kmers(21)``, and the FASTQ
+        quality decoders; all per-base work stays in the Rust data plane.
+
+        Returns:
+            The `.seq` accessor namespace.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> bt.col("s").seq.reverse_complement().to_ir()["e"]
+                'seq'
+        """
+        return _accessor("batcher.plan.expr_ir.namespaces.sequence", "_SeqNamespace")(self)
+
     def hash(self, seed: int = 0) -> Expr:
         """A deterministic 64-bit hash of this expression's value, per row → Int64.
 
@@ -3541,6 +3567,101 @@ class Expr:
         """
         return AggExpr("mode", self)
 
+    def n50(self) -> AggExpr:
+        """Assembly N50 — the contig length at which half the assembly's bases are covered.
+
+        Sort the pieces longest-first and walk down: N50 is the length of the piece at which
+        the running total first reaches half the total. It is the standard measure of how
+        contiguous an assembly is.
+
+        **This is not the median of the same lengths, and the difference is the point.** A
+        median weighs every contig equally, so an assembly of one 10 Mb chromosome plus a
+        thousand 500 bp fragments has a median of 500 — a number describing the debris. N50
+        weighs by *base* and answers 10 Mb.
+
+        Mergeable, so a per-sample N50 over a shuffle is the same number a single node would
+        compute. Null lengths, negative lengths, and non-finite values are excluded.
+
+        Returns:
+            An aggregate expression yielding Float64; null for a group with no usable
+            lengths, or whose lengths sum to zero.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"asm": ["a"] * 9, "len": [1, 2, 3, 4, 5, 6, 7, 8, 9]})
+                >>> ds.group_by("asm").agg(n=bt.col("len").n50()).to_pydict()
+                {'asm': ['a'], 'n': [7.0]}
+        """
+        return AggExpr("n_length", self, param=0.5)
+
+    def n90(self) -> AggExpr:
+        """Assembly N90 — the contig length covering 90% of the assembly's bases.
+
+        The same walk as :meth:`n50` at a stricter threshold, so it reaches further down the
+        length distribution and is never larger than N50. Where N50 says how big the good
+        pieces are, N90 says how far the assembly stays good.
+
+        Returns:
+            An aggregate expression yielding Float64; null on the same conditions as
+            :meth:`n50`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"asm": ["a"] * 9, "len": [1, 2, 3, 4, 5, 6, 7, 8, 9]})
+                >>> ds.group_by("asm").agg(n=bt.col("len").n90()).to_pydict()
+                {'asm': ['a'], 'n': [3.0]}
+        """
+        return AggExpr("n_length", self, param=0.9)
+
+    def l50(self) -> AggExpr:
+        """Assembly L50 — how many contigs are needed to cover half the bases.
+
+        The companion of :meth:`n50` and the one it is confused with: **N is a length, L is a
+        count**. A low L50 means a few big pieces carry the assembly.
+
+        Returns:
+            An aggregate expression yielding Int64; null on the same conditions as
+            :meth:`n50`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"asm": ["a"] * 9, "len": [1, 2, 3, 4, 5, 6, 7, 8, 9]})
+                >>> ds.group_by("asm").agg(l=bt.col("len").l50()).to_pydict()
+                {'asm': ['a'], 'l': [3]}
+        """
+        return AggExpr("l_count", self, param=0.5)
+
+    def aun(self) -> AggExpr:
+        """Area under the Nx curve — the threshold-free contiguity statistic, ``sum(l²)/sum(l)``.
+
+        Equivalently the base-weighted mean length: every base contributes the length of the
+        contig holding it. It exists because N50 is a *step* function of the length
+        distribution — one contig crossing the halfway mark moves it discontinuously, so two
+        assemblies can swap rank on a rounding difference. auN integrates over every threshold
+        instead and is continuous in the lengths, which makes it the better number to rank on.
+
+        Needs no sort, so it is the cheapest of the four as well.
+
+        Returns:
+            An aggregate expression yielding Float64; null on the same conditions as
+            :meth:`n50`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"asm": ["a"] * 3, "len": [10, 20, 30]})
+                >>> round(ds.group_by("asm").agg(a=bt.col("len").aun()).to_pydict()["a"][0], 4)
+                23.3333
+        """
+        return AggExpr("aun", self)
+
     def first(self, order_by: IntoExpr) -> AggExpr:
         """This expression's value at the first row in `order_by` order (SQL ``first``).
 
@@ -3919,6 +4040,94 @@ class Expr:
 
         return lag(self, n) if n >= 0 else lead(self, -n)
 
+    def _peak(
+        self,
+        greater: bool,
+        partition_by: Iterable[IntoExpr],
+        order_by: Iterable[IntoExpr],
+    ) -> Expr:
+        """A local extremum: strictly beyond both neighbours along the given order.
+
+        Composed from two `lag`/`lead` windows, so it adds no IR. The comparison is
+        *strict*, which is what makes a plateau not a peak — and null-safe, because a
+        neighbouring null would otherwise make the comparison null rather than false: a
+        row with no neighbour on one side is not a peak, it is an edge."""
+        from batcher.plan.expr_ir.nodes import lag, lead
+
+        prev = lag(self, 1).over(partition_by=partition_by, order_by=order_by)
+        nxt = lead(self, 1).over(partition_by=partition_by, order_by=order_by)
+        cmp_prev = self > prev if greater else self < prev
+        cmp_next = self > nxt if greater else self < nxt
+        return cmp_prev.fill_null(False) & cmp_next.fill_null(False)
+
+    def peak_max(
+        self,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """True at a local maximum — strictly above both neighbours (Polars ``peak_max``).
+
+        The turning points of a series: the highs of a price trace, the spikes in a sensor
+        reading, the local optima of a scan. The comparison is strict, so a plateau has no
+        peak.
+
+        **The first and last rows of a partition are never peaks**, because a peak is
+        defined by the rows on *both* sides and an edge row has only one. Polars decides the
+        edges differently — it counts a row that beats its single neighbour — so the two
+        agree on every interior row and can differ on the two ends. Batcher takes the
+        symmetric rule deliberately: it is the one that means the same thing for `peak_max`
+        and `peak_min`, and the one that does not change an answer when a partition is
+        split differently.
+
+        Composed from two `shift` windows, so it adds no engine surface. `order_by` decides
+        which rows are "neighbours" and is what makes the answer well defined.
+
+        Args:
+            partition_by: Restart the neighbour comparison per group of these keys.
+            order_by: Order rows by these expressions before comparing neighbours.
+
+        Returns:
+            A Boolean expression, true at a local maximum.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4, 5], "x": [1, 5, 2, 8, 3]})
+                >>> ds.with_columns(p=bt.col("x").peak_max(order_by=["t"])).to_pydict()["p"]
+                [False, True, False, True, False]
+        """
+        return self._peak(True, partition_by, order_by)
+
+    def peak_min(
+        self,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+        order_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """True at a local minimum — strictly below both neighbours (Polars ``peak_min``).
+
+        The mirror of :meth:`peak_max`; see it for the strictness and the edge convention
+        (an edge row is never a peak, which is where Batcher and Polars differ).
+
+        Args:
+            partition_by: Restart the neighbour comparison per group of these keys.
+            order_by: Order rows by these expressions before comparing neighbours.
+
+        Returns:
+            A Boolean expression, true at a local minimum.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4, 5], "x": [5, 1, 4, 0, 6]})
+                >>> ds.with_columns(p=bt.col("x").peak_min(order_by=["t"])).to_pydict()["p"]
+                [False, True, False, True, False]
+        """
+        return self._peak(False, partition_by, order_by)
+
     def forward_fill(self) -> WindowExpr:
         """Carry the last non-null value forward — Polars ``forward_fill``.
 
@@ -3970,6 +4179,284 @@ class Expr:
         from batcher.plan.expr_ir.nodes import WindowExpr
 
         return WindowExpr("backward_fill", self, [], [], None)
+
+    def interpolate(self) -> WindowExpr:
+        """Draw a straight line across each interior gap — Polars ``interpolate``.
+
+        Where :meth:`forward_fill` holds the last reading flat across a gap, this
+        assumes the quantity moved steadily and reconstructs the path: a null bracketed
+        by non-null values at ordered positions ``a`` and ``b`` takes the point on the
+        segment between them, weighted by how far along the gap it sits. Use it for a
+        continuous physical signal (a temperature, a level, a cumulative counter);
+        prefer a fill for a state that genuinely holds between reports.
+
+        Leading and trailing nulls have nothing to interpolate *between* and stay null.
+        The result is always floating point, because the value between two integers
+        generally is not one.
+
+        A window expression, so it must be bound with ``.over(...)`` and ``order_by``
+        is required — interpolation follows a defined row order, and an unordered
+        relation has none.
+
+        Returns:
+            A window expression carrying the interpolated column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4], "x": [10.0, None, None, 40.0]})
+                >>> ds.with_columns(i=bt.col("x").interpolate().over(order_by=["t"])).to_pydict()
+                {'t': [1, 2, 3, 4], 'x': [10.0, None, None, 40.0], 'i': [10.0, 20.0, 30.0, 40.0]}
+        """
+        from batcher.plan.expr_ir.nodes import WindowExpr
+
+        return WindowExpr("interpolate", self, [], [], None)
+
+    def rle_id(self) -> WindowExpr:
+        """Number the runs of equal consecutive values — Polars ``rle_id``.
+
+        Each row gets the 0-based index of the run it belongs to, incrementing every
+        time the value differs from the previous row's along the order. It is the
+        segmentation primitive behind "how long has this machine been in its current
+        state" and "split this series wherever the regime changed": group by the run id
+        to collapse each run to a row, or count within it to measure a run's length.
+
+        Consecutive nulls form one run, and a value that returns after a gap opens a
+        *new* run rather than rejoining the earlier one.
+
+        A window expression, so it must be bound with ``.over(...)`` and ``order_by``
+        is required.
+
+        Returns:
+            A window expression carrying the 0-based run index.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3, 4], "s": ["on", "on", "off", "on"]})
+                >>> ds.with_columns(r=bt.col("s").rle_id().over(order_by=["t"])).to_pydict()
+                {'t': [1, 2, 3, 4], 's': ['on', 'on', 'off', 'on'], 'r': [0, 0, 1, 2]}
+        """
+        from batcher.plan.expr_ir.nodes import WindowExpr
+
+        return WindowExpr("rle_id", self, [], [], None)
+
+    # --- exponentially weighted moving statistics ---------------------------
+    def _ewm(
+        self,
+        func: str,
+        com: float | None,
+        span: float | None,
+        half_life: float | None,
+        alpha: float | None,
+    ) -> WindowExpr:
+        """Resolve one of the four decay spellings to an alpha and build the window."""
+        from batcher.plan.expr_ir.nodes import WindowExpr
+
+        resolved = _ewm_alpha(func, com, span, half_life, alpha)
+        return WindowExpr(func, self, [], [], None, alpha=resolved)
+
+    def ewm_mean(
+        self,
+        *,
+        com: float | None = None,
+        span: float | None = None,
+        half_life: float | None = None,
+        alpha: float | None = None,
+    ) -> WindowExpr:
+        """Exponentially weighted moving average — Polars/pandas ``ewm_mean``.
+
+        Where :meth:`rolling_mean` gives every row in a fixed window the same weight and
+        forgets everything older, an EWM weights row ``i`` by ``(1-alpha)^(t-i)``: recent
+        readings dominate, old ones fade smoothly rather than dropping off a cliff. That
+        makes it the standard smoother for a noisy sensor or price series, and the basis
+        of MACD and similar indicators.
+
+        Give the decay exactly one way. All four are the same number spelled for
+        different habits: ``alpha`` directly, ``span`` (``alpha = 2/(span+1)``, the
+        "N-period EMA" of technical analysis), ``half_life`` (the lag at which a
+        reading's weight halves), or ``com`` (centre of mass,
+        ``alpha = 1/(1+com)``).
+
+        A null input row yields a null output and contributes no value, but still ages
+        the decay — pandas' ``adjust=True, ignore_na=False`` and Polars'
+        ``adjust=True, ignore_nulls=False``, the default in both.
+
+        A window expression, so it must be bound with ``.over(...)`` and ``order_by``
+        is required.
+
+        Args:
+            com: Centre of mass, ``>= 0``.
+            span: Span, ``>= 1``.
+            half_life: Half-life in rows, ``> 0``.
+            alpha: The smoothing factor itself, in ``(0, 1]``.
+
+        Returns:
+            A window expression carrying the exponentially weighted mean.
+
+        Raises:
+            PlanError: If none or more than one of the four is given, or one is out of
+                range.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3], "x": [1.0, 2.0, 3.0]})
+                >>> w = bt.col("x").ewm_mean(alpha=0.5).over(order_by=["t"])
+                >>> ds.with_columns(e=w).to_pydict()["e"]
+                [1.0, 1.6666666666666665, 2.4285714285714284]
+        """
+        return self._ewm("ewm_mean", com, span, half_life, alpha)
+
+    def ewm_mean_by(
+        self,
+        by: IntoExpr,
+        half_life: str | int | float,
+        *,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> WindowExpr:
+        """Exponentially weighted mean decayed by *elapsed time* — Polars ``ewm_mean_by``.
+
+        :meth:`ewm_mean` decays once per row, which is right only when the readings are
+        evenly spaced. An irregular feed breaks it: an hour of silence costs exactly the
+        weight one second would, so a burst of samples dominates a quiet stretch that
+        actually lasted longer. Here the weight is ``exp(-ln2 · Δt / half_life)``, where
+        ``Δt`` is the real gap in the `by` column — so the smoother says the same thing
+        whatever the sampling rate did.
+
+        `half_life` is the lag at which a reading's weight halves: give a duration
+        (``"5m"``) for a timestamp or date column, and a number in the column's own units
+        for a numeric one.
+
+        A null value yields a null output and leaves the anchor where it was, so the next
+        reading decays from the last one actually seen rather than from an empty row.
+
+        A window expression, so it must be bound with ``.over(...)``. `by` becomes its
+        order, which is what makes the gap well defined.
+
+        Args:
+            by: The single numeric or temporal column the decay is measured along.
+            half_life: The lag at which a weight halves, as a duration or a number.
+            partition_by: Restart the recurrence per group of these key expressions.
+
+        Returns:
+            A window expression carrying the time-decayed exponentially weighted mean.
+
+        Raises:
+            PlanError: If `half_life` is not a positive fixed-length duration or number.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> base = dt.datetime(2024, 1, 1)
+                >>> ds = bt.from_pydict(
+                ...     {
+                ...         "t": [base, base + dt.timedelta(minutes=1),
+                ...               base + dt.timedelta(minutes=5)],
+                ...         "x": [1.0, 2.0, 3.0],
+                ...     }
+                ... )
+                >>> ds.with_columns(e=bt.col("x").ewm_mean_by("t", "2m")).to_pydict()["e"]
+                [1.0, 1.2928932188134525, 2.573223304703363]
+        """
+        from batcher.plan.expr_ir.nodes import WindowExpr
+        from batcher.plan.functions.temporal import _duration_micros
+
+        if isinstance(half_life, str):
+            hl = float(_duration_micros(half_life, arg="ewm_mean_by half_life"))
+        else:
+            hl = require_float(half_life, func="ewm_mean_by", arg="half_life")
+            if hl <= 0:
+                raise PlanError(f"ewm_mean_by(): half_life must be > 0, got {half_life!r}")
+        return WindowExpr("ewm_mean", self, [], [], None, half_life=hl).over(
+            partition_by=partition_by, order_by=[by]
+        )
+
+    def ewm_std(
+        self,
+        *,
+        com: float | None = None,
+        span: float | None = None,
+        half_life: float | None = None,
+        alpha: float | None = None,
+    ) -> WindowExpr:
+        """Exponentially weighted moving standard deviation — Polars ``ewm_std``.
+
+        The spread counterpart of :meth:`ewm_mean`, over the same decaying weights: a
+        recent burst of noise widens it quickly and a quiet stretch narrows it, which is
+        what makes it usable as a live volatility or control-limit estimate.
+
+        This is the *sample* form, debiased by the weights, so the first row of a
+        partition is null — a single observation has no spread, exactly as
+        ``col("x").std()`` over a one-row window is null. (Polars reports ``0.0`` there;
+        pandas reports null, and this follows pandas and Batcher's own ``var``/``std``.)
+
+        Args:
+            com: Centre of mass, ``>= 0``.
+            span: Span, ``>= 1``.
+            half_life: Half-life in rows, ``> 0``.
+            alpha: The smoothing factor itself, in ``(0, 1]``.
+
+        Returns:
+            A window expression carrying the exponentially weighted standard deviation.
+
+        Raises:
+            PlanError: If none or more than one of the four is given, or one is out of
+                range.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3], "x": [1.0, 2.0, 3.0]})
+                >>> w = bt.col("x").ewm_std(alpha=0.5).over(order_by=["t"])
+                >>> ds.with_columns(e=w).to_pydict()["e"]
+                [None, 0.7071067811865477, 0.9636241116594317]
+        """
+        return self._ewm("ewm_std", com, span, half_life, alpha)
+
+    def ewm_var(
+        self,
+        *,
+        com: float | None = None,
+        span: float | None = None,
+        half_life: float | None = None,
+        alpha: float | None = None,
+    ) -> WindowExpr:
+        """Exponentially weighted moving variance — Polars ``ewm_var``.
+
+        The square of :meth:`ewm_std`, sharing its decay spellings and its null first
+        row. Prefer it when the value feeds further arithmetic (a z-score, a Kalman-style
+        update) and the square root would only be undone.
+
+        Args:
+            com: Centre of mass, ``>= 0``.
+            span: Span, ``>= 1``.
+            half_life: Half-life in rows, ``> 0``.
+            alpha: The smoothing factor itself, in ``(0, 1]``.
+
+        Returns:
+            A window expression carrying the exponentially weighted variance.
+
+        Raises:
+            PlanError: If none or more than one of the four is given, or one is out of
+                range.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [1, 2, 3], "x": [1.0, 2.0, 3.0]})
+                >>> w = bt.col("x").ewm_var(alpha=0.5).over(order_by=["t"])
+                >>> ds.with_columns(e=w).to_pydict()["e"]
+                [None, 0.5000000000000002, 0.928571428571429]
+        """
+        return self._ewm("ewm_var", com, span, half_life, alpha)
 
     # --- rolling (fixed-size trailing window) aggregates --------------------
     def _rolling(
@@ -4169,6 +4656,222 @@ class Expr:
                 {'x': [1, None, 3, 4], 'r': [1, 1, 1, 2]}
         """
         return self._rolling("count", window_size, min_periods, partition_by, order_by)
+
+    # --- rolling over a time window, not a row count -----------------------
+    def _rolling_by(
+        self,
+        agg: str,
+        by: IntoExpr,
+        window_size: str | int,
+        min_periods: int | None,
+        partition_by: Iterable[IntoExpr],
+    ) -> Expr:
+        """`agg` over the rows within `window_size` of the current row's `by` value.
+
+        A `RANGE` frame of ``(-width, 0)`` ordered by `by`, where `width` is the window
+        in the key's own units — microseconds for a temporal key, so a duration string
+        resolves through the same parser `bt.window` uses and the two cannot disagree
+        about how long a minute is. Everything else (partial leading frames,
+        `min_periods`) is `_rolling`'s, over a different frame."""
+        from batcher.plan.expr_ir.constructors import nullif, when
+        from batcher.plan.functions.temporal import _duration_micros
+
+        if isinstance(window_size, str):
+            width = _duration_micros(window_size, arg=f"rolling_{agg}_by window_size")
+        else:
+            width = require_int(window_size, func=f"rolling_{agg}_by", arg="window_size", minimum=1)
+        if min_periods is not None:
+            min_periods = require_int(min_periods, func=f"rolling_{agg}_by", arg="min_periods")
+            if min_periods < 1:
+                raise PlanError(f"rolling_{agg}_by(): min_periods must be >= 1, got {min_periods}")
+        frame = (-width, 0, "range")
+        value = AggExpr(agg, self).over(partition_by=partition_by, order_by=[by], frame=frame)
+        if min_periods is None:
+            return value
+        seen = AggExpr("count", self).over(partition_by=partition_by, order_by=[by], frame=frame)
+        return when(seen >= Lit(min_periods)).then(value).otherwise(nullif(value, value))
+
+    def rolling_sum_by(
+        self,
+        by: IntoExpr,
+        window_size: str | int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Sum over a *time* window ending at this row — Polars ``rolling_sum_by``.
+
+        Where :meth:`rolling_sum` counts rows, this counts along the `by` column's values:
+        ``rolling_sum_by("ts", "5m")`` is the last five minutes however many readings that
+        turns out to be. That is the difference between a moving average that means the
+        same thing at every sampling rate and one that silently widens whenever a sensor
+        goes quiet.
+
+        It is SQL's ``RANGE BETWEEN <window_size> PRECEDING AND CURRENT ROW``, so **both
+        endpoints are included** — Polars' ``closed="both"``, not its ``closed="right"``
+        default. Rows exactly `window_size` back are in the window.
+
+        `by` must be a single numeric or temporal column, because the bound is arithmetic
+        on it. Give `window_size` as a duration (``"5m"``, ``"1h30m"``) for a timestamp or
+        date column, and as a number for a numeric one.
+
+        Args:
+            by: The single column whose values the window is measured in.
+            window_size: The window width, as a duration string or a number.
+            min_periods: Least non-null values the window must hold, else the row is null.
+            partition_by: Restart the window per group of these key expressions.
+
+        Returns:
+            The rolling sum over the time window.
+
+        Raises:
+            PlanError: If `window_size` is not a positive fixed-length duration or count,
+                or `min_periods` is below 1.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> base = dt.datetime(2024, 1, 1, 0, 0)
+                >>> ds = bt.from_pydict(
+                ...     {
+                ...         "ts": [base, base + dt.timedelta(minutes=1),
+                ...                base + dt.timedelta(minutes=30)],
+                ...         "v": [1, 2, 4],
+                ...     }
+                ... )
+                >>> ds.with_columns(r=bt.col("v").rolling_sum_by("ts", "5m")).to_pydict()["r"]
+                [1, 3, 4]
+        """
+        return self._rolling_by("sum", by, window_size, min_periods, partition_by)
+
+    def rolling_mean_by(
+        self,
+        by: IntoExpr,
+        window_size: str | int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Mean over a time window ending at this row — Polars ``rolling_mean_by``.
+
+        See :meth:`rolling_sum_by` for how the window is measured and for the inclusive
+        endpoint rule.
+
+        Args:
+            by: The single column whose values the window is measured in.
+            window_size: The window width, as a duration string or a number.
+            min_periods: Least non-null values the window must hold, else the row is null.
+            partition_by: Restart the window per group of these key expressions.
+
+        Returns:
+            The rolling mean over the time window.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [0, 60, 1800], "v": [1.0, 3.0, 5.0]})
+                >>> ds.with_columns(r=bt.col("v").rolling_mean_by("t", 300)).to_pydict()["r"]
+                [1.0, 2.0, 5.0]
+        """
+        return self._rolling_by("mean", by, window_size, min_periods, partition_by)
+
+    def rolling_min_by(
+        self,
+        by: IntoExpr,
+        window_size: str | int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Minimum over a time window ending at this row — Polars ``rolling_min_by``.
+
+        See :meth:`rolling_sum_by` for how the window is measured.
+
+        Args:
+            by: The single column whose values the window is measured in.
+            window_size: The window width, as a duration string or a number.
+            min_periods: Least non-null values the window must hold, else the row is null.
+            partition_by: Restart the window per group of these key expressions.
+
+        Returns:
+            The rolling minimum over the time window.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [0, 60, 1800], "v": [5, 3, 9]})
+                >>> ds.with_columns(r=bt.col("v").rolling_min_by("t", 300)).to_pydict()["r"]
+                [5, 3, 9]
+        """
+        return self._rolling_by("min", by, window_size, min_periods, partition_by)
+
+    def rolling_max_by(
+        self,
+        by: IntoExpr,
+        window_size: str | int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Maximum over a time window ending at this row — Polars ``rolling_max_by``.
+
+        See :meth:`rolling_sum_by` for how the window is measured.
+
+        Args:
+            by: The single column whose values the window is measured in.
+            window_size: The window width, as a duration string or a number.
+            min_periods: Least non-null values the window must hold, else the row is null.
+            partition_by: Restart the window per group of these key expressions.
+
+        Returns:
+            The rolling maximum over the time window.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [0, 60, 1800], "v": [5, 3, 9]})
+                >>> ds.with_columns(r=bt.col("v").rolling_max_by("t", 300)).to_pydict()["r"]
+                [5, 5, 9]
+        """
+        return self._rolling_by("max", by, window_size, min_periods, partition_by)
+
+    def rolling_count_by(
+        self,
+        by: IntoExpr,
+        window_size: str | int,
+        *,
+        min_periods: int | None = None,
+        partition_by: Iterable[IntoExpr] = (),
+    ) -> Expr:
+        """Count of non-null values over a time window — Polars ``rolling_count_by``.
+
+        The natural way to ask "how many events in the last five minutes", and the guard
+        that tells you whether a rolling mean over the same window is worth trusting.
+        See :meth:`rolling_sum_by` for how the window is measured.
+
+        Args:
+            by: The single column whose values the window is measured in.
+            window_size: The window width, as a duration string or a number.
+            min_periods: Least non-null values the window must hold, else the row is null.
+            partition_by: Restart the window per group of these key expressions.
+
+        Returns:
+            The rolling count over the time window.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": [0, 60, 120, 1800], "v": [1, 2, 3, 4]})
+                >>> ds.with_columns(r=bt.col("v").rolling_count_by("t", 300)).to_pydict()["r"]
+                [1, 2, 3, 1]
+        """
+        return self._rolling_by("count", by, window_size, min_periods, partition_by)
 
     def _rolling_var(
         self,
@@ -4551,6 +5254,49 @@ from batcher.plan.expr_ir.node_base import (  # noqa: E402
 )
 
 
+def _ewm_alpha(
+    func: str,
+    com: float | None,
+    span: float | None,
+    half_life: float | None,
+    alpha: float | None,
+) -> float:
+    """Resolve the four EWM decay spellings to the single smoothing factor.
+
+    pandas and Polars both accept `com`/`span`/`half_life`/`alpha` and require exactly
+    one, because they are one number in four idioms: a trader says "12-period EMA"
+    (`span`), a physicist says "half-life", a statistician says "centre of mass". The
+    conversion is done once, here, so the IR and the engine carry a single alpha rather
+    than four fields and a precedence rule.
+    """
+    given = {"com": com, "span": span, "half_life": half_life, "alpha": alpha}
+    named = [k for k, v in given.items() if v is not None]
+    if len(named) != 1:
+        raise PlanError(
+            f"{func}(): give exactly one of com, span, half_life, alpha — "
+            f"got {', '.join(named) if named else 'none'}"
+        )
+    (key,) = named
+    value = require_float(given[key], func=func, arg=key)
+    if key == "alpha":
+        resolved = value
+    elif key == "com":
+        if value < 0.0:
+            raise PlanError(f"{func}(): com must be >= 0, got {value}")
+        resolved = 1.0 / (1.0 + value)
+    elif key == "span":
+        if value < 1.0:
+            raise PlanError(f"{func}(): span must be >= 1, got {value}")
+        resolved = 2.0 / (value + 1.0)
+    else:
+        if value <= 0.0:
+            raise PlanError(f"{func}(): half_life must be > 0, got {value}")
+        resolved = 1.0 - math.exp(-math.log(2.0) / value)
+    if not 0.0 < resolved <= 1.0:
+        raise PlanError(f"{func}(): {key}={value} gives alpha {resolved}, outside (0, 1]")
+    return resolved
+
+
 def _as_exact_float(value: object) -> object:
     """A `Decimal` as a float when the float is the same number; anything else unchanged.
 
@@ -4697,12 +5443,12 @@ class Lit(Expr):
             # datetimes" (which crashed `col("ts") > lit(aware_datetime)`), and its micros land
             # on the true UTC instant that the engine's tz-aware comparison expects.
             epoch = (
-                _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+                _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)
                 if v.tzinfo is not None
                 else _dt.datetime(1970, 1, 1)
             )
             delta = v - epoch
-            micros = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+            micros = delta.days * MICROS_PER_DAY + delta.seconds * 1_000_000 + delta.microseconds
             tagged = {"timestamp": micros}
         elif isinstance(v, _dt.date):
             tagged = {"date": (v - _dt.date(1970, 1, 1)).days}
@@ -4742,6 +5488,59 @@ class InList(Expr):
             "input": self.input.to_ir(),
             "set": [Lit(v).to_ir()["value"] for v in self.values],
         }
+
+
+#: Scalar types an `InList` set may hold. Each has a `Lit` encoding in the JSON IR, so a set
+#: built from them round-trips into `bc_expr::Expr::InList`'s `Vec<Literal>`.
+_IN_LIST_SCALARS = (int, float, str, bytes, _dt.date, _dt.datetime)
+
+
+def _in_list_foldable(values: list) -> bool:
+    """Whether `values` can be an `InList` set rather than a chain of equalities.
+
+    The exclusions mirror `kyber.rules.normalize.disjunctions`, which folds this same shape
+    from the other direction and has to agree with this:
+
+    * a non-scalar member (an `Expr`) has no `Literal` encoding at all;
+    * a **bool**, whose set is not the one the engine would build beside an int;
+    * a **NaN**, because `InList` probes a hash set and ``NaN != NaN``, while the engine's
+      ``=`` *does* match a NaN row — so folding one would silently drop the rows the
+      equality selects.
+
+    A mixed-type set is refused for the same reason as the bool: the members have to be one
+    type for the engine to build a typed set of them.
+    """
+    kinds = {type(v) for v in values}
+    if len(kinds) != 1:
+        return False
+    (kind,) = kinds
+    if kind is bool or kind not in _IN_LIST_SCALARS:
+        return False
+    return not any(is_nan(v) for v in values)
+
+
+def _membership_test(input: Expr, values: list) -> Expr:
+    """``input IN (values)`` over a non-empty list of non-null members.
+
+    Prefers the `InList` node, which lowers to one hash-set probe per row
+    (`bc_expr::eval::in_list`) rather than one full-column comparison per member, and which
+    is the shape eight existing Kyber rules match on (`prune_in_list_by_zonemap`,
+    `dedup_in_list`, `intersect_in_lists`, …). Building the chain and leaving the fold to
+    `or_equalities_to_in_list` gave those rules nothing outside a `Filter`, and it cost more
+    than plan quality: the chain is left-deep, one IR nesting level per member, and the
+    engine's `serde` reader descends it recursively — so a *projection* over ~100 members
+    overflowed the Rust stack and took the process down with SIGSEGV rather than raising.
+    ``TfidfVectorizer(stop_words="english")`` is 318 members, which is how it was found.
+
+    The fallback goes through `combine_disjuncts`, which builds a balanced tree, so a set
+    this cannot fold — expression members, mixed types — is `log2(n)` levels deep instead of
+    `n`. Imported inside the function because `plan.expr_rewrite` imports this module.
+    """
+    from batcher.plan.expr_rewrite import combine_disjuncts
+
+    if _in_list_foldable(values):
+        return InList(input, tuple(values))
+    return combine_disjuncts([input == v for v in values])
 
 
 @expr_node
@@ -4817,6 +5616,17 @@ class Aliased(Expr):
     def to_ir(self) -> dict[str, Any]:
         """Lower to the wrapped expression's JSON IR (the alias is transparent in the IR)."""
         return self.inner.to_ir()
+
+
+#: An explicit window frame as the expression layer spells it: signed `(start, end)`
+#: offsets from the current row, optionally followed by the units they are counted in
+#: (``"rows"``, the default, ``"range"``, or ``"groups"``). Negative is *preceding*, ``0``
+#: is the current row, ``None`` is unbounded. `plan.logical.WindowFrame` is the validated
+#: form this lowers to.
+FrameSpec = Union[
+    "tuple[int | None, int | None]",
+    "tuple[int | None, int | None, str]",
+]
 
 
 def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr]) -> list[IntoExpr]:
@@ -4923,7 +5733,7 @@ class AggExpr:
         self,
         partition_by: Iterable[IntoExpr] = (),
         order_by: Iterable[IntoExpr] = (),
-        frame: tuple[int | None, int | None] | None = None,
+        frame: FrameSpec | None = None,
     ):
         """Turn this aggregate into a window expression — SQL ``<agg> OVER (…)``.
 

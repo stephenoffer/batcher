@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher.api.orchestration import with_auto_config
 from batcher.api.streaming._query import (
     StreamingQuery,
     _deregister,
@@ -75,6 +76,7 @@ def _build_run_batch(
     return run_batch, opt_plan.source_projections.get(0), opt_plan.source_predicates.get(0)
 
 
+@with_auto_config
 def start_streaming_query(
     plan: LogicalPlan,
     sources: list[Source],
@@ -98,6 +100,18 @@ def start_streaming_query(
     exactly-once check and the listener events are all unchanged. Until this existed the
     only way to consume a stream-stream join was `iter_batches()`, which the cookbook
     called the sharpest edge in the streaming story.
+
+    `with_auto_config` for the same reason every batch terminal carries it, and with more
+    at stake. It senses `memory.max_memory_bytes` from the live envelope (host RAM, honoring
+    a cgroup limit) and pins it for the query. Without it a streaming query ran under
+    `max_memory_bytes = None` for its entire life, so `spill_budget_bytes()` fell back to the
+    static 8 GiB `default_total_bytes` — which is the number the data plane's spill backstop
+    and every streaming operator's state cap are derived from. On a 4 GiB container that cap
+    is never reached before the kernel kills the process; on a 512 GiB host it forces
+    out-of-core work a decade early. A batch query on the same box got the sensed figure.
+
+    The scope this opens is what `StreamingQueryEngine.start` snapshots into the loop
+    thread, so the sensed envelope governs every micro-batch and not just this setup.
     """
     from batcher import core
     from batcher._internal.errors import PlanError
@@ -142,7 +156,7 @@ def start_streaming_query(
         run_batch, projection, predicate = (
             _build_run_batch(plan, sources) if _is_stateless(plan) else (None, None, None)
         )
-    processor = core.make_processor(plan, output_mode, run_batch)
+    processor = core.make_processor(plan, output_mode, run_batch, sources[0])
     query_name = name or _next_name()
     engine = core.StreamingQueryEngine(
         name=query_name,
@@ -154,6 +168,7 @@ def start_streaming_query(
         checkpoint=store,
         projection=projection,
         predicate=predicate,
+        rate_controller=_rate_controller(trigger),
     )
     query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)
@@ -277,6 +292,7 @@ def _start_driver_stream(
         output_mode=output_mode,
         checkpoint=None,
         runner_factory=make_runner,
+        rate_controller=_rate_controller(trigger),
     )
     query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)
@@ -286,6 +302,30 @@ def _start_driver_stream(
         _deregister(query_name)
         raise
     return query
+
+
+def _rate_controller(trigger: Trigger):
+    """The adaptive ingestion controller for `trigger`, or `None` when it is off.
+
+    `api` is the conductor: Carbonite owns the policy, `core` drives the loop, and neither
+    subsystem may import the other. This is the one place the two are joined, so the
+    single-node, driver, and distributed launchers cannot end up pacing differently.
+
+    Args:
+        trigger: The query's trigger, whose cadence is the window a derived rate is spread
+            over.
+
+    Returns:
+        A `StreamingRateController`, or `None` when `streaming.backpressure_enabled` is off
+        (the default) — which leaves the source's configured per-trigger cap governing.
+    """
+    from batcher.config import active_config
+
+    if not active_config().streaming.backpressure_enabled:
+        return None
+    from batcher.carbonite.policies.rate_control import StreamingRateController
+
+    return StreamingRateController(trigger.interval_seconds)
 
 
 def _is_stateless(plan: LogicalPlan) -> bool:

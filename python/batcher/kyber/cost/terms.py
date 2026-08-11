@@ -23,6 +23,7 @@ from batcher.kyber.storage_cost import spill_device_factor
 __all__ = [
     "cache_factor",
     "memory_budget",
+    "merge_io",
     "merge_passes",
     "sort_comparisons",
     "spill_io",
@@ -96,27 +97,45 @@ def memory_budget(worker_memory_bytes: int = 0) -> float:
     return min(configured, worker)
 
 
-def cache_factor(state_bytes: float) -> float:
+def cache_factor(state_bytes: float, cache_bytes: float | None = None) -> float:
     """The per-access slowdown of a hash table of `state_bytes`, from cache residency.
 
     `1.0` while the table fits in the last-level cache, then growing by a fixed penalty per
     doubling beyond it and flattening at a ceiling — the shape a random-access probe
     actually has. With no detectable cache size the factor is 1.0.
 
+    **The cache that matters is the one the operator will run on.** Read from this process
+    unconditionally, this term described the *driver* on a distributed run — and on the usual
+    cluster shape the driver is a fat head node beside small workers, so a hash table that
+    misses on every worker was priced as resident. That is the same gap `memory_budget` closes
+    for the spill threshold, in the term `terms` itself calls "precisely what join ordering is
+    choosing between": a driver publishing 100 MiB of L3 planning for 4 MiB workers under-states
+    the knee by more than an octave, across join ordering, aggregate, distinct and distinct
+    union at once.
+
     Args:
         state_bytes: Resident size of the hash table being probed.
+        cache_bytes: Last-level cache of the node the operator will run on, from
+            `HardwareProfile.l3_cache_bytes`. `None` — what every caller without a profile
+            passes — probes this machine, which is exactly right single-node and is the
+            behavior this term always had.
 
     Returns:
         A multiplier on the per-probe cost, at least 1.0.
     """
-    cache = float(l3_cache_bytes())
+    cache = float(l3_cache_bytes() if cache_bytes is None else cache_bytes)
     if cache <= 0.0 or state_bytes <= cache:
         return 1.0
     octaves = math.log2(state_bytes / cache)
     return min(_CACHE_MISS_MAX_FACTOR, 1.0 + _CACHE_MISS_PENALTY_PER_OCTAVE * octaves)
 
 
-def spill_io(state_bytes: float, budget: float | None = None) -> float:
+def spill_io(
+    state_bytes: float,
+    budget: float | None = None,
+    storage_class: str = "",
+    device_factor: float | None = None,
+) -> float:
     """Bytes of spill IO an operator whose state is `state_bytes` will move.
 
     Zero while the state fits the memory budget. Past it, everything that does not fit is
@@ -133,6 +152,14 @@ def spill_io(state_bytes: float, budget: float | None = None) -> float:
         budget: The spill threshold, or `None` to read the configured one. A caller with a
             `HardwareProfile` passes the worker-aware budget so the prediction is about the
             node the operator runs on rather than about the driver.
+        storage_class: Measured device class of the node that will spill, from
+            `HardwareProfile.storage_class`. `""` — every caller without a profile — reads
+            this process's own spill directory, which is the single-node answer.
+        device_factor: A per-byte factor already resolved by the caller, overriding the
+            class lookup. This is how a *measured* correction reaches the term
+            (`spill_rates.learned_spill_factor`): the model resolves it once per plan rather
+            than having this function reach for a metadata hub per node. `None` keeps the
+            class lookup, which is what every caller without a hub gets.
 
     Returns:
         Spill bytes on the `io` axis, `0.0` when the state fits.
@@ -140,7 +167,8 @@ def spill_io(state_bytes: float, budget: float | None = None) -> float:
     budget = memory_budget() if budget is None else budget
     if budget <= 0.0 or state_bytes <= budget:
         return 0.0
-    return _SPILL_WRITE_READ_PASSES * (state_bytes - budget) * spill_device_factor()
+    factor = spill_device_factor(storage_class) if device_factor is None else device_factor
+    return _SPILL_WRITE_READ_PASSES * (state_bytes - budget) * factor
 
 
 def merge_passes(state_bytes: float, budget: float | None = None) -> float:
@@ -168,7 +196,12 @@ def merge_passes(state_bytes: float, budget: float | None = None) -> float:
     return max(1.0, math.ceil(math.log(runs, fan_in)))
 
 
-def merge_io(state_bytes: float, budget: float | None = None) -> float:
+def merge_io(
+    state_bytes: float,
+    budget: float | None = None,
+    storage_class: str = "",
+    device_factor: float | None = None,
+) -> float:
     """Bytes an out-of-core sort of `state_bytes` moves, across all its merge passes.
 
     A sort rewrites its runs once per merge pass, so unlike a hash operator's one-shot
@@ -177,12 +210,20 @@ def merge_io(state_bytes: float, budget: float | None = None) -> float:
     Args:
         state_bytes: The sort's total state size.
         budget: The spill threshold, or `None` to read the configured one.
+        storage_class: Measured device class of the node that will spill, from
+            `HardwareProfile.storage_class`. `""` reads this process's own spill directory.
+            An external merge is where this matters most: it rewrites the whole state once
+            per pass, and its concurrent run reads are exactly the access pattern a
+            rotational or network volume punishes hardest.
+        device_factor: A per-byte factor already resolved by the caller, overriding the class
+            lookup — see `spill_io`.
 
     Returns:
         Spill bytes on the `io` axis, `0.0` when the sort fits in memory.
     """
     passes = merge_passes(state_bytes, budget)
-    return _SPILL_WRITE_READ_PASSES * state_bytes * passes * spill_device_factor()
+    factor = spill_device_factor(storage_class) if device_factor is None else device_factor
+    return _SPILL_WRITE_READ_PASSES * state_bytes * passes * factor
 
 
 def sort_comparisons(n: float, heap: float) -> float:

@@ -5,8 +5,8 @@ Read a collection into Arrow, write a dataset back as bulk upserts. Both directi
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.mongo(uri=..., database=..., collection=...)` |
-| **Write** | `ds.write.mongo(collection, uri=..., database=...)`, a bulk upsert on `key_field` |
+| **Read** | {py:meth}`bt.read.mongo(uri=..., database=..., collection=...) <batcher.api.io_namespace.reader.Reader.mongo>` |
+| **Write** | {py:meth}`ds.write.mongo(collection, uri=..., database=...) <batcher.api.io_namespace.writer.Writer.mongo>`, a bulk upsert on `key_field` |
 | **Extra** | `pip install 'batcher-engine[mongo]'` |
 | **Parallelism** | Off by default. `PartitionSpec(segments=N)` splits the `_id` range. |
 | **Pushdown** | Predicates become a Mongo filter document, AND-merged into the `find` |
@@ -141,7 +141,7 @@ The matched document is replaced wholesale by the row, so columns you did not se
 preserved.
 :::
 
-Rows do cross into Python for the write (`to_pylist()` per batch, then one `bulk_write`). That is
+Rows do cross into Python for the write ({py:meth}`to_pylist() <batcher.Dataset.to_pylist>` per batch, then one `bulk_write`). That is
 the driver's shape, and it makes Mongo a fine sink for a serving or feature collection and a poor
 one for dumping a billion analytical rows. Write those to Parquet or Delta.
 
@@ -174,6 +174,6 @@ recovery story; there is no rollback.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: sinks, modes, and idempotent re-runs.
 - {doc}`Feature pipeline </cookbook/ml/pipelines/features/feature-pipeline>`: the shape that ends in an upsert to
   a serving collection.
-- {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the `Source`/`Sink`/`Split` protocol.
+- {doc}`Custom connectors </user-guide/moving-data/custom-connectors>`: the {py:class}`Source <batcher.io.Source>`/{py:class}`Sink <batcher.io.Sink>`/{py:class}`Split <batcher.io.Split>` protocol.
 - {doc}`I/O API </api/relational/io>`: the full reader/writer reference.
 - {doc}`Elasticsearch </integrations/databases/elasticsearch>`: the other document store, read-only.

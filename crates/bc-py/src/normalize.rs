@@ -9,9 +9,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::{make_array, Array, ArrayRef, RecordBatch};
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::array::{make_array, Array, ArrayRef, RecordBatch, RunArray, UInt64Array};
+use arrow::compute::{cast, take};
+use arrow::datatypes::{
+    DataType, Field, Fields, Int16Type, Int32Type, Int64Type, RunEndIndexType, Schema,
+};
 use arrow_pyarrow::PyArrowType;
 use bc_ir::{AggregateItem, ProjectionItem};
 use pyo3::exceptions::PyRuntimeError;
@@ -19,7 +21,7 @@ use pyo3::PyResult;
 
 use crate::to_pyerr;
 
-/// The cast dtype names the engine accepts on `Expr::Cast` (the live wire
+/// The **fixed** cast dtype names the engine accepts on `Expr::Cast` (the live wire
 /// vocabulary). The Python `plan.types.CAST_DTYPES` set is parity-tested against
 /// this so the two cannot drift.
 #[pyo3::pyfunction]
@@ -28,6 +30,20 @@ pub(crate) fn supported_cast_dtypes() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Resolve one cast dtype *name* to the Arrow type the engine would build from it, or
+/// `None` when the engine rejects the name.
+///
+/// The parametrized half of the vocabulary (`decimal(12,4)`, `timestamp(us, UTC)`,
+/// `time64(ns)`) is a grammar rather than a set, so it cannot be parity-tested by
+/// comparing name lists the way `supported_cast_dtypes` allows. This resolves a single
+/// spelling instead, so the Python mirror can be checked to produce the *same type* the
+/// engine does — which is the property that actually matters, and the one a name list
+/// cannot see.
+#[pyo3::pyfunction]
+pub(crate) fn resolve_cast_dtype(name: &str) -> Option<PyArrowType<arrow::datatypes::DataType>> {
+    bc_arrow::dtype_from_name(name).map(PyArrowType)
 }
 
 /// Deserialize a group-key projection list from the control plane's JSON.
@@ -70,6 +86,13 @@ pub(crate) fn widen_to(dt: &DataType) -> Option<DataType> {
 /// type) from the morsel's *physical* encoding (dictionary), so the encoding is an internal
 /// optimization the schema does not see. Until then, decode at the boundary.
 ///
+/// Run-end encoding is handled *before* this, by [`decode_run_ends`] at the column level,
+/// so a `RunEndEncoded` never reaches here. That split is deliberate rather than tidy:
+/// decoding is a materialization (it expands runs into rows), and this function's contract
+/// is that everything it names is reachable by a single `cast`. A run-end column nested
+/// inside a struct or list is therefore left encoded, which is honest -- the boundary does
+/// not rebuild a nested array's children -- and `plan.types.widen` mirrors the same split.
+///
 /// Normalization **recurses into nested types**: a `struct<a: int32>` normalizes to
 /// `struct<a: int64>`, a `list<float32>` to `list<float64>`, and a `Dictionary` whose value
 /// type is itself nested is decoded and then normalized. Without this, a narrow numeric buried
@@ -90,6 +113,23 @@ fn normalize_to(dt: &DataType) -> Option<DataType> {
         // (≤16,384 rows) cannot exceed the 32-bit offset range. (If a batch ever did, `cast`
         // errors and `normalize_batch` falls back to passing the column through unchanged.)
         LargeUtf8 => Some(Utf8),
+        // The **view** layouts, for the same reason and with more urgency. `Utf8View` /
+        // `BinaryView` are what a Parquet reader with view types enabled, DuckDB, Polars
+        // and every Velox-backed producer hand over, and the engine's kernels reject them
+        // outright ("Invalid comparison operation: Utf8View > Utf8"), so a column that is
+        // *only* a different physical spelling of `Utf8` failed the whole query. A view
+        // array is a 16-byte view struct per row plus one or more data buffers; casting to
+        // `Utf8` re-lays those out behind a 32-bit offset buffer, which a single morsel
+        // (<=16,384 rows) cannot overflow.
+        Utf8View => Some(Utf8),
+        BinaryView => Some(Binary),
+        // The list *view* layouts carry an offset **and** a size per row instead of a
+        // monotonic offset buffer, so they are a distinct physical layout the list kernels
+        // do not read. Normalize to the plain `List` they are equivalent to, recursing into
+        // the child so a `list_view<float32>` widens like a `list<float32>` does.
+        ListView(field) | LargeListView(field) => Some(List(Arc::new(
+            normalize_field(field).unwrap_or_else(|| field.as_ref().clone()),
+        ))),
         Struct(fields) => normalize_fields(fields).map(Struct),
         List(field) => normalize_field(field).map(|f| List(Arc::new(f))),
         LargeList(field) => normalize_field(field).map(|f| LargeList(Arc::new(f))),
@@ -97,6 +137,60 @@ fn normalize_to(dt: &DataType) -> Option<DataType> {
         Map(field, sorted) => normalize_field(field).map(|f| Map(Arc::new(f), *sorted)),
         other => widen_to(other),
     }
+}
+
+/// Expand a run-end-encoded column into its logical value array, or `None` if `arr` is not
+/// one.
+///
+/// Run-end encoding is a *compression* of the value type in exactly the sense a dictionary
+/// is: `RunArray` stores one value and one end index per **run**, and its `len()` is the
+/// logical row count the runs expand to. Every operator would otherwise need a kernel for
+/// it -- `Aggregate`, `Sort`, `Join` and the group-key identity in `bc_runtime::keys` all
+/// reject the type outright -- so it decodes at the boundary for the same reason a
+/// dictionary does: no operator should have to know how the column it reads was encoded.
+///
+/// `arrow::compute::cast` does not implement this in arrow 56, so the decode is done
+/// directly: map each logical row to the physical slot holding its run's value, then
+/// `take`. That is one gather over the column, and it is the same work the first operator
+/// to touch the column would have had to do anyway.
+///
+/// This runs at the **column** level only. A run-end column nested inside a struct or list
+/// is left encoded, because decoding it means rebuilding the containing array rather than
+/// casting it. See the note on [`normalize_to`].
+fn decode_run_ends(arr: &ArrayRef) -> Option<ArrayRef> {
+    let DataType::RunEndEncoded(run_ends, _) = arr.data_type() else {
+        return None;
+    };
+    // `get_physical_indices` is generic over the run-end index type, and the Arrow spec
+    // admits exactly these three. An unrecognized one falls through to `None`, leaving the
+    // column encoded rather than guessing at its layout.
+    let physical = match run_ends.data_type() {
+        DataType::Int16 => run_physical_indices::<Int16Type>(arr),
+        DataType::Int32 => run_physical_indices::<Int32Type>(arr),
+        DataType::Int64 => run_physical_indices::<Int64Type>(arr),
+        _ => None,
+    }?;
+    let values = match run_ends.data_type() {
+        DataType::Int16 => arr.as_any().downcast_ref::<RunArray<Int16Type>>()?.values(),
+        DataType::Int32 => arr.as_any().downcast_ref::<RunArray<Int32Type>>()?.values(),
+        DataType::Int64 => arr.as_any().downcast_ref::<RunArray<Int64Type>>()?.values(),
+        _ => return None,
+    };
+    take(values.as_ref(), &physical, None).ok()
+}
+
+/// The physical slot each logical row of a `RunArray<R>` reads its value from.
+///
+/// Split out only because the three run-end index widths are three distinct types and the
+/// lookup is identical for all of them. `get_physical_indices` accounts for the array's
+/// slice offset, so a sliced run-end column decodes to its own rows and not its parent's.
+fn run_physical_indices<R: RunEndIndexType>(arr: &ArrayRef) -> Option<UInt64Array> {
+    let run = arr.as_any().downcast_ref::<RunArray<R>>()?;
+    let logical: Vec<u32> = (0..u32::try_from(run.len()).ok()?).collect();
+    let physical = run.get_physical_indices(&logical).ok()?;
+    Some(UInt64Array::from_iter_values(
+        physical.into_iter().map(|i| i as u64),
+    ))
 }
 
 /// Whether `dt` is a type whose normalization is a *pure numeric widening* — either a
@@ -214,6 +308,20 @@ fn deep_null_count(arr: &ArrayRef) -> usize {
     total
 }
 
+/// Push a column through unchanged, carrying whatever type it actually has.
+///
+/// The two fall-through arms of [`normalize_batch`] must agree with the column they push:
+/// after [`decode_run_ends`] the array's type is the decoded value type, not the schema
+/// field's `RunEndEncoded`, and pushing the original field there would build a
+/// `RecordBatch` whose schema contradicts its columns.
+fn push_as_is(fields: &mut Vec<Field>, columns: &mut Vec<ArrayRef>, field: &Field, col: &ArrayRef) {
+    fields.push(
+        Field::new(field.name(), col.data_type().clone(), field.is_nullable())
+            .with_metadata(field.metadata().clone()),
+    );
+    columns.push(col.clone());
+}
+
 /// Upcast narrow numeric columns of one batch to Int64/Float64 and decode any
 /// dictionary-encoded columns to their value type. Non-numeric, already-wide,
 /// non-dictionary columns are passed through untouched (a cheap `Arc` clone).
@@ -231,7 +339,22 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
     let mut fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
     let mut columns = Vec::with_capacity(batch.num_columns());
     for (i, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(i);
+        let raw = batch.column(i);
+        // Run-end encoding is expanded first, so what follows sees the value type. An
+        // extension column is opaque at the boundary and skips both steps.
+        let decoded;
+        let col = if is_extension_field(field) {
+            raw
+        } else {
+            match decode_run_ends(raw) {
+                Some(arr) => {
+                    changed = true;
+                    decoded = arr;
+                    &decoded
+                }
+                None => raw,
+            }
+        };
         // An extension column (e.g. a fixed-shape-tensor embedding) is opaque at the
         // boundary — never rewrite its storage type. See `is_extension_field`.
         let normalized = if is_extension_field(field) {
@@ -265,13 +388,11 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
                     columns.push(arr);
                 }
                 Err(_) => {
-                    fields.push(field.as_ref().clone());
-                    columns.push(col.clone());
+                    push_as_is(&mut fields, &mut columns, field, col);
                 }
             },
             None => {
-                fields.push(field.as_ref().clone());
-                columns.push(col.clone());
+                push_as_is(&mut fields, &mut columns, field, col);
             }
         }
     }

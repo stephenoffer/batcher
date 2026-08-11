@@ -21,11 +21,14 @@ from batcher.api.io_namespace._write_opts import (
     MODE_AWARE_SINKS as _MODE_AWARE_SINKS,
 )
 from batcher.api.io_namespace._write_opts import (
+    derive_partition_columns,
     normalize_partition_by,
     normalize_save_mode,
+    one_or_many,
     reject_row_index,
 )
 from batcher.api.session import read as _read
+from batcher.io.sink import check_write_options
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -39,7 +42,9 @@ if TYPE_CHECKING:
 __all__ = ["Writer"]
 
 
-def _prune_stale_after_overwrite(path: str, fmt: str, manifest: WriteManifest) -> None:
+def _prune_stale_after_overwrite(
+    path: str, fmt: str, manifest: WriteManifest, *, only_written_partitions: bool = False
+) -> None:
     """Delete files a prior write left under `path` that this overwrite did not rewrite.
 
     A file sink writes ``part-NNNNN`` (and Hive ``col=v/…``) files whose *names* depend
@@ -49,6 +54,12 @@ def _prune_stale_after_overwrite(path: str, fmt: str, manifest: WriteManifest) -
     in place, and the next read unions the stale rows back in (silent data corruption). A
     plain overwrite must *replace* the output, so any surviving file this write did not
     produce is deleted after the (atomic, hence complete) write commits.
+
+    `only_written_partitions` narrows that to the partition directories this write
+    actually produced files in — the dynamic partition overwrite (``mode=
+    "overwrite_partitions"``). A partition the incoming data says nothing about is then
+    left exactly as it was, which is what makes a daily reload of one day's data safe
+    against a table holding five years of them.
 
     Runs only for the plain file sinks (`FileSink`): the lakehouse/warehouse sinks manage
     their own overwrite through a transaction log or a target table. Fails safe — if the
@@ -90,11 +101,55 @@ def _prune_stale_after_overwrite(path: str, fmt: str, manifest: WriteManifest) -
             found.extend(_walk(sub))
         return found
 
-    existing = set(_walk(path))
+    # Dynamic partition overwrite: only look inside the directories this write wrote to,
+    # so a partition the new data never mentioned is neither listed nor touched.
+    roots = (
+        sorted({f.path.rsplit("/", 1)[0] for f in manifest.files})
+        if only_written_partitions
+        else [path]
+    )
+    existing = {f for root in roots for f in _walk(root)}
     if not keep.issubset(existing):
         return  # listing did not surface our own files — do not risk a wrong deletion
     for stale in existing - keep:
         fs.remove(stale)
+    # Then the directories those files were the last occupants of. Overwriting a table
+    # partitioned by ``dt=`` with one partitioned by ``g=`` otherwise leaves the ``dt=``
+    # directories standing, empty, and the tree advertises two partition schemes at once.
+    from batcher.io.filesystem import prune_empty_dirs
+
+    prune_empty_dirs(fs, path)
+
+
+def _check_overwrite_partitions(fmt: str, partition_by: list[str] | None) -> None:
+    """Refuse a dynamic partition overwrite the target cannot give the caller.
+
+    Both refusals name the operation that *does* work, because the mode is reached by
+    someone who already knows exactly which rows they mean to replace.
+
+    Args:
+        fmt: The sink format this write resolved to.
+        partition_by: The partition columns the write names, if any.
+
+    Raises:
+        PlanError: On a transactional target, or with no partitioning to scope to.
+    """
+    from batcher._internal.errors import PlanError
+
+    if fmt in _MODE_AWARE_SINKS:
+        raise PlanError(
+            "write(mode='overwrite_partitions') is for a Hive-partitioned file "
+            f"directory; {fmt!r} is a transactional table, where the same intent "
+            "is a scoped commit rather than a file rewrite. Use "
+            "write(replace_where=<predicate over the partition columns>), which "
+            "retires exactly the matching partitions inside one transaction."
+        )
+    if not partition_by:
+        raise PlanError(
+            "write(mode='overwrite_partitions') replaces only the partitions the "
+            "incoming data covers, so it needs partition_by=[...] to know what a "
+            "partition is. Without partitioning, that is a plain mode='overwrite'."
+        )
 
 
 def _undistributable_stream_reason(plan: Any) -> str | None:
@@ -145,6 +200,32 @@ def _undistributable_stream_reason(plan: Any) -> str | None:
     return None
 
 
+def _writes_into_a_partition_directory(path: str, single_file: bool) -> bool:
+    """Whether `path` names a Hive partition directory rather than a file to create.
+
+    A last segment of the form ``col=value`` is a partition directory everywhere in this
+    ecosystem, and writing one partition of a table at a time is how a daily job appends:
+    Spark's ``df.write.parquet("table/day=2024-01-01")`` puts ``part-*`` files inside it.
+    Batcher wrote a *file* at that exact path instead, because the path carries no
+    extension and a single-shard write goes straight to its destination. The result was a
+    tree Batcher could not read back: ``table/day=2024-01-01`` is an extensionless file, so
+    ``read.parquet("table")`` found no ``.parquet`` files at all and raised — a round trip
+    broken through Batcher's own writer, on the layout a ported Spark job produces first.
+
+    `single_file=True` is the caller saying they meant one file, and wins.
+
+    Args:
+        path: The write destination.
+        single_file: Whether the caller explicitly asked for one file.
+
+    Returns:
+        True when the destination should hold ``part-*`` files.
+    """
+    from batcher.io.base._paths import hive_segment
+
+    return not single_file and hive_segment(path) is not None
+
+
 class Writer:
     """The `ds.write` namespace: callable for autodetect, typed methods per format.
 
@@ -192,13 +273,13 @@ class Writer:
         format: str | None = None,
         *,
         mode: str = "overwrite",
-        partition_by: list[str] | None = None,
+        partition_by: list[str | Any] | None = None,
         single_file: bool = False,
         distributed: bool | str = "auto",
         num_workers: int | None = None,
         resume: bool = False,
         max_rows_per_file: int | None = None,
-        sort_by: list[str] | None = None,
+        sort_by: str | list[str] | None = None,
         replace_where: Any = None,
         trigger: Trigger | None = None,
         output_mode: str = "append",
@@ -218,6 +299,11 @@ class Writer:
         `mode` is the save mode (Spark ``SaveMode`` parity):
 
         * ``"overwrite"`` (default) — write, replacing any existing output.
+        * ``"overwrite_partitions"`` — replace only the partitions the incoming data
+          covers and leave every other one untouched (Spark's
+          ``partitionOverwriteMode="dynamic"``, Hive's ``INSERT OVERWRITE``). Needs
+          `partition_by`, and is the safe way to reload one day into a table holding
+          years of them: a plain ``"overwrite"`` would delete the rest.
         * ``"error"`` — raise `PlanError` if `path` already exists.
         * ``"ignore"`` — skip the write (return an empty manifest) if `path` exists.
         * ``"append"`` — add to an existing table; only the sinks that can add to one
@@ -225,10 +311,19 @@ class Writer:
           it has nothing to append to.
 
         Spark's own ``"errorIfExists"`` and Python's file modes (``"w"``, ``"a"``,
-        ``"x"``) are accepted as spellings of those four, so a ported job does not fail
+        ``"x"``) are accepted as spellings of those, so a ported job does not fail
         on its last line. `partition_by` likewise answers to Spark's ``partitionBy=``
         and pandas' ``partition_cols=``, and pandas' ``index=False`` is accepted and
         dropped — Batcher has no row index, so there is nothing to suppress.
+
+        A `partition_by` entry may be an **expression** rather than a column name, which
+        is how a *partition transform* is spelled (Iceberg's ``days(ts)`` /
+        ``bucket(16, id)``, Spark's generated partition column). The expression is
+        evaluated once and partitioned on by its alias, so
+        ``partition_by=[bt.col("ts").dt.year().alias("year")]`` writes ``year=2024/``
+        directories without adding a column to the data or to the source table. An
+        expression key must carry an ``.alias(...)``, since the alias is the directory
+        name.
 
         ``single_file=True`` guarantees the output is the one file at `path` rather than
         a directory of shards: it refuses the arguments that shard (`partition_by`,
@@ -241,9 +336,9 @@ class Writer:
         key-matched — for a key-matched upsert (update/insert by join key) use
         `merge` instead.
 
-        ``sort_by=[cols]`` clusters the output: rows are sorted (ascending) before
-        writing, so each file / row-group's min/max bounds are tight and downstream
-        queries skip far more data via zonemaps and bloom filters — the engine-side
+        ``sort_by="col"`` or ``sort_by=[cols]`` clusters the output: rows are sorted
+        (ascending) before writing, so each file / row-group's min/max bounds are tight
+        and downstream queries skip far more data via zonemaps and bloom filters — the engine-side
         slice of liquid clustering (you choose the keys; there is no managed table
         service). Bounded batch writes only.
 
@@ -276,7 +371,7 @@ class Writer:
         from batcher._internal.errors import PlanError
         from batcher.api.terminal import _write
         from batcher.io.base._paths import normalize_path
-        from batcher.io.detect import detect_format
+        from batcher.io.detect import detect_format, hive_partition_keys
         from batcher.io.manifest import WriteManifest
         from batcher.io.source import is_bounded
 
@@ -287,10 +382,38 @@ class Writer:
         mode = normalize_save_mode(mode)
         partition_by = normalize_partition_by(opts, partition_by)
         reject_row_index(opts)
-        if single_file:
-            self._check_single_file(partition_by, max_rows_per_file)
-            distributed = False
+        if partition_by and any(not isinstance(k, str) for k in partition_by):
+            # A partition transform (`col('ts').dt.year().alias('year')`) becomes an
+            # ordinary derived column, then re-enters this call with a plain name list —
+            # so every layer below sees the column-name partitioning it already handles.
+            derived, names = derive_partition_columns(self._ds, partition_by)
+            return derived.write(
+                path,
+                format,
+                mode=mode,
+                partition_by=names,
+                single_file=single_file,
+                distributed=distributed,
+                num_workers=num_workers,
+                resume=resume,
+                max_rows_per_file=max_rows_per_file,
+                sort_by=sort_by,
+                replace_where=replace_where,
+                trigger=trigger,
+                output_mode=output_mode,
+                checkpoint=checkpoint,
+                query_name=query_name,
+                auto_compact=auto_compact,
+                **opts,
+            )
         fmt = detect_format(path, format)
+        # Before anything is provisioned, sorted or written: a write keyword the sink
+        # cannot take is a typo, and saying so here costs nothing where letting it reach a
+        # Ray worker's constructor costs a provisioned cluster to say the same thing worse.
+        check_write_options(fmt, opts)
+        if single_file:
+            self._check_single_file(partition_by, max_rows_per_file, path, fmt)
+            distributed = False
 
         # `sort_by` clusters the output: sort rows (ascending) before writing so each
         # file / row-group's min/max bounds are tight, maximizing downstream zonemap +
@@ -303,7 +426,7 @@ class Writer:
                     "write(sort_by=...) clusters a bounded batch write; it cannot sort an "
                     "unbounded stream"
                 )
-            return self._ds.sort(*sort_by).write(
+            return self._ds.sort(*one_or_many(sort_by)).write(
                 path,
                 format,
                 mode=mode,
@@ -317,6 +440,7 @@ class Writer:
                 output_mode=output_mode,
                 checkpoint=checkpoint,
                 query_name=query_name,
+                auto_compact=auto_compact,
                 **opts,
             )
 
@@ -346,12 +470,20 @@ class Writer:
                     "output_mode='complete')), or .write.for_each_batch(fn) for a custom upsert."
                 )
             if distributed is True:
+                if max_rows_per_file is not None:
+                    raise PlanError(
+                        "write(max_rows_per_file=..., distributed=True) is not supported for "
+                        "a streaming write: the distributed drain names each file after its "
+                        "epoch and shard, and does not subdivide one further. Run the stream "
+                        "single-node to cap the file size, or compact the output afterwards "
+                        "with bt.compact(path, target_size_mb=...)."
+                    )
                 drain = self._maybe_distributed_stream(
                     path, fmt, opts, trigger, checkpoint, num_workers, query_name, output_mode
                 )
                 if drain is not None:
                     return drain
-            sink = self._stream_sink_for(path, fmt, opts, query_name)
+            sink = self._stream_sink_for(path, fmt, opts, query_name, max_rows_per_file)
             return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
 
         # Resume is exactly-once only on a deterministic plan: the same input must
@@ -399,16 +531,41 @@ class Writer:
                 mode = "overwrite"
             elif resolve_filesystem(path).exists(path):
                 kept = _read(path, format=fmt).filter(~replace_where)
+                # `union` is positional, and a partitioned read hands its partition columns
+                # back *last* (they come from the directory names, not the files), so the
+                # kept rows and the incoming ones agree on names and disagree on order.
+                # Align to the incoming dataset — it is the one whose column order the
+                # rewritten table should keep.
+                if set(kept.columns) == set(self._ds.columns) and kept.columns != self._ds.columns:
+                    kept = kept.select(*self._ds.columns)
                 combined = kept.union(self._ds)
+                # A backfill replaces *rows*, never the table's organization. Carry the
+                # existing Hive layout forward when the call did not name one, or the
+                # rewrite lands the whole table flat and the partitioning the caller was
+                # backfilling *into* is gone — with every row still present, so nothing
+                # fails until the next partition-pruned query reads the lot.
+                if partition_by is None:
+                    partition_by = hive_partition_keys(path) or None
+                # Forward the execution options too, not just the layout ones. A
+                # copy-on-write `replace_where` rewrites the *whole* table, so it is the
+                # write most in need of the cluster — and dropping `distributed` here ran
+                # exactly that rewrite on the driver alone, on the largest input of any
+                # write shape. (`sort_by` is already None here: its branch above re-enters
+                # this call on the sorted dataset.)
                 return combined.write(
                     path,
                     fmt,
                     mode="overwrite",
                     partition_by=partition_by,
                     single_file=single_file,
+                    distributed=distributed,
+                    num_workers=num_workers,
                     max_rows_per_file=max_rows_per_file,
+                    auto_compact=auto_compact,
                     **opts,
                 )
+        if mode == "overwrite_partitions":
+            _check_overwrite_partitions(fmt, partition_by)
         if mode == "append" and fmt not in _MODE_AWARE_SINKS:
             raise PlanError(
                 f"write(): mode='append' is only supported for {sorted(_MODE_AWARE_SINKS)}, "
@@ -416,8 +573,8 @@ class Writer:
                 "mean rewriting the whole output. Either write each batch to its own path "
                 "under a directory and read the directory back as one relation "
                 f"(write(f'{{root}}/batch-{{n}}.{fmt}'), then read(root)), or use a "
-                "transactional sink — write.delta / write.iceberg / write.hudi — where "
-                "append is a real commit."
+                "transactional sink — write.delta / write.iceberg — where append is a "
+                "real commit. (Not write.hudi: Batcher reads Hudi but cannot write it.)"
             )
         # error/ignore are a pre-write existence gate (resume has its own per-file
         # idempotence, so it is exempt).
@@ -464,6 +621,7 @@ class Writer:
             max_rows_per_file=max_rows_per_file,
             num_files=num_files,
             target_bytes_per_file=target_bytes,
+            directory=_writes_into_a_partition_directory(path, single_file),
             sink_kwargs=sink_kwargs,
         )
         # Overwrite must REPLACE the output: drop any stale files a prior, differently
@@ -471,19 +629,29 @@ class Writer:
         # read unions them back in). `resume` is exempt — it intentionally keeps and skips
         # already-present files. Only the plain file sinks need this; the mode-aware sinks
         # overwrite through their own log/table.
-        if mode == "overwrite" and not resume and fmt not in _MODE_AWARE_SINKS:
-            _prune_stale_after_overwrite(path, fmt, manifest)
+        overwriting = mode in ("overwrite", "overwrite_partitions")
+        if overwriting and not resume and fmt not in _MODE_AWARE_SINKS:
+            _prune_stale_after_overwrite(
+                path, fmt, manifest, only_written_partitions=mode == "overwrite_partitions"
+            )
         return manifest
 
     @staticmethod
-    def _check_single_file(partition_by: list[str] | None, max_rows_per_file: int | None) -> None:
-        """Refuse the arguments that would shard a `single_file=True` write.
+    def _check_single_file(
+        partition_by: list[str] | None, max_rows_per_file: int | None, path: str, fmt: str
+    ) -> None:
+        """Refuse anything that would stop a `single_file=True` write being one file.
 
-        Both of these produce a *directory* of ``part-*`` files, which is the one layout
-        `single_file` exists to rule out. Dropping them silently would hand back the
-        sharded output the caller just said they did not want — and the caller usually
-        wants one file because something downstream (a spreadsheet, a script, a tool that
-        takes a filename) cannot open a directory at all.
+        `partition_by` and `max_rows_per_file` both produce a *directory* of ``part-*``
+        files, which is the one layout `single_file` exists to rule out. Dropping them
+        silently would hand back the sharded output the caller just said they did not want
+        — and the caller usually wants one file because something downstream (a
+        spreadsheet, a script, a tool that takes a filename) cannot open a directory.
+
+        A destination that *already is* a directory is the same conflict arriving from the
+        other side: a write there is a directory rewrite, so the promise cannot be kept.
+        Said plainly here rather than left to fail as an `IsADirectoryError` from inside a
+        rename, three layers down.
         """
         from batcher._internal.errors import PlanError
 
@@ -496,6 +664,26 @@ class Writer:
             raise PlanError(
                 f"write(single_file=True, {conflict}=...): {conflict} writes a directory of "
                 "part files, which is what single_file rules out. Pass one or the other."
+            )
+        # Only a file sink has a *location* to be occupied. A warehouse or table sink's
+        # "path" is an identifier, so stat-ing it would ask a question about the local
+        # working directory that has nothing to do with the write.
+        from batcher.io.base.sink import FileSink
+        from batcher.io.filesystem import resolve_filesystem
+        from batcher.io.sink import SINKS
+
+        sink_cls = SINKS.get(fmt)
+        if not (isinstance(sink_cls, type) and issubclass(sink_cls, FileSink)):
+            return
+        try:
+            occupied = resolve_filesystem(path).is_dir(path)
+        except Exception:
+            occupied = False
+        if occupied:
+            raise PlanError(
+                f"write(single_file=True): {path!r} is already a directory, so one file "
+                "cannot be written at that exact path. Write to a new path, or remove the "
+                "directory first."
             )
 
     # --- streaming sink targets -------------------------------------------
@@ -619,7 +807,12 @@ class Writer:
         )
 
     def _stream_sink_for(
-        self, path: str, fmt: str, opts: dict[str, Any], query_name: str | None = None
+        self,
+        path: str,
+        fmt: str,
+        opts: dict[str, Any],
+        query_name: str | None = None,
+        max_rows_per_file: int | None = None,
     ) -> Any:
         """Build the per-micro-batch `StreamSink` for a path/format streaming write.
 
@@ -631,11 +824,19 @@ class Writer:
         a Delta-pinned sink, so a streaming ``format="iceberg"`` write produced a Delta
         table at the Iceberg path, with the right rows and no error anywhere.
         """
+        from batcher._internal.errors import PlanError
         from batcher.io.formats.streaming.sinks import FileStreamSink, TransactionalStreamSink
 
         if fmt in _MODE_AWARE_SINKS:
+            if max_rows_per_file is not None:
+                raise PlanError(
+                    f"write(max_rows_per_file=...) has no meaning for a streaming {fmt!r} "
+                    "write: each micro-batch is one transaction, and the file layout inside "
+                    "it belongs to the table. Compact the table instead — "
+                    "bt.compact(path, target_size_mb=...) — or write with auto_compact=True."
+                )
             return TransactionalStreamSink(path, fmt, query_name=query_name, **opts)
-        return FileStreamSink(path, fmt, **opts)
+        return FileStreamSink(path, fmt, max_rows_per_file=max_rows_per_file, **opts)
 
     def console(
         self,
@@ -1050,6 +1251,100 @@ class Writer:
         """
         return self(path, "avro", **opts)
 
+    def fasta(self, path: PathLike, **opts: Any) -> WriteManifest:
+        """Write as FASTA, one record per row.
+
+        The dataset must carry `id` and `sequence` columns; a `description` column is used
+        for the rest of the header line when present. Sequences are wrapped at 60 characters,
+        the width the NCBI and UniProt reference files use.
+
+        Args:
+            path: Output path/URI to write to.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": ["chr1"], "sequence": ["ATGGCC"]})
+                >>> ds.write.fasta("genome.fasta")  # doctest: +SKIP
+        """
+        return self(path, "fasta", **opts)
+
+    def fastq(self, path: PathLike, **opts: Any) -> WriteManifest:
+        """Write as four-line FASTQ, one read per row.
+
+        The dataset must carry `id`, `sequence`, and `quality` columns, and the sequence and
+        quality strings must be the same length in every row — a quality string is one
+        character per base, so a mismatch is refused rather than written out for the next
+        reader to misinterpret.
+
+        Args:
+            path: Output path/URI to write to.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"id": ["r1"], "sequence": ["ACGT"], "quality": ["IIII"]}
+                ... )
+                >>> ds.write.fastq("reads.fastq")  # doctest: +SKIP
+        """
+        return self(path, "fastq", **opts)
+
+    def bed(self, path: PathLike, **opts: Any) -> WriteManifest:
+        """Write interval rows as BED, in the specification's column order.
+
+        The dataset must carry `chrom`, `start`, and `end`. The leading run of standard
+        columns also present is written after them, so a table with `name` writes BED4. BED
+        is positional, so a gap cannot be expressed and the run stops at the first absent
+        column.
+
+        Args:
+            path: Output path/URI to write to.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"chrom": ["chr1"], "start": [0], "end": [100]})
+                >>> ds.write.bed("regions.bed")  # doctest: +SKIP
+        """
+        return self(path, "bed", **opts)
+
+    def gff(self, path: PathLike, **opts: Any) -> WriteManifest:
+        """Write annotation rows as GFF3, with the version directive on the first line.
+
+        All nine columns are required, because GFF is positional. Nulls are written as ``.``,
+        the format's own missing marker.
+
+        Args:
+            path: Output path/URI to write to.
+            opts: Additional write options forwarded to the sink.
+
+        Returns:
+            A `WriteManifest` describing the files written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> genes.write.gff("out.gff3")  # doctest: +SKIP
+        """
+        return self(path, "gff", **opts)
+
     def lance(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write a Lance dataset (needs ``batcher-engine[lance]``).
 
@@ -1220,6 +1515,7 @@ class Writer:
         merge_on: str | list[str] | None = None,
         auto_compact: bool = False,
         merge_schema: bool = False,
+        table_properties: dict[str, str] | None = None,
         **opts: Any,
     ) -> WriteManifest:
         """Write to a Delta Lake table (one transactional commit).
@@ -1245,6 +1541,11 @@ class Writer:
             merge_schema: Evolve the table to accept columns this write has and the table
                 does not. Off by default — an unexpected column is refused rather than
                 silently written into the files where the table cannot see it.
+            table_properties: Delta table properties, Spark's ``TBLPROPERTIES`` — set when
+                this write creates the table, altered when it already exists. This is how
+                protocol features are turned on: ``delta.enableChangeDataFeed`` (required
+                before `bt.read.read_change_feed` can read the table),
+                ``delta.appendOnly``, the retention durations.
             opts: Additional write options (e.g. ``merge_predicate=``) forwarded to the sink.
 
         Returns:
@@ -1256,12 +1557,18 @@ class Writer:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
                 >>> ds.write.delta("warehouse/orders", merge_on="id")  # doctest: +SKIP
+                >>> ds.write.delta(  # doctest: +SKIP
+                ...     "warehouse/orders",
+                ...     table_properties={"delta.enableChangeDataFeed": "true"},
+                ... )
         """
         if merge_on is not None:
             from batcher.api.merge import merge_predicate_for
 
             opts["merge_predicate"] = merge_predicate_for(merge_on)
         opts["merge_schema"] = merge_schema
+        if table_properties is not None:
+            opts["table_properties"] = table_properties
         return self(uri, "delta", mode=mode, auto_compact=auto_compact, **opts)
 
     def iceberg(self, identifier: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
@@ -1285,22 +1592,33 @@ class Writer:
         return self(identifier, "iceberg", mode=mode, **opts)
 
     def hudi(self, table_uri: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
-        """Write to an Apache Hudi table (``mode="append"|"overwrite"``).
+        """Raise: Batcher reads Hudi tables but does not write them.
+
+        A Hudi write needs that project's Spark/Flink write stack — timeline, file groups
+        and the index — which Batcher does not implement. The method exists so the refusal
+        names the reason instead of arriving as a missing attribute, and so `bt.read.hudi`
+        has a visible counterpart. Use `write.delta` or `write.iceberg`, both of which are
+        real transactional writes here.
 
         Args:
             table_uri: Path/URI of the Hudi table root.
-            mode: ``"append"`` (default) or ``"overwrite"``.
-            opts: Additional write options forwarded to the sink.
+            mode: Accepted for signature parity; no mode is writable.
+            opts: Accepted for signature parity.
 
         Returns:
-            A `WriteManifest` describing the committed Hudi files.
+            Never returns.
+
+        Raises:
+            BackendError: Always — Hudi writes are not supported.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
-                >>> ds.write.hudi("s3://lake/orders", mode="append")  # doctest: +SKIP
+                >>> ds.write.hudi("s3://lake/orders")  # doctest: +SKIP
+                Traceback (most recent call last):
+                BackendError: Hudi writes require Spark/Flink; Batcher supports Hudi reads only
         """
         return self(table_uri, "hudi", mode=mode, **opts)
 

@@ -15,8 +15,7 @@ from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _wrap
 from batcher.plan.expr_ir.func_nodes import MakeTemporal, WindowBuckets, WindowStart
 from batcher.plan.expr_ir.namespaces.temporal import parse_offset
-
-_DAY_MICROS = 86_400_000_000
+from batcher.plan.ir_tags import MICROS_PER_DAY
 
 
 def _duration_micros(duration: str, *, arg: str) -> int:
@@ -54,7 +53,7 @@ def _duration_micros(duration: str, *, arg: str) -> int:
             f"{arg} {duration!r} uses a calendar unit (month/year) with no fixed length; "
             "use fixed units (days/hours/minutes/seconds)"
         )
-    return _positive_micros(days * _DAY_MICROS + micros, duration, arg)
+    return _positive_micros(days * MICROS_PER_DAY + micros, duration, arg)
 
 
 def _positive_micros(total: int, duration: str, arg: str) -> int:

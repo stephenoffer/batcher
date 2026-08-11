@@ -160,7 +160,28 @@ def test_rounding_of_int_is_cast():
 
 
 def test_rounding_of_int_is_cast_end_to_end():
-    assert _optimized(col("x").round()) == Cast(Col("x"), "float64").to_ir()
+    assert _optimized(col("x").floor()) == Cast(Col("x"), "float64").to_ir()
+
+
+def test_round_of_int_is_not_cast_to_float():
+    """`round` is the one member of the family the engine does NOT promote.
+
+    `bc_expr::eval::math::eval_math` special-cases `(Round, Int64)` and returns the array
+    untouched, because DuckDB answers BIGINT for `round(bigint)`. Rewriting it to
+    `cast(i, float64)` therefore retyped the column *and* lost every value past 2^53 —
+    which is precisely the corruption the engine's own special case exists to prevent.
+    """
+    _noop(ax.rounding_of_int_is_cast, col("x").round())
+    assert _optimized(col("x").round()) == MathExpr("round", Col("x")).to_ir()
+
+
+def test_round_of_large_int_keeps_every_bit():
+    """The end-to-end regression: optimized and unoptimized must agree past 2^53."""
+    big = 2**53 + 1
+    ds = bt.from_pydict({"x": [big, 7]})
+    out = ds.select(r=col("x").round(0)).collect()
+    assert out.schema.field("r").type == pa.int64()
+    assert out.column("r").to_pylist() == [big, 7]
 
 
 def test_rounding_of_float_is_kept():

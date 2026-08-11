@@ -40,6 +40,12 @@ def to_format(batch: pa.RecordBatch, fmt: str) -> Any:
     ``polars`` a ``polars.DataFrame`` (Arrow-native, near zero-copy); ``jax`` a
     ``{col: jax.Array}`` dict (numeric columns only). Requires the matching library.
 
+    **Tensor columns and `polars`.** The `pyarrow`, `numpy`, and `pandas` paths all hand a
+    tensor column over with its per-row shape intact. Polars has no dtype for one, so
+    `pl.from_arrow` reads the canonical extension type as its flat storage: a ``(3, 3)`` image
+    arrives as a 9-element list and comes back as one. The values are unharmed and the shape
+    is not; use ``"numpy"`` or ``"pandas"`` for a `fn` that needs it.
+
     Raises:
         ValueError: if `fmt` is not one of `FORMATS`.
     """
@@ -48,7 +54,7 @@ def to_format(batch: pa.RecordBatch, fmt: str) -> Any:
     if fmt == "numpy":
         return next(to_numpy_batches([batch]))
     if fmt == "pandas":
-        return batch.to_pandas()
+        return _to_pandas(batch)
     if fmt == "torch":
         arrays = next(to_numpy_batches([batch]))
         _warn_dropped(arrays, fmt)
@@ -62,6 +68,32 @@ def to_format(batch: pa.RecordBatch, fmt: str) -> Any:
         _warn_dropped(arrays, fmt)
         return {n: jnp.asarray(a) for n, a in arrays.items() if a.dtype.kind in "biufc"}
     raise ValueError(f"unknown batch_format {fmt!r}; expected one of {FORMATS}")
+
+
+def _to_pandas(batch: pa.RecordBatch) -> Any:
+    """`batch` as a `DataFrame`, with tensor columns kept shaped.
+
+    ``RecordBatch.to_pandas()`` on a fixed-shape tensor column hands back an object column of
+    **flat** arrays: a ``(3, 3)`` image arrives as a 9-element vector, and the shape is gone
+    before the user's `fn` is called. A `fn` that reshapes by hand is guessing, and one that
+    does not silently computes on a vector. The result path then infers a plain list column
+    from those flat arrays, so the shape never comes back either.
+
+    Overwriting those columns with their real per-row arrays fixes both ends at once: the
+    `fn` sees ``(3, 3)``, and returning them unchanged rebuilds the tensor column.
+    """
+    from batcher.interop.arrays import _column_to_numpy
+    from batcher.io.formats.ml.ragged import is_ragged_tensor_column
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    frame = batch.to_pandas()
+    # Resolved once per batch, not once per column: this runs on every `batch_format="pandas"`
+    # call, and most batches have no tensor column at all.
+    for name in batch.schema.names:
+        column = batch.column(name)
+        if is_tensor_column(column) or is_ragged_tensor_column(column):
+            frame[name] = list(_column_to_numpy(column))
+    return frame
 
 
 #: Column sets already warned about, so a dropped column is reported once per stage rather
@@ -86,13 +118,33 @@ def _warn_dropped(arrays: dict[str, Any], fmt: str) -> None:
     import warnings
 
     warnings.warn(
-        f"batch_format={fmt!r} cannot represent non-numeric column(s) {list(dropped)}, so the "
-        f"function will not receive them and they will be missing from its output. Keep them by "
-        f"using batch_format='pyarrow' (or 'pandas'), or select the numeric columns explicitly "
-        f"with `input_columns=` so the drop is intentional.",
+        f"batch_format={fmt!r} cannot represent {_why_dropped(arrays, dropped)} "
+        f"{list(dropped)}, so the function will not receive them and they will be missing "
+        f"from its output. Keep them by using batch_format='pyarrow' (or 'pandas'), or select "
+        f"the numeric columns explicitly with `input_columns=` so the drop is intentional.",
         UserWarning,
         stacklevel=4,
     )
+
+
+def _why_dropped(arrays: dict[str, Any], dropped: tuple[str, ...]) -> str:
+    """Name the *reason* a column is being dropped, not just the fact.
+
+    "non-numeric" is accurate for a string id and misleading for a variable-shape tensor
+    column, which is numeric in every sense the user cares about and is dropped because rows
+    of differing shape have no single tensor to become. A reader told "non-numeric" about an
+    image column goes looking for the wrong thing.
+    """
+    import numpy as np
+
+    def holds_arrays(name: str) -> bool:
+        column = arrays[name]
+        return column.dtype == object and any(isinstance(v, np.ndarray) for v in column[:1])
+
+    ragged = [name for name in dropped if holds_arrays(name)]
+    if ragged and len(ragged) == len(dropped):
+        return "variable-shape tensor column(s) — rows of differing shape have no one tensor —"
+    return "non-numeric column(s)"
 
 
 def result_to_arrowable(result: Any, fmt: str) -> Any:
@@ -135,7 +187,31 @@ def _pandas_result(result: Any) -> Any:
                 "a column name. Return a DataFrame, or name it with `series.rename('col')`."
             )
         return {str(result.name): result.to_numpy()}
+    if _holds_arrays(result):
+        # A tensor column has no pandas dtype, so it arrives as an object column of ndarrays
+        # and `from_pandas` infers a plain list column from it — losing the shape, and (via
+        # the boundary's widening of narrow numerics) turning a uint8 image into int64, eight
+        # bytes a pixel. Handing back a column dict routes it through the same tensorization
+        # the `pyarrow` and `numpy` paths use, which rebuilds the tensor column instead.
+        return {str(name): result[name].to_numpy() for name in result.columns}
     return pa.RecordBatch.from_pandas(result, preserve_index=False)
+
+
+def _holds_arrays(frame: Any) -> bool:
+    """Whether any column of a pandas `frame` holds NumPy arrays rather than scalars.
+
+    Checked on the first value of each object column only: it is `O(columns)` per batch, and a
+    frame whose column changes from scalars to arrays partway down is not the case this is for.
+    """
+    import numpy as np
+
+    for name in frame.columns:
+        column = frame[name]
+        if column.dtype != object or not len(column):
+            continue
+        if isinstance(column.iloc[0], np.ndarray):
+            return True
+    return False
 
 
 def _polars_result(result: Any) -> Any:

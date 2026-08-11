@@ -21,6 +21,13 @@ CRATES = ROOT / "crates"
 SEARCH_ROOTS = ("python", "tests", "benchmarks", "examples", "tools", "docs", "crates")
 SEARCH_SUFFIXES = {".py", ".rs", ".md", ".toml", ".txt", ".pyi"}
 
+#: Generated output to keep out of the reference index, anchored to the directory that
+#: produces it rather than matched by component name. Matching a bare ``_build`` component
+#: also excluded the real package ``python/batcher/api/dataset/_build/`` — which is still
+#: *scanned for definitions*, so every name referenced only from those three modules read
+#: as dead. `_all_bounded` was reported as unreferenced while `sessions.py` imports it.
+BUILD_OUTPUT_PREFIXES = ("docs/_build",)
+
 #: Decorators that make a definition reachable without its name ever appearing at a call
 #: site. Kyber rules, IO formats, and pytest fixtures all work this way.
 REGISTERED_BY = ("register", "rule", "fixture", "hookimpl", "overload", "abstractmethod")
@@ -57,11 +64,17 @@ DEAD_ALLOW: dict[str, str] = {
 }
 
 #: The handful of handlers that are silent on purpose and cannot be made otherwise, keyed by
-#: ``file:line-of-except``. Keep this list at approximately zero entries: the fix for a silent
-#: best-effort path is `note_suppressed`, and an exemption is only right when *calling* it is
-#: the thing that would fail. Re-check the line numbers when the file moves.
+#: ``file::enclosing-function``. Keep this list at approximately zero entries: the fix for a
+#: silent best-effort path is `note_suppressed`, and an exemption is only right when *calling*
+#: it is the thing that would fail.
+#:
+#: Keyed by the enclosing symbol and **not** by line number, because the line-numbered form
+#: silently stopped applying: the one entry here read `scan_read.py:171` while the handler had
+#: drifted to line 194, so a waived site came back as a `high` finding and the waiver became
+#: invisible debt. A key that no longer resolves is now reported as `stale-waiver` rather than
+#: quietly ignored — the same failure mode `DUPLICATION_ALLOW` had at `flight_sort.py:332`.
 SILENT_ALLOW: dict[str, str] = {
-    "python/batcher/dist/executors/scan_read.py:171": (
+    "python/batcher/dist/executors/scan_read.py::_record_skipped": (
         "this handler *is* the logging path for a skipped split, so anything it could report "
         "would take the same route that just failed — the one place where staying silent is "
         "the only option, and it is documented in the handler body"
@@ -139,13 +152,13 @@ def build_context() -> Context:
         for path in sorted((ROOT / root).rglob("*")):
             if path.suffix not in SEARCH_SUFFIXES or not path.is_file():
                 continue
-            if "__pycache__" in path.parts or "_build" in path.parts:
+            rel = _rel(path)
+            if "__pycache__" in path.parts or rel.startswith(BUILD_OUTPUT_PREFIXES):
                 continue
             try:
                 text = path.read_text()
             except (UnicodeDecodeError, OSError):
                 continue
-            rel = _rel(path)
             if path.suffix == ".rs":
                 rust_text[path] = text
             for token, count in Counter(_WORD.findall(text)).items():

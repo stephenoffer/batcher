@@ -19,21 +19,27 @@ It imports the callable builder from `udf` lazily, inside the probe, so there is
 
 from __future__ import annotations
 
-import threading
 import warnings
 
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import ceil_div
+from batcher.core.udf.call import shared_error_budget
 from batcher.core.udf.processes import is_picklable
 from batcher.core.udf.sizing import warn_if_row_is_unsplittable
 from batcher.metadata.hardware_scope import scoped
+from batcher.metadata.udf_stats import (
+    load_udf_row_seconds,
+    record_udf_row_seconds,
+    udf_cost_key,
+)
 from batcher.plan.logical import MapBatches
 
 __all__ = [
     "PROC_BATCHES_PER_WORKER",
     "PROC_MIN_BATCH_ROWS",
+    "budget_key",
     "disable_processes",
     "error_budget",
     "map_strategy",
@@ -108,16 +114,18 @@ _processes_disabled = False
 # restarts instead of re-probing every fresh session.
 _PROC_PROBE_CACHE: dict[str, bool] = {}
 # The probe's measured per-row compute (seconds) per `fn`, reused to size the thread batch:
-# a light `fn` coarsens onto the plateau, a heavy one fills cores. Also hub-persisted so a
-# recurring `fn` skips the re-probe.
+# a light `fn` coarsens onto the plateau, a heavy one fills cores. Persisted through the
+# *neutral* `metadata.udf_stats` store rather than the private entry below, because Kyber's
+# cost model spends the same number — see that module.
 _FN_ROW_SECONDS: dict[str, float] = {}
 _REJECTED: set[str] = set()
 
-# Hub namespace the measured per-`fn` policy (threads-vs-processes verdict + per-row seconds)
-# persists under, keyed by the callable's `module.qualname`. Reading it seeds the in-process
-# caches so a recurring UDF starts tuned across runs; a cold entry leaves the caches empty and
-# the `fn` is probed exactly as before. Neither the verdict (threads vs processes) nor the
-# batch size can change what a UDF computes, so a warm start is result-identical to a cold one.
+# Hub namespace the measured threads-vs-processes verdict persists under, keyed by the
+# callable's identity. Reading it seeds the in-process cache so a recurring UDF starts on the
+# right pool across process restarts; a cold entry leaves the cache empty and the `fn` is
+# probed exactly as before. The verdict cannot change what a UDF computes, so a warm start is
+# result-identical to a cold one. It stays private to Core: which pool to dispatch on is an
+# execution mechanism, not something the optimizer has any use for.
 _LEARN_NS = "udf_strategy"
 
 
@@ -133,8 +141,8 @@ def _learning_hub():
 
 
 def _learned_strategy(key: str) -> dict:
-    """The persisted policy entry (``{"proc": bool, "row_secs": float}``) for a `fn` key, or
-    ``{}`` when the hub is cold/unreachable. Best-effort — never raises into the probe."""
+    """The persisted policy entry (``{"proc": bool}``) for a `fn` key, or ``{}`` when the hub
+    is cold/unreachable. Best-effort — never raises into the probe."""
     hub = _learning_hub()
     if hub is None:
         return {}
@@ -148,8 +156,8 @@ def _learned_strategy(key: str) -> dict:
 def _persist_strategy(key: str | None, **fields: object) -> None:
     """Merge `fields` into the persisted policy entry for a `fn` key (best-effort).
 
-    Merges rather than overwrites so the verdict and the per-row seconds — measured by different
-    probes — accumulate under one key without clobbering each other."""
+    Merges rather than overwrites so several policy fields measured by different probes can
+    accumulate under one key without clobbering each other."""
     if key is None:
         return
     hub = _learning_hub()
@@ -163,21 +171,14 @@ def _persist_strategy(key: str | None, **fields: object) -> None:
         return
 
 
-# The `max_errored_rows` allowances, one shared list per (`fn`, allowance) per worker process.
-#
-# The public contract says the allowance is "per worker". The code did not mean that: both
-# `execute._apply_udf` and `stream._apply_udf_stream` built `[op.max_errored_rows]` fresh on
-# every invocation, so each partition, each streaming window, and each of the two paths a single
-# query can route through got its OWN full allowance. `max_errored_rows=100` therefore meant
-# "100 per call", and the real bound grew with the number of calls — effectively unbounded at
-# scale, which is exactly the reverse of what a budget is for. Sharing one list per worker makes
-# the code mean the documented thing.
-#
-# It is deliberately NOT global across workers: a cluster-wide counter would need a round trip
-# per dropped row on the hot path. So the honest cluster bound is `workers x max_errored_rows`,
-# and that is what the public docstring must say.
-_ERROR_BUDGETS: dict[tuple[str, int], list[int]] = {}
-_BUDGET_LOCK = threading.Lock()
+def budget_key(op: MapBatches) -> str:
+    """A stable identity for `op`'s UDF, shared by every path that runs it.
+
+    The process path needs the same key the thread path uses, and it has to survive the trip
+    to a child where `id()` means nothing — so an identity-derived fallback is a last resort,
+    not the normal answer.
+    """
+    return _fn_probe_key(op.fn) or f"id:{id(op.fn)}"
 
 
 def error_budget(op: MapBatches) -> list[int]:
@@ -188,9 +189,7 @@ def error_budget(op: MapBatches) -> list[int]:
     it in place: ``budget[0]`` counts down, ``budget[1]`` accumulates the drops (appended on
     the first drop, so a one-element list stays valid).
     """
-    key = _fn_probe_key(op.fn) or f"id:{id(op.fn)}"
-    with _BUDGET_LOCK:
-        return _ERROR_BUDGETS.setdefault((key, op.max_errored_rows), [op.max_errored_rows])
+    return shared_error_budget(budget_key(op), op.max_errored_rows)
 
 
 def disable_processes(exc: BaseException) -> None:
@@ -214,10 +213,10 @@ def wants_processes(op: MapBatches, total_rows: int, current: list[pa.RecordBatc
     measured cost comparison (`_prefer_processes`) shows their extra cores beat the
     result-pickle tax. A GIL-releasing vectorized `fn` (the common NumPy/Arrow/torch case)
     is routed to the cheaper thread path instead — threads keep input and output in shared
-    memory, while the process path must ship results back. A GPU / class / non-pyarrow /
-    unpicklable `fn` never qualifies (see `_process_capable`), nor does anything once the
-    pool has proven unusable this session. The runtime still falls back to threads if a
-    process actually fails, so this never drops a batch.
+    memory, while the process path must ship results back. A GPU `fn`, a class `fn`, or one
+    that cannot be serialized to a child never qualifies (see `_process_capable`), nor does
+    anything once the pool has proven unusable this session. The runtime still falls back to
+    threads if a process actually fails, so this never drops a batch.
     """
     if op.num_workers <= 1 or _processes_disabled:
         return False
@@ -330,10 +329,13 @@ def _fn_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | No
     if key is not None and key in _FN_ROW_SECONDS:
         return _FN_ROW_SECONDS[key]
     # Warm start: reuse a prior run's measured per-row cost so the thread batch is sized right
-    # from the first batch, without re-timing the `fn` this session.
+    # from the first batch, without re-timing the `fn` this session. Read from the *shared*
+    # store (`metadata.udf_stats`) rather than Core's private policy entry: this is the one
+    # fact here that another subsystem also spends, and Kyber's cost model reads exactly this
+    # value to stop pricing an expensive UDF as a trivial column map.
     if key is not None:
-        learned = _learned_strategy(key).get("row_secs")
-        if isinstance(learned, (int, float)):
+        learned = load_udf_row_seconds(_learning_hub(), key)
+        if learned is not None:
             _FN_ROW_SECONDS[key] = float(learned)
             return float(learned)
     if not _probe_safe(op):
@@ -344,7 +346,7 @@ def _fn_row_seconds(op: MapBatches, current: list[pa.RecordBatch]) -> float | No
         secs = None
     if key is not None and secs is not None:
         _FN_ROW_SECONDS[key] = secs
-        _persist_strategy(key, row_secs=secs)
+        record_udf_row_seconds(_learning_hub(), key, secs)
     return secs
 
 
@@ -449,19 +451,32 @@ def _probe_callable(op: MapBatches):
 
 
 def _fn_probe_key(fn: object) -> str | None:
-    """A stable cache key for a `fn`'s probe verdict, or None if it can't be keyed."""
-    mod = getattr(fn, "__module__", None)
-    qual = getattr(fn, "__qualname__", None)
-    return f"{mod}.{qual}" if mod and qual else None
+    """A stable cache key for a `fn`'s probe verdict, or None if it can't be keyed.
+
+    ``module.qualname`` is not unique for a locally-defined callable: every lambda in one
+    enclosing function shares the qualname ``mod.outer.<locals>.<lambda>``. Two different
+    UDFs written the ordinary way — ``map_batches(lambda b: cheap(b))`` and
+    ``map_batches(lambda b: expensive(b))`` in the same function — therefore collided, and
+    the second silently inherited the first's measured per-row cost, its threads-vs-processes
+    verdict, *and* its `max_errored_rows` allowance. The defining line disambiguates them, and
+    is added only for the local case so a module-level `fn`'s key stays stable across edits
+    (it is persisted to the learning hub and reused across sessions).
+
+    The rule itself lives in neutral `metadata.udf_stats`, because Kyber's cost model now
+    reads the per-row cost measured here and a value is worthless if the writer and the reader
+    spell the identity differently. One definition, not two that agree by inspection.
+    """
+    return udf_cost_key(fn)
 
 
 def _process_capable(op: MapBatches) -> bool:
     """Whether `op.fn` *can* run in a process pool (a quiet predicate, no warning).
 
     A factory/class would reload the model per child (and risk OOM); a GPU `fn` wants
-    one CUDA context; a lambda/closure `fn` cannot be pickled to a spawned child. Any
-    `batch_format` is fine — the numpy/pandas/torch conversion runs in the child from
-    the picklable ``(fn, batch, fmt)`` payload, no closure required.
+    one CUDA context; anything that cannot be serialized to a child is out. A lambda or a
+    closure *is* serializable wherever `cloudpickle` is installed, which is what admits the
+    most common spelling of a UDF to the pool. Any `batch_format` is fine — the
+    numpy/pandas/torch conversion runs in the child from the dispatch payload.
     """
     return not isinstance(op.fn, type) and op.num_gpus <= 0 and is_picklable(op.fn)
 
@@ -477,7 +492,10 @@ def _process_safe(op: MapBatches) -> bool:
     if op.num_gpus > 0:
         return _reject("a GPU fn must keep a single process/CUDA context")
     if not is_picklable(op.fn):
-        return _reject("the fn is not picklable (a lambda or closure)")
+        return _reject(
+            "the fn cannot be serialized to a worker process; install `cloudpickle` if it "
+            "is a lambda or a closure"
+        )
     return True
 
 

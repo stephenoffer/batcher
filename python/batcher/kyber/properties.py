@@ -5,8 +5,10 @@ they are the two every mature optimizer reasons about:
 
   - **Ordering** — the row order a node hands upward. A `Sort` whose input already delivers
     the ordering it wants is pure waste, and the only way to know that is to propagate the
-    property. `RelStats.sorted_by` carries it (a canonical ascending, nulls-last column
-    prefix — the one ordering a producer and a consumer can compare unambiguously).
+    property. `RelStats.sorted_by` carries it, as a prefix of `SortOrder` keys that each
+    name a column, a direction, and a null placement. Recording the direction is what makes
+    the property pay: restricted to ascending keys it could not describe `ORDER BY ts DESC`,
+    so the most common ordered shape in analytics delivered no ordering at all.
   - **Distribution** — how a relation's rows are spread across workers. A hash join
     co-partitions both sides by the join key, so its *output* is hash-partitioned by that
     key; an aggregate whose group keys are a superset of it therefore computes complete
@@ -38,7 +40,7 @@ from batcher.plan.logical import (
     LogicalPlan,
     Project,
 )
-from batcher.plan.stats import RelStats
+from batcher.plan.stats import RelStats, SortOrder, orderings_satisfy
 
 __all__ = [
     "PhysicalProperties",
@@ -53,18 +55,22 @@ __all__ = [
 class PhysicalProperties:
     """The shape a node hands its parent: row order, and how rows are distributed.
 
-    `ordering` is a canonical **ascending, nulls-last** column prefix — a descending or
-    nulls-first key is simply not recorded, because a producer and a consumer can only
-    compare orderings they both spell the same way. `hash_partitioned_on` is the key set
-    whose equal values are guaranteed to share a partition; empty means "no guarantee",
-    which is always the safe answer.
+    `ordering` is a prefix of `SortOrder` keys, each carrying its direction and null
+    placement, so a descending ordering is as expressible as an ascending one.
+    `hash_partitioned_on` is the key set whose equal values are guaranteed to share a
+    partition; empty means "no guarantee", which is always the safe answer.
     """
 
-    ordering: tuple[str, ...] = ()
+    ordering: tuple[SortOrder, ...] = ()
     hash_partitioned_on: tuple[str, ...] = ()
 
 
-def satisfies(have: PhysicalProperties, want: PhysicalProperties) -> bool:
+def satisfies(
+    have: PhysicalProperties,
+    want: PhysicalProperties,
+    *,
+    non_nullable: frozenset[str] = frozenset(),
+) -> bool:
     """Whether a relation delivering `have` already satisfies a requirement for `want`.
 
     **Ordering and partitioning contain in opposite directions** — the single most
@@ -72,7 +78,9 @@ def satisfies(have: PhysicalProperties, want: PhysicalProperties) -> bool:
 
     * An **ordering** satisfies a requirement when it is a *prefix-extension* of it: rows
       sorted by `(a, b)` are also sorted by `(a)`, so a stronger (longer) order satisfies a
-      weaker one, never the reverse.
+      weaker one, never the reverse. Each key must agree on direction; it need only agree
+      on null placement for a column that can actually hold a null, which is what
+      `non_nullable` relaxes.
     * A **partitioning** satisfies a grouping requirement when the delivered keys are a
       *subset* of the required ones — the opposite containment. Rows partitioned by `hash(a)`
       keep every `(a, b)` group whole (equal `(a, b)` implies equal `a`, hence one bucket), so
@@ -85,11 +93,12 @@ def satisfies(have: PhysicalProperties, want: PhysicalProperties) -> bool:
     Args:
         have: The properties the relation delivers.
         want: The properties the consumer requires.
+        non_nullable: Columns proven to hold no nulls, where null placement is unobservable.
 
     Returns:
         True iff no extra sort or shuffle is needed.
     """
-    ordered = have.ordering[: len(want.ordering)] == want.ordering
+    ordered = orderings_satisfy(have.ordering, want.ordering, non_nullable=non_nullable)
     partitioned = not want.hash_partitioned_on or (
         bool(have.hash_partitioned_on)
         and set(have.hash_partitioned_on) <= set(want.hash_partitioned_on)
@@ -97,7 +106,7 @@ def satisfies(have: PhysicalProperties, want: PhysicalProperties) -> bool:
     return ordered and partitioned
 
 
-def project_ordering(items: tuple, child_sorted_by: tuple[str, ...]) -> tuple[str, ...]:
+def project_ordering(items: tuple, child_sorted_by: tuple[SortOrder, ...]) -> tuple[SortOrder, ...]:
     """The ordering a `Project` delivers, given the ordering of its input.
 
     A projection selects and renames columns; it reorders nothing, so the input's row order
@@ -109,25 +118,26 @@ def project_ordering(items: tuple, child_sorted_by: tuple[str, ...]) -> tuple[st
 
     Only a bare-column output can carry an order key: a *computed* output is not the key it
     was computed from. An order key the projection does not carry forward truncates the
-    prefix — the columns before it are still delivered in order.
+    prefix — the columns before it are still delivered in order. Direction and null
+    placement ride along untouched, since renaming a column cannot reverse it.
 
     Args:
         items: The projection's output items.
-        child_sorted_by: The canonical ordering the projection's input delivers.
+        child_sorted_by: The ordering the projection's input delivers.
 
     Returns:
-        The canonical ordering the projection delivers, under its output names.
+        The ordering the projection delivers, under its output names.
     """
     renamed: dict[str, str] = {}
     for item in items:
         if isinstance(item.expr, Col) and item.expr.name not in renamed:
             renamed[item.expr.name] = item.alias
-    out: list[str] = []
+    out: list[SortOrder] = []
     for key in child_sorted_by:
-        alias = renamed.get(key)
+        alias = renamed.get(key.column)
         if alias is None:
             break  # the order's next key is not projected — the prefix ends here
-        out.append(alias)
+        out.append(SortOrder(alias, key.descending, key.nulls_first))
     return tuple(out)
 
 

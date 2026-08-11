@@ -166,17 +166,39 @@ def _column_of(ir: dict[str, Any] | None) -> str | None:
     return ir["name"] if isinstance(ir, dict) and ir.get("e") == "col" else None
 
 
-def _literal_of(ir: dict[str, Any] | None) -> tuple[Any, bool]:
-    """``(value, is_literal)`` for a literal IR node, unwrapping its typed kind.
+#: The Arrow type each temporal literal kind counts in. A literal reaches this module as a
+#: raw epoch offset (`{"date": 19724}`), which compares against nothing on its own — the
+#: kind is what says whether 19724 is a day, a microsecond, or an ordinary integer.
+_TEMPORAL_KINDS: dict[str, Any] = {}
 
-    Temporal kinds stay as their raw epoch offsets (date=days, timestamp/time=micros),
-    matching how a manifest records them; a mismatch merely fails the comparison cast
-    below and keeps the file.
+
+def _temporal_kinds() -> dict[str, Any]:
+    """`_TEMPORAL_KINDS`, built on first use (pyarrow types cannot be module constants here
+    without importing pyarrow at import time, which the neutral IO layer avoids)."""
+    if not _TEMPORAL_KINDS:
+        import pyarrow as pa
+
+        _TEMPORAL_KINDS.update(
+            {
+                "date": pa.date32(),
+                "timestamp": pa.timestamp("us"),
+                "time": pa.time64("us"),
+            }
+        )
+    return _TEMPORAL_KINDS
+
+
+def _literal_of(ir: dict[str, Any] | None) -> tuple[Any, str | None]:
+    """``(value, kind)`` for a literal IR node, or ``(None, None)`` if it is not one.
+
+    Temporal kinds stay as their raw epoch offsets (date=days, timestamp/time=micros);
+    `kind` is returned alongside so `_align` can give the number back its meaning before
+    comparing it to a manifest column.
     """
     if not isinstance(ir, dict) or ir.get("e") != "lit":
-        return None, False
-    ((_kind, value),) = ir["value"].items()
-    return value, True
+        return None, None
+    ((kind, value),) = ir["value"].items()
+    return value, kind
 
 
 def _comparison(
@@ -184,19 +206,23 @@ def _comparison(
 ) -> Any | None:
     """Keep-mask for one ``col OP literal`` term, from the column's per-file bounds."""
     column, value = _column_of(left), None
-    literal, is_lit = _literal_of(right)
-    if column is not None and is_lit:
+    literal, kind = _literal_of(right)
+    if column is not None and kind is not None:
         value = literal
     else:  # try the flipped form: `literal OP col`
         column = _column_of(right)
-        literal, is_lit = _literal_of(left)
-        if column is None or not is_lit:
+        literal, kind = _literal_of(left)
+        if column is None or kind is None:
             return None
         value, op = literal, COMPARISON_FLIP[op]
 
     lo, hi = _bounds(column, manifest)
     if lo is None or hi is None:
         return None  # no recorded bound for this column → cannot prune on it
+    aligned = _align(lo, hi, value, kind, pc)
+    if aligned is None:
+        return None
+    lo, hi, value = aligned
 
     try:
         # A file whose values are all NULL matches no comparison (NULL OP x is never
@@ -211,6 +237,98 @@ def _comparison(
     except Exception as exc:
         note_suppressed("io", "evaluate zone-map prune", exc)
         return None  # a type that will not compare prunes nothing
+
+
+def _align(lo: Any, hi: Any, value: Any, kind: str, pc: Any) -> tuple[Any, Any, Any] | None:
+    """Put the bounds and the literal into one type Arrow has a comparison kernel for.
+
+    Left alone, this is where date partitioning quietly stopped pruning. The two spellings
+    of the most common PB-scale layout there is both arrive mismatched: a manifest records
+    a partition value as **text** (``"2024-01-02"``, which is what a Delta/Iceberg log
+    holds and what a Hive directory name is) while a date literal arrives as the **integer**
+    19724, and a partition column typed as `date32` meets the string literal a SQL predicate
+    writes. Arrow has no ``equal(string, int64)`` or ``equal(date32, int64)`` kernel, so
+    every such comparison raised, was caught, and pruned nothing — a table with a directory
+    per day read all 3,650 of them to answer a one-day query, correctly and 3,650x over.
+
+    A **temporal** literal is given its meaning first (`_temporal_kinds`) and then both
+    sides are moved to one instant type (`_temporal_target`) — never by truncating a bound,
+    which would narrow the interval the zone map stands for and could prune a file that
+    does match. Widening a date bound to that day's midnight is the only direction taken,
+    and it is exactly what the bound already meant.
+
+    Every **other** literal is cast to the bounds' own type, so an integer written against a
+    narrower column still compares — but only *within* a kind. Arrow will happily cast the
+    integer 5 to the string ``"5"``, and comparing that against text bounds orders it
+    lexicographically, where ``"10" < "5"``: a range predicate would then prune files that do
+    match. Numbers stay with numbers and text with text, and a genuine kind mismatch declines.
+
+    Args:
+        lo: The per-file lower-bound array.
+        hi: The per-file upper-bound array.
+        value: The literal's raw value.
+        kind: The literal's IR kind (``date``/``timestamp``/``time``/``int``/``str``/…).
+        pc: The `pyarrow.compute` module.
+
+    Returns:
+        The aligned ``(lo, hi, value)``, or None when no comparable pair exists — which
+        the caller reads as "prune nothing", never as "prune everything".
+    """
+    import pyarrow as pa
+
+    temporal = _temporal_kinds().get(kind)
+    try:
+        if lo.type == pa.null():
+            return None  # a column of only-null bounds proves nothing about any file
+        if temporal is None:
+            literal = pa.scalar(value)
+            if not _same_kind(literal.type, lo.type, pa):
+                return None
+            # A text literal against a temporal bound is the SQL spelling of a date
+            # (``day = '2024-01-02'``), and it is what the engine's own comparison coerces,
+            # so the prune must reach the same conclusion. A string that will not parse
+            # raises below and keeps every file.
+            return lo, hi, literal.cast(lo.type)
+        target = _temporal_target(lo.type, temporal, pa)
+        literal = pa.scalar(value, temporal).cast(target)
+        return pc.cast(lo, target), pc.cast(hi, target), literal
+    except Exception as exc:
+        note_suppressed("io", "align a zone-map bound with its literal", exc)
+        return None
+
+
+def _same_kind(literal_type: Any, bound_type: Any, pa: Any) -> bool:
+    """Whether a literal and a bound order the same way, so a cast between them is sound.
+
+    Numeric with numeric and text with text. Anything else is a mismatch the manifest cannot
+    decide, and declining is the only safe answer: the alternative is a cast Arrow performs
+    happily and an ordering that is not the column's own.
+    """
+    numeric = (pa.types.is_integer, pa.types.is_floating, pa.types.is_decimal)
+    textual = (pa.types.is_string, pa.types.is_large_string)
+    if any(check(literal_type) for check in textual):
+        # Text against a temporal bound is the SQL spelling of a date literal, and the
+        # engine coerces it the same way, so it is in-kind here too.
+        return any(check(bound_type) for check in textual) or pa.types.is_temporal(bound_type)
+    for family in (numeric, (pa.types.is_boolean,)):
+        if any(check(literal_type) for check in family):
+            return any(check(bound_type) for check in family)
+    return literal_type == bound_type
+
+
+def _temporal_target(bound_type: Any, literal_type: Any, pa: Any) -> Any:
+    """The instant type a temporal comparison is decided in.
+
+    A timestamp is the finer of the two and carries the timezone, so it wins; a manifest
+    that records its bounds as **text** has no type to contribute and takes the literal's.
+    """
+    if pa.types.is_string(bound_type) or pa.types.is_large_string(bound_type):
+        return literal_type
+    if pa.types.is_timestamp(bound_type):
+        return bound_type
+    if pa.types.is_timestamp(literal_type):
+        return literal_type
+    return bound_type if pa.types.is_temporal(bound_type) else literal_type
 
 
 def _compare(op: str, lo: Any, hi: Any, value: Any, pc: Any) -> Any | None:

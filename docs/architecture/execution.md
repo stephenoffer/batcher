@@ -20,7 +20,7 @@ config names, and the metadata layer that answers some terminals without a scan,
 
 ## Lazy evaluation
 
-The API is lazy and immutable. Each operation returns a new `Dataset` wrapping a
+The API is lazy and immutable. Each operation returns a new {py:class}`Dataset <batcher.Dataset>` wrapping a
 `LogicalPlan`, and nothing computes until a terminal call.
 
 ```python
@@ -39,10 +39,10 @@ projections down, fuse operators, and choose join orders before a single batch i
 It's also what makes adaptive re-optimization possible mid-query, because there is one
 plan to revise rather than a sequence of already-executed steps.
 
-The terminal operations are `collect()`, which returns a PyArrow `Table`;
+The terminal operations are {py:meth}`collect() <batcher.Dataset.collect>`, which returns a PyArrow `Table`;
 `to_pydict()`; `count()`; `iter_batches()`, which streams a result without
-materializing it whole; and the `write` namespace, either `ds.write("out/")` or a typed
-form such as `ds.write.parquet(...)`. To see the optimized plan without running it,
+materializing it whole; and the `write` namespace, either {py:obj}`ds.write("out/") <batcher.Dataset.write>` or a typed
+form such as {py:meth}`ds.write.parquet(...) <batcher.api.io_namespace.writer.Writer.parquet>`. To see the optimized plan without running it,
 call `explain()`:
 
 ```python

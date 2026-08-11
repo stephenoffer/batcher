@@ -35,10 +35,15 @@ last commit alone.
   finalize` is what lets the same operator run on one core or a cluster with bounded
   memory. Adding a stateful operator without a mergeable form caps it at single-node
   — not acceptable.
-- **Adaptive intra-query re-optimization** is the moat. Plans re-optimize at
-  pipeline breakers using *measured* cardinalities (not just estimates) — the thing
-  DuckDB (static) and Spark AQE (stage boundaries only) can't do. Don't regress the
-  re-optimization hooks or collapse breakers that feed them.
+- **The learning loop is the moat — not the within-query loop.** Plans re-optimize at
+  pipeline breakers using *measured* cardinalities, which DuckDB (static) does not do at
+  all; but that is **the same mechanism and granularity as Spark AQE**, and calling it
+  finer is a claim the code does not support. Two things are genuinely differentiated,
+  and they are what to protect: the loop runs **single-node**, where AQE needs shuffle
+  stages, and what it measures **outlives the query** — sketches, calibrated costs and a
+  bandit in `kyber/learning.py` + `kyber/learned_tuning/`, so the same query gets faster
+  across runs. Don't regress the re-optimization hooks, collapse the breakers that feed
+  them, or break the path that writes measurements back to the `MetadataHub`.
 - **Out-of-core spilling** keeps large queries alive under bounded memory
   (aggregation, join, sort all spill). New stateful operators should have a spill
   story; integration tests under memory pressure (`test_spilling.py`) must stay
@@ -62,12 +67,20 @@ last commit alone.
 
 | System    | Their limit                         | Batcher's answer                          |
 |-----------|-------------------------------------|-------------------------------------------|
-| DuckDB    | static optimization, single-node    | intra-query adaptive re-opt; distributed  |
-| Spark AQE | adapts only at stage boundaries     | continuous re-opt at pipeline breakers    |
+| DuckDB    | static optimization, single-node    | re-plans at breakers on measured sizes; distributed |
+| Spark AQE | cluster-only, keeps nothing per run | the same grain, single-node too, and learned across runs |
 | Polars    | single-backend, single-node         | mergeable algebra → distributed; adaptive |
+
+Note what the middle row does **not** say. Batcher does not re-plan at a finer grain
+than AQE, and the within-query loop is off below a size floor
+(`api/adaptive/gating.py`), so on most queries it does not run at all. Claim the two
+things that are true — single-node availability, and cross-run learning — and nothing
+past them.
 
 Use these as the bar to clear, and verify the claim with `benchmarks/` before
 asserting it. Don't ship a positioning statement the benchmark doesn't support.
+`docs/architecture/internals/competitive_architecture.md` is the code-checked scorecard
+and outranks this table; read it before writing any competitive claim.
 
 ## Gate before "done"
 

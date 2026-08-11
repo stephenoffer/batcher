@@ -93,7 +93,7 @@ what the control plane is for. Recompute those days from raw and replace them:
 
 :::{note}
 `replace_where=` has to resolve to partition filters delta-rs can act on from the log
-alone, which means an AND of `partition_col == value`. A multi-value `is_in([...])`
+alone, which means an AND of `partition_col == value`. A multi-value {py:meth}`is_in([...]) <batcher.plan.expr_ir.core.Expr.is_in>`
 is not expressible that way, so `rebuild` loops and issues one partition-scoped overwrite
 per day. Each one is still a metadata operation that moves no data, so the loop costs about
 what a single call would.
@@ -121,7 +121,7 @@ A streaming aggregate cannot wait forever for a straggler. It has to emit the 10
 at some point, and it has to forget the state that window used, or memory grows without
 bound and the job dies on a Sunday.
 
-A watermark is where you write that decision down. `with_watermark(time_col, lateness)`
+A watermark is where you write that decision down. {py:meth}`with_watermark(time_col, lateness) <batcher.Dataset.with_watermark>`
 says: once I have seen event time T, I will accept rows back to `T - lateness` and drop
 anything older. The query is the same either way. What changes is what the watermark is
 actually doing.

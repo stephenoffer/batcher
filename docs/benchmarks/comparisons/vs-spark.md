@@ -1,25 +1,22 @@
 # vs Spark
 
 This page compares Batcher and Spark on architecture: where each one re-plans a query, what
-moves the bulk data, and what that means for a single node. It carries no timings, and the
-reason comes first.
+moves the bulk data, and what that means for a single node.
 
-:::{important}
-**There are no head-to-head Spark timings in this repository, and this page invents none.**
-Every other page on this site is a measurement. This one is an architectural comparison, and
-it is labeled as one so nothing here reads as a speed result. When a Spark run lands in
-`benchmarks/BENCHMARK_RESULTS.md`, the numbers will appear here.
+:::{note}
+This is an architectural comparison rather than a benchmark. Every other page on this site
+carries measurements; this one carries a design argument, and it is labeled so that nothing
+here reads as a speed result. Spark timings will appear here once a run lands in
+`benchmarks/BENCHMARK_RESULTS.md`.
 :::
 
-What follows is a comparison against the system Spark actually is, which is worth writing
-down because the design difference is specific and testable.
+The design difference is specific and testable, which is what makes it worth writing down.
 
-| | Status |
+| | Where to look |
 |---|---|
-| Head-to-head Spark timings | **None.** Not run, not published, not claimed. |
-| Architectural comparison | Below, and it is an argument rather than a measurement. |
-| Measured distributed results | Real, but against {doc}`/benchmarks/comparisons/vs-daft`, not Spark. See {doc}`/benchmarks/results/scaling`. |
-| API migration | Mapped verb by verb in the {doc}`/getting-started/migration/index`. |
+| Architectural comparison | Below |
+| Measured distributed results | {doc}`/benchmarks/results/scaling`, measured against {doc}`/benchmarks/comparisons/vs-daft` |
+| API migration | Mapped verb by verb in the {doc}`/getting-started/migration/index` |
 
 ## Adaptation granularity
 
@@ -80,7 +77,7 @@ and spill. See {doc}`/benchmarks/results/scaling`.
 
 ## Migrating
 
-If you are coming from Spark, the API is deliberately close. `Session`, SQL, `write` modes,
+If you are coming from Spark, the API is deliberately close. {py:class}`Session <batcher.Session>`, SQL, `write` modes,
 triggers, watermarks, and output modes all mirror the Spark spelling. The
 {doc}`/getting-started/migration/index` maps them verb by verb.
 

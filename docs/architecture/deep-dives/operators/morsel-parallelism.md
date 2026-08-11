@@ -134,7 +134,7 @@ because it's the cdylib every crate links into (`crates/bc-py/src/lib.rs`).
 
 ## Seeing it
 
-Morsel size is observable through `iter_batches`, and the result is invariant to it:
+Morsel size is observable through {py:meth}`iter_batches <batcher.Dataset.iter_batches>`, and the result is invariant to it:
 
 ```python
 import dataclasses
@@ -165,14 +165,13 @@ Morsel granularity buys load balance and cache residency. It costs a per-morsel 
 and state-merge overhead that only amortizes if the morsel is big enough. 16,384
 rows was chosen to sit in L2/L3 for narrow data; an un-coalesced source is what defeats it.
 
-The honest headline number: **single-node parallelism reaches only about 1.7x to 3.8x on 16
-cores** on the TPC-H shapes (`benchmarks/BENCHMARK_RESULTS.md`). The scan-and-aggregate core scales
-well. The join doesn't, and the reason is Amdahl rather than mystery. Serial prefixes
-before the per-bucket join (materializing a side, gathering the probe side, the shuffle
-itself) cap the achievable speedup. Two of those have already been removed (the radix
-partition is now a parallel histogram/prefix-sum/scatter; the probe side is gathered once via
-`interleave` rather than concatenated and then re-gathered), and the remaining ones are the
-open work. Closing that gap is what would close the join-heavy TPC-H gap against DuckDB.
+How far a shape scales is set by Amdahl rather than by the morsel loop. The
+scan-and-aggregate core scales well, and `GROUP BY` alone reaches **19.2x** on 16 cores
+(`benchmarks/BENCHMARK_RESULTS.md`). The join is bounded by the serial prefixes around the
+per-bucket work: materializing a side, gathering the probe side, and the shuffle itself. Two
+of those have been removed, so the radix partition is now a parallel
+histogram/prefix-sum/scatter and the probe side is gathered once via `interleave` rather than
+concatenated and then re-gathered.
 
 ## Where the code lives
 

@@ -46,7 +46,7 @@ MUSTs. A change that breaks one is wrong even if it compiles and your tests pass
    Arrow `RecordBatch`. Zero-copy across FFI. No bespoke row formats.
 4. **Only `bc-py` links PyO3.** Every other crate `cargo test`s without a Python interpreter.
 5. **The crate DAG points one way.** `bc-arrow → bc-expr → {bc-ir → bc-runtime, bc-codegen}
-   → bc-interp → bc-py`, with `bc-geo`/`bc-sketches`/`bc-resource`/`bc-transport`/`bc-io` hanging off
+   → bc-interp → bc-py`, with `bc-geo`/`bc-spatial`/`bc-sketches`/`bc-resource`/`bc-transport`/`bc-io` hanging off
    it and consumed higher up. Never an upward or sideways edge.
 6. **One `Expr`, one `RelOp`, across tiers.** The Tier-0 interpreter is the correctness
    oracle; the Cranelift JIT MUST be bit-for-bit identical on its supported subset and
@@ -121,6 +121,7 @@ crates/             Data plane — pure Rust + Arrow (only bc-py links PyO3)
              — NOT sorting: every sort lives in bc-interp::ops
   bc-codegen Cranelift JIT · bc-interp Tier-0 execute/par/dist + sorts + spill
   bc-geo geometry model + WKB/WKT/GeoJSON + planar algos + grids (feeds bc-expr)
+  bc-spatial quaternions + SE(3) poses + frame transforms (robotics/AV; feeds bc-expr)
   bc-sketches · bc-transport (Flight; bypasses the Ray object store) · bc-resource
   bc-io · bc-udf (NOT wired into bc-py — not on a live path) · bc-py (FFI)
 ```

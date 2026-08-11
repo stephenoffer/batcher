@@ -216,7 +216,7 @@ class _StrNamespace:
         return StrFunc("crc32", self._e)
 
     def mime_type(self) -> StrFunc:
-        """Identify a payload from its leading bytes (``image/png``, ``video/mp4``, ...).
+        r"""Identify a payload from its leading bytes (``image/png``, ``video/mp4``, ...).
 
         The byte-oriented sibling of the ``mime`` column the media and blob readers produce,
         for the bytes that never came from a file read: a :meth:`~batcher.Dataset.ml`
@@ -929,7 +929,12 @@ class _StrNamespace:
                 >>> ds.select(r=bt.col("s").str.word_count()).to_pydict()
                 {'r': [3, 1]}
         """
-        return self.regexp_count(r"\S+")
+        # A native single-pass scan rather than `regexp_count(r"\S+")`, which is what this
+        # was: identical semantics (a maximal run of non-whitespace is a word either way),
+        # but no regex automaton stepped per character. It matters because this is the
+        # denominator of every Gopher-style quality ratio, so a corpus filter evaluates it
+        # once per document over the whole dataset.
+        return StrFunc("word_count", self._e)
 
     def digit_count(self) -> StrFunc:
         """Count the digit characters in the string (→ Int64).
@@ -3458,6 +3463,269 @@ class _StrNamespace:
                 {'n': ['quick brown fox', 'catdog']}
         """
         return StrFunc("squad_normalize", self._e)
+
+    # --- Per-document text quality ------------------------------------------------------
+    #
+    # The Gopher (Rae et al. 2021), C4, and RefinedWeb heuristics, as per-row measures. The
+    # same properties are scored across a *corpus* by the aggregates in
+    # `batcher.plan.functions.metrics.text`; these answer "which documents do I drop", which
+    # is what a `filter()` needs and an aggregate cannot express.
+    #
+    # Every ratio is in [0, 1] and null where the document has nothing to measure. That is
+    # load-bearing: an empty extraction must not pass a `< 0.1` threshold by scoring zero.
+
+    def mean_word_length(self) -> StrFunc:
+        """The mean word length in characters.
+
+        Gopher keeps a document in ``[3, 10]``. Below three is a token list or a table of
+        numbers; above ten is usually a base64 blob, a minified script, or a URL dump.
+
+        Returns:
+            A Float64 expression; null for a document with no words, and for null input.
+            Null rather than 0.0 deliberately — an empty extraction must fail a
+            ``>= 3`` filter rather than sliding under it.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["aa bbbb", "   "]})
+                >>> ds.select(m=bt.col("s").str.mean_word_length()).to_pydict()
+                {'m': [3.0, None]}
+        """
+        return StrFunc("mean_word_length", self._e)
+
+    def symbol_ratio(self) -> StrFunc:
+        """The ratio of ``#`` and ellipsis characters to words.
+
+        Gopher drops a document above 0.1. A high hash count is a stripped-out heading
+        structure or a code fragment; a high ellipsis count is a listing page whose entries
+        were truncated for display, which reads as prose and finishes no sentence.
+
+        Both spellings of an ellipsis count, since which one a page uses is a function of its
+        encoder rather than of its content.
+
+        Returns:
+            A Float64 expression; null for a document with no words, and for null input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["a... b... c... d"]})
+                >>> ds.select(r=bt.col("s").str.symbol_ratio()).to_pydict()
+                {'r': [0.75]}
+        """
+        return StrFunc("symbol_ratio", self._e)
+
+    def alpha_word_ratio(self) -> StrFunc:
+        """The fraction of words containing at least one letter.
+
+        Gopher drops a document below 0.8. The words without letters are prices, timestamps,
+        part numbers and bare punctuation, and a document that is mostly those is a table
+        that lost its structure.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``; null for a document with no words.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["the quick brown fox", "1.99 2.50 3.75 four"]})
+                >>> ds.select(r=bt.col("s").str.alpha_word_ratio()).to_pydict()
+                {'r': [1.0, 0.25]}
+        """
+        return StrFunc("alpha_word_ratio", self._e)
+
+    def stopword_count(self) -> StrFunc:
+        """How many of Gopher's eight stop words appear, counted distinctly.
+
+        The words are ``the``, ``be``, ``to``, ``of``, ``and``, ``that``, ``have``, ``with``,
+        and a document containing fewer than two is almost never English prose — it is a
+        keyword list, a table of figures, or a directory index.
+
+        Distinct words rather than occurrences: a page repeating ``the`` two hundred times is
+        not better evidence of English than one using ``the`` and ``of`` once each.
+        Surrounding punctuation is ignored.
+
+        Returns:
+            An Int64 count between 0 and 8; null stays null.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["the the the the", "the cat sat with a hat"]})
+                >>> ds.select(n=bt.col("s").str.stopword_count()).to_pydict()
+                {'n': [1, 2]}
+        """
+        return StrFunc("stopword_count", self._e)
+
+    def bullet_line_ratio(self) -> StrFunc:
+        r"""The fraction of non-empty lines starting with a bullet.
+
+        Gopher drops a document above 0.9 — that is a navigation menu or a sitemap, not
+        prose. Both the typographic bullets and the ``-``/``*`` that Markdown and plain-text
+        listings use are counted, because a menu is a menu whichever glyph it chose.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``; null for a document with no lines.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["- home\n- about\n- contact\nreal prose"]})
+                >>> ds.select(r=bt.col("s").str.bullet_line_ratio()).to_pydict()
+                {'r': [0.75]}
+        """
+        return StrFunc("bullet_line_ratio", self._e)
+
+    def ellipsis_line_ratio(self) -> StrFunc:
+        r"""The fraction of non-empty lines ending in an ellipsis.
+
+        Gopher drops a document above 0.3. This is the signature of a listing page: every
+        entry is a teaser cut off at a fixed width, so the text reads like prose and says
+        nothing.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``; null for a document with no lines.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["A story about...\nAnother one...\nplain"]})
+                >>> round(ds.select(r=bt.col("s").str.ellipsis_line_ratio()).to_pydict()["r"][0], 4)
+                0.6667
+        """
+        return StrFunc("ellipsis_line_ratio", self._e)
+
+    def duplicate_line_ratio(self) -> StrFunc:
+        r"""The fraction of *characters* sitting in repeated lines.
+
+        Weighed by characters rather than by line count, following Gopher: a page whose one
+        duplicated line is its 500-character footer is a different document from one whose
+        fifty duplicated lines are single words, and a line count cannot tell them apart.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``; null for a document with no content.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["unique\nsame\nsame"]})
+                >>> r = ds.select(r=bt.col("s").str.duplicate_line_ratio()).to_pydict()["r"]
+                >>> round(r[0], 3)
+                0.286
+        """
+        return StrFunc("duplicate_line_ratio", self._e)
+
+    def duplicate_paragraph_ratio(self) -> StrFunc:
+        r"""The fraction of characters sitting in repeated paragraphs.
+
+        The same measure as :meth:`duplicate_line_ratio` over blank-line-separated blocks,
+        which is what catches a page assembled by repeating a whole section rather than a
+        single line.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``; null for a document with no content.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["one\n\ntwo\n\none"]})
+                >>> r = ds.select(r=bt.col("s").str.duplicate_paragraph_ratio()).to_pydict()
+                >>> r["r"][0] > 0.3
+                True
+        """
+        return StrFunc("duplicate_paragraph_ratio", self._e)
+
+    def top_ngram_ratio(self, n: int = 2) -> StrFunc:
+        """The fraction of characters covered by the single most frequent word n-gram.
+
+        Gopher applies this for `n` of 2 to 4, dropping a document above roughly 0.20 to
+        0.15. It catches keyword-stuffed SEO pages, where one phrase is repeated to game a
+        ranking, and templated product pages, where one clause appears once per item.
+
+        Every occurrence of the winning n-gram counts. Because word n-grams overlap, the raw
+        footprint can exceed the document, so the result is clamped to 1.0 — Gopher defines
+        and thresholds this as a fraction, and a value above 1 would break every comparison
+        built on it.
+
+        Args:
+            n: The n-gram length in words.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``; null for a document shorter than `n` words.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["cheap flights cheap flights cheap flights"]})
+                >>> ds.select(r=bt.col("s").str.top_ngram_ratio(2)).to_pydict()["r"][0] > 0.8
+                True
+        """
+        # `length` carries `n`, the same scalar slot `token_ngrams` and `chunk` reuse.
+        return StrFunc("top_ngram_ratio", self._e, length=n)
+
+    def duplicate_ngram_ratio(self, n: int = 5) -> StrFunc:
+        """The fraction of characters covered by word n-grams appearing more than once.
+
+        Gopher applies this for `n` of 5 to 10, with thresholds falling from 0.15 to 0.10.
+        Unlike :meth:`top_ngram_ratio` it sums over *every* repeated n-gram, which is what
+        catches a document assembled from a dozen boilerplate blocks rather than one repeated
+        phrase.
+
+        Each duplicated n-gram is counted once however often it recurs, matching the
+        published definition: the question is how much of the document is boilerplate, not
+        how many times the boilerplate appears. The two measures are therefore not comparable
+        to each other — neither bounds the other.
+
+        Args:
+            n: The n-gram length in words.
+
+        Returns:
+            A Float64 expression in ``[0, 1]``; null for a document shorter than `n` words.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["aa bb cc xx aa bb cc yy dd ee ff zz dd ee ff"]})
+                >>> r = ds.select(r=bt.col("s").str.duplicate_ngram_ratio(3)).to_pydict()["r"]
+                >>> round(r[0], 4)
+                0.3636
+        """
+        return StrFunc("duplicate_ngram_ratio", self._e, length=n)
+
+    def char_entropy(self) -> StrFunc:
+        """The Shannon entropy of the character distribution, in bits.
+
+        The gibberish and encoded-blob detector, and the one measure in this family that is
+        not Gopher's. Natural language in any script lands in a narrow band — roughly 4 to 5
+        bits per character for English prose. A base64 or hex blob sits above it, being
+        near-uniform over its alphabet, and a run of one repeated character sits at zero.
+
+        Both survive every ratio above, because neither has unusual words, lines, or n-grams
+        — they have unusual *characters*, which is the only thing this sees.
+
+        Returns:
+            A Float64 expression; null for the empty string, which has no distribution.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": ["aaaaaaaa"]})
+                >>> ds.select(h=bt.col("s").str.char_entropy()).to_pydict()
+                {'h': [0.0]}
+        """
+        return StrFunc("char_entropy", self._e)
 
     def token_ngrams(self, n: int) -> StrFunc:
         """Every window of `n` adjacent whitespace tokens, joined by a space → List<Utf8>.

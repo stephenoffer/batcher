@@ -264,41 +264,89 @@ def _stage_spec(group: list[LogicalPlan], base: LogicalPlan) -> StageSpec:
     return StageSpec(_rebuild_stage(group, base), num_gpus, accel, wants_pool, concurrency)
 
 
-def split_at_first_pool_boundary(plan: LogicalPlan) -> tuple[StageSpec, StageSpec] | None:
-    """Split a linear `map_batches` pipeline at the first GPU/load-once stage.
+def _pool_key(node: LogicalPlan) -> object | None:
+    """What pool a node belongs to, or `None` when it is ordinary stateless CPU work.
 
-    Returns `(producer, consumer)`: the producer is the stateless-CPU prefix (scan +
-    read/decode/preprocess `map_batches`) up to — but not including — the first
-    GPU/load-once stage; the consumer is that stage onward (inference plus any
-    postprocess maps). The producer streams its output to the consumer pool so the CPU
-    prefix overlaps the model stage, for *any* linear pipeline — not just an exactly
-    two-stage one (a CPU→GPU→CPU-postprocess chain splits into CPU producer + GPU+post
-    consumer). Returns `None` when there is no GPU/load-once stage, or no CPU
-    `map_batches` precedes it (nothing worth a Flight hand-off) — the caller then keeps
-    the non-overlapped distributed-map path.
+    A pool-class stage is keyed by **identity**, not by its resource numbers: two load-once
+    models chained one after the other each want their own actor pool, even when both ask for
+    one GPU, because putting them in one actor loads both models into one device and runs them
+    in series — which is the starvation this whole module exists to remove.
+    """
+    if not isinstance(node, MapBatches) or not _is_pool_class(node):
+        return None
+    return id(node)
 
-    Pure plan inspection. The producer's leaf scan is relabeled to read source 0 (the
-    real partition); the consumer's leaf scan reads an intermediate source 0 holding the
-    producer's published output (an empty schema is fine — it is only consulted when the
-    producer yielded no rows, where the consumer result is empty regardless).
+
+def split_into_resource_stages(plan: LogicalPlan) -> list[StageSpec] | None:
+    """Split a linear `map_batches` pipeline at **every** resource-class boundary.
+
+    This used to split *once*: the CPU prefix, then the first pool-class stage *and everything
+    above it*. That one cut is the right one for a two-stage pipeline and wrong for anything
+    longer. A
+    ``decode → embed → rerank → write`` chain ran its two models in one actor, so they shared
+    a device and took turns instead of overlapping; and a CPU postprocess after inference ran
+    on the GPU actor, spending device time on host work and forcing the two to scale together.
+
+    The grouping rule is that consecutive stateless-CPU maps form one stage — a Flight hop
+    between two host transforms costs more than it saves — and every pool-class map (a GPU
+    stage, an explicit `concurrency`, or a class UDF that loads a model once) is a stage of
+    its own. A leading scan with no CPU map before the first pool stage is folded *into* that
+    stage rather than becoming a hand-off of its own, for the same reason the single cut used
+    to decline that shape outright: streaming an unprocessed partition over Flight is not worth
+    the hop.
+
+    Args:
+        plan: The linear `Scan → map → … → map` plan to split.
+
+    Returns:
+        The stages bottom-up, each reading its upstream's published output as source 0, or
+        `None` when the chain has no pool-class stage or does not divide into at least two.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.dist.executors.plan_analysis import split_into_resource_stages
+            >>> class Model:  # a load-once class UDF: its own pool
+            ...     def __call__(self, batch):
+            ...         return batch
+            >>> ds = bt.from_pydict({"x": [1]})
+            >>> ds = ds.ml.map_batches(lambda b: b).ml.map_batches(Model)
+            >>> ds = ds.ml.map_batches(lambda b: b)
+            >>> [s.wants_pool for s in split_into_resource_stages(ds._plan)]
+            [False, True, False]
     """
     nodes = _linear_nodes(plan)
-    boundary = next(
-        (i for i, n in enumerate(nodes) if isinstance(n, MapBatches) and _is_pool_class(n)),
-        None,
+    if not any(_pool_key(n) is not None for n in nodes):
+        return None
+    groups: list[list[LogicalPlan]] = []
+    current_key: object = object()  # a key nothing can equal, so the first node opens a group
+    for node in nodes:
+        key = _pool_key(node)
+        # A pool node always opens a group (its key is unique to it); a CPU node joins the
+        # open group only when that group is itself CPU work.
+        if key is not None or current_key is not None or not groups:
+            groups.append([node])
+        else:
+            groups[-1].append(node)
+        current_key = key
+    # A leading scan-only group is not a hand-off worth making — fold it into the stage above,
+    # which then reads the partition itself.
+    if len(groups) > 1 and not any(isinstance(n, MapBatches) for n in groups[0]):
+        groups[1] = [*groups[0], *groups[1]]
+        del groups[0]
+    if len(groups) < 2:
+        return None
+    stages = [_stage_spec(groups[0], groups[0][0])]
+    relabeled, _sid = _relabel_single_source(stages[0].sub_plan)
+    stages[0] = dataclasses.replace(stages[0], sub_plan=relabeled)
+    # Every later stage reads its upstream's published morsels as source 0. The empty schema
+    # is only consulted when the upstream produced no rows, where this stage's result is empty
+    # whatever the schema says.
+    stages.extend(
+        _stage_spec(group, Scan(0, SchemaRef.from_arrow(_EMPTY_SCHEMA))) for group in groups[1:]
     )
-    if boundary is None:
-        return None
-    prefix, suffix = nodes[:boundary], nodes[boundary:]
-    # Require real CPU compute in the prefix (a decode/preprocess map) to overlap; a
-    # bare scan prefix isn't worth a Flight hand-off for an in-memory partition.
-    if not any(isinstance(n, MapBatches) for n in prefix):
-        return None
-    producer = _stage_spec(prefix, prefix[0])  # prefix[0] is the original Scan
-    relabeled, _sid = _relabel_single_source(producer.sub_plan)
-    producer = dataclasses.replace(producer, sub_plan=relabeled)
-    consumer = _stage_spec(suffix, Scan(0, SchemaRef.from_arrow(_EMPTY_SCHEMA)))
-    return producer, consumer
+    return stages
 
 
 def requires_staging(plan: LogicalPlan) -> bool:

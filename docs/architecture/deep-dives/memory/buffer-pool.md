@@ -1,9 +1,10 @@
 # The buffer pool
 
-The *buffer pool* is the single process-wide account of how many bytes the engine has
+The *buffer pool* is the process-wide account of how many bytes the engine has
 outstanding. Every allocation of consequence reserves against it before allocating. This
-page describes the reservation contract, the pressure levels every backpressure mechanism
-reads, cooperative spilling, and where the pool's limit comes from.
+page describes the reservation contract, the two pool instances a process actually runs,
+the pressure levels every backpressure mechanism reads, cooperative spilling, how
+concurrent queries divide the envelope, and where the limit comes from.
 
 Two operators, each estimating its own memory, each deciding independently that it has
 room, will together exceed the machine. That's the whole problem, and one shared counter
@@ -43,6 +44,34 @@ whatever remains. An operator that panics doesn't leak its budget.
 
 The pool itself is policy-free. It accounts and it admits. Every decision about what to
 *do* when a reservation fails lives above it.
+
+## There are two pools, and they are different budgets
+
+One `MemoryPool` type, two live instances, and knowing which one a number came from is
+what makes the number mean anything.
+
+The **engine pool** is created inside `execute_plan` and sized from
+`EngineConfig.memory_budget_bytes`. Operator state reserves against it, and the Flight
+shuffle store registers with it as a spillable consumer. On any real query this is where
+the bytes are.
+
+The **control-plane pool** is created by Carbonite and sized from its memory envelope. It
+carries the coarse per-query reservation Carbonite takes for the duration of execution, so
+concurrent queries admit against one budget.
+
+They are deliberately not one counter. Carbonite reserves a plan's *estimated* peak and
+the engine then reserves the same operator's *actual* bytes, so charging both to one
+account would double-count every query and push it out of core at half its envelope.
+
+What they do share is a reader. `engine_pool_stats()` in `carbonite/memory/pool.py` reads
+the engine's pool, the pressure monitor classifies against whichever of the two is fuller,
+and `ResourceManager.stats()` reports both side by side. Before that, the control plane
+could only infer the engine's memory from process RSS, which lags a reservation by however
+long the operator takes to fill the state it reserved.
+
+Reading the pair is a diagnosis. A query that spilled with Carbonite's pool nearly empty
+and the engine's at its limit was bound by an estimate that was too low, not by the box.
+The reverse means the estimate was too high and the query spilled needlessly.
 
 ## Pressure
 
@@ -101,13 +130,15 @@ The finer ladder lives in `carbonite/memory/pressure.py`:
 `max(raw, previous_ewma)`, so pressure escalates instantly and de-escalates only as the EWMA
 relaxes. A monitor that flapped between NORMAL and SPILL would flap the morsel size and the
 credit window with it. Readers that must not advance the EWMA, such as morsel sizing and the
-cache trim, call `classify()` instead. Exactly one component per round may call `level()`.
+cache trim, call {py:meth}`classify() <batcher.api.dataset.ml.DatasetML.classify>` instead. Exactly one component per round may call `level()`.
 :::
 ::::
 
-The fraction it classifies is the **maximum** of `pool.used / pool.limit` and
-`process_footprint / total`, where the footprint prefers the cgroup's `memory.current`
-over RSS.
+The fraction it classifies is the **maximum** over three readings: the control-plane
+pool's `used / limit`, the engine pool's, and `process_footprint / total`, where the
+footprint prefers the cgroup's `memory.current` over RSS. Both pools, because the engine's
+is the one holding operator state, and reading only the control plane's classified a query
+holding 90% of the engine's envelope as `NORMAL` until RSS caught up.
 
 :::{warning}
 The Flight `PartitionStore` and any off-pool pyarrow buffer are real memory the pool has never
@@ -140,6 +171,18 @@ small aggregate no longer dies while a large neighboring join sits on the whole 
 
 With no registered consumers this is exactly `try_reserve`, so nothing pays for machinery
 it doesn't use.
+
+One consumer registers today, and which one it is decides where the mechanism applies.
+`ShuffleSpiller` in `crates/bc-py/src/flight.rs` puts the published shuffle store in the
+registry when a Flight server binds, and keeps a pool reservation equal to the store's
+resident bytes so spilling it hands real credit back. Published output is finished work
+waiting to be collected, so writing it out stalls nobody and costs one re-read.
+
+That means a distributed worker gets cooperative spilling and a **single-node** query does
+not: no Flight server exists there, the registry is empty, and a breaker that cannot
+reserve is always the one that spills. Closing that half needs a `Spillable` on the
+operators that own in-progress state, which the pool may call from another thread while
+the owning operator is reading it.
 
 ## Where the limit comes from
 
@@ -199,12 +242,61 @@ Pressure Stall Information answers the coping question directly. A cgroup can si
 
 `memory.events` records whether this cgroup has already been OOM-killed. That is evidence rather than a forecast, so a restarted worker scales its envelope by `memory.oom_kill_backoff` instead of re-deriving the number that got it killed, and an un-sized plan spills rather than repeating the kill.
 
-Read what the kernel published through `Dataset.explain(analyze=True)`, whose Carbonite resource decision carries a `kernel` block. The block is absent on a host with no cgroups, which is deliberately distinct from a block of zeros.
+Read what the kernel published through {py:meth}`Dataset.explain(analyze=True) <batcher.Dataset.explain>`, whose Carbonite resource decision carries a `kernel` block. The block is absent on a host with no cgroups, which is deliberately distinct from a block of zeros.
+
+## Concurrent queries divide the envelope
+
+The pool is one envelope for the whole process, so a second query's reservations are
+visible to the first. What is *not* visible that way is a plan that has not reserved yet.
+A query decides whether to go out of core by comparing its estimated peak against the
+budget, and that comparison happens before any reservation. When several queries reach it
+at the same moment, each one sees an empty pool, each concludes that a plan needing most of
+RAM fits, and all of them take the in-memory path.
+
+Batcher divides the budget the same way it divides the cores. When
+`execution.max_concurrent_queries` is set, a query admitted while N are running plans
+against `1/N` of the envelope, which is Apache Spark's `ExecutionMemoryPool` rule applied
+at query granularity. A plan that fits on an idle machine goes out of core on a busy one,
+which is the correct outcome: spilling costs a disk round trip, and the alternative costs
+the process.
+
+Three things bound the division:
+
+- The share only moves the *spill threshold*. The pool keeps the whole envelope, because
+  shrinking it would make a concurrent query's already-granted reservation retroactively
+  unaffordable.
+- A nested query, such as a `collect()` inside a `map_batches` UDF, takes no admission slot
+  and so does not raise the occupancy. The outer query already paid for the machine.
+- The default is unbounded concurrency (`max_concurrent_queries = 0`), where the share is
+  exactly 1 and no budget changes.
+
+The share is reactive as well as proactive. `BudgetingAdmission` subtracts what concurrent
+queries have already reserved, and a reservation that does not fit routes the query out of
+core. Those two see reservations that have happened; the share covers the window before
+they do.
+
+Read the division back from the Carbonite resource decision:
+
+```python
+import json
+import batcher as bt
+
+ds = bt.from_pydict({"g": [i % 100 for i in range(5000)], "x": [1.0] * 5000})
+report = json.loads(ds.group_by("g").agg(n=bt.count()).explain(analyze=True, format="json"))
+resources = [d for d in report["decisions"] if d["category"] == "resources"]
+detail = resources[0]["detail"]
+print("share:", detail["memory_share"])
+print("this query's budget:", detail["hard_budget_bytes"])
+print("queries admitted:", detail["admission"]["active"])
+```
+
+On an idle process the share is `1.0` and `hard_budget_bytes` is the whole envelope times
+`memory.hard_limit`.
 
 ## Storage yields to execution
 
 `ResourceManager.reserve` in `carbonite/manager.py` implements Spark's unified memory
-model, in two steps. The result cache behind `Dataset.cache()`, bounded by
+model, in two steps. The result cache behind {py:meth}`Dataset.cache() <batcher.Dataset.cache>`, bounded by
 `memory.result_cache_max_bytes`, is *storage*. An operator building a hash table is
 *execution*. Execution wins.
 

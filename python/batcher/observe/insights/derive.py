@@ -25,6 +25,7 @@ from batcher.observe.insights.resources import (
     paging_operators,
     preempted_operators,
     spilled_operators,
+    stale_core_budget,
 )
 from batcher.observe.insights.stages import (
     gpu_starved,
@@ -63,6 +64,10 @@ _RULES = (
     # run's, with larger numbers in it.
     device_bottleneck,
     derated_host_link,
+    # A finding about neither the plan nor the devices: whether the two *planes* agreed about
+    # the machine at all. A cgroup that lands after `import batcher` leaves the control plane
+    # sizing for hardware the engine is not running on, and nothing else anywhere reports it.
+    stale_core_budget,
 )
 
 

@@ -12,9 +12,13 @@
 
 mod assign;
 mod combine;
+mod hash;
 
 pub(crate) use assign::{assign_groups, dense_budget};
-pub(super) use combine::{combine_radix, combine_radix_parts, merge_state};
+pub use combine::concat_disjoint;
+pub(super) use combine::{
+    combine_radix, combine_radix_parts, merge_state, radix_parallel_default, radix_partitions,
+};
 
 // Same seed both halves use — bucketing is independent of the seed, but sharing it keeps
 // the paths consistent when one is checked against the other.

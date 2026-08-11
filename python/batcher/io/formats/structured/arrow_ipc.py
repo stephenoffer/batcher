@@ -34,6 +34,62 @@ def _select(batch: pa.RecordBatch, projection: list[str] | None) -> pa.RecordBat
     return batch.select(projection) if projection is not None else batch
 
 
+#: Offset widths for the variable-length layouts, by the predicate that recognizes them.
+_OFFSET_WIDTHS: tuple[tuple[Any, str], ...] = (
+    (pa.types.is_large_string, "q"),
+    (pa.types.is_large_binary, "q"),
+    (pa.types.is_large_list, "q"),
+    (pa.types.is_string, "i"),
+    (pa.types.is_binary, "i"),
+    (pa.types.is_list, "i"),
+)
+
+
+def _offset_base(array: pa.Array) -> int:
+    """The first entry of `array`'s offsets buffer, or 0 when it has none.
+
+    A variable-length Arrow array is free to start its offsets anywhere in the values
+    buffer, and the engine produces exactly that for the trailing partial batch of a
+    `limit`: the batch is a window onto its morsel, so its offsets begin mid-buffer.
+    """
+    fmt = next((code for check, code in _OFFSET_WIDTHS if check(array.type)), None)
+    if fmt is None:
+        return 0
+    buffers = array.buffers()
+    if len(buffers) < 2 or buffers[1] is None or buffers[1].size < 8:
+        return 0
+    return int(memoryview(buffers[1]).cast(fmt)[array.offset])
+
+
+def _rebase_offsets(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Return `batch` with every variable-length column's offsets starting at zero.
+
+    Works around a defect in `pyarrow.ipc` (reproduced on 19.0.1, and with no engine code
+    involved): a string, binary or list array whose offsets buffer does *not* start at
+    zero serializes to garbage. The array is valid Arrow — `validate(full=True)` passes,
+    and reading it in memory is correct — so nothing upstream notices, and the corruption
+    surfaces only after a round trip, as NUL bytes or invalid UTF-8 in the tail.
+
+    Batcher hits it on the trailing partial batch of a `limit`, which is a window onto its
+    morsel and therefore has non-zero offsets. `ds.head(50_000).write.arrow(path)` wrote
+    848 corrupt rows before this.
+
+    `concat_arrays` on a single array copies it into a fresh contiguous buffer with the
+    offsets rebased, which is the cheapest normalization pyarrow offers. Columns that are
+    already based at zero are passed through untouched, so a batch that does not need this
+    pays one buffer read per column and no copy.
+    """
+    columns = list(batch.columns)
+    rebased = False
+    for index, column in enumerate(columns):
+        if _offset_base(column):
+            columns[index] = pa.concat_arrays([column])
+            rebased = True
+    if not rebased:
+        return batch
+    return pa.RecordBatch.from_arrays(columns, schema=batch.schema)
+
+
 @dataclass(frozen=True, slots=True)
 class ArrowBlockSplit:
     """A contiguous run of record-batch blocks within one Arrow IPC file.
@@ -161,7 +217,10 @@ class ArrowIPCSink(FileSink):
         ipc = _require_ipc()
         options = ipc.IpcWriteOptions(compression=self.compression)
         with ipc.new_file(fh, table.schema, options=options) as writer:
-            writer.write_table(table)
+            # Per batch rather than `write_table`, so each one passes through the offset
+            # rebase. A table assembled from engine batches carries the same chunks.
+            for batch in table.to_batches():
+                writer.write_batch(_rebase_offsets(batch))
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:
         ipc = _require_ipc()
@@ -169,7 +228,7 @@ class ArrowIPCSink(FileSink):
         return ipc.new_file(fh, schema, options=options)
 
     def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
-        writer.write_batch(batch)
+        writer.write_batch(_rebase_offsets(batch))
 
     def _close_stream_writer(self, writer: Any) -> None:
         writer.close()

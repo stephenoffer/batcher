@@ -6,11 +6,56 @@
 //! `bc_resource::MemoryPool` it wraps.
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
-/// A process-wide memory accounting pool (Carbonite's reserve-before-allocate
-/// enforcement primitive, from `bc-resource`). Carbonite sets the limit from its
-/// memory envelope and reserves/releases against it so the engine spills instead
-/// of OOMing. Accounts bytes; it does not allocate them.
+/// What the **data plane's** process-wide pool is holding, or `None` if none exists yet.
+///
+/// The engine and the control plane account against two different `MemoryPool` objects.
+/// `execute_plan` reserves operator state against the process-wide pool (and the Flight
+/// shuffle store registers there as a spillable consumer); Carbonite's Python `BufferPool`
+/// wraps a pool it constructs itself and charges its own coarse per-query reservations to
+/// it. Neither can see the other, which left the control plane's pressure reading blind to
+/// the reservations that dominate a real query — it could only infer them from process RSS.
+///
+/// This closes that in the safe direction, by *reading*. Merging the two counters would
+/// double-count every query: Carbonite reserves the plan's estimated peak for the duration
+/// of execution and the engine then reserves the same operator's actual bytes, so a plan
+/// sized at 60% of the budget would leave the engine 40% and spill at half its envelope.
+///
+/// Returns:
+///     A dict of `limit_bytes`, `used_bytes`, `available_bytes`, `peak_used_bytes`,
+///     `denied`, `spill_requests` and `utilization`, or `None` when no query has run under
+///     a memory budget in this process. `None` is deliberately distinct from a dict of
+///     zeros, which would assert something about a pool that has never existed.
+#[pyfunction]
+pub(crate) fn engine_pool_stats(py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+    let Some(pool) = crate::process::shared_memory_pool_if_created() else {
+        return Ok(None);
+    };
+    let stats = pool.stats();
+    let out = PyDict::new(py);
+    out.set_item("limit_bytes", stats.limit as u64)?;
+    out.set_item("used_bytes", stats.used as u64)?;
+    out.set_item(
+        "available_bytes",
+        stats.limit.saturating_sub(stats.used) as u64,
+    )?;
+    out.set_item("peak_used_bytes", stats.peak_used as u64)?;
+    out.set_item("denied", stats.denied as u64)?;
+    out.set_item("spill_requests", stats.spill_requests as u64)?;
+    out.set_item("utilization", stats.utilization())?;
+    Ok(Some(out.unbind()))
+}
+
+/// A memory accounting pool (Carbonite's reserve-before-allocate enforcement primitive,
+/// from `bc-resource`). Carbonite sets the limit from its memory envelope and
+/// reserves/releases against it so the engine spills instead of OOMing. Accounts bytes; it
+/// does not allocate them.
+///
+/// **Constructing one makes a new, independent pool** — not a handle to the process-wide
+/// pool `execute_plan` charges operator state to. The two are separate budgets on purpose
+/// (see [`engine_pool_stats`], which is how the control plane reads the other one), so
+/// every counter below describes only the reservations made through *this* object.
 #[pyclass]
 pub(crate) struct MemoryPool {
     inner: std::sync::Arc<bc_resource::MemoryPool>,
@@ -65,8 +110,9 @@ impl MemoryPool {
     /// High-water mark of concurrently-reserved bytes over this pool's life.
     ///
     /// A live `used` reading cannot be recovered after the fact, and after the fact is
-    /// when anyone asks how close a query ran to its envelope. Measured in the data plane
-    /// so it also counts reservations the control plane never made.
+    /// when anyone asks how close a query ran to its envelope. Operator state and the
+    /// Flight transit buffers are charged to the *engine's* pool, so their peak is in
+    /// [`engine_pool_stats`] rather than here.
     #[getter]
     fn peak_used(&self) -> u64 {
         self.inner.peak_used() as u64

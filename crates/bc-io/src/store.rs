@@ -20,6 +20,14 @@ use crate::IoError;
 pub(crate) struct Resolved {
     pub store: Arc<dyn ObjectStore>,
     pub path: object_store::path::Path,
+    /// Whether reads go over the network (`s3://`, `gs://`, `az://`, `http(s)://`) rather
+    /// than to a local file.
+    ///
+    /// The distinction is a *throughput* one, and it is what [`crate::split_read`] keys off.
+    /// A remote GET is limited to roughly one connection's bandwidth however large the range
+    /// is, so a big read has to be split across several to go fast; a local read is served by
+    /// the page cache at memory speed and splitting it only adds syscalls.
+    pub remote: bool,
 }
 
 /// Process-wide cache of built object stores, keyed by `(scheme, host, sorted-options)`.
@@ -43,11 +51,16 @@ pub(crate) fn resolve(uri: &str) -> Result<Resolved, IoError> {
         let store = cached_store("file::local", || {
             Ok(Arc::new(object_store::local::LocalFileSystem::new()) as Arc<dyn ObjectStore>)
         })?;
-        return Ok(Resolved { store, path });
+        return Ok(Resolved {
+            store,
+            path,
+            remote: false,
+        });
     }
 
     let url = Url::parse(uri).map_err(|e| IoError::Uri(format!("{uri}: {e}")))?;
-    let opts = store_options(&url);
+    let mut opts = store_options(&url);
+    resolve_s3_region(&url, &mut opts);
     // The path within the store is per-object (not cached); the store (connection pool +
     // resolved credentials) is keyed by scheme+host+options so it is built once and reused.
     let key = format!(
@@ -64,25 +77,143 @@ pub(crate) fn resolve(uri: &str) -> Result<Resolved, IoError> {
             .map_err(|e| IoError::Store(format!("{url2}: {e}")))?;
         Ok(Arc::from(store))
     })?;
-    // Re-derive just the object path (cheap, no I/O) from the URL the cached store covers.
-    let (_s, path) =
-        object_store::parse_url(&url).map_err(|e| IoError::Store(format!("{uri}: {e}")))?;
-    Ok(Resolved { store, path })
+    // Re-derive just the object path from the URL the cached store covers.
+    //
+    // This asks `ObjectStoreScheme::parse` and NOT `object_store::parse_url`, even though the
+    // latter reads as the obvious counterpart to the `parse_url_opts` above and returns the
+    // same `Path`. `parse_url` **builds an entire second store** and drops it — for `s3://`
+    // that means an `AmazonS3Builder::build()`, whose `reqwest` client loads and parses the
+    // system root-certificate bundle. Measured on this bucket: **~83 ms per call**, against
+    // ~3 us for the path alone. Paid once per file read, it was ~85 s of CPU across a
+    // 1,024-file scan — the single largest term in it, and invisible as anything but "the
+    // reader is slow", because the store it built was never used for anything.
+    //
+    // `parse_url_opts` derives its `Path` by calling exactly this function (then a
+    // `Path::parse` that is idempotent over an already-parsed path), so the result is
+    // identical for every scheme — including the bucket-stripping the HTTPS forms of S3 and
+    // Azure need, which a plain `Path::from_url_path(url.path())` would get wrong.
+    let (scheme, path) = object_store::ObjectStoreScheme::parse(&url)
+        .map_err(|e| IoError::Store(format!("{uri}: {e}")))?;
+    // `file://` reaches here as a URL but is still a local read, so it must not be split.
+    let remote = !matches!(scheme, object_store::ObjectStoreScheme::Local);
+    Ok(Resolved {
+        store,
+        path,
+        remote,
+    })
 }
 
-/// Get a cached store for `key`, building it with `build` on first sight.
+/// The bucket whose region needs looking up, or `None` when it must not be asked for.
+///
+/// Pure, and separated from the lookup so the guards can be tested without a network: which
+/// URLs skip the `HeadBucket` is the whole safety argument, and every one of them (a non-S3
+/// scheme, an explicit region, a custom endpoint) is a case where the call is either wrong or
+/// pointless.
+fn region_lookup_bucket<'a>(url: &'a Url, opts: &[(String, String)]) -> Option<&'a str> {
+    if url.scheme() != "s3" && url.scheme() != "s3a" {
+        return None;
+    }
+    let has = |k: &str| opts.iter().any(|(name, _)| name == k);
+    // An explicit region needs no lookup. A custom endpoint (MinIO, Ceph, a test double) is
+    // not AWS: `HeadBucket` against `<bucket>.s3.amazonaws.com` would query a bucket that is
+    // not the one being read, and the cross-region redirect it exists to avoid cannot happen.
+    if has("aws_region") || has("aws_endpoint") {
+        return None;
+    }
+    url.host_str()
+}
+
+/// Fill in an S3 bucket's region when nothing configured one, by asking S3.
+///
+/// **This was the single largest term in the scan benchmark, and it is not an engine cost at
+/// all.** With no region, `object_store` signs for `us-east-1`; a bucket living anywhere else
+/// then answers every single request with a redirect, so each GET costs two round trips and a
+/// re-sign. Measured on `scan-sum1-many_small` (1,024 objects in `us-west-2`): **5,369 ms with
+/// no region set against 281.7 ms with `AWS_REGION=us-west-2`** — the same code, a 19x
+/// difference, and the reason Batcher looked 7-9x behind DuckDB on that suite. DuckDB's own
+/// adapter issues `SET s3_region=...`, and PyArrow's `S3FileSystem` resolves the bucket's
+/// region for itself, so both were quietly reading a correctly-addressed bucket while Batcher
+/// redirected on every object.
+///
+/// `resolve_bucket_region` is one `HeadBucket` call, cached here per bucket for the life of the
+/// process, so a whole scan pays it once. It runs only when the region is genuinely absent —
+/// an explicit `?region=`, `AWS_REGION`, or a custom `endpoint` (MinIO/Ceph, where the call
+/// would be meaningless and the redirect cannot happen) all skip it. A failure is ignored
+/// rather than raised: the previous behaviour was to sign for `us-east-1` and it must remain
+/// the fallback, since a bucket that really is there is better served slowly than not at all.
+fn resolve_s3_region(url: &Url, opts: &mut Vec<(String, String)>) {
+    let Some(bucket) = region_lookup_bucket(url, opts) else {
+        return;
+    };
+    let bucket = bucket.to_string();
+    let bucket = bucket.as_str();
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Held across the lookup for the same single-flight reason `cached_store` is: the callers
+    // fan out hundreds of tasks at once, and without it every one of them would issue its own
+    // `HeadBucket` for the same bucket.
+    let mut guard = cache.lock().unwrap();
+    let region = guard
+        .entry(bucket.to_string())
+        .or_insert_with(|| head_bucket_region(bucket));
+    if let Some(region) = region {
+        opts.push(("aws_region".into(), region.clone()));
+    }
+}
+
+/// One `HeadBucket` for `bucket`'s region, on a thread of its own.
+///
+/// Its own thread, and its own single-thread runtime, because `resolve` is reached from
+/// *inside* the shared runtime's worker tasks (`read_parquet_async`, `load_metadata_many`) and
+/// `Runtime::block_on` panics when called from within a runtime context. Handing the await to
+/// a plain OS thread and joining it is the one form that is correct from both a sync caller
+/// and an async one. It runs at most once per bucket per process.
+fn head_bucket_region(bucket: &str) -> Option<String> {
+    let bucket = bucket.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        rt.block_on(object_store::aws::resolve_bucket_region(
+            &bucket,
+            &Default::default(),
+        ))
+        .ok()
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+/// Get a cached store for `key`, building it with `build` **once** on first sight.
+///
+/// The build runs under the lock, which is the whole point: it is single-flight, not merely
+/// cached. Releasing the lock to build let every task that missed a cold cache build its own
+/// store, and the callers here miss it *simultaneously* — `load_metadata_many` and
+/// `read_parquet_many` both fan out `file_concurrency()` tasks at once, so a cold read of a
+/// directory built hundreds of S3 clients where it needed one. Each build resolves the
+/// credential chain and loads the system root-certificate bundle (~83 ms; see `resolve`), so
+/// the herd cost seconds and — the tell — got *worse* as concurrency rose. Measured cold over
+/// 1,024 S3 footers: 3.4 s at 8-way, 5.9 s at 64-way, 5.5 s at 384-way, against a warm sweep
+/// that scales the right way (12.0 s -> 158 ms over the same range).
+///
+/// Serializing the build costs nothing real. There is one store per `(scheme, host, options)`
+/// and a process has a handful, so the lock is uncontended after the first read of each; what
+/// used to be N redundant builds is now one build and N-1 waits on its result.
 fn cached_store(
     key: &str,
     build: impl FnOnce() -> Result<Arc<dyn ObjectStore>, IoError>,
 ) -> Result<Arc<dyn ObjectStore>, IoError> {
-    if let Some(s) = store_cache().lock().unwrap().get(key) {
+    let mut cache = store_cache().lock().unwrap();
+    if let Some(s) = cache.get(key) {
         return Ok(Arc::clone(s));
     }
+    // Held across `build` deliberately (see above). `build` is `object_store::parse_url_opts`
+    // — synchronous, and needing neither this cache nor the async runtime — so it cannot
+    // re-enter and cannot deadlock.
     let store = build()?;
-    store_cache()
-        .lock()
-        .unwrap()
-        .insert(key.to_string(), Arc::clone(&store));
+    cache.insert(key.to_string(), Arc::clone(&store));
     Ok(store)
 }
 
@@ -286,6 +417,111 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The region lookup must fire for a plain `s3://` URL and for nothing else.
+    ///
+    /// The `HeadBucket` is one request against `<bucket>.s3.amazonaws.com`, so the cases that
+    /// must skip it are the ones where that host is the wrong thing to ask: a non-AWS scheme,
+    /// and above all a **custom endpoint** — MinIO, Ceph, or a test double, where the answer
+    /// would describe a real AWS bucket of the same name rather than the one being read, and
+    /// where the cross-region redirect the lookup exists to avoid cannot occur anyway.
+    #[test]
+    fn the_region_lookup_fires_only_where_it_is_meaningful() {
+        let bucket_of = |uri: &str| {
+            let url = Url::parse(uri).unwrap();
+            let opts = store_options(&url);
+            region_lookup_bucket(&url, &opts).map(str::to_string)
+        };
+        let _g = env_guard();
+        // Guard against an AWS_REGION in the ambient environment answering for the plain case.
+        let saved = std::env::var("AWS_REGION").ok();
+        let saved_default = std::env::var("AWS_DEFAULT_REGION").ok();
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+
+        assert_eq!(
+            bucket_of("s3://my-bucket/key.parquet").as_deref(),
+            Some("my-bucket"),
+            "a plain s3:// URL with no region anywhere is exactly the case that redirects"
+        );
+        assert_eq!(
+            bucket_of("s3://my-bucket/key.parquet?region=eu-west-1"),
+            None,
+            "an explicit region needs no lookup"
+        );
+        assert_eq!(
+            bucket_of("s3://my-bucket/key.parquet?endpoint=http://minio.local:9000"),
+            None,
+            "a custom endpoint is not AWS: asking s3.amazonaws.com would be a wrong answer"
+        );
+        assert_eq!(
+            bucket_of("gs://my-bucket/key.parquet"),
+            None,
+            "only the S3 schemes"
+        );
+        assert_eq!(bucket_of("https://example.com/key.parquet"), None);
+
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("AWS_REGION", v);
+            }
+            if let Some(v) = saved_default {
+                std::env::set_var("AWS_DEFAULT_REGION", v);
+            }
+        }
+    }
+
+    /// An `AWS_REGION` in the environment must suppress the lookup too — it is the ordinary
+    /// way a deployment configures this, and paying a `HeadBucket` per process on top of it
+    /// would be pure waste.
+    #[test]
+    fn an_environment_region_suppresses_the_lookup() {
+        let _g = env_guard();
+        let saved = std::env::var("AWS_REGION").ok();
+        unsafe { std::env::set_var("AWS_REGION", "ap-south-1") };
+        let url = Url::parse("s3://my-bucket/key.parquet").unwrap();
+        let opts = store_options(&url);
+        assert_eq!(region_lookup_bucket(&url, &opts), None);
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("AWS_REGION", v),
+                None => std::env::remove_var("AWS_REGION"),
+            }
+        }
+    }
+
+    /// A local path must resolve as *not* remote, in both spellings.
+    ///
+    /// `split_read` keys its request splitting off this flag, and a local file misclassified
+    /// as remote would be cut into concurrent range reads the page cache gains nothing from.
+    /// The `file://` form is the one worth pinning: it arrives as a URL and so takes the
+    /// scheme branch, where every other scheme is remote.
+    #[test]
+    fn a_local_path_is_not_remote() {
+        let dir = std::env::temp_dir();
+        let bare = resolve(dir.to_str().unwrap()).expect("bare path resolves");
+        assert!(!bare.remote, "a bare filesystem path is local");
+        let url = format!("file://{}", dir.to_str().unwrap());
+        let via_url = resolve(&url).expect("file:// resolves");
+        assert!(!via_url.remote, "file:// is local, not remote");
+    }
+
+    /// Every network scheme the reader accepts must classify as remote, so its large reads
+    /// are split across connections.
+    #[test]
+    fn network_schemes_are_remote() {
+        let _g = env_guard();
+        for uri in [
+            "s3://bucket/key.parquet?region=us-east-1&anonymous=true",
+            "gs://bucket/key.parquet",
+            "https://example.com/key.parquet",
+        ] {
+            let resolved = resolve(uri).unwrap_or_else(|e| panic!("{uri}: {e}"));
+            assert!(resolved.remote, "{uri} should be remote");
+        }
+    }
+
     /// Static credentials in the environment must reach the builder for every cloud, not
     /// just AWS. Without this the on-prem case (MinIO/Ceph with `AWS_ACCESS_KEY_ID`, where
     /// there is no metadata service to fall back on) fails to authenticate and the scan
@@ -433,6 +669,44 @@ mod tests {
             Some("true")
         );
         assert!(!opts_for("s3://b/k").contains_key("aws_virtual_hosted_style_request"));
+    }
+
+    /// The in-store path must be exactly what `object_store::parse_url` would have returned.
+    ///
+    /// `resolve` derives it with `ObjectStoreScheme::parse` instead, because `parse_url`
+    /// builds and discards a whole store to do it (~83 ms per call on S3, once per file read).
+    /// The two agree by construction — `parse_url_opts` calls this same function — and this
+    /// test is what keeps "make the path derivation cheap" from quietly becoming "make it
+    /// wrong". The bucket-stripping cases are the ones a naive `url.path()` gets wrong: they
+    /// address S3 and Azure through an HTTPS host, where the first path segment is the
+    /// *bucket* and belongs to the store, not to the object.
+    #[test]
+    fn the_object_path_matches_what_parse_url_derives() {
+        for (uri, expected) in [
+            ("s3://bucket/a/b.parquet", "a/b.parquet"),
+            ("s3a://bucket/a/b.parquet", "a/b.parquet"),
+            ("gs://bucket/a/b.parquet", "a/b.parquet"),
+            ("abfss://fs@acct.dfs.core.windows.net/a/b", "a/b"),
+            ("az://container/a/b.parquet", "b.parquet"), // container is stripped
+            ("http://host/a/b.parquet", "a/b.parquet"),
+            ("https://host.example/a/b.parquet", "a/b.parquet"),
+            // Path-style S3 over HTTPS: the leading segment is the bucket.
+            (
+                "https://s3.us-east-1.amazonaws.com/bkt/a/b.parquet",
+                "a/b.parquet",
+            ),
+            // Virtual-hosted S3 over HTTPS: the bucket is in the host, so nothing is stripped.
+            (
+                "https://bkt.s3.us-east-1.amazonaws.com/a/b.parquet",
+                "a/b.parquet",
+            ),
+            // A space and a percent-escape must decode to one unescaped object name.
+            ("s3://bucket/a%20b/c.parquet", "a b/c.parquet"),
+        ] {
+            let url = Url::parse(uri).unwrap();
+            let (_scheme, path) = object_store::ObjectStoreScheme::parse(&url).unwrap();
+            assert_eq!(path.as_ref(), expected, "path for {uri}");
+        }
     }
 
     /// `AWS_ALLOW_HTTP=false` must not switch plain HTTP *on*. It had, because the variable

@@ -17,8 +17,14 @@ from sqlglot import expressions as exp
 from batcher._internal.errors import PlanError
 from batcher._sql.parser import udf
 from batcher._sql.parser.joins import and_conjuncts as _and_conjuncts
-from batcher._sql.parser.joins import outer_theta_join, swap_on_sides
+from batcher._sql.parser.joins import asof_join, is_asof, outer_theta_join, swap_on_sides
 from batcher._sql.parser.joins.lateral import lateral_select, lateral_unnest
+from batcher._sql.parser.table_functions import (
+    is_predict_source,
+    is_series_source,
+    predict_table,
+    series_table,
+)
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
 from batcher.plan.expr_ir import col, lit
@@ -48,8 +54,15 @@ def _from(tr, node) -> Dataset:
         right = _table(tr, join.this)
         on = join.args.get("on")
         using = join.args.get("using")
-        natural = (join.args.get("method") or "").upper() == "NATURAL"
+        method = (join.args.get("method") or "").upper()
+        _reject_unknown_join_method(method)
+        natural = method == "NATURAL"
         how = _join_how(join)
+        if is_asof(join):
+            # Read before the ON path below: an ASOF's inequality is its nearest-match
+            # key, not a theta predicate, and lowering it as one emits every match.
+            ds = asof_join(ds, right, join, how)
+            continue
         if how.endswith("_swapped"):
             # RIGHT SEMI/ANTI: run it as a left-driven semi/anti over swapped operands.
             # The ON predicate must be swapped too — `_split_join_on` reads the equality's
@@ -84,6 +97,27 @@ def _from(tr, node) -> Dataset:
         else:
             ds = _join_on(tr, ds, right, on, how)
     return ds
+
+
+#: The join *methods* this translator lowers. sqlglot puts NATURAL, ASOF and POSITIONAL in
+#: one `method` slot, and a method it does not recognize used to fall through to the
+#: ON/cross-join path with the method silently dropped — so `a POSITIONAL JOIN b` ran as a
+#: cross join and returned 16 rows where DuckDB returns 4. Wrong answers, not errors.
+_JOIN_METHODS = {"", "NATURAL", "ASOF"}
+
+
+def _reject_unknown_join_method(method: str) -> None:
+    """Raise on a join method that would otherwise be dropped on the floor."""
+    if method in _JOIN_METHODS:
+        return
+    if method == "POSITIONAL":
+        raise NotImplementedError(
+            "POSITIONAL JOIN is not supported: it pairs rows by their position in the "
+            "relation, and position is not defined for a Batcher relation (operators are "
+            "morsel-parallel and may run across several nodes). Join on a key, or add an "
+            "explicit row number with row_number() OVER (ORDER BY ...) to both sides first"
+        )
+    raise NotImplementedError(f"{method} JOIN is not supported")
 
 
 def _join_how(join) -> str:
@@ -213,7 +247,17 @@ def _join_keeping_both_keys(
     # its own column — the reference that named it came from the right side.
     restore = {k: col(s) for s, k in shadow_l.items()}
     restore.update({k: col(s) for s, k in shadow_r.items()})
-    return joined.with_columns(**restore).drop(*shadow_l, *shadow_r)
+    out = joined.with_columns(**restore).drop(*shadow_l, *shadow_r)
+    # `join` coalesced the right key away, so restoring it *appends* it — and `SELECT *`
+    # then reported the right side's key last instead of in its own relation's position
+    # (`a, g, id` where SQL says `a, id, g`). Put the columns back in left-then-right
+    # order. Guarded, because the reorder is only expressible while every name is
+    # distinct and still present; a collision the disambiguator could not reach leaves
+    # the order alone rather than dropping a column.
+    natural = [*left.columns, *right.columns]
+    if len(set(natural)) == len(natural) and set(natural) == set(out.columns):
+        out = out.select(*natural)
+    return out
 
 
 def _outer_join_residual(tr, left: Dataset, right: Dataset, extra, how: str):
@@ -308,6 +352,19 @@ def _table(tr, node) -> Dataset:
     # it is applied rather than rejected. Deferred until after the base relation is
     # resolved (it needs the table's column list to infer the index columns).
     pivots = node.args.get("pivots") if getattr(node, "args", None) else None
+
+    # FROM generate_series(a, b) / range(a, b) — a generated integer spine. Read before
+    # the registered-function lookup below, which has no name to look up for these and
+    # reported `unknown table ''`.
+    if is_series_source(node):
+        return _apply_tablesample(series_table(node), node)
+
+    # FROM ML_PREDICT(t, model) / FROM ML.PREDICT(MODEL m, TABLE t) — model scoring. Read
+    # before the registered-function lookup for the same reason as the series above: the
+    # BigQuery spelling carries no function name to look up, and the neutral one is a
+    # built-in rather than something the user registered.
+    if is_predict_source(node):
+        return _apply_tablesample(predict_table(tr, node), node)
 
     # FROM f(t) — a registered table function (`f` wraps the relation argument).
     if isinstance(node, exp.Table) and isinstance(node.this, exp.Anonymous):

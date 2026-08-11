@@ -159,3 +159,39 @@ def test_learning_curve_rejects_a_bad_holdout(problem) -> None:
 def test_learning_curve_rejects_a_bad_fraction(problem) -> None:
     with pytest.raises(PlanError, match="fraction"):
         learning_curve(problem, _fit, _predict, y_true="y", metric=_r2, fractions=[1.5])
+
+
+def test_the_native_estimators_satisfy_the_estimator_protocol() -> None:
+    """`Estimator` describes the shape the estimators already have, not a new one imposed.
+
+    The protocol was written to give cross-validation, tuning and interpretation one name for
+    "a thing you can fit" instead of the three different callable conventions they had. That
+    is only worth anything if it matches what `batcher.ml` actually ships — so check the
+    families that fit by different means (closed form, Lloyd's, IRLS) all conform.
+    """
+    from batcher.ml._estimator import Estimator
+    from batcher.ml.cluster import KMeans
+    from batcher.ml.discriminant import LinearDiscriminantAnalysis
+    from batcher.ml.glm import PoissonRegressor
+    from batcher.ml.linear import LinearRegression, LogisticRegression
+
+    for cls in (
+        LinearRegression,
+        LogisticRegression,
+        KMeans,
+        PoissonRegressor,
+        LinearDiscriminantAnalysis,
+    ):
+        assert isinstance(cls.__new__(cls), Estimator), cls.__name__
+
+
+def test_the_estimator_protocol_rejects_a_mis_shaped_object() -> None:
+    """A protocol satisfied by everything would be a comment, not a check."""
+    from batcher.ml._estimator import Estimator
+
+    class OnlyFits:
+        def fit(self, ds: Any) -> Any:
+            return self
+
+    assert not isinstance(OnlyFits(), Estimator)
+    assert not isinstance(object(), Estimator)

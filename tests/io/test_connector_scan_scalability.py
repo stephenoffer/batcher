@@ -86,26 +86,41 @@ def test_orc_single_stripe_row_count_is_exact_and_free(tmp_path, monkeypatch):
     assert splits[0].row_count() == 500
 
 
-def test_orc_footer_is_cached_across_split_metadata_calls(tmp_path):
-    """Repeated metadata questions must not re-open the file and re-parse the footer."""
+def test_orc_footer_is_cached_across_split_metadata_calls(tmp_path, monkeypatch):
+    """Repeated metadata questions must not re-open the file and re-parse the footer.
+
+    Counts the *footer reads* rather than a cache's hit/miss bookkeeping. The cache is a
+    bounded `FileMetaCache` shared with the Parquet readers rather than a `functools.
+    lru_cache`, so there are no counters to read — and the read count is the quantity the
+    cache exists to hold down anyway (~100 ms per footer round trip on object storage).
+    """
     pytest.importorskip("pyarrow.orc")
     from batcher.io.formats.structured import orc as orc_mod
 
     path = str(tmp_path / "t.orc")
     _write_orc(path)
 
-    orc_mod._orc_footer_cached.cache_clear()
+    orc_mod._ORC_FOOTERS.clear()
+    reads = {"n": 0}
+    real = orc_mod._read_orc_footer
+
+    def counting(p):
+        reads["n"] += 1
+        return real(p)
+
+    monkeypatch.setattr(orc_mod, "_read_orc_footer", counting)
+
     source = orc_mod.ORCSource(path)
     splits = source.splits()
+    assert len(splits) > 1, "a single split would not exercise the sharing"
 
-    before = orc_mod._orc_footer_cached.cache_info()
+    after_planning = reads["n"]
     for s in splits:
         s.schema()
         s.row_count()
-    after = orc_mod._orc_footer_cached.cache_info()
 
-    assert after.misses == before.misses, "the footer was re-read after being cached"
-    assert after.hits > before.hits
+    assert reads["n"] == after_planning, "the footer was re-read after being cached"
+    assert after_planning >= 1, "the footer was never read at all"
 
 
 def test_orc_footer_cache_sees_a_rewritten_file(tmp_path):

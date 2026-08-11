@@ -8,7 +8,7 @@ Batcher's answer is to execute the plan one *pipeline breaker* at a time. A brea
 
 ## How it compares to other engines
 
-Re-planning mid-query isn't unique to Batcher, and the honest comparison is narrower than it first looks.
+Re-planning mid-query isn't unique to Batcher. What is different is where the loop can run and what it keeps.
 
 ![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running on a single node, and carrying what was learned into the next run. DuckDB optimizes once and keeps no cross-run state. Spark AQE re-plans at stage boundaries but needs shuffle stages and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the same loop on a single node, and carries sketches, calibrated costs, and a bandit into the next run.](/_static/diagrams/adaptive_positioning.svg)
 
@@ -66,7 +66,7 @@ Kyber optimizes the logical plan once, up front. Then each round does the follow
 ```
 
 :::{important}
-Step 5 is what makes this work. A collected table is spliced back as an `InMemorySource` with a known row count, so its cardinality carries `Provenance.EXACT`. The next iteration isn't merely re-optimized. It's optimized on a plan where one subtree's size is *known*. Join order, build-side choice, and broadcast eligibility above that point are decided against a fact rather than a guess.
+Step 5 is what makes this work. A collected table is spliced back as an {py:class}`InMemorySource <batcher.io.InMemorySource>` with a known row count, so its cardinality carries `Provenance.EXACT`. The next iteration isn't merely re-optimized. It's optimized on a plan where one subtree's size is *known*. Join order, build-side choice, and broadcast eligibility above that point are decided against a fact rather than a guess.
 :::
 
 On the distributed path a stage can stay partitioned on disk or on the Flight fleet instead of collecting to the driver, and its `row_count` feeds the next round the same way. A large multi-stage query never funnels every breaker's output through driver memory.
@@ -87,23 +87,25 @@ Staging isn't *triggered* by a bad estimate. Staging is the default, and a *good
 
 The economics justify the inversion. Each stage costs roughly 20 to 40 ms of control plane. If the estimator is already tracking reality, buying another measurement is pure overhead. If it isn't, every additional measurement is worth more than it costs.
 
-The consequence worth being honest about: on a query whose estimates are accurate, the loop adapts at exactly one breaker and then behaves like a static optimizer. Re-planning at every breaker happens only while estimates keep missing, which is the case the mechanism exists for.
+On a query whose estimates are accurate, the loop adapts at exactly one breaker and then stops paying for measurements it does not need. Re-planning at every breaker happens while estimates keep missing, which is the case the mechanism exists for.
 
 The early exit has one guard. A residual plan that still has no one-shot distributed path, such as a 4-table bushy join, keeps staging regardless of accuracy, because the dispatcher would otherwise refuse it. The shortcut may skip re-optimization, never the staging a plan structurally requires.
 
 ## When it turns on
 
-`adaptive="auto"` is the default on `collect()`. `gating.resolve_adaptive` asks measured history first and falls back to a structural heuristic:
+`adaptive="auto"` is the default on {py:meth}`collect() <batcher.Dataset.collect>`. `gating.resolve_adaptive` asks measured history first and falls back to a structural heuristic:
 
 - The plan requires staging on the distributed path, such as a 3-or-more-table star join that the one-shot dispatcher can't route at all. There staging isn't an optimization, it's the only distributed path, and it always wins.
 - Otherwise the `MetadataHub` decides, if it has measured this plan signature on both routes. `learned_adaptive_route` is a two-arm bandit over `staged` and `one_shot`, keyed by plan signature and rewarded with the whole query's wall time. Staging only re-plans equivalent algebra, so both arms return the identical relation.
-- With no history, the structural heuristic decides: the plan has a join, its total scan rows clear `_ADAPTIVE_MIN_INPUT_ROWS` (20,000,000, a hard-coded module constant in `gating.py` rather than a config knob), and some join operand is both non-streamable and sized by a merely-default-provenance estimate.
+- With no history, the structural heuristic decides: the plan has a join, its total scan rows clear `_ADAPTIVE_MIN_ROWS_PER_STAGE` (5,000,000, a hard-coded module constant in `gating.py` rather than a config knob) multiplied by the number of pipeline breakers the loop would cut at, and some join operand is both non-streamable and sized by a merely-default-provenance estimate.
+
+That floor is charged per cut rather than per query, because that is what staging costs. One breaker-produced operand is one materialization, one re-plan, and the fusion given up at one boundary; a snowflake pays that six times over. A single flat number has to be set for the worst shape it will meet, and the flat 20,000,000 this replaced was: it kept the loop away from the many-join shapes that measurably lost, at the price of never reaching the cheap two-breaker shapes at all. Per-stage, the same arithmetic lands at 20M for a four-cut plan, 10M for a two-cut one, and 30M for a six-cut one.
 
 The bandit matters more than it sounds, because staging is not the planning round-trip the structural gate was priced against. The loop runs one breaker per stage, so it materializes every join separately and gives up both operator fusion and the streaming executor's width. On TPC-H sf10 with warm statistics that costs a multiple of the whole query: q8 887 ms staged against 142 ms one-shot, q17 476 against 105, q2 205 against 32, and q5 running at 1.9x parallelism on a 96-core machine where the one-shot plan reaches 22.6x. The structural heuristic fires on nearly every multi-join query at that scale, and nothing used to measure whether it paid.
 
 It is a bandit rather than a rule because which route wins is not a constant of the plan. Staging is the only distributed route for some shapes; it is what earns the statistics a cold shape has not learned yet; and the cost of a mis-estimated plan grows with the data. Exploration is bounded at roughly one run of the losing arm per signature, and the arms are re-explored as their measurements age (the discounted-UCB horizon in `bandit.py`).
 
-So on a small single-node query, adaptive is off and stays off. That floor exists because a sub-second query can't afford a staging round-trip to learn something it could have guessed. The gate reads exact source row counts, which separates scales cleanly: TPC-H sf1 is roughly 9M rows and stays off, sf10 is roughly 90M and turns on. Below 20M rows you can still force it with `adaptive=True`.
+So on a small single-node query, adaptive is off and stays off. That floor exists because a sub-second query can't afford a staging round-trip to learn something it could have guessed. The gate reads exact source row counts, which separates scales cleanly: TPC-H sf1 is roughly 9M rows and stays off, sf10 is roughly 90M and turns on. Below its own floor you can still force it with `adaptive=True`.
 
 ## Two feedback loops, one measurement layer
 

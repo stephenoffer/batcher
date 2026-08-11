@@ -7,19 +7,24 @@ their first argument.
 
 from __future__ import annotations
 
-import sys
-
 from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
 from batcher._sql.parser import windowing
 from batcher._sql.parser.core_utils import (
+    _alias_of,
     _has_aggregate,
+    _is_star,
     _positional,
+    _positional_output,
+    _row_window,
     _unwrap_alias,
     _within_group_to_agg,
 )
+from batcher._sql.parser.joins.lateral import select_unnest
+from batcher._sql.parser.subquery import core as subquery
 from batcher.api.dataset import Dataset
+from batcher.plan.expr_ir import col
 
 
 def _filter_to_case(node):
@@ -75,7 +80,9 @@ def _project_ordered(tr, ds: Dataset, named, order, projections) -> Dataset:
     if order is None:
         return ds.select(**named)
     ds = ds.with_columns(**named)
-    ds = _order(tr, ds, order, projections)
+    # `with_columns` keeps the input columns in scope for the sort, so ORDER BY ALL is
+    # given the projection's own columns rather than everything currently visible.
+    ds = _order(tr, ds, order, projections, output=list(named))
     return ds.select(*named.keys())
 
 
@@ -120,8 +127,18 @@ def _select(tr, node) -> Dataset:
         # before the predicate references it.
         ds, (residual,) = tr._hoist_udfs(ds, [residual])
         ds = ds.filter(tr._scalar(residual))
+        # An `EXISTS` or `IN (SELECT …)` under `OR` became a column so the predicate above
+        # could read it (see `subquery.core._exists_marker` / `_in_marker`). It has served
+        # its purpose now, and it is an implementation detail rather than an output column
+        # — `SELECT *` must not see it.
+        spent = [c for c in ds.columns if c.startswith(subquery.MARKER_PREFIXES)]
+        if spent:
+            ds = ds.drop(*spent)
 
     projections = node.expressions  # SELECT list
+    # `SELECT unnest(xs)` expands the relation the projection is about to read, so it is
+    # applied here — after WHERE, which SQL evaluates first, and before the projection.
+    ds = select_unnest(tr, ds, projections)
     group = node.args.get("group")
     order = node.args.get("order")
     limit = node.args.get("limit")
@@ -157,14 +174,22 @@ def _select(tr, node) -> Dataset:
     elif has_window and not has_agg:
         # Windows buried inside larger expressions become synthetic columns the
         # projection then reads; whole-item windows keep their user alias directly.
+        # `lag/lead(x, n, default)` becomes a CASE over supported window functions,
+        # before hoisting, so the constructs it introduces are hoisted with the rest.
+        windowing.rewrite_offset_defaults(projections)
         projections, nested = windowing.hoist_nested_windows(projections)
+        # `*` expands the columns the query selects *from*, so it is captured before the
+        # window pass adds its output columns. Reading them afterwards made
+        # `SELECT *, sum(x) OVER (...) AS s` expand the star over `s` as well and emit it
+        # twice, where DuckDB emits it once.
+        star_cols = list(ds.columns)
         ds = tr._window(ds, [*projections, *nested])
         # QUALIFY filters on the window-function results (named by their SELECT
         # alias) — applied after the window columns exist, before the projection
         # drops any not in the final SELECT.
         if qualify is not None:
             ds = ds.filter(tr._scalar(qualify.this))
-        named = tr._projection_map(ds, projections)
+        named = tr._projection_map(ds, projections, star_cols)
         ds = _project_ordered(tr, ds, named, order, projections)
     elif qualify is not None:
         if has_agg:
@@ -185,6 +210,7 @@ def _select(tr, node) -> Dataset:
         # the window items are handed to the aggregate path rather than computed first.
         windows = None
         if has_window:
+            windowing.rewrite_offset_defaults(projections)
             projections, nested = windowing.hoist_nested_windows(projections)
             windows = [*(p for p in projections if tr._is_window(p)), *nested]
         ds, named = tr._aggregate(ds, projections, group, node.args.get("having"), windows, order)
@@ -203,14 +229,15 @@ def _select(tr, node) -> Dataset:
     if distinct is not None and distinct_on is None:
         ds = ds.distinct()
         if deferred_order is not None:
+            deferred_order = _retarget_order_to_aliases(deferred_order, projections)
+            deferred_order = _retarget_positional_order(deferred_order, projections)
             ds = tr._order(ds, deferred_order, projections)
     tr._agg_map = None
 
     if limit is not None or offset is not None:
-        skip = int(offset.expression.this) if offset is not None else 0
-        # A bare OFFSET (no LIMIT) keeps every row after `skip`; the engine takes
-        # min(n, remaining), so sys.maxsize means "all remaining".
-        n = int(limit.expression.this) if limit is not None else sys.maxsize
+        # A bare OFFSET (no LIMIT) keeps every row after the skip; the engine takes
+        # min(n, remaining), so the helper's sys.maxsize means "all remaining".
+        n, skip = _row_window(limit, offset)
         ds = ds.limit(n, offset=skip)
     return ds
 
@@ -220,9 +247,14 @@ def _qualify_windows(tr, ds: Dataset, qualify):
 
     `QUALIFY row_number() OVER (...) = 1` filters on a value the SELECT list never
     mentions, so the column has to be materialized before the filter can reference it.
-    Each window expression in the predicate becomes a `__qualify<n>` column and is
+    Each window expression in the predicate becomes a `__bc_qualify<n>` column and is
     replaced in the predicate by a reference to it; the projection that follows selects
     only the user's columns, so the helpers never reach the output.
+
+    The `__bc_` prefix is load-bearing, not cosmetic: it is what the projection builder
+    filters out of a star expansion. Under the bare `__qualify<n>` these columns *did*
+    reach the output — ``SELECT * FROM t QUALIFY row_number() OVER (...) = 1`` returned
+    an extra ``__qualify0`` column that no query asked for.
 
     A QUALIFY with no window function is just a WHERE over the current columns and is
     returned unchanged.
@@ -241,7 +273,7 @@ def _qualify_windows(tr, ds: Dataset, qualify):
         return ds, pred
     synthetic = []
     for i, win in enumerate(windows):
-        alias = f"__qualify{i}"
+        alias = f"__bc_qualify{i}"
         # Copy before replacing: `synthetic` must keep the window expression itself,
         # while `pred` keeps only the reference to its output column.
         synthetic.append(exp.alias_(win.copy(), alias))
@@ -267,18 +299,128 @@ def _reject_udf_in_agg_window(tr, node, projections) -> None:
         )
 
 
-def _order(tr, ds: Dataset, order, projections=None) -> Dataset:
+def _is_order_all(order) -> bool:
+    """Whether this ORDER BY is DuckDB's ``ORDER BY ALL`` — sort by every output column.
+
+    sqlglot leaves the bare ``ALL`` keyword as a `Var`, which the scalar path rejected as
+    an unsupported expression, so the whole (valid) query failed.
+    """
+    items = order.expressions
+    return (
+        len(items) == 1
+        and isinstance(items[0].this, exp.Var)
+        and items[0].this.name.upper() == "ALL"
+    )
+
+
+def _retarget_order_to_aliases(order, projections):
+    """Rewrite `ORDER BY <source column>` to the alias the projection gave it.
+
+    With `DISTINCT` the sort runs *after* the projection (deduping is a hash operation and
+    does not preserve order, so sorting first would discard the ORDER BY). That is correct,
+    but it means the sort sees the projection's *output* names — and
+    `SELECT DISTINCT f AS r FROM t ORDER BY f` names the input one. SQL resolves that
+    perfectly well, because `f` does appear in the SELECT list; the relation simply no
+    longer has a column called `f` by the time the sort runs, so it failed with
+    "sort key references unknown column(s) ['f']".
+
+    Only a *bare rename* is retargeted (`f AS r`), which is the case where the two names
+    denote the same values. A computed projection is left alone: `ORDER BY f` beside
+    `SELECT DISTINCT f * 2 AS r` is a genuinely unresolvable query, and it should keep
+    saying so rather than silently sorting by something else.
+    """
+    if projections is None:
+        return order
+    rename: dict[str, str] = {}
+    produced: set[str] = set()
+    for p in projections:
+        alias = _alias_of(p)
+        inner = _unwrap_alias(p)
+        if alias:
+            produced.add(alias)
+        if alias and isinstance(inner, exp.Column) and inner.name != alias:
+            rename.setdefault(inner.name, alias)
+    # An output column wins over a source column of the same name, which is SQL's own
+    # resolution order and is not a nicety: `SELECT DISTINCT g AS f, f AS g ... ORDER BY f`
+    # swaps the two names, so retargeting `f` to its source's alias would sort by the
+    # *other* column. Silently.
+    rename = {src: alias for src, alias in rename.items() if src not in produced}
+    if not rename:
+        return order
+    retargeted = order.copy()
+    for item in retargeted.expressions:
+        target = item.this
+        if isinstance(target, exp.Column) and target.name in rename:
+            item.set("this", exp.column(rename[target.name]))
+    return retargeted
+
+
+def _retarget_positional_order(order, projections):
+    """Rewrite `ORDER BY <n>` to the alias of the n-th SELECT item, for the DISTINCT path.
+
+    `ORDER BY 1` resolves to the SELECT item's *expression*, which after `SELECT DISTINCT
+    f AS r` is the source column `f` — gone from the relation by the time the deferred sort
+    runs, exactly as the named form was. Resolving it to the output name instead keeps the
+    positional and named spellings behaving the same way, which is the only defensible
+    outcome: `ORDER BY 1` and `ORDER BY f` are the same request.
+    """
+    if projections is None:
+        return order
+    retargeted = order.copy()
+    for item in retargeted.expressions:
+        target = item.this
+        if not (isinstance(target, exp.Literal) and not target.is_string):
+            continue
+        try:
+            selected = _positional(projections, target, "ORDER BY")
+        except Exception:  # an out-of-range position keeps its own error, raised later
+            continue
+        alias = _alias_of(selected)
+        if alias:
+            item.set("this", exp.column(alias))
+    return retargeted
+
+
+def _order_all(ds: Dataset, order, output: list[str]) -> Dataset:
+    """``ORDER BY ALL`` — sort by each output column, left to right.
+
+    The single ``ALL`` item carries the direction and null placement for every key, which
+    is DuckDB's reading: ``ORDER BY ALL DESC`` sorts every column descending.
+    """
+    item = order.expressions[0]
+    descending = bool(item.args.get("desc"))
+    nulls_first = bool(item.args.get("nulls_first"))
+    keys = [col(c) for c in output]
+    if not keys:
+        return ds
+    return ds.sort(
+        *keys, descending=[descending] * len(keys), nulls_first=[nulls_first] * len(keys)
+    )
+
+
+def _order(tr, ds: Dataset, order, projections=None, output: list[str] | None = None) -> Dataset:
     # ORDER BY accepts arbitrary expressions (columns, functions, arithmetic),
     # resolved the same way as any scalar — including aggregate outputs in a
     # grouped query (via `_scalar`'s aggregate-output resolution) — and the
     # 1-based positional form `ORDER BY <n>` referring to a SELECT item.
+    if _is_order_all(order):
+        # `output` is the projection's own column list where the caller knows it; the
+        # relation's columns otherwise (a set operation, or a sort after DISTINCT, where
+        # the relation *is* the projected output).
+        return _order_all(ds, order, output if output is not None else list(ds.columns))
     keys: list = []
     desc: list[bool] = []
     nulls_first: list[bool] = []
+    # A `SELECT *` in the list makes every position after it ambiguous against the AST,
+    # so positions are resolved against the projection's own output names instead.
+    by_output = output is not None and projections is not None and any(map(_is_star, projections))
     for o in order.expressions:
         target = o.this
         if projections is not None and isinstance(target, exp.Literal) and not target.is_string:
-            target = _unwrap_alias(_positional(projections, target, "ORDER BY"))
+            if by_output:
+                target = exp.column(_positional_output(output, target, "ORDER BY"))
+            else:
+                target = _unwrap_alias(_positional(projections, target, "ORDER BY"))
         keys.append(tr._scalar(target))
         desc.append(bool(o.args.get("desc")))
         # sqlglot normalizes an absent NULLS clause to `nulls_first=False`, which is

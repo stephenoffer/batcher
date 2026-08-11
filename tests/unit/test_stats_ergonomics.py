@@ -178,10 +178,21 @@ def clean_metrics():
 def test_metrics_snapshot_shape(clean_metrics):
     snap = metrics_snapshot()
     assert sorted(snap) == [
+        # Which execution tier ran the per-row work, per operator — the only way to see the
+        # JIT silently falling back to the interpreter.
+        "backends",
         "bytes",
+        # What the run cost the *machine*, summed from the engine's whole-execution reading:
+        # CPU across every worker thread, resident-set high-water, page faults, involuntary
+        # context switches, and real block-device bytes. None of it was exported before, so
+        # "is this job CPU-bound or waiting on disk" had no answer from the metrics alone.
+        "cpu",
+        "data_quality",
         "gpu",
         "inference",
+        "io",
         "logs",
+        "memory",
         # Hardware conditions rather than engine counters: a degraded host link, memory
         # repairing itself, an NVLink fabric down. Each leaves a job correct and slow, so
         # none of the counters above can carry it.
@@ -193,10 +204,21 @@ def test_metrics_snapshot_shape(clean_metrics):
         # Recovery used to be entirely unobservable, so a query that transparently
         # survived losing two workers looked identical to one that was merely slow.
         "recovery",
+        # Carbonite's own readings — the buffer-pool envelope and its high-water mark, the
+        # spill store's tiers, the admission queue, the result cache. Every one of them was
+        # measured and readable only by holding the object that owned it.
+        "resources",
         "rows",
         "skipped",
         "spills",
+        # One entry per continuous query. Absent until a stream has run a micro-batch,
+        # which is the one section that stays empty rather than zeroed: a zero here is
+        # indistinguishable from a query that has stopped.
+        "streaming",
         "uptime_seconds",
+        # What the job *produced*: files, rows and bytes on storage, per sink format.
+        # The read side was always countable and this never was.
+        "writes",
     ]
 
 
@@ -239,10 +261,34 @@ def test_metrics_count_operator_time_and_spills(clean_metrics):
 
 
 def test_metrics_count_scanned_rows_and_bytes(clean_metrics):
-    events.publish(events.PROGRESS, query_id="q1", name="p", rows=7, bytes=4096)
+    """Scanned volume comes from the scan operators, on every path.
+
+    It used to come from progress events, which only the `iter_batches` path publishes and
+    which measure rows *delivered* rather than rows read — so a `collect()` reported zero
+    rows scanned however much it read, and a stream reported its own output twice under two
+    names. The scan operator's measured output is what "rows read from sources" means, and
+    the engine reports it whichever terminal op ran.
+    """
+    events.publish(
+        events.STAGE_END,
+        query_id="q1",
+        name="scan",
+        op_id=0,
+        measured=True,
+        rows_out=7,
+        result_bytes=4096,
+    )
     snap = metrics_snapshot()
     assert snap["rows"]["scanned_total"] == 7
     assert snap["bytes"]["scanned_total"] == 4096
+
+
+def test_progress_events_count_as_streamed_volume(clean_metrics):
+    events.publish(events.PROGRESS, query_id="q1", name="p", rows=7, bytes=4096)
+    snap = metrics_snapshot()
+    assert snap["rows"]["streamed_total"] == 7
+    assert snap["bytes"]["streamed_total"] == 4096
+    assert snap["rows"]["scanned_total"] == 0
 
 
 def test_duration_histogram_buckets_are_cumulative(clean_metrics):

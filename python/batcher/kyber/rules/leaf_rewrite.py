@@ -14,6 +14,13 @@ and only falls back to comparing the serialized IR on the path where the object
 actually changed — which is needed because a rule may rebuild an equal-but-new tree,
 and calling that a change would spin the fixpoint forever.
 
+`EXPR_NODES` and `register_leaf_rule` are the other two. The node types that carry
+expressions are one fact about the plan, and sixteen rule modules had each written the
+tuple out; the registration call that turns a leaf into a registered rule is one shape,
+and eleven had each written it out. Neither duplicate was reachable by a change: adding a
+new expression-bearing plan node meant finding sixteen tuples, and none of them named the
+others.
+
 `safe_expr` is the soundness gate. Most algebraic identities are only valid if
 dropping or duplicating a sub-expression preserves the query's *error behavior* as
 well as its value. It answers whether an expression is deterministic and total: a
@@ -47,10 +54,24 @@ from batcher.plan.expr_ir.core import IsInf, IsNan
 from batcher.plan.expr_ir.nodes import Array, HashRows, MakeStruct
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.ir_tags import SAFE_BINARY_OPS
-from batcher.plan.logical import LogicalPlan
+from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
 from batcher.plan.visitor import transform_up
 
-__all__ = ["SAFE_BINARY_OPS", "rewrite_node", "safe_expr", "whole_plan_expr_rule"]
+__all__ = [
+    "EXPR_NODES",
+    "SAFE_BINARY_OPS",
+    "register_leaf_rule",
+    "rewrite_node",
+    "safe_expr",
+    "whole_plan_expr_rule",
+]
+
+#: The plan nodes that carry expressions, and therefore the `matches` of every leaf rule.
+#: One tuple, because it is one fact: a leaf rule rewrites expressions, and these are the
+#: nodes that have any. It was written out identically in sixteen rule modules, so a new
+#: expression-bearing node type would have had to find all sixteen — and nothing would have
+#: failed if it missed one, the rules in that module would simply have stopped firing there.
+EXPR_NODES: tuple[type, ...] = (Filter, Project, Aggregate, Sort, Window)
 
 #: Binary operators that are deterministic and cannot raise. Wrapping add/sub/mul,
 #: the comparisons, and the Kleene boolean connectives are total. Division and modulo
@@ -137,3 +158,54 @@ def rewrite_node(node: LogicalPlan, leaf: Callable[[Expr], Expr]) -> LogicalPlan
     if new is node:  # structural sharing already proved it was a no-op
         return None
     return new if new.to_ir() != node.to_ir() else None
+
+
+def register_leaf_rule(
+    name: str,
+    leaf: Callable[[Expr], Expr],
+    *,
+    expr_matches: tuple[type, ...],
+    expr_ops: tuple[str, ...] | None = None,
+    matches: tuple[type, ...] = EXPR_NODES,
+    phase=None,
+):
+    """Register `leaf` as a normalize-phase rule over every expression-bearing node.
+
+    The last step of writing a leaf rule, and it was the same eleven lines in eleven rule
+    modules: wrap the leaf in `rewrite_node`, declare the plan nodes and the expression
+    shapes it can act on, and add it to the registry. What actually varied between those
+    copies was two arguments, so those are the arguments here.
+
+    `expr_matches` and `expr_ops` are the driver's index, not a behavior: they let it skip a
+    rule for an expression that cannot possibly match, and a rule that under-declares them
+    silently stops firing. Declaring an operator means declaring its **mirror** too wherever
+    the leaf normalizes the computed side to the left, which is why several callers pass
+    `(op, COMPARISON_FLIP[op])`.
+
+    Args:
+        name: The rule's registry name, unique across the optimizer.
+        leaf: The `Expr -> Expr` rewrite, applied bottom-up to every sub-expression.
+        expr_matches: Expression node types the leaf can rewrite.
+        expr_ops: Operator tags the leaf can rewrite, or `None` for every operator.
+        matches: Plan node types to visit. Defaults to every expression-bearing node,
+            which is what all but the schema-guarded rules want.
+        phase: The phase to register in, defaulting to `Phase.NORMALIZE`.
+
+    Returns:
+        Whatever the registry's `add` returns, so a caller can keep using it as a decorator
+        target or discard it as these all do.
+    """
+    from batcher.kyber.registry import DEFAULT_REGISTRY
+    from batcher.kyber.rule import Phase, node_rule
+
+    return DEFAULT_REGISTRY.add(
+        node_rule(
+            name,
+            Phase.NORMALIZE if phase is None else phase,
+            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
+            matches=matches,
+            expr_fn=leaf,
+            expr_matches=expr_matches,
+            expr_ops=expr_ops,
+        )
+    )

@@ -159,7 +159,7 @@ historical default and the value a 16 MiB L3 resolves to anyway. Any positive
 ## Expressions have costs too
 
 `filter_row × in_rows` prices "running a filter". It does not price *which* filter. A
-`col > 5` and a `regexp_matches(col, '...')` are not the same work, and an optimizer that
+`col > 5` and a {py:meth}`regexp_matches(col, '...') <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_matches>` are not the same work, and an optimizer that
 cannot tell them apart will not bother pushing the expensive one anywhere useful.
 
 `kyber/expr_cost/` prices the expression tree. `weights.py` carries the per-node table, and
@@ -250,7 +250,7 @@ far it may travel.
 Refit is throttled: only after 64 new feedback rows accrue
 (`calibration._RECALIBRATE_AFTER`). Profiling a small query once showed ~90% of its latency
 was the planner, growing with the session's query count, because calibration rescanned the
-entire `op_stats` history on every `collect()`.
+entire `op_stats` history on every {py:meth}`collect() <batcher.Dataset.collect>`.
 
 ## Join ordering
 

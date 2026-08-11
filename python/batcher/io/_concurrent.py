@@ -15,7 +15,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
-__all__ = ["is_local_path", "read_each_file", "total_file_bytes"]
+__all__ = ["is_local_path", "listed_sizes", "read_each_file", "total_file_bytes"]
 
 T = TypeVar("T")
 
@@ -58,19 +58,60 @@ def read_each_file(fs: Any, files: list[str], read_one: Callable[[Any, str], T])
         return list(pool.map(lambda path: read_one(fs, path), files))  # order preserved
 
 
+def listed_sizes(fs: Any, files: list[str]) -> list[int] | None:
+    """Every file's on-disk size, from the directory listing, at **no I/O cost** — or None.
+
+    `expand` already received each file's size and mtime from the very `get_file_info` /
+    `ls` call that produced `files`, and the backend keeps them (`listing_info`). So the
+    sizes are a dict lookup per file, where `fs.size(path)` is one HEAD per file — an
+    O(files) round-trip sweep for a number already paid for.
+
+    That distinction is what makes size-based split planning affordable at scale: packing a
+    million files into byte-sized tasks needs a million sizes, and a million HEADs on the
+    driver is exactly the cost the packing exists to avoid.
+
+    Returns None when *any* file's size is not in the listing (a pinned subset, a glob that
+    bypassed it, a backend that keeps none). Partial sizes are refused rather than mixed
+    with stats, so a caller either plans on complete information or falls back knowingly.
+
+    Args:
+        fs: The filesystem the files were listed through.
+        files: The paths to size, in order.
+
+    Returns:
+        One size per file, in `files` order, or None when the listing cannot answer for all.
+    """
+    info = getattr(fs, "listing_info", None)
+    if info is None:
+        return None
+    sizes: list[int] = []
+    for path in files:
+        entry = info(path)
+        if entry is None:
+            return None
+        sizes.append(entry[0])
+    return sizes
+
+
 def total_file_bytes(fs: Any, files: list[str]) -> int | None:
     """The summed on-disk byte size of every file, or None if it can't be stated whole.
 
     A *partial* total is worse than none: read-cost prediction and `total_bytes` sum across
     sources, so one unreadable size would silently under-report the whole query. Any file
-    whose size cannot be read voids the figure rather than skewing it. Sizes are read
-    concurrently for a remote store (each is one latency-bound HEAD) via :func:`read_each_file`.
+    whose size cannot be read voids the figure rather than skewing it.
+
+    The directory listing is consulted first (:func:`listed_sizes`), which costs nothing;
+    only a source whose files did not come from one falls back to stat-ing them, and then
+    concurrently for a remote store via :func:`read_each_file`.
 
     One home for the "sum sizes, void on any gap" rule, shared by `FileSource.statistics`, the
     delimited row estimator, and the standalone text source — it was pasted into all three.
     """
     if not files:
         return None
+    listed = listed_sizes(fs, files)
+    if listed is not None:
+        return sum(listed) or None
     try:
         sizes = read_each_file(fs, files, lambda filesystem, path: filesystem.size(path))
     except Exception:

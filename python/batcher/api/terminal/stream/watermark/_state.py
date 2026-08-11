@@ -1,16 +1,25 @@
-"""State shared by the event-time streaming operators: eviction, units, and the cap.
+"""State shared by the event-time streaming operators: the watermark, eviction, and the cap.
 
 Watermark dedup, the stream-stream interval join, and the session window all retain rows
-between micro-batches and release them as event time advances, so they share three things
-and nothing else: how a state table is kept from fragmenting, how an event-time column is
-normalized to the microseconds every bound is expressed in, and what happens when a
-watermark stops advancing and the retained state stops shrinking.
+between micro-batches and release them as event time advances, so they share four things
+and nothing else: how far event time has actually advanced, how a state table is kept from
+fragmenting, how an event-time column is normalized to the microseconds every bound is
+expressed in, and what happens when a watermark stops advancing and the retained state stops
+shrinking.
+
+The first of those used to be three separate answers — each operator advanced its own
+`max(event time) - lateness` scalar inline — and three copies of a rule is three chances to
+get it wrong. They now share `plan.streaming.WatermarkTracker`, which is where the rule that
+a stream's frontier is a *minimum over its partitions* is stated once.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pyarrow as pa
 
+from batcher.plan.streaming import WatermarkTracker, event_micros
 from batcher.plan.types import retained_bytes
 
 #: Chunks a retained state table may accumulate before it is compacted.
@@ -34,20 +43,41 @@ def _compact(table: pa.Table | None) -> pa.Table | None:
     return table
 
 
-def _event_micros(
-    col: pa.Array | pa.ChunkedArray | pa.Scalar,
-) -> pa.Array | pa.ChunkedArray | pa.Scalar:
-    """Event-time ticks as int64 **microseconds**, whatever the column's resolution.
+#: Event-time ticks as int64 **microseconds**, whatever the column's resolution.
+#:
+#: Watermarks, `within`, and `lateness` are all microseconds. Reading the raw int64 ticks of
+#: a non-`us` timestamp (e.g. `timestamp[ns]`) would scale the watermark by up to 1000x —
+#: evicting keys too early (re-emitting duplicates) or missing valid interval-join matches.
+#: The definition lives beside the tracker that depends on it, so the operators and the
+#: watermark cannot normalize differently; this alias keeps the local spelling.
+_event_micros = event_micros
 
-    Watermarks, `within`, and `lateness` are all microseconds. Reading the raw int64
-    ticks of a non-`us` timestamp (e.g. `timestamp[ns]`) would scale the watermark by
-    up to 1000x — evicting keys too early (re-emitting duplicates) or missing valid
-    interval-join matches. Normalizing through `timestamp[us]` first keeps every
-    comparison in the same unit. A column already in `us` (or int64) is unchanged.
+
+def _stream_tracker(source, lateness_micros: int) -> tuple[WatermarkTracker, Sequence[str]]:
+    """A watermark tracker for `source`, and the columns that attribute a row to a partition.
+
+    The columns are best-effort here in a way they are not for the windowed aggregate. That
+    driver reads the source itself, so it can widen the projection to keep the partition
+    columns alive; these operators consume the *output of a pipeline*, and a `select` that
+    does not carry `partition` through leaves nothing to attribute by. The tracker degrades
+    to a single partition in that case — today's behavior, and still an improvement on three
+    hand-rolled scalars, because idleness, monotonicity, and unit normalization now come
+    from one place.
+
+    Args:
+        source: The stream the operator reads.
+        lateness_micros: Allowed lateness for this operator.
+
+    Returns:
+        `(tracker, partition columns to attribute rows by)`.
     """
-    import pyarrow.compute as pc
+    from batcher.io.source import watermark_partition_columns, watermark_partitions
 
-    return pc.cast(pc.cast(col, pa.timestamp("us")), pa.int64())
+    cols = watermark_partition_columns(source)
+    tracker = WatermarkTracker(
+        lateness_micros, expected_partitions=watermark_partitions(source) if cols else ()
+    )
+    return tracker, cols
 
 
 def _check_stream_state(table: pa.Table | None, label: str) -> None:

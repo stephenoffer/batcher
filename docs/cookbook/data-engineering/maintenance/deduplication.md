@@ -22,7 +22,7 @@ events = bt.from_pydict(
 )
 ```
 
-`e1` and `e3` are each in there twice. And `distinct()` over the whole row does nothing
+`e1` and `e3` are each in there twice. And {py:meth}`distinct() <batcher.Dataset.distinct>` over the whole row does nothing
 about it, because the rows are not identical:
 
 ```python
@@ -39,16 +39,18 @@ that gets caught in a board meeting rather than in CI.
 
 ## Find it before you fix it
 
-`ds.dq.unique` counts the keys that occur more than once, which is the check to put in
-front of anything that assumes a primary key:
+{py:meth}`ds.dq.unique <batcher.api.dataset.dq.DatasetDQ.unique>` counts the *rows* whose key occurs more than once, which is the check
+to put in front of anything that assumes a primary key. It counts rows rather than keys so
+that the report and the split agree: this is exactly the number `drop()` removes and
+`quarantine()` rejects.
 
 ```python
 print(str(events.dq.unique("event_id").validate()))
-# ValidationReport(violations: unique(event_id)=2)
+# ValidationReport(violations: unique(event_id)=4)
 ```
 
-Two duplicated keys. Compare `count()` against `n_unique()` for the same signal in one
-number:
+Four rows across two duplicated keys. Compare `count()` against `n_unique()` for the same
+signal in one number:
 
 ```python
 print(events.count(), events.n_unique("event_id"))
@@ -142,7 +144,7 @@ only want the answer, and the window when you want the evidence.
 On an unbounded source you cannot remember every key you have ever seen. State grows
 forever and the job dies at 3am on a Sunday.
 
-`drop_duplicates_within_watermark` bounds it: the seen-key set is dropped once the
+{py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` bounds it: the seen-key set is dropped once the
 event-time watermark passes it, so memory is proportional to the lateness you allow, not
 to the lifetime of the job.
 
@@ -176,7 +178,7 @@ the row to the question you actually need answered:
 | Tool | Gives you | Costs | Reach for it when |
 |---|---|---|---|
 | `distinct(subset=..., keep=..., order_by=...)` | one row per key | one hash pass | you want the answer and nothing else |
-| a `row_number` window | the survivors *and* the losers | a pass plus the ranking window | you need a duplicate-rate metric or a dead-letter table |
+| a {py:func}`row_number <batcher.row_number>` window | the survivors *and* the losers | a pass plus the ranking window | you need a duplicate-rate metric or a dead-letter table |
 | `drop_duplicates_within_watermark` | one row per key, bounded state | exactness beyond the lateness bound | the source is unbounded and the job must not grow forever |
 
 ## See also

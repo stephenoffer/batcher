@@ -120,6 +120,18 @@ def set_job_ships_batcher(value: bool) -> None:
     _JOB_SHIPS_BATCHER = value
 
 
+def job_ships_batcher() -> bool:
+    """Whether the active Ray job already makes batcher importable on its workers.
+
+    True exactly when Batcher performed the `ray.init` itself, so it doubles as the honest
+    witness for "did this process start the cluster or attach to one that was running" — which
+    is what `lifecycle._report_attachment` reports. An accessor rather than a direct read of
+    the global, because `set_job_ships_batcher` rebinds it and a from-import would freeze the
+    value another module saw at import time.
+    """
+    return _JOB_SHIPS_BATCHER
+
+
 # Cache the uploaded-package runtime_env (one GCS upload, reused by every task/actor),
 # keyed by the **Ray session** it was uploaded into.
 #
@@ -421,6 +433,10 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     group, or `None` when placement is unavailable (single worker) or the cluster can't
     satisfy the request within the timeout (the caller then falls back to default
     scheduling rather than hanging — the over-subscription case the autoscaler handles).
+
+    On a cluster spanning availability zones the bundles additionally carry a one-zone label
+    selector (`_fleet_zone_selector`), because a shuffle's bytes are billed and delayed by
+    the zone boundary they cross and the bundles are interchangeable.
     """
     if workers <= 1:
         return None
@@ -435,13 +451,118 @@ def create_worker_placement(workers: int, env: SchedulingEnvelope | None):
     bundles = _collective_bundles(workers, env, node_class) or [
         _bundle(env, node_class) for _ in range(workers)
     ]
-    pg = placement_group(bundles, strategy=strategy)
+    zone = _fleet_zone_selector(len(bundles), env)
+    pg = _reserve(placement_group, bundles, strategy, zone)
     ready, _ = ray.wait([pg.ready()], timeout=_placement_timeout_s())
     if not ready:
         with contextlib.suppress(Exception):
             remove_placement_group(pg)
+        _report_placement_timeout(workers, env, strategy)
         return None
+    _report_placement(len(bundles), strategy, zone)
     return pg
+
+
+def _report_placement(bundles: int, strategy: str, zone: dict[str, str]) -> None:
+    """Record where the fleet was reserved, on the same bus the fan-out chain reports to.
+
+    Placement is the other half of "why did my query run the way it did", and it was
+    invisible in exactly the cases a reader asks about: a SPREAD that quietly became PACK on a
+    one-node cluster, a fleet pinned into one availability zone, a collective that got
+    STRICT_PACK. Reported as a `Decision` so it lands in `explain(analyze=True)` and the
+    dashboard beside Kyber's and Carbonite's, rather than only in a log nobody enabled.
+
+    Never raises: this describes a reservation that has already succeeded.
+    """
+    try:
+        from batcher._internal import events
+        from batcher.plan.profile import Decision
+
+        where = f" in {next(iter(zone.values()))}" if zone else ""
+        events.publish(
+            events.DECISION,
+            **Decision(
+                subsystem="core",
+                category="placement",
+                summary=f"reserved {bundles} bundle(s) {strategy}{where}",
+                detail={"bundles": bundles, "strategy": strategy, "zone": dict(zone)},
+            ).to_dict(),
+        )
+    except Exception as exc:  # pragma: no cover - observation must never fail a placement
+        note_suppressed("dist", "report the fleet placement", exc)
+
+
+def _reserve(placement_group, bundles: list[dict], strategy: str, zone: dict[str, str]):
+    """Create the group, with the zone selector when the Ray in use accepts one.
+
+    `bundle_label_selector` is newer than the rest of the placement API, so a cluster running
+    an older Ray rejects the keyword. That must cost the zone preference and nothing else —
+    the fleet still has to be reserved — so the unpinned form is the fallback rather than an
+    error.
+    """
+    if not zone:
+        return placement_group(bundles, strategy=strategy)
+    try:
+        return placement_group(
+            bundles, strategy=strategy, bundle_label_selector=[dict(zone)] * len(bundles)
+        )
+    except TypeError as exc:
+        note_suppressed("dist", "pin the fleet to one availability zone", exc)
+        return placement_group(bundles, strategy=strategy)
+
+
+def _fleet_zone_selector(workers: int, env: SchedulingEnvelope | None) -> dict[str, str]:
+    """The one-zone bundle label selector for this fleet, or `{}`.
+
+    Gated on `distributed.zone_aware_placement` and on the fleet being one whose traffic
+    crosses the zone boundary at all. A GPU collective is excluded: it is already STRICT_PACK
+    onto a single node, so it is inside one zone by construction, and adding a selector to it
+    could only narrow which node that is.
+    """
+    if env is not None and env.gpu_collective:
+        return {}
+    if not active_config().distributed.zone_aware_placement:
+        return {}
+    try:
+        from .capacity import Demand, preferred_fleet_zone
+
+        return preferred_fleet_zone(workers, Demand.from_envelope(env, count=workers))
+    except Exception as exc:  # pragma: no cover - a cost hint never fails a placement
+        note_suppressed("dist", "choose an availability zone for the fleet", exc)
+        return {}
+
+
+def _report_placement_timeout(workers: int, env: SchedulingEnvelope | None, strategy: str) -> None:
+    """Say why the gang did not form, at the moment the reservation is given up on.
+
+    The fallback to default scheduling is silent, and that silence is expensive: the tasks
+    it falls back to ask for the same per-task resources the bundles did, so whatever made
+    the group unsatisfiable usually makes them unschedulable too — and the barrier that
+    gathers them has no deadline. The query then hangs with nothing anywhere saying a
+    reservation was attempted, let alone why it failed.
+
+    When the ask is one no node can host, that is said outright, because no amount of
+    waiting or autoscaling fixes a bundle wider than the widest machine. Otherwise the
+    timeout is reported as what it is — a cluster that was busy for longer than the budget
+    — which is ordinary on a shared cluster and must not read as an error.
+    """
+    from batcher._internal.logging import get_logger, log_kv
+
+    from .capacity import Demand, describe_pending_demand
+
+    try:
+        reason = describe_pending_demand(Demand.from_envelope(env, count=workers))
+    except Exception as exc:  # pragma: no cover - a diagnostic never fails a placement
+        note_suppressed("dist", "diagnose the placement timeout", exc)
+        reason = None
+    log_kv(
+        get_logger("dist"),
+        logging.WARNING,
+        "placement group did not form within the timeout; falling back to default scheduling",
+        workers=workers,
+        strategy=strategy,
+        reason=reason or "cluster busy for longer than placement_timeout_s",
+    )
 
 
 def placement_actor_options(pg, index: int, base: dict | None = None) -> dict:

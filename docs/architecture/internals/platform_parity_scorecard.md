@@ -89,11 +89,11 @@ Legend: **W** Batcher wins · **=** parity · **L** Batcher loses · **✗** can
 death** — not spot preemption, not node loss, not a network partition, not a slow disk. Any
 recovery claim inherits that scope.
 
-**Replication is wired for the flat aggregate reduce only.** `replicate_shuffle_output` has one
-caller and hardcodes `stage=0, epoch=0`, so the combiner tree — the path a *large* cluster takes,
-i.e. where node loss is likeliest — plus join, sort, and window all fall back to full lineage
-recompute. This settles a contradiction between two ledgers by reading the code; see Phase 1E in
-the plan. Slow-but-correct, not wrong.
+**Replication is wired for every Flight shuffle.** It was once the flat aggregate reduce alone —
+`replicate_shuffle_output` had one caller and hardcoded `stage=0, epoch=0` — so the combiner tree,
+the path a *large* cluster takes and therefore where node loss is likeliest, fell back to full
+lineage recompute along with join, sort, and window. All four now call it, and the tree's interior
+levels are copied per level by `replicate_interior_outputs` rather than living on one node.
 
 ### 2. Reliability (does it return the right answer under stress?)
 

@@ -8,7 +8,7 @@ Everything here runs as written.
 
 :::{note}
 **What you'll build.** One aggregate query, written twice, with `explain()` used as the
-proof that both spellings produce the identical optimized plan. Then a `Session` with a
+proof that both spellings produce the identical optimized plan. Then a {py:class}`Session <batcher.Session>` with a
 registered catalog, a view, and a Python function callable from SQL. You need `pip install
 batcher-engine` and nothing else: no cluster, no files, no GPU.
 :::
@@ -32,7 +32,7 @@ print(orders.columns)
 
 ## 2. Write it in SQL
 
-`bt.sql(query, **tables)` binds each table named in the `FROM` clause to a Dataset passed as
+{py:func}`bt.sql(query, **tables) <batcher.sql>` binds each table named in the `FROM` clause to a Dataset passed as
 a keyword argument. The keyword is the table name.
 
 ```python
@@ -51,7 +51,7 @@ print(revenue.to_pydict())
 # {'region': ['us'], 'revenue': [225.0], 'orders': [3]}
 ```
 
-Nothing has executed until `to_pydict()`. `bt.sql` returns a lazy `Dataset`, exactly like
+Nothing has executed until {py:meth}`to_pydict() <batcher.Dataset.to_pydict>`. `bt.sql` returns a lazy {py:class}`Dataset <batcher.Dataset>`, exactly like
 every other operation.
 
 ## 3. Write it as a DataFrame
@@ -62,7 +62,7 @@ writes them:
 | SQL | DataFrame |
 |---|---|
 | `WHERE` | `.filter(...)` |
-| `GROUP BY` | `.group_by(...)` |
+| `GROUP BY` | {py:meth}`.group_by(...) <batcher.Dataset.group_by>` |
 | `SUM(x) AS y` | `.agg(y=bt.col("x").sum())` |
 | `HAVING` | `.filter(...)` after `.agg` |
 | `ORDER BY x DESC` | `.sort("x", descending=True)` |
@@ -136,14 +136,14 @@ print(
 # {'region': ['eu', 'us'], 'n': [2, 3]}
 ```
 
-`ds.sql(...)` queries the current dataset, which `self` names. The filter is a DataFrame
+{py:meth}`ds.sql(...) <batcher.Dataset.sql>` queries the current dataset, which `self` names. The filter is a DataFrame
 call, the rollup is SQL, and the plan does not know the difference.
 :::
 ::::
 
 ## 6. A session, for a catalog you keep
 
-`bt.Session` is the `DuckDBPyConnection` / `SparkSession` analogue: a dialect plus a catalog
+{py:class}`bt.Session <batcher.Session>` is the `DuckDBPyConnection` / `SparkSession` analogue: a dialect plus a catalog
 of tables and Python functions. Register once, query by name.
 
 ```python
@@ -234,5 +234,5 @@ The same operators, over a source that never ends.
 - {doc}`Expressions </user-guide/transform/columns/expressions>`: the column language underneath both spellings.
 - {doc}`Explain plans </user-guide/operate/tuning/explain-plans>`: how to read the thing you just compared.
 - {doc}`Plan IR </architecture/deep-dives/query/plan-ir>`: the single `LogicalPlan` both front ends build.
-- {doc}`SQL API reference </api/relational/sql>`: `Session`, `register`, `register_function`.
+- {doc}`SQL API reference </api/relational/sql>`: `Session`, `register`, {py:func}`register_function <batcher.register_function>`.
 - {doc}`Migration guide </getting-started/migration/index>`: if the SQL you know is Spark's or DuckDB's.

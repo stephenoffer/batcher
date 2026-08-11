@@ -107,10 +107,15 @@ def drop_redundant_distinct_build(node: Join, _ctx: OptimizerContext) -> Logical
     Distinct(orders.o_custkey))`, and that distinct over 1.5M orders is ~55% of the
     query's time and entirely removable. `Distinct` preserves its input's columns, so
     the join keys (and the left-only output) stay valid after the drop.
+
+    Whole-row dedup only. A *keyed* build-side dedup does not merely remove duplicates — it
+    removes rows that differ outside its key, and one of those may be the only row carrying a
+    given join key. Dropping it would then find matches the original plan did not, flipping
+    semi-join rows in and anti-join rows out.
     """
     if node.join_type not in ("semi", "anti"):
         return None
-    if not isinstance(node.right, Distinct):
+    if not isinstance(node.right, Distinct) or node.right.keys:
         return None
     return Join(
         node.left,
@@ -135,6 +140,11 @@ def join_to_semijoin(node: Distinct, _ctx: OptimizerContext) -> LogicalPlan | No
     win is avoiding the inner join's fan-out (and materializing right columns). Returns
     None unless the projection touches no right-side output column.
     """
+    # Whole-row dedup only. The argument rests on the dedup collapsing the join's *identical*
+    # duplicate rows; a keyed dedup keeps one row per key out of rows that may differ, so which
+    # row survives depends on the fan-out the semi-join is about to remove.
+    if node.keys:
+        return None
     proj = node.input
     if not isinstance(proj, Project):
         return None
@@ -325,7 +335,10 @@ def _right_unique_on_keys(join: Join, ctx: OptimizerContext) -> bool:
     # a DISTINCT over exactly the join key columns likewise.
     if isinstance(right, Aggregate) and {k.alias for k in right.group_keys} <= keys:
         return True
-    if isinstance(right, Distinct) and set(right.available_columns()) == keys:
+    # A whole-row dedup over exactly the join key columns yields one row per key. A keyed one
+    # does not: it keeps one row per *its* key, and rows sharing a join key but differing in
+    # that key both survive.
+    if isinstance(right, Distinct) and not right.keys and set(right.available_columns()) == keys:
         return True
     # Metadata: an EXACT distinct count equal to the EXACT row count (rare but solid).
     #

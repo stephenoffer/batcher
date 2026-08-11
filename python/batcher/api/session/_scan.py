@@ -14,6 +14,7 @@ from batcher.api.dataset import Dataset
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
+from batcher.plan.source_stats import stable_source_key
 
 
 def _scan(source: Source) -> Dataset:
@@ -24,7 +25,16 @@ def _scan(source: Source) -> Dataset:
     """
     from batcher.api.security import govern_scan
 
-    plan: LogicalPlan = Scan(source_id=0, schema=SchemaRef.from_arrow(source.schema()))
+    # The scan carries *which relation* it reads, not just its position in the source list.
+    # Without it every query's first scan is `source_id=0`, so anything keyed by plan
+    # signature — a measured selectivity, a q-error correction — is shared across unrelated
+    # tables of the same query shape. Only a *data-stable* identity qualifies; see
+    # `stable_source_key` for why an in-memory source deliberately contributes nothing.
+    plan: LogicalPlan = Scan(
+        source_id=0,
+        schema=SchemaRef.from_arrow(source.schema()),
+        source_key=stable_source_key(source),
+    )
     return Dataset(govern_scan(plan, source), sources=[source])
 
 

@@ -13,6 +13,8 @@ a newly added file yields only the new one).
 
 from __future__ import annotations
 
+import datetime
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -205,6 +207,68 @@ def test_incremental_file_source_splits_are_picklable(tmp_path):
     assert len(splits) == 1
     restored = pickle.loads(pickle.dumps(splits[0]))
     assert restored.read()[0].to_pylist() == [{"id": 1}]
+
+
+def test_incremental_file_source_forwards_reader_options(tmp_path):
+    """The public entry documents forwarding reader options; it used to raise on any.
+
+    A continuous ingest is where these matter most — a semicolon-separated export, a bucket
+    with explicit credentials, a producer that occasionally emits a ragged line — and none
+    of the three could be expressed. The source built every reader as
+    ``SOURCES.get(fmt)(path)``, with nothing.
+    """
+    data_dir = tmp_path / "incoming"
+    data_dir.mkdir()
+    (data_dir / "0001.csv").write_text("a;b\n1;2\n3;4;5\n6;7\n")
+
+    src = IncrementalFileSource(
+        str(data_dir),
+        "csv",
+        state_dir=str(tmp_path / "state"),
+        delimiter=";",
+        on_bad_lines="skip",
+    )
+
+    assert src.schema().names == ["a", "b"]
+    rows = [row for batch in src.iter_batches() for row in batch.to_pylist()]
+    assert rows == [{"a": 1, "b": 2}, {"a": 6, "b": 7}]
+
+
+def test_incremental_file_source_rejects_a_bad_option_at_construction(tmp_path):
+    """A streaming query is started and then left alone, so the typo must raise at start.
+
+    Discovering it on the fifth file at three in the morning is a materially worse error,
+    and the reader's own spec already knows the correct spelling.
+    """
+    from batcher._internal.errors import FormatError
+
+    data_dir = tmp_path / "incoming"
+    data_dir.mkdir()
+
+    with pytest.raises(FormatError, match="Did you mean 'delimiter'"):
+        IncrementalFileSource(
+            str(data_dir), "csv", state_dir=str(tmp_path / "state"), delimeter=";"
+        )
+
+
+def test_incremental_file_source_splits_carry_the_reader_options(tmp_path):
+    """A worker rebuilds the reader from the split alone, so the options must ride it.
+
+    Otherwise the stream parses one way on the driver and another on the cluster — the
+    shape of defect that every local test passes.
+    """
+    import pickle
+
+    data_dir = tmp_path / "incoming"
+    data_dir.mkdir()
+    (data_dir / "0001.csv").write_text("a;b\n1;2\n")
+
+    src = IncrementalFileSource(
+        str(data_dir), "csv", state_dir=str(tmp_path / "state"), delimiter=";"
+    )
+    split = pickle.loads(pickle.dumps(src.splits()[0]))
+
+    assert split.read()[0].to_pylist() == [{"a": 1, "b": 2}]
 
 
 # --------------------------------------------------------------------------
@@ -404,16 +468,19 @@ def test_broker_resume_token_overrides_offset_in_snapshot():
 
 
 class _FakeEvent:
-    """A stand-in for azure ``EventData`` — no ``azure-eventhub`` install needed."""
+    """A stand-in for azure ``EventData`` — no ``azure-eventhub`` install needed.
+
+    Models the *real* property surface: ``body`` (not a ``body_as_bytes()`` method) and
+    ``enqueued_time`` (a `datetime`, not an ``enqueued_time_utc_ms`` int). Neither of the
+    names this fake used to expose exists on any released `azure-eventhub`, which is how the
+    source came to be written against a client that was never there.
+    """
 
     def __init__(self, body, key, offset="7", ts=123):
-        self._body = body
+        self.body = body
         self.partition_key = key
         self.offset = offset
-        self.enqueued_time_utc_ms = ts
-
-    def body_as_bytes(self):
-        return self._body
+        self.enqueued_time = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.UTC)
 
 
 def test_eventhubs_event_preserves_binary_body_and_coerces_key():
@@ -443,11 +510,17 @@ def test_eventhubs_event_handles_none_key_and_offset():
 
 
 class _FakeEHConsumer:
-    def __init__(self, events):
-        self._events = events
+    """`EventHubConsumer.receive` returns None and delivers through the callback."""
 
-    def receive_message_batch(self, max_batch_size, max_wait_time):
-        return self._events
+    def __init__(self, events, on_event_received):
+        self._events = events
+        self._deliver = on_event_received
+
+    def receive(self, batch, max_batch_size, max_wait_time):
+        ready, self._events = self._events[:max_batch_size], self._events[max_batch_size:]
+        if ready:
+            self._deliver(ready)
+        return None
 
     def close(self):
         pass
@@ -463,7 +536,7 @@ class _FakeEHClient:
 
     def _create_consumer(self, consumer_group, partition_id, event_position, on_event_received):
         self.created.append((partition_id, event_position))
-        return _FakeEHConsumer(self._events.get(int(partition_id), []))
+        return _FakeEHConsumer(list(self._events.get(int(partition_id), [])), on_event_received)
 
 
 def test_eventhubs_resumes_from_checkpointed_offset():

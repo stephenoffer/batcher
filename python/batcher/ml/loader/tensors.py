@@ -11,6 +11,8 @@ import warnings
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
+from batcher.interop.arrays import uniform_list_to_matrix
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -48,6 +50,12 @@ def column_to_tensor(array: pa.Array) -> Any | None:
         if child.dtype.kind not in "biuf":
             return None
         nd = child.reshape(n, w)
+    elif (matrix := uniform_list_to_matrix(array)) is not None:
+        # The *same* feature matrix, stored as a plain `List<T>` — which is what
+        # `from_pydict`, a Parquet or JSON read, and `collect_list` all produce. One
+        # implementation, in `interop.arrays`, because the converter path
+        # (`to_numpy_batches`) needs exactly this too and a second copy would drift.
+        nd = matrix
     else:
         try:
             nd = array.to_numpy(zero_copy_only=False)

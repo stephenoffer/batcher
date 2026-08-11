@@ -26,9 +26,14 @@ from batcher.ml.stats import (
     t_test_ind,
 )
 from batcher.ml.stats._special import (
+    chi2_ppf,
     chi2_sf,
+    f_ppf,
     f_sf,
+    normal_sf,
     normal_two_sided_p,
+    students_t_ppf,
+    students_t_sf,
     students_t_two_sided_p,
 )
 
@@ -91,6 +96,64 @@ def test_normal_two_sided_matches_scipy(z: float) -> None:
     )
 
 
+# --- one-sided tails and quantiles -----------------------------------------------------
+
+
+@pytest.mark.parametrize("df", [1, 5, 30, 200])
+@pytest.mark.parametrize("t", [-6.0, -2.0, -0.4, 0.0, 0.4, 2.0, 6.0])
+def test_students_t_one_sided_matches_scipy(t: float, df: int) -> None:
+    """Signed, unlike the two-sided function — the half a directional test needs."""
+    assert students_t_sf(t, df) == pytest.approx(
+        scipy_stats.t.sf(t, df), rel=_TAIL_RTOL, abs=1e-300
+    )
+
+
+@pytest.mark.parametrize("z", [-8.0, -1.96, -0.5, 0.0, 0.5, 1.96, 8.0])
+def test_normal_one_sided_matches_scipy(z: float) -> None:
+    assert normal_sf(z) == pytest.approx(scipy_stats.norm.sf(z), rel=_TAIL_RTOL, abs=1e-300)
+
+
+@pytest.mark.parametrize("df", [1, 2, 5, 10, 30, 100, 1000])
+@pytest.mark.parametrize("p", [0.001, 0.01, 0.025, 0.05, 0.5, 0.95, 0.975, 0.99, 0.999])
+def test_students_t_quantile_matches_scipy(p: float, df: int) -> None:
+    assert students_t_ppf(p, df) == pytest.approx(scipy_stats.t.ppf(p, df), rel=_TAIL_RTOL)
+
+
+@pytest.mark.parametrize("df", [1, 2, 5, 10, 30, 100, 500])
+@pytest.mark.parametrize("p", [0.001, 0.01, 0.05, 0.5, 0.95, 0.99, 0.999])
+def test_chi2_quantile_matches_scipy(p: float, df: int) -> None:
+    assert chi2_ppf(p, df) == pytest.approx(scipy_stats.chi2.ppf(p, df), rel=_TAIL_RTOL)
+
+
+@pytest.mark.parametrize(("d1", "d2"), [(1, 1), (3, 20), (10, 10), (50, 200), (2, 5)])
+@pytest.mark.parametrize("p", [0.01, 0.05, 0.5, 0.95, 0.99])
+def test_f_quantile_matches_scipy(p: float, d1: int, d2: int) -> None:
+    assert f_ppf(p, d1, d2) == pytest.approx(scipy_stats.f.ppf(p, d1, d2), rel=1e-8)
+
+
+@pytest.mark.parametrize(
+    ("ppf", "args"), [(students_t_ppf, (5,)), (chi2_ppf, (5,)), (f_ppf, (3, 7))]
+)
+def test_quantiles_invert_their_own_survival_function(ppf, args) -> None:
+    """The quantile is the inverse of the tail this module already ships.
+
+    Checking against SciPy proves the value; this proves the two halves of *this* module
+    agree, which is what a caller composing `sf` and `ppf` — a confidence interval — relies
+    on. A drift in either one alone shows up here.
+    """
+    sf = {students_t_ppf: students_t_sf, chi2_ppf: chi2_sf, f_ppf: f_sf}[ppf]
+    for p in (0.01, 0.1, 0.5, 0.9, 0.99):
+        assert sf(ppf(p, *args), *args) == pytest.approx(1.0 - p, rel=1e-9)
+
+
+@pytest.mark.parametrize("ppf", [students_t_ppf, chi2_ppf])
+def test_quantiles_reject_a_degenerate_parameter(ppf) -> None:
+    """Bad `df` or a probability outside [0, 1] is NaN, not a silent bracket failure."""
+    assert math.isnan(ppf(0.5, 0))
+    assert math.isnan(ppf(1.5, 5))
+    assert math.isnan(ppf(-0.1, 5))
+
+
 # --- tests vs scipy --------------------------------------------------------------------
 
 
@@ -113,6 +176,46 @@ def test_welch_two_sample_matches_scipy() -> None:
     t, p = scipy_stats.ttest_ind(a, b, equal_var=False)
     assert abs(got.statistic) == pytest.approx(abs(t), abs=1e-8)
     assert got.pvalue == pytest.approx(p, abs=1e-8)
+
+
+def test_one_sample_t_interval_and_effect_match_scipy() -> None:
+    """The interval is the part a p-value cannot give — so it is checked, not just present."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(1.0, 2.0, 200)
+    got = t_test_1samp(bt.from_pydict({"x": x.tolist()}), 0.5)
+    expected = scipy_stats.ttest_1samp(x, 0.5).confidence_interval(0.95)
+    # SciPy's interval is around the mean; ours is around the difference from `popmean`.
+    assert got.ci is not None
+    assert got.ci[0] == pytest.approx(expected.low - 0.5, rel=1e-12)
+    assert got.ci[1] == pytest.approx(expected.high - 0.5, rel=1e-12)
+    assert got.ci_level == 0.95
+    assert got.n == 200
+    assert got.alternative == "two-sided"
+    assert got.effect_size == pytest.approx((x.mean() - 0.5) / x.std(ddof=1), rel=1e-12)
+
+
+def test_welch_interval_matches_scipy() -> None:
+    rng = np.random.default_rng(1)
+    a, b = rng.normal(0, 1, 150), rng.normal(0.4, 1.5, 180)
+    ds = bt.from_pydict({"g": ["a"] * 150 + ["b"] * 180, "x": a.tolist() + b.tolist()})
+    got = t_test_ind(ds, "x", "g")
+    expected = scipy_stats.ttest_ind(a, b, equal_var=False).confidence_interval(0.95)
+    assert got.ci is not None
+    assert got.ci[0] == pytest.approx(expected.low, rel=1e-12)
+    assert got.ci[1] == pytest.approx(expected.high, rel=1e-12)
+    assert got.n == 330
+
+
+def test_a_test_that_estimates_nothing_reports_no_interval() -> None:
+    """The optional fields stay `None` rather than being filled with a meaningless number.
+
+    A chi-squared test of independence has no single effect to put an interval around. An
+    interval invented for it would be read as one, which is worse than its absence.
+    """
+    ds = bt.from_pydict({"a": [0, 1, 0, 1, 1, 0], "b": [1, 0, 1, 0, 0, 1]})
+    got = chi_square_test(ds, "a", "b")
+    assert got.ci is None
+    assert got.effect_size is None
 
 
 def test_welch_rejects_a_non_binary_group() -> None:

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import AggExpr, Expr, col, nullif
+from batcher.plan.logical import Union
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -69,7 +70,7 @@ class MultiLevelGroupBy:
             >>> ds = bt.from_pydict({"r": ["e", "e", "w"], "c": ["x", "y", "z"], "v": [1, 2, 4]})
             >>> out = ds.rollup("r", "c").agg(total=bt.col("v").sum())
             >>> out.sort("r", "c").to_pydict()["total"]
-            [3, 1, 2, 4, 4, 7]
+            [1, 2, 3, 4, 4, 7]
     """
 
     __slots__ = ("_ds", "_keys", "_levels")
@@ -115,12 +116,26 @@ class MultiLevelGroupBy:
                 "rollup()/cube()/grouping_sets() need at least one aggregate, "
                 "e.g. .agg(total=col('x').sum())"
             )
-        out = None
-        for level in self._levels:
-            frame = self._level_frame(level, named)
-            out = frame if out is None else out.union(frame, distinct=False)
-        assert out is not None  # `_levels` is never empty: the grand total is always one
-        return out
+        # Every level is built from `self._ds`, so every level's plan indexes *this* source
+        # list — the same objects in the same order. `Dataset.union` cannot know that: it
+        # takes arbitrary datasets, so it renumbers each one's scans and concatenates the
+        # source lists. Going through it here would bind the same relation once per level:
+        # 5 levels over TPC-DS q22's three tables is 15 bindings of 3 relations. That is not
+        # a cosmetic difference — it is what stops plan-level CSE recognizing the levels as
+        # sharing a subtree, so each level re-reads and re-joins the whole input, and q22
+        # runs 61x DuckDB. Building the `Union` over the one shared list keeps the levels
+        # structurally identical below the aggregate, which is the precondition for sharing
+        # the work.
+        #
+        # Deliberately not a change to `Dataset.union`, which must keep renumbering because
+        # its inputs are unrelated in general. This is the one caller that can prove they
+        # are not.
+        frames = [self._level_frame(level, named) for level in self._levels]
+        assert frames  # `_levels` is never empty: the grand total is always one
+        plans = tuple(f._plan for f in frames)
+        if len(plans) == 1:
+            return frames[0]
+        return self._ds._derive(Union(plans, False))
 
     def _level_frame(self, level: tuple[str, ...], named: dict[str, AggExpr | Expr]) -> Dataset:
         """One level: group by its active keys, null the rest, and order the columns.

@@ -6,11 +6,12 @@ Kyber/Carbonite decisions, and the measured per-operator profile — the same `Q
 `explain(analyze=True)` renders. It is the developer/operator artifact for understanding,
 after the fact, what a query planned and did.
 
-It is **opt-in** (see `ObservabilityConfig.event_log`). An enabled log attaches the
-collector for the whole query and then assembles, JSON-encodes, and writes one document
-per query — ~0.3 ms, which on a small `collect()` is a quarter of the entire control
-plane. Left on by default, every query paid for an artifact almost none of them had a
-reader for.
+It is **on by default** (`ObservabilityConfig.event_log`, and `docs/configuration/options.md`
+documents it that way). An enabled log attaches the collector for the whole query and then
+assembles, JSON-encodes, and writes one document per query — ~0.3 ms, which on a small
+`collect()` is a quarter of the entire control plane. That is a real cost on every query,
+for an artifact many callers have no reader for; `explain(analyze=True)` and `stats()`
+produce the same profile on demand, so `event_log=False` gets the overhead back.
 
 Note the cost is *not* the disk: the write is a page-cached `open`/`write`/`close` and
 releases the GIL, and moving it to a background writer thread measured **no improvement at
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Iterator
 from itertools import count
@@ -131,6 +133,8 @@ def write_event_log(
     total_ms: float,
     rows: int,
     query_id: str | None = None,
+    plan: object = None,
+    sources: list | None = None,
 ) -> None:
     """Report `collector`'s profile: the JSON event log and/or OpenTelemetry spans.
 
@@ -141,6 +145,17 @@ def write_event_log(
     for a query that finished. The profile is assembled once and fed to both sinks.
     Best-effort: a filesystem or exporter error is swallowed so observability never fails a
     query.
+
+    `plan` and `sources` are what let a **`map_batches`/ML pipeline** report at all. That
+    shape has no engine IR — `to_ir()` deliberately raises on an opaque UDF — so
+    `optimized_ir` stays `None` and the early return above used to swallow it whole: no
+    event-log document, no spans, no stage events, and therefore no operators, no rows
+    scanned and no machine cost in the metrics export. Only `query_start` and `query_end`
+    ever reached the bus. The orchestrator *did* measure every stage into the
+    `StageRecorder` all along; `stats()` rendered it against the logical tree and nothing
+    else consumed it. Given the plan, this takes the same route `stats()` does, so the
+    batch-inference pipeline is observable through the same four surfaces as a relational
+    query rather than being the one shape that reports nothing.
 
     Assembling the profile is not free — it walks every operator and renders the whole
     document to a plain dict — so it happens only once something will actually read it: a
@@ -160,7 +175,7 @@ def write_event_log(
     `observability.event_log` to `False` through `bt.set_config` / `bt.config_context`, or
     export `BATCHER_OBSERVABILITY_EVENT_LOG=0`.
     """
-    if collector is None or collector.optimized_ir is None:
+    if collector is None or not _has_something_to_report(collector, plan):
         _publish_end(query_id, total_ms=total_ms, rows=rows, profile=None)
         return
     from batcher._internal import events
@@ -177,12 +192,18 @@ def write_event_log(
     # Reuse the id `start_query_report` already announced, so the live view and the archived
     # document name the same query; mint one only for a caller that never announced a start.
     query_id = query_id or _query_id(seq)
-    profile = collector.to_profile(total_ms=total_ms, rows=rows, query_id=query_id)
+    profile = _assemble(collector, plan, sources, total_ms=total_ms, rows=rows, query_id=query_id)
     # One render, both sinks: `to_dict` walks the whole operator tree, and the bus payload
     # and the on-disk document are the same document.
     document = profile.to_dict()
     _publish_stages(profile, query_id)
-    _publish_end(query_id, total_ms=total_ms, rows=rows, profile=document)
+    _publish_end(
+        query_id,
+        total_ms=total_ms,
+        rows=rows,
+        profile=document,
+        usage=document.get("usage"),
+    )
     if cfg.event_log:
         try:
             log_dir = _resolve_dir(cfg.event_log_dir)
@@ -196,6 +217,59 @@ def write_event_log(
             get_logger("api").debug("event-log write failed", exc_info=True)
     # The emitter is itself a no-op unless OTel is enabled and a provider is configured.
     emit_query_spans(profile)
+
+
+def _is_udf_pipeline(plan: object) -> bool:
+    """Whether `plan` is a `map_batches`/ML pipeline, which has no engine IR to profile."""
+    if plan is None:
+        return False
+    from batcher import core
+
+    return bool(core.has_map_batches(plan))
+
+
+def _has_something_to_report(collector: ProfileCollector, plan: object) -> bool:
+    """Whether this run measured anything worth assembling a profile from.
+
+    Two shapes qualify and they are measured by different things. A relational query is
+    measured by the engine and joined against the lowered IR, so `optimized_ir` is the tell.
+    A UDF pipeline has no lowered IR at all and is measured by the orchestrator into the
+    `StageRecorder` instead — checking only the former is what made the batch-inference
+    shape report nothing.
+    """
+    return collector.optimized_ir is not None or _is_udf_pipeline(plan)
+
+
+def _assemble(
+    collector: ProfileCollector,
+    plan: object,
+    sources: list | None,
+    *,
+    total_ms: float,
+    rows: int,
+    query_id: str,
+):
+    """The `QueryProfile` for this run, by whichever route measured it.
+
+    The same branch `run_profiled` takes for `stats()`, so the archived document, the
+    dashboard's timeline and the terminal table can never disagree about a pipeline.
+
+    Ordered so a relational query never pays for the question: having a lowered IR settles
+    it, and `has_map_batches` walks the plan tree — cheap, but this runs on every profiled
+    query and the answer is already known.
+    """
+    if collector.optimized_ir is None and _is_udf_pipeline(plan):
+        from batcher.api.terminal.profile import _udf_measured_profile
+
+        return _udf_measured_profile(
+            plan,  # type: ignore[arg-type]
+            sources or [],
+            collector,
+            total_ms=total_ms,
+            rows=rows,
+            query_id=query_id,
+        )
+    return collector.to_profile(total_ms=total_ms, rows=rows, query_id=query_id)
 
 
 def query_label(plan: object) -> str:
@@ -316,6 +390,12 @@ def _publish_stages(profile: object, query_id: str) -> None:
     per-stage events are emitted here, after the fact, rather than live. That is an honest
     limit of where the measurement happens: the dashboard's timeline is exact, and it fills
     in when the query completes rather than growing during it.
+
+    A distributed run's *worker* sub-plan is replayed too, tagged ``scope="worker"``. Its
+    operators live in a separate op-id space from the driver tree, so a sink that keys on
+    `op_id` must filter on the scope rather than assume the ids are unique — `observe.store`
+    does. Without them a distributed query reported no scan at all, because on that path the
+    scan happens on the workers and only the combine survives on the driver.
     """
     from batcher._internal import events
 
@@ -325,21 +405,84 @@ def _publish_stages(profile: object, query_id: str) -> None:
         events.publish(
             events.STAGE_START,
             query_id=query_id,
-            name=op.kind,
+            # Normalized here as well as on the end event, so the pair naming one `op_id`
+            # cannot disagree about what that operator is called — and so a dashboard shows
+            # `map_batches` beside `scan` and `hash_join` rather than one node in a
+            # different case from all its neighbours.
+            name=_metric_kind(op.kind),
             op_id=op.op_id,
             est_rows=None if op.est_rows != op.est_rows else op.est_rows,  # NaN → None
         )
-        events.publish(
-            events.STAGE_END,
-            query_id=query_id,
-            name=op.kind,
-            op_id=op.op_id,
-            rows_out=op.rows_out,
-            elapsed_ms=op.elapsed_ms,
-            spilled=op.spilled,
-        )
+        events.publish(events.STAGE_END, query_id=query_id, **_stage_fields(op, "driver"))
+    for op in getattr(profile, "worker_ops", ()):
+        events.publish(events.STAGE_END, query_id=query_id, **_stage_fields(op, "worker"))
     for decision in getattr(profile, "decisions", ()):
         events.publish(events.DECISION, query_id=query_id, **decision.to_dict())
+
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _metric_kind(kind: str) -> str:
+    """One operator vocabulary for the counters, whichever tree the profile came from.
+
+    The engine names operators by their IR tag — `scan`, `hash_join`. A UDF pipeline has no
+    IR, so its profile is built off the *logical* tree and names each node by its class:
+    `Scan`, `MapBatches`. Both are correct where they are rendered, and folding them into
+    one counter map without reconciling them gives `scan` and `Scan` as separate series for
+    the same operator — which also made "rows read from sources" miss every ML pipeline,
+    because the scan it was looking for was spelled the other way.
+
+    Snake-casing the class name lands exactly on the IR tag for every relational node and
+    leaves an already-tagged name untouched, so this is a normalization rather than a second
+    vocabulary. It keeps the one distinction the logical tree adds and the IR cannot:
+    `MapRows` and `MapBatches` are the same node and 10-100x apart in cost, so they stay
+    apart as `map_rows` and `map_batches`.
+
+    Args:
+        kind: The operator name off an `OpProfile`.
+
+    Returns:
+        The snake_case name to report it under.
+    """
+    return _CAMEL_BOUNDARY.sub("_", kind).lower()
+
+
+def _stage_fields(op: Any, scope: str) -> dict[str, Any]:
+    """The whole measured record for one operator, as `STAGE_END` fields.
+
+    The engine measures far more than time and output rows — CPU across every worker thread,
+    the bytes routed to spill, real block-device I/O, page faults, which tier ran the per-row
+    work — and this event was carrying three of those fields. Everything the profile holds
+    goes on the bus, because the process-wide export cannot report a figure that never
+    reached it, and `plan.profile` is where the transcription already happened.
+    """
+    return {
+        "name": _metric_kind(op.kind),
+        "op_id": op.op_id,
+        "scope": scope,
+        # False on a path the engine did not measure — an out-of-core run, or a plan the
+        # metadata fast path answered. The timeline still wants the stage; a counter must not
+        # fold it in, or every such query would add operators with zero rows and zero time
+        # and deflate the per-kind averages a capacity dashboard reads.
+        "measured": op.measured,
+        "rows_in": op.rows_in,
+        "rows_out": op.rows_out,
+        "elapsed_ms": op.elapsed_ms,
+        "cpu_ms": op.cpu_ms,
+        "threads": op.threads,
+        "result_bytes": op.result_bytes,
+        "peak_rss_bytes": op.peak_rss_bytes,
+        "spilled": op.spilled,
+        "spill_bytes": op.spill_bytes,
+        "backend": op.backend,
+        "minor_faults": op.minor_faults,
+        "major_faults": op.major_faults,
+        "vol_ctx_switches": op.vol_ctx_switches,
+        "invol_ctx_switches": op.invol_ctx_switches,
+        "io_read_bytes": op.io_read_bytes,
+        "io_write_bytes": op.io_write_bytes,
+    }
 
 
 def _publish_end(
@@ -348,8 +491,14 @@ def _publish_end(
     total_ms: float,
     rows: int,
     profile: dict | None,
+    usage: dict | None = None,
 ) -> None:
-    """Close the query out on the bus. A no-op when the caller never announced a start."""
+    """Close the query out on the bus. A no-op when the caller never announced a start.
+
+    `usage` is carried as its own field rather than left inside `profile` so a sink that
+    only wants the machine cost — the metrics collector does — never has to parse a whole
+    plan document to find it. `None` on a path that assembled no profile.
+    """
     from batcher._internal import events
 
     if not query_id:
@@ -361,6 +510,7 @@ def _publish_end(
         total_ms=total_ms,
         rows=rows,
         profile=profile,
+        usage=usage,
     )
 
 

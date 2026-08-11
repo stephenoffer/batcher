@@ -18,9 +18,9 @@ Every example on this page needs a real bucket and credentials, so the blocks ar
 
 ## Reading from object storage
 
-{py:obj}`bt.read <batcher.read>` infers the format from the extension. The format-specific readers (`bt.read.parquet`, `bt.read.csv`, `bt.read.json`) take the same cloud paths.
+{py:obj}`bt.read <batcher.read>` infers the format from the extension. The format-specific readers ({py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>`, {py:meth}`bt.read.csv <batcher.api.io_namespace.reader.Reader.csv>`, {py:meth}`bt.read.json <batcher.api.io_namespace.reader.Reader.json>`) take the same cloud paths.
 
-Use a typed reader when the path contains a glob. Format inference reads the extension off the literal path and stops at the first `*`, so `bt.read("s3://b/*.parquet")` has nothing to infer from and raises `FormatError`. `bt.read.parquet(...)` is already explicit. A `*` also matches within one path segment only, so crossing directories in a Hive layout needs `**`.
+Use a typed reader when the path contains a glob. Format inference reads the extension off the literal path and stops at the first `*`, so `bt.read("s3://b/*.parquet")` has nothing to infer from and raises {py:exc}`FormatError <batcher.FormatError>`. `bt.read.parquet(...)` is already explicit. A `*` also matches within one path segment only, so crossing directories in a Hive layout needs `**`.
 
 ```python
 # docs: skip
@@ -175,5 +175,5 @@ result = ds.group_by("region").agg(total=bt.col("amount").sum()).collect(
 - {doc}`Reading data </user-guide/moving-data/reading-data>` and {doc}`Writing data </user-guide/moving-data/writing-data>`: the full reader
   and writer surface.
 - {doc}`Lakehouse </user-guide/moving-data/lakehouse>`: Delta, Iceberg, and Hudi tables on object storage.
-- {doc}`IO API </api/relational/io>`: the `bt.read` / `ds.write` reference.
+- {doc}`IO API </api/relational/io>`: the {py:obj}`bt.read <batcher.read>` / {py:obj}`ds.write <batcher.Dataset.write>` reference.
 - {doc}`/cookbook/io/sources_and_sinks`: which formats exist, and the objects behind them.

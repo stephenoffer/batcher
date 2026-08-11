@@ -8,7 +8,13 @@ build-backend = "maturin"
 [project]
 name = "batcher-engine"
 description = "A native, JIT-compiling, adaptive data engine — single-node sub-second to PB-scale."
-requires-python = ">=3.10"
+# 3.11, not 3.10: the control plane uses `enum.StrEnum` (in `plan.expr_ir.fn_names`, which
+# every expression import reaches), `datetime.UTC`, `tomllib`, and `BaseException.add_note`,
+# all of which arrived in 3.11. The floor said 3.10 and the release workflow built the abi3
+# wheel on 3.10, so pip installed happily on 3.10 and `import batcher` then failed outright.
+# CI only ever ran 3.11, so nothing could see it. `tests/unit/test_python_floor.py` now pins
+# this declaration against the features the code actually uses.
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Batcher contributors" }]
 readme = "README.md"
@@ -392,7 +398,10 @@ exclude_also = [
 # The control plane is the public face of the engine: lint-clean, typed, no
 # duplication, no dead code. See .claude/rules/python-quality.md.
 [tool.ruff]
-target-version = "py310"
+# Matches `requires-python`. It is not cosmetic: at py310 ruff classified `tomllib` as a
+# third-party import (it is stdlib from 3.11) and sorted it into the wrong block, and `UP`
+# withheld the rewrites the real floor allows.
+target-version = "py311"
 line-length = 100
 src = ["python", "tests", "benchmarks", "examples"]
 
@@ -418,5 +427,8 @@ ignore = ["RUF003"]
 # Tests may shadow/redefine fixtures and assert freely.
 "tests/**" = ["ARG"]
 # Examples define mock model/callable signatures with deliberately-unused params to
-# show the real API shape; that is illustrative, not dead code.
-"examples/**" = ["ARG"]
+# show the real API shape; that is illustrative, not dead code. E402 is the import of
+# `_common` (the shared S3 dataset loader), which must follow the `sys.path` line that
+# makes it importable — a script has to work when run directly, not only under the
+# test runner, so there is nowhere earlier to put it.
+"examples/**" = ["ARG", "E402"]

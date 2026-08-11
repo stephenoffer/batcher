@@ -53,7 +53,7 @@ class SourcePlacement:
 
     __slots__ = ("_hosts", "_on_host", "_workers")
 
-    def __init__(self, workers: int) -> None:
+    def __init__(self, workers: int, hosts: list[int] | None = None) -> None:
         self._workers = workers
         # Only relocated sources are stored; an absent entry means "still on its own
         # worker", so a clean run allocates nothing and behaves exactly as before.
@@ -64,9 +64,19 @@ class SourcePlacement:
         # scan per failure, on a path that only runs when the cluster is already losing
         # workers and a correlated preemption wave can be losing many at once.
         self._on_host: dict[int, set[int]] = {}
+        # `hosts[src]` is where source `src` landed on its first attempt. Needed as soon as
+        # a shuffle has more sources than workers, because then "source `s` is on worker
+        # `s`" is not merely unrelocated-yet, it is out of range — the identity the sparse
+        # form assumes never held. Recording every source up front keeps `host_of` and
+        # `sources_on` exact without giving either one a second code path: the reverse
+        # index is simply complete from the start rather than filled in by relocations.
+        if hosts is not None:
+            for src, host in enumerate(hosts):
+                self._hosts[src] = host
+                self._on_host.setdefault(host, set()).add(src)
 
     def host_of(self, src: int) -> int:
-        """The worker holding `src`'s latest output — `src` itself until it moves."""
+        """The worker holding `src`'s latest output — where it was first placed until it moves."""
         return self._hosts.get(src, src)
 
     def sources_on(self, host: int) -> set[int]:

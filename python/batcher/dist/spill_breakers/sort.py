@@ -7,7 +7,6 @@ Globally sorted with no k-way merge, bounded by one bucket. A top-N `limit` stop
 from __future__ import annotations
 
 import json
-import shutil
 
 import pyarrow as pa
 
@@ -18,9 +17,13 @@ from batcher.dist.executors.plan_analysis import _single_source
 from batcher.dist.spill import (
     _fd_safe,
     _iter_spill_morsels,
-    _make_store,
-    _work_dir,
     map_projection,
+)
+from batcher.dist.spill.buckets import (
+    BucketWriters,
+    read_reserved_bucket,
+    resident_bytes,
+    spill_scratch,
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
@@ -101,10 +104,8 @@ def _buckets_for_staged(stage_handle: object, hint: int) -> int:
     misconfigured spill.
 
     Staging has already measured the mapped input, so the count can come from the same
-    envelope the aggregate reduce uses (`memory.spill_bucket_max_bytes`). `logical_nbytes`
-    is the **uncompressed** size — what reading the bucket back actually costs in RAM —
-    where `nbytes` is the on-disk size, which for a compressible column can be several times
-    smaller and would let an over-large bucket through.
+    envelope the aggregate reduce uses (`memory.spill_bucket_max_bytes`), sized by
+    `resident_bytes` — the same uncompressed measure every other breaker budgets against.
 
     The caller's `hint` is a floor, so a small sort still gets the parallelism it had, and
     `_fd_safe` is the ceiling, because the partition phase holds one writer per non-empty
@@ -116,7 +117,7 @@ def _buckets_for_staged(stage_handle: object, hint: int) -> int:
     """
     if stage_handle is None:
         return max(1, hint)
-    resident = getattr(stage_handle, "logical_nbytes", 0) or getattr(stage_handle, "nbytes", 0)
+    resident = resident_bytes(stage_handle)
     bucket_max = active_config().memory.spill_bucket_max_bytes
     if bucket_max <= 0 or resident <= 0:
         return _fd_safe(max(1, hint))
@@ -164,23 +165,11 @@ def stage_and_partition(
     boundaries = merge_boundaries(grids, n_buckets) if n_buckets > 1 else []
 
     # --- pass 2: assign staged rows to ordered buckets and spill ----------
-    writers: dict[int, object] = {}
-    handles: list[object] = [None] * n_buckets
+    writers = BucketWriters(store, "bucket")
     staged = store.read_stream(stage_handle) if stage_handle is not None else iter(())
     for rb in staged:
-        parts = bucketize([rb], key_name, boundaries, n_buckets, nulls_first, descending)
-        for b, part in enumerate(parts):
-            if not part:
-                continue
-            w = writers.get(b)
-            if w is None:
-                w = store.writer(f"bucket_{b}")
-                writers[b] = w
-            for pb in part:
-                if pb.num_rows:
-                    w.write(pb)
-    for b, w in writers.items():
-        handles[b] = w.close()
+        writers.add(bucketize([rb], key_name, boundaries, n_buckets, nulls_first, descending))
+    handles = writers.close_dense(n_buckets)
     # The staged copy is the *whole* mapped input and pass 2 has finished re-reading it, so
     # holding it while the buckets are processed doubled peak scratch for no reader. Giving
     # it back here is what makes out-of-core sort cost one copy of the data on disk, not two.
@@ -215,9 +204,7 @@ def stream_spilling_sort(
     scan = {"op": "scan", "source_id": 0}
     sort_ir = json.dumps({"op": "sort", "input": scan, "keys": keys_ir, "limit": sort.limit})
 
-    work_dir, owns_dir = _work_dir(spill_dir, "batcher_sort_spill_")
-    store = _make_store(work_dir)
-    try:
+    with spill_scratch("batcher_sort_spill_", spill_dir) as store:
         handles = stage_and_partition(
             sources[sid],
             map_ir,
@@ -237,13 +224,7 @@ def stream_spilling_sort(
         for b in order:
             if handles[b] is None:
                 continue
-            # `read_reserved` accounts the bucket's *resident* footprint against the process
-            # buffer pool while it is held. Reading a bucket back is the one step of spilling
-            # that can undo it, and a plain `read` told the pool nothing — so a concurrent
-            # query sizing its own state saw headroom this sort was already using. The
-            # aggregate reduce has always done this; the ordering breakers had not.
-            with store.read_reserved(handles[b]) as stream:
-                bucket = list(stream)
+            bucket = read_reserved_bucket(store, handles[b])
             if not bucket:
                 continue
             try:
@@ -264,14 +245,5 @@ def stream_spilling_sort(
                 # Buckets are read once, in key order, so this one will never be read again.
                 # Releasing it as it is consumed bounds peak scratch to the buckets still
                 # outstanding rather than to the whole spilled input — the disk analogue of
-                # the credit window, and what the aggregate reduce already does.
+                # the credit window.
                 store.release(handles[b])
-    finally:
-        # `cleanup` before the `rmtree`, and unconditionally. It aborts any writer still
-        # open (a partition phase abandoned by an exception) and deletes both tiers' files
-        # — the `rmtree` only ever reached the *local* one, so a failed query that had
-        # overflowed left orphaned objects in the remote bucket, accumulating and billable,
-        # with nothing recording that they existed.
-        store.cleanup()
-        if owns_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)

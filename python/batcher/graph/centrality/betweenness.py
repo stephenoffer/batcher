@@ -126,50 +126,63 @@ def betweenness_centrality(
         levels = _shortest_path_counts(g, source, max_depth)
         if len(levels) < 2:
             continue
-        # Backward pass. `delta[v]` is the share of shortest-path traffic through `v`;
-        # a node at the deepest level has none, and each level hands its share back to
-        # the level above in proportion to the paths it received from there.
-        delta = checkpoint(levels[-1].select(**{NODE: bt.col(NODE), "delta": bt.lit(0.0)}))
-        deeper = levels[-1]
-        for depth in range(len(levels) - 2, -1, -1):
-            above = levels[depth]
-            contribution = (
-                edges.join(
-                    above.select(**{SRC: bt.col(NODE), "_sv": bt.col("sigma")}),
-                    on=SRC,
-                    how="inner",
-                )
-                .join(
-                    deeper.select(**{DST: bt.col(NODE), "_sw": bt.col("sigma")}),
-                    on=DST,
-                    how="inner",
-                )
-                .join(
-                    delta.select(**{DST: bt.col(NODE), "_dw": bt.col("delta")}),
-                    on=DST,
-                    how="inner",
-                )
-                .select(
-                    **{
-                        NODE: bt.col(SRC),
-                        "_c": (bt.col("_sv") / bt.col("_sw")) * (bt.lit(1.0) + bt.col("_dw")),
-                    }
-                )
-                .group_by(NODE)
-                .agg(_c=bt.sum("_c"))
-            )
-            level_delta = checkpoint(
-                above.select(NODE)
-                .join(contribution, on=NODE, how="left")
-                .select(**{NODE: bt.col(NODE), "delta": bt.coalesce(bt.col("_c"), bt.lit(0.0))})
-            )
-            # The source itself accumulates nothing: it is an endpoint of every path it
-            # starts, and betweenness counts only the nodes a path passes *through*.
-            if depth > 0:
-                totals = level_delta if totals is None else checkpoint(totals.union(level_delta))
-            delta = level_delta
-            deeper = above
+        totals = _accumulate_backward(edges, levels, totals)
 
+    return _finalize(g, totals)
+
+
+def _accumulate_backward(
+    edges: Dataset, levels: list[Dataset], totals: Dataset | None
+) -> Dataset | None:
+    """Fold one source's backward pass into `totals`, returning the new running sum."""
+    # Backward pass. `delta[v]` is the share of shortest-path traffic through `v`;
+    # a node at the deepest level has none, and each level hands its share back to
+    # the level above in proportion to the paths it received from there.
+    delta = checkpoint(levels[-1].select(**{NODE: bt.col(NODE), "delta": bt.lit(0.0)}))
+    deeper = levels[-1]
+    for depth in range(len(levels) - 2, -1, -1):
+        above = levels[depth]
+        contribution = (
+            edges.join(
+                above.select(**{SRC: bt.col(NODE), "_sv": bt.col("sigma")}),
+                on=SRC,
+                how="inner",
+            )
+            .join(
+                deeper.select(**{DST: bt.col(NODE), "_sw": bt.col("sigma")}),
+                on=DST,
+                how="inner",
+            )
+            .join(
+                delta.select(**{DST: bt.col(NODE), "_dw": bt.col("delta")}),
+                on=DST,
+                how="inner",
+            )
+            .select(
+                **{
+                    NODE: bt.col(SRC),
+                    "_c": (bt.col("_sv") / bt.col("_sw")) * (bt.lit(1.0) + bt.col("_dw")),
+                }
+            )
+            .group_by(NODE)
+            .agg(_c=bt.sum("_c"))
+        )
+        level_delta = checkpoint(
+            above.select(NODE)
+            .join(contribution, on=NODE, how="left")
+            .select(**{NODE: bt.col(NODE), "delta": bt.coalesce(bt.col("_c"), bt.lit(0.0))})
+        )
+        # The source itself accumulates nothing: it is an endpoint of every path it
+        # starts, and betweenness counts only the nodes a path passes *through*.
+        if depth > 0:
+            totals = level_delta if totals is None else checkpoint(totals.union(level_delta))
+        delta = level_delta
+        deeper = above
+    return totals
+
+
+def _finalize(g: Graph, totals: Dataset | None) -> Dataset:
+    """Sum each node's accumulated share and left-join it back onto the full node set."""
     if totals is None:
         return g.nodes().select(**{NODE: bt.col(NODE), "betweenness": bt.lit(0.0)})
     summed = totals.group_by(NODE).agg(betweenness=bt.sum("delta"))

@@ -7,7 +7,7 @@ point at a terabyte of Parquet.
 ## Import and build a dataset
 
 The conventional alias is `bt`. Build an in-memory dataset from a column-oriented
-dictionary with `from_pydict`.
+dictionary with {py:func}`from_pydict <batcher.from_pydict>`.
 
 ```python
 import batcher as bt
@@ -26,7 +26,7 @@ print(ds.columns)
 # ['id', 'name', 'category', 'price', 'qty']
 ```
 
-A `Dataset` is lazy. Each operation returns a new `Dataset` describing a plan, and no
+A {py:class}`Dataset <batcher.Dataset>` is lazy. Each operation returns a new {py:class}`Dataset <batcher.Dataset>` describing a plan, and no
 work runs until a terminal operation such as `to_pydict` or `collect`. That one idea
 explains most of the API, and {doc}`concepts/lazy` unpacks it.
 
@@ -41,7 +41,7 @@ print(filtered.to_pydict())
 # {'id': [3, 4, 5], 'name': ['cy', 'dan', 'eve'], 'category': ['a', 'b', 'a'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
 ```
 
-Null handling, `is_in`, and sampling are in {doc}`/user-guide/transform/rows/filtering`.
+Null handling, {py:meth}`is_in <batcher.plan.expr_ir.core.Expr.is_in>`, and sampling are in {doc}`/user-guide/transform/rows/filtering`.
 
 ## Select and transform columns
 
@@ -113,7 +113,7 @@ translates a SQL query into DataFrame verbs step by step.
 
 ## Execute and inspect
 
-Terminal operations run the plan. `to_pydict` returns columns, `to_pylist`
+Terminal operations run the plan. {py:meth}`to_pydict <batcher.Dataset.to_pydict>` returns columns, {py:meth}`to_pylist <batcher.Dataset.to_pylist>`
 returns rows, `count` returns the row count, and `collect` returns a
 `pyarrow.Table`.
 

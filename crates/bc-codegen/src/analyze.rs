@@ -280,11 +280,22 @@ pub(crate) fn analyze(
         Expr::ImageCrop { .. } => Err(CodegenError::Unsupported("image crop".into())),
         Expr::Audio { .. } => Err(CodegenError::Unsupported("audio function".into())),
         Expr::Video { .. } => Err(CodegenError::Unsupported("video function".into())),
+        // The JIT compiles fixed-width scalar arithmetic; every `.seq` op is a variable-length
+        // pass over a row's bytes producing text, a list, or a struct. There is nothing here
+        // for Cranelift to lower, so it declines and the interpreter — the oracle — runs it.
+        // Declining is the contract: a JIT path that disagreed would be wrong *fast*.
+        Expr::Seq { .. } => Err(CodegenError::Unsupported("sequence function".into())),
         // Geospatial work decodes WKB and walks variable-length geometry per row, which
         // has no scalar-register form at all — there is nothing here for a JIT to
         // compile, and falling back is the correct and permanent answer rather than a
         // gap waiting to be filled.
         Expr::Geo { .. } => Err(CodegenError::Unsupported("geospatial function".into())),
+        // Declined rather than compiled, even though the arithmetic is exactly the
+        // numeric subset this tier handles. The kernels call transcendental functions
+        // (`atan2`, `asin`, `acos`, `sin_cos`) that the JIT would have to reach through
+        // libm calls, and bit-for-bit agreement with the interpreter across those is a
+        // parity claim nothing here proves. The interpreter's loop is already tight.
+        Expr::Spatial { .. } => Err(CodegenError::Unsupported("rigid-body function".into())),
         Expr::Coalesce { .. } => Err(CodegenError::Unsupported("coalesce".into())),
         // `x IN (lit, ...)`: compiled as an OR-chain of equality compares, so the whole
         // surrounding predicate stays in one JIT pass instead of falling back wholesale.

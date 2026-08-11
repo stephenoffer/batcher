@@ -24,12 +24,12 @@ in and the shared machinery it should build on rather than reinvent.
 
 | You want to add | Go to | Reuse |
 |---|---|---|
-| A scalar/aggregate function (`concat`, `corr`) | `plan/functions/<family>.py` | compose existing `Expr` nodes |
+| A scalar/aggregate function (`concat`, `corr`) | `plan/functions/<family>.py` | compose existing {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` nodes |
 | A new expression IR node (a new wire shape) | `plan/expr_ir/func_nodes.py` (or `nodes.py`/`core.py`) | `IRNode` + `child`/`scalar`/`literal` |
-| A typed-accessor method (`.str.slug`, `.dt.iso_year`) | `plan/expr_ir/namespaces/<family>.py` | the namespace class / dispatch table |
+| A typed-accessor method (`.str.slug`, {py:meth}`.dt.iso_year <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.iso_year>`) | `plan/expr_ir/namespaces/<family>.py` | the namespace class / dispatch table |
 | A new function *name* for an existing node | `plan/expr_ir/fn_names.py` | the family vocabulary |
 | A Kyber optimizer rule | `kyber/rules/<family>.py` or `kyber/rules/extra/<family>.py` | `@rule` + `transform_up` |
-| An IO format (a reader/writer) | `io/formats/<category>/<fmt>.py` | `FileSource`/`FileSink` + `@SOURCES.register` |
+| An IO format (a reader/writer) | `io/formats/<category>/<fmt>.py` | {py:class}`FileSource <batcher.io.FileSource>`/{py:class}`FileSink <batcher.io.FileSink>` + `@SOURCES.register` |
 | A relational operator | Rust `bc-runtime` + `plan/logical/` | see the `add-relational-operator` skill |
 
 The golden rule: **per-row work lives in Rust** behind the JSON IR. Python builds and
@@ -99,8 +99,8 @@ Rules:
 
 ## Add a typed-accessor method
 
-Per-type breadth lives on the `.str` / `.dt` / `.list` / `.struct` / `.json` / `.map`
-namespaces, not as new `Expr`/`Dataset` methods (keeping those thin is how v2 avoids
+Per-type breadth lives on the {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>` / {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>` / {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` / {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>` / {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>` / {py:class}`.map <batcher.plan.expr_ir.namespaces.collections._MapNamespace>`
+namespaces, not as new {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`/{py:class}`Dataset <batcher.Dataset>` methods (keeping those thin is how v2 avoids
 v1's god-objects).
 
 A **parameterless** accessor is one row in the family's dispatch table, and nothing more:
@@ -126,7 +126,7 @@ def slug(self, sep: str = "-") -> StrFunc:
 
 Each function node validates its `fn` against a family vocabulary in
 `plan/expr_ir/fn_names.py` at construction, so an unknown name fails early with a
-clear `PlanError` instead of an opaque engine error. When you add a function to a
+clear {py:exc}`PlanError <batcher.PlanError>` instead of an opaque engine error. When you add a function to a
 node family, add its name here too:
 
 - **Closed families** hold a handful of stable ops and are `StrEnum`s: `MapFn`,

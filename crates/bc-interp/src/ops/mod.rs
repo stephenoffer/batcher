@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, UInt64Array};
+use arrow::buffer::NullBuffer;
 use arrow::compute::SortOptions;
 use arrow::compute::{filter_record_batch, lexsort_to_indices, SortColumn};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -18,8 +19,8 @@ use bc_ir::{
     WindowFunc,
 };
 use bc_runtime::agg::{self, AggCall};
+use bc_runtime::window::frame as window_frame;
 use bc_runtime::window::{self, WindowCall};
-use bc_runtime::window_frame;
 
 use crate::error::InterpError;
 
@@ -361,6 +362,65 @@ pub(crate) fn build_agg_batch(
     )?)
 }
 
+/// Resolve a `DISTINCT ON`'s plan-level key names and ordering into what the runtime takes:
+/// a batch that carries every ordering column, the key column indices, and the ordering as
+/// `(column index, options)`.
+///
+/// The runtime compares the ordering while gathering rows, so the ordering has to be *in* the
+/// batch to survive the gather. An ordering term that is already a plain column reference is
+/// used where it sits and nothing is appended — the common `order_by="ts"` case, whose batch
+/// comes back unchanged. Only a computed term (`order_by=col("a") + col("b")`) is evaluated and
+/// appended, and the caller then narrows the result back to the input's columns.
+///
+/// The one place the plan and runtime representations meet, so the sequential oracle, the
+/// parallel executor and the spill path cannot disagree about which columns a dedup keys on or
+/// where its ordering puts nulls. `SortOptions` is built from the IR's own flags rather than
+/// arrow's `default()`, whose `nulls_first` is `true` where SQL's `ORDER BY` puts nulls last.
+pub(crate) fn distinct_on_widen(
+    batch: &RecordBatch,
+    keys: &[String],
+    order: &[SortKey],
+) -> Result<(RecordBatch, Vec<usize>, Vec<agg::OrderKey>), InterpError> {
+    let schema = batch.schema();
+    let key_idx = keys
+        .iter()
+        .map(|k| {
+            schema
+                .index_of(k)
+                .map_err(|_| InterpError::DistinctUnknownColumn(k.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut ord = Vec::with_capacity(order.len());
+    for (j, key) in order.iter().enumerate() {
+        let options = SortOptions {
+            descending: key.descending,
+            nulls_first: key.nulls_first,
+        };
+        if let bc_expr::Expr::Col { name } = &key.expr {
+            if let Ok(i) = schema.index_of(name) {
+                ord.push((i, options));
+                continue;
+            }
+        }
+        let arr = key.expr.eval(batch)?;
+        fields.push(Field::new(
+            format!("__bc_distinct_order_{j}"),
+            arr.data_type().clone(),
+            true,
+        ));
+        ord.push((columns.len(), options));
+        columns.push(arr);
+    }
+    if columns.len() == batch.num_columns() {
+        return Ok((batch.clone(), key_idx, ord));
+    }
+    let wide = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+    Ok((wide, key_idx, ord))
+}
+
 /// Deduplicate the merged partials of an all-column group-by into distinct rows.
 pub(crate) fn distinct_partial(batch: &RecordBatch) -> Result<agg::Partial, InterpError> {
     let keys: Vec<ArrayRef> = batch.columns().to_vec();
@@ -394,6 +454,62 @@ pub(crate) fn parallel_distinct(batches: &[RecordBatch]) -> Result<Vec<RecordBat
     )?])
 }
 
+/// The sequential oracle for a keyed dedup: one whole row per distinct key.
+///
+/// Deliberately the simplest correct statement of the operator — materialize, resolve the
+/// ordering, take the per-key minimum — with none of [`parallel_distinct_on`]'s pre-reduce or
+/// key partitioning. That is what makes it the thing the other paths are checked against.
+pub(crate) fn distinct_on_batches(
+    batches: &[RecordBatch],
+    keys: &[String],
+    order: &[SortKey],
+) -> Result<RecordBatch, InterpError> {
+    let combined = materialize(batches).map_err(|_| InterpError::EmptyAggregateInput)?;
+    let ncols = combined.num_columns();
+    let (wide, key_idx, ord) = distinct_on_widen(&combined, keys, order)?;
+    let out = agg::distinct_on(&wide, &key_idx, &ord)?;
+    Ok(match out.num_columns() == ncols {
+        true => out,
+        // A computed ordering was appended to compare on; drop it from the result.
+        false => out.project(&(0..ncols).collect::<Vec<_>>())?,
+    })
+}
+
+/// [`parallel_distinct`] for a key *subset*: one whole row per dedup key, across cores.
+///
+/// The in-memory half of every keyed dedup — the `par` executor's operator arm, the streaming
+/// breaker and the shard-parallel driver all reduce through here, so there is one statement of
+/// how the widening, the reduction and the narrowing fit together. Only the out-of-core path
+/// (`crate::distinct_on_spill`) differs, and only in where the buckets live.
+pub(crate) fn parallel_distinct_on(
+    batches: &[RecordBatch],
+    keys: &[String],
+    order: &[SortKey],
+) -> Result<Vec<RecordBatch>, InterpError> {
+    use rayon::prelude::*;
+    let Some(first) = batches.first() else {
+        return Ok(Vec::new());
+    };
+    let ncols = first.num_columns();
+    // Widen every morsel identically, so the ordering columns sit at the same indices in all of
+    // them and travel with their rows through the reduction's gathers.
+    let wide: Vec<RecordBatch> = batches
+        .par_iter()
+        .map(|b| distinct_on_widen(b, keys, order).map(|(b, _, _)| b))
+        .collect::<Result<_, InterpError>>()?;
+    let (_, key_idx, ord) = distinct_on_widen(first, keys, order)?;
+    let out = agg::distinct_on_parts(&wide, &key_idx, &ord, rayon::current_num_threads().max(1))?;
+    if wide[0].num_columns() == ncols {
+        return Ok(out);
+    }
+    // A computed ordering was appended to compare on; drop it from the result.
+    let keep: Vec<usize> = (0..ncols).collect();
+    Ok(out
+        .iter()
+        .map(|b| b.project(&keep))
+        .collect::<Result<_, _>>()?)
+}
+
 fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
     match item.func {
         AggFunc::CountStar => agg::AggFunc::CountStar,
@@ -418,6 +534,15 @@ fn map_agg_func(item: &AggregateItem) -> agg::AggFunc {
             agg::AggFunc::ApproxQuantile((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
         }
         AggFunc::Mode => agg::AggFunc::Mode,
+        // The contiguity fraction rides `param`, exactly as the quantile does; the default
+        // is 0.5, so a plan that omits it asks for N50/L50.
+        AggFunc::NLength => {
+            agg::AggFunc::NLength((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+        }
+        AggFunc::LCount => {
+            agg::AggFunc::LCount((item.param.unwrap_or(0.5) * 1000.0).round() as u16)
+        }
+        AggFunc::AuN => agg::AggFunc::AuN,
         AggFunc::ArgMin => agg::AggFunc::ArgMin,
         AggFunc::ArgMax => agg::AggFunc::ArgMax,
         AggFunc::Product => agg::AggFunc::Product,
@@ -697,6 +822,134 @@ fn take_batch(
 /// morsel and reuse it for the selection, the top-N bound check and the candidate gather.
 /// Evaluating them here instead would repeat a computed key's work, and would repeat
 /// `normalize_sort_key`'s whole-column scan for a float key.
+/// `k` must be this many times smaller than the morsel before selecting beats sorting it.
+///
+/// The selection is O(n) with a heap of `k`; the full sort is a fixed number of linear passes
+/// (radix) or O(n log n) (strings). Selecting wins comfortably at every `k` a `LIMIT` realistically
+/// asks for, and the two converge as `k` approaches `n` — where a heap holding nearly every row is
+/// the wrong shape and the sort is also what the caller wanted anyway. Two is the conservative
+/// side of that crossover, not a measured optimum: the measured cases are all `k << n`.
+const TOP_K_SELECT_RATIO: usize = 2;
+
+/// Rows beyond `k` that the leading key may leave unresolved before selecting is judged not to
+/// apply and the caller sorts or quickselects instead.
+///
+/// The leading key narrows by *ranking*, and a rank that ties settles nothing. A `Utf8` column
+/// whose values share their first eight bytes — a URL, an ISO timestamp rendered as text — packs
+/// to one constant; a leading `COUNT(*)` where most counts are 1 ties just as hard. In both the
+/// "rows the key cannot separate" is the whole morsel, and bounding that is what keeps the bad
+/// case at the cost of the old path rather than the cost of both. The slack is generous because
+/// the *good* case leaves almost exactly `k`, so a loose bound never fires there.
+const TOP_K_CANDIDATE_SLACK: usize = 8;
+
+/// Floor under [`TOP_K_CANDIDATE_SLACK`] so a very small `k` still tolerates a handful of ties
+/// rather than declining over three of them.
+const TOP_K_CANDIDATE_FLOOR: usize = 256;
+
+/// The `k` best row indices of a **single** sort key, in output order, or `None` when this
+/// selection does not apply to the key's type.
+///
+/// Identical to `stable_sort(values, opts)[..k]`, and that equality is the whole contract: the
+/// selection is a cost choice, never a semantic one. Null keys order as one block ahead of (or
+/// behind) every live row, which is what lets them be answered by counting rather than ranking.
+fn top_k_single_key(
+    values: &ArrayRef,
+    opts: SortOptions,
+    k: usize,
+) -> Option<arrow::array::UInt32Array> {
+    use arrow::array::UInt32Array;
+    if k == 0 {
+        return Some(UInt32Array::from(Vec::<u32>::new()));
+    }
+    let null_count = values.null_count();
+    // With nulls first, the answer starts with as many null rows as there are (up to `k`) and
+    // needs only the remainder from the live rows. With nulls last they are the opposite: a
+    // filler, used only when the column holds fewer than `k` live rows.
+    let leading_nulls = if opts.nulls_first {
+        null_count.min(k)
+    } else {
+        0
+    };
+    let live_k = k - leading_nulls;
+    let live: Vec<u32> = if live_k == 0 {
+        Vec::new()
+    } else {
+        radix_sort::top_k_live(values, opts.descending, live_k)
+            .or_else(|| str_sort::top_k_live(values, opts.descending, live_k))?
+    };
+    if null_count == 0 {
+        return Some(UInt32Array::from(live));
+    }
+    let trailing_nulls = if opts.nulls_first {
+        0
+    } else {
+        k.saturating_sub(live.len())
+    };
+    let wanted_nulls = leading_nulls + trailing_nulls;
+    let nulls = values
+        .nulls()
+        .expect("null_count > 0 implies a null buffer");
+    let null_idx: Vec<u32> = (0..values.len() as u32)
+        .filter(|&i| nulls.is_null(i as usize))
+        .take(wanted_nulls)
+        .collect();
+    let mut out = Vec::with_capacity(k.min(null_idx.len() + live.len()));
+    if opts.nulls_first {
+        out.extend_from_slice(&null_idx);
+        out.extend_from_slice(&live);
+    } else {
+        out.extend_from_slice(&live);
+        out.extend_from_slice(&null_idx);
+    }
+    Some(UInt32Array::from(out))
+}
+
+/// The `k` smallest-ranking live row indices, ordered by rank then by input position.
+///
+/// `rank` maps a row to an order-preserving `u64` — smaller ranks come first, which is what the
+/// callers' `descending` inversion already accounts for. Rows the null buffer marks are skipped
+/// entirely (the caller places them as a block), and fewer than `k` live rows yields all of them.
+///
+/// The heap holds at most `k` entries, so a row that cannot reach the answer costs one comparison
+/// against the current worst and nothing else. Ties break toward the earlier row because the scan
+/// runs in input order and only a *strictly* better entry displaces the worst — which is exactly
+/// the stable sort's tie order.
+fn heap_select_k<F>(n: usize, nulls: Option<&NullBuffer>, k: usize, rank: F) -> Vec<u32>
+where
+    F: Fn(usize) -> u64,
+{
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<(u64, u32)> = BinaryHeap::with_capacity(k + 1);
+    macro_rules! consider {
+        ($i:expr) => {{
+            let entry = (rank($i), $i as u32);
+            if heap.len() < k {
+                heap.push(entry);
+            } else if entry < *heap.peek().expect("k >= 1, so the heap is non-empty") {
+                heap.pop();
+                heap.push(entry);
+            }
+        }};
+    }
+    match nulls {
+        Some(nb) => {
+            for i in 0..n {
+                if nb.is_valid(i) {
+                    consider!(i);
+                }
+            }
+        }
+        None => {
+            for i in 0..n {
+                consider!(i);
+            }
+        }
+    }
+    let mut kept = heap.into_vec();
+    kept.sort_unstable();
+    kept.into_iter().map(|(_, i)| i).collect()
+}
+
 fn top_k_indices_of(
     key_arrays: &[ArrayRef],
     keys: &[SortKey],
@@ -704,32 +957,63 @@ fn top_k_indices_of(
     k: usize,
 ) -> Result<arrow::array::UInt32Array, InterpError> {
     use arrow::array::UInt32Array;
-    // A single key takes the O(n) specialized full sort ONLY where `sort_indices_of` has one:
-    // the string permutation builder or the integer/temporal radix. Both are linear, so
-    // sorting the whole morsel to keep `k` costs no more than selecting `k`.
+    // A single key first tries the bounded-heap **selection**, which reads each key once and
+    // touches its heap only for a row that beats the worst of the `k` kept so far — for a small
+    // `k` over random data that is ~one comparison per row and nothing else.
     //
-    // A float, decimal or boolean key has no specialized path. It used to full-`lexsort` every
-    // morsel to keep `k` rows — an O(n log n) sort. Measured on 6M rows: `ORDER BY <f64> DESC
-    // LIMIT 100` took **26.3 ms against DuckDB's 8.7 ms (3.0x)**, while the *three*-key form of
-    // the same query ran in 18 ms because it reached the O(n) quickselect below. Fewer sort
-    // keys costing more was the tell. So those keys now fall through to that same quickselect,
-    // which is O(n) for any type and (with the fixed `parallel_top_n` tie-break) selects
-    // exactly the stable sort's top-k — proven for a float key with `-0.0`/`0.0`, NaN and
-    // heavy ties by `parallel_top_n_float_key_matches_eager`.
+    // It replaces a *full per-morsel sort* on this path, and the difference is not marginal.
+    // Measured on 6 M random rows, `ORDER BY <i64> LIMIT 10`: the LSD radix runs five passes of
+    // random-access counting and scatter to order 16,384 rows and keep ten of them — 199 ms
+    // single-threaded, 53 ms across the pool. A `Utf8` key is worse still, because
+    // `stable_sort_indices_str` is a comparison sort: `ORDER BY <string> LIMIT 10` cost 401 ms
+    // where the same query with a second sort key — which fell through to the O(n) quickselect
+    // below — cost 77 ms. **Fewer sort keys costing five times more was the tell**, the same
+    // tell that had already moved float keys to the quickselect.
+    //
+    // The earlier attempt at this replaced the sort with the general quickselect and measured a
+    // wash at `LIMIT 10`, which is why the full sort stayed. Two things are different here.
+    // The selection is typed — it ranks by the same order-preserving `u64` the radix builds, so
+    // there is no `make_comparator` dynamic dispatch in the inner loop — and it **returns its
+    // survivors already sorted**, so the downstream merge still receives sorted runs. That was
+    // the reason the full sort was kept (a quickselect's unordered output made `LIMIT 100000`
+    // 893 -> 1139 ms), and it no longer applies. The `k * 2 <= num_rows` gate keeps the full
+    // sort for the large-`k` case anyway, where a heap of nearly every row is the wrong shape.
+    if !keys.is_empty() && k > 0 && k.saturating_mul(TOP_K_SELECT_RATIO) <= num_rows {
+        if keys.len() == 1 {
+            let opts = SortOptions {
+                descending: keys[0].descending,
+                nulls_first: keys[0].nulls_first,
+            };
+            if let Some(sel) = top_k_single_key(&key_arrays[0], opts, k) {
+                return Ok(sel);
+            }
+        } else if let Some(sel) = top_k_by_leading_key(key_arrays, keys, num_rows, k)? {
+            return Ok(sel);
+        }
+    }
+    // A single key with a large `k`, or one whose type has no selection: the specialized full
+    // sort, sliced. `stable_sort_indices_str` for strings, the LSD radix for integer/temporal.
+    //
+    // A float, decimal or boolean key has no specialized full sort. It used to full-`lexsort`
+    // every morsel to keep `k` rows — an O(n log n) sort. Measured on 6M rows: `ORDER BY <f64>
+    // DESC LIMIT 100` took **26.3 ms against DuckDB's 8.7 ms (3.0x)**, while the *three*-key
+    // form of the same query ran in 18 ms because it reached the O(n) quickselect below. So
+    // those keys fall through to that same quickselect, which is O(n) for any type and (with
+    // the fixed `parallel_top_n` tie-break) selects exactly the stable sort's top-k — proven
+    // for a float key with `-0.0`/`0.0`, NaN and heavy ties by
+    // `parallel_top_n_float_key_matches_eager`.
     if keys.len() == 1 {
         let v = key_arrays[0].clone();
         let opts = SortOptions {
             descending: keys[0].descending,
             nulls_first: keys[0].nulls_first,
         };
-        // The string builder and the integer/temporal radix are stable *full* sorts, and for
-        // top-k that only pays when the full sort is genuinely as cheap as selecting k. Integer
-        // radix is (a few cache-friendly LSD passes over a compact key, measured a win vs
-        // DuckDB). A **float** key is not: its radix runs 8 LSD passes scattering by a random
-        // key byte, so sorting a whole morsel to keep 100 rows costs ~8x an O(n) selection and
-        // thrashes cache. So exclude float here and let it fall to the quickselect below —
-        // which the fixed `parallel_top_n` tie-break makes result-identical to this full sort
-        // (`parallel_top_n_float_key_matches_eager`).
+        // A **float** key is excluded: its radix runs 8 LSD passes scattering by a random key
+        // byte, so sorting a whole morsel to keep 100 rows costs ~8x an O(n) selection and
+        // thrashes cache. It falls to the quickselect below — which the fixed `parallel_top_n`
+        // tie-break makes result-identical to this full sort
+        // (`parallel_top_n_float_key_matches_eager`). The string builder has no such problem:
+        // it reads the value buffer only for comparisons its packed prefix cannot settle.
         let is_float = matches!(
             v.data_type(),
             DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -758,9 +1042,27 @@ fn top_k_indices_of(
     // survivors globally and breaks ties by original `(morsel, row)` — never by this order.
     // Covered by `parallel_top_n_matches_eager` (int key) and
     // `parallel_top_n_float_key_matches_eager` (float key with -0.0/NaN/heavy ties).
+    let cmp = row_comparator(key_arrays, keys)?;
+    let n = num_rows;
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    if n > k {
+        idx.select_nth_unstable_by(k - 1, &cmp);
+        idx.truncate(k);
+    }
+    Ok(UInt32Array::from(idx))
+}
+
+/// The strict total order on rows that a stable `ORDER BY keys` sort induces: each key in turn,
+/// then the original row index, which breaks every remaining tie.
+///
+/// Shared by the quickselect and by [`top_k_by_leading_key`]'s exact pass so the two cannot
+/// disagree about what "the k best rows" means.
+fn row_comparator<'a>(
+    key_arrays: &'a [ArrayRef],
+    keys: &[SortKey],
+) -> Result<impl Fn(&u32, &u32) -> std::cmp::Ordering + 'a, InterpError> {
     use arrow::array::make_comparator;
     use std::cmp::Ordering;
-    let n = num_rows;
     let comparators = keys
         .iter()
         .zip(key_arrays)
@@ -775,21 +1077,82 @@ fn top_k_indices_of(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let cmp = |a: &u32, b: &u32| -> Ordering {
+    Ok(move |a: &u32, b: &u32| -> Ordering {
         for c in &comparators {
             match c(*a as usize, *b as usize) {
                 Ordering::Equal => continue,
                 other => return other,
             }
         }
-        a.cmp(b) // strict total order: earlier row wins a tie, matching the eager sort
+        a.cmp(b)
+    })
+}
+
+/// The `k` best rows of a **multi-key** sort, narrowed by the leading key alone, or `None` when
+/// that key cannot narrow enough to pay.
+///
+/// A row strictly worse on the leading key than `k` other rows loses to all of them whatever the
+/// remaining keys say, because the leading key dominates the comparison. So ranking by that key
+/// alone — one `u64` per row, no row-format encoding, no per-comparison dynamic dispatch — yields
+/// a threshold, the rows at or below it are a **superset** of the answer, and only that superset
+/// is ever compared on the full key list. On a leading key that separates rows, the superset is
+/// about `k` rows out of the morsel.
+///
+/// This is the multi-key twin of [`top_k_single_key`], and it is what makes a `LIMIT` cheap for
+/// the shape a `LIMIT` almost always has: `ORDER BY <measure> DESC, <tie-breakers…>`. Without it
+/// the tie-breakers cost a full quickselect over an `arrow` comparator, whose per-comparison
+/// dispatch is the reason a *three*-key top-N used to be the fast one.
+fn top_k_by_leading_key(
+    key_arrays: &[ArrayRef],
+    keys: &[SortKey],
+    num_rows: usize,
+    k: usize,
+) -> Result<Option<arrow::array::UInt32Array>, InterpError> {
+    use arrow::array::UInt32Array;
+    let lead = &key_arrays[0];
+    let opts = SortOptions {
+        descending: keys[0].descending,
+        nulls_first: keys[0].nulls_first,
     };
-    let mut idx: Vec<u32> = (0..n as u32).collect();
-    if n > k {
-        idx.select_nth_unstable_by(k - 1, cmp);
-        idx.truncate(k);
+    // Nulls take the extreme rank their placement asks for. That keeps the narrowing sound
+    // without a separate null block: a live row may share the extreme rank, in which case both
+    // are candidates and the exact pass — which knows `nulls_first` — orders them properly.
+    let Some(mut ranks) = radix_sort::ranks(lead, opts.descending)
+        .or_else(|| str_sort::prefix_ranks(lead, opts.descending))
+    else {
+        return Ok(None);
+    };
+    if let Some(nb) = lead.nulls().filter(|nb| nb.null_count() > 0) {
+        let extreme = if opts.nulls_first { 0 } else { u64::MAX };
+        for (i, rank) in ranks.iter_mut().enumerate() {
+            if nb.is_null(i) {
+                *rank = extreme;
+            }
+        }
     }
-    Ok(UInt32Array::from(idx))
+    let seeds = heap_select_k(num_rows, None, k, |i| ranks[i]);
+    let Some(&last) = seeds.last() else {
+        return Ok(Some(UInt32Array::from(Vec::<u32>::new())));
+    };
+    let threshold = ranks[last as usize];
+    // The same budget the string prefix uses, and for the same reason: a leading key with heavy
+    // ties at the threshold — a boolean, a status column, a `COUNT(*)` where most counts are 1 —
+    // narrows nothing, and paying for the attempt *and* the quickselect is the one outcome worth
+    // ruling out.
+    let budget = k.saturating_add((k * TOP_K_CANDIDATE_SLACK).max(TOP_K_CANDIDATE_FLOOR));
+    let mut candidates: Vec<u32> = Vec::with_capacity(budget.min(num_rows));
+    for (i, &rank) in ranks.iter().enumerate() {
+        if rank <= threshold {
+            if candidates.len() == budget {
+                return Ok(None);
+            }
+            candidates.push(i as u32);
+        }
+    }
+    let cmp = row_comparator(key_arrays, keys)?;
+    candidates.sort_unstable_by(&cmp);
+    candidates.truncate(k);
+    Ok(Some(UInt32Array::from(candidates)))
 }
 
 pub(crate) fn parallel_top_n(
@@ -1004,6 +1367,8 @@ pub(crate) fn window_batch_with(
             values,
             offset: f.offset,
             frame: map_frame(f.frame)?,
+            alpha: f.alpha,
+            half_life: f.half_life,
         });
     }
 
@@ -1092,22 +1457,22 @@ fn map_window_func(f: WindowFn) -> window::WindowFn {
         WindowFn::BitOr => window::WindowFn::BitOr,
         WindowFn::BitXor => window::WindowFn::BitXor,
         WindowFn::CountDistinct => window::WindowFn::CountDistinct,
+        WindowFn::EwmMean => window::WindowFn::EwmMean,
+        WindowFn::EwmVar => window::WindowFn::EwmVar,
+        WindowFn::EwmStd => window::WindowFn::EwmStd,
+        WindowFn::Interpolate => window::WindowFn::Interpolate,
+        WindowFn::RleId => window::WindowFn::RleId,
     }
 }
 
-/// Map an IR window frame to the runtime frame. `ROWS` and `GROUPS` frames are
-/// honored directly. A `RANGE` frame is honored only for peer bounds (CURRENT ROW /
-/// UNBOUNDED).
+/// Map an IR window frame to the runtime frame. Every unit maps directly.
 ///
-/// A numeric `RANGE` offset is *value*-based — the frame covers rows whose ORDER BY
-/// value lies within `n` of the current row's, which needs typed order-key arithmetic
-/// the runtime does not implement. It is rejected rather than approximated: silently
-/// substituting the peer-`RANGE` running aggregate returns a *wrong answer* for any
-/// frame that is not already peer-shaped, and a wrong answer is worse than an error.
-///
-/// The Python control plane rejects this shape first (`plan/logical/window.py` raises
-/// `PlanError`, and the SQL parser raises `NotImplementedError`), so this is the
-/// data-plane half of that contract — reachable only via directly-constructed IR.
+/// A numeric `RANGE` offset is *value*-based — the frame covers rows whose ORDER BY value
+/// lies within `n` of the current row's, in the key's own units and in microseconds for a
+/// temporal key. `bc_runtime::window::frame` resolves those bounds by searching the key's
+/// values, so the mapping here has no special case: the runtime declines a key it cannot
+/// subtract (`RangeFrameKeyNotMeasurable`) rather than substituting the peer frame, which
+/// would answer a different question with no error.
 fn map_frame(frame: Option<WindowFrame>) -> Result<Option<window_frame::Frame>, InterpError> {
     let Some(f) = frame else {
         return Ok(None);
@@ -1115,26 +1480,13 @@ fn map_frame(frame: Option<WindowFrame>) -> Result<Option<window_frame::Frame>, 
     let unit = match f.units {
         FrameUnits::Rows => window_frame::FrameUnit::Rows,
         FrameUnits::Groups => window_frame::FrameUnit::Groups,
-        FrameUnits::Range => {
-            if is_numeric_offset(f.start) || is_numeric_offset(f.end) {
-                return Err(InterpError::ValueBasedRangeFrame);
-            }
-            window_frame::FrameUnit::Range
-        }
+        FrameUnits::Range => window_frame::FrameUnit::Range,
     };
     Ok(Some(window_frame::Frame {
         unit,
         start: map_bound(f.start),
         end: map_bound(f.end),
     }))
-}
-
-/// Whether a frame bound carries a numeric `n` offset (`<n> PRECEDING/FOLLOWING`).
-fn is_numeric_offset(b: FrameBound) -> bool {
-    matches!(
-        b,
-        FrameBound::Preceding { .. } | FrameBound::Following { .. }
-    )
 }
 
 fn map_bound(b: FrameBound) -> window_frame::FrameBound {
@@ -1532,6 +1884,86 @@ mod sort_tests {
         }
     }
 
+    /// A **string** single sort key must agree with the eager stable oracle too.
+    ///
+    /// The int and float keys each have this test; the string key — which reaches
+    /// `top_k_indices_of` through a third path, `stable_sort_indices_str` — did not, so nothing
+    /// pinned the one key type whose ordering is a hand-written comparator rather than arrow's.
+    /// That gap is why replacing the path with a quickselect could be prototyped, measured and
+    /// rejected on cost alone without any test objecting to the semantics.
+    ///
+    /// The payload column is what makes a divergence visible: with heavy ties on the key, a
+    /// difference in *which* tied row survives shows up nowhere in the key column and everywhere
+    /// in `p`. The values include a shared 8-byte pack and a literal NUL, the two cases the
+    /// packed prefix key cannot settle on its own.
+    #[test]
+    fn parallel_top_n_string_key_matches_eager() {
+        let n = 40_000usize;
+        // Heavy ties, nulls, empty strings, a shared 8-byte pack that the prefix cannot settle,
+        // and a NUL byte where another value simply ends.
+        let key: Vec<Option<String>> = (0..n)
+            .map(|i| match i % 97 {
+                0 => None,
+                1 => Some(String::new()),
+                2 => Some("prefix8shared\0".to_string()),
+                3 => Some("prefix8shared".to_string()),
+                _ => Some(format!("k{:04}", (i * 13) % 250)),
+            })
+            .collect();
+        let payload: Vec<i64> = (0..n as i64).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "k",
+                Arc::new(arrow::array::StringArray::from(key)) as ArrayRef,
+            ),
+            ("p", Arc::new(Int64Array::from(payload)) as ArrayRef),
+        ])
+        .unwrap();
+        let parts: Vec<RecordBatch> = [0usize, 7000, 16384, 23000, 32768, n]
+            .windows(2)
+            .map(|w| batch.slice(w[0], w[1] - w[0]))
+            .collect();
+
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let keys = vec![SortKey {
+                    expr: Expr::Col { name: "k".into() },
+                    descending,
+                    nulls_first,
+                }];
+                for k in [1usize, 5, 100, 20_000] {
+                    let locals: Vec<RecordBatch> = parts
+                        .iter()
+                        .map(|b| sort_batch(b, &keys, Some(k)).unwrap())
+                        .collect();
+                    let merged = materialize(&locals).unwrap();
+                    let eager = sort_batch(&merged, &keys, Some(k)).unwrap();
+                    let late = parallel_top_n(&parts, &keys, k).unwrap();
+
+                    assert_eq!(late.num_rows(), eager.num_rows(), "k={k} desc={descending}");
+                    let ci = eager.schema().index_of("p").unwrap();
+                    let le = late
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    let ea = eager
+                        .column(ci)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    for r in 0..ea.len() {
+                        assert_eq!(
+                            le.value(r),
+                            ea.value(r),
+                            "row {r} k={k} desc={descending} nf={nulls_first}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Parallel sample-sort must match the serial sort in the **key-column sequence**
     /// (identical regardless of tie order — fully-tied rows carry identical key values)
     /// and in the **full-row multiset**.
@@ -1795,12 +2227,13 @@ mod window_frame_tests {
         Some(WindowFrame { units, start, end })
     }
 
-    /// A value-based `RANGE` offset must be rejected, not approximated. Before this
-    /// was an error it silently mapped to `None` — the peer-`RANGE` running aggregate
-    /// — which is a *different frame* and therefore a wrong answer for any input whose
-    /// order key is not already peer-shaped.
+    /// A value-based `RANGE` offset maps through as a `RANGE` frame carrying its offsets.
+    /// It used to be rejected here, because the runtime had no way to resolve it; the
+    /// bound is now searched against the order key's values. What must NOT happen — then
+    /// or now — is a silent downgrade to the peer-`RANGE` running aggregate, which is a
+    /// different frame and therefore a wrong answer.
     #[test]
-    fn numeric_range_offset_is_rejected_not_downgraded() {
+    fn numeric_range_offsets_map_through_intact() {
         for (start, end) in [
             (FrameBound::Preceding { n: 2 }, FrameBound::CurrentRow),
             (FrameBound::CurrentRow, FrameBound::Following { n: 3 }),
@@ -1809,11 +2242,12 @@ mod window_frame_tests {
                 FrameBound::Following { n: 1 },
             ),
         ] {
-            let got = map_frame(frame(FrameUnits::Range, start, end));
-            assert!(
-                matches!(got, Err(InterpError::ValueBasedRangeFrame)),
-                "RANGE {start:?}..{end:?} must error, got {got:?}"
-            );
+            let got = map_frame(frame(FrameUnits::Range, start, end))
+                .expect("a value RANGE frame must map")
+                .expect("a value RANGE frame must produce a frame");
+            assert_eq!(got.unit, window_frame::FrameUnit::Range);
+            assert_eq!(got.start, map_bound(start), "start offset must survive");
+            assert_eq!(got.end, map_bound(end), "end offset must survive");
         }
     }
 
@@ -1958,5 +2392,264 @@ mod topn_bound_tests {
             );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod top_k_selection_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{
+        Float64Array, Int64Array, StringArray, TimestampMicrosecondArray, UInt32Array,
+    };
+
+    use super::*;
+
+    /// The stable sort the selection must agree with, defined independently of both
+    /// implementations: arrow's own comparator for the type, with the input position breaking
+    /// every remaining tie. This is the definition [`top_k_single_key`] claims to match.
+    fn stable_full_sort(values: &ArrayRef, opts: SortOptions) -> Vec<u32> {
+        let cmp = arrow::array::make_comparator(values.as_ref(), values.as_ref(), opts)
+            .expect("comparable type");
+        let mut idx: Vec<u32> = (0..values.len() as u32).collect();
+        idx.sort_by(|&a, &b| cmp(a as usize, b as usize).then(a.cmp(&b)));
+        idx
+    }
+
+    /// Every `k`, every direction, every null placement: selecting must return exactly the first
+    /// `k` rows of the stable sort. Declining (`None`) is allowed — the caller then full-sorts —
+    /// so the assertion only fires on a selection that ran and disagreed.
+    fn assert_selects_like_a_sort(values: ArrayRef) {
+        let n = values.len();
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let opts = SortOptions {
+                    descending,
+                    nulls_first,
+                };
+                let full = stable_full_sort(&values, opts);
+                for k in 1..=n {
+                    let Some(sel) = top_k_single_key(&values, opts, k) else {
+                        continue;
+                    };
+                    assert_eq!(
+                        sel.values(),
+                        &full[..k],
+                        "k={k} descending={descending} nulls_first={nulls_first} \
+                         type={:?}",
+                        values.data_type()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn int64_with_nulls_ties_and_extremes() {
+        assert_selects_like_a_sort(Arc::new(Int64Array::from(vec![
+            Some(5i64),
+            None,
+            Some(-3),
+            Some(5),
+            Some(0),
+            None,
+            Some(i64::MIN),
+            Some(i64::MAX),
+            Some(-3),
+            Some(5),
+        ])) as ArrayRef);
+    }
+
+    #[test]
+    fn uint32_and_timestamps_rank_like_their_sort() {
+        assert_selects_like_a_sort(Arc::new(UInt32Array::from(vec![
+            Some(7u32),
+            Some(0),
+            None,
+            Some(u32::MAX),
+            Some(7),
+        ])) as ArrayRef);
+        assert_selects_like_a_sort(Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1_700_000_000_000_000i64),
+            None,
+            Some(-1),
+            Some(0),
+            Some(1_700_000_000_000_000),
+        ])) as ArrayRef);
+    }
+
+    /// The bit patterns that make raw-bit reasoning disagree with SQL: signed zeros, both NaN
+    /// signs, and the infinities. The float ranking is a total order (`f64::total_cmp`), so it
+    /// must place all of them where arrow's comparator does — including the negative NaN the
+    /// radix declines to encode at all.
+    #[test]
+    fn float64_signed_zeros_nans_and_infinities() {
+        assert_selects_like_a_sort(Arc::new(Float64Array::from(vec![
+            Some(0.0f64),
+            Some(-0.0),
+            None,
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::NAN),
+            Some(-f64::NAN),
+            Some(1.5),
+            Some(-1.5),
+            Some(0.0),
+        ])) as ArrayRef);
+    }
+
+    #[test]
+    fn strings_with_nulls_shared_prefixes_and_empties() {
+        assert_selects_like_a_sort(Arc::new(StringArray::from(vec![
+            Some("zebra"),
+            None,
+            Some(""),
+            Some("alpha"),
+            Some("alphabet"),
+            Some("alpha"),
+            None,
+            Some("aaaaaaaaaa1"),
+            Some("aaaaaaaaaa0"),
+            Some("\u{0}"),
+        ])) as ArrayRef);
+    }
+
+    /// A key longer than the packed prefix, sharing every one of its first eight bytes, is the
+    /// shape the candidate budget exists for: the pack settles nothing, so *every* row is a
+    /// candidate. The selection must decline rather than sort the whole morsel twice.
+    #[test]
+    fn a_column_whose_prefix_settles_nothing_declines() {
+        let values: ArrayRef = Arc::new(StringArray::from(
+            (0..4_000)
+                .map(|i| format!("https://example.com/{i:08}"))
+                .collect::<Vec<_>>(),
+        ));
+        assert!(
+            top_k_single_key(&values, SortOptions::default(), 10).is_none(),
+            "a constant eight-byte prefix must fall back to the full sort"
+        );
+    }
+
+    /// The same shared-prefix column, but few enough rows to stay inside the budget: the
+    /// selection runs and still has to be right, because the exact pass — not the pack — is
+    /// what orders the survivors.
+    #[test]
+    fn a_shared_prefix_within_budget_still_orders_by_the_whole_value() {
+        let values: ArrayRef = Arc::new(StringArray::from(
+            (0..40)
+                .rev()
+                .map(|i| format!("https://example.com/{i:08}"))
+                .collect::<Vec<_>>(),
+        ));
+        let opts = SortOptions::default();
+        let sel = top_k_single_key(&values, opts, 3).expect("inside the candidate budget");
+        assert_eq!(sel.values(), &stable_full_sort(&values, opts)[..3]);
+    }
+
+    /// The multi-key narrowing must select exactly what a full multi-key stable sort would keep,
+    /// including when the leading key ties heavily across the cut — which is the shape a
+    /// `ORDER BY count DESC, name` has, and the one where the remaining keys decide the answer.
+    #[test]
+    fn multi_key_narrowing_matches_the_full_sort() {
+        let n = 4_000usize;
+        // A leading key with only 40 distinct values guarantees ties straddle every threshold;
+        // the second key is what actually orders them, and the third is a pure tie-break.
+        let lead: Vec<Option<i64>> = (0..n)
+            .map(|i| {
+                if i % 211 == 0 {
+                    None
+                } else {
+                    Some(((i * 7) % 40) as i64)
+                }
+            })
+            .collect();
+        let mid: Vec<Option<String>> = (0..n)
+            .map(|i| match i % 97 {
+                0 => None,
+                _ => Some(format!("name{:04}", (i * 13) % 300)),
+            })
+            .collect();
+        let tail: Vec<i64> = (0..n as i64).collect();
+        let key_arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(lead)),
+            Arc::new(StringArray::from(mid)),
+            Arc::new(Int64Array::from(tail)),
+        ];
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let keys: Vec<SortKey> = ["a", "b", "c"]
+                    .iter()
+                    .map(|name| SortKey {
+                        expr: bc_expr::Expr::Col {
+                            name: (*name).into(),
+                        },
+                        descending,
+                        nulls_first,
+                    })
+                    .collect();
+                let cmp = row_comparator(&key_arrays, &keys).unwrap();
+                let mut full: Vec<u32> = (0..n as u32).collect();
+                full.sort_by(&cmp);
+                for k in [1usize, 10, 137, 2_000] {
+                    let got = top_k_by_leading_key(&key_arrays, &keys, n, k)
+                        .unwrap()
+                        .expect("a 40-value leading key narrows inside the candidate budget");
+                    assert_eq!(
+                        got.values(),
+                        &full[..k],
+                        "k={k} descending={descending} nulls_first={nulls_first}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A leading key that is nearly constant separates nothing, so the narrowing has to decline
+    /// rather than hand the exact pass the whole morsel — otherwise the shape pays for the
+    /// attempt *and* for the quickselect that follows it.
+    #[test]
+    fn a_leading_key_that_separates_nothing_declines() {
+        let n = 8_000usize;
+        let key_arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1i64; n])),
+            Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+        ];
+        let keys: Vec<SortKey> = ["a", "b"]
+            .iter()
+            .map(|name| SortKey {
+                expr: bc_expr::Expr::Col {
+                    name: (*name).into(),
+                },
+                descending: false,
+                nulls_first: false,
+            })
+            .collect();
+        assert!(
+            top_k_by_leading_key(&key_arrays, &keys, n, 10)
+                .unwrap()
+                .is_none(),
+            "a constant leading key must fall back rather than collect every row"
+        );
+    }
+
+    /// A column of nothing but nulls has no live row to rank, so the answer is decided entirely
+    /// by `nulls_first` — and the selection must still produce it rather than divide by the
+    /// live count.
+    #[test]
+    fn all_null_and_single_row_columns() {
+        assert_selects_like_a_sort(Arc::new(Int64Array::from(
+            vec![None, None, None] as Vec<Option<i64>>
+        )) as ArrayRef);
+        assert_selects_like_a_sort(Arc::new(Int64Array::from(vec![Some(1i64)])) as ArrayRef);
+        assert_eq!(
+            top_k_single_key(
+                &(Arc::new(Int64Array::from(vec![Some(1i64), Some(2)])) as ArrayRef),
+                SortOptions::default(),
+                0
+            )
+            .expect("zero rows is a valid selection")
+            .len(),
+            0
+        );
     }
 }

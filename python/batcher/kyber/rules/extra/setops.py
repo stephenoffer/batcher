@@ -175,7 +175,9 @@ def drop_distinct_in_distinct_union(node: Union, _ctx: OptimizerContext) -> Logi
     changed = False
     for branch in node.inputs:
         stripped = branch
-        while isinstance(stripped, Distinct):
+        # A keyed dedup in a branch is not made redundant by the union's own dedup: the union
+        # dedups whole rows, while the branch collapsed rows that differ outside its key.
+        while isinstance(stripped, Distinct) and not stripped.keys:
             stripped = stripped.input
         if stripped is not branch:
             changed = True
@@ -237,9 +239,15 @@ def push_filter_through_distinct(node: Filter, _ctx: OptimizerContext) -> Logica
     the dedup of the rows satisfying `p` — so filtering first shrinks the input the
     dedup must carry. The predicate references `Distinct`'s (pass-through) columns, so it
     transfers unchanged.
+
+    Whole-row dedup only. It does **not** commute with a keyed one: that keeps a chosen row
+    per key, so filtering first changes which rows are available to be chosen. `distinct(["k"],
+    keep="first", order_by="ts").filter(v > 5)` takes each key's earliest row and keeps it only
+    if it clears the predicate; filtering first would instead take the earliest row *among those
+    clearing it*, which is a different row and a different number of them.
     """
     inner = node.input
-    if isinstance(inner, Distinct):
+    if isinstance(inner, Distinct) and not inner.keys:
         return Distinct(Filter(inner.input, node.predicate))
     return None
 

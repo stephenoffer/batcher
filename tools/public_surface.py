@@ -68,7 +68,7 @@ def _subpackage_exports() -> list[tuple[str, Any]]:
 
 def _accessor_namespaces() -> list[type]:
     """The typed accessor classes reached as attributes of Expr/Dataset."""
-    from batcher.api.dataset.dq import DatasetDQ, ValidationReport
+    from batcher.api.dataset.dq import ConstraintResult, DatasetDQ, ValidationReport
     from batcher.api.dataset.meta import (
         ApproxMeta,
         ColumnChecks,
@@ -91,6 +91,7 @@ def _accessor_namespaces() -> list[type]:
         _MapNamespace,
         _StructNamespace,
     )
+    from batcher.plan.expr_ir.namespaces.sequence import _SeqNamespace
     from batcher.plan.expr_ir.namespaces.strings import _StrNamespace
     from batcher.plan.expr_ir.namespaces.temporal import _DtNamespace
     from batcher.plan.expr_ir.selectors.core import _SelectorNameNamespace
@@ -106,12 +107,14 @@ def _accessor_namespaces() -> list[type]:
         _ImageNamespace,
         _AudioNamespace,
         _VideoNamespace,
+        _SeqNamespace,
         _SelectorNameNamespace,
         Reader,
         Writer,
         DatasetML,
         DatasetDQ,
         ValidationReport,
+        ConstraintResult,
         DatasetSCD,
         # The `ds.meta` accessor tree — metadata shortcuts, reached as `ds.meta.col("x")`,
         # `ds.meta.col("x").check`, `ds.meta.schema`, `.nulls`, `.approx`, `.storage`,

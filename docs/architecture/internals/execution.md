@@ -67,8 +67,10 @@ live here, because these are the values you change or cite in code.
 
 Adaptive re-optimization triggers when an estimate was wrong by more than
 `optimizer.reoptimize_error` (default 2x). It engages only on a query that contains a
-join and whose total scan input clears 20M rows or roughly 1.3 GB
-(`api/adaptive/gating.py`), so most small queries never reach it. Be precise about what
+join and whose total scan input clears 5M rows, or roughly 320 MB, for each pipeline
+breaker the loop would cut at (`api/adaptive/gating.py`) — about 10M rows for the
+simplest joined shape, and more for a many-join one, because each cut is what costs.
+Most small queries never reach it. Be precise about what
 that buys: this is stage-boundary re-optimization, the same mechanism and granularity as
 Spark AQE, not something finer. The two places the loop reaches further than AQE are
 that it runs single-node as well as distributed, and that what it measured is recorded
@@ -97,19 +99,19 @@ The layer covers the terminals whose result a footer can carry:
 
 - `count()` and `is_empty()`, from the relation's exact row count (an ORC `nrows`, a
   summed Parquet footer), through row-preserving projections, and across the
-  mergeable operators that keep an exact count (an empty-side join, `limit(0)`, a
+  mergeable operators that keep an exact count (an empty-side join, {py:meth}`limit(0) <batcher.Dataset.limit>`, a
   UNION of exact counts).
 - Global (keyless) aggregates: `min` and `max` from footer bounds, `count(*)`,
   `count(col)` from `rows − null_count`, `sum` from a catalog's recorded total,
   `n_unique` and `count_distinct` from an exact distinct count, and `bool_and` and
   `bool_or` from a boolean column's exact min/max.
-- Per-column existence and null facets: `null_count`, `has_nulls`, `all_null`.
+- Per-column existence and null facets: {py:meth}`null_count <batcher.Dataset.null_count>`, {py:meth}`has_nulls <batcher.Dataset.has_nulls>`, {py:meth}`all_null <batcher.Dataset.all_null>`.
 - Filtered counts. `WHERE col IS NULL` is exactly the recorded null count,
   `col IS NOT NULL` is `rows − null_count`, and a provably out-of-range predicate
   (`col > max`, or `col = v` outside `[min, max]` or absent from the column's
   membership bloom) is exactly `0`. A predicate that only *partially* overlaps the
   column's range needs a histogram, so it is **not** answered and falls back.
-- `describe()` and `summary()`, as a per-column snapshot assembled from whichever
+- {py:meth}`describe() <batcher.Dataset.describe>` and `summary()`, as a per-column snapshot assembled from whichever
   facets are exact, omitting the rest so the caller runs the real describe for what
   is missing.
 - A provably-empty plan. `_collect` short-circuits a contradiction filter,
@@ -136,8 +138,8 @@ This is proven, not asserted: property tests generate random data and assert the
 metadata answer equals the executed answer equals DuckDB across the covered
 terminals. One correctness fix the discipline caught: Parquet's `distinct_count` is
 only an *estimate*, but it had been tagged EXACT, which would have let it answer an
-exact `count_distinct` wrongly. It is now `SKETCH`, kept only on already-inexact
-columns to inform cost and `approx_count_distinct`.
+exact {py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>` wrongly. It is now `SKETCH`, kept only on already-inexact
+columns to inform cost and {py:meth}`approx_count_distinct <batcher.plan.expr_ir.core.Expr.approx_count_distinct>`.
 
 ```python
 # docs: run

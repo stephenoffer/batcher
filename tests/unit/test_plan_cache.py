@@ -217,18 +217,24 @@ def test_a_bandit_arms_mean_invalidates_but_a_bare_tick_does_not():
     assert _materially_differs({"sum": 100.0, "n": 10}, {"sum": 300.0, "n": 11})
 
 
-def test_the_calibration_epoch_advances_only_with_a_refit():
-    """The epoch is the identity of the live cost fit, not a bucket of the feedback counter.
+def test_the_calibration_key_tracks_the_fit_not_the_refit_count():
+    """The key must move when the coefficients move, and not when a refit merely happened.
 
-    Those read as the same quantity and are different clocks. `calibrate`'s throttle counts
-    feedback rows *since its last refit*; `version // _RECALIBRATE_AFTER` counts from zero. On
-    TPC-H q8 at sf10, which records ~35 operators per execution, the bucket rolled over every
-    second run over a completely stable set of coefficients — so the plan cache alternated
-    hit/miss forever, and a miss costs 350 ms there against a hit's 160 ms.
+    Those are different clocks, and keying on the wrong one is what makes the memo useless.
+    `calibrate`'s throttle counts feedback rows *since its last refit*, so a query recording
+    more operators than `_RECALIBRATE_AFTER` in one execution refits on **every** execution —
+    and an epoch that names "when did we last refit" then advances every execution. Measured
+    on tpcds-q83, that was `hit=0 / miss=1` on every run of an identical query: 190 ms of
+    re-optimization against 20 ms in the engine, forever. tpcds-q80's epoch climbed by 76 per
+    run and never settled.
+
+    So the key carries the *fit itself*, bucketed at half-octaves (`plan_cache._bucketed`) —
+    stable under the drift a settled exponential average always has, and moving as soon as a
+    coefficient crosses a bucket. The two assertions below are the whole contract.
     """
     import batcher as bt
-    from batcher.config import active_config
-    from batcher.kyber import calibration, cpu_shares, plan_cache
+    from batcher.config import CostCoefficients, active_config
+    from batcher.kyber import calibration, plan_cache
     from batcher.metadata import MetadataHub
     from batcher.metadata.backends import InProcessBackend
 
@@ -236,26 +242,41 @@ def test_the_calibration_epoch_advances_only_with_a_refit():
     ds = bt.from_pydict({"x": [1, 2, 3]})
     cfg, pk = active_config(), ds._plan.content_key()
 
-    assert calibration.refit_version(hub) == 0  # nothing fitted yet
-    assert cpu_shares.refit_version(hub) == 0
-    first = plan_cache.cache_key(pk, ds._sources, cfg, hub)
-
-    # Feedback accrues — the hub version climbs — but no refit has replaced either fit, so the
-    # plan chosen under the old one is still the plan the new one would choose.
     calibration.calibrate(hub, cfg)
-    before = calibration.refit_version(hub)
-    for _ in range(200):
+    settled = plan_cache.cache_key(pk, ds._sources, cfg, hub)
+
+    # Feedback accrues and refits fire, but the fit reproduces itself — the plan chosen under
+    # it is still the plan it would choose, so the key must not move.
+    for _ in range(400):
         hub.record(_feedback_row())
-    assert plan_cache.cache_key(pk, ds._sources, cfg, hub) == plan_cache.cache_key(
-        pk, ds._sources, cfg, hub
-    )
-    assert calibration.refit_version(hub) == before, "the fit changed without being re-run"
+        calibration.calibrate(hub, cfg)
+    assert plan_cache.cache_key(pk, ds._sources, cfg, hub) == settled
 
-    # A refit past the throttle does advance it, so a plan chosen under the old coefficients
-    # is not served under the new ones.
-    calibration.calibrate(hub, cfg)
-    assert calibration.refit_version(hub) != before
-    assert plan_cache.cache_key(pk, ds._sources, cfg, hub) != first
+    # A coefficient that actually moves a bucket must invalidate: a plan chosen under the old
+    # costs must not be served under the new ones.
+    live = calibration.live_coefficients(hub)
+    assert live is not None
+    moved = dataclasses.replace(live, filter_row=live.filter_row * 8.0)
+    assert plan_cache._bucketed(moved) != plan_cache._bucketed(live)
+    assert isinstance(moved, CostCoefficients)
+
+
+def test_the_bucketed_fingerprint_absorbs_drift_but_not_a_real_move():
+    """`_bucketed` is the whole stability argument, so it is pinned directly."""
+    from batcher.config import CostCoefficients
+    from batcher.kyber import plan_cache
+
+    base = CostCoefficients()
+    assert plan_cache._bucketed(None) == "-"
+    # A few percent of drift — what a settled exponential average does every run — must not move.
+    drifted = dataclasses.replace(base, filter_row=base.filter_row * 1.03)
+    assert plan_cache._bucketed(drifted) == plan_cache._bucketed(base)
+    # A 40%+ move crosses a half-octave bucket and must.
+    moved = dataclasses.replace(base, filter_row=base.filter_row * 1.6)
+    assert plan_cache._bucketed(moved) != plan_cache._bucketed(base)
+    # A dict (the cpu-share medians) takes the same treatment, and a family appearing moves it.
+    assert plan_cache._bucketed({"scan": 1.0}) == plan_cache._bucketed({"scan": 1.02})
+    assert plan_cache._bucketed({"scan": 1.0}) != plan_cache._bucketed({"scan": 1.0, "filter": 1.0})
 
 
 def _feedback_row():

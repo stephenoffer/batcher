@@ -7,7 +7,7 @@ code won and the doc is named as wrong.
 **What the 2026-08-01 pass changed:** ceiling 3 no longer says the shuffle is RAM-only — a byte
 cap and a disk spill landed in `24d89d9e`/`f18d6a36`, so the memory half is closed and only the
 survivability half (no external shuffle service) remains, which is why the scorecard row is
-still **L**. The rule count was stale at 375; the live registry holds **722** (the `@rule` decorator count of 395 undercounts, because a `_register(...)` loop produces several rules from one decorator).
+still **L**. The rule count was stale at 375; the live registry holds **725** as of 2026-08-08 (the `@rule` decorator count undercounts, because a `_register(...)` loop produces several rules from one decorator). It drifts as rules land, so read it from `DEFAULT_REGISTRY.rules()` rather than from this line; the seven phases it spreads over are `NORMALIZE` (545), `REWRITE` (83), `PUSHDOWN` (68), `FUSION` (23), `SELECTION` (3), `ENFORCE` (2) and `JOIN_REORDER` (1).
 
 **What the 2026-07-29 pass changed**, so a reader knows which numbers are current:
 ceiling 3 (shuffle replication) is now wired to all four shuffles rather than one; ceiling 8
@@ -82,7 +82,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 | String execution | **L** (no StringView, dict decoded at leaf) | **L** | = | — | L | L |
 | Streaming guarantees | — | — | L | **✗** | — | — |
 | Fault tolerance | — | — | **L** (no external shuffle service; buckets die with their worker) | L | = | L |
-| Skew handling | — | — | **L** (AQE splits; Batcher salts opt-in) | — | = | L |
+| Skew handling | — | — | **=** (AQE splits on a size rule; Batcher salts on measured hot keys, no opt-in) | — | = | L |
 | AI / GPU pipelines | — | — | — | — | **L** by default | — |
 | Lakehouse formats | — | — | L (all via pyiceberg/delta-rs) | — | = | L |
 
@@ -125,8 +125,9 @@ training, where Batcher does not compete — see ceilings):
   with the four header facts (`width`/`height`/`channels`/`mode`) from **one** read where
   Daft spends a call per fact. It leads on **audio**: Daft has **no native
   mel-spectrogram / MFCC** (per-row UDFs), which Batcher does in-engine (both torchaudio-matched).
-  Daft still leads on the **variable-shape tensor type** (ceiling below). The
-  color-conversion gap this bullet used to record is closed.
+  The variable-shape tensor gap this bullet used to record is closed too: mixed-resolution
+  arrays are carried as a column (`io/formats/ml/ragged.py`), so the two gaps it named are
+  both gone. Daft still leads on decoding *into* that type from more source formats.
 - **Ray Data** has good CPU preprocessors (scalers/encoders/imputers) and a tensor type, but
   multimodal decode is a torch/PIL **UDF per batch**, not an engine expression; **no native
   mel-spectrogram**; fuzzy-match/minhash are user code.
@@ -145,9 +146,9 @@ training, where Batcher does not compete — see ceilings):
 
 **Honest bottom line for this axis:** among general-purpose engines, Batcher has the broadest
 *native* (non-UDF) AI-preprocessing expression surface, and native mel-spectrogram + MFCC are a genuine
-first. This does **not** change the GPU-execution verdict (ceiling #5) or close the two AI gaps
-called out next: **no ML-in-SQL** (BigQuery leads) and **no variable-shape tensor type** (Daft
-and Ray Data lead). Do not let a preprocessing-coverage win be read as a GPU-pipeline win.
+first. This does **not** change the GPU-execution verdict (ceiling #5) or close the AI gap called
+out next: **no ML-in-SQL** (BigQuery leads). Do not let a preprocessing-coverage win be read
+as a GPU-pipeline win.
 
 ## The structural ceilings
 
@@ -233,7 +234,17 @@ generic byte-row `RowConverter` path.
 values* (cardinality-length) and gather one bit per row through the keys, never decoding the
 column. Measured on 6M rows × 25 distinct values — TPC-H `l_shipmode`, ClickBench's whole string
 shape — `m = 'AIR'` goes **144.9 ms → 7.4 ms (19.6x)** against the same column already decoded;
-the old dictionary path was worse still, paying a full decode on top of that 144.9 ms. It is
+the old dictionary path was worse still, paying a full decode on top of that 144.9 ms.
+
+**Do not quote the 19.6x outside this kernel comparison.** `competitor_technique_review.md`
+item 6 re-measured it end to end and retired it: a plain-string filter over 6M rows costs
+**3.8 ms**, not the 144.9 ms this ratio divides into, and the boundary change that would have
+let a dictionary reach the kernel from Python was built, benchmarked at **1.2x-2.8x on
+consuming shapes only**, and reverted for regressing `SELECT <string col>` to 0.63x. So no
+dictionary reaches the engine from Python on a live path, and the figure describes a kernel
+in isolation rather than anything a query can currently obtain. It is
+
+
 bit-identical to the decoded path by construction (an elementwise comparison commutes with a
 gather: `cmp(take(v, k), lit) == take(cmp(v, lit), k)`), which is what lets it live inside the
 correctness oracle, and that equality is pinned by tests over every comparison operator, both
@@ -326,22 +337,68 @@ which is the only thing that can observe a leak before it is fatal.
 ### 4. Streaming is micro-batch, and cannot express Flink's guarantees
 
 Not a dataflow runtime: no operator graph, no barriers, no keyed state backend. One Python driver
-thread running `while True: pull → execute_plan → write`.
+thread running `while True: pull → execute_plan → write`. That model is the ceiling, and it has
+not moved. Four specific defects underneath it *have*, so the section separates what is fixed
+from what remains structural.
 
-- **The watermark is a single global scalar** on the driver (`core/streaming.py:201`) —
-  `max(event_time) - lateness` over whatever the driver saw. There are **no per-partition
-  watermarks and no `min()` across inputs**, so one fast Kafka partition drags the watermark
-  forward and every slow partition's rows are then dropped as "late." No idle-source detection.
-- **State is one in-memory Arrow batch**, checkpointed by rewriting it *in full* every
-  micro-batch, to a **local filesystem only** (`sqlite3.connect`, `os.replace` — it cannot write
-  `s3://`, though `resilience="spot"` tells you to). No incremental checkpoint, no changelog, no
-  spillable state. The repo *has* an out-of-core spill system; it is not wired to any streaming
-  operator.
-- **Sliding windows silently fall back** to an unbounded running aggregate with no eviction.
-  Session windows do not exist as a streaming construct.
-- **The driver is a single point of failure** with no HA and a local-disk checkpoint.
+**Fixed — the watermark is per-partition, and takes the minimum.** It was one global scalar,
+`max(event_time) - lateness` over whatever the driver saw, so one fast Kafka partition dragged
+the frontier forward and every slow partition's rows were then dropped as "late" — silently, the
+only trace a window total that came out short. It is now `plan/streaming/tracker.py`: per-partition
+event-time maxima and a watermark that is their **minimum**, which is the strongest claim a
+multi-partition stream can actually support. Partitions are named by the source
+(`BrokerSource.watermark_partition_columns = ("topic", "partition")`) and the windowed-aggregate
+driver widens Kyber's projection to keep those columns alive, stripping them again before the
+batch reaches the plan. A minimum stalls on a silent partition, so it is paired with Flink's
+answer — `streaming.watermark_idle_timeout_seconds`, a documented trade rather than a free fix,
+and settable to zero for the fully conservative frontier. The source's *expected* partition set
+holds the minimum back at startup so it is not taken over a subset. Per-partition state
+checkpoints with the fold, because restoring only the frontier would let the first partition to
+speak after a restart set the minimum on its own. The dedup, the interval join and the session
+window share the same tracker; they consume a pipeline's output rather than the source, so they
+get per-partition attribution only where the pipeline preserves the columns, and degrade to the
+old maximum where it does not. There is still **no watermark propagation across operators**,
+because there is no operator graph to propagate along.
 
-Exactly-once *is* real for Delta (idempotent `txn` actions, genuinely good), but only for Delta.
+**Fixed — sliding windows are windowed.** `window(ts, w, slide)` is exploded before grouping, so
+the aggregate's group key is a plain column with the geometry two nodes below it, and the driver
+— which recognized only a `window_start` key — fell through to the *unwatermarked* running
+aggregate. Nothing was dropped as late, nothing was evicted, and nothing was emitted until a
+source that never ends ended. `_window_key` now reads the `Unnest`/`WindowBuckets` shape and the
+eviction sweep keys on the **hop** rather than the width. The remaining un-windowable shape — a
+watermark on an aggregate with no event-time group key — is refused over an unbounded source
+instead of silently degrading. Session windows *do* exist as a streaming construct
+(`api/terminal/stream/session.py`); that line was stale.
+
+**Fixed — the checkpoint can be written where the durability advice says to write it.** The store
+called `os.makedirs` and `sqlite3.connect` on the raw location, so `s3://bucket/ckpt` created a
+local directory named `s3:` — while `resilience="spot"` warned that a node-local checkpoint is
+lost with the node and told the caller to use `s3://`. The advice and the implementation
+disagreed, silently. A remote location now uses one immutable file per batch id through the
+`io.filesystem` façade (`checkpoint/fs_logs.py`, Spark's design, atomic as a single PUT); a local
+one keeps SQLite plus the fsync-then-rename-then-fsync-the-directory ordering, which `pyarrow.fs`
+cannot express and which the commit ordering depends on. `is_local_location` is the one answer
+both the warning and the store dispatch on, and
+`tests/unit/test_checkpoint_log_conformance.py` drives both log backends through the same
+sequence so they cannot drift.
+
+**Still open, and structural:**
+
+- **State is still one in-memory Arrow batch rewritten in full every micro-batch.** No
+  incremental checkpoint, no changelog, no spillable state. The repo *has* an out-of-core spill
+  system; it is still not wired to any streaming operator. Where it is written is fixed; how much
+  is written per epoch is not.
+- **The driver is still a single point of failure.** `_run_resilient` restarts from the last
+  committed checkpoint on a transient fault, which covers a preempted worker or a dropped
+  connection *in process*; it does not cover the process. There is no standby and no leader
+  election, so a driver that dies needs an external supervisor to restart the query — which will
+  resume correctly from the checkpoint, and only if the checkpoint is somewhere the supervisor's
+  next host can read.
+
+Exactly-once *is* real for Delta (idempotent `txn` actions, genuinely good) and for the file sink
+by batch position (`resume=True` skips a `part-batch<id>` already present). Every other table
+format gets an ordinary append and `TransactionalStreamSink.open()` warns once that a replayed
+epoch writes its rows twice.
 
 ### 5. The AI moat was shipped disabled — **fixed (the CPU→GPU overlap is now default)**
 
@@ -369,8 +426,8 @@ nothing turning red.
 **Still open on this ceiling:** it splits at exactly *one* boundary (2 stages, the third stage
 riding in the consumer); there is no N-stage topology and no per-stage autoscaling.
 
-Also missing for AI: **no variable-shape tensor type** (Ray Data and Daft both have one) and
-data never stays resident on the GPU across operators (host round-trip per op).
+Also missing for AI: data never stays resident on the GPU across operators (host round-trip
+per op). The variable-shape tensor type this paragraph used to name is now implemented.
 
 Video decode *was* the third item here — a per-row Python loop that materialized **every frame
 of a clip** to sample 8 of them (a 1-minute 1080p clip is ~1,800 x 6.2 MB ≈ 11 GB resident, for
@@ -381,21 +438,40 @@ output is byte-identical to the retaining implementation, which is pinned by a t
 the old version as its oracle. Still a Python loop, and still per row; what changed is that it
 is no longer unbounded.
 
-### 6. Task granularity ≈ node, not partition
+### 6. Task granularity — the shuffle map side is finer than a node; the rest is not
 
-Shuffle map tasks = one per node; non-shuffle tasks are clamped to cluster cores. Spark decouples
-tasks from executors (routinely 10k–100k tasks/stage), which is what buys dynamic load balancing,
-work stealing off a slow node, and fine-grained recovery. Batcher's coarse unit means a straggler's
-*entire* partition must be redone, and skew cannot be diluted by over-partitioning.
+**Closed for the Flight shuffles.** The map stage cuts its input into `workers x
+map_partition_multiplier` partitions (default 4x, `dist/executors/ray_runtime/reducers.py::map_partitions`)
+rather than one per worker, and `map_barrier` hands them out as actors go idle, keeping exactly
+`workers` in flight. So a slow worker takes fewer partitions instead of holding the barrier open
+on the one oversized partition it was statically dealt, and a dead worker's outstanding
+partitions are re-dealt across every survivor rather than replayed whole onto one. It is a
+ceiling, not a target: a source that cannot yield that many splits produces fewer partitions
+instead of empty tasks, and an in-memory source stays at one per worker (cutting driver-resident
+batches finer buys no recovery). Wired through aggregate, join, sort and window; the join pads
+the shorter side's partition list because both sides map through one barrier under one source id.
 
-Compounding it: **salting is off** (`skew_join_salt = 0`). Locality-aware reducer placement
-is now **on** (`locality_aware_scheduling = True`), which does not make the task unit finer —
-it only decides which node a coarse reducer runs on. Out of the box, resilience is Ray task
-retries + single-stage lineage recompute + whole-query retry.
+Do not restate this as "skew can now be diluted by over-partitioning." It cannot, and that half
+of the Spark argument was always wrong here: map partitions divide the *input*, while a shuffle's
+imbalance lives in its hash buckets, where a single dominant key is indivisible however fine the
+hash (measured: max/mean bucket load 3.8 at 8 buckets and 51.8 at 128). Splitting one key is
+salting, below.
+
+**Still coarse:** non-shuffle tasks are clamped to cluster cores, the disk transport still maps
+one partition per worker (it is the single-node fallback — `resolve_transport` picks Flight on any
+multi-node cluster), and the reducer remains one task per bucket.
+
+On salting: `skew_join_salt = 0` is **not** "off" and has not been since hot keys became
+measured. `dist/skew.py::resolve_hot_keys` takes them from the set learned for the join shape,
+else from the column statistics Kyber holds, else from a Misra-Gries pre-pass it runs on its own
+above ~8.4M input rows — and sizes the fan-out from the key's measured share. `0` means "let the
+measurement decide"; a negative value is the actual off switch. Locality-aware reducer placement
+is **on** (`locality_aware_scheduling = True`), which does not make the task unit finer — it only
+decides which node a reducer runs on.
 
 Speculation is **on** (`speculation_max_backups = 1`) — this section previously said it was off
-at `max_backups = 0`, which the config contradicts. The granularity argument above stands
-regardless: a backup duplicates one coarse task, it does not make the unit finer.
+at `max_backups = 0`, which the config contradicts. A backup duplicates one task; it makes the
+unit no finer, which is what the paragraph above is for.
 
 Since 2026-07-26 all of this is at least **observable**: recompute rounds, worker loss,
 speculative backups, replica retirement, and proactive spot migration publish
@@ -512,6 +588,26 @@ under load average ~18, which if anything overstates the Batcher numbers.
 The diagnosis below (282 rules over 7 phases, 19 traversals, no single dominant term) and the
 four measured-and-reverted attempts remain worth reading. Do not re-quote its timings.
 
+#### The warm gap, addressed 2026-08-07
+
+The paragraph above ends by locating the remaining **warm** ~2x in per-query fixed cost rather
+than the optimizer. That diagnosis held, and most of that cost is now gone on the opt-in path.
+Over five small shapes at 1,000 rows, measured against the engine's own cost and A/B'd between
+two sandboxes sharing one `lib_native.so`
+(`benchmarks/BENCHMARK_RESULTS.md`, 2026-08-07): per-query control-plane overhead falls from
+**5.77 ms to 0.27 ms (21.4x)** and end-to-end from 6.35 ms to 0.85 ms, comparing today's
+default path against `execution.fast_path=True` after the change.
+
+Three things were paying it, and the first was the largest: a re-issued query re-derived its
+whole plan every call, which `api/orchestration/prepared.py` now memoizes. The other two are on
+**every** path — `config_context` re-resolved the config on every terminal op (10.3 us -> 1.4
+us), and `MetadataHub.record` JSON-encoded each feedback row to store it in an in-process dict.
+
+Two limits on what this retires. It is **opt-in**: the default path improved only 1.09x,
+because its remaining overhead is the learned-stats write side (~218 us a query), and skipping
+that is the trade `fast_path` exists to document. And it is a **warm** result only — a
+first-seen shape still pays the cold optimize measured above, which this did not touch.
+
 #### The original measurement, superseded
 
 Measured at `n = 10,000`, DuckDB in native storage, median over 12 never-seen query shapes:
@@ -573,8 +669,9 @@ These are asserted in the repo and contradicted by its own code.
    match."** The loop is real (`api/adaptive.py:342-410`, genuinely re-optimizing on *measured*
    cardinalities) — but it **is** stage-boundary adaptation. `api/adaptive.py:1` says so verbatim
    in its own first line: *"Adaptive (intra-query) execution: stage-boundary re-optimization."*
-   Same mechanism, same granularity as AQE. It is also **off for every query under 20M input
-   rows** (`_ADAPTIVE_MIN_INPUT_ROWS`), so most queries never touch it.
+   Same mechanism, same granularity as AQE. It is also **off below a size floor**
+   (`_ADAPTIVE_MIN_ROWS_PER_STAGE`, 5M input rows for each pipeline breaker the loop would
+   cut at — about 10M for the simplest joined shape), so most queries never touch it.
    *Defensible replacement:* "stage-boundary re-optimization like Spark AQE, but available
    single-node too, **plus** a sketch-backed cross-query learned-stats and bandit loop that
    neither DuckDB nor Spark has." That is true, and still interesting.
@@ -660,17 +757,36 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
 3. **~~Wire the shuffle replication that already exists~~ (done — all four shuffles) and
    ~~call `clear_plan` on the batch path~~ (done).** Spot preemption is now a re-fetch rather
    than a recompute for aggregate, join, sort and window, and long-lived fleets no longer leak
-   buckets. Remaining on this ceiling: a **disk tier / external shuffle service** (replicas are
-   RAM today, so they cost memory and a whole-node loss taking every copy still recomputes),
-   and replicating **interior combiner-tree outputs**, which are single-copy.
+   buckets. ~~Interior combiner-tree outputs~~ are replicated too (done —
+   `shuffle_replication.replicate_interior_outputs`, called per level from
+   `flight_aggregate._tree_reduce`), so losing one combiner no longer discards every level
+   built beneath it. Remaining on this ceiling: a **disk tier / external shuffle service**
+   (replicas are RAM today, so they cost memory and a whole-node loss taking every copy still
+   recomputes).
 4. **~~Default `stream_inference=True`~~ (done), generalize to N stages with per-stage
    autoscaling.** The AI moat is now on out of the box. Remaining: the N-stage topology,
-   per-stage autoscaling, a variable-shape tensor type, and keeping data resident on-device
-   across ops.
-5. **Per-partition watermarks + a real state backend** (spillable, incremental, object-store
-   checkpoints). Until then, do not claim Flink parity — and refuse, loudly, the shapes that
-   cannot be honoured (the distributed watermark gate now does).
+   per-stage autoscaling and keeping data resident on-device across ops. (The variable-shape
+   tensor type this item used to list is done.)
+5. **~~Per-partition watermarks~~ (done) + ~~object-store checkpoints~~ (done); a real state
+   backend remains.** The frontier is now a minimum over per-partition maxima with idleness, and
+   a checkpoint can live on `s3://`/`gs://`/`hdfs://`. What is left is the state itself:
+   spillable and incremental rather than one Arrow batch rewritten whole every micro-batch, and a
+   driver that is not a single point of failure. Until those land, do not claim Flink parity —
+   and refuse, loudly, the shapes that cannot be honoured (the distributed watermark gate and the
+   unwindowed-watermark refusal both do).
 6. **Decouple tasks from nodes**; turn on speculation and skew splitting by default.
+7. **Plan on the layout a table already has.** `SourceStatistics.partition_keys` reaches the
+   optimizer and **nothing plans on it** — its only consumer is the user-facing
+   `ds.meta.storage.partition_keys()`. A Hive-partitioned table is already clustered by its
+   partition column, so a `GROUP BY day` over a directory-per-day table has every group wholly
+   inside one directory and needs no exchange at all; today it hash-shuffles every row. The
+   condition is `partition columns ⊆ group keys` **and** whole directories assigned to workers
+   (which `PartitionDirSplit` gives and the per-file fragment path does not), so it is a
+   dispatcher decision rather than a rewrite. The machinery to skip a shuffle over an
+   already-partitioned relation exists for *intermediates* (`dist/fleet/source.py`); what is
+   missing is applying it to the partitioning a table has on disk. Note the failure mode
+   before implementing: getting the condition wrong reports partial groups as final, which is
+   a wrong answer at cluster scale and green everywhere else.
 
 Until 1–2 land, the defensible positioning is narrower than the current one, and *still strong*:
 

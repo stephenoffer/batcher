@@ -30,7 +30,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher.core.udf.call import _coerce_udf_result, _record_dropped_row
+from batcher.core.udf.call import _claim_dropped_row, _coerce_udf_result
 from batcher.plan.logical import MapBatches
 
 __all__ = ["is_async_udf", "run_async_batches", "run_coroutine_blocking"]
@@ -142,10 +142,11 @@ async def _resilient_batch(
         return _coerce_udf_result(await _call_resilient(call, batch, op))
     except Exception as exc:
         if batch.num_rows <= 1:
-            if budget[0] <= 0:
+            # The same atomic claim the synchronous path uses. The budget is shared per
+            # process (`shared_error_budget`), and an async stage can run alongside a threaded
+            # one, so "only one event loop touches this" was never true of the allowance.
+            if not _claim_dropped_row(budget, exc):
                 raise  # the error budget is spent — a real bug on clean data still fails
-            budget[0] -= 1
-            _record_dropped_row(budget, exc)
             return []  # drop the one corrupt row and carry on
         mid = batch.num_rows // 2
         left, right = await asyncio.gather(
@@ -176,7 +177,7 @@ async def _call_resilient(
             if timeout is not None:
                 try:
                     return await asyncio.wait_for(call(batch), timeout=timeout)
-                except (asyncio.TimeoutError, TimeoutError) as exc:
+                except TimeoutError as exc:
                     # Normalize a cancelled call to a clear `TimeoutError`; caught below and
                     # retried like any transient (it was added to `retry_on` above).
                     raise TimeoutError(

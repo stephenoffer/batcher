@@ -4,8 +4,9 @@
 This diagram carries a claim the project is careful about, so it is drawn to the
 wording `docs/architecture/internals/competitive_architecture.md` sanctions rather than the older
 marketing line. The inner loop is stage-boundary re-optimization at the same
-granularity as Spark AQE, gated off below `_ADAPTIVE_MIN_INPUT_ROWS`
-(`python/batcher/api/adaptive/gating.py`, 20,000,000 rows). The outer loop is the
+granularity as Spark AQE, gated off below `_ADAPTIVE_MIN_ROWS_PER_STAGE`
+(`python/batcher/api/adaptive/gating.py`, 5,000,000 rows per pipeline breaker the loop
+would cut at). The outer loop is the
 cross-query learned-stats loop, which is the half with no DuckDB or Spark equivalent.
 
 If either the gate constant or the retired-claim wording changes, change this too.
@@ -38,7 +39,7 @@ body = [
     curve(820, ROW1_BOTTOM, 490, RETURN_APEX, 143, ROW1_BOTTOM, "blue"),
     label(490, 208, "the remaining stages, re-planned", anchor="middle"),
     note(490, 250, "Same mechanism and granularity as Spark AQE, and available single-node.", anchor="middle"),
-    note(490, 270, "Gated off below 20,000,000 input rows, so most queries never reach it.", anchor="middle"),
+    note(490, 270, "Gated off below 5,000,000 input rows per pipeline breaker, so most queries never reach it.", anchor="middle"),
 
     # ---- Outer loop: across runs ------------------------------------------
     band(20, 318, 940, 218, "ACROSS RUNS  ·  LEARNED STATISTICS", "amber"),

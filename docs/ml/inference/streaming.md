@@ -1,7 +1,7 @@
 # Streaming for training
 
 A training loop wants a stream of batches, not one materialized result. Batcher
-produces that with `iter_batches()`. The engine yields Arrow
+produces that with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`. The engine yields Arrow
 `RecordBatch`es as they are produced, so memory stays bounded and the loop starts
 consuming before the full dataset is read.
 
@@ -89,7 +89,7 @@ for batch in prepared.iter_batches(batch_size=256):
 
 ## Tensor batches without the boilerplate
 
-`ds.ml.iter_torch_batches` folds the convert-to-tensor step into the stream. It
+{py:meth}`ds.ml.iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` folds the convert-to-tensor step into the stream. It
 consumes `iter_batches()` incrementally and yields `{column: tensor}` dicts over the
 numeric columns, dropping the rest, moving each batch to `device` and overlapping that
 move with the next batch's host work. It is the single-process training-iteration path,
@@ -114,7 +114,7 @@ zero-copy options in full, along with a runnable in-memory example.
 
 ## Distributed and resumable training
 
-For data-parallel training across ranks, `ds.ml.stream_loader` gives each rank a
+For data-parallel training across ranks, {py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` gives each rank a
 `torch.utils.data.IterableDataset` over its slice of a single, seed-reproducible global
 order. It is the streaming-ingest path for PyTorch DDP, FSDP, and DeepSpeed, and it holds
 four guarantees a distributed loop needs.
@@ -152,11 +152,11 @@ for batch in DataLoader(iterable, batch_size=None):  # batches are already sized
     train_step(batch["features"].cuda(), batch["label"].cuda())
 ```
 
-`stream_loader` materializes the dataset once, which is fine up to RAM. For a
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` materializes the dataset once, which is fine up to RAM. For a
 larger-than-RAM corpus, write it with `batcher.io.formats.ml.write_shards` and stream from
-disk with `batcher.ml.shard_stream_loader`, which keeps a bounded shard cache and the
+disk with {py:func}`batcher.ml.shard_stream_loader <batcher.ml.shard_stream_loader>`, which keeps a bounded shard cache and the
 identical sample-order contract. For an unbounded or streaming source with no global
-length, use `batcher.ml.streaming_split` instead, which fans one read of the stream out to
+length, use {py:func}`batcher.ml.streaming_split <batcher.ml.streaming_split>` instead, which fans one read of the stream out to
 `world_size` rank iterators, consumed concurrently and with backpressure.
 
 At the top of each epoch, bump `epoch` so the shuffle reseeds. On restart, pass the
@@ -187,7 +187,7 @@ step.
 
 `shard_stream_loader`, the larger-than-RAM path, draws its indices from
 `rank_index_batches`, which holds one batch of indices at a time. `stream_loader`
-materializes the dataset with `collect()` anyway, so it keeps the simpler list path.
+materializes the dataset with {py:meth}`collect() <batcher.Dataset.collect>` anyway, so it keeps the simpler list path.
 
 ```python
 from batcher.ml import rank_index_batches
@@ -249,7 +249,7 @@ costs less memory than either, because it is never stored.
 
 ### Checkpointing the position
 
-`ResumableSampler` owns the `(epoch, global_consumed)` pair for you, with the
+{py:class}`ResumableSampler <batcher.ml.ResumableSampler>` owns the `(epoch, global_consumed)` pair for you, with the
 `state_dict` and `load_state_dict` protocol a checkpoint already speaks, so the training
 loop never computes a sample offset by hand.
 

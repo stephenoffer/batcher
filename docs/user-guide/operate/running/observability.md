@@ -9,7 +9,7 @@ of that bus:
 | --- | --- | --- |
 | Terminal progress bar | watching a query run, interactively | on in a real terminal |
 | Structured logs | what the engine decided, and why | `WARNING` and above |
-| Web dashboard | plans, per-operator timings, throughput, live logs | off (`bt.start_ui()`) |
+| Web dashboard | plans, per-operator timings, throughput, live logs | off ({py:func}`bt.start_ui() <batcher.start_ui>`) |
 | JSON event log | the durable per-query artifact, on disk | on |
 
 Because they share one source, they can never disagree: the timeline in the dashboard and
@@ -98,7 +98,7 @@ Three details worth knowing, because they are deliberate:
 
 - **The bar advances in eighth-cells**, giving it eight times the resolution of its width,
   which is what makes it read as motion rather than as stepping blocks.
-- **Live row counts only exist on the streaming path.** `iter_batches` surfaces each Arrow
+- **Live row counts only exist on the streaming path.** {py:meth}`iter_batches <batcher.Dataset.iter_batches>` surfaces each Arrow
   batch in Python, so counting rows there is free. `collect` measures inside Rust and returns
   the profile at the end, so its bar shows an indeterminate sweep and its counts appear in the
   summary line.
@@ -198,6 +198,18 @@ platform without anyone re-parsing prose.
 The `log_level` also drives the Rust data plane's tracing, so raising it to `DEBUG` reveals
 the engine's per-operator work, not only the Python control plane's.
 
+`DEBUG` additionally reveals records from the decoder libraries the engine links, such as
+the audio decoder behind `.audio.decode()`. Below `DEBUG` those stay hidden, and that is
+deliberate rather than an oversight. A decoder reports a payload it cannot parse as an
+error, but every media expression treats an unreadable payload as a null row, because an
+unstructured corpus is expected to be mixed. Forwarding those reports would put one error
+line in your log per row that is behaving exactly as documented, and would bury the
+engine's real diagnostics underneath them.
+
+The suppression is also what keeps the null path fast. Each forwarded record acquires the
+Python GIL, which serializes the parallel decode. Turn `DEBUG` on when you are diagnosing
+why a specific file will not decode, and expect a mixed corpus to run slower while it is on.
+
 ## The web dashboard
 
 Start it and keep working. It runs on its own port, in a daemon thread, and never blocks
@@ -277,8 +289,8 @@ New to the dashboard, or arriving from another engine? The **Learn** page maps t
 you already know, such as a Spark UI tab, an Airflow view, or a DuckDB `EXPLAIN`, to its
 equivalent here.
 
-`start_ui` is idempotent. Calling it again returns the URL of the dashboard already
-running rather than binding a second port. Ask for that URL at any time with `bt.ui_url()`,
+{py:func}`start_ui <batcher.start_ui>` is idempotent. Calling it again returns the URL of the dashboard already
+running rather than binding a second port. Ask for that URL at any time with {py:func}`bt.ui_url() <batcher.ui_url>`,
 which returns `None` when no dashboard is running. That helps when a helper needs to print
 or link the dashboard without caring who started it:
 
@@ -341,68 +353,11 @@ if you run many small queries and nothing consumes the documents.
 ## Metrics
 
 The event bus is the right tool when you want every detail of one query. When you want a
-handful of numbers scraped every fifteen seconds forever, use the counters instead.
-`metrics_snapshot` returns them as a nested dict of plain numbers, with no Batcher types in
-it and nothing to close:
-
-```python
-from batcher.observe import metrics_snapshot
-
-snap = metrics_snapshot()
-print(sorted(snap))
-# ['bytes', 'gpu', 'inference', 'logs', 'operators', 'partitions', 'queries', 'rows',
-#  'skipped', 'spills', 'uptime_seconds']
-```
-
-The last four fill in only for work that reports them: `partitions` and `skipped` for a
-distributed read, `inference` and `gpu` for a batch-inference pass. A single-node
-relational query leaves them at zero rather than absent, so a scraper never has to handle
-a changing key set.
-
-If the dashboard is already running, the same counters are served from it, so a scrape
-loop needs no code of yours at all:
-
-```bash
-curl -s http://127.0.0.1:4040/metrics        # Prometheus text exposition
-curl -s http://127.0.0.1:4040/api/metrics    # the same numbers as JSON
-```
-
-The whole read-only API lists itself at `/api`, and every route there is a `GET` over what
-the dashboard is showing.
-
-Counters are cumulative from the moment collection starts, the convention every metrics
-backend expects, so a scrape loop differences successive snapshots to get rates. Collecting
-costs a few integer adds per event.
-
-The first snapshot starts collection, which means it reports only what happened after it.
-Call `start_metrics()` once during startup when the first scrape should also cover the
-queries that ran before it:
-
-```python
-from batcher.observe import start_metrics
-
-start_metrics()
-```
-
-Collection is opt-in rather than always-on for a reason. Attaching any sink to the event
-bus tells the engine that per-query profiles are being consumed, so it assembles one on
-every query. A process that exports no metrics shouldn't pay that on the sub-second path.
-
-`prometheus_text` renders the same numbers in the Prometheus text exposition format. Serve
-it from the `/metrics` endpoint your application already has and Batcher joins whatever you
-scrape today. Batcher runs no HTTP server for this and pulls in no client library:
-
-```python
-from batcher.observe import prometheus_text
-
-print("batcher_queries_total" in prometheus_text())
-# True
-```
-
-Series are prefixed `batcher_`, counters carry the conventional `_total` suffix, and query
-duration is a real histogram with `_bucket`, `_sum`, and `_count` series. OpenTelemetry and
-StatsD users can map the same dict onto their own instruments. `reset_metrics` zeroes the
-counters, for tests and for a service that would rather report per-interval numbers itself.
+handful of numbers scraped every fifteen seconds forever, use the counters instead:
+`metrics_snapshot` returns them as a nested dict of plain numbers, and `prometheus_text`
+renders the same numbers for a scraper. They cover throughput, the duration histogram,
+per-operator work, data-quality contracts, and what the run cost the machine in CPU,
+memory, and disk. See {doc}`Metrics <metrics>`.
 
 ## OpenTelemetry
 

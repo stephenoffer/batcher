@@ -1,6 +1,6 @@
 # Expressions run in Rust
 
-Column work is expressed with `Expr` values built from
+Column work is expressed with {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` values built from
 {py:obj}`bt.col(...) <batcher.col>` and {py:obj}`bt.lit(...) <batcher.lit>`. An
 expression is a *description* of a computation. It isn't a Python loop. When the plan
 executes, the Rust data plane evaluates that expression over whole Arrow batches:
@@ -52,5 +52,5 @@ bt.col("tags").list.contains("ai")    # list / array ops
 ## See also
 
 - {doc}`/user-guide/transform/columns/expressions`: the full expression surface, with nulls and casting.
-- {doc}`/user-guide/transform/columns/expression-accessors`: the `.str`, `.dt`, `.list`, and `.json` namespaces.
+- {doc}`/user-guide/transform/columns/expression-accessors`: the {py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, and {py:class}`.json <batcher.plan.expr_ir.namespaces.collections._JsonNamespace>` namespaces.
 - {doc}`/api/relational/expressions`: every `Expr` method in one reference.

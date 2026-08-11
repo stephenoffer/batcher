@@ -30,13 +30,14 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.exprs.guards import is_date, is_timestamp, schema_rule
+from batcher.kyber.rules.exprs.guards import (
+    is_date,
+    is_timestamp,
+    register_schema_leaf_rule,
+)
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import DateFunc
 from batcher.plan.ir_tags import COMPARISON_FLIP
-from batcher.plan.logical import Filter, Project
 from batcher.plan.schema import SchemaRef
 
 __all__ = ["EPOCH_DATE_RANGE_RULES", "EPOCH_RANGE_RULES"]
@@ -112,18 +113,13 @@ def _epoch_leaf(op_wanted: str) -> Callable[[Expr, SchemaRef | None], Expr]:
 
 def _register(op: str):
     leaf = _epoch_leaf(op)
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            f"epoch_{op}_to_instant_range",
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: schema_rule(node, _leaf, carries=(Binary,)),
-            matches=(Filter, Project),
-            expr_schema_fn=leaf,
-            expr_matches=(Binary,),
-            # Both `op` and its mirror: the comparison is normalized with the computed side
-            # on the left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
-            expr_ops=(op, COMPARISON_FLIP[op]),
-        )
+    # Both `op` and its mirror: the comparison is normalized with the computed side on the
+    # left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
+    return register_schema_leaf_rule(
+        f"epoch_{op}_to_instant_range",
+        leaf,
+        expr_matches=(Binary,),
+        expr_ops=(op, COMPARISON_FLIP[op]),
     )
 
 
@@ -192,18 +188,13 @@ def _epoch_date_leaf(op_wanted: str) -> Callable[[Expr, SchemaRef | None], Expr]
 
 def _register_date(op: str):
     leaf = _epoch_date_leaf(op)
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            f"epoch_{op}_to_date_range",
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: schema_rule(node, _leaf, carries=(Binary,)),
-            matches=(Filter, Project),
-            expr_schema_fn=leaf,
-            expr_matches=(Binary,),
-            # Both `op` and its mirror: the comparison is normalized with the computed side
-            # on the left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
-            expr_ops=(op, COMPARISON_FLIP[op]),
-        )
+    # Both `op` and its mirror: the comparison is normalized with the computed side on the
+    # left, so a `lt` leaf is reached by a `gt` node with the literal on the left.
+    return register_schema_leaf_rule(
+        f"epoch_{op}_to_date_range",
+        leaf,
+        expr_matches=(Binary,),
+        expr_ops=(op, COMPARISON_FLIP[op]),
     )
 
 

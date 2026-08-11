@@ -9,6 +9,8 @@ still produces the optimized plans the old ordered-pass pipeline did.
 
 from __future__ import annotations
 
+import pytest
+
 import batcher as bt
 from batcher import col
 from batcher.kyber.optimizer import Optimizer
@@ -236,3 +238,109 @@ def test_run_phase_identity_fixpoint_no_to_ir_on_stable_plan(monkeypatch):
     _run_phase(plan, [noop], None, 8)
     # No change ever → identity break → zero to_ir() calls in the loop.
     assert calls["n"] == 0
+
+
+# --- rule names are identities, so they must be unique --------------------------------
+
+
+def test_no_two_rules_share_a_name():
+    """Every registered rule has a distinct name.
+
+    A rule's name is its identity in explain output, in telemetry, and in the run-order
+    snapshot, and `RuleRegistry.add` keys on it. A collision is not a cosmetic clash: the
+    second registration is refused, so one of the two implementations never runs at all
+    while its own unit tests keep passing, because those call the module function directly
+    and never go through the registry.
+    """
+    names = [r.name for r in DEFAULT_REGISTRY.rules()]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    assert not duplicates, f"rules sharing a name: {duplicates}"
+
+
+def test_registering_a_second_rule_under_a_taken_name_raises():
+    """The collision is refused loudly rather than dropped silently.
+
+    Two independent `intersect_in_lists` implementations once claimed the same name; import
+    order picked the winner and the loser became dead code whose test asserted the opposite
+    of the shipped behaviour. Silence is what made that survive, so `add` raises.
+    """
+    from batcher._internal.errors import PlanError
+
+    reg = RuleRegistry()
+    first = node_rule("collide", Phase.REWRITE, lambda _n, _c: None, matches=(Filter,))
+    second = node_rule("collide", Phase.REWRITE, lambda _n, _c: None, matches=(Window,))
+    reg.add(first)
+    reg.add(first)  # the identical object is still a no-op, so a double import is safe
+    assert len(reg.rules()) == 1
+    with pytest.raises(PlanError, match="two different rules are registered"):
+        reg.add(second)
+
+
+# --- The phase partition is shared, not rebuilt -------------------------------
+
+
+class TestByPhaseHandsBackStableLists:
+    """`Optimizer` is constructed per query, and it used to partition the rule set into
+    seven fresh lists each time. Those lists' *identity* is load-bearing:
+    `optimizer.expr_dispatch.expr_type_index` memoizes a rule list's expression-type
+    inversion on `id(rules)`, so a new list every query missed the memo on 7 of its 8
+    lookups and re-inverted the whole rule set. These pin the identity and the
+    invalidation that keeps it honest.
+    """
+
+    def test_repeated_calls_return_the_same_list_objects(self):
+        """Identity, not just equality — equality would pass with the bug present."""
+        first = DEFAULT_REGISTRY.by_phase()
+        second = DEFAULT_REGISTRY.by_phase()
+        for phase in Phase:
+            assert first[phase] is second[phase]
+
+    def test_every_optimizer_shares_one_partition(self):
+        """The per-query path: two optimizers built the default way must not each mint
+        their own lists, or the memo downstream cannot hit."""
+        for phase in Phase:
+            assert Optimizer()._by_phase[phase] is Optimizer()._by_phase[phase]
+
+    def test_an_explicit_rule_list_still_partitions_privately(self):
+        """A caller driving a subset has no registry to memoize against, and must not be
+        handed the default registry's lists."""
+        registry = RuleRegistry()
+        register_builtin_rules(registry)
+        explicit = registry.rules()
+        assert (
+            Optimizer(rules=explicit)._by_phase[Phase.NORMALIZE]
+            is not (DEFAULT_REGISTRY.by_phase()[Phase.NORMALIZE])
+        )
+
+    def test_a_later_registration_invalidates_the_partition(self):
+        """Registration order is run order, so a rule added after the first partition was
+        built must still appear -- and appear last, where it registered."""
+        registry = RuleRegistry()
+        register_builtin_rules(registry)
+        before = list(registry.by_phase()[Phase.NORMALIZE])
+
+        added = node_rule(
+            "a_rule_registered_after_the_partition_was_built",
+            Phase.NORMALIZE,
+            lambda plan, ctx: None,
+            matches=(Filter,),
+            category=RuleCategory.REWRITE,
+        )
+        registry.add(added)
+
+        after = registry.by_phase()[Phase.NORMALIZE]
+        assert after == [*before, added], "order must be registration order, new rule last"
+
+    def test_every_phase_is_present_even_when_empty(self):
+        """Callers index the mapping by `Phase` directly, so a missing key is a KeyError
+        on whichever phase happens to have no rules."""
+        partition = RuleRegistry().by_phase()
+        assert set(partition) == set(Phase)
+        assert all(rules == [] for rules in partition.values())
+
+    def test_the_partition_is_the_whole_rule_set(self):
+        """No rule may be dropped or duplicated by the partitioning."""
+        partitioned = [r for phase in Phase for r in DEFAULT_REGISTRY.by_phase()[phase]]
+        assert sorted(r.name for r in partitioned) == sorted(
+            r.name for r in DEFAULT_REGISTRY.rules()
+        )

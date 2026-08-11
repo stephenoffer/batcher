@@ -20,4 +20,4 @@ python examples/dataset/meta_schema.py
 - {doc}`/cookbook/dataset/inspecting/meta_predicates`: cheap yes/no questions about the data, and the column-check shorthands.
 - {doc}`/cookbook/dataset/cleaning/null_handling`: dropping, filling, and counting missing values.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
-- {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.
+- {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

@@ -7,19 +7,14 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 
 __all__ = ["_catalog_key", "_new_write_token", "_require_pyiceberg", "_staged_schema"]
 
 
 def _require_pyiceberg() -> None:
     """Raise `BackendError` if pyiceberg is not importable."""
-    try:
-        import pyiceberg  # noqa: F401
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            "Iceberg support requires pyiceberg: pip install 'batcher-engine[iceberg]'"
-        ) from exc
+    require("pyiceberg", feature="Iceberg support", provides="pyiceberg", extra="iceberg")
 
 
 def _new_write_token() -> str:

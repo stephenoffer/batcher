@@ -9,6 +9,7 @@ a two-column expression, a date column, a zero scale — drops to unknown, as be
 from __future__ import annotations
 
 import datetime
+from decimal import Decimal
 
 import pytest
 
@@ -67,6 +68,56 @@ def test_date_column_is_not_shifted_as_a_number():
 def test_missing_bounds_is_unknown():
     child = RelStats(100.0, Provenance.EXACT, {"x": ColumnStat(ndv=5.0)})
     assert derived_projection_stat(col("x") + 10, child) is None
+
+
+@pytest.mark.parametrize(
+    ("expr", "lo", "hi"),
+    [
+        (col("x") * 0.2, 0.0, 20.0),
+        (0.2 * col("x"), 0.0, 20.0),
+        (col("x") * -0.2, -20.0, 0.0),
+        (col("x") + 0.5, 0.5, 100.5),
+        (col("x") - 0.5, -0.5, 99.5),
+        (0.5 - col("x"), -99.5, 0.5),
+    ],
+)
+def test_a_decimal_column_scaled_by_a_float_literal_still_maps(expr, lo, hi):
+    """A DECIMAL column's bounds against a float literal must not raise.
+
+    Python refuses `Decimal * float` outright, and a footer records a DECIMAL column's
+    min/max as `Decimal`, so every arithmetic branch here used to raise `TypeError` on the
+    shape `l_quantity * 0.2` — TPC-H q17 and TPC-DS q32/q92 all fail to plan on it. The
+    bounds are an estimate carrying `Provenance.DEFAULT`, so widening to float is the
+    correct resolution: nothing downstream needs the decimal to be exact.
+    """
+    child = RelStats(
+        100.0,
+        Provenance.EXACT,
+        {
+            "x": ColumnStat(
+                min=Decimal("0"),
+                max=Decimal("100"),
+                ndv=101.0,
+                null_count=0,
+                provenance=Provenance.EXACT,
+            )
+        },
+    )
+    stat = derived_projection_stat(expr, child)
+    assert stat is not None
+    assert (float(stat.min), float(stat.max)) == (lo, hi)
+
+
+def test_a_decimal_column_and_an_int_literal_keep_exact_decimal_arithmetic():
+    """Only the incompatible pairing is widened; `Decimal * int` is exact in Python and stays so."""
+    child = RelStats(
+        100.0,
+        Provenance.EXACT,
+        {"x": ColumnStat(min=Decimal("0.1"), max=Decimal("0.3"), provenance=Provenance.EXACT)},
+    )
+    stat = derived_projection_stat(col("x") * 3, child)
+    assert stat is not None
+    assert (stat.min, stat.max) == (Decimal("0.3"), Decimal("0.9"))
 
 
 def test_nullif_carries_the_column_bounds():

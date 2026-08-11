@@ -1,6 +1,6 @@
 # Filtering and selection
 
-Filtering keeps the rows that satisfy a predicate. A predicate is an `Expr` that
+Filtering keeps the rows that satisfy a predicate. A predicate is an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` that
 evaluates to a boolean column, built with comparisons and combined with boolean
 operators. Null tests, set membership, ranges, deduplication and limiting all follow
 from the same idea.
@@ -46,7 +46,7 @@ print(ds.filter(~(bt.col("city") == "nyc")).to_pydict())
 
 ## is_in
 
-`is_in` keeps rows whose value is in a given collection.
+{py:meth}`is_in <batcher.plan.expr_ir.core.Expr.is_in>` keeps rows whose value is in a given collection.
 
 ```python
 print(ds.filter(bt.col("city").is_in(["nyc", "la"])).to_pydict())
@@ -64,7 +64,7 @@ print(ds.filter(bt.col("age").between(23, 35)).to_pydict())
 
 ## Null tests
 
-`is_null` keeps rows where a column is null; `is_not_null` keeps the rest.
+{py:meth}`is_null <batcher.plan.expr_ir.core.Expr.is_null>` keeps rows where a column is null; {py:meth}`is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` keeps the rest.
 
 ```python
 print(ds.filter(bt.col("age").is_null()).to_pydict())

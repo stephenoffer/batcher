@@ -96,10 +96,29 @@ class PhysicalPlan:
     # subset to its backend filter to skip I/O; the engine keeps the `Filter`
     # operator as a safe re-check, so an absent/partial translation is correct.
     source_predicates: dict[int, dict[str, Any]] = field(default_factory=dict)
+    #: Kyber's verdict that this plan's grouped aggregate is cheaper materialized than
+    #: streamed. Set from the estimated group count, which only the control plane has; the
+    #: engine pairs it with its own memory-affordability check. See
+    #: `EngineConfig.prefer_materializing_aggregate` for the measurements behind the
+    #: threshold, and `MATERIALIZE_AGG_MIN_GROUPS` for the threshold itself.
+    prefer_materializing_aggregate: bool = False
+    #: One-slot memo for `to_json`. A list rather than a plain string because the dataclass
+    #: is frozen: appending to a mutable default needs no `object.__setattr__` escape, and
+    #: `compare=False` keeps the memo out of plan equality. See `to_json` for why it exists.
+    _json_memo: list[str] = field(default_factory=list, init=False, repr=False, compare=False)
 
     def to_json(self) -> str:
-        """Serialize the relational IR for the engine."""
-        return json.dumps(self.ir)
+        """Serialize the relational IR for the engine, memoized per plan instance.
+
+        Kyber's plan cache hands the *same* `PhysicalPlan` object back for a re-issued
+        query, so without the memo a repeated `collect()` re-serializes an identical IR on
+        every execution. That is 7 us of a small query's ~360 us, and it buys nothing: the
+        plan is frozen, so its IR cannot have changed since the last call.
+        """
+        memo = self._json_memo
+        if not memo:
+            memo.append(json.dumps(self.ir))
+        return memo[0]
 
     def op_budgets(self) -> dict[int, int]:
         """Per-operator spill budgets (bytes) keyed by pre-order `op_id`.

@@ -14,16 +14,28 @@ rather than failing, which is the failure mode `clamp_workers` exists to prevent
 Related: `dist.executor._cluster_fill_workers` slices nodes the same way when *choosing* a
 fan-out. This module answers the complementary question — whether a fan-out already chosen can
 be placed — and the two must keep using the same `floor(node_cores / num_cpus)` rule.
+
+`describe_pending_demand` is that same question asked about a request Ray has *already*
+refused to place, and phrased for a person: a task waiting on a busy cluster finishes
+eventually, a task asking for more CPUs than any node has never runs, and `ray.wait` cannot
+tell the two apart. Neither could the engine, which is why every stalled barrier used to
+report the same "go run `ray status`" whichever it was.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from batcher._internal.logging import get_logger, note_suppressed
 
 __all__ = [
+    "Demand",
+    "describe_pending_demand",
     "free_cpus_by_node",
     "placeable_workers",
+    "preferred_fleet_zone",
     "warn_once_if_allocation_is_wider_than_ray",
+    "workers_per_node",
 ]
 
 
@@ -43,10 +55,26 @@ def free_cpus_by_node() -> dict[str, float] | None:
     failed after three sixty-second waits until the grant was sized from these numbers
     instead of the nameplate.
 
+    Snapshot-aware: inside a `scaling.topology_scope()` this is the figure read once for the
+    whole scheduling phase. Without that it was the hole in the snapshot — `node_classes`
+    reads it on every call, and the placement phase calls `node_classes` from five places, so
+    a scope that had carefully collapsed its `ray.nodes()` reads still paid five GCS round
+    trips for the free-CPU half of the same question.
+
     Returns:
         Node id -> free CPU count, or `None` when the per-node figures cannot be read. `None`
         means "assume nameplate", which is the behaviour every caller had before.
     """
+    from batcher.dist.executors.ray_runtime.scaling import _TOPOLOGY
+
+    snap = _TOPOLOGY.get()
+    if snap is not None:
+        return snap.free_cpus
+    return _live_free_cpus_by_node()
+
+
+def _live_free_cpus_by_node() -> dict[str, float] | None:
+    """The unsnapshotted read behind `free_cpus_by_node`, and what fills the snapshot."""
     try:
         from ray._private.state import available_resources_per_node
 
@@ -115,20 +143,266 @@ def placeable_workers(
             # (`cpu_only_can_host`), so an empty list here means the topology changed under
             # us. Report unknown rather than zero: zero would clamp the fan-out to one.
             return None
-    total = 0
-    for node in nodes:
-        fits = int(float(node["cpus"]) // num_cpus)
-        if num_gpus > 0:
-            fits = min(fits, int(float(node["gpus"]) // num_gpus))
-        node_memory = float(node.get("memory", 0.0))
-        # Only bound by memory where the node actually reports it. A node advertising no
-        # `memory` resource is not a node with no memory — Ray simply is not tracking it —
-        # and reading the absent value as zero would place zero workers everywhere and
-        # collapse the whole fan-out to one.
-        if memory_bytes > 0 and node_memory > 0:
-            fits = min(fits, int(node_memory // memory_bytes))
-        total += max(0, fits)
+    demand = Demand(num_cpus=num_cpus, num_gpus=num_gpus, memory_bytes=memory_bytes)
+    # Nameplate, because this answers what the cluster can host rather than what is free
+    # right now — the fan-out is sized before the fleet is placed, and a co-tenant that
+    # finishes in the meantime must not have shrunk it.
+    total = sum(workers_per_node(node, demand, nameplate=True) for node in nodes)
     return total
+
+
+@dataclass(frozen=True, slots=True)
+class Demand:
+    """What one pending task or placement-group bundle is asking for.
+
+    Mirrors the fields `scheduling._bundle` reserves, so a diagnosis is made against the ask
+    Ray was actually given rather than an approximation of it.
+
+    * `num_cpus` — CPU shares one task/bundle requests.
+    * `num_gpus` — GPUs one task/bundle requests; `0.0` for the CPU relational path.
+    * `memory_bytes` — heap bytes reserved per task/bundle; `0` when nothing was granted.
+    * `resources` — custom Ray resources (`TPU`, `neuron_cores`, an operator's own name).
+    * `count` — how many are outstanding, for the message only.
+    """
+
+    num_cpus: float = 1.0
+    num_gpus: float = 0.0
+    memory_bytes: int = 0
+    resources: tuple[tuple[str, float], ...] = ()
+    count: int = 1
+
+    @classmethod
+    def from_envelope(cls, env, count: int | None = None) -> Demand:
+        """The demand a `SchedulingEnvelope`'s per-task grant places on one node.
+
+        Args:
+            env: The `SchedulingEnvelope` in force, or `None` for Ray's implicit one CPU.
+            count: Outstanding tasks; defaults to the envelope's fan-out.
+
+        Returns:
+            The `Demand` for one of that envelope's tasks.
+        """
+        if env is None:
+            return cls(count=max(1, count or 1))
+        return cls(
+            num_cpus=float(env.num_cpus),
+            num_gpus=float(env.num_gpus),
+            memory_bytes=int(env.memory_bytes),
+            resources=tuple(env.resources),
+            count=max(1, count if count is not None else env.n_tasks),
+        )
+
+
+def _node_shortfall(node: dict, demand: Demand) -> str | None:
+    """The resource `node`'s **nameplate** cannot cover for one `demand`, or `None` if it fits.
+
+    Nameplate, not free: this answers "can this ever be placed", and a busy node is a
+    scheduling delay rather than an impossibility. `placeable_workers` asks the
+    complementary question against what is free right now.
+
+    Returns the *binding* resource rather than a bare bool because that is the whole
+    actionable content of the answer. Told only that a node cannot host the task, a reader
+    compares the numbers they can see — cores against cores — and concludes the engine is
+    wrong when the constraint was RAM.
+    """
+    if float(node.get("cpus", 0.0)) < demand.num_cpus:
+        return f"CPU ({float(node.get('cpus', 0.0)):g} available, {demand.num_cpus:g} needed)"
+    if demand.num_gpus > 0 and float(node.get("gpus", 0.0)) < demand.num_gpus:
+        return f"GPU ({float(node.get('gpus', 0.0)):g} available, {demand.num_gpus:g} needed)"
+    node_memory = float(node.get("memory", 0.0))
+    # A node advertising no `memory` resource is not a node with no memory — Ray simply is
+    # not tracking it — so an unreported figure cannot rule the node out. Same reading
+    # `placeable_workers` takes, and for the same reason.
+    if demand.memory_bytes > 0 and 0 < node_memory < demand.memory_bytes:
+        return (
+            f"memory ({node_memory / 1e9:.1f} GB available, "
+            f"{demand.memory_bytes / 1e9:.1f} GB needed)"
+        )
+    return None
+
+
+def _missing_custom_resources(demand: Demand) -> list[str]:
+    """Custom resources the cluster advertises less of than one task needs.
+
+    Checked against the cluster *total* rather than per node, because `node_classes`
+    deliberately does not carry them — it classifies nodes, and an operator's own resource
+    names are unbounded. That is the weaker test (it cannot see units spread thin across
+    nodes), which is the right way to be wrong: it claims an impossibility only when the
+    resource is genuinely absent.
+    """
+    if not demand.resources:
+        return []
+    try:
+        import ray
+
+        totals = dict(ray.cluster_resources())
+    except Exception as exc:
+        note_suppressed("dist", "read cluster resources for the demand diagnosis", exc)
+        return []
+    return [name for name, amount in demand.resources if totals.get(name, 0.0) < amount]
+
+
+def _ask(demand: Demand) -> str:
+    """The demand as a resource phrase a reader can match against `ray status`."""
+    parts = [f"{demand.num_cpus:g} CPU"]
+    if demand.num_gpus > 0:
+        parts.append(f"{demand.num_gpus:g} GPU")
+    if demand.memory_bytes > 0:
+        parts.append(f"{demand.memory_bytes / 1e9:.1f} GB")
+    parts.extend(f"{amount:g} {name}" for name, amount in demand.resources)
+    return ", ".join(parts)
+
+
+def describe_pending_demand(demand: Demand) -> str | None:
+    """One sentence naming why `demand` has not been placed, or `None` if nothing is wrong.
+
+    Three outcomes, in the order a reader needs them:
+
+    * **Unsatisfiable** — no node in the cluster is large enough to host one of these, so
+      waiting cannot help. Names what was asked and what the widest node holds, because the
+      fix is always to change one of the two.
+    * **Short** — the nodes that could host it do not have enough free capacity for what is
+      outstanding. Reported as the three numbers rather than as a verdict, because the same
+      shape means different things to the two callers: a gang needs every bundle at once, so
+      it is why the group will not form, while a barrier's tasks queue happily and it is
+      merely why nothing has started. Both callers ask only after a stall, and at that point
+      the numbers are what a reader needs either way.
+    * **`None`** — there is room for what is outstanding and the topology has no complaint.
+      The wait is a slow task, not a scheduling problem, and manufacturing a diagnosis for it
+      would train readers to skip the ones that mean something.
+
+    Args:
+        demand: The per-task or per-bundle ask that is pending.
+
+    Returns:
+        The diagnosis, or `None` when the topology reports nothing actionable.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import node_classes
+
+    try:
+        nodes = node_classes()
+    except Exception as exc:  # pragma: no cover - a diagnosis never fails its caller
+        note_suppressed("dist", "read node classes for the demand diagnosis", exc)
+        return None
+    if not nodes:
+        return None
+
+    missing = _missing_custom_resources(demand)
+    if missing:
+        return (
+            f"no node advertises {', '.join(missing)}: this stage asks for {_ask(demand)} per "
+            f"task and the cluster has none of that resource, so waiting cannot schedule it"
+        )
+
+    shortfalls = {id(n): _node_shortfall(n, demand) for n in nodes}
+    hosts = [n for n in nodes if shortfalls[id(n)] is None]
+    if not hosts:
+        # Report against the widest node rather than an arbitrary one: it is the node a
+        # reader would compare the ask to, and the one whose shape has to change.
+        widest = max(nodes, key=lambda n: float(n.get("cpus", 0.0)))
+        return (
+            f"no node can host one task: this stage asks for {_ask(demand)} per task and the "
+            f"widest of {len(nodes)} node(s) is short on {shortfalls[id(widest)]}, so waiting "
+            f"cannot schedule it"
+        )
+
+    free = sum(float(n.get("free_cpus", n.get("cpus", 0.0))) for n in hosts)
+    if free < demand.num_cpus * demand.count:
+        return (
+            f"the cluster is short of free capacity: {demand.count} outstanding at "
+            f"{_ask(demand)} each, and {len(hosts)} candidate node(s) have {free:g} CPU free "
+            f"between them — another job, or an earlier stage's placement group, is holding "
+            f"the rest"
+        )
+    return None
+
+
+def preferred_fleet_zone(workers: int, demand: Demand) -> dict[str, str]:
+    """A one-zone label selector for a shuffle fleet, or `{}` to place it anywhere.
+
+    A shuffle moves nearly all of its bytes worker to worker, and on every cloud those bytes
+    are billed and delayed differently depending on whether the two workers sit in the same
+    availability zone. AWS charges $0.01/GB in *each* direction across zones and adds a
+    round-trip; a fleet spread evenly over three zones sends roughly two thirds of its
+    shuffle across that boundary. Nothing about the query requires it: the bundles are
+    interchangeable, so a fleet that fits inside one zone can simply be placed inside one.
+
+    The zone chosen is the one with the most free capacity among those that can host the
+    *whole* fleet, so pinning never trades a cost saving for a placement that will not form.
+    Everything else returns `{}` and the fleet is placed exactly as it was before:
+
+    * a cluster in one zone, or one whose nodes carry no zone label — nothing to choose;
+    * a fleet no single zone can host — spreading it is the only arrangement available;
+    * an unreadable topology — a cost optimization must not act on a guess.
+
+    Placement-only, so the result is identical either way. And it is applied to the bundles
+    rather than to the tasks, which is what keeps the failure mode benign: a group that does
+    not form within the timeout is abandoned and the stage falls back to default scheduling,
+    where a zone pin on the tasks themselves would instead leave them pending forever.
+
+    Args:
+        workers: Bundles being reserved.
+        demand: What one bundle asks for.
+
+    Returns:
+        `{label_key: zone}` to pin the fleet, or `{}` to leave placement unconstrained.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import node_classes
+
+    try:
+        nodes = node_classes()
+    except Exception as exc:  # pragma: no cover - a cost hint never fails a placement
+        note_suppressed("dist", "read node classes for zone-aware placement", exc)
+        return {}
+    zoned = [n for n in nodes if n.get("zone")]
+    if len(zoned) < 2 or len({n["zone"] for n in zoned}) < 2:
+        return {}
+    best: tuple[float, str, str] | None = None
+    for zone in {n["zone"] for n in zoned}:
+        members = [n for n in zoned if n["zone"] == zone]
+        fits = sum(workers_per_node(n, demand) for n in members)
+        if fits < workers:
+            continue
+        free = sum(float(n.get("free_cpus", n.get("cpus", 0.0))) for n in members)
+        key = members[0].get("zone_label") or ""
+        if key and (best is None or free > best[0]):
+            best = (free, key, zone)
+    return {best[1]: best[2]} if best is not None else {}
+
+
+def workers_per_node(node: dict, demand: Demand, *, nameplate: bool = False) -> int:
+    """How many workers of `demand` one node can host — the single per-node placement rule.
+
+    Every question this module answers reduces to it: how wide a fan-out the cluster can
+    place, which zone can hold a fleet, and whether the widest node can host one task at all.
+    Stated three times it drifted three ways, and a per-node rule that disagrees with itself
+    produces a fan-out no arrangement of nodes can satisfy — which hangs the job rather than
+    failing it.
+
+    Args:
+        node: One `scaling.node_classes` record.
+        demand: What one worker asks for.
+        nameplate: Size against the node's full capacity rather than what is unreserved now.
+            True when sizing a fan-out, which happens before the fleet is placed and must not
+            shrink because a co-tenant was momentarily busy. False when deciding where a
+            reservation can actually form.
+
+    Returns:
+        The worker count, never negative.
+    """
+    cpus = float(node.get("cpus", 0.0))
+    if not nameplate:
+        cpus = float(node.get("free_cpus", cpus))
+    fits = int(cpus // max(demand.num_cpus, 1e-9))
+    if demand.num_gpus > 0:
+        fits = min(fits, int(float(node.get("gpus", 0.0)) // demand.num_gpus))
+    node_memory = float(node.get("memory", 0.0))
+    # Only bound by memory where the node actually reports it. A node advertising no `memory`
+    # resource is not a node with no memory — Ray simply is not tracking it — and reading the
+    # absent value as zero would place zero workers everywhere and collapse the fan-out to one.
+    if demand.memory_bytes > 0 and node_memory > 0:
+        fits = min(fits, int(node_memory // demand.memory_bytes))
+    return max(0, fits)
 
 
 # Set once the allocation-width notice has been given. The shape of a job does not change

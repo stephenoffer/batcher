@@ -4,9 +4,9 @@ The four shapes a generation call takes, from the one-liner to the class UDF.
 
 ## On a Dataset
 
-`ds.ml.generate(...)` is the Dataset-native form. It returns a new lazy `Dataset` with
+{py:meth}`ds.ml.generate(...) <batcher.api.dataset.ml.DatasetML.generate>` is the Dataset-native form. It returns a new lazy {py:class}`Dataset <batcher.Dataset>` with
 the generated column appended, and reuses the same `num_gpus`, `concurrency`, and
-`accelerator_type` GPU-actor scheduling as `ds.ml.infer` and `ds.ml.embed`.
+`accelerator_type` GPU-actor scheduling as {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`.
 
 ```python
 # docs: skip
@@ -79,7 +79,7 @@ Packing is sequential and stateful. A document that does not fit is carried into
 sequence rather than padded, so it transforms a *batch stream* instead of running as a
 `map_batches`. A parallel per-batch map would cut the stream in a nondeterministic place.
 Shuffle before packing, not after. The output is a `FixedSizeList<Int64>[seq_len]` column,
-which `iter_torch_batches` turns into an `(n, seq_len)` tensor with no reshape at the
+which {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` turns into an `(n, seq_len)` tensor with no reshape at the
 edge.
 
 The trailing partial sequence is dropped by default. Set `drop_remainder=False` to pad it

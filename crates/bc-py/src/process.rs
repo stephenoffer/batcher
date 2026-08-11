@@ -76,10 +76,31 @@ fn shuffle_runtime_threads() -> usize {
 /// can't shrink the envelope below a larger concurrent query's live reservations;
 /// reservations are RAII, so `used()` returns to 0 between queries.
 pub(crate) fn shared_memory_pool(budget: usize) -> Arc<MemoryPool> {
-    static POOL: OnceLock<Arc<MemoryPool>> = OnceLock::new();
-    let pool = POOL.get_or_init(|| MemoryPool::new(budget));
+    let pool = MEMORY_POOL.get_or_init(|| MemoryPool::new(budget));
     if budget > pool.limit() {
         pool.set_limit(budget);
     }
     Arc::clone(pool)
 }
+
+/// The process-wide pool **if a query has already created it**, else `None`.
+///
+/// Lifted out of [`shared_memory_pool`] so a reader can observe the data plane's envelope
+/// without bringing one into existence. That distinction carries information: a `None` says
+/// no query has run under a budget in this process, which is not the same as an empty pool,
+/// and reporting it as zeros would be a claim about a thing that does not exist.
+///
+/// The control plane needs this because its own `carbonite.memory.BufferPool` wraps a
+/// *different* `MemoryPool` — one it constructs itself — so the reservations that dominate
+/// a real query's footprint (operator state, the Flight transit buffers) are invisible to
+/// it. Reading rather than reserving is deliberate: Carbonite reserves a plan's estimated
+/// peak for the duration of execution and the engine then reserves the same operator's
+/// actual bytes, so charging both to one counter would double-count every query and spill
+/// it at half its budget.
+pub(crate) fn shared_memory_pool_if_created() -> Option<Arc<MemoryPool>> {
+    MEMORY_POOL.get().map(Arc::clone)
+}
+
+/// Backing store for both accessors above. At module scope rather than inside
+/// `shared_memory_pool` so the peek can reach it.
+static MEMORY_POOL: OnceLock<Arc<MemoryPool>> = OnceLock::new();

@@ -12,20 +12,24 @@
 //! it per row-group split, falling back to PyArrow if a scheme/feature is unsupported,
 //! so the result is byte-identical either way.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use arrow::record_batch::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
+use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
-use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::file::metadata::ParquetMetaData;
 
 mod avro;
 mod bloom;
 mod footer_stats;
 mod page_index;
 mod predicate;
+mod projection;
 mod row_filter;
+mod split_read;
 mod store;
 
 /// Below this many candidate rows a read is short enough that the row-filter probe would cost
@@ -64,6 +68,34 @@ fn rg_concurrency() -> usize {
             .and_then(|s| s.parse().ok())
             .filter(|&n| n > 0)
             .unwrap_or(16)
+    })
+}
+
+/// How many trailing bytes to speculatively read when fetching a file's footer.
+///
+/// The metadata reader's default prefetch is the 8-byte footer *length*, which makes every
+/// cold footer load two round trips: read the length, then come back for the metadata it
+/// points at. One speculative read of this size collapses that to one whenever the footer
+/// fits, which it does for ordinary schemas — a 16-column file's footer plus its page index
+/// is a few KB. Overshooting costs only the over-read bytes; undershooting degrades to the
+/// two-trip behavior.
+///
+/// **Only safe because the file size is known.** This hint is a size, not a range, and it
+/// becomes a bounded read only against a known end. Read as a bare *suffix*, the page-index
+/// offsets are computed against a buffer whose start was guessed, and
+/// `ParquetMetaDataReader::load_page_index_with_remainder` asserts on the mismatch
+/// (`assert!(end <= remainder.len())`) rather than re-fetching — so the process aborts. Five
+/// `bc-io` tests panicked inside the parquet crate that way, and a *smaller* hint failed ten.
+/// `load_metadata_cached` gets the size from the same suffix `GET` that fetches these bytes,
+/// which is why the guarantee now costs no round trip of its own.
+fn footer_prefetch() -> usize {
+    static P: OnceLock<usize> = OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("BATCHER_PARQUET_FOOTER_PREFETCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64 * 1024)
     })
 }
 
@@ -164,6 +196,19 @@ pub fn read_parquet_filtered(
 /// How many whole files to read concurrently in a batched multi-file read. A
 /// many-small-files scan is latency-bound on per-file footer+chunk GETs, so overlapping
 /// files (on top of each file's own row-group concurrency) is the throughput lever.
+///
+/// **This is a latency budget, not a CPU one, and a flat 64 was leaving most of it unspent.**
+/// Each file costs about two sequential round trips (footer, then its column chunks) and
+/// almost no CPU, so the useful concurrency is set by how many requests are needed to cover
+/// the round-trip time — far more than the core count. Measured reading the 1,024-file
+/// `small-parquet/1GiB` corpus from S3 on a 96-core node, one column: **803 ms at 64, 411 ms
+/// at 256, 167 ms at 512** — 4.8x for a number, on the layout the scan benchmark measures as
+/// Batcher's largest gap.
+///
+/// Scaled by the core count rather than pinned at the measured best, because the figure that
+/// is right here is a property of this link and this host size, and a small pod raising 64 to
+/// 512 would spend memory and sockets it does not have on requests its bandwidth cannot
+/// carry. The floor keeps every host at least as concurrent as it was.
 fn file_concurrency() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
     *C.get_or_init(|| {
@@ -171,7 +216,7 @@ fn file_concurrency() -> usize {
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(64)
+            .unwrap_or_else(|| bc_arrow::usable_cores().saturating_mul(4).clamp(64, 512))
     })
 }
 
@@ -275,44 +320,153 @@ pub(crate) fn load_metadata_many(
     })
 }
 
+/// A parquet reader whose first request has already happened.
+///
+/// The footer load needs two facts about a file: how big it is, and the bytes at its end.
+/// Asking for them separately costs two round trips per file — a `head()` for the size, then
+/// a ranged `GET` for the footer — and on an object store that is the dominant cost of
+/// opening a small file. A **suffix** `GET` answers both at once: `ObjectMeta.size` comes
+/// back with the response, so one request yields the size *and* the tail.
+///
+/// This serves any range that falls inside that prefetched tail from memory and forwards
+/// anything else to the store. In practice the footer, and usually the page index with it,
+/// are entirely inside it — so opening a file is one request, against two before and three
+/// with no size hint at all (an 8-byte length read, then the footer).
+///
+/// It matters most exactly where it looks smallest. The benchmark's `many_small` layout is
+/// ~1.2 MiB files, so a 1 GiB read opens ~850 of them and every saved round trip is paid 850
+/// times; that suite measured 10-12x DuckDB before this.
+struct PrefetchedFooter {
+    store: Arc<dyn ObjectStore>,
+    path: object_store::path::Path,
+    /// Where `tail` starts within the file.
+    tail_start: u64,
+    tail: bytes::Bytes,
+}
+
+impl parquet::arrow::async_reader::AsyncFileReader for PrefetchedFooter {
+    fn get_bytes(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+        use futures::FutureExt;
+        if range.start >= self.tail_start && range.end <= self.tail_start + self.tail.len() as u64 {
+            let from = (range.start - self.tail_start) as usize;
+            let to = (range.end - self.tail_start) as usize;
+            let slice = self.tail.slice(from..to);
+            return async move { Ok(slice) }.boxed();
+        }
+        let store = self.store.clone();
+        let path = self.path.clone();
+        async move {
+            store
+                .get_range(&path, range)
+                .await
+                .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> futures::future::BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        use futures::FutureExt;
+        // The file size is known exactly — the suffix `GET` that filled `tail` reported it —
+        // so the metadata reader gets a *bounded* read and never has to guess where the file
+        // ends. That is the property `footer_prefetch` documents as load-bearing: without it
+        // the page-index offsets are computed against a buffer whose start was guessed, and
+        // the parquet crate asserts rather than re-fetching.
+        let file_size = self.tail_start + self.tail.len() as u64;
+        let prefetch = self.tail.len();
+        let page_index = options.map(|o| o.page_index()).unwrap_or(false);
+        async move {
+            let reader = parquet::file::metadata::ParquetMetaDataReader::new()
+                // `Optional`, never `Required`: a file written without a page index is
+                // ordinary, and `bool::into` would map this to `Required` and fail the read
+                // outright rather than decoding every page as it did before.
+                .with_page_index_policy(if page_index {
+                    parquet::file::metadata::PageIndexPolicy::Optional
+                } else {
+                    parquet::file::metadata::PageIndexPolicy::Skip
+                })
+                .with_prefetch_hint(Some(prefetch));
+            Ok(Arc::new(
+                reader.load_and_finish(&mut *self, file_size).await?,
+            ))
+        }
+        .boxed()
+    }
+}
+
 async fn load_metadata_cached(
     uri: &str,
     resolved: &store::Resolved,
 ) -> Result<(u64, ArrowReaderMetadata), IoError> {
+    // Warm: one HEAD confirms the file is the one the entry describes, and the expensive
+    // half — the ranged footer GET and the parse — is served from memory. Serving an
+    // unvalidated hit costs correctness instead: the failure is not a stale-looking answer
+    // but reading *new* bytes at the *old* row-group offsets.
     let cached = meta_cache().lock().unwrap().get(uri).cloned();
-    // One HEAD confirms the file is the one the entry describes. It is the same request
-    // the cold path makes, and it leaves the expensive half — the ranged footer GET and
-    // the parse — served from the cache, so a hit still costs a single round trip rather
-    // than a fetch-and-parse. Serving an unvalidated hit costs correctness instead.
-    let meta = resolved.store.head(&resolved.path).await?;
     if let Some((size, amd)) = cached {
-        if size == meta.size {
+        if resolved.store.head(&resolved.path).await?.size == size {
             return Ok((size, amd));
         }
     }
-    // Cold or changed: one ranged GET for the footer (no probing), parsed once. Stored so
-    // no later read of this file re-fetches or re-parses it.
-    // Load the ColumnIndex/OffsetIndex alongside the footer. They are what `page_index`
-    // prunes with, they live in the same footer region the ranged GET already covers, and
-    // they are cached with it — so a read that never uses them pays a parse of a few KB,
-    // while one that does skips whole pages instead of decoding them.
+    // Cold (or changed): **one** request. A suffix `GET` returns the trailing bytes *and*
+    // `ObjectMeta.size`, which is the whole trick — the two things a footer load needs, and
+    // the two things this used to spend two round trips acquiring.
     //
-    // The preload flags must be set on the **reader**, not via
-    // `ArrowReaderOptions::with_page_index`. `ParquetObjectReader::get_metadata` ignores the
-    // options' page-index policy entirely and consults its own `preload_*` fields, so the
-    // options form compiles, runs, and silently loads no index at all — `column_index()`
-    // stays `None` and every page survives. That reads exactly like a working feature: the
-    // results are correct, the tests pass, and nothing is pruned.
-    let mut probe = ParquetObjectReader::new(resolved.store.clone(), resolved.path.clone())
-        .with_file_size(meta.size)
-        .with_preload_column_index(true)
-        .with_preload_offset_index(true);
-    let amd = ArrowReaderMetadata::load_async(&mut probe, ArrowReaderOptions::new()).await?;
+    // Both of the obvious one-trip shapes are wrong, and the file has worn each of them:
+    //
+    // - `head()` then a ranged `GET` is correct but costs two trips. On the benchmark's
+    //   `many_small` layout (~1.2 MiB objects) a 1 GiB read opens ~850 files, so the extra
+    //   trip is paid 850 times and dominates the read.
+    // - Dropping the `head()` and letting `ParquetObjectReader` read a *suffix* is one trip
+    //   but unsound: without a known file size it slices the page index out of a buffer
+    //   whose start it guessed, and `load_page_index_with_remainder` asserts on the mismatch
+    //   rather than re-fetching. Five `bc-io` tests aborted inside that assert.
+    //
+    // `PrefetchedFooter` is the shape that is both: the size comes back with the bytes, so
+    // every offset is computed against a known end, and the metadata reader's fetches land
+    // in the tail already in memory. A footer larger than the hint still works — the reader
+    // asks for the range it needs and gets the one extra request it would have made anyway.
+    //
+    // The ColumnIndex/OffsetIndex load alongside the footer, since they live in the region
+    // the suffix already covers and are cached with it: a read that never prunes pays a
+    // parse of a few KB, one that does skips whole pages instead of decoding them.
+    let want = footer_prefetch() as u64;
+    let get = resolved
+        .store
+        .get_opts(
+            &resolved.path,
+            object_store::GetOptions {
+                range: Some(object_store::GetRange::Suffix(want)),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let size = get.meta.size;
+    let tail = get.bytes().await?;
+    let mut probe = PrefetchedFooter {
+        store: resolved.store.clone(),
+        path: resolved.path.clone(),
+        tail_start: size.saturating_sub(tail.len() as u64),
+        tail,
+    };
+    // The page index sits just below the footer, so it is normally inside the tail above and
+    // costs nothing extra; when it is not, `PrefetchedFooter` fetches it and the file simply
+    // takes the second request it would have taken anyway.
+    let amd = ArrowReaderMetadata::load_async(
+        &mut probe,
+        ArrowReaderOptions::new().with_page_index(true),
+    )
+    .await?;
     meta_cache()
         .lock()
         .unwrap()
-        .insert(uri.to_string(), (meta.size, amd.clone()));
-    Ok((meta.size, amd))
+        .insert(uri.to_string(), (size, amd.clone()));
+    Ok((size, amd))
 }
 
 async fn read_parquet_async(
@@ -353,7 +507,7 @@ async fn read_parquet_async(
     // here but `[c,a]` from PyArrow — a silent column-order divergence. We reorder the
     // output below to the requested order to honor that contract.
     let projection = columns.map(|cols| {
-        ProjectionMask::columns(arrow_meta.parquet_schema(), cols.iter().map(|s| s.as_str()))
+        projection::exact_columns(arrow_meta.parquet_schema(), cols.iter().map(|s| s.as_str()))
     });
 
     // Decide, by measurement, whether a row-level filter pays on this read.
@@ -423,7 +577,7 @@ async fn read_parquet_async(
                     let reader =
                         ParquetObjectReader::new(resolved.store.clone(), resolved.path.clone())
                             .with_file_size(size);
-                    let mask = ProjectionMask::columns(
+                    let mask = projection::exact_columns(
                         arrow_meta.parquet_schema(),
                         cols.iter().map(String::as_str),
                     );
@@ -468,9 +622,14 @@ async fn read_parquet_async(
     // This mirrors the per-file spawn `read_parquet_many` already does across files.
     let store = resolved.store;
     let loc = resolved.path;
+    let remote = resolved.remote;
     let batch_size = batch_size.max(1);
     let per_rg = targets.into_iter().map(|rg| {
-        let reader = ParquetObjectReader::new(store.clone(), loc.clone()).with_file_size(size);
+        // Over the network a row group's contiguous column chunks coalesce into one enormous
+        // GET, which one connection then serves at a fraction of the link — see `split_read`.
+        // Local reads keep the plain reader: the page cache has no such limit.
+        let base = ParquetObjectReader::new(store.clone(), loc.clone()).with_file_size(size);
+        let reader = split_read::maybe_split(base, &store, &loc, remote);
         let amd = arrow_meta.clone();
         let proj = projection.clone();
         // Page-level pruning *within* a surviving row group. Computed here, on the metadata

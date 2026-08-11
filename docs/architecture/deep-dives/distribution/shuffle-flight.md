@@ -190,6 +190,28 @@ server, and the page cache does the work. The work directory is driver-local, wh
 
 `resolve_transport` in `dist/executors/ray_runtime/lifecycle.py` makes the call.
 
+### Compressing what the disk shuffle writes
+
+The Flight wire has always compressed its batches (`distributed.flight_compression`). The
+disk shuffle now makes the same trade, and it makes it the way the spill store does, by
+looking at where the bytes are going rather than at what is in them.
+
+A scratch directory on a **cluster-shared mount** is a network filesystem. Every byte a
+mapper writes crosses the wire twice, once out to the mount and once back to the reducer, so
+a cheap codec pays there for the same reason it pays on the remote spill tier: LZ4 runs at
+around a gigabyte per second per core, well ahead of any network mount, and it gives up
+quickly on data that will not compress. A scratch directory on node-local disk is fast, so it
+honors `memory.spill_compression` instead and stays uncompressed under that field's `"auto"`
+default.
+
+Nothing on the read side changes. An Arrow IPC message records its own codec, so a reducer
+decompresses whatever it is handed, and a file written by an earlier build still reads.
+`shuffle_ipc_options` in `dist/shuffle_io.py` makes the call, and it decides from the path
+alone. That is deliberate rather than incidental: a Ray worker's `active_config()` is its own
+process default, not the driver's, so a codec chosen from configuration on a worker would
+silently disagree with the one the driver intended. The branch where compression matters
+reads no configuration and therefore agrees on every node.
+
 ## The self-limiting shared-memory mirror
 
 The shared-memory file is a second copy of the bucket, in tmpfs, on top of the in-memory
@@ -211,7 +233,7 @@ Two independent layers, both off by default.
 
 A shuffle token, set as `distributed.shuffle_token` or through the `BATCHER_SHUFFLE_TOKEN`
 environment variable, is checked constant-time against `path[1]` before any data is served.
-Separately, `distributed.tls` enables TLS on the Flight channel through `ShuffleTlsConfig`,
+Separately, `distributed.tls` enables TLS on the Flight channel through {py:class}`ShuffleTlsConfig <batcher.config.config.ShuffleTlsConfig>`,
 and setting `require_client_auth` there turns that into mutual TLS.
 
 ## Code map

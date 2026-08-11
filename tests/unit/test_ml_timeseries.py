@@ -100,3 +100,53 @@ def test_durbin_watson_is_near_two_for_independent_residuals() -> None:
     e = rng.normal(0, 1, 1000)
     ds = bt.from_pydict({"t": list(range(1000)), "e": e.tolist()})
     assert durbin_watson(ds, "e", order_by="t") == pytest.approx(2.0, abs=0.2)
+
+
+def test_the_acf_costs_one_window_however_many_lags() -> None:
+    """Every lag shares one `Window`, which is the whole point of computing them together.
+
+    Lag by lag, an ACF costs three executions *and a full global sort* each — a 40-lag
+    seasonal diagnostic meant 40 sorts of the entire series. Building the lag columns in one
+    `with_columns` collapses them onto a single `Window` node over one ordering. A correctness
+    test cannot see the difference (the numbers are identical either way), so the plan shape
+    is what has to be pinned.
+    """
+    from batcher.plan.expr_ir.constructors import col
+    from batcher.plan.expr_ir.nodes import lag
+
+    ds = bt.from_pydict({"t": list(range(50)), "x": [float(i % 7) for i in range(50)]})
+    lagged = ds.with_columns(
+        **{f"__l{k}": lag(col("x"), k).over(order_by=["t"]) for k in range(1, 41)}
+    )
+    plan = lagged.agg(**{f"r{k}": col(f"__l{k}").sum() for k in range(1, 41)}).explain()
+    assert plan.lower().count("window") == 1, plan
+
+
+def test_the_acf_is_unchanged_by_computing_the_lags_together() -> None:
+    """The fused form must equal the per-lag form exactly, not merely closely."""
+    rng = np.random.default_rng(7)
+    series = [0.0]
+    for _ in range(299):
+        series.append(0.7 * series[-1] + float(rng.normal()))
+    ds = bt.from_pydict({"t": list(range(300)), "x": series})
+
+    fused = autocorrelations(ds, "x", 12, order_by="t")
+    one_at_a_time = {k: autocorrelation(ds, "x", k, order_by="t") for k in range(1, 13)}
+    assert fused == one_at_a_time
+
+
+def test_a_lag_longer_than_the_series_is_undefined_not_zero() -> None:
+    """No overlapping pair means no correlation to report, so it is NaN rather than 0.0.
+
+    Summing over an empty overlap gives null, and reading that as a number used to raise a
+    `TypeError` from inside `float()` — a message about a conversion for a question that
+    simply has no answer.
+    """
+    ds = bt.from_pydict({"t": [0, 1, 2], "x": [1.0, 5.0, 3.0]})
+    assert np.isnan(autocorrelations(ds, "x", 5, order_by="t")[4])
+
+
+def test_autocorrelations_rejects_a_non_positive_lag_count() -> None:
+    ds = bt.from_pydict({"t": [0, 1, 2], "x": [1.0, 2.0, 3.0]})
+    with pytest.raises(PlanError, match="positive lag count"):
+        autocorrelations(ds, "x", 0, order_by="t")

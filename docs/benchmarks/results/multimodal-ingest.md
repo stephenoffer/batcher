@@ -21,7 +21,7 @@ One 96-core node, best-of-3 warm. 2,000 JPEG frames, 640x480 to 224x224, which i
 
 ## Point cloud and LiDAR
 
-Same node. 20,000 frames of 4,096x3 points, streamed to torch through `iter_torch_batches`.
+Same node. 20,000 frames of 4,096x3 points, streamed to torch through {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`.
 
 | Metric | Batcher |
 |---|---:|

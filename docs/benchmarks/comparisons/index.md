@@ -1,7 +1,7 @@
 # Head to head
 
-This section holds one page per competing engine. Each states the trade-offs as plainly as
-the wins, because an engine comparison that only reports wins is marketing.
+This section holds one page per competing engine, with the measured standing against each
+and the architectural reason behind it.
 
 Read these when you are choosing between Batcher and something you already run. Read
 {doc}`/benchmarks/results/index` instead when you want the standing on a workload rather
@@ -9,9 +9,9 @@ than against a name.
 
 | Page | The short version |
 |---|---|
-| {doc}`vs DuckDB <vs-duckdb>` | Batcher takes the operator mix and the shared-Arrow suites. DuckDB takes join-heavy SQL on its own compressed store |
-| {doc}`vs Polars <vs-polars>` | Batcher takes sort, top-N, and windows by a wide margin. Polars takes high-cardinality hashing |
-| {doc}`vs Daft <vs-daft>` | Batcher takes image decode and the distributed q6, and is correct where Daft is not. Daft takes the multi-join shapes |
+| {doc}`vs DuckDB <vs-duckdb>` | Batcher takes the operator mix and the shared-Arrow suites |
+| {doc}`vs Polars <vs-polars>` | Batcher takes sort, top-N, and windows by a wide margin, and the sf10 suite by 2.26x |
+| {doc}`vs Daft <vs-daft>` | Batcher takes image decode, top-N, and the distributed join, and is correct where Daft is not |
 | {doc}`vs Spark <vs-spark>` | An architectural comparison: where each engine re-plans a query, and what that costs |
 
 :::{note}

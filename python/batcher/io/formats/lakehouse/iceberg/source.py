@@ -101,7 +101,10 @@ class IcebergSource:
         try:
             from batcher.io.predicate import to_iceberg_expression
 
-            return to_iceberg_expression(predicate)
+            # `allow_partial`: this filter only prunes what the scan reads, and the
+            # engine's `Filter` re-checks every row that comes back, so pushing the
+            # conjuncts that *did* translate is strictly better than pushing none.
+            return to_iceberg_expression(predicate, allow_partial=True)
         except Exception:
             return None
 

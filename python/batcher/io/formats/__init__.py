@@ -17,9 +17,19 @@ how it is reached.
 from __future__ import annotations
 
 # Importing each category subpackage triggers its modules' registry side effects.
+import batcher.io.formats.genomics
 import batcher.io.formats.multimodal
 import batcher.io.formats.robotics  # noqa: F401
 from batcher.io.formats.base import SINKS, SOURCES, SinkFormat, SourceFormat
+from batcher.io.formats.genomics import (
+    BedSource,
+    FastaSink,
+    FastaSource,
+    FastqSink,
+    FastqSource,
+    GffSource,
+    VcfSource,
+)
 from batcher.io.formats.robotics import MCAP_SCHEMA, MDF_SCHEMA, MCAPSource, MDFSource
 from batcher.io.formats.semistructured import JSONSink, JSONSource
 from batcher.io.formats.structured import (
@@ -36,9 +46,15 @@ __all__ = [
     "MDF_SCHEMA",
     "SINKS",
     "SOURCES",
+    "BedSource",
     "BinarySource",
     "CSVSink",
     "CSVSource",
+    "FastaSink",
+    "FastaSource",
+    "FastqSink",
+    "FastqSource",
+    "GffSource",
     "JSONSink",
     "JSONSource",
     "MCAPSource",
@@ -49,4 +65,5 @@ __all__ = [
     "SinkFormat",
     "SourceFormat",
     "TextSource",
+    "VcfSource",
 ]

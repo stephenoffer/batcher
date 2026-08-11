@@ -29,17 +29,15 @@ from batcher.kyber.rule import Phase
 # modules load before this one, so these cannot move any rule's registration.
 from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.nullability import _replaceable
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import EXPR_NODES, rewrite_node
 from batcher.plan.expr_ir import Binary, Case, Expr
 from batcher.plan.expr_rewrite import expr_key
-from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
+from batcher.plan.logical import LogicalPlan
 
 __all__ = [
     "drop_nested_case_on_settled_condition",
     "merge_case_branches_with_equal_results",
 ]
-
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 
 def _merge_equal_branches(expr: Expr) -> Expr:
@@ -60,7 +58,7 @@ def _merge_equal_branches(expr: Expr) -> Expr:
 @rule(
     name="merge_case_branches_with_equal_results",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_merge_equal_branches,
     expr_matches=(Case,),
 )
@@ -108,7 +106,7 @@ def _drop_settled_nested_case(expr: Expr, schema) -> Expr:
 @rule(
     name="drop_nested_case_on_settled_condition",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_schema=_drop_settled_nested_case,
     expr_matches=(Case,),
 )

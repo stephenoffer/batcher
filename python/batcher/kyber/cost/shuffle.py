@@ -249,8 +249,13 @@ def _distinct_net(node: Distinct, rows_of, row_bytes_of, workers: int) -> float:
 
     Distinct is an aggregate with every output column as a group key and no measures, so it
     pre-reduces to its local distinct set before shuffling and is bounded the same way.
+
+    A *keyed* dedup shuffles on its key columns, and the co-partitioning test has to ask about
+    those. Asking about every column instead is not merely imprecise: an input already
+    partitioned on the dedup key would answer "no", so the model charges a shuffle the
+    execution does not perform, and the plan is ranked below one that moves more data.
     """
-    keys = tuple(node.available_columns() or ())
+    keys = tuple(node.keys) if node.keys else tuple(node.available_columns() or ())
     if keys and _already_partitioned_on(node.input, keys):
         return 0.0
     partial_rows = min(rows_of(node.input), max(1.0, rows_of(node)) * workers)

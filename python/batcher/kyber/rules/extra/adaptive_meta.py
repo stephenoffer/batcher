@@ -130,7 +130,7 @@ def empty_limit_past_offset(node: Limit, ctx: OptimizerContext) -> LogicalPlan |
     return None
 
 
-@rule(name="fold_exact_empty_input", phase=Phase.SELECTION, matches=_SCHEMA_PRESERVING)
+@rule(name="fold_exact_empty_input", phase=Phase.FUSION, matches=_SCHEMA_PRESERVING)
 def fold_exact_empty_input(node: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold a schema-preserving operator over a provably-empty input to the empty marker.
 

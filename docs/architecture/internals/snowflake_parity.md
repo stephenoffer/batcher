@@ -42,7 +42,7 @@ Two things follow immediately, and they frame everything else:
 | Columnar format | Proprietary micro-partitions with per-column metadata | **Arrow only**, by invariant | Batcher: `CLAUDE.md` invariant 3 |
 | Storage/compute separation | The defining property | Batcher reads open formats; storage is not its concern | SIGMOD 2016 |
 | Optimizer | Cost-based, statistics from micro-partition metadata | Kyber: rules + cost model + **sketch-backed learned stats across runs** (`kyber/learning.py`) | Snowflake ⚠️ |
-| Adaptivity | ⚠️ believed to re-plan | Stage-boundary re-optimization on measured cardinalities, **off below 20M rows** | Batcher: `api/adaptive/` |
+| Adaptivity | ⚠️ believed to re-plan | Stage-boundary re-optimization on measured cardinalities, **off below 5M input rows per pipeline breaker** | Batcher: `api/adaptive/` |
 | Elasticity | Multi-cluster warehouses, resize under load | **None in-query** | Snowflake ⚠️ |
 | Result cache | ⚠️ believed 24 h, query-text keyed | In-memory, keyed by plan signature + tenant + viewer (`api/executors.py`) | Batcher: code |
 

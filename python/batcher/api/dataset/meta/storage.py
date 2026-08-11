@@ -16,6 +16,7 @@ from __future__ import annotations
 from batcher._internal.logging import note_suppressed
 from batcher.api.dataset.meta._facts import MetaBase
 from batcher.kyber.shortcuts import storage
+from batcher.plan.stats import SortOrder
 
 __all__ = ["StorageMeta"]
 
@@ -171,11 +172,12 @@ class StorageMeta(MetaBase):
         """
         return storage.is_partitioned(self.source_stats())
 
-    def sorted_by(self) -> tuple[str, ...]:
-        """The ascending, nulls-last ordering every source maintains, in order.
+    def sorted_by(self) -> tuple[SortOrder, ...]:
+        """The ordering every source maintains, in order, direction included.
 
         Only a *recorded* ordering: empty means "not declared", not "unordered". A sort on
-        this prefix is a no-op, which is what the optimizer uses it for.
+        this prefix is a no-op, which is what the optimizer uses it for. Each key is a
+        `SortOrder` naming the column, whether it descends, and where its nulls sit.
 
         Returns:
             The common sort prefix.

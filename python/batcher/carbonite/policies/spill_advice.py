@@ -24,12 +24,14 @@ policies rather than as the spill library itself.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
-from batcher._internal.logging import note_suppressed
+from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.carbonite.policies.spill_shape import (
     SPILL_BYTES_PER_PARTITION,
+    envelope_shortfall,
     partitions_for_envelope,
     partitions_for_volume,
     should_compress,
@@ -58,6 +60,7 @@ class SpillAdvisor:
         model: LearnedMemoryModel,
         pressure: PressureMonitor,
         envelope_bytes: int,
+        share: float = 1.0,
     ) -> None:
         self._config = config
         self._ctx = ctx
@@ -65,6 +68,10 @@ class SpillAdvisor:
         self._model = model
         self._pressure = pressure
         self._envelope = envelope_bytes
+        # This query's entitlement to the envelope when several run at once (see
+        # `policies.concurrency.query_memory_share`). Exactly `1.0` for the default
+        # unbounded-concurrency deployment, so every budget below is unchanged there.
+        self._share = min(1.0, max(0.0, share)) or 1.0
         # Single-entry envelope cache keyed by plan *identity* (a held reference, so
         # `is` is stable and the object can't be GC'd into an id collision).
         self._peak_plan: object = None
@@ -252,7 +259,37 @@ class SpillAdvisor:
         if bounds is None:
             return 0
         basis = spill_basis(self.peak_bytes(plan), self._spill_volume(plan))
-        return partitions_for_envelope(basis, bounds.m_max_bytes)
+        parts = partitions_for_envelope(basis, bounds.m_max_bytes)
+        self._warn_if_buckets_will_not_fit(basis, bounds.m_max_bytes, parts)
+        return parts
+
+    @staticmethod
+    def _warn_if_buckets_will_not_fit(basis: int, envelope_bytes: int, parts: int) -> None:
+        """Say so when the bucket count saturates and each bucket is still over the envelope.
+
+        `partitions_for_envelope` clamps at `MAX_SPILL_PARTITIONS`, so past
+        `4,096 x envelope` of state its own promise — "each bucket fits" — quietly stops
+        holding. `envelope_shortfall` has existed to report that and nothing consulted it, so
+        the miss was computable and never computed. It is not a failure (the reduce splits an
+        over-large bucket by grace recursion), but it *is* the reason an out-of-core query
+        pays an extra write and re-read of its whole spilled state, and that is otherwise
+        indistinguishable from the spill simply being large.
+
+        One line per spilling query, at INFO for the same reason the admission verdict is:
+        an operator wants to see it without opting into per-phase timing.
+        """
+        shortfall = envelope_shortfall(basis, envelope_bytes)
+        if shortfall <= 0:
+            return
+        log_kv(
+            get_logger("carbonite.spill"),
+            logging.INFO,
+            "spill buckets exceed the offered envelope",
+            partitions=parts,
+            envelope_bytes=envelope_bytes,
+            per_bucket_bytes=envelope_bytes + shortfall,
+            shortfall_bytes=shortfall,
+        )
 
     def compression(self, plan: PhysicalPlan) -> bool | None:
         """Whether spilling `plan` should compress its buckets, from the learned peak.
@@ -278,34 +315,38 @@ class SpillAdvisor:
     def _spill_device_factor(self) -> float:
         """What a byte costs on the device this query will spill to, against local flash.
 
-        Resolved the same three ways the spill paths resolve their directory — configured
-        root, measured local scratch, system tempdir — so the policy and the write agree about
-        which disk is being reasoned about. `1.0` on anything unidentified, which is the
-        size-only behaviour this had before.
+        The directory comes from `site.spill_scratch_dir`, the one resolution every spill
+        path shares, so the policy and the write agree about which disk is being reasoned
+        about. Spelling the three steps out here instead is how the cost model came to price
+        a container's overlay while the spill landed on the node's NVMe. `1.0` on anything
+        unidentified, which is the size-only behaviour this had before.
         """
-        import tempfile
-
         from batcher._internal.hardware.storage import device_cost_factor
-        from batcher._internal.site import local_scratch_root
+        from batcher._internal.site import spill_scratch_dir
 
         try:
-            target = self._config.memory.spill_dir or local_scratch_root() or tempfile.gettempdir()
-            return device_cost_factor(target)
+            return device_cost_factor(spill_scratch_dir())
         except Exception as exc:  # pragma: no cover - a probe must never break spilling
             note_suppressed("carbonite", "read the spill device class", exc)
             return 1.0
 
     def soft_budget(self) -> int:
         """Bytes a query aims to stay under (the admission/throttle threshold)."""
-        return int(self._envelope * self._config.memory.soft_limit)
+        return int(self._envelope * self._config.memory.soft_limit * self._share)
 
     def hard_budget(self) -> int:
-        """Bytes a query may hold before it must spill (the spill/reserve cap).
+        """Bytes *this query* may hold before it must spill (the spill/reserve cap).
 
-        Both the spill decision and the reservation use this one figure, derived from the
-        once-sampled envelope, so the two can never disagree.
+        Every out-of-core decision uses this one figure, derived from the once-sampled
+        envelope, so they can never disagree.
+
+        Scaled by the query's concurrency share. The **pool** stays sized to the whole
+        envelope — it is the process's one real budget, and shrinking it would make a
+        concurrent query's already-granted reservation retroactively unaffordable. What the
+        share bounds is the amount this query *plans* to hold, which is the figure that has
+        to shrink when it is one of N.
         """
-        return int(self._envelope * self._config.memory.hard_limit)
+        return int(self._envelope * self._config.memory.hard_limit * self._share)
 
     def _spill_volume(self, plan: PhysicalPlan) -> int:
         """Bytes this plan's family is predicted to actually write to disk, or 0."""

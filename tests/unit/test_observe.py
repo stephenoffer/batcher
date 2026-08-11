@@ -154,7 +154,13 @@ def test_store_folds_a_query_lifecycle(bus):
             "est_rows": None,
             "rows_out": 500,
             "elapsed_ms": 12.5,
+            # The CPU the operator consumed and the magnitude behind `spilled`, which
+            # cannot tell a 1 GB spill from a 100 GB one. Both `0` here because this
+            # synthetic event carries neither — and `0` means unmeasured, which is exactly
+            # what the streaming executor reports for them on a real run.
+            "cpu_ms": 0.0,
             "spilled": True,
+            "spill_bytes": 0,
             "done": True,
         }
     ]
@@ -4150,3 +4156,71 @@ def test_a_tiny_run_is_still_too_small_to_conclude_from():
         ],
     }
     assert "gpu-starved" not in _rules(profile)
+
+
+def test_a_small_container_on_a_busy_host_is_not_told_its_box_is_oversubscribed(monkeypatch):
+    """`os.getloadavg()` counts runnable tasks across the whole machine and Linux publishes no
+    per-cgroup equivalent, so the slice-relative `load_per_core` is 16.0 for a 4-core container
+    on a *half-idle* 128-core host. This rule read that figure and told the user their box was
+    sixteen times oversubscribed and to go find a quieter machine — about a machine that was
+    50% idle, on the single most common deployment shape there is."""
+    from batcher.observe.insights import resources
+
+    monkeypatch.setattr(
+        resources,
+        "cpu_contention",
+        lambda: {"load_per_core": 16.0, "host_load_per_core": 0.5},
+    )
+    assert resources.stolen_cpu(0.2, resources.cpu_contention(), {}) == []
+
+
+def test_a_genuinely_oversubscribed_host_still_reports_it(monkeypatch):
+    from batcher.observe.insights import resources
+
+    contention = {"load_per_core": 64.0, "host_load_per_core": 2.0}
+    monkeypatch.setattr(resources, "cpu_contention", lambda: contention)
+    found = resources.stolen_cpu(0.2, contention, {})
+    assert [i.rule for i in found] == ["cpu-contended"]
+    # The slice-relative figure is far larger, so the evidence says plainly that most of the
+    # competing work is not this process's — which is the actionable half of the finding.
+    assert "not ours" in found[0].evidence
+
+
+def test_a_cgroup_landing_after_import_is_reported(monkeypatch):
+    """The control plane's probes memoize at first use; a Ray worker's CPU quota lands when the
+    actor is *placed*, which is after `import batcher`. The engine detects its own hardware
+    locally, the two figures were never compared, and nothing anywhere said the two planes were
+    describing different machines — while fan-out, spill thresholds and per-task CPU shares
+    were all sized against the larger one."""
+    import batcher._internal.hardware as hw
+    from batcher.observe.insights import resources
+
+    monkeypatch.setattr(hw, "engine_hardware", lambda: {"logical_cores": 4})
+    monkeypatch.setattr(hw, "available_cpu_count", lambda: 16)
+    found = resources.stale_core_budget({}, [], 0.0)
+    assert [i.rule for i in found] == ["core-budget-mismatch"]
+    assert found[0].detail == {"control_plane_cores": 16, "engine_cores": 4}
+
+
+def test_agreement_and_ordinary_rounding_are_not_reported(monkeypatch):
+    """One core is ordinary rounding between a CFS quota and a thread count; a factor is a
+    different machine."""
+    import batcher._internal.hardware as hw
+    from batcher.observe.insights import resources
+
+    monkeypatch.setattr(hw, "engine_hardware", lambda: {"logical_cores": 16})
+    monkeypatch.setattr(hw, "available_cpu_count", lambda: 16)
+    assert resources.stale_core_budget({}, [], 0.0) == []
+    monkeypatch.setattr(hw, "engine_hardware", lambda: {"logical_cores": 15})
+    assert resources.stale_core_budget({}, [], 0.0) == []
+
+
+def test_an_engine_that_cannot_report_is_a_shrug_not_agreement(monkeypatch):
+    """An installed extension routinely lags the source tree, and an absent answer must not
+    read as 'the two planes agree'."""
+    import batcher._internal.hardware as hw
+    from batcher.observe.insights import resources
+
+    monkeypatch.setattr(hw, "engine_hardware", dict)
+    monkeypatch.setattr(hw, "available_cpu_count", lambda: 64)
+    assert resources.stale_core_budget({}, [], 0.0) == []

@@ -49,17 +49,30 @@ def _feedback(signature: str) -> OperatorFeedback:
 
 def test_concurrent_pipelines_do_not_overwrite_each_others_feedback(_preemptive):
     """Every recorded row must land under its own key, whoever else is recording."""
-    hub = MetadataHub(InProcessBackend())
+    backend = InProcessBackend()
     keys: list[object] = []
     guard = threading.Lock()
-    original_put = hub._backend.put
 
-    def _tracking_put(space, key, value, *args, **kwargs):
-        with guard:
-            keys.append(key)
-        return original_put(space, key, value, *args, **kwargs)
+    # Wrap *every* write the backend offers, before the hub is built. The hub picks its
+    # write method once, in `__init__` (`put_row` where a backend can take a structured row,
+    # `put` otherwise), so instrumenting only one of them is how this test silently starts
+    # observing nothing while still passing its collision check on an empty list. The
+    # `len(keys) == expected` assertion below is what makes that failure loud, and wrapping
+    # both is what keeps it from happening at all.
+    def _tracking(name):
+        original = getattr(backend, name)
 
-    hub._backend.put = _tracking_put
+        def wrapper(space, key, value, *args, **kwargs):
+            with guard:
+                keys.append(key)
+            return original(space, key, value, *args, **kwargs)
+
+        return wrapper
+
+    for _name in ("put", "put_row"):
+        if hasattr(backend, _name):
+            setattr(backend, _name, _tracking(_name))
+    hub = MetadataHub(backend)
 
     n_pipelines, per_pipeline = 8, 1500
 

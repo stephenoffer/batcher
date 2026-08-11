@@ -48,6 +48,12 @@ What a dropped straggler costs, and where it goes.
 :link-type: doc
 A resident model over micro-batches, and the poison record.
 :::
+
+:::{grid-item-card} {octicon}`stop;1.1em` Backpressure
+:link: backpressure
+:link-type: doc
+Stopping a source from handing you more than you can process.
+:::
 ::::
 
 ## The sharp edges, up front
@@ -63,6 +69,7 @@ than discover. None of them is a bug you can configure away.
 | A non-replayable source ignores `checkpoint=` | No offsets are recorded, so a restart re-reads from the beginning. Nothing warns you. | {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>` |
 | Late rows are dropped, not diverted | No side output and no dead-letter: the rows are gone. `num_late_rows` on each micro-batch counts them, so the shortfall is visible. | {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>` |
 | A session only closes when event time moves past it | The gap is measured in event time, so a source whose clock stalls never closes a session and the buffered rows never leave. A `ResourceError` names the stall rather than letting the process die. | {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>` |
+| A runaway backlog is not gradual | A batch that overruns its interval leaves the next one starting later against a larger backlog, so the divergence compounds and ends in an epoch that does not fit in memory. `behind_by_ms` is the early warning; a per-trigger cap is the bound. | {doc}`Backpressure </cookbook/streaming/backpressure>` |
 | A query that retains rows reports no state metrics | The stream-stream join, the stream-static join, the session window, the dedup, a limit and a stream union all run through a driver, so `state_operators` is empty and `num_input_rows` counts what the driver emitted. The memory guard still fires. | {doc}`Monitoring </user-guide/moving-data/streaming-monitoring>` |
 
 ## See also
@@ -84,4 +91,5 @@ stream-join
 exactly-once-sink
 late-data-watermarks
 streaming-inference
+backpressure
 ```

@@ -110,10 +110,22 @@ def try_gpu_collect(
         return None
     if result is None:
         return None
-    # Stopped before shadow-verify, which doubles the work by design: the recorded figure has
-    # to be what the device path costs, not what verifying it costs, or the learned GPU/CPU
-    # crossover moves the moment an operator switches the diagnostic on.
+    # Stopped before verification of either kind: the recorded figure has to be what the device
+    # path costs, not what checking it costs, or the learned GPU/CPU crossover moves the moment
+    # an operator switches a diagnostic on.
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    from batcher.api.terminal.gpu_backend.verify import enforce_schema_contract
+
+    # The engine declares this plan's column types without running it, so every device result
+    # can be held against them for the price of a field-list walk. Unconditional, unlike
+    # shadow-verify below: every defect this tier has shipped was a column-type defect with
+    # correct values, on a device, invisible to a pandas CI replay — and this is the only check
+    # that sees that class without a GPU lane and without doubling the work. A result that
+    # disagrees is refused, and the CPU engine answers the query.
+    checked = enforce_schema_contract(result, plan)
+    if checked is None:
+        return None
+    result = checked
     from batcher.config import active_config
 
     if active_config().distributed.gpu_shadow_verify:

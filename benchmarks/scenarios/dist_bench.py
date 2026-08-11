@@ -23,11 +23,15 @@ import argparse
 import dataclasses
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 
-sys.path.insert(0, "benchmarks")
+# Resolved from this file, not the working directory: the cwd-relative form only imported
+# when the script was launched from the repo root (`ModuleNotFoundError: No module named
+# 'harness'` from anywhere else, including the spelling this file's own docstring gives).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from harness import results_match
 from sources import load_tables
 

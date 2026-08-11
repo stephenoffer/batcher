@@ -8,7 +8,7 @@ index you never needed or wait for a linear scan you should not have run.
 
 ## Brute force, in the engine
 
-When the vectors already ride in a column, score them with the `.list` distance
+When the vectors already ride in a column, score them with the {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` distance
 expressions. There is no index, no extra service, and no data movement. It is a
 projection and a top-n.
 
@@ -34,7 +34,7 @@ print(hits.select("id", "title").to_pydict())
 # {'id': [1, 3], 'title': ['cats', 'kittens']}
 ```
 
-`ds.ml.nearest_neighbors(query, column, k, metric)` is the one-call shorthand for exactly
+{py:meth}`ds.ml.nearest_neighbors(query, column, k, metric) <batcher.api.dataset.ml.DatasetML.nearest_neighbors>` is the one-call shorthand for exactly
 that projection → sort → limit, with `metric="cosine"` (default), `"l2"`, or `"dot"`:
 
 ```python
@@ -45,26 +45,26 @@ Use the explicit form above when you want to keep the score column under your ow
 combine it with other predicates. Reach for the verb when you want the top `k` and nothing
 else.
 
-Two companions round out the pattern. `ds.ml.similarity_to(query, column=, metric=)` scores
+Two companions round out the pattern. {py:meth}`ds.ml.similarity_to(query, column=, metric=) <batcher.api.dataset.ml.DatasetML.similarity_to>` scores
 every row against the query **without** the top-`k` cut, which is what thresholding and
-reranking need. `ds.ml.normalize_embeddings(column)` unit-normalizes an embedding column so
-a later `.list.dot` ranks exactly as cosine, the cheap and index-friendly form:
+reranking need. {py:meth}`ds.ml.normalize_embeddings(column) <batcher.api.dataset.ml.DatasetML.normalize_embeddings>` unit-normalizes an embedding column so
+a later {py:meth}`.list.dot <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>` ranks exactly as cosine, the cheap and index-friendly form:
 
 ```python
 scored = docs.ml.normalize_embeddings("vec").ml.similarity_to([1.0, 0.0], column="vec")
 ```
 
-`cosine_distance` is `1 - cosine_similarity`: 0 for identical direction, 1 for
+{py:meth}`cosine_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` is `1 - cosine_similarity`: 0 for identical direction, 1 for
 orthogonal, 2 for opposite. It sorts ascending, so nearest comes first.
-`.list.l2_distance` is Euclidean, and `.list.dot` is the raw inner product. For the vector
-*magnitude* rather than a pairwise distance, `.list.l2_norm()` is the Euclidean length and
-`.list.l1_norm()` the Manhattan length, the sum of absolute values, used for L1
-normalization. `.list.max_abs()` returns the largest magnitude in the row. That is the
+{py:meth}`.list.l2_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>` is Euclidean, and `.list.dot` is the raw inner product. For the vector
+*magnitude* rather than a pairwise distance, {py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` is the Euclidean length and
+{py:meth}`.list.l1_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l1_norm>` the Manhattan length, the sum of absolute values, used for L1
+normalization. {py:meth}`.list.max_abs() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.max_abs>` returns the largest magnitude in the row. That is the
 divisor for MaxAbs scaling, which maps a feature vector into `[-1, 1]` without shifting
 its zero.
 
-For other embedding geometries the engine has the matching metric. `.list.l1_distance` is
-Manhattan distance, the sum of absolute differences. `.list.hamming_distance` handles
+For other embedding geometries the engine has the matching metric. {py:meth}`.list.l1_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l1_distance>` is
+Manhattan distance, the sum of absolute differences. {py:meth}`.list.hamming_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.hamming_distance>` handles
 **binary or quantized embeddings**, where each element is `0` or `1` or a small integer.
 Hamming counts the differing positions and is far cheaper than a float metric, which is
 exactly what a binary vector index ranks by:
@@ -148,7 +148,7 @@ hits = vector_search(
 top = hits.collect()  # k rows, nearest first, with a _distance column
 ```
 
-`vector_search` returns a `Dataset`, so the hits join, filter, and aggregate the way any
+`vector_search` returns a {py:class}`Dataset <batcher.Dataset>`, so the hits join, filter, and aggregate the way any
 other relation does. `nprobes` trades latency for recall, because more probes search more
 of the index. `refine_factor` re-scores an over-fetched candidate set with exact
 distances, which buys back most of the recall an approximate index loses. Vector search
@@ -163,7 +163,7 @@ answer, not a higher `nprobes`.
 
 ## Joining on meaning
 
-`ds.ml.similarity_join` is the other shape: not one query against a corpus, but every row
+{py:meth}`ds.ml.similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` is the other shape: not one query against a corpus, but every row
 of one dataset matched against the nearest rows of another. This is entity resolution, a
 product catalog against a supplier feed or a CRM against a billing export, where the
 join key is "means the same thing" rather than "is the same string".
@@ -199,7 +199,7 @@ corpus size and query pattern to a row:
 
 | Situation | Reach for |
 | --- | --- |
-| Candidates already narrowed by a filter, or a reranking pass | `.list.cosine_distance` + `top_k` |
+| Candidates already narrowed by a filter, or a reranking pass | {py:meth}`.list.cosine_distance <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>` + `top_k` |
 | Millions of vectors, repeated queries, latency matters | Lance index + `vector_search` |
 | Every row of A against the nearest rows of B | `ds.ml.similarity_join` |
 | Exact duplicates or near-duplicate text, not vectors | `distinct` / `drop_near_duplicates` |
@@ -216,4 +216,4 @@ corpus size and query pattern to a row:
 - {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: the exact and near-duplicate
   tools the last row of that table points at.
 - {doc}`ML API </api/models/ml>`: the `build_vector_index`, `vector_search`, and
-  `similarity_join` reference.
+  {py:meth}`similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` reference.

@@ -39,19 +39,23 @@ def _apply_autoscale_floor(
     with contextlib.suppress(Exception):
         from ray.autoscaler.sdk import request_resources
 
-        if resources:
-            # A custom accelerator needs bundles naming *that* resource: a `{"GPU": 1}`
-            # bundle asks for GPU nodes, which a TPU cluster has none of, so the query would
-            # wait out the autoscale window and then run on whatever was already up.
-            request_resources(num_cpus=cpus, bundles=[{n: a} for n, a in resources])
-        elif gpus > 0:
-            # A GPU floor needs GPU *bundles* — `request_resources(num_cpus=)` alone never
-            # triggers GPU-node scale-up, so a GPU query would hang or fall back to CPU
-            # nodes it can't run on. One `{"GPU": 1}` bundle per requested GPU asks the
-            # autoscaler for that many GPUs; the CPU floor rides alongside for the
-            # relational stages. (Whole-GPU bundles — fractional packing is a scheduling
-            # concern, not an autoscale-shape one.)
-            request_resources(num_cpus=cpus, bundles=[{"GPU": 1}] * gpus)
+        # A GPU floor needs GPU *bundles* — `request_resources(num_cpus=)` alone never
+        # triggers GPU-node scale-up, so a GPU query would hang or fall back to CPU nodes it
+        # can't run on. One `{"GPU": 1}` bundle per requested GPU asks the autoscaler for that
+        # many GPUs; the CPU floor rides alongside for the relational stages. (Whole-GPU
+        # bundles — fractional packing is a scheduling concern, not an autoscale-shape one.)
+        bundles = [{"GPU": 1}] * gpus if gpus > 0 else []
+        # A custom accelerator needs bundles naming *that* resource: a `{"GPU": 1}` bundle
+        # asks for GPU nodes, which a TPU cluster has none of, so the query would wait out
+        # the autoscale window and then run on whatever was already up.
+        #
+        # Both lists, not one or the other. Naming a custom resource used to *replace* the
+        # GPU bundles rather than join them, so a job with a GPU stage and a TPU stage — or
+        # any accelerator alongside an operator's own resource — asked the autoscaler for one
+        # of the two and then waited for hardware it had not requested.
+        bundles += [{name: amount} for name, amount in resources]
+        if bundles:
+            request_resources(num_cpus=cpus, bundles=bundles)
         else:
             request_resources(num_cpus=cpus)
 

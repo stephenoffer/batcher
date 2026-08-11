@@ -108,8 +108,33 @@ class ErrorPolicy:
             format=format_name,
             error=f"{type(exc).__name__}: {exc}",
         )
+        _publish_skip(format_name, exc)
         return True
 
     def skipped(self) -> list[str]:
         """The paths dropped so far, in failure order."""
         return list(self._skipped)
+
+
+def _publish_skip(format_name: str, exc: Exception) -> None:
+    """Announce one dropped input on the event bus, so a fleet can alert on it.
+
+    `corrupt_files()` answers "what did *this* source drop", which requires already
+    suspecting that something was dropped and holding the source object to ask. The warning
+    log answers it for a human reading a terminal. Neither reaches a metrics backend, and
+    silent data loss is exactly the condition that has to reach one: a job that quietly read
+    98% of its corpus produces a plausible answer and no error.
+
+    The path is deliberately *not* carried. A metrics label built from a path is unbounded
+    cardinality, and a path can itself be sensitive; the exception type is the bounded fact
+    worth counting, and the path is already in the warning above for whoever needs it.
+    """
+    from batcher._internal import events
+
+    events.publish(
+        events.SKIPPED,
+        name=format_name,
+        count=1,
+        reason=type(exc).__name__,
+        source=format_name,
+    )

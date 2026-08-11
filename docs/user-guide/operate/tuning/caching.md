@@ -1,6 +1,6 @@
 # Caching results
 
-A `Dataset` is a plan, not a result. Call `collect()` twice and the plan runs twice.
+A {py:class}`Dataset <batcher.Dataset>` is a plan, not a result. Call {py:meth}`collect() <batcher.Dataset.collect>` twice and the plan runs twice.
 That surprises people coming from pandas, where a DataFrame *is* the data. Laziness is
 what lets the optimizer push filters into the scan and fuse projections, so the answer
 is not to make datasets eager. It is to say, once, which result you intend to reuse.

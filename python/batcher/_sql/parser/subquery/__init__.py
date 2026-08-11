@@ -8,6 +8,8 @@ optimizer and executor already understand:
 - `neq` — a correlated ``<>`` residual, which is not an equi-join: it decorrelates to a
   per-key `min`/`max` bound test (the TPC-H q21 shape).
 - `range` — an *inequality* correlation, which decorrelates to a range semi/anti join.
+- `quantified` — a pre-pass turning `= ANY` / `<> ALL` into the `IN` / `NOT IN` they are
+  defined as, so those inherit `core`'s decorrelation rather than needing their own.
 
 The public import path `batcher._sql.parser.subquery` is unchanged and so is what it means;
 the split is the sanctioned response to the parser directory reaching its file-count ceiling,
@@ -36,6 +38,7 @@ from batcher._sql.parser.subquery.correlation import (
     _outer_key_reducer,
     _reject_correlated,
 )
+from batcher._sql.parser.subquery.quantified import normalize_quantified
 
 __all__ = [
     "_apply_exists",
@@ -52,4 +55,5 @@ __all__ = [
     "_not_in_antijoin",
     "_outer_key_reducer",
     "_reject_correlated",
+    "normalize_quantified",
 ]

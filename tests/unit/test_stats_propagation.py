@@ -14,7 +14,7 @@ import batcher as bt
 from batcher import col, count, lit
 from batcher.kyber.stats import StatsEstimator
 from batcher.plan.source_stats import SourceStatistics
-from batcher.plan.stats import ColumnStat, Provenance
+from batcher.plan.stats import ColumnStat, Provenance, SortOrder
 
 
 def _exact_source(rows: int, **cols: ColumnStat) -> SourceStatistics:
@@ -62,7 +62,7 @@ def test_sort_preserves_exact_value_set_and_records_order():
     rs = _est(ds, src).estimate(ds._plan)
     assert rs.rows == 100 and rs.rows_exact
     assert rs.column("x").provenance is Provenance.EXACT  # reordering preserves values
-    assert rs.sorted_by == ("x",)
+    assert rs.sorted_by == (SortOrder("x"),)
 
 
 def test_limit_caps_rows_exact_when_child_exact():

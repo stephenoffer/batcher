@@ -132,6 +132,24 @@ def test_a_deferred_shrink_is_remembered_not_dropped() -> None:
     assert pool.limit == 1 << 20
 
 
+def test_a_later_reconcile_supersedes_an_earlier_pending_shrink() -> None:
+    """The pending figure is the *latest* request, not the smallest ever seen.
+
+    Holding the `min` looked conservative and was the opposite: one small caller — a unit
+    test, a deliberately tiny `config_context`, a cheap query — pinned the pending figure
+    at its budget, and nothing but a growth past the live limit ever cleared it. The first
+    moment the pool went idle, the process-wide envelope collapsed to that stale figure and
+    every later query spilled against a budget the machine had not had for hours.
+    """
+    pool = process_pool(1 << 30)
+    with pool.reserve(1024):
+        process_pool(1 << 20)  # a tiny caller, refused while busy
+        process_pool(1 << 28)  # then a realistic one, also refused while busy
+        assert pool.limit == 1 << 30
+    process_pool(1 << 30)  # idle: the shrink that lands is the *last* one asked for
+    assert pool.limit == 1 << 28
+
+
 def test_growth_always_applies_immediately() -> None:
     pool = process_pool(1 << 20)
     with pool.reserve(1024):

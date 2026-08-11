@@ -121,6 +121,17 @@ def plan_collective(
         )
         return CollectivePlacement(world_size=want, reason=reason)
 
+    for place in (_place_in_one_domain, _place_in_one_node):
+        found = place(records, want, cpus_per_device)
+        if found is not None:
+            return found
+    return _place_across_nodes(records, want, cpus_per_device)
+
+
+def _place_in_one_domain(
+    records: tuple[GpuNodeTopology, ...], want: int, cpus_per_device: float
+) -> CollectivePlacement | None:
+    """A node whose coherent fabric domain already holds the whole collective, or `None`."""
     # Prefer a single node whose coherent domain already holds the whole collective.
     for node in _preferred_order(records):
         if node.local_domain >= want:
@@ -138,6 +149,13 @@ def plan_collective(
                 ),
             )
 
+    return None
+
+
+def _place_in_one_node(
+    records: tuple[GpuNodeTopology, ...], want: int, cpus_per_device: float
+) -> CollectivePlacement | None:
+    """A node with the devices even though no vendor fabric joins them, or `None`."""
     # Failing that, prefer a single node that has the devices even though no vendor fabric
     # joins them. This tier is the whole PCIe-attached fleet — T4, L4, A10G, L40S, and every
     # workstation part — where the coherent domain is one device and the test above can never
@@ -161,7 +179,13 @@ def plan_collective(
                     "all-reduce crosses the host link but stays off the network"
                 ),
             )
+    return None
 
+
+def _place_across_nodes(
+    records: tuple[GpuNodeTopology, ...], want: int, cpus_per_device: float
+) -> CollectivePlacement:
+    """Spread the collective over the fewest fabric tiers, short-filling if the fleet cannot."""
     # Otherwise fill the largest fabric group first, so the split is across the fewest tiers.
     bundles: list[dict[str, float]] = []
     ids: list[str] = []

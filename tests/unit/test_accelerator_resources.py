@@ -297,3 +297,43 @@ def test_the_pool_bundle_reserves_what_the_actor_requests():
     cpu = SchedulingEnvelope(num_cpus=4.0, n_tasks=2)
     assert _pool_placement_envelope(cpu, _gpu_options(0.0, None, None)) is cpu
     assert _pool_placement_envelope(None, _gpu_options(1.0, None, None)) is None
+
+
+def test_the_autoscaler_is_asked_for_both_gpus_and_a_custom_accelerator(monkeypatch):
+    """A job with a GPU stage and a TPU stage must request hardware for both.
+
+    The bundle list used to be `if resources: ... elif gpus: ...`, so naming a custom resource
+    *replaced* the GPU bundles instead of joining them. A pipeline whose embedder wants a GPU
+    and whose scorer wants a TPU then asked the autoscaler for one of the two, waited out the
+    autoscale window for the other, and ran on whatever was already up.
+    """
+    import batcher.dist.executors.ray_runtime.autoscale_request as autoscale
+
+    requested: list[dict] = []
+
+    def _fake_request_resources(num_cpus=0, bundles=None):
+        requested.append({"num_cpus": num_cpus, "bundles": list(bundles or ())})
+
+    monkeypatch.setattr(
+        "ray.autoscaler.sdk.request_resources", _fake_request_resources, raising=False
+    )
+    autoscale._apply_autoscale_floor(8, 2, (("TPU", 4.0),))
+    assert requested, "the autoscaler must be asked at all"
+    bundles = requested[-1]["bundles"]
+    assert bundles.count({"GPU": 1}) == 2
+    assert {"TPU": 4.0} in bundles
+    assert requested[-1]["num_cpus"] == 8
+
+
+def test_a_cpu_only_floor_asks_for_no_bundles(monkeypatch):
+    """The plain relational case stays a bare core request, with nothing added to it."""
+    import batcher.dist.executors.ray_runtime.autoscale_request as autoscale
+
+    requested: list[dict] = []
+    monkeypatch.setattr(
+        "ray.autoscaler.sdk.request_resources",
+        lambda num_cpus=0, bundles=None: requested.append({"cpus": num_cpus, "bundles": bundles}),
+        raising=False,
+    )
+    autoscale._apply_autoscale_floor(16, 0, ())
+    assert requested[-1] == {"cpus": 16, "bundles": None}

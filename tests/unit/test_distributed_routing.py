@@ -23,8 +23,9 @@ pytestmark = pytest.mark.unit
 
 
 class _Src:
-    def __init__(self, rows: int | None):
+    def __init__(self, rows: int | None, *, node_local: bool = False):
         self._rows = rows
+        self.node_local = node_local
 
     def row_count(self) -> int | None:
         return self._rows
@@ -76,6 +77,37 @@ def test_unknown_size_distributes(multinode):
     # A source that can't cheaply report a row count -> distribute (safe for large data).
     assert resolve_distributed("auto", None, [_Src(None)]) is True
     assert resolve_distributed("auto", None, None) is True
+
+
+def test_unknown_size_over_a_node_local_path_stays_single_node(multinode):
+    """ "Distribute when the size is unknown" is a throughput bet, and it needs reachable data.
+
+    A bare filesystem path may be this node's own disk, and shipping the scan to workers on
+    other machines fails outright — `path ... does not exist` from the worker — rather than
+    running slowly. The two conditions coincide exactly: the formats with no cheap row count
+    (CSV, JSON, text, the bioinformatics readers) are the ones that reach this branch, while
+    Parquet answers from its footer and never does. So on any Ray-connected process
+    `bt.read.csv("/tmp/x.csv").collect()` died on a three-row file, with no `distributed=`
+    argument anywhere in the call.
+    """
+    assert resolve_distributed("auto", None, [_Src(None, node_local=True)]) is False
+    # One unreachable source is enough to ground the whole plan.
+    assert resolve_distributed("auto", None, [_Src(None), _Src(None, node_local=True)]) is False
+    # A remote URI of unknown size still distributes — that is the case the rule is for.
+    assert resolve_distributed("auto", None, [_Src(None)]) is True
+
+
+def test_a_node_local_path_of_known_size_is_unaffected(multinode):
+    """The locality check guards the *unknown-size* branch only.
+
+    A shared mount is a bare path too, and the big ones are Parquet, which reports an exact
+    footer row count. Grounding those would have turned every recorded distributed benchmark
+    single-node, so the size decision still runs first and still wins.
+    """
+    assert resolve_distributed("auto", None, [_Src(10_000_000, node_local=True)]) is True
+    assert resolve_distributed("auto", None, [_Src(1, node_local=True)]) is False
+    # And an explicit request always beats the inference: the caller may know it is shared.
+    assert resolve_distributed(True, None, [_Src(None, node_local=True)]) is True
 
 
 def _gpu_stage():

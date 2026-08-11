@@ -23,9 +23,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher._internal.errors import PlanError
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.kyber.rules.nulls.strictness import STRICT_MATH_FNS, STRICT_STR_FNS
 from batcher.plan.expr_ir import Case, Expr, InList
 from batcher.plan.expr_ir.core import Binary, IsInf, IsNan, MathExpr
@@ -42,11 +41,8 @@ from batcher.plan.expr_ir.func_nodes import (
     Strptime,
     StructField,
 )
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["CASE_PUSH_RULES"]
-
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 
 def _rebuild_unary(call: Expr, value: Expr) -> Expr:
@@ -86,7 +82,18 @@ def _rebuild_unary(call: Expr, value: Expr) -> Expr:
         return InList(value, call.values)
     if isinstance(call, IsNan):
         return IsNan(value)
-    return IsInf(value)
+    if isinstance(call, IsInf):
+        return IsInf(value)
+    # Unreachable: `_push_unary` only calls this for a node its family predicate accepted,
+    # and every entry in `_UNARY_FAMILIES` has a branch above. Stated as a raise rather than
+    # a trailing `return IsInf(value)`, because the fall-through was the dangerous spelling:
+    # adding a sixteenth family and forgetting the branch here would have silently rebuilt
+    # every one of its calls as an infinity check -- a wrong *answer*, produced by a rule
+    # whose own tests still pass, since they exercise the fifteen families that do have one.
+    raise PlanError(
+        f"push-into-CASE has no rebuild branch for {type(call).__name__}; add one to "
+        "`_rebuild_unary` alongside the `_UNARY_FAMILIES` entry"
+    )
 
 
 def _push_unary(matches: Callable[[Expr], bool]) -> Callable[[Expr], Expr]:
@@ -133,16 +140,7 @@ def _push_binary(ops: frozenset[str]) -> Callable[[Expr], Expr]:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], expr_matches: tuple[type, ...]):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=expr_matches,
-        )
-    )
+    return register_leaf_rule(name, leaf, expr_matches=expr_matches)
 
 
 #: `(rule suffix, node predicate)` for each unary family pushed into the branches. Every

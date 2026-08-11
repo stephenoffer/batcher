@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 # Daft must use its native multithreaded local runner — its fast single-node engine,
 # the fair counterpart to batcher single-node. Without this, importing Daft *after*
@@ -41,7 +42,11 @@ from collections.abc import Callable
 import numpy as np
 import pyarrow as pa
 
-sys.path.insert(0, "benchmarks")
+# Resolved from this file, not the working directory. `sys.path.insert(0, "benchmarks")`
+# resolved against the *cwd*, so this only imported when launched from the repo root and
+# raised `ModuleNotFoundError: No module named 'harness'` from anywhere else — including
+# the `python benchmarks/scenarios/strength_bench.py` spelling the docstring gives.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from harness import bench, results_match
 from sources import load_tables
 

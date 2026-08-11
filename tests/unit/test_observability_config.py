@@ -89,12 +89,24 @@ def test_event_log_writes_document_and_prunes(tmp_path):
 
 
 def test_event_log_disabled_collector_is_none():
+    """With every consumer off, the collector is not built and the query pays nothing.
+
+    The bus is emptied for the duration, because "no consumer" is the whole premise and
+    `event_log_collector` deliberately returns a collector whenever *anything* is watching
+    — a dashboard, a metrics scrape, an OTel exporter. Without this the assertion holds or
+    fails according to whether some earlier test in the process left a sink attached, which
+    is a property of the run order rather than of the code under test.
+    """
+    from batcher._internal import events
     from batcher.api.terminal.event_log import event_log_collector
     from batcher.config import active_config, set_config
 
     prev = active_config()
+    saved_subscribers = events._subscribers
+    events._subscribers = ()
     set_config(prev.replace(observability=ObservabilityConfig(event_log=False)))
     try:
         assert event_log_collector() is None
     finally:
         set_config(prev)
+        events._subscribers = saved_subscribers

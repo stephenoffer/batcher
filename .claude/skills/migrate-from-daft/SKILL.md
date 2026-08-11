@@ -141,6 +141,7 @@ bare integer as *microseconds*. `bt.from_epoch(c, "s")` is the port.
 | `@daft.udf(return_dtype=...)` on a batch fn | `@bt.udf(output_columns=[...])`, applied to a `Dataset` |
 | stateful class UDF (`__init__` + `__call__`) | the same class handed to `ds.map_batches(Cls, ...)` / `ds.ml.map_batches` |
 | per-row UDF | `@bt.udf(per_row=True)`, or `ds.map`/`ds.flat_map` — avoid; see gotchas |
+| a Python row predicate | `ds.ml.filter(fn)` — the last resort; an `Expr` in `ds.filter` stays in Rust |
 | SQL-callable UDF | `bt.register_function(name, fn, result_type=...)` |
 
 `ds.map_batches(fn)` hands `fn` a pyarrow `RecordBatch` and expects one back —

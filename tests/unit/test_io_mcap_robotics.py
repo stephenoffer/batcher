@@ -341,3 +341,49 @@ def test_a_pushed_predicate_agrees_with_the_engine_filter(log) -> None:
 
     assert pushed == 100
     assert everything == 300
+
+
+def test_the_handle_fallback_batches_like_the_streaming_route(tmp_path) -> None:
+    """`_read_file` shares the streaming route's message loop rather than copying it.
+
+    The copy it used to carry took every message of the file into a single batch. A drive
+    log is millions of messages with megabyte payloads, so that is an unbounded
+    materialization of the whole recording — and it read differently from the route every
+    real query takes, which is how the two drift apart unnoticed.
+    """
+    from batcher.io.formats.robotics.mcap import _MESSAGES_PER_BATCH
+
+    path = tmp_path / "many.mcap"
+    n = _MESSAGES_PER_BATCH + 17
+    _write_log(path, topics=("/imu",), n=n)
+
+    src = MCAPSource(str(path))
+    with open(path, "rb") as fh:
+        batches = src._read_file(fh, None)
+
+    assert sum(b.num_rows for b in batches) == n
+    assert len(batches) > 1, "the whole file came back as one batch"
+    assert max(b.num_rows for b in batches) <= _MESSAGES_PER_BATCH
+
+
+def test_both_read_routes_agree_that_an_empty_topic_restriction_selects_nothing(
+    tmp_path,
+) -> None:
+    """`topics=[]` means *no* topics, on whichever route runs.
+
+    A pin rather than a regression test: both routes already answer this correctly, the
+    streaming one through its own guard and the handle one because the mcap reader
+    happens to treat an empty list as a restriction rather than as "unrestricted". The
+    second of those is a property of a third-party library, which is exactly the kind of
+    thing worth holding still — the guard reads as if it were load-bearing on both.
+    """
+    path = tmp_path / "empty_restriction.mcap"
+    _write_log(path, topics=("/imu", "/lidar"), n=10)
+
+    src = MCAPSource(str(path), topics=[])
+    with open(path, "rb") as fh:
+        batches = src._read_file(fh, None)
+    assert sum(b.num_rows for b in batches) == 0
+
+    # And the streaming route agrees, which is the property that was broken.
+    assert sum(b.num_rows for b in src.iter_batches()) == 0

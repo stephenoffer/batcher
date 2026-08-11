@@ -7,7 +7,7 @@ those right and a 100M-document embed job is a scan with a GPU stage bolted to i
 
 ## Embed a column
 
-`ds.ml.embed(model, column=...)` takes a model identifier and resolves a
+{py:meth}`ds.ml.embed(model, column=...) <batcher.api.dataset.ml.DatasetML.embed>` takes a model identifier and resolves a
 `sentence-transformers` model, loading it once per worker. Pass a **class** instead when
 the encoder is yours: a local ONNX model, a fine-tuned checkpoint, a non-text modality.
 
@@ -132,7 +132,7 @@ print(vectors.to_pydict())
 
 Cosine similarity is a dot product divided by both magnitudes. On unit-length vectors
 those magnitudes are 1, so cosine and dot rank identically, and dot is the cheaper
-kernel. Normalize at ingest with `.list.normalize()` and every query afterwards gets to
+kernel. Normalize at ingest with {py:meth}`.list.normalize() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.normalize>` and every query afterwards gets to
 use the cheap one.
 
 ```python
@@ -143,7 +143,7 @@ print(unit.select(norm=col("embedding").list.l2_norm()).to_pydict())
 # {'norm': [1.0, 1.0, 1.0]}
 ```
 
-`.list.l2_norm()` is how you check whether vectors from an unfamiliar source are already
+{py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` is how you check whether vectors from an unfamiliar source are already
 normalized before you spend a pass normalizing them again. Many hosted embedding APIs
 return unit vectors; many local models do not.
 
@@ -151,7 +151,7 @@ return unit vectors; many local models do not.
 
 When a small recall loss is acceptable, a binary embedding is far cheaper to search: each
 dimension becomes one bit by its sign, and distance is a bit count rather than a float dot
-product. `ds.ml.binarize_embeddings` produces the sign code, and `nearest_neighbors` ranks
+product. {py:meth}`ds.ml.binarize_embeddings <batcher.api.dataset.ml.DatasetML.binarize_embeddings>` produces the sign code, and {py:meth}`nearest_neighbors <batcher.api.dataset.ml.DatasetML.nearest_neighbors>` ranks
 it with `metric="hamming"`.
 
 ```python
@@ -164,7 +164,7 @@ print(coded.select(col("code")).to_pydict()["code"][0])
 
 A Matryoshka-trained model (the `text-embedding-3-*` family, Nomic, mxbai) packs the most
 signal into the leading dimensions, so a prefix is a smaller, faster index for a small
-recall cost. Take the prefix with `ds.ml.truncate_embeddings`, which re-normalizes it. A
+recall cost. Take the prefix with {py:meth}`ds.ml.truncate_embeddings <batcher.api.dataset.ml.DatasetML.truncate_embeddings>`, which re-normalizes it. A
 raw slice is no longer unit length, and a cosine index silently assumes it is:
 
 ```python
@@ -175,7 +175,7 @@ print(short.select(norm=col("embedding").list.l2_norm()).to_pydict())
 
 Before indexing, drop rows whose vector is the zero vector or null. A zero vector has no
 direction, so an index returns it as a garbage neighbor; it usually means an empty input
-or a failed encode. `ds.ml.drop_degenerate_embeddings` removes both:
+or a failed encode. {py:meth}`ds.ml.drop_degenerate_embeddings <batcher.api.dataset.ml.DatasetML.drop_degenerate_embeddings>` removes both:
 
 ```python
 with_holes = bt.from_pydict(
@@ -191,7 +191,7 @@ print(clean.to_pydict()["id"])
 Embedding is the expensive stage. Every duplicate document is a full forward pass you did
 not need, and web corpora are full of them: the same article under three headers, the
 same product blurb from four suppliers. `distinct` removes byte-identical rows, and
-`drop_near_duplicates` removes the ones that are the same document with a different
+{py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` removes the ones that are the same document with a different
 header.
 
 ```python
@@ -219,7 +219,7 @@ your GPU bill. See {doc}`preprocessors </ml/preparing/preprocessors/index>` for 
 
 Dense embedding search and lexical (BM25) search miss different things: the embedding finds
 paraphrases, the keyword match finds exact terms and rare tokens. Hybrid retrieval runs both
-and fuses the rankings. `ds.ml.reciprocal_rank_fusion` does the fusing without asking you to
+and fuses the rankings. {py:meth}`ds.ml.reciprocal_rank_fusion <batcher.api.dataset.ml.DatasetML.reciprocal_rank_fusion>` does the fusing without asking you to
 put the two score scales into agreement. Each list contributes `1 / (k + rank)` per key, and
 a document ranked highly by either retriever floats up.
 
@@ -237,7 +237,7 @@ Pass more result sets as extra arguments to fuse three or more retrievers.
 ## Score a whole query set at once
 
 Evaluating retrieval means running many queries against the corpus, not one.
-`ds.ml.batched_nearest_neighbors` scores a query set against this corpus and keeps each
+{py:meth}`ds.ml.batched_nearest_neighbors <batcher.api.dataset.ml.DatasetML.batched_nearest_neighbors>` scores a query set against this corpus and keeps each
 query's top `k` in one pass. It is an exact, index-free brute force that is right for an eval set
 and honest about being `O(queries x corpus)`.
 
@@ -254,7 +254,7 @@ print(sorted(zip(hits.to_pydict()["qid"], hits.to_pydict()["cid"])))
 For a large corpus queried in production, build an ANN index instead, as described below.
 
 Once you have the retrieved neighbors and a set of ground-truth relevant pairs,
-`ds.ml.recall_at_k` scores the retrieval: of the documents that should have come back for
+{py:meth}`ds.ml.recall_at_k <batcher.api.dataset.ml.DatasetML.recall_at_k>` scores the retrieval: of the documents that should have come back for
 each query, what fraction did, averaged over queries.
 
 ```python
@@ -264,9 +264,9 @@ print(round(retrieved.ml.recall_at_k(relevant, query_key="qid", corpus_key="cid"
 # 0.75
 ```
 
-Recall asks whether the right documents came back; `ds.ml.mrr` asks how *high* the first
+Recall asks whether the right documents came back; {py:meth}`ds.ml.mrr <batcher.api.dataset.ml.DatasetML.mrr>` asks how *high* the first
 right one ranked. Ask for the rank alongside the neighbors (`rank_column="rank"` on
-`batched_nearest_neighbors`), then:
+{py:meth}`batched_nearest_neighbors <batcher.api.dataset.ml.DatasetML.batched_nearest_neighbors>`), then:
 
 ```python
 ranked = bt.from_pydict({"qid": [1, 1, 2, 2], "cid": [10, 11, 20, 21], "rank": [1, 2, 1, 2]})
@@ -283,7 +283,7 @@ Nothing raises, nothing warns, and the retrieval quality quietly is not what you
 think it is.
 :::
 
-Split first with `.str.chunk(size, overlap)`, then `explode` into one row per chunk, and
+Split first with {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>`, then `explode` into one row per chunk, and
 each chunk gets its own vector.
 
 ```python
@@ -313,14 +313,14 @@ unit.write.lance("s3://bucket/vectors.lance")
 :::{note}
 A 1024-dimension float64 vector is 8 KB per row, so a million rows is 8 GB. Cast to
 `float32` before writing if the recall loss is acceptable, and keep the vector column out
-of any sort or join that does not need it. `offload_blobs` exists for exactly that. See
+of any sort or join that does not need it. {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>` exists for exactly that. See
 {doc}`multimodal </ml/preparing/multimodal/index>`.
 :::
 
 ## Driving the pool yourself
 
-Sometimes you are composing a stage rather than executing a `Dataset`, inside a custom
-loop or a serving process. `batcher.ml.embed` does the same work over a bare batch iterator. It
+Sometimes you are composing a stage rather than executing a {py:class}`Dataset <batcher.Dataset>`, inside a custom
+loop or a serving process. {py:func}`batcher.ml.embed <batcher.ml.embed>` does the same work over a bare batch iterator. It
 takes an `EncoderFactory`: a zero-argument callable returning an encoder, which is any
 callable from `list[str]` to one vector per string. The factory runs once per worker.
 
@@ -344,7 +344,7 @@ model, an ONNX runtime, and a hosted embedding API are interchangeable at this s
 
 ## Scoring embedding quality
 
-Once vectors exist, the questions you ask of them are numeric, and the metrics for that aggregate a per-row vector operation to a corpus score in one scan. `bt.mean_cosine_similarity(query, doc)` is the headline retrieval-alignment number; `bt.mean_euclidean_distance` and `bt.mean_dot_product` are the magnitude-sensitive and inner-product variants a distance-thresholded or MIPS index ranks by.
+Once vectors exist, the questions you ask of them are numeric, and the metrics for that aggregate a per-row vector operation to a corpus score in one scan. {py:func}`bt.mean_cosine_similarity(query, doc) <batcher.mean_cosine_similarity>` is the headline retrieval-alignment number; {py:func}`bt.mean_euclidean_distance <batcher.mean_euclidean_distance>` and {py:func}`bt.mean_dot_product <batcher.mean_dot_product>` are the magnitude-sensitive and inner-product variants a distance-thresholded or MIPS index ranks by.
 
 ```python
 import batcher as bt
@@ -353,9 +353,9 @@ pairs = bt.from_pydict({"q": [[1.0, 0.0], [1.0, 1.0]], "doc": [[1.0, 0.0], [0.0,
 print(pairs.agg(sim=bt.mean_cosine_similarity("q", "doc")).to_pydict())
 ```
 
-The single-column checks catch a degenerate index before it returns garbage: `bt.unit_norm_rate` verifies the vectors are normalized the way a cosine index assumes, `bt.zero_vector_rate` finds empty or failed embeddings, and `bt.mean_embedding_norm` tracks the average magnitude for drift. All compose with `group_by` to monitor per model, per source, or per day.
+The single-column checks catch a degenerate index before it returns garbage: {py:func}`bt.unit_norm_rate <batcher.unit_norm_rate>` verifies the vectors are normalized the way a cosine index assumes, {py:func}`bt.zero_vector_rate <batcher.zero_vector_rate>` finds empty or failed embeddings, and {py:func}`bt.mean_embedding_norm <batcher.mean_embedding_norm>` tracks the average magnitude for drift. All compose with {py:meth}`group_by <batcher.Dataset.group_by>` to monitor per model, per source, or per day.
 
-Match the drift metric to the distance space your index uses. `bt.mean_cosine_distance` is the `1 - cosine` form a cosine index ranks by, `bt.mean_manhattan_distance` is the L1 metric that resists a single dominant dimension, `bt.mean_angular_distance` is the true-metric angle some indexes build on, and `bt.mean_hamming_distance` is the bit-disagreement count for binary or product-quantized vectors.
+Match the drift metric to the distance space your index uses. {py:func}`bt.mean_cosine_distance <batcher.mean_cosine_distance>` is the `1 - cosine` form a cosine index ranks by, {py:func}`bt.mean_manhattan_distance <batcher.mean_manhattan_distance>` is the L1 metric that resists a single dominant dimension, {py:func}`bt.mean_angular_distance <batcher.mean_angular_distance>` is the true-metric angle some indexes build on, and {py:func}`bt.mean_hamming_distance <batcher.mean_hamming_distance>` is the bit-disagreement count for binary or product-quantized vectors.
 
 ```python
 import batcher as bt
@@ -365,7 +365,7 @@ print(vecs.agg(drift=bt.mean_cosine_distance("a", "b")).to_pydict())
 # {'drift': [0.5]}
 ```
 
-Run `bt.embedding_dim_drift` on ingest, before the index build. A vector index is built for one
+Run {py:func}`bt.embedding_dim_drift <batcher.embedding_dim_drift>` on ingest, before the index build. A vector index is built for one
 dimension, and a column that mixes two is not a degraded index but a broken one: the mismatched
 rows either fail to insert or are silently dropped, and the queries that should have matched them
 return the next-nearest thing with a confident-looking distance. Nothing downstream notices,

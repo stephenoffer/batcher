@@ -102,3 +102,52 @@ def test_four_way_join_vs_duckdb(duck):
         "JOIN grade USING (region_id)"
     )
     assert_same(out, expected)
+
+
+# JOB q7c's `FROM` list and full equi-join graph. Two of its eight tables (`it`, whose
+# only partner is `pi`; `lt`, whose only partner is `ml`) are listed several joins before
+# the table they join to, so the left-deep comma lowering cross-joins them into whatever
+# has accumulated. Reordering has to see through the `__cross_key` scaffolding to repair
+# that; this pins the repaired plan against the answer DuckDB gives for the same SQL.
+_Q7C_GRAPH = """
+SELECT MIN(n.gender) AS g, MIN(pi.info) AS i, COUNT(*) AS c
+FROM an, ci, it, lt, ml, n, pi, t
+WHERE it.info = 'mini biography'
+  AND lt.link IN ('references', 'features')
+  AND t.production_year BETWEEN 1980 AND 2010
+  AND n.id = an.person_id
+  AND n.id = pi.person_id
+  AND ci.person_id = n.id
+  AND t.id = ci.movie_id
+  AND ml.linked_movie_id = t.id
+  AND lt.id = ml.link_type_id
+  AND it.id = pi.info_type_id
+  AND pi.person_id = an.person_id
+  AND pi.person_id = ci.person_id
+  AND an.person_id = ci.person_id
+  AND ci.movie_id = ml.linked_movie_id
+"""
+
+_Q7C_TABLES = {
+    "an": {"person_id": [1, 1, 2, 3], "name": ["a", "aa", "b", "c"]},
+    "ci": {"person_id": [1, 2, 2, 3], "movie_id": [10, 20, 30, 10]},
+    "it": {"id": [5, 6], "info": ["mini biography", "trivia"]},
+    "lt": {"id": [3, 4], "link": ["features", "spoofs"]},
+    "ml": {"linked_movie_id": [10, 20, 30], "link_type_id": [3, 4, 3]},
+    "n": {"id": [1, 2, 3], "gender": ["m", "f", "m"]},
+    "pi": {
+        "person_id": [1, 2, 2, 3],
+        "info_type_id": [5, 5, 6, 5],
+        "info": ["bio1", "bio2", "triv", "bio3"],
+    },
+    "t": {"id": [10, 20, 30], "production_year": [1990, 2000, 1970]},
+}
+
+
+def test_job_q7c_shaped_comma_join_vs_duckdb(duck):
+    sess = bt.Session()
+    for name, cols in _Q7C_TABLES.items():
+        table = pa.table(cols)
+        duck.register(name, table)
+        sess.register(name, bt.from_arrow(table))
+    assert_same(sess.sql(_Q7C_GRAPH).collect(), duck.sql(_Q7C_GRAPH))

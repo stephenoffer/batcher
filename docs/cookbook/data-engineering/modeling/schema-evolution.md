@@ -55,13 +55,20 @@ does share a schema. It is a lie the moment they do not.
 If the *type* moved rather than the column set (`amount` written as `int32` in January
 and `float64` in March), strict does not go quiet. The first file's type is the contract,
 March cannot be cast to it without losing the fractional part, and the read stops with a
-`SchemaError` naming the file, the column, both types, and `schema_mode="union"` as the
+{py:exc}`SchemaError <batcher.SchemaError>` naming the file, the column, both types, and `schema_mode="union"` as the
 fix. An error you can see beats a column you cannot, but neither is what you wanted.
 
 A file that is *missing* a declared column fails the same way and for the same reason:
 strict promised that column for the whole directory. Only an **extra** column is dropped
 rather than reported, because it was never part of the contract the first file set. That
 is the one case above, and the reason it is the dangerous one.
+
+It is no longer silent, though it is still a drop. Strict reads one extra footer, the
+*last* file's, and warns when that file carries columns the result will not: enough to
+catch a schema that evolved forward, which is how almost every directory acquires a new
+column, and cheap enough not to give up what strict is for. The warning names the columns
+and points at `schema_mode="union"`. It claims only what it looked at: a column that
+appears in a middle file and not the last one is still dropped without a word.
 
 ## Union: read every footer, reconcile
 
@@ -93,7 +100,9 @@ print(bt.read.parquet(raw, schema_mode="union").sort("id").to_pydict())
 # {'id': [1, 2, 3, 4], 'amount': [10.0, 20.0, 30.0, 40.5], 'region': [None, None, 'us', 'eu']}
 ```
 
-The whole lattice, since it is the thing deciding what your column ends up as:
+The lattice deciding what your column ends up as is the same one the engine uses for a
+`union`, a `coalesce`, a comparison, and a join key, so a directory that reconciles on
+read also joins and unions afterwards. The pairs a drifting directory actually produces:
 
 | The column appears as | It reads back as |
 |---|---|
@@ -101,7 +110,17 @@ The whole lattice, since it is the thing deciding what your column ends up as:
 | `int32` and `int64` | `int64` |
 | `float32` and `float64` | `float64` |
 | an integer and a float | `float64` |
+| `decimal(10,2)` and `decimal(12,4)` | `decimal(12,4)` — the finer scale, the wider integer part |
+| a decimal and an integer | a decimal wide enough for both, so the cents survive |
+| `timestamp[ms]` and `timestamp[us]` | `timestamp[us]` — the finer resolution |
+| a date and a timestamp | the timestamp, since a date is midnight |
+| `string` and `large_string` | `large_string` |
+| a dictionary-encoded column and a plain one | the plain value type |
+| two timestamps in different timezones | nothing, because the read fails |
 | `int64` and `string` | nothing, because the read fails |
+
+The full table, including the nested cases, is on
+{doc}`the type system page </user-guide/transform/columns/type-system>`.
 
 `schema_mode="latest"` is the other useful mode: the newest file's schema wins outright
 and older files are cast toward it. Reach for it when the newest file *is* the contract
@@ -245,6 +264,29 @@ from your own pipeline instead of from Slack, and you will hear about it on the 
 that sees the new column rather than on the day someone notices the dashboard is short a
 dimension.
 :::
+
+## Compaction reads the union, always
+
+Compacting a drifted directory is the one place the narrowing is not recoverable.
+{py:func}`bt.compact <batcher.compact>` rewrites many small files into fewer large ones and
+**deletes the files it replaced**, so a column the read failed to see is not missing from
+one result, it is gone from the table. Compaction therefore reads the union whatever you
+would have passed, and you do not have to remember to ask:
+
+```python
+compacted = tempfile.mkdtemp()
+for name, table in (
+    ("a.parquet", pa.table({"id": [1], "amount": [10]})),
+    ("b.parquet", pa.table({"id": [2], "amount": [20], "region": ["us"]})),
+):
+    pq.write_table(table, os.path.join(compacted, name))
+bt.compact(compacted)
+print(sorted(bt.read.parquet(compacted, schema_mode="union").columns))
+# ['amount', 'id', 'region']
+```
+
+The same holds for a Hive-partitioned directory, where the partition column comes back
+alongside the evolved one rather than instead of it.
 
 ## See also
 

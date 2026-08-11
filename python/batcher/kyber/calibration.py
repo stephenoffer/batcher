@@ -13,7 +13,7 @@ milliseconds; coefficients are in abstract work units, so we anchor the two with
 single global factor `k` (work units per ms) chosen to preserve the default model's
 overall scale — when reality matches the defaults, calibration is a no-op. Each
 coefficient is then `median(k x t_ms / basis)` over its samples, **shrunk toward the
-shipped default in proportion to how little evidence there is** (`_shrink`), and clamped
+shipped default in proportion to how little evidence there is** (`shrink`), and clamped
 to within a configured factor of that default, so timing noise can never produce a
 degenerate model. Families without enough samples keep their default. Pure function:
 reads the hub, returns coefficients; decides nothing.
@@ -36,7 +36,7 @@ from batcher._internal.mathx import clamp_factor
 from batcher.config import Config, CostCoefficients, active_config
 from batcher.metadata import MetadataHub
 
-__all__ = ["calibrate", "refit_version"]
+__all__ = ["calibrate", "live_coefficients", "shrink"]
 
 # Per-hub memo of the calibrated coefficients, keyed weakly by the hub so a dropped
 # hub (e.g. a test's process-wide reset) evicts its entry automatically. The value is
@@ -56,20 +56,16 @@ _CALIB_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, tuple, CostCoeff
 _RECALIBRATE_AFTER = 64
 
 
-def refit_version(hub: MetadataHub | None) -> int:
-    """The hub version at which the coefficients now in force were fitted (`0` if never).
+def live_coefficients(hub: MetadataHub | None) -> CostCoefficients | None:
+    """The coefficients currently in force for `hub`, without provoking a refit.
 
-    This is the *identity of the live fit*, and it is what a memoized plan has to be keyed by:
-    it advances exactly when `calibrate` re-scans, and not once per recorded operator. Keying
-    on a bucket of the raw version instead (`version // _RECALIBRATE_AFTER`) looks equivalent
-    and is not — the two are different clocks. The refit throttle counts rows *since the last
-    refit*, while the bucket counts from zero, so on a query recording ~35 operators the bucket
-    rolled over every second execution whether or not anything had been re-fit. Measured on
-    TPC-H q8 at sf10: the plan cache alternated hit/miss forever on a completely stable set of
-    coefficients, and a miss costs 350 ms against a hit's 160 ms.
+    `plan_cache` fingerprints these directly rather than keying on *when* they were last
+    fitted. A refit counter is the wrong clock for the memo: on a query recording more
+    operators than `_RECALIBRATE_AFTER`, a refit fires every execution, so a counter moves
+    every execution even when the fit reproduces itself.
     """
     cached = _CALIB_CACHE.get(hub) if hub is not None else None
-    return int(cached[0]) if cached is not None else 0
+    return cached[2] if cached is not None else None
 
 
 # Each calibratable operator `kind` (the native `ExecMetrics` tag) maps to the cost
@@ -141,23 +137,43 @@ def _samples(rows: list[dict]) -> list[tuple[float, float, float, float]]:
     return out
 
 
-def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoefficients:
+def calibrate(
+    hub: MetadataHub | None,
+    config: Config | None = None,
+    hw_fingerprint: str | None = None,
+) -> CostCoefficients:
     """Fit `CostCoefficients` from the hub's measured `op_stats`.
 
     Returns the default coefficients unchanged when there is no hub, no measured
     data, or no family with enough samples — so a cold metadata store never degrades
     planning. Best-effort: any failure falls back to the defaults.
+
+    Args:
+        hub: The metadata hub holding the measured history.
+        config: The config supplying the default coefficients and the fit's bounds.
+        hw_fingerprint: The machine class whose measurements to fit from, from
+            `HardwareProfile.fingerprint`. `None` fits from this process's own class, which is
+            right single-node and wrong on a cluster: these coefficients are in machine units,
+            the plan they rank will run on the workers, and this process is the driver. A mixed
+            fleet has no single answer and passes `""`, which falls back to the local class.
+
+    Returns:
+        The fitted coefficients, or the shipped defaults when there is not enough evidence.
     """
     cfg = config or active_config()
     defaults = cfg.optimizer.cost_coeffs
     if hub is None:
         return defaults
     # Reuse the prior fit unless the hub absorbed new feedback or the relevant config
-    # changed — avoids the whole-history op_stats scan on every optimize.
+    # changed — avoids the whole-history op_stats scan on every optimize. The machine class is
+    # part of the key: the same hub fits different coefficients for different target hardware,
+    # and a session that plans single-node and distributed in turn must not serve one from the
+    # other's cache.
     fingerprint = (
         defaults,
         cfg.optimizer.cost_calibration_min_samples,
         cfg.optimizer.cost_calibration_clamp,
+        hw_fingerprint or "",
     )
     # `learning_smoothing_alpha` is deliberately *not* in the fingerprint: neither
     # `_calibrate` nor `_measured_jit_speedup` reads it, so including it only forced a
@@ -177,7 +193,7 @@ def calibrate(hub: MetadataHub | None, config: Config | None = None) -> CostCoef
     ):
         return cached[2]
     try:
-        coeffs = _calibrate(hub.op_stats_by_kind(), defaults, cfg)
+        coeffs = _calibrate(hub.op_stats_by_kind(hw_fingerprint), defaults, cfg)
     except Exception as exc:  # pragma: no cover - calibration must never break planning
         note_suppressed("kyber", "load calibrated cost coefficients", exc)
         coeffs = defaults
@@ -232,9 +248,7 @@ def _calibrate(
         if not per_row:
             continue
         measured = median(per_row)
-        updates[coeff] = clamp_factor(
-            _shrink(measured, c0, len(per_row), prior_strength), c0, clamp
-        )
+        updates[coeff] = clamp_factor(shrink(measured, c0, len(per_row), prior_strength), c0, clamp)
 
     speedup = _measured_jit_speedup(by_kind, defaults, cfg)
     if speedup is not None:
@@ -298,17 +312,17 @@ def _measured_jit_speedup(
     # ratio *scales* the prior rather than replacing it. A compiled expression is never
     # slower than the same expression interpreted, hence the floor at 1.0.
     #
-    # Deliberately NOT run through `_shrink`, unlike the absolute coefficients. Those fit an
+    # Deliberately NOT run through `shrink`, unlike the absolute coefficients. Those fit an
     # absolute value that must be blended toward the shipped default; this one is already
     # *prior-relative* — the measurement is `prior x ratio`, so the prior is the anchor, and
     # each ratio is itself a median over `min_samples` rows. Shrinking would anchor it twice
     # and stop the loop learning a genuinely different engine, which is exactly the fixed-point
-    # failure `_shrink` was written to remove. `clamp_factor` still bounds how far it may travel.
+    # failure `shrink` was written to remove. `clamp_factor` still bounds how far it may travel.
     measured = defaults.jit_speedup * median(ratios)
     return clamp_factor(max(1.0, measured), defaults.jit_speedup, clamp)
 
 
-def _shrink(measured: float, prior: float, n_samples: int, prior_strength: float) -> float:
+def shrink(measured: float, prior: float, n_samples: int, prior_strength: float) -> float:
     """Blend a measured coefficient toward its prior, weighted by how much evidence exists.
 
     The previous blend was `alpha*measured + (1-alpha)*default` with a fixed `alpha = 0.5`.

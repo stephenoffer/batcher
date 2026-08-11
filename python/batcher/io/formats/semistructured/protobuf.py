@@ -138,4 +138,9 @@ class ProtobufSource(FileSource):
         table = protarrow.messages_to_table(messages, self._message_cls)
         if projection is not None:
             table = table.select(projection)
-        return table.combine_chunks().to_batches()[0]
+        # `to_batches()[0]` looks like "the table as one batch" and is not: `to_batches`
+        # splits at the 32-bit offset limit, so a buffer holding more than 2 GiB of string
+        # or `bytes` fields — which is what a protobuf payload column is — came back as
+        # several batches and taking the first silently dropped the rest.
+        batches = table.combine_chunks().to_batches()
+        return batches[0] if len(batches) == 1 else pa.concat_batches(batches)

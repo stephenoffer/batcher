@@ -19,6 +19,7 @@ import pytest
 
 from batcher.kyber.shortcuts import bounds, checks, distinct, joins, moments, nulls, ordering, rows
 from batcher.kyber.shortcuts.facts import ColumnFacts, Facts
+from batcher.plan.stats import SortOrder, as_sort_orders
 
 pytestmark = pytest.mark.unit
 
@@ -29,7 +30,7 @@ def facts(
     *,
     rows_count: int | None = 10,
     columns: dict[str, ColumnFacts] | None = None,
-    sorted_by: tuple[str, ...] = (),
+    sorted_by: tuple[SortOrder | str, ...] = (),
     nan_safe: bool = True,
 ) -> Facts:
     """A `Facts` bundle with the fields a test cares about; `rows_count=None` means not exact."""
@@ -37,7 +38,7 @@ def facts(
         rows=rows_count,
         estimated_rows=float(rows_count if rows_count is not None else 100),
         columns=columns or {},
-        sorted_by=sorted_by,
+        sorted_by=as_sort_orders(sorted_by),
         nan_safe=nan_safe,
     )
 
@@ -270,6 +271,26 @@ def test_sortedness_is_one_sided_a_match_proves_it_and_a_miss_proves_nothing():
     assert ordering.is_sorted_by(f, ["region", "day"]) is True
     assert ordering.is_sorted_by(f, ["day"]) is None  # not a prefix — unknown, not false
     assert ordering.sort_prefix(f, ["region", "hour"]) == 1  # the work a sort can still skip
+
+
+def test_a_descending_ordering_is_recorded_and_only_matches_a_descending_request():
+    """Direction is part of the ordering: `ts DESC` is not satisfied by asking for `ts`."""
+    f = facts(sorted_by=(SortOrder("ts", descending=True),))
+    assert ordering.is_sorted_by(f, [SortOrder("ts", descending=True)]) is True
+    assert ordering.is_sorted_by(f, ["ts"]) is None
+    assert ordering.sorted_columns(f) == (SortOrder("ts", descending=True),)
+
+
+def test_null_placement_is_ignored_only_for_a_column_proven_free_of_nulls():
+    """With no null row to place, `NULLS FIRST` and `NULLS LAST` are the same row order."""
+    proven = facts(
+        sorted_by=(SortOrder("k"),),
+        columns={"k": ColumnFacts(name="k", null_count=0)},
+    )
+    assert ordering.is_sorted_by(proven, [SortOrder("k", nulls_first=True)]) is True
+
+    unproven = facts(sorted_by=(SortOrder("k"),))
+    assert ordering.is_sorted_by(unproven, [SortOrder("k", nulls_first=True)]) is None
 
 
 # --- joins -------------------------------------------------------------------------------

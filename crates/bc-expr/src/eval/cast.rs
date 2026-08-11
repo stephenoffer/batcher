@@ -67,6 +67,16 @@ pub(crate) fn cast_expr(
     {
         return float_to_string(arr, target, &opts);
     }
+    // Timestamp→string: arrow writes the ISO `T` separator and a fixed-width sub-second
+    // field (`2021-01-02T03:04:05.500`); DuckDB — like Postgres, Spark and Polars — writes
+    // a space and trims the fraction's trailing zeros (`2021-01-02 03:04:05.5`), omitting
+    // it entirely when it is zero. Every `CAST(<timestamp> AS VARCHAR)`, and so every
+    // concatenation or string comparison built on one, differed in both places.
+    if matches!(arr.data_type(), DataType::Timestamp(_, None))
+        && matches!(target, DataType::Utf8 | DataType::LargeUtf8)
+    {
+        return timestamp_to_string(arr, target, &opts);
+    }
     // DuckDB trims leading/trailing whitespace before parsing a string into a
     // numeric or temporal value: `CAST('  12  ' AS BIGINT)` = 12, `' 3.14 '::DOUBLE`
     // = 3.14, `' 2024-01-05 '::DATE` = 2024-01-05. Arrow's kernel does not trim, so
@@ -406,6 +416,57 @@ fn parse_string_to_int(
 /// `str`. The engine folds `-0.0` to `0.0` for *key identity* (grouping, joins, ordering);
 /// that is about which rows are equal, not about how a value is displayed, and `sign(x)` and
 /// `1/x` still distinguish the two. Rendering it away lost information every oracle keeps.
+/// Render a naive `Timestamp` array the way DuckDB's `CAST(... AS VARCHAR)` does.
+///
+/// Built from arrow's own string, not from a re-derived calendar date: arrow already
+/// handles the epoch arithmetic, the pre-1970 direction and the year padding, and the two
+/// engines disagree only about punctuation. Replacing the `T` and trimming the fraction
+/// keeps this a formatting fix rather than a second date implementation to keep in step.
+fn timestamp_to_string(
+    arr: &ArrayRef,
+    target: &arrow::datatypes::DataType,
+    opts: &CastOptions,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::{LargeStringArray, StringArray};
+    use arrow::datatypes::DataType;
+    let strs = cast_with_options(arr, target, opts)?;
+    match target {
+        DataType::Utf8 => {
+            let a = strs.as_string::<i32>();
+            let out: StringArray = (0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| duckdb_timestamp_text(a.value(i))))
+                .collect();
+            Ok(Arc::new(out) as ArrayRef)
+        }
+        DataType::LargeUtf8 => {
+            let a = strs.as_string::<i64>();
+            let out: LargeStringArray = (0..a.len())
+                .map(|i| (!a.is_null(i)).then(|| duckdb_timestamp_text(a.value(i))))
+                .collect();
+            Ok(Arc::new(out) as ArrayRef)
+        }
+        _ => unreachable!("timestamp_to_string only called for Utf8/LargeUtf8 target"),
+    }
+}
+
+/// One arrow timestamp string in DuckDB's spelling: `T` → space, fraction de-padded.
+///
+/// A fraction that trims away entirely takes its `.` with it, because DuckDB writes a
+/// whole second as `03:04:05` rather than `03:04:05.`.
+fn duckdb_timestamp_text(s: &str) -> String {
+    let spaced = s.replacen('T', " ", 1);
+    let Some(dot) = spaced.rfind('.') else {
+        return spaced;
+    };
+    let (head, frac) = spaced.split_at(dot);
+    let trimmed = frac[1..].trim_end_matches('0');
+    if trimmed.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}.{trimmed}")
+    }
+}
+
 fn float_to_string(
     arr: &ArrayRef,
     target: &arrow::datatypes::DataType,

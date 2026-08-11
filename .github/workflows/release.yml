@@ -45,13 +45,13 @@ jobs:
             # define __ARM_ARCH". Upstream declines to support sysroots that old and names
             # manylinux_2_28 as the supported target (PyO3/maturin-action#222,
             # briansmith/ring#1789). That floor is RHEL 8+, Debian 10+, Ubuntu 18.10+ — every
-            # distro shipping a Python this package supports (>=3.10) clears it.
+            # distro shipping a Python this package supports (>=3.11) clears it.
             manylinux: "2_28"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:

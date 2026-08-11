@@ -209,55 +209,64 @@ class MCAPSource(FileSource):
         start: int | None,
         end: int | None,
     ) -> Iterator[pa.RecordBatch]:
-        make_reader = _require_mcap()
+        with self._fs.open(path) as fh:
+            reader = _require_mcap()(fh)
+            yield from self._batches_from(reader, projection, topics, start, end)
+
+    def _batches_from(
+        self,
+        reader: Any,
+        projection: list[str] | None,
+        topics: list[str] | None,
+        start: int | None,
+        end: int | None,
+    ) -> Iterator[pa.RecordBatch]:
+        """Batch a reader's messages — the one message loop every route shares.
+
+        Shared rather than written per entry point because the row tuple has to line up
+        with `MCAP_SCHEMA` positionally, and a second copy is a second thing to remember
+        when a column is added. The copy that used to live in `_read_file` had already
+        drifted in the way that matters: it took every message of the file into one
+        unbounded list, where this batches.
+        """
         if topics is not None and not topics:
             # The predicate excluded every topic; the file has nothing to contribute, and
             # asking the reader for "no topics" would mean "all topics".
             return
+        kwargs: dict[str, Any] = {}
+        if topics is not None:
+            kwargs["topics"] = topics
+        if start is not None:
+            kwargs["start_time"] = start
+        if end is not None:
+            kwargs["end_time"] = end
         rows: list[tuple] = []
-        with self._fs.open(path) as fh:
-            reader = make_reader(fh)
-            kwargs: dict[str, Any] = {}
-            if topics is not None:
-                kwargs["topics"] = topics
-            if start is not None:
-                kwargs["start_time"] = start
-            if end is not None:
-                kwargs["end_time"] = end
-            for schema, channel, message in reader.iter_messages(**kwargs):
-                rows.append(
-                    (
-                        channel.topic,
-                        message.log_time,
-                        message.publish_time,
-                        message.sequence,
-                        schema.name if schema is not None else None,
-                        channel.message_encoding,
-                        message.data,
-                    )
+        for schema, channel, message in reader.iter_messages(**kwargs):
+            rows.append(
+                (
+                    channel.topic,
+                    message.log_time,
+                    message.publish_time,
+                    message.sequence,
+                    schema.name if schema is not None else None,
+                    channel.message_encoding,
+                    message.data,
                 )
-                if len(rows) >= _MESSAGES_PER_BATCH:
-                    yield _batch(rows, projection)
-                    rows = []
+            )
+            if len(rows) >= _MESSAGES_PER_BATCH:
+                yield _batch(rows, projection)
+                rows = []
         if rows:
             yield _batch(rows, projection)
 
     def _read_file(self, fh: IO[Any], projection: list[str] | None) -> list[pa.RecordBatch]:
-        """Read from an open handle — the template's fallback when no path is available."""
-        make_reader = _require_mcap()
-        rows = [
-            (
-                channel.topic,
-                message.log_time,
-                message.publish_time,
-                message.sequence,
-                schema.name if schema is not None else None,
-                channel.message_encoding,
-                message.data,
-            )
-            for schema, channel, message in make_reader(fh).iter_messages(topics=self._topics)
-        ]
-        return [_batch(rows, projection)]
+        """Read from an open handle — the template's fallback when no path is available.
+
+        A drive log is millions of messages carrying megabyte payloads, so this batches
+        exactly as the streaming route does rather than building one batch of the file.
+        """
+        reader = _require_mcap()(fh)
+        return list(self._batches_from(reader, projection, self._topics, None, None))
 
     # ---- cheap metadata, all from the summary index ------------------------
     def _summary(self, path: str) -> Any:

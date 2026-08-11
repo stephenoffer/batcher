@@ -11,9 +11,11 @@ column you can filter and aggregate.
 
 Three shapes, because they fail differently:
 
-* `llm_score_udf` grades one output against a rubric on a numeric scale. The score is parsed
-  and **range-checked**, so a judge that answers "8/10" or "high" yields null rather than
-  poisoning a mean.
+* `llm_score_udf` grades one output against a rubric on a numeric scale. The score is read
+  from the **start** of the answer and **range-checked**, so a judge that writes prose
+  ("I would not give this more than a 2"), answers "high", or returns a number outside the
+  scale yields null rather than poisoning a mean. A leading number is taken even when the
+  judge decorated it, so "8/10" scores 8 on a 1-10 scale and nulls on a 1-5 one.
 * `llm_pairwise_udf` compares two outputs and picks a winner. It is the shape to prefer when
   comparing two systems: a judge is far more consistent choosing between two answers than
   assigning either an absolute number, and the position bias that introduces is measurable
@@ -109,17 +111,25 @@ def _render(
     Uses `str.format_map` over a per-row view rather than `format`, so a template mentioning a
     column the batch does not have raises a clear `PlanError` naming it instead of a `KeyError`
     from inside the formatter.
+
+    Only the columns the template names are materialized. A judged eval runs over the rows a
+    generation stage just produced, so the batch still carries whatever that stage read —
+    contexts, retrieved passages, embeddings, images — and converting every one of them to
+    Python per row, to fill a two-slot rubric, cost more than the judge call it prepared.
     """
-    columns = {name: batch.column(i).to_pylist() for i, name in enumerate(batch.schema.names)}
-    if extra:
-        columns.update(extra)
     names = set(re.findall(r"\{(\w+)\}", template))
-    missing = sorted(names - set(columns))
+    available = set(batch.schema.names) | set(extra or ())
+    missing = sorted(names - available)
     if missing:
         raise PlanError(
             f"judge template references column(s) not in the batch: {missing}; "
-            f"available: {sorted(columns)}"
+            f"available: {sorted(available)}"
         )
+    # `extra` (the swapped-order pairwise columns) shadows a batch column of the same name.
+    columns = {
+        name: extra[name] if extra and name in extra else batch.column(name).to_pylist()
+        for name in names
+    }
     return [
         template.format_map({k: _cell(v[i]) for k, v in columns.items()})
         for i in range(batch.num_rows)
@@ -132,12 +142,18 @@ def _cell(value: Any) -> str:
 
 
 def _append(batch: pa.RecordBatch, name: str, values: list, dtype: Any) -> pa.RecordBatch:
-    """The batch with one column appended, keeping every input column."""
+    """The batch with the judged column set, keeping every input column.
+
+    **Replaces** `name` when the batch already carries it. Arrow permits duplicate field
+    names, so appending unconditionally produced two columns of one name — `to_pydict()`
+    keeps the last, expressions resolve the first, nothing raises. Re-judging with a second
+    model into the default `score` is the ordinary way to hit that.
+    """
     import pyarrow as pa
 
-    arrays = [batch.column(i) for i in range(batch.num_columns)]
-    arrays.append(pa.array(values, type=dtype))
-    return pa.RecordBatch.from_arrays(arrays, names=[*batch.schema.names, name])
+    from batcher.ml.tabular.features import append_columns
+
+    return append_columns(batch, {name: pa.array(values, type=dtype)})
 
 
 def _validate_scale(low: float, high: float) -> None:

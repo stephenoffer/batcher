@@ -20,4 +20,4 @@ python examples/expressions/strings_hashing.py
 - {doc}`/cookbook/expressions/strings/matching/strings_extraction`: pulling entities and leading fragments out of free text.
 - {doc}`/cookbook/expressions/strings/shaping/strings_padding`: fixed-width keys and cleaning stray whitespace.
 - {doc}`/user-guide/transform/columns/expressions`: what an expression is, and how it is evaluated.
-- {doc}`/api/relational/expressions`: the complete `Expr` reference.
+- {doc}`/api/relational/expressions`: the complete {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` reference.

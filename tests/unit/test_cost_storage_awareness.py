@@ -139,3 +139,88 @@ def test_both_subsystems_read_one_table_rather_than_two():
 
     assert kyber_side.SPILL_DEVICE_FACTOR is layer0.SPILL_DEVICE_FACTOR
     assert kyber_side.SPILL_DEVICE_FACTOR_DEFAULT == layer0.SPILL_DEVICE_FACTOR_DEFAULT
+
+
+# --- The worker's device, not the driver's -------------------------------------------------
+#
+# Everything above resolves the class from *this process's* spill directory, which is exactly
+# right single-node and describes the wrong machine on a cluster: the driver spills nothing,
+# the workers do, to their own volumes. A driver on local NVMe planning for workers on a
+# network volume under-stated a spilled byte tenfold, in the one term that decides whether an
+# out-of-core plan is acceptable at all. `HardwareProfile.storage_class` carries the binding
+# worker's measured class so the prediction is about the node that will pay for it.
+
+
+def test_a_named_class_overrides_the_local_probe(spill_device):
+    """The explicit class wins, whatever this process happens to be sitting on."""
+    spill_device("nvme")
+    assert storage_cost.spill_device_factor("network") == 10.0
+    assert storage_cost.spill_device_factor("rotational") == 30.0
+
+
+def test_no_named_class_still_reads_this_machine(spill_device):
+    """The default is the pre-existing behavior, which every single-node caller takes."""
+    spill_device("rotational")
+    assert storage_cost.spill_device_factor("") == storage_cost.spill_device_factor()
+
+
+def test_an_unrecognized_class_reports_no_opinion(spill_device):
+    """A class this build has no figure for must not re-rank anything."""
+    spill_device("nvme")
+    assert storage_cost.spill_device_factor("some-future-device") == 1.0
+
+
+def test_the_spill_terms_take_the_workers_device(spill_device):
+    """Both out-of-core terms scale, and the merge is where it compounds per pass."""
+    spill_device("nvme")
+    budget = terms.memory_budget(8 << 30)
+    state = 32e9
+    assert terms.spill_io(state, budget, "network") == pytest.approx(
+        10.0 * terms.spill_io(state, budget)
+    )
+    assert terms.merge_io(state, budget, "rotational") == pytest.approx(
+        30.0 * terms.merge_io(state, budget)
+    )
+
+
+def test_the_cost_model_reads_the_profile(spill_device):
+    """End to end: two models over one plan, differing only in the volume they spill to."""
+    import batcher as bt
+    from batcher import col
+    from batcher.kyber.cardinality import CardinalityEstimator
+    from batcher.kyber.cost import CostModel
+    from batcher.plan.resource import HardwareProfile
+
+    spill_device("nvme")
+    frame = bt.from_pydict({"k": list(range(5_000)), "v": list(range(5_000))})
+    plan = frame.group_by("k").agg(total=col("v").sum())._plan
+    estimator = CardinalityEstimator(frame._sources)
+    # A worker small enough that this aggregate spills, so the device factor has something to
+    # scale. Only the device differs between the two.
+    tiny = 1
+    flash = CostModel(estimator, hardware=HardwareProfile(memory_bytes=tiny, storage_class="nvme"))
+    remote = CostModel(
+        estimator, hardware=HardwareProfile(memory_bytes=tiny, storage_class="network")
+    )
+    # The `io` axis carries scanned bytes as well as spilled ones, and only the spill half is
+    # device-scaled — so the ratio to assert is of the *spill component*, isolated by a third
+    # model whose worker is large enough that nothing spills at all.
+    resident = CostModel(
+        estimator, hardware=HardwareProfile(memory_bytes=1 << 50, storage_class="nvme")
+    )
+    scanned = resident.cost(plan).io
+    flash_spill = flash.cost(plan).io - scanned
+    remote_spill = remote.cost(plan).io - scanned
+    assert flash_spill > 0.0
+    assert remote_spill == pytest.approx(10.0 * flash_spill)
+
+
+def test_a_profile_that_could_not_probe_the_device_is_unchanged(spill_device):
+    """`""` on the profile is "unprobeable", and must read as the local answer."""
+    from batcher.kyber.cost.model import CostModel
+    from batcher.kyber.stats.estimator import StatsEstimator
+    from batcher.plan.resource import HardwareProfile
+
+    spill_device("nvme")
+    model = CostModel(StatsEstimator([]), hardware=HardwareProfile(cpu_cores=8))
+    assert model._storage_class == ""

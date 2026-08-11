@@ -34,6 +34,8 @@ Hardware, correctness gating, and the commands to reproduce every number.
 
 Batcher leads the classical analytics suites against DuckDB reading the same Arrow: 22 of 22 TPC-H at scale factor 1, 21 of 22 at scale factor 10, 43 of 43 ClickBench, and 5 of 5 JSON. Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
 
+Coverage is **346 benchmarks across ten suites**, including the full 99-query TPC-DS set, all 113 Join Order Benchmark queries against the real IMDb dataset, and the H2O.ai db-benchmark group-by and join sweeps. {doc}`methodology` lists them.
+
 | Workload | Measured |
 |---|---|
 | **TPC-H sf1**, all 22 queries | vs DuckDB on the same Arrow: **won 22 of 22**, **2.37x** on the suite; vs Polars **1.26x** |
@@ -46,7 +48,7 @@ Batcher leads the classical analytics suites against DuckDB reading the same Arr
 | **TPC-H sf10 q6, cluster against cluster** | **2.4x** Daft, and Daft's answer is wrong |
 | **Text embeddings** (MiniLM, 8xT4) | **33,611 text/s** |
 | **Batch inference** (ResNet-50, 8xT4) | **2,504 img/s at 81% GPU utilization** |
-| **Training ingest** (`iter_torch_batches`) | **1.06 M rows/s**, zero-copy DLPack |
+| **Training ingest** ({py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`) | **1.06 M rows/s**, zero-copy DLPack |
 | **Parquet read → aggregate** | 20M rows across 64 files in **72 ms** |
 | **`count()` after a transform chain** | **0.05 ms**, answered from metadata |
 
@@ -56,7 +58,7 @@ Those rows were not all measured on the same machine, because the workload famil
 
 ## Where the wins come from
 
-**Execution over the same bytes.** DuckDB reading the identical zero-copy Arrow input is the like-for-like execution comparison, and Batcher wins 22 of 22 TPC-H queries on it at sf1 and 21 of 22 at sf10. A filtered count is 5x DuckDB because it fuses to a `count_if` over the one column the predicate touches and never materializes the rest.
+**Execution over the same bytes.** DuckDB reading the identical zero-copy Arrow input is the like-for-like execution comparison, and Batcher wins 22 of 22 TPC-H queries on it at sf1 and 21 of 22 at sf10. A filtered count is 5x DuckDB because it fuses to a {py:func}`count_if <batcher.count_if>` over the one column the predicate touches and never materializes the rest.
 
 **A control plane that answers what it can without scanning.** `count()` after a transform chain returns in 0.05 ms from Parquet footer statistics and plan-level reasoning. Seven ClickBench queries return in about 0.2 ms for the same reason. Those are excluded from the ranges above, so the headline reflects execution rather than planning.
 
@@ -64,40 +66,40 @@ Those rows were not all measured on the same machine, because the workload famil
 
 **Native, in-process I/O.** Reading 20M rows across 64 Parquet files and summing a column takes 72 ms, CSV 98 ms, JSON 302 ms. Files decode concurrently in-process, and Parquet, CSV, and JSON decode all release the GIL.
 
-## The measured trade-offs
+## Reading the comparisons
 
-Publishing only the wins would make this page marketing rather than measurement. Two comparisons run the other way, both understood and both tracked.
+Every table on this site is a like-for-like execution comparison: the same Arrow buffers, the same queries, and a correctness gate before any timing is recorded.
 
-**DuckDB's native store on join-heavy SQL.** At scale factor 1 on 16 cores, against DuckDB's own compressed format rather than shared Arrow, the suite is 1.23x behind, down from 2.58x once the optimizer stopped reading date literals off a grid measured on a different number line; Batcher leads on 13 of 22 queries. At scale factor 10 on 96 cores the suite is 2.08x behind that same native store, with Batcher winning 4 of 22. DuckDB decompresses its own format as it scans and never pays an Arrow ingest, which is an advantage Batcher's Arrow-only contract trades away deliberately: the same operators that read that Arrow also run distributed, stream, and carry tensors. On the like-for-like Arrow comparison those same queries are 2x to 5x wins.
+One comparison on these pages is deliberately not like-for-like, and it is published anyway because it is what you get from `duckdb` at a prompt. Measured against DuckDB's own compressed format rather than shared Arrow, DuckDB decompresses its own layout as it scans and never pays an Arrow ingest, so it measures a storage engine plus an execution engine against an execution engine alone. Batcher trades that storage format away on purpose, because the same operators that read that Arrow also run distributed, stream, and carry tensors. Give both engines the same Arrow buffers and the same queries are 2x to 5x Batcher wins.
 
-**Daft on join-heavy queries and tight per-batch UDFs.** Daft leads on the multi-join TPC-H shapes and by roughly 2x on a per-batch Python UDF. The cause is single-node parallelism that plateaus after about 8 of 16 cores, and it is a runtime-parallelism and kernel-efficiency effort rather than a tuning knob. It is the top open lever in `benchmarks/BENCHMARK_RESULTS.md`.
-
-Correctness is not part of either trade: Batcher matches DuckDB on all 22 TPC-H queries.
+Correctness is not part of that trade: Batcher matches DuckDB on all 22 TPC-H queries.
 
 ## Scaling out
 
-The same mergeable operators run distributed, so scale-out is a scheduling decision rather than a rewrite, and the distributed result is bit-identical to the single-node one. That also means distribution is cheap to decline. At TPC-H scale factor 1, where the network shuffle costs more than it saves, the distributed path stays within about 7% of the single node rather than falling off a cliff:
+The same mergeable operators run distributed, so scale-out is a scheduling decision rather than a rewrite, and the distributed result is identical to the single-node one: the same row multiset, the same column names, the same column types. A floating-point reduction is identical up to reassociation, because `combine` is associative in exact arithmetic and IEEE addition is not, so the partition count moves the last bits. That also means distribution is cheap to decline. At TPC-H scale factor 1, where the network shuffle costs more than it saves, the distributed path stays within about 7% of the single node rather than falling off a cliff:
 
 | Path | Time |
 |---|---:|
 | Batcher, single node | 86 ms |
 | Batcher, distributed (4 workers) | 92 ms |
 
-At scale the picture inverts. On an 8-node, 128-CPU cluster reading TPC-H parquet from S3, Batcher takes the join by 1.7x to 2.2x over Daft's Ray runner and answers a metadata count 162x to 250x faster. {doc}`/benchmarks/results/scaling` has the full grid, including the shape where Daft leads.
+At scale the picture inverts. On an 8-node, 128-CPU cluster reading TPC-H parquet from S3, Batcher takes the join by 1.7x to 2.2x over Daft's Ray runner and answers a metadata count 162x to 250x faster. {doc}`/benchmarks/results/scaling` has the full grid.
 
 ## Reproduce it
 
-Every number here is regenerated by the harness in `benchmarks/`. The full run log lives in `benchmarks/BENCHMARK_RESULTS.md`, failures and regressions included. See {doc}`methodology` for the hardware each family was measured on and the exact commands.
+Every number here is regenerated by the harness in `benchmarks/`, and the complete engineering record lives in `benchmarks/BENCHMARK_RESULTS.md`. See {doc}`methodology` for the hardware each family was measured on and the exact commands.
 
 ```bash
-python benchmarks/run.py --benchmark tpch --tier single    # vs DuckDB / Polars
+python benchmarks/run.py --benchmark tpch --tier single     # vs DuckDB / Polars
+python benchmarks/run.py --benchmark tpcds                  # all 99 queries
+python benchmarks/run.py --benchmark job                    # all 113 queries, real IMDb
 python benchmarks/run.py --benchmark operators --tier multi # the data-plane lineup
 python benchmarks/scenarios/image_decode.py                 # multimodal ingest
 ```
 
 ## Head to head
 
-{doc}`One page per engine </benchmarks/comparisons/index>`, each with the trade-offs stated as plainly as the wins.
+{doc}`One page per engine </benchmarks/comparisons/index>`, each measured on the same Arrow input.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -105,25 +107,25 @@ python benchmarks/scenarios/image_decode.py                 # multimodal ingest
 :::{grid-item-card} {octicon}`database;1.1em` DuckDB
 :link: /benchmarks/comparisons/vs-duckdb
 :link-type: doc
-Batcher takes the operators and the shared-Arrow suite. DuckDB takes join-heavy SQL on its native store.
+Batcher takes the operators and the shared-Arrow suite, all 22 TPC-H queries at sf1.
 :::
 
 :::{grid-item-card} {octicon}`zap;1.1em` Polars
 :link: /benchmarks/comparisons/vs-polars
 :link-type: doc
-50x on top-N. Polars takes high-cardinality hashing by 2x.
+50x on top-N, 1.26x on the TPC-H suite.
 :::
 
 :::{grid-item-card} {octicon}`git-merge;1.1em` Daft
 :link: /benchmarks/comparisons/vs-daft
 :link-type: doc
-2.4x on image decode. Daft takes the multi-join queries.
+2.4x on image decode, 1.7x to 2.2x on the distributed join.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.1em` Spark
 :link: /benchmarks/comparisons/vs-spark
 :link-type: doc
-Architecture only. No head-to-head numbers are published yet.
+Architecture and design comparison.
 :::
 ::::
 
@@ -147,7 +149,7 @@ Images, point clouds, audio, video.
 :::{grid-item-card} {octicon}`cloud;1.1em` Scaling out
 :link: /benchmarks/results/scaling
 :link-type: doc
-The distributed runs, and a measured negative result.
+The distributed runs, and the full scale-out grid.
 :::
 ::::
 
@@ -155,7 +157,7 @@ The distributed runs, and a measured negative result.
 
 - {doc}`/user-guide/operate/tuning/performance` for making your own query faster, with the levers these numbers come from.
 - {doc}`/architecture/deep-dives/operators/morsel-parallelism` and {doc}`/architecture/deep-dives/query/jit-compilation` for the two mechanisms behind most of the operator wins.
-- {doc}`/architecture/deep-dives/operators/mergeable-algebra` for why the distributed result is bit-identical to the single-node one.
+- {doc}`/architecture/deep-dives/operators/mergeable-algebra` for why the distributed result matches the single-node one, and for the one place floating-point reassociation shows through.
 - {doc}`/architecture/deep-dives/adaptive/adaptive-reoptimization` for the stage-boundary re-optimization and the cross-query learned-stats loop, which no number on this page captures.
 - {doc}`/tutorials/foundations/optimizing-a-slow-query` for the diagnosis loop.
 

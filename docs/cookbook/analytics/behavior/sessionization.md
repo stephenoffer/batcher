@@ -95,7 +95,7 @@ Second, flag the session boundaries. An event starts a session if there is nothi
 or if the gap exceeds the threshold.
 
 :::{important}
-That first `is_null()` check is not a defensive nicety. Drop it and every user's first
+That first {py:meth}`is_null() <batcher.plan.expr_ir.core.Expr.is_null>` check is not a defensive nicety. Drop it and every user's first
 event silently falls into session 0.
 :::
 
@@ -196,7 +196,7 @@ exactly the fraction of sessions with `pages == 1`.
 
 :::{tip}
 If all you want is the per-session aggregate and not the session id on every row,
-`session_window` does the whole thing in one call. It composes the same window and
+{py:meth}`session_window <batcher.Dataset.session_window>` does the whole thing in one call. It composes the same window and
 group-by operators, so the result is identical.
 :::
 

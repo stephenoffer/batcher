@@ -340,6 +340,41 @@ def notify_query_progress(name: str, progress: StreamingQueryProgress) -> None:
         progress: The completed micro-batch's metrics.
     """
     _fire("on_query_progress", "onQueryProgress", QueryProgressEvent(name, progress))
+    _publish_progress(name, progress)
+
+
+def _publish_progress(name: str, progress: StreamingQueryProgress) -> None:
+    """Put the micro-batch's numbers on the observability bus as well as on the listeners.
+
+    A listener is a callback the user has to write and register. That is the right shape for
+    "do something when a batch lands" and the wrong shape for "chart this forever": it left
+    the one workload that runs for weeks as the one workload a scrape loop could not see,
+    with no lag gauge, no state-store growth, and no throughput series.
+
+    The bus carries the same record, so the counters, the dashboard, and the OTel export all
+    get it without a user writing anything. A no-op when nothing is listening, which keeps
+    the per-micro-batch cost at a tuple check.
+    """
+    from batcher._internal import events
+
+    if not events.listening():
+        return
+    state_rows = sum(op.num_rows_total for op in progress.state_operators)
+    state_bytes = sum(op.memory_used_bytes for op in progress.state_operators)
+    events.publish(
+        events.STREAM,
+        name=name or "stream",
+        batch_id=progress.batch_id,
+        input_rows=progress.num_input_rows,
+        output_rows=progress.num_output_rows,
+        duration_ms=progress.duration_ms,
+        behind_by_ms=progress.behind_by_ms,
+        input_rows_per_second=progress.input_rows_per_second,
+        processed_rows_per_second=progress.processed_rows_per_second,
+        state_rows=state_rows,
+        state_bytes=state_bytes,
+        **{f"duration_{phase}_ms": ms for phase, ms in progress.duration_breakdown_ms},
+    )
 
 
 def notify_query_terminated(name: str, exception: BaseException | None) -> None:

@@ -31,6 +31,7 @@ How work is sized and parallelized.
 | `cpu_share_min` | `0.25` | Floor for the adaptive per-task CPU share, so an IO-bound stage never asks for an unschedulable sliver of a core. |
 | `adaptive_morsel_sizing` | `True` | Shrink the per-morsel (rows, bytes) target under memory pressure so the streaming working set stays bounded. Result-invariant; the static target is used unchanged until the pressure monitor reports elevated. Set `False` to pin the static target. |
 | `fuse_linear` | `True` | Fuse chains of linear streaming operators (filter/project) into one pass over the input morsels instead of a dispatch and buffer per operator. Result-invariant; engages only on a chain of two or more fusable ops. |
+| `fast_path` | `False` | Skip the per-query orchestration for small in-memory plans that provably don't need it: run the optimizer (through its plan cache) and the engine, and nothing else. Result-invariant, and narrowly gated to plans that are single-node, CPU, in-memory, free of UDFs, and under a row and node cap. It trades away the **write** side of the cross-query learned-stats loop, so a query answered here never sharpens Kyber's estimates for the next one. Turn it on for a latency-sensitive serving path where the plan shape is already known good. See {doc}`/user-guide/operate/tuning/performance`. |
 | `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`/user-guide/trust/hardening`. |
 | `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
 | `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
@@ -62,7 +63,7 @@ Buffer-pool envelope and the out-of-core spill story. Setting `max_memory_bytes`
 | `spill_dir` | `None` | Scratch directory for spill files. `None` uses a per-query temp dir. |
 | `spill_remote_uri` | `None` | fsspec URL, such as `s3://` or `gs://`, that the local spill tier overflows to, so a PB-scale spill doesn't die when local disk fills. |
 | `spill_local_budget_bytes` | `None` | Local spill-tier capacity before overflowing to `spill_remote_uri`. |
-| `spill_compression` | `"auto"` | Arrow-IPC codec for spilled batches. `"auto"` lets the engine choose. `"lz4"`, `"zstd"`, or `None` force it. |
+| `spill_compression` | `"auto"` | Arrow-IPC codec for spilled batches, and for the disk shuffle's bucket files. `"auto"` lets the engine choose. `"lz4"`, `"zstd"`, or `None` force it. Scratch on a cluster-shared mount is compressed whatever this says, because the bytes cross a network there. |
 | `spill_bucket_max_bytes` | `134217728` (128 MiB) | A spilled aggregate bucket larger than this is re-partitioned (grace recursion) so a skewed key set degrades gracefully instead of OOMing the reduce. |
 | `unbounded_memory` | `False` | Opt out of the auto-sensed spill budget and keep the fully in-memory fast path, with no out-of-core spilling. Set it when you'd rather a query fail fast than spill to disk. |
 | `result_cache_max_bytes` | `268435456` (256 MiB) | Byte budget for the process-wide result cache backing {py:meth}`Dataset.cache() <batcher.Dataset.cache>`, described in {doc}`/user-guide/operate/tuning/performance`. Cached Arrow results are held LRU and evicted to stay within this, so caching never grows the process without bound. |
@@ -108,12 +109,35 @@ operator's state may hold is `memory.streaming_state_max_bytes`, in the `memory`
 |-------|---------|---------|
 | `idle_poll_seconds` | `0.2` | How long a runner waits before asking an idle unbounded source for data again. Only an empty pass pays it. |
 | `progress_history` | `100` | Micro-batch progress records a query handle keeps for `recent_progress`. |
+| `watermark_idle_timeout_seconds` | `60.0` | How long a stream partition may deliver nothing before it stops holding the event-time watermark back. |
+| `backpressure_enabled` | `False` | Derive each trigger's admission cap from measured throughput instead of holding it at the source's configured limit. |
+| `backpressure_pid_proportional` | `1.0` | Weight on the current rate error. |
+| `backpressure_pid_integral` | `0.2` | Weight on the accumulated backlog. This is the term that removes steady-state error. |
+| `backpressure_pid_derivative` | `0.0` | Weight on the error's rate of change, damping overshoot on a bursty source. |
+| `backpressure_min_rate` | `100.0` | Rows per second the derived rate can never fall below. |
+| `backpressure_max_rows_per_trigger` | `0` | Hard ceiling on the derived cap, independent of the source. `0` is unbounded. |
 
 Lower `idle_poll_seconds` when first-row latency after a quiet stretch matters more than
 the cost of re-listing a directory or re-asking a broker for its partitions. Raise it when
 a stream is idle most of the time and the listing is expensive, such as a large cloud
 prefix. The single-node and distributed runners read the same value, so an idle stream
 behaves the same on one machine and on a cluster.
+
+The `backpressure_*` options carry Spark's names and Spark's defaults, so tuning advice
+written for `spark.streaming.backpressure.pid.*` applies unchanged. They are off by default,
+and when on they only ever *lower* a source's configured per-trigger cap. An admission cap
+changes how much of a stream a trigger reads, never what the query computes from it, so none
+of them can change a result. See {doc}`Backpressure </cookbook/streaming/backpressure>`.
+
+`watermark_idle_timeout_seconds` is a correctness dial, not a performance one. The
+event-time watermark is the *minimum* over each partition's highest event time, because
+that is the strongest claim a multi-partition stream can support. A minimum stalls on a
+silent partition, so a partition that has delivered nothing for this long stops
+contributing to it. That is a real trade: a partition idle for longer than this finds the
+rows it eventually delivers ruled late. Raise it for a legitimately bursty partition; set
+it to zero to disable idleness entirely and keep the conservative watermark that never
+advances past a silent partition, accepting that one empty partition then holds every
+window open until the state cap fires.
 
 ```python
 from batcher import Config, StreamingConfig

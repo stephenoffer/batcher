@@ -19,8 +19,9 @@ It is two other things, and this diagram is built to show exactly those:
    comparable cross-query loop.
 
 The honest caveat is drawn, not omitted. The within-query loop engages only on a plan
-that contains a join and whose total scan input clears `_ADAPTIVE_MIN_INPUT_ROWS`
-(20,000,000 rows) **or** `_ADAPTIVE_MIN_INPUT_BYTES` (20,000,000 x 64, about 1.3 GB),
+that contains a join and whose total scan input clears `_ADAPTIVE_MIN_ROWS_PER_STAGE`
+(5,000,000 rows) **or** `_ADAPTIVE_MIN_BYTES_PER_STAGE` (5,000,000 x 64, about 320 MB),
+multiplied by the number of pipeline breakers the loop would cut at,
 both in `python/batcher/api/adaptive/gating.py`. Most small queries never reach it.
 
 If the gate constant or the sanctioned wording changes, change this diagram with it.
@@ -126,8 +127,8 @@ for y, (name, sub, cells) in zip(ROW_Y, rows):
 parts += [
     f'<text x="40" y="{H - 42}" font-family="{FONT}" font-size="11.5" class="t-sub">'
     f'The within-query loop is the same mechanism and granularity as Spark AQE, not something '
-    f'finer. It also engages only on a joined query whose scan input clears 20M rows or '
-    f'roughly 1.3 GB,</text>',
+    f'finer. It also engages only on a joined query whose scan input clears 5M rows or '
+    f'roughly 320 MB per pipeline breaker,</text>',
     f'<text x="40" y="{H - 24}" font-family="{FONT}" font-size="11.5" class="t-sub">'
     f'so most small queries never use it. The third column is the half with no DuckDB or Spark '
     f'equivalent. Source: docs/architecture/internals/competitive_architecture.md.</text>',

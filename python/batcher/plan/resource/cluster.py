@@ -178,7 +178,15 @@ class ClusterShape:
 
     @property
     def aggregate_gpu_memory_bytes(self) -> int:
-        """VRAM across every device in the fleet, `0` when any part is unknown."""
+        """VRAM across every device in the fleet; a node that could not report it adds nothing.
+
+        A **partial** total, and it has to be read as one: a node whose VRAM is unknown
+        contributes `0`, so on a partly-labelled fleet this under-states the real capacity
+        rather than reporting `0` for the whole thing. Under-stating is the safe direction for
+        a capacity figure — it declines work the fleet could have held, where over-stating
+        admits work it cannot. Use `known` and `binding_gpu_memory_bytes` to tell "the fleet is
+        small" from "the fleet did not say".
+        """
         return sum(n.aggregate_gpu_memory_bytes for n in self.nodes)
 
     @property
@@ -205,6 +213,23 @@ class ClusterShape:
         on every other one.
         """
         sized = (n.gpu_memory_bytes for n in self.gpu_nodes if n.gpu_memory_bytes > 0)
+        return min(sized, default=0)
+
+    @property
+    def binding_cpu_cores(self) -> int:
+        """Cores on the smallest worker, `0` when no node reported any.
+
+        The per-worker figure a plan must be valid at, for the reason `binding_gpu_memory_bytes`
+        takes the smallest device: a task sized to the largest node's core count over-subscribes
+        every smaller node it lands on.
+        """
+        sized = (n.cpu_cores for n in self.nodes if n.cpu_cores > 0)
+        return min(sized, default=0)
+
+    @property
+    def binding_memory_bytes(self) -> int:
+        """Usable RAM on the smallest worker, `0` when no node reported any."""
+        sized = (n.memory_bytes for n in self.nodes if n.memory_bytes > 0)
         return min(sized, default=0)
 
     @property
@@ -260,6 +285,13 @@ class ClusterShape:
         worker per node an exchange has no intra-node tier at all, which erases the whole
         distinction on precisely the dense fleets the tier model exists for.
 
+        Device capacity is counted in **schedulable** devices, not in devices that exist: a
+        board the fleet has quarantined for uncorrectable ECC or a pending reset is one the
+        scheduler will not place on, so a fan-out sized to it asks for a width the cluster
+        cannot satisfy and the placement group pends. `total_gpus` is the right figure for
+        sizing a shard (it says what hardware the plan may meet) and the wrong one for sizing a
+        fan-out (which needs what hardware will actually take work), and this is the fan-out.
+
         Args:
             unit: `"cpu"` for a relational exchange, `"gpu"` for a device fan-out.
 
@@ -269,7 +301,10 @@ class ClusterShape:
         """
         if not self.known:
             return 1
-        capacity = self.total_gpus if unit == "gpu" else self.total_cores
+        # A fleet whose devices are *all* quarantined still has to run somewhere, and reporting
+        # a width of zero would be read as "unknown" rather than as "nothing schedulable" —
+        # so the physical count stands in, matching `_schedulable`'s survivors-or-nothing rule.
+        capacity = (self.healthy_gpus or self.total_gpus) if unit == "gpu" else self.total_cores
         return max(1, capacity)
 
     def locality_shares(self, workers: int, *, unit: str = "cpu") -> LocalityShares:
@@ -306,12 +341,18 @@ class ClusterShape:
             [size for node, placed in per_node for size in _domain_split(node, placed, unit)],
             count,
         )
-        by_rack: dict[str, int] = {}
+        by_rack: dict[tuple[str, str], int] = {}
         for index, (node, placed) in enumerate(per_node):
             # An unlabelled node is its own rack: two nodes that never said they were adjacent
             # are not evidence that they are, and assuming otherwise would under-charge every
             # cross-host byte on an unlabelled fleet — the common case.
-            key = node.rack or f"\x00{index}"
+            #
+            # Qualified by zone, so a rack label is only ever compared within the availability
+            # zone that issued it. Rack identifiers are namespaced per zone by every scheduler
+            # that emits them, so two nodes in different zones sharing the string `"rack-3"` are
+            # in different buildings — and grouping them would report a cross-zone byte as
+            # rack-local, which is the largest single under-charge the tier model can make.
+            key = (node.zone, node.rack or f"\x00{index}")
             by_rack[key] = by_rack.get(key, 0) + placed
         same_rack = _group_share(list(by_rack.values()), count)
 

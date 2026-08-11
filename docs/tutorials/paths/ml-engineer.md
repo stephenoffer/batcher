@@ -15,7 +15,7 @@ batch.
 1. {doc}`Feature engineering </tutorials/ml/feature-engineering>`: build a model-ready
    feature matrix with fit/transform preprocessors.
 1. {doc}`ML overview </ml/index>`: the accessor and its operations.
-1. {doc}`Inference </ml/inference/inference>`: `ds.ml.infer` and `ds.ml.embed`.
+1. {doc}`Inference </ml/inference/inference>`: {py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`.
 1. {doc}`GPU execution </ml/inference/gpu>`: reserving and sharing GPUs.
 1. {doc}`PyTorch integration </ml/inference/pytorch>`.
 1. {doc}`Streaming </ml/inference/streaming>`: processing batches as a stream.
@@ -69,11 +69,11 @@ class Embedder:
 
 ## Runnable examples
 
-- `ml_inference.py` is a batch-inference pipeline built on `ds.ml.map_batches`, and it
+- `ml_inference.py` is a batch-inference pipeline built on {py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>`, and it
   runs as written.
 - `feature_engineering.py` prepares model-ready features.
 - `preprocessors.py` builds the same features from fit/transform preprocessor objects
-  and `Chain`.
+  and {py:class}`Chain <batcher.ml.preprocessors.Chain>`.
 - `streaming_pipeline.py` sketches the shape of a streaming inference pipeline. It
   needs a broker to run.
 

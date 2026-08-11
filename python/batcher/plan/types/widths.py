@@ -33,6 +33,13 @@ DEFAULT_VARLEN_BYTES = 32.0
 # Arrow's offset buffers cost 4 or 8 bytes per row on top of the value bytes.
 _OFFSET_BYTES = 4.0
 
+# Identity-keyed memo for `schema_row_bytes`, mapping `(id(schema), default_varlen)` to the
+# schema itself and its width. The schema is retained so the id cannot be recycled under the
+# entry; see the function's docstring for why an identity key rather than a value one.
+# Bounded and cleared wholesale — a dropped entry costs one recomputation, never a wrong width.
+_ROW_BYTES_CACHE: dict[tuple[int, float], tuple[pa.Schema, float]] = {}
+_ROW_BYTES_CACHE_MAX = 1024
+
 # Elements assumed in a variable-length `list`/`large_list` with no measured width.
 # A list column's width is `len × element_width`, so charging it a flat scalar prior —
 # as this module did before, ignoring the value type entirely — under-predicts by the
@@ -206,9 +213,21 @@ def _has_type(dtype: pa.DataType, *predicates: str) -> bool:
     return False
 
 
-@functools.lru_cache(maxsize=1024)
 def schema_row_bytes(schema: pa.Schema, default_varlen: float = DEFAULT_VARLEN_BYTES) -> float:
     """Estimated bytes per row for a whole schema — the sum of its columns' widths.
+
+    Memoized by the schema's **identity**, not its value. `pa.Schema.__hash__` walks every
+    field, so on a wide schema hashing the key costs more than the sum it is meant to save:
+    measured on a 105-column schema, `hash()` alone is 97 us against a 129 us recompute, and
+    the `functools.lru_cache` this replaces was therefore hitting 100% of the time while
+    saving 24% of the work. Arrow schemas are immutable, and the repeat callers are plan
+    nodes handing back a schema their own `available_schema()` memoized, so identity is
+    exactly the key that repeats.
+
+    The entry retains the schema it is keyed on, which is what makes an `id()` key sound:
+    without a reference the address of a freed schema is reused immediately and a stale width
+    would be served for an unrelated one. Two equal-but-distinct schemas simply get two
+    entries and one extra computation each.
 
     Args:
         schema: The Arrow schema to size.
@@ -217,4 +236,12 @@ def schema_row_bytes(schema: pa.Schema, default_varlen: float = DEFAULT_VARLEN_B
     Returns:
         The estimated per-row width of one row of `schema`, in bytes.
     """
-    return sum(column_bytes(f.type, default_varlen) for f in schema)
+    key = (id(schema), default_varlen)
+    hit = _ROW_BYTES_CACHE.get(key)
+    if hit is not None and hit[0] is schema:
+        return hit[1]
+    width = sum(column_bytes(f.type, default_varlen) for f in schema)
+    if len(_ROW_BYTES_CACHE) >= _ROW_BYTES_CACHE_MAX:
+        _ROW_BYTES_CACHE.clear()
+    _ROW_BYTES_CACHE[key] = (schema, width)
+    return width

@@ -106,14 +106,57 @@ def fold_date_func(expr: Expr) -> Expr:
     return expr if fold is None else Lit(fold(value))
 
 
+#: Day-of-month at or below which adding calendar months cannot clamp.
+#:
+#: The engine shifts months with chrono's `checked_add_months`, which lands on the same
+#: day-of-month unless that day does not exist in the target month, and then clamps to the
+#: month's last day (`bc-expr/src/eval/temporal/date.rs::add_months`). February is the
+#: shortest month at 28 days, so a source day at or below 28 exists in *every* month of
+#: *every* year and the clamp can never fire — which makes "keep the day, shift the month"
+#: exact rather than an approximation of the engine's rule.
+_NO_CLAMP_DAY = 28
+
+
+def _shift_months(value: _dt.date | _dt.datetime, months: int) -> _dt.date | _dt.datetime | None:
+    """`value` shifted by `months` calendar months, or None if that is not provably exact.
+
+    Refuses any day past [`_NO_CLAMP_DAY`], where the engine's clamp-to-month-end could
+    apply and this arithmetic would have to reproduce it. Refuses a year outside Python's
+    calendar too, which is narrower than the engine's — so the fold declines and the engine
+    answers, rather than this raising on a plan it could have left alone.
+    """
+    if value.day > _NO_CLAMP_DAY:
+        return None
+    total = value.year * 12 + (value.month - 1) + months
+    year, month = divmod(total, 12)
+    try:
+        return value.replace(year=year, month=month + 1)
+    except ValueError:
+        return None  # off the end of Python's calendar
+
+
 def fold_date_offset(expr: Expr) -> Expr:
     if not (isinstance(expr, DateOffset) and isinstance(expr.input, Lit)):
         return expr
     value = expr.input.value
-    if not _naive_temporal(value) or expr.months:
-        return expr  # calendar months clamp to the month end — the engine's rule, not ours
+    if not _naive_temporal(value):
+        return expr
     if expr.micros and not isinstance(value, _dt.datetime):
         return expr  # the engine *errors* on a sub-day offset of a Date — preserve that
+    if expr.months:
+        # A month shift is folded only where the engine's clamp provably cannot fire, and
+        # only when it is the *whole* offset — mixing months with days would additionally
+        # require knowing which the engine applies first, which is a second assumption this
+        # does not need to make. Everything else is left to the data plane, as before.
+        #
+        # Worth folding rather than leaving alone: `date '1994-01-01' + interval '1' year`
+        # is the upper bound of TPC-H q20's `l_shipdate` range, and unfolded it runs chrono
+        # month arithmetic *per row* over 4.3M rows — measured at 434 ms of CPU in a 61 ms
+        # query, the single largest term in it.
+        if expr.days or expr.micros:
+            return expr
+        shifted = _shift_months(value, expr.months)
+        return expr if shifted is None else Lit(shifted)
     try:
         return Lit(value + _dt.timedelta(days=expr.days, microseconds=expr.micros))
     except (OverflowError, ValueError):

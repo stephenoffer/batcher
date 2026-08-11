@@ -29,6 +29,7 @@ from batcher.dist.executors.partition_io._sources import (
 from batcher.dist.executors.partition_io._sources import (
     consumer_pushdown,
     descriptor_rows,
+    empty_descriptor,
     iter_partition,
     iter_partition_descriptor,
     materialize_reduce_output,
@@ -53,8 +54,12 @@ from batcher.dist.executors.partition_io.folds import (
 from batcher.dist.executors.partition_io.ranges import (
     SAMPLE_PROBS,
     bucketize,
+    hot_sub_bucket,
     merge_boundaries,
+    plan_hot_split,
     sample_key_grid,
+    sample_probs,
+    split_hot_bucket,
 )
 
 __all__ = [
@@ -64,16 +69,21 @@ __all__ = [
     "bucketize",
     "consumer_pushdown",
     "descriptor_rows",
+    "empty_descriptor",
     "has_affinity",
+    "hot_sub_bucket",
     "iter_partition",
     "iter_partition_descriptor",
     "materialize_reduce_output",
     "merge_boundaries",
     "partition_descriptors",
+    "plan_hot_split",
     "read_partition",
     "read_partition_descriptor",
     "sample_key_grid",
+    "sample_probs",
     "source_pushdown",
+    "split_hot_bucket",
     "streaming_map_buckets",
     "streaming_partial_aggregate",
     "streaming_topn",

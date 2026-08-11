@@ -86,17 +86,21 @@ def _warn_if_checkpoint_not_durable(location: str) -> None:
     a restart cannot resume — defeating the durability the checkpoint exists for. A
     durable location (object storage, or a shared mount) survives the node. Only a
     warning, not an error: a bare path may legitimately be a shared filesystem, which
-    we cannot tell apart from node-local storage."""
-    import re
+    we cannot tell apart from node-local storage.
+
+    The local test is `checkpoint.is_local_location`, the same one the store dispatches on
+    — so the advice this prints and the backend the store then uses cannot disagree about
+    what "node-local" means. They did: this warning recommended ``s3://`` while the store
+    resolved it with `os.makedirs`, creating a local directory called ``s3:`` and
+    checkpointing into it."""
     import warnings
 
     from batcher.config import active_config
+    from batcher.io.formats.streaming.checkpoint import is_local_location
 
     if active_config().distributed.resilience != "spot":
         return
-    has_scheme = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", location)
-    node_local = has_scheme is None or location.lower().startswith("file://")
-    if node_local:
+    if is_local_location(location):
         warnings.warn(
             f"streaming checkpoint_location {location!r} looks node-local; on a "
             "spot/preemptible cluster a reclaimed node loses the checkpoint and its "

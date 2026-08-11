@@ -37,7 +37,7 @@ def _append(table: pa.Table, path: str, idx: int) -> None:
 
 
 def _ts_predicate(column: str, boundary: dt.datetime) -> dict:
-    micros = int((boundary - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)).total_seconds() * 1e6)
+    micros = int((boundary - dt.datetime(1970, 1, 1, tzinfo=dt.UTC)).total_seconds() * 1e6)
     return {
         "e": "binary",
         "op": "gt",
@@ -49,7 +49,7 @@ def _ts_predicate(column: str, boundary: dt.datetime) -> dict:
 def test_pushed_predicate_on_utc_timestamp_column(tmp_path) -> None:
     """A ``ts > x`` predicate on a tz-aware column reads (does not crash) and prunes right."""
     path = str(tmp_path / "events")
-    base = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+    base = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
     ts_type = pa.timestamp("us", tz="UTC")
     _append(
         pa.table({"id": [1, 2], "t": pa.array([base, base + dt.timedelta(days=1)], type=ts_type)}),
@@ -69,7 +69,7 @@ def test_pushed_predicate_on_utc_timestamp_column(tmp_path) -> None:
         1,
     )
 
-    boundary = dt.datetime(2024, 1, 5, tzinfo=dt.timezone.utc)
+    boundary = dt.datetime(2024, 1, 5, tzinfo=dt.UTC)
     predicate = _ts_predicate("t", boundary)
 
     # The pushed read must match a full scan re-filtered in memory — same rows, no crash.
@@ -86,7 +86,7 @@ def test_pushed_predicate_on_utc_timestamp_split(tmp_path) -> None:
     """The worker-side split read applies the same predicate without crashing."""
     path = str(tmp_path / "events2")
     ts_type = pa.timestamp("us", tz="UTC")
-    base = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+    base = dt.datetime(2024, 1, 1, tzinfo=dt.UTC)
     _append(
         pa.table({"id": [1], "t": pa.array([base], type=ts_type)}),
         path,
@@ -97,7 +97,7 @@ def test_pushed_predicate_on_utc_timestamp_split(tmp_path) -> None:
         path,
         1,
     )
-    predicate = _ts_predicate("t", dt.datetime(2024, 1, 5, tzinfo=dt.timezone.utc))
+    predicate = _ts_predicate("t", dt.datetime(2024, 1, 5, tzinfo=dt.UTC))
     ids: list[int] = []
     for split in DeltaSource(path).splits(predicate=predicate):
         for batch in split.read(predicate=predicate):

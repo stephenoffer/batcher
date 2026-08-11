@@ -5,7 +5,7 @@ helpers, the text-extraction and prompt-building functions for LLM pipelines, th
 horizontal reducers that work across columns within a row, and the aggregates and window
 functions that reduce down a column.
 
-The `Expr` *methods* these compose with are in {doc}`/api/relational/expressions`. The metric aggregates
+The {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` *methods* these compose with are in {doc}`/api/relational/expressions`. The metric aggregates
 have their own page, {doc}`/api/models/metrics`.
 
 ```{eval-rst}
@@ -156,7 +156,7 @@ These reduce *across* the listed expressions within one row, rather than down a 
 
 ## Aggregate and window functions
 
-Use these in `group_by(...).agg(...)` or `.over(...)` window frames. The ranking and
+Use these in {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` or {py:meth}`.over(...) <batcher.AggExpr.over>` window frames. The ranking and
 value functions are window-only: bind them with `.over(partition_by=…, order_by=…)`.
 
 ```{eval-rst}

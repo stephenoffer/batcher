@@ -47,6 +47,7 @@ __all__ = [
     "learned_straggler_factor",
     "record_actor_pool_reuse",
     "record_partition_rows",
+    "row_shuffle_reducer_count",
 ]
 
 # Namespaces for the two directly-folded EMAs (no per-operator feedback analogue exists).
@@ -298,32 +299,148 @@ def learned_straggler_factor(hub: MetadataHub | None, family: str) -> float | No
 
 
 # --- Aggregate reducer count (learned output cardinality) --------------------------------
-def aggregate_reducer_count(agg, base_reducers: int) -> int:
-    """Reducer count for a keyed aggregate, sized by its LEARNED output cardinality.
+def _estimated_rows(node, sources) -> float | None:
+    """Kyber's estimate of `node`'s output rows, or `None` if it cannot be had.
 
-    An aggregate's reduce shuffles PARTIAL-aggregated state, whose size is the group count —
-    not the (far larger) scanned input. `base_reducers` (the generic one-per-worker fan-out)
-    is therefore wrong for a low-cardinality group-by: a 60M-row → 4-group aggregate does not
-    need one reducer per worker each fetching from every mapper (a near-empty all-to-all), it
-    needs one. When a prior run measured this aggregate's output rows
-    (`record_aggregate_cardinality`), size the reducers to keep each within
-    `target_rows_per_task` groups. A cold signature keeps `base_reducers`; the mergeable
-    algebra makes any reducer count result-identical, so this only shapes the exchange."""
+    The cold-start half of every reducer sizing. `learned_signature_rows` only answers once
+    the shape has run at least once, and the run it cannot help is the one that most needs
+    it: a first execution at full scale, where guessing one reducer per worker is what makes
+    the reduce spill. Kyber has already estimated this node's output cardinality from source
+    statistics and its ndv sketches, and that estimate is a far better prior than the
+    cluster's shape — it is at least *about* the data.
+
+    For an aggregate the estimate is its group count (what the reduce holds); for a raw-row
+    exchange — a join, sort, window, or distinct — it is the row count itself. Both callers
+    want the same number for the same reason, which is why this is one function.
+
+    Best-effort by construction, and only ever a fan-out: a wrong estimate costs a
+    badly-shaped exchange, never a wrong answer.
+
+    **It is only as good as the source's column statistics, and for some sources there are
+    none.** An aggregate whose group keys have no measured `ndv` falls back in
+    `StatsEstimator._estimate_aggregate` to a flat `rows x 0.1`, which is a constant rather
+    than an estimate: measured cold in a fresh process over 4 M rows, it reads 400,000 whether
+    the true group count is 100 or 3,147,395. That is survivable *here* only because the
+    caller floors the reducer count at the worker count — a low estimate therefore lands on
+    exactly the pre-existing one-reducer-per-worker behaviour and cannot make the exchange
+    worse. It does mean the cold-start scaling this fallback exists for is real only for
+    sources that carry statistics (a Parquet footer, a learned `__column_ndv__`), and that
+    giving in-memory sources cheap key statistics would be what makes it general.
+
+    The learned path above needs none of this: it is exact from the second run on.
+    """
+    if not sources:
+        return None
     try:
-        import math
+        cardinality = active_config().optimizer.cardinality
+        from batcher.kyber.cardinality import CardinalityEstimator
 
+        est = CardinalityEstimator(list(sources), {}, cardinality)
+        rows = est.estimate(node).rows
+    except Exception as exc:
+        note_suppressed("dist", "estimate reducer count", exc)
+        return None
+    if not rows or rows <= 0:
+        return None
+    # `unknown_rows` (1e12) is Kyber's *placeholder* for a relation nothing could size — its
+    # own estimator calls it "not an estimate at all" and refuses to reason from it. A sizing
+    # that took it at face value would read a source with no statistics (an iterator, a
+    # connector with no catalog) as the largest table imaginable and open the maximum number
+    # of near-empty streams for it, which is the low-end waste the reducer counts exist to
+    # avoid. No evidence must look like no evidence.
+    return None if rows >= cardinality.unknown_rows else rows
+
+
+def _sizing_rows(node, sources) -> float | None:
+    """How many rows the exchange below `node` carries — measured, else estimated, else None.
+
+    The one place the two reducer sizings agree on where their number comes from: the
+    measured history for this exact shape first, because it is exact from the second run on,
+    and Kyber's estimate only when there is none. Both were written out twice before, and the
+    two copies are what a divergence would hide — a sizing that consults history in one
+    exchange and not another is invisible until a cluster is under it.
+
+    Every failure lands on None, which every caller reads as "keep the fan-out you had". That
+    is the module's standing contract made mechanical rather than incidental: a scheduling
+    knob must never raise into execution, and the estimate path reaches the optimizer, the
+    metadata hub, and the config to produce its answer.
+
+    Args:
+        node: The plan node whose output volume is being sized.
+        sources: The sources `node` reads, for the cold-start estimate. Must be narrowed to
+            match the node's own source ids — a relabeled map plan reads source 0.
+
+    Returns:
+        A positive row count, or None when neither history nor an estimate can supply one.
+    """
+    rows = None
+    try:
         from batcher.core.runtime import default_hub
         from batcher.kyber.learned_tuning import learned_signature_rows
         from batcher.kyber.signature import plan_signature
 
-        rows = learned_signature_rows(default_hub(), plan_signature(agg))
+        rows = learned_signature_rows(default_hub(), plan_signature(node))
     except Exception as exc:  # learning is best-effort; a miss keeps the default fan-out
         note_suppressed("dist", "read learned reducer count", exc)
-        return base_reducers
     if rows is None or rows <= 0:
+        try:
+            rows = _estimated_rows(node, sources)
+        except Exception as exc:  # pragma: no cover - the estimator guards itself too
+            note_suppressed("dist", "estimate reducer count", exc)
+            rows = None
+    return rows if rows is not None and rows > 0 else None
+
+
+def aggregate_reducer_count(agg, base_reducers: int, floor: int = 1, sources=None) -> int:
+    """Reducer count for a keyed aggregate, sized by its LEARNED output cardinality.
+
+    An aggregate's reduce shuffles PARTIAL-aggregated state, whose size is the group count —
+    not the (far larger) scanned input. `base_reducers` (the generic one-per-worker fan-out)
+    is therefore the wrong number in *both* directions, and the group count is what fixes it.
+
+    Too many, at the low end: a 60M-row to 4-group aggregate does not need one reducer per
+    worker each fetching from every mapper (a near-empty all-to-all), it needs one.
+
+    Too few, at the high end, which is the one that breaks scaling. One reducer per worker
+    fixes the reduce fan-out to the *cluster*, so each reducer's group table grows with the
+    data: double the rows on the same cluster and every reducer's hash table doubles, until
+    it stops fitting and the reduce spills. Wall time then grows faster than the input, which
+    is exactly the superlinearity the mergeable algebra exists to avoid — the algebra allows
+    any number of partial states to be merged independently, and pinning that number to the
+    node count throws the property away. Sizing to `target_rows_per_task` groups per reducer
+    instead keeps each reducer's state bounded at any scale; Ray queues the surplus tasks
+    across the same workers, so more reducers cost scheduling, not memory.
+
+    The count is capped by `distributed.max_shuffle_partitions`, because an exchange opens
+    `mappers x reducers` streams and that product, not the reducer count, is what a very
+    large cluster cannot afford.
+
+    `floor` is the count below which trimming stops paying — the worker count, because a
+    bucket is reduced by exactly ONE worker, so fewer buckets than workers leaves the rest
+    idle for the whole reduce phase. The group count alone cannot see that: 5 M groups
+    against a 4 M-row target asks for 2 reducers, which on an 8-worker cluster sat six
+    workers out and made the reduce *slower* the more workers were added — measured on a
+    9-node cluster at 0.65 s (2 workers), 1.05 s (4) and 4.47 s (8), against a map barrier
+    that scaled normally over the same runs. The floor is itself capped by `rows`, so the
+    low-cardinality trim above still reaches 1 for an aggregate that really does produce
+    fewer groups than there are workers — that near-empty all-to-all is real.
+
+    A cold signature falls back to Kyber's *estimated* group count
+    (`_estimated_rows`) so a first run at scale is still sized by cardinality rather
+    than by the cluster's shape; only when there is no estimate either does it keep
+    `base_reducers`. The mergeable algebra makes any reducer count result-identical, so this
+    only shapes the exchange.
+    """
+    rows = _sizing_rows(agg, sources)
+    if rows is None:
         return base_reducers
     target = max(1, active_config().optimizer.target_rows_per_task)
-    return max(1, min(base_reducers, math.ceil(rows / target)))
+    # `rows` is a learned EMA and therefore a float; the floor is capped by it, so it must be
+    # truncated to an int or the whole count becomes a float and `partition_batches` — whose
+    # `num_partitions` is a Rust `usize` — raises at the FFI boundary on the worker.
+    want = max(1, math.ceil(rows / target), min(floor, int(rows)))
+    cap = active_config().distributed.max_shuffle_partitions
+    return min(want, cap) if cap > 0 else want
 
 
 def record_aggregate_cardinality(agg, output_rows: int) -> None:
@@ -340,3 +457,63 @@ def record_aggregate_cardinality(agg, output_rows: int) -> None:
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("dist", "record aggregate cardinality", exc)
         return
+
+
+def row_shuffle_reducer_count(
+    map_plan, base_reducers: int, sources=None, source_id: int = 0
+) -> int:
+    """Reducer count for an exchange that shuffles **raw rows** — join, sort, window, distinct.
+
+    `aggregate_reducer_count` sizes the one exchange whose shuffled volume is *smaller* than
+    its input: an aggregate exchanges partial state, so its reduce is sized by the group
+    count. Every other shuffle exchanges the rows themselves, and until now every one of them
+    took `shuffle_partitions(workers)` — a count that consults only *learned* history and, on
+    a cold store, is exactly one bucket per worker.
+
+    One bucket per worker is the wrong shape at scale for a reason that has nothing to do
+    with parallelism. A bucket is the unit a reducer holds at once: a join builds its hash
+    table from one, a sort sorts one, a window materializes one partition-run of one. Fixing
+    the bucket count to the *cluster* makes that working set grow with the data — double the
+    rows on the same cluster and every reducer's working set doubles, until it stops fitting
+    and the operator spills. Wall time then grows faster than the input, which is the
+    superlinearity the mergeable algebra exists to remove; pinning the bucket count to the
+    node count is how it gets put back. The first run at full scale is both the one that
+    suffers most and the one a learned count cannot help, so this reads Kyber's estimate
+    when no history exists.
+
+    **This may only raise the count, never lower it.** Below `base_reducers` a bucket-per-
+    worker floor is already in force for a reason (fewer buckets than workers idles workers
+    for the whole reduce phase), and unlike an aggregate a raw-row shuffle has no
+    low-cardinality case where trimming is right — every input row lands in some bucket. The
+    surplus buckets cost scheduling, not memory: Ray queues them across the same workers.
+
+    The count is capped by `distributed.max_shuffle_partitions`, because an exchange opens
+    `mappers x reducers` streams and that product is what a very large cluster cannot afford.
+
+    Args:
+        map_plan: The map-side plan whose output is exchanged. Its estimated or measured
+            row count is the volume being divided. It has been relabeled to read source 0.
+        base_reducers: The generic fan-out (`shuffle_partitions`), used as the floor.
+        sources: The query's bound sources, for Kyber's cold-start estimate.
+        source_id: Which of them `map_plan` originally read. The narrowing happens **here**
+            rather than at the call site so an out-of-range id costs the estimate and not the
+            query — every caller relabels its plan, and every one of them had to remember to
+            pass `[sources[its own id]]` or silently size the exchange from whichever table
+            happened to be source 0.
+
+    Returns:
+        The reducer count, at least `base_reducers`. Any count is result-identical under the
+        mergeable algebra, so this only shapes the exchange.
+    """
+    try:
+        narrowed = None if sources is None else [sources[source_id]]
+    except (IndexError, TypeError) as exc:
+        note_suppressed("dist", "narrow the sources for a shuffle estimate", exc)
+        narrowed = None
+    rows = _sizing_rows(map_plan, narrowed)
+    if rows is None:
+        return base_reducers
+    target = max(1, active_config().optimizer.target_rows_per_task)
+    want = max(base_reducers, math.ceil(rows / target))
+    cap = active_config().distributed.max_shuffle_partitions
+    return min(want, cap) if cap > 0 else want

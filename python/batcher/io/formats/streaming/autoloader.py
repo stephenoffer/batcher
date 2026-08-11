@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from typing import Any
 
 import pyarrow as pa
 
@@ -66,6 +67,12 @@ class IncrementalFileSource:
             ``maxBytesPerTrigger``). Composes with `max_files_per_trigger`; whichever
             bound trips first wins. A single file larger than the budget is still
             admitted alone.
+        reader_options: Everything else, forwarded verbatim to the file reader for each
+            new file — a CSV ``delimiter``, a declared ``schema``, ``storage_options``
+            for the store the files live in, and the two tolerance flags (``on_error``,
+            ``on_bad_lines``). A continuous ingest is exactly where these matter most:
+            the files arrive from a producer nobody is watching, so a stream that cannot
+            be told to tolerate one malformed record stops on it and stays stopped.
 
     Laziness: ``iter_batches`` runs one discovery pass per call (a streaming
     driver loops). ``row_count`` is ``None`` — the directory is unbounded over
@@ -90,6 +97,7 @@ class IncrementalFileSource:
         "_max_files",
         "_path",
         "_pending",
+        "_reader_options",
         "_schema_cache",
         "_state_dir",
         "_store_obj",
@@ -105,6 +113,7 @@ class IncrementalFileSource:
         suffix: str | None = None,
         max_files_per_trigger: int | None = None,
         max_bytes_per_trigger: int | None = None,
+        **reader_options: Any,
     ) -> None:
         self._path = path
         self._format = format
@@ -144,6 +153,34 @@ class IncrementalFileSource:
         self._completed: list[str] = []
         self._completed_set: set[str] = set()
         self._store_obj: SeenStore | None = None
+        # Validated once, here, by building a reader against the format's own option spec.
+        # A streaming query is started and then left alone, so a typo that first raises on
+        # the fifth file at three in the morning is a materially worse error than the same
+        # typo raising at `start()`.
+        self._reader_options = dict(reader_options)
+        self._reject_unknown_options()
+
+    def _reject_unknown_options(self) -> None:
+        """Fail at construction on an option the file reader will not accept.
+
+        The reader is built against a path that need not exist: every format resolves its
+        keywords in `__init__` and touches the filesystem only when read, so this validates
+        the vocabulary without listing the directory (which on a watched prefix may still be
+        empty).
+        """
+        if not self._reader_options:
+            return
+        SOURCES.get(self._format)(self._path, **self._reader_options)
+
+    def _reader(self, path: str):
+        """The file reader for one discovered file, carrying the caller's options.
+
+        One place, because the three call sites — schema inference, the read, and the
+        distributed split — must agree. They did not: none of them forwarded anything, so a
+        `delimiter=` or `storage_options=` accepted by the public entry point reached no
+        reader at all.
+        """
+        return SOURCES.get(self._format)(path, **self._reader_options)
 
     # ---- discovery --------------------------------------------------------
     def _store(self) -> SeenStore:
@@ -284,8 +321,7 @@ class IncrementalFileSource:
                 raise IOError(
                     f"cannot infer schema: no {self._suffix} files yet under {self._path!r}"
                 )
-            reader = SOURCES.get(self._format)(files[0])
-            self._schema_cache = reader.schema()
+            self._schema_cache = self._reader(files[0]).schema()
         return self._schema_cache
 
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
@@ -299,8 +335,7 @@ class IncrementalFileSource:
         in flight.
         """
         for path in self.discover():
-            reader = SOURCES.get(self._format)(path)
-            yield from reader.iter_batches(projection)
+            yield from self._reader(path).iter_batches(projection)
             self.complete([path])
         # Reaching here means the consumer drained the pass: under the streaming engine
         # every batch yielded has been published (a publish precedes the next pull), and a
@@ -321,7 +356,12 @@ class IncrementalFileSource:
         and publishes the whole pass as a single transaction — so the epoch's files are
         confirmed together or not at all.
         """
-        return [FileSplit(self._format, path) for path in self.discover()]
+        # The options ride the split for the reason `FileSplit` carries them everywhere
+        # else: a worker rebuilds the reader from the split alone, so anything left out
+        # reverts to its default on the cluster and nowhere else.
+        return [
+            FileSplit(self._format, path, dict(self._reader_options)) for path in self.discover()
+        ]
 
 
 def _safe_size(fs: object, path: str) -> int:

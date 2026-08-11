@@ -238,22 +238,46 @@ class LearnedMemoryModel:
         widths = [w for k, w in self._bytes_per_row.items() if k in wanted and w > 0]
         return max(widths) if widths else None
 
-    def blend_peak(self, kind: str, plan_estimate: int) -> int:
+    def blend_peak(self, kind: str, plan_estimate: int, row_size: float | None = None) -> int:
         """Blend a plan's per-operator peak-byte estimate toward the measured reality.
 
-        The plan estimate assumes `optimizer.row_bytes` bytes per row; the learned
-        `bytes_per_row` is what the family actually used. Their ratio rescales the
+        The plan sized the operator at roughly `rows x row_size` bytes; the learned
+        `bytes_per_row` is what the family actually used per row. Their ratio rescales the
         estimate to measured reality (size-general — it multiplies *this* plan's own
         estimate), exp-smoothed toward the measurement by `alpha` and clamped to within
         `clamp`x of the estimate so timing/measurement noise can't produce a degenerate
         size. Returns the plan estimate unchanged when the family is unlearned; when the
         plan could not size the op (`plan_estimate <= 0`) there is nothing to rescale,
         so it also abstains (an unsized op stays unsized — conservative).
+
+        **`row_size` is the width the plan actually sized with**, and passing it is what
+        makes the ratio mean anything. This divided by the flat `optimizer.row_bytes`
+        default instead, which stopped being the width `annotate` uses once it moved to a
+        byte-true `row_width` — so the rescale was wrong by exactly `row_size / row_bytes`.
+        That is one to two orders of magnitude on the wide payloads `row_width` exists to
+        model (embeddings, blobs, images), in the direction that *inflates* the estimate:
+        every such operator blew straight through to the `clamp` ceiling the moment its
+        family was learned, and queries that fit were routed out-of-core. It is the same
+        mistake `_est_input_rows` above already documents and avoids, one method apart.
+
+        Args:
+            kind: The operator's family name.
+            plan_estimate: The peak bytes Kyber sized this operator at.
+            row_size: The per-row width that estimate was built from
+                (`PlanProperties.row_size`). `None` falls back to `optimizer.row_bytes`,
+                which is right only for a plan that sized with the flat default — a bare
+                test double, or an operator that published no width.
+
+        Returns:
+            The blended peak in bytes.
         """
         bpr = self.bytes_per_row(kind)
-        if bpr is None or plan_estimate <= 0 or self._row_bytes <= 0:
+        if bpr is None or plan_estimate <= 0:
             return plan_estimate
-        measured = plan_estimate * (bpr / self._row_bytes)
+        assumed = float(row_size) if row_size is not None and row_size > 0 else self._row_bytes
+        if assumed <= 0:
+            return plan_estimate
+        measured = plan_estimate * (bpr / assumed)
         blended = blend(plan_estimate, measured, self._alpha)
         return int(clamp_factor(blended, plan_estimate, self._clamp))
 

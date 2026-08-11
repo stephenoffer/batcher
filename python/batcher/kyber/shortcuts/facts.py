@@ -35,7 +35,7 @@ from batcher.config import Config
 from batcher.kyber.metadata_answer import _root_stats, nan_aware_bounds
 from batcher.metadata.hub import MetadataHub
 from batcher.plan.logical import LogicalPlan
-from batcher.plan.stats import ColumnStat, Provenance, RelStats
+from batcher.plan.stats import ColumnStat, Provenance, RelStats, SortOrder
 
 __all__ = ["ColumnFacts", "Facts", "facts_for", "facts_from_relstats"]
 
@@ -106,7 +106,7 @@ class Facts:
     rows: int | None = None
     estimated_rows: float = 0.0
     columns: Mapping[str, ColumnFacts] = field(default_factory=dict)
-    sorted_by: tuple[str, ...] = ()
+    sorted_by: tuple[SortOrder, ...] = ()
     nan_safe: bool = False
 
     def col(self, name: str) -> ColumnFacts:

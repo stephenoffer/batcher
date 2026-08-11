@@ -90,6 +90,10 @@ def supported_op(ir: dict) -> bool:
         return supported_aggregate(ir)
     if op == "window":
         return supported_window(ir)
+    # A keyed dedup is declined at the shape check too, so `eligibility` never routes a plan
+    # containing one to the device and then falls back mid-chain. See `_distinct`.
+    if op == "distinct":
+        return not ir.get("keys")
     return True
 
 
@@ -238,9 +242,18 @@ def distinct_rows(df, be: DfBackend):
     return df[~be.lib.DataFrame(folded).duplicated()].reset_index(drop=True)
 
 
-def _distinct(df, _ir: dict, be: DfBackend):
+def _distinct(df, ir: dict, be: DfBackend):
     # DISTINCT is a group-by over every column (`Distinct.as_aggregate`), so it inherits the
     # group-key problem the fold above exists for.
+    #
+    # A *keyed* dedup (`keys` non-empty) is declined rather than translated. The dataframe
+    # libraries do have `drop_duplicates(subset=...)`, but which row survives is the whole
+    # answer here, and matching the CPU engine on that — a `min` under an ordering, with this
+    # engine's null placement and float identity — is a second statement of the semantics that
+    # this tier's contract says must be proven against the oracle on real hardware before it
+    # ships. Declining costs a CPU fallback; approximating costs a wrong row.
+    if ir.get("keys"):
+        raise Unsupported("distinct on a key subset")
     return distinct_rows(df, be)
 
 

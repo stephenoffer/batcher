@@ -93,6 +93,18 @@ INPUTS = {
 RIGHT = pa.table(
     {"k": pa.array([1, 3, 5, 7, 9, None], pa.int64()), "w": ["p", "q", "r", "s", "u", "z"]}
 )
+#: A **string**-keyed build side. The integer `RIGHT` above exercises the join's `Int64` fast
+#: path; nothing here reached the byte-keyed one, which hashes and compares raw bytes instead
+#: of encoding both sides through arrow's row format. The values carry what could separate the
+#: two encodings: a null (never matches), a duplicate key (a chain of length 2), the empty
+#: string, and a key that is a strict prefix of another ("a" against "aa") — which raw bytes
+#: keep distinct only because the length does.
+RIGHT_STR = pa.table(
+    {
+        "g": pa.array(["a", "b", "c", "a", None, "", "aa"]),
+        "w": ["p", "q", "r", "p2", "z", "e", "aa2"],
+    }
+)
 
 ORDERINGS = list(itertools.product([False, True], [False, True]))  # (descending, nulls_first)
 
@@ -141,6 +153,40 @@ UNORDERED_OPS: dict[str, tuple] = {
         "SELECT DISTINCT g, k FROM t",
     ),
     "distinct_float": (lambda d: d.select(bt.col("f")).distinct(), "SELECT DISTINCT f FROM t"),
+    # A *keyed* dedup: one whole row per key, payload carried. Distinct enough from the
+    # whole-row form to need its own rows — it gathers rows by index rather than emitting the
+    # hash table's own key columns, so a `-0.0`/NaN or null key that grouped correctly can
+    # still come back attached to the wrong payload.
+    #
+    # The ordering is over EVERY column, for the reason `window_row_number` gives: which of
+    # two rows tied on the ordering key survives is unspecified, so ordering on `k` alone
+    # would compare a free choice across paths rather than the operator. With a total order
+    # each tie group holds identical rows and any divergence is a real bug.
+    "dedup_keyed_first": (
+        lambda d: d.distinct(["g"], keep="first", order_by=TOTAL_ORDER),
+        "SELECT k, g, f, v FROM (SELECT *, row_number() OVER ("
+        "  PARTITION BY g ORDER BY k, g, f, v"
+        ") rn FROM t) WHERE rn = 1",
+    ),
+    "dedup_keyed_last": (
+        lambda d: d.distinct(["g"], keep="last", order_by=TOTAL_ORDER),
+        "SELECT k, g, f, v FROM (SELECT *, row_number() OVER ("
+        "  PARTITION BY g ORDER BY k DESC, g DESC, f DESC, v DESC"
+        ") rn FROM t) WHERE rn = 1",
+    ),
+    # A float key, where the surviving row must follow the engine's `-0.0`/NaN identity.
+    "dedup_keyed_float": (
+        lambda d: d.distinct(["f"], keep="first", order_by=TOTAL_ORDER),
+        None,
+    ),
+    # A composite key, and a key that is nearly unique (so almost nothing collapses).
+    "dedup_keyed_multi": (
+        lambda d: d.distinct(["g", "k"], keep="first", order_by=TOTAL_ORDER),
+        None,
+    ),
+    # `keep="any"` picks an unspecified row, so it gets no oracle and no path comparison —
+    # only the invariant that must hold however the row is picked, checked in
+    # `test_keyed_dedup_any_keeps_one_real_row_per_key`.
     "union": (lambda d: d.union(d), "SELECT * FROM t UNION ALL SELECT * FROM t"),
     "limit": (lambda d: d.limit(4), None),
     "row_index": (lambda d: d.with_row_index("rid"), None),
@@ -269,6 +315,38 @@ UNORDERED_OPS: dict[str, tuple] = {
         lambda d: d.with_columns(m=bt.col("v").max().over(partition_by="g")),
         None,
     ),
+    # A **string** join key, on all four join types. The integer entries above take the
+    # join's `Int64` fast path and never reach the byte-keyed one, so a raw-byte hash or
+    # comparison that disagreed with the row encoding — on the null, the duplicate, the
+    # empty string, or the "a"/"aa" prefix pair in `RIGHT_STR` — was invisible here.
+    "join_inner_str": (
+        lambda d: d.join(bt.from_arrow(RIGHT_STR), left_on="g", right_on="g", how="inner"),
+        None,
+    ),
+    "join_left_str": (
+        lambda d: d.join(bt.from_arrow(RIGHT_STR), left_on="g", right_on="g", how="left"),
+        None,
+    ),
+    "join_semi_str": (
+        lambda d: d.join(bt.from_arrow(RIGHT_STR), left_on="g", right_on="g", how="semi"),
+        None,
+    ),
+    "join_anti_str": (
+        lambda d: d.join(bt.from_arrow(RIGHT_STR), left_on="g", right_on="g", how="anti"),
+        None,
+    ),
+    # A group key that is (almost) unique, so the group count reaches the row count. That is
+    # the shape where `assign_groups` hands its key columns back untouched instead of `take`ing
+    # them at an identity permutation, and where the executor abandons pre-aggregation for the
+    # partitioned shape — neither of which any low-cardinality `GROUP BY g` above exercises.
+    "agg_unique_key": (
+        lambda d: d.group_by("k", "g", "v").agg(s=bt.col("v").sum()),
+        "SELECT k, g, v, SUM(v) AS s FROM t GROUP BY k, g, v",
+    ),
+    "distinct_unique_key": (
+        lambda d: d.select(bt.col("k"), bt.col("g"), bt.col("v")).distinct(),
+        "SELECT DISTINCT k, g, v FROM t",
+    ),
 }
 
 
@@ -336,6 +414,48 @@ def test_every_path_agrees_with_the_oracle(op, shape):
     assert_tables_equal(_stream(build(bt.from_arrow(table))), oracle)
 
 
+#: Two more schedulings of the same semantics, kept beside the three above because they are
+#: the same claim: only *where and when* the work happens changes.
+#:
+#: `spill(num_partitions=…)` forces a bucket count the data-sized default would not pick, and
+#: the bucket count is what three of the four bugs in this file's header had in common — a
+#: key that lands in one bucket by default and two when the count is forced is a key whose
+#: grouping is being decided by the partitioner rather than by its value.
+#:
+#: `adaptive=True` re-plans at pipeline breakers on *measured* cardinalities, so it can pick
+#: a different join side or algorithm than the one-shot plan did. It is the one path whose
+#: whole purpose is to arrive at a different plan, which makes "same answer" a claim worth
+#: making explicitly rather than one that follows from the operator tests.
+#:
+#: `repartitioned` splits the *input* before the operator runs, which is the closest thing to
+#: a distributed shuffle that CI can execute: the same `partial → combine → finalize`
+#: primitives run per partition and merge, with no Ray involved. The Ray-backed matrix in
+#: `test_diff_distributed_operator_matrix.py` covers the real thing, and the repo contract is
+#: explicit that CI installs no Ray — so without an entry here the whole operator table has no
+#: partitioned coverage in the PR gate at all.
+#:
+#: `repartitioned_sparse` asks for far more partitions than some shapes have rows, so most
+#: come back empty. An operator that mishandles an empty partial — by skipping the merge, or
+#: by seeding an identity that is wrong for it — passes every dense test and fails here.
+_SCHEDULINGS = {
+    "spill_partitioned": lambda ds: ds.collect(spill=True, num_partitions=3),
+    "adaptive": lambda ds: ds.collect(adaptive=True),
+    "repartitioned": lambda ds: ds.repartition(4).collect(),
+    "repartitioned_sparse": lambda ds: ds.repartition(64).collect(),
+}
+
+
+@pytest.mark.parametrize("scheduling", sorted(_SCHEDULINGS))
+@pytest.mark.parametrize("op", sorted(UNORDERED_OPS))
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+def test_the_replanning_and_repartitioning_paths_agree_too(scheduling, op, shape):
+    build, _ = UNORDERED_OPS[op]
+    table = INPUTS[shape]
+    oracle = build(bt.from_arrow(table)).collect()
+    got = _SCHEDULINGS[scheduling](build(bt.from_arrow(table)))
+    assert_tables_equal(got, oracle)
+
+
 @pytest.mark.parametrize("op", sorted(o for o, (_, sql) in UNORDERED_OPS.items() if sql))
 @pytest.mark.parametrize("shape", sorted(INPUTS))
 def test_every_operator_matches_duckdb(duck, op, shape):
@@ -344,6 +464,55 @@ def test_every_operator_matches_duckdb(duck, op, shape):
     table = INPUTS[shape]
     duck.register("t", table)
     assert_same(build(bt.from_arrow(table)).collect(), duck.sql(sql))
+
+
+@pytest.mark.parametrize("shape", sorted(INPUTS))
+@pytest.mark.parametrize("keys", [["g"], ["f"], ["g", "k"]])
+def test_keyed_dedup_any_keeps_one_real_row_per_key(shape, keys):
+    """`keep="any"` on all three paths, asserted on what it actually guarantees.
+
+    Which row survives is unspecified, so there is no oracle and no path-vs-path comparison
+    to make. What must hold however the row is picked is: exactly one row per distinct key,
+    the same key *set* the whole-row dedup of those key columns produces, and every returned
+    row is one that was really in the input — a synthesized row (one column's value paired
+    with another row's) would satisfy a row-count check and fail this.
+
+    The float key `f` carries both zeros and a NaN, so it also pins that the survivor is
+    chosen under the engine's float identity rather than raw bits.
+    """
+    table = INPUTS[shape]
+    real = {tuple(row.values()) for row in _rows(table)}
+    key_set = _rows(bt.from_arrow(table).select(*keys).distinct().collect())
+    for out in (
+        bt.from_arrow(table).distinct(keys).collect(),
+        bt.from_arrow(table).distinct(keys).collect(spill=True),
+        _stream(bt.from_arrow(table).distinct(keys)),
+    ):
+        rows = _rows(out)
+        assert len(rows) == len(key_set), f"expected one row per key, got {len(rows)}"
+        assert {tuple(r[k] for k in keys) for r in rows} == {
+            tuple(r[k] for k in keys) for r in key_set
+        }
+        for row in rows:
+            assert tuple(row.values()) in real, f"row {row} was never in the input"
+
+
+def _rows(table: pa.Table) -> list[dict]:
+    """`table`'s rows as dicts, with float keys canonicalized the way the engine groups them.
+
+    `-0.0` and `0.0` are one key to the engine and every NaN is one key, so a membership test
+    against the raw values would call a correctly-returned row missing.
+    """
+    import math
+
+    def canon(v):
+        if isinstance(v, float):
+            if math.isnan(v):
+                return "nan"
+            return 0.0 if v == 0.0 else v
+        return v
+
+    return [{k: canon(v) for k, v in row.items()} for row in table.to_pylist()]
 
 
 @pytest.mark.parametrize("shape", sorted(INPUTS))

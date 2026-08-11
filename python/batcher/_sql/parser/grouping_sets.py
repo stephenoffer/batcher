@@ -10,10 +10,10 @@ the levels are combined with UNION ALL. That keeps the aggregate path in
 
 from __future__ import annotations
 
-import sys
-
 from sqlglot import expressions as exp
 
+from batcher._sql.parser.clauses import _is_order_all, _order_all
+from batcher._sql.parser.core_utils import _alias_of, _row_window
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import col
 
@@ -88,6 +88,7 @@ def _grouping_sets_union(tr, node, group) -> Dataset:
     order = node.args.pop("order", None)
     limit = node.args.pop("limit", None)
     offset = node.args.pop("offset", None)
+    _pin_grouping_names(node)
 
     factors = _grouping_factors(group)
     levels = [[e for part in combo for e in part] for combo in itertools.product(*factors)]
@@ -107,33 +108,71 @@ def _grouping_sets_union(tr, node, group) -> Dataset:
         out = out.union(d, distinct=False)
 
     if order is not None:
-        out = _order_union(out, order, node.expressions)
+        out = _order_union(tr, out, order, node.expressions)
     if limit is not None or offset is not None:
-        skip = int(offset.expression.this) if offset is not None else 0
-        n = int(limit.expression.this) if limit is not None else sys.maxsize
+        n, skip = _row_window(limit, offset)
         out = out.limit(n, offset=skip)
     return out
 
 
-def _order_union(out: Dataset, order, projections) -> Dataset:
+def _pin_grouping_names(node) -> None:
+    """Give every un-aliased ``GROUPING(...)`` select item an explicit output name.
+
+    ``GROUPING(x)`` becomes a different integer literal in every level, and an un-aliased
+    select item is named after the expression it holds — so the levels disagreed on the
+    output name (``(0)`` against ``(1)``) and the UNION that combines them failed with
+    ``union inputs must have identical columns``. Standard reporting SQL
+    (``SELECT g, GROUPING(g), count(*) ... GROUP BY ROLLUP(g)``) could not run at all.
+
+    Naming the item once, here, from the expression as *written*, pins it across levels —
+    and matches what DuckDB names the same column.
+    """
+    for proj in list(node.expressions):
+        if isinstance(proj, exp.Alias):
+            continue
+        if next(proj.find_all(exp.Grouping, exp.GroupingId), None) is None:
+            continue
+        proj.replace(exp.alias_(proj.copy(), _alias_of(proj)))
+
+
+def _order_union(tr, out: Dataset, order, projections) -> Dataset:
     """Sort the unioned levels by the query's ORDER BY.
 
     The union carries the *projected* output columns, so an ORDER BY item is resolved
     against the SELECT list by name (its alias, or the SQL text of the item it repeats)
     rather than re-resolved against the source relation, which the union no longer has.
-    The 1-based positional form is resolved the same way. An item that names neither an
-    output column nor a position is rejected rather than silently ignored: SQL allows
-    ordering a grouped query by an expression outside the SELECT list, and this path
-    cannot see one.
+    The 1-based positional form is resolved the same way.
+
+    An item that is an *expression over* the select list — TPC-DS q70's
+    ``ORDER BY CASE WHEN grouping(a) + grouping(b) = 0 THEN a END`` — is rewritten term by
+    term onto the output columns and then lowered normally, which is the one reading that
+    works here: the source columns the expression was written against are gone, but every
+    part of it is still projected under some name. An item that reaches a column the union
+    does not carry is still rejected rather than silently ignored.
     """
-    by_text = {}
+    # `ORDER BY ALL` names no column at all, so it cannot be resolved against the SELECT
+    # list the way every other term here is; it means "every output column, left to
+    # right". Handled before that resolution rather than falling into it and being
+    # rejected as an unresolvable term.
+    if _is_order_all(order):
+        return _order_all(out, order, list(out.columns))
+
+    # Two maps, deliberately. `by_expr` holds only real expression texts and output names,
+    # and is what a *sub*-expression is matched against; `by_text` adds the 1-based
+    # positions, which are only ever a whole term. Folding the positions into the
+    # sub-expression map would rewrite the `1` in `ORDER BY x + 1` to the first output
+    # column — a silent wrong answer.
+    by_expr: dict[str, str] = {}
+    by_text: dict[str, str] = {}
     for i, p in enumerate(projections):
         name = p.alias_or_name
         if name:
-            by_text.setdefault(p.this.sql() if isinstance(p, exp.Alias) else p.sql(), name)
-            by_text.setdefault(name, name)
+            by_expr.setdefault(p.this.sql() if isinstance(p, exp.Alias) else p.sql(), name)
+            by_expr.setdefault(name, name)
         by_text.setdefault(str(i + 1), name)
+    by_text = {**by_expr, **by_text}
 
+    columns = set(out.columns)
     keys, desc, nulls_first = [], [], []
     for o in order.expressions:
         target = o.this
@@ -141,15 +180,43 @@ def _order_union(out: Dataset, order, projections) -> Dataset:
         name = by_text.get(text) or by_text.get(target.name)
         if name is None and isinstance(target, exp.Literal) and not target.is_string:
             name = by_text.get(target.this)
-        if name is None or name not in out.columns:
-            raise NotImplementedError(
-                f"ORDER BY {text} on a ROLLUP/CUBE/GROUPING SETS query must name a column "
-                "of the SELECT list; order in an enclosing query instead"
-            )
-        keys.append(col(name))
+        if name is not None and name in columns:
+            keys.append(col(name))
+        else:
+            keys.append(_order_expr_over_outputs(tr, target, by_expr, columns))
         desc.append(bool(o.args.get("desc")))
         nulls_first.append(bool(o.args.get("nulls_first")))
     return out.sort(*keys, descending=desc, nulls_first=nulls_first)
+
+
+def _order_expr_over_outputs(tr, target, by_expr: dict[str, str], columns: set[str]):
+    """Lower an ORDER BY term that computes over the union's output columns."""
+    rewritten = _retarget_to_outputs(target.copy(), by_expr, columns)
+    missing = sorted({c.name for c in rewritten.find_all(exp.Column)} - columns)
+    if missing:
+        raise NotImplementedError(
+            f"ORDER BY {target.sql()} on a ROLLUP/CUBE/GROUPING SETS query reaches "
+            f"{', '.join(missing)}, which the grouped result does not carry; name a column "
+            "of the SELECT list, or order in an enclosing query instead"
+        )
+    return tr._scalar(rewritten)
+
+
+def _retarget_to_outputs(node, by_expr: dict[str, str], columns: set[str]):
+    """Rewrite every sub-expression of `node` that the SELECT list projects to its name.
+
+    Outermost first, so a compound the query already names (``grouping(a) + grouping(b)``
+    projected as ``lochierarchy``) becomes that one column instead of being rebuilt from
+    parts the grouped relation no longer has.
+    """
+    name = by_expr.get(node.sql())
+    if name is not None and name in columns:
+        return exp.column(name)
+    for child in list(node.iter_expressions()):
+        replacement = _retarget_to_outputs(child, by_expr, columns)
+        if replacement is not child:
+            child.replace(replacement)
+    return node
 
 
 def _grouping_level_node(node, active: dict, every: dict):
@@ -184,4 +251,36 @@ def _grouping_level_node(node, active: dict, every: dict):
         inner = proj.this if isinstance(proj, exp.Alias) else proj
         if _grouping_key(inner) in inactive:
             proj.replace(exp.alias_(typed_null(inner), proj.alias_or_name))
+        else:
+            _null_inactive_refs(inner, inactive, typed_null)
+    having = m.args.get("having")
+    if having is not None:
+        _null_inactive_refs(having, inactive, typed_null)
     return m
+
+
+def _null_inactive_refs(node, inactive: dict, typed_null) -> None:
+    """NULL out, in place, every *nested* reference to a rolled-up grouping expression.
+
+    The top-level pass above rewrites a select item that *is* an inactive grouping key.
+    A reference buried inside a larger expression needs the same treatment and did not get
+    it, which is what broke the reporting idiom TPC-DS q70 and q86 are built on:
+
+        rank() OVER (PARTITION BY grouping(a) + grouping(b),
+                     CASE WHEN grouping(b) = 0 THEN a END ORDER BY sum(x) DESC)
+
+    At the level that rolls `a` up, the bare `a` inside the CASE is not a column of the
+    grouped relation at all, so the window's partition key failed to resolve.
+
+    Aggregate arguments are deliberately skipped: `sum(x)` at a level that rolls `x` up
+    still sums the underlying rows. Only the *grouped* reference goes to NULL.
+    """
+    from batcher._sql.parser.expressions.aggregates import is_agg_node
+
+    for child in list(node.iter_expressions()):
+        if is_agg_node(child):
+            continue
+        if _grouping_key(child) in inactive:
+            child.replace(typed_null(child))
+        else:
+            _null_inactive_refs(child, inactive, typed_null)

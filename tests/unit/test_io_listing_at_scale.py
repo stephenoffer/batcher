@@ -169,6 +169,57 @@ def test_a_glob_records_listing_info_so_identity_needs_no_stat(tmp_path) -> None
     )
 
 
+def test_the_prefix_scoped_remote_glob_also_records_listing_info(monkeypatch) -> None:
+    """The fsspec fast path recorded nothing, so the stat storm survived on remote globs.
+
+    The test above passes on a *local* path, and `_glob_prefix_scoped` declines local
+    schemes outright — so the one glob shape that skipped the recording was the one nothing
+    covered. It is also the shape that needs it most: the fast path is taken exactly for
+    ``dir/PREFIX*.ext``, the many-small-files layout it exists to speed up. Measured on a
+    1,024-file S3 corpus before the fix: 3,072 `_stat` calls costing 1.58 s against a 340 ms
+    read of the same bytes.
+
+    fsspec is faked rather than reached, so this asserts the contract (list once, record what
+    came back) with no network and no credentials.
+    """
+    import sys
+    import types
+
+    from batcher.io._backend import _ArrowFileSystem
+
+    listed = {
+        "bucket/dir/part-0.parquet": {"size": 11, "LastModified": 1_700_000_000.0},
+        "bucket/dir/part-1.parquet": {"size": 22, "LastModified": 1_700_000_001.0},
+        "bucket/dir/_SUCCESS": {"size": 0, "LastModified": 1_700_000_002.0},
+    }
+    calls = {"n": 0}
+
+    class _FakeBackend:
+        def glob(self, pattern, detail=False):
+            calls["n"] += 1
+            assert detail, "the listing must be requested with its detail, not re-stat-ed"
+            return dict(listed)
+
+    fake = types.ModuleType("fsspec")
+    fake.filesystem = lambda _scheme: _FakeBackend()
+    monkeypatch.setitem(sys.modules, "fsspec", fake)
+
+    import pyarrow.fs as pafs
+
+    fs = _ArrowFileSystem(pafs.LocalFileSystem(), "s3://", atomic_rename=False)
+    files = fs._glob_prefix_scoped("s3://bucket/dir/part-*.parquet", "bucket/dir/part-*.parquet")
+
+    assert calls["n"] == 1, "one LIST, not one per file"
+    assert files == ["s3://bucket/dir/part-0.parquet", "s3://bucket/dir/part-1.parquet"], (
+        "the marker file must still be filtered out of the returned set"
+    )
+    for path, size in (("part-0.parquet", 11), ("part-1.parquet", 22)):
+        info = fs.listing_info(f"s3://bucket/dir/{path}")
+        assert info is not None, f"{path} must answer from the listing, not a stat"
+        assert info[0] == size
+        assert info[1] > 0, "the listing's timestamp must survive into the identity"
+
+
 def test_glob_listing_info_does_not_survive_this_filesystem_overwriting_the_file(
     tmp_path,
 ) -> None:
@@ -213,8 +264,7 @@ def _count_footer_reads(monkeypatch) -> list[str]:
         return original(path)
 
     monkeypatch.setattr(parquet_splits, "_read_footer", _spy)
-    monkeypatch.setattr(parquet_splits._parquet_footer_cached, "cache_clear", lambda: None)
-    parquet_splits._parquet_footer_cached.cache_clear()
+    parquet_splits._FOOTERS.clear()
     return seen
 
 

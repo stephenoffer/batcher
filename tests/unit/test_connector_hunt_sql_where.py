@@ -76,9 +76,24 @@ def test_non_finite_float_is_not_pushed(bad: float):
 
 
 @pytest.mark.unit
-def test_non_finite_float_makes_whole_conjunction_unpushable():
+def test_non_finite_float_leaves_only_its_own_conjunct_unpushed():
+    # The non-finite term drops; the finite one still goes to the database. Widening a
+    # conjunction is safe (the engine's Filter re-checks every row that comes back) and
+    # the alternative is a full table extract because of one unspellable literal.
     pred = _binary(
         "and",
+        _binary("eq", _col("a"), _lit("int", 1)),
+        _binary("lt", _col("f"), _lit("float", float("inf"))),
+    )
+    assert to_sql_where(pred) == "a = 1"
+
+
+@pytest.mark.unit
+def test_non_finite_float_makes_a_disjunction_unpushable():
+    # An OR is the opposite: keeping only `a = 1` would drop the rows the other side
+    # matched, and no post-scan Filter can recover rows that never crossed the wire.
+    pred = _binary(
+        "or",
         _binary("eq", _col("a"), _lit("int", 1)),
         _binary("lt", _col("f"), _lit("float", float("inf"))),
     )

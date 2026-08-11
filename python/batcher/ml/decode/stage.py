@@ -116,7 +116,12 @@ def _require_frames(num_frames: int, who: str) -> int:
 
 def _require_size(size: tuple[int, int] | None, who: str) -> tuple[int, int]:
     if size is None:
-        raise PlanError(f"{who} requires size=(height, width), e.g. size=(224, 224)")
+        raise PlanError(
+            f"{who} requires size=(height, width), e.g. size=(224, 224). The native decode "
+            f"emits a fixed-shape tensor column, which needs one shape for every row. To keep "
+            f"each image at its own resolution, decode in a `map_batches` and return the "
+            f"arrays — the engine carries mixed shapes as a variable-shape tensor column."
+        )
     height, width = size
     if height <= 0 or width <= 0:
         raise PlanError(f"{who} size must be positive, got {size}")

@@ -7,16 +7,18 @@ windowing, and the row-reshaping nodes live in sibling modules.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr
+from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.ir_tags import Op
 from batcher.plan.logical.base import (
     LogicalPlan,
+    SortKeySpec,
     _reject_duplicate_aliases,
     _validate_projection_refs,
     _validate_refs,
@@ -46,8 +48,25 @@ class Scan(LogicalPlan):
 
     source_id: int
     schema: SchemaRef
+    #: A stable name for *which relation* this reads, from `plan.source_stats.source_stats_key`
+    #: — `""` for a scan over an intermediate that has no cross-run identity.
+    #:
+    #: `source_id` cannot serve: it is an index into *this plan's* own source list, so the
+    #: first source of every query is `0`. That is why `kyber.signature` rendered every scan
+    #: as the bare token `["scan"]`, and why two filters of the same shape over different
+    #: tables shared one learned entry — the "scan-collision defect" that module names.
+    #:
+    #: Excluded from equality (`compare=False`) deliberately. Plan nodes are compared to
+    #: decide whether a rewrite changed anything, and that question is about *shape*; making
+    #: two structurally identical scans unequal because they read different files would
+    #: perturb rule fixpoints to fix a problem that is not about rewriting. Identity is what
+    #: `signature` and `content_key` ask for, and both read the field directly.
+    source_key: str = field(default="", compare=False)
 
     def to_ir(self) -> dict[str, Any]:
+        # Deliberately not on the wire. The engine is handed the bound sources positionally,
+        # so `source_id` is all it needs; `source_key` exists for the planner's own keying and
+        # a second copy of it in the IR would be a second, driftable source of truth.
         return {"op": Op.SCAN, "source_id": self.source_id}
 
     def identity_suffix(self) -> str:
@@ -165,15 +184,64 @@ class Limit(LogicalPlan):
 
 @dataclass(frozen=True, slots=True)
 class Distinct(LogicalPlan):
-    """Deduplicate rows over all columns."""
+    """Deduplicate rows: over every column, or over a key subset keeping one whole row.
+
+    With no `keys` this is SQL `DISTINCT` — rows agreeing on all columns collapse, and
+    there is nothing to choose between them. With `keys` it is `DISTINCT ON`: the named
+    columns decide which rows collapse and the survivor still carries every other column,
+    chosen by `order` (the minimum under it) or arbitrarily when `order` is empty.
+
+    Both forms are one mergeable reduction in the engine, so the single-node, parallel and
+    distributed paths schedule the same operator rather than implementing it twice.
+    """
 
     input: LogicalPlan
+    keys: tuple[str, ...] = ()
+    order: tuple[SortKeySpec, ...] = ()
+    limit: int | None = None
+
+    def __post_init__(self) -> None:
+        available = available_column_set(self.input)
+        # A dedup key is a column name, so an unknown one is caught here rather than
+        # surfacing from the engine as an index-of failure after the whole scan.
+        unknown = [k for k in self.keys if k not in available]
+        if unknown:
+            raise PlanError(f"distinct(): unknown key column(s) {sorted(unknown)}")
+        for key in self.order:
+            _validate_refs(key.expr, available, what="distinct order key")
+        if self.order and not self.keys:
+            raise PlanError(
+                "distinct() over every column has no payload to order: an ordering only "
+                "chooses between rows that differ, and rows that agree on all columns do not"
+            )
+        if self.limit is not None:
+            if self.limit < 0:
+                raise PlanError(f"distinct(): limit must not be negative, got {self.limit}")
+            # The engine's early exit keeps the first `limit` distinct rows in input order,
+            # which only has a meaning when every surviving row is interchangeable. A keyed
+            # dedup chooses *which* row survives per key, so a later row can replace an
+            # earlier survivor and no prefix of the input settles the answer.
+            if self.keys:
+                raise PlanError(
+                    "distinct(): a limit fuses only into a whole-column DISTINCT, not "
+                    "DISTINCT ON — a keyed dedup's survivor can be replaced by a later row"
+                )
 
     def to_ir(self) -> dict[str, Any]:
-        return {"op": Op.DISTINCT, "input": self.input.to_ir()}
+        ir: dict[str, Any] = {
+            "op": Op.DISTINCT,
+            "input": self.input.to_ir(),
+            "keys": list(self.keys),
+            "order": sort_keys_ir(self.order),
+        }
+        # Omitted when unset so the wire shape is byte-identical to what it was before the
+        # limit existed; `bc_ir::RelOp::Distinct::limit` is `#[serde(default)]`.
+        if self.limit is not None:
+            ir["limit"] = self.limit
+        return ir
 
     def as_aggregate(self):
-        """This `Distinct` as the equivalent `Aggregate` — group by every column.
+        """This whole-row `Distinct` as the equivalent `Aggregate` — group by every column.
 
         DISTINCT is a group-by over all columns with no aggregate functions, which is
         what lets it reuse the mergeable aggregate wholesale: identical rows fold into
@@ -187,12 +255,33 @@ class Distinct(LogicalPlan):
         copy-pasted — which is exactly what had happened. `plan` is neutral, so this is
         the one place all three can reach.
 
+        Only the whole-row form has this equivalence. A keyed dedup is *not* a group-by:
+        the surviving row carries columns the grouping does not determine, and folding
+        them with per-column aggregates would build a row that was never in the input.
+
         Returns:
             An `Aggregate` over the same input, grouping by every available column.
+
+        Raises:
+            PlanError: If this node dedups on a key subset, or carries a fused limit.
         """
         from batcher.plan.expr_ir import Col
         from batcher.plan.logical.aggregate import Aggregate
 
+        if self.keys:
+            raise PlanError(
+                "a keyed distinct is not a group-by: its surviving row carries columns the "
+                "key does not determine, so there is no aggregate equivalent"
+            )
+        # `Aggregate` has nowhere to put the fused limit, so converting would drop the early
+        # exit *and* the truncation — the same rows as an unlimited DISTINCT, silently. Raise
+        # instead: every caller here reaches a path that runs the `Distinct` operator itself,
+        # so a limit arriving here means the fusion rule fired somewhere it should not have.
+        if self.limit is not None:
+            raise PlanError(
+                "a distinct carrying a fused limit has no aggregate equivalent: `Aggregate` "
+                "cannot express the early exit, so the conversion would silently drop it"
+            )
         keys = tuple(Projection(c, Col(c)) for c in self.input.available_columns())
         return Aggregate(self.input, keys, ())
 
@@ -390,6 +479,14 @@ class Sample(LogicalPlan):
     Deterministic and partition-independent: a row is kept iff a stable seeded hash
     of its values falls under `fraction`, so the same rows are sampled single-node or
     distributed. Streaming and stateless; output schema equals the input's.
+
+    The selection unit is therefore the *distinct row*, not the row: identical rows hash
+    identically and are all kept or all dropped together. On an input with few distinct
+    rows the realized fraction is far from the requested one — two distinct values over
+    10,000 rows yield 0 at ``fraction=0.1`` and 5,000 at ``0.5``. Fixing that needs a
+    per-row disambiguator in the hash, which costs a shuffle to compute and would change
+    which rows every existing query samples, so it is a deliberate open trade rather than
+    an oversight. `Dataset.sample` documents the user-facing consequence.
     """
 
     input: LogicalPlan
@@ -498,8 +595,9 @@ class MapBatches(LogicalPlan):
     # Run the per-batch calls across `num_workers` *processes* instead of threads, so a
     # CPU-bound pure-Python `fn` (which the GIL would serialize across threads) uses
     # multiple cores on a single node. Opt-in; the local executor falls back to threads
-    # when the `fn` is not process-safe (a factory/class, a GPU `fn`, or a non-pyarrow
-    # `batch_format`). No effect on the distributed path (Ray actors already isolate).
+    # when the `fn` is not process-safe (a factory/class, a GPU `fn`, or one that cannot be
+    # serialized to a child). Any `batch_format` is fine — the conversion runs in the child.
+    # No effect on the distributed path (Ray actors already isolate).
     multiprocessing: bool = False
     # Dirty-data tolerance: the maximum number of ROWS whose per-row `fn` call may raise
     # before the query fails. 0 (the default) = strict (any error propagates). When > 0, a

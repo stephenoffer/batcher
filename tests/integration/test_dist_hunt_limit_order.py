@@ -141,3 +141,83 @@ def test_distributed_with_row_index_preserves_source_order(
     dist_map = dict(zip(dist.column("id").to_pylist(), dist.column("idx").to_pylist(), strict=True))
     assert single_map == {i: i for i in range(8000)}
     assert dist_map == single_map
+
+
+@pytest.fixture
+def _tied_key_parquet(tmp_path):
+    """Twelve row-groups over a key with heavy ties, on worker-readable storage.
+
+    Ties are the point. A distributed `ORDER BY k LIMIT n` returns the right *keys*
+    whatever order its input arrived in, so a key-only assertion cannot see the defect;
+    what it selects is a particular set of *rows* among those tied at the cut, and that is
+    decided by input order. The key therefore has to repeat far more often than `n`.
+    """
+    from batcher.dist.shuffle_io import shared_scratch_root
+
+    root = shared_scratch_root()
+    if root is not None:
+        base = os.path.join(root, f"tied_sort_{os.getpid()}")
+        os.makedirs(base, exist_ok=True)
+    else:
+        base = str(tmp_path)
+    rng = np.random.default_rng(17)
+    for i in range(12):
+        pq.write_table(
+            pa.table(
+                {
+                    "k": rng.integers(0, 40, 2_000).astype("int64"),
+                    "payload": np.arange(i * 2_000, (i + 1) * 2_000, dtype="int64"),
+                }
+            ),
+            os.path.join(base, f"tied_{i}.parquet"),
+        )
+    return base
+
+
+def _rows(table):
+    import collections
+
+    return collections.Counter(tuple(sorted(r.items())) for r in table.to_pylist())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("lim", [1, 20, 137])
+@pytest.mark.parametrize("descending", [False, True])
+def test_a_limited_sort_over_ties_returns_the_same_rows_as_single_node(
+    _tied_key_parquet, _fewer_partitions_than_splits, lim, descending
+):
+    """`ORDER BY k LIMIT n` must return single-node's *rows*, not merely its keys.
+
+    It did not, on either transport, and for a reason no key assertion reaches: splits were
+    assigned to partitions largest-first for even load, so a partition held non-adjacent
+    runs of the source. Every partition then cut its own ties in an order the source never
+    had, and the surviving rows differed from single-node's — same keys, same count,
+    correctly ordered, different rows. That is exactly what the distributed contract calls
+    out as exact ("the multiset of rows ... are exact"), with float reassociation as the
+    only exception.
+
+    Both routings are covered: `sort.limit` inside the shuffle-free top-N ceiling takes the
+    mergeable `_distributed_topn`, and the parametrization is small enough that it always
+    does — the full-range-sort-then-slice route is checked by the unlimited case below.
+    """
+    ds = bt.read.parquet(_tied_key_parquet).sort("k", descending=descending).limit(lim)
+    single = ds.collect()
+    dist = ds.collect(distributed=True, num_workers=4)
+
+    assert single.column("k").to_pylist() == dist.column("k").to_pylist()
+    assert _rows(single) == _rows(dist), "the same keys, but a different set of tied rows"
+
+
+@pytest.mark.integration
+def test_an_unlimited_sort_over_ties_returns_every_row(
+    _tied_key_parquet, _fewer_partitions_than_splits
+):
+    """The counterpart, and the reason the fix is scoped to *limited* sorts: an unlimited
+    sort keeps every row, so the tie order inside a key is free and the load-balanced split
+    assignment stays the better one."""
+    ds = bt.read.parquet(_tied_key_parquet).sort("k")
+    single = ds.collect()
+    dist = ds.collect(distributed=True, num_workers=4)
+
+    assert single.column("k").to_pylist() == dist.column("k").to_pylist()
+    assert _rows(single) == _rows(dist)

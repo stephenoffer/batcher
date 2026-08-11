@@ -1,7 +1,7 @@
 # Pub/Sub
 
-`bt.read.pubsub(subscription)` consumes a Google Cloud Pub/Sub subscription as an unbounded
-`Dataset`. Read only. There is no Pub/Sub sink in Batcher.
+{py:meth}`bt.read.pubsub(subscription) <batcher.api.io_namespace.reader.Reader.pubsub>` consumes a Google Cloud Pub/Sub subscription as an unbounded
+{py:class}`Dataset <batcher.Dataset>`. Read only. There is no Pub/Sub sink in Batcher.
 
 | | |
 | --- | --- |
@@ -103,7 +103,7 @@ Against the live subscription, the only line that changes is the source:
 ## It does not parallelize
 
 :::{important}
-A `Source` divides into `Split`s and each split is a unit of read parallelism. Pub/Sub exposes
+A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>`s and each split is a unit of read parallelism. Pub/Sub exposes
 no partitions, so the source models the stream as one logical partition and `splits()` returns
 exactly one split. One split means one reader, on one worker, however large your cluster.
 :::
@@ -143,7 +143,7 @@ a subscription-side setting, so it is a `gcloud` change, not a Batcher one.
 
 :::{tab-item} Deduplicate downstream
 Deduplicate on the message id, which is what the `offset` column is for.
-`drop_duplicates_within_watermark` does it with bounded state:
+{py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` does it with bounded state:
 
 ```python
 # docs: skip
@@ -183,8 +183,8 @@ The checkpoint directory is SQLite plus Arrow IPC on a real filesystem, not a `g
 `query_name` must be stable across restarts: it is the Delta transaction id a replayed
 micro-batch is recognized by.
 
-`collect()` raises `PlanError` on an unbounded source. Use `iter_batches()`, a triggered write,
-or `bt.Trigger.available_now()` to drain the current backlog and stop.
+{py:meth}`collect() <batcher.Dataset.collect>` raises {py:exc}`PlanError <batcher.PlanError>` on an unbounded source. Use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a triggered write,
+or {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>` to drain the current backlog and stop.
 
 ## Failure modes worth knowing
 

@@ -6,8 +6,8 @@ What changes once media is a column: what it costs to move, how it reaches a mod
 
 A multi-GB payload such as a video, an audio file, or a PDF carried inline in a column is
 copied through every sort and join and spill buffer it crosses, even when those
-operators only touch other columns. `offload_blobs` writes each payload to a
-content-addressed store and leaves a tiny URI handle in its place. `materialize_blobs`
+operators only touch other columns. {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>` writes each payload to a
+content-addressed store and leaves a tiny URI handle in its place. {py:meth}`materialize_blobs <batcher.Dataset.materialize_blobs>`
 reads it back right before you need the bytes. In between, only the short handle string
 rides through the pipeline.
 
@@ -94,7 +94,7 @@ once per GPU actor. A plain function would rebuild it on every batch. See
 ## Chunking documents for RAG ingest
 
 A document is usually longer than an embedding model's context, so the ingest chain is
-**load, split, embed, index**. `.str.chunk(size, overlap)` is the split stage. It
+**load, split, embed, index**. {py:meth}`.str.chunk(size, overlap) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.chunk>` is the split stage. It
 slices text into fixed-size overlapping windows as a `List<Utf8>`, which `explode` turns
 into one row per chunk. Sizes are in characters, and a chunk boundary never splits a
 Unicode codepoint.
@@ -110,7 +110,7 @@ print(chunks.select("id", "chunk").to_pydict())
 
 `overlap` carries context across a boundary, so a sentence cut in half still appears
 whole in one chunk. Chunks stop once one reaches the end of the text, so the last chunk
-is never a redundant suffix of its predecessor. From here, `ds.ml.embed(...)` produces
+is never a redundant suffix of its predecessor. From here, {py:meth}`ds.ml.embed(...) <batcher.api.dataset.ml.DatasetML.embed>` produces
 the vectors and the section below indexes them.
 
 The whole chain of scan, chunk, explode, and embed is a linear row-wise pipeline, so it
@@ -121,8 +121,8 @@ the downstream GPU stage for it. See {doc}`adaptive re-optimization </architectu
 
 ## Vector search over the embeddings
 
-`ds.ml.embed` produces the vectors on a `Dataset`. Over a bare batch stream, such as
-chunks coming out of a reader or a stage you are composing by hand, `batcher.ml.embed`
+`ds.ml.embed` produces the vectors on a {py:class}`Dataset <batcher.Dataset>`. Over a bare batch stream, such as
+chunks coming out of a reader or a stage you are composing by hand, {py:func}`batcher.ml.embed <batcher.ml.embed>`
 does the same work and takes an `EncoderFactory`. That is a zero-argument callable
 returning an encoder, which is any callable mapping `list[str]` to one equal-length
 vector per string. The factory is called once per worker, so the embedding model loads a
@@ -166,10 +166,10 @@ compute side and {doc}`LLM inference </ml/retrieval/llm/index>` for generation o
 
 Sometimes the embeddings already ride in a column, as in a reranking pass or a small
 candidate set that does not warrant an index. Score them against a query vector in-engine
-with the `.list` distance expressions, and no Lance is required. `.list.cosine_distance(q)`
+with the {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` distance expressions, and no Lance is required. {py:meth}`.list.cosine_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_distance>`
 is `1 - cosine_similarity`, so it reads 0 for identical direction, 1 for orthogonal, and 2
-for opposite. That is the standard embedding metric. `.list.l2_distance(q)` is the
-Euclidean distance. Each takes the query as another column or an `array(...)` literal and
+for opposite. That is the standard embedding metric. {py:meth}`.list.l2_distance(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_distance>` is the
+Euclidean distance. Each takes the query as another column or an {py:func}`array(...) <batcher.array>` literal and
 returns a Float64 that sorts ascending, so the nearest rows come first:
 
 ```python
@@ -189,9 +189,9 @@ print(out["id"], [round(d, 4) for d in out["dist"]])
 A dot product is a cheaper kernel than a full cosine, and on **unit-length** vectors
 the two rank identically. Cosine similarity is the dot product divided by both
 magnitudes, and those are 1 once the vectors are normalized. So normalize once, up front
-at embedding time, with `.list.normalize()`, which L2-normalizes each vector to unit
-length, and retrieve with the plain `.list.dot(q)` against a likewise-normalized query.
-`.list.l2_norm()` reports a vector's Euclidean magnitude, which confirms a vector is
+at embedding time, with {py:meth}`.list.normalize() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.normalize>`, which L2-normalizes each vector to unit
+length, and retrieve with the plain {py:meth}`.list.dot(q) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.dot>` against a likewise-normalized query.
+{py:meth}`.list.l2_norm() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` reports a vector's Euclidean magnitude, which confirms a vector is
 already unit-length before you skip the normalization:
 
 ```python

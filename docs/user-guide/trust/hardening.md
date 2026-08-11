@@ -11,7 +11,7 @@ making them mandatory, and about everything else on the disk and in the process.
 
 Batcher **authorizes**. It does not **authenticate**.
 
-A `Principal` is asserted by the caller. Any code running inside the engine's process can
+A {py:class}`Principal <batcher.Principal>` is asserted by the caller. Any code running inside the engine's process can
 construct any principal it likes, including one holding every role, and Batcher will honor
 it. That is not an oversight to be fixed by a future release: Batcher is a library imported
 into your process, and code already inside a process cannot be kept out of it.
@@ -20,7 +20,7 @@ So the trust boundary is **the process**, and the deployment pattern that follow
 
 - Run one process per trust domain. Authenticate at the layer that has a network edge,
   meaning your notebook server, API gateway, or job submitter, and pass the identity it
-  established into `bt.security(...)`.
+  established into {py:func}`bt.security(...) <batcher.security>`.
 - Treat "who is running this query" as answered before Batcher starts, not by Batcher.
 
 Everything below hardens what happens *inside* that boundary.
@@ -28,7 +28,7 @@ Everything below hardens what happens *inside* that boundary.
 ## Make governance mandatory
 
 By default, row filters and column masks apply only inside a `bt.security(...)` block. A
-`Dataset` built outside one is ungoverned, which is the correct default for a library and
+{py:class}`Dataset <batcher.Dataset>` built outside one is ungoverned, which is the correct default for a library and
 the wrong one for a deployment: forgetting the `with` block becomes the difference between
 a masked column and a plain one, and nothing says so.
 
@@ -54,7 +54,7 @@ print(strict.governance.mode)
 # strict
 ```
 
-Under `strict`, a read that no `security()` block covers raises `AccessDeniedError`. So
+Under `strict`, a read that no {py:func}`security() <batcher.security>` block covers raises {py:exc}`AccessDeniedError <batcher.AccessDeniedError>`. So
 does a source that cannot be governed at all. An in-memory table or a live stream has no
 durable name to write a policy about, so it is refused rather than silently exempted.
 

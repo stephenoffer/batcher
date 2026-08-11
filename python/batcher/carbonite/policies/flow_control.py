@@ -12,8 +12,9 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.mathx import clamp
 from batcher.carbonite.memory.pressure import total_memory_bytes
+from batcher.carbonite.policies.congestion import CongestionSignal
 from batcher.config import Config, active_config
-from batcher.metadata.smoothed import load_scalar, record_smoothed_scalar
+from batcher.metadata.smoothed import load_scalar_estimate, record_smoothed_scalar
 
 if TYPE_CHECKING:
     from batcher.carbonite.base import ResourceContext
@@ -27,6 +28,7 @@ __all__ = [
     "load_shuffle_window",
     "record_shuffle_window",
     "shuffle_store_cap",
+    "shuffle_window_is_stable",
 ]
 
 # Learned-parameter namespace for the converged AIMD credit window, keyed by a shuffle
@@ -241,6 +243,54 @@ _SLOW_START_FACTOR = 2
 _MAX_RECOVERY_ROUNDS = 1 << 20
 
 
+def _opening_window(
+    default_credits: int,
+    initial_window: int | None,
+    initial_window_stable: bool,
+    bdp_window: int | None,
+) -> tuple[int, bool]:
+    """Where a channel's window starts, and whether that start was actually *informed*.
+
+    Three sources, in increasing order of authority, and the second half of the answer matters
+    as much as the first. Slow start is a *search*: it doubles the window until the first
+    congestion signal, costing `log2(W)` round trips — two on a 100 ms link between 16 credits
+    and 64, by which time a short bucket has finished and spent its whole life below the window
+    it needed. Skipping that search is worth it only when something firm already knows the
+    answer, because an informed start with no ramp cannot correct itself upward.
+
+    **The configured default** is the floor, and it is a measured one rather than a guess: an
+    18 MiB partition over a 50 ms link moves at 2.4 MiB/s on 4 credits against 7.7 on 16.
+
+    **A measured bandwidth-delay product** may only ever raise that floor. This is the one place
+    the measurement can do harm taken literally — a loopback path really does have a product of
+    a credit or two, correct for that path and a disastrous opening window for the cross-node
+    fetch the same process makes next. Held one-sided, the failure stays one-sided with it: a
+    window may start wider than a short path needs, which the ceiling bounds and the control law
+    trims, but never narrower than the value chosen for the case where narrowness costs most.
+
+    **A learned window** for this shuffle's own signature wins outright, because it is where a
+    full control loop of this exact shape converged — it already accounts for the paths and for
+    everything the product cannot see: the reducer's fold rate, the memory the query holds
+    elsewhere, the skew across buckets. But it only counts as *informed* when past runs agreed
+    on it. A window averaged over runs that scattered is still the best guess available and is
+    used as the start; it has not earned the right to switch off the search.
+
+    Args:
+        default_credits: The configured cold-start window.
+        initial_window: A learned window for this shuffle signature, or `None`.
+        initial_window_stable: Whether past runs agreed on that learned window.
+        bdp_window: The measured bandwidth-delay product in credits, or `None`.
+
+    Returns:
+        The starting window before clamping, and whether slow start should be skipped.
+    """
+    if initial_window is not None:
+        return initial_window, initial_window_stable
+    if bdp_window is not None and bdp_window > default_credits:
+        return bdp_window, True
+    return default_credits, False
+
+
 class AIMDFlowControl:
     """Adaptive credit window via AIMD with TCP-style slow-start.
 
@@ -268,6 +318,8 @@ class AIMDFlowControl:
         effective_morsel_bytes: int | None = None,
         channels: int | None = None,
         ceiling: int | None = None,
+        bdp_window: int | None = None,
+        initial_window_stable: bool = True,
     ) -> None:
         cfg = config or active_config()
         fc = cfg.flow_control
@@ -305,9 +357,24 @@ class AIMDFlowControl:
         # so the window a channel actually uses is unchanged, only its starting point. A
         # warm-started channel skips slow-start: its window already reflects a prior run's
         # congestion, so exponential ramp from there would overshoot the learned value.
-        start = fc.default_credits if initial_window is None else initial_window
+        # Precedence: a learned window beats a measured bandwidth-delay product, and both
+        # beat the configured default.
+        #
+        # Not because the learned value is more recent — it is usually older — but because it
+        # is a strictly more informed *kind* of number. The BDP is what the network alone
+        # allows, and so it is a lower bound on the useful window. The learned value is where
+        # a full control loop of this exact shuffle shape actually converged, which already
+        # accounts for the paths *and* for everything the BDP cannot see: the reducer's fold
+        # rate, the memory the query holds elsewhere, the skew across buckets. Preferring the
+        # network-only figure would discard all of that.
+        #
+        # All three are only a starting point — the control law governs from there — so this
+        # decides how many rounds are spent finding the operating point, never what it is.
+        start, informed = _opening_window(
+            fc.default_credits, initial_window, initial_window_stable, bdp_window
+        )
         self._window: float = float(min(max(start, self._floor), self._ceiling))
-        self._slow_start = initial_window is None
+        self._slow_start = not informed
         # CUBIC state: the window the last backoff started from, and how many rounds ago that
         # was. `None` means no backoff has happened yet, so there is no known-good window to
         # recover toward and growth is slow-start or plain additive.
@@ -323,7 +390,15 @@ class AIMDFlowControl:
         # that reads as "the query is slow" with nothing pointing at the cause.
         self._backoffs = 0
         self._rounds = 0
+        # Rounds the window was held because the channel measured as saturated. The figure
+        # that says the controller is *converged* rather than merely uncongested: a window
+        # that holds most rounds has found the channel's bandwidth-delay product, and one
+        # that never holds is climbing to its ceiling on no evidence.
+        self._holds = 0
         self._peak_window = int(self._window)
+        # The network's own answer, kept so `stats` can say which constraint is actually
+        # binding. See `network_limited`.
+        self._bdp_window = bdp_window
 
     @property
     def window(self) -> int:
@@ -390,26 +465,87 @@ class AIMDFlowControl:
             "rounds": self._rounds,
             "backoffs": self._backoffs,
             "backoff_rate": (self._backoffs / self._rounds) if self._rounds else 0.0,
+            "holds": self._holds,
+            # A window that holds most of its rounds has converged on the channel's
+            # bandwidth-delay product. One that never holds is climbing on no evidence, which
+            # is what this controller did before it could see the channel.
+            "hold_rate": (self._holds / self._rounds) if self._rounds else 0.0,
             "slow_start": int(self._slow_start),
+            # Which constraint the window is actually up against. A shuffle capped by memory
+            # and one capped by the wire look identical in every other figure here, and they
+            # have opposite remedies: the first wants a bigger node or a narrower fan-in, the
+            # second wants a faster link or more of them. Nothing else in the engine can tell
+            # them apart, because nothing else knows what the path could carry.
+            "network_limited": int(self.network_limited),
         }
 
-    def observe(self, *, congested: bool) -> int:
-        """Update the window from one round's congestion signal; return the new window.
+    @property
+    def network_limited(self) -> bool:
+        """Whether the wire, rather than the memory ceiling, is what bounds this window.
 
-        `congested` is true when the round hit backpressure (e.g. the producer ran
-        the window full, or memory pressure was high): cut multiplicatively and leave
-        slow-start. Else the consumer kept up with headroom to spare: double the window
-        in slow-start, otherwise grow along the CUBIC curve toward the window the last
-        backoff happened at (`_grown_window`), never below what additive increase would give.
+        `True` when the path's bandwidth-delay product fits inside the ceiling Carbonite set,
+        so the window is free to sit where the network wants it. `False` when the ceiling is
+        the tighter of the two and the channel is being held below what the link could carry
+        — the memory-limited shuffle, which is a node-sizing problem rather than a network one.
+
+        `True` when no product has been measured, which reads as "no evidence of a memory
+        constraint" rather than as a diagnosis.
+        """
+        return self._bdp_window is None or self._bdp_window <= self._ceiling
+
+    def observe(self, *, congested: bool) -> int:
+        """Update the window from one round's *memory* signal; return the new window.
+
+        The two-state shorthand for `observe_signal`, kept for a caller that can see whether
+        the node is in trouble but not whether the channel is doing anything: `True` cuts,
+        `False` grows. Growing on every uncongested round is the permissive reading, and it is
+        what this controller did when memory was its only evidence.
+
+        Prefer `observe_signal` where the channel's occupancy is measurable — it is the
+        difference between a control loop and a ramp.
 
         Args:
-            congested: Whether this round hit backpressure.
+            congested: Whether this round hit memory backpressure.
+
+        Returns:
+            The new credit window.
+        """
+        return self.observe_signal(
+            CongestionSignal.CONGESTED if congested else CongestionSignal.STARVED
+        )
+
+    def observe_signal(self, signal: CongestionSignal) -> int:
+        """Update the window from one round's three-state verdict; return the new window.
+
+        - `CONGESTED` — cut multiplicatively and leave slow-start, relieving memory fast.
+        - `SATURATED` — hold. The consumer never waited on the wire, so the window already
+          covers the channel's bandwidth-delay product and further credits buy buffered
+          memory rather than throughput. This is the state the two-state law could not
+          express, and its absence is why an uncongested channel climbed to its ceiling
+          whether or not the extra credits moved a byte.
+        - `STARVED` — grow: double the window in slow-start, otherwise follow the CUBIC curve
+          back toward the window the last backoff happened at, never below what additive
+          increase would give.
+
+        A held round still counts as a round, so `hold_rate` reads as convergence rather than
+        as an idle controller.
+
+        Args:
+            signal: What the channel and the node measured this round.
 
         Returns:
             The new credit window.
         """
         self._rounds += 1
-        if congested:
+        if signal is CongestionSignal.SATURATED:
+            # Held, not grown — and the recovery clock is *not* advanced. Advancing it would
+            # walk the cubic forward through the rounds a converged window spent doing
+            # nothing, so the first later round that did starve would evaluate `(t - k)**3`
+            # far out on the curve and jump straight to the ceiling. The clock measures
+            # rounds spent recovering, and a held round is not one of them.
+            self._holds += 1
+            return self.window
+        if signal is CongestionSignal.CONGESTED:
             # Remember the window congestion was found at: that is the channel's measured
             # capacity, and the point growth should return to rather than crawl toward.
             self._w_max = self._window
@@ -467,9 +603,36 @@ def load_shuffle_window(hub: MetadataHub | None, signature: str) -> int | None:
 
     The stored value is a smoothed float; a window is a count of batch slots, so it is
     rounded here rather than truncated.
+
+    Whether the runs behind that average actually *agreed* is a separate question, asked
+    separately: see `shuffle_window_is_stable`. It is deliberately not folded into the return
+    value here, because the two have different consumers — the credit grant wants only the
+    number, and the adaptive controller wants both.
     """
-    value = load_scalar(hub, _SHUFFLE_WINDOW_NS, signature)
-    return None if value is None else round(value)
+    estimate = load_scalar_estimate(hub, _SHUFFLE_WINDOW_NS, signature)
+    return None if estimate is None else round(estimate.value)
+
+
+def shuffle_window_is_stable(hub: MetadataHub | None, signature: str) -> bool:
+    """Whether past runs of this shuffle agreed closely enough to act on the learned window.
+
+    A shuffle whose window has scattered across an order of magnitude has not learned a
+    window, it has averaged a bimodal population. Warm-starting from that is still the best
+    guess available, but *skipping slow start* as well leaves a badly-sized channel with no
+    ramp to escape on — strictly worse than never having learned. See
+    `metadata.smoothed.ScalarEstimate.stable`.
+
+    Args:
+        hub: The metadata hub, or `None` when learning is off.
+        signature: The shuffle channel's stable signature.
+
+    Returns:
+        `False` for a cold store, an unseen signature, or a value written before dispersion
+        was tracked — the conservative reading in every case, since an unknown spread is not
+        a small one.
+    """
+    estimate = load_scalar_estimate(hub, _SHUFFLE_WINDOW_NS, signature)
+    return estimate is not None and estimate.stable
 
 
 def record_shuffle_window(

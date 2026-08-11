@@ -24,6 +24,16 @@ Two knobs fix it, and both are Carbonite's job — this is the "protects" verb:
 Either alone is half a fix. Slots without width still oversubscribe within the admitted
 set. Width without slots leaves an unbounded queue of 1-core queries, which is fair but
 starves everyone equally.
+
+# The third knob: memory
+
+Cores were divided; memory was not. Every admitted query sized its spill decision against
+the *whole* envelope, so sixteen concurrent queries each concluded that a plan needing 60%
+of RAM fit — and all sixteen took the in-memory path into a collective OOM. That is the
+same oversubscription failure one level down, and `query_memory_share` is the same fix:
+divide the envelope by the queries actually running, exactly as `width_for` divides the
+cores. It is Spark's `ExecutionMemoryPool` rule (each of N active consumers is entitled to
+`1/N` of the pool) applied at query granularity.
 """
 
 from __future__ import annotations
@@ -39,8 +49,46 @@ __all__ = [
     "ConcurrencyLimiter",
     "ExecutionGrant",
     "process_limiter",
+    "query_memory_share",
     "reset_process_limiter",
 ]
+
+
+def query_memory_share(active: int, slots: int) -> float:
+    """The share of the process memory envelope one query may plan against.
+
+    The memory counterpart to `ConcurrencyLimiter.width_for`, and it exists for the same
+    reason. A query's spill decision compares its estimated peak against the envelope; when
+    N queries run at once and each compares against the *whole* envelope, N plans that each
+    need most of RAM all read as fitting, and every one of them takes the in-memory path.
+    Dividing by the live occupancy is Spark's `ExecutionMemoryPool` rule (each of N active
+    consumers is entitled to `1/N` of the pool) at query granularity.
+
+    This is the *proactive* half of cross-query memory safety. The reactive half already
+    existed in two places and is unchanged: `BudgetingAdmission` subtracts what concurrent
+    queries have already reserved from the shared buffer pool, and a `reserve` that does not
+    fit routes the query out-of-core. Both only see reservations that have *happened*, so
+    neither helps when several queries admit at the same moment — which is exactly the
+    16-client case this module was written for.
+
+    A share only moves the spill threshold, and spilling is result-invariant, so the cost of
+    being wrong here is latency in one direction and the process in the other.
+
+    Args:
+        active: Queries holding a slot, including this one.
+        slots: The configured slot count; `0` or less means unbounded.
+
+    Returns:
+        The fraction of the envelope this query may plan against, in ``(0, 1]``. Exactly
+        `1.0` when concurrency is unbounded or this is the only query — so an unconfigured
+        deployment (`execution.max_concurrent_queries = 0`, the default) is byte-identical.
+    """
+    if slots <= 0 or active <= 1:
+        return 1.0
+    # Held under `slots` as well as `active`: the limiter admits at most `slots` at once, so
+    # a transiently larger `active` (a limiter rebuilt under load) must not shrink a real
+    # query's budget below the share it is actually guaranteed.
+    return 1.0 / min(active, slots)
 
 
 class AdmissionTimeout(ResourceError):
@@ -110,17 +158,20 @@ class ConcurrencyLimiter:
         """Queries currently queued for a slot."""
         return self._waiting
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | float]:
         """Admission counters: live occupancy, and the lifetime queue/shed totals.
 
         Returns:
-            `slots`/`active`/`waiting` for the live picture, plus `queued` (queries that
-            had to wait) and `rejected` (queries turned away by a full queue or a deadline).
+            `slots`/`active`/`waiting` for the live picture, `memory_share` for the fraction
+            of the envelope a query admitted right now would plan against, plus `queued`
+            (queries that had to wait) and `rejected` (queries turned away by a full queue
+            or a deadline).
         """
         return {
             "slots": self._slots,
             "active": self._active,
             "waiting": self._waiting,
+            "memory_share": self.memory_share(),
             "queued": self._queued,
             "rejected": self._rejected,
         }
@@ -141,6 +192,21 @@ class ConcurrencyLimiter:
         if self._slots <= 0 or active <= 1:
             return 0  # unbounded: the historical single-query behavior
         return max(1, self._core_count() // active)
+
+    def memory_share(self) -> float:
+        """This query's share of the memory envelope, from the live occupancy.
+
+        Reads the limiter rather than taking an `active` argument because the caller that
+        needs it — the `ResourceManager`, at construction — is not the caller that acquired
+        the slot. A manager built *before* admission sees an occupancy that excludes its own
+        query and so plans against a slightly larger share; that is the conservative
+        direction, and the manager that makes the spill decision is built while the slot is
+        held.
+
+        Returns:
+            The fraction in ``(0, 1]``; `1.0` when concurrency is unbounded.
+        """
+        return query_memory_share(max(1, self._active), self._slots)
 
     def _core_count(self) -> int:
         """Cores to divide among running queries, memoized after the first probe.

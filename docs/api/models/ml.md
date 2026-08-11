@@ -1,26 +1,26 @@
 # The ML accessor
 
-This page covers the `.ml` accessor on a `Dataset` and the `batcher.ml` package behind it. For the relational surface these compose with, see {doc}`Dataset </api/relational/dataset>`.
+This page covers the `.ml` accessor on a {py:class}`Dataset <batcher.Dataset>` and the `batcher.ml` package behind it. For the relational surface these compose with, see {doc}`Dataset </api/relational/dataset>`.
 
 ML work attaches to a `Dataset` through the `.ml` accessor:
 
 | Method | Use |
 | --- | --- |
-| `ds.ml.map_batches(fn, ...)` | Apply an arbitrary function to each Arrow batch. |
-| `ds.ml.infer(model, ...)` | Run batch inference from a model id plus `column`, or from a model callable. |
-| `ds.ml.embed(model, ...)` | Generate embeddings from a model id plus `column`, or from a model callable. |
-| `ds.ml.generate(engine, ...)` | Offline LLM text generation, appending the response column. |
-| `ds.ml.download(url_col, ...)` | Fetch bytes at each URL/path into a column. |
-| `ds.ml.upload(data_col, dir, ...)` | Write a bytes column out to object storage. |
-| `ds.ml.iter_torch_batches(...)` | Stream the dataset to PyTorch as tensor batches. |
-| `ds.ml.stream_loader(...)` | A distributed-training `IterableDataset` for one rank. |
-| `ds.ml.train_test_split(test_size, seed=0)` | Disjoint, reproducible train/test `Dataset`s. |
-| `ds.ml.random_split(fractions, seed=0)` | The n-way generalization (train/val/test). |
-| `ds.ml.near_duplicates(column, threshold=0.8)` | MinHash + LSH near-duplicate pairs. |
-| `ds.ml.drop_near_duplicates(column, threshold=0.8)` | Fuzzy dedup, keeping one per cluster. |
-| `ds.ml.nearest_neighbors(query, column="embedding", k=10, metric="cosine")` | Exact brute-force top-`k` retrieval against a query vector. |
-| `ds.ml.similarity_to(query, column="embedding", metric="cosine")` | Score every row against a query vector (no top-`k` cut). |
-| `ds.ml.normalize_embeddings(column, output_column=None)` | Unit-normalize an embedding column (L2 = 1). |
+| {py:meth}`ds.ml.map_batches(fn, ...) <batcher.api.dataset.ml.DatasetML.map_batches>` | Apply an arbitrary function to each Arrow batch. |
+| {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` | Run batch inference from a model id plus `column`, or from a model callable. |
+| {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` | Generate embeddings from a model id plus `column`, or from a model callable. |
+| {py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` | Offline LLM text generation, appending the response column. |
+| {py:meth}`ds.ml.download(url_col, ...) <batcher.api.dataset.ml.DatasetML.download>` | Fetch bytes at each URL/path into a column. |
+| {py:meth}`ds.ml.upload(data_col, dir, ...) <batcher.api.dataset.ml.DatasetML.upload>` | Write a bytes column out to object storage. |
+| {py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` | Stream the dataset to PyTorch as tensor batches. |
+| {py:meth}`ds.ml.stream_loader(...) <batcher.api.dataset.ml.DatasetML.stream_loader>` | A distributed-training `IterableDataset` for one rank. |
+| {py:meth}`ds.ml.train_test_split(test_size, seed=0) <batcher.api.dataset.ml.DatasetML.train_test_split>` | Disjoint, reproducible train/test `Dataset`s. |
+| {py:meth}`ds.ml.random_split(fractions, seed=0) <batcher.api.dataset.ml.DatasetML.random_split>` | The n-way generalization (train/val/test). |
+| {py:meth}`ds.ml.near_duplicates(column, threshold=0.8) <batcher.api.dataset.ml.DatasetML.near_duplicates>` | MinHash + LSH near-duplicate pairs. |
+| {py:meth}`ds.ml.drop_near_duplicates(column, threshold=0.8) <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>` | Fuzzy dedup, keeping one per cluster. |
+| {py:meth}`ds.ml.nearest_neighbors(query, column="embedding", k=10, metric="cosine") <batcher.api.dataset.ml.DatasetML.nearest_neighbors>` | Exact brute-force top-`k` retrieval against a query vector. |
+| {py:meth}`ds.ml.similarity_to(query, column="embedding", metric="cosine") <batcher.api.dataset.ml.DatasetML.similarity_to>` | Score every row against a query vector (no top-`k` cut). |
+| {py:meth}`ds.ml.normalize_embeddings(column, output_column=None) <batcher.api.dataset.ml.DatasetML.normalize_embeddings>` | Unit-normalize an embedding column (L2 = 1). |
 
 These operate on whole `pyarrow.RecordBatch` objects, never on individual rows. They're lazy, as every other transformation is, and return a new `Dataset`. The loaders are the exception, returning a torch iterator.
 
@@ -134,7 +134,7 @@ See {doc}`Inference </ml/inference/inference>` for the inference workflow and
 
 ## What lives outside the accessor
 
-Operators that aren't `Dataset` methods live in `batcher.ml`: the standalone `embed` and `llm_generate` functions, the {doc}`preprocessors </ml/preparing/preprocessors/index>`, the {doc}`serving adapters </ml/training/serving>`, {doc}`vector search </ml/preparing/multimodal/index>`, the `Chain` preprocessor pipeline, the `ResumableSampler` checkpointable per-rank index stream, and the {doc}`LLM engines </ml/retrieval/llm/index>`.
+Operators that aren't `Dataset` methods live in `batcher.ml`: the standalone `embed` and `llm_generate` functions, the {doc}`preprocessors </ml/preparing/preprocessors/index>`, the {doc}`serving adapters </ml/training/serving>`, {doc}`vector search </ml/preparing/multimodal/index>`, the {py:class}`Chain <batcher.ml.preprocessors.Chain>` preprocessor pipeline, the {py:class}`ResumableSampler <batcher.ml.ResumableSampler>` checkpointable per-rank index stream, and the {doc}`LLM engines </ml/retrieval/llm/index>`.
 
 A *callable* model passed to `map_batches` or `infer` receives the whole batch and picks its own columns, so there's no `input_columns=` keyword. The model-identifier form of `infer` and `embed` takes the `column` to run on instead.
 
@@ -301,7 +301,7 @@ shard.
 ### Feature contract
 
 A trained model is only valid against the exact columns, order, and dtypes it saw during
-training. `FeatureSpec` pins that contract so scoring can be checked against it rather than
+training. {py:class}`FeatureSpec <batcher.ml.FeatureSpec>` pins that contract so scoring can be checked against it rather than
 failing silently on a reordered or retyped frame.
 
 ```{eval-rst}

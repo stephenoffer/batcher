@@ -48,7 +48,7 @@ overhead is not a rounding error, it is the workload.
 
 ## Compact in place
 
-`bt.compact` reads the path and rewrites it into fewer, larger files. The parts it
+{py:func}`bt.compact <batcher.compact>` reads the path and rewrites it into fewer, larger files. The parts it
 replaced are deleted:
 
 ```python
@@ -73,7 +73,7 @@ for written in manifest.files:
 # part-00000.parquet 24 879
 ```
 
-The `WriteManifest` is the record of what the rewrite produced: one entry per file, with
+The {py:class}`WriteManifest <batcher.io.WriteManifest>` is the record of what the rewrite produced: one entry per file, with
 its row count and size. It is the same object every write returns, so a scheduled
 compaction job can log it, compare it against the previous run, and tell you the day the
 file sizes started drifting back down.
@@ -102,7 +102,7 @@ target file size at write time, say so and skip the second pass entirely.
 
 :::{tab-item} Size the files by bytes
 
-`repartition(target_size_mb=...)` sizes the output files from the materialized result:
+{py:meth}`repartition(target_size_mb=...) <batcher.Dataset.repartition>` sizes the output files from the materialized result:
 
 ```python
 sized = os.path.join(work, "sized")
@@ -175,7 +175,7 @@ older version can still be read. Your bill does not go down until you vacuum, an
 compaction job that runs nightly and never vacuums grows the bucket instead of shrinking it.
 :::
 
-`bt.vacuum` is the operation that reclaims them, and it defaults to a dry run:
+{py:func}`bt.vacuum <batcher.vacuum>` is the operation that reclaims them, and it defaults to a dry run:
 
 ```python
 # docs: skip

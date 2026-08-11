@@ -1,7 +1,7 @@
 # Custom connectors
 
-Batcher reads and writes through two small contracts. A `Source` says what its
-schema is and how it divides into `Split`s. A `Sink` consumes Arrow tables and
+Batcher reads and writes through two small contracts. A {py:class}`Source <batcher.io.Source>` says what its
+schema is and how it divides into {py:class}`Split <batcher.io.Split>`s. A {py:class}`Sink <batcher.io.Sink>` consumes Arrow tables and
 reports the files it produced. Everything the engine ships (Parquet, CSV, JSON,
 Delta, Kafka) is written against those contracts and registered by name, and your
 own format plugs in the same way, with no fork of the engine.
@@ -16,7 +16,7 @@ from batcher.io import SINKS, SOURCES, FileSink, FileSource
 ## The read side
 
 A `Source` is a lazily-readable relation. It knows its `schema()` without touching
-the data, reads on demand (`read()` materializes, `iter_batches()` streams), reports
+the data, reads on demand (`read()` materializes, {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` streams), reports
 `row_count()` when that is cheap (and `None` when counting would cost a scan), and
 returns a stable `identity()` string that the metadata hub keys learned statistics
 under.
@@ -44,9 +44,9 @@ Three split types cover almost everything:
 
 | Split | Covers | Used by |
 | --- | --- | --- |
-| `FileSplit` | one whole file, rebuilt on the worker from `(format_name, path, kwargs)` | the `FileSource` default |
-| `RowGroupSplit` | a contiguous run of Parquet row-groups inside one file | `ParquetSource` |
-| `WholeSourceSplit` | a source that cannot subdivide, read as one slice | `InMemorySource`, `IteratorSource` |
+| {py:class}`FileSplit <batcher.io.FileSplit>` | one whole file, rebuilt on the worker from `(format_name, path, kwargs)` | the {py:class}`FileSource <batcher.io.FileSource>` default |
+| {py:class}`RowGroupSplit <batcher.io.RowGroupSplit>` | a contiguous run of Parquet row-groups inside one file | {py:class}`ParquetSource <batcher.io.ParquetSource>` |
+| {py:class}`WholeSourceSplit <batcher.io.WholeSourceSplit>` | a source that cannot subdivide, read as one slice | {py:class}`InMemorySource <batcher.io.InMemorySource>`, {py:class}`IteratorSource <batcher.io.IteratorSource>` |
 
 This is why a directory of 1,000 files and a single Parquet file with 1,000
 row-groups both parallelize: the first yields a split per file, the second a split
@@ -78,17 +78,17 @@ print(type(mem.splits()[0]).__name__, type(stream.splits()[0]).__name__)
 ```
 
 `RowGroupSplit` carries the footer-derived row count, so balancing the splits across
-workers never re-opens the file. `CSVSource` and `JSONSource` go further and cut a
+workers never re-opens the file. {py:class}`CSVSource <batcher.io.CSVSource>` and {py:class}`JSONSource <batcher.io.JSONSource>` go further and cut a
 large file into newline-aligned byte ranges, so one multi-GB CSV or NDJSON file fans
 across workers instead of being read on one node.
 
 ## The write side
 
-A `Sink` takes the other direction. `write(table, path)` writes a single file
-atomically and returns a `WrittenFile` (path, rows, bytes, and any Hive partition
+A `Sink` takes the other direction. {py:obj}`write(table, path) <batcher.Dataset.write>` writes a single file
+atomically and returns a {py:class}`WrittenFile <batcher.io.WrittenFile>` (path, rows, bytes, and any Hive partition
 values). `write_partitioned(table, path, ...)` writes one shard of a directory
 write and returns a `WrittenFile` per file. `commit(manifest, path)` finalizes the
-write from the `WriteManifest` that every shard contributed to: a no-op for file
+write from the {py:class}`WriteManifest <batcher.io.WriteManifest>` that every shard contributed to: a no-op for file
 sinks, whose data is visible as soon as it is written, and an atomic transaction-log
 commit for a lakehouse sink.
 
@@ -99,7 +99,7 @@ commit runs at the end.
 ## The registries
 
 `SOURCES` and `SINKS` map a name to a class. Registering under a name is what
-makes `bt.read(path, format="myfmt")` and `ds.write(path, format="myfmt")` resolve to
+makes {py:obj}`bt.read(path, format="myfmt") <batcher.read>` and {py:obj}`ds.write(path, format="myfmt") <batcher.Dataset.write>` resolve to
 your class, and it is also how a worker rebuilds a reader from a `FileSplit`: the
 split ships the format *name*, not the object.
 
@@ -110,7 +110,7 @@ a custom format is addressed by passing `format=` explicitly.
 
 ## A custom format, end to end
 
-`FileSource` and `FileSink` are Template-Method bases that already own path/glob
+{py:class}`FileSource <batcher.io.FileSource>` and {py:class}`FileSink <batcher.io.FileSink>` are Template-Method bases that already own path/glob
 expansion, filesystem resolution, schema caching, multi-file reads, projection
 plumbing, streaming, atomic writes, Hive partitioning, and split generation. A
 concrete format is the two or three primitives they call. Here is a pipe-separated
@@ -217,7 +217,7 @@ or the wrong protobuf message class, will happily return rows.
 A source does not have to subclass `FileSource`. Implement the six `Source` methods
 directly (a generator, a REST API, a table in a system Batcher has never heard of),
 return a single `WholeSourceSplit` if it cannot be sliced, and register it. Non-file
-sources are read by name with `bt.read.table(name, *args, **opts)`, which forwards
+sources are read by name with {py:meth}`bt.read.table(name, *args, **opts) <batcher.api.io_namespace.reader.Reader.table>`, which forwards
 its arguments straight to your constructor:
 
 ```python
@@ -261,9 +261,9 @@ print(bt.read.table("squares", 4).to_pydict())
 ```
 
 `InMemorySource` and `IteratorSource` are the two built-ins of this shape: the first
-wraps batches already in the process (what `from_arrow` and `from_pydict` build), the
+wraps batches already in the process (what {py:func}`from_arrow <batcher.from_arrow>` and {py:func}`from_pydict <batcher.from_pydict>` build), the
 second wraps a zero-argument factory that returns a fresh iterator of batches each
-time it is called (what `from_batches` builds, and the entry point for unbounded
+time it is called (what {py:func}`from_batches <batcher.from_batches>` builds, and the entry point for unbounded
 streams).
 
 ## Reference points in the tree
@@ -273,9 +273,9 @@ different split strategy.
 
 | Format | Source / sink | Splits into |
 | --- | --- | --- |
-| Parquet | `ParquetSource` / `ParquetSink` | `RowGroupSplit` runs, packed toward a target size |
-| CSV | `CSVSource` / `CSVSink` | newline-aligned byte ranges, or one `FileSplit` for a small file |
-| JSON (NDJSON) | `JSONSource` / `JSONSink` | newline-aligned byte ranges, same rule |
+| Parquet | {py:class}`ParquetSource <batcher.io.ParquetSource>` / {py:class}`ParquetSink <batcher.io.ParquetSink>` | {py:class}`RowGroupSplit <batcher.io.RowGroupSplit>` runs, packed toward a target size |
+| CSV | {py:class}`CSVSource <batcher.io.CSVSource>` / {py:class}`CSVSink <batcher.io.CSVSink>` | newline-aligned byte ranges, or one `FileSplit` for a small file |
+| JSON (NDJSON) | {py:class}`JSONSource <batcher.io.JSONSource>` / {py:class}`JSONSink <batcher.io.JSONSink>` | newline-aligned byte ranges, same rule |
 
 `ParquetSink` streams row-groups incrementally, `CSVSink` and `JSONSink` fan their
 encode across cores. None of that is required of a new format: implement `_write_file`

@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from batcher._internal.errors import ConfigError, MissingDependencyError
+from batcher._internal.errors import ConfigError
+from batcher._internal.optional import require
 from batcher.metadata.store import Key, decode_key, encode_key, require_uri
 
 __all__ = ["RedisBackend"]
@@ -65,12 +66,9 @@ class RedisBackend:
                 available_label="Supported schemes",
                 hint="A bare host:port needs the scheme, e.g. 'redis://localhost:6379/0'.",
             )
-        try:
-            import redis
-        except ImportError as exc:  # pragma: no cover - exercised only without redis
-            raise MissingDependencyError.of(
-                feature="The redis metadata backend", provides="redis-py", extra="redis"
-            ) from exc
+        redis = require(
+            "redis", feature="The redis metadata backend", provides="redis-py", extra="redis"
+        )
 
         self._uri = uri
         self._redis = redis.Redis.from_url(uri)

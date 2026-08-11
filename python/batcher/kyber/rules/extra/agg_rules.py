@@ -77,11 +77,17 @@ def _unique_column(stats: RelStats, name: str) -> bool:
     """Whether `name` provably holds a different value in every row — EXACT ``ndv >= rows``.
 
     Both facets must be EXACT; an HLL-derived ndv is a `SKETCH`, never a proof.
+
+    The gate is `ndv_is_exact` — the ndv's *own* tag — not the bundle's `provenance`, and the
+    difference is a wrong answer rather than a lost optimization. A scan whose bounds and null
+    count are EXACT carries an `ndv` that is only a bound (`ndv_provenance=DEFAULT`, typically
+    the row count itself), so reading the bundle tag proved every such column unique and every
+    relation already duplicate-free.
     """
     if not stats.rows_exact:
         return False
     stat = stats.column(name)
-    return stat.provenance is Provenance.EXACT and stat.ndv is not None and stat.ndv >= stats.rows
+    return stat.ndv_is_exact and stat.ndv is not None and stat.ndv >= stats.rows
 
 
 def _constant_value(stats: RelStats, name: str):

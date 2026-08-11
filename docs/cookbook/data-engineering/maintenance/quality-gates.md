@@ -27,7 +27,7 @@ customers = bt.from_pydict({"customer_id": [10, 20, 30], "name": ["ann", "bob", 
 
 ## Say what a good row is
 
-A constraint is a boolean expression that is TRUE for a valid row. `ds.dq` accumulates
+A constraint is a boolean expression that is TRUE for a valid row. {py:obj}`ds.dq <batcher.Dataset.dq>` accumulates
 them and returns a new accessor each time, so they chain, and the whole chain lowers to
 the same relational operators as everything else. There is no separate validation engine
 scanning your data a second time.
@@ -52,8 +52,8 @@ print(report.ok, report.total_violations)
 passed, so it is not in the report.
 
 :::{note}
-The value constraints treat NULL as valid: `in_range` does not fire on the NULL amount,
-`not_null` does. That is deliberate, so the checks compose independently instead of
+The value constraints treat NULL as valid: {py:meth}`in_range <batcher.api.dataset.dq.DatasetDQ.in_range>` does not fire on the NULL amount,
+{py:meth}`not_null <batcher.api.dataset.dq.DatasetDQ.not_null>` does. That is deliberate, so the checks compose independently instead of
 double-counting one bad row. State the null rule explicitly when you mean it.
 :::
 
@@ -64,9 +64,9 @@ that failed:
 
 | Verdict | What happens to a bad row | What it is for |
 |---|---|---|
-| `fail()` | nothing loads; `DataQualityError` carries the counts | a data contract at a pipeline boundary |
+| {py:meth}`fail() <batcher.api.dataset.dq.DatasetDQ.fail>` | nothing loads; {py:exc}`DataQualityError <batcher.DataQualityError>` carries the counts | a data contract at a pipeline boundary |
 | `drop()` | discarded, with no record it was ever there | a bad row that is genuinely noise |
-| `quarantine()` | routed to a second dataset, whole | a partner feed you have to keep loading |
+| {py:meth}`quarantine() <batcher.api.dataset.dq.DatasetDQ.quarantine>` | routed to a second dataset, whole | a partner feed you have to keep loading |
 
 ::::{tab-set}
 
@@ -82,7 +82,8 @@ try:
     batch.dq.not_null("amount").fail()
 except DataQualityError as err:
     print(err)
-# data-quality check failed: ValidationReport(violations: not_null(amount)=1)
+# data-quality check failed: not_null(amount)=1. Use .drop() to keep only valid rows, or
+# .quarantine() to route violating rows aside.
 ```
 :::
 
@@ -156,7 +157,7 @@ month is telling you something before it trips the gate.
 ## Referential integrity
 
 `order_id=4` references customer 99, who does not exist. No constraint above catches it,
-because the answer is not in this dataset. `foreign_key` joins against the reference and
+because the answer is not in this dataset. {py:meth}`foreign_key <batcher.api.dataset.dq.DatasetDQ.foreign_key>` joins against the reference and
 returns the orphans, so an empty result means every key resolves:
 
 ```python

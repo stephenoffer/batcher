@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
+from typing import Any
 
 from batcher.metadata.store import Key
 
@@ -13,7 +15,9 @@ class InProcessBackend:
     """A `MetadataBackend` backed by nested dicts. Not durable across processes."""
 
     def __init__(self) -> None:
-        self._tables: dict[str, dict[Key, bytes]] = {}
+        # A slot holds either the encoded `bytes` a `put` supplied, or the raw row dict a
+        # `put_row` deferred. `_encoded` collapses the difference at read time.
+        self._tables: dict[str, dict[Key, bytes | dict[str, Any]]] = {}
 
     def __repr__(self) -> str:
         """Summarize what is stored, per table — the question asked when learning looks cold."""
@@ -21,10 +25,44 @@ class InProcessBackend:
         return f"InProcessBackend({held or 'empty'})"
 
     def get(self, table: str, key: Key) -> bytes | None:
-        return self._tables.get(table, {}).get(key)
+        rows = self._tables.get(table)
+        if rows is None or key not in rows:
+            return None
+        return self._encoded(rows, key)
 
     def put(self, table: str, key: Key, value: bytes) -> None:
         self._tables.setdefault(table, {})[key] = value
+
+    def put_row(self, table: str, key: Key, row: dict[str, Any]) -> None:
+        """Store an already-structured row, deferring the JSON encoding to a read.
+
+        The optional half of the backend protocol, and the reason it is worth having: this
+        backend is a dict in the running process, so `put(json.dumps(row).encode())`
+        serializes a flat dict of scalars purely so that a later read can parse it straight
+        back. Every terminal op records one row per operator, and nothing reads them until
+        a view loads (once per process), so the encoding was paid on the hot path for a
+        result almost always thrown away — 30-40 us of a small query's ~1 ms.
+
+        A backend that must actually transmit or persist bytes does not implement this, and
+        `MetadataHub` falls back to `put` for it, so durability is unaffected.
+
+        Args:
+            table: The logical table to write into.
+            key: The row's key.
+            row: A JSON-serializable flat mapping. Held by reference, so the caller must
+                not mutate it after handing it over.
+        """
+        self._tables.setdefault(table, {})[key] = row
+
+    @staticmethod
+    def _encoded(rows: dict[Key, bytes | dict[str, Any]], key: Key) -> bytes:
+        """The slot's bytes, encoding and caching a deferred row in place on first read."""
+        value = rows[key]
+        if type(value) is bytes:
+            return value
+        encoded = json.dumps(value).encode()
+        rows[key] = encoded
+        return encoded
 
     def scan(self, table: str, prefix: Key = ()) -> Iterator[tuple[Key, bytes]]:
         """Every `(key, value)` under `prefix`, from a snapshot taken when the scan starts.
@@ -40,9 +78,10 @@ class InProcessBackend:
         Copying the item list is O(entries) in pointers and happens at most once per view per
         process, against a table whose reads are rare and whose writes are frequent.
         """
-        for key, value in list(self._tables.get(table, {}).items()):
-            if key[: len(prefix)] == prefix:
-                yield key, value
+        rows = self._tables.get(table, {})
+        for key, _value in list(rows.items()):
+            if key[: len(prefix)] == prefix and key in rows:
+                yield key, self._encoded(rows, key)
 
     def batch_put(self, table: str, items: list[tuple[Key, bytes]]) -> None:
         dst = self._tables.setdefault(table, {})

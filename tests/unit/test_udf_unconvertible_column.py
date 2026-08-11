@@ -17,7 +17,7 @@ import pytest
 
 import batcher as bt
 from batcher._internal.errors import PlanError
-from batcher.core.udf.call import _fix_for, _sample_type
+from batcher.interop.diagnostics import _remedy, _sample_type
 
 pytestmark = pytest.mark.unit
 
@@ -70,11 +70,11 @@ def _element(module: str, name: str) -> object:
 def test_the_named_causes_get_their_own_one_line_fix(module, name, expected) -> None:
     """PIL Images and torch tensors are the two the guides name; each has a one-line answer,
     and a generic "convert to an Arrow type" would make the user go looking for it."""
-    assert expected in _fix_for([_element(module, name)])
+    assert expected in _remedy([_element(module, name)])
 
 
 def test_an_unknown_type_still_gets_a_usable_fix() -> None:
-    assert "Arrow-native" in _fix_for([_Thing()])
+    assert "Arrow-native" in _remedy([_Thing()])
 
 
 def test_the_description_names_the_element_type_not_the_container() -> None:
@@ -103,42 +103,32 @@ def test_a_numpy_tensor_column_still_works() -> None:
 
 
 # --- the mixed-resolution case ---------------------------------------------------------
-# Arrow has no variable-shape tensor type, so a column of differently-shaped arrays cannot
-# be typed at all. The generic "convert it to an ndarray" advice is *actively wrong* there:
-# the caller already passed ndarrays. Mixed-resolution images are the common multimodal
-# shape, and the guides flag it as `ArrowTypeError` on write.
+# Mixed-resolution images are the common multimodal shape, and Arrow's canonical tensor type
+# needs one shape for the whole column. This used to be a hard stop, diagnosed but not
+# solved. It is now carried as a variable-shape tensor column
+# (`io.formats.ml.ragged`), so the tests below assert it *works*; the message they replaced
+# survives in `interop.diagnostics` for the shapes that genuinely still cannot be typed.
 
 
-def test_ragged_arrays_are_diagnosed_as_a_shape_problem() -> None:
+def test_mixed_resolution_arrays_are_carried_rather_than_rejected() -> None:
     import numpy as np
 
-    ds = bt.from_pydict({"id": [1, 2]})
-    with pytest.raises(PlanError, match="different shapes"):
-        ds.map_batches(
+    out = (
+        bt.from_pydict({"id": [1, 2]})
+        .map_batches(
             lambda b: {"img": [np.ones((2, 2), "uint8"), np.ones((3, 3), "uint8")]},
             output_columns=["img"],
-        ).collect()
+        )
+        .to_numpy()["img"]
+    )
+    assert [a.shape for a in out] == [(2, 2), (3, 3)]
 
 
-def test_the_ragged_message_names_both_shapes() -> None:
-    """ "they differ" is a restatement; "(2, 2) and (3, 3)" is the diagnosis."""
+def test_the_ragged_message_still_exists_for_a_shape_that_cannot_be_typed() -> None:
+    """The advice it replaced told the caller to pass an ndarray, which they had done."""
     import numpy as np
 
-    ds = bt.from_pydict({"id": [1, 2]})
-    with pytest.raises(PlanError, match=r"\(2, 2\).*\(3, 3\)"):
-        ds.map_batches(
-            lambda b: {"img": [np.ones((2, 2), "uint8"), np.ones((3, 3), "uint8")]},
-            output_columns=["img"],
-        ).collect()
-
-
-def test_the_ragged_message_does_not_tell_you_to_pass_an_ndarray() -> None:
-    """The bug this fixes: the generic advice told the caller to do what they had done."""
-    import numpy as np
-
-    from batcher.core.udf.call import _fix_for
-
-    fix = _fix_for([np.ones((2, 2)), np.ones((3, 3))])
+    fix = _remedy([np.ones((2, 2)), np.ones((3, 3))])
     assert "Resize or pad" in fix
     assert "Convert it to an Arrow-native type" not in fix
 
@@ -153,3 +143,24 @@ def test_uniform_arrays_still_become_a_tensor_column() -> None:
         .collect()
     )
     assert out.num_rows == 2
+
+
+def test_columns_of_different_lengths_are_named_individually() -> None:
+    """pyarrow says "Arrays were not all the same length: 1 vs 2", which for a wide result
+    identifies neither column. The short one is usually the one built from a partial result."""
+    ds = bt.from_pydict({"id": [1, 2]})
+    with pytest.raises(PlanError, match=r"a=2, b=1, c=2"):
+        ds.map_batches(
+            lambda batch: {"a": [1, 2], "b": [1], "c": [1, 2]},
+            output_columns=["a", "b", "c"],
+        ).collect()
+
+
+def test_equal_lengths_are_not_reported_as_a_length_problem() -> None:
+    """The guard must not claim a length mismatch for a column that is simply un-typable."""
+    ds = bt.from_pydict({"id": [1, 2]})
+    with pytest.raises(PlanError, match="Arrow cannot represent"):
+        ds.map_batches(
+            lambda batch: {"a": [1, 2], "b": [_Thing(), _Thing()]},
+            output_columns=["a", "b"],
+        ).collect()

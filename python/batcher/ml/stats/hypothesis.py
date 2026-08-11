@@ -23,6 +23,7 @@ from batcher.ml.stats._special import (
     chi2_sf,
     f_sf,
     normal_two_sided_p,
+    students_t_ppf,
     students_t_two_sided_p,
 )
 from batcher.ml.stats.association import anova_f, chi_square
@@ -55,6 +56,13 @@ class TestResult:
     degrees of freedom are kept so the result can be reported in full or fed to a power
     calculation.
 
+    The four trailing fields are optional because not every test can fill them: a chi-squared
+    test of independence has no single effect to put an interval around, while a t test does.
+    They exist so a test that *can* report an interval or an effect size does not need a second
+    result type to carry it — a p-value alone answers "is this distinguishable from noise" and
+    says nothing about how large the effect is, which is the question an experiment readout
+    actually needs.
+
     Examples:
         .. doctest::
 
@@ -68,11 +76,37 @@ class TestResult:
         statistic: The test statistic.
         pvalue: The p-value under the null hypothesis.
         df: The degrees of freedom, a single value or an ``(df1, df2)`` pair for an F test.
+        ci: The confidence interval for the estimated effect, or ``None`` if the test does not
+            estimate one. Its coverage is `ci_level`.
+        ci_level: The coverage of `ci` — 0.95 unless the caller asked for another.
+        n: The number of rows the test consumed, or ``None`` if it was not counted.
+        alternative: Which departures from the null the p-value covers: ``"two-sided"``,
+            ``"greater"``, or ``"less"``.
+        effect_size: A standardized effect (Cohen's d for the t tests), or ``None``.
     """
 
     statistic: float
     pvalue: float
     df: float | tuple[float, float]
+    ci: tuple[float, float] | None = None
+    ci_level: float = 0.95
+    n: int | None = None
+    alternative: str = "two-sided"
+    effect_size: float | None = None
+
+
+def _mean_ci(estimate: float, se: float, df: float, level: float = 0.95) -> tuple[float, float]:
+    """A two-sided t interval around `estimate`, at `level` coverage.
+
+    The t quantile rather than the normal one: `plan.functions.analysis.inference` already
+    ships `mean_ci_half_width` as a single-pass *aggregate*, which is the right tool when the
+    interval is a column. Here the mean, its standard error and the degrees of freedom are
+    already scalars in hand, and at small `df` the normal quantile is too narrow.
+    """
+    if not math.isfinite(se) or se <= 0.0 or df <= 0:
+        return (estimate, estimate)
+    half = students_t_ppf(0.5 * (1.0 + level), df) * se
+    return (estimate - half, estimate + half)
 
 
 def t_test_1samp(ds: Dataset, popmean: float, column: str = "x") -> TestResult:
@@ -105,8 +139,16 @@ def t_test_1samp(ds: Dataset, popmean: float, column: str = "x") -> TestResult:
     s = float(row.column("s")[0].as_py())
     n = int(row.column("n")[0].as_py())
     df = n - 1
-    t = (m - popmean) / (s / math.sqrt(n)) if s > 0 else math.inf
-    return TestResult(statistic=t, pvalue=students_t_two_sided_p(t, df), df=float(df))
+    se = s / math.sqrt(n)
+    t = (m - popmean) / se if s > 0 else math.inf
+    return TestResult(
+        statistic=t,
+        pvalue=students_t_two_sided_p(t, df),
+        df=float(df),
+        ci=_mean_ci(m - popmean, se, df),
+        n=n,
+        effect_size=(m - popmean) / s if s > 0 else math.inf,
+    )
 
 
 def t_test_ind(ds: Dataset, value: str, group: str) -> TestResult:
@@ -161,7 +203,17 @@ def t_test_ind(ds: Dataset, value: str, group: str) -> TestResult:
     se = math.sqrt(v1 / n1 + v2 / n2)
     t = (m1 - m2) / se if se > 0 else math.inf
     df = (v1 / n1 + v2 / n2) ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
-    return TestResult(statistic=t, pvalue=students_t_two_sided_p(t, df), df=df)
+    # Cohen's d takes the *pooled* SD even though the test itself is Welch's: the interval is
+    # about the difference in the data's own units, while d is about a common scale.
+    pooled = math.sqrt(((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2)) if n1 + n2 > 2 else 0.0
+    return TestResult(
+        statistic=t,
+        pvalue=students_t_two_sided_p(t, df),
+        df=df,
+        ci=_mean_ci(m1 - m2, se, df),
+        n=n1 + n2,
+        effect_size=(m1 - m2) / pooled if pooled > 0 else math.inf,
+    )
 
 
 def anova_test(ds: Dataset, value: str, group: str) -> TestResult:
@@ -196,7 +248,7 @@ def anova_test(ds: Dataset, value: str, group: str) -> TestResult:
     k = int(row.column("k")[0].as_py())
     n = int(row.column("n")[0].as_py())
     df1, df2 = float(k - 1), float(n - k)
-    return TestResult(statistic=f, pvalue=f_sf(f, df1, df2), df=(df1, df2))
+    return TestResult(statistic=f, pvalue=f_sf(f, df1, df2), df=(df1, df2), n=n)
 
 
 def chi_square_test(ds: Dataset, x: str, y: str) -> TestResult:

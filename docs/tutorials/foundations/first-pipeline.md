@@ -18,7 +18,7 @@ path and changes nothing else, which is the point of the whole tutorial.
 
 ## Build a dataset
 
-A `Dataset` is a lazy, immutable handle to a query plan. {py:obj}`bt.from_pydict <batcher.from_pydict>` builds one
+A {py:class}`Dataset <batcher.Dataset>` is a lazy, immutable handle to a query plan. {py:obj}`bt.from_pydict <batcher.from_pydict>` builds one
 from a column-oriented dict. No work runs until a terminal operation.
 
 ```python
@@ -38,7 +38,7 @@ print(ds.columns)
 
 ## Derive a column
 
-Column work is expressed with `Expr`. `with_columns` adds or replaces columns and
+Column work is expressed with {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`. {py:meth}`with_columns <batcher.Dataset.with_columns>` adds or replaces columns and
 keeps the rest. The arithmetic runs in the Rust data plane, not in Python.
 
 ```python
@@ -49,7 +49,7 @@ print(priced.to_pydict())
 
 ## Group and aggregate
 
-`group_by(*keys)` returns a `GroupBy`; finalize it with `.agg(**named_aggs)`.
+`group_by(*keys)` returns a {py:class}`GroupBy <batcher.GroupBy>`; finalize it with `.agg(**named_aggs)`.
 Aggregates are passed as keyword arguments where the name becomes the output column.
 
 ::::{tab-set}
@@ -166,7 +166,7 @@ import batcher as bt
 :::{warning}
 The one thing that trips people up on their first pipeline is expecting a transform to *do*
 something. It does not. `with_columns`, `filter`, `group_by`, and `sort` all return a new
-`Dataset` and run nothing at all. The work happens at the terminal op (`to_pydict`,
+`Dataset` and run nothing at all. The work happens at the terminal op ({py:meth}`to_pydict <batcher.Dataset.to_pydict>`,
 `collect`, `count`, `write`). If your timing shows a transform taking no time, that is
 because it took no time.
 :::
@@ -180,7 +180,7 @@ arithmetic in a `map_batches` blocks predicate pushdown and roughly halves throu
 
 ## What you learned
 
-A `Dataset` is a lazy plan. Expressions describe columns. `group_by().agg()` rolls them up,
+A `Dataset` is a lazy plan. Expressions describe columns. {py:meth}`group_by().agg() <batcher.Dataset.group_by>` rolls them up,
 a terminal op runs the whole thing, and pointing the same code at a file changes one line.
 
 ::::{grid} 1 2 2 2

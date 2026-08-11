@@ -14,7 +14,45 @@ from collections import deque
 
 from batcher.plan.logical import LogicalPlan
 
-__all__ = ["ProducerActor", "consumer_batch_rows"]
+__all__ = ["ProducerActor", "coalesce", "consumer_batch_rows"]
+
+
+def coalesce(batches: list, target_rows: int) -> list:
+    """Regroup `batches` so each holds at least `target_rows` rows, where the data allows.
+
+    The eager counterpart of `ProducerActor._take_batch`, for a stage whose whole output is
+    already in hand. Both exist for one reason: a published morsel is one model call on the
+    stage above, so a morsel below that stage's declared batch size is a small forward pass no
+    downstream re-batching can undo. The producer has to gather *lazily*, pulling more input
+    only when it is short, or it would defeat the streaming it exists to do; a relay has run
+    its whole morsel already and has nothing left to pull.
+
+    Args:
+        batches: The stage's output batches, in order.
+        target_rows: Rows to gather per morsel; `0` leaves the batches as they are.
+
+    Returns:
+        The regrouped batches. A short final morsel is correct — there are no more rows.
+    """
+    import pyarrow as pa
+
+    if target_rows <= 0 or len(batches) <= 1:
+        return list(batches)
+    out: list = []
+    held: list = []
+    rows = 0
+    for batch in batches:
+        held.append(batch)
+        rows += batch.num_rows
+        if rows >= target_rows:
+            # `concat_batches` rather than `combine_chunks`: the latter splits at the 32-bit
+            # offset limit, so a morsel holding more than 2 GiB of string or binary data comes
+            # back as several batches — see `_take_batch`, which learned this the hard way.
+            out.append(held[0] if len(held) == 1 else pa.concat_batches(held))
+            held, rows = [], 0
+    if held:
+        out.append(held[0] if len(held) == 1 else pa.concat_batches(held))
+    return out
 
 
 def consumer_batch_rows(sub_plan: LogicalPlan) -> int:
@@ -150,7 +188,11 @@ try:
                 rows += nxt.num_rows
             if len(held) == 1:
                 return held[0]
-            return pa.Table.from_batches(held).combine_chunks().to_batches()[0]
+            # `concat_batches` rather than `combine_chunks().to_batches()[0]`: the latter
+            # splits at the 32-bit offset limit, so a published morsel holding more than
+            # 2 GiB of string or binary data came back as several batches and taking the
+            # first silently dropped every row after it.
+            return pa.concat_batches(held)
 
         def release(self, ticket) -> None:
             """Evict a published morsel once its consumer has fetched it — frees one

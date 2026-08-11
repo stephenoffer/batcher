@@ -19,7 +19,7 @@ skip it. A principal who may not read a column doesn't read it and then get filt
 
 ## Identity
 
-A query runs *as* a {py:obj}`Principal <batcher.governance.Principal>`: a name, the roles
+A query runs *as* a {py:obj}`Principal <batcher.Principal>`: a name, the roles
 it holds, and its attributes. Attributes are what row filters compare against, so one
 policy (`region = principal.attrs["region"]`) serves every user.
 
@@ -78,19 +78,15 @@ JWKS, and needs the optional `pyjwt` dependency.
 ```{eval-rst}
 .. autoclass:: batcher.governance.authn.ProcessIdentityVerifier
    :members:
-   :no-index:
 
 .. autoclass:: batcher.governance.authn.HmacTokenVerifier
    :members:
-   :no-index:
 
 .. autoclass:: batcher.governance.authn.JwtVerifier
    :members:
-   :no-index:
 
 .. autoclass:: batcher.governance.authn.CredentialVerifier
    :members:
-   :no-index:
 ```
 
 ```{warning}
@@ -103,7 +99,7 @@ trust domain. See {doc}`/user-guide/trust/hardening`.
 
 ## The catalog
 
-{py:obj}`SecurityCatalog <batcher.governance.SecurityCatalog>` holds the policy: which
+{py:obj}`SecurityCatalog <batcher.SecurityCatalog>` holds the policy: which
 roles may select which columns, which columns are masked, and which rows each principal
 may see.
 

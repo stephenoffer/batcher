@@ -535,3 +535,33 @@ def test_degree_keeps_the_nodes_that_have_no_edge_on_the_counted_side():
     assert out == {1: 2, 2: 0, 3: 0, 9: 0}, "sinks and the isolated node must survive with 0"
     assert bg.isolated_nodes(g).to_pydict()["node"] == [9]
     assert sum(bg.degree(g).to_pydict()["degree"]) == 2 * 2, "handshake identity"
+
+
+def test_katz_centrality_solves_its_own_linear_system():
+    """Katz is `x = beta + alpha * A' x`, and the answer is that system's exact solution.
+
+    The recurrence is *affine*, so its fixed point is bounded and rescaling the iterate each
+    round moves it: the propagated term shrinks against the constant `beta` that is the
+    whole point of Katz. Sharing eigenvector centrality's per-round normalization produced a
+    plausible, converged, wrongly-*ranked* vector — 0.5115 where the answer is 0.5241 — with
+    no error and no divergence to notice. Asserted against a dense solve rather than against
+    a remembered vector, so it pins the definition and not the previous output.
+    """
+    numpy = pytest.importorskip("numpy")
+    edges = [(0, 1), (1, 2), (2, 0), (0, 2), (3, 0), (1, 3)]
+    n, alpha, beta = 4, 0.1, 1.0
+    adjacency = numpy.zeros((n, n))
+    for src, dst in edges:
+        adjacency[src, dst] = 1.0
+    exact = numpy.linalg.solve(numpy.eye(n) - alpha * adjacency.T, beta * numpy.ones(n))
+    exact = exact / numpy.linalg.norm(exact)
+
+    g = bg.Graph.from_edges(
+        bt.from_pydict({"src": [e[0] for e in edges], "dst": [e[1] for e in edges]})
+    )
+    got = (
+        bg.katz_centrality(g, attenuation=alpha, baseline=beta, max_iterations=500, tolerance=1e-12)
+        .sort("node")
+        .to_pydict()["katz_centrality"]
+    )
+    assert got == pytest.approx(list(exact), abs=1e-6)

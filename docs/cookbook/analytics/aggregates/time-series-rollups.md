@@ -34,8 +34,8 @@ print(events.count())
 
 ## The rollup
 
-`dt.truncate` floors a timestamp to a unit, and `group_by` takes the derived key
-directly, with no separate `with_columns` step needed. `DATE_TRUNC` in the SQL tab lowers
+`dt.truncate` floors a timestamp to a unit, and {py:meth}`group_by <batcher.Dataset.group_by>` takes the derived key
+directly, with no separate {py:meth}`with_columns <batcher.Dataset.with_columns>` step needed. `DATE_TRUNC` in the SQL tab lowers
 to the same expression.
 
 ::::{tab-set}
@@ -81,7 +81,7 @@ spine does.
 :::
 
 Plot this and the line runs straight from June 2nd to June 4th, quietly interpolating
-through the outage. Feed it to `rolling_mean(7)` and it is worse: the window counts seven
+through the outage. Feed it to {py:meth}`rolling_mean(7) <batcher.plan.expr_ir.core.Expr.rolling_mean>` and it is worse: the window counts seven
 *rows*, and if a fortnight of rows is missing, "the 7-day average" silently becomes the
 average of the last seven days that happened to have data. That is not a moving average,
 it is a moving average of a series you do not have.
@@ -90,7 +90,7 @@ The fix is not clever. Build the days you expect, and left-join the data onto th
 
 ## The spine
 
-`bt.date_range` generates the calendar. Truncate it the same way you truncated the events
+{py:func}`bt.date_range <batcher.date_range>` generates the calendar. Truncate it the same way you truncated the events
 so the join keys have the same type, then left-join and fill.
 
 ```python
@@ -190,7 +190,7 @@ asks why the number moved.
 - {doc}`Sessionization </cookbook/analytics/behavior/sessionization>`: the opposite problem, where the buckets have to be
   derived from the gaps rather than fixed by the calendar.
 - {doc}`Window functions </user-guide/analyze/window-functions>`: `rolling_*`, frames, and
-  `forward_fill`.
+  {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>`.
 - {doc}`Joins </user-guide/analyze/joins>`: the left join and the cross join used here.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: what `group_by(...).agg(...)` supports.
 - {doc}`Aggregation internals </architecture/deep-dives/operators/aggregation-internals>`: how the daily rollup

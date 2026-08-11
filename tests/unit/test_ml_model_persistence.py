@@ -110,6 +110,13 @@ def _build(name: str, klass: type):
 
         ds = _multiclass()
         return OneVsRestClassifier(LogisticRegression, ["x"], "label").fit(ds), ds
+    if name == "CalibratedClassifierCV":
+        # Takes the estimator *class* first, like the two meta-estimators above, so the
+        # `klass(features, target)` fallback at the end cannot build it.
+        from batcher.ml import CalibratedClassifierCV, LogisticRegression
+
+        ds = _classification()
+        return CalibratedClassifierCV(LogisticRegression, ["x", "z"], "label").fit(ds), ds
     if name == "TransformedTargetRegressor":
         from batcher.ml import LinearRegression, TransformedTargetRegressor
 

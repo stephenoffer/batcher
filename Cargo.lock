@@ -492,6 +492,7 @@ name = "bc-arrow"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "chrono",
  "libc",
 ]
 
@@ -521,6 +522,7 @@ dependencies = [
  "bc-arrow",
  "bc-geo",
  "bc-secrets",
+ "bc-spatial",
  "brotli",
  "chrono",
  "chrono-tz",
@@ -563,6 +565,7 @@ dependencies = [
 name = "bc-interp"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow",
  "bc-arrow",
  "bc-codegen",
@@ -667,6 +670,10 @@ dependencies = [
  "arrow",
  "bc-arrow",
 ]
+
+[[package]]
+name = "bc-spatial"
+version = "0.1.0"
 
 [[package]]
 name = "bc-transport"

@@ -17,6 +17,7 @@ mod json;
 mod like;
 mod minhash;
 mod numfmt;
+mod quality;
 mod regex_cache;
 mod uri_path;
 
@@ -106,6 +107,17 @@ pub(crate) fn eval_str(
     let coerced;
     let arr = match arr.data_type() {
         DataType::Binary | DataType::LargeBinary => {
+            coerced = cast(arr, &DataType::Utf8)?;
+            &coerced
+        }
+        // An all-null column types as `Null`, which is a real type and not an error: it is
+        // what a batch of failed generations, a left join that matched nothing, and
+        // `from_pydict({"s": [None, None]})` all produce. Arithmetic, `cast`, `coalesce`
+        // and `is_null` already answer `null` for it; every string function instead
+        // rejected the column outright and failed the whole query. Casting to an all-null
+        // `Utf8` hands each function its own null handling, so `f(null)` is `null` — which
+        // is both the convention the numeric path already sets and what DuckDB does.
+        DataType::Null => {
             coerced = cast(arr, &DataType::Utf8)?;
             &coerced
         }
@@ -606,6 +618,21 @@ pub(crate) fn eval_str(
         }
         StrFunc::Chunk => chunk::eval_chunk(s, start, length, pattern)?,
         StrFunc::SquadNormalize => case::eval_squad_normalize(s),
+        // Per-document quality measures. `length` carries `n` for the two n-gram ratios and
+        // is unused by the rest, so they ride the existing `Expr::Str` wire shape — no new
+        // IR node, and every existing string function's serialized form is untouched.
+        StrFunc::WordCount => quality::word_count(s),
+        StrFunc::MeanWordLength => quality::mean_word_length(s),
+        StrFunc::SymbolRatio => quality::symbol_ratio(s),
+        StrFunc::AlphaWordRatio => quality::alpha_word_ratio(s),
+        StrFunc::StopwordCount => quality::stopword_count(s),
+        StrFunc::BulletLineRatio => quality::bullet_line_ratio(s),
+        StrFunc::EllipsisLineRatio => quality::ellipsis_line_ratio(s),
+        StrFunc::DuplicateLineRatio => quality::duplicate_line_ratio(s),
+        StrFunc::DuplicateParagraphRatio => quality::duplicate_paragraph_ratio(s),
+        StrFunc::TopNgramRatio => quality::top_ngram_ratio(s, length.unwrap_or(2)),
+        StrFunc::DuplicateNgramRatio => quality::duplicate_ngram_ratio(s, length.unwrap_or(5)),
+        StrFunc::CharEntropy => quality::char_entropy(s),
         StrFunc::TokenNgrams => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
             // `length` carries `n`; clamp to at least 1 so a bad plan never panics.

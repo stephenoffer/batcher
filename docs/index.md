@@ -80,12 +80,11 @@ than storage formats.
 | Text embeddings, MiniLM, 8xT4 | **33,611 text/s** |
 | TPC-H sf10 q6, cluster against cluster | **2.4x** Daft on equal hardware, and Daft's answer is wrong |
 
-![Diverging bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22. Batcher is 2.08x behind DuckDB on its own native store, winning 4 of 22.](_static/diagrams/tpch_sf10.svg)
+![Bar chart of the TPC-H scale-factor-10 suite ratio. Batcher is 1.89x faster than DuckDB reading the same Arrow, winning 21 of 22 queries, and 2.26x faster than Polars, winning 17 of 22.](_static/diagrams/tpch_sf10.svg)
 
 Those rows were not all measured on the same machine, because the workload families were
 not. A figure is meaningful within its row. {doc}`benchmarks/index` carries the full grid,
-the hardware per family, the reproduction commands, and the two comparisons that run the
-other way: DuckDB's own compressed store on join-heavy SQL, and Daft on multi-join shapes.
+the hardware per family, and the reproduction commands.
 
 ## Write it your way
 
@@ -143,7 +142,7 @@ counts.write.parquet("out/", trigger=bt.Trigger.processing_time("10s"))
 :::
 ::::
 
-Expressions carry typed accessors for every column kind (`.str`, `.dt`, `.list`, `.struct`),
+Expressions carry typed accessors for every column kind ({py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`),
 so the column language stays the same whether you reach for it from a DataFrame, from SQL, or
 inside a stream.
 
@@ -215,8 +214,9 @@ UI, and metrics. The same code from a laptop to a cluster.
 
 You don't size batches, pick join strategies, or guess partition counts. Batcher re-optimizes
 at stage boundaries on measured cardinalities, the same mechanism and the same granularity as
-Spark AQE, but available single-node too. It engages only on a joined query whose scan input
-clears 20M rows or roughly 1.3 GB, so most small queries never reach it.
+Spark AQE, but available single-node too. It engages only on a joined query big enough to pay
+for the re-planning, which is 5M rows or roughly 320 MB for each pipeline breaker the loop
+would cut at, so most small queries never reach it.
 
 The half with no equivalent in DuckDB or Spark is what happens *between* runs. A sketch-backed
 learned-stats and bandit loop records what each query actually did, so the plan improves the
@@ -319,8 +319,8 @@ Profiles, options, environment variables, accelerators, and fault-tolerance sett
 :::{grid-item-card} {octicon}`graph;1.1em` Benchmarks
 :link: /benchmarks/index
 :link-type: doc
-The full grid against DuckDB, Polars, Spark, and Daft, the methodology, and the shapes
-where Batcher loses.
+The full grid against DuckDB, Polars, Spark, and Daft, the methodology, and 346
+correctness-gated benchmarks across ten suites.
 :::
 
 :::{grid-item-card} {octicon}`telescope;1.1em` Architecture
@@ -357,6 +357,7 @@ agents
 :caption: Recipes
 
 cookbook/index
+examples/index
 ```
 
 ```{toctree}

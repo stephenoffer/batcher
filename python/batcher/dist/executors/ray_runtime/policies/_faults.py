@@ -326,6 +326,15 @@ def actor_fault_options() -> dict:
     Not applied to the Flight shuffle-server actors — their loss is recovered by the
     lineage recompute loop, and letting Ray restart them out from under it would race
     that recovery.
+
+    **`max_task_retries > 0` is safe here specifically because Batcher does not use Ray's
+    `ActorPool`.** The field guidance is emphatic that the two must not be combined — a retry
+    loses the actor's `client_address_` inside `ActorPool` and the driver then waits forever
+    (`../optimization-guides`, `foundations/core/tasks-and-actors.md`) — and its prescribed
+    alternative is "handle retries at the application level", which is what
+    `map._drive_actor_pool` and `policies._barrier` are. `ActorPool` appears nowhere in this
+    codebase except in the comments naming what those two replaced. Anyone reconsidering that
+    replacement has to move this option back to `0` in the same change.
     """
     d = active_config().distributed
     return {

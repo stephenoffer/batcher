@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from batcher.ml.stats._shared import require_columns as _require_columns
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.nodes import cume_dist, rank, row_number
 from batcher.plan.functions.aggregate import count_if
@@ -285,23 +286,6 @@ def ks_statistic(
     gap = (col(_CUM_POS) / col("__bt_tot_pos") - col("__bt_cum_neg") / col("__bt_tot_neg")).abs()
     aggregated = _aggregate(running, groups, {metric: gap.max()})
     return _one_or_frame(aggregated, groups, metric)
-
-
-def _require_columns(ds: Dataset, *names: str) -> None:
-    """Raise a `ColumnNotFoundError` naming the closest real column for any missing name."""
-    available = ds.columns
-    # Membership against a set: the check runs per requested name, and `available` is the
-    # relation's full width — a wide feature table turned a handful of name checks into a
-    # scan of thousands of columns each. The list is kept for the error message, which
-    # needs the original order to suggest a close match.
-    present = set(available)
-    for name in names:
-        if name not in present:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, available, hint="Pass an existing column.")
-            )
 
 
 def _aggregate(ds: Dataset, groups: list[str], metrics: dict[str, Any]) -> Dataset:

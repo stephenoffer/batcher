@@ -27,14 +27,27 @@ import glob
 import os
 
 __all__ = [
+    "affinity_cpu_ids",
     "cpus_per_numa_node",
     "numa_node_count",
     "physical_core_count",
+    "read_cpu_list",
 ]
 
 
-def _parse_cpu_list(raw: str) -> set[int]:
-    """Parse a Linux CPU list like ``"0-3,8,10-11"`` into the set of CPU ids it names."""
+def parse_cpu_list(raw: str) -> set[int]:
+    """Parse a Linux CPU list like ``"0-3,8,10-11"`` into the set of CPU ids it names.
+
+    Public within the package because `cache` reads the same format from a different file
+    (`shared_cpu_list`, which names a cache domain) — one parser, so a malformed list cannot be
+    read one way here and another way there.
+
+    Args:
+        raw: The `/sys` cpulist text.
+
+    Returns:
+        The CPU ids named, empty when nothing parses.
+    """
     out: set[int] = set()
     for part in raw.strip().split(","):
         if not part:
@@ -50,13 +63,43 @@ def _parse_cpu_list(raw: str) -> set[int]:
     return out
 
 
-def _read_cpu_list(path: str) -> set[int]:
-    """The CPU set named by a `/sys` cpulist file, or empty when absent."""
+def read_cpu_list(path: str) -> set[int]:
+    """The CPU set named by a `/sys` cpulist file, or empty when absent.
+
+    Args:
+        path: The cpulist file to read.
+
+    Returns:
+        The CPU ids it names, empty when the file is absent or unreadable.
+    """
     try:
         with open(path) as f:
-            return _parse_cpu_list(f.read())
+            return parse_cpu_list(f.read())
     except OSError:
         return set()
+
+
+def affinity_cpu_ids() -> set[int] | None:
+    """CPU ids this process may be scheduled on, or `None` when the mask is unreadable.
+
+    `None` and the empty set are deliberately distinct: `None` means "this platform publishes
+    no mask, so do not narrow anything by it", while an empty mask would mean a process that
+    can run nowhere. Every reader here treats `None` as "no restriction".
+
+    The one place the affinity mask is read, because three probes need it for the same reason
+    — `/sys` is host-wide even inside a container, so a NUMA node, a physical core, or a cache
+    domain the process can never be scheduled on must not enter its own description.
+
+    Returns:
+        The schedulable CPU ids, or `None` off Linux.
+    """
+    getaffinity = getattr(os, "sched_getaffinity", None)
+    if getaffinity is None:  # not Linux (macOS/Windows expose no affinity mask)
+        return None
+    try:
+        return set(getaffinity(0))
+    except OSError:
+        return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -86,20 +129,14 @@ def cpus_per_numa_node() -> dict[int, int]:
     Returns:
         NUMA node id to the count of usable CPUs on it, empty when NUMA is not exposed.
     """
-    getaffinity = getattr(os, "sched_getaffinity", None)
-    allowed: set[int] | None = None
-    if getaffinity is not None:
-        try:
-            allowed = set(getaffinity(0))
-        except OSError:
-            allowed = None
+    allowed = affinity_cpu_ids()
     out: dict[int, int] = {}
     for node_dir in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
         try:
             node_id = int(os.path.basename(node_dir)[4:])
         except ValueError:
             continue
-        cpus = _read_cpu_list(os.path.join(node_dir, "cpulist"))
+        cpus = read_cpu_list(os.path.join(node_dir, "cpulist"))
         if allowed is not None:
             cpus &= allowed
         if cpus:
@@ -125,13 +162,7 @@ def physical_core_count() -> int:
     from batcher._internal.hardware.cpu import available_cpu_count
 
     logical = available_cpu_count()
-    getaffinity = getattr(os, "sched_getaffinity", None)
-    allowed: set[int] | None = None
-    if getaffinity is not None:
-        try:
-            allowed = set(getaffinity(0))
-        except OSError:
-            allowed = None
+    allowed = affinity_cpu_ids()
     cores: set[frozenset[int]] = set()
     for cpu_dir in glob.glob("/sys/devices/system/cpu/cpu[0-9]*"):
         try:
@@ -140,7 +171,7 @@ def physical_core_count() -> int:
             continue
         if allowed is not None and cpu_id not in allowed:
             continue
-        siblings = _read_cpu_list(os.path.join(cpu_dir, "topology", "thread_siblings_list"))
+        siblings = read_cpu_list(os.path.join(cpu_dir, "topology", "thread_siblings_list"))
         if allowed is not None:
             siblings &= allowed
         cores.add(frozenset(siblings) if siblings else frozenset({cpu_id}))

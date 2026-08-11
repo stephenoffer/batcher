@@ -56,11 +56,24 @@ pub fn concat_columns(arrays: &[&dyn Array]) -> Result<ArrayRef, RuntimeError> {
                         if let Some(out) = concat_strings::<i32>(arrays) {
                             return Ok(Arc::new(out));
                         }
+                        // `concat_strings` returned `None`. Either the downcast failed (an
+                        // unexpected layout — arrow's own `concat` handles it) or the result
+                        // does not fit 32-bit offsets, and *that* case must not reach arrow:
+                        // its builder does `.expect("byte array offset overflow")`, so it
+                        // aborts the process rather than returning an error. A panic inside a
+                        // rayon worker crosses the FFI as an unrecoverable `PanicException`
+                        // and takes the whole query engine with it.
+                        //
+                        // Reached on the Join Order Benchmark's `q7c`, whose join output holds
+                        // more than 2 GiB of `name`/`title` text in one column. DuckDB answers
+                        // it in 936 ms; Batcher aborted.
+                        byte_span_fits::<i32>(arrays)?;
                     }
                     DataType::LargeUtf8 => {
                         if let Some(out) = concat_strings::<i64>(arrays) {
                             return Ok(Arc::new(out));
                         }
+                        byte_span_fits::<i64>(arrays)?;
                     }
                     _ => {}
                 }
@@ -76,6 +89,36 @@ pub fn concat_columns(arrays: &[&dyn Array]) -> Result<ArrayRef, RuntimeError> {
 /// `None` when any input is not a `GenericStringArray<O>` or the concatenated characters would
 /// overflow the offset type, so the caller falls back to arrow's `concat` (which errors or
 /// widens as it sees fit) rather than wrapping.
+/// Refuse a concat whose character bytes cannot be addressed by `O`-width offsets.
+///
+/// Arrow's `concat` builds through `GenericStringBuilder`, which `.expect()`s on the offset
+/// conversion — so an oversized result aborts the process instead of returning an error. This
+/// is the guard in front of it: same arithmetic as `concat_strings`, reported as a typed error
+/// naming the fix. `Ok(())` when the arrays are not the expected string layout at all, which is
+/// arrow's case to handle rather than this one's.
+fn byte_span_fits<O: OffsetSizeTrait>(arrays: &[&dyn Array]) -> Result<(), RuntimeError> {
+    let mut total: usize = 0;
+    for a in arrays {
+        let Some(s) = a.as_any().downcast_ref::<GenericStringArray<O>>() else {
+            return Ok(()); // not the layout we model; let arrow decide
+        };
+        let o = s.value_offsets();
+        total += o[s.len()].as_usize() - o[0].as_usize();
+    }
+    if O::from_usize(total).is_none() {
+        return Err(RuntimeError::ByteOffsetOverflow {
+            dtype: if O::IS_LARGE {
+                "large_string"
+            } else {
+                "string"
+            }
+            .to_string(),
+            bytes: total,
+        });
+    }
+    Ok(())
+}
+
 fn concat_strings<O: OffsetSizeTrait>(arrays: &[&dyn Array]) -> Option<GenericStringArray<O>> {
     let arrs: Vec<&GenericStringArray<O>> = arrays
         .iter()

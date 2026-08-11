@@ -50,9 +50,15 @@ def execute_adaptive(
 
     When `distributed`, each breaker stage fans out across Ray workers and its
     *exact* output cardinality feeds the next stage's optimizer — so even at scale
-    join build-side and broadcast choices use measured sizes, not estimates. This
-    is strictly stronger than Spark AQE (which adapts only at stage boundaries on
-    coarse stats); the mergeable algebra guarantees the result equals single-node.
+    join build-side and broadcast choices use measured sizes, not estimates. The
+    mergeable algebra guarantees the result equals single-node.
+
+    That is **the same mechanism and the same granularity as Spark AQE**, not a finer
+    one: both re-plan the remainder of a query at a pipeline breaker, on the sizes the
+    completed part measured. What differs is where it is available — this loop runs
+    single-node too, where AQE needs shuffle stages — and what survives the query, which
+    is the cross-run learned statistics and the bandit in `kyber.learning`. Do not
+    restate this as re-planning *within* a stage; nothing here does that.
 
     Intermediate distributed stages keep their result *partitioned on disk* (a
     `MaterializedSource`) or on a persistent Flight fleet rather than collecting it
@@ -445,7 +451,7 @@ def _worth_staging(srcs: list[Source], hub):
 
     def accept(node: LogicalPlan) -> bool:
         try:
-            from batcher.api.adaptive.gating import _build_estimator
+            from batcher.api.adaptive.gating import build_estimator
 
             # `Provenance` is ordered strongest-trust *first* (EXACT=0 … DEFAULT=4), so the
             # test for "less than exact" is `> EXACT`. Comparing `>= DEFAULT` instead — as
@@ -455,7 +461,7 @@ def _worth_staging(srcs: list[Source], hub):
             # aggregate chose its build side from that estimate rather than from the
             # measured size, and adaptive re-optimization got quietly *weaker* the more the
             # learning loop knew.
-            return _build_estimator(srcs, hub).estimate(node).provenance > Provenance.EXACT
+            return build_estimator(srcs, hub).estimate(node).provenance > Provenance.EXACT
         except Exception as exc:  # pragma: no cover - an estimate must never break staging
             note_suppressed("api", "read breaker provenance for staging", exc)
             return True

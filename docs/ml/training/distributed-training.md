@@ -10,7 +10,7 @@ This page is the data-side contract. The training loop itself is yours.
 
 ## The four guarantees
 
-`ds.ml.stream_loader` gives each rank a `torch.utils.data.IterableDataset` over its
+{py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` gives each rank a `torch.utils.data.IterableDataset` over its
 slice of one global order, and holds four properties a distributed loop actually needs.
 
 **Balanced.** Every rank yields the same number of batches. The default `drop_last=True`
@@ -112,7 +112,7 @@ for indices in rank_index_batches(10**12, batch_size=8, world_size=1024, rank=3,
 
 ## Checkpointing the position
 
-`ResumableSampler` owns the `(epoch, global_consumed)` pair and speaks the
+{py:class}`ResumableSampler <batcher.ml.ResumableSampler>` owns the `(epoch, global_consumed)` pair and speaks the
 `state_dict` and `load_state_dict` protocol your checkpoint already uses, so the loop
 never computes a sample offset by hand.
 
@@ -145,7 +145,7 @@ reshuffling, which is the guard against the failure above.
 
 ## Larger than RAM, and unbounded
 
-`stream_loader` materializes the dataset once, which is fine up to RAM. Past that, the
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` materializes the dataset once, which is fine up to RAM. Past that, the
 source decides which loader you get.
 
 ::::{tab-set}
@@ -218,7 +218,7 @@ less memory than either, because it is never stored.
 
 ## Preparing the data, once
 
-Everything upstream of the loader is a `Dataset`, so the split, the feature transform,
+Everything upstream of the loader is a {py:class}`Dataset <batcher.Dataset>`, so the split, the feature transform,
 and the dedup all run as engine stages, distributed and vectorized and out of the
 training process.
 

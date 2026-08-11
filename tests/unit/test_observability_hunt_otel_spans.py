@@ -72,18 +72,24 @@ def test_distributed_emits_worker_operator_spans():
     c = ProfileCollector()
     c.optimized_ir = {"op": "aggregate", "input": {"op": "scan", "source_id": 0}}
     c.distributed = True
+    # One whole `ExecMetrics` document per worker, not a bare op-list: the document also
+    # carries the `query` block, which is where a worker's share of the CPU, memory and
+    # disk cost lives and is unrecoverable once the driver has dropped the rest of it.
     c.worker_metrics = [
-        [
-            {
-                "op_id": 0,
-                "kind": "aggregate",
-                "rows_in": 100,
-                "rows_out": 5,
-                "elapsed_ns": 9000,
-                "result_bytes": 256,
-                "backend": "interp",
-            }
-        ]
+        {
+            "ops": [
+                {
+                    "op_id": 0,
+                    "kind": "aggregate",
+                    "rows_in": 100,
+                    "rows_out": 5,
+                    "elapsed_ns": 9000,
+                    "result_bytes": 256,
+                    "backend": "interp",
+                }
+            ],
+            "query": {"wall_ns": 9_000, "cpu_ns": 36_000},
+        }
     ]
     _emit(c)
     spans = exporter.get_finished_spans()
@@ -93,3 +99,10 @@ def test_distributed_emits_worker_operator_spans():
     worker = next(s for s in spans if s.name == "batcher.op.aggregate")
     assert worker.attributes.get("batcher.op.scope") == "worker"
     assert worker.attributes.get("batcher.op.rows_out") == 5
+    # And the worker's share of what the run cost the machine reaches the query span, so a
+    # tracing backend can filter on it (`batcher.cores_busy < 2` finds a query that failed
+    # to parallelize). Without it a distributed trace shows where the time went and never
+    # whether the cluster had the cores to spend.
+    query_span = next(s for s in spans if s.name == "batcher.query")
+    assert query_span.attributes.get("batcher.cpu_ms") == 0.036
+    assert query_span.attributes.get("batcher.cores_busy") == 4.0

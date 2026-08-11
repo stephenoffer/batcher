@@ -16,8 +16,8 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
 from batcher._internal.mathx import safe_div
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.multimodal.media import MediaSource
 
@@ -55,10 +55,4 @@ class AudioSource(MediaSource):
 
 def _soundfile() -> Any:
     """The soundfile module, or a typed error pointing at the ``audio`` extra."""
-    try:
-        import soundfile
-    except ImportError as exc:
-        raise BackendError(
-            "reading audio needs the audio extra: pip install 'batcher-engine[audio]'"
-        ) from exc
-    return soundfile
+    return require("soundfile", feature="Audio support", provides="soundfile", extra="audio")

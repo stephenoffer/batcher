@@ -16,7 +16,7 @@ import pyarrow as pa
 
 from batcher.io.splits import Split
 
-__all__ = ["Checkpointable", "Source", "is_checkpointable"]
+__all__ = ["Checkpointable", "RateLimited", "Source", "is_checkpointable", "is_rate_limited"]
 
 
 @runtime_checkable
@@ -182,3 +182,27 @@ def is_checkpointable(source: Source) -> bool:
     return callable(getattr(source, "snapshot_position", None)) and callable(
         getattr(source, "seek", None)
     )
+
+
+@runtime_checkable
+class RateLimited(Protocol):
+    """A streaming source whose per-trigger admission can be narrowed while it runs.
+
+    The seam a streaming rate controller acts through. A source that implements it can be
+    told, before each micro-batch, how many rows that trigger may read; one that does not is
+    simply never throttled, and its configured static cap continues to govern.
+
+    An admission cap changes how much of a stream a trigger reads, never what the query
+    computes from the rows it read, so honouring one can never change a result.
+    """
+
+    def set_admission_limit(self, max_rows: int | None) -> None: ...
+
+
+def is_rate_limited(source: Source) -> bool:
+    """Whether `source` accepts a per-trigger admission cap (`RateLimited`).
+
+    Read through a callable check rather than `isinstance`, matching `is_checkpointable`
+    beside it, so a duck-typed connector participates without inheriting anything.
+    """
+    return callable(getattr(source, "set_admission_limit", None))

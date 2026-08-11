@@ -209,6 +209,39 @@ match.
 Like the equi-join, it carries no single-node assumption: partitioning both sides by `by` makes
 a global ASOF equal the union of per-partition ASOFs.
 
+### Distributing an ASOF with no `by` keys
+
+A `by`-keyed ASOF co-partitions by hash, because a match only ever pairs rows inside one `by`
+group. A **keyless** ASOF has no group to hash. Any left row may match any right row, and which
+one it matches is decided by a global order on `on`, so hashing is not merely unbalanced, it
+sends a row and its match to different workers.
+
+Range partitioning is the shape that works, and it is the one the distributed sort already
+uses. Batcher samples the left key's distribution, cuts it into ordered intervals, and sends
+both sides through the *same* boundary list. Bucket `r` then holds every left row and every
+right row whose key falls in interval `r`, so a match inside the interval is already local.
+
+What remains is the match that is not. A left row in bucket `r` can match a right row in an
+earlier bucket when the direction is `backward`, or a later one when it is `forward`, and the
+gap between them is unbounded, so no fixed overlap covers it. Exactly one row per direction
+does. The intervals are ordered, so among every right row below the bucket the only one that
+can ever win a backward match is the largest, and among every row above it the only forward
+candidate is the smallest. Batcher lends each bucket those rows before the reducer runs. The
+carry costs one row per bucket per direction rather than a share of the data, and it is
+measured inside the range task that already holds the bucket, so it adds no pass over the
+input.
+
+Two details decide whether the carry is exactly right rather than approximately right. It is
+the *boundary member* of a tie group, not an arbitrary one: when several right rows share the
+extreme key, a backward match takes the last of them and a forward match the first, so keeping
+the wrong member returns the right key with a neighbouring row's payload. And a `tolerance`
+does not shrink the carry, because whether the carried row is near enough is the engine's
+decision, made after it arrives.
+
+The buckets are concatenated in key order, which is a permutation of the single-node result
+rather than a match for it. A single-node ASOF emits rows in left-input order. That is already
+true of the `by`-keyed path's hash buckets, and of every distributed join.
+
 ## Using it
 
 ```python
@@ -247,17 +280,15 @@ in the tree.
 
 The `None` in the left join is the null index in the index-pair builder, made visible.
 
-## Closing the gap
+## Parallelism
 
-The join gap against DuckDB is a parallelism gap, and the profile says where it lives: the
-serial prefixes around the parallel per-bucket join. Two have been removed (the radix scatter is
-now parallel; the probe side is gathered once instead of concatenated and re-gathered). What
-remains (build-side materialization, the shuffle's own serial phases) is the open work, and
-it's tracked in `benchmarks/BENCHMARK_RESULTS.md` rather than in an aspiration.
+Join throughput is set by how much of the operator runs in parallel, and the profile says
+exactly where that is decided: the serial prefixes around the parallel per-bucket join. The
+radix scatter is now parallel, and the probe side is gathered once instead of concatenated and
+re-gathered. Both changes are measured in `benchmarks/BENCHMARK_RESULTS.md`.
 
-The distributed picture is different and better: on the operator-mix benchmarks Batcher's
-distributed join beats Daft's by 1.7x to 2.2x at every scale measured. Scale-out isn't the
-weak axis. Single-node join parallelism is.
+Scale-out is the strong axis: on the operator-mix benchmarks Batcher's distributed join beats
+Daft's by 1.7x to 2.2x at every scale measured.
 
 ## Code map
 

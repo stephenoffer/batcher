@@ -29,6 +29,28 @@ def sql_fanout(ctx: Context, sql: str) -> EngineQueries:
     return {name: (lambda run=run: run(sql)) for name, run in ctx.sql_runners().items()}
 
 
+def cannot_run(fns: EngineQueries, engine: str, reason: str) -> EngineQueries:
+    """Replace `engine`'s runner with one that reports `reason` instead of executing.
+
+    For an engine that does not merely lose a case but **cannot survive it**. The harness
+    catches an exception and prints the row; it cannot catch a `SIGKILL`, and one engine
+    dying that way takes the whole suite's process with it — the `operators` run died at
+    case 8 of 11 having printed no table at all, so four working engines reported nothing.
+
+    Raising the reason keeps that fact in the report (the row shows the engine failing, with
+    this text in the `[PARTIAL]` line) instead of trading it for a silent kill. It is not a
+    way to hide a loss: an engine that merely runs slowly must keep its runner and be timed.
+    Every use states what was measured, so it can be re-checked when the engine changes.
+    """
+    if engine in fns:
+
+        def refuse() -> object:
+            raise RuntimeError(reason)
+
+        fns[engine] = refuse
+    return fns
+
+
 def with_native(
     ctx: Context,
     fns: EngineQueries,

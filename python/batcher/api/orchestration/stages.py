@@ -192,15 +192,24 @@ def spill_to_disk(
     """
     from batcher.api.tuning import spill_compression_scope
     from batcher.dist.spill import spill_collect
+    from batcher.plan.profile.usage import UsageStopwatch
 
     partitions = (
         rm.recommend_spill_partitions(opt) or partitions_from_physical(opt) or DEFAULT_PARTITIONS
     )
     partitions = max(partitions, rm.partitions_for_bounds(opt, verdict.suggested_bounds))
+    # The out-of-core path runs thousands of *unmetered* engine dispatches rather than one
+    # metered call, so the engine's own whole-execution reading never happens on it — the
+    # queries most worth observing reported no CPU, memory or disk cost at all. Two syscalls
+    # around the whole phase measure the same counters, and the reading is shaped exactly
+    # like the engine's, so the profile consumes either without knowing which it got.
+    watch = UsageStopwatch()
     # Force the learned spill codec (large IO-bound state compresses; small state does not).
     # IPC self-describes its codec, so the un-spilled result is byte-identical either way.
     with spill_compression_scope(rm, opt):
         spilled = spill_collect(logical_opt, sources, partitions)
+    if spilled is not None and ctx.profile is not None:
+        ctx.profile.record_usage(watch.finish())
     # Record the spill only once it has actually happened. `spill_collect` returns `None` for
     # a shape with no out-of-core path (a string-keyed sort, a filter/project with no state),
     # and the caller then falls through to the in-memory path — so recording *before* the

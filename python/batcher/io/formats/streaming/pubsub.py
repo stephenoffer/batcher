@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
 
@@ -70,12 +70,13 @@ def _is_pull_timeout(exc: BaseException) -> bool:
 
 def _import_subscriber() -> Any:
     """Import ``pubsub_v1.SubscriberClient`` or raise a guiding ``BackendError``."""
-    try:
-        from google.cloud import pubsub_v1
-    except ImportError as exc:
-        raise BackendError(
-            "reading from Pub/Sub needs the pubsub extra: pip install 'batcher-engine[pubsub]'"
-        ) from exc
+    pubsub_v1 = require(
+        "google.cloud",
+        "pubsub_v1",
+        feature="Pub/Sub support",
+        provides="google-cloud-pubsub",
+        extra="pubsub",
+    )
     return pubsub_v1.SubscriberClient
 
 

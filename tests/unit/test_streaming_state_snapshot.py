@@ -84,8 +84,7 @@ def test_prune_removes_orphaned_temp_files(store, tmp_path):
 def _windowed_fold():
     ds = bt.from_pydict({"ts": [_at(0)], "v": [1]}).with_watermark("ts", "5 minutes")
     agg = ds.group_by(w=bt.window(col("ts"), "10 minutes")).agg(total=col("v").sum())._plan
-    alias, width = _window_key(agg)
-    return agg, _WindowedAggFold(agg, alias, width)
+    return agg, _WindowedAggFold(agg, _window_key(agg))
 
 
 def test_the_end_of_stream_flush_leaves_exactly_the_shape_that_was_being_dropped(store):
@@ -103,7 +102,6 @@ def test_the_end_of_stream_flush_leaves_exactly_the_shape_that_was_being_dropped
     restored = store.restore(3)
     assert restored is not None
 
-    alias, width = _window_key(agg)
-    resumed = _WindowedAggFold(agg, alias, width)
+    resumed = _WindowedAggFold(agg, _window_key(agg))
     resumed.restore(restored)
     assert resumed._wm == fold._wm, "the watermark rewound across the restart"

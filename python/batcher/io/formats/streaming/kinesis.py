@@ -17,25 +17,18 @@ The ``boto3`` import is deferred to construction; if the extra is missing a
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource
+from batcher.io.formats.streaming.broker import BrokerMessage, BrokerSource, opaque_offset
 
 __all__ = ["KinesisSource"]
 
 
 def _import_boto3() -> Any:
     """Import ``boto3`` or raise a guiding ``BackendError``."""
-    try:
-        import boto3
-    except ImportError as exc:
-        raise BackendError(
-            "reading from Kinesis needs the kinesis extra: pip install 'batcher-engine[kinesis]'"
-        ) from exc
-    return boto3
+    return require("boto3", feature="Kinesis support", provides="boto3", extra="kinesis")
 
 
 def _is_throttle(exc: BaseException) -> bool:
@@ -107,12 +100,13 @@ class KinesisSource(BrokerSource):
     format_name = "kinesis"
 
     __slots__ = (
+        "_adopted",
         "_client_obj",
         "_closed",
         "_iterators",
         "_partitions",
         "_pool_obj",
-        "_shard_ids",
+        "_shards_cache",
     )
 
     def __init__(
@@ -143,7 +137,7 @@ class KinesisSource(BrokerSource):
         )
         self._partitions = partitions
         self._client_obj: Any = None
-        self._shard_ids: list[str] | None = None
+        self._shards_cache: list[dict[str, Any]] | None = None
         self._iterators: dict[str, str] = {}
         # Lazily built; only a multi-shard reader ever needs it. See `_get_records`.
         self._pool_obj: Any = None
@@ -151,6 +145,10 @@ class KinesisSource(BrokerSource):
         # Their records already flowed through the children a reshard created, so they must
         # never be polled again — reusing their final iterator raises `ExpiredIterator`.
         self._closed: set[str] = set()
+        # Children this reader has taken over from a drained shard of its own. They are the
+        # continuation of a key range it already owns, so they are read from the *beginning*
+        # rather than from the configured `iterator_type`. See `_adopt_children`.
+        self._adopted: set[str] = set()
 
     def _client(self) -> Any:
         if self._client_obj is None:
@@ -158,35 +156,34 @@ class KinesisSource(BrokerSource):
             self._client_obj = boto3.client("kinesis", region_name=self._options["region"])
         return self._client_obj
 
-    def _shards(self) -> list[str]:
-        """Every shard of the stream, paginated.
+    def _shards(self) -> list[dict[str, Any]]:
+        """Every shard of the stream, paginated, with its lineage.
 
         `list_shards` returns at most 100 shards per call and hands back a `NextToken` for
         the rest. Reading only the first page looked like it worked — it just silently
         skipped every shard past the hundredth, which on a large stream is most of the
         data. Note that `StreamName` and `NextToken` are mutually exclusive in the API.
 
-        The result is cached for the life of the source. That is correct across a
-        *restart* — a fresh source re-lists, and `_shard_map` keys everything on stable
-        shard numbers so a reshard is handled (see `_shard_map`). It does mean a shard
-        created **mid-run**, without a restart, is not discovered until the next planning
-        cycle; a continuous consumer that must pick up splits live needs a periodic
-        re-list, which is a driver-timed change left for when there is a live stream to
-        validate it against.
+        The whole descriptor is kept, not just the id, because ``ParentShardId`` /
+        ``AdjacentParentShardId`` are what say which shards *replaced* a shard a reshard
+        closed — the fact `_adopt_children` needs and that a bare id list threw away.
+
+        The result is cached for the life of the source, and `_advance` invalidates the
+        cache the moment a shard is drained, which is exactly when a reshard has happened.
         """
-        if self._shard_ids is None:
+        if self._shards_cache is None:
             client = self._client()
-            shard_ids: list[str] = []
+            shards: list[dict[str, Any]] = []
             kwargs: dict[str, Any] = {"StreamName": self.topic}
             while True:
                 resp = client.list_shards(**kwargs)
-                shard_ids.extend(s["ShardId"] for s in resp.get("Shards", []))
+                shards.extend(resp.get("Shards", []))
                 token = resp.get("NextToken")
                 if not token:
                     break
                 kwargs = {"NextToken": token}
-            self._shard_ids = shard_ids
-        return self._shard_ids
+            self._shards_cache = shards
+        return self._shards_cache
 
     def _shard_map(self) -> dict[int, str]:
         """The stream's shards keyed by their **stable** shard number, not list position.
@@ -205,7 +202,7 @@ class KinesisSource(BrokerSource):
         that survives a reshard. A non-standard id (a test stub, a future format) falls
         back to a deterministic `sha256` — stable across processes, unlike `hash()`.
         """
-        return {_shard_number(shard_id): shard_id for shard_id in self._shards()}
+        return {_shard_number(s["ShardId"]): s["ShardId"] for s in self._shards()}
 
     def _discover_partitions(self) -> list[int]:
         if self._partitions is not None:
@@ -215,18 +212,78 @@ class KinesisSource(BrokerSource):
     def _active_shards(self) -> list[tuple[int, str]]:
         """``(shard_number, shard_id)`` for the shards this reader should poll.
 
-        A requested partition whose shard is no longer in the stream is dropped — but
-        that is not the silent loss the old positional code risked: a shard absent from
-        ``list_shards`` has been closed by a reshard, its records already drained through
-        its children, which appear under their own new numbers.
+        A reader pinned to a partition set — which is every reader on the distributed path,
+        since :class:`BrokerSplit` rebuilds the source as ``partitions=[n]`` — used to poll
+        *only* the shards whose numbers were in that set. A reshard is the routine event
+        partitioning exists to absorb, and it replaces a shard with children carrying
+        **new** numbers. Those numbers were in nobody's pinned set, so once the parent
+        drained the reader went permanently quiet on that key range: every poll returned
+        nothing, the empty-poll back-off made it look like an idle stream, and every record
+        written to the children was silently lost. Nothing raised, and no count was wrong
+        anywhere it could be compared.
+
+        `_adopt_children` closes that by following the lineage `list_shards` reports, so a
+        pinned reader takes over the children of its own drained shards.
         """
-        shard_map = self._shard_map()
-        numbers = self._partitions if self._partitions is not None else sorted(shard_map)
-        return [
-            (n, shard_map[n])
-            for n in numbers
-            if n in shard_map and shard_map[n] not in self._closed
-        ]
+        shards = self._shards()
+        self._adopt_children(shards)
+        owned = self._owned_shard_ids(shards)
+        return sorted((_shard_number(sid), sid) for sid in owned if sid not in self._closed)
+
+    def _owned_shard_ids(self, shards: list[dict[str, Any]]) -> set[str]:
+        """The shard ids this reader is responsible for: its pinned set, plus adoptions."""
+        if self._partitions is None:
+            return {s["ShardId"] for s in shards}  # this reader owns the whole stream
+        wanted = set(self._partitions)
+        return {
+            s["ShardId"]
+            for s in shards
+            if _shard_number(s["ShardId"]) in wanted or s["ShardId"] in self._adopted
+        }
+
+    def _adopt_children(self, shards: list[dict[str, Any]]) -> None:
+        """Take over the children of every shard of ours that has been drained.
+
+        A drained shard (`_closed`) has been replaced by children a reshard created. Its
+        records are already read; theirs are not, and they belong to the key range this
+        reader owns — so it must take them over rather than wait for a replan.
+
+        **Exactly one reader may adopt a merge child**, or its records are delivered twice.
+        A merge child has two parents, which may sit on two different readers, and neither
+        can see the other's state. The owner is defined as the reader holding the
+        *lowest-numbered* parent: a rule each reader evaluates from the child's own
+        lineage, with no coordination, that names the same reader everywhere. A split child
+        has a single parent, so the rule reduces to "the parent's owner".
+
+        Adoption is transitive — a child can itself be resharded — so this runs to a
+        fixpoint rather than one level deep.
+        """
+        pending = [s for s in shards if s["ShardId"] not in self._adopted]
+        while True:
+            newly = [s for s in pending if self._should_adopt(s)]
+            if not newly:
+                return
+            self._adopted.update(s["ShardId"] for s in newly)
+            adopted_now = {s["ShardId"] for s in newly}
+            pending = [s for s in pending if s["ShardId"] not in adopted_now]
+
+    def _should_adopt(self, shard: dict[str, Any]) -> bool:
+        """Whether this reader takes over `shard` from a parent it has drained."""
+        parents = _parent_ids(shard)
+        if not parents:
+            return False
+        primary = min(parents, key=_shard_number)
+        # Not drained yet: the parent still holds records, and Kinesis orders a child
+        # strictly after its parents. Reading the child now would deliver out of order.
+        if primary not in self._closed:
+            return False
+        return self._owns(primary)
+
+    def _owns(self, shard_id: str) -> bool:
+        """Whether `shard_id` is one this reader is responsible for."""
+        if self._partitions is None:
+            return True
+        return _shard_number(shard_id) in set(self._partitions) or shard_id in self._adopted
 
     def _iterator(self, shard_id: str, shard_number: int) -> str:
         """A shard iterator, resuming after a checkpointed sequence when present.
@@ -241,6 +298,12 @@ class KinesisSource(BrokerSource):
         expired mid-run. Falling back to `_resume_from` there would have re-read the whole
         micro-batch history since the restart, and falling back to ``TRIM_HORIZON`` — which
         is what an absent `_resume_from` means — would have replayed the entire shard.
+
+        A shard *adopted* from a drained parent (`_adopt_children`) starts at
+        ``TRIM_HORIZON`` whatever `iterator_type` says. It is the continuation of a range
+        this reader was already following, and its records begin at the reshard: under
+        ``LATEST`` every record written between the reshard and the first poll of the child
+        would be skipped, which is the same silent loss adoption exists to stop.
         """
         if shard_id not in self._iterators:
             client = self._client()
@@ -253,10 +316,11 @@ class KinesisSource(BrokerSource):
                     StartingSequenceNumber=str(resume),
                 )
             else:
+                start = (
+                    "TRIM_HORIZON" if shard_id in self._adopted else self._options["iterator_type"]
+                )
                 resp = client.get_shard_iterator(
-                    StreamName=self.topic,
-                    ShardId=shard_id,
-                    ShardIteratorType=self._options["iterator_type"],
+                    StreamName=self.topic, ShardId=shard_id, ShardIteratorType=start
                 )
             self._iterators[shard_id] = resp["ShardIterator"]
         return self._iterators[shard_id]
@@ -352,8 +416,9 @@ class KinesisSource(BrokerSource):
         # permanently quiet on the resharded key range. Every poll returned nothing, the
         # empty-poll back-off made it look like an idle stream, and the records that flowed
         # into the children were never read. Dropping the cache costs one `list_shards` per
-        # reshard, which is as rare as a reshard is.
-        self._shard_ids = None
+        # reshard, which is as rare as a reshard is. `_adopt_children` then reads the fresh
+        # listing's lineage and takes the children over.
+        self._shards_cache = None
 
     def _decode(self, shard_number: int, resp: dict) -> list[BrokerMessage]:
         """One shard's `GetRecords` response as broker messages."""
@@ -367,7 +432,7 @@ class KinesisSource(BrokerSource):
                     offset=_seq_to_offset(rec["SequenceNumber"]),
                     # The raw sequence is the resume token (the int64 offset is a
                     # lossy hash); `AFTER_SEQUENCE_NUMBER` needs the exact string.
-                    resume_token=rec["SequenceNumber"],
+                    resume_token=rec["SequenceNumber"],  # exact; `offset` is the lossy one
                     timestamp=int(ts.timestamp() * 1000) if ts is not None else 0,
                     topic=self.topic,
                     key=(rec.get("PartitionKey") or "").encode("utf-8") or None,
@@ -382,6 +447,19 @@ class KinesisSource(BrokerSource):
             pool.shutdown(wait=False)
 
 
+def _parent_ids(shard: dict[str, Any]) -> list[str]:
+    """The shards a `list_shards` descriptor names as this shard's parents.
+
+    A shard created by a *split* has one ``ParentShardId``; one created by a *merge* has
+    that plus an ``AdjacentParentShardId``. A shard that predates any reshard has neither.
+    """
+    return [
+        shard[key]
+        for key in ("ParentShardId", "AdjacentParentShardId")
+        if shard.get(key) is not None
+    ]
+
+
 def _shard_number(shard_id: str) -> int:
     """The stable numeric identity of a Kinesis shard, from its ShardId.
 
@@ -393,26 +471,12 @@ def _shard_number(shard_id: str) -> int:
     still round-trips to the same shard after a restart.
     """
     _, _, suffix = shard_id.partition("shardId-")
-    if suffix.isdigit():
-        return int(suffix)
-    return int.from_bytes(hashlib.sha256(shard_id.encode("utf-8")).digest()[:8], "big") % (1 << 63)
+    return opaque_offset(suffix if suffix.isdigit() else shard_id)
 
 
-def _seq_to_offset(sequence_number: str) -> int:
-    """Map an opaque Kinesis sequence number to a stable int64 offset column.
-
-    The raw sequence is a large decimal string; take it modulo 2**63 so it fits
-    the fixed int64 ``offset`` column while preserving monotonic ordering within
-    the precision of int64 (sequence numbers within a shard are increasing).
-
-    A non-numeric sequence falls back to a `sha256` digest rather than `hash()`: Python salts
-    `str` hashing per process, so the fallback produced a different `offset` for the same
-    record on every run and on every worker — silently breaking the ordering and de-dup the
-    column exists for, across exactly the restart and distributed boundaries that matter.
-    """
-    try:
-        return int(sequence_number) % (1 << 63)
-    except ValueError:
-        return int.from_bytes(
-            hashlib.sha256(sequence_number.encode("utf-8")).digest()[:8], "big"
-        ) % (1 << 63)
+#: Kinesis's spelling of the shared "opaque native position -> int64 offset column" rule.
+#: The same digest-with-a-numeric-fast-path was pasted into four brokers; it lives in
+#: `broker.schema` now, because four copies of one projection is four chances for one of
+#: them to drift back to `hash()` — which is per-process salted, and so produced a different
+#: offset for the same record on every worker.
+_seq_to_offset = opaque_offset

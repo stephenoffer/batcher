@@ -7,20 +7,20 @@ device.
 
 | | |
 | --- | --- |
-| **Tensors in** | `bt.from_torch(tensor)` |
-| **Tensors out** | `ds.ml.iter_torch_batches(...)` |
-| **Distributed** | `batcher.ml.streaming_split(...)`, or `ds.ml.stream_loader` |
-| **Inference** | `ds.ml.map_batches(SomeClass, batch_format="torch")` |
+| **Tensors in** | {py:func}`bt.from_torch(tensor) <batcher.from_torch>` |
+| **Tensors out** | {py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` |
+| **Distributed** | {py:func}`batcher.ml.streaming_split(...) <batcher.ml.streaming_split>`, or {py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` |
+| **Inference** | {py:meth}`ds.ml.map_batches(SomeClass, batch_format="torch") <batcher.api.dataset.ml.DatasetML.map_batches>` |
 | **Extra** | `pip install 'batcher-engine[torch]'` |
 
 The measured stake, on 10 M rows x 32 float features, `batch_size=1024`, `prefetch=2`: 1.76 Mrows/s
-through `iter_torch_batches`, and 1.28 Mrows/s on a 4-rank DDP `streaming_split`
+through {py:meth}`iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`, and 1.28 Mrows/s on a 4-rank DDP `streaming_split`
 (`benchmarks/BENCHMARK_RESULTS.md`). Ingest throughput is easy to assume and cheap to check,
 so measure it against your own data rather than taking either figure on trust.
 
 ## Tensors in
 
-`bt.from_torch` adapts a tensor, a tuple of tensors, or a map-style `Dataset` into the engine.
+`bt.from_torch` adapts a tensor, a tuple of tensors, or a map-style {py:class}`Dataset <batcher.Dataset>` into the engine.
 Tensors are moved to CPU and adapted through NumPy in bulk, with no per-row Python.
 
 ```python
@@ -41,12 +41,12 @@ shape. A tuple of tensors becomes one column each, named `col_0`, `col_1`, and s
 :::
 
 This is for adapting something you already have in memory. It is not the ingest path; for that,
-read the corpus with `bt.read.parquet` and never build the tensors twice.
+read the corpus with {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` and never build the tensors twice.
 
 ## Tensors out
 
 `ds.ml.iter_torch_batches(...)` streams the dataset to the training loop, consuming
-`iter_batches()` incrementally. Nothing is materialized, so it scales past memory and works on an
+{py:meth}`iter_batches() <batcher.Dataset.iter_batches>` incrementally. Nothing is materialized, so it scales past memory and works on an
 unbounded source. Numeric columns convert; strings and other types are dropped (keep ids and text
 in the engine, not in the trainer's hot path).
 
@@ -141,7 +141,7 @@ split is exactly balanced, deterministic in `(seed, epoch)`, and resumable mid-e
 `global_consumed`, even onto a differently-sized cluster.
 
 :::{important}
-`stream_loader` is the one shard authority, so **turn off any framework auto-sharding**
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` is the one shard authority, so **turn off any framework auto-sharding**
 (`DistributedSampler`, a DataLoader sampler) or your ranks will overlap.
 {doc}`Streaming for training </ml/inference/streaming>` has the ordering contract.
 :::
@@ -205,7 +205,7 @@ partition is recomputed. Side effects (writing to a feature store, POSTing to a 
 twice. Make them idempotent.
 
 **Don't do feature engineering in `__getitem__`.** Every row that goes through Python is a row the
-engine could have vectorized. Express it as a `map_batches` or an `Expr` and the work runs in
+engine could have vectorized. Express it as a `map_batches` or an {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` and the work runs in
 parallel, in Rust, before it becomes a tensor.
 
 ## See also

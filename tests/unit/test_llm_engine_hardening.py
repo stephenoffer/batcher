@@ -507,3 +507,43 @@ def test_a_small_image_is_not_upscaled():
     Image.new("RGB", (32, 16)).save(buf, format="PNG")
     (image,) = _decode_image_inputs(pa.array([buf.getvalue()], type=pa.binary()))
     assert image.size == (32, 16)
+
+
+# --- the request pool is released with the worker -------------------------------------
+
+
+def test_a_served_engine_releases_its_request_pool_on_close():
+    """Nothing was ever shutting these pools down.
+
+    Each served engine builds a `ThreadPoolExecutor` sized to `concurrency` and keeps it for
+    the worker's lifetime, which is correct — but `close` is the teardown contract
+    `core.udf.lifecycle` and `InferencePool` look for, and neither the engine nor the class
+    UDF holding it defined one. So `concurrency` threads outlived every worker, per
+    `collect()`, for the life of the process.
+    """
+    import threading
+
+    from batcher.ml.llm import llm_udf
+    from batcher.ml.llm.engines import anthropic_engine, http_engine
+
+    for factory in (
+        http_engine("http://example.invalid/v1", model="m", concurrency=4),
+        anthropic_engine("m", api_key="k", concurrency=4),
+    ):
+        before = threading.active_count()
+        udf = llm_udf(factory, prompt_column="q")()
+        assert callable(getattr(udf, "close", None))
+        assert callable(getattr(udf._engine, "close", None))
+        udf.close()
+        assert threading.active_count() <= before + 1
+
+
+def test_a_served_embedding_encoder_releases_its_request_pool_on_close():
+    from batcher.ml import openai_embedding_encoder, tei_encoder
+
+    for encoder in (
+        openai_embedding_encoder("m", "text", concurrency=4)(),
+        tei_encoder("text", base_url="http://example.invalid", concurrency=4)(),
+    ):
+        assert callable(getattr(encoder, "close", None))
+        encoder.close()

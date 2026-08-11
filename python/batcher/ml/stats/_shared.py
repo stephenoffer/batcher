@@ -1,8 +1,9 @@
-"""Helpers shared by the statistical modules — column checks and scalar collection.
+"""Helpers shared across `ml` — column checks, indicator casting, and scalar collection.
 
-Two one-liners that every module in this package needs and none of them owns. They live
-here rather than being pasted three times, and rather than living in whichever module
-happened to be written first.
+Small pieces that many modules need and none of them owns. They live here rather than
+being pasted into whichever module happened to be written first: `require_columns` had
+reached four verbatim copies across `splitting`, `metrics`, and `preprocessors` before
+they were collapsed onto this one.
 """
 
 from __future__ import annotations
@@ -48,12 +49,15 @@ def indicator(name: str) -> Expr:
     return col(name).cast("boolean")
 
 
-def require_columns(ds: Dataset, *names: str) -> None:
+def require_columns(ds: Dataset, *names: str, hint: str = "Pass an existing column.") -> None:
     """Raise a `ColumnNotFoundError` naming the closest real column for any missing name.
 
     Args:
         ds: The dataset to check against.
         *names: The column names that must be present.
+        hint: The remedy appended to the error, for callers that want a narrower one
+            than "pass an existing column" (a projection that needs *numeric* columns,
+            say).
 
     Raises:
         ColumnNotFoundError: On the first name that is not a column of `ds`.
@@ -75,9 +79,7 @@ def require_columns(ds: Dataset, *names: str) -> None:
         if name not in present:
             from batcher._internal.errors import ColumnNotFoundError, unknown_message
 
-            raise ColumnNotFoundError(
-                unknown_message("column", name, available, hint="Pass an existing column.")
-            )
+            raise ColumnNotFoundError(unknown_message("column", name, available, hint=hint))
 
 
 def scalar(ds: Dataset, name: str) -> float:

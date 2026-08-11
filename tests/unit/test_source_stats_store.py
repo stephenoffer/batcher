@@ -13,7 +13,7 @@ from batcher.metadata import MetadataHub
 from batcher.metadata.backends import InProcessBackend
 from batcher.metadata.source_stats_store import load_source_stats, save_source_stats
 from batcher.plan.source_stats import SourceStatistics
-from batcher.plan.stats import ColumnStat, Provenance
+from batcher.plan.stats import ColumnStat, Provenance, SortOrder
 
 pytestmark = pytest.mark.unit
 
@@ -47,14 +47,25 @@ def test_roundtrip_preserves_sorted_by_and_partition_keys():
     hub = _hub()
     stats = SourceStatistics(
         row_count=10,
-        sorted_by=("ts", "id"),
+        sorted_by=(SortOrder("ts", descending=True), SortOrder("id")),
         partition_keys=("region",),
     )
     save_source_stats(hub, "src://b", stats)
     got = load_source_stats(hub, "src://b")
     assert got is not None
-    assert got.sorted_by == ("ts", "id")
+    # The direction survives: a descending key round-trips as descending, and the plain
+    # ascending one still persists in the compact bare-name form an older store wrote.
+    assert got.sorted_by == (SortOrder("ts", descending=True), SortOrder("id"))
     assert got.partition_keys == ("region",)
+
+
+def test_a_bare_column_name_from_an_older_store_reads_as_ascending():
+    """The compact encoding is what earlier stores wrote, and it must keep its meaning."""
+    hub = _hub()
+    save_source_stats(hub, "src://c", SourceStatistics(row_count=1, sorted_by=("ts",)))
+    got = load_source_stats(hub, "src://c")
+    assert got is not None
+    assert got.sorted_by == (SortOrder("ts"),)
 
 
 def test_missing_identity_returns_none():

@@ -13,6 +13,8 @@ correctness test could see. The guard itself is untouched — everything it exis
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import pytest
 
 from batcher.carbonite.memory import probe
@@ -39,13 +41,35 @@ def test_anonymous_memory_is_still_counted_in_full(monkeypatch):
     assert probe.cgroup_current_bytes() == 8 * _GIB
 
 
+def _simulated_host(monkeypatch, *, total: float, charged: float, cache: float) -> None:
+    """Present a whole simulated box to `PressureMonitor`, cgroup ceiling included.
+
+    Patching `total_memory_bytes` and the two `memory.current` readers is not enough, and the
+    gap was invisible rather than noisy. `available_bytes` clamps the host figure to
+    `cap_to_cgroup_headroom`, which reads the *real* `memory.max` — so on a big idle box the
+    headroom came back larger than the simulated total, `min()` returned the total itself, and
+    every reading here was "0% used" whatever the simulated numbers said. The NORMAL
+    assertions passed for that reason instead of for the reason they claim, and the CRITICAL
+    one could only pass on a box that happened to be nearly full.
+
+    Pinning the ceiling to the simulated total makes headroom `total - anonymous`, which is
+    what the docstrings above describe. `reset_memory_sampling` clears the TTL cache so a
+    reading taken by an earlier test cannot be served to this one.
+    """
+    monkeypatch.setattr(probe, "_cgroup_total_bytes", lambda: int(charged * _GIB))
+    monkeypatch.setattr(probe, "_cgroup_file_cache_bytes", lambda: int(cache * _GIB))
+    monkeypatch.setattr(probe, "total_memory_bytes", lambda: int(total * _GIB))
+    # `lru_cache`-wrapped, because `reset_memory_sampling` calls `cache_clear()` on whatever
+    # is bound to this name — a bare lambda makes the reset raise instead of clearing.
+    monkeypatch.setattr(probe, "cgroup_limit_bytes", lru_cache(lambda: int(total * _GIB)))
+    probe.reset_memory_sampling()
+
+
 def _cache_heavy_host(monkeypatch) -> None:
     """The measured reading after loading TPC-H sf1 on a 30 GiB box: 24.3 GiB charged to the
     cgroup, of which 15.3 GiB is page cache. Only 9 GiB is anonymous — but the raw 0.81
     fraction sails past the 0.765 ELEVATED line, and every morsel is halved from here on."""
-    monkeypatch.setattr(probe, "_cgroup_total_bytes", lambda: int(24.3 * _GIB))
-    monkeypatch.setattr(probe, "_cgroup_file_cache_bytes", lambda: int(15.3 * _GIB))
-    monkeypatch.setattr(probe, "total_memory_bytes", lambda: 30 * _GIB)
+    _simulated_host(monkeypatch, total=30, charged=24.3, cache=15.3)
 
 
 def test_a_cache_heavy_host_does_not_throttle_an_idle_engine(monkeypatch):
@@ -72,9 +96,7 @@ def test_reading_files_does_not_halve_the_morsel(monkeypatch):
 
 def test_a_genuinely_full_host_still_reports_pressure(monkeypatch):
     """The other half: anonymous memory near the ceiling must still escalate."""
-    monkeypatch.setattr(probe, "_cgroup_total_bytes", lambda: 29 * _GIB)
-    monkeypatch.setattr(probe, "_cgroup_file_cache_bytes", lambda: 0)
-    monkeypatch.setattr(probe, "total_memory_bytes", lambda: 30 * _GIB)
+    _simulated_host(monkeypatch, total=30, charged=29, cache=0)
     cfg = Config()
     with config_context(cfg):
         process_pool(24 * _GIB)  # the pool is empty; the anonymous footprint is what bites

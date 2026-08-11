@@ -12,10 +12,11 @@ conductor computes it and passes it in, keeping the decision in Kyber's lane.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.core.streaming.folds import (
@@ -24,10 +25,11 @@ from batcher.core.streaming.folds import (
     _rebatch,
     _window_key,
     _WindowedAggFold,
+    check_agg_state_bounded,
     empty_global_aggregate,
+    streaming_state_budget,
 )
 from batcher.io.source import Source
-from batcher.plan.ir_specs import sort_keys_ir
 from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
 
 __all__ = [
@@ -53,10 +55,18 @@ def stream_aggregate(
     (filter/project/scan); each source batch is run through it, partial-aggregated,
     and combined into the running state. Yields the finalized result once the source
     is exhausted (one logical result, optionally rebatched by `batch_size`).
+
+    A *keyed* aggregate over an *unbounded* source holds one entry per group for the life
+    of the query and only emits when the source ends, which it never does — so the state is
+    capped here exactly as it is on the sink path (`AggregateProcessor`). Only that path had
+    the guard, so the driver that grows forever was the one nothing was watching.
     """
     fold = _AggFold(agg)
+    guard = _unbounded_group_guard(agg, source)
     for batch in _read(source, projection):
         fold.push(batch)
+        if guard is not None:
+            check_agg_state_bounded(fold, guard[0], guard[1], label="streaming aggregate")
     result = fold.finalize()
     if result is None and not agg.group_keys:
         # A *global* aggregate over an empty input still yields exactly one row — `SUM` is
@@ -74,6 +84,24 @@ def _empty_global_aggregate(agg: Aggregate, source: Source) -> pa.RecordBatch | 
     return empty_global_aggregate(agg, source.schema())
 
 
+def _unbounded_group_guard(agg: Aggregate, source: Source) -> tuple[int, str] | None:
+    """The `(cap, cause)` to check a running aggregate against, or None when unneeded.
+
+    A keyless aggregate holds one row, and a bounded source ends — neither can leak, so
+    neither pays for the check.
+    """
+    from batcher.io.source import is_bounded
+
+    if not agg.group_keys or is_bounded(source):
+        return None
+    return (
+        streaming_state_budget(),
+        "this aggregate has no watermark, so no group is ever closed and evicted. Add "
+        ".with_watermark(...) with a windowed group_by so closed windows evict, narrow the "
+        "group keys, or raise memory.streaming_state_max_bytes",
+    )
+
+
 def stream_windowed_aggregate(
     agg: Aggregate,
     source: Source,
@@ -82,18 +110,93 @@ def stream_windowed_aggregate(
     projection: list[str] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Windowed aggregation over a stream, emitting each window as the watermark
-    closes it and flushing the rest at end-of-stream (bounded state)."""
+    closes it and flushing the rest at end-of-stream (bounded state).
+
+    A watermarked aggregate whose group keys contain no event-time window has nothing the
+    watermark can close, so over an unbounded source it is refused rather than run: the
+    fallback it used to take was an ordinary running aggregate, which on a stream that never
+    ends emits nothing, evicts nothing, and grows until the memory cap fires. Over a bounded
+    source the same fallback terminates and is correct, so it stays.
+    """
+    from batcher.io.source import (
+        is_bounded,
+        watermark_partition_columns,
+        watermark_partitions,
+    )
+
     key = _window_key(agg)
     if key is None or agg.watermark is None:  # not a watermarked windowed agg
+        if agg.watermark is not None and not is_bounded(source):
+            raise _unwindowed_watermark_error(agg)
         yield from stream_aggregate(agg, source, batch_size, projection=projection)
         return
-    fold = _WindowedAggFold(agg, key[0], key[1])
-    for batch in _read(source, projection):
+    # The watermark is a minimum over the source's partitions, so the partition columns have
+    # to survive the projection — and then be removed again before the batch reaches the
+    # plan, which must compute what it would have computed without them.
+    partition_cols = watermark_partition_columns(source)
+    read_projection, extra = _widen(projection, partition_cols, source)
+    fold = _WindowedAggFold(
+        agg,
+        key,
+        partition_cols=partition_cols,
+        expected_partitions=watermark_partitions(source),
+        drop_columns=extra,
+    )
+    for batch in _read(source, read_projection):
         for result in fold.push(batch):
             yield from _rebatch(result, batch_size)
     final = fold.flush()
     if final is not None:
         yield from _rebatch(final, batch_size)
+
+
+def _widen(
+    projection: list[str] | None, partition_cols: Sequence[str], source: Source
+) -> tuple[list[str] | None, tuple[str, ...]]:
+    """Add the watermark's partition columns to `projection`, and name what was added.
+
+    A projection of `None` already reads everything, so there is nothing to widen and
+    nothing extra to strip. A column the source's schema does not carry is skipped rather
+    than requested, so a projection is never widened into a read that fails.
+
+    Args:
+        projection: Kyber's source projection for the plan, or None to read everything.
+        partition_cols: Columns the watermark needs to attribute rows to partitions.
+        source: The stream, for the schema that says which of those columns exist.
+
+    Returns:
+        `(projection to read with, columns added purely for the watermark)`.
+    """
+    if projection is None or not partition_cols:
+        return projection, ()
+    try:
+        available = set(source.schema().names)
+    except Exception as exc:
+        # A source that cannot describe itself before it is read gets the unwidened
+        # projection: no per-partition watermark, rather than a read of a column that may
+        # not exist. The tracker degrades to one partition, which is today's behavior.
+        # Traced, because that degradation is invisible in the result: the query still runs
+        # and still returns rows, it just attributes event time less precisely.
+        note_suppressed("core", "widen projection for per-partition watermark", exc)
+        return projection, ()
+    extra = tuple(c for c in partition_cols if c in available and c not in projection)
+    return ([*projection, *extra], extra) if extra else (projection, ())
+
+
+def _unwindowed_watermark_error(agg: Aggregate):
+    """The refusal for `.with_watermark(...)` on an aggregate with no event-time window."""
+    from batcher._internal.errors import PlanError
+
+    keys = ", ".join(repr(k.alias) for k in agg.group_keys) or "(none)"
+    return PlanError(
+        f"this aggregate sets a watermark on {agg.watermark.time_col!r} but groups by "
+        f"{keys}, none of which is an event-time window — so the watermark has nothing to "
+        "close and no state is ever released. Over an unbounded source that never emits a "
+        "row and grows without limit. Group by a window "
+        "(`group_by(w=bt.window(col('ts'), '1h'))`, or `bt.window(col('ts'), '1h', '30m')` "
+        "exploded first for overlapping windows), or drop the watermark and write the "
+        "running aggregate to a sink with output_mode='update'."
+    )
 
 
 def stream_distinct(
@@ -108,6 +211,10 @@ def stream_distinct(
     DISTINCT is a group-by over *all* columns with no aggregate functions, so it
     reuses the incremental aggregate driver verbatim: identical rows fold into the
     same running group, and the state is bounded by the number of distinct rows.
+
+    Whole-row only. A keyed dedup (`distinct(subset=...)`) is not a group-by — its
+    surviving row carries columns the key does not determine — and the dispatcher keeps
+    it off this driver; `as_aggregate` raises rather than approximate it here.
     """
     yield from stream_aggregate(distinct.as_aggregate(), source, batch_size, projection=projection)
 
@@ -181,9 +288,10 @@ def stream_topn(
 
     sort_ir = json.dumps(
         {
-            "op": "sort",
+            **sort.shape_ir(),
             "input": {"op": "scan", "source_id": 0},
-            "keys": sort_keys_ir(sort.keys),
+            # The driver trims each micro-batch to its own running limit, which is not the
+            # plan's — the only field it overrides rather than carries.
             "limit": limit,
         }
     )

@@ -39,6 +39,12 @@ if TYPE_CHECKING:
 
     from batcher.api.dataset import Dataset
 
+    # `Fit`/`Predict` are the unbound pair (this module refits per fold) and `Scorer` grades
+    # the result; all three are defined once in `ml._estimator`. They stay plain callables
+    # rather than requiring the `Estimator` protocol, so a framework model composes without an
+    # adapter — which is the reason this module took callables in the first place.
+    from batcher.ml._estimator import Fit, Predict, Scorer
+
 __all__ = [
     "SearchResult",
     "cross_val_predict",
@@ -50,13 +56,6 @@ __all__ = [
     "random_search",
     "validation_curve",
 ]
-
-# A fit callable takes a training Dataset and returns something predict can score; a predict
-# callable takes (fitted, dataset) and returns a Dataset with a prediction column. Kept as
-# plain callables so any framework composes without an adapter.
-Fit = "Callable[[Dataset], Any]"
-Predict = "Callable[[Any, Dataset], Dataset]"
-Metric = "Callable[[Dataset, str, str], float]"
 
 
 def _folds(
@@ -80,7 +79,7 @@ def cross_val_score(
     predict: Predict,
     *,
     y_true: str,
-    metric: Metric,
+    metric: Scorer,
     k: int = 5,
     prediction: str = "prediction",
     seed: int = 0,
@@ -214,7 +213,7 @@ def learning_curve(
     predict: Predict,
     *,
     y_true: str,
-    metric: Metric,
+    metric: Scorer,
     fractions: list[float] | None = None,
     holdout: float = 0.25,
     prediction: str = "prediction",
@@ -303,7 +302,7 @@ def validation_curve(
     predict: Predict,
     *,
     y_true: str,
-    metric: Metric,
+    metric: Scorer,
     param_values: list[Any],
     param_name: str = "param",
     k: int = 5,
@@ -545,7 +544,7 @@ def grid_search(
     predict: Predict,
     *,
     y_true: str,
-    metric: Metric,
+    metric: Scorer,
     grid: Sequence[dict[str, Any]],
     greater_is_better: bool = True,
     k: int = 5,
@@ -636,7 +635,7 @@ def random_search(
     predict: Predict,
     *,
     y_true: str,
-    metric: Metric,
+    metric: Scorer,
     distributions: dict[str, Sequence[Any] | Callable[[Random], Any]],
     n_iter: int = 10,
     greater_is_better: bool = True,

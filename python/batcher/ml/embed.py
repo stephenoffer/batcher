@@ -92,7 +92,10 @@ def sentence_transformer_encoder(
                 self._model.half()
 
         def __call__(self, batch: Any) -> Any:
-            texts = batch.column(text_column).to_pylist()
+            # A null cell reaches `encode` as `None`, which the tokenizer rejects — one null
+            # text failed the whole batch. `""` is the same rendering the streaming `embed`
+            # path and the prompt renderers use.
+            texts = [_text_cell(v) for v in batch.column(text_column).to_pylist()]
             vectors = self._model.encode(
                 texts,
                 convert_to_numpy=True,
@@ -100,10 +103,7 @@ def sentence_transformer_encoder(
                 normalize_embeddings=normalize,
             )
             col = _to_embedding_column(vectors, output_type=output_type)
-            if output_column in batch.schema.names:
-                idx = batch.schema.get_field_index(output_column)
-                return batch.set_column(idx, output_column, col)
-            return batch.append_column(output_column, col)
+            return _append_embedding_column(batch, output_column, col)
 
     return _STEncoder
 
@@ -230,13 +230,35 @@ def _embedding_column(arr: Any, output_type: str) -> pa.Array:
     return pa.FixedSizeListArray.from_arrays(pa.array(arr.reshape(-1)), arr.shape[1])
 
 
+def _text_cell(value: Any) -> str:
+    """One cell as encoder input — a null reads as ``""``, never the string ``"None"``."""
+    return "" if value is None else str(value)
+
+
+def _append_embedding_column(batch: Any, name: str, column: Any) -> Any:
+    """`batch` with `name` set to `column`, replacing it in place when it already exists.
+
+    The one write-back step every encoder in this package shares — the local
+    sentence-transformers one, the streaming `embed` pool, and the served-endpoint encoders
+    in `embed_api`, which import it from here rather than keeping a second copy.
+
+    Replacing matters because Arrow permits duplicate field names: appending unconditionally
+    left a batch carrying two columns of one name, where `to_pydict()` keeps the last,
+    expressions resolve the first, and nothing raises. Re-embedding into the column you read
+    is the ordinary way to hit it.
+    """
+    if name in batch.schema.names:
+        return batch.set_column(batch.schema.get_field_index(name), name, column)
+    return batch.append_column(name, column)
+
+
 def _chunk_texts(texts: list[Any], size: int, overlap: int) -> tuple[list[str], list[int]]:
     """Split each text into overlapping windows, with the row each window came from."""
     step = max(size - overlap, 1)
     chunks: list[str] = []
     owners: list[int] = []
     for row, text in enumerate(texts):
-        body = "" if text is None else str(text)
+        body = _text_cell(text)
         starts = range(0, max(len(body) - overlap, 1), step) if len(body) > size else (0,)
         for start in starts:
             chunks.append(body[start : start + size])
@@ -341,8 +363,6 @@ def embed(
     Yields:
         Each input batch with `output_column` appended, in order.
     """
-    import pyarrow as pa
-
     from batcher._internal.errors import PlanError
 
     if pooling not in _POOLINGS:
@@ -361,14 +381,17 @@ def embed(
         )
 
         def worker(batch: pa.RecordBatch) -> pa.RecordBatch:
-            texts = batch.column(text_column).to_pylist()
+            # A null cell reaches the encoder as `None`, which sentence-transformers and every
+            # tokenizer behind it reject — so one null text failed the whole batch, on the one
+            # column type most likely to have them. Rendered as "" here (what `_chunk_texts`
+            # already did on the chunked path, and what the prompt renderers do), *before*
+            # `embed_unique`, so nulls and empties dedupe to the one forward pass they share.
+            texts = [_text_cell(v) for v in batch.column(text_column).to_pylist()]
             matrix = embed_unique(texts, encode) if dedup else encode(texts)
             if normalize:
                 matrix = _l2_normalize(matrix)
             embeddings = _embedding_column(matrix, output_type)
-            arrays = [batch.column(i) for i in range(batch.num_columns)] + [embeddings]
-            names = [*batch.schema.names, output_column]
-            return pa.RecordBatch.from_arrays(arrays, names=names)
+            return _append_embedding_column(batch, output_column, embeddings)
 
         return worker
 

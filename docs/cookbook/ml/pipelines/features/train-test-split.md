@@ -17,7 +17,7 @@ production.
 | The split moves when you touch a feature | two experiments compared on two different test sets | name a stable `key`; the default hashes every column |
 | The future in the training set | a random split over time-ordered data trains on Tuesday to predict Monday | cut on time with a `filter`, and hold out a gap |
 
-`ds.ml.train_test_split` assigns each row by a reproducible hash of its own values. The
+{py:meth}`ds.ml.train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` assigns each row by a reproducible hash of its own values. The
 parts are disjoint, they cover every row, and the assignment does not depend on how the
 data is partitioned: single-node, multi-core, distributed, or streaming all produce the
 same split. Nothing is shuffled and nothing is materialized: each part is a row-wise filter,
@@ -119,7 +119,7 @@ cutoff have labels drawn from the test period). Two filters, one gap, no leak.
 
 ## Three-way splits
 
-`random_split` generalizes to validation sets and takes the same `key` and `seed`.
+{py:meth}`random_split <batcher.api.dataset.ml.DatasetML.random_split>` generalizes to validation sets and takes the same `key` and `seed`.
 
 ```python
 parts = events.ml.random_split([0.6, 0.2, 0.2], seed=3, key="event_id")
@@ -178,6 +178,6 @@ matters on a real corpus.
 - {doc}`Streaming for training </ml/inference/streaming>`: deterministic, resumable sample order
   across DDP ranks.
 - {doc}`Data loaders </ml/training/data-loaders>`: handing `train` and `test` to a training loop.
-- {doc}`ML API reference </api/models/ml>`: `train_test_split`, `random_split`,
-  `drop_near_duplicates`.
+- {doc}`ML API reference </api/models/ml>`: {py:meth}`train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>`, {py:meth}`random_split <batcher.api.dataset.ml.DatasetML.random_split>`,
+  {py:meth}`drop_near_duplicates <batcher.api.dataset.ml.DatasetML.drop_near_duplicates>`.
 - {doc}`Sampling </user-guide/transform/rows/sampling>`: the sampling surface the split is built on.

@@ -344,8 +344,15 @@ def test_signed_arithmetic_matches_cpu_engine(expr, be):
         lambda ds: ds.filter(col("s").str.contains("o")),
         lambda ds: ds.filter(col("s") == "world"),
         lambda ds: ds.group_by("g").agg(n=col("s").count(), d=col("s").count_distinct()),
-        # `distinct(subset=)` lowers to window + filter + project, so it exercises all three
-        lambda ds: ds.distinct(subset=["g"]),
+        # A ranking window under a filter and a projection, which exercises all three on the
+        # device in one chain. Spelled out rather than as `distinct(subset=["g"])`: that used
+        # to lower to exactly this and now lowers to a `Distinct` node the device declines, so
+        # the short spelling would silently stop covering the shape it was chosen for.
+        lambda ds: (
+            ds.window(partition_by=["g"], order_by=["s"], functions={"rn": "row_number"})
+            .filter(col("rn") == 1)
+            .select("g", "s")
+        ),
     ],
 )
 def test_string_operations_match_cpu_engine(build, be):

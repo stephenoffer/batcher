@@ -21,6 +21,8 @@ from collections.abc import Sequence
 import pyarrow as pa
 
 from batcher._internal.hardware import fingerprint
+from batcher._internal.hardware.cgroup import cgroup_throttled_ratio
+from batcher._internal.hardware.cpu import cpu_thermal_events
 from batcher._internal.mathx import safe_div
 from batcher._internal.native import engine
 from batcher.config import active_config
@@ -103,6 +105,16 @@ def _record_op_feedback(
     # node that produced them; falling back to this process's fingerprint is right for every
     # single-node run and for a worker whose document predates the stamp.
     local_fingerprint = fingerprint()
+    # How hard this process's CPU quota was biting while the work ran. A property of the
+    # cgroup rather than of any one operator, so it is read once and stamped on every row of
+    # the batch — the same shape as the fingerprint above, and for the same reason: it
+    # describes the machine the measurements were taken on, not the operator that took them.
+    # `None` (no cgroup, or unreadable counters) records `0.0`, which is "no evidence".
+    local_throttled = cgroup_throttled_ratio() or 0.0
+    # And whether the silicon clamped *itself* while the work ran. Read once per batch, and
+    # a *delta* since the previous batch, so it describes this run rather than the machine's
+    # whole uptime. Always `0` on a virtualized host, which does not expose the counters.
+    local_thermal = cpu_thermal_events()
     for op in ops:
         rows_in = op.get("rows_in", 0)
         rows_out = op.get("rows_out", 0)
@@ -144,6 +156,11 @@ def _record_op_feedback(
                 io_read_bytes=int(op.get("io_read_bytes", 0) or 0),
                 io_write_bytes=int(op.get("io_write_bytes", 0) or 0),
                 hw_fingerprint=str(op.get("hw_fingerprint", "") or local_fingerprint),
+                # A distributed worker stamps its own reading into the document before it
+                # travels, exactly as it does the fingerprint, so a driver recording on its
+                # behalf attributes the throttling to the node that suffered it.
+                cpu_throttled_ratio=float(op.get("cpu_throttled_ratio") or local_throttled),
+                cpu_thermal_events=int(op.get("cpu_thermal_events") or local_thermal),
             )
         )
 
@@ -179,7 +196,10 @@ class LocalExecutor:
         cfg = active_config()
         # Ship Kyber's per-operator spill budgets alongside the plan so the engine
         # budgets each stateful operator individually (not one global cap for all).
-        engine_cfg = cfg.engine_config_json_with(plan.op_budgets())
+        engine_cfg = cfg.engine_config_json_with(
+            plan.op_budgets(),
+            prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+        )
         # Collect per-operator metrics only when there is a sink to consume them;
         # the plain entry point avoids the (tiny) JSON serialization otherwise.
         _ensure_native_tracing(_native)
@@ -210,18 +230,26 @@ def execute_local_metered(
     plan: PhysicalPlan,
     sources: list[list[pa.RecordBatch]],
     feedback: FeedbackSink | None = None,
-) -> tuple[list[pa.RecordBatch], list[dict]]:
-    """Execute and return ``(batches, ops)`` where `ops` is *this run's* raw
-    per-operator `ExecMetrics` (one dict per operator: ``op_id``, ``kind``,
-    ``rows_in``, ``rows_out``, ``elapsed_ns``, ``peak_bytes``, ``spilled``,
-    ``backend``, ``cpu_ns``, ``threads``).
+) -> tuple[list[pa.RecordBatch], list[dict], dict]:
+    """Execute and return ``(batches, ops, usage)``.
+
+    `ops` is *this run's* raw per-operator `ExecMetrics` (one dict per operator: ``op_id``,
+    ``kind``, ``rows_in``, ``rows_out``, ``elapsed_ns``, ``peak_bytes``, ``spilled``,
+    ``backend``, ``cpu_ns``, ``threads``). `usage` is the document's ``query`` block — what
+    the whole execution cost the machine (CPU, peak RSS, faults, real block-device bytes).
+
+    The two are separate because they hold on different tiers. Per-operator hardware
+    counters are only sound where each operator owns an exclusive wall interval, which the
+    streaming executor — the default — does not give them, so it reports zeros. The
+    whole-execution reading is measured at the FFI boundary and holds everywhere, which
+    makes it the one that answers "what did this cost" on the common path.
 
     Core *measures*; this is the same metered native call the feedback loop uses,
     surfaced directly so the control plane can report measured per-operator stats
     (`Dataset.stats()` / `explain(analyze=True)`). When `feedback` is supplied the
     same ops are also recorded into the sink, so a profiled run still feeds the
-    learning loop. A malformed/empty metrics document yields an empty `ops` list
-    rather than raising.
+    learning loop. A malformed/empty metrics document yields an empty `ops` list and an
+    empty `usage` rather than raising.
     """
     _native = engine()
     # The same tracing bridge `LocalExecutor.execute` installs. Without it a session whose
@@ -233,13 +261,24 @@ def execute_local_metered(
     out, metrics_json = _native.execute_plan_metered(
         plan.to_json(),
         sources,
-        cfg.engine_config_json_with(plan.op_budgets()),
+        # The routing hint travels with the budgets, exactly as `LocalExecutor.execute`
+        # ships it. Dropping it here silently disarmed the whole optimization on the
+        # ordinary path: `collect()` reaches the engine through *this* entry point, so
+        # a plan Kyber had marked as a materializing aggregate was executed as a
+        # streaming one anyway — and only a run that took the unmetered wrapper ever
+        # saw the faster route.
+        cfg.engine_config_json_with(
+            plan.op_budgets(),
+            prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+        ),
         current_query_id() or None,
     )
     try:
-        ops = json.loads(metrics_json).get("ops", [])
+        doc = json.loads(metrics_json)
+        ops = doc.get("ops", [])
+        usage = doc.get("query") or {}
     except (ValueError, TypeError):
-        ops = []
+        ops, usage = [], {}
     if feedback is not None and ops:
         _record_op_feedback(feedback, ops, cfg.execution.morsel_rows, plan.ops)
-    return out, ops
+    return out, ops, usage

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from batcher.api.streaming._launch import _rate_controller
 from batcher.api.streaming._query import (
     StreamingQuery,
     _deregister,
@@ -116,6 +117,10 @@ def start_distributed_stream(
         output_mode=output_mode,
         checkpoint=store,
         runner_factory=make_runner,
+        # The same pacing on a cluster as on one machine. A distributed epoch fans the
+        # source's splits across workers, so an unpaced trigger multiplies the backlog it
+        # cannot hold by the fleet size rather than dividing it.
+        rate_controller=_rate_controller(trigger),
     )
     query = StreamingQuery(query_name, engine, plan, sources)
     _register(query_name, query)

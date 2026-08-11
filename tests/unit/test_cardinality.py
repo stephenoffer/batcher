@@ -243,3 +243,33 @@ def test_partial_distinct_ndv_floors_the_estimate():
     learned = {"__column_ndv__": {"a": 600.0}}
     est = StatsEstimator(ds._sources, learned, active_config().optimizer.cardinality)
     assert est.estimate(node).rows >= 600.0
+
+
+def test_a_unique_key_caps_the_join_estimate_at_the_other_sides_rows():
+    """A unique key on one side bounds the join's output by the *other* side's rows.
+
+    This is a ceiling, not a heuristic: if every key value on one side is distinct, each row
+    of the other side finds at most one partner, so the result cannot be larger than that
+    other side. The Selinger ratio does not know that — with only one side's distinct count
+    measured it divides by the one it has, which over-estimates by design ("safe for memory").
+    Safe for memory is the wrong direction for *join order*, and an estimate above a provable
+    ceiling is simply wrong: on the Join Order Benchmark's `q32a` a 219,569-row intermediate
+    joined to an 18-row dimension on its primary key was estimated at 411,452,101 rows.
+
+    `inf` where nothing is proven, so an unmeasured join keeps whatever the caller estimated.
+    """
+    from batcher.kyber.stats.estimator import _unique_key_row_cap
+    from batcher.plan.stats import Provenance, RelStats
+
+    rel = lambda n: RelStats(rows=n, provenance=Provenance.DEFAULT)  # noqa: E731
+
+    # A unique-key dimension on the right bounds the output by the left's rows.
+    assert _unique_key_row_cap(rel(219_569), rel(18), None, 18.0) == 219_569
+    # ...and symmetrically.
+    assert _unique_key_row_cap(rel(18), rel(219_569), 18.0, None) == 219_569
+    # Both unique: the smaller side bounds it, since each side matches at most once.
+    assert _unique_key_row_cap(rel(100), rel(50), 100.0, 50.0) == 50
+    # A key that repeats (16 distinct over 29,997 rows) proves nothing.
+    assert _unique_key_row_cap(rel(597), rel(29_997), None, 16.0) == float("inf")
+    # Nothing measured proves nothing.
+    assert _unique_key_row_cap(rel(10), rel(20), None, None) == float("inf")

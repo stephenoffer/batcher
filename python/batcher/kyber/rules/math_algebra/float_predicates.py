@@ -22,16 +22,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_ir.core import IsInf, IsNan, MathExpr
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["NON_FINITE_THROUGH_ROUNDING_RULES"]
 
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 #: Unary math functions that map NaN to NaN, each infinity to an infinity, and every finite
 #: value to a finite one — so they change neither of the two non-finite classes. `sign` is
@@ -54,16 +50,7 @@ def _through_rounding(check: type) -> Callable[[Expr], Expr]:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], expr_matches: tuple[type, ...]):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=expr_matches,
-        )
-    )
+    return register_leaf_rule(name, leaf, expr_matches=expr_matches)
 
 
 #: `isnan(f(x)) -> isnan(x)` and `isinf(f(x)) -> isinf(x)` for the six class-preserving

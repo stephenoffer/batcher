@@ -543,7 +543,7 @@ pub(crate) fn shm_available() -> bool {
 }
 
 /// What this process fetched from each shuffle peer, as `(addr, bytes, seconds, fetches,
-/// retries)` per peer, sorted by address.
+/// retries, starved_seconds)` per peer, sorted by address.
 ///
 /// The measurement a slow shuffle needs and none of the existing figures carry. A locality
 /// ratio says where the bytes came from and a credit window says how the producer was paced;
@@ -555,14 +555,62 @@ pub(crate) fn shm_available() -> bool {
 /// `bytes / seconds` a *per-stream* rate, the figure that is comparable against a link's
 /// capability. Retries are counted separately and their failed attempt is not timed, so a
 /// stale connection's timeout is never charged to the peer's bandwidth.
+///
+/// `starved_seconds` is the part of `seconds` the consumer spent blocked waiting for the next
+/// batch to arrive. It is the credit window's own feedback: near zero means the producer stayed
+/// ahead and a wider window would buy buffered memory rather than throughput, while a large
+/// share means the window is below the channel's bandwidth-delay product.
 #[pyfunction]
-pub(crate) fn shuffle_peer_stats() -> Vec<(String, u64, f64, u64, u64)> {
+pub(crate) fn shuffle_peer_stats() -> Vec<(String, u64, f64, u64, u64, f64)> {
     bc_transport::peer_transfers()
         .into_iter()
-        .map(|(addr, bytes, nanos, fetches, retries)| {
-            (addr, bytes, nanos as f64 / 1e9, fetches, retries)
+        .map(|(addr, bytes, nanos, fetches, retries, starved)| {
+            (
+                addr,
+                bytes,
+                nanos as f64 / 1e9,
+                fetches,
+                retries,
+                starved as f64 / 1e9,
+            )
         })
         .collect()
+}
+
+/// This process's running `(starved_seconds, total_seconds)` across every shuffle peer.
+///
+/// Totals rather than a ratio, because a credit controller acts once per round and needs how
+/// the channel behaved *during that round*. A lifetime ratio cannot say: after a few seconds of
+/// a long shuffle its denominator is large enough that a round of pure starvation barely moves
+/// it, so a controller reading it converges to a number and stops responding to the link.
+/// Differencing these two against the previous reading gives the interval the control law is
+/// defined over.
+///
+/// `(0.0, 0.0)` on a process that has fetched nothing, which callers must read as "no opinion"
+/// rather than as a saturated link.
+#[pyfunction]
+pub(crate) fn shuffle_flow_totals() -> (f64, f64) {
+    let (starved, total) = bc_transport::fleet_flow_totals();
+    (starved as f64 / 1e9, total as f64 / 1e9)
+}
+
+/// The largest bandwidth-delay product across every shuffle peer, in bytes, or `None`.
+///
+/// `BtlBw x RTprop`: the bytes a path holds in flight when it is exactly busy. This is the
+/// quantity a credit window exists to match, and the one a loss-based controller has to
+/// discover by overshooting it. Both terms are filtered rather than averaged — the delay is a
+/// running minimum and the rate a running maximum, because every error in the first is
+/// non-negative and every error in the second is non-positive.
+///
+/// The maximum across peers, because one credit window serves every channel a session fetches
+/// on: sizing to the median starves the longest path, and over-sizing is already bounded by
+/// Carbonite's byte ceiling.
+///
+/// `None` until both terms have been sampled, which callers must read as "no estimate" rather
+/// than as a pipe of zero width.
+#[pyfunction]
+pub(crate) fn shuffle_bdp_bytes() -> Option<u64> {
+    bc_transport::fleet_bdp_bytes()
 }
 
 /// Forget every peer's transfer totals, so the next reading measures one stage.

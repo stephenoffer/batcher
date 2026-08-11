@@ -51,7 +51,7 @@ _FALSE = False
 # Flip a comparison when the column is on the right (`lit < col` ≡ `col > lit`).
 
 
-@rule(name="zonemap_prune_filter", phase=Phase.SELECTION, matches=(Filter,))
+@rule(name="zonemap_prune_filter", phase=Phase.FUSION, matches=(Filter,))
 def zonemap_prune_filter(node: Filter, ctx: OptimizerContext) -> LogicalPlan | None:
     """Drop a Filter that metadata proves always-true, or replace one proved
     always-false with an empty (zero-row) relation. Returns None when undecidable."""
@@ -66,13 +66,22 @@ def zonemap_prune_filter(node: Filter, ctx: OptimizerContext) -> LogicalPlan | N
 
 # Operators that pass their input through unchanged in schema and merely shrink or
 # reorder rows — so an empty input produces an empty output with the same columns.
-_SCHEMA_PRESERVING = (Filter, Sort, Distinct, Sample)
+#
+# `Limit` belongs here for the same reason the others do (a limit of nothing is nothing, and
+# it keeps every column), and leaving it out had a specific consequence: nothing collapsed a
+# *nested* empty marker. `Limit(Limit(x, 0), 0)` is the canonical marker wrapped around
+# itself, and the rules that hoist a marker upward -- `project_over_empty` and its aggregate
+# and window siblings -- produce exactly that whenever the relation under the marker is
+# already empty. With nothing to collapse them the markers stack: iterating this phase over
+# TPC-DS q4 grew a tower of fourteen-deep `Limit(0)` nodes, one per pass, which is why the
+# phase could never reach a fixpoint. Folding the pair makes the family confluent.
+_SCHEMA_PRESERVING = (Filter, Sort, Distinct, Sample, Limit)
 
 
 @rule(
     name="propagate_empty_relation",
-    phase=Phase.SELECTION,
-    matches=(Filter, Sort, Distinct, Sample, Union, Join),
+    phase=Phase.FUSION,
+    matches=(Filter, Sort, Distinct, Sample, Limit, Union, Join),
 )
 def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold a provably-empty subtree upward through operators that preserve it.
@@ -81,8 +90,10 @@ def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> Logic
     emits for an always-false predicate, and what `.limit(0)` builds. This rule
     propagates that emptiness through the operators above it:
 
-    - a schema-preserving unary parent (`Filter`/`Sort`/`Distinct`/`Sample`) over an
-      empty input is itself empty — replace it with the empty input;
+    - a schema-preserving unary parent (`Filter`/`Sort`/`Distinct`/`Sample`/`Limit`) over
+      an empty input is itself empty — replace it with the empty input. Including `Limit`
+      is what collapses a *nested* marker, `Limit(Limit(x, 0), 0)`, which the hoisting
+      rules produce whenever the relation under a marker is already empty;
     - a `Union` drops its empty branches (an empty contributes no rows); if all are
       empty the union is empty, and a single surviving branch makes the union a
       pass-through (still deduplicated for a DISTINCT union);
@@ -90,9 +101,10 @@ def propagate_empty_relation(node: LogicalPlan, _ctx: OptimizerContext) -> Logic
       `_join_over_empty_side`, where the *output schema* is what limits how far it
       can go.
 
-    Registered after `zonemap_prune_filter` in the SELECTION phase so it folds the
-    empties that pruning produces in the same pass; bottom-up traversal collapses a
-    whole chain of empty-over-empty in one application. Returns None (no change)
+    Registered after `zonemap_prune_filter` in the FUSION phase so it folds the empties
+    that pruning produces in the same pass; bottom-up traversal collapses a whole chain of
+    empty-over-empty in one application, and the phase iterates so a marker emitted by a
+    later-registered producer is still picked up. Returns None (no change)
     when nothing is empty, so the rule is idempotent.
     """
     if isinstance(node, Union):

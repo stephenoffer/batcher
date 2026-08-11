@@ -2,14 +2,16 @@
 
 # Why this exists
 
-`benchmarks/suites/standard/tpcds.py` runs 7 of the 99 queries, and its docstring says
-expanding "is mechanical once a query's tables are added to `sources.TPCDS_TABLES`". That is
-the wrong binding constraint. Adding tables is trivial; the constraint is the **SQL surface**.
-Which of the 99 Batcher can express was an opinion. This makes it a measurement.
+`benchmarks/suites/standard/tpcds.py` now registers and executes all 99 queries, so the
+question "which of them does Batcher run" is answered there, against real data and the other
+engines. This file answers the cheaper, sharper question underneath it: **which of them can
+the SQL front-end express at all, and for what reason does each of the rest fail.**
 
 It runs parse-and-plan only — no data, no execution, seconds to complete — against empty
-registered schemas. So it answers "can the front-end express this query", which is the
-question the roadmap needs, without a data generator or a scale factor.
+registered schemas. That means no `dsdgen`, no scale factor, and no waiting on 99 timed
+queries, which is what makes it usable as a roadmap tool: the grouped reasons ("12 queries
+need ROLLUP") are the SQL-parity backlog, whereas the suite's per-query PARTIAL rows are the
+symptom. Run this to decide what to build; run the suite to prove it works.
 
 # Neither the queries nor the schemas are ours, and neither is invented
 

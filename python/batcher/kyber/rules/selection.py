@@ -153,17 +153,18 @@ def adaptive_build_side(
     )
 
 
-def _broadcast_max_bytes(l3_cache_bytes: int = 0) -> int:
-    """Build-side broadcast threshold in bytes, resolved against the last-level cache.
+def _broadcast_max_bytes(l3_cache_bytes: int = 0, workers: int = 1) -> int:
+    """Build-side broadcast threshold in bytes, resolved against the cache or the cluster.
 
     Delegates to `OptimizerConfig.resolved_broadcast_max_bytes`, so a pinned value wins and an
-    auto (`0`) value is sized to `l3_cache_bytes` — the residency the strategy actually depends
-    on. The single source of truth shared with the distributed executor's runtime guard; a
-    function (not an inlined read) so tests can patch the planner's threshold.
+    auto (`0`) value is sized to what the strategy actually depends on: L3 residency on one
+    node, and the network trade against a `workers`-wide shuffle on a cluster. The single
+    source of truth shared with the distributed executor's runtime guard; a function (not an
+    inlined read) so tests can patch the planner's threshold.
     """
     from batcher.config import active_config
 
-    return active_config().optimizer.resolved_broadcast_max_bytes(l3_cache_bytes)
+    return active_config().optimizer.resolved_broadcast_max_bytes(l3_cache_bytes, workers)
 
 
 def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
@@ -177,7 +178,12 @@ def build_side_rule(plan: LogicalPlan, ctx: OptimizerContext) -> LogicalPlan:
     equivalent physical algorithms, so the result is invariant."""
     if not ctx.sources:
         return plan
-    cache_default = _broadcast_max_bytes(ctx.hardware.l3_cache_bytes)
+    # Sized to the fan-out this plan targets. `worker_count > 1` means the join will be run
+    # across a cluster, where broadcast-vs-shuffle is a network trade rather than a cache one
+    # and the crossover is orders of magnitude higher — see `resolved_broadcast_max_bytes`.
+    # Without this the planner declined every dimension table larger than a quarter of one
+    # L3, so the distributed broadcast path was reachable only for the very smallest joins.
+    cache_default = _broadcast_max_bytes(ctx.hardware.l3_cache_bytes, ctx.hardware.worker_count)
     learned_bmax = learned_broadcast_max_bytes(ctx.hub, default=cache_default)
     max_bytes = learned_bmax if learned_bmax is not None else cache_default
     learned_smr = learned_sort_merge_min_rows(ctx.hub, SORT_MERGE_MIN_ROWS)
@@ -262,20 +268,38 @@ def _rewrite(
     if isinstance(node, Scan):
         return node
     if isinstance(node, Union):
-        return Union(
-            tuple(_rewrite(i, est, cost, decisions, max_bytes, smr, smb) for i in node.inputs),
-            node.distinct,
+        rewritten = tuple(
+            _rewrite(i, est, cost, decisions, max_bytes, smr, smb) for i in node.inputs
         )
+        if all(a is b for a, b in zip(rewritten, node.inputs, strict=True)):
+            return node  # structural sharing — see the note on the `Join` arm below
+        return Union(rewritten, node.distinct)
     if isinstance(node, Join):
         left = _rewrite(node.left, est, cost, decisions, max_bytes, smr, smb)
         right = _rewrite(node.right, est, cost, decisions, max_bytes, smr, smb)
-        node = Join(
-            left, right, node.left_keys, node.right_keys, node.join_type, node.output, node.strategy
-        )
+        # Rebuild only when a child actually moved. This used to construct a new `Join`
+        # unconditionally, which made the rule report "I changed the plan" on every single
+        # invocation even when it re-derived the identical orientation and strategy.
+        #
+        # That is not just wasted allocation. Plan nodes memoize `to_ir`, `available_columns`
+        # and `available_schema` in their instance `__dict__`, so rebuilding the whole join
+        # tree discards all of it every time the rule runs. And the optimizer driver detects a
+        # fixpoint by object *identity* first (`updated is plan`), so a rule that always
+        # returns a new tree can never converge on that cheap path -- which is what made this
+        # phase impossible to iterate, and in turn why the empty-relation rules that share it
+        # cannot see each other's output. Structural sharing here is the precondition for
+        # fixing that.
+        if left is not node.left or right is not node.right:
+            node = Join(
+                left,
+                right,
+                node.left_keys,
+                node.right_keys,
+                node.join_type,
+                node.output,
+                node.strategy,
+            )
         l_est, r_est = est.estimate(node.left), est.estimate(node.right)
-        # Build-side swap is only valid for inner joins (associative/commutative).
-        # Compare the cost of this orientation against the swapped one; children are
-        # identical between them, so the per-join `op_cost` is the deciding term.
         # Build-side swap is only valid for inner joins (associative/commutative).
         # Compare the cost of this orientation against the swapped one; children are
         # identical between them, so the per-join `op_cost` is the deciding term.
@@ -353,22 +377,29 @@ def _rewrite(
         build_measured = bounded is not None
         if bounded is not None:
             build_bytes = max(build_bytes, bounded)
+        # Sort-merge only when the *build* side (the one hashed, after the swap) is
+        # itself so large that a hash table over it is memory-prohibitive — then
+        # SMJ's bounded-memory merge wins despite its RowConverter encoding cost.
+        # Gating on the build side (not both inputs) is the key: a hash join builds
+        # only the smaller side and streams the larger one, so a 6M ⋈ 1.5M join
+        # hashes 1.5M (fits easily) and beats sorting *both* 6M and 1.5M. The old
+        # "both sides large" gate mis-chose SMJ for selective joins whose small side
+        # was merely over a million rows (TPC-H Q18's top join: 219ms SMJ sorting 6M
+        # lineitem to emit 399 rows, where a hash probe is ~30ms).
+        # NOTE: preferring SMJ for *already-ordered* inputs was tried and reverted —
+        # SMJ's encoding overhead loses to hash even when its sort is skipped; only
+        # the genuinely-too-big-to-hash build keeps it.
         if broadcast:
-            node = dataclasses.replace(node, strategy="broadcast")
+            strategy = "broadcast"
         elif build_rows >= smr and (build_bytes > smb or not build_measured):
-            # Sort-merge only when the *build* side (the one hashed, after the swap) is
-            # itself so large that a hash table over it is memory-prohibitive — then
-            # SMJ's bounded-memory merge wins despite its RowConverter encoding cost.
-            # Gating on the build side (not both inputs) is the key: a hash join builds
-            # only the smaller side and streams the larger one, so a 6M ⋈ 1.5M join
-            # hashes 1.5M (fits easily) and beats sorting *both* 6M and 1.5M. The old
-            # "both sides large" gate mis-chose SMJ for selective joins whose small side
-            # was merely over a million rows (TPC-H Q18's top join: 219ms SMJ sorting 6M
-            # lineitem to emit 399 rows, where a hash probe is ~30ms).
-            # NOTE: preferring SMJ for *already-ordered* inputs was tried and reverted —
-            # SMJ's encoding overhead loses to hash even when its sort is skipped; only
-            # the genuinely-too-big-to-hash build keeps it.
-            node = dataclasses.replace(node, strategy="sort_merge")
+            strategy = "sort_merge"
+        else:
+            strategy = node.strategy  # no strategy opinion; leave whatever is already set
+        # Naming the choice and applying it once keeps the node's identity when the rule
+        # re-derives the strategy it already had, which is what lets the driver see a
+        # fixpoint (see the structural-sharing note on the rebuild above).
+        if strategy != node.strategy:
+            node = dataclasses.replace(node, strategy=strategy)
         decisions.append(
             BuildSideDecision(
                 l_est.rows,
@@ -383,11 +414,12 @@ def _rewrite(
             )
         )
         return node
-    # Single-input nodes: rewrite the child in place.
+    # Single-input nodes: rewrite the child, and rebuild only if it moved.
     if hasattr(node, "input"):
-        return dataclasses.replace(
-            node, input=_rewrite(node.input, est, cost, decisions, max_bytes, smr, smb)
-        )
+        rewritten_input = _rewrite(node.input, est, cost, decisions, max_bytes, smr, smb)
+        if rewritten_input is node.input:
+            return node
+        return dataclasses.replace(node, input=rewritten_input)
     return node
 
 

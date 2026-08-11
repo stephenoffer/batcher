@@ -26,6 +26,7 @@ Three things here are what separate a demo from a production client, and they ap
 
 from __future__ import annotations
 
+import contextlib
 import random
 import time
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -362,6 +363,24 @@ def serving_udf(
                 lambda: self._client.predict(feed), retries, retry_backoff, "predict"
             )
 
+        def close(self) -> None:
+            """Release the backend connection when the worker is done with it.
+
+            `close` is the teardown contract `core.udf.lifecycle` and `InferencePool` look
+            for, and they look for it on *this* object. Without it a client holding a real
+            connection — a Triton HTTP pool or gRPC channel, a database handle — was released
+            only whenever the garbage collector happened to reach it, so a script running two
+            serving stages back to back held both generations of connections at once. A client
+            that needs no teardown simply defines no `close`, and this is a no-op.
+
+            Best-effort by the same contract as `teardown_udf`: the rows are already produced,
+            so a failing `close` must not fail the query.
+            """
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+
         def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
             import pyarrow as pa
 
@@ -374,8 +393,18 @@ def serving_udf(
             keep = [batch.column(i) for i in range(batch.num_columns)]
             names = list(batch.schema.names)
             for name in outputs if outputs is not None else list(result):
-                keep.append(_array_from_numpy(result[name]))
-                names.append(name)
+                array = _array_from_numpy(result[name])
+                # An output whose name the batch already carries **replaces** it rather than
+                # being appended beside it. Arrow permits duplicate field names, so appending
+                # produced a batch with two columns of one name: `to_pydict()` keeps only the
+                # last, every expression resolves the first, and nothing raises. That happens
+                # whenever a server echoes an input back or a pipeline re-scores into the
+                # column it read — and the model-id inference path already handles it.
+                if name in names:
+                    keep[names.index(name)] = array
+                else:
+                    keep.append(array)
+                    names.append(name)
             return pa.RecordBatch.from_arrays(keep, names=names)
 
     return _ServingUDF

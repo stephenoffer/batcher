@@ -20,17 +20,21 @@ needs both and deriving one from the other after the fact is lossy.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
     "DECISION",
+    "DQ",
     "GPU",
     "INFER",
     "LOG",
+    "MALFORMED",
     "PARTITION",
     "POOL",
     "PROGRESS",
@@ -38,13 +42,18 @@ __all__ = [
     "QUERY_START",
     "RECOVERY",
     "RECOVERY_EVENTS",
+    "RESOURCE",
     "SKIPPED",
     "STAGE_END",
     "STAGE_START",
+    "STREAM",
+    "WRITE",
     "Event",
     "Subscriber",
+    "current_query_id",
     "listening",
     "publish",
+    "query_scope",
     "subscribe",
 ]
 
@@ -66,6 +75,22 @@ PROGRESS = "progress"
 DECISION = "decision"
 #: A `batcher.*` log record, bridged onto the bus so the UI shows logs beside metrics.
 LOG = "log"
+
+# --- Data-quality observability ----------------------------------------------
+# A contract that is checked and never charted is a contract nobody notices degrading. The
+# report `ds.dq.validate()` returns is a per-run value: it answers "is today's data good",
+# and cannot answer "has the null rate been climbing for a week", which is the question that
+# catches an upstream change before it becomes an incident. Publishing each constraint's
+# result puts that series on the bus every other subsystem already reports to.
+
+#: One data-quality constraint was evaluated. Fields: ``constraint`` (its name, also carried
+#: as the event `name`), ``check`` (``row``/``unique``/``reference``/``aggregate``/
+#: ``schema``), ``severity`` (``error``/``warn``), ``violations`` (violating rows, or 1 for a
+#: failed relation-level or schema check), ``rows`` (rows considered), ``ok`` (whether it
+#: passed after its tolerance), and ``value`` (the measured number, for a relation-level
+#: check). Emitted once per constraint per `validate` — including for constraints that
+#: passed, because a series that only appears when something breaks has no baseline.
+DQ = "dq"
 
 # --- Distributed / inference observability -----------------------------------
 # A multi-hour batch-inference or distributed job needs progress the query/stage vocabulary
@@ -89,13 +114,87 @@ GPU = "gpu"
 #: signal). `name` is the stage label. This is the per-batch reading `InferencePool` already
 #: measures for its controller and otherwise discards.
 INFER = "infer"
-#: Rows/splits dropped under ``on_read_error="skip"``, aggregated to the driver. Fields:
-#: ``count`` (this increment), ``reason``, ``source`` (optional). Silent data loss at scale
-#: unless it reaches the driver, so the driver publishes the drained per-query count here.
+#: An input was dropped under ``on_error="skip"`` — one unreadable file or split, not one
+#: row: the file could not be read, so how many rows it held is exactly what is unknown.
+#: Fields: ``count`` (this increment), ``reason`` (the exception's type), ``source`` (the
+#: format). Published by `io.base._tolerance.ErrorPolicy` as each drop is decided.
+#:
+#: The path is deliberately absent. A metrics label built from a path is unbounded
+#: cardinality and a path can itself be sensitive; `Source.corrupt_files()` and the warning
+#: log both carry it for whoever needs it. This carries the bounded fact worth alerting on,
+#: because a job that quietly read 98% of its corpus produces a plausible answer and no error.
 SKIPPED = "skipped"
+#: Rows dropped inside a file that was otherwise read successfully — a malformed CSV line
+#: under ``on_bad_lines="skip"``. Fields: ``count`` (this increment), ``reason`` (a bounded
+#: cause label), ``source`` (the format). Published by the format's bad-row policy.
+#:
+#: Deliberately *not* folded into `SKIPPED`, which counts whole unreadable inputs. A total
+#: that adds files to rows answers no question anyone has, and the two failures want
+#: different responses: an unreadable file is usually infrastructure, a malformed row is
+#: usually the producer upstream.
+MALFORMED = "malformed"
 #: Actor-pool size observation. Fields: ``size`` (live actors), ``pending`` (queued tasks).
 #: `name` is the stage label. Emit on a scale-up / scale-down or on the sampling interval.
 POOL = "pool"
+
+# --- Resource-utilization observability ---------------------------------------
+# Carbonite already measures every resource it governs — the buffer pool's envelope and its
+# high-water mark, the spill store's per-tier bytes and free disk, the result cache's hit
+# rate, the admission limiter's queue depth, the shuffle session's locality and credit
+# window. Every one of those is a `stats()` method returning a plain dict of numbers, and
+# before this kind existed *none of them reached the metrics export*: they were readable
+# only by holding the object that owned them, so the process-wide counters could report how
+# many queries spilled but not how many bytes, how full the envelope got, or whether the
+# shuffle was network-bound or memory-bound.
+#
+# One kind carrying a whole named group rather than a constant per resource, for the same
+# reason `RECOVERY` uses an `event` discriminator: the kind vocabulary crosses to the web UI
+# verbatim, and the set of things Carbonite governs grows.
+
+#: A group of resource gauges was read. `name` is the group (``memory``, ``spill``,
+#: ``shuffle``, ``admission``, ``result_cache``); ``stats`` is that group's reading, the
+#: dict its owner's `stats()` returns, nested at most one level deep.
+#:
+#: **Gauges, not counters.** Each event replaces the previous reading for its group rather
+#: than adding to it, because these describe a level (bytes held, queue depth, window size)
+#: and not an accumulation. A consumer that differences successive readings gets noise.
+#: Publish on a query boundary or a teardown, never per batch: the reading costs a `stat`
+#: of the spill volume and a walk of the pool's accounting, which is cheap once a query and
+#: not cheap once a morsel.
+RESOURCE = "resource"
+
+# --- Streaming observability --------------------------------------------------
+# A continuous query already produces a full Spark-parity `StreamingQueryProgress` per
+# micro-batch — input and output rows, the per-phase duration breakdown, how far behind the
+# trigger cadence it is, and per-operator state size. All of it was delivered *only* to a
+# `StreamingQueryListener` the user had to write and register, and to `query.last_progress`.
+# Neither reaches a metrics backend, which left the one workload that runs for weeks as the
+# one workload a scrape loop could not see at all: no lag gauge, no state-store growth, no
+# throughput series.
+
+#: One streaming micro-batch completed. `name` is the query's name; the fields are the flat
+#: numbers off `plan.streaming.StreamingQueryProgress` — ``batch_id``, ``input_rows``,
+#: ``output_rows``, ``duration_ms``, ``behind_by_ms``, ``input_rows_per_second``,
+#: ``processed_rows_per_second``, ``state_rows``, ``state_bytes``, and the per-phase
+#: ``duration_*_ms`` breakdown.
+#:
+#: The counters accumulate and the rates are gauges, which is why they are carried together
+#: rather than split: a lag figure without the throughput that produced it says nothing about
+#: whether the query is recovering.
+STREAM = "stream"
+
+# --- Sink observability --------------------------------------------------------
+# The read side of a job has always been countable and the write side never was, which is
+# backwards for an ETL job: the thing it exists to produce is the thing nothing measured.
+# Every sink already returns a `WrittenFile` per file carrying its row count and its size on
+# storage, and `WriteManifest` already rolls them up — the numbers were there, and stopped
+# at whoever held the manifest.
+
+#: A write committed. `name` is the format (``parquet``, ``delta``, ...); fields are
+#: ``files``, ``rows`` and ``bytes`` from the `io.WriteManifest`. One event per commit, from
+#: the single funnel every write branch already routes through, so a partitioned write is one
+#: event rather than one per file.
+WRITE = "write"
 
 # --- Fault-tolerance observability -------------------------------------------
 # The distributed path has a lot of recovery machinery — lineage recompute with epoch
@@ -262,6 +361,52 @@ def subscribe(sink: Subscriber) -> Callable[[], None]:
     return _unsubscribe
 
 
+# The query a publisher's events belong to, when one is in flight. Ambient because the
+# subsystems that have the most to say about a query — `dist` deciding a fan-out, a placement,
+# a transport — are the ones furthest from where the id is minted, and `dist` MUST NOT import
+# `api` to ask for it.
+#
+# This is what `observe.store` matches against: it drops any event whose id names no live
+# record, silently and by design, so that a late event cannot resurrect an aged-out query as a
+# ghost. Without an ambient id every scheduling `Decision` published from `dist` reached the
+# bus and was discarded by the one consumer that matters — which is why `FanoutTrace` reported
+# to the logger instead and documented the gap rather than filling it.
+_QUERY_ID: contextvars.ContextVar[str] = contextvars.ContextVar("batcher_query_id", default="")
+
+
+def current_query_id() -> str:
+    """The id of the query in flight on this context, or `""` when none is.
+
+    Returns:
+        The ambient query id, empty outside any `query_scope`.
+    """
+    return _QUERY_ID.get()
+
+
+@contextlib.contextmanager
+def query_scope(query_id: str) -> Iterator[str]:
+    """Make `query_id` the ambient owner of every event published inside the block.
+
+    Nesting is allowed and the innermost wins, which is what a sub-query (an adaptive stage
+    re-run, a `ds.dq` probe) should see. An empty id is a no-op rather than an error, so a
+    caller that has not minted one yet does not have to branch.
+
+    Args:
+        query_id: The id the event log assigned, or `""` to leave the scope unchanged.
+
+    Yields:
+        The id now in force.
+    """
+    if not query_id:
+        yield _QUERY_ID.get()
+        return
+    token = _QUERY_ID.set(query_id)
+    try:
+        yield query_id
+    finally:
+        _QUERY_ID.reset(token)
+
+
 def publish(kind: str, *, query_id: str = "", name: str = "", **fields: Any) -> None:
     """Emit an event to every attached sink; a no-op when none are attached.
 
@@ -270,13 +415,16 @@ def publish(kind: str, *, query_id: str = "", name: str = "", **fields: Any) -> 
 
     Args:
         kind: One of the module-level kind constants.
-        query_id: The owning query's id, or empty for engine-level events.
+        query_id: The owning query's id. Left empty, the ambient `query_scope` id is used,
+            so a subsystem too far from the conductor to be handed one still attributes its
+            events to the right query; empty with no scope means an engine-level event.
         name: A short human label (the operator kind, the stage name).
         **fields: The kind-specific payload; must be JSON-encodable.
     """
     sinks = _subscribers
     if not sinks:
         return
+    query_id = query_id or _QUERY_ID.get()
     if getattr(_publishing, "active", False):
         # Already delivering on this thread — this call is a sink's own side effect (almost
         # always the failure log). Dropping it keeps delivery acyclic; see `_publishing`.

@@ -1,6 +1,6 @@
 # Databricks
 
-`bt.read.databricks(table)` reads a Unity Catalog table. A Databricks managed table *is* a Delta
+{py:meth}`bt.read.databricks(table) <batcher.api.io_namespace.reader.Reader.databricks>` reads a Unity Catalog table. A Databricks managed table *is* a Delta
 table in your own cloud storage, so the fast path skips the SQL warehouse entirely: Unity vends
 short-lived, table-scoped storage credentials, and Batcher reads the Delta files directly. No
 cluster spins up. Nothing queues.
@@ -10,7 +10,7 @@ of this page.
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.databricks(table)` direct, or `bt.read.table("databricks", query=...)` via a warehouse |
+| **Read** | `bt.read.databricks(table)` direct, or {py:meth}`bt.read.table("databricks", query=...) <batcher.api.io_namespace.reader.Reader.table>` via a warehouse |
 | **Write** | Not supported. Write Delta to an external location, or land files for `COPY INTO`. |
 | **Extra** | `pip install 'batcher-engine[databricks]'` |
 | **Parallelism** | Direct: one split per Delta data file. Warehouse: a single split. |
@@ -46,7 +46,7 @@ print(big.count())
 
 All three arguments are required for this path: the fully-qualified `catalog.schema.table`, the
 workspace URL, and a token. Miss one and the source falls through to the warehouse configuration
-check, and raises `BackendError` if that is not satisfied either.
+check, and raises {py:exc}`BackendError <batcher.BackendError>` if that is not satisfied either.
 :::
 
 :::{tab-item} Warehouse (SQL)
@@ -82,7 +82,7 @@ helpful permissions message.
 
 ## How it parallelizes
 
-A `Source` divides into `Split`s, and a split is the unit of read parallelism. On the direct path
+A {py:class}`Source <batcher.io.Source>` divides into {py:class}`Split <batcher.io.Split>`s, and a split is the unit of read parallelism. On the direct path
 the splits are Delta's splits: one per data file (or row-group range), taken from the transaction
 log. That is real parallelism across a whole cluster, and it is the same machinery
 {doc}``bt.read.delta` <delta-lake>` uses.
@@ -121,7 +121,7 @@ in memory. There is no fan-out. A result that does not fit on one node does not 
 :::
 
 :::{important}
-It also runs the query twice, once to infer the schema when the `Dataset` is constructed and once
+It also runs the query twice, once to infer the schema when the {py:class}`Dataset <batcher.Dataset>` is constructed and once
 when you collect it. A cold warehouse takes seconds to start before either.
 :::
 
@@ -138,7 +138,7 @@ There is no Databricks sink, and credential vending requests `READ` access only.
 results back into the lakehouse:
 
 1. Write Delta to an external location. If the target is an external table whose storage you can
-   reach with your own credentials, `ds.write.delta("s3://.../orders")` is a normal transactional
+   reach with your own credentials, {py:meth}`ds.write.delta("s3://.../orders") <batcher.api.io_namespace.writer.Writer.delta>` is a normal transactional
    Delta commit, and Unity sees the new data on its next read. This does not work for a *managed*
    table; do not write into managed storage behind Unity's back.
 1. Write Parquet or Delta to a landing path and let Databricks ingest it. A `COPY INTO` or an Auto

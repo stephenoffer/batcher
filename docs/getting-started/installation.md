@@ -10,7 +10,7 @@ plane. Distribution, file formats, and ML backends arrive through extras.
 
 ## Requirements
 
-- Python 3.10 or newer.
+- Python 3.11 or newer.
 - A 64-bit platform (Linux, macOS, or Windows).
 
 Releases ship the compiled engine as a native extension module, so you don't need a
@@ -36,7 +36,7 @@ If that prints, the control plane and the compiled engine are both in place.
 
 ## Confirm what you installed
 
-`bt.versions()` reports the Batcher version, the compiled engine, and which optional
+{py:func}`bt.versions() <batcher.versions>` reports the Batcher version, the compiled engine, and which optional
 backends resolved, which is the first thing to check when an extra seems missing:
 
 ```python
@@ -48,7 +48,7 @@ print("batcher" in info, "engine" in info, "engine_profile" in info)
 The same dict carries a key per optional backend (`ray`, `torch`, `polars`, `deltalake`, and
 the rest), whose value is the installed version or `None` when the extra is absent.
 
-`bt.show_versions()` prints the same information as a block, and it is what to paste into
+{py:func}`bt.show_versions() <batcher.show_versions>` prints the same information as a block, and it is what to paste into
 a bug report.
 
 ## Optional extras

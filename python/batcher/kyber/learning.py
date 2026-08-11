@@ -23,6 +23,8 @@ from batcher.kyber.column_tables import (
     MCV_KEY,
     NDV_KEY,
     QUANTILES_KEY,
+    ROW_BYTES_KEY,
+    UDF_ROW_SECONDS_KEY,
     merge_column_table,
     qualify,
 )
@@ -31,8 +33,10 @@ from batcher.kyber.column_tables import (
 )
 from batcher.kyber.correction import correction_factor
 from batcher.kyber.measured_selectivity import measured_selectivities
+from batcher.kyber.measured_width import measured_widths
 from batcher.kyber.signature import plan_signature
 from batcher.metadata import MetadataHub
+from batcher.metadata.udf_stats import load_udf_row_seconds_table
 from batcher.plan.logical import LogicalPlan
 
 __all__ = [
@@ -41,6 +45,7 @@ __all__ = [
     "is_material_change",
     "load_learned_stats",
     "q_error_window",
+    "record_column_row_bytes",
     "record_column_stats",
     "record_execution",
     "record_selectivity",
@@ -164,6 +169,20 @@ def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
         entry = dict(stats.get(sig) or {})
         entry.setdefault("selectivity", sel)
         stats[sig] = entry
+    for sig, width in measured_widths(hub).items():
+        # The measured output width of a shape. The byte axes otherwise re-derive it by summing
+        # per-column priors through every operator that reshapes a row, which is what
+        # `cost.model` cites as the reason it declines to charge for width at all. Folded into
+        # the same per-signature entry so the estimator reads one map rather than three.
+        entry = dict(stats.get(sig) or {})
+        entry.setdefault("row_bytes", width)
+        stats[sig] = entry
+    # Measured per-row cost of each `map_batches` callable Core has timed. Keyed by UDF
+    # identity rather than plan signature (a callable costs what it costs, whatever plan it
+    # sits in), so it rides under its own reserved key instead of the per-signature entries.
+    udf_costs = load_udf_row_seconds_table(hub)
+    if udf_costs:
+        stats[UDF_ROW_SECONDS_KEY] = udf_costs
     return stats
 
 
@@ -357,6 +376,47 @@ def _filter_over_scan(plan: LogicalPlan):
     if isinstance(node, Filter) and isinstance(node.input, Scan):
         return node
     return None
+
+
+def record_column_row_bytes(
+    hub: MetadataHub | None,
+    widths: dict[str, float],
+    source_key: str | None = None,
+) -> None:
+    """Record cheaply-measured byte widths for **every** column a query read.
+
+    The sketched statistics (`record_column_stats`) are restricted to the columns a later plan
+    could consult a *distribution* for — join keys, group keys, filtered columns — because a
+    KLL grid and a Misra-Gries table cost ~56 ns a cell and a column nothing predicates on has
+    no use for either.
+
+    A byte width is not like that. `StatsEstimator.row_width` sums per-column widths over every
+    **output** column, so the columns that dominate a row's size are precisely the payload ones
+    no predicate mentions — the embedding, the document, the image — and those were the ones
+    never measured. The result was a row width understated by orders of magnitude on exactly the
+    data where it decides whether a task fits in memory: `kyber.annotate` sizes a stage from it,
+    and its own table puts a 768-dim embedding at 12 GB per task under the flat prior.
+
+    Measuring it costs nothing worth counting. Arrow already knows an array's buffer size, so
+    this is `nbytes / num_rows` per column — O(columns), no sample, no sketch, no per-row work.
+
+    Written to its own table rather than `AVG_BYTES_KEY`; see `column_tables.ROW_BYTES_KEY` for
+    why that separation is load-bearing.
+
+    Args:
+        hub: The metadata hub to write to; `None` is a no-op.
+        widths: `{column: bytes per row}` for the columns read.
+        source_key: The source these columns belong to. `None` skips the write — a width that
+            cannot be attributed to a source is a width that would be applied to the wrong one.
+    """
+    if hub is None or not widths or not source_key:
+        return
+    try:
+        merge_column_table(
+            hub, ROW_BYTES_KEY, {qualify(source_key, c): w for c, w in widths.items()}
+        )
+    except Exception as exc:  # pragma: no cover - learning must never break a query
+        note_suppressed("kyber", "persist measured column row widths", exc)
 
 
 def record_column_stats(

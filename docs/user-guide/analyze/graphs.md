@@ -5,7 +5,7 @@ the algorithms, and turning a graph into features a model can train on.
 
 ## A graph is an edge table
 
-There is no graph data structure to build and no index to load. A graph is a `Dataset`
+There is no graph data structure to build and no index to load. A graph is a {py:class}`Dataset <batcher.Dataset>`
 with two columns naming the endpoints, and every algorithm is a sequence of joins and
 aggregations over it:
 
@@ -392,8 +392,8 @@ an optimization to add later.
   will not finish, however many workers you add. The degree functions are single-pass and
   have no such limit.
 - **Eleven algorithms cannot run under an explicit `distributed=True`.** They build a plan
-  shape the distributed executor has no path for, so `collect(distributed=True)` on a
-  file-backed graph raises `PlanError` rather than running. They still compute the right
+  shape the distributed executor has no path for, so {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` on a
+  file-backed graph raises {py:exc}`PlanError <batcher.PlanError>` rather than running. They still compute the right
   answer single-node, and the default `distributed="auto"` still returns it, so this is a
   scaling ceiling rather than a wrong result. The affected functions are `triangles`,
   `triangle_count`, `clustering_coefficient`, `structural_features`, `candidate_pairs`,
@@ -412,13 +412,13 @@ an optimization to add later.
   Three natural readings of that limit are wrong, so do not plan around them: it is not
   about outer joins, since a `distinct` over the same union feeds a left join fine; it is
   not about a pipeline breaker over a `union`, since a `distinct` there is fine; and it is
-  not about two-level aggregation, since `group_by` over `group_by` distributes over a plain
+  not about two-level aggregation, since {py:meth}`group_by <batcher.Dataset.group_by>` over {py:meth}`group_by <batcher.Dataset.group_by>` distributes over a plain
   scan.
 
   There are two ways around it. Where the join only restored zero rows for nodes that
   contributed none, emit those rows as another `union` arm feeding the same `group_by`
   instead; that is what the degree functions do and why they distribute. Otherwise
-  materialize the aggregate with `bt.from_arrow(ds.collect())` before the next step, which
+  materialize the aggregate with {py:func}`bt.from_arrow(ds.collect()) <batcher.from_arrow>` before the next step, which
   clears the limit at the cost of passing that intermediate through the driver.
 - **`betweenness_centrality` and `co_occurrence_graph` hang under `distributed=True`.**
   Unlike the eleven above they raise nothing: the query reserves the cluster and then waits
@@ -432,8 +432,8 @@ an optimization to add later.
   plan whose sources are all resident in the driver to single-node at any size, because
   shipping resident data out and gathering it back costs more than the compute it
   parallelizes. Read the edges from Parquet or a lakehouse table to get the distributed
-  path; `bt.from_pydict` will stay local no matter how large it is.
-- **`Graph.cache` helps single-node only.** `Dataset.cache` memoizes a result in a
+  path; {py:func}`bt.from_pydict <batcher.from_pydict>` will stay local no matter how large it is.
+- **`Graph.cache` helps single-node only.** {py:meth}`Dataset.cache <batcher.Dataset.cache>` memoizes a result in a
   process-local LRU, which the distributed executor does not consult. Caching a graph
   before running several algorithms is worth it locally and is inert on a cluster, where
   each algorithm re-reads the edge table.

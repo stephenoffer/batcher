@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+from collections import deque
 from concurrent import futures
 from typing import TYPE_CHECKING
 
@@ -57,6 +58,12 @@ __all__ = [
 # query's driver was still building. A fresh thread starts from the default rather than
 # inheriting, which is the isolation we want here.
 _DEFAULT_PLAN_ID = 1
+
+#: `ExecMetrics` documents one worker holds between drains. A fleet actor outlives the query
+#: that spawned it, so an undrained buffer would grow for the actor's whole life; the cap
+#: bounds it at a few hundred kilobytes. Calibration wants a *sample* of observations, so
+#: dropping the oldest past the cap costs nothing a fitted coefficient can notice.
+_METRICS_BUFFER = 256
 _current_plan_id: contextvars.ContextVar[int] = contextvars.ContextVar(
     "batcher_shuffle_plan_id", default=_DEFAULT_PLAN_ID
 )
@@ -74,21 +81,19 @@ _JOIN_REDUCE_SUBBUCKETS = 16
 def _reduce_spill_opts(engine_config: str) -> tuple[int, str | None, str | None]:
     """`(memory_budget_bytes, spill_dir, spill_compression)` from a worker's engine config.
 
+    The disk transport's reducers read the same three terms from the same shipped config
+    (`shuffle_io.reduce_envelope`), so they are read in one place: the two transports are
+    the same mergeable algebra with a different sink, and an envelope that meant different
+    things on each would be exactly the kind of divergence that never shows up in a result.
+
     A positive budget routes the flight aggregate reduce through its memory-bounded path
     (`_bounded_reduce`): stage each mapper's partial to disk, then merge in memory if the
     bucket fits the budget or grace-partition out of core if not — so a high-cardinality
     bucket never assembles whole in RAM. `(0, ...)` means unbounded (the in-memory fold).
     """
-    if not engine_config:
-        return (0, None, None)
-    import json
+    from batcher.dist.shuffle_io import reduce_envelope
 
-    cfg = json.loads(engine_config)
-    return (
-        int(cfg.get("memory_budget_bytes", 0) or 0),
-        cfg.get("spill_dir"),
-        cfg.get("spill_compression"),
-    )
+    return tuple(reduce_envelope(engine_config))
 
 
 def _reduce_work_dir(prefix: str, spill_dir: str | None) -> str:
@@ -381,9 +386,63 @@ try:
             # so the driver can place each reducer where its bucket is concentrated
             # (locality-aware scheduling). Overwritten each map; read after the barrier.
             self._bucket_bytes: dict[int, int] = {}
+            # `ExecMetrics` documents from the sub-plans this worker has run, waiting for
+            # the driver to drain them (`drain_metrics`). Bounded: a fleet actor outlives
+            # the query that spawned it, and a driver on a path that never drains would
+            # otherwise grow this for the actor's whole life. Dropping the oldest is right
+            # for a *sample* — calibration wants observations, not all of them.
+            self._metrics: deque[str] = deque(maxlen=_METRICS_BUFFER)
 
         def addr(self) -> str:
             return self.session.addr
+
+        def _run(self, plan_ir: str, sources: list) -> list:
+            """Execute a sub-plan here, keeping its measurements for the driver to collect.
+
+            The drop-in every worker-side execution of a real stage should use instead of
+            `nat.execute_plan`. `Core measures, Kyber decides` is a contract rather than a
+            single-node convenience, and this transport was the hole in it: the Flight
+            worker called the unmetered entry point everywhere, so a distributed sort, join
+            or window taught the cost model and the memory model nothing at all — while
+            being the path that runs the largest inputs and the one that spills.
+
+            Deliberately *not* used for the sampling passes (heavy hitters, quantile grids).
+            Those run a plan over a partition to look at its key distribution, not to
+            produce the stage's rows; feeding their partial scans to a per-kind cost
+            calibration would teach it a shape no query actually runs.
+
+            Args:
+                plan_ir: The lowered sub-plan IR, already JSON-encoded.
+                sources: Input relations, one list of batches per source id.
+
+            Returns:
+                The sub-plan's result batches, exactly as `nat.execute_plan` returns them.
+            """
+            from batcher.dist.executors.ray_runtime.metering import execute_metered
+
+            batches, metrics_json = execute_metered(plan_ir, sources, self._engine_config)
+            if metrics_json:
+                self._metrics.append(metrics_json)
+            return batches
+
+        def drain_metrics(self) -> list[str]:
+            """Hand the driver every `ExecMetrics` document collected since the last drain.
+
+            Drained rather than pushed because nothing subscribes to the event bus inside a
+            Ray worker: a measurement published here would be delivered to no one. The
+            driver holds the actor handles, so it pulls after its barrier — one extra round
+            trip per stage carrying a few kilobytes of JSON, against a shuffle that has just
+            moved the data itself.
+
+            Clearing on read is what makes a reused fleet actor's next stage report its own
+            work rather than the previous stage's again.
+
+            Returns:
+                The documents, oldest first. Empty when this worker ran no metered sub-plan.
+            """
+            out = list(self._metrics)
+            self._metrics.clear()
+            return out
 
         def set_grant(self, credits: int, engine_config: str) -> None:
             """Re-grant this worker for the query about to borrow it.
@@ -532,8 +591,28 @@ try:
             driver therefore only advertises a replica whose ack it has in hand.
             """
             _use_plan(plan_id)
-            for r in range(n_buckets):
-                ticket = _ticket(stage, src, r, epoch)
+            return self.replicate_tickets(
+                primary_addr, [_ticket(stage, src, r, epoch) for r in range(n_buckets)], plan_id
+            )
+
+        def replicate_tickets(self, primary_addr, tickets, plan_id=None) -> str:
+            """Copy an explicit list of tickets from `primary_addr` onto this worker.
+
+            The general form of `replicate_buckets`, which addresses a mapper's whole
+            `(stage, src, *)` row. A combiner-tree node does not have one: an interior level
+            publishes a *single* merged partial per task, at a `(stage, task, bucket)`
+            coordinate that says nothing about the coordinates of the other tasks on the same
+            worker. Naming the tickets is what lets an interior output be replicated at all,
+            and it is the only thing the two callers differ on — the fetch, the republish and
+            the all-or-nothing ack below are shared, which is why they live here.
+
+            Returns this worker's address once **every** ticket is registered, and raises if
+            any fetch failed, for the reason spelled out in `replicate_buckets`: an
+            unregistered ticket reads back as an *empty* bucket rather than an error, so a
+            half-filled replica would be a silent wrong answer rather than a failure.
+            """
+            _use_plan(plan_id)
+            for ticket in tickets:
                 self.session.publish(ticket, self.session.fetch(primary_addr, ticket))
             return self.session.addr
 
@@ -606,7 +685,25 @@ try:
                 if on_disk <= budget:
                     running = None
                     for p in paths:
-                        batch = read_ipc(p)
+                        # Drop 0-row partials, not just absent files. An empty bucket is the
+                        # identity for `combine` (mergeable algebra), so folding one in cannot
+                        # change the answer -- but it does put a 0-row batch into the
+                        # concatenation `combine` performs, and a staged empty batch read back
+                        # from `gather_to_files` reaches the bulk string-concat path with an
+                        # offset window it cannot honor:
+                        #
+                        #     panicked at bc-runtime/src/gather.rs:147
+                        #     range start index 18446744073520397944 out of range for slice of
+                        #     length 0
+                        #
+                        # (that index is a negative `i32` offset widened to `usize`.) The
+                        # guard was invisible while a keyed aggregate ran one reducer per
+                        # measured 4M groups, because a shuffle that coarse rarely produces an
+                        # empty bucket at all; flooring the reducer count at the worker count
+                        # makes empty buckets ordinary. Skipping them is right on its own
+                        # terms -- an empty partial is pure work -- and it is not a fix for
+                        # the concat itself, which should not accept the array either.
+                        batch = [b for b in read_ipc(p) if b.num_rows]
                         if not batch:
                             continue
                         merged = batch if running is None else [running, *batch]
@@ -644,11 +741,11 @@ try:
             status, payload = self.reduce_fetch(
                 gk, aj, mapper_addrs, reducer_id, epochs, replicas, None, stage_base
             )
-            if status != "ok" or payload is None:
-                return (status, payload)  # retry, or an empty bucket (no handle)
-            ticket = _ticket(result_stage, self.id, reducer_id)
-            self.session.publish(ticket, [payload])
-            return ("ok", (self.session.addr, ticket, payload.num_rows, payload.schema))
+            if status != "ok":
+                return (status, payload)  # retry: `payload` carries the unreachable mappers
+            return self._publish_result(
+                status, None if payload is None else [payload], reducer_id, result_stage
+            )
 
         def combine_publish(self, gk, aj, sources, out_ticket, replicas=None):
             # One interior node of the combiner tree: merge <= fan_in upstream
@@ -667,8 +764,64 @@ try:
             running = _combine_sources(self.session, gk, aj, sources, replicas)
             return None if running is None else nat.combine_finalize(gk, aj, [running])
 
+        def _gather_and_run(self, plan_ir, addrs, reducer_id, epochs, replicas, stage):
+            """Fetch this reducer's bucket from every mapper, concatenate, run `plan_ir`.
+
+            The shape every *row-preserving* reduce has: the operator needs its bucket's raw
+            rows whole (a window partition must be ranked complete, a key range must be
+            sorted complete), so the reducer holds the bucket — which shrinks as workers are
+            added — and the only thing that varies between them is the IR it then runs.
+
+            A mapper that is gone is served from a replica; a source whose every copy is lost
+            comes back as `("retry", lost)` for the driver to recompute and retry.
+            """
+            epochs = epochs or {}
+            sources = [
+                (addr, _ticket(stage, src, reducer_id, epochs.get(src, 0)))
+                for src, addr in enumerate(addrs)
+            ]
+            rows, unreachable = self.session.gather_concat(sources, replicas=replicas)
+            if unreachable:
+                return ("retry", _lost(unreachable))
+            if not rows:
+                return ("ok", None)
+            return ("ok", self._run(plan_ir, [rows]))
+
+        def _publish_result(self, status, batches, reducer_id, result_stage):
+            """Turn a reduce's `("ok", batches)` into `("ok", handle)`, published here.
+
+            Every `*_publish` variant ends this way, and the one subtle line is the same in
+            all of them: **an empty bucket publishes nothing and yields no handle.** It
+            contributes no rows to the relation, and a zero-row partition is not merely
+            pointless to serve — the Flight encoder emits no data message for it, so a reader
+            blocks until the fetch idle timeout (60s) and then reports the perfectly healthy
+            worker holding it as unreachable. Stating that rule once is the point of this
+            helper; it was written out four times, and it is a *hang*, not a wrong answer.
+
+            A non-"ok" status passes straight through, so the caller composes with the same
+            recovery loop as the non-publishing reduce.
+            """
+            if status != "ok":
+                return (status, batches)  # retry: `batches` carries the unreachable mappers
+            live = [b for b in (batches or []) if b.num_rows > 0]
+            if not live:
+                return ("ok", None)
+            ticket = _ticket(result_stage, self.id, reducer_id)
+            self.session.publish(ticket, live)
+            rows = sum(b.num_rows for b in live)
+            return ("ok", (self.session.addr, ticket, rows, live[0].schema))
+
         def map_publish_raw(
-            self, sub_ir, key_names, partition, n_buckets, stage, src=None, epoch=0, plan_id=None
+            self,
+            sub_ir,
+            key_names,
+            partition,
+            n_buckets,
+            stage,
+            src=None,
+            epoch=0,
+            plan_id=None,
+            skew=None,
         ) -> str:
             _use_plan(plan_id)
             nat = engine()
@@ -691,6 +844,11 @@ try:
             # not cover: `memory_budget_bytes` bounds allocations inside `execute_plan`, not
             # what the worker keeps afterwards. That gap is what OOM-kills a shuffle worker
             # (BENCHMARK_RESULTS.md, sf10 q5), and at sf100 it killed two of them on TPC-H q9.
+            #
+            # `skew` is `(hot_keys, salt_count, replicate)` when the driver measured a hot join
+            # key, spreading that key across sub-buckets instead of piling it on one reducer.
+            # `None` (the default, and every non-join shuffle) hashes exactly as before.
+            hot, salt, replicate = skew or ((), 0, False)
             buckets = streaming_map_buckets(
                 nat,
                 sub_ir,
@@ -698,6 +856,9 @@ try:
                 iter_partition_descriptor(partition),
                 n_buckets,
                 self._engine_config,
+                hot_keys=hot,
+                salt_count=salt,
+                replicate=replicate,
             )
             for r in range(n_buckets):
                 self.session.publish(
@@ -711,12 +872,50 @@ try:
                     buckets[r] = []
             return self.session.addr
 
+        def heavy_hitters(self, sub_ir, key_name, partition, fraction):
+            """This split's heavy-hitter values of `key_name`, with its row count.
+
+            The join-skew detection pre-pass: each worker runs Misra-Gries over its **own**
+            split (the data is never read on the driver) and the driver sums the local counts
+            to decide which values clear `fraction` of the side globally. Approximate in the
+            usual Misra-Gries direction — it can over-report — which is safe here because
+            salting a value that is not actually hot costs a little fan-out and never a row.
+            """
+            _use_plan(None)
+            nat = engine()
+            from batcher.dist.executors.partition_io import read_partition_descriptor
+
+            rows = nat.execute_plan(
+                sub_ir, [read_partition_descriptor(partition)], self._engine_config
+            )
+            n = sum(b.num_rows for b in rows)
+            if not n:
+                return [], 0
+            hh = nat.heavy_hitters([key_name], rows, fraction)
+            return [(v, int(c)) for v, c in hh.get(key_name, [])], n
+
         def map_publish_join(
-            self, left, right, n_buckets, src=None, epoch=0, plan_id=None, stage_base=0
+            self,
+            left,
+            right,
+            n_buckets,
+            src=None,
+            epoch=0,
+            plan_id=None,
+            stage_base=0,
+            skew=None,
         ) -> str:
             """Publish BOTH sides of one join source partition in a single actor call.
 
             `left`/`right` are each `(sub_ir, key_names, partition)`.
+
+            `skew` is `(hot_keys, salt_count)` when the driver measured a hot join key. The
+            two sides take it with opposite `replicate`: the probe (left) side sends each hot
+            row to ONE of the key's sub-buckets, the build (right) side sends every hot row to
+            ALL of them, so each salted reducer holds the whole build side for that key and
+            its local join is complete. That asymmetry is the whole mechanism, which is why it
+            is applied here — where both sides are published together — rather than left to
+            two independent call sites to keep consistent.
 
             A join mapper must land its left (stage 0) *and* right (stage 1) buckets before
             any reducer fetches them. Issuing the two `map_publish_raw` calls separately and
@@ -728,34 +927,65 @@ try:
             it actually is.
             """
             _use_plan(plan_id)
+            hot, salt = skew or ((), 0)
             self.map_publish_raw(
-                left[0], left[1], left[2], n_buckets, stage_base, src, epoch, plan_id
+                left[0],
+                left[1],
+                left[2],
+                n_buckets,
+                stage_base,
+                src,
+                epoch,
+                plan_id,
+                (hot, salt, False),
             )
             return self.map_publish_raw(
-                right[0], right[1], right[2], n_buckets, stage_base + 1, src, epoch, plan_id
+                right[0],
+                right[1],
+                right[2],
+                n_buckets,
+                stage_base + 1,
+                src,
+                epoch,
+                plan_id,
+                (hot, salt, True),
             )
 
         def reduce_window(
             self, win_ir, addrs, reducer_id, epochs=None, replicas=None, plan_id=None, stage=0
         ):
             _use_plan(plan_id)
-            nat = engine()
-            # A window partition is computed whole, so this reducer holds all of its
-            # bucket's raw rows (memory = the bucket, which shrinks as workers grow).
-            # Fetch every mapper concurrently, falling over to a replica of any mapper that
-            # is gone, and tracking the sources whose every copy is lost so the driver
-            # recomputes + retries.
-            epochs = epochs or {}
-            sources = [
-                (addr, _ticket(stage, src, reducer_id, epochs.get(src, 0)))
-                for src, addr in enumerate(addrs)
-            ]
-            rows, unreachable = self.session.gather_concat(sources, replicas=replicas)
-            if unreachable:
-                return ("retry", _lost(unreachable))
-            if not rows:
-                return ("ok", None)
-            return ("ok", nat.execute_plan(win_ir, [rows], self._engine_config))
+            return self._gather_and_run(win_ir, addrs, reducer_id, epochs, replicas, stage)
+
+        def reduce_window_publish(
+            self,
+            win_ir,
+            addrs,
+            reducer_id,
+            epochs=None,
+            replicas=None,
+            plan_id=None,
+            stage=0,
+            result_stage=_RESULT_STAGE,
+        ):
+            """Like `reduce_window`, but PUBLISH this bucket's rows on the worker's own
+            Flight server and hand back only an `(addr, ticket, rows, schema)` handle.
+
+            Serves both operators that ride the keyed row shuffle — a partitioned window and
+            a keyed dedup — and both are (near-)row-preserving, so what the collect it
+            replaces costs is the size of the relation on one node rather than the size of a
+            summary. Bucket order is irrelevant to either result, which is a multiset.
+
+            The status protocol is `reduce_window`'s, so it composes with the same recovery
+            loop: `("retry", unreachable)` on a lost mapper, `("ok", None)` for an empty
+            bucket (nothing to publish, and a zero-row Flight partition would hang a reader
+            until the fetch idle timeout — see `reduce_join_publish`).
+            """
+            _use_plan(plan_id)
+            status, batches = self.reduce_window(
+                win_ir, addrs, reducer_id, epochs, replicas, plan_id, stage
+            )
+            return self._publish_result(status, batches, reducer_id, result_stage)
 
         def reduce_join(
             self,
@@ -850,7 +1080,7 @@ try:
                     join_ir, relations, gk, aj, self._engine_config, finalize
                 )
                 return ("ok", [out] if out is not None else [])
-            joined = nat.execute_plan(join_ir, relations, self._engine_config)
+            joined = self._run(join_ir, relations)
             return ("ok", joined)
 
         def _bounded_reduce_join(
@@ -934,11 +1164,7 @@ try:
                     right = [b for p in right_paths for b in read_ipc(p)]
                     # Schema-bearing empties so an outer join still null-extends, as the
                     # unbounded path's `relations` does.
-                    joined = nat.execute_plan(
-                        join_ir,
-                        [left or [left_empty], right or [right_empty]],
-                        self._engine_config,
-                    )
+                    joined = self._run(join_ir, [left or [left_empty], right or [right_empty]])
                 else:
                     joined = reduce_join_paths_spilling(
                         join_ir,
@@ -1010,21 +1236,75 @@ try:
                 plan_id,
                 stage_base,
             )
-            if status != "ok":
-                return (status, batches)  # retry: `batches` carries the unreachable mappers
-            # An EMPTY bucket publishes nothing and yields no handle. It contributes no rows
-            # to the relation, and a zero-row partition is not merely pointless to serve: the
-            # Flight encoder emits no data message for it, so a reader blocks until the fetch
-            # idle timeout (60s) and then reports the perfectly healthy worker holding it as
-            # unreachable. (`reduce_fetch_publish` returns `None` for an empty bucket for the
-            # same reason.) The join's probe schema — not an empty bucket — carries the schema.
-            batches = [b for b in (batches or []) if b.num_rows > 0]
-            if not batches:
-                return ("ok", None)
-            ticket = _ticket(result_stage, self.id, reducer_id)
-            self.session.publish(ticket, batches)
-            rows = sum(b.num_rows for b in batches)
-            return ("ok", (self.session.addr, ticket, rows, batches[0].schema))
+            # An empty bucket yields no handle (see `_publish_result`); the join's probe
+            # schema, not an empty bucket, is what carries the schema downstream.
+            return self._publish_result(status, batches, reducer_id, result_stage)
+
+        def broadcast_probe_join(
+            self,
+            probe_ir,
+            join_ir,
+            partition,
+            build_side,
+            gk=None,
+            aj=None,
+            plan_id=None,
+            publish=False,
+            result_stage=_RESULT_STAGE,
+            probe_id=0,
+        ):
+            """Join this worker's own probe split against a **replicated** build side.
+
+            The map-only counterpart of `reduce_join`, and the reason it exists: a join whose
+            build side fits the broadcast budget needs no exchange at all. `reduce_join` moves
+            *both* sides across the network to co-partition them, which for a fact table joined
+            to a dimension means shuffling the fact — the very thing the broadcast strategy is
+            chosen to avoid. Here the small side arrives once per worker and the large side
+            never moves.
+
+            Correct for exactly `plan.distribution.BROADCAST_SAFE_JOINS`: every probe row lands
+            on one worker and sees the *whole* build side, so its match set is complete and the
+            union over workers is the join, with nothing duplicated and nothing missed. RIGHT
+            and FULL are excluded because a build row's matched-ness is a global question no
+            single worker can answer.
+
+            The split is streamed a chunk at a time past the resident build side, so peak
+            memory is the build side plus one chunk plus its output — never the whole split.
+
+            `gk`/`aj` fold a **partial** aggregate into each probe task. Groups are not
+            co-partitioned here (there is no shuffle to co-partition them), so this is always
+            a partial the driver must `combine_finalize` — unlike `reduce_join`, which may
+            finalize locally because its bucket holds whole groups.
+
+            Returns the joined batches, or with `publish` an `(addr, ticket, rows, schema)`
+            handle to the rows left on this worker.
+            """
+            _use_plan(plan_id)
+            nat = engine()
+            from batcher.dist.executors.partition_io import iter_partition_descriptor
+            from batcher.dist.flight_broadcast import stream_probe_join
+
+            out = stream_probe_join(
+                nat,
+                probe_ir,
+                join_ir,
+                iter_partition_descriptor(partition),
+                build_side,
+                self._engine_config,
+                gk,
+                aj,
+            )
+            if not publish:
+                return out
+            # An empty split publishes nothing: the Flight encoder emits no data message for a
+            # zero-row partition, so a reader would block to its idle timeout and then report
+            # this perfectly healthy worker as unreachable (see `reduce_join_publish`).
+            out = [b for b in out if b.num_rows > 0]
+            if not out:
+                return None
+            ticket = _ticket(result_stage, self.id, probe_id)
+            self.session.publish(ticket, out)
+            return (self.session.addr, ticket, sum(b.num_rows for b in out), out[0].schema)
 
         def local_topn(self, plan_ir, partition, merge_ir=None):
             """Run `plan_ir` (the map prefix + sort + limit) on this worker's own split and
@@ -1089,6 +1369,9 @@ try:
             epoch=0,
             plan_id=None,
             stage_base=0,
+            hot_bucket=-1,
+            subs=0,
+            n_mappers=1,
         ) -> str:
             """Range-partition this split's rows by `boundaries` and publish each bucket.
 
@@ -1101,16 +1384,36 @@ try:
 
             `epoch` rises on each recompute, so a regenerated bucket is published under a
             fresh ticket and a zombie worker's stale one can never be read.
+
+            `hot_bucket`/`subs` spread one dominant key value across several buckets. A range
+            partition otherwise has to keep equal keys together, so that value pins its whole
+            share on one reducer however wide the shuffle is — the busiest bucket simply
+            stops shrinking as workers are added. Splitting is sound because those rows all
+            tie, and `hot_sub_bucket` lays the pieces out by mapper id so the driver's
+            ordered concatenation still reads them in mapper order. See `plan_hot_split`.
+
+            **Opt-in, and the global window must not opt in.** The split is sound for a
+            consumer that only concatenates its buckets. A ranking window is not one: `rank`
+            and `dense_rank` must give tied rows the same value, which a bucket holding
+            only some of them cannot know. The window path leaves these at their defaults
+            and gets the unsplit partition.
             """
             _use_plan(plan_id)
-            nat = engine()
-            from batcher.dist.executors.partition_io import bucketize, read_partition_descriptor
+            from batcher.dist.executors.partition_io import (
+                bucketize,
+                hot_sub_bucket,
+                read_partition_descriptor,
+                split_hot_bucket,
+            )
 
             src = self.id if src is None else src
-            rows = nat.execute_plan(
-                map_ir, [read_partition_descriptor(partition)], self._engine_config
-            )
+            rows = self._run(map_ir, [read_partition_descriptor(partition)])
             buckets = bucketize(rows, key_name, boundaries, n_buckets, nulls_first, desc)
+            if hot_bucket >= 0 and subs > 1:
+                buckets = split_hot_bucket(
+                    buckets, hot_bucket, subs, hot_sub_bucket(src, n_mappers, subs, desc)
+                )
+            n_buckets = len(buckets)
             # Publish EVERY bucket (empty included) so a reducer's failed fetch means
             # a lost worker, not an empty bucket — the recompute loop's clean signal.
             for r in range(n_buckets):
@@ -1127,24 +1430,41 @@ try:
             plan_id=None,
             stage_base=0,
         ):
+            # This reducer owns one contiguous key range, so its bucket is globally ordered
+            # relative to the others and the driver's final concat needs no merge. The fetch
+            # and recovery are `_gather_and_run`'s, shared with the window reduce.
             _use_plan(plan_id)
-            nat = engine()
-            # This reducer owns one contiguous key range; fetch its bucket from every
-            # mapper concurrently, concatenate, and sort by all keys — the bucket is
-            # globally ordered relative to the others, so a final concat needs no merge.
-            # A mapper that is gone is served from a replica; only a source whose every
-            # copy is lost is reported retryable for the driver to recompute.
-            epochs = epochs or {}
-            sources = [
-                (addr, _ticket(stage_base, src, reducer_id, epochs.get(src, 0)))
-                for src, addr in enumerate(addrs)
-            ]
-            rows, unreachable = self.session.gather_concat(sources, replicas=replicas)
-            if unreachable:
-                return ("retry", _lost(unreachable))
-            if not rows:
-                return ("ok", None)
-            return ("ok", nat.execute_plan(sort_ir, [rows], self._engine_config))
+            return self._gather_and_run(sort_ir, addrs, reducer_id, epochs, replicas, stage_base)
+
+        def sort_reduce_publish(
+            self,
+            sort_ir,
+            addrs,
+            reducer_id,
+            epochs=None,
+            replicas=None,
+            plan_id=None,
+            stage_base=0,
+            result_stage=_RESULT_STAGE,
+        ):
+            """Like `sort_reduce`, but PUBLISH this range bucket's sorted rows on the
+            worker's own Flight server and hand back only an `(addr, ticket, rows, schema)`
+            handle.
+
+            The sort analogue of `reduce_join_publish`. A sort is row-preserving, so
+            collecting its buckets is the whole relation through one process; the driver
+            instead keeps the handles **in range order**, which is the sorted order, and the
+            next stage (or the caller's iteration) reads one bucket at a time.
+
+            The status protocol is `sort_reduce`'s, so it composes with the same recovery
+            loop: `("retry", unreachable)` on a lost mapper, `("ok", None)` for an empty
+            range (nothing to publish).
+            """
+            _use_plan(plan_id)
+            status, batches = self.sort_reduce(
+                sort_ir, addrs, reducer_id, epochs, replicas, plan_id, stage_base
+            )
+            return self._publish_result(status, batches, reducer_id, result_stage)
 
 except ImportError:  # pragma: no cover - ray optional
     _FlightWorker = None  # type: ignore

@@ -113,6 +113,41 @@ def test_distributed_distinct_with_filter_and_post_sort():
     assert single == distrib  # sorted → exact match
 
 
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_keyed_dedup_matches_single_node(transport):
+    """A keyed dedup keeps one *whole row* per key, so the payload must match too.
+
+    Not a group-by, and not on the aggregate shuffle: each mapper reduces its own partition
+    and ships one row per key, the rows shuffle by key, and the reducer reduces again. The
+    thing that could go wrong and still look right is the payload — a key set that matches
+    while the surviving rows came from the wrong side of the shuffle — so the comparison is
+    over whole rows, with an ordering that makes the survivor unique.
+    """
+    t = _data()
+
+    def q(ds):
+        return ds.distinct(["k"], keep="first", order_by="v")
+
+    single = q(bt.from_arrow(t)).collect()
+    distrib = q(bt.from_arrow(t)).collect(distributed=True, num_workers=4, transport=transport)
+    assert _norm(single) == _norm(distrib)
+
+
+def test_distributed_keyed_dedup_any_keeps_one_real_row_per_key():
+    """`keep="any"` picks an unspecified row, so what must hold distributed is what holds
+    single-node: one row per key, and every returned row really in the input."""
+    t = _data()
+    rows = {tuple(r.values()) for r in t.to_pylist()}
+    keys = {r["k"] for r in t.to_pylist()}
+
+    out = bt.from_arrow(t).distinct(["k"]).collect(distributed=True, num_workers=4)
+    got = out.to_pylist()
+    assert {r["k"] for r in got} == keys
+    assert len(got) == len(keys)
+    for row in got:
+        assert tuple(row.values()) in rows, f"row {row} was never in the input"
+
+
 def test_distributed_window_partition_aggregate_matches_single_node():
     # Whole-partition window aggregate: rows shuffle by partition key `k`, each
     # partition is computed whole on one reducer, the union equals single-node.
@@ -919,6 +954,42 @@ def test_flight_sort_skewed_keys_match_single_node():
     assert single.column("k").to_pylist() == flight.column("k").to_pylist()
 
 
+@pytest.mark.parametrize("descending", [False, True])
+def test_flight_sort_reads_every_range_bucket_not_just_the_first_workers(monkeypatch, descending):
+    """Regression: the driver concatenated `workers` buckets, not `n_buckets`.
+
+    `shuffle_partitions` treats the worker count as a *floor* and raises the bucket count
+    toward `workers x shuffle_partition_multiplier` once a shuffle's volume has been measured,
+    so the two are equal only on a cold store. The Flight sort's final concatenation walked
+    `range(workers)` and therefore skipped every range bucket past the worker count, returning
+    a short result with no error — and only after the shape had run once, which is why a cold
+    suite never saw it. The disk sort has always walked `n_buckets`.
+
+    Forcing more buckets than workers is what reproduces it; nothing else about the sort
+    changes, so a correct driver returns every row in key order either way.
+    """
+    from batcher.dist import flight_sort as fs
+
+    monkeypatch.setattr(fs, "shuffle_partitions", lambda w: 2 * w)
+
+    rng = np.random.default_rng(31)
+    n = 60_000
+    t = pa.table(
+        {
+            "k": rng.integers(0, 1_000_000, n).astype("int64"),
+            "v": rng.integers(0, 100, n).astype("int64"),
+        }
+    )
+    single = bt.from_arrow(t).sort("k", descending=descending).collect()
+    flight = (
+        bt.from_arrow(t)
+        .sort("k", descending=descending)
+        .collect(distributed=True, num_workers=4, transport="flight")
+    )
+    assert flight.num_rows == single.num_rows, "range buckets past the worker count were dropped"
+    assert flight.column("k").to_pylist() == single.column("k").to_pylist()
+
+
 def test_distributed_sort_top_n():
     rng = np.random.default_rng(14)
     t = pa.table(
@@ -1322,13 +1393,12 @@ def test_distributed_global_window_matches_single_node(cluster_tmp_path, transpo
     aggregate broadcast: a zero-key mergeable aggregate, then a stateless map that appends
     the scalar. It used to raise `PlanError` (nothing to hash-shuffle on).
 
-    An *ordered* global window (`row_number() OVER (ORDER BY v)`) needs one global row order
-    and still has no distributed path — it must keep failing loudly, not silently run on one
-    node with a quiet perf cliff.
+    A window that is neither hash-shuffleable nor offsettable (`lag` needs rows its bucket
+    does not hold) must still fail loudly rather than silently run on one node behind a quiet
+    perf cliff. The *ordered* global window is covered by
+    `test_distributed_ordered_global_window_matches_single_node`.
     """
     import pyarrow.parquet as pq
-
-    from batcher import row_number
 
     rng = np.random.default_rng(9)
     n = 30_000
@@ -1356,11 +1426,104 @@ def test_distributed_global_window_matches_single_node(cluster_tmp_path, transpo
         assert single.schema == dist.schema
         assert rowset(single) == rowset(dist)
 
-    # An ordered global window has no distributed path; it must raise, not fall back.
+    # A global window outside the offsettable set (`lag` reads rows its bucket does not
+    # hold) still has no distributed path; it must raise, not quietly fall back to one node.
     with pytest.raises(PlanError):
-        bt.read.parquet(path).with_columns(r=row_number().over(order_by="v")).collect(
+        bt.read.parquet(path).with_columns(p=col("v").shift(1).over(order_by="v")).collect(
             distributed=True, num_workers=4, transport=transport
         )
+
+
+@pytest.mark.parametrize("transport", ["disk", "flight"])
+def test_distributed_ordered_global_window_matches_single_node(cluster_tmp_path, transport):
+    """`row_number() OVER (ORDER BY v)` and the running aggregates distribute by *order*.
+
+    A global window has one partition over every row, so there is nothing to hash-shuffle on
+    — which is why this shape used to raise `PlanError` outright. It splits along the order
+    instead: range-partition into ordered buckets, window each on its own worker, then shift
+    each bucket by the prior buckets' contribution (`dist/global_window/`). The result must be
+    the single-node result, row for row.
+
+    The cases below exercise every offset in the algebra: `row_number`, `rank`, the gap-free
+    `dense_rank` (whose shift is *distinct keys*, not rows), the running `sum`/`count`, the
+    element-wise running `min`/`max`, `avg` (offset through an injected running sum and count,
+    whose private helper columns must not leak), `first_value`, several functions at once, a
+    descending key (buckets visited in reverse), and a key with heavy ties, where a peer group
+    split across a bucket boundary would move every rank and every running total after it.
+
+    `row_number` is asserted only over the *unique* key `u`. Over a tied key its value is
+    genuinely unspecified: which of two peers is "first" depends on the order the rows reach
+    the kernel, which partitioning changes. That is not a property of this executor — the
+    pre-existing partitioned distributed window disagrees with single-node on exactly the same
+    query — so pinning it here would assert something the engine does not promise. `rank`,
+    `dense_rank` and the running aggregates are peer-invariant and *are* asserted over ties.
+    """
+    import pyarrow.parquet as pq
+
+    from batcher import dense_rank, first_value, rank, row_number
+
+    rng = np.random.default_rng(17)
+    n = 40_000
+    t = pa.table(
+        {
+            "k": rng.integers(0, 20, n).astype("int64"),
+            # `u` is unique, `v` near-unique, and `tied` has ~40 rows per distinct value, so
+            # peer groups are wide enough that a bucket boundary would have to split one.
+            "u": np.arange(n).astype("int64"),
+            "v": rng.integers(0, 1_000_000, n).astype("int64"),
+            "tied": rng.integers(0, 1_000, n).astype("int64"),
+            "w": rng.integers(0, 100, n).astype("float64"),
+        }
+    )
+    path = str(cluster_tmp_path / "gw.parquet")
+    pq.write_table(t, path, row_group_size=2_500)
+
+    def rowset(tb):
+        return sorted(map(str, tb.to_pylist()))
+
+    cases = [
+        lambda d: d.with_columns(r=row_number().over(order_by="u")),
+        lambda d: d.with_columns(r=rank().over(order_by="v")),
+        lambda d: d.with_columns(r=dense_rank().over(order_by="tied")),
+        lambda d: d.with_columns(s=col("w").sum().over(order_by="v")),
+        lambda d: d.with_columns(c=col("w").count().over(order_by="v")),
+        lambda d: d.with_columns(lo=col("w").min().over(order_by="v")),
+        lambda d: d.with_columns(hi=col("w").max().over(order_by="v")),
+        lambda d: d.with_columns(a=col("w").mean().over(order_by="v")),
+        lambda d: d.with_columns(f=first_value(col("w")).over(order_by="v")),
+        lambda d: d.with_columns(
+            r=row_number().over(order_by="u"),
+            s=col("w").sum().over(order_by="u"),
+            a=col("w").mean().over(order_by="u"),
+        ),
+        # Descending: the driver walks the buckets in reverse so the offsets still accumulate
+        # in global order.
+        lambda d: d.with_columns(r=row_number().over(order_by=[("u", True)])),
+        lambda d: d.with_columns(s=col("w").sum().over(order_by=[("tied", True)])),
+        # Ties on the ORDER BY: `rank` shares the min rank across a peer group, and the
+        # running aggregates take the end-of-peer-group value, so a peer group split across
+        # two buckets would show up in these two and nowhere else.
+        lambda d: d.with_columns(r=rank().over(order_by="tied")),
+        lambda d: d.with_columns(s=col("w").sum().over(order_by="tied")),
+    ]
+    for build in cases:
+        single = build(bt.read.parquet(path)).collect(distributed=False)
+        dist = build(bt.read.parquet(path)).collect(
+            distributed=True, num_workers=4, transport=transport
+        )
+        assert single.schema == dist.schema, "the injected avg helper columns leaked"
+        assert rowset(single) == rowset(dist)
+
+    # A `QUALIFY`-shaped filter is fused by Kyber into the window's `rank_limit`, which the
+    # offsets refuse: `rank_limit` drops rows by rank, and a bucket only knows the rank
+    # *within itself*, so filtering per bucket would keep the wrong rows. Refusing is the
+    # correct answer today rather than a silently wrong one. Lifting it means keeping each
+    # bucket's local top-k (a global top-k row is always in its own bucket's top-k) and
+    # re-applying the bound on the driver after the offsets land.
+    with pytest.raises(PlanError):
+        bt.read.parquet(path).with_columns(r=row_number().over(order_by="u")).filter(
+            col("r") <= 100
+        ).collect(distributed=True, num_workers=4, transport=transport)
 
 
 @pytest.mark.parametrize("transport", ["disk", "flight"])
@@ -1573,8 +1736,10 @@ def test_distributed_sample_matches_single_node(cluster_tmp_path, transport):
     single_n = bt.read.parquet(path).sample(n=5, seed=3).collect(distributed=False)
     assert single_n.num_rows == 5
     for workers in (4, 8):
-        dist_n = bt.read.parquet(path).sample(n=5, seed=3).collect(
-            distributed=True, num_workers=workers, transport=transport
+        dist_n = (
+            bt.read.parquet(path)
+            .sample(n=5, seed=3)
+            .collect(distributed=True, num_workers=workers, transport=transport)
         )
         assert dist_n.num_rows == 5, f"{workers} workers kept n rows each"
         assert rowset(single_n) == rowset(dist_n)
@@ -1638,3 +1803,36 @@ def test_an_aggregate_over_a_union_cannot_feed_a_join_or_another_aggregate(clust
     # Materializing between the two clears it, which is the documented workaround.
     staged = bt.from_arrow(unioned.group_by("k").agg(m=count()).collect())
     run(staged.group_by("m").agg(c=count()))
+
+
+def test_positional_splits_are_identical_distributed():
+    """A positional split places the same rows in the same parts on one node and on many.
+
+    `split_at_indices` numbers rows with `RowId` and filters ranges over that number. `RowId`
+    is defined to number the *assembled* result in its final global order, so the property
+    under test is that the distributed path assembles in the same order the single-node one
+    does — if it did not, every part would still hold the right *count* while holding the
+    wrong rows, which is invariant #7 failing silently rather than loudly.
+
+    Ordered comparison on purpose: the multiset of all parts together is unchanged even when
+    the boundaries land in the wrong place, so an unordered check cannot see this at all.
+    """
+    ds = bt.from_arrow(_data()).sort("k", "v")
+    parts = ds.split_at_indices([1, 16_384, 100_000])
+    for i, part in enumerate(parts):
+        single = part.collect()
+        dist = part.collect(distributed=True, num_workers=4, transport="disk")
+        assert dist.column("k").to_pylist() == single.column("k").to_pylist(), f"part {i} keys"
+        assert dist.column("v").to_pylist() == single.column("v").to_pylist(), f"part {i} values"
+
+
+def test_proportional_splits_are_identical_distributed():
+    """The same for `split_proportionately`, whose cuts come from an eagerly executed count."""
+    ds = bt.from_arrow(_data()).sort("k", "v")
+    parts = ds.split_proportionately([0.1, 0.65])
+    sizes = [p.count() for p in parts]
+    assert sum(sizes) == 200_000 and all(s > 0 for s in sizes)
+    for i, part in enumerate(parts):
+        single = part.collect()
+        dist = part.collect(distributed=True, num_workers=4, transport="disk")
+        assert dist.column("k").to_pylist() == single.column("k").to_pylist(), f"part {i}"

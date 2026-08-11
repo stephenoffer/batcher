@@ -256,6 +256,20 @@ def locality_summary(hardware, workers: int, *, unit: str = "cpu") -> dict:
             "intra_node": tiers.intra_node,
             "intra_rack": tiers.intra_rack,
         },
+        # How many availability zones the exchange spans, and a note when that is more than
+        # one. Every tier price here is `<= 1.0` by construction — cross-rack is the unit and
+        # `locality_factor` clamps to it — so the model has no way to charge a cross-zone byte
+        # *more* than a cross-rack one, though it demonstrably costs more and is separately
+        # billed. That is a real limit of the model rather than a measurement it happens to be
+        # missing, so it is reported rather than approximated: a reader comparing a multi-AZ
+        # plan's predicted `net` against its measured one needs to know the prediction had a
+        # floor under it.
+        "zones": cluster.zones,
+        "zone_note": (
+            "exchange spans availability zones; cross-zone bytes are priced as cross-rack"
+            if cluster.zones > 1
+            else ""
+        ),
     }
 
 

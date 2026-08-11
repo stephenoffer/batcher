@@ -28,7 +28,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
-from batcher.api.terminal.stream.watermark._state import _event_micros
+from batcher.api.terminal.stream.watermark._state import _event_micros, _stream_tracker
 from batcher.io.source import Source
 from batcher.plan.logical import StreamingSessionWindow
 
@@ -63,7 +63,7 @@ def stream_session_window(
     """
     from batcher.api.terminal.stream.dispatch import _iter_streaming
 
-    state = _SessionBuffer(plan)
+    state = _SessionBuffer(plan, source)
     for batch in _iter_streaming(plan.input, [source], None):
         if batch.num_rows == 0:
             continue
@@ -91,12 +91,17 @@ class _SessionBuffer:
     in the engine, and the driver never touches a row.
     """
 
-    __slots__ = ("_buffer", "_max_seen", "_plan")
+    __slots__ = ("_buffer", "_partition_cols", "_plan", "_tracker")
 
-    def __init__(self, plan: StreamingSessionWindow) -> None:
+    def __init__(self, plan: StreamingSessionWindow, source: Source) -> None:
         self._plan = plan
         self._buffer: pa.Table | None = None
-        self._max_seen: int | None = None  # the largest event time seen, in epoch micros
+        # The frontier, from the same tracker the windowed aggregate and the interval join
+        # use. A session closes when the watermark passes its last event plus the gap, so a
+        # watermark that ran ahead of the slowest partition closed sessions early and then
+        # dropped the rows that would have extended them — the session was emitted short,
+        # and the rows that proved it wrong were the ones ruled late.
+        self._tracker, self._partition_cols = _stream_tracker(source, plan.lateness_micros)
 
     def push(self, batch: pa.RecordBatch) -> Iterator[pa.Table]:
         """Buffer `batch`, then yield the sessions the new watermark closes."""
@@ -104,13 +109,13 @@ class _SessionBuffer:
 
         from batcher._internal.errors import PlanError
 
-        column = batch.column(self._plan.time_col) if self._has_time(batch) else None
-        if column is None:
+        if not self._has_time(batch):
             raise PlanError(
                 f"session_window(): the event-time column {self._plan.time_col!r} is not in "
                 f"the streamed rows ({batch.schema.names})"
             )
-        table = pa.Table.from_batches([batch])
+        arrived = pa.Table.from_batches([batch])
+        table = arrived
         # Drop rows the watermark has already passed -- the watermark as it stood *before*
         # this batch, which is the one whose promise the engine has already acted on. Using
         # the batch's own maximum instead would drop the earlier rows of the very session
@@ -120,9 +125,11 @@ class _SessionBuffer:
         if before is not None:
             keep = pc.greater_equal(_event_micros(table.column(self._plan.time_col)), before)
             table = table.filter(pc.fill_null(keep, True))
-        arrived = _to_micros(column)
-        if arrived is not None:
-            self._max_seen = arrived if self._max_seen is None else max(self._max_seen, arrived)
+        # Observed on what *arrived*, not on what survived the late filter. A partition
+        # delivering only late rows is still a partition that spoke, and recording that
+        # keeps it out of the idle set — where, in a stream that mixes a lagging partition
+        # with a fast one, it belongs least.
+        self._tracker.observe(arrived, self._plan.time_col, self._partition_cols)
 
         self._buffer = table if self._buffer is None else pa.concat_tables([self._buffer, table])
         watermark = self.watermark
@@ -144,10 +151,13 @@ class _SessionBuffer:
 
     @property
     def watermark(self) -> int | None:
-        """``max observed event time - lateness``, in epoch microseconds."""
-        if self._max_seen is None:
-            return None
-        return self._max_seen - self._plan.lateness_micros
+        """The event-time frontier in epoch microseconds, or None before the first claim.
+
+        The tracker's minimum over partitions less the allowed lateness — not a maximum
+        over rows, which would let the fastest partition decide when everyone's sessions
+        close.
+        """
+        return self._tracker.watermark
 
     def _has_time(self, batch: pa.RecordBatch) -> bool:
         return self._plan.time_col in batch.schema.names
@@ -227,10 +237,3 @@ def _strip(table: pa.Table) -> pa.Table:
     """Drop the marker columns, so a re-marked buffer does not collide with itself."""
     present = [name for name in _INTERNAL if name in table.schema.names]
     return table.drop_columns(present) if present else table
-
-
-def _to_micros(column: pa.ChunkedArray | pa.Array) -> int | None:
-    """The largest value of an event-time column, in epoch microseconds."""
-    import pyarrow.compute as pc
-
-    return pc.max(_event_micros(column)).as_py()

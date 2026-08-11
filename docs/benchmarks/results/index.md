@@ -1,7 +1,7 @@
 # Results by workload
 
 This section holds the measured results, one page per workload family. Each page carries the
-hardware it ran on, the correctness gate it passed, and the shapes where Batcher loses.
+hardware it ran on, the correctness gate it passed, and the standing on every shape measured.
 
 Read these when you want to know what Batcher does on work that looks like yours. Read
 {doc}`/benchmarks/comparisons/index` instead when you want the standing against one specific

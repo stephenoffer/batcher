@@ -21,7 +21,15 @@ from dataclasses import dataclass
 
 from batcher._internal.logging import note_suppressed
 
-__all__ = ["PeerTransfer", "peer_transfers", "reset_peer_transfers", "straggler_peer"]
+__all__ = [
+    "PeerTransfer",
+    "bdp_bytes",
+    "flow_totals",
+    "peer_transfers",
+    "reset_peer_transfers",
+    "starved_ratio",
+    "straggler_peer",
+]
 
 #: Bytes a peer must have carried before its rate is trusted. A single small fetch measures
 #: the connection setup, not the wire, and naming that peer the fleet's straggler sends an
@@ -45,6 +53,8 @@ class PeerTransfer:
             striping one bucket over several flows contributes each flow's own duration.
         fetches: Fetches completed.
         retries: Fetches that had to be redialed because the cached connection was stale.
+        starved_seconds: The part of `seconds` spent blocked awaiting the next batch — the
+            credit window's own feedback. See `starved_fraction`.
     """
 
     addr: str
@@ -52,6 +62,7 @@ class PeerTransfer:
     seconds: float = 0.0
     fetches: int = 0
     retries: int = 0
+    starved_seconds: float = 0.0
 
     @property
     def gbps(self) -> float:
@@ -61,6 +72,23 @@ class PeerTransfer:
         fetched from must not rank as the slowest one.
         """
         return self.bytes * 8 / self.seconds / 1e9 if self.seconds > 0 else 0.0
+
+    @property
+    def starved_fraction(self) -> float | None:
+        """Share of this peer's fetch time spent waiting for data, or `None` if unmeasured.
+
+        A credit window exists to cover the channel's bandwidth-delay product: enough batches
+        in flight that the consumer never waits on the wire, and not one more, because every
+        credit past that point is buffered memory bought for no throughput. This is the only
+        figure that says which side of that line a channel is on.
+
+        `None` rather than `0.0` for an unmeasured peer, because the two mean opposite things
+        to a controller: zero says "already wide enough, stop growing", and a channel nobody
+        has fetched from has not earned that verdict.
+        """
+        if self.seconds <= 0:
+            return None
+        return min(1.0, max(0.0, self.starved_seconds / self.seconds))
 
 
 def peer_transfers() -> tuple[PeerTransfer, ...]:
@@ -78,9 +106,83 @@ def peer_transfers() -> tuple[PeerTransfer, ...]:
         note_suppressed("carbonite", "read the shuffle peer counters", exc)
         return ()
     return tuple(
-        PeerTransfer(addr=addr, bytes=int(b), seconds=float(s), fetches=int(f), retries=int(r))
-        for addr, b, s, f, r in raw
+        PeerTransfer(
+            addr=addr,
+            bytes=int(b),
+            seconds=float(s),
+            fetches=int(f),
+            retries=int(r),
+            starved_seconds=float(w),
+        )
+        for addr, b, s, f, r, w in raw
     )
+
+
+def flow_totals() -> tuple[float, float]:
+    """This process's running `(starved_seconds, total_seconds)` across every shuffle peer.
+
+    Totals rather than a ratio, because a credit controller acts once per round and needs how
+    the channel behaved *during that round*. A lifetime ratio cannot say: after a few seconds
+    of a long shuffle its denominator is large enough that a round of pure starvation barely
+    moves it, so a controller reading it converges to a number and stops responding to the
+    link. `carbonite.policies.congestion.StarvationMeter` differences these into the interval
+    the control law is defined over.
+
+    Byte-weighted by construction — a peer that carried more of the shuffle contributed more
+    of both clocks — so a single trivial fetch cannot swing a verdict the way averaging
+    per-peer ratios would.
+
+    Returns:
+        The pair in seconds, `(0.0, 0.0)` on a process that has fetched nothing and on a build
+        whose engine predates the counter. Both mean "no opinion", never "saturated".
+    """
+    from batcher._internal.native import engine
+
+    try:
+        starved, total = engine().shuffle_flow_totals()
+    except Exception as exc:  # an older extension has no such symbol
+        note_suppressed("carbonite", "read the shuffle starvation counters", exc)
+        return (0.0, 0.0)
+    return (float(starved), float(total))
+
+
+def bdp_bytes() -> int | None:
+    """The widest path's bandwidth-delay product in bytes, or `None` when unmeasured.
+
+    `BtlBw x RTprop` — the bytes a path holds in flight when it is exactly busy, and the target
+    a credit window should be sized to rather than probed toward. The transport keeps both
+    terms as filters rather than averages: the delay as a running minimum and the rate as a
+    running maximum, because every error in the first is non-negative and every error in the
+    second is non-positive.
+
+    The maximum across peers, because one credit window serves every channel a session fetches
+    on: sizing to the median starves the longest path.
+
+    Returns:
+        The product in bytes, or `None` on a process that has completed no fetch and on a build
+        whose engine predates the filters. Both mean "no estimate", never "a pipe of no width".
+    """
+    from batcher._internal.native import engine
+
+    try:
+        measured = engine().shuffle_bdp_bytes()
+    except Exception as exc:  # an older extension has no such symbol
+        note_suppressed("carbonite", "read the shuffle bandwidth-delay product", exc)
+        return None
+    return None if measured is None or measured <= 0 else int(measured)
+
+
+def starved_ratio() -> float | None:
+    """Share of this process's shuffle-fetch time spent waiting for data, or `None`.
+
+    The *lifetime* reading, for a diagnosis rather than for a control loop — see `flow_totals`
+    for why a controller must difference the totals instead.
+
+    Returns:
+        The ratio in `[0, 1]`, or `None` when nothing has been fetched.
+    """
+    starved, total = flow_totals()
+    return None if total <= 0 else min(1.0, max(0.0, starved / total))
 
 
 def reset_peer_transfers() -> None:

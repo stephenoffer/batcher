@@ -195,7 +195,7 @@ compare against.
 | Shape | vs DuckDB | vs Polars |
 |---|---:|---:|
 | running `sum()` | 2.6x | 6.3x |
-| `lag()` | 1.9x | 25x |
+| {py:func}`lag() <batcher.lag>` | 1.9x | 25x |
 | `rank()` | 1.4x | 6.7x |
 | `sum()` over partition | 1.1x | 1.0x |
 
@@ -214,7 +214,7 @@ a 16-core release build with every correctness check passing.
 - `crates/bc-runtime/src/window_frame.rs`: explicit `ROWS` frames, one-pass accumulator/deque
 - `crates/bc-runtime/src/window_partition_agg.rs`: whole-partition aggregates via dense ids
 - `crates/bc-runtime/src/window_parallel.rs`: bucket-parallel execution and the skew guard
-- `crates/bc-runtime/src/window_fill.rs`: `forward_fill` / `backward_fill`
+- `crates/bc-runtime/src/window_fill.rs`: {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`backward_fill <batcher.plan.expr_ir.core.Expr.backward_fill>`
 - `crates/bc-interp/src/window_spill.rs`: grace partitioning for bounded memory
 
 ## See also

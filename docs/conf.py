@@ -190,6 +190,11 @@ exclude_patterns = [
     # which it still inherits, read against a field-engineering corpus. A contributor
     # working record like the parity scorecards above, not a site page.
     "architecture/internals/ray_pitfall_parity.md",
+    # An audit of whether the hardware metrics Batcher collects are actually acted upon by the
+    # optimizer (mostly they are not), plus the catalog of optimizations the unspent measured
+    # metadata makes possible. It names live defects and carries reproduction scripts for two of
+    # them, so it is a contributor working record, not a site page.
+    "architecture/internals/kyber_optimization_backlog.md",
     # The tombstone for the fourteen working ledgers retired on 2026-07-29: what they were,
     # what was still open, and why they are not coming back. It exists so a contributor (or an
     # agent) who finds one missing reads "retired on purpose" instead of restoring it. Written

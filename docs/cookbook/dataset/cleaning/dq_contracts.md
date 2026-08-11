@@ -20,4 +20,4 @@ python examples/dataset/dq_contracts.py
 - {doc}`/cookbook/dataset/cleaning/deduplication`: exact keys, whole rows, and keeping a chosen survivor.
 - {doc}`/cookbook/dataset/verbs/grouping`: agg, multi-key rollups, and the cube/rollup/grouping-set variants.
 - {doc}`/user-guide/transform/rows/transformations`: the full transformation surface these recipes draw on.
-- {doc}`/api/relational/dataset`: every `Dataset` method, in one reference table.
+- {doc}`/api/relational/dataset`: every {py:class}`Dataset <batcher.Dataset>` method, in one reference table.

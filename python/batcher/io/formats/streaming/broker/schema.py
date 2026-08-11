@@ -21,8 +21,39 @@ __all__ = [
     "BrokerMessage",
     "broker_schema",
     "normalize_starting_position",
+    "opaque_offset",
     "redact_broker_options",
 ]
+
+
+def opaque_offset(position: str) -> int:
+    """Map a broker's opaque native position onto the fixed int64 ``offset`` column.
+
+    Kinesis sequence numbers and Event Hubs offsets are *text*, and the broker schema's
+    ``offset`` is ``int64``. A numeric position is taken modulo ``2**63``, which preserves
+    the within-partition ordering the column exists for. Anything else falls back to a
+    `sha256` digest rather than `hash()`, because Python salts `str` hashing per process:
+    with `hash()` the same record got a different ``offset`` on every run and on every
+    worker, silently breaking the ordering and de-duplication the column is for, across
+    exactly the restart and distributed boundaries that matter.
+
+    The *native* position still travels separately as `BrokerMessage.resume_token`; this
+    is the lossy projection onto a schema column, never what a client seeks with.
+
+    Args:
+        position: The broker's native position, as text.
+
+    Returns:
+        A stable, non-negative int64 offset.
+    """
+    import hashlib
+
+    try:
+        return int(position) % (1 << 63)
+    except ValueError:
+        digest = hashlib.sha256(position.encode("utf-8")).digest()[:8]
+        return int.from_bytes(digest, "big") % (1 << 63)
+
 
 #: The two whole-stream starting positions every broker understands, under the names Spark
 #: uses. Each concrete broker maps them onto its own vocabulary (Kafka's

@@ -85,8 +85,6 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     "argmin": "Spelled bt.col('x').arg_min() here.",
     "idxmax": "The argmax index is bt.col('x').arg_max().",
     "idxmin": "The argmin index is bt.col('x').arg_min().",
-    "peak_max": "Local maxima are not built in; compare against lag/lead with a window.",
-    "peak_min": "Local minima are not built in; compare against lag/lead with a window.",
     # --- clipping / casting naming ----------------------------------------------------
     "clip_lower": "Spelled bt.col('x').clip_min(lo) here.",
     "clip_upper": "Spelled bt.col('x').clip_max(hi) here.",
@@ -95,24 +93,13 @@ EXPR_UNSUPPORTED: dict[str, str] = {
     ),
     "reinterpret": "Change type with bt.col('x').cast('int64') / .try_cast(...).",
     # --- row-order-dependent stats need a window --------------------------------------
-    "ewm_mean": (
-        "Exponentially weighted mean is not built in; use bt.col('x').rolling_mean(...) in a "
-        "window."
-    ),
-    "ewm_std": (
-        "Exponentially weighted std is not built in; use bt.col('x').rolling_std(...) in a window."
-    ),
-    "ewm_var": (
-        "Exponentially weighted var is not built in; use bt.col('x').rolling_var(...) in a window."
-    ),
-    "interpolate": (
-        "Interpolation is not built in; use bt.col('x').forward_fill() / .backward_fill()."
-    ),
     "search_sorted": (
         "Binary search over a column is not an expression op; use a join or ds.map_batches()."
     ),
-    "rle": "Run-length encoding is not built in; detect run boundaries with a lag window.",
-    "rle_id": "Run ids are not built in; derive them from a lag window and a running sum.",
+    "rle": (
+        "Run-length encoding as a struct is not built in; number the runs with "
+        "bt.col('x').rle_id().over(order_by=...) and group by the result."
+    ),
     "dot": "The dot product of two vector columns is bt.col('a').list.dot(bt.col('b')).",
     "reshape": "Reshape a flat column into lists with the .list accessor or a group_by array_agg.",
     "extend_constant": (
@@ -230,15 +217,16 @@ LIST_UNSUPPORTED: dict[str, str] = {
 
 # pandas/Polars datetime methods a migrant types on ``.dt`` that Batcher spells differently.
 DT_UNSUPPORTED: dict[str, str] = {
-    "ceil": "Rounding up is not built in; .dt.truncate(unit) / .dt.floor(unit) round down.",
     "isocalendar": "ISO parts are separate: .dt.iso_year() and .dt.week().",
-    "round": "Rounding to a unit is not built in; .dt.truncate(unit) / .dt.floor(unit) truncate.",
     "time": "Extract time parts with .dt.hour(), .dt.minute(), .dt.second().",
     "timetz": (
         "Extract time parts with .dt.hour()/.dt.minute()/.dt.second(); shift zones with "
         ".dt.convert_timezone(...)."
     ),
-    "to_period": "Bucket to a period with .dt.truncate('1mo'), then group on it.",
+    "to_period": (
+        "Bucket to a period with .dt.truncate('month') -- a calendar unit name, not a "
+        "duration -- then group on it. For a fixed-width bucket use bt.window(col, '1h')."
+    ),
     "total_seconds": (
         "Seconds between two timestamps is bt.col('a').dt.seconds_between(bt.col('b'))."
     ),

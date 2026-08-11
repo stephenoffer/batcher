@@ -2,7 +2,7 @@
 
 Run batch inference against an external inference server (Triton, TorchServe, or any
 columnar-JSON HTTP endpoint) instead of loading the model in-process. Each adapter is
-a load-once class UDF for `ds.ml.map_batches`, so preprocessing stays on CPU workers
+a load-once class UDF for {py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>`, so preprocessing stays on CPU workers
 while the model call goes to the server, and the stage parallelizes across the cluster.
 
 ```python
@@ -27,7 +27,7 @@ gRPC channel, the tensor metadata handshake) happens once, not per batch. If you
 your own adapter, do the connecting in `__init__` and leave nothing per call but the
 request itself.
 
-The class implements the `ServingClient` protocol: one `predict` method that takes a
+The class implements the {py:class}`ServingClient <batcher.ml.ServingClient>` protocol: one `predict` method that takes a
 dict of named NumPy arrays and returns a dict of named arrays. Batcher handles the
 columnar plumbing on both sides. Input columns are pulled from the Arrow batch and
 converted to NumPy in the order given by `input_columns`; output arrays come back keyed
@@ -139,8 +139,8 @@ The input columns pass through unchanged and `score` is appended, which is the s
 shape a real Triton or TorchServe call produces.
 
 When the server returns raw `logits` (a list per row), turn them into a probability
-distribution in the data plane with `.list.softmax()`, and rank the classes with
-`.list.arg_sort()` reversed for highest-first. No per-row Python runs:
+distribution in the data plane with {py:meth}`.list.softmax() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.softmax>`, and rank the classes with
+{py:meth}`.list.arg_sort() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.arg_sort>` reversed for highest-first. No per-row Python runs:
 
 ```python
 # docs: skip
@@ -151,7 +151,7 @@ scored = scored.with_columns(
 )
 ```
 
-`arg_sort` gives you positions, and `.list.gather(...)` is what spends them. Together they
+{py:meth}`arg_sort <batcher.plan.expr_ir.namespaces.collections._ListNamespace.arg_sort>` gives you positions, and {py:meth}`.list.gather(...) <batcher.plan.expr_ir.namespaces.collections._ListNamespace.gather>` is what spends them. Together they
 turn a score vector and a candidate list into a ranked selection without a per-row loop, which
 is the shape of a reranking stage:
 
@@ -169,12 +169,12 @@ print(candidates.select(top2=bt.col("docs").list.gather(best_first.list.head(2))
 A cutoff wider than the candidate list is fine — the extra positions come back as nulls rather
 than an error, because a fixed `k` against a short candidate set is ordinary.
 
-Two more read the scores rather than reorder them. `.list.log_softmax()` is the log-domain
+Two more read the scores rather than reorder them. {py:meth}`.list.log_softmax() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.log_softmax>` is the log-domain
 distribution, and it is not the same as taking the log of `softmax`: a probability small enough
 to underflow to zero there becomes `-inf`, while the log form stays finite. That is the whole
 reason a scoring pipeline carries log-probabilities.
 
-`.list.entropy()` reduces a row to its uncertainty in nats — zero when the model put all its
+{py:meth}`.list.entropy() <batcher.plan.expr_ir.namespaces.collections._ListNamespace.entropy>` reduces a row to its uncertainty in nats — zero when the model put all its
 mass on one class, `ln n` when it spread evenly over `n`. It is the routing signal for a
 cascade: answer the confident rows from the small model and send the rest somewhere more
 expensive.
@@ -201,7 +201,7 @@ server can absorb.
 `http_client` retries with exponential backoff on transient failures: connection
 errors, timeouts, and the retryable status codes (408, 425, 429, 500, 502, 503, 504).
 Other 4xx responses fail immediately, since a malformed request will not improve on a
-retry. Once `retries` attempts are exhausted the adapter raises `BackendError` with the
+retry. Once `retries` attempts are exhausted the adapter raises {py:exc}`BackendError <batcher.BackendError>` with the
 endpoint and the last error. Triton and TorchServe surface backend errors the same way.
 Nothing is dropped silently; a failure propagates up through the stage.
 

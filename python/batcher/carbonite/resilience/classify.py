@@ -259,6 +259,14 @@ _MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "slow_down",
             "rate limit",
             "throttl",
+            # What a busy *model* endpoint says instead of a status code. An inference
+            # stage is the main consumer of this taxonomy, and "the server is overloaded"
+            # (OpenAI) / "model is currently loading" (HuggingFace) are the two phrasings
+            # it meets — both of which the next attempt usually serves.
+            "overloaded",
+            "is currently loading",
+            "model_not_ready",
+            "not ready yet",
         ),
     ),
     (

@@ -23,6 +23,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.persistence.document import (
+    PREPROCESSOR_TAG,
     SCHEMA_VERSION,
     check_version,
     decode_value,
@@ -164,6 +165,21 @@ def _encode_field(value: Any, model: str, field: str) -> Any:
                 "Parameterize the wrapper with an exported estimator."
             )
         return {_CLASS_TAG: value.__name__}
+    if _is_preprocessor(value):
+        # A fitted *preprocessor* held as an estimator's state, which
+        # `CalibratedClassifierCV` is: what it learns is a `PlattCalibrator` /
+        # `IsotonicCalibrator` mapping scores onto probabilities. It is not an estimator —
+        # it transforms rather than predicts — so `_is_estimator` above does not see it, and
+        # the bare `encode_value` below refused it as an unserializable type. The whole
+        # calibration surface was therefore unsaveable, which is close to useless: a
+        # calibrator exists to be fitted on held-out data and then *used later*.
+        #
+        # Written through the preprocessor package's own `to_dict` rather than a second
+        # encoding of the same objects, so a nested calibrator and a standalone one are the
+        # same document and cannot drift apart.
+        from batcher.ml.preprocessors.persistence import to_dict
+
+        return {PREPROCESSOR_TAG: to_dict(value)}
     if isinstance(value, list) and any(_is_estimator(item) for item in value):
         # One-vs-rest keeps a list of fitted sub-models. Encoding them individually keeps
         # the whole ensemble in one document, matching the single-estimator case above.
@@ -186,8 +202,19 @@ def _is_estimator(value: Any) -> bool:
     return type(value).__name__ in _registry() and callable(getattr(value, "predict", None))
 
 
+def _is_preprocessor(value: Any) -> bool:
+    """Whether `value` is a fitted preprocessor, which has its own document shape."""
+    from batcher.ml.preprocessors.base import Preprocessor
+
+    return isinstance(value, Preprocessor)
+
+
 def _decode_field(value: Any) -> Any:
-    """Decode one field, rebuilding a nested estimator."""
+    """Decode one field, rebuilding a nested estimator or preprocessor."""
+    if isinstance(value, dict) and PREPROCESSOR_TAG in value:
+        from batcher.ml.preprocessors.persistence import from_dict
+
+        return from_dict(value[PREPROCESSOR_TAG])
     if isinstance(value, dict) and _MODEL_TAG in value:
         return model_from_dict(value[_MODEL_TAG])
     if isinstance(value, dict) and _CLASS_TAG in value:

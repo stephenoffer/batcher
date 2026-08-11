@@ -22,7 +22,7 @@ from batcher._internal.errors import PlanError
 from batcher._internal.sql_errors import parse_sql
 from batcher.api.dataset import Dataset
 from batcher.api.sql_session import statements
-from batcher.api.sql_session.registry import RegisteredFunction, resolve_type
+from batcher.api.sql_session.registry import RegisteredFunction, resolve_type, validate_options
 
 __all__ = ["Session"]
 
@@ -45,12 +45,13 @@ class Session:
             {'total': [6]}
     """
 
-    __slots__ = ("_dialect", "_functions", "_generation", "_plan_cache", "_tables")
+    __slots__ = ("_dialect", "_functions", "_generation", "_models", "_plan_cache", "_tables")
 
     def __init__(self, *, dialect: str = "duckdb") -> None:
         """Create an empty session reading SQL in `dialect` (the sqlglot read dialect)."""
         self._tables: dict[str, Dataset] = {}
         self._functions: dict[str, RegisteredFunction] = {}
+        self._models: dict[str, Any] = {}
         self._dialect = dialect
         # Prepared-statement cache: (dialect, query, bound names) ->
         # (catalog generation, bound objects, Dataset).
@@ -277,7 +278,14 @@ class Session:
           ``config`` forward to `map_batches`.
 
         Scalar functions are not supported in ``GROUP BY`` keys, aggregate arguments,
-        or ``ORDER BY`` — compute them in a subquery or projected alias first.
+        or ``ORDER BY`` — compute them in a subquery or projected alias first. There is no
+        aggregate form at all: an aggregate needs a mergeable partial/combine/finalize
+        implementation in the engine, which a Python callable over one batch cannot provide.
+        Use ``ds.group_by(...).agg(...)``, or ``map_groups`` for arbitrary Python per group.
+
+        An option the chosen call form cannot honour is rejected rather than ignored, so a
+        misspelled keyword or a `map_batches` option on the scalar form fails at registration
+        instead of quietly doing nothing.
 
         Args:
             name: The SQL name the function is called by.
@@ -287,8 +295,12 @@ class Session:
             vectorized: Scalar form only — pass Arrow arrays (else per-row scalars).
             result_type: Scalar output Arrow type (or alias).
             output_columns: Table-function result column names.
-            batch_format: Table form `map_batches` batch format.
-            **config: Extra `map_batches` keyword arguments (table form).
+            batch_format: Batch table form only — the `map_batches` batch format.
+            **config: Extra `map_batches` (or, with `per_row`, `map`) keyword arguments,
+                forwarded by the table form. Anything the call form cannot honour raises.
+
+        Raises:
+            PlanError: If an option cannot take effect for the chosen call form.
 
         Examples:
             .. doctest::
@@ -301,7 +313,20 @@ class Session:
                 >>> s.sql("SELECT dbl(x) AS y FROM t").to_pydict()
                 {'y': [2, 4, 6]}
         """
-        if table:
+        # `batch_format` is a named parameter rather than part of `**config`, so it bypasses
+        # the check below — and both forms that cannot honour it dropped it in silence.
+        if batch_format != "pyarrow" and (not table or per_row):
+            form = "a per-row table function" if per_row else "a scalar function"
+            raise PlanError(
+                f"register_function({name!r}): batch_format={batch_format!r} has no effect on "
+                f"{form}, which receives {'one row dict' if per_row else 'Arrow arrays'} at a "
+                f"time. Drop it, or register a batch table function (table=True)."
+            )
+        validate_options(name, config, table=table, per_row=per_row)
+        if table and not per_row:
+            # `batch_format` is a `map_batches` option; the per-row form goes through
+            # `ml.map`, which has no such thing, so injecting it there would fail the very
+            # validation above at the point of use rather than at the point of the mistake.
             config = {"batch_format": batch_format, **config}
         self._functions[name] = RegisteredFunction(
             name=name,
@@ -314,6 +339,57 @@ class Session:
             config=config,
         )
         self._bump()
+
+    def register_model(self, name: str, model: Any) -> None:
+        """Register a fitted model that SQL can score with ``ML_PREDICT``.
+
+        The BigQuery ``CREATE MODEL`` analogue for a model that already exists: it binds a
+        name in this session's model catalog so a query can name it, the way `register` binds
+        a table. Registering never scores anything — the prediction happens when the query
+        that names the model runs.
+
+        `model` is a fitted model object (XGBoost, LightGBM, CatBoost, scikit-learn, ONNX) or
+        a path to a saved one. A query can also name a saved model by quoted path without
+        registering it at all; the catalog exists for the case a path cannot express, which is
+        a model fitted in this process and never written to storage.
+
+        Args:
+            name: The SQL name the model is scored by.
+            model: A fitted model object, or a path/URI to a saved one.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml import LinearRegression
+                >>> train = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
+                >>> fitted = LinearRegression(features=["x"], target="y").fit(train)
+                >>> s = bt.Session()
+                >>> s.register_model("doubler", fitted)
+                >>> s.list_models()
+                ['doubler']
+        """
+        if not isinstance(name, str) or not name:
+            raise PlanError(f"a model name must be a non-empty string, got {name!r}")
+        self._models[name] = model
+        self._bump()
+
+    def list_models(self) -> list[str]:
+        """The sorted names of all registered models.
+
+        Returns:
+            The sorted list of registered model names.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> s = bt.Session()
+                >>> s.register_model("scorer", "s3://models/churn.onnx")
+                >>> s.list_models()
+                ['scorer']
+        """
+        return sorted(self._models)
 
     def list_functions(self) -> list[str]:
         """The sorted names of all registered functions.
@@ -431,7 +507,12 @@ class Session:
         """
         from batcher._sql import translate_ast
 
-        return translate_ast(ast, functions=self._functions, **{**self._tables, **tables})
+        return translate_ast(
+            ast,
+            functions=self._functions,
+            models=self._models,
+            **{**self._tables, **tables},
+        )
 
     def _rebind(self, name: str, dataset: Dataset) -> None:
         """Point `name` at `dataset` and invalidate the prepared-statement cache.
@@ -453,17 +534,18 @@ class Session:
         self._bump()
 
     def _with_dialect(self, dialect: str) -> Session:
-        """A view of this session reading `dialect`, sharing its tables and functions.
+        """A view of this session reading `dialect`, sharing its tables, functions and models.
 
         Everything mutable is shared *by reference* with the owning session — the
-        catalog, the function registry, the plan cache, and the generation counter —
-        so a table registered on either is visible to both. Only the read dialect
+        catalog, the function and model registries, the plan cache, and the generation
+        counter — so a table registered on either is visible to both. Only the read dialect
         differs, and the plan cache is keyed by dialect, so the same query text
         parsed as Spark and as DuckDB cannot collide.
         """
         view = Session.__new__(Session)
         view._tables = self._tables
         view._functions = self._functions
+        view._models = self._models
         view._dialect = dialect
         view._plan_cache = self._plan_cache
         view._generation = self._generation

@@ -26,6 +26,7 @@ __all__ = [
     "MCV_KEY",
     "NDV_KEY",
     "QUANTILES_KEY",
+    "ROW_BYTES_KEY",
     "STATS_NAMESPACE",
     "columns_for",
     "merge_column_table",
@@ -40,10 +41,26 @@ STATS_NAMESPACE = "kyber.stats"
 NDV_KEY = "__column_ndv__"  # per-column distinct counts
 QUANTILES_KEY = "__column_quantiles__"  # per-column quantile grids
 AVG_BYTES_KEY = "__column_avg_bytes__"  # per-column average byte widths
+# Per-column byte widths measured the *cheap* way, for every column a query touched rather
+# than only the ones a statistic is sketched for.
+#
+# It is a separate table from `AVG_BYTES_KEY` and must stay one, because that key carries a
+# second job: `api.terminal._metadata.learn_column_stats` uses *the presence of an average
+# byte width* as its "already sketched" marker, deliberately and for a documented reason.
+# Writing a width there for a column nothing sketched would mark it done and cost that column
+# its quantiles and most-common-values forever. So the cheap widths live here, the marker
+# keeps meaning what it meant, and the estimator reads the sketched width first.
+ROW_BYTES_KEY = "__column_row_bytes__"
 MCV_KEY = "__column_mcv__"  # per-column most-common-values (skew)
 # Derived, not stored: `load_learned_stats` folds the measured q-error history into
 # `{signature: correction_factor}` under this key.
 CARDINALITY_CORRECTION_KEY = "__cardinality_correction__"
+# Derived, not stored: `load_learned_stats` folds `metadata.udf_stats` into
+# `{udf_identity: seconds_per_row}` under this key, so the cost model can price a
+# `map_batches` by what Core measured its `fn` to cost rather than as a trivial column map.
+# Keyed by UDF identity, not by plan signature — the cost of a callable is a property of the
+# callable, and the same `fn` under two different plans costs the same per row.
+UDF_ROW_SECONDS_KEY = "__udf_row_seconds__"
 
 # Column statistics are keyed by **source, then column** — never by column name alone.
 #
@@ -78,6 +95,9 @@ _SOURCE_SEP = "\x1f"
 _TABLE_MAX: dict[str, int] = {
     NDV_KEY: 20_000,
     AVG_BYTES_KEY: 20_000,
+    # Sized with `AVG_BYTES_KEY`: one float per column, and it covers *every* column a
+    # source has rather than the sketched subset, so it fills faster on a wide table.
+    ROW_BYTES_KEY: 20_000,
     QUANTILES_KEY: 5_000,
     MCV_KEY: 5_000,
 }

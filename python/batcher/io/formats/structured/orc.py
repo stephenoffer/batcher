@@ -9,9 +9,9 @@ distributed read parallelizes within a file, reading only its assigned stripe vi
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import IO, Any
 
 import pyarrow as pa
@@ -21,8 +21,19 @@ from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.splits import Split
-from batcher.io.stats.file_identity import file_identity
+from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.plan.source_stats import SourceStatistics
+
+# Bytes per ORC stripe. A stripe is what `ORCSource.splits()` cuts a file into, so this is
+# the ceiling on how many workers can read one file: pyarrow's 64 MiB default gave an
+# 8M-row / 68 MB file **two** stripes, and a 64-worker cluster reading it used two of them.
+# Measured over 64/16/8/4/2 MiB on that file, the write time (1,172-1,245 ms) and the file
+# size (67.6-67.7 MB) are flat across the whole range — the coarse default buys nothing to
+# trade away — while splits go 2 -> 32 and a full read goes 506 ms -> ~390 ms. 8 MiB is the
+# knee: eight splits, and past it the read stops improving. Overridable because the right
+# answer depends on the reader — a warehouse tuned for HDFS-block-sized stripes wants the
+# ecosystem's 64 MiB back.
+_STRIPE_BYTES = max(1 << 16, int(os.environ.get("BATCHER_ORC_STRIPE_BYTES", str(8 << 20))))
 
 __all__ = ["ORCSink", "ORCSource", "ORCStripeSplit"]
 
@@ -63,21 +74,27 @@ def _orc_footer(path: str) -> _ORCFooter:
     so a re-run overwrites its own output and a path-keyed footer then reports the
     *previous* file's stripe count and row count for the new bytes.
 
-    Bounded (`lru_cache(maxsize=1024)`) because an unbounded dict here grows with every
-    file the process has ever touched — a leak proportional to a long-lived worker's whole
-    scan history, not to its working set. A file that cannot be stat-ed is read uncached
-    rather than cached under a token that could not detect it changing.
+    Bounded because an unbounded dict here grows with every file the process has ever
+    touched — a leak proportional to a long-lived worker's whole scan history, not to its
+    working set. A file that cannot be stat-ed is read uncached rather than cached under a
+    token that could not detect it changing.
     """
     identity = file_identity(path)
     if identity is None:
         return _read_orc_footer(path)
-    return _orc_footer_cached(identity)
+    hit = _ORC_FOOTERS.get(identity)
+    if hit is None:
+        hit = _read_orc_footer(identity[0])
+        _ORC_FOOTERS.put(identity, hit)
+    return hit
 
 
-@lru_cache(maxsize=1024)
-def _orc_footer_cached(identity: tuple[str, int, int]) -> _ORCFooter:
-    """`_orc_footer` keyed on the file identity (see there)."""
-    return _read_orc_footer(identity[0])
+#: An `_ORCFooter` is three small fields, so this is bounded by plain entry count. It carried
+#: Parquet's 1,024 — copied across from a cache whose entries are orders of magnitude larger,
+#: and undersized there too. The figure that matters is the per-file-sweep ceiling: planning
+#: touches up to that many files and the workers then read the same ones, so a cache below it
+#: returns nothing on the one pass certain to fill it.
+_ORC_FOOTERS: FileMetaCache = FileMetaCache(65_536)
 
 
 def _read_orc_footer(path: str) -> _ORCFooter:
@@ -309,27 +326,36 @@ class ORCSource(FileSource):
 
 @SINKS.register("orc")
 class ORCSink(FileSink):
-    """Write an ORC file."""
+    """Write an ORC file.
+
+    A **stripe** is ORC's unit of read parallelism and of statistics, exactly as a row
+    group is Parquet's — and it is what `ORCSource.splits()` divides a file into, so the
+    stripe size a write chooses is the ceiling on how many workers a later read of that
+    file can use.
+    """
 
     suffix = ".orc"
     format_name = "orc"
 
-    __slots__ = ("compression",)
+    __slots__ = ("compression", "stripe_size")
 
-    def __init__(self, compression: str = "zstd", **kwargs: Any) -> None:
+    def __init__(
+        self, compression: str = "zstd", stripe_size: int = _STRIPE_BYTES, **kwargs: Any
+    ) -> None:
         super().__init__(**kwargs)  # carries filesystem= / storage_options=
         self.compression = compression
+        self.stripe_size = stripe_size
 
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
         orc = _require_orc()
-        orc.write_table(table, fh, compression=self.compression)
+        orc.write_table(table, fh, compression=self.compression, stripe_size=self.stripe_size)
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:  # noqa: ARG002 (ORCWriter infers the schema from the first write)
         # Incremental ORCWriter: `write_stream` appends one batch at a time so a
         # breaker-free read→transform→write never materializes the whole result
         # (bounded memory), instead of the base default that buffers one table.
         orc = _require_orc()
-        return orc.ORCWriter(fh, compression=self.compression)
+        return orc.ORCWriter(fh, compression=self.compression, stripe_size=self.stripe_size)
 
     def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
         writer.write(pa.Table.from_batches([batch]))

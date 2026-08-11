@@ -111,11 +111,55 @@ def from_pydict(mapping: Mapping[str, Any], *, schema: pa.Schema | None = None) 
             f"from_pydict() expects a {{column: values}} mapping, got {type(mapping).__name__}; "
             "for a list of row dicts use bt.from_pylist()"
         )
+    columns = dict(mapping)
     try:
-        table = pa.table(dict(mapping), schema=schema)
+        table = pa.table(columns, schema=schema)
     except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
-        raise PlanError(f"from_pydict(): could not build an Arrow table — {exc}") from None
+        table = _retry_as_tensors(columns, schema)
+        if table is None:
+            raise PlanError(_column_error("from_pydict", columns, exc)) from None
     return from_arrow(table)
+
+
+def _retry_as_tensors(columns: dict[str, Any], schema: pa.Schema | None) -> pa.Table | None:
+    """Rebuild `columns`, turning a column of NumPy arrays into the tensor column that fits.
+
+    Attempted only after a plain conversion has already failed, so the happy path pays
+    nothing: a column of numbers never reaches here. A list of same-shape arrays becomes the
+    canonical fixed-shape tensor column; a list of mixed-shape ones — the mixed-resolution
+    image decode — becomes a variable-shape tensor column. Both used to be answered with
+    "convert it to an ndarray", which the caller had already done.
+    """
+    from batcher.io.formats.ml.ragged import ragged_from_values
+    from batcher.io.formats.ml.tensor import tensor_from_values
+
+    converted = {
+        name: tensor_from_values(value) or ragged_from_values(value)
+        for name, value in columns.items()
+    }
+    if not any(v is not None for v in converted.values()):
+        return None
+    rebuilt = {name: converted[name] or value for name, value in columns.items()}
+    try:
+        return pa.table(rebuilt, schema=schema)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError):
+        return None
+
+
+def _column_error(caller: str, columns: dict[str, Any], cause: Exception) -> str:
+    """A message naming the column Arrow could not type, and the fix for what it holds.
+
+    pyarrow quotes the offending value and its class and stops there, so a UUID primary key
+    or an enum member in a fifty-column dict produced an error that named neither the column
+    nor the remedy. The diagnosis is shared with the `map_batches` result path
+    (`interop.diagnostics`): the same value is just as unconvertible on the way out.
+    """
+    from batcher.interop.diagnostics import describe_unconvertible, find_unconvertible_column
+
+    name = find_unconvertible_column(columns)
+    if name is None:
+        return f"{caller}(): could not build an Arrow table — {cause}"
+    return f"{caller}(): {describe_unconvertible(name, columns[name])}"
 
 
 def from_dict(mapping: Mapping[str, Any], *, schema: pa.Schema | None = None) -> Dataset:
@@ -162,14 +206,31 @@ def from_pylist(rows: Sequence[Mapping[str, Any]]) -> Dataset:
 
     Raises:
         PlanError: If `rows` is a mapping (the column-oriented shape) rather than a
-            sequence of row dicts.
+            sequence of row dicts, or if a column holds values Arrow cannot type.
     """
     if isinstance(rows, Mapping):
         raise PlanError(
             "from_pylist() expects a list of row dicts, got a mapping; "
             "for {column: values} use bt.from_pydict()"
         )
-    return _scan(interop.from_pylist(list(rows)))
+    listed = list(rows)
+    try:
+        return _scan(interop.from_pylist(listed))
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+        raise PlanError(_column_error("from_pylist", _as_columns(listed), exc)) from None
+
+
+def _as_columns(rows: list) -> dict[str, list]:
+    """Row dicts pivoted to ``{column: values}``, so the column diagnosis has columns to look at.
+
+    Only ever built on the error path: the rows have already failed to convert, and finding
+    *which* column did it is worth one pass over data that is not going anywhere.
+    """
+    names: dict[str, None] = {}
+    for row in rows:
+        if isinstance(row, Mapping):
+            names.update(dict.fromkeys(row))
+    return {name: [row.get(name) for row in rows if isinstance(row, Mapping)] for name in names}
 
 
 def from_dicts(rows: Sequence[Mapping[str, Any]]) -> Dataset:
@@ -260,8 +321,54 @@ def from_items(items: Sequence[Any], *, column: str = "item") -> Dataset:
 
     Returns:
         A lazy `Dataset` with one row per item.
+
+    Raises:
+        PlanError: If the items cannot become one Arrow column — most often because they
+            are row tuples or Arrow batches, each of which has its own constructor.
     """
-    return _scan(interop.from_items(list(items), column=column))
+    rows = list(items)
+    try:
+        return _scan(interop.from_items(rows, column=column))
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+        raise PlanError(_items_error("from_items", rows, exc)) from None
+
+
+#: The item shapes that fail to become one column *and* have a better constructor waiting.
+#: Each entry is ``(predicate, remedy)``. Without this, ``bt.from_items([(1, "a")])`` — the
+#: `cursor.fetchall()` shape, and the most common thing to try — raised pyarrow's
+#: ``Could not convert 'a' with type str: tried to convert to int64``, which names neither
+#: the constructor, nor the item, nor the fact that a one-line fix exists.
+_ITEM_REMEDIES = (
+    (
+        lambda item: isinstance(item, pa.RecordBatch | pa.Table),
+        "these are Arrow batches, not rows — use bt.from_batches(lambda: iter(batches)), "
+        "which streams them in bounded memory, or bt.from_arrow(table)",
+    ),
+    (
+        lambda item: isinstance(item, tuple | list),
+        "row tuples carry no column names — use bt.from_records(rows, columns=[...])",
+    ),
+    (
+        lambda item: isinstance(item, Mapping),
+        "the items are not all dicts, so they cannot share a schema — make every item a "
+        "{column: value} dict, or pass only the scalar items",
+    ),
+)
+
+
+def _items_error(caller: str, rows: list, cause: Exception) -> str:
+    """A message naming the item shape and the constructor that takes it.
+
+    Falls back to quoting pyarrow when the shape is not one of the known confusions, because
+    an unrecognized shape still deserves the underlying reason rather than a shrug.
+    """
+    first = next(iter(rows), None)
+    for matches, remedy in _ITEM_REMEDIES:
+        if matches(first):
+            return f"{caller}(): {remedy}."
+    return (
+        f"{caller}(): could not build a column from items of type {type(first).__name__} — {cause}"
+    )
 
 
 def from_iter(
@@ -301,7 +408,11 @@ def from_iter(
             f"from_iter() expects an iterable of rows, got {type(iterable).__name__}; "
             "wrap a single value in a list"
         )
-    return from_items(list(iterable), column=column)
+    rows = list(iterable)
+    try:
+        return _scan(interop.from_items(rows, column=column))
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+        raise PlanError(_items_error("from_iter", rows, exc)) from None
 
 
 def from_batches(

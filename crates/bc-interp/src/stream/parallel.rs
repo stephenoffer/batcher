@@ -83,7 +83,7 @@ pub fn execute_streaming_parallel_or_hand_off(
     handoff: bool,
     cancel: Option<&CancelToken>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    in_scoped_pool(workers, || {
+    in_scoped_pool(useful_workers(plan, sources, workers), || {
         run(plan, sources, workers, None, budget, handoff, cancel)
     })
 }
@@ -138,6 +138,67 @@ where
     crate::par::pool_for(workers.max(1))?.install(f)
 }
 
+/// `workers`, capped by the shards this plan could actually keep busy.
+///
+/// The pool this executor installs was sized from the *machine* while the work was sized from
+/// the *data*: [`effective_shard_count`] already refuses to cut a relation below one morsel per
+/// shard, so a 100 K-row query runs 6 shards — inside a 96-thread pool. The other 90 threads are
+/// not free. Rayon wakes them, they contend for the job queue and the epoch GC, and the cost is
+/// paid on exactly the queries that can least absorb it. Measured on a 100 K-row point lookup:
+/// **6.15 ms of CPU for 1.46 ms of wall time (4.2 cores)**, against 1.66 ms of CPU — and a
+/// *faster* 1.25 ms wall — at a width of six.
+///
+/// This is the cap [`crate::par::auto_width`] already applies on the materializing path, for the
+/// reason its docstring gives: "a one-row query would otherwise install and spin a 96-thread
+/// pool. Batcher's stated goal of low fixed overhead on sub-second queries is exactly this
+/// case." This is the *default* executor, so it is where that goal is mostly decided.
+///
+/// It is an upper bound over every source rather than the driving one alone, which is not yet
+/// chosen here — so it can only ever be larger than the shard count, and can never remove
+/// parallelism the plan could have used. Scheduling only: the shard count, and therefore the
+/// result, is unchanged.
+///
+/// **Exception — media decode**, the same one `auto_width` carves out and for the same reason. A
+/// `.image`/`.audio`/`.video` decode does heavy per-row work *inside* the morsel with its own
+/// rayon fan-out, and its input is tiny encoded bytes, so the morsel count understates the
+/// useful width by orders of magnitude. Those plans keep every core.
+fn useful_workers(plan: &RelOp, sources: &[Vec<RecordBatch>], workers: usize) -> usize {
+    if nothing_to_parallelize(plan) {
+        return 1;
+    }
+    if plan.contains_media_decode() {
+        return workers.max(1);
+    }
+    let widest = sources
+        .iter()
+        .map(|batches| batches.iter().map(|b| b.num_rows()).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    workers.min(widest / bc_arrow::DEFAULT_MORSEL_ROWS).max(1)
+}
+
+/// A plan that computes nothing per row, so spreading it across cores cannot make it faster.
+///
+/// A bare `Scan` *is* its source: the streaming pipeline over it hands back the morsels it was
+/// given. Running that in parallel means cutting the source into shards, running an identity
+/// pipeline over each, concatenating them back, and installing a pool to do it in. All of that
+/// machinery is overhead with nothing to amortize it against, and it is not free — measured on
+/// the 3 M-row local Parquet read in `benchmarks/scenarios/formats/read.py`, a single-column
+/// `read.parquet(...).collect()` cost **9.7 ms wall and 70.2 ms of CPU** at the automatic width
+/// against **7.5 ms and 12.5 ms** at a width of one. The parallel path was both slower and five
+/// times more expensive, on the most ordinary call a user makes: load a file.
+///
+/// This is a different bound from the one [`useful_workers`] otherwise applies, and neither
+/// subsumes the other. That one asks *how many morsels exist* — a 3 M-row scan has 183, so it
+/// caps nothing. This one asks *whether spreading them accomplishes anything*, and for an
+/// identity pipeline the answer is no at any size.
+///
+/// Result-preserving in the strongest sense: the operator computes the same rows in the same
+/// order either way, so this does not even move a float the way a partition-count change can.
+fn nothing_to_parallelize(plan: &RelOp) -> bool {
+    matches!(plan, RelOp::Scan { .. })
+}
+
 /// [`execute_streaming_parallel`], with per-operator metrics. Results are identical; the metrics
 /// are a side-channel the control plane learns from.
 pub fn execute_streaming_parallel_metered(
@@ -159,7 +220,7 @@ pub fn execute_streaming_parallel_metered_or_hand_off(
     cancel: Option<&CancelToken>,
 ) -> Result<(Vec<RecordBatch>, ExecMetrics), InterpError> {
     let m = Meter::new(plan, workers.max(1) as u32);
-    let out = in_scoped_pool(workers, || {
+    let out = in_scoped_pool(useful_workers(plan, sources, workers), || {
         run(plan, sources, workers, Some(&m), budget, handoff, cancel)
     })?;
     Ok((out, m.finish()))
@@ -352,6 +413,53 @@ fn run_with_cache(
         }
     }
 
+    // A `UNION ALL` runs its branches **across the pool**, not one after another.
+    //
+    // Each branch is a whole plan in its own right — its own scans, its own joins, its own
+    // aggregate — and nothing about one branch's rows depends on another's. But a `Union` root
+    // is not shardable (there is no single driving relation to slice), so without this arm the
+    // whole query fell to the sequential pipeline and *every branch lost its own parallelism
+    // too*. That is a far larger cost than the missed overlap between branches, and it is the
+    // dominant defect in TPC-DS: measured on q22's five grouping levels over
+    // `inventory x date_dim x item`, one level alone runs at **63.6 cores in 106 ms**, and the
+    // five of them unioned ran at **5.8 cores in 2,624 ms** — the same 15.1 s of CPU, spread
+    // over a ninth of the machine. The five levels run standalone sum to 331 ms, so the union
+    // was costing 8x the sum of its parts.
+    //
+    // Order is preserved: `par_iter().collect::<Result<Vec<_>>>()` keeps branch order, so the
+    // rows appear exactly as the sequential loop emitted them. Every branch still goes through
+    // `run_with_cache`, so each one shards, pre-builds and meters as it would on its own — the
+    // `Meter`'s counters are atomics precisely so concurrent workers can share it.
+    //
+    // `UNION` (distinct) is deliberately excluded: it needs the dedup the fallback path applies
+    // over the concatenated result, and returning early here would skip it.
+    //
+    // The memory budget is **divided** among the branches rather than handed to each in full.
+    // Branches now run at the same time, so their peaks are concurrent, and giving each the
+    // whole envelope would authorize `branches x budget` — the one way this change could turn a
+    // query that fitted into one that does not.
+    if let RelOp::Union { inputs, distinct } = plan {
+        if !*distinct && inputs.len() > 1 && workers > 1 {
+            let share = if budget == 0 {
+                0
+            } else {
+                (budget / inputs.len()).max(1)
+            };
+            let per: Vec<Vec<RecordBatch>> = inputs
+                .par_iter()
+                .map(|branch| {
+                    run_with_cache(
+                        branch, sources, workers, meter, share, None, None, false, cancel,
+                    )
+                })
+                .collect::<Result<_, _>>()?;
+            let all: Vec<RecordBatch> = per.into_iter().flatten().collect();
+            // Promotable-but-different branch types (`int64 ∪ float64`) coerce to the union's
+            // advertised supertype, exactly as the sequential arm does.
+            return Ok(strip_empties(crate::coerce_union_branches(all)?));
+        }
+    }
+
     // (1) The build sides, once. Executed on the streaming path themselves, so building them
     // never materializes their subtree either. Note they are built from the **unsharded**
     // `sources`, which is what lets a worker probe the whole build relation with its shard.
@@ -423,7 +531,11 @@ fn run_with_cache(
         .get(driving)
         .map(|b| b.iter().map(|x| x.num_rows()).sum())
         .unwrap_or(0);
-    if workers == 1 || driving_rows < MIN_ROWS_TO_SHARD {
+    // `nothing_to_parallelize` joins the two existing reasons not to cut the source up: a plan
+    // that computes nothing per row gains nothing from being sharded, however many rows it has.
+    // Without it the width cap alone would leave the worst of both — ~96 shards of an identity
+    // pipeline, reassembled, on a pool of one.
+    if workers == 1 || nothing_to_parallelize(plan) || driving_rows < MIN_ROWS_TO_SHARD {
         return fallback_with(plan, sources, meter, budget, cache, workers, mats, cancel);
     }
 
@@ -474,8 +586,8 @@ fn run_with_cache(
             let partials: Vec<agg::Partial> = folded.into_iter().filter_map(|(p, _)| p).collect();
             if partials.is_empty() {
                 // No shard saw a row. A global aggregate over nothing still yields one row
-                // (`COUNT` 0, `SUM` NULL) — the oracle owns that.
-                return crate::execute(plan, sources);
+                // (`COUNT` 0, `SUM` NULL) — the oracle owns that, over an empty input.
+                return empty_shard_result(plan, sources);
             }
             // Keys *and* accumulators — see the sequential path in `stream::breaker`. The
             // holistic aggregates keep a per-group value list that grows with the input, so
@@ -513,9 +625,11 @@ fn run_with_cache(
             }
             Ok(out)
         }
-        // `DISTINCT` over a shard is a *partial* dedup, so each worker runs the pipeline below the
+        // A dedup over a shard is a *partial* dedup, so each worker runs the pipeline below the
         // dedup and the driver dedups the union — the same `partial → combine` the aggregate arm
-        // above runs, with the empty aggregate list.
+        // above runs, with the empty aggregate list. A keyed dedup reduces the same way: its
+        // `partial` and `combine` are one function, so the union of shard reductions reduced
+        // again is the whole answer.
         //
         // The result is identical to the unsharded path, not merely equivalent. Shards are
         // contiguous in-order row ranges, so flattening them in shard order reproduces the
@@ -526,8 +640,114 @@ fn run_with_cache(
         //
         // Peak memory is what the sequential streaming breaker already held (it `drain`s its
         // input), so this buys the parallelism without widening the envelope.
-        RelOp::Distinct { input } => {
+        RelOp::Distinct {
+            input,
+            keys,
+            order,
+            limit,
+        } => {
             let t = std::time::Instant::now();
+
+            // A fused `LIMIT k` makes each shard keep only its own first `k` distinct rows and
+            // stop pulling, then combines those in shard order. The mergeable argument is on
+            // `DistinctPrefix`: a row among the global first `k` is among its own shard's first
+            // `k`, so the ordered union of the shard prefixes contains the answer and
+            // re-applying the operator to it selects exactly that answer.
+            //
+            // `par_iter().collect()` preserves shard order, and the shards partition the source
+            // in order, so the concatenation below is the input's own row order — which is what
+            // makes this equal to the sequential oracle rather than merely the same size.
+            // `DISTINCT ON` is excluded for the reason the sequential breaker gives.
+            if let (Some(k), true) = (limit, keys.is_empty()) {
+                // Each shard probes a bounded prefix of its own slice. It stops the moment it
+                // holds `k` distinct rows — the win — and gives up hashing at
+                // `PREFIX_PROBE_MORSELS` if it does not, because a key that sparse against the
+                // limit is one the whole-column dense direct-map deduplicates faster than any
+                // exit can be reached. A shard that gives up keeps *collecting* its batches,
+                // which costs nothing, so the fallback below pays for the ordinary dedup and
+                // sixteen morsels of wasted hashing rather than a second pass over the source.
+                type Probe = (Option<RecordBatch>, Vec<RecordBatch>, bool);
+                let probes: Vec<Probe> = shard_sources
+                    .par_iter()
+                    .map(|srcs| {
+                        let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
+                        let mut acc = bc_runtime::agg::DistinctPrefix::new(*k);
+                        let mut held: Vec<RecordBatch> = Vec::new();
+                        let mut gave_up = false;
+                        for batch in with_cancellation(build_with(input, ctx)?, cancel) {
+                            let batch = batch?;
+                            if !gave_up {
+                                acc.push(&batch)?;
+                                if acc.is_satisfied() {
+                                    held.push(batch);
+                                    break;
+                                }
+                                gave_up = held.len() + 1 >= super::breaker::PREFIX_PROBE_MORSELS;
+                            }
+                            held.push(batch);
+                        }
+                        Ok::<_, InterpError>((acc.finish(), held, gave_up))
+                    })
+                    .collect::<Result<Vec<_>, InterpError>>()?;
+
+                // Only when *every* shard filled its prefix is the ordered union of those
+                // prefixes the answer; one shard that gave up may still hold distinct rows the
+                // global first `k` needs, and its prefix does not contain them.
+                if probes.iter().all(|(_, _, gave_up)| !gave_up) {
+                    let shard_rows: Vec<RecordBatch> =
+                        probes.into_iter().filter_map(|(p, _, _)| p).collect();
+                    if shard_rows.is_empty() {
+                        // No shard saw a row. The oracle owns the correctly-typed empty relation.
+                        return empty_shard_result(plan, sources);
+                    }
+                    let rows_in = crate::count_rows(&shard_rows);
+                    let out: Vec<RecordBatch> = bc_runtime::agg::distinct_prefix(&shard_rows, *k)?
+                        .into_iter()
+                        .collect();
+                    if let Some(m) = meter {
+                        m.breaker(
+                            m.id(plan),
+                            rows_in,
+                            0,
+                            0,
+                            &out,
+                            t.elapsed().as_nanos() as u64,
+                        );
+                    }
+                    return Ok(out);
+                }
+
+                // Measured low cardinality. Dedup the ordinary bucket-parallel way over
+                // everything the shards collected; the limit binds only if that turns up more
+                // than `k` distinct rows, and only then is the ordered prefix recomputed.
+                let batches: Vec<RecordBatch> =
+                    probes.into_iter().flat_map(|(_, held, _)| held).collect();
+                if batches.is_empty() {
+                    return empty_shard_result(plan, sources);
+                }
+                let rows_in = crate::count_rows(&batches);
+                let held = crate::batch_bytes(&batches);
+                let full = ops::parallel_distinct(&batches)?;
+                let distinct_rows: usize = full.iter().map(|b| b.num_rows()).sum();
+                let out = match distinct_rows > *k {
+                    false => full,
+                    true => bc_runtime::agg::distinct_prefix(&batches, *k)?
+                        .into_iter()
+                        .collect(),
+                };
+                if let Some(m) = meter {
+                    m.breaker(
+                        m.id(plan),
+                        rows_in,
+                        0,
+                        held,
+                        &out,
+                        t.elapsed().as_nanos() as u64,
+                    );
+                }
+                return Ok(out);
+            }
+
             let parts: Vec<Vec<RecordBatch>> = shard_sources
                 .par_iter()
                 .map(|srcs| {
@@ -539,7 +759,7 @@ fn run_with_cache(
             let batches: Vec<RecordBatch> = parts.into_iter().flatten().collect();
             if batches.is_empty() {
                 // No shard saw a row. The oracle owns the correctly-typed empty relation.
-                return crate::execute(plan, sources);
+                return empty_shard_result(plan, sources);
             }
             let rows_in = crate::count_rows(&batches);
             let held = crate::batch_bytes(&batches);
@@ -550,7 +770,10 @@ fn run_with_cache(
                     reason: "the streaming distinct does not spill",
                 });
             }
-            let out = ops::parallel_distinct(&batches)?;
+            let out = match keys.is_empty() {
+                true => ops::parallel_distinct(&batches)?,
+                false => ops::parallel_distinct_on(&batches, keys, order)?,
+            };
             if let Some(m) = meter {
                 m.breaker(
                     m.id(plan),
@@ -576,6 +799,39 @@ fn run_with_cache(
             Ok(strip_empties(parts.into_iter().flatten().collect()))
         }
     }
+}
+
+/// The plan's answer when sharded execution proved its input holds no rows.
+///
+/// Four arms below reach the same situation — every shard reported nothing — and each needs the
+/// *shape* of an empty answer rather than its content: a keyless aggregate still owes one row
+/// (`COUNT` 0, `SUM` NULL), a grouped one owes none, a `DISTINCT` owes an empty relation with the
+/// right column types. The sequential oracle owns those rules and this path should not restate
+/// them.
+///
+/// What it must not do is ask the oracle over the **whole relation**, which is what all four did:
+/// having just established that the answer is empty, the executor re-ran the entire query
+/// single-threaded to be told so again. That is not a small tax. TPC-H q18 and q19 both end in an
+/// aggregate whose input is empty at sf1, and both spent ~120 ms of a ~140 ms query inside this
+/// second, serial execution — measured at **2 runnable threads against 92**, immediately after a
+/// correct 92-way parallel phase that had taken 5.9 ms and already had the answer. It is also why
+/// adding one predicate to a join's build side could make a query *seven times slower* while
+/// doing strictly less work: the extra predicate emptied the join, and emptying it bought a whole
+/// extra execution.
+///
+/// Slicing each source to zero rows keeps every schema the oracle needs and leaves it nothing to
+/// scan. Sound because the operators here are the plan's root: their input is empty in the real
+/// execution and empty in this one, so they compute the same answer — and the arms only reach it
+/// having proved that emptiness.
+fn empty_shard_result(
+    plan: &RelOp,
+    sources: &[Vec<RecordBatch>],
+) -> Result<Vec<RecordBatch>, InterpError> {
+    let empty: Vec<Vec<RecordBatch>> = sources
+        .iter()
+        .map(|s| s.first().map(|b| vec![b.slice(0, 0)]).unwrap_or_default())
+        .collect();
+    crate::execute(plan, &empty)
 }
 
 /// The plan cannot be sharded: run it on the sequential streaming path. Still bounded-memory,
@@ -754,7 +1010,7 @@ fn shardable_source(plan: &RelOp, cache: &BuildCache, mats: Option<&MatCache>) -
     // k` into `count(*)` over `DISTINCT (k, x)`, that serialized every grouped `COUNT(DISTINCT)`
     // (ClickBench q10/q11/q13: 22 of 25 ms was the single-threaded scan+filter below the dedup).
     let spine = match plan {
-        RelOp::Aggregate { input, .. } | RelOp::Distinct { input } => input,
+        RelOp::Aggregate { input, .. } | RelOp::Distinct { input, .. } => input,
         other => other,
     };
     if !spine_is_shardable(spine, cache, mats) {
@@ -847,19 +1103,30 @@ fn spine_join_blocks_sharding(
     mats: Option<&MatCache>,
     sources: &[Vec<RecordBatch>],
 ) -> Option<&'static str> {
-    if count_hash_joins(plan) != 1 {
-        return None;
-    }
     // The root aggregate/distinct is not itself on the spine — each worker's `Partial` is
     // combined rather than finalized — so look through it, exactly as `shardable_source` does.
     let spine = match plan {
-        RelOp::Aggregate { input, .. } | RelOp::Distinct { input } => input.as_ref(),
+        RelOp::Aggregate { input, .. } | RelOp::Distinct { input, .. } => input.as_ref(),
         other => other,
     };
     let driving_rows: usize = leftmost_scan(spine, mats)
         .and_then(|sid| sources.get(sid))
         .map(|b| b.iter().map(|x| x.num_rows()).sum())
         .unwrap_or(0);
+    // Only the **first** join on the spine is judged, and only in a single-join plan. Both
+    // restrictions look over-cautious and both were measured before being left in place.
+    //
+    // Extending the walk to every spine join, and dropping the single-join requirement, lets a
+    // star-schema query hand off — which is what TPC-DS q17 (seven joins) appears to want, since
+    // it runs 1,035 ms at 10 cores streaming against 447 ms at 22 materializing in isolation. In
+    // the harness it is a **net loss**, measured 2026-08-08: q50 155 -> 115 ms, q45 126 -> 112 and
+    // q85 101 -> 89 improve, but **q17 320 -> 975 ms and q25 201 -> 467** — the two it was aimed
+    // at regress by 3.0x and 2.3x. Handing the whole plan to the materializing executor on the
+    // evidence of one oversized build is too blunt: the other joins on that spine are served fine
+    // per morsel, and their probe sides lose the sharding they were getting.
+    if count_hash_joins(plan) != 1 {
+        return None;
+    }
     let mut node = spine;
     loop {
         if is_materialized(node, mats) {
@@ -1030,6 +1297,52 @@ pub fn streaming_parallelizes(plan: &RelOp) -> bool {
     counts.values().all(|&c| c <= 1)
 }
 
+/// Whether this plan is a **join-free grouped aggregation**, which the materializing
+/// executor computes for about half the CPU the streaming one spends.
+///
+/// Both executors parallelize this shape — that was checked rather than assumed, and the
+/// `cpu=` figure `explain(analyze)` prints for the operator is misleading here: measured
+/// process CPU over wall time, streaming ran it on 14.2 cores and materializing on 11.4. The
+/// difference is not parallelism but *work*. On the H2O `groupby` suite at its own 1e7-row
+/// tier, streaming burned roughly twice the CPU for the identical answer:
+///
+/// | query | streaming | materializing |
+/// |---|---|---|
+/// | `sum(v1), mean(v3) by id3` (1e5 groups) | 269 ms / 3,813 cpu-ms | **174 ms / 1,993 cpu-ms** |
+/// | `sum(v1:v3) by id6` (1e5 groups) | 178 ms / 2,505 cpu-ms | **97 ms / 955 cpu-ms** |
+/// | `sum(v3), count by id1:id6` (1e7 groups) | 1,494 ms / 16,662 cpu-ms | **753 ms / 10,107 cpu-ms** |
+///
+/// A 100-group aggregate is the one case streaming wins, and it wins by 4.5 ms (31.8 against
+/// 36.3) — against 741 ms on the 1e7-group case. The trade is one-sided at every size measured.
+///
+/// **Join-free is the whole restriction, and it is deliberate.** A grouped aggregate *under*
+/// a join is a different plan with different intermediates, and none of it was measured here;
+/// restricting to a plan with no `HashJoin` anywhere keeps this off every TPC-H shape. The
+/// caller pairs it with the same `materialize_fits` envelope guard `streaming_parallelizes`
+/// uses, so a large input still keeps the bounded streaming path.
+/// **Seen through a row-wise root**, because most grouped aggregates do not have the aggregate
+/// at the root and the shape of the projection above it says nothing about which executor
+/// should run them. `SELECT id3, max(v1) - min(v2) ... GROUP BY id3` leaves a `Project` over the
+/// `Aggregate` for the subtraction, and `stddev` leaves one for its `sqrt`; on H2O `groupby`
+/// those are q7 and q6, and both were routed to streaming and ran **~1.8x slower** than the
+/// materializing path they qualify for on every other count — q6 90.0 ms against 47.9 ms, q7
+/// 100.4 ms against 56.9 ms. The projection itself is over the aggregate's *output*, which is
+/// one row per group and therefore trivial next to the aggregation, so peeling it cannot change
+/// which executor is the right one.
+pub fn materializing_aggregate_is_faster(plan: &RelOp) -> bool {
+    fn has_join(op: &RelOp) -> bool {
+        if matches!(op, RelOp::HashJoin { .. }) {
+            return true;
+        }
+        op.children().iter().any(|c| has_join(c))
+    }
+    let mut node = plan;
+    while let RelOp::Project { input, .. } = node {
+        node = input;
+    }
+    matches!(node, RelOp::Aggregate { group_keys, .. } if !group_keys.is_empty()) && !has_join(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1415,97 @@ mod tests {
     /// every worker still fans out fully. Without the cap, a 96-core box split a 200k-row
     /// relation (~12 morsels) into 96 ~2k-row shards and the dispatch/`combine` overhead ran
     /// the parallel path *slower* than sequential.
+    /// The installed pool must be no wider than the shards it will run.
+    ///
+    /// The regression this guards is silent and only visible in CPU time: a 96-thread pool
+    /// running six shards returns the right answer at the right wall-clock, while burning four
+    /// cores doing nothing. On a shared box that is the difference between a query costing what
+    /// it needs and a query costing what the machine has.
+    #[test]
+    fn the_pool_is_no_wider_than_the_shards_it_will_run() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let m = bc_arrow::DEFAULT_MORSEL_ROWS;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let rows = 6 * m + 7; // six whole morsels and a remainder
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(
+                (0..rows as i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let sources = vec![vec![batch]];
+        // A plan that does per-row work, so the *morsel-count* bound is the one under test.
+        // A bare scan is capped at one worker for a different reason — see
+        // `an_identity_pipeline_is_never_sharded_or_spread`.
+        let plan = RelOp::Filter {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            predicate: bc_expr::Expr::Col {
+                name: "a".to_string(),
+            },
+        };
+
+        let capped = useful_workers(&plan, &sources, 96);
+        assert_eq!(
+            capped, 6,
+            "six morsels of data cannot keep more than six shards busy"
+        );
+        assert!(
+            capped >= effective_shard_count(96, rows),
+            "the pool must never be narrower than the shard count it has to run"
+        );
+        // A width the caller asked for explicitly is still an upper bound, never raised.
+        assert_eq!(useful_workers(&plan, &sources, 2), 2);
+        // And an empty relation still gets a usable pool rather than a zero-width one.
+        assert_eq!(useful_workers(&plan, &[vec![]], 96), 1);
+    }
+
+    /// An identity pipeline is neither sharded nor spread, however much data it carries.
+    ///
+    /// `read.parquet(...).collect()` reaches the executor as a bare `Scan`: the file has already
+    /// been decoded and the plan's whole job is to hand those batches back. The morsel-count
+    /// bound cannot see this — 3 M rows are 183 morsels, so it permits every core — and the
+    /// result was that the most ordinary call a user makes paid for ~96 shards of an identity
+    /// pipeline and a 96-thread pool to run them on. Measured at 9.7 ms wall / 70.2 ms CPU
+    /// against 7.5 ms / 12.5 ms: slower *and* five times the CPU.
+    #[test]
+    fn an_identity_pipeline_is_never_sharded_or_spread() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let m = bc_arrow::DEFAULT_MORSEL_ROWS;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        // Far more morsels than cores, so nothing but the identity rule can be doing the capping.
+        let rows = 200 * m;
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(
+                (0..rows as i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let sources = vec![vec![batch]];
+
+        let scan = RelOp::Scan { source_id: 0 };
+        assert!(nothing_to_parallelize(&scan));
+        assert_eq!(
+            useful_workers(&scan, &sources, 96),
+            1,
+            "a scan computes nothing per row, so no width above one can help it"
+        );
+
+        // The moment an operator sits on top there *is* per-row work, and the morsel-count
+        // bound takes over — this is the boundary the rule must not overreach past.
+        let filtered = RelOp::Filter {
+            input: Box::new(RelOp::Scan { source_id: 0 }),
+            predicate: bc_expr::Expr::Col {
+                name: "a".to_string(),
+            },
+        };
+        assert!(!nothing_to_parallelize(&filtered));
+        assert_eq!(useful_workers(&filtered, &sources, 96), 96);
+    }
+
     #[test]
     fn shard_count_never_goes_below_one_morsel() {
         let m = bc_arrow::DEFAULT_MORSEL_ROWS;

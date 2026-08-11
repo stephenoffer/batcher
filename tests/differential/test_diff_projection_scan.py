@@ -38,10 +38,23 @@ def test_dedupe_sort_keys(duck):
 
 
 def test_sort_before_full_sample(duck):
+    """A sample of a sorted relation comes back sorted, full-fraction or not.
+
+    This used to expect the *unordered* `SELECT * FROM t`, and it passed, because
+    `eliminate_sort_before_sample` deleted the `Sort` beneath the `Sample`. That rewrite was
+    justified on the sampled **multiset** being order-independent, which is true and is not
+    sufficient: `Sample` is order-preserving in the engine, so deleting the sort changed the
+    order of the rows the user asked for. The rule is gone (see
+    `kyber/rules/extra/projection_scan.py`), so the sort now survives and the expectation is
+    the sorted one.
+
+    Compared against `ORDER BY x, y` rather than `ORDER BY x` because that is a total order
+    over this data, so no tie-break ambiguity can make the comparison flaky.
+    """
     t = _data()
     duck.register("t", t)
     out = bt.from_arrow(t).sort("x").sample(fraction=1.0).collect()
-    assert_same_ordered(out, duck.sql("SELECT * FROM t"))
+    assert_same_ordered(out, duck.sql("SELECT * FROM t ORDER BY x, y"))
 
 
 # --- schema NOT-NULL null checks ---------------------------------------------

@@ -43,8 +43,8 @@ def _logical_avro(path: str) -> None:
     records = [
         {
             "id": 1,
-            "ts_ms": datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc),
-            "ts_us": datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc),
+            "ts_ms": datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC),
+            "ts_us": datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC),
             "day": datetime.date(2020, 1, 1),
             "tm": datetime.time(1, 2, 3),
             "amt": decimal.Decimal("3.14"),
@@ -52,8 +52,8 @@ def _logical_avro(path: str) -> None:
         },
         {
             "id": 2,
-            "ts_ms": datetime.datetime(2021, 6, 15, 12, tzinfo=datetime.timezone.utc),
-            "ts_us": datetime.datetime(2021, 6, 15, 12, tzinfo=datetime.timezone.utc),
+            "ts_ms": datetime.datetime(2021, 6, 15, 12, tzinfo=datetime.UTC),
+            "ts_us": datetime.datetime(2021, 6, 15, 12, tzinfo=datetime.UTC),
             "day": datetime.date(2021, 6, 15),
             "tm": datetime.time(4, 5, 6),
             "amt": decimal.Decimal("99.99"),
@@ -112,7 +112,5 @@ def test_avro_fastavro_fallback_decodes_logical_types(tmp_path, monkeypatch):
 
     assert fallback.schema.equals(native.schema)
     assert fallback.to_pydict() == native.to_pydict()
-    assert fallback.column("ts_ms")[0].as_py() == datetime.datetime(
-        2020, 1, 1, tzinfo=datetime.timezone.utc
-    )
+    assert fallback.column("ts_ms")[0].as_py() == datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
     assert fallback.column("day")[0].as_py() == datetime.date(2020, 1, 1)

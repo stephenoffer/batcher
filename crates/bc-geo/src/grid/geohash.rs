@@ -171,18 +171,6 @@ pub fn neighbors(hash: &str) -> GeoResult<Vec<String>> {
     Ok(out)
 }
 
-/// The cell width and height in degrees at a given precision.
-pub fn cell_size(precision: usize) -> GeoResult<(f64, f64)> {
-    check_precision(precision)?;
-    let bits = precision * 5;
-    let lon_bits = bits.div_ceil(2);
-    let lat_bits = bits / 2;
-    Ok((
-        360.0 / 2f64.powi(lon_bits as i32),
-        180.0 / 2f64.powi(lat_bits as i32),
-    ))
-}
-
 /// The shortest hash that covers the whole box, or `None` when the box straddles a
 /// top-level cell boundary and no single hash contains it.
 ///
@@ -235,18 +223,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn precision_narrows_the_cell_monotonically() {
-        let mut prev = f64::INFINITY;
-        for p in 1..=MAX_PRECISION {
-            let (w, h) = cell_size(p).unwrap();
-            assert!(w * h < prev, "precision {p} must be finer");
-            prev = w * h;
-        }
-        assert!(cell_size(0).is_err());
-        assert!(cell_size(13).is_err());
     }
 
     #[test]

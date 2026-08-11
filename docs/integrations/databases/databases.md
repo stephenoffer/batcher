@@ -4,8 +4,8 @@ This page covers reading and writing any SQL database from a standard connection
 
 | | |
 | --- | --- |
-| **Read** | `bt.read.sql(query, uri=...)`, `bt.read.sql(query, connection=...)`, or `bt.read.table("dbapi", module=..., ...)` |
-| **Write** | `ds.write.sql(table, uri=...)`, ADBC schemes only |
+| **Read** | {py:meth}`bt.read.sql(query, uri=...) <batcher.api.io_namespace.reader.Reader.sql>`, {py:meth}`bt.read.sql(query, connection=...) <batcher.api.io_namespace.reader.Reader.sql>`, or {py:meth}`bt.read.table("dbapi", module=..., ...) <batcher.api.io_namespace.reader.Reader.table>` |
+| **Write** | {py:meth}`ds.write.sql(table, uri=...) <batcher.api.io_namespace.writer.Writer.sql>`, ADBC schemes only |
 | **Extra** | `pip install 'batcher-engine[sql]'` or `[connectorx]`, plus the per-database driver |
 | **Parallelism** | FlightSQL server-side partitions, or `partition_on=` range partitions on every other backend |
 | **Pushdown** | Projection and predicate, both folded into the submitted SQL |
@@ -99,7 +99,7 @@ events = bt.read.sql(
 Wire compatibility is not SQL compatibility. The connection works, the query runs, and Arrow comes back, but a query that calls a function the target engine does not implement fails on the server with the server's own error. Routing a `cockroachdb://` URI to the PostgreSQL driver does not make CockroachDB understand every PostgreSQL function. Test against the real database, not against PostgreSQL or MySQL.
 :::
 
-Presto is deliberately not routed. Presto and Trino diverged after the fork, and ConnectorX ships a Trino reader, so sending Presto to it would be a guess dressed up as support. A `presto://` URI raises a `BackendError` pointing at ODBC, `bt.read.table("odbc", connection_string=...)`.
+Presto is deliberately not routed. Presto and Trino diverged after the fork, and ConnectorX ships a Trino reader, so sending Presto to it would be a guess dressed up as support. A `presto://` URI raises a {py:exc}`BackendError <batcher.BackendError>` pointing at ODBC, `bt.read.table("odbc", connection_string=...)`.
 
 ## Credentials
 
@@ -140,7 +140,7 @@ Kyber pushes both the projection and the predicate into the SQL that is actually
 | What you write | Where it runs |
 | --- | --- |
 | `.filter(...)` after the read | The database, as a `WHERE` below the projection |
-| `.select(...)` after the read | The database, as the submitted `SELECT` column list |
+| {py:meth}`.select(...) <batcher.Dataset.select>` after the read | The database, as the submitted `SELECT` column list |
 | A predicate the translator cannot express | Your process, in the engine's `Filter` |
 
 The last row is a slowdown and never a wrong answer. An unpushed predicate is re-checked by the engine regardless, so the result is identical either way.
@@ -249,7 +249,7 @@ Each partition is a separate query on a separate connection, so `num_partitions=
 
 Skew is the cost of wrong bounds. Bounds much narrower than the data leave the edge partitions carrying most of the rows, and the extract runs at the speed of its slowest query. Bounds much wider leave the interior partitions empty. Neither loses a row. A cheap `SELECT min(id), max(id)` before the extract is usually all the accuracy needed.
 
-The splits are what the distributed executor schedules across workers, so the fan-out is realized on a `collect(distributed=...)` run. On a single node the partitioned queries still run, and ConnectorX is the backend that parallelizes within one process regardless.
+The splits are what the distributed executor schedules across workers, so the fan-out is realized on a {py:meth}`collect(distributed=...) <batcher.Dataset.collect>` run. On a single node the partitioned queries still run, and ConnectorX is the backend that parallelizes within one process regardless.
 
 ADBC prefers server-side partitioning when the driver has it. With `partition=True` Batcher tries `adbc_execute_partitions` first, which splits one already-executed result set and is strictly better than N independent queries. Range partitioning is the fallback, reached only once the driver has declined.
 
@@ -373,7 +373,7 @@ The `connection=` support is there so a `pandas.read_sql` line ports almost verb
 | `pandas.read_sql(query, engine)` | `bt.read.sql(query, connection=engine)` |
 | `pandas.read_sql(query, sqlalchemy_conn)` | `bt.read.sql(query, connection=sqlalchemy_conn)` |
 
-The result is a lazy `Dataset` rather than an eager DataFrame, so nothing runs until a terminal op such as `collect` or `to_pydict`. When you have a URI rather than a connection object, `bt.read.sql(query, uri=...)` is the better port, because it scales across workers and keeps the password out of the process image.
+The result is a lazy {py:class}`Dataset <batcher.Dataset>` rather than an eager DataFrame, so nothing runs until a terminal op such as `collect` or `to_pydict`. When you have a URI rather than a connection object, `bt.read.sql(query, uri=...)` is the better port, because it scales across workers and keeps the password out of the process image.
 
 ## Requirements and limitations
 

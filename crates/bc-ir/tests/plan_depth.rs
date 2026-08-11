@@ -82,6 +82,9 @@ fn the_walkers_survive_far_past_the_wire_limit() {
     for _ in 0..20_000 {
         plan = RelOp::Distinct {
             input: Box::new(plan),
+            keys: Vec::new(),
+            order: Vec::new(),
+            limit: None,
         };
     }
     assert_eq!(plan.node_count(), 20_001);

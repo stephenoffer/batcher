@@ -449,23 +449,51 @@ class FileStreamSink:
     skips a part file already present, giving exactly-once output by batch position
     when the source offsets are replayable (Workstream D). The output directory is a
     valid dataset the existing readers can scan.
+
+    `max_rows_per_file` caps each output file, splitting a micro-batch across as many as
+    it needs. Without it a batch is one file whatever its size, which on a long-running
+    stream is the small-files problem in its purest form — the file size is whatever the
+    trigger interval happened to produce, and nothing in the query says otherwise. The
+    chunk index joins the batch id in the name, so every file is still named by position
+    and `resume` still recognises what it already wrote.
     """
 
-    def __init__(self, path: str, fmt: str, *, resume: bool = True, **opts: Any) -> None:
+    def __init__(
+        self,
+        path: str,
+        fmt: str,
+        *,
+        resume: bool = True,
+        max_rows_per_file: int | None = None,
+        **opts: Any,
+    ) -> None:
         from batcher.io.formats import SINKS
 
         self._path = path.rstrip("/")
         self._sink = SINKS.get(fmt)(**opts)
         self._suffix = getattr(self._sink, "suffix", "")
         self._resume = resume
+        self._max_rows_per_file = max_rows_per_file
 
     def open(self) -> None:
         pass
 
     def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
-        file_path = f"{self._path}/part-batch{batch_id:05d}{self._suffix}"
-        written = self._sink.write(table, file_path, resume=self._resume)
-        return written.path
+        """Write one micro-batch, as one file or as row-capped chunks of one.
+
+        Returns the first file's path as the batch's token: the name identifies the batch
+        by position, and any further chunks are the same name with a rising chunk index.
+        """
+        cap = self._max_rows_per_file
+        if cap is None or table.num_rows <= cap:
+            file_path = f"{self._path}/part-batch{batch_id:05d}{self._suffix}"
+            return self._sink.write(table, file_path, resume=self._resume).path
+        first: str | None = None
+        for chunk_index, start in enumerate(range(0, table.num_rows, cap)):
+            chunk_path = f"{self._path}/part-batch{batch_id:05d}-{chunk_index:05d}{self._suffix}"
+            written = self._sink.write(table.slice(start, cap), chunk_path, resume=self._resume)
+            first = first or written.path
+        return first
 
     def close(self) -> None:
         pass

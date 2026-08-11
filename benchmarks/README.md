@@ -1,10 +1,12 @@
 # Batcher benchmark suite
 
 A correctness-first, multi-engine comparison of the Batcher data engine on the
-workloads the industry actually cites — **TPC-H** (all 22 queries), **ClickBench**
-(43 queries), a **TPC-DS** subset, an **operator-mix** of single relational
-operators, a **scan** benchmark over three parquet file layouts, and an **images**
-benchmark for unstructured multimodal ingest — against the engines Batcher claims to beat:
+workloads the industry actually cites — **TPC-H** (all 22 queries), **TPC-DS** (all 99),
+**ClickBench** (43 queries), the **Join Order Benchmark** (all 113, over the real IMDb
+database), the **H2O.ai db-benchmark** (its 10 groupby and 5 join questions), an
+**operator-mix** of single relational operators, a **JSON** suite for semistructured
+parsing, a **scan** benchmark over three parquet file layouts, and an **images** benchmark
+for unstructured multimodal ingest — against the engines Batcher claims to beat:
 
 | Tier            | Engines                                              |
 |-----------------|------------------------------------------------------|
@@ -20,18 +22,27 @@ Correctness is checked before any timing is trusted: a query is only timed once 
 result matches the reference engine, so a fast wrong answer can never be reported as
 a win.
 
-## No generated data — established public sources only
+## No invented data — public sources, or the benchmark's own generator
 
-The suite **never generates data**. Every table is read from a canonical public
-parquet location and normalized once (`sources/`) so all engines see identical
-inputs:
+The suite never invents a substrate to benchmark on. Every table is either read from a
+canonical public parquet location and normalized once (`sources/`), or produced by the
+**benchmark's own published generator** — which is how those benchmarks are specified, and
+what every published result for them does:
 
 | Dataset    | Default source                                                                 | Access |
 |------------|--------------------------------------------------------------------------------|--------|
 | TPC-H      | `s3://ray-benchmark-data/tpch/parquet/sf{scale}/{table}/`                       | S3 (creds/region may be needed) |
 | ClickBench | `https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_*.parquet` | anonymous HTTPS |
-| TPC-DS     | `s3://ray-benchmark-data/tpcds/parquet/sf{scale}/{table}/`                      | S3 (configurable) |
+| TPC-DS     | `~/bench-data/tpcds/sf{scale}/` — materialized once by the spec's own `dsdgen` (DuckDB's `tpcds` extension); no public parquet mirror exists | local, generated on first run |
 | Scan       | `s3://ray-benchmark-data/{parquet,parquet/128MiB-file,small-parquet}/{size}/`   | S3 (creds/region may be needed) |
+| JOB (IMDb) | `https://event.cwi.nl/da/job/imdb.tgz` — the archive the reference implementation distributes, converted to parquet at `~/bench-data/job/parquet/` on first run | HTTPS, ~1.2 GiB once |
+| H2O.ai     | built in-process to the benchmark's `groupby-datagen.R` / `join-datagen.R` spec (`datagen/h2o_tables.py`); db-benchmark ships no data | fixed seed, in memory |
+| JSON       | built in-process (`datagen/json_events.py`); no public nested-JSON corpus exists | fixed seed, in memory |
+
+The generated datasets are fixed-seed and shared as one Arrow table across every engine, so
+the correctness gate compares engines on byte-identical input. They are not byte-identical
+to another project's copy of the same generator, so their absolute times are comparable
+**across the engines in a run**, not against a published leaderboard.
 
 Loading uses DuckDB's `httpfs` (already a core dependency), which reads local paths,
 `s3://`, and `https://` directly. Override the base URI, scale, or ClickBench
@@ -43,6 +54,19 @@ export BENCH_CLICKBENCH_PARTS=10                        # read 10 hits partition
 export BENCH_SCAN_BASE=s3://my-mirror                   # scan corpus bucket root
 export BENCH_S3_REGION=us-east-1                        # for S3 sources
 ```
+
+### Standard benchmarks deliberately not wired up
+
+Each of these was evaluated and rejected for a specific, checkable reason. Re-check the
+reason before re-treading one; do not add a suite whose data cannot be obtained, because a
+benchmark that never runs is worse than an absent one — it reads as coverage.
+
+| Benchmark | Why not |
+|---|---|
+| Nexmark (22 streaming queries) | Written in Flink SQL (`TUMBLE`/`HOP`/`MATCH_RECOGNIZE` over a `datagen` connector), and its generator is Java with no published spec to follow. Roughly half the queries would not translate, and reproducing the generator from its source is the kind of guess this suite does not make. |
+| Star Schema Benchmark (13 queries) | Needs `ssb-dbgen`, a C program with no packaged build here and no public parquet mirror. Deriving `lineorder` from TPC-H is a transformation the SSB paper describes but does not specify precisely enough to reproduce faithfully. |
+| TPCx-BB / BigBench, TPCx-AI | Data comes from PDGF, a Java generator that is not redistributable. |
+| TSBS (time series) | Go generator, no published data. Worth revisiting if the generator's spec is documented. |
 
 ## The scan benchmark: one table, three file layouts
 
@@ -91,6 +115,75 @@ Because every repeat re-reads the corpus from object storage, this benchmark run
 best-of-2 (best-of-1 above scale 10) rather than the best-of-5 the in-memory suites use.
 For the same reason `scan` is **excluded from `--benchmark all`** and must be asked for
 by name: at scale 1 the many-small-files family alone takes tens of minutes.
+
+## The Join Order Benchmark: the optimizer test, on real data
+
+TPC-H and TPC-DS generate their data from uniform, independent distributions, which is
+precisely the assumption a textbook cost model makes — so they flatter cardinality
+estimation. JOB does not. Its 113 queries run over a real 2014 IMDb snapshot where
+predicates are correlated the way real data is, and Leis et al. built it to show that
+estimation error, not the join-order search, is where optimizers actually lose.
+
+That makes it the benchmark aimed most directly at Batcher's stated moat. Re-optimizing on
+*measured* cardinalities at pipeline breakers is only worth its complexity if estimates are
+badly wrong somewhere, and JOB is the workload where they are. A loss here is more
+interesting than a win on TPC-H.
+
+Every query has the same shape: `SELECT MIN(...) FROM a, b, ... WHERE <equi-joins and
+filters>`, joining 3 to 16 tables and returning a single row. That is deliberate on the
+benchmark's part — the result is trivial to compare, so what gets measured is the plan.
+
+The data is the archive the reference implementation distributes: 21 tables, 3.6 GiB of CSV,
+converted once to 1.8 GiB of parquet under `~/bench-data/job/parquet/`. Column names and
+types are read from the `schematext.sql` shipped *inside* that archive, never transcribed.
+The suite is **excluded from `--benchmark all`** because of the one-time 1.2 GiB download.
+
+```bash
+python3 benchmarks/run.py --benchmark job                      # all 113 queries
+python3 benchmarks/run.py --benchmark job --only job-q1        # q1a-q1d (and q10-q19: substring)
+python3 benchmarks/run.py --benchmark job --skip job-q7c       # complete a run around a fatal query
+BENCH_JOB_LOCAL=/data/job python3 benchmarks/run.py --benchmark job   # relocate the mirror
+```
+
+> **Batcher currently cannot finish this suite.** Two full runs were **OOM-killed** — at
+> `job-q7c`, and with that skipped at `job-q10a` — on a 30 GiB box, where DuckDB answers
+> q7c in 0.43 s. Both are many-way joins whose predicates are all top-level equalities, so
+> this is join ordering, not the disjunction problem TPC-DS q13 turned out to be. Pinning
+> `--memory-bytes` does not contain it: the allocation is outside the path Carbonite bounds,
+> so the process dies rather than spilling. Use `--skip` to complete a run around a fatal
+> query; `BENCHMARK_RESULTS.md` has the detail.
+
+## The H2O.ai db-benchmark: groupby and join at dataframe scale
+
+TPC-H and TPC-DS ask a snowflake schema hard questions. `db-benchmark` asks one wide table a
+different kind: aggregate it by keys whose cardinality spans three orders of magnitude (100
+groups against N/100), then join it against three tables spanning six. It is where Polars,
+DuckDB, data.table, pandas, Spark and Dask publish comparable numbers, and it isolates the
+two things TPC-* buries inside larger plans — group-by state management, and join
+build-side selection.
+
+| Dataset       | Cases | Shape |
+|---------------|-------|-------|
+| `h2o-groupby` | 10    | one table `x`; keys from 100 groups to N/100, plus a median/stddev pair, a correlation, a top-2-per-group window, and a group-by on all six keys |
+| `h2o-join`    | 5     | LHS `x` joined against `small` (N/1e6 rows), `medium` (N/1e3) and `big` (N), inner and left, on integer and string keys |
+
+`--scale` selects the benchmark's own row tier: **1 → 1e7 rows** (its smallest published
+size, the default), 10 → 1e8. Both suites are **excluded from `--benchmark all`**, and
+`h2o-join` in particular is not a quick check: every RHS has a unique join key, so all five
+questions return about as many rows as they read, and the correctness gate canonicalizes and
+sorts every one of those rows for each engine before it will report a timing. A three-engine lineup at scale 1 held ~18 GiB
+resident here. Drop to two engines, or to `--scale 0.1`, on a smaller box.
+
+The generator (`datagen/h2o_tables.py`) follows the benchmark's published
+`groupby-datagen.R` / `join-datagen.R` column for column, including the join key split that
+gives each side 10% of keys the other lacks — so an inner join genuinely drops rows and a
+left join genuinely produces nulls.
+
+```bash
+python3 benchmarks/run.py --benchmark h2o-groupby                 # 1e7 rows, 10 questions
+python3 benchmarks/run.py --benchmark h2o-join --scale 0.01       # 1e5 rows, a fast check
+python3 benchmarks/run.py --benchmark h2o-join --only h2o-join-q5 # one question
+```
 
 ## The images benchmark: unstructured multimodal ingest
 
@@ -141,6 +234,7 @@ single-file, correctness-gated head-to-heads that synthesize their own local cor
 python benchmarks/scenarios/image_decode.py       # JPEG decode+resize vs Daft
 python benchmarks/scenarios/point_cloud_load.py   # LiDAR .npy -> torch tensors
 python benchmarks/scenarios/audio_decode.py       # native audio decode vs a soundfile loop
+python benchmarks/scenarios/robotics/sweep_transform.py  # LiDAR sweep -> world frame, vs NumPy
 ```
 
 On a 96-core node these show batcher **2.4× faster than Daft** on image decode+resize,
@@ -148,6 +242,31 @@ and they exercise the physical-AI (camera / LiDAR / audio) ingest path. Findings
 fix chain are in
 `BENCHMARK_RESULTS.md`; the mechanism is documented in `docs/user-guide/operate/tuning/performance.md`
 ("Multimodal & physical-AI ingest").
+
+### Small-query latency (the transactional shape)
+
+Every other suite here measures throughput: one large query, timed once. That is blind to
+the workload an OLTP-shaped application actually issues — thousands of tiny queries where
+the result is a handful of rows and nearly all the elapsed time is control plane.
+
+```bash
+python benchmarks/scenarios/latency_bench.py                    # 100k rows, 300 iterations
+python benchmarks/scenarios/latency_bench.py --engines batcher,duckdb
+```
+
+It reports wall p50/p99 **and CPU p50** per shape. Quote the CPU figure when comparing two
+builds: on a shared box the wall p99 moves by more than 10x under another session's test
+run while CPU p50 barely moves.
+
+Two things it is built to expose:
+
+- **The repeated-vs-parameterized gap.** The same query shape with a different literal each
+  time misses the plan cache, because `LogicalPlan.content_key()` includes literal values.
+  That gap is the prize a prepared-statement API would collect.
+- **The index gap.** SQLite is included as the *transactional reference*, not as a
+  competitor Batcher claims to beat — it answers a primary-key lookup from a B-tree while
+  Batcher scans. It correspondingly loses the aggregate shape by more than an order of
+  magnitude, which is the honest mirror image.
 
 ### Structured streaming (Batcher vs Spark Structured Streaming)
 
@@ -190,15 +309,20 @@ engine adapter already has a `read_parquet`.
 benchmarks/
   harness.py     correctness check + best-of-N timing (the measurement core)
   registry.py    the benchmark registry, the suite(...) decorator, and sql_case
-  sources/       established public parquet sources (no data generation)
+  sources/       established public parquet sources; job.py fetches the IMDb database
+  datagen/       the two datasets with no public corpus: h2o_tables.py  json_events.py
   context.py     loads a benchmark's tables once, serves every engine
   engines/       one adapter per engine, behind a common contract
     base.py  lineup.py  batcher.py  duckdb.py  polars.py  pyarrow.py
     spark.py  daft.py  ray.py
   suites/
-    standard/    SQL-first: tpch.py (22)  clickbench.py (43)  tpcds.py (subset)
+    standard/    SQL-first: tpch.py (22)  clickbench.py (43)  tpcds.py (99)  job.py (113)
+                 — the latter two split vendored .sql files written by
+                 tools/vendor_{tpcds,job}_queries.py
+    h2o/         H2O.ai db-benchmark: groupby.py (10)  join.py (5)
     operators/   dataframe-API operator-mix; where PyArrow also competes natively
     scan/        one table x three parquet file layouts; isolates scan planning
+    semistructured/ JSON parsing + typed path extraction
     multimodal/  unstructured ingest: images.py (list/decode/resize) vs Daft
   cluster/       distributed GPU multimodal benchmarks (inference/LLM/audio/video)
   run.py         the CLI: select engines, load data, run, report
@@ -223,6 +347,14 @@ duckdb, polars `SQLContext`, spark, daft). Adding one is a single line:
 # suites/standard/tpch.py  (or a new file in the same dir)
 tpch.sql("tpch-q6", "SELECT sum(l_extendedprice * l_discount) ... FROM lineitem WHERE ...")
 ```
+
+TPC-DS and JOB are the exceptions to writing the SQL inline, for a reason worth keeping: at
+99 and 113 queries, hand-transcribing the statements is how a benchmark quietly stops being
+the benchmark. Both are vendored verbatim — TPC-DS from DuckDB's `tpcds` extension (the same
+extension whose `dsdgen` produces the tables), JOB from its reference implementation — into
+`suites/standard/{tpcds,job}_queries.sql`, and the suite modules only split those files.
+Refresh with `python tools/vendor_tpcds_queries.py` / `python tools/vendor_job_queries.py`;
+do not edit the `.sql` by hand.
 
 PyArrow has no SQL surface, so it sits out the standard suites (shown `n/a`) and competes
 in the operator-mix, where a case is one SQL string for the SQL engines plus a native
@@ -284,15 +416,24 @@ python -c "from benchmarks.engines.lineup import _ADAPTERS; \
 ```bash
 python3 benchmarks/run.py                                # TPC-H, scale 1, single-node lineup
 python3 benchmarks/run.py --benchmark clickbench         # ClickBench (hits)
-python3 benchmarks/run.py --benchmark tpcds --scale 1    # TPC-DS subset
+python3 benchmarks/run.py --benchmark tpcds --scale 1    # TPC-DS, all 99 queries
+python3 benchmarks/run.py --benchmark job                # Join Order Benchmark, 113 queries
 python3 benchmarks/run.py --benchmark operators          # operator-mix (incl. PyArrow/Ray)
-python3 benchmarks/run.py --benchmark all                # every dataset
+python3 benchmarks/run.py --benchmark h2o-groupby        # H2O.ai db-benchmark, 10 groupby
+python3 benchmarks/run.py --benchmark h2o-join           # H2O.ai db-benchmark, 5 joins
+python3 benchmarks/run.py --benchmark all                # every dataset but scan/images/h2o-*
 
 python3 benchmarks/run.py --engines batcher,duckdb,spark # opt in to PySpark
 python3 benchmarks/run.py --tier multi                   # batcher, ray, daft
 python3 benchmarks/run.py --benchmark tpch --only q1     # one query
+python3 benchmarks/run.py --benchmark tpcds --only q17,q72  # a subset, in ONE process
 python3 benchmarks/run.py --list                         # list, do not run
 ```
+
+`--only` matches on substring and takes a comma-separated list, so an arbitrary subset runs in
+one process. That matters for an A/B over a handful of queries: a process per query re-loads
+the whole table set, which on TPC-DS costs more wall time than the measurement and is what gets
+a run `SIGKILL`ed on a box that is short of memory.
 
 `run.py` is the **single entrypoint**: besides the engine-comparison datasets it also
 dispatches the standalone benchmarks —
@@ -300,9 +441,9 @@ dispatches the standalone benchmarks —
 `--benchmark optimizer` (Kyber planning latency), and
 `--benchmark shuffle` (Arrow Flight vs the Ray object store).
 
-`just` shortcuts: `bench`, `bench-tpch`, `bench-clickbench`, `bench-tpcds`,
-`bench-ops`, `bench-scan`, `bench-images`, `bench-multi`, `bench-all`, `bench-list`,
-`bench-dist`, `bench-aux <which>`.
+`just` shortcuts: `bench`, `bench-tpch`, `bench-clickbench`, `bench-tpcds`, `bench-job`,
+`bench-h2o-groupby`, `bench-h2o-join`, `bench-ops`, `bench-scan`, `bench-images`,
+`bench-multi`, `bench-all`, `bench-list`, `bench-dist`, `bench-aux <which>`.
 
 The harness (`harness.py`):
 
@@ -320,9 +461,15 @@ The harness (`harness.py`):
 
 `b/<engine>` is `batcher_ms / engine_ms` (lower means Batcher is faster). Timings vary
 run to run; treat them as order-of-magnitude. The status column is the gate: only `OK`
-rows have been verified to match the reference engine. `PARTIAL` means an engine in the
-lineup legitimately could not express that query (e.g. Polars' SQL subset, PyArrow on
-the SQL suites) — the verified engines still agreed.
+rows have been verified to match the reference engine. `PARTIAL` means some engine in the
+lineup could not express that query, while the ones that did still agreed.
+
+Read `PARTIAL` carefully rather than as a footnote, because on TPC-DS it is usually
+**Batcher's** gap, not a comparator's. The full 99 include shapes the SQL front-end does
+not yet cover, and each one prints the reason beneath the table. That is deliberate: a
+suite that registered only the queries Batcher already runs would report 100% and measure
+nothing. `python benchmarks/internals/tpcds_coverage.py` gives the same gaps grouped by
+cause in seconds, without data or a scale factor.
 
 ## internals/distributed.py: single-node vs many-partition equivalence
 

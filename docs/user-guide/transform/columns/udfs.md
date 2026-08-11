@@ -1,7 +1,7 @@
 # User-defined functions
 
 The first rule of a UDF in Batcher is not to write one. An expression such as
-`bt.col("x") * 2` or `.str.contains(...)` lowers to Rust, runs vectorized over Arrow, and
+`bt.col("x") * 2` or {py:meth}`.str.contains(...) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.contains>` lowers to Rust, runs vectorized over Arrow, and
 can be JIT-compiled. A Python UDF is none of those things. The optimizer also can't see
 through your function, so it won't push a filter past it or prune a column it might read.
 Reach for a UDF when the expression language genuinely has no answer, and when you do,
@@ -9,7 +9,7 @@ hand it whole batches.
 
 | Form | What the engine sees | Cost per row |
 | --- | --- | --- |
-| An `Expr` | a plan node it can push, prune, fuse, and JIT | vectorized in Rust |
+| An {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` | a plan node it can push, prune, fuse, and JIT | vectorized in Rust |
 | `map_batches(fn)` | an opaque stage over an Arrow batch | whatever `fn` does, once per batch |
 | `map` / `flat_map` | an opaque stage over a Python dict per row | a Python object per row |
 
@@ -58,8 +58,13 @@ time. Declare it whenever the columns differ from the input.
 
 `num_workers` defaults to `"auto"`, which fans the per-batch calls across local cores.
 That helps only if `fn` releases the GIL, which Arrow, NumPy, and torch all do. For a CPU-bound
-pure-Python `fn`, pass `multiprocessing=True`. Then `fn` must be importable and your
-script needs an `if __name__ == "__main__":` guard, because the workers re-import it.
+pure-Python `fn`, pass `multiprocessing=True`. Your script still needs an
+`if __name__ == "__main__":` guard, because a worker process starts by importing it.
+
+A lambda or a closure is fine there as long as `cloudpickle` is installed, which is how the
+function reaches a worker that cannot import it by name. Without `cloudpickle` only a
+module-level function or a picklable callable object can cross, and anything else stays on
+threads with a warning saying so.
 
 ## Declare what you read with input_columns
 
@@ -156,6 +161,10 @@ print(ds.select("price", "qty")
 input row. The rows are built inside the worker, never in the driver, so the hot-path
 rule holds. But you are paying Python-object cost per row, and it shows.
 
+Declare `input_columns` here if you declare it anywhere. A batch callback pays for an
+undeclared column once, when it is decoded. A row callback pays twice, because every one of
+those columns is also boxed into a Python object for every row.
+
 ::::{tab-set}
 :::{tab-item} flat_map
 
@@ -176,6 +185,34 @@ print(ds.select(tok=bt.col("text").str.split(",")).explode("tok").to_pydict())
 
 :::
 ::::
+
+### A Python predicate
+
+{py:meth}`ds.ml.filter <batcher.api.dataset.ml.DatasetML.filter>` keeps the rows for which
+`fn(row_dict)` is true. Reach for it when the condition genuinely cannot be written as an
+expression, such as a call into a library or a model's verdict. {py:meth}`ds.filter
+<batcher.Dataset.filter>` stays vectorized in Rust and is the right answer everywhere else.
+
+```python
+print(ds.ml.filter(lambda row: row["text"].count(",") > 0).to_pydict())
+# {'text': ['a,b', 'd,e,f'], 'price': [10.0, 30.0], 'qty': [1, 3]}
+```
+
+The predicate's answers become one Arrow boolean mask, so the surviving rows keep their exact
+types and no value makes the round trip back through Python. Dropping rows also changes no
+column, which the stage declares, so a cheap expression filter written after it is still
+pushed underneath and runs first.
+
+Declare `input_columns` here. Building a Python dict per row is the entire cost of a row
+predicate, and declaring what it reads narrows that dict to those columns: on a ten-column
+table reading one column, that measured 12x end to end. Every column still comes out, because
+the output is the input masked. Reading a column you did not declare raises rather than
+working by accident.
+
+```python
+print(ds.ml.filter(lambda row: "," in row["text"], input_columns=["text"]).to_pydict())
+# {'text': ['a,b', 'd,e,f'], 'price': [10.0, 30.0], 'qty': [1, 3]}
+```
 
 Same rows, and the expression form builds no Python object per row. Check for an
 expression before you write the loop.
@@ -245,13 +282,13 @@ print(bt.from_pydict({"text": ["ab", "cd"]}).map_batches(explode_chars).to_pydic
 # {'ch': ['a', 'b', 'c', 'd']}
 ```
 
-Returning a list of *row* dicts is rejected, because that is `ds.ml.flat_map`, which
+Returning a list of *row* dicts is rejected, because that is {py:meth}`ds.ml.flat_map <batcher.api.dataset.ml.DatasetML.flat_map>`, which
 declares the row-at-a-time cost rather than hiding it.
 
 ## map_groups: one call per group
 
-`map_groups` hands your function every row of one group and no row of another. It is the
-Batcher spelling of pandas `groupby().apply()`, Polars `group_by().map_groups()`, and Spark
+{py:meth}`map_groups <batcher.GroupBy.map_groups>` hands your function every row of one group and no row of another. It is the
+Batcher spelling of pandas {py:meth}`groupby().apply() <batcher.Dataset.groupby>`, Polars {py:meth}`group_by().map_groups() <batcher.Dataset.group_by>`, and Spark
 `applyInPandas`, and it is what per-entity work needs: a user's session sequence, a device's
 time series, a document's chunks.
 
@@ -302,9 +339,32 @@ matters.
 
 :::{note}
 `map_groups` builds an aggregation followed by a `map_batches`, so whether
-`collect(distributed=True)` accepts the plan is the same question as for
-`ds.group_by("k").agg(...).map_batches(fn)`. Check it on your plan before relying on it.
+{py:meth}`collect(distributed=True) <batcher.Dataset.collect>` accepts the plan is the same question as for
+{py:meth}`ds.group_by("k").agg(...).map_batches(fn) <batcher.Dataset.group_by>`. Check it on your plan before relying on it.
 :::
+
+## Running a UDF pipeline on a cluster
+
+A `map_batches` chain distributes on its own: each worker reads its own splits and runs the
+function over them, and nothing passes through the driver.
+
+A UDF with a *breaker* above it needs one more step, because the breaker cannot see through
+an opaque Python function to co-partition anything. Batcher runs the UDF as its own
+distributed stage, lands its output on cluster-shared scratch, and then dispatches the
+breaker over that — so the operator above gets the shuffle, the skew handling and the spill
+it always had. Sorts, `distinct`, windows and limits go through this, and so do joins and
+unions, where each operand that holds a UDF is staged separately:
+
+```python
+# docs: skip
+embedded = docs.map_batches(Embedder, num_gpus=1)
+enriched = embedded.join(metadata, on="doc_id").group_by("topic").agg(n=bt.col("doc_id").count())
+enriched.collect(distributed=True)
+```
+
+The staging needs a scratch directory every node can reach. On a cluster with no shared
+mount, point `memory.spill_dir` at a shared filesystem; without one Batcher raises rather
+than writing files a worker cannot open.
 
 ## Tolerating dirty data
 
@@ -332,10 +392,30 @@ Default is 0 (strict). Set it deliberately and keep it small. A budget of 1,000,
 silently deleted rows is not resilience, it is a deletion policy nobody agreed to.
 :::
 
+The budget is one allowance per worker process, whichever way the stage runs: threads,
+worker processes, or a streamed window all draw down the same count. Across a cluster the
+honest bound is therefore `workers x max_errored_rows`. Every drop is published to the
+observability bus with the running total and the error text, so a long job reports the loss
+while it happens rather than at the end.
+
+The row callbacks take it too. `ds.map`, `ds.flat_map`, and `ds.ml.filter` all lower to a
+`map_batches` stage, so the same budget isolates a raising callback down to the rows that
+raised:
+
+```python
+def parse_row(row):
+    return {"n": int(row["s"])}
+
+
+rows = bt.from_pydict({"s": ["1", "2", "oops", "4"]})
+print(rows.map(parse_row, output_columns=["n"], max_errored_rows=10).to_pydict())
+# {'n': [1, 2, 4]}
+```
+
 ## UDFs in SQL
 
-`bt.register_function(name, fn, result_type=...)` makes a Python function callable from
-`bt.sql`. The vectorized form (the default) receives whole Arrow arrays.
+{py:func}`bt.register_function(name, fn, result_type=...) <batcher.register_function>` makes a Python function callable from
+{py:func}`bt.sql <batcher.sql>`. The vectorized form (the default) receives whole Arrow arrays.
 
 ```python
 bt.register_function("bump", lambda a: pc.add(a, 100), result_type="int64")
@@ -346,7 +426,15 @@ print(bt.sql("SELECT bump(qty) AS q FROM t", t=ds).to_pydict())
 Scalar SQL functions do not work inside `GROUP BY` keys, aggregate arguments, or
 `ORDER BY`. Compute them in a subquery or a projected alias first. For a function that
 transforms a whole table, register it with `table=True` and it follows the `map_batches`
-contract.
+contract, forwarding any `map_batches` option you pass alongside it.
+
+There is no aggregate form. An aggregate has to be mergeable — a partial, a combine, and a
+finalize — so that one machine and a hundred produce the same answer, and a Python callable
+over one batch cannot supply that. Use `ds.group_by(...).agg(...)` for a built-in aggregate,
+or `map_groups` for arbitrary Python over each group.
+
+An option the call form cannot honour is rejected at registration rather than ignored, so a
+misspelled keyword fails where you wrote it.
 
 ## The distributed caveat
 

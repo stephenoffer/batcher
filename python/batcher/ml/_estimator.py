@@ -13,26 +13,79 @@ plane seeing one of them.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from typing import TypeAlias
 
     from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir.core import Expr
 
+    # The callable shapes the model-selection, interpretation and tuning surfaces exchange.
+    #
+    # These are `TYPE_CHECKING`-only, and deliberately: an alias naming `Dataset` has to
+    # resolve it, and `ml._estimator` is imported by estimators that `api.dataset` itself can
+    # reach. Under `from __future__ import annotations` every annotation is already a string,
+    # so a checker sees these and the runtime never needs them. They are *not* in `__all__`
+    # for the same reason — a star-import would fail on a name that does not exist at runtime.
+    #
+    # What they replace: three modules each declared their own, as plain `str` values
+    # (`Fit = "Callable[[Dataset], Any]"`). A string is not a type alias — a checker reads it
+    # as `str` and silently gives up, so every signature annotated with one was effectively
+    # `Any`. Two of the three also spelled the *same* concept differently (`Metric` twice,
+    # `Predict` against `Predictor` at a different arity), which is what made a fourth
+    # spelling the default outcome of adding tuning.
+
+    #: A *bound* predictor: a fitted model already closed over, so it just scores.
+    Predictor: TypeAlias = Callable[[Dataset], Dataset]
+    #: Scores a prediction against the truth, as ``(dataset, y_true_col, y_pred_col) -> float``.
+    #: Lower is better by convention, so a permutation importance is the *rise* under shuffling.
+    Scorer: TypeAlias = Callable[[Dataset, str, str], float]
+    #: The *unbound* pair, for cross-validation, which refits per fold: `Fit` trains and
+    #: returns whatever model object it likes, and `Predict` takes that object back. Currying
+    #: `Predict` with a fitted model gives a `Predictor` — which is the relationship the two
+    #: separate spellings used to obscure.
+    Fit: TypeAlias = Callable[[Dataset], Any]
+    Predict: TypeAlias = Callable[[Any, Dataset], Dataset]
+
 T = TypeVar("T")
 
 __all__ = [
+    "Estimator",
     "argmax_prediction",
     "linear_score",
     "require_fitted",
     "require_numeric",
     "require_rows",
 ]
+
+
+@runtime_checkable
+class Estimator(Protocol):
+    """What `batcher.ml`'s estimators have in common: `fit` learns, `predict` appends a column.
+
+    The shape every native estimator already follows — `LinearRegression`, `KMeans`,
+    `GaussianMixture`, the GLMs, the discriminants — stated once so the surfaces built on top
+    of them (cross-validation, tuning, interpretation) can name what they accept instead of
+    taking `Any`. `fit` returns `self` so `Model(...).fit(ds).predict(ds)` chains, and
+    `predict` returns a new `Dataset` with the prediction column appended, executing nothing.
+
+    Runtime-checkable so a caller can reject a mis-shaped object with a clear message rather
+    than an `AttributeError` several frames deep. Note that this checks method *presence*
+    only, which is all `runtime_checkable` can do — it is a guard, not a proof.
+    """
+
+    def fit(self, ds: Dataset) -> Estimator:
+        """Learn this estimator's parameters from `ds` and return the fitted estimator."""
+        ...
+
+    def predict(self, ds: Dataset) -> Dataset:
+        """Append this estimator's prediction column to `ds`, lazily."""
+        ...
 
 
 def require_fitted(estimator: object, state: T | None, method: str = "predict") -> T:

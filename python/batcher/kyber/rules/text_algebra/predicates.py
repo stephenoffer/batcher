@@ -27,17 +27,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Binary, Expr, Lit, Not
 from batcher.plan.expr_ir.func_nodes import StrFunc
 from batcher.plan.ir_tags import COMPARISON_FLIP
-from batcher.plan.logical import Aggregate, Filter, Project, Sort, Window
 
 __all__ = ["COUNTING_PREDICATE_RULES", "REVERSE_EQUALITY_RULES", "SLICE_PREDICATE_RULES"]
-
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 
 def _int_literal(expr: Expr) -> int | None:
@@ -92,16 +87,10 @@ def _counting_leaf(fn: str, key: tuple[str, int]) -> Callable[[Expr], Expr]:
 
 
 def _register(name: str, leaf: Callable[[Expr], Expr], op: str):
-    return DEFAULT_REGISTRY.add(
-        node_rule(
-            name,
-            Phase.NORMALIZE,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
-            matches=_NODES,
-            expr_fn=leaf,
-            expr_matches=(Binary,),
-            expr_ops=(op, COMPARISON_FLIP[op]),
-        )
+    # `op` and its mirror: the leaf normalizes the computed side to the left, so a `lt` leaf
+    # is reached by a `gt` node with the literal on the left.
+    return register_leaf_rule(
+        name, leaf, expr_matches=(Binary,), expr_ops=(op, COMPARISON_FLIP[op])
     )
 
 

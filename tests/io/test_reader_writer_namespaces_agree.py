@@ -21,7 +21,8 @@ bt = pytest.importorskip("batcher")
 
 #: Writers that are not file formats, so there is nothing to read back by the same name.
 #: Streaming sinks address a destination rather than a file (`console` prints, `memory`
-#: accumulates, `for_each*` calls back), and the MERGE builders mutate a table in place.
+#: accumulates, `for_each*` calls back, `noop` discards — Spark's `format("noop")`, which
+#: exists precisely to write nothing), and the MERGE builders mutate a table in place.
 _NOT_A_READABLE_FORMAT = {
     "console",
     "for_each",
@@ -29,6 +30,7 @@ _NOT_A_READABLE_FORMAT = {
     "memory",
     "merge",
     "merge_into",
+    "noop",
 }
 
 

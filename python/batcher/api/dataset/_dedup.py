@@ -125,14 +125,15 @@ def _signatures(ds: Dataset, column: str, key: str | None, num_perm: int, ngram:
     Collapsing duplicate keys here is what makes the joins below safe: a key appearing
     twice would multiply every pair it takes part in, and (with the default key, a digest
     of the text) two byte-identical documents *do* share one.
-    """
-    from batcher.plan.expr_ir.nodes import row_number
 
+    Rows sharing a key hold the same document, so which one survives is immaterial —
+    `keep="any"`, which is one hash pass. This was a `row_number() … = 1` window, which
+    sorted every key's rows to pick one of a set of identical ones.
+    """
     base = ds.select(
         **{_KEY: _row_key(column, key), _SIG: Col(column).str.minhash(num_perm, ngram)}
     )
-    # Rows sharing a key hold the same document, so which one survives is immaterial.
-    return base.filter(row_number().over(partition_by=[Col(_KEY)], order_by=[Col(_KEY)]) == 1)
+    return base.distinct([_KEY])
 
 
 def build_drop_near_duplicates(
@@ -146,19 +147,15 @@ def build_drop_near_duplicates(
     key: str | None = None,
 ) -> Dataset:
     """Drop every row that has a near-duplicate with a smaller key (see `Dataset.ml`)."""
-    from batcher.plan.expr_ir.nodes import row_number
-
     pairs = build_near_duplicates(
         ds, column, threshold=threshold, num_perm=num_perm, ngram=ngram, bands=bands, key=key
     )
-    keyed = ds.with_columns(**{_KEY: _row_key(column, key)})
     # Rows sharing a key are the *same* document (the default key is the text's digest),
     # and a key is what the pair table names — so they must collapse to one row first, or
-    # a winning key would carry all of its exact copies through.
-    # Every row in a key-partition holds the same document, so the ordering key is
-    # immaterial; when a row's *other* columns differ, the representative is arbitrary.
-    first_of_key = row_number().over(partition_by=[Col(_KEY)], order_by=[Col(_KEY)])
-    keyed = keyed.filter(first_of_key == 1)
+    # a winning key would carry all of its exact copies through. Every row in a key group
+    # holds the same document; when a row's *other* columns differ, the survivor is
+    # arbitrary, which is what `keep="any"` says.
+    keyed = ds.with_columns(**{_KEY: _row_key(column, key)}).distinct([_KEY])
     # Survivors are then the keys minimal among their near-duplicates. For a duplicate
     # cluster where every member matches every other — the usual shape — that is one row.
     losers = pairs.select("key_b").distinct()
@@ -256,8 +253,6 @@ def _vector_signatures(
     candidate join — a quadratic blow-up over rows that can never clear the threshold.
     They are dropped here instead.
     """
-    from batcher.plan.expr_ir.nodes import row_number
-
     base = ds.select(
         **{
             _KEY: Col(key) if key is not None else hash_rows(Col(column)),
@@ -266,7 +261,7 @@ def _vector_signatures(
         }
     ).filter(Col(_SIG).is_not_null())
     # A repeated key would multiply every pair it takes part in.
-    return base.filter(row_number().over(partition_by=[Col(_KEY)], order_by=[Col(_KEY)]) == 1)
+    return base.distinct([_KEY])
 
 
 def build_similarity_join(

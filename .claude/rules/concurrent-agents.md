@@ -166,6 +166,27 @@ pytest processes against the installed `.so` for its entire duration.
 The same swap is why a benchmark can silently measure the *other* agent's build: check
 `bt.versions()["engine_profile"]`, which the suite now does for you.
 
+Two ways to shoot yourself with the sandbox, both of which happened in one session:
+
+- **One sandbox, two concurrent runs.** Copying the `.so` in is the same in-place overwrite
+  `just build` does, so a second run started while the first is going kills it — a fatal
+  interpreter error, a 300-line list of loaded extension modules, and no test results. Name
+  the sandbox per invocation (`pybox-$$` or a caller-supplied tag) and the problem is gone.
+- **Deleting a sandbox a run is still using.** `pytest` `chdir`s back to its start path at the
+  end and dies with `FileNotFoundError` on a directory you cleaned up. Check for a live
+  process before `rm -rf`.
+
+### A full suite gets OOM-killed on a busy box; chunk it
+
+The head node has 30 GB and is shared. With three other sessions running suites, a
+whole-directory `pytest tests/differential` was **killed** twice, ~20% in, reporting nothing —
+the same `Killed` you would see from a hang, and easy to misread as your change.
+
+Run the directory in chunks of ~40 files, one process each. A chunk's peak is its own files,
+so the run survives; and a chunk that *is* killed names itself instead of taking the whole
+result with it. `ls dir/*.py | xargs -n 40` and a loop is the entire fix. The same applies to
+a memory-hungry benchmark: a 10 M-row x 9-column A/B was killed until it was cut to 4 M.
+
 ## The pre-commit hook is repo-wide, so someone else's half-done refactor blocks you
 
 `lint-structure` runs over the whole tree, not your staged paths. An agent mid-way through

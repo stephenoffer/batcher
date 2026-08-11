@@ -43,6 +43,8 @@ __all__ = [
     "LIST_FNS",
     "MAKE_TEMPORAL_FNS",
     "MATH_FNS",
+    "SEQ_FNS",
+    "SPATIAL_FNS",
     "STR_FNS",
     "VIDEO_FNS",
     "WINDOW_AGGREGATES",
@@ -133,6 +135,14 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "right", "rpad", "sha1", "sha256", "soundex", "split", "split_part",
         "starts_with", "strip_html", "substr", "substring_index", "to_case",
         "squad_normalize", "token_ngrams", "translate",
+        # Per-document text quality — the Gopher/C4/RefinedWeb pretraining-corpus
+        # filters, as per-row measures. The corpus-level *aggregates* of the same
+        # properties live in `plan/functions/metrics/text/`; these answer "which
+        # documents do I drop", which is what a filter needs.
+        "word_count", "mean_word_length", "symbol_ratio",
+        "alpha_word_ratio", "stopword_count", "bullet_line_ratio",
+        "ellipsis_line_ratio", "duplicate_line_ratio", "duplicate_paragraph_ratio",
+        "top_ngram_ratio", "duplicate_ngram_ratio", "char_entropy",
         "trim", "unhex", "upper", "xxhash64",
         "from_binary", "hamming", "jaccard_similarity", "parse_dirname", "parse_dirpath",
         "parse_filename", "parse_path", "regexp_escape", "to_binary", "url_decode",
@@ -174,7 +184,7 @@ LIST_FNS: Final[frozenset[str]] = frozenset(
         "arg_max", "arg_min", "arg_sort", "cum_sum", "diff", "entropy", "flatten", "l1_norm",
         "l2_norm", "len", "log_softmax",
         "max", "max_abs", "mean", "median", "min", "n_unique", "normalize", "product",
-        "reverse", "softmax", "sort", "std", "sum", "unique", "var",
+        "reverse", "softmax", "sort", "sort_desc", "std", "sum", "unique", "var",
     }
 )  # fmt: skip
 
@@ -227,6 +237,39 @@ The argument *count* is not stated here — it lives in `bc_expr::GeoFunc::arity
 the one place that can check it, and the Python constructors in `plan/functions/geo/`
 each build a fixed argument list so a mismatch is impossible to write."""
 
+SPATIAL_FNS: Final[frozenset[str]] = frozenset(
+    {
+        # Quaternion properties. One quaternion in, one number out.
+        "quat_norm", "quat_normalize_x", "quat_normalize_y", "quat_normalize_z",
+        "quat_normalize_w", "quat_inverse_x", "quat_inverse_y", "quat_inverse_z",
+        "quat_inverse_w", "quat_angle", "quat_to_roll", "quat_to_pitch", "quat_to_yaw",
+        # Building a quaternion from the two representations a log is likely to carry.
+        "quat_from_euler_x", "quat_from_euler_y", "quat_from_euler_z", "quat_from_euler_w",
+        "quat_from_rotmat_x", "quat_from_rotmat_y", "quat_from_rotmat_z",
+        "quat_from_rotmat_w",
+        # Composing and comparing two rotations.
+        "quat_multiply_x", "quat_multiply_y", "quat_multiply_z", "quat_multiply_w",
+        "quat_angular_distance",
+        # Interpolating between two rotations.
+        "quat_slerp_x", "quat_slerp_y", "quat_slerp_z", "quat_slerp_w",
+        # Rotating a vector.
+        "quat_rotate_x", "quat_rotate_y", "quat_rotate_z", "quat_inverse_rotate_x",
+        "quat_inverse_rotate_y", "quat_inverse_rotate_z",
+        # Applying a full pose to a point.
+        "se3_transform_x", "se3_transform_y", "se3_transform_z",
+        "se3_inverse_transform_x", "se3_inverse_transform_y", "se3_inverse_transform_z",
+    }
+)  # fmt: skip
+"""The rigid-body vocabulary, mirroring `bc_expr::SpatialFunc`'s serde tags exactly.
+
+One name per *output component*, because a rotation produces three numbers and a
+quaternion four. See `bc_expr::SpatialFunc` for why that beats a struct-returning node,
+and `bc_spatial` for the component order and the angle conventions.
+
+As with `GEO_FNS` the argument count is not stated here; it lives in
+`bc_expr::SpatialFunc::arity`, and the Python constructors in
+`plan/functions/spatial/` each build a fixed argument list."""
+
 MATH_FNS: Final[frozenset[str]] = frozenset(
     {
         "abs", "acos", "asin", "atan", "bit_count", "cbrt", "ceil", "cos", "cosh",
@@ -264,3 +307,29 @@ AUDIO_FNS: Final[frozenset[str]] = frozenset(
 
 VIDEO_FNS: Final[frozenset[str]] = frozenset({"decode", "frames", "thumbnail", "frame_at"})
 """The `.video` vocabulary, mirroring `bc_expr::VideoFunc`'s serde tags exactly."""
+
+SEQ_FNS: Final[frozenset[str]] = frozenset(
+    {
+        # Nucleotide transforms and composition.
+        "complement", "reverse_complement", "transcribe", "back_transcribe",
+        "gc_content", "gc_skew", "base_counts", "max_homopolymer", "is_valid",
+        # Coding.
+        "translate",
+        # Sketching.
+        "kmers", "canonical_kmers", "minimizers",
+        # Physical chemistry.
+        "melting_temp", "molecular_weight", "gravy", "isoelectric_point",
+        # FASTQ quality.
+        "phred_quality", "mean_quality", "expected_errors",
+        # Motif search.
+        "find_motif", "count_motif",
+    }
+)  # fmt: skip
+"""The `.seq` vocabulary, mirroring `bc_expr::SeqFunc`'s serde tags exactly.
+
+Names follow Biopython where Biopython has one (`reverse_complement`, `transcribe`,
+`translate`, `gc_skew`, `molecular_weight`, `isoelectric_point`), because that is the
+vocabulary a bioinformatician already has, and a ported script should read the same. Where it
+does not, the name comes from the tool that owns the concept: `minimizers` from minimap2,
+`canonical_kmers` from Jellyfish and KMC, `expected_errors` from the USEARCH/VSEARCH
+`fastq_maxee` filter, `gravy` from the Kyte-Doolittle literature."""

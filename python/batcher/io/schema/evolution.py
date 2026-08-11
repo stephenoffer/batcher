@@ -47,31 +47,17 @@ def _common_supertype(a: pa.DataType, b: pa.DataType) -> pa.DataType | None:
     scalar = promote(a, b)
     if scalar is not None:
         return scalar
-    # A `dictionary<T>` is an *encoding* of its value type `T`, not a distinct logical type:
-    # a dict-encoded file and a plain-`T` file both read as `T` (DuckDB decodes both to the
-    # value type). Unwrap either side and unify the values — so Parquet's routine mix of
-    # dictionary and plain pages across files reconciles instead of raising.
+    # The scalar arms that used to sit here — `string`/`large_string` offset widening and
+    # timestamp resolution — are the shared `promote` lattice's job and were restated in
+    # this file. A second answer to the same question in a second place is exactly how the
+    # io layer and the engine came to disagree about a `timestamp[ms]` file. What remains
+    # is genuinely this module's own: the *structural* recursion into nested types, which
+    # only the file-level reader needs. (`promote` unwraps a dictionary of a scalar; the
+    # arms below re-do it so a `dictionary<list<...>>` reaches the nested recursion too.)
     if pa.types.is_dictionary(a):
         return _common_supertype(a.value_type, b)
     if pa.types.is_dictionary(b):
         return _common_supertype(a, b.value_type)
-    # Same logical type, wider offsets: `string`/`large_string` and `binary`/`large_binary`
-    # unify to the large variant (lossless), exactly as `int32`/`int64` widen.
-    if (pa.types.is_string(a) and pa.types.is_large_string(b)) or (
-        pa.types.is_large_string(a) and pa.types.is_string(b)
-    ):
-        return pa.large_string()
-    if (pa.types.is_binary(a) and pa.types.is_large_binary(b)) or (
-        pa.types.is_large_binary(a) and pa.types.is_binary(b)
-    ):
-        return pa.large_binary()
-    # Same instant type, different resolution: widen a timestamp to the finer unit when the
-    # timezone matches. A differing timezone is a genuine semantic conflict (different
-    # instants), so it still returns None and the caller raises.
-    if pa.types.is_timestamp(a) and pa.types.is_timestamp(b) and a.tz == b.tz:
-        order = ["s", "ms", "us", "ns"]
-        finer = a.unit if order.index(a.unit) >= order.index(b.unit) else b.unit
-        return pa.timestamp(finer, a.tz)
     if pa.types.is_struct(a) and pa.types.is_struct(b):
         return _merge_structs(a, b)
     if pa.types.is_map(a) and pa.types.is_map(b):
@@ -201,13 +187,33 @@ def reconcile_batches(batches: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
 def normalize_batch(batch: pa.RecordBatch, target: pa.Schema) -> pa.RecordBatch:
     """Reshape `batch` to `target`: add missing columns as typed nulls, cast
     promotable columns, and reorder to the target field order. Vectorized (no row
-    iteration)."""
+    iteration).
+
+    The source column index is built **once** per batch rather than being re-derived per
+    target field. `Schema.names` is a property that materializes a fresh Python list on
+    every access, so asking `field.name in batch.schema.names` inside the loop was
+    quadratic in the column count — and this runs per batch on every schema-evolving read
+    (single-node and on each distributed worker via `NormalizedFileSplit`) and on every
+    drifting `map_batches` output via `reconcile_batches`. Measured cost of the lookup
+    alone, per batch: 16 columns 0.10 ms, 64 columns 1.4 ms, 256 columns 25 ms, 1,024
+    columns 323 ms. A wide table did not read slowly so much as stop reading: the control
+    plane spent a third of a second per 16,384-row morsel deciding which columns it had.
+    A dict keyed on the names list makes it linear (1,024 columns: 323 ms -> 1.9 ms).
+    """
     import pyarrow.compute as pc
 
+    names = batch.schema.names
+    source = {name: i for i, name in enumerate(names)}
+    # A duplicate column name makes the index ambiguous, and `RecordBatch.column(name)`
+    # raises on exactly that rather than picking one. Keeping the raise is the point: the
+    # dict would silently resolve to whichever occurrence it kept, so an ambiguous batch
+    # would start returning *a* column instead of saying it cannot choose.
+    ambiguous = len(source) != len(names)
     cols: list[pa.Array] = []
     for field in target:
-        if field.name in batch.schema.names:
-            arr = batch.column(field.name)
+        index = source.get(field.name)
+        if index is not None:
+            arr = batch.column(field.name) if ambiguous else batch.column(index)
             if arr.type.equals(field.type):
                 cols.append(arr)
             else:

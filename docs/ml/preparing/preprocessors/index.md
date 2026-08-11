@@ -6,13 +6,14 @@ is distributed and spillable for free. `transform` is a lazy column rewrite. Fit
 on the training set, then `transform` the training **and** validation sets with the
 same learned state.
 
-Every preprocessor is importable from both `batcher.ml.preprocessors` and `batcher.ml`.
-`tests/unit/test_ml_preprocessing_workflow.py` pins that, so the two paths cannot drift.
+Every preprocessor is importable from `batcher.ml.preprocessors`. Most are also
+re-exported from `batcher.ml`, with the exceptions of {py:class}`TargetEncoder <batcher.ml.preprocessors.TargetEncoder>` and
+{py:class}`PolynomialFeatures <batcher.ml.preprocessors.PolynomialFeatures>`, which you import from `batcher.ml.preprocessors`.
 
 ## Splitting first
 
 `fit` must see the training rows only. Fit on the whole frame and held-out statistics
-leak into your features. `ds.ml.train_test_split` gives disjoint parts that
+leak into your features. {py:meth}`ds.ml.train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` gives disjoint parts that
 together cover every row, assigned by a reproducible hash of each row's own content.
 Each part is a plain row-wise filter, so the split streams, distributes, and is
 *partition-independent*. A row lands in the same part however the data is laid out.
@@ -26,7 +27,7 @@ print(train.count() + test.count())
 # 1000
 ```
 
-`ds.ml.random_split([0.7, 0.15, 0.15], seed=42)` generalizes it to a
+{py:meth}`ds.ml.random_split([0.7, 0.15, 0.15], seed=42) <batcher.api.dataset.ml.DatasetML.random_split>` generalizes it to a
 train/validation/test split.
 
 Pass `key=` to hash only the columns that identify a row:
@@ -53,16 +54,16 @@ changes.
 
 ## The three-call contract
 
-Every preprocessor exposes the same `Preprocessor` API. `fit(ds)` runs a small aggregate,
+Every preprocessor exposes the same {py:class}`Preprocessor <batcher.ml.preprocessors.Preprocessor>` API. `fit(ds)` runs a small aggregate,
 stores the learned state on the object, and returns `self`. Even a stateless transform
-such as `Normalizer`, `Concatenator`, or `Tokenizer` needs a `fit` or `fit_transform`
-before `transform`. `transform(ds)` returns a new lazy `Dataset` with the learned rewrite
+such as {py:class}`Normalizer <batcher.ml.preprocessors.Normalizer>`, {py:class}`Concatenator <batcher.ml.preprocessors.Concatenator>`, or {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` needs a `fit` or `fit_transform`
+before `transform`. `transform(ds)` returns a new lazy {py:class}`Dataset <batcher.Dataset>` with the learned rewrite
 applied, and runs no work until a terminal op such as `collect` or `write.parquet`.
 `fit_transform(ds)` is `fit(ds).transform(ds)`, the common single-split path.
 
 `fit` is the one place a preprocessor *executes* and touches data. `transform` stays
 lazy, so it composes with the rest of the pipeline and runs inside the engine. Calling
-`transform` before `fit` raises `PlanError`.
+`transform` before `fit` raises {py:exc}`PlanError <batcher.PlanError>`.
 
 ## Available preprocessors
 
@@ -71,37 +72,37 @@ does. Stateless entries learn nothing and only need a `fit` call to satisfy the 
 
 | Class | `fit` learns | `transform` |
 | --- | --- | --- |
-| `StandardScaler` | mean, population std | `(x - mean) / std` |
-| `MinMaxScaler` | min, max | scale into `feature_range`, default `[0, 1]` |
-| `MaxAbsScaler` | max absolute value | `x / max(\|x\|)` into `[-1, 1]` |
-| `RobustScaler` | median, IQR | `(x - median) / IQR`, outlier-robust |
-| `OrdinalEncoder` | sorted categories | integer code per category |
-| `LabelEncoder` | sorted classes | integer code for one target column |
-| `OneHotEncoder` | categories | one 0/1 indicator column per category |
-| `BinaryEncoder` | categories | the category's integer code in base 2, one column per bit |
-| `MultiHotEncoder` | distinct list elements | one 0/1 indicator column per category, for a list column |
+| {py:class}`StandardScaler <batcher.ml.preprocessors.StandardScaler>` | mean, population std | `(x - mean) / std` |
+| {py:class}`MinMaxScaler <batcher.ml.preprocessors.MinMaxScaler>` | min, max | scale into `feature_range`, default `[0, 1]` |
+| {py:class}`MaxAbsScaler <batcher.ml.preprocessors.MaxAbsScaler>` | max absolute value | `x / max(\|x\|)` into `[-1, 1]` |
+| {py:class}`RobustScaler <batcher.ml.preprocessors.RobustScaler>` | median, IQR | `(x - median) / IQR`, outlier-robust |
+| {py:class}`OrdinalEncoder <batcher.ml.preprocessors.OrdinalEncoder>` | sorted categories | integer code per category |
+| {py:class}`LabelEncoder <batcher.ml.preprocessors.LabelEncoder>` | sorted classes | integer code for one target column |
+| {py:class}`OneHotEncoder <batcher.ml.preprocessors.OneHotEncoder>` | categories | one 0/1 indicator column per category |
+| {py:class}`BinaryEncoder <batcher.ml.preprocessors.BinaryEncoder>` | categories | the category's integer code in base 2, one column per bit |
+| {py:class}`MultiHotEncoder <batcher.ml.preprocessors.MultiHotEncoder>` | distinct list elements | one 0/1 indicator column per category, for a list column |
 | `TargetEncoder` | per-category target mean, global prior | smoothed mean-target code per high-cardinality category |
-| `KBinsDiscretizer` | bin edges, quantile or uniform | integer bin index `0..n_bins-1` |
+| {py:class}`KBinsDiscretizer <batcher.ml.preprocessors.KBinsDiscretizer>` | bin edges, quantile or uniform | integer bin index `0..n_bins-1` |
 | `Normalizer` | nothing, stateless | scale each row to unit L1, L2, or max norm across columns |
-| `SimpleImputer` | mean, median, mode, or constant | fill nulls |
+| {py:class}`SimpleImputer <batcher.ml.preprocessors.SimpleImputer>` | mean, median, mode, or constant | fill nulls |
 | `Concatenator` | nothing, stateless | stack columns into one tensor column |
 | `PolynomialFeatures` | nothing, stateless | add interaction and power terms such as `a*b` and `a^2` up to a degree |
 | `Tokenizer` | nothing, stateless | tokenize text with a user tokenizer |
-| `QuantileTransformer` | `n_quantiles` cut points | map onto a uniform or normal distribution by rank |
-| `PowerTransformer` | the Yeo-Johnson lambda, by maximum likelihood | make a skewed column more Gaussian |
-| `BoxCoxTransformer` | the Box-Cox lambda, by maximum likelihood | the same, for a strictly positive column |
-| `LogTransformer` | nothing, stateless | `log(x + offset)`, the explainable shape fix |
-| `Clipper` | lower and upper quantiles | clamp values into the learned range |
-| `MissingIndicator` | nothing, stateless | append a boolean flag per column, before imputation |
-| `FrequencyEncoder` | per-category frequency | replace a category with how often it occurs |
-| `RareCategoryEncoder` | the categories clearing `min_frequency` | collapse the tail into one bucket |
-| `HashingEncoder` | nothing, stateless | hash a category into one of `n_buckets` |
+| {py:class}`QuantileTransformer <batcher.ml.preprocessors.QuantileTransformer>` | `n_quantiles` cut points | map onto a uniform or normal distribution by rank |
+| {py:class}`PowerTransformer <batcher.ml.preprocessors.PowerTransformer>` | the Yeo-Johnson lambda, by maximum likelihood | make a skewed column more Gaussian |
+| {py:class}`BoxCoxTransformer <batcher.ml.preprocessors.BoxCoxTransformer>` | the Box-Cox lambda, by maximum likelihood | the same, for a strictly positive column |
+| {py:class}`LogTransformer <batcher.ml.preprocessors.LogTransformer>` | nothing, stateless | `log(x + offset)`, the explainable shape fix |
+| {py:class}`Clipper <batcher.ml.preprocessors.Clipper>` | lower and upper quantiles | clamp values into the learned range |
+| {py:class}`MissingIndicator <batcher.ml.preprocessors.MissingIndicator>` | nothing, stateless | append a boolean flag per column, before imputation |
+| {py:class}`FrequencyEncoder <batcher.ml.preprocessors.FrequencyEncoder>` | per-category frequency | replace a category with how often it occurs |
+| {py:class}`RareCategoryEncoder <batcher.ml.preprocessors.RareCategoryEncoder>` | the categories clearing `min_frequency` | collapse the tail into one bucket |
+| {py:class}`HashingEncoder <batcher.ml.preprocessors.HashingEncoder>` | nothing, stateless | hash a category into one of `n_buckets` |
 
 All preprocessors share the `Preprocessor` base contract of `fit`, `transform`, and
 `fit_transform`.
 
 Each scaler matches scikit-learn's definitions, and `StandardScaler` uses population
-variance. `fit` lowers to the existing `group_by().agg(...)` and `distinct()`
+variance. `fit` lowers to the existing {py:meth}`group_by().agg(...) <batcher.Dataset.group_by>` and {py:meth}`distinct() <batcher.Dataset.distinct>`
 operators, so it is partition-independent. A fit on a distributed dataset learns the
 same statistics as a single-node fit.
 
@@ -124,9 +125,9 @@ Three groups depart from that, each deliberately:
 
 | Preprocessor | A null becomes | Why |
 |---|---|---|
-| `SimpleImputer`, `GroupImputer` | the fitted fill value | Filling nulls is the whole point of them. |
+| {py:class}`SimpleImputer <batcher.ml.preprocessors.SimpleImputer>`, {py:class}`GroupImputer <batcher.ml.preprocessors.GroupImputer>` | the fitted fill value | Filling nulls is the whole point of them. |
 | `LabelEncoder`, `OrdinalEncoder`, `FrequencyEncoder` | `unknown_value` | A missing value is not a category, so it joins the unknown bucket. |
-| `OneHotEncoder`, `LabelBinarizer`, `RareCategoryEncoder` | all-zero indicators, or the rare bucket | It belongs to no class, which the indicators already express. |
+| {py:class}`OneHotEncoder <batcher.ml.preprocessors.OneHotEncoder>`, {py:class}`LabelBinarizer <batcher.ml.preprocessors.LabelBinarizer>`, {py:class}`RareCategoryEncoder <batcher.ml.preprocessors.RareCategoryEncoder>` | all-zero indicators, or the rare bucket | It belongs to no class, which the indicators already express. |
 
 Reach for `MissingIndicator` before an encoder when the difference between "absent" and
 "rare" carries signal for your model. It adds a 0/1 column recording where the nulls were,
@@ -155,7 +156,7 @@ The check reads the schema rather than the data, so it costs no pass over the da
 ## Where they run
 
 `transform` is a lazy `Dataset`, so it composes with the rest of a pipeline and the
-result is computed by a terminal op such as `collect()` or `write.parquet(...)`, on one
+result is computed by a terminal op such as {py:meth}`collect() <batcher.Dataset.collect>` or `write.parquet(...)`, on one
 node or across a cluster. Use preprocessors before a training loop, covered in
 {doc}`PyTorch integration </ml/inference/pytorch>`, or before batch {doc}`inference </ml/inference/inference>`.
 
@@ -185,13 +186,13 @@ Timestamps, text statistics, history, PCA, and assembly.
 :::{grid-item-card} {octicon}`link;1.1em` Chaining and persisting
 :link: /ml/preparing/preprocessors/pipelines
 :link-type: doc
-`Chain`, fitting a whole pipeline, and saving the fitted state.
+{py:class}`Chain <batcher.ml.preprocessors.Chain>`, fitting a whole pipeline, and saving the fitted state.
 :::
 
 :::{grid-item-card} {octicon}`duplicate;1.1em` Deduplication and matching
 :link: /ml/preparing/preprocessors/deduplication
 :link-type: doc
-Fuzzy dedup with MinHash, and `similarity_join` on embeddings.
+Fuzzy dedup with MinHash, and {py:meth}`similarity_join <batcher.api.dataset.ml.DatasetML.similarity_join>` on embeddings.
 :::
 ::::
 

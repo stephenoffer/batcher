@@ -214,3 +214,38 @@ def test_a_judged_column_aggregates_like_any_other():
         udf, output_columns=["a", "score"]
     )
     assert scored.agg(m=bt.col("score").mean()).to_pydict()["m"] == [3.0]
+
+
+def test_a_judge_template_only_materializes_the_columns_it_names():
+    """A judged eval runs over rows a generation stage just produced.
+
+    So the batch still carries whatever that stage read — contexts, retrieved passages,
+    embeddings, images — and converting all of it to Python per row, to fill a two-slot
+    rubric, cost more than the judge call it was preparing.
+    """
+    import pyarrow as pa
+
+    from batcher.ml.llm.judge import _render
+
+    touched: list[str] = []
+
+    class _Batch:
+        schema = pa.schema([("a", pa.string()), ("ctx", pa.string())])
+        num_rows = 2
+
+        def column(self, name):
+            touched.append(name)
+            return pa.array(["x", "y"])
+
+    assert _render("Rate: {a}", _Batch()) == ["Rate: x", "Rate: y"]
+    assert touched == ["a"]
+
+
+def test_a_judge_template_naming_a_missing_column_still_names_what_is_available():
+    import pyarrow as pa
+
+    from batcher.ml.llm.judge import _render
+
+    batch = pa.RecordBatch.from_pydict({"a": ["x"], "b": ["y"]})
+    with pytest.raises(PlanError, match=r"nope.*available.*'a'.*'b'"):
+        _render("{nope}", batch)

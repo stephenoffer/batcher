@@ -12,15 +12,15 @@ from sqlglot import expressions as exp
 from batcher._sql.parser.core_utils import _columns_selector
 from batcher._sql.parser.expressions.aggregates import is_agg_node
 from batcher._sql.parser.expressions.anonymous import anonymous_scalar
+from batcher._sql.parser.expressions.collections import list_function
 from batcher._sql.parser.expressions.functions import (
-    _date_diff,
-    _list_function,
     _regexp_replace,
     _scalar_function,
 )
 from batcher._sql.parser.expressions.json import json_extract
 from batcher._sql.parser.expressions.literals import (
     _BINOPS,
+    _EXTRACT_COMPOSITE,
     _EXTRACT_PART,
     _TEMPORAL_KINDS,
     _apply_interval,
@@ -32,6 +32,7 @@ from batcher._sql.parser.expressions.literals import (
     _regexp_flags_prefix,
     _temporal_literal,
 )
+from batcher._sql.parser.expressions.temporal import _date_diff
 from batcher.plan.expr_ir import (
     Array,
     Binary,
@@ -87,7 +88,11 @@ def _scalar(tr, node) -> Expr:
         return lit(node.this)
     if isinstance(node, exp.Boolean):
         return lit(bool(node.this))
-    if isinstance(node, exp.Neg):
+    # `exp.Neg` is the unary minus (`-x`); `exp.Negative` is the *function* spelling
+    # (`negative(x)`, which Spark and DuckDB both have). sqlglot parses them to two
+    # different nodes and only the operator one was handled, so `negative(x)` reached the
+    # fallthrough as "unsupported SQL expression: Negative". They mean the same thing.
+    if isinstance(node, (exp.Neg, exp.Negative)):
         return Lit(0) - tr._scalar(node.this)
     if isinstance(node, exp.Not):
         return ~tr._scalar(node.this)
@@ -154,7 +159,7 @@ def _scalar(tr, node) -> Expr:
         return least(*_scalar_args(tr, node))
     if isinstance(node, exp.Array):
         return Array([tr._scalar(e) for e in node.expressions])
-    list_fn = _list_function(tr, node)
+    list_fn = list_function(tr, node)
     if list_fn is not None:
         return list_fn
     if isinstance(node, (exp.Concat, exp.ConcatWs)):
@@ -165,6 +170,9 @@ def _scalar(tr, node) -> Expr:
         return ~_is_distinct_from(tr, node)
     if isinstance(node, exp.Extract):
         part = node.this.name.lower()
+        composite = _EXTRACT_COMPOSITE.get(part)
+        if composite is not None:
+            return composite(tr._scalar(node.expression).dt)
         method = _EXTRACT_PART.get(part)
         if method is None:
             raise NotImplementedError(f"EXTRACT field {part!r} is not supported")
@@ -178,6 +186,14 @@ def _scalar(tr, node) -> Expr:
         return tr._scalar(node.this).dt.truncate(unit.name.lower())
     if isinstance(node, exp.RegexpReplace):
         return _regexp_replace(tr, node)
+    if isinstance(node, exp.SimilarTo):
+        # `x SIMILAR TO p` matches the *whole* string against `p` as a regex — DuckDB's
+        # reading, and the one that matters here: `'abc' SIMILAR TO 'a%'` is False, so
+        # this is not LIKE with regex syntax bolted on. `regexp_matches` is unanchored,
+        # hence the wrapping. The non-capturing group keeps an alternation in `p` from
+        # binding past the anchors (`a|b` would otherwise mean `^a` or `b$`).
+        pattern = _const_str_arg(node.expression, "SIMILAR TO", "pattern")
+        return tr._scalar(node.this).str.regexp_matches(f"^(?:{pattern})$")
     if isinstance(node, exp.RegexpLike):  # regexp_matches(s, pattern[, options])
         pat = _const_str_arg(node.expression, "regexp_matches", "pattern")
         flag_node = node.args.get("flag")
@@ -310,6 +326,11 @@ def _typed_null(arrow_type) -> Expr:
     return typed  # integer (and any other) → the int-typed NULL
 
 
+def _null_boolean() -> Expr:
+    """A NULL of boolean type. `lit(None)` has no type to give it, so NULLIF supplies one."""
+    return nullif(lit(True), lit(True))
+
+
 def _in(tr, node) -> Expr:
     items = node.expressions
     if node.args.get("query") is not None:
@@ -319,6 +340,21 @@ def _in(tr, node) -> Expr:
     if not items:
         raise NotImplementedError("IN requires an explicit value list")
     target = tr._scalar(node.this)
+    # A NULL in the list is not a comparable value: `x IN (a, NULL)` is TRUE when x = a
+    # and NULL otherwise (never FALSE), which is exactly `(x IN (a)) OR NULL` under SQL's
+    # three-valued OR. Comparing against it instead built `x = NULL`, and the untyped NULL
+    # literal lowered as Int64 — so `g IN ('a', NULL)` on a text column died with
+    # `Invalid comparison operation: Utf8 == Int64` rather than answering.
+    values = [i for i in items if not isinstance(i, exp.Null)]
+    if len(values) != len(items):
+        if not values:
+            # `x IN (NULL)` is NULL for every row, x included.
+            return _null_boolean()
+        return _in_values(tr, target, values) | _null_boolean()
+    return _in_values(tr, target, values)
+
+
+def _in_values(tr, target: Expr, items) -> Expr:
     # x IN (a, b, c)  →  (x == a) | (x == b) | (x == c)
     result: Expr | None = None
     for item in items:

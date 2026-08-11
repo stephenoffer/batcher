@@ -157,7 +157,7 @@ ratios, not milliseconds, and never gate a test on one of these timings.
 
 ## stats(): the same measurements as a table
 
-`stats()` runs the query and returns the per-operator measurements as a `RunStats`
+{py:meth}`stats() <batcher.Dataset.stats>` runs the query and returns the per-operator measurements as a `RunStats`
 object rather than a rendered tree, which is the shape you want when a script is checking
 a number rather than a human reading a plan.
 
@@ -185,10 +185,32 @@ That table is one run, so on a query this small the bottleneck line can name a
 different operator each time; it earns its keep on data where one operator dominates.
 
 :::{note}
-`stats()` raises `BackendError` on a `map_batches` / ML pipeline, which runs outside the
+`stats()` raises {py:exc}`BackendError <batcher.BackendError>` on a `map_batches` / ML pipeline, which runs outside the
 relational engine, so there is nothing to measure per operator. Use
 `explain(analyze=True)` there.
 :::
+
+### What the run cost the machine
+
+The per-operator table says where the time went. `RunStats.usage` says what the run
+consumed while it was going: CPU across every worker thread, resident-set growth, page
+faults, and bytes that actually reached a disk.
+
+```python
+usage = query.stats().usage
+print(usage.cpu_ms >= 0.0, usage.cores_busy >= 0.0)
+```
+
+`cores_busy` is `cpu_ms / wall_ms`, the mean cores the run kept busy. On a sixteen-core
+machine a value near 1 means the plan did not parallelize, and a high value alongside a
+high `invol_ctx_switches` means it parallelized fine and then fought something else on the
+box for the cores. Those look identical in wall time and have opposite fixes.
+
+This is measured across the execution as a whole rather than per operator, and that is why
+it is trustworthy everywhere. The engine's streaming executor interleaves its operators, so
+attributing an OS counter to any one of them would be a fabricated number; the per-operator
+`cpu_ms`, `peak_rss_bytes`, and `io_read_bytes` fields on `OpStat` are therefore zero on
+that tier. Read a zero anywhere here as *unmeasured*, never as *none*.
 
 ## format="json": for tooling
 

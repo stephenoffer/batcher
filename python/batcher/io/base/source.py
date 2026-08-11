@@ -15,15 +15,15 @@ import hashlib
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from typing import IO, Any, ClassVar, TypeVar
 
 import pyarrow as pa
 
 from batcher._internal.errors import FormatError, IOError, SchemaError, unknown_value
 from batcher._internal.hardware import available_cpu_count
-from batcher.io._backend import _scheme
-from batcher.io._concurrent import total_file_bytes
+from batcher._internal.logging import note_suppressed
+from batcher.io._backend import _has_wildcard, _scheme
+from batcher.io._concurrent import listed_sizes, read_each_file, total_file_bytes
 from batcher.io.base._options import BASE_SOURCE_ALIASES, BASE_SOURCE_OPTIONS
 from batcher.io.base._paths import normalize_source_path
 from batcher.io.base._readahead import ordered_readahead
@@ -31,8 +31,9 @@ from batcher.io.base._tolerance import ErrorPolicy
 from batcher.io.base._transient import with_retry
 from batcher.io.detect import compression_for_path
 from batcher.io.filesystem import resolve_filesystem
-from batcher.io.splits import FileSplit, Split
+from batcher.io.splits import FileSplit, MultiFileSplit, Split, pack_files
 from batcher.io.stats.file_identity import files_version
+from batcher.io.stats.row_estimate import estimate_rows_from_footer_sample
 from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["FileSource"]
@@ -73,11 +74,6 @@ _ITER_READAHEAD_BYTES = max(1 << 20, int(os.environ.get("BATCHER_READAHEAD_BYTES
 # whole source by definition, so extra concurrency there only widens the transient decode
 # working set.
 _REMOTE_READ_CONCURRENCY = max(2, int(os.environ.get("BATCHER_REMOTE_READ_CONCURRENCY", "32")))
-# Concurrency for the driver's footer-read phase (`splits`/`row_count`). Footer reads are
-# pure object-store *latency* (a small metadata GET each), not CPU or bandwidth, so a wide
-# fan-out is safe and cuts the many-thousand-file driver stall the old cap of 16 left on the
-# table. Env-overridable; capped at the file count so a small dataset spawns no idle threads.
-_FOOTER_READ_CONCURRENCY = max(8, int(os.environ.get("BATCHER_FOOTER_CONCURRENCY", "64")))
 # Attempts (including the first) for a read that fails *transiently* — an object-store
 # throttle, 5xx, or dropped connection. 3 absorbs the blips a cloud SDK would absorb on its
 # own without masking a real outage for long; 1 disables retrying. Non-transient failures
@@ -96,6 +92,19 @@ _READ_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_READ_RETRY_BACKOF
 # more numerous than the workers. Whole-file splits need no footer and give the same rows.
 # Env-overridable for a workload whose files are few but enormous.
 _MAX_FOOTER_PLAN_FILES = max(1, int(os.environ.get("BATCHER_MAX_FOOTER_PLAN_FILES", "10000")))
+# Rough bytes a whole-file split should cover when the caller names no target. One split
+# per file is the right unit until files outnumber workers by orders of magnitude; past
+# that, every split is a scheduled task and a pickled locator, so a million 4 KB objects
+# become a million tasks to move four gigabytes. 128 MiB is the figure Spark settled on for
+# the same job (`spark.sql.files.maxPartitionBytes`) and for the same reason. Files are only
+# ever *grouped*, never divided, so a dataset of large files packs one-per-split as before.
+_COALESCE_TARGET_BYTES = max(1, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTES", str(128 << 20))))
+# The fewest splits packing may leave when there are at least that many files. Grouping is
+# a throughput win and a parallelism risk in the same move: eight 10 MB files under a
+# 128 MiB target would coalesce to one task and idle every core but one. The driver cannot
+# see the cluster, so the floor is generous rather than exact — it only has to stop the
+# pathological collapse, and `pack_files` re-packs to `total / min_runs` when it trips.
+_MIN_SPLITS = max(64, available_cpu_count() * 8)
 
 
 def _resolve_base_aliases(
@@ -217,7 +226,15 @@ class FileSource(ABC):
         # Kept separately from `_files_cache` (which is merely a memo of the listing) because
         # `identity` must be able to tell "the whole directory" from "these files" — see there.
         self._pinned: list[str] | None = list(files) if files is not None else None
-        self._files_cache: list[str] | None = list(files) if files is not None else None
+        # Resolved *here*, on whoever constructed the source, because a pinned entry may
+        # name a directory or a glob and the resulting file list has to travel with the
+        # source. Resolving it lazily instead would have each worker re-list — and a worker
+        # that cannot see the driver's paths (a remote node, a different mount) would then
+        # fail on a listing the driver had already done successfully. Costs nothing for the
+        # common all-files list: `_expand_pinned` short-circuits without a single stat.
+        self._files_cache: list[str] | None = (
+            self._expand_pinned(self._pinned) if self._pinned is not None else None
+        )
         self._schema_cache: pa.Schema | None = None
         # "strict" (default) keeps the historical behavior — file 0's schema is
         # assumed for all. "union"/"latest" reconcile differing per-file schemas
@@ -244,6 +261,90 @@ class FileSource(ABC):
             self._files_cache = self._fs.expand(self._path, suffix=self.suffix)
         return self._files_cache
 
+    def _expand_pinned(self, paths: list[str]) -> list[str]:
+        """Resolve any pinned entry that names a directory or a glob into its files.
+
+        ``read.parquet([a, b])`` is the shape `pandas.concat` and ``spark.read.parquet(*p)``
+        cover, and the entries are not always files: pointing it at two *output directories*
+        is the natural way to union two runs, and it used to fail with "path is a directory"
+        raised from inside the format's file reader — an error about the wrong thing, at the
+        wrong layer. Expanding here makes a list accept exactly the vocabulary one path
+        accepts.
+
+        Only the entries that need it are listed. A path already ending in one of this
+        format's suffixes is a file, so an explicit list of ten thousand Parquet files costs
+        no `get_file_info` calls at all — which is the point of pinning one, and what makes
+        it safe to run this from the constructor.
+        """
+        suffixes = (self.suffix,) if isinstance(self.suffix, str) else tuple(self.suffix)
+        if all(p.endswith(suffixes) and not _has_wildcard(p) for p in paths):
+            return paths
+        out: list[str] = []
+        for entry in paths:
+            out.extend(
+                [entry]
+                if entry.endswith(suffixes) and not _has_wildcard(entry)
+                else self._fs.expand(entry, suffix=self.suffix)
+            )
+        # A file matched by two overlapping entries would otherwise be read twice; keep the
+        # first occurrence of each and the caller's order.
+        return list(dict.fromkeys(out))
+
+    def _too_many_files_to_sweep(self) -> bool:
+        """Whether this source has more files than a per-file metadata pass is worth.
+
+        Every O(files) metadata sweep on the driver — footers for split planning, footers
+        for a row count, footers for column bounds, HEADs for byte sizes — asks the same
+        question, so they answer it through one predicate rather than four copies of the
+        same threshold that can drift apart. Past the ceiling each of them declines and the
+        caller degrades to something that costs nothing per file.
+        """
+        return len(self._files()) > _MAX_FOOTER_PLAN_FILES
+
+    def _sub_file_splits_cannot_help(self, files: list[str], target_size: int | None) -> bool:
+        """Whether planning splits *within* each file could add nothing this read wants.
+
+        Sub-file splitting exists to stop one large file from being one task. It is the
+        wrong tool for the opposite shape, and the cost of finding that out is the whole
+        problem: `_file_splits` reads a footer per file, so a corpus of many small files
+        pays an O(files) metadata sweep on the driver to produce splits that are *finer
+        than a file* — the granularity it already had for free, and finer than any split
+        the packer will keep. Measured on 4,096 local 50 KB Parquet files: 668 ms of driver
+        footer reads to plan 4,096 splits of 46 KB each, which is 4,096 scheduled tasks to
+        move 190 MB. On an object store the same sweep is a round trip per file.
+
+        Two conditions, and both are needed:
+
+        - **There are already at least `_MIN_SPLITS` files.** Below that the files *are* the
+          parallelism and sub-file granularity is exactly what supplies it — eight 24 MB
+          Parquet files should still plan forty row-group splits, not eight whole-file ones.
+        - **No file exceeds one split's worth of bytes.** A file bigger than the target is
+          the case sub-file splitting was built for, and one such file is enough to want the
+          sweep. This is `max`, not a mean, so a compacted table's single large file is not
+          averaged away by its small siblings.
+
+        The sizes come from the directory listing, which already reported them, so this
+        costs no I/O. When it cannot answer for every file this returns False and the sweep
+        proceeds as before, rather than paying a HEAD per file to decide whether to pay a
+        footer read per file.
+
+        A pushed `predicate` is handled by the caller and never reaches here: footer
+        statistics prune whole files at plan time, which is worth a sweep at any file size.
+
+        Args:
+            files: The paths this read covers, in read order.
+            target_size: Rough bytes per split, or None for the default.
+
+        Returns:
+            True when whole-file splits are as fine as this read can use.
+        """
+        if len(files) < _MIN_SPLITS:
+            return False
+        sizes = listed_sizes(self._fs, files)
+        if not sizes:
+            return False
+        return max(sizes) <= (target_size or _COALESCE_TARGET_BYTES)
+
     def _is_remote(self) -> bool:
         """Whether this source's files sit behind a network round trip.
 
@@ -253,6 +354,37 @@ class FileSource(ABC):
         `_REMOTE_READ_CONCURRENCY`.
         """
         return _scheme(self._path) not in ("", "file")
+
+    @property
+    def node_local(self) -> bool:
+        """Whether this source's files may be readable only by the node that named them.
+
+        A bare path is a path *on some filesystem this process can see*. That may be a
+        shared mount every node reads, or it may be this node's own disk, and the path
+        alone cannot tell the two apart — so the honest answer for anything without a
+        remote scheme is "possibly not shared". An object-store URI is unambiguous: every
+        node resolves it identically.
+
+        Read by `api.terminal.routing`, which must not ship a scan of a node-local path to
+        workers on other machines: they fail with `path ... does not exist` rather than
+        falling back, which is a hard failure on a query that runs fine single-node.
+
+        Examples:
+            .. doctest::
+
+                >>> import pathlib, tempfile
+                >>> import batcher as bt
+                >>> tmp = pathlib.Path(tempfile.mkdtemp()) / "events.csv"
+                >>> _ = tmp.write_text("a\\n1\\n")
+                >>> bt.read.csv(str(tmp))._sources[0].node_local
+                True
+                >>> bt.read.csv("s3://bucket/e.csv")._sources[0].node_local  # doctest: +SKIP
+                False
+
+        Returns:
+            Whether the path may resolve differently (or not at all) on another node.
+        """
+        return not self._is_remote()
 
     def _read_concurrency(self, n_files: int) -> int:
         """How many files a materializing `read` decodes at once — never more than there are.
@@ -314,8 +446,59 @@ class FileSource(ABC):
         if self._schema_cache is None:
             full = self._read_full_schema()
             self._warn_if_dropping_partition_columns(full)
+            self._warn_if_a_later_file_has_more_columns(full)
             self._schema_cache = self._select(full)
         return self._schema_cache
+
+    def _warn_if_a_later_file_has_more_columns(self, schema: pa.Schema) -> None:
+        """Warn when `strict` mode is about to drop columns a later file added.
+
+        The sibling of `_warn_if_dropping_partition_columns`, and the same kind of loss: in
+        `strict` mode file 0's schema stands for every file, so a directory written over
+        months — where a column was added partway — reads back without it. Every row is
+        returned and no error is raised, so the result is indistinguishable from a correct
+        one for a table that never had the column.
+
+        Reads exactly *one* extra schema, the last file's, because reading them all is
+        precisely the cost `strict` exists to avoid and the newest file is where a
+        forward-evolving schema differs. So this detects the common case and claims no
+        more than that: the message says which columns *it* found, not that they are all.
+        """
+        if self._schema_mode != "strict":
+            return  # the evolution modes unify every file's schema; nothing is dropped
+        files = self._files()
+        if len(files) < 2:
+            return
+        try:
+            latest = self._file_schema(files[-1])
+        except Exception as exc:
+            # Best-effort: an unreadable last file is `on_error`'s business, not this check's.
+            # Traced, because what is lost is the *warning* — the read then drops a column a
+            # later file added and says nothing, which is the loss this method exists to name.
+            note_suppressed("io", "read the last file's schema to warn about dropped columns", exc)
+            return
+        if latest is None:
+            return
+        # `schema.names` rebuilds the whole name list on every access, so hoisting it out
+        # of the comprehension is what keeps this check linear rather than quadratic in the
+        # column count — 46 ms of a wide (512-column) read's metadata phase went here.
+        have = set(schema.names)
+        missing = [name for name in latest.names if name not in have]
+        if not missing:
+            return
+        import warnings
+
+        from batcher._internal.errors import DataWarning
+
+        warnings.warn(
+            f"{files[-1]!r} has columns the read will not return: {missing}. In "
+            "schema_mode='strict' (the default) the first file's schema stands for every "
+            "file, so a column added later is dropped from the result while every row is "
+            "still returned. Pass schema_mode='union' to reconcile the files' schemas, or "
+            "'strict' deliberately if the first file is the contract.",
+            DataWarning,
+            stacklevel=3,
+        )
 
     def _warn_if_dropping_partition_columns(self, schema: pa.Schema) -> None:
         """Warn when the files sit in ``col=val/`` directories this reader will not recover.
@@ -443,15 +626,11 @@ class FileSource(ABC):
             raise self._all_files_unreadable(len(files))
         from batcher.io.schema import unify_schemas
 
-        # Schema evolution reads every file's schema; read them concurrently (each a
-        # GIL-releasing metadata round trip) so a many-file unify isn't serialized.
-        if len(files) <= 1:
-            pairs = [(f, self._tolerant_file_schema(f)) for f in files]
-        else:
-            cap = min(_FOOTER_READ_CONCURRENCY, len(files))
-            with ThreadPoolExecutor(max_workers=cap) as pool:
-                pairs = list(zip(files, pool.map(self._tolerant_file_schema, files), strict=True))
-        schemas = [s for _, s in pairs if s is not None]
+        # Schema evolution reads every file's schema. `read_each_file` owns whether that
+        # fan-out happens at all — see `row_count` for why fanning a *local* metadata
+        # sweep out across threads makes it slower, not faster.
+        read = read_each_file(self._fs, files, lambda _fs, f: self._tolerant_file_schema(f))
+        schemas = [s for s in read if s is not None]
         if not schemas:
             raise self._all_files_unreadable(len(files))
         return unify_schemas(schemas, self._schema_mode)
@@ -788,8 +967,8 @@ class FileSource(ABC):
         512-file directory of 400,000 rows: `row_count` was **three** calls accounting for
         0.104 s of a 0.157 s query — two thirds of the wall clock spent re-deriving one
         number. The cost is not the footer I/O (that is cached per path) but the walk
-        itself: a fresh `ThreadPoolExecutor` and a Python call per file, per call, which at
-        a million files is three full metadata passes before any data is read.
+        itself: a Python call per file, per call, which at a million files is three full
+        metadata passes before any data is read.
 
         Safe to memoize because every input is already fixed for the source's lifetime:
         `_files()` is a cached listing, the per-file footers are cached by path, and
@@ -810,15 +989,25 @@ class FileSource(ABC):
         if self._row_count_cache is not _UNSET:
             return self._row_count_cache  # type: ignore[return-value]
         files = self._files()
-        # Each `_file_row_count` reads a footer (a ~80ms object-store round trip for
-        # Parquet, cached after the first read); over a many-file dataset the serial loop
-        # dominates a distributed query's driver phase, so read them concurrently on a
-        # small pool — exactly as `splits()` does. A single file skips the pool.
-        if len(files) <= 1:
-            counts = [self._tolerant_file_row_count(f) for f in files]
-        else:
-            with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
-                counts = list(pool.map(self._tolerant_file_row_count, files))
+        # Above the ceiling the sweep is the query. A million footers at ~80 ms each, even
+        # 64-wide, is over twenty minutes of driver time to learn a number the planner uses
+        # to size a join — and `splits()` and `_total_byte_size` already refuse the same
+        # sweep at the same count for the same reason. Reporting no exact count here is not
+        # a loss of information so much as a refusal to buy it at that price: `statistics()`
+        # falls through to its byte-scaled estimate, marked inexact, and a `count()` that
+        # genuinely needs the exact figure reads the data.
+        if self._too_many_files_to_sweep():
+            self._row_count_cache = None
+            return None
+        # Each `_file_row_count` reads a footer — a ~80ms round trip on an object store,
+        # a page-cache syscall locally, and nothing at all once the footer cache holds it.
+        # Whether to fan that out across threads is exactly the decision `read_each_file`
+        # owns and has measured, so this asks it rather than opening a pool of its own.
+        # Opening one unconditionally is what this used to do, and on a local dataset it
+        # was a large *pessimization*: the per-file work is pure Python once the footer is
+        # cached, so N threads contend for the GIL instead of overlapping any I/O. Warm,
+        # over 4,096 local files, the 64-thread pool cost 374 ms against 64 ms serial.
+        counts = read_each_file(self._fs, files, lambda _fs, f: self._tolerant_file_row_count(f))
         if any(c is None for c in counts):
             self._row_count_cache = None
             return None
@@ -908,20 +1097,36 @@ class FileSource(ABC):
         stats = SourceStatistics(row_count=rows, byte_size=size, exact_rows=exact)
         return self._stats_apply(stats)
 
-    def _estimated_row_count(self, byte_total: int | None) -> int | None:  # noqa: ARG002
-        """An advisory row-count estimate for a footerless format, or None (the default).
+    def _estimated_row_count(self, byte_total: int | None) -> int | None:
+        """An advisory row-count estimate for a source that cannot be counted exactly.
 
-        A columnar format answers `row_count()` exactly from its footer and never reaches
-        here. A footerless text format (CSV, line-delimited JSON) has no exact count, so it
-        overrides this to extrapolate one from a byte sample (`io.stats.row_estimate`) — far
-        better than the planner's blind default for sizing a join, and always advisory
-        (`statistics()` marks it `exact_rows=False`). The base returns None: a format that
-        cannot estimate cheaply simply reports no count, exactly as before.
+        Two different shapes arrive here, and the base answers the second of them.
 
-        `byte_total` is the dataset's on-disk size, already computed by `statistics()` and
-        passed in so an estimator that scales by it need not re-sweep every file's size.
+        A **footerless** text format (CSV, line-delimited JSON) has no exact count at any
+        size, so it overrides this to extrapolate one from a byte sample
+        (`estimate_delimited_rows`).
+
+        A **columnar** format reaches here only when its dataset is past
+        `_MAX_FOOTER_PLAN_FILES` — the point where `row_count()` refuses the O(files) footer
+        sweep. That refusal is right, and reporting *nothing* in its place was not: a table
+        large enough to decline the sweep is exactly the one whose join order, build side,
+        spill budget, and worker fan-out are worth getting right, and above the ceiling the
+        planner was sizing every one of them on a default. `estimate_rows_from_footer_sample`
+        buys the number back for a fixed sixty-four footers regardless of file count.
+
+        The estimate is always advisory — `statistics()` marks it `exact_rows=False`, so it
+        sizes plans and never answers a `count()`.
+
+        Args:
+            byte_total: The dataset's on-disk size, already computed by `statistics()` and
+                passed in so an estimator that scales by it need not re-sweep every size.
+
+        Returns:
+            An advisory total row count, or None when none can be produced cheaply.
         """
-        return None
+        return estimate_rows_from_footer_sample(
+            self._fs, self._files(), self._file_row_count, total_bytes=byte_total
+        )
 
     def _total_byte_size(self) -> int | None:
         """The summed on-disk byte size of every file, or None if it can't be stated whole.
@@ -930,14 +1135,18 @@ class FileSource(ABC):
         across sources, so one unreadable size would silently under-report the whole query.
         Any file whose size cannot be read voids the figure rather than skewing it.
 
-        Skipped above `_MAX_FOOTER_PLAN_FILES` — the same ceiling `splits()` uses to stop
-        reading a footer per file. Past it, an O(files) sweep of size round trips on the
-        driver costs more than a byte-size estimate is worth, and the read is already
-        amply parallel. The sizes are read concurrently for a remote store (each is one
-        latency-bound HEAD) and serially for local disk, via `read_each_file`.
+        The directory listing already reported every size, so the common case costs no I/O
+        at all and holds at any file count. Only a source whose files did not come from a
+        listing — a pinned subset, a glob that bypassed it — has to stat them, and *that*
+        is what stays capped at `_MAX_FOOTER_PLAN_FILES`: an O(files) sweep of HEAD requests
+        on the driver costs more than a byte-size estimate is worth, and the read is already
+        amply parallel at that count.
         """
         files = self._files()
-        if len(files) > _MAX_FOOTER_PLAN_FILES:
+        listed = listed_sizes(self._fs, files)
+        if listed is not None:
+            return sum(listed) or None
+        if self._too_many_files_to_sweep():
             return None
         return total_file_bytes(self._fs, files)
 
@@ -1052,29 +1261,109 @@ class FileSource(ABC):
             target = self.schema()
             kwargs = self._reader_kwargs()
             return [NormalizedFileSplit(self.format_name, f, target, kwargs) for f in files]
+        # A format with no sub-file granularity (CSV, JSON, Avro, text, images — everything
+        # that does not override `_file_splits`) is planned straight from the file list. The
+        # base `_file_splits` reads nothing and returns one `FileSplit`, so calling it a
+        # million times over a thread pool only built a million objects the slow way.
+        if type(self)._file_splits is FileSource._file_splits:
+            return self._whole_file_splits(files, target_size)
         # Above this many files, planning sub-file splits is itself the bottleneck: each
         # `_file_splits` reads a footer, and a million-file corpus means a million metadata
         # GETs on the DRIVER before a single task launches. Past the threshold, fall back to
-        # one whole-file split per file, which needs no footer at all — there is already
-        # ample parallelism at that file count, so sub-file granularity buys nothing.
+        # whole-file splits, which need no footer at all — there is already ample parallelism
+        # at that file count, so sub-file granularity buys nothing.
         # A `predicate` suspends this: footer statistics let `_file_splits` drop row-groups
         # (often whole files) at plan time, which is worth the sweep precisely because the
-        # dataset is large. `target_size` likewise means the caller asked for sized splits.
-        if len(files) > _MAX_FOOTER_PLAN_FILES and predicate is None and target_size is None:
-            return [FileSplit(self.format_name, f, self._reader_kwargs()) for f in files]
+        # dataset is large. `target_size` no longer does — `_whole_file_splits` honors it by
+        # packing whole files to it, so a caller asking for sized splits gets them without
+        # the sweep, which is what it wanted in the first place.
+        if self._too_many_files_to_sweep() and predicate is None:
+            return self._whole_file_splits(files, target_size)
+        # Below the ceiling, the sweep can still be pure waste: it buys granularity *inside*
+        # a file, and there is none worth having once the files are already smaller than one
+        # split. See `_sub_file_splits_cannot_help`.
+        if predicate is None and self._sub_file_splits_cannot_help(files, target_size):
+            return self._whole_file_splits(files, target_size)
         # `_file_splits` reads each file's footer (a ~100ms object-store round trip for
         # Parquet); over a many-file dataset that serial loop dominates a distributed
         # query's driver phase (TPC-H sf100: 100 files ≈ 12s of otherwise-idle driver
-        # time while the workers wait). Read the footers concurrently on a small pool —
-        # order is preserved so a downstream that assumes file order is unaffected. A
-        # single file (the common small case) skips the pool entirely.
-        if len(files) <= 1:
-            return [s for f in files for s in self._tolerant_file_splits(f, target_size, predicate)]
-        with ThreadPoolExecutor(max_workers=min(_FOOTER_READ_CONCURRENCY, len(files))) as pool:
-            per_file = pool.map(
-                lambda f: self._tolerant_file_splits(f, target_size, predicate), files
-            )
-        return [s for file_splits in per_file for s in file_splits]
+        # time while the workers wait). Locally — and on any re-plan the footer cache
+        # serves — that same fan-out is a pessimization, so the choice is `read_each_file`'s
+        # rather than restated here. Order is preserved either way, so a downstream that
+        # assumes file order is unaffected.
+        per_file = read_each_file(
+            self._fs, files, lambda _fs, f: self._tolerant_file_splits(f, target_size, predicate)
+        )
+        planned = [s for file_splits in per_file for s in file_splits]
+        return self._coalesce(planned, target_size)
+
+    def _coalesce(self, planned: list[Split], target_size: int | None) -> list[Split]:
+        """Group `planned` into multi-file splits when every one of them is a whole file.
+
+        A format that *can* subdivide often decides not to: `CSVSource` plans byte ranges
+        for a file big enough to be worth ranging and hands back a plain `FileSplit` for
+        one that is not, so a directory of small CSVs reaches here as one whole-file split
+        per file — the very shape that needs grouping, arriving from a format the class-level
+        check for "does not subdivide" does not catch.
+
+        So the test is on the result, not the class. Anything finer than a whole file
+        (a row-group run, a byte range, a schema-normalizing split) is left exactly as
+        planned: those already divide *within* a file, which is the opposite problem, and
+        grouping them would undo the parallelism the format just went to the trouble of
+        creating.
+        """
+        if len(planned) < 2 or not all(type(s) is FileSplit for s in planned):
+            return planned
+        paths = [s.path for s in planned]  # type: ignore[attr-defined]
+        sizes = listed_sizes(self._fs, paths)
+        if sizes is None:
+            return planned
+        runs = pack_files(sizes, target_size or _COALESCE_TARGET_BYTES, _MIN_SPLITS)
+        if len(runs) == len(planned):
+            return planned  # nothing grouped; keep the splits the format built
+        kwargs = planned[0].kwargs  # type: ignore[attr-defined]
+        return [
+            planned[start]
+            if stop - start == 1
+            else MultiFileSplit(self.format_name, tuple(paths[start:stop]), kwargs)
+            for start, stop in runs
+        ]
+
+    def _whole_file_splits(self, files: list[str], target_size: int | None) -> list[Split]:
+        """One split per file, or one per *group* of files where grouping is worth it.
+
+        A whole-file split is the natural unit for a format with no sub-file granularity,
+        and it stops being a good one the moment files outnumber workers by orders of
+        magnitude. A million 4 KB objects is a million scheduled tasks, a million pickled
+        locators, and a million worker round trips to move four gigabytes — the read is
+        entirely overhead, and no amount of cluster fixes it because the cost is per *file*,
+        not per byte. `pack_files` groups adjacent files up to `target_size`, so the task
+        count follows the dataset's bytes instead of the number of objects it is stored in.
+
+        The sizes come from the directory listing, which already reported them
+        (`listed_sizes`), so the packing costs no I/O. When they are not all available — a
+        pinned file subset, a glob that bypassed the listing, a backend that keeps none —
+        this returns one split per file exactly as before, rather than paying an O(files)
+        HEAD sweep to plan a read whose cost is what we were trying to reduce.
+
+        Args:
+            files: The paths to cover, in read order.
+            target_size: Rough bytes per split, or None for the default.
+
+        Returns:
+            Splits covering `files` exactly once, in order.
+        """
+        kwargs = self._reader_kwargs()
+        sizes = listed_sizes(self._fs, files)
+        if sizes is None:
+            return [FileSplit(self.format_name, f, kwargs) for f in files]
+        runs = pack_files(sizes, target_size or _COALESCE_TARGET_BYTES, _MIN_SPLITS)
+        return [
+            FileSplit(self.format_name, files[start], kwargs)
+            if stop - start == 1
+            else MultiFileSplit(self.format_name, tuple(files[start:stop]), kwargs)
+            for start, stop in runs
+        ]
 
     def _tolerant_file_splits(
         self, path: str, target_size: int | None, predicate: dict | None

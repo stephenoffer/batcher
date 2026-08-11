@@ -37,7 +37,9 @@ __all__ = [
     "fits_one_domain",
     "gpu_node_topology",
     "interconnect_class",
+    "is_preemptible",
     "largest_local_domain",
+    "node_zone",
     "nvlink_domain_size",
     "topology_summary",
 ]
@@ -56,6 +58,19 @@ POWER_ZONE_LABEL = "batcher.io/power-zone"
 #: Ray's own because on a managed cluster they are already set by the cloud provider.
 _ZONE_LABELS = ("topology.kubernetes.io/zone", "ray.io/availability-zone")
 _REGION_LABELS = ("topology.kubernetes.io/region", "ray.io/region")
+
+#: Labels naming how a node was purchased. Ray's own key first, then the three the major
+#: Kubernetes provisioners set, because a KubeRay fleet is labelled by whichever of them
+#: brought the node up rather than by Ray. Values are compared case-insensitively against
+#: `_PREEMPTIBLE_VALUES`, which is why `SPOT` and `spot` both read the same.
+_MARKET_LABELS = (
+    "ray.io/market-type",
+    "karpenter.sh/capacity-type",
+    "eks.amazonaws.com/capacityType",
+    "cloud.google.com/gke-spot",
+)
+#: What those labels say when the node can be reclaimed. `"true"` covers GKE's boolean spelling.
+_PREEMPTIBLE_VALUES = frozenset({"spot", "preemptible", "true"})
 
 #: Interconnect tiers, fastest first. The order is the whole contract: a caller ranks candidate
 #: placements by the index of their class, and the specific numbers behind each tier vary by
@@ -107,6 +122,50 @@ def _label(labels: dict, names: tuple[str, ...]) -> str:
         if value:
             return str(value)
     return ""
+
+
+def is_preemptible(labels: dict) -> bool:
+    """Whether a node's labels say it can be reclaimed out from under a running job.
+
+    Spot capacity is the failure domain a replica most needs to be independent of: a
+    reclamation wave takes a whole instance group, so a second copy on another spot node of
+    the same group dies with the first and buys nothing. A node with none of these labels
+    reads as **not** preemptible, which is the safe direction — it makes an unlabelled fleet
+    behave exactly as it did before rather than distrusting every node in it.
+
+    Args:
+        labels: A Ray node record's `Labels` mapping.
+
+    Returns:
+        True when a market-type label says spot, preemptible, or (GKE's spelling) true.
+    """
+    for name in _MARKET_LABELS:
+        value = labels.get(name)
+        if value and str(value).strip().lower() in _PREEMPTIBLE_VALUES:
+            return True
+    return False
+
+
+def node_zone(labels: dict) -> tuple[str, str]:
+    """`(label_key, zone)` for a node's availability zone, or `("", "")` when unlabelled.
+
+    The key comes back with the value because a caller pinning a fleet to a zone has to name
+    the label it matched on: a fleet whose zone was read from `topology.kubernetes.io/zone`
+    must be selected on *that* key, and asking Ray for `ray.io/availability-zone` on such a
+    cluster selects nothing. Restating the preference order at each call site is how the two
+    would drift.
+
+    Args:
+        labels: A Ray node record's `Labels` mapping.
+
+    Returns:
+        The matched label key and its value, both `""` when no zone label is present.
+    """
+    for name in _ZONE_LABELS:
+        value = labels.get(name)
+        if value:
+            return name, str(value)
+    return "", ""
 
 
 def gpu_node_topology() -> tuple[GpuNodeTopology, ...]:

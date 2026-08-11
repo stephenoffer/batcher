@@ -19,6 +19,7 @@ import pyarrow as pa
 
 from batcher._internal.logging import get_logger, note_suppressed
 from batcher.config import active_config
+from batcher.io.base._bad_rows import measuring
 from batcher.io.source import Source, iter_source
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, Not
 from batcher.plan.logical import Aggregate, Filter, Join, LogicalPlan
@@ -64,17 +65,22 @@ def _stats_sample(src: Source) -> list[pa.RecordBatch]:
     already done). The fast reader cuts that to ~0.4 s. Any non-splittable source (or a
     read failure) falls back to the lazy `iter_source` read; `iter_source` stops after the
     first batches past the row cap (an in-memory source is already resident and small)."""
-    fast = _fast_sample(src)
-    if fast is not None:
-        return fast
-    out: list[pa.RecordBatch] = []
-    n = 0
-    for b in iter_source(src, None, None):
-        out.append(b)
-        n += b.num_rows
-        if n >= _STATS_SAMPLE_ROWS:
-            break
-    return out
+    # Under `measuring()`: this read meets the same malformed records the data read did,
+    # and counting them again would inflate the very metric that says how much data the job
+    # quietly dropped. Tolerance still applies — a bad record must not fail the sample —
+    # only the tally is suppressed.
+    with measuring():
+        fast = _fast_sample(src)
+        if fast is not None:
+            return fast
+        out: list[pa.RecordBatch] = []
+        n = 0
+        for b in iter_source(src, None, None):
+            out.append(b)
+            n += b.num_rows
+            if n >= _STATS_SAMPLE_ROWS:
+                break
+        return out
 
 
 def _fast_sample(src: Source) -> list[pa.RecordBatch] | None:
@@ -294,6 +300,82 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
         note_suppressed("api", "learn column NDV", exc)
 
 
+def _learn_row_bytes(hub, resolved, sources) -> None:
+    """Record `nbytes / rows` for every column of every keyable source in `resolved`.
+
+    The cheap half of column learning, and the half that was missing. `learn_column_stats`
+    restricts its sketches to the columns a later plan could consult a *distribution* for, on
+    the sound reasoning that a KLL grid for a column nothing filters on is pure loss. A byte
+    width is the exception: `StatsEstimator.row_width` sums widths over every **output**
+    column, so the payload columns no predicate mentions — the embedding, the document, the
+    frame — are both the widest in the row and the ones never measured.
+
+    An ephemeral source is skipped for the reason the sketch pass skips it: its key does not
+    survive the execution, so anything filed under it is unreadable by a later query.
+
+    Best-effort and silent: a source that cannot report a width simply contributes none.
+    """
+    from batcher import kyber
+
+    if not resolved:
+        return
+    # What is already on file, so a steady-state query writes nothing. `merge_column_table` is
+    # a whole-table read-modify-write, and this runs on *every* execution rather than being
+    # gated by the sketch pass's "already measured" marker — so without this check a served
+    # workload would pay that write per query forever to re-record the same numbers.
+    known = kyber.load_learned_stats(hub)
+    for i, batches in enumerate(resolved):
+        if not batches:
+            continue
+        source = sources[i] if sources is not None and i < len(sources) else None
+        if source is None or getattr(source, "ephemeral", False):
+            continue
+        try:
+            source_key = source_stats_key(source)
+            if source_key is None:
+                continue
+            rows = sum(b.num_rows for b in batches)
+            if rows <= 0:
+                continue
+            on_file = kyber.columns_for(known, kyber.ROW_BYTES_KEY, source_key)
+            names = [n for n in batches[0].schema.names if n not in on_file]
+            if not names:
+                # Every column of this source already has a width, so there is nothing to
+                # learn and the measurement below is pure cost. It is not a small one:
+                # `Array.nbytes` walks a column's buffers and is charged per batch *and* per
+                # column, so `lineitem` at scale 1 (49 batches x 16 columns) is a 5.1 ms sweep
+                # — 18% of TPC-H q6's entire wall time, paid on every execution to re-derive
+                # numbers already on file. The write was guarded against that; the
+                # measurement was not.
+                #
+                # Gating on the columns rather than on a marker keeps the loop live where it
+                # can still learn: a projection that returns a column not measured before, a
+                # new source object (an in-memory source is keyed per instance), or a first
+                # run all fall through and measure. What it gives up is re-deriving a width
+                # for a *file* source whose bytes changed under an unchanged path — and a
+                # width is a cost input rather than an answer, so a stale one costs plan
+                # quality, never correctness. This is the same trade the sketch pass makes
+                # with its "already measured" marker.
+                continue
+            # Only the columns with nothing on file, so every measurement here is one the
+            # store does not have. `is_material_change` guarded the write when this measured
+            # every column on every run; with the gate above it would be checking a prior
+            # that is `None` by construction, which is worse than not checking it.
+            widths: dict[str, float] = {}
+            for name in names:
+                total = sum(b.column(name).nbytes for b in batches)
+                if total > 0:
+                    widths[name] = total / rows
+            if widths:
+                kyber.record_column_row_bytes(hub, widths, source_key=source_key)
+        except Exception:
+            # Per source, and swallowed here rather than by the caller's `try`. This runs
+            # *before* the sketch pass, so letting one unreadable source's width escape would
+            # cost every source its quantiles and most-common-values as well — a failure in
+            # the cheap half taking the expensive half down with it.
+            _log.debug("row-width learning failed for one source", exc_info=True)
+
+
 def learnable_columns(plan: LogicalPlan) -> set[str]:
     """The columns whose measured statistics a later plan of this shape could actually read.
 
@@ -420,6 +502,13 @@ def learn_column_stats(
         min_frac = active_config().optimizer.cardinality.mcv_min_fraction
         max_cells = active_config().optimizer.ndv_sketch_max_cells
         wanted = learnable_columns(plan) if plan is not None else None
+        # Byte widths first, for **every** column, and before the `wanted` gate returns. They
+        # are not a sketch: Arrow already knows each array's buffer size, so this is
+        # `nbytes / rows` per column and costs nothing worth measuring. It has to be outside
+        # the gate because the gate is about *distribution* statistics — a column no predicate
+        # mentions has no use for a quantile grid, and is very often the widest column in the
+        # row. See `record_column_row_bytes`.
+        _learn_row_bytes(hub, resolved, sources)
         if wanted is not None and not wanted:
             return  # nothing in this plan consults a column statistic
         for i, batches in enumerate(resolved):

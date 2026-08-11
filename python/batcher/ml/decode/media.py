@@ -91,9 +91,15 @@ def audio_dataset(
             [None if w is None else np.asarray(w, dtype=np.float32) for w in waves],
             type=pa.list_(pa.float32()),
         )
-        return batch.append_column(output_column, col)
+        # Replaces `output_column` when the batch already carries it; a bare `append_column`
+        # left two Arrow fields of one name, which nothing raises on and every reader
+        # disagrees about.
+        from batcher.ml.tabular.features import append_columns
 
-    return ds.map_batches(_decode, output_columns=[*list(ds.columns), output_column])
+        return append_columns(batch, {output_column: col})
+
+    declared = [*list(ds.columns), *([] if output_column in ds.columns else [output_column])]
+    return ds.map_batches(_decode, output_columns=declared)
 
 
 def _decode_audio_bytes(

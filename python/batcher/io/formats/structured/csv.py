@@ -20,6 +20,7 @@ from batcher.io.formats.structured._csv_diagnostics import (
     mismatch_reported,
 )
 from batcher.io.formats.structured._csv_options import (
+    WRITE_SPEC,
     CSVReadOptions,
     resolve_read_options,
     resolve_write_options,
@@ -98,7 +99,7 @@ class CSVRangeSplit:
         options = self._options()
         return pacsv.read_csv(
             io.BytesIO(data),
-            parse_options=options.parse_options(),
+            parse_options=options.parse_options(self.path),
             convert_options=options.convert_options(column_types=types, include_columns=projection),
         )
 
@@ -233,7 +234,9 @@ class CSVSource(FileSource):
             types = {name: t for name, t in types.items() if name in set(projection)}
         return self._options.convert_options(column_types=types, include_columns=projection)
 
-    def _parse_kwargs(self, projection: list[str] | None, *, pin_types: bool) -> dict[str, Any]:
+    def _parse_kwargs(
+        self, projection: list[str] | None, *, pin_types: bool, path: str = ""
+    ) -> dict[str, Any]:
         """The pyarrow option objects shared by schema inference and every read path.
 
         There is one builder because there must be one answer. Inference is the only caller
@@ -243,7 +246,9 @@ class CSVSource(FileSource):
         """
         return {
             "read_options": self._options.read_options(),
-            "parse_options": self._options.parse_options(),
+            # Inference is the one path that must not count its drops: it re-reads the
+            # first block the read is about to read, so counting there doubles every row.
+            "parse_options": self._options.parse_options(path or self._path, observe=pin_types),
             "convert_options": (
                 self._convert_options(projection)
                 if pin_types
@@ -259,7 +264,11 @@ class CSVSource(FileSource):
         # runs during planning, so reading a multi-GB CSV end-to-end here would read it once
         # for the schema and again for the data. First-block inference is what pyarrow's own
         # streaming read commits to (and what DuckDB/Polars sample), so the schema matches.
-        schema = pacsv.open_csv(fh, **self._parse_kwargs(None, pin_types=False)).schema
+        # Inference reads the first block, so it meets a ragged line before the read does
+        # and used to report it as an unreadable *file* — offering on_error='skip', which
+        # discards every good row in it. Same diagnosis as the read path, one block earlier.
+        with mismatch_reported(self._path):
+            schema = pacsv.open_csv(fh, **self._parse_kwargs(None, pin_types=False)).schema
         # pyarrow reports undecodable bytes by *typing the column `binary`* rather than by
         # failing, which turns a corrupt file into a successful read of a differently-typed
         # table. Nothing downstream can tell that apart from a column of genuine bytes, so
@@ -294,7 +303,7 @@ class CSVSource(FileSource):
 
         # `_open` rather than `_fs.open`, so `events.csv.gz` streams here too.
         with self._open(path) as fh:
-            reader = pacsv.open_csv(fh, **self._parse_kwargs(projection, pin_types=True))
+            reader = pacsv.open_csv(fh, **self._parse_kwargs(projection, pin_types=True, path=path))
             with mismatch_reported(self._path):
                 yield from reader
 
@@ -355,6 +364,9 @@ class CSVSink(FileSink):
 
     suffix = ".csv"
     format_name = "csv"
+    #: CSV's write vocabulary, published so the write path can reject a misspelling at the
+    #: API edge with the aliases in hand rather than at the sink, a cluster later.
+    write_spec = WRITE_SPEC
 
     __slots__ = ("_options",)
 

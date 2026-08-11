@@ -15,6 +15,7 @@ each stays within the module-size budget; the import path is preserved by re-exp
 
 from __future__ import annotations
 
+import weakref
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     from batcher.plan.logical import LogicalPlan
 
 __all__ = [
+    "build_estimator",
     "collect_source_stats",
     "column_bounds_needed",
     "invalidate_source_stats",
@@ -50,6 +52,63 @@ __all__ = [
 
 # Session cache of per-source statistics, keyed by source identity (see collect_source_stats).
 _SOURCE_STATS_CACHE: dict[str, object] = {}
+
+# Per-instance memo of the *narrowed* resident view (`_resident_subset_stats`), keyed by the
+# source object itself and, within it, by the exact set of columns whose bounds were asked for.
+#
+# The shared `_SOURCE_STATS_CACHE` above deliberately excludes resident sources, because an
+# in-memory `identity()` is shape-based and two different relations of the same shape collide
+# on it. Keying on the *object* has no such failure mode: an `InMemorySource` holds a fixed
+# list of Arrow batches from construction, so its statistics cannot change, and two distinct
+# relations are two distinct keys however alike their schemas are. The nested key is the
+# requested column set, which preserves the property the un-memoized version had — a later
+# query needing a *different* column's bounds still computes them.
+#
+# It is weak-keyed so an entry dies with its source; a benchmark or a notebook that builds a
+# relation per iteration must not accumulate their statistics forever.
+#
+# The "keyed on the object" argument rests on the lookup being by *identity*, and a
+# `WeakKeyDictionary` looks up by `==`. That is identity here because no source class defines
+# `__eq__` (`InMemorySource` is the only `resident` one and does not), so the default
+# identity comparison applies. A source that gave itself value equality would silently make
+# two relations share an entry — which for zone-map bounds is a wrong answer, not a slow plan.
+#
+# What it removes is quadratic in the wrong variable. The view is rebuilt on every `collect()`,
+# and building it costs one `ColumnStat` per column of the *source* — not per column the query
+# reads. On ClickBench's 105-column `hits` that is 105 objects per query, then re-digested by
+# the plan cache and re-derived by the estimator, for a query naming one column.
+_RESIDENT_SUBSET_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def build_estimator(sources: list[Source], hub: MetadataHub | None):
+    """A `CardinalityEstimator` configured exactly as the optimizer configures its own.
+
+    Anything in the conductor that wants to *reason* about a plan's size before executing
+    it — the adaptive gate, the common-subplan analysis — has to read the same numbers
+    Kyber will plan with, or it is deciding against a different query than the one that
+    runs. That means the same learned corrections, the same cardinality config, and the
+    same per-source statistics, which is three couplings and exactly the kind of thing
+    that drifts when it is spelled out twice.
+
+    Args:
+        sources: The plan's bound inputs.
+        hub: The metadata hub, or `None` for a cold estimator with no learned corrections.
+
+    Returns:
+        The estimator, ready to `estimate(node)`.
+    """
+    from batcher.config import active_config
+    from batcher.kyber import load_learned_stats
+    from batcher.kyber.cardinality import CardinalityEstimator
+
+    cfg = active_config()
+    learned = load_learned_stats(hub) if hub is not None else {}
+    return CardinalityEstimator(
+        sources,
+        learned,
+        cfg.optimizer.cardinality,
+        source_stats=collect_source_stats(sources, hub),
+    )
 
 
 def collect_source_stats(
@@ -136,12 +195,26 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
     statistics whatsoever and priced every row from a type prior: a `group_by` over a column
     of 2 KB documents was sized at the 36-byte string prior, 56x under, while the identical
     source under a `filter` reported the true width.
+
+    The result is memoized per (source instance, requested column set) — see
+    `_RESIDENT_SUBSET_CACHE` for why that is sound where the identity-keyed session cache is
+    not, and for the per-query cost it removes on a wide relation.
     """
     if not getattr(source, "resident", False):
         return None
     row_count = getattr(source, "row_count", None)
     if not callable(row_count):
         return None
+    # Per-instance memo (`_RESIDENT_SUBSET_CACHE`): the answer is a pure function of the
+    # source's fixed batches and the requested column set, so recomputing it once per
+    # `collect()` rebuilds an object identical to the one it just discarded.
+    memo_key = frozenset(need_columns)
+    try:
+        by_columns = _RESIDENT_SUBSET_CACHE.setdefault(source, {})
+    except TypeError:  # not weak-referenceable — compute it every time, as before
+        by_columns = None
+    if by_columns is not None and memo_key in by_columns:
+        return by_columns[memo_key]
     rc = row_count()
     if rc is None:
         return None
@@ -162,7 +235,10 @@ def _resident_subset_stats(source: Source, need_columns: set[str]):
             stat = cheap_stat(name)
             if stat is not None:
                 columns[name] = stat
-    return SourceStatistics(row_count=rc, columns=columns)
+    stats = SourceStatistics(row_count=rc, columns=columns)
+    if by_columns is not None:
+        by_columns[memo_key] = stats
+    return stats
 
 
 def column_bounds_needed(plan: LogicalPlan) -> set[str]:

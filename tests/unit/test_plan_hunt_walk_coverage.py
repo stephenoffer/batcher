@@ -84,3 +84,45 @@ def test_referenced_columns_descends_into_every_child_node() -> None:
         "referenced_columns does not descend into these node types (a pruning bug "
         f"waiting to happen): {sorted(missing)}. Add an arm in plan/expr_ir/walk.py."
     )
+
+
+# --- the memo is shared, so it must not be mutable ------------------------------------
+
+
+def test_computing_a_parent_does_not_pollute_a_childs_cached_columns() -> None:
+    """Asking a `CASE` what it reads must not change the answer for its `ELSE` branch.
+
+    `referenced_columns` memoizes onto the (immutable) expression node and hands the
+    *same* object back on every call. `_referenced_columns_impl` used to seed its
+    accumulator from a child's cached answer and then union the siblings into it in
+    place, so computing the parent silently rewrote the child's cache to the parent's
+    answer -- permanently, for the rest of the process.
+
+    The consequence was not a wrong estimate. `Project.__post_init__` validates its items
+    with this function, so a projection could be reported as reading a column it does not
+    reference; TPC-DS q80 failed to plan with ``projection 'id' references unknown
+    column(s) ['store_id']`` for exactly that reason.
+    """
+    branch, otherwise = bt.col("a"), bt.col("b")
+    case = bt.when(bt.col("c") > bt.lit(1)).then(branch).otherwise(otherwise)
+
+    assert referenced_columns(otherwise) == {"b"}
+    assert referenced_columns(case) == {"a", "b", "c"}
+    # The child is unchanged by the parent having been asked.
+    assert referenced_columns(otherwise) == {"b"}
+    assert referenced_columns(branch) == {"a"}
+
+
+def test_the_cached_column_set_cannot_be_mutated_by_a_caller() -> None:
+    """The memo is handed out by reference, so it is immutable rather than trusted.
+
+    The previous contract was a comment asserting that no caller mutates the returned
+    set. That was not true even inside the module that wrote it, and nothing checked it.
+    A `frozenset` makes the guarantee mechanical: an in-place update is an
+    `AttributeError` at the call site instead of silent corruption everywhere else.
+    """
+    cols = referenced_columns(bt.col("a") + bt.col("b"))
+    assert cols == {"a", "b"}
+    assert isinstance(cols, frozenset)
+    with pytest.raises(AttributeError):
+        cols.add("c")  # type: ignore[attr-defined]

@@ -8,7 +8,7 @@ Each page here covers the reader, the writer if there is one, how credentials wo
 source divides itself for parallel reads, and the failure mode that bites people in
 production.
 
-Every connector is built from the same four types (`Source`, `Sink`, `Split`, and the
+Every connector is built from the same four types ({py:class}`Source <batcher.io.Source>`, {py:class}`Sink <batcher.io.Sink>`, {py:class}`Split <batcher.io.Split>`, and the
 format registry). If yours is not on this list, that surface is public and documented in
 {doc}`custom connectors </user-guide/moving-data/custom-connectors>`.
 

@@ -62,6 +62,15 @@ __all__ = ["Cost", "CostCoefficients", "CostModel", "CostWeights"]
 # rows reaching it (pushing filters/sampling below the stage).
 _GPU_INFERENCE_FACTOR = 100.0
 
+# Seconds per row a *trivial* `map_batches` costs — the rate the `map_row` coefficient stands
+# for, and therefore the denominator that turns Core's measured seconds-per-row into the
+# relative units the rest of this model works in (`_measured_map_factor`). Sized from the
+# threshold `core.udf.strategy` already uses to call a `fn` "light": below `_LIGHT_FN_ROW_
+# SECONDS` (5e-8) the cost is dominated by the fixed per-call overhead rather than the work,
+# which is exactly the regime `map_row` was fitted in. Keeping the two in step means a `fn`
+# Core calls light is one this model prices at ~1.0.
+_MAP_ROW_SECONDS_PRIOR = 5e-8
+
 
 @dataclass(frozen=True, slots=True)
 class Cost:
@@ -104,6 +113,7 @@ class CostModel:
         workers: int = 1,
         source_io_factors: list[float] | None = None,
         hardware=None,
+        spill_device_factor: float | None = None,
     ) -> None:
         self._est = estimator
         self._c = coeffs or active_config().optimizer.cost_coeffs
@@ -127,10 +137,57 @@ class CostModel:
         # small workers, and a plan ranked against it believes an operator that will spill on
         # every worker does not. Combined with `min`, so a single-node run is unchanged.
         self._budget = memory_budget(getattr(hardware, "memory_bytes", 0) or 0)
+        # Last-level cache of the node the operators will actually run on. `0`/absent — a
+        # caller with no profile, or a cluster whose workers could not be probed — leaves this
+        # `None`, and `cache_factor` then probes this machine exactly as it always did.
+        self._cache_bytes: float | None = getattr(hardware, "l3_cache_bytes", 0) or None
+        # Device class of the volume this plan's operators will spill *to*. Resolved in this
+        # process it describes the driver, which on a cluster spills nothing; the spread across
+        # classes is roughly thirtyfold. `""` reads the local volume, as it always did.
+        self._storage_class: str = getattr(hardware, "storage_class", "") or ""
+        # What a spilled byte costs, when the caller has *measured* it rather than inferring it
+        # from the device class. `device_class` resolves a composite device to the slowest
+        # class beneath it and reads a transport string to call an NVMe namespace remote, so it
+        # errs toward pessimism by construction; `spill_rates.learned_spill_factor` falsifies
+        # that from the fleet's own spill history when the history supports it. Resolved once
+        # per model — it is a property of the machine, not of a node — and `None` (every caller
+        # without a hub) keeps the class lookup each term already does.
+        self._spill_factor: float | None = spill_device_factor
         self._cost_cache: dict[int, tuple[LogicalPlan, Cost]] = {}
 
     def _rows(self, node: LogicalPlan) -> float:
         return self._est.estimate(node).rows
+
+    def _measured_map_factor(self, node: MapBatches, default: float) -> float:
+        """`node`'s cost multiplier from the per-row cost Core measured for its `fn`.
+
+        A CPU `map_batches` was priced at exactly `map_row` — the trivial-column-map rate —
+        whatever the `fn` did, so a stage running a hundred microseconds a row was the
+        *cheapest* node in its plan and Kyber had no reason to push a selective filter below
+        it. The accelerator branch above exists to produce precisely that rewrite, and every
+        expensive-but-CPU stage was excluded from it.
+
+        Core already times the `fn` on a sample to size its batches
+        (`core.udf.strategy._fn_row_seconds`) and now records it in neutral
+        `metadata.udf_stats`; this converts that measurement into the same relative units the
+        rest of the model works in, by comparing it against the per-row cost the coefficients
+        already assign a map.
+
+        Two bounds, both deliberate. The factor never drops **below** `default`: a UDF
+        measured cheaper than the prior is still an opaque Python call the engine cannot
+        fuse, and letting it price *under* a projection would start moving filters the wrong
+        way on the strength of one sample. And it is capped at the accelerator factor, so a
+        pathological measurement (a `fn` timed while the machine was thrashing, a first call
+        that paid an import) cannot make one node dominate a plan outright.
+
+        Returns `default` unchanged whenever nothing is measured — a lambda, a first run, a
+        cold hub — so this is inert until the loop has actually closed.
+        """
+        seconds = self._est.udf_row_seconds(node.fn)
+        if seconds is None or seconds <= 0.0:
+            return default
+        prior = _MAP_ROW_SECONDS_PRIOR
+        return max(default, min(_GPU_INFERENCE_FACTOR, seconds / prior))
 
     def expr_factor(self, node: LogicalPlan) -> float:
         """The per-row expression-cost multiplier for `node`'s own work.
@@ -195,6 +252,16 @@ class CostModel:
         which is the one SELECTION will pick. A non-inner join is not commutative and its
         build side is fixed, so it is priced as written.
 
+        **Both orientations go through `_hash_join_cost`**, so they are compared on the same
+        formula. They were not: the swap used to adjust `base.cpu` by a build/probe row
+        difference that omitted the probe's `cache_factor` while `base.cpu` included it, which
+        left the swapped estimate carrying a residue of the *as-written* build side's cache
+        residency and none of its own — and it left the `io` axis sized by a build side the
+        plan would not build, so a swap that removes a spill was still charged for it. The
+        choice between the two was made on that same partial arithmetic. Every one of those
+        errors scales with the build side's size, which is the quantity the term exists to
+        price.
+
         Args:
             node: The join to price.
 
@@ -204,16 +271,52 @@ class CostModel:
         base = self.op_cost(node)
         if node.join_type != "inner":
             return base
+        left = self._rows(node.left)
+        swapped = self._hash_join_cost(
+            build_rows=left,
+            build_bytes=self.row_bytes(node.left) * left,
+            probe_rows=self._rows(node.right),
+            out_rows=self._rows(node),
+        )
+        # `net` is a property of how much the operator moves across the fleet, which does not
+        # depend on which side holds the hash table, so it carries over rather than being
+        # recomputed.
+        swapped = replace(swapped, net=base.net)
+        return swapped if swapped.total() < base.total() else base
+
+    def _hash_join_cost(
+        self, build_rows: float, build_bytes: float, probe_rows: float, out_rows: float
+    ) -> Cost:
+        """A hash join's own local cost at one orientation, from the side that builds.
+
+        The closed form lives here rather than inline in `_local_cost` so the two
+        orientations `join_op_cost` chooses between are priced by the *same* function —
+        see that method for what went wrong while they were not.
+
+        Args:
+            build_rows: Rows of the side the hash table is built over.
+            build_bytes: Byte width of that side, which drives memory and spill.
+            probe_rows: Rows of the side streamed against the table.
+            out_rows: Rows the join emits.
+
+        Returns:
+            The join's cpu/mem/io cost, excluding its inputs and the `net` axis.
+        """
         c = self._c
-        left, right = self._rows(node.left), self._rows(node.right)
-        swapped_cpu = c.hash_build_row * left + c.hash_probe_row * right
-        as_written_cpu = c.hash_build_row * right + c.hash_probe_row * left
-        if swapped_cpu >= as_written_cpu:
-            return base
-        return replace(
-            base,
-            cpu=base.cpu - as_written_cpu + swapped_cpu,
-            mem=self.row_bytes(node.left) * left,
+        return Cost(
+            # Every probe row makes one random access into the build-side hash table, so the
+            # table's cache residency multiplies the probe term. This is the term that
+            # distinguishes the two orientations of a join between a tiny dimension and a huge
+            # fact table by more than their row counts, and it is what makes the enumerator
+            # prefer keeping intermediates small rather than merely keeping row counts down.
+            cpu=c.hash_build_row * build_rows
+            + c.hash_probe_row * probe_rows * cache_factor(build_bytes, self._cache_bytes)
+            + c.output_row * out_rows,
+            mem=build_bytes,
+            # A build side past the memory budget partitions to disk and reads both sides
+            # back — the grace-hash fallback. Costing it at zero made a plan that spills
+            # look identical to one that does not.
+            io=spill_io(build_bytes, self._budget, self._storage_class, self._spill_factor),
         )
 
     def op_cost(self, node: LogicalPlan) -> Cost:
@@ -304,6 +407,8 @@ class CostModel:
             factor = 1.0
             if node.num_gpus > 0 or getattr(node, "resources", ()):
                 factor = _GPU_INFERENCE_FACTOR * (1.0 + node.model_memory_gb)
+            else:
+                factor = self._measured_map_factor(node, factor)
             return Cost(cpu=c.map_row * out_rows * factor)
 
         if isinstance(node, Aggregate):
@@ -314,10 +419,10 @@ class CostModel:
             # aggregate are not the same operator, and only the second is memory-bound.
             state_bytes = self.row_bytes(node) * out_rows
             return Cost(
-                cpu=c.hash_build_row * in_rows * cache_factor(state_bytes)
+                cpu=c.hash_build_row * in_rows * cache_factor(state_bytes, self._cache_bytes)
                 + c.output_row * out_rows,
                 mem=state_bytes,
-                io=spill_io(state_bytes, self._budget),
+                io=spill_io(state_bytes, self._budget, self._storage_class, self._spill_factor),
             )
 
         if isinstance(node, Sort):
@@ -329,7 +434,7 @@ class CostModel:
                 mem=state_bytes,
                 # An out-of-core sort rewrites its runs once per merge pass, and the pass count
                 # grows only logarithmically in how far over budget it is.
-                io=merge_io(state_bytes, self._budget),
+                io=merge_io(state_bytes, self._budget, self._storage_class, self._spill_factor),
             )
 
         if isinstance(node, Join):
@@ -346,32 +451,21 @@ class CostModel:
             # than the right way. The width signal is real but the width *estimate* is not
             # yet good enough to rank on; it belongs here once intermediate widths are
             # measured rather than inferred. Recorded so it is not "fixed" again blind.
-            build_bytes = self.row_bytes(node.right) * build
-            # Every probe row makes one random access into the build-side hash table, so the
-            # table's cache residency multiplies the probe term. This is the term that
-            # distinguishes the two orientations of a join between a tiny dimension and a huge
-            # fact table by more than their row counts, and it is what makes the enumerator
-            # prefer keeping intermediates small rather than merely keeping row counts down.
-            probe_factor = cache_factor(build_bytes)
-            return Cost(
-                cpu=c.hash_build_row * build
-                + c.hash_probe_row * probe * probe_factor
-                + c.output_row * out_rows,
-                # Hash table is built over the right side, so its byte width drives mem.
-                mem=build_bytes,
-                # A build side past the memory budget partitions to disk and reads both sides
-                # back — the grace-hash fallback. Costing it at zero made a plan that spills
-                # look identical to one that does not.
-                io=spill_io(build_bytes, self._budget),
+            # Hash table is built over the right side, so its byte width drives mem and io.
+            return self._hash_join_cost(
+                build_rows=build,
+                build_bytes=self.row_bytes(node.right) * build,
+                probe_rows=probe,
+                out_rows=out_rows,
             )
 
         if isinstance(node, Distinct):
             in_rows = self._rows(node.input)
             state_bytes = self.row_bytes(node) * out_rows
             return Cost(
-                cpu=c.distinct_row * in_rows * cache_factor(state_bytes),
+                cpu=c.distinct_row * in_rows * cache_factor(state_bytes, self._cache_bytes),
                 mem=state_bytes,
-                io=spill_io(state_bytes, self._budget),
+                io=spill_io(state_bytes, self._budget, self._storage_class, self._spill_factor),
             )
 
         if isinstance(node, Window):
@@ -404,9 +498,10 @@ class CostModel:
             in_rows = sum(self._rows(i) for i in node.inputs)
             state_bytes = self.row_bytes(node) * out_rows
             return Cost(
-                cpu=c.union_row * in_rows + c.distinct_row * in_rows * cache_factor(state_bytes),
+                cpu=c.union_row * in_rows
+                + c.distinct_row * in_rows * cache_factor(state_bytes, self._cache_bytes),
                 mem=state_bytes,
-                io=spill_io(state_bytes, self._budget),
+                io=spill_io(state_bytes, self._budget, self._storage_class, self._spill_factor),
             )
 
         if isinstance(node, Limit):

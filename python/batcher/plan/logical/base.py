@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import ColumnNotFoundError, PlanError
@@ -21,7 +22,7 @@ from batcher.plan.expr_ir import referenced_columns as _referenced_columns
 if TYPE_CHECKING:
     from batcher.plan.schema import SchemaRef
 
-__all__ = ["LogicalPlan"]
+__all__ = ["LogicalPlan", "SortKeySpec"]
 
 # Sentinel distinguishing "not yet cached" from a cached `None` (an `available_schema`
 # that legitimately returns "unknown").
@@ -253,3 +254,21 @@ class LogicalPlan:
     def _check(self, expr: Expr) -> None:
         """Raise `PlanError` if `expr` references a column not produced by input."""
         _validate_refs(expr, available_column_set(self), what="expression")
+
+
+@dataclass(frozen=True, slots=True)
+class SortKeySpec:
+    """One ordering term: an expression and how it orders.
+
+    Lives here, in the neutral base, because three nodes in two sibling modules order rows
+    by it — `Sort` and `Distinct` in one, `Window` in the other — and both modules already
+    depend on this one. Its previous home next to `Sort` made `relational` import
+    `aggregate` while `aggregate` imports `relational`, which is a cycle.
+
+    `nulls_first` defaults to `False` to match SQL's `ORDER BY`, not arrow's `SortOptions`,
+    whose default is the opposite. The engine reads this flag rather than defaulting.
+    """
+
+    expr: Expr
+    descending: bool = False
+    nulls_first: bool = False

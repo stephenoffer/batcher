@@ -12,7 +12,7 @@ import itertools
 import pytest
 
 from batcher.plan.source_stats import SourceStatistics
-from batcher.plan.stats import ColumnStat, Provenance, RelStats, weakest
+from batcher.plan.stats import ColumnStat, Provenance, RelStats, SortOrder, weakest
 
 
 def test_provenance_order_exact_is_strongest():
@@ -65,7 +65,7 @@ def test_source_statistics_to_relstats_exact():
     )
     rs = ss.to_relstats(default_rows=1e12)
     assert rs.rows == 100 and rs.rows_exact
-    assert rs.sorted_by == ("x",)
+    assert rs.sorted_by == (SortOrder("x"),)
     assert rs.column("x").max == 99
 
 

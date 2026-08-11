@@ -311,3 +311,111 @@ def test_the_intra_node_tier_only_appears_at_the_real_width():
     dense = _dense(nodes=4, gpus=8)
     assert dense.locality_shares(dense.node_count, unit="cpu").intra_node == 0.0
     assert dense.locality_shares(dense.exchange_width("cpu"), unit="cpu").intra_node > 0.2
+
+
+# --- Sizing a fan-out against devices that will actually take work ----------------------------
+
+
+def test_a_device_fan_out_is_sized_to_schedulable_devices(monkeypatch):
+    """A board quarantined for uncorrectable ECC is one the scheduler will not place on, so a
+    fan-out sized to it asks for a width the cluster cannot satisfy and the placement group
+    pends. `total_gpus` is right for sizing a *shard* (what hardware the plan may meet) and
+    wrong for sizing a *fan-out* (what hardware will take work)."""
+    shape = ClusterShape(
+        nodes=(
+            NodeShape(node_id="a", cpu_cores=64, gpus=8, unhealthy_gpus=3),
+            NodeShape(node_id="b", cpu_cores=64, gpus=8),
+        )
+    )
+    assert shape.total_gpus == 16
+    assert shape.healthy_gpus == 13
+    assert shape.exchange_width("gpu") == 13
+    assert shape.exchange_width("cpu") == 128  # cores are unaffected
+
+
+def test_a_wholly_quarantined_fleet_reports_its_physical_width():
+    """Zero would be read as "unknown" rather than as "nothing schedulable", and the fleet
+    still has to run somewhere — the survivors-or-nothing rule the drain filter follows."""
+    shape = ClusterShape(nodes=(NodeShape(node_id="a", cpu_cores=8, gpus=4, unhealthy_gpus=4),))
+    assert shape.healthy_gpus == 0
+    assert shape.exchange_width("gpu") == 4
+
+
+def test_the_binding_worker_is_the_smallest_one():
+    shape = ClusterShape(
+        nodes=(
+            NodeShape(node_id="big", cpu_cores=64, memory_bytes=512 << 30),
+            NodeShape(node_id="small", cpu_cores=8, memory_bytes=32 << 30),
+            NodeShape(node_id="mute", cpu_cores=0, memory_bytes=0),  # unreported: not a zero
+        )
+    )
+    assert shape.binding_cpu_cores == 8
+    assert shape.binding_memory_bytes == 32 << 30
+
+
+def test_an_unreported_fleet_reports_unknown_not_zero():
+    assert ClusterShape().binding_cpu_cores == 0
+    assert ClusterShape().binding_memory_bytes == 0
+
+
+# --- A profile built from a shape must not contradict it --------------------------------------
+
+
+def test_unstated_fields_are_derived_from_the_fleet_shape():
+    """A caller that can read per-node topology but not the device-model labels — an unlabelled
+    on-prem fleet — passed `gpu_memory_bytes=0` and got a profile reporting NO VRAM for a
+    cluster whose shape recorded it node by node, so every VRAM-sized decision took its default
+    on a fleet that had, in the same object, said exactly how much it had."""
+    shape = ClusterShape(
+        nodes=(
+            NodeShape(
+                node_id="a", cpu_cores=32, memory_bytes=256 << 30, gpus=8, gpu_memory_bytes=80 << 30
+            ),
+            NodeShape(
+                node_id="b", cpu_cores=16, memory_bytes=64 << 30, gpus=4, gpu_memory_bytes=24 << 30
+            ),
+        )
+    )
+    hw = HardwareProfile.for_cluster(cpu_cores=0, memory_bytes=0, worker_count=2, cluster=shape)
+    assert hw.gpu_count == 12
+    assert hw.gpu_memory_bytes == 24 << 30  # the binding device, not the largest
+    assert hw.cpu_cores == 16
+    assert hw.memory_bytes == 64 << 30
+
+
+def test_a_measured_field_always_beats_the_derived_one():
+    """The caller measured the fleet directly; the shape may be partial. Derivation only ever
+    fills a stated unknown."""
+    shape = ClusterShape(nodes=(NodeShape(node_id="a", cpu_cores=32, gpus=8),))
+    hw = HardwareProfile.for_cluster(
+        cpu_cores=4, memory_bytes=8 << 30, worker_count=1, gpu_count=2, cluster=shape
+    )
+    assert (hw.cpu_cores, hw.memory_bytes, hw.gpu_count) == (4, 8 << 30, 2)
+
+
+def test_a_rack_label_is_only_compared_within_its_zone():
+    """Rack identifiers are namespaced per availability zone by every scheduler that emits
+    them, so two nodes in different zones both labelled `"rack-3"` are in different buildings.
+    Grouping them reported a cross-zone byte as rack-local — the largest single under-charge
+    the tier model can make, and it lands on the multi-AZ fleets where cross-zone traffic is
+    both slowest and separately billed."""
+    same_zone = ClusterShape(
+        nodes=(
+            NodeShape(node_id="a", cpu_cores=8, rack="rack-3", zone="us-east-1a"),
+            NodeShape(node_id="b", cpu_cores=8, rack="rack-3", zone="us-east-1a"),
+        )
+    )
+    split_zone = ClusterShape(
+        nodes=(
+            NodeShape(node_id="a", cpu_cores=8, rack="rack-3", zone="us-east-1a"),
+            NodeShape(node_id="b", cpu_cores=8, rack="rack-3", zone="us-east-1b"),
+        )
+    )
+    together = same_zone.locality_shares(16)
+    apart = split_zone.locality_shares(16)
+    # Genuinely one rack: half the exchange stays in it, so nothing is charged to the network.
+    assert together.intra_rack > 0.0
+    assert together.cross_rack == pytest.approx(0.0, abs=1e-9)
+    # Split across zones: the same label buys no adjacency, so the same traffic crosses.
+    assert apart.intra_rack == pytest.approx(0.0, abs=1e-9)
+    assert apart.cross_rack > 0.0

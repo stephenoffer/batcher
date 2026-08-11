@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from batcher.metadata.hardware_scope import scoped
 from batcher.metadata.hub import MetadataHub
 from batcher.metadata.smoothed import load_scalar, record_smoothed_scalar
+from batcher.plan.types import logical_bytes
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -90,6 +91,12 @@ def scanned_byte_count(
     misses the memo and is measured afresh, which is what makes this safe for a source whose
     contents move underneath it.
 
+    The read goes through `plan.types.logical_bytes` rather than `b.nbytes` directly. That is
+    the same exact figure on every layout `nbytes` can walk, and on the *view* layouts --
+    where `nbytes` raises rather than answering -- it falls back to the buffer size instead
+    of taking the query down. The paragraph above still holds for every other source: the
+    fallback is reached only where the exact figure does not exist at all.
+
     Args:
         identity: The source's stable identity, as `record_source_io` keys throughput on.
         projection: The columns this read requested, or None for all of them.
@@ -100,12 +107,12 @@ def scanned_byte_count(
         The summed `nbytes` of `batches`, 0 when the source has no stable identity to key on.
     """
     if not identity:
-        return sum(b.nbytes for b in batches)
+        return sum(logical_bytes(b) for b in batches)
     key = (identity, repr(projection), rows)
     hit = _BYTES_MEMO.get(key)
     if hit is not None:
         return hit
-    total = sum(b.nbytes for b in batches)
+    total = sum(logical_bytes(b) for b in batches)
     if len(_BYTES_MEMO) >= _BYTES_MEMO_MAX:
         _BYTES_MEMO.clear()
     _BYTES_MEMO[key] = total

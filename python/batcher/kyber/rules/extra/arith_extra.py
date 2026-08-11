@@ -62,9 +62,10 @@ from batcher.kyber.rule import Phase
 from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.arith_algebra import _is_int_lit
 from batcher.kyber.rules.extra.boolean_algebra import _key, _rewrite_node, _safe
+from batcher.kyber.rules.leaf_rewrite import EXPR_NODES
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit
 from batcher.plan.expr_ir.core import MathExpr
-from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
+from batcher.plan.logical import LogicalPlan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.types import infer_type
 
@@ -85,7 +86,6 @@ __all__ = [
 
 # Every node whose expressions these rules rewrite (each has a single `.input`, whose
 # schema types the expressions).
-_NODES = (Filter, Project, Aggregate, Sort, Window)
 
 _INT64_MIN = -(2**63)
 
@@ -101,6 +101,15 @@ _INT64_MIN = -(2**63)
 _IDEMPOTENT_MATH = frozenset({"abs", "sign", "floor", "ceil", "trunc", "round", "rint"})
 # The rounding family — each maps any float to an integral float (or NaN/±inf).
 _ROUNDING = frozenset({"floor", "ceil", "trunc", "round", "rint"})
+# The subset of `_ROUNDING` that the engine really does evaluate by promoting an Int64 to
+# Float64 first, so that over an integer the whole call collapses to that promotion.
+# **`round` is not one of them.** `bc_expr::eval::math::eval_math` special-cases
+# `(Round, Int64)` and returns the array *unchanged*, because DuckDB answers BIGINT for
+# `round(bigint)` and the f64 round-trip corrupts values above 2^53. Treating `round` as
+# promoting made this rule rewrite it to `cast(i, float64)`, which reintroduced exactly
+# that corruption at plan time: `round(2^53+1, 0)` came back as `9007199254740992.0`
+# against the engine's own `9007199254740993`, and the column changed from int64 to double.
+_ROUNDING_PROMOTES_INT = _ROUNDING - {"round"}
 # Unary math functions whose value over an *integer* literal is exactly computable here.
 _FOLDABLE_MATH = _IDEMPOTENT_MATH | {"sqrt"}
 # The bitwise logic ops (associative/commutative, and closed over i64). Each is also
@@ -158,7 +167,7 @@ def _abs_of_negation(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="abs_of_negation",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(MathExpr,),
     expr_ops=("abs",),
     expr_schema=_abs_of_negation,
@@ -191,7 +200,7 @@ def _collapse_idempotent(expr: Expr) -> Expr:
 @rule(
     name="collapse_idempotent_math_fn",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_collapse_idempotent,
     expr_matches=(MathExpr,),
 )
@@ -225,7 +234,7 @@ def _collapse_nested_rounding(expr: Expr) -> Expr:
 @rule(
     name="collapse_nested_rounding",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_collapse_nested_rounding,
     expr_matches=(MathExpr,),
 )
@@ -245,7 +254,11 @@ def collapse_nested_rounding(node: LogicalPlan, _ctx: OptimizerContext) -> Logic
 
 
 def _rounding_of_int(expr: Expr, schema: SchemaRef | None) -> Expr:
-    if isinstance(expr, MathExpr) and expr.fn in _ROUNDING and _is_int64(expr.input, schema):
+    if (
+        isinstance(expr, MathExpr)
+        and expr.fn in _ROUNDING_PROMOTES_INT
+        and _is_int64(expr.input, schema)
+    ):
         return Cast(expr.input, "float64")
     return expr
 
@@ -253,13 +266,13 @@ def _rounding_of_int(expr: Expr, schema: SchemaRef | None) -> Expr:
 @rule(
     name="rounding_of_int_is_cast",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_matches=(MathExpr,),
-    expr_ops=tuple(sorted(_ROUNDING)),
+    expr_ops=tuple(sorted(_ROUNDING_PROMOTES_INT)),
     expr_schema=_rounding_of_int,
 )
 def rounding_of_int_is_cast(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
-    """`floor(i) / ceil(i) / trunc(i) / round(i)` over an **Int64** expression → `cast(i,
+    """`floor(i) / ceil(i) / trunc(i) / rint(i)` over an **Int64** expression → `cast(i,
     float64)` — the cast the engine was going to do anyway, with the now-pointless math
     kernel removed.
 
@@ -270,6 +283,10 @@ def rounding_of_int_is_cast(node: LogicalPlan, _ctx: OptimizerContext) -> Logica
     own first step. The result stays Float64 (both the rounding functions and the cast
     produce it), and nulls propagate through the cast exactly as through the kernel. Fires
     only on a provably Int64 operand — over a float, rounding is real work.
+
+    **`round` is excluded**, because that premise is false for it alone: the engine returns
+    an Int64 `round(i)` unchanged rather than promoting, so the rewrite both retyped the
+    column double and corrupted every value past 2^53. See `_ROUNDING_PROMOTES_INT`.
     """
     return schema_rule(node, _rounding_of_int, carries=_CARRIES)
 
@@ -291,7 +308,14 @@ def _math_of_int(fn: str, value: int) -> Lit | None:
         # be correctly rounded, so Python's and Rust's agree bit-for-bit, over the same
         # int→f64 promotion (round-to-nearest-even in both).
         return None if value < 0 else Lit(math.sqrt(value))
-    # floor/ceil/trunc/round: the engine promotes the integer to f64 and applies the
+    if fn == "round":
+        # `round` alone keeps an integer an integer: `bc_expr` special-cases
+        # `(Round, Int64)` and hands the value back untouched, because DuckDB answers
+        # BIGINT here. Folding to `float(value)` retyped the column double *and* lost
+        # precision past 2^53 — `round(2^53+1)` folded to `9007199254740992.0` where the
+        # engine returns `9007199254740993`.
+        return Lit(value)
+    # floor/ceil/trunc/rint: the engine promotes the integer to f64 and applies the
     # function, which is the identity on the (integral) result — so the fold is the
     # promotion alone. `float(value)` rounds exactly as the engine's cast does.
     return Lit(float(value))
@@ -308,7 +332,7 @@ def _fold_math_lit(expr: Expr) -> Expr:
 @rule(
     name="fold_math_of_int_literal",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_fold_math_lit,
     expr_matches=(MathExpr,),
 )
@@ -346,7 +370,7 @@ def _fold_bitwise(expr: Expr) -> Expr:
 @rule(
     name="fold_bitwise_literals",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr=_fold_bitwise,
     expr_matches=(Binary,),
     expr_ops=tuple(sorted(_BITWISE_LOGIC)),
@@ -414,7 +438,7 @@ def _bit_or_self_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:
     return _self_bitwise(expr, schema, "bit_or")
 
 
-@rule(name="bit_or_zero", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_or_zero_leaf)
+@rule(name="bit_or_zero", phase=Phase.NORMALIZE, matches=EXPR_NODES, expr_schema=_bit_or_zero_leaf)
 def bit_or_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x | 0 → x` (and `0 | x → x`) for an Int64 `x`. Zero is OR's identity element in
     every bit position, and the kernel propagates nulls, so a null `x` is null on both
@@ -426,7 +450,9 @@ def bit_or_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None
     return schema_rule(node, _bit_or_zero_leaf, carries=_CARRIES)
 
 
-@rule(name="bit_xor_zero", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_xor_zero_leaf)
+@rule(
+    name="bit_xor_zero", phase=Phase.NORMALIZE, matches=EXPR_NODES, expr_schema=_bit_xor_zero_leaf
+)
 def bit_xor_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x ^ 0 → x` (and `0 ^ x → x`) for an Int64 `x`. XOR with an all-zero pattern flips
     no bit, and nulls propagate through the kernel, so the operand survives unchanged in
@@ -440,7 +466,7 @@ def bit_xor_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | Non
 @rule(
     name="bit_and_minus_one",
     phase=Phase.NORMALIZE,
-    matches=_NODES,
+    matches=EXPR_NODES,
     expr_schema=_bit_and_minus_one_leaf,
 )
 def bit_and_minus_one(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
@@ -452,7 +478,9 @@ def bit_and_minus_one(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan 
     return schema_rule(node, _bit_and_minus_one_leaf, carries=_CARRIES)
 
 
-@rule(name="shift_by_zero", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_shift_by_zero_leaf)
+@rule(
+    name="shift_by_zero", phase=Phase.NORMALIZE, matches=EXPR_NODES, expr_schema=_shift_by_zero_leaf
+)
 def shift_by_zero(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x << 0 → x` and `x >> 0 → x` for an Int64 `x`. A zero-bit shift moves nothing, in
     either direction and at either sign, and the kernel propagates nulls. Not commutative
@@ -474,7 +502,9 @@ def _self_bitwise(expr: Expr, schema: SchemaRef | None, op: str) -> Expr:
     return expr
 
 
-@rule(name="bit_and_self", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_and_self_leaf)
+@rule(
+    name="bit_and_self", phase=Phase.NORMALIZE, matches=EXPR_NODES, expr_schema=_bit_and_self_leaf
+)
 def bit_and_self(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x & x → x` for an Int64 `x`. Bitwise AND is idempotent in every bit position, and
     the kernel's null propagation agrees (`NULL & NULL` is NULL, which is what a lone
@@ -486,7 +516,7 @@ def bit_and_self(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | Non
     return schema_rule(node, _bit_and_self_leaf, carries=_CARRIES)
 
 
-@rule(name="bit_or_self", phase=Phase.NORMALIZE, matches=_NODES, expr_schema=_bit_or_self_leaf)
+@rule(name="bit_or_self", phase=Phase.NORMALIZE, matches=EXPR_NODES, expr_schema=_bit_or_self_leaf)
 def bit_or_self(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """`x | x → x` for an Int64 `x` — the dual of `bit_and_self`, with the same proof:
     bitwise OR is idempotent bit by bit, `NULL | NULL` is NULL, the dropped copy must be

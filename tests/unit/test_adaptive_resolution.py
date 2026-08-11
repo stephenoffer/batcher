@@ -4,7 +4,7 @@
 and it asks two independent questions:
 
 1. **Is the query big enough?** Re-opt trades a per-stage materialize and re-plan for a
-   better downstream join choice. Below `_ADAPTIVE_MIN_INPUT_ROWS` the one-shot plan is
+   better downstream join choice. Below `_ADAPTIVE_MIN_ROWS_PER_STAGE` the one-shot plan is
    already fast and the re-plan is pure overhead.
 2. **Would measuring actually change anything?** Only a join whose operand comes out of a
    pipeline breaker with a *guessed* size (`Provenance.DEFAULT`) can have its build-side or
@@ -48,7 +48,7 @@ def _fresh_hub():
 @pytest.fixture
 def any_size(monkeypatch):
     """Lower the size gate so the *confidence* gate is what the test measures."""
-    monkeypatch.setattr(adaptive_mod, "_ADAPTIVE_MIN_INPUT_ROWS", 1)
+    monkeypatch.setattr(adaptive_mod, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
 
 
 def _join_over_a_breaker():

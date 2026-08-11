@@ -155,6 +155,24 @@ pub fn segments_intersect(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> bool {
         || (o4 == Orientation::Collinear && on_segment(p2, q1, q2))
 }
 
+/// True when the two segments cross at a single point strictly interior to both.
+///
+/// All four orientations must be non-collinear: a collinear one means an endpoint of one
+/// segment sits on the other, which is a boundary contact rather than a transversal
+/// crossing. Deciding this from orientations alone keeps it exact — the crossing *point*
+/// is computed in floating point and generally lands on neither segment, so locating it
+/// afterwards with `on_segment` would report a crossing that is plainly there as absent.
+pub fn segments_cross_properly(p1: Coord, p2: Coord, q1: Coord, q2: Coord) -> bool {
+    let o1 = orientation(p1, p2, q1);
+    let o2 = orientation(p1, p2, q2);
+    let o3 = orientation(q1, q2, p1);
+    let o4 = orientation(q1, q2, p2);
+    if [o1, o2, o3, o4].contains(&Orientation::Collinear) {
+        return false;
+    }
+    o1 != o2 && o3 != o4
+}
+
 /// The intersection point of two segments, when they cross at exactly one point.
 ///
 /// `None` for parallel, collinear, or non-intersecting segments — the overlay code

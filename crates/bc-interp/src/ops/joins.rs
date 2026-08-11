@@ -108,9 +108,20 @@ fn map_range_op(op: bc_ir::RangeOp) -> join::RangeOp {
     }
 }
 
+/// Map the IR's ASOF direction tag onto the runtime enum. Kept beside the call rather
+/// than derived, so the wire vocabulary and the kernel's stay independently readable.
+fn map_asof_direction(d: bc_ir::AsofDirection) -> join::AsofDirection {
+    match d {
+        bc_ir::AsofDirection::Backward => join::AsofDirection::Backward,
+        bc_ir::AsofDirection::Forward => join::AsofDirection::Forward,
+        bc_ir::AsofDirection::Nearest => join::AsofDirection::Nearest,
+    }
+}
+
 /// ASOF (nearest-match) join: each left row matched to the right row whose `on` key
-/// is nearest in `direction` within its `by` group. A breaker (both sides fully
-/// materialized), left-style (every left row emitted; unmatched → null right cols).
+/// is nearest in `direction` within its `by` group, optionally capped by `tolerance`.
+/// A breaker (both sides fully materialized), left-style (every left row emitted;
+/// unmatched → null right cols).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn asof_join_batches(
     left: &RecordBatch,
@@ -119,7 +130,9 @@ pub(crate) fn asof_join_batches(
     right_on: &str,
     left_by: &[String],
     right_by: &[String],
-    backward: bool,
+    direction: bc_ir::AsofDirection,
+    tolerance: Option<f64>,
+    allow_exact_matches: bool,
     output: &[JoinOutputCol],
 ) -> Result<RecordBatch, InterpError> {
     let left_on_col = left
@@ -137,7 +150,11 @@ pub(crate) fn asof_join_batches(
         &right_on_col,
         &left_by_cols,
         &right_by_cols,
-        backward,
+        join::AsofSpec {
+            direction: map_asof_direction(direction),
+            tolerance,
+            allow_exact_matches,
+        },
     )?;
     gather_join_output(left, right, &idx, output)
 }

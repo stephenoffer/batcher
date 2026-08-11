@@ -123,7 +123,15 @@ def _native_accumulators(stats: Any) -> dict[str, _ColAcc]:
     Exists so both paths finish through the same `_finalize_columns`: provenance, NaN
     poisoning, and the distinct-count rule then have one implementation that neither path
     can drift away from.
+
+    The bounds table is indexed by *position* through a name map built once. Both
+    ``column_names`` and ``column(name)`` are linear in the table's width, so asking them
+    per column made this loop quadratic — which is invisible on a ten-column table and the
+    whole cost on a wide one: 512 columns spent 225 ms here against 18 ms in the native
+    footer walk it was reading the results of.
     """
+    bounds = stats.bounds
+    position = {name: i for i, name in enumerate(bounds.column_names)}
     acc: dict[str, _ColAcc] = {}
     for name, has_stats, null_count, null_known, nan_seen, distinct in stats.columns:
         entry = _ColAcc()
@@ -132,10 +140,11 @@ def _native_accumulators(stats: Any) -> dict[str, _ColAcc]:
         entry.null_known = null_known
         entry.nan_seen = nan_seen
         entry.distinct = distinct
-        if name in stats.bounds.column_names:
+        index = position.get(name)
+        if index is not None:
             # Row 0 is the global min and row 1 the global max, each still carrying the
             # column's own Arrow type — so this is a typed read-out, not a parse.
-            column = stats.bounds.column(name)
+            column = bounds.column(index)
             entry.min = column[0].as_py()
             entry.max = column[1].as_py()
         acc[name] = entry
@@ -350,10 +359,14 @@ def _finalize_columns(
     acc: dict[str, _ColAcc], schema: pa.Schema, *, single_row_group: bool
 ) -> dict[str, ColumnStat]:
     columns: dict[str, ColumnStat] = {}
+    # `schema.names` builds a fresh list of every field name on each access, so consulting
+    # it inside this loop is quadratic in the table's width — the same wide-table cost
+    # `_native_accumulators` documents. Resolve the types once instead.
+    field_types = {field.name: field.type for field in schema}
     for name, a in acc.items():
         if not a.has_stats:
             continue
-        arrow_type = schema.field(name).type if name in schema.names else None
+        arrow_type = field_types.get(name)
         exact_minmax = arrow_type is not None and is_exact_minmax_type(arrow_type)
         # Exact only for non-truncatable numeric/temporal min/max with known nulls
         # and no NaN poisoning (which would make the bound unordered).

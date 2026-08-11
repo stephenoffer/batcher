@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher._internal.logging import get_logger, log_kv
+from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.orchestration.sizing import (
     DEFAULT_PARTITIONS,
@@ -24,6 +24,7 @@ from batcher.api.orchestration.stages import execute_distributed, resolve_source
 from batcher.api.source_stats import collect_source_stats, column_bounds_needed
 from batcher.config import active_config, config_context
 from batcher.core.runtime import query_scope
+from batcher.metadata.hardware_scope import planning_for
 
 if TYPE_CHECKING:
     from batcher.core import ExecutionContext
@@ -34,6 +35,11 @@ if TYPE_CHECKING:
 __all__ = ["DEFAULT_PARTITIONS", "partitions_from_physical", "run_relational"]
 
 _log = get_logger("api.run")
+
+#: Sentinel for `_execute_in_memory(feedback=...)` meaning "use this context's hub". A plain
+#: `None` default cannot express it: `None` is the meaningful value the fast path passes to
+#: turn metric recording off, so the two would be indistinguishable.
+_HUB = object()
 
 
 def _phase(name: str, seconds: float) -> None:
@@ -212,7 +218,7 @@ def _with_grant(scope, grant):
             yield
 
 
-def _optimize(plan, sources, ctx, *, distributed: bool):
+def _optimize(plan, sources, ctx, *, hardware=None):
     """Collect source statistics, seed the learner, and run Kyber once.
 
     One optimizer run yields both the physical plan (for admission and costing) and the
@@ -238,10 +244,9 @@ def _optimize(plan, sources, ctx, *, distributed: bool):
     # No file footer carries a distinct count, so without this seeding a query's *first*
     # run orders its joins blind.
     seed_column_ndv(ctx.hub, sources, plan)
-    # The hardware Kyber plans for. Distributed runs plan against the cluster's *binding*
-    # worker (smallest cores and RAM), so a cache- or memory-sized threshold tracks the
-    # workers rather than a possibly-fat driver.
-    hardware = distributed_hardware() if distributed else None
+    # The hardware Kyber plans for, resolved once by the caller: it also keys the machine-
+    # scoped learned state (`planning_for`), and resolving it twice across an autoscale is
+    # how a read and a write come to disagree.
     result = kyber.optimize_full(
         plan, sources=sources, hub=ctx.hub, source_stats=source_stats, hardware=hardware
     )
@@ -286,10 +291,18 @@ def _admit(opt, decisions, ctx, *, distributed: bool):
     return rm, verdict, must_spill
 
 
-def _execute_in_memory(logical_opt, plan, opt, ctx, resolved):
-    """Run the plan through the local engine over already-resolved batches."""
+def _execute_in_memory(logical_opt, plan, opt, ctx, resolved, *, feedback=_HUB):
+    """Run the plan through the local engine over already-resolved batches.
+
+    `feedback` is the sink the engine's per-operator `ExecMetrics` are recorded into, and
+    defaults to the sentinel meaning "this context's hub" — the ordinary path, where Core
+    measuring is the point. `fast_path` passes `None` to turn the recording off, which is a
+    quarter of what that path has left to spend; see its module docstring for the trade.
+    """
     from batcher import core
 
+    if feedback is _HUB:
+        feedback = ctx.hub
     prof = ctx.profile
     # A bare `Scan` is already done: the reader decoded the files and applied the pushed
     # projection, so its batches *are* the result. Handing them back to the engine only to
@@ -308,10 +321,13 @@ def _execute_in_memory(logical_opt, plan, opt, ctx, resolved):
     # `ExecMetrics` the conductor's `QueryProfile` needs. An ordinary run takes the plain
     # path and skips even the small metrics serialization.
     if prof is not None:
-        batches, metric_ops = core.execute_local_metered(opt, resolved.batches, feedback=ctx.hub)
+        batches, metric_ops, usage = core.execute_local_metered(
+            opt, resolved.batches, feedback=feedback
+        )
         prof.metric_ops = metric_ops
+        prof.record_usage(usage)
     else:
-        batches = core.execute_local(opt, resolved.batches, feedback=ctx.hub)
+        batches = core.execute_local(opt, resolved.batches, feedback=feedback)
     return pa.Table.from_batches(
         batches,
         schema=batches[0].schema if batches else _empty_result_schema(plan, ctx.columns),
@@ -396,6 +412,11 @@ def _close_resident_free_loops(
         wall_ms=(time.perf_counter() - started) * 1000.0,
     )
     _record_flap_rate(ctx.hub, rm)
+    # The envelope's high-water mark, the spill volume and the cache's hit rate, onto the
+    # bus — read here for the same reason the flap rate is, and only here: at admission none
+    # of it has happened yet. Self-gating on whether anything is listening, so a process
+    # exporting no metrics does not pay for a reading nothing reads.
+    _publish_resource_gauges(rm)
 
 
 def _run_relational(
@@ -407,13 +428,43 @@ def _run_relational(
     materialize: bool = True,
 ) -> tuple[pa.Table | Source, list[BuildSideDecision]]:
     """The Kyber → Carbonite → Core body, run under the (possibly adapted) config."""
-    from batcher import kyber
     from batcher._internal.logging import ensure_configured
 
     ensure_configured()
     started = time.perf_counter()  # the join-strategy bandit's per-run reward clock
 
-    opt, logical_opt, decisions = _optimize(plan, sources, ctx, distributed=distributed)
+    # The hardware Kyber plans for. Distributed runs plan against the cluster's *binding*
+    # worker (smallest cores and RAM), so a cache- or memory-sized threshold tracks the
+    # workers rather than a possibly-fat driver.
+    #
+    # Resolved **here**, once, because it does two jobs: it sizes the plan, and it names the
+    # machine class every machine-unit learned value in this run is keyed by. The bandit's
+    # arm, the broadcast crossover and the build-side priors are all written after the run
+    # and read while planning the next one, and both halves run on this driver about work
+    # done on those workers. Keyed by the driver they name the wrong machine; keyed by two
+    # independent lookups they can disagree across an autoscale, which files a value under a
+    # key nothing ever reads. One resolution, one ambient scope, both halves inside it.
+    hardware = distributed_hardware() if distributed else None
+    with planning_for(getattr(hardware, "fingerprint", "") or ""):
+        return _run_relational_scoped(
+            plan, sources, ctx, hardware, started, distributed=distributed, materialize=materialize
+        )
+
+
+def _run_relational_scoped(
+    plan: LogicalPlan,
+    sources: list[Source],
+    ctx: ExecutionContext,
+    hardware,
+    started: float,
+    *,
+    distributed: bool,
+    materialize: bool,
+) -> tuple[pa.Table | Source, list[BuildSideDecision]]:
+    """The body of `_run_relational`, inside the machine-scoping context it opens."""
+    from batcher import kyber
+
+    opt, logical_opt, decisions = _optimize(plan, sources, ctx, hardware=hardware)
     if ctx.profile is not None:
         from batcher.api.terminal.profile import record_plan
 
@@ -483,10 +534,16 @@ def _run_relational(
     with rm.reserve(rm.estimated_bytes(opt)) as granted:
         if not granted:
             from batcher.dist.spill import spill_collect
+            from batcher.plan.profile.usage import UsageStopwatch
 
             parts = partitions_from_physical(opt) or DEFAULT_PARTITIONS
+            # As in `spill_to_disk`: this path runs unmetered engine dispatches, so the
+            # whole-phase reading is the only account of what it cost.
+            watch = UsageStopwatch()
             spilled = spill_collect(logical_opt, sources, parts)
             if spilled is not None:
+                if ctx.profile is not None:
+                    ctx.profile.record_usage(watch.finish())
                 _close_resident_free_loops(
                     plan,
                     logical_opt,
@@ -513,6 +570,14 @@ def _run_relational(
 
         ctx.profile.decisions.append(resource_decision(rm))
     return table, decisions
+
+
+def _publish_resource_gauges(rm: object) -> None:
+    """Publish Carbonite's reading to the event bus. Best-effort; never breaks a query."""
+    try:
+        rm.publish_stats()  # type: ignore[attr-defined]
+    except Exception as exc:  # pragma: no cover - telemetry must never fail a run
+        note_suppressed("api", "publish Carbonite resource gauges", exc)
 
 
 def _record_flap_rate(hub: object, rm: object) -> None:

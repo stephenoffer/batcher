@@ -56,6 +56,21 @@ impl JoinBuild {
 pub(crate) struct BuildCache {
     joins: HashMap<usize, Arc<JoinBuild>>,
     filters: runtime_filter::RuntimeFilters,
+    /// Cumulative materialized bytes of every build side in `joins`.
+    ///
+    /// Every side prepared into this cache stays resident until the query ends — that is the
+    /// point of prebuilding them — so the quantity that has to fit in the envelope is this
+    /// sum, not any one side. Each side is "small by construction" relative to the relation
+    /// it broadcasts, which is what made checking them one at a time look sufficient; a plan
+    /// with several joins then holds up to `joins.len() * budget` while no single check ever
+    /// fires, and the process is killed at exactly the point the handoff exists to prevent.
+    /// TPC-H q9 at sf100 is the shape that shows it: five build sides, an 82 GB envelope, and
+    /// a 184 GB machine.
+    ///
+    /// `bc-py` already draws this distinction one level up — its pool is process-wide
+    /// "(per-query pools would let N concurrent queries each hold `budget` and OOM)". This is
+    /// the same argument one level down, for N build sides inside a single query.
+    bytes: u64,
 }
 
 impl BuildCache {
@@ -63,11 +78,29 @@ impl BuildCache {
         Self {
             joins: HashMap::new(),
             filters: runtime_filter::RuntimeFilters::new(),
+            bytes: 0,
         }
     }
 
     fn insert(&mut self, key: usize, build: Arc<JoinBuild>) {
+        self.bytes += build.side.get_array_memory_size() as u64;
         self.joins.insert(key, build);
+    }
+
+    /// Stop if the build sides prepared so far have outgrown `budget` (`0` is unbounded).
+    ///
+    /// Returning here is the same handoff a breaker makes, and sound for the same reason: the
+    /// caller re-runs on the materializing executor, which spills, and the two are checked
+    /// against one sequential oracle — so this changes peak memory and speed, never the answer.
+    fn check_total(&self, budget: usize) -> Result<(), InterpError> {
+        if budget > 0 && self.bytes as usize > budget {
+            return Err(InterpError::MemoryBudgetExceeded {
+                needed: self.bytes as usize,
+                budget,
+                reason: "the streaming executor's join build sides do not spill",
+            });
+        }
+        Ok(())
     }
 
     /// The prepared build side for a `HashJoin` node, if it has one.
@@ -156,6 +189,10 @@ fn collect_builds(
         if let Ok(side) = ops::materialize(&batches) {
             let probe = make_probe(&side, right_keys, *join_type)?;
             cache.insert(node_key(plan), Arc::new(JoinBuild { side, probe }));
+            // After the insert, not before: the check is on what is *resident*, and this side
+            // is resident now. Declining before building it would be the thing the comment
+            // above rules out — refusing a plan on a fact that does not exist yet.
+            cache.check_total(budget)?;
         }
         return Ok(());
     }

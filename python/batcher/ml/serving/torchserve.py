@@ -25,6 +25,7 @@ def torchserve_client(
     input_columns: Sequence[str],
     output_columns: Sequence[str],
     timeout: float = 30.0,
+    retries: int = 3,
     tensor_encoding: str = "json",
     max_batch_size: int | None = None,
     pipeline_depth: int = 1,
@@ -49,6 +50,9 @@ def torchserve_client(
         input_columns: the columns sent to the handler, in order.
         output_columns: the result columns appended to each batch.
         timeout: per-request timeout in seconds.
+        retries: retry attempts, with jittered backoff, for a transient failure (a
+            restarting worker, a dropped connection, a 429 or 5xx). `triton_client` and
+            `http_client` both take one; only this wrapper hard-coded it.
         tensor_encoding: how tensor inputs are encoded. Defaults to ``"json"``, the
             nested-list shape a stock TorchServe handler expects. Pass ``"auto"`` for
             the compact binary envelope when your handler decodes it.
@@ -67,6 +71,7 @@ def torchserve_client(
         input_columns=input_columns,
         output_columns=output_columns,
         timeout=timeout,
+        retries=retries,
         tensor_encoding=tensor_encoding,
         max_batch_size=max_batch_size,
         pipeline_depth=pipeline_depth,

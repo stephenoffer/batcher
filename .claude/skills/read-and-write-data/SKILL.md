@@ -127,18 +127,33 @@ sort_by=, replace_where=, distributed=, num_workers=, **opts)` is the general fo
 belong to `manage-a-lakehouse-table`.
 
 **Save modes** (`mode=`, Spark `SaveMode` parity) — `"overwrite"` (default), `"error"`
-(raise if the path exists), `"ignore"` (skip, return an empty manifest), `"append"`.
+(raise if the path exists), `"ignore"` (skip, return an empty manifest), `"append"`, and
+`"overwrite_partitions"` (replace only the partitions the new data covers).
 
 ```python
 ds.write(p, mode="error")     # PlanError: path already exists
 ds.write(p, mode="ignore")    # returns a manifest with 0 files
 ds.write(p, mode="append")    # PlanError — append is delta/iceberg/hudi/snowflake only
+ds.write(p, mode="overwrite_partitions", partition_by=["dt"])  # other dt= dirs survive
 ```
+
+`overwrite_partitions` is Spark's `partitionOverwriteMode="dynamic"` and Hive's
+`INSERT OVERWRITE` (both spellings resolve to it). Reach for it on **any** reload of part
+of a partitioned table: `mode="overwrite"` there deletes every partition the new batch
+does not mention, silently and at full speed. It needs `partition_by`; on a transactional
+table use `replace_where` instead, which scopes the same intent inside one commit.
 
 `append` is refused on a file sink on purpose: a directory of part files has nothing to
 append *to* transactionally. An overwrite is a true replace — files a previous,
 differently-shaped write left behind are pruned after the commit, so a 5-file output
 overwritten by a 2-file one does not silently union the three stale files back in.
+
+**Knowing a write finished.** Per-file atomicity does not make a *directory* safe: a run
+that dies partway leaves valid files that read back silently short. A directory write ends
+by publishing an empty `_SUCCESS` marker, only once every shard is accounted for, and
+`bt.read(path, require_success=True)` refuses a directory that has none. Off by default —
+a directory Batcher did not write has no marker and is not thereby incomplete — so reach
+for it on a path *another* job produces.
 
 **Atomicity and the manifest.** Every write returns a `WriteManifest` (`io/manifest.py`) of
 `WrittenFile` records — `path`, `rows`, `bytes`, `partition_values`, and per-column
@@ -155,11 +170,22 @@ m.files[0].partition_values         # {'region': 'us'}
 ```
 
 **Layout knobs.** `partition_by=["region"]` writes Hive `region=us/` directories that a
-later `parquet_dataset` read prunes on — partition by a column you actually filter on, and
+later read prunes on (`bt.read.parquet(dir)` routes a Hive tree to the partition-aware
+reader by itself, so the partition columns come back). A key may be an **expression** with
+an `.alias(...)` — `partition_by=[bt.col("ts").dt.year().alias("year")]` — which is how a
+partition transform (Iceberg `days()`/`bucket()`) is spelled — partition by a column you actually filter on, and
 one with modest cardinality. `max_rows_per_file=` caps file size (4 rows at 2 → 2 files).
 `sort_by=[cols]` clusters rows before writing so each file's min/max bounds are tight and
 downstream zonemap/bloom skipping multiplies; bounded batch writes only.
 `ds.repartition(num_files=, target_size_mb=, by=)` supplies these as defaults.
+
+All three sizing knobs reach the **workers** on a distributed write (the layout travels and
+is resolved against each shard, since a streaming distributed write never materializes on
+the driver), and `max_rows_per_file` over a lazy source *streams*, rolling over to a new
+file as each fills — so capping file size no longer costs a full materialization. A
+partitioned write whose plan has a breaker cuts its shards by partition key, so it emits
+one file per partition rather than one per partition per worker; a breaker-free one cannot
+(nothing reaches the driver), and `sort_by=` the partition columns is the lever there.
 
 **`resume=True`** skips already-present (therefore fully committed) output files, so a job
 re-run after a crash or spot preemption finishes only the unwritten shards. It is
@@ -209,8 +235,11 @@ ds.collect().schema      # i: int64,  f: double                 ← what you act
 
 ## Error tolerance
 
-A corpus at scale always contains a truncated upload or a zero-byte object. `on_error=`
-(`io/base/_tolerance.py`) decides whether one bad file kills the read:
+Two failures look alike here and take **opposite** flags. Reaching for the wrong one is how
+a job silently returns a fraction of its corpus, so decide which you have before you type.
+
+**An unreadable file** — a truncated upload, a zero-byte object, a JPEG with no trailer.
+`on_error=` (`io/base/_tolerance.py`) decides whether one of them kills the read:
 
 ```python
 bt.read.json(d)                      # ArrowInvalid — the default, "raise", is all-or-nothing
@@ -219,12 +248,29 @@ bt.read.json(d, on_error="skip")     # {'a': [1]} — logs a WARNING, drops the 
 
 `"skip"` records every dropped path (`source.corrupt_files()`) so the loss is auditable
 rather than silent. It is explicit and not the default because dropping data is the right
-call across 10,000 files and the wrong one for the single file you just wrote.
+call across 10,000 files and the wrong one for the single file you just wrote. It covers
+the metadata probes too, including Parquet's footer `row_count()`.
 
-**Known gap:** `on_error="skip"` covers the *data* read but not Parquet's footer-based
-`row_count()`, which the autotuner calls. A corrupt Parquet file therefore still aborts the
-read with `ArrowInvalid` despite the policy. Other formats (JSON, CSV, images) skip
-correctly.
+**A malformed record inside a readable file** — a CSV row with a field the header lacks, an
+NDJSON line that is not JSON. `on_error` is the *wrong* flag: it drops the whole file, so
+one stray line discards every good row in it. `on_bad_lines=` (`io/base/_bad_rows.py`)
+drops the record instead:
+
+```python
+bt.read.csv(p,  on_bad_lines="skip")   # drop it silently, counted as malformed_rows_total
+bt.read.json(p, on_bad_lines="warn")   # drop it and log the offending text
+bt.read.csv(p)                         # "error" — the default, and Spark's FAILFAST
+```
+
+Both readers carry the flag into byte-range splits, so a distributed read returns what the
+single-node read returns. Dropped records are counted on the event bus (`events.MALFORMED`)
+and exported as `malformed_rows_total`, kept apart from `skipped_total`, which counts whole
+files — a total mixing rows with files answers neither question.
+
+**Neither flag touches a value that will not convert** (an `"N/A"` in a column inference
+typed `int64`). That is inference having been shown too little, and its fix is `schema=`.
+`on_bad_lines` deliberately refuses to delete such a record, because dropping it removes the
+rows that were about to tell you the type is wrong.
 
 ## Checklist
 
@@ -238,6 +284,8 @@ correctly.
 - [ ] `resume=True` only on a deterministic (breaker-free) plan.
 - [ ] `schema_mode="union"` whenever files were written across schema changes.
 - [ ] `on_error="skip"` on a large multi-file corpus — and its skipped list is inspected.
+- [ ] `on_bad_lines="skip"` where the *records* are untrusted (a CSV/NDJSON export from a
+      producer you do not control) — `on_error` is not a substitute and costs the file.
 - [ ] Credentials come from the environment, never hardcoded in a path.
 
 ## See also

@@ -56,6 +56,12 @@ __all__ = [
 #: two. A host runs one vendor, so consulting all three is safe and the first one set wins.
 VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
 
+#: Whole values of a visibility variable that mean "no devices at all", distinct from a device
+#: list this code merely failed to parse. Kept in step with `_internal.accelerators._NO_DEVICES`,
+#: which applies the same rule to the inventory; the two answer for different callers (this one
+#: pins and sizes, that one enumerates) and both took the whole node on a `-1`.
+_NO_DEVICES = frozenset({"", "-1", "none", "void"})
+
 #: The variable that decides how the CUDA runtime *numbers* devices.
 DEVICE_ORDER_ENV = "CUDA_DEVICE_ORDER"
 
@@ -338,8 +344,17 @@ def _resolve(raw: str, telemetry) -> tuple[int, ...]:
     host: that is a value this code does not understand rather than a device list it disagrees
     with, and the conservative reading of "I cannot tell which device is mine" is the one every
     caller already handles.
+
+    **Except when the value is an explicit "no devices".** `-1` is CUDA's own documented way of
+    saying so, and it is what a framework or a CI script writes to keep a run off the GPU. It
+    is not a digit, so it resolved to nothing — and "nothing resolved" then took the
+    whole-host fallback above. So a process explicitly denied every device was told it owned
+    all eight of them, and the pool sized itself, attributed telemetry, and picked a NUMA
+    affinity accordingly. The truncation rule already handles `-1` correctly *anywhere but
+    first* (`"0,-1,1"` yields device 0); only the leading position hit the fallback, which is
+    the position anything disabling the GPU actually writes.
     """
-    if not raw:
+    if not raw or raw.strip().lower() in _NO_DEVICES:
         return ()
     by_uuid = {t.uuid: t.index for t in telemetry if t.uuid}
     count = len(telemetry)

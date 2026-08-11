@@ -6,6 +6,7 @@ creating an import cycle through the translator class.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from sqlglot import expressions as exp
@@ -34,6 +35,51 @@ def _columns_selector(node) -> Any:
     )
 
 
+def _row_window(limit, offset) -> tuple[int, int]:
+    """The ``(count, skip)`` a ``LIMIT``/``OFFSET``/``FETCH`` clause pair asks for.
+
+    ANSI SQL spells the row cap ``FETCH FIRST n ROWS ONLY``; sqlglot parses that into an
+    `exp.Fetch` (holding ``count``) rather than an `exp.Limit` (holding ``expression``),
+    and both land in the same ``limit`` slot. Reading only the `Limit` shape crashed the
+    ANSI spelling with ``AttributeError: 'NoneType' object has no attribute 'this'`` —
+    an internal error for standard SQL — so both node shapes are read here, in one place
+    shared by the SELECT and set-operation paths that each used to carry a copy.
+
+    Args:
+        limit: The ``limit`` arg — an `exp.Limit`, an `exp.Fetch`, or None.
+        offset: The ``offset`` arg — an `exp.Offset` or None.
+
+    Returns:
+        The row count to keep (``sys.maxsize`` for "all remaining", which is what a bare
+        ``OFFSET`` asks for) and the number of rows to skip.
+    """
+    skip = int(offset.expression.this) if offset is not None else 0
+    if limit is None:
+        return sys.maxsize, skip
+    # PERCENT takes a fraction of a cardinality nothing has measured yet, and WITH TIES
+    # keeps an unbounded number of peers of the last row. Neither is `Dataset.limit`, and
+    # both modify a `LIMIT` as well as a `FETCH`. Dropping the modifier and applying the
+    # bare row cap is a silent wrong answer: `LIMIT 20 PERCENT` over five rows returned
+    # all five where DuckDB returns one. Reject instead.
+    options = limit.args.get("limit_options")
+    if options is not None:
+        for flag, name in (("percent", "PERCENT"), ("with_ties", "WITH TIES")):
+            if options.args.get(flag):
+                raise NotImplementedError(
+                    f"{name} row limits are not supported; use a plain row count "
+                    "(LIMIT n / FETCH FIRST n ROWS ONLY)"
+                )
+    if isinstance(limit, exp.Fetch):
+        count = limit.args.get("count")
+        # `FETCH FIRST ROW ONLY` omits the count, and sqlglot leaves the bare `ROW`
+        # keyword in the slot as an Identifier rather than a number. Standard SQL
+        # defaults an omitted count to one.
+        if not isinstance(count, exp.Literal):
+            return 1, skip
+        return int(count.this), skip
+    return int(limit.expression.this), skip
+
+
 def _positional(projections, literal, clause: str):
     """Resolve a 1-based positional reference (`ORDER BY 2`) to its SELECT item."""
     idx = int(literal.this)
@@ -45,6 +91,28 @@ def _positional(projections, literal, clause: str):
     return projections[idx - 1]
 
 
+def _is_star(p) -> bool:
+    """Is this SELECT item a `*` or a qualified `t.*`?"""
+    return isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))
+
+
+def _positional_output(output: list[str], literal, clause: str) -> str:
+    """Resolve a 1-based positional reference to the n-th *output* column name.
+
+    The counterpart to :func:`_positional` for a SELECT list carrying a star. A star has no
+    single AST item a position can name, and — the part that is easy to miss — it also
+    *shifts* every position after it, so counting select-list items is wrong for the whole
+    tail of the list rather than only for the star itself. The projected output names are
+    the one enumeration that matches what SQL means by "the n-th column".
+    """
+    idx = int(literal.this)
+    if not 1 <= idx <= len(output):
+        raise PlanError(
+            f"{clause} position {idx} is out of range: the query projects {len(output)} column(s)"
+        )
+    return output[idx - 1]
+
+
 def _unwrap_alias(p):
     return p.this if isinstance(p, exp.Alias) else p
 
@@ -52,8 +120,15 @@ def _unwrap_alias(p):
 def _alias_of(p) -> str:
     if isinstance(p, exp.Alias):
         return p.alias
-    if isinstance(p, exp.Column):
-        return p.name
+    # Parentheses around a bare column are grouping, not an expression, so the output name
+    # is the column's. `SELECT DISTINCT(x)` parses as `DISTINCT (x)` and is the common way
+    # to hit this (TPC-DS q41), which was naming its one output column `(i_product_name)`
+    # — enough for the query's own `ORDER BY i_product_name` to fail to resolve.
+    bare = p
+    while isinstance(bare, exp.Paren):
+        bare = bare.this
+    if isinstance(bare, exp.Column):
+        return bare.name
     # No explicit `AS`: derive the output name from the expression, matching the
     # convention of the reference engines (DuckDB/Polars) so a column the user did not
     # alias lines up across engines — `sum(l_quantity)`, `count_star()` — rather than a
@@ -84,6 +159,65 @@ def _join_and(preds):
     for p in preds[1:]:
         out = exp.And(this=out, expression=p)
     return out
+
+
+def _split_or(pred) -> list:
+    """Flatten a disjunction (and parentheses) into its top-level alternatives."""
+    out: list = []
+    stack = [pred]
+    while stack:
+        p = stack.pop()
+        if isinstance(p, exp.Or):
+            stack.extend((p.expression, p.this))
+        elif isinstance(p, exp.Paren):
+            stack.append(p.this)
+        else:
+            out.append(p)
+    return out
+
+
+def _factor_common_conjuncts(pred):
+    """``(C AND A) OR (C AND B)`` → ``C AND (A OR B)``, for a conjunct shared by every arm.
+
+    Distribution is what hides a correlation from every rewrite in the `subquery` package:
+    they all look for the correlating equality among the *top-level conjuncts* of a
+    subquery's WHERE, and a query that repeats it inside each arm of an `OR` has no
+    top-level conjuncts at all. TPC-DS q41 is exactly that — the same
+    ``i_manufact = i1.i_manufact`` in both arms of a two-arm disjunction — and it was
+    refused as an unsupported correlated subquery.
+
+    The factoring is a boolean identity, so it is safe whether or not it enables anything,
+    and conjuncts are matched by SQL text: an arm repeating a *differently spelled* but
+    equivalent predicate simply is not factored, which costs a rewrite rather than
+    correctness.
+
+    Args:
+        pred: A predicate tree.
+
+    Returns:
+        The factored predicate, or `pred` itself when no conjunct is shared by every arm.
+    """
+    arms = _split_or(pred)
+    if len(arms) < 2:
+        return pred
+    per_arm = [_split_and(a) for a in arms]
+    later = [{c.sql() for c in group} for group in per_arm[1:]]
+    common = [c for c in per_arm[0] if all(c.sql() in seen for seen in later)]
+    if not common:
+        return pred
+    shared = {c.sql() for c in common}
+    remainders = []
+    for group in per_arm:
+        rest = [c.copy() for c in group if c.sql() not in shared]
+        if not rest:
+            # This arm is nothing but the shared part, so it subsumes every other arm and
+            # the whole disjunction reduces to it.
+            return _join_and([c.copy() for c in common])
+        remainders.append(_join_and(rest))
+    alternatives = remainders[0]
+    for r in remainders[1:]:
+        alternatives = exp.Or(this=alternatives, expression=r)
+    return _join_and([*(c.copy() for c in common), exp.Paren(this=alternatives)])
 
 
 def _within_group_to_agg(node):
@@ -186,9 +320,8 @@ def _source_columns(tr, node, depth: int = 0) -> list[str] | None:
         # `SELECT *` / `SELECT x.*` — expand from the inner FROM. TPC-DS q44 needs this:
         # its ranked relations are `(SELECT * FROM (SELECT item_sk, ... rnk FROM …) V11 …)`,
         # so the colliding `rnk` is two levels down and invisible to the projection list.
-        star = isinstance(p, exp.Star)
         qualified_star = isinstance(p, exp.Column) and isinstance(p.this, exp.Star)
-        if star or qualified_star:
+        if _is_star(p):
             want = p.table if qualified_star else None
             for s in inner_sources:
                 if want and (s.alias or getattr(s, "name", None)) != want:
