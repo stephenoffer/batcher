@@ -166,9 +166,40 @@ q77's hit rate from zero to roughly half. The rest of the flap is not noise arou
 the shipped defaults over the last window of feedback. A cost model that swings by an order of
 magnitude on unchanged data is the defect, and it is upstream of the cache.
 
+### h2o-groupby is a storage gap, not a string-key gap — measured against both bars
+
+This file has attributed h2o-groupby to "string-keyed group-by" and the `StringView` axis.
+The same five questions, timed against DuckDB on its **native compressed store** and against
+DuckDB on the **same Arrow table Batcher reads**:
+
+| question | batcher | duckdb native | duckdb arrow | b/native | b/arrow |
+|---|---:|---:|---:|---:|---:|
+| q1 `sum(v1) by id1` | 17.9 ms | 10.1 ms | 249.4 ms | 1.77x | **0.07x** |
+| q2 `sum(v1) by id1, id2` | 50.3 ms | 18.0 ms | 519.6 ms | 2.79x | **0.10x** |
+| q3 `sum(v1), avg(v3) by id3` | 58.8 ms | 43.2 ms | 488.2 ms | 1.36x | **0.12x** |
+| q4 `avg(v1:v3) by id4` | 9.7 ms | 4.1 ms | 131.7 ms | 2.34x | **0.07x** |
+| q9 `corr by id2, id4` | 64.7 ms | 26.6 ms | 480.3 ms | 2.43x | **0.13x** |
+
+Batcher is **7 to 14 times faster** than DuckDB reading the identical bytes, and 1.4 to 2.8
+times slower than DuckDB reading its own. The whole of the deficit is what the two engines
+read, and q4 is the clearest case because it has no string in it at all: `id4`, `v1` and `v2`
+are `int32` in the generated table, which the FFI boundary normalizes to `Int64`, while
+DuckDB keeps them narrow *and* compressed. Batcher moves ~320 MB at ~33 GB/s; DuckDB moves
+perhaps an eighth of that, more slowly per byte, and wins.
+
+Two things follow. **The string-key story does not survive**: the single-key path already
+packs a `<= 7`-byte key into a `u64` and routes it to `int_group_ids`' dense direct map (h2o's
+`id001` is five bytes), and the two-key path already packs the pair into a `u128` — so q1 and
+q2 are on the specialized paths, not on a byte-slice hash. And **narrowing the boundary is not
+the cheap half of the fix either**: the same relation built as `int64` up front measured
+8.66 ms against the `int32` copy's 9.18 ms, because `InMemorySource` already widens lazily and
+memoizes, so the cast is paid once and the 6% is all that is left of it at query time. Reading
+narrow *through* the engine means narrow kernels, which is invariant #6's territory and a
+project, not a patch.
+
 **tpcds-q17 is genuinely execution-bound** (393 ms of its 408 ms in the engine) and is the one
-query of the four the standing join-order explanation does fit. **h2o-groupby is untouched**
-at 1.250x; its two worst questions group by two string keys and by a correlation.
+query of the four the standing join-order explanation does fit. **h2o-groupby is untouched** at 1.250x, and the section
+above says what that number is made of.
 
 Gated: differential vs DuckDB **10,828 passed / 0 failed**, unit **17,549 passed**,
 `cargo test --workspace --exclude bc-py` green, clippy clean, ruff clean, `lint-layers` 6/6,
