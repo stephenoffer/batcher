@@ -29,11 +29,20 @@ if TYPE_CHECKING:
 
 __all__ = ["enrich_in_memory"]
 
-# facet name → (the source accessor that computes it, the `ColumnStat` field it fills)
+# facet name → (the source accessor that computes it, the `ColumnStat` field it fills, and
+# the field carrying *that facet's own* provenance).
+#
+# The third element is what makes the enrichment reach the answer. A `ColumnStat`'s
+# `provenance` describes the whole bundle, and the conductor pre-collects the bundle with
+# only the columns a `MIN`/`MAX` needs — so a `SUM`'s bundle arrives tagged `DEFAULT` with
+# no bounds in it. Attaching an exactly-computed total to that bundle used to leave the
+# bundle's tag alone, and the EXACT-gated answerer then refused the very statistic this
+# module had just computed. Tagging the facet says the true thing: this one number came
+# from the relation's actual values, whatever the bundle around it is worth.
 _FACETS = {
-    "ndv": ("column_ndv", "ndv"),
-    "mean": ("column_mean", "mean"),
-    "total": ("column_sum", "total_sum"),
+    "ndv": ("column_ndv", "ndv", "ndv_provenance"),
+    "mean": ("column_mean", "mean", "moments_provenance"),
+    "total": ("column_sum", "total_sum", "moments_provenance"),
 }
 
 
@@ -80,9 +89,9 @@ def enrich_in_memory(
     columns = dict(declared.columns)
     changed = False
     for facet, names in wanted.items():
-        accessor, field = _FACETS[facet]
+        accessor, field, tag = _FACETS[facet]
         for name in names:
-            if _fill(source, columns, name, accessor, field):
+            if _fill(source, columns, name, accessor, field, tag):
                 changed = True
     if not changed:
         return stats
@@ -90,12 +99,21 @@ def enrich_in_memory(
 
 
 def _fill(
-    source: Any, columns: dict[str, ColumnStat], name: str, accessor: str, field: str
+    source: Any,
+    columns: dict[str, ColumnStat],
+    name: str,
+    accessor: str,
+    field: str,
+    tag: str,
 ) -> bool:
     """Attach one facet of one column, returning whether anything changed.
 
     The facet is marked `Provenance.EXACT` because the source computed it from the real
     values of an immutable relation — the same standard a Parquet footer's null count meets.
+    `tag` names the facet's *own* provenance field, and setting it is what carries that
+    standard onto a column whose surrounding bundle is weaker: the conductor collects bounds
+    only for the columns a `MIN`/`MAX` reads, so a `SUM`'s bundle is `DEFAULT` and an exact
+    total attached to it would otherwise be refused along with the bounds it sits beside.
     """
     existing = columns.get(name)
     if existing is not None and getattr(existing, field) is not None:
@@ -103,8 +121,9 @@ def _fill(
     value = getattr(source, accessor)(name)
     if value is None:
         return False  # this column's type has no such statistic — fall back to execution
+    facets = {field: value, tag: Provenance.EXACT}
     if existing is None:
-        columns[name] = ColumnStat(**{field: value}, provenance=Provenance.EXACT)
+        columns[name] = ColumnStat(**facets, provenance=Provenance.EXACT)
     else:
-        columns[name] = dataclasses.replace(existing, **{field: value})
+        columns[name] = dataclasses.replace(existing, **facets)
     return True

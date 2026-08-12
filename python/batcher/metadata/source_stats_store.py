@@ -124,7 +124,12 @@ def _encode_column(col: ColumnStat) -> dict[str, Any]:
     # `null_count_is_exact` fall back to the *bundle* tag on reload — silently promoting a
     # sketch to EXACT (a wrong `count_distinct`) or demoting an exact count to a rescan. So
     # they must round-trip alongside the bundle provenance the values were stored with.
-    for field in ("ndv_provenance", "null_count_provenance"):
+    # `moments_provenance` (the tag on `total_sum`/`mean`) is here for the same reason and
+    # in the same direction as `null_count_provenance`: a sum an in-memory source computed
+    # over its own values is exact while the bundle around it holds no bounds at all, so
+    # dropping the tag on reload demotes the sum to a rescan of a relation whose total is
+    # already on file.
+    for field in ("ndv_provenance", "null_count_provenance", "moments_provenance"):
         sub = getattr(col, field)
         if sub is not None:
             out[field] = sub.name
@@ -160,6 +165,7 @@ def _decode_column(blob: dict[str, Any]) -> ColumnStat:
         bloom = base64.b64decode(bloom_b64)
     ndv_prov = blob.get("ndv_provenance")
     null_prov = blob.get("null_count_provenance")
+    moments_prov = blob.get("moments_provenance")
     return ColumnStat(
         min=blob.get("min"),
         max=blob.get("max"),
@@ -171,4 +177,5 @@ def _decode_column(blob: dict[str, Any]) -> ColumnStat:
         bloom=bloom,
         ndv_provenance=Provenance[ndv_prov] if isinstance(ndv_prov, str) else None,
         null_count_provenance=Provenance[null_prov] if isinstance(null_prov, str) else None,
+        moments_provenance=Provenance[moments_prov] if isinstance(moments_prov, str) else None,
     )

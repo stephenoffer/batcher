@@ -78,3 +78,47 @@ def test_mean_and_bundle_provenance_roundtrip() -> None:
     # A bundle-only provenance (no per-field override) still falls back correctly.
     assert rc.ndv_provenance is None
     assert rc.ndv_is_exact is True
+
+
+def test_exact_moments_beside_boundless_stats_stay_exact() -> None:
+    """The third sub-tag, in the same direction as the null count's.
+
+    An immutable in-memory relation computes its own `sum`/`mean` on demand, and the
+    conductor collects the surrounding bundle only for the columns a `MIN`/`MAX` reads — so
+    a `SUM`'s bundle holds no bounds and is tagged `DEFAULT` while the total inside it is
+    exact. Dropping `moments_provenance` on reload sends `SELECT sum(x) FROM t` back to a
+    full scan of a relation whose total is already on file.
+    """
+    hub = _hub()
+    col = ColumnStat(
+        null_count=0,
+        total_sum=4950.0,
+        mean=49.5,
+        provenance=Provenance.DEFAULT,
+        moments_provenance=Provenance.EXACT,
+    )
+    assert col.moments_are_exact is True  # baseline before persistence
+    save_source_stats(hub, "src://moments", SourceStatistics(row_count=100, columns={"c": col}))
+    got = load_source_stats(hub, "src://moments")
+    assert got is not None
+    rc = got.columns["c"]
+    assert rc.moments_provenance is Provenance.EXACT
+    assert rc.moments_are_exact is True
+    assert rc.total_sum == 4950.0
+    assert rc.mean == 49.5
+
+
+def test_moments_without_a_subtag_follow_the_bundle() -> None:
+    """No sub-tag means "the bundle speaks for it" — the pre-existing contract, unchanged.
+
+    A catalog-recorded total on an EXACT bundle stays answerable, and one on a DEFAULT
+    bundle stays refused, exactly as before the sub-tag existed.
+    """
+    for bundle, expected in ((Provenance.EXACT, True), (Provenance.DEFAULT, False)):
+        hub = _hub()
+        col = ColumnStat(total_sum=1.0, mean=1.0, provenance=bundle)
+        save_source_stats(hub, "src://plain", SourceStatistics(row_count=1, columns={"c": col}))
+        got = load_source_stats(hub, "src://plain")
+        assert got is not None
+        assert got.columns["c"].moments_provenance is None
+        assert got.columns["c"].moments_are_exact is expected

@@ -88,7 +88,18 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats, plan=None):
     if col_name is None:
         return None
     stat = child.columns.get(col_name)
-    if stat is None or stat.provenance is not Provenance.EXACT:
+    if stat is None:
+        return None
+    # The bundle's tag gates only the facets *derived from the extremes* — `min`, `max`, and
+    # the boolean folds below, which read `min`/`max` directly. `sum`, `mean` and
+    # `count_distinct` each carry their own tag and check it themselves, for the reason
+    # `count` above already returns before reaching here: a bundle is `DEFAULT` whenever any
+    # one of its facets is untrustworthy, and gating every facet on that refuses exact
+    # statistics for sitting beside inexact ones. It did: the conductor collects bounds only
+    # for the columns a `MIN`/`MAX` reads, so `SELECT sum(x) FROM t` arrived with a `DEFAULT`
+    # bundle and an exactly-computed total inside it, and executed anyway.
+    reads_extremes = func in ("min", "max") or func in _BOOL_AND_FUNCS or func in _BOOL_OR_FUNCS
+    if reads_extremes and stat.provenance is not Provenance.EXACT:
         return None
     if func == "min":
         # Sound for every type, floats included: NaN is the *greatest* value in the total
@@ -112,15 +123,20 @@ def _derive_scalar_aggregate(func: str, input_expr, child: RelStats, plan=None):
             return None
         return stat.max
     if func == "sum":
-        # An exact recorded total (a catalog/format `total_sum`). SQL `sum` over a
-        # group with no non-null value is NULL, so a provably-empty relation is not
-        # derivable — return None to fall back rather than claim a spurious 0.
+        # An exact total — a catalog/format `total_sum`, or one an immutable in-memory
+        # relation computed over its own values. SQL `sum` over a group with no non-null
+        # value is NULL, so a provably-empty relation is not derivable — return None to fall
+        # back rather than claim a spurious 0.
+        if not stat.moments_are_exact:
+            return None
         if child.rows_exact and child.rows == 0:
             return None
         return stat.total_sum
     if func == "mean":
-        # SQL `avg`/`mean` of the non-null values (a recorded exact mean). NULL over an
+        # SQL `avg`/`mean` of the non-null values (an exact recorded mean). NULL over an
         # all-null / empty group — not derivable, fall back rather than divide by zero.
+        if not stat.moments_are_exact:
+            return None
         return stat.mean
     if func == "count_distinct":
         # SQL `count(distinct col)` excludes NULL; the `ndv` contract is likewise the number

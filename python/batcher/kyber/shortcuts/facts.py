@@ -180,11 +180,20 @@ def _column_facts(
       statistics and a KLL sketch drops it — so an unaware bound reports the largest
       *non-NaN* value, and a sum/mean computed without it is likewise not the sum/mean the
       engine would compute. `min` is exempt: a dropped NaN can never have been the minimum.
+    * `total_sum`/`mean` carry their own tag too (`moments_are_exact`), for the same reason
+      `ndv` does and with the same effect on both gates above. A moment the *source itself*
+      computed over an immutable relation is exact whatever its bundle is worth, and it saw
+      every NaN — so it clears the float gate that a merely *recorded* moment cannot.
     """
     exact = stat.provenance is Provenance.EXACT
     is_float = dtype is not None and pa.types.is_floating(dtype)
     float_gated = is_float and not nan_safe
     ndv_exact = stat.ndv is not None and stat.ndv_is_exact
+    moments_exact = (
+        stat.moments_provenance.is_exact
+        if stat.moments_provenance is not None
+        else (exact and not float_gated)
+    )
     return ColumnFacts(
         name=name,
         dtype=dtype,
@@ -198,8 +207,8 @@ def _column_facts(
             else None
         ),
         ndv=int(stat.ndv) if ndv_exact else None,
-        total_sum=stat.total_sum if (exact and not float_gated) else None,
-        mean=stat.mean if (exact and not float_gated) else None,
+        total_sum=stat.total_sum if moments_exact else None,
+        mean=stat.mean if moments_exact else None,
         approx_ndv=int(stat.ndv) if stat.ndv is not None else None,
         quantiles=stat.quantiles,
         mcv=stat.mcv,
