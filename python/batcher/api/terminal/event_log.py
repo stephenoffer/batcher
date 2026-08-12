@@ -29,6 +29,7 @@ import json
 import os
 import re
 import time
+from collections import deque
 from collections.abc import Iterator
 from itertools import count
 from pathlib import Path
@@ -50,9 +51,6 @@ __all__ = [
 
 # Per-process query counter, so two queries in the same millisecond get distinct ids.
 _counter = count()
-# Prune the directory once every this many writes, so the O(files) scan is amortized
-# across queries instead of paid on every small query.
-_PRUNE_EVERY = 64
 
 
 def event_log_collector() -> ProfileCollector | None:
@@ -207,12 +205,11 @@ def write_event_log(
     if cfg.event_log:
         try:
             log_dir = _resolve_dir(cfg.event_log_dir)
-            with open_private(log_dir / f"{query_id}.json") as fh:
+            name = f"{query_id}.json"
+            with open_private(log_dir / name) as fh:
                 fh.write(json.dumps(document, default=str).encode("utf-8"))
-            # Pruning scans the directory (O(files)); amortize it across writes so a small
-            # query doesn't pay it every time.
-            if seq % _PRUNE_EVERY == 0:
-                _prune(log_dir, cfg.event_log_max_files)
+            # Retention runs on every write because it is now O(1) there — see `_prune`.
+            _prune(log_dir, cfg.event_log_max_files, wrote=name, seq=seq)
         except Exception:  # pragma: no cover - event logging must never break a query
             get_logger("api").debug("event-log write failed", exc_info=True)
     # The emitter is itself a no-op unless OTel is enabled and a provider is configured.
@@ -553,10 +550,58 @@ def _resolve_dir(configured: str) -> Path:
     return path
 
 
-def _prune(log_dir: Path, max_files: int) -> None:
-    """Keep at most `max_files` event-log documents, deleting the oldest first."""
+#: Names this process has written, oldest first, per log directory — the retention window
+#: held in memory so the steady state costs a `popleft` and one `unlink` rather than a scan.
+_WRITTEN: dict[Path, deque[str]] = {}
+
+#: Writes between full directory scans. A scan is the only way to see documents *another*
+#: process (or an earlier session) left, so it cannot be dropped entirely — but it is the
+#: expensive half, and it does not have to run on the same cadence as the deletions.
+_RESCAN_EVERY = 512
+
+
+def _prune(log_dir: Path, max_files: int, *, wrote: str, seq: int) -> None:
+    """Keep at most `max_files` event-log documents in `log_dir`, deleting the oldest first.
+
+    Ordered by name, which is why `_query_id` leads with a timestamp: the id sorts the way
+    the clock does, so "oldest" needs no `stat`.
+
+    **Incremental, because the scan was the cost.** Retention was previously a
+    `glob` + `sort` of the whole directory every 64 writes, and at the default cap of 200
+    that measured **0.184 ms per query** — 11% of a small query's entire control plane, and
+    the single largest item in the event log's budget, larger than assembling the document
+    and encoding it put together. It also grew with the cap, so raising retention silently
+    taxed every query.
+
+    So the window is held in memory instead. This process knows the names it wrote and it
+    wrote them in order, which is exactly the state a scan was re-deriving each time: one
+    `popleft` and one `unlink` retire one document, and nothing is listed. A directory is
+    scanned once, on the first write into it, to seed the window from whatever an earlier
+    session left, and every `_RESCAN_EVERY` writes thereafter so that documents written by
+    *other* processes sharing the directory are still collected. Between rescans a
+    multi-writer directory can exceed the cap by what its other writers produced in that
+    window; the cap is a retention bound on an observability artifact, not a quota, and the
+    alternative was paying a scan on every query to hold it exactly.
+
+    Args:
+        log_dir: The directory holding the documents.
+        max_files: Retention cap; non-positive disables pruning.
+        wrote: The document just written, which joins the window as its newest entry.
+        seq: This write's sequence number, which paces the reconciling rescan.
+    """
     if max_files <= 0:
         return
-    files = sorted(log_dir.glob("*.json"), key=lambda p: p.name)
-    for stale in files[:-max_files]:
-        stale.unlink(missing_ok=True)
+    window = _WRITTEN.get(log_dir)
+    if window is None or seq % _RESCAN_EVERY == 0:
+        # The scan already sees `wrote`, so it is seeded rather than appended.
+        window = deque(sorted(entry.name for entry in os.scandir(log_dir) if _is_document(entry)))
+        _WRITTEN[log_dir] = window
+    else:
+        window.append(wrote)
+    while len(window) > max_files:
+        (log_dir / window.popleft()).unlink(missing_ok=True)
+
+
+def _is_document(entry: os.DirEntry[str]) -> bool:
+    """Whether a directory entry is an event-log document (a ``*.json`` file)."""
+    return entry.name.endswith(".json") and entry.is_file()

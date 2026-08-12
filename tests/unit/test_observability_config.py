@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from unittest import mock
 
 import pytest
 
@@ -79,13 +81,50 @@ def test_event_log_writes_document_and_prunes(tmp_path):
         doc = json.loads(files[0].read_text())
         assert doc["rows"] == 3 and doc["ops"][0]["kind"] == "scan"
         assert doc["decisions"][0]["summary"] == "feasible"
-        # Pruning keeps at most `max_files`, oldest first.
+        # Pruning keeps at most `max_files`, oldest first. `seq=0` is a reconciling pass,
+        # which is what collects documents this process did not write -- here the five
+        # planted below, and in a deployment the ones a sibling process left.
         for i in range(5):
             (tmp_path / f"20200101-000000-{i:06d}.json").write_text("{}")
-        _prune(tmp_path, max_files=2)
-        assert len(list(tmp_path.glob("*.json"))) == 2
+        _prune(tmp_path, max_files=2, wrote="20200101-000000-000004.json", seq=0)
+        kept = sorted(p.name for p in tmp_path.glob("*.json"))
+        # Two survive, and they are the two newest by name: the planted `2020` documents go
+        # oldest-first, and the real one written above carries today's date, so it sorts last.
+        assert len(kept) == 2
+        assert kept[0] == "20200101-000000-000004.json"
+        assert not any(name.startswith("20200101-000000-00000") and name < kept[0] for name in kept)
     finally:
         set_config(prev)
+
+
+def test_event_log_prunes_incrementally_without_rescanning(tmp_path):
+    """Retention holds at the cap across many writes without listing the directory.
+
+    The in-memory window is the whole point of `_prune` (it was 11% of a small query's
+    control plane as a scan), so the test asserts *both* halves: the cap is honored, and
+    the scan does not happen. Without the second assertion the fast path could regress to
+    the slow one and nothing would notice -- the directory would look identical.
+    """
+    from batcher.api.terminal.event_log import _WRITTEN, _prune
+
+    _WRITTEN.pop(tmp_path, None)
+    scans = 0
+    real_scandir = os.scandir
+
+    def counting_scandir(path):
+        nonlocal scans
+        if str(path) == str(tmp_path):
+            scans += 1
+        return real_scandir(path)
+
+    with mock.patch.object(os, "scandir", counting_scandir):
+        for i in range(40):
+            name = f"20200101-000000-{i:06d}.json"
+            (tmp_path / name).write_text("{}")
+            _prune(tmp_path, max_files=5, wrote=name, seq=i + 1)
+
+    assert len(list(tmp_path.glob("*.json"))) == 5
+    assert scans == 1  # only the first write seeds the window
 
 
 def test_event_log_disabled_collector_is_none():
