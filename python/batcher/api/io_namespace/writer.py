@@ -152,6 +152,43 @@ def _check_overwrite_partitions(fmt: str, partition_by: list[str] | None) -> Non
         )
 
 
+def distributed_stream_refusal(plan: Any, trigger: Trigger | None) -> str | None:
+    """Why the cluster cannot run this streaming write correctly, or None if it can.
+
+    The whole gate for a continuous distributed stream, in one place and answered for every
+    trigger — including the absent one. It used to be two conditions at the call site guarded
+    by ``trigger is not None``, and that guard was the hole: ``trigger=None`` is not an
+    unusual call, it is the *default*, and it means "processing time, as soon as possible"
+    rather than "no streaming". So `ds.write(path, "delta", distributed=True)` on a
+    watermarked aggregation skipped every check below and ran the shape the checks exist to
+    refuse. Taking the trigger as an argument is what makes the default case impossible to
+    forget, since there is no longer a branch it can fall outside of.
+
+    Args:
+        plan: The streaming plan the cluster would run.
+        trigger: The query's trigger, or None for the processing-time default.
+
+    Returns:
+        An actionable refusal, or None when the cluster computes what one node would.
+    """
+    if trigger is not None and trigger.kind == "continuous" and not _is_stateless_plan(plan):
+        return (
+            "a continuous trigger supports only stateless pipelines (filter / "
+            "select / map_batches); a streaming aggregation needs a micro-batch "
+            "boundary to fold — use Trigger.processing_time(...)"
+        )
+    if _is_stateless_plan(plan):
+        return None
+    return _undistributable_stream_reason(plan)
+
+
+def _is_stateless_plan(plan: Any) -> bool:
+    """Whether `plan` is a breaker-free pipeline — the shape every path streams."""
+    from batcher.api.streaming import _is_stateless
+
+    return _is_stateless(plan)
+
+
 def _undistributable_stream_reason(plan: Any) -> str | None:
     """Why the cluster cannot fold this streaming plan with single-node semantics, or None.
 
@@ -162,7 +199,7 @@ def _undistributable_stream_reason(plan: Any) -> str | None:
     (single-node == distributed), and is not a slogan: the one shape that slipped through this
     gate silently returned a different answer on a cluster than on one box.
     """
-    from batcher.plan.logical import Aggregate, TransformWithState, is_streamable
+    from batcher.plan.logical import Distinct, TransformWithState, streaming_fold_target
 
     if isinstance(plan, TransformWithState):
         # Named rather than folded into "another pipeline breaker": this one *has* a
@@ -176,13 +213,25 @@ def _undistributable_stream_reason(plan: Any) -> str | None:
             "do. Run it with distributed=False rather than have the cluster compute "
             "something else."
         )
-    if not isinstance(plan, Aggregate) or not is_streamable(plan.input):
+    agg = streaming_fold_target(plan)
+    if agg is None:
+        if isinstance(plan, Distinct) and plan.keys:
+            # Named rather than folded into "another pipeline breaker", for the same reason
+            # `transform_with_state` is: the caller wrote no breaker, and telling them to
+            # restructure a sort/join/window sends them looking for one that is not there.
+            return (
+                "distinct(subset=...) cannot run as a distributed streaming query: keeping "
+                "one row per key needs the key set held for the life of the query, and which "
+                "row wins is decided by an ordering over rows that have not arrived. Use "
+                "drop_duplicates_within_watermark(subset, event_time=..., lateness=...) "
+                "single-node, or distinct() with no subset when the whole row is the key."
+            )
         return (
             "distributed streaming supports a stateless pipeline or a top-level "
             "streaming aggregation; this plan has another pipeline breaker "
             "(sort / join / window) — restructure it, or omit distributed."
         )
-    if plan.watermark is not None:
+    if agg.watermark is not None:
         # The shape that slipped through. A watermarked aggregate is an `Aggregate` over a
         # streamable input, so the old gate waved it past — and `dist/` implements no
         # watermark at all (no window eviction, no late-row drop, no append mode). It
@@ -737,7 +786,6 @@ class Writer:
         weaker guarantee than the API implies.
         """
         from batcher._internal.errors import PlanError
-        from batcher.api.streaming import _is_stateless
         from batcher.dist.executor import _is_splittable_source
         from batcher.io.source import is_bounded
 
@@ -780,16 +828,9 @@ class Writer:
                 "instead of being recognized as already-committed. Write to Delta for an "
                 "exactly-once distributed stream, or run single-node (distributed=False)."
             )
-        if not _is_stateless(self._ds._plan) and trigger is not None:
-            if trigger.kind == "continuous":
-                raise PlanError(
-                    "a continuous trigger supports only stateless pipelines (filter / "
-                    "select / map_batches); a streaming aggregation needs a micro-batch "
-                    "boundary to fold — use Trigger.processing_time(...)"
-                )
-            reason = _undistributable_stream_reason(self._ds._plan)
-            if reason is not None:
-                raise PlanError(reason)
+        reason = distributed_stream_refusal(self._ds._plan, trigger)
+        if reason is not None:
+            raise PlanError(reason)
         from batcher.api.streaming import start_distributed_stream
         from batcher.plan.streaming import Trigger as _Trigger
 

@@ -132,8 +132,24 @@ print(peek.count())
 ```
 
 That works against a topic that never ends, which is what makes it the right first thing to
-type. What still refuses is a limit over a *sort*: top-N is finite too, and not knowable
-until the last row has arrived.
+type.
+
+`distinct()` before the limit is finite for the same reason, so the second question you
+usually have about an unfamiliar stream also has an answer. Once the engine has seen `n`
+distinct rows it stops reading, because every later row is either a duplicate or arrives too
+late to displace one of the first `n`:
+
+```python
+values = bt.read.rate(5, num_rows=100, pace=False).select("value").distinct().head(3)
+print(values.to_pydict())
+# {'value': [0, 1, 2]}
+```
+
+What still refuses is a limit over a *sort*: top-N is finite too, and not knowable until the
+last row has arrived. A keyed `distinct(subset=...)` refuses as well, because which row
+survives per key is decided by an ordering over rows that have not arrived. Use
+{py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>`
+when you need one row per key off a stream.
 
 ## Writing streams: the unified `ds.write`
 

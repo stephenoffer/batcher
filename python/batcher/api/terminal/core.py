@@ -1165,13 +1165,30 @@ def _narrowed_limit(plan: LogicalPlan, limit: int) -> LogicalPlan:
 def _is_bounded_peek(plan) -> bool:
     """Whether `plan` is a `LIMIT n` whose result is finite even over an endless source.
 
-    Only over a breaker-free input: the router streams that and stops the moment it has n
-    rows. Over a sort the answer is finite too and unreachable, because top-N is not known
-    until the last row has arrived.
-    """
-    from batcher.plan.logical import Limit, is_streamable
+    Two inputs qualify, and both for the same reason: the router has a driver that stops
+    reading the moment the answer is settled.
 
-    return isinstance(plan, Limit) and is_streamable(plan.input)
+    - A **breaker-free** input — filter / select / map_batches — where the first `n` rows
+      out are the answer.
+    - A whole-column **`DISTINCT`**, where the first `n` distinct rows are. Once `n` of
+      them have been seen, every later row is either a duplicate or arrives too late to
+      displace one, so the read stops there (`core.streaming.stream_distinct_limit`).
+      `distinct().head(20)` is how anyone finds out what values a topic carries, and it
+      was refused while `filter().head(20)` beside it was not — a difference the caller had
+      no way to predict, since both terminate and both hold `n` rows.
+
+    Over a *sort* the answer is finite too and still unreachable, because top-N is not
+    known until the last row has arrived. A **keyed** `DISTINCT ON` likewise stays out: its
+    survivor per key can be replaced by a later row, so no prefix settles it.
+    """
+    from batcher.plan.logical import Distinct, Limit, is_streamable
+
+    if not isinstance(plan, Limit):
+        return False
+    inner = plan.input
+    if is_streamable(inner):
+        return True
+    return isinstance(inner, Distinct) and not inner.keys and is_streamable(inner.input)
 
 
 def _peek_schema(plan) -> pa.Schema:

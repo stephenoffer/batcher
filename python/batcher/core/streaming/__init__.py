@@ -10,6 +10,7 @@ from __future__ import annotations
 from batcher.core.streaming.drivers import (
     stream_aggregate,
     stream_distinct,
+    stream_distinct_limit,
     stream_keyed_state,
     stream_limit,
     stream_topn,
@@ -43,6 +44,7 @@ __all__ = [
     "empty_global_aggregate",
     "stream_aggregate",
     "stream_distinct",
+    "stream_distinct_limit",
     "stream_keyed_state",
     "stream_limit",
     "stream_topn",

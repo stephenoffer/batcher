@@ -8,14 +8,16 @@ Two derivations exist twice in the tree, each carrying a comment saying so:
    launcher returned the runner *without* the source projection, so `LocalRunner` read
    the source with `iter_batches(None)` while the identical `iter_batches` pipeline
    pushed the projection down — single-node streaming to a sink decoded every column.
-2. `Distinct` → `Aggregate` over all columns —
-   `core/streaming_query.py::_distinct_as_aggregate` and the derivation inlined in
-   `core/streaming.py::stream_distinct` (and a third copy in
-   `dist/executors/distinct.py`).
+2. `Distinct` → `Aggregate` over all columns — now one definition,
+   `plan.logical.streaming_fold_target`, which `core/streaming_query.py::make_processor`
+   and the distributed epoch gate both ask. The derivation inlined in
+   `core/streaming.py::stream_distinct` (and the copy in `dist/executors/distinct.py`)
+   still exists, so the equality below is still worth asserting — it is now
+   "the shared predicate agrees with the driver" rather than "two copies agree".
 
-Neither could be collapsed to one definition without editing a file outside this
+The first could not be collapsed to one definition without editing a file outside this
 change's scope, so these tests are the guard: they assert the *observable* equality of
-the two copies rather than trusting a comment.
+the copies rather than trusting a comment.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import pytest
 import batcher as bt
 from batcher.api.streaming._launch import _build_run_batch
 from batcher.api.terminal.stream.dispatch import _iter_streaming
-from batcher.core.streaming_query import _distinct_as_aggregate
+from batcher.plan.logical import streaming_fold_target
 
 pytestmark = pytest.mark.unit
 
@@ -155,8 +157,8 @@ def test_launcher_leaves_a_map_batches_pipeline_unpushed():
 # --- (2) the two Distinct -> Aggregate derivations must agree -----------------------
 
 
-def test_distinct_as_aggregate_matches_the_stream_distinct_derivation(monkeypatch):
-    """`_distinct_as_aggregate` builds the same `Aggregate` `stream_distinct` folds.
+def test_streaming_fold_target_matches_the_stream_distinct_derivation(monkeypatch):
+    """`streaming_fold_target` names the same `Aggregate` `stream_distinct` folds.
 
     Patched at `core.streaming.drivers`, where `stream_aggregate` is *defined and called*,
     not at the `core.streaming` façade that re-exports it: `stream_distinct` resolves the
@@ -181,4 +183,4 @@ def test_distinct_as_aggregate_matches_the_stream_distinct_derivation(monkeypatc
     assert len(seen) == 1
     # `Expr.__eq__` builds an expression, so dataclass equality on a plan is unusable —
     # compare the IR, which is the wire contract both derivations must agree on.
-    assert _distinct_as_aggregate(distinct).to_ir() == seen[0].to_ir()
+    assert streaming_fold_target(distinct).to_ir() == seen[0].to_ir()

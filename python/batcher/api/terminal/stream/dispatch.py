@@ -1,10 +1,11 @@
 """Streaming-strategy selection for `Dataset.iter_batches` (control plane, `api`).
 
 The seam: this module is the *router*. It inspects a plan and picks the most
-bounded-memory way to yield its result, then drives the two paths that are pure plan
-shape — the breaker-free pipeline and the exact-size rebatcher. Strategies with their
-own retained state live beside it (`watermark`), as do their proof obligations (`union`)
-and the distributed (`distributed_stream`), map (`map_stream`), running-state
+bounded-memory way to yield its result. Driving the two paths that are pure plan shape —
+the breaker-free pipeline and the peeled row-wise re-application — lives next door in
+`pipeline`, and the exact-size rebatcher in `rebatch`. Strategies with their own
+retained state live beside it (`watermark`), as do their proof obligations (`union`) and
+the distributed (`distributed_stream`), map (`map_stream`), running-state
 (`core.streaming`), and out-of-core bucket (`dist.spill_breakers`) drivers it delegates
 to. Preference order:
 
@@ -31,6 +32,7 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher.api.terminal.stream.pipeline import _apply_peeled, _iter_streaming, _pushdown
 from batcher.api.terminal.stream.rebatch import _rebatch_exact, _take
 from batcher.api.terminal.stream.static_join import (
     refuse_reason as static_join_refusal,
@@ -49,7 +51,11 @@ from batcher.api.terminal.stream.watermark import stream_stream_join, stream_wat
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
-__all__ = ["_iter_batches", "_iter_streaming"]
+#: `_iter_streaming` and `_pushdown` are re-exported rather than merely imported: both are
+#: reached by name from outside this package (`terminal.core`, the launcher-parity tests),
+#: and this is the path they have always used. A move that changed it would also silently
+#: defuse any monkeypatch aimed at the old name.
+__all__ = ["_iter_batches", "_iter_streaming", "_pushdown"]
 
 
 def _iter_batches(
@@ -252,6 +258,25 @@ def _iter_batches(
                 plan, _iter_streaming(plan.input, sources, None), batch_size
             )
             return
+        # A `Distinct` carrying a fused `limit` is bounded by that limit and stops reading
+        # once it has that many distinct rows, so it takes the capped driver rather than the
+        # running fold below — which has no early exit and whose `as_aggregate` refuses a
+        # fused limit outright. Tested before the general branch because it is a strictly
+        # narrower case of the same node. This is the shape Kyber's `fuse_limit_into_distinct`
+        # produces, so the router meets it whenever it re-enters on an optimized subtree.
+        if (
+            isinstance(plan, Distinct)
+            and plan.limit is not None
+            and not plan.keys
+            and is_streamable(plan.input)
+            and not core.has_map_batches(plan.input)
+        ):
+            from batcher.core.streaming import stream_distinct_limit
+
+            yield from stream_distinct_limit(
+                plan, sources[0], batch_size, projection=_pushdown(plan)
+            )
+            return
         # A *keyed* dedup is deliberately not routed here. It is not a group-by — its
         # surviving row carries columns the key does not determine — so the aggregate fold
         # below cannot express it, and it falls through to the ordinary materializing path
@@ -275,6 +300,35 @@ def _iter_batches(
 
             driver = stream_distinct if isinstance(plan, Distinct) else stream_aggregate
             yield from driver(plan, sources[0], batch_size, projection=_pushdown(plan))
+            return
+        # `distinct().limit(n)` — the first `n` distinct rows, then stop reading. Bounded
+        # state and a terminating read, yet the router refused it: the `Limit` branch below
+        # needs a breaker-free input and a `Distinct` is a breaker, so the pair fell through
+        # to "this plan must materialize" for the most ordinary way anyone inspects an
+        # unfamiliar topic. Matched here on the *unfused* pair rather than waiting for
+        # `fuse_limit_into_distinct`, which is gated on a cardinality estimate a stream does
+        # not have — the streaming exit is sound for any cardinality, since it is the
+        # operator's own input-order rule that makes it so.
+        if (
+            isinstance(plan, Limit)
+            and plan.n > 0
+            and isinstance(plan.input, Distinct)
+            and not plan.input.keys
+            and plan.input.limit is None
+            and is_streamable(plan.input.input)
+            and not core.has_map_batches(plan.input.input)
+        ):
+            import dataclasses
+
+            from batcher.core.streaming import stream_distinct_limit
+
+            capped = dataclasses.replace(plan.input, limit=plan.offset + plan.n)
+            yield from _take(
+                stream_distinct_limit(capped, sources[0], None, projection=_pushdown(plan)),
+                plan.n,
+                plan.offset,
+                batch_size,
+            )
             return
         # Top-N (`head` over a sort) streams with memory bounded by N: keep only the
         # running best N rows.
@@ -405,13 +459,7 @@ def _iter_batches(
     if any(not is_bounded(s) for s in sources):
         from batcher._internal.errors import PlanError
 
-        raise PlanError(
-            f"this pipeline has an unbounded (streaming) source but its top-level "
-            f"{type(plan).__name__} forces the plan to materialize (a pipeline breaker "
-            "such as sort / join / window / multi-source), which cannot be streamed in "
-            "bounded memory. Restructure to a streamable shape (filter / project / "
-            "map_batches, or a single top-level aggregate / distinct / top-N)."
-        )
+        raise PlanError(_unstreamable_reason(plan))
     from batcher.api.terminal.core import _collect
 
     table = _collect(plan, sources, columns)
@@ -421,149 +469,41 @@ def _iter_batches(
     yield from batches
 
 
-def _apply_peeled(
-    peeled: list[LogicalPlan], batches: Iterator[pa.RecordBatch]
-) -> Iterator[pa.RecordBatch]:
-    """Re-apply row-wise operators peeled from above a breaker to each streamed batch.
+def _unstreamable_reason(plan: LogicalPlan) -> str:
+    """Why this plan cannot stream, naming the operator that stops it.
 
-    The caller guarantees every entry of `peeled` is `is_partition_independent` — a
-    stateless, row-wise transform — which is exactly what makes per-batch application equal
-    to whole-relation application. That admits the row-multiplying reshapers (`Unnest`,
-    `Unpivot`) as well as `Project`/`Filter`: they hold no state, so a batch's output does
-    not depend on how the input was split.
-
-    The chain is rebuilt over a `Scan(0)` and optimized **once**, not per batch. Kyber's
-    `optimize` is plan-shaped work that does not depend on the data, so running it inside
-    the loop would pay the full optimizer cost per morsel — which for many small batches
-    can cost more than the materialization this path exists to avoid.
-    """
-    import dataclasses
-
-    from batcher import core, kyber
-    from batcher.plan.logical import Scan
-    from batcher.plan.schema import SchemaRef
-
-    physical = None
-    for batch in batches:
-        if physical is None:
-            chain: LogicalPlan = Scan(0, SchemaRef.from_arrow(batch.schema))
-            for node in reversed(peeled):  # innermost (closest to the breaker) first
-                chain = dataclasses.replace(node, input=chain)
-            physical = kyber.optimize(chain)
-        # `execute_local` takes already-resolved batch lists, one per source — not `Source`
-        # objects. The batch IS the resolved single source here.
-        out = core.execute_local(physical, [[batch]])
-        # A `Filter` that matches nothing in this batch yields no batches; skip it rather
-        # than emitting an empty batch, so a filtered stream does not pad the consumer with
-        # zero-row batches. The final schema still comes from the batches that do match.
-        for b in out:
-            if b.num_rows:
-                yield b
-
-
-def _pushdown(plan: LogicalPlan) -> list[str] | None:
-    """The columns source 0 must produce for `plan` — Kyber's answer, for a core driver.
-
-    The bounded-state drivers in `core.streaming` read the source directly, and every one of
-    them read it *whole*: a `group_by("user").sum("cents")` over a forty-column event decoded
-    thirty-eight columns per micro-batch and threw them away. `_iter_streaming` on the
-    neighbouring branch has always read through the pushdown; this is the same answer for the
-    branches that bypass it.
-
-    Computed over the plan the driver will actually execute, not over an optimized rewrite of
-    it, so the projection is exactly the set that plan's own IR references. Asking Kyber keeps
-    the decision in Kyber's lane; `core` only reads what it is handed.
+    The message used to name `type(plan).__name__` — the *top* node — which is the culprit
+    only when the breaker happens to be at the root. ``ds.sort("t").group_by("a").agg(...)``
+    reported "its top-level Aggregate forces the plan to materialize", and a streaming
+    aggregate is exactly the shape that *does* stream: the reader was pointed at the one
+    operator in their query that was fine, while the `sort` beneath it went unmentioned.
+    Kyber already knows which nodes cannot emit under a stream
+    (`kyber.streaming.blocking_operators`), so ask it rather than guess from the root.
 
     Args:
-        plan: The logical plan the driver runs, rooted at the operator being streamed.
+        plan: The plan the router found no streaming strategy for.
 
     Returns:
-        The projection for source 0, or ``None`` when the plan does not narrow it.
+        A refusal naming the blocking operators, and the shapes that do stream.
     """
-    from batcher import kyber
+    from batcher.kyber.streaming import blocking_operators
 
-    return kyber.required_columns_per_source(plan).get(0)
+    blocking = blocking_operators(plan)
+    if blocking:
+        # Deduplicated and ordered so a plan with three sorts reads as "sort", not
+        # "sort / sort / sort", while a mixed plan still names each distinct offender.
+        names = sorted({type(n).__name__.lower() for n in blocking})
+        culprit = f"its {' and '.join(names)} cannot emit a row until the input ends"
+    else:
+        culprit = (
+            f"its top-level {type(plan).__name__.lower()} forces the plan to materialize "
+            "(a multi-source shape no streaming driver covers)"
+        )
+    return (
+        f"this pipeline has an unbounded (streaming) source but {culprit}, so it cannot be "
+        "streamed in bounded memory. Restructure to a streamable shape: filter / select / "
+        "with_columns / map_batches, or a single top-level aggregate, distinct, limit or "
+        "top-N over one of those."
+    )
 
 
-def _iter_streaming(
-    plan: LogicalPlan, sources: list[Source], batch_size: int | None
-) -> Iterator[pa.RecordBatch]:
-    """Drive a breaker-free pipeline one source batch at a time."""
-    from batcher import core, kyber
-    from batcher.io.source import InMemorySource, iter_source
-
-    source = sources[0]
-
-    # map_batches pipelines are orchestrated in Python (no Kyber pass over the
-    # opaque UDF), mirroring collect(); the relational path is optimized so the
-    # source projection (and predicate, for capable sources) is pushed down.
-    if core.has_map_batches(plan):
-        # Build the (class) UDFs once so a load-once inference model loads a single time
-        # and is reused across every streamed batch, not rebuilt per batch.
-        resident = core.prebuild_factories(plan)
-
-        # Stream the source in *windows* of batches, not one batch at a time: a
-        # `map_batches` UDF parallelizes across `num_workers` only when it is handed
-        # several batches at once (a single batch is applied sequentially). Feeding one
-        # source batch per call throws away all UDF parallelism — the difference between
-        # a serial and an all-cores read→map→write. The window holds ~one morsel per
-        # worker so the pool fills, and bounds driver memory to that window (+ its
-        # output) — never the whole input.
-        from batcher.api.terminal.map_stream import max_map_workers, stream_windowed
-        from batcher.config import active_config
-
-        # The row target is a *cap*, not the operating point: `stream_windowed` also flushes on
-        # a byte budget, and for ordinary (narrow) rows that is what binds. Sized so a window
-        # still holds at least one morsel per worker — the pool has to have something to fan
-        # across — but far enough above it that the fixed per-window cost is amortized instead
-        # of paid every 245,760 rows. Wide rows flush on bytes long before this.
-        workers = max(1, max_map_workers(resident))
-        morsel = max(1, active_config().execution.morsel_rows)
-        target_rows = max(workers * morsel, active_config().optimizer.target_rows_per_task)
-
-        def run_window(window_batches):
-            return core.execute_with_udfs(resident, [InMemorySource(window_batches)])
-
-        try:
-            # Read only the columns the pipeline needs. `collect()` has always done this
-            # (`kyber.required_columns_per_source`, via the UDF executor) and so has the
-            # relational branch below; the *streamed* map branch read the source whole. On a
-            # 31-column corpus whose `fn` declares four `input_columns` that is 27 columns
-            # decoded per window and discarded, measured at **4,425 ms against 733 ms for the
-            # same query collected** — the streaming API, which exists for inputs too large to
-            # collect, was the one paying for the widest read. An undeclared `fn` still yields
-            # `None` here and still reads everything, which is the only safe answer for a
-            # black box.
-            yield from stream_windowed(
-                source, run_window, target_rows, batch_size, projection=_pushdown(plan)
-            )
-        finally:
-            # `prebuild_factories` made this generator the models' owner, and `teardown_udf`
-            # declines a prebuilt instance for exactly that reason — so without this a
-            # streamed model held its GPU allocation for the life of the process.
-            core.release_prebuilt(resident)
-        return
-
-    # Relational (no UDF) breaker-free pipeline: optimize once, then stream micro-batches.
-    hub = core.default_hub()
-    opt_plan = kyber.optimize(plan, sources=sources, hub=hub)
-    projection = opt_plan.source_projections.get(0)
-    predicate = opt_plan.source_predicates.get(0)
-
-    # Close the metadata loop on the streaming path too: each micro-batch's
-    # per-operator stats feed the learner, so streaming queries also improve
-    # future plans (cost calibration, cardinality, selectivity).
-    def run(batch):
-        return core.execute_local(opt_plan, [[batch]], feedback=hub)
-
-    for batch in iter_source(source, projection, predicate):
-        if batch.num_rows == 0:
-            continue
-        for b in run(batch):
-            if b.num_rows == 0:
-                continue
-            if batch_size is None:
-                yield b
-            else:
-                for off in range(0, b.num_rows, batch_size):
-                    yield b.slice(off, batch_size)

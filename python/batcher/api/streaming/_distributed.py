@@ -66,7 +66,7 @@ def start_distributed_stream(
     import json
 
     from batcher import core, kyber
-    from batcher.plan.logical import Aggregate
+    from batcher.plan.logical import streaming_fold_target
 
     output_mode = OutputMode.validate(output_mode)
     store = None
@@ -80,7 +80,12 @@ def start_distributed_stream(
     # its projection pushed into the read); an aggregate's workers run only its *input*
     # pipeline and hand back a partial, exactly as the single-node fold does — so the two
     # paths compute the same thing from the same IR.
-    agg = plan if isinstance(plan, Aggregate) else None
+    #
+    # `streaming_fold_target` rather than `isinstance(plan, Aggregate)`: a whole-column
+    # `distinct()` IS that aggregate (a group-by over every column), which the single-node
+    # processor has always folded and the cluster used to refuse. Both now ask the one
+    # neutral predicate, so neither can be handed a node the other would run differently.
+    agg = streaming_fold_target(plan)
     if agg is None:
         physical = kyber.optimize(plan, sources=sources, hub=core.default_hub())
         plan_ir, projection = physical.to_json(), physical.source_projections.get(0)

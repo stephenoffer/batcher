@@ -16,18 +16,14 @@ from batcher.core.streaming_query.processors import (
     MicroBatchProcessor,
     StatelessProcessor,
     WindowedAggregateProcessor,
-    _distinct_as_aggregate,
     make_processor,
 )
 
-#: `_distinct_as_aggregate` is engine-internal but reached for by name across modules, and
-#: this is the import path it has always used (see `core.streaming.__init__`).
 __all__ = [
     "AggregateProcessor",
     "MicroBatchProcessor",
     "StatelessProcessor",
     "StreamingQueryEngine",
     "WindowedAggregateProcessor",
-    "_distinct_as_aggregate",
     "make_processor",
 ]

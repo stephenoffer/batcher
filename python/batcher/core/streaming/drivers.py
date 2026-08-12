@@ -35,6 +35,7 @@ from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
 __all__ = [
     "stream_aggregate",
     "stream_distinct",
+    "stream_distinct_limit",
     "stream_keyed_state",
     "stream_limit",
     "stream_topn",
@@ -217,6 +218,83 @@ def stream_distinct(
     it off this driver; `as_aggregate` raises rather than approximate it here.
     """
     yield from stream_aggregate(distinct.as_aggregate(), source, batch_size, projection=projection)
+
+
+def stream_distinct_limit(
+    distinct: Distinct,
+    source: Source,
+    batch_size: int | None = None,
+    *,
+    projection: list[str] | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """The first `distinct.limit` distinct rows of a stream, then stop reading.
+
+    "Show me the first fifty distinct values off this topic" is how anyone inspects an
+    unfamiliar stream, and it is bounded in every way that matters: the state is `limit`
+    rows, and the read stops as soon as that many distinct rows exist. An uncapped
+    `stream_distinct` can do neither — it holds one entry per distinct value forever and
+    finalizes only at an end-of-input a stream never reaches — so the router refused the
+    capped form along with the uncapped one, and a query that terminates in bounded memory
+    was answered with "this plan must materialize".
+
+    **The early exit is sound because the survivors are the first `limit` in input order.**
+    Once that many distinct rows have been seen, every later row is either a duplicate (which
+    changes nothing) or a new distinct row that arrived later and therefore cannot displace
+    one of them. That is the same rule the engine's own fused `Distinct(limit)` follows and
+    the same one `kyber.rules.extra.topn_limit.fuse_limit_into_distinct` documents, which is
+    why the two agree on *which* rows come back and not merely on how many.
+
+    The dedup itself is the engine's `Distinct` operator, run over the accumulated survivors
+    concatenated with the newly-mapped batch. Re-running the real operator is what keeps this
+    from being a second definition of what `DISTINCT` means: the alternative — folding
+    through the group-by hash state the way `stream_distinct` does — returns the rows in
+    hash-bucket order, which is not input order and so is not the same answer.
+
+    Args:
+        distinct: A whole-column `Distinct` carrying a `limit`, over a breaker-free input.
+        source: The stream to read.
+        batch_size: Optional output rebatching.
+        projection: The columns the plan needs, from Kyber.
+
+    Yields:
+        One logical result of at most `distinct.limit` rows, rebatched by `batch_size`.
+    """
+    from batcher.plan.logical import Scan
+    from batcher.plan.schema import SchemaRef
+
+    cap = distinct.limit
+    if cap is None or cap <= 0:
+        return
+    nat = engine()
+    cfg = active_config().engine_config_json()
+    input_ir = json.dumps(distinct.input.to_ir())
+
+    survivors: pa.RecordBatch | None = None
+    dedup_ir: str | None = None
+    for batch in _read(source, projection):
+        if batch.num_rows == 0:
+            continue
+        mapped = [b for b in nat.execute_plan(input_ir, [[batch]], cfg) if b.num_rows]
+        if not mapped:
+            continue
+        if dedup_ir is None:
+            # Built from the *mapped* schema, not the source's: the input pipeline may
+            # project, rename, or compute columns, and the dedup runs over what it produced.
+            capped = Distinct(Scan(0, SchemaRef.from_arrow(mapped[0].schema)), limit=cap)
+            dedup_ir = json.dumps(capped.to_ir())
+        rows = mapped if survivors is None else [survivors, *mapped]
+        out = [b for b in nat.execute_plan(dedup_ir, [rows], cfg) if b.num_rows]
+        # The operator caps its own output at `cap`, so concatenating is bounded by it.
+        survivors = (
+            pa.Table.from_batches(out).combine_chunks().to_batches()[0]
+            if len(out) > 1
+            else (out[0] if out else survivors)
+        )
+        if survivors is not None and survivors.num_rows >= cap:
+            break  # no later row can displace one of the first `cap` distinct rows
+
+    if survivors is not None and survivors.num_rows:
+        yield from _rebatch(survivors, batch_size)
 
 
 def stream_limit(
