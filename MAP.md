@@ -1059,7 +1059,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `signature.py` | 204 | Structural plan signatures. |
 | `spill_rates.py` | 194 | What the spill device *measured*, against what its class claimed. |
 | `storage_cost.py` | 80 | What spilling costs on *this* machine's storage. |
-| `streaming.py` | 194 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
+| `streaming.py` | 322 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
 
 ### `batcher/kyber/cost/` — 3 · subsystem
 
