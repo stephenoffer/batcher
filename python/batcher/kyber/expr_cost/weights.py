@@ -172,6 +172,9 @@ _MATH_COST: dict[str, float] = {
     "sinh": 6.0,
     "cosh": 6.0,
     "tanh": 6.0,
+    "asinh": 7.0,
+    "acosh": 7.0,
+    "atanh": 7.0,
     "factorial": 15.0,
 }
 

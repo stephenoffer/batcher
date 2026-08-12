@@ -1623,6 +1623,22 @@ pub enum MathFunc {
     /// Distinct from `round`, which is half away from zero here and in DuckDB:
     /// `rint(2.5)` is `2`, `round(2.5)` is `3`.
     Rint,
+    /// `asinh(x)` — inverse hyperbolic sine, defined for every real.
+    ///
+    /// A node rather than the textbook `ln(x + sqrt(x*x + 1))` composition, because that
+    /// composition is wrong at both ends of the range: `x*x` overflows above ~1.3e154, so
+    /// `asinh(1e300)` returned `inf` instead of 691.47, and `-inf` produced
+    /// `ln(-inf + inf)` = NaN instead of `-inf`.
+    Asinh,
+    /// `acosh(x)` — inverse hyperbolic cosine, defined for `x >= 1` (NaN below).
+    ///
+    /// A node for the same overflow reason as [`MathFunc::Asinh`]: `acosh(1e300)` came
+    /// back `inf` from `ln(x + sqrt(x*x - 1))`.
+    Acosh,
+    /// `atanh(x)` — inverse hyperbolic tangent, defined for `|x| < 1`; `±1` gives `±inf`
+    /// and beyond that NaN. A node beside its two siblings, and more accurate near zero
+    /// than `0.5 * ln((1 + x) / (1 - x))`, which loses precision to cancellation there.
+    Atanh,
 }
 
 /// String functions. `upper`/`lower` → Utf8; `len` → Int64; `contains`/

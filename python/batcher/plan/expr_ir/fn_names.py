@@ -272,10 +272,10 @@ As with `GEO_FNS` the argument count is not stated here; it lives in
 
 MATH_FNS: Final[frozenset[str]] = frozenset(
     {
-        "abs", "acos", "asin", "atan", "bit_count", "cbrt", "ceil", "cos", "cosh",
-        "cot", "degrees", "exp", "factorial", "floor", "ln", "log10", "log2",
-        "radians", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc",
-        "csc", "even", "gamma", "lgamma", "rint", "sec",
+        "abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "bit_count",
+        "cbrt", "ceil", "cos", "cosh", "cot", "degrees", "exp", "factorial", "floor",
+        "ln", "log10", "log2", "radians", "round", "sign", "sin", "sinh", "sqrt",
+        "tan", "tanh", "trunc", "csc", "even", "gamma", "lgamma", "rint", "sec",
     }
 )  # fmt: skip
 

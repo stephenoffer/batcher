@@ -387,6 +387,11 @@ fn apply_unary(func: MathFunc, v: f64) -> f64 {
         Sinh => v.sinh(),
         Cosh => v.cosh(),
         Tanh => v.tanh(),
+        // std's routines are the FDLIBM ones, so they hold at the range ends where the
+        // `ln(x ± sqrt(x*x ∓ 1))` identities overflow or cancel.
+        Asinh => v.asinh(),
+        Acosh => v.acosh(),
+        Atanh => v.atanh(),
         Degrees => v.to_degrees(),
         Radians => v.to_radians(),
         Cot => 1.0 / v.tan(),

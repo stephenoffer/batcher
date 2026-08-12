@@ -1404,7 +1404,9 @@ class Expr:
     def asinh(self) -> Expr:
         """Inverse hyperbolic sine (→ Float64; defined for all reals; nulls propagate).
 
-        Composed as ``ln(x + sqrt(x*x + 1))``, matching NumPy/DuckDB ``asinh``.
+        Evaluated by the engine's ``asinh`` rather than composed as
+        ``ln(x + sqrt(x*x + 1))``, which overflows to ``inf`` above ~1.3e154 and turns
+        ``-inf`` into NaN. Matches NumPy/DuckDB ``asinh``.
 
         Returns:
             A new Float64 expression of the inverse hyperbolic sines.
@@ -1417,13 +1419,15 @@ class Expr:
                 >>> ds.select(r=bt.col("x").asinh()).to_pydict()
                 {'r': [0.0, 0.8813735870195429]}
         """
-        return (self + (self * self + Lit(1)).sqrt()).ln()
+        return MathExpr("asinh", self)
 
     def acosh(self) -> Expr:
         """Inverse hyperbolic cosine (→ Float64; defined for ``x >= 1``; nulls propagate).
 
-        Composed as ``ln(x + sqrt(x*x - 1))``, matching NumPy/DuckDB ``acosh``. Inputs
-        below 1 yield NaN, as the real inverse is undefined there.
+        Evaluated by the engine's ``acosh`` rather than composed as
+        ``ln(x + sqrt(x*x - 1))``, which overflows to ``inf`` above ~1.3e154. Matches
+        NumPy/DuckDB ``acosh``; inputs below 1 yield NaN, as the real inverse is
+        undefined there.
 
         Returns:
             A new Float64 expression of the inverse hyperbolic cosines.
@@ -1436,13 +1440,15 @@ class Expr:
                 >>> ds.select(r=bt.col("x").acosh()).to_pydict()
                 {'r': [0.0, 1.3169578969248166]}
         """
-        return (self + (self * self - Lit(1)).sqrt()).ln()
+        return MathExpr("acosh", self)
 
     def atanh(self) -> Expr:
         """Inverse hyperbolic tangent (→ Float64; defined for ``|x| < 1``; nulls propagate).
 
-        Composed as ``0.5 * ln((1 + x) / (1 - x))``, matching NumPy/DuckDB ``atanh``.
-        ``|x| >= 1`` yields ±inf/NaN, as the real inverse diverges there.
+        Evaluated by the engine's ``atanh`` rather than composed as
+        ``0.5 * ln((1 + x) / (1 - x))``, which loses precision to cancellation near
+        zero. Matches NumPy/DuckDB ``atanh``; ``|x| >= 1`` yields ±inf/NaN, as the real
+        inverse diverges there.
 
         Returns:
             A new Float64 expression of the inverse hyperbolic tangents.
@@ -1455,7 +1461,7 @@ class Expr:
                 >>> ds.select(r=bt.col("x").atanh()).to_pydict()
                 {'r': [0.0, 0.5493061443340549]}
         """
-        return Lit(0.5) * ((Lit(1) + self) / (Lit(1) - self)).ln()
+        return MathExpr("atanh", self)
 
     def arcsin(self) -> MathExpr:
         """Arcsine in radians — the Polars/NumPy ``arcsin`` spelling of :meth:`asin`.
@@ -5629,7 +5635,7 @@ FrameSpec = Union[
 ]
 
 
-def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr]) -> list[IntoExpr]:
+def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr] | None) -> list[IntoExpr]:
     """Normalize a ``partition_by``/``order_by`` argument to a list of key expressions.
 
     A single ``str`` column name or a lone ``Expr`` is wrapped in a one-element list; an
@@ -5638,7 +5644,14 @@ def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr]) -> list[IntoExpr]:
     into ``['g', 'r', 'p']`` (partition by three phantom columns), and
     ``over(partition_by=col("g"))`` would iterate an `Expr` — which has an unbounded
     `__getitem__` — until memory is exhausted.
+
+    ``None`` means *no keys* — an unpartitioned or unordered window, which is what SQL's
+    bare ``OVER ()`` is and what a caller passing a conditionally-set variable holds.
+    Without this case it reached ``list(None)`` and surfaced as a bare
+    ``TypeError: 'NoneType' object is not iterable`` from inside the plan builder.
     """
+    if keys is None:
+        return []
     if isinstance(keys, (str, Expr)):
         return [keys]
     return list(keys)
@@ -5731,8 +5744,8 @@ class AggExpr:
 
     def over(
         self,
-        partition_by: Iterable[IntoExpr] = (),
-        order_by: Iterable[IntoExpr] = (),
+        partition_by: Iterable[IntoExpr] | None = (),
+        order_by: Iterable[IntoExpr] | None = (),
         frame: FrameSpec | None = None,
     ):
         """Turn this aggregate into a window expression — SQL ``<agg> OVER (…)``.
@@ -5745,7 +5758,9 @@ class AggExpr:
 
         Args:
             partition_by: Key expressions whose groups the aggregate is computed within.
+                ``None`` or empty means unpartitioned, over the whole input.
             order_by: Expressions to order rows by, making it a running aggregate.
+                ``None`` or empty leaves the aggregate unordered.
             frame: An explicit ``ROWS`` frame as ``(preceding, following)`` offsets; ``None`` for
                 the default.
 
