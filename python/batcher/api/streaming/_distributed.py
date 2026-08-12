@@ -66,8 +66,13 @@ def start_distributed_stream(
     import json
 
     from batcher import core, kyber
+    from batcher.api.streaming._diagnostics import warn_if_state_is_unbounded
     from batcher.plan.logical import streaming_fold_target
 
+    # A cluster does not make unbounded state bounded — it spreads it over more machines,
+    # which buys time and nothing else. The same warning, from the same analysis, so the two
+    # launchers cannot come to differ about what a query costs.
+    warn_if_state_is_unbounded(plan, sources)
     output_mode = OutputMode.validate(output_mode)
     store = None
     if checkpoint is not None:

@@ -312,6 +312,19 @@ def unbounded_state_operators(plan: LogicalPlan) -> list[LogicalPlan]:
     plan can stream perfectly and still leak, which is the failure that only appears in
     production. Callers that report to a user want the offending nodes, not a bare bool.
 
+    **A `Limit` bounds the operator directly beneath it**, which `retains_unbounded_state`
+    cannot see because it classifies one node. `sort(...).head(10)` and
+    `distinct().head(10)` each hold ten rows, not the stream: the engine fuses the limit
+    into the operator (`Sort.limit`, `Distinct.limit`, and the Kyber rules that set them),
+    and both nodes carry the field precisely because they can. Reporting them would be a
+    false alarm on two of the most ordinary things anyone types against a topic — and a
+    warning that cries wolf on `head(10)` is one nobody reads on the query that does leak.
+
+    Only the *direct* input is discounted. A row-wise operator between the limit and the
+    breaker still leaves the breaker unbounded in general (a `Filter` under a `Limit` does
+    not cap what the operator below the filter retains), so the narrow reading is the safe
+    one, and it is the one that matches what the fusion rules actually rewrite.
+
     Args:
         plan: The plan to walk.
 
@@ -319,4 +332,9 @@ def unbounded_state_operators(plan: LogicalPlan) -> list[LogicalPlan]:
         The leaking nodes, in an unspecified order (empty when every operator's state is
         bounded by something that advances).
     """
-    return [n for n in walk(plan) if retains_unbounded_state(n)]
+    capped = {
+        id(n.input)
+        for n in walk(plan)
+        if isinstance(n, Limit) and isinstance(n.input, (Sort, Distinct))
+    }
+    return [n for n in walk(plan) if retains_unbounded_state(n) and id(n) not in capped]

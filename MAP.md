@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1325 Python modules across 201 packages and 255 Rust files across 15 crates.
+Covering 1326 Python modules across 201 packages and 255 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -368,8 +368,9 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 
 | module | lines | what it is |
 |---|---|---|
-| `_distributed.py` | 275 | Streaming with the micro-batch fanned across the cluster. |
-| `_launch.py` | 375 | The single-node streaming launcher: optimize once, then drive micro-batches. |
+| `_diagnostics.py` | 106 | What a streaming plan will do to memory, said at `start()` rather than at the OOM. |
+| `_distributed.py` | 280 | Streaming with the micro-batch fanned across the cluster. |
+| `_launch.py` | 380 | The single-node streaming launcher: optimize once, then drive micro-batches. |
 | `_query.py` | 426 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
@@ -380,7 +381,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 582 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1199 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1210 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 607 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `map_stream.py` | 168 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
@@ -846,12 +847,12 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 2486 | The distributed executor — the dispatcher. |
+| `executor.py` | 2479 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 806 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 322 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 546 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 543 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
-| `flight_window.py` | 362 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
+| `flight_window.py` | 363 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
 | `flight_worker.py` | 1624 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 327 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 304 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
@@ -874,12 +875,12 @@ Per-operator distributed executor implementations.
 |---|---|---|
 | `aggregate.py` | 442 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
-| `join.py` | 827 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
-| `keyed_shuffle.py` | 215 | Shuffle raw rows by key columns, then run one plan per bucket. |
+| `join.py` | 824 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
+| `keyed_shuffle.py` | 216 | Shuffle raw rows by key columns, then run one plan per bucket. |
 | `map.py` | 1934 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 461 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 591 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
-| `sort.py` | 473 | Distributed sort over a disk Arrow-IPC shuffle. |
+| `sort.py` | 474 | Distributed sort over a disk Arrow-IPC shuffle. |
 | `union.py` | 120 | Distributed UNION — one shuffle when the branches allow it, else branch by branch. |
 | `window.py` | 61 | Distributed window functions over a disk Arrow-IPC shuffle. |
 | `write.py` | 448 | Distributed write — parallel data-file writers + one driver-side commit. |
@@ -953,10 +954,10 @@ The *global* (no-``PARTITION BY``) ordered window, in bounded memory and across 
 
 | module | lines | what it is |
 |---|---|---|
-| `disk.py` | 177 | Distributed *global* ordered window over a disk Arrow-IPC shuffle. |
-| `flight.py` | 288 | Distributed *global* (no-``PARTITION BY``) ordered window over an Arrow Flight shuffle. |
+| `disk.py` | 178 | Distributed *global* ordered window over a disk Arrow-IPC shuffle. |
+| `flight.py` | 289 | Distributed *global* (no-``PARTITION BY``) ordered window over an Arrow Flight shuffle. |
 | `offsets.py` | 240 | Ordered-bucket offsetting: the algebra that makes a *global* window splittable. |
-| `stream.py` | 103 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window, on one node. |
+| `stream.py` | 104 | Bounded-memory streaming for a *global* (no-``PARTITION BY``) window, on one node. |
 
 ### `batcher/dist/gpu/` — 4 · backend
 
@@ -1009,9 +1010,9 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 
 | module | lines | what it is |
 |---|---|---|
-| `join.py` | 369 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
+| `join.py` | 370 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
 | `sort.py` | 249 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
-| `window.py` | 128 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
+| `window.py` | 129 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
 ### `batcher/dist/streaming/` — 4 · backend
 
@@ -1060,7 +1061,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `signature.py` | 204 | Structural plan signatures. |
 | `spill_rates.py` | 194 | What the spill device *measured*, against what its class claimed. |
 | `storage_cost.py` | 80 | What spilling costs on *this* machine's storage. |
-| `streaming.py` | 322 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
+| `streaming.py` | 340 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
 
 ### `batcher/kyber/cost/` — 3 · subsystem
 
@@ -1602,7 +1603,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 
 | module | lines | what it is |
 |---|---|---|
-| `drivers.py` | 429 | Bounded-memory drivers for a top-level operator over a streaming source. |
+| `drivers.py` | 463 | Bounded-memory drivers for a top-level operator over a streaming source. |
 | `folds.py` | 587 | The running-state folds a streaming aggregate is built on, and their memory bound. |
 | `keyed_state.py` | 371 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
 
@@ -2016,7 +2017,7 @@ Catalog-derived statistics for SQL warehouses and databases.
 |---|---|---|
 | `columns.py` | 273 | Per-column statistics from a dialect's sampled statistics catalog. |
 | `compose.py` | 66 | Composing every catalog probe into the one `SourceStatistics` a connector returns. |
-| `constraints.py` | 243 | Statistics a table's *declared constraints* prove, rather than a sample estimates. |
+| `constraints.py` | 234 | Statistics a table's *declared constraints* prove, rather than a sample estimates. |
 | `counts.py` | 140 | Table-level catalog figures: how many rows, and how many bytes on disk. |
 | `probes.py` | 132 | How a connector asks a catalog a question, and which catalog it is asking. |
 
@@ -2134,11 +2135,11 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `bloom_index.py` | 119 | `BloomIndex` — a data-skipping membership index over a column's values. |
 | `feedback.py` | 338 | Execution feedback contract: Core → Kyber. |
 | `ids.py` | 10 | Stable identifiers used across plans and feedback. |
-| `ir_specs.py` | 102 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
+| `ir_specs.py` | 166 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
 | `ir_tags.py` | 270 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 136 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
-| `source_stats.py` | 273 | `plan.source_stats` — what a connector declares about a source, cheaply. |
+| `source_stats.py` | 284 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 525 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
