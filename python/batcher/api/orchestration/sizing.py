@@ -115,7 +115,7 @@ def projected_input_bytes(sources: list[Source], projections: dict[int, list[str
         The total byte estimate, or `0` when any source can offer no row count at all —
         which is not evidence of fitting, so the caller must fall back to its other signals.
     """
-    from batcher.plan.types import schema_row_bytes
+    from batcher.plan.types import projected_row_bytes
 
     total = 0.0
     for i, src in enumerate(sources):
@@ -125,13 +125,10 @@ def projected_input_bytes(sources: list[Source], projections: dict[int, list[str
         if rows is None or rows < 0:
             return 0
         try:
-            schema = src.schema()
-            projection = projections.get(i)
-            if projection:
-                schema = pa.schema([schema.field(schema.get_field_index(c)) for c in projection])
+            width = projected_row_bytes(src.schema(), projections.get(i))
         except Exception:  # pragma: no cover - a source that cannot describe itself
             return 0
-        total += rows * schema_row_bytes(schema)
+        total += rows * width
     return int(total)
 
 

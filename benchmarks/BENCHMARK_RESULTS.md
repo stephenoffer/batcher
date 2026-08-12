@@ -1,5 +1,365 @@
 # Batcher CPU benchmark results
 
+## TPC-DS's worst queries were not executing slowly — the analysis that finds a repeated subplan was being executed as the plan. q80 1,155 -> 465 ms (2026-08-11)
+
+### Every suite, before and after, on an idle 96-core / 184 GiB box
+
+Sequential, never two suites at once, same lineups both times. Geomean `b/duckdb` against
+DuckDB's **native** store — the harder bar.
+
+| suite | n | before | after | |
+|---|---:|---:|---:|---|
+| JSON | 5 | 0.281x | **0.271x** | win |
+| ClickBench | 43 | 0.636x | **0.633x** | win |
+| operators | 19 | 0.699x | **0.675x** | win |
+| TPC-H sf1 | 22 | 0.999x | **0.963x** | win |
+| h2o-join | 5 | 1.012x | **1.003x** | level |
+| h2o-groupby | 10 | 1.226x | 1.250x | lose (untouched) |
+| TPC-DS sf1 | 99 | 1.570x | **1.531x** | lose |
+
+The baseline reproduces the 1.567x this file already recorded for TPC-DS, to three digits,
+so the box and the build agree with the file before anything below is read.
+
+### The standing explanation for TPC-DS was wrong, and the clock says so
+
+This file has said for several sessions that TPC-DS and JOB are lost to cardinality
+estimation on first execution. Splitting the four worst queries' **warm** wall time into
+engine, optimizer and everything else says otherwise:
+
+| query | wall | engine | optimize | other |
+|---|---:|---:|---:|---:|
+| tpcds-q77 | 341 ms | 101 ms | 6 ms | **234 ms** |
+| tpcds-q80 | 1,029 ms | 351 ms | 231 ms | **447 ms** |
+| tpcds-q5 | 463 ms | 183 ms | 108 ms | **172 ms** |
+| tpcds-q17 | 408 ms | **393 ms** | 0.1 ms | 15 ms |
+
+q17 is what a query dominated by execution looks like, and it is the *only* one of the four.
+Running each of q77's six CTEs on its own says the same thing from the other side: every one
+of them **beats** DuckDB (0.30x-1.01x), and together they are 52 ms of a 341 ms query.
+
+All of "other" was one module. `api/subplan_reuse.py` was 93% of q77's profile, and it held
+three separate defects.
+
+### 1. The canonical form the analysis needs was also the plan being executed
+
+`_one_id_per_source` points every binding of one source object at that object's first index.
+It has to: `Dataset.join` renumbers the right-hand side's scans, so a dataset joined to
+something derived from itself binds the identical `Source` at two indices, and the two
+subtrees are not structurally equal until they are collapsed. Making the repeat visible is
+the whole reason it exists.
+
+The rewriter then executed that collapsed plan. A collapsed plan scans one `source_id` more
+than once, which is **exactly** the predicate `bc_interp::streaming_parallelizes` tests — so
+the engine routed the entire query to the *materializing* executor. On a snowflake schema,
+where every fact table is bound alongside the same `date_dim`, that is most queries.
+
+The appearances are now *located* through the canonical tree and rewritten in the plan as
+written. `walk` is pre-order and the two trees differ only in the `source_id` **field** of
+their `Scan`s, so the two walks are the same sequence of nodes and position `i` names the
+same subtree in both — an exact correspondence, not a heuristic. Measured in isolation:
+
+| query | before | after |
+|---|---:|---:|
+| tpcds-q80 | 1,010 ms | **151 ms** |
+| tpcds-q77 | 482 ms | **91 ms** |
+| tpcds-q5 | 473 ms | **199 ms** |
+
+The reuse itself was never at fault: q14 (5.5x) and q73 (4.9x) keep their wins either way.
+
+### 2. Only the *rejections* were cached, so the analysis re-ran on every collect
+
+`_NO_REUSE` recorded "nothing repeats" and nothing else, on the reasoning that a plan with
+something to reuse pays the analysis once and is then dominated by the materialization. That
+is true of a walk, and the analysis is not one — it is a canonical rebuild of the plan, a
+`structural_key` (a whole-subtree IR serialization) per node, and a `CostModel` pass over the
+plan per candidate. Measured on q80, per collect:
+
+| step | cost |
+|---|---:|
+| `common_subplans` | 337 ms |
+| `_one_id_per_source` | 65 ms |
+| `_materialize` (after defect 1) | 52 ms |
+| the query itself | 19 ms |
+
+The verdict is now cached positively as well as negatively, as the pre-order **positions** of
+each chosen subtree's appearances. Positions rather than nodes or keys because the key carries
+`plan.content_key()` — the plan's whole lowered IR — so an entry can only be served to a plan
+with the identical tree, where position `i` is the identical node. A hit costs one `walk`.
+
+### 3. The verdict was keyed on learned state, so inside a suite it never hit at all
+
+Caching it was not enough, and the way that failed is the most transferable part of this
+entry. The key was Kyber's optimizer-memo key, which folds in the learned generation, the
+calibration fingerprint, the measured read costs and the source statistics — deliberately, so
+a *cost-based* rejection cannot outlive its evidence. In isolation that reasoning holds and
+q80 ran in **97 ms**. Inside the 99-query suite the same query ran in **848 ms**, because
+every other query in the suite moves the generation for this one, so the key never repeated
+and the 400 ms analysis ran on every execution forever.
+
+`cache_key(..., learned=False)` drops those four fields for this one caller. What it trades
+away is stated plainly rather than hidden: a verdict can outlive the estimates it was taken
+on, so a subtree that stops being worth materializing keeps being materialized until the
+plan, the config, the hub or the sources change. That costs a slower query, never a wrong
+one, and the decision is far less sensitive than a plan — it asks only whether a subtree
+repeats and whether materializing it beats an engine round trip.
+
+**Do not fold this back into the optimizer memo.** There the learned fields are the point.
+
+Suite-level, over the three defects: q80 **1,155 -> 465 ms**, q77 **599 -> 360 ms**, q5
+**383 -> 293 ms**, TPC-DS 1.570x -> 1.531x.
+
+### A single low-cardinality string sort key routes by rank, not by boundary search
+
+`ORDER BY <a column with seven values>` is the shape the sample-sort serves worst, and it is
+not rare — a shipmode, a status, a region, a country code. Quantile boundaries drawn from
+seven distinct values cannot separate 64 ranges, so the routing binary-searched ~64 duplicate
+boundaries per row, and `split_constant_ranges` then had to *prove* each oversized bucket
+constant, which reads every row of the range through the offset buffer.
+
+`sample_sort::lowcard` asks the question once per distinct value instead: two parallel passes
+build chunk-local dense ids and translate them to a global rank, and the caller's existing
+counting-sort scatter does the rest. Its buckets are one key value each, so they are constant
+*by construction* — the proof pass is not cheaper, it is unnecessary — and the pieces handed
+to the gather are plain slices rather than copies.
+
+`op-sort-string-lowcard` (6M `l_shipmode`, seven values): **66.2 -> 42.8 ms**, 2.19x -> 1.41x
+against DuckDB, whose own time was 30.2 and 30.4 ms across the two runs.
+
+It declines above 256 distinct values, where the sample-sort's boundaries genuinely balance
+and its per-range comparison sort is the right algorithm again.
+
+### Also: a projected row width was a full pyarrow schema walk per query
+
+`projected_input_bytes` sliced the source schema to the pushed projection with
+`pa.schema([schema.field(schema.get_field_index(c)) for c in projection])` — a **linear** name
+scan per projected column, a fresh `Field` per column, and a whole new `pa.Schema` whose
+identity the width memo behind `schema_row_bytes` could never hit. On ClickBench's 105-column
+`hits` that is a full schema walk on every query, for a query naming one column.
+`plan.types.projected_row_bytes` sums memoized per-column widths instead.
+
+### What is left, stated precisely so it is not re-derived
+
+**The reuse cost model still materializes losers.** With the analysis cached and the executor
+no longer switched, reuse is a clear win on q80 and q73 (16 ms against 108 with it off) and
+still a clear loss on q77, q5 and q17. `_worth_materializing` prices the saving as
+`share x (a-1)/a` of the plan's cost, which counts a subtree once per appearance. On 96 cores
+those appearances are branches of a `Union` and run **concurrently**, so recomputing them
+costs about one of them in wall time while materializing serializes the work into its own
+engine round trip. The model is counting work; the query is paying critical path. Picking a
+new `_MIN_SAVED_SHARE` from the four queries above would be fitting to them.
+
+**The plan cache still alternates hit/miss on a large query.** q77 is 90 ms on a hit and
+430 ms on a miss, and the field that moves is the calibration fingerprint. Two attempts to
+stop it are recorded here as **rejected on measurement**, so they are not re-tried:
+
+* *Wider buckets.* Fingerprinting the coefficients at whole octaves rather than half. TPC-DS
+  went 1.540x -> 1.567x and q17 420 -> 932 ms.
+* *Damping the refit.* Blending each refit geometrically with the previous fit (an EWMA at
+  0.5 and again at 0.2) so consecutive fits are successive rather than independent. It does
+  converge — in ten executions, against the six a best-of-five measurement has.
+
+A deadband on the bucket edges **is** kept (`_BUCKET_HYSTERESIS`), because bucketing alone
+cannot help a coefficient whose band straddles an edge, and that part is measured: it took
+q77's hit rate from zero to roughly half. The rest of the flap is not noise around an edge —
+`sort_row` and `scan_row` move by **8x** between two runs of the identical query, and
+`hash_build_row` across a factor of ten, because every refit is derived from scratch against
+the shipped defaults over the last window of feedback. A cost model that swings by an order of
+magnitude on unchanged data is the defect, and it is upstream of the cache.
+
+**tpcds-q17 is genuinely execution-bound** (393 ms of its 408 ms in the engine) and is the one
+query of the four the standing join-order explanation does fit. **h2o-groupby is untouched**
+at 1.250x; its two worst questions group by two string keys and by a correlation.
+
+Gated: differential vs DuckDB **10,828 passed / 0 failed**, unit **17,549 passed**,
+`cargo test --workspace --exclude bc-py` green, clippy clean, ruff clean, `lint-layers` 6/6,
+`lint-structure` OK, `lint-docstrings` OK, `lint-ir-contract` OK, `lint-tests` clean,
+`lint-guardrails` clean. No IR tag and no FFI signature changed.
+
+## Every suite re-measured on a 96-core box, and a keyless `SUM` was answered by scanning a total it already held — ClickBench 0.837x -> 0.625x, operators 0.814x -> 0.677x (2026-08-11)
+
+### First: the tree was shipping a debug build
+
+`bt.versions()["engine_profile"]` read `debug`. Nothing below was measurable until
+`maturin develop --release`. The harness refuses a debug build unless asked
+(`--allow-debug-build`) precisely so this cannot happen by accident, and it is worth
+checking first on any box whose history you do not know.
+
+### Baseline: every suite, one at a time, on an idle 96-core / 184 GiB box
+
+Sequential — never two suites at once, because contention inflates our ratio (2026-08-08).
+Geomean `b/duckdb` against DuckDB's **native** store, the harder bar:
+
+| suite | before | after | n |
+|---|---:|---:|---:|
+| JSON | **0.296x** | — | 5 |
+| operators | 0.814x | **0.677x** | 19 |
+| ClickBench | 0.837x | **0.625x** | 43 |
+| h2o-join | **0.970x** | — | 5 |
+| TPC-H sf1 | 0.973x | 0.959x (unchanged — see q6 below) | 22 |
+| h2o-groupby | 1.149x | — | 10 |
+| TPC-DS sf1 | 1.567x | — | 99 |
+| JOB (isolated) | 2.053x | — | 109 |
+
+Against the other engines the margin is not close: TPC-H `b/polars` 0.519x / `b/daft`
+0.424x; operators 0.128x / 0.123x / `b/pyarrow` 0.102x; ClickBench 0.321x / 0.273x.
+
+### Three FAILED rows, and none of them is ours
+
+`tpch-q6`, `tpch-q15`, `cb-q03` report FAILED. In every case the disagreement is **Daft
+against DuckDB** — Batcher matches the oracle. The note line names the pair correctly
+(`duckdb != daft`); the run's non-zero exit does not, and reads as ours.
+
+### TPC-DS's SIGKILL at q64 is Daft's memory, not ours
+
+A full-lineup TPC-DS run died at `tpcds-q64` (exit 137, no table, every result after it
+lost). Re-run as `--engines batcher,duckdb,polars,pyarrow` it completes **99/99**. Daft is
+SIGKILLed on several large shapes and the kill takes the runner rather than the query,
+which the operator suite's window cases already document. q64 is a Batcher win.
+
+### JOB now completes: 113/113, zero correctness failures
+
+The standing note that "Batcher currently cannot finish this suite" (two runs OOM-killed at
+`q7c` and `q10a`) was measured on a **30 GiB** box. On 184 GiB with `--isolate` all 113
+queries run and every one that has a DuckDB oracle agrees with it. The geomean is **2.053x**,
+and that number is the *cold-start* case by construction: `--isolate` gives every query a
+fresh process, so nothing carries the measured cardinalities that took `tpcds-q17` from
+995 ms to 200 ms. Do not compare it against a shared-process figure.
+
+### The defect: a keyless `SUM`/`AVG`/`COUNT(DISTINCT)` executed in full while holding the exact answer
+
+An immutable in-memory relation computes its own sum, average and distinct count on demand
+(`InMemorySource.column_sum`, memoized), and `metadata_answer.enrich` lifts them into the
+statistics so the query is answered without touching a row. That is the learned-metadata
+moat and `enrich.py`'s own docstring describes it. It had stopped firing.
+
+Two sound decisions composed into a broken one:
+
+* the conductor collects source statistics **only for the columns a `MIN`/`MAX` reads**
+  (`_global_agg_bound_columns`) — an empty set for a `SUM` — so the bundle arrives holding
+  no bounds and tagged `Provenance.DEFAULT`;
+* `ColumnStat.provenance` describes the **whole bundle**, so attaching an exactly-computed
+  total to that bundle left it `DEFAULT`, and `_derive_scalar_aggregate`'s EXACT gate
+  refused it.
+
+Each is right alone. Together, `SELECT sum(x) FROM t` collected the statistics, computed the
+exact total, threw it away, and executed the query. 6M rows, warm, best of five:
+
+| shape | before | after |
+|---|---:|---:|
+| `sum(a)` float | 2.559 ms | **0.256 ms** |
+| `mean(a)` | 2.523 ms | **0.241 ms** |
+| `n_unique(i)` | 3.986 ms | **0.289 ms** |
+| `sum(i)` integer | 2.5 ms | **0.240 ms** |
+| `min(a)` — the control | 0.236 ms | 0.192 ms |
+| `max(a)` float — must refuse | 2.611 ms | 2.611 ms |
+
+`min` is the control and was always answered: a `MIN` is what makes the conductor collect
+bounds in the first place, so its bundle was `EXACT` and the same gate let it through.
+`max` over a float still executes and must — a recorded bound cannot represent the NaN that
+SQL's total order makes the maximum.
+
+**The fix is the one this codebase has now made three times: give the facet its own
+provenance tag.** `ndv_provenance` exists so a sketch distinct count can ride beside exact
+bounds; `null_count_provenance` so an exact null count can ride beside byte-truncated ones.
+`moments_provenance` is the third, covering `total_sum`/`mean`. It also settles the NaN
+question those two otherwise inherit: a moment the *source* computed saw every value and
+equals what the engine computes, so it clears the float gate a merely *recorded* moment
+cannot. The bundle tag still gates `min`/`max` and the boolean folds, which read the
+extremes. Round-tripped through `source_stats_store` beside its two siblings, for the reason
+recorded there.
+
+What moved, per case (only shapes the fix can reach moved):
+
+| case | before | after | |
+|---|---:|---:|---|
+| `op-global-sum` | 3.2 ms (2.60x) | **0.1 ms (0.11x)** | the suite's worst loss, now its best win |
+| `cb-q02` `SUM`+`COUNT`+`AVG` | 2.2 ms (2.06x) | **0.2 ms (0.17x)** | |
+| `cb-q03` `AVG(UserID)` | 1.9 ms (1.75x) | **0.2 ms (0.14x)** | |
+| `cb-q04` `COUNT(DISTINCT)` | 5.1 ms (1.00x) | **0.2 ms (0.04x)** | |
+| `cb-q05` `COUNT(DISTINCT)` | 6.2 ms (1.00x) | **0.2 ms (0.02x)** | |
+
+`tpch-q6` also read 10.0 -> 6.4 ms across the two sweeps, and that one is **not** the fix:
+q6 carries a `WHERE`, so a recorded whole-relation total can never answer it (a test pins
+that). Two further runs on an idle box put it at **6.4 and 6.5 ms (1.55x, 1.53x)**, so
+6.4 ms is the real figure and the 10.0 ms baseline reading was the outlier — TPC-H was the
+first suite to run after the box went idle, and the first suite of a sweep pays a cold page
+cache. The TPC-H geomean is 0.964x / 0.974x over those two runs against the sweep's 0.973x,
+i.e. unchanged. **Do not read the first suite of a sweep as comparable to the rest**; that
+is the second time a cold-start artifact has been recorded here as a change.
+
+**Quote this honestly: it is a caching win, not a faster reduction.** The first such query
+still pays its O(rows) pass; every repeat is free. That is exactly the cross-run learning a
+static optimizer does not do, and exactly why a best-of-five benchmark sees it. The
+reduction itself is unchanged and still at memory bandwidth.
+
+Gated: ruff clean, `lint-layers` 6/6, `lint-structure` OK, `lint-docstrings` OK,
+`lint-ir-contract` OK, `lint-guardrails` clean, `lint-tests` clean, unit **17,538 passed**,
+differential vs DuckDB **10,828 passed / 0 failed**. No Rust changed, so the IR contract and
+the crate DAG are untouched. New equivalence tests cover nulls, all-null, empty (SQL `NULL`,
+not 0), NaN, signed zero, one row, an integer sum past 2^53, a filtered relation, and — the
+dangerous shape for a facet lifted onto a *source* column — a `Project` that rebinds a
+source column's **name** beneath the aggregate, where answering `sum(a)` from the source's
+`a` would be a wrong answer a row-multiset comparison could never see.
+
+### `distributed="auto"` made a GCS round-trip per query to confirm an answer it already had
+
+`_resolve_distributed` read `cluster_topology()` — a Ray GCS RPC — *before* the two arms
+that settle a resident-source plan, both answerable from the plan alone. So every terminal
+op in a process where anything had initialized Ray paid one: an Anyscale workspace, a script
+that also uses Daft or Ray Data, any Ray-using library. The same 100k-row grouped sum, one
+process, before and after `ray.init()`:
+
+| | before the hoist | after |
+|---|---:|---:|
+| Ray not imported | 1.360 ms | 1.405 ms |
+| Ray initialized | 2.141 ms (**+0.78**) | 1.885 ms (**+0.48**) |
+
+`cluster_topology()` measures 0.26-0.34 ms per call here, which is the whole difference.
+
+**The remaining +0.48 ms is located and not fixed.** It is a *second* `ray.nodes()`, from
+`_collect` -> `record_cpu_crossover` -> `gpu_backend.fanout._cluster_gpu_count()` ->
+`cluster_topology()`, and it costs 0.56 ms profiled per query. `record_cpu_crossover`
+documents itself as "tightly gated ... only when the cluster actually has a GPU (else the
+crossover is irrelevant and this pays nothing)", but the gate that establishes "has a GPU"
+*is* the round trip. Its two cheaper conditions short-circuit ahead of it, so the cost lands
+on exactly one shape — a single-key aggregate over a scan, which is most grouped queries.
+
+The fix is a short TTL on `_cluster_gpu_count`: it asks whether the *deployment* has
+accelerators, to decide whether a best-effort learning sample is worth keeping, and that
+answer changes when a cluster autoscales rather than when a query runs. It must not be a
+copy of `cgroup._ttl_cached` (`api` cannot import that private name, and pasting it is the
+one sharing this codebase forbids), so it wants that helper lifted into a neutral module
+first — and `_internal/` is at its 12-file limit, so the lift needs a subpackage. That is a
+structural change, not a one-liner, which is why it is written down here rather than
+half-done. Do not cache `cluster_topology()` itself: its own docstring explains why it
+tracks the autoscaler live, and distributed scheduling depends on that.
+
+No suite number above moves: the single-node lineups never initialize Ray (Daft uses its
+native runner outside the distributed tier). Pinned by a test that *counts* topology reads,
+because the `except` arm returns the same `False` for the wrong reason.
+
+### The per-query floor, for whoever takes it next
+
+A query over a **single row** costs 1.36 ms; a 1,000-row filter+project costs 1.27 ms; the
+engine call inside them is ~0.26 ms profiled. The rest is diffuse — nothing above ~10% —
+the largest being `projected_input_bytes` (a pyarrow schema walk redone every query on an
+immutable source), `_close_learning_loops`, Carbonite's `recommended_config`, and ~2.1
+`memory.current` reads per query. `execution.fast_path` already buys all of it back and is
+off by default because it opts out of the learning loop. Making the *ordinary* path cheap is
+the unsolved half, and it is what the remaining ClickBench losses are made of — every one of
+them is a sub-10 ms query.
+
+### Where the rest of the deficit is, in order of size
+
+1. **TPC-DS 1.567x** and **JOB 2.053x cold** — join ordering on first execution. Unchanged
+   here and still the largest body of work. `tpcds-q77` 48x, `q80` 32x, `q5` 18x, `q17` 16x.
+2. **h2o-groupby 1.149x** — string-keyed group-by (`q2` 2.39x, `q9` 2.03x). The `StringView`
+   axis, whose two cheap approximations are already measured and rejected.
+3. **`op-sort-string-lowcard` 2.24x** — `ORDER BY` a 7-value string over 6M rows. The
+   sample-sort routes every row by binary search over boundaries drawn from seven distinct
+   values; a cardinality-adaptive counting sort is the algorithmic answer and `rank_sort_live`
+   is already its serial half.
+
 ## Session close-out: five of eight suites beat DuckDB, and what is left is one problem (2026-08-09)
 
 Where the engine stands after this session, every figure re-measured on this box with the

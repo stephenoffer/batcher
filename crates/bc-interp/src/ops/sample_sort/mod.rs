@@ -23,6 +23,8 @@ use arrow::datatypes::DataType;
 use bc_ir::SortKey;
 use rayon::prelude::*;
 
+mod lowcard;
+
 use crate::error::InterpError;
 
 /// Rows below which the single-node sample-sort stays serial — the sampling + range
@@ -93,6 +95,38 @@ pub(crate) fn parallel_sort_batch(
     // 157/123/124/120/116 ms — past 64 the sort is memory-bandwidth bound, not
     // parallelism bound, so more ranges only add sampling and concat overhead.
     let parts = rayon::current_num_threads().clamp(2, 64);
+
+    // A SINGLE LOW-CARDINALITY STRING KEY routes by **rank**, not by boundary search.
+    // Quantile boundaries drawn from seven distinct values cannot separate `parts` ranges, so
+    // on that shape the routing below binary-searches ~64 duplicate boundaries per row and
+    // `split_constant_ranges` then reads every row of every oversized bucket to prove it
+    // constant. Ranking asks the question once per distinct value, and its buckets are
+    // constant *by construction* — one bucket is one key value — so the proof pass is not
+    // merely cheaper, it is unnecessary. `lowcard` declines above its distinct-count cap,
+    // which is exactly where the sample-sort is the right algorithm again.
+    if keys.len() == 1 {
+        if let Some((part_of, ranks)) = lowcard::rank_part_of(key, k0.descending, k0.nulls_first) {
+            let buckets = bc_runtime::shuffle::bucket_indices(&part_of, ranks);
+            let fair = (batch.num_rows() / parts).max(1);
+            // Every bucket is one key value, so it is already in its final order and may be
+            // cut anywhere — which makes the pieces plain **slices** of the buckets rather
+            // than the owned index vectors the sample-sort's `Range` carries. On this shape
+            // the index list is the whole relation, so copying it to split it is a full extra
+            // pass over 4 bytes a row for nothing.
+            let pieces: Vec<&[u32]> = buckets
+                .iter()
+                .filter(|b| !b.is_empty())
+                .flat_map(|b| b.chunks(b.len().div_ceil(b.len().div_ceil(fair)).max(1)))
+                .collect();
+            // The rank already carries `descending`, so the bucket order *is* the final
+            // order and nothing may be reversed.
+            let sorted: Vec<RecordBatch> = pieces
+                .par_iter()
+                .map(|idx| bc_runtime::shuffle::gather_rows(batch, idx).map_err(InterpError::from))
+                .collect::<Result<_, InterpError>>()?;
+            return Ok(Some(sorted));
+        }
+    }
 
     // Route each row to a range, as *indices only*. Gathering the payload into range
     // batches here (and again to sort each one, and a third time to concatenate) copies
@@ -222,24 +256,45 @@ pub(crate) fn parallel_sort_batch(
             .collect()
     };
 
-    // Each range sorts independently: gather only its *key* columns (one or two narrow
-    // arrays), sort those, then map the range-local permutation back through the range's
-    // row indices and gather the payload once. A range `split_constant_ranges` proved
-    // constant skips both — its permutation is the identity (see [`Range`]) — and goes
-    // straight to the one payload gather every range pays.
-    let mut sorted: Vec<RecordBatch> = ranges
+    let mut sorted = gather_ranges(batch, &ranges, &key_arrays, keys, composite_rows.as_ref())?;
+
+    // Ranges are globally ordered relative to each other, so the sorted relation is simply
+    // the ranges in key order.
+    if reverse {
+        sorted.reverse();
+    }
+    Ok(Some(sorted))
+}
+
+/// Sort and gather every range in parallel, producing the sorted relation as pieces.
+///
+/// Each range sorts independently: gather only its *key* columns (one or two narrow arrays),
+/// sort those, then map the range-local permutation back through the range's row indices and
+/// gather the payload once. A range known constant skips both — its permutation is the
+/// identity (see [`Range`]) — and goes straight to the one payload gather every range pays.
+///
+/// `composite_rows`, when present, is the routing encoding: the range's rows are already
+/// ordered by it, so they sort by comparing rows of *that* encoding rather than building a
+/// second one over their own key gather.
+fn gather_ranges(
+    batch: &RecordBatch,
+    ranges: &[Range],
+    key_arrays: &[ArrayRef],
+    keys: &[SortKey],
+    composite_rows: Option<&arrow::row::Rows>,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    ranges
         .par_iter()
         .map(|range| -> Result<RecordBatch, InterpError> {
             let idx = &range.idx;
             if range.constant {
                 return Ok(bc_runtime::shuffle::gather_rows(batch, idx)?);
             }
-            // Composite re-route: the routing encoding already orders these rows, so sort the
-            // range's row numbers by it directly. Ties on the whole encoded key are rows equal
-            // on every sort key, and they break on the input row number — the same input order
-            // `stable_lexsort_indices` resolves them to, which is why `sort_unstable_by` is
-            // safe here (a unique final key makes the comparator a total order).
-            if let Some(rows) = composite_rows.as_ref() {
+            // Ties on the whole encoded key are rows equal on every sort key, and they break
+            // on the input row number — the same input order `stable_lexsort_indices` resolves
+            // them to, which is why `sort_unstable_by` is safe here (a unique final key makes
+            // the comparator a total order).
+            if let Some(rows) = composite_rows {
                 let mut order = idx.clone();
                 order.sort_unstable_by(|&a, &b| {
                     rows.row(a as usize)
@@ -257,14 +312,7 @@ pub(crate) fn parallel_sort_batch(
             let global: Vec<u32> = local.values().iter().map(|&l| idx[l as usize]).collect();
             Ok(bc_runtime::shuffle::gather_rows(batch, &global)?)
         })
-        .collect::<Result<_, InterpError>>()?;
-
-    // Ranges are globally ordered relative to each other, so the sorted relation is simply
-    // the ranges in key order.
-    if reverse {
-        sorted.reverse();
-    }
-    Ok(Some(sorted))
+        .collect()
 }
 
 /// Whether every row of `idx` carries the same string key, so the range is already in its
@@ -1046,13 +1094,51 @@ mod tests {
         );
     }
 
+    /// A key with ONE distinct value has no quantile boundaries at all, so the sample-sort
+    /// used to decline it and the whole relation fell to the serial sort. Rank routing does
+    /// not need boundaries: it produces one bucket, which is constant by construction, and is
+    /// cut into core-sized slices. The result is still exactly the serial oracle's — the point
+    /// of the assertion — and it is now produced in parallel.
     #[test]
-    fn single_distinct_key_declines_sample_sort() {
+    fn single_distinct_key_is_ranked_rather_than_declined() {
         let n = 1 << 18;
         let vals: Vec<Option<&str>> = (0..n).map(|_| Some("same")).collect();
         let b = str_batch(vals, (0..n as i64).collect());
-        assert!(parallel_sort_batch(&b, &key(false, false), None)
+        let ranges = parallel_sort_batch(&b, &key(false, false), None)
             .unwrap()
-            .is_none());
+            .expect("rank routing needs no boundaries");
+        assert!(
+            ranges.len() > 1,
+            "a constant key must still spread over cores"
+        );
+        assert_eq!(
+            sort_batch(&b, &key(false, false), None).unwrap(),
+            concat_ranges(&b.schema(), ranges)
+        );
+    }
+
+    /// The rank-routed path must reproduce the serial oracle under every direction and null
+    /// placement, on the shape it exists for: a seven-value key over enough rows to
+    /// parallelize. `lowcard_sort`'s own tests check the permutation; this checks the whole
+    /// operator, through the caller that splits and gathers it.
+    #[test]
+    fn rank_routed_low_cardinality_sort_matches_serial() {
+        let n = 1 << 18;
+        let values = ["AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK"];
+        let vals: Vec<Option<&str>> = (0..n)
+            .map(|i| {
+                if i % 97 == 0 {
+                    None
+                } else {
+                    Some(values[i % values.len()])
+                }
+            })
+            .collect();
+        let b = str_batch(vals, (0..n as i64).collect());
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                assert_matches_serial(&b, &key(descending, nulls_first));
+            }
+        }
     }
 }

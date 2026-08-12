@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1314 Python modules across 200 packages and 252 Rust files across 15 crates.
+Covering 1314 Python modules across 200 packages and 253 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -170,7 +170,7 @@ The public, fluent, lazy, expression-first API surface.
 | `multi_group.py` | 151 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 458 | Per-source statistics collection for the conductor. |
 | `stats.py` | 441 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
-| `subplan_reuse.py` | 328 | Compute a repeated subplan once and read it back (control plane, `api`). |
+| `subplan_reuse.py` | 402 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
 
@@ -309,7 +309,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `fast_path.py` | 223 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `prepared.py` | 223 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
 | `run.py` | 596 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
-| `sizing.py` | 204 | What the conductor needs to know about a plan's size before it runs it. |
+| `sizing.py` | 201 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 281 | The three ways the conductor can execute an admitted plan, plus the source read. |
 
 ### `batcher/api/security/` — 5 · conductor
@@ -387,7 +387,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `otel.py` | 144 | Emit a query's execution profile as OpenTelemetry spans. |
 | `preview.py` | 186 | Render a small result as a readable table for `Dataset.show`. |
 | `profile.py` | 446 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
-| `routing.py` | 245 | The `distributed="auto"` routing decision for terminal operations. |
+| `routing.py` | 282 | The `distributed="auto"` routing decision for terminal operations. |
 
 ### `batcher/api/terminal/gpu_backend/` — 5 · conductor
 
@@ -409,7 +409,7 @@ Metadata-first terminal resolution — the façade over the answer modules.
 |---|---|---|
 | `_core.py` | 379 | Metadata-first terminal resolution. |
 | `aggregate.py` | 272 | Metadata-first resolution of a *keyless aggregate* terminal. |
-| `enrich.py` | 110 | Teach the source statistics the facets a source can compute but has not been asked for. |
+| `enrich.py` | 129 | Teach the source statistics the facets a source can compute but has not been asked for. |
 
 ### `batcher/api/terminal/stream/` — 5 · conductor
 
@@ -620,7 +620,7 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 | `imputers.py` | 385 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
 | `persistence.py` | 261 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
 | `polynomial.py` | 364 | Basis expansion — polynomial/interaction terms, and B-splines. |
-| `power.py` | 385 | The Yeo-Johnson power transform and its one-pass maximum-likelihood fit. |
+| `power.py` | 389 | The Yeo-Johnson power transform and its one-pass maximum-likelihood fit. |
 | `scalers.py` | 510 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
 | `text.py` | 252 | Feature assembly and text tokenization. |
 | `text_features.py` | 160 | Surface features from a text column — the numbers a model can use before an embedding. |
@@ -1052,7 +1052,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `metadata_answer.py` | 427 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
 | `pass_base.py` | 66 | The optimizer context — shared analysis threaded through every rule. |
-| `plan_cache.py` | 554 | Memoize the optimizer — the same query, planned once. |
+| `plan_cache.py` | 625 | Memoize the optimizer — the same query, planned once. |
 | `properties.py` | 219 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 251 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 238 | The Kyber rule abstraction — one small, pure unit of optimization. |
@@ -1402,7 +1402,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `bounds.py` | 170 | Bound shortcuts — a column's extremes, and the facts that follow from them. |
 | `checks.py` | 266 | Predicate shortcuts — questions about a column's *values*, answered from its bounds. |
 | `distinct.py` | 121 | Cardinality shortcuts — how many distinct values, and whether a column is a key. |
-| `facts.py` | 228 | The one place a plan's statistics become *facts* — the substrate every shortcut reads. |
+| `facts.py` | 237 | The one place a plan's statistics become *facts* — the substrate every shortcut reads. |
 | `joins.py` | 90 | Join shortcuts — the questions two relations' bounds answer about their join. |
 | `moments.py` | 54 | Additive shortcuts — a column's total and its average, when something already recorded them. |
 | `nulls.py` | 110 | Null-shape shortcuts — how much of a column is missing, and which columns are complete. |
@@ -1416,7 +1416,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate_columns.py` | 248 | Aggregate output column statistics — the values a grouped/global aggregate produces. |
+| `aggregate_columns.py` | 264 | Aggregate output column statistics — the values a grouped/global aggregate produces. |
 | `columns.py` | 551 | Per-operator column-statistics propagation. |
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 261 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
@@ -2125,7 +2125,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `physical.py` | 136 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 120 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 273 | `plan.source_stats` — what a connector declares about a source, cheaply. |
-| `stats.py` | 492 | `plan.stats` — the neutral statistics algebra shared across every layer. |
+| `stats.py` | 525 | `plan.stats` — the neutral statistics algebra shared across every layer. |
 | `visitor.py` | 215 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract
@@ -2398,7 +2398,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `registry.py` | 342 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name grammar. |
 | `sequence.py` | 81 | Output types for the `.seq` genomics expressions. |
 | `text_quality.py` | 47 | Output types for the per-document text-quality string functions. |
-| `widths.py` | 247 | Static per-column byte widths derived from a column's Arrow type. |
+| `widths.py` | 314 | Static per-column byte widths derived from a column's Arrow type. |
 
 ### `batcher/plan/types/infer/` — 1 · contract
 
@@ -2422,7 +2422,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | `io_stats.py` | 249 | Observed per-source I/O throughput — measured on read, captured for prediction. |
 | `params.py` | 320 | `LearnedParams` — the learned-parameter half of the store, and its parsed-read cache. |
 | `smoothed.py` | 371 | Best-effort read/write of a single learned scalar, exponentially smoothed across runs. |
-| `source_stats_store.py` | 174 | Persisted source statistics — remember what Batcher wrote, for the next read. |
+| `source_stats_store.py` | 181 | Persisted source statistics — remember what Batcher wrote, for the next read. |
 | `store.py` | 122 | The pluggable persistence abstraction behind the MetadataHub. |
 | `udf_stats.py` | 136 | Measured per-UDF execution cost — Core measures it, and two subsystems spend it. |
 | `views.py` | 164 | The bounded derived views over the feedback history. |
@@ -2713,7 +2713,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/radix_sort.rs` | 297 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/repartition.rs` | 362 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 452 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
-| `ops/sample_sort.rs` | 517 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort/lowcard.rs` | 198 | Rank-routing for a **single low-cardinality string sort key**. |
+| `ops/sample_sort/mod.rs` | 565 | Single-node parallel full sort by **sample-sort**. |
 | `ops/str_sort.rs` | 438 | Stable sort permutation for a `Utf8` / `LargeUtf8` sort key. |
 | `par.rs` | 3208 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |

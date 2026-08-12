@@ -18,10 +18,16 @@ Neutral layer: imports only `pyarrow`.
 from __future__ import annotations
 
 import functools
+from collections.abc import Sequence
 
 import pyarrow as pa
 
-__all__ = ["DEFAULT_VARLEN_BYTES", "column_bytes", "schema_row_bytes"]
+__all__ = [
+    "DEFAULT_VARLEN_BYTES",
+    "column_bytes",
+    "projected_row_bytes",
+    "schema_row_bytes",
+]
 
 # Prior for a variable-length column (string/binary/list/struct) with no measured
 # width. Deliberately generous — over-estimating a payload column's width is the
@@ -39,6 +45,10 @@ _OFFSET_BYTES = 4.0
 # Bounded and cleared wholesale — a dropped entry costs one recomputation, never a wrong width.
 _ROW_BYTES_CACHE: dict[tuple[int, float], tuple[pa.Schema, float]] = {}
 _ROW_BYTES_CACHE_MAX = 1024
+
+# The same identity-keyed memo, one level finer: `{name -> width}` for a whole schema, which
+# is what lets a *projected* width be summed without building a second `pa.Schema`.
+_COLUMN_BYTES_CACHE: dict[tuple[int, float], tuple[pa.Schema, dict[str, float]]] = {}
 
 # Elements assumed in a variable-length `list`/`large_list` with no measured width.
 # A list column's width is `len × element_width`, so charging it a flat scalar prior —
@@ -240,8 +250,65 @@ def schema_row_bytes(schema: pa.Schema, default_varlen: float = DEFAULT_VARLEN_B
     hit = _ROW_BYTES_CACHE.get(key)
     if hit is not None and hit[0] is schema:
         return hit[1]
+    # Summed over *fields*, not over the name map `_column_widths` builds: a schema may
+    # legally repeat a name, and a whole-schema width has to charge for both columns.
     width = sum(column_bytes(f.type, default_varlen) for f in schema)
     if len(_ROW_BYTES_CACHE) >= _ROW_BYTES_CACHE_MAX:
         _ROW_BYTES_CACHE.clear()
     _ROW_BYTES_CACHE[key] = (schema, width)
     return width
+
+
+def projected_row_bytes(
+    schema: pa.Schema,
+    projection: Sequence[str] | None,
+    default_varlen: float = DEFAULT_VARLEN_BYTES,
+) -> float:
+    """Estimated bytes per row of `schema` restricted to `projection`'s columns.
+
+    The projected counterpart to `schema_row_bytes`, and it exists because the obvious
+    spelling of it is quadratic. Slicing a schema down to a projection with
+    ``pa.schema([schema.field(schema.get_field_index(c)) for c in projection])`` runs a
+    **linear** name scan per projected column, allocates a `Field` per column and a whole
+    new `pa.Schema` — and because that schema is a fresh object every call, the identity
+    memo behind `schema_row_bytes` can never hit for it. On ClickBench's 105-column `hits`
+    that is a full pyarrow schema walk on every single query, for a query naming one column.
+    Summing memoized per-column widths instead is a dict lookup per projected column.
+
+    A projected name the schema does not carry contributes nothing rather than raising: the
+    caller is sizing a read, and a projection is derived from the plan's own column
+    resolution, so a name absent here means the two disagree — which is a reason to
+    under-estimate a byte total, never to fail a query.
+
+    Args:
+        schema: The source's full Arrow schema.
+        projection: The column names actually read, or `None` for the whole schema.
+        default_varlen: Bytes to assume for a variable-length value.
+
+    Returns:
+        The estimated per-row width of the projected row, in bytes.
+    """
+    if not projection:
+        return schema_row_bytes(schema, default_varlen)
+    widths = _column_widths(schema, default_varlen)
+    return sum(widths.get(name, 0.0) for name in projection)
+
+
+def _column_widths(schema: pa.Schema, default_varlen: float) -> dict[str, float]:
+    """`{column name -> width}` for `schema`, memoized on the schema's identity.
+
+    Keyed the same way, and for the same reason, as `schema_row_bytes` — see its docstring
+    for why identity rather than value. A duplicated column name keeps the first field's
+    width, which matches what a projection naming it would read.
+    """
+    key = (id(schema), default_varlen)
+    hit = _COLUMN_BYTES_CACHE.get(key)
+    if hit is not None and hit[0] is schema:
+        return hit[1]
+    widths: dict[str, float] = {}
+    for field in schema:
+        widths.setdefault(field.name, column_bytes(field.type, default_varlen))
+    if len(_COLUMN_BYTES_CACHE) >= _ROW_BYTES_CACHE_MAX:
+        _COLUMN_BYTES_CACHE.clear()
+    _COLUMN_BYTES_CACHE[key] = (schema, widths)
+    return widths

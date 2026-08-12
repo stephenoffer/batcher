@@ -25,7 +25,12 @@ from batcher.plan.types.registry import (
     dtype_name,
     resolve_dtype,
 )
-from batcher.plan.types.widths import DEFAULT_VARLEN_BYTES, column_bytes, schema_row_bytes
+from batcher.plan.types.widths import (
+    DEFAULT_VARLEN_BYTES,
+    column_bytes,
+    projected_row_bytes,
+    schema_row_bytes,
+)
 
 __all__ = [
     "CAST_DTYPES",
@@ -36,6 +41,7 @@ __all__ = [
     "dtype_name",
     "infer_type",
     "logical_bytes",
+    "projected_row_bytes",
     "promote",
     "resolve_dtype",
     "retained_bytes",
