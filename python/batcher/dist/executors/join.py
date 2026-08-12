@@ -31,6 +31,7 @@ from batcher.dist.executors.ray_runtime import (
 from batcher.dist.skew import join_skew_key, resolve_hot_keys, salting_preserves_result
 from batcher.io.source import Source
 from batcher.plan.distribution import BROADCAST_SAFE_JOINS
+from batcher.plan.ir_specs import binary_task_ir
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
 from batcher.plan.types import retained_bytes, total_retained_bytes
 
@@ -139,11 +140,7 @@ def _join_reducer_ir(join: Join) -> dict:
     dropped). Used by both the shuffle reducer (co-partitioned buckets) and the
     broadcast task (left chunk joined with the full right).
     """
-    return {
-        **join.shape_ir(),
-        "left": {"op": "scan", "source_id": 0},
-        "right": {"op": "scan", "source_id": 1},
-    }
+    return binary_task_ir(join)
 
 
 def _distributed_join(

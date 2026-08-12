@@ -28,6 +28,7 @@ from batcher.dist.spill.buckets import (
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import Window
 
 
@@ -65,7 +66,7 @@ def stream_spilling_window(
     # came back as `window ← scan`, and the next `collect()` either returned the wrong rows
     # or raised `unknown column: x`. Copy before rewriting.
     win_ir = dict(window.to_ir())
-    win_ir["input"] = {"op": "scan", "source_id": 0}
+    win_ir["input"] = task_scan_ir()
     win_json = json.dumps(win_ir)
     n_buckets = _fd_safe(num_partitions)
     source = sources[sid]

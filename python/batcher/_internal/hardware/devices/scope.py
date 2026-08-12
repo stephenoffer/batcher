@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from batcher._internal.accelerators import NO_DEVICE_TOKENS, VISIBLE_DEVICE_ENVS
 from batcher._internal.hardware.nvml import device_telemetry
 
 __all__ = [
@@ -50,17 +51,6 @@ __all__ = [
     "visible_device_indices",
     "visible_device_telemetry",
 ]
-
-#: The environment variables a scheduler pins a process's *visible* devices through, in
-#: priority order. NVIDIA and HIP both honor ``CUDA_VISIBLE_DEVICES``; AMD ROCm adds its own
-#: two. A host runs one vendor, so consulting all three is safe and the first one set wins.
-VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
-
-#: Whole values of a visibility variable that mean "no devices at all", distinct from a device
-#: list this code merely failed to parse. Kept in step with `_internal.accelerators._NO_DEVICES`,
-#: which applies the same rule to the inventory; the two answer for different callers (this one
-#: pins and sizes, that one enumerates) and both took the whole node on a `-1`.
-_NO_DEVICES = frozenset({"", "-1", "none", "void"})
 
 #: The variable that decides how the CUDA runtime *numbers* devices.
 DEVICE_ORDER_ENV = "CUDA_DEVICE_ORDER"
@@ -354,7 +344,7 @@ def _resolve(raw: str, telemetry) -> tuple[int, ...]:
     first* (`"0,-1,1"` yields device 0); only the leading position hit the fallback, which is
     the position anything disabling the GPU actually writes.
     """
-    if not raw or raw.strip().lower() in _NO_DEVICES:
+    if not raw or raw.strip().lower() in NO_DEVICE_TOKENS:
         return ()
     by_uuid = {t.uuid: t.index for t in telemetry if t.uuid}
     count = len(telemetry)

@@ -20,6 +20,7 @@ from batcher._internal.optional import require
 from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
+from batcher.io.predicate import to_pyarrow_expression
 from batcher.io.splits import Split
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.plan.source_stats import SourceStatistics
@@ -224,18 +225,10 @@ class ORCSource(FileSource):
                     batch = batch.select(projection)
                 yield batch
 
-    @staticmethod
-    def _pa_filter(predicate: dict | None) -> Any:
-        if predicate is None:
-            return None
-        from batcher.io.predicate import to_pyarrow_expression
-
-        return to_pyarrow_expression(predicate)
-
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        flt = self._pa_filter(predicate)
+        flt = to_pyarrow_expression(predicate)
         if flt is None:
             return super().read(projection)
         import pyarrow.dataset as pads
@@ -246,7 +239,7 @@ class ORCSource(FileSource):
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        flt = self._pa_filter(predicate)
+        flt = to_pyarrow_expression(predicate)
         if flt is None:
             yield from super().iter_batches(projection)
             return

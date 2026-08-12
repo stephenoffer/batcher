@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir import Expr, array, col, lit
 
 if TYPE_CHECKING:
@@ -73,15 +74,7 @@ def read_reference(
         ColumnNotFoundError: If a named column is missing.
     """
     names = [*features, *extra]
-    available = ds.columns
-    present = set(available)
-    for name in names:
-        if name not in present:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, available, hint=f"{what} needs this column.")
-            )
+    require_columns(ds, *names, hint=f"{what} needs this column.")
     kept = ds.select(*names)
     for name in features:
         kept = kept.filter(col(name).is_not_null())

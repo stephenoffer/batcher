@@ -50,6 +50,18 @@ _NS_ROUTE = "tuning.adaptive_route_v1"  # per-signature staged-vs-one-shot arm s
 _NS_ROUTE_COLD = "tuning.adaptive_route_cold_v1"  # which route arms have spent their cold sample
 
 # The discrete join-algorithm arms the bandit ranges over — all equivalent relations.
+#
+# An *ordered* view of the plan layer's `JOIN_STRATEGIES`, not a second list of them. Order
+# matters here and does not there: `ucb1_best_arm` walks the arms and takes the first untried
+# one, so the tuple decides which algorithm a cold signature measures first, and `hash` is the
+# right default to spend that sample on. That is why this is spelled out rather than derived
+# by `sorted(JOIN_STRATEGIES)`, which would put `broadcast` first and silently change which
+# arm every cold signature probes.
+#
+# What must not differ is *membership*. A strategy the engine gains and the bandit never ranges
+# over is an arm only the static cost model can ever pick, which is precisely the thing the
+# bandit exists to correct — and nothing about that failure is visible: plans stay correct and
+# merely stop improving. `tests/unit/test_shared_vocabulary_contract.py` holds the two in step.
 JOIN_ARMS: tuple[str, ...] = ("hash", "broadcast", "sort_merge")
 # The two execution routes for a plan: re-optimize between stages, or plan once and run.
 # Equivalent relations again — staging only re-plans, it never changes the algebra.

@@ -27,7 +27,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.exprs.guards import is_float, is_integer, nullable, schema_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node, safe_expr
+from batcher.kyber.rules.leaf_rewrite import node_expr_rule, rewrite_node, safe_expr
 from batcher.plan.expr_ir import Expr, Lit
 from batcher.plan.expr_ir.core import Binary, IsInf, IsNan, Math2Expr, MathExpr
 from batcher.plan.expr_rewrite import expr_key
@@ -423,15 +423,6 @@ def _fold_int_math2(fn: str):
     return leaf
 
 
-def _make_int_math2_rule(fn: str):
-    leaf = _fold_int_math2(fn)
-
-    def apply(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_node(node, leaf)
-
-    return apply
-
-
 # One rule per exact integer two-argument function. Both have a single mathematical
 # answer, so Python's arbitrary-precision result and the engine's agree by definition --
 # unlike the transcendentals, which stay unfolded because implementations legitimately
@@ -441,7 +432,7 @@ INT_MATH2_FOLD_RULES = [
         node_rule(
             f"fold_{fn}_of_literals",
             Phase.NORMALIZE,
-            _make_int_math2_rule(fn),
+            node_expr_rule(_fold_int_math2(fn)),
             matches=(Filter, Project),
             expr_fn=_fold_int_math2(fn),
             expr_matches=(Math2Expr,),
@@ -471,15 +462,6 @@ def _fold_shift_impl(expr: Expr, op: str) -> Expr:
     return expr
 
 
-def _make_shift_rule(op: str):
-    leaf = _fold_shift_op(op)
-
-    def apply(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_node(node, leaf)
-
-    return apply
-
-
 # One rule per shift direction. The distance must be in `[0, 64)` and the result must fit
 # in `Int64`, so the fold never has to model the engine's behaviour for an over-wide shift
 # or an overflow -- outside that window the data plane evaluates it as before.
@@ -488,7 +470,7 @@ SHIFT_FOLD_RULES = [
         node_rule(
             f"fold_{op}_of_literals",
             Phase.NORMALIZE,
-            _make_shift_rule(op),
+            node_expr_rule(_fold_shift_op(op)),
             matches=(Filter, Project),
             expr_fn=_fold_shift_op(op),
             expr_matches=(Binary,),

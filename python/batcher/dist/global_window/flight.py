@@ -57,6 +57,7 @@ from batcher.dist.global_window.offsets import (
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan, Window
 
 __all__ = ["execute_global_window_flight"]
@@ -92,7 +93,7 @@ def execute_global_window_flight(
     # before touching them — mutating the cached structures would corrupt every later use of
     # the same plan.
     win_ir = dict(window.to_ir())
-    win_ir["input"] = {"op": "scan", "source_id": 0}
+    win_ir["input"] = task_scan_ir()
     win_ir["functions"] = list(win_ir["functions"])
     # `avg` is offset through its running sum and count, so ask the kernel for those two
     # alongside it under private aliases; the driver reads them back per bucket and drops

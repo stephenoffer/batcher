@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.metrics.tables import calibration_curve
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.functions.metrics.model.classification import positive_mask
 
 if TYPE_CHECKING:
@@ -184,13 +185,7 @@ def brier_skill_score(
     import batcher as bt
     from batcher.plan.expr_ir.constructors import col, lit, when
 
-    for name in (y_true, y_score):
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )
+    require_columns(ds, y_true, y_score)
     actual = when(positive_mask(col(y_true), positive)).then(lit(1.0)).otherwise(lit(0.0))
     error = col(y_score) - actual
     row = (

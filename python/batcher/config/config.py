@@ -25,6 +25,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
 from batcher.config.accelerator import AcceleratorConfig
+from batcher.config.env import falsy, truthy
 from batcher.config.fault_tolerance import FaultToleranceConfig
 
 __all__ = [
@@ -2645,13 +2646,9 @@ class Config:
         return f"Config({shown}{more})"
 
 
-_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
-_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
-
-
 def _coerce(raw: str, to: object) -> object:
     if to is bool:
-        return raw.strip().lower() in _TRUE_TOKENS
+        return truthy(raw)
     if to is int:
         return int(raw)
     if to is float:
@@ -2663,8 +2660,8 @@ def _coerce(raw: str, to: object) -> object:
     # while the string literal "auto" happened to pass. Enabling/disabling the feature via
     # env raised `ConfigError`; a string-valued sentinel like "auto" still passes through.
     members = [a for a in typing.get_args(to) if a is not type(None)]
-    if bool in members and raw.strip().lower() in (_TRUE_TOKENS | _FALSE_TOKENS):
-        return raw.strip().lower() in _TRUE_TOKENS
+    if bool in members and (truthy(raw) or falsy(raw)):
+        return truthy(raw)
     if str in members:
         return raw
     return raw

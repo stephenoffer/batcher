@@ -190,7 +190,7 @@ def _field_type(schema: Any | None, name: str) -> Any | None:
         return None
 
 
-def to_pyarrow_expression(ir: dict[str, Any], schema: Any | None = None) -> Any | None:
+def to_pyarrow_expression(ir: dict[str, Any] | None, schema: Any | None = None) -> Any | None:
     """Translate the pushable subset of `ir` to a `pyarrow.dataset.Expression`.
 
     `schema` is the scanned table's Arrow schema, when the caller has it. It lets a
@@ -199,8 +199,23 @@ def to_pyarrow_expression(ir: dict[str, Any], schema: Any | None = None) -> Any 
     filter on such a column raises rather than prunes. Omitting it keeps the prior
     behavior (a tz-naive ``timestamp[us]`` literal).
 
-    Returns ``None`` if the predicate is not (fully) pushable.
+    **`None` in gives `None` out**, the same answer an unpushable predicate gets, because
+    every caller treats the two identically: no filter to bind, so read what you would have
+    read. Accepting it here retired five near-identical wrappers — `orc._pa_filter`,
+    `parquet.source._pa_filter`, `parquet.dataset._pa_filter`, `hudi._expression` and
+    `delta.source`'s guard — that existed for no other reason. The signature was the only
+    thing making them necessary, and a wrapper whose whole body is an argument check belongs in
+    the callee.
+
+    Args:
+        ir: The predicate IR Kyber pushed to this scan, or `None` when it pushed nothing.
+        schema: The scanned relation's Arrow schema, when the caller has it.
+
+    Returns:
+        A `pyarrow.dataset.Expression`, or `None` when there is nothing pushable to bind.
     """
+    if ir is None:
+        return None
     return _to_pa(ir, _dataset_module(), schema)
 
 

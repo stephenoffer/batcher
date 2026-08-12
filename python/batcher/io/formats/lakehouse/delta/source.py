@@ -194,8 +194,12 @@ class DeltaSource:
         return self._snapshot().add_actions()
 
     def _pa_filter(self, predicate: dict | None) -> Any:
-        if predicate is None:
-            return None
+        """The pushed filter, typed against the snapshot's schema. `None` in, `None` out.
+
+        Kept where the four wrappers like it were deleted, because this one does something:
+        it reads `self._snapshot().schema()`. The `predicate is None` guard is `to_pyarrow_
+        expression`'s job now.
+        """
         from batcher.io.predicate import to_pyarrow_expression
 
         # Pass the table schema so a temporal literal is typed to its column — without it,

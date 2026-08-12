@@ -31,7 +31,7 @@ from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.io.source import Source
 from batcher.plan.distribution import BROADCAST_SAFE_JOINS
-from batcher.plan.ir_specs import agg_spec_json
+from batcher.plan.ir_specs import agg_spec_json, task_scan_ir
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
 from batcher.plan.types import retained_bytes, total_retained_bytes
 
@@ -184,8 +184,8 @@ def execute_broadcast_join_flight(
     join_ir = json.dumps(
         {
             **join.shape_ir(),
-            "left": {"op": "scan", "source_id": 0},
-            "right": {"op": "scan", "source_id": 1},
+            "left": task_scan_ir(),
+            "right": task_scan_ir(1),
         }
     )
 

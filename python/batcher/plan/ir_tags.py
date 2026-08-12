@@ -190,13 +190,16 @@ WINDOW_AGGREGATES: Final = frozenset(
         "bool_and", "bool_or", "bit_and", "bit_or", "bit_xor", "count_distinct",
     }
 )  # fmt: skip
+# The value functions that select a row by *offset* or position. Named on its own because
+# the device translator dispatches these separately from the fills below — it had its own
+# copy of exactly this set, which is how a vocabulary the engine grows silently stops being
+# the vocabulary a tier claims to translate.
+WINDOW_OFFSET_VALUE: Final = frozenset({"first_value", "last_value", "lag", "lead", "nth_value"})
 # The fills select by *nullness* rather than by offset, but share the value functions'
 # contract: input required, output type = input type, no explicit frame (theirs is
 # implied). Unlike the other value functions they are meaningless without an order.
 WINDOW_FILL: Final = frozenset({"forward_fill", "backward_fill"})
-WINDOW_VALUE: Final = (
-    frozenset({"first_value", "last_value", "lag", "lead", "nth_value"}) | WINDOW_FILL
-)
+WINDOW_VALUE: Final = WINDOW_OFFSET_VALUE | WINDOW_FILL
 # The whole-prefix recurrences (`bc_runtime::window::series`). Each row's answer is a
 # function of the entire ordered prefix carried in a running state, which is why none of
 # them takes a frame — there is no subset of rows to aggregate — and why all of them
@@ -245,6 +248,17 @@ AGG_FNS: Final = frozenset(
         "n_length", "l_count", "aun",
     }
 )  # fmt: skip
+
+#: The aggregates that *count* rather than measure, so their answer over no rows is `0` and
+#: never null. Every other aggregate over an empty group is null, and the distinction is the
+#: one thing a caller must get right about an empty input: the device translator builds its
+#: empty-global row from it, and Kyber's statistics use it to bound a count's output at zero
+#: rather than at "unknown".
+#:
+#: Those two are `core` and `kyber`, which the independence contract forbids from importing
+#: each other — so a shared vocabulary can only live here. Pasted twice is the *only* wrong
+#: way to share between them, and it had been pasted twice.
+COUNTING_AGGS: Final = frozenset({"count", "count_star", "count_distinct"})
 
 #: How a window frame counts its offsets, mirroring the Rust `FrameUnits` enum.
 FRAME_UNITS: Final = frozenset({"rows", "range", "groups"})

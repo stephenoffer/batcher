@@ -43,6 +43,7 @@ from batcher._internal.errors import BackendError
 from batcher._internal.logging import note_suppressed
 from batcher._internal.optional import require
 from batcher.io.formats.base import SINKS, SOURCES
+from batcher.io.predicate import to_pyarrow_expression
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.source_stats import SourceStatistics
@@ -144,13 +145,6 @@ class HudiFileSliceSplit:
             batch = batch.select(projection)
         return batch if batch.num_rows else None
 
-    def _expression(self, predicate: dict | None) -> Any:
-        if predicate is None:
-            return None
-        from batcher.io.predicate import to_pyarrow_expression
-
-        return to_pyarrow_expression(predicate)
-
     def schema(self) -> pa.Schema:
         return HudiSource(
             self.table_uri, options=dict(self.options), as_of_instant=self.as_of_instant
@@ -173,7 +167,7 @@ class HudiFileSliceSplit:
         than the worker's memory could not be read at all — which is the one thing a
         per-file split exists to make impossible.
         """
-        expression = self._expression(predicate)
+        expression = to_pyarrow_expression(predicate)
         for batch in self._slice_batches():
             shaped = self._shape(batch, expression, projection)
             if shaped is not None:

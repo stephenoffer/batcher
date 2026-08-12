@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from batcher.core.gpu_plan.backend import Unsupported
 from batcher.core.gpu_plan.exprs import eval_expr
+from batcher.plan.ir_tags import COUNTING_AGGS
 
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
@@ -364,7 +365,8 @@ def _global(df, ir: dict, be: DfBackend):
 
 
 #: Reductions that count rather than measure, so their answer over no rows is `0` and not null.
-_COUNTING = frozenset({"count", "count_star", "count_distinct"})
+#: Imported, not restated: Kyber's statistics need the same set and cannot import this module.
+_COUNTING = COUNTING_AGGS
 
 
 def _empty_global_row(out, ir: dict):

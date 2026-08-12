@@ -28,7 +28,13 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node, safe_expr
+from batcher.kyber.rules.leaf_rewrite import (
+    collapse_doubled_call,
+    collapse_involution,
+    node_expr_rule,
+    rewrite_node,
+    safe_expr,
+)
 from batcher.plan.expr_ir import Expr, Lit
 from batcher.plan.expr_ir.func_nodes import ListFunc, ListGet, ListSet, ListSlice, StructField
 from batcher.plan.expr_ir.nodes import Array, MakeStruct
@@ -202,15 +208,6 @@ def _idempotent_list(fn: str):
     return leaf
 
 
-def _make_idempotent_rule(fn: str):
-    leaf = _idempotent_list(fn)
-
-    def apply(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_node(node, leaf)
-
-    return apply
-
-
 # One rule per idempotent list function, over a shared body -- the registration shape
 # `extra/temporal_sargable` uses for its own cross-product family. `sort(sort(x))` is
 # `sort(x)`, and likewise for `unique`, `arg_sort`, `flatten`, and `normalize`: each maps
@@ -222,9 +219,9 @@ IDEMPOTENT_LIST_RULES = [
         node_rule(
             f"collapse_idempotent_list_{fn}",
             Phase.NORMALIZE,
-            _make_idempotent_rule(fn),
+            node_expr_rule(collapse_doubled_call(ListFunc, fn)),
             matches=(Filter, Project),
-            expr_fn=_idempotent_list(fn),
+            expr_fn=collapse_doubled_call(ListFunc, fn),
             expr_matches=(ListFunc,),
         )
     )
@@ -232,15 +229,8 @@ IDEMPOTENT_LIST_RULES = [
 ]
 
 
-def _reverse_involution(expr: Expr) -> Expr:
-    if (
-        isinstance(expr, ListFunc)
-        and expr.fn == "reverse"
-        and isinstance(expr.input, ListFunc)
-        and expr.input.fn == "reverse"
-    ):
-        return expr.input.input
-    return expr
+#: `reverse(reverse(x))` over a list, through the shared involution factory.
+_reverse_involution = collapse_involution(ListFunc, "reverse")
 
 
 @rule(
@@ -274,15 +264,6 @@ def _reduce_through_permutation(reduction: str, permutation: str):
     return leaf
 
 
-def _make_permutation_rule(reduction: str, permutation: str):
-    leaf = _reduce_through_permutation(reduction, permutation)
-
-    def apply(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_node(node, leaf)
-
-    return apply
-
-
 # The (reduction x permutation) cross-product, one registered rule per pair.
 #
 # `max(sort(x)) -> max(x)`: a permutation rearranges a list without adding or removing
@@ -297,7 +278,7 @@ REDUCTION_THROUGH_PERMUTATION_RULES = [
         node_rule(
             f"{reduction}_through_list_{permutation}",
             Phase.NORMALIZE,
-            _make_permutation_rule(reduction, permutation),
+            node_expr_rule(_reduce_through_permutation(reduction, permutation)),
             matches=(Filter, Project),
             expr_fn=_reduce_through_permutation(reduction, permutation),
             expr_matches=(ListFunc,),
@@ -353,15 +334,6 @@ def _reduce_through_unique(reduction: str):
     return leaf
 
 
-def _make_unique_rule(reduction: str):
-    leaf = _reduce_through_unique(reduction)
-
-    def apply(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_node(node, leaf)
-
-    return apply
-
-
 # One rule per dedup-independent reduction. `min(unique(x)) -> min(x)`: de-duplication
 # changes an element's multiplicity, never the set of values present, so a reduction
 # that reads only the set is unaffected -- and the `unique` it sits on costs a hash set
@@ -372,7 +344,7 @@ REDUCTION_THROUGH_UNIQUE_RULES = [
         node_rule(
             f"{reduction}_through_list_unique",
             Phase.NORMALIZE,
-            _make_unique_rule(reduction),
+            node_expr_rule(_reduce_through_unique(reduction)),
             matches=(Filter, Project),
             expr_fn=_reduce_through_unique(reduction),
             expr_matches=(ListFunc,),

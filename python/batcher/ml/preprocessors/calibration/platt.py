@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, column_arg
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -40,17 +41,7 @@ def require_calibration_columns(ds: Dataset, *names: str, what: str) -> None:
     Raises:
         ColumnNotFoundError: If a named column is missing.
     """
-    available = ds.columns
-    present = set(available)
-    for name in names:
-        if name not in present:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message(
-                    "column", name, available, hint=f"{what} needs the score and label columns."
-                )
-            )
+    require_columns(ds, *names, hint=f"{what} needs the score and label columns.")
 
 
 def binary_label(label_column: str, positive: object) -> object:

@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.expr_ir.nodes import row_number
 from batcher.plan.functions.aggregate import count_if
@@ -44,13 +45,7 @@ _RELEVANT = "__bt_relevant"
 
 def _ranked(ds: Dataset, query: str, score: str, label: str, positive: Any) -> Dataset:
     """One row per candidate, carrying its 1-based rank within its query and a 0/1 relevance."""
-    for name in (query, score, label):
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )
+    require_columns(ds, query, score, label)
     return ds.with_columns(
         **{
             _RANK: row_number().over(partition_by=[query], order_by=[(score, True)]),

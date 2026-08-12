@@ -17,7 +17,7 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import require_fitted, require_numeric
+from batcher.ml._estimator import require_fit_columns, require_fitted
 from batcher.plan.expr_ir.constructors import col, lit, when
 from batcher.plan.functions.horizontal import max_horizontal, sum_horizontal
 
@@ -188,14 +188,7 @@ class GaussianMixture:
         from batcher.plan.functions.aggregate import mean as mean_
         from batcher.plan.functions.aggregate import sum as sum_
 
-        for name in self.columns:
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
-        require_numeric(self, ds, self.columns)
+        require_fit_columns(self, ds, self.columns)
         d = len(self.columns)
         n = ds.count()
         if n < self.n_components:

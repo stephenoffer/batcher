@@ -30,7 +30,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.rules.exprs.guards import is_string, schema_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import collapse_involution, rewrite_node
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc
 from batcher.plan.logical import Filter, LogicalPlan, Project
@@ -219,15 +219,10 @@ def regexp_anchored_to_equality(
 # --- string identities ---------------------------------------------------------
 
 
-def _reverse_involution(expr: Expr) -> Expr:
-    if (
-        isinstance(expr, StrFunc)
-        and expr.fn == "reverse"
-        and isinstance(expr.input, StrFunc)
-        and expr.input.fn == "reverse"
-    ):
-        return expr.input.input
-    return expr
+#: `reverse(reverse(s))` over a string, through the shared involution factory. `_reverse_leaf`
+#: below adds the coercion guard this family needs and lists cannot: dropping both calls also
+#: drops a Binary-to-Utf8 coercion the result may still depend on.
+_reverse_involution = collapse_involution(StrFunc, "reverse")
 
 
 def _reverse_leaf(expr: Expr, schema: SchemaRef | None) -> Expr:

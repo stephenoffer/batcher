@@ -49,7 +49,7 @@ from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
 from batcher.io.source import Source
-from batcher.plan.ir_specs import sort_keys_ir
+from batcher.plan.ir_specs import sort_keys_ir, task_scan_ir
 from batcher.plan.logical import LogicalPlan, Sort
 
 __all__ = ["execute_sort_flight", "execute_topn_flight"]
@@ -112,7 +112,7 @@ def execute_topn_flight(
     # Per-worker plan: read the split (scan 0) → map prefix → local top-N heap.
     local_ir = _sort_ir(sort.keys, sort.limit, map_plan.to_ir())
     # Driver merge plan: top-N over the concatenated per-worker top-Ns (scan 0).
-    merge_ir = _sort_ir(sort.keys, sort.limit, {"op": "scan", "source_id": 0})
+    merge_ir = _sort_ir(sort.keys, sort.limit, task_scan_ir())
 
     actors, pg, fleet_addrs, workers, owns = acquire_fleet(workers, _shuffle_credits(), cfg_json)
     try:
@@ -209,7 +209,7 @@ def execute_sort_flight(
     sort_ir = json.dumps(
         {
             **sort.shape_ir(),
-            "input": {"op": "scan", "source_id": 0},
+            "input": task_scan_ir(),
         }
     )
     credits = _shuffle_credits()

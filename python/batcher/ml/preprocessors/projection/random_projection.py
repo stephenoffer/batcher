@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, columns_arg
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir import Expr, col, lit
 
 if TYPE_CHECKING:
@@ -145,15 +146,7 @@ class _RandomProjection(Preprocessor):
             ColumnNotFoundError: If a named column is missing.
         """
         self._check_numeric(ds)
-        available = ds.columns
-        present = set(available)
-        for name in self.columns:
-            if name not in present:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, available, hint="Pass numeric columns.")
-                )
+        require_columns(ds, *self.columns, hint="Pass numeric columns.")
         terms = self.n_components * len(self.columns)
         if terms > self.max_terms:
             raise PlanError(

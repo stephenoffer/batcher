@@ -20,6 +20,7 @@ these tunables carry their own range checks, which would otherwise push
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Final
 
 from batcher._internal.errors import ConfigError
 
@@ -31,10 +32,20 @@ __all__ = [
     "validate_accelerator",
 ]
 
-#: Cache element types an inference stage may be sized for. Mirrors what the KV-cache math in
-#: `carbonite.accel.kv_cache` knows an element width for, so a config that validates is a
-#: config that can be sized.
-_CACHE_DTYPES = frozenset({"fp32", "float32", "fp16", "float16", "bf16", "fp8", "int8"})
+#: Bytes per element for every cache dtype an inference stage may be sized for. FP8 KV cache
+#: halves the cache against FP16 at a small quality cost, and is the single largest lever on
+#: concurrency.
+#:
+#: The *widths* are what defines the vocabulary, so this table is both the validator's accepted
+#: set and the sizing math's element width — one table, at the layer both callers can see
+#: (`carbonite.accel.kv_cache` computes the sizing and may import config; config may not import
+#: it back). They were two lists whose only guarantee of agreement was a comment here saying
+#: this one "mirrors" that one, and the failure it invited is exact: a dtype accepted by
+#: validation but absent from the width table sizes its cache at zero bytes, so the admission
+#: check waves through a load the device cannot hold.
+CACHE_DTYPE_BYTES: Final[dict[str, int]] = {
+    "fp32": 4, "float32": 4, "fp16": 2, "float16": 2, "bf16": 2, "fp8": 1, "int8": 1,
+}  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,7 +336,7 @@ def validate_accelerator(cfg: AcceleratorConfig) -> None:
         (0.0 <= cfg.kv_cache_headroom < 1.0, "accelerator.kv_cache_headroom must be in [0, 1)"),
         (cfg.max_context_tokens >= 0, "accelerator.max_context_tokens must be >= 0"),
         (
-            cfg.kv_cache_dtype.lower() in _CACHE_DTYPES,
+            cfg.kv_cache_dtype.lower() in CACHE_DTYPE_BYTES,
             f"accelerator.kv_cache_dtype {cfg.kv_cache_dtype!r} is not a supported cache dtype",
         ),
     )

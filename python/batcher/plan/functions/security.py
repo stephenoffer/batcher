@@ -35,10 +35,10 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
 import warnings
 
 from batcher._internal.errors import PlanError, SecurityWarning
+from batcher.config.env import env_flag
 from batcher.plan.expr_ir.core import Expr, IntoExpr, _wrap
 from batcher.plan.expr_ir.func_nodes import StrFunc
 
@@ -69,12 +69,11 @@ def _is_key_ref(key: str) -> bool:
 #: Env var that upgrades the inline-key warning to a hard error. Set it (to any truthy
 #: value) in a deployment where a key must never enter a plan.
 _REQUIRE_KEY_REFS_VAR = "BATCHER_REQUIRE_KEY_REFS"
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def _require_key_refs() -> bool:
     """Whether inline keys are forbidden outright in this deployment."""
-    return os.environ.get(_REQUIRE_KEY_REFS_VAR, "").strip().lower() in _TRUTHY
+    return env_flag(_REQUIRE_KEY_REFS_VAR)
 
 
 def _warn_inline_key(func: str) -> None:

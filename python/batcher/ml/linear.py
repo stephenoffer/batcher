@@ -19,10 +19,11 @@ from batcher._internal.errors import PlanError
 from batcher.ml._estimator import (
     argmax_prediction,
     linear_score,
+    require_fit_columns,
     require_fitted,
-    require_numeric,
     require_rows,
 )
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -45,15 +46,7 @@ def _solve(
     from batcher.plan.functions.aggregate import mean as mean_
 
     columns = [*features, target]
-    for name in columns:
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )
-    require_numeric(estimator, ds, features)
-    require_numeric(estimator, ds, [target], role="target")
+    require_fit_columns(estimator, ds, features, target, numeric_target=True)
     d = len(features)
     n = ds.count()
     require_rows(estimator, n, 2, because="the covariance it is built from divides by n - 1")
@@ -298,14 +291,7 @@ class LogisticRegression:
 
         from batcher.plan.functions.aggregate import sum as sum_
 
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
-        require_numeric(self, ds, self.features)
+        require_fit_columns(self, ds, self.features, self.target)
         # A non-binary target is the one input this fit cannot detect from its own arithmetic.
         # IRLS treats `target - probability` as a residual, so labels of 0/1/2 converge to a
         # model that predicts one class for nearly every row: fitted, plausible, and wrong,
@@ -490,12 +476,7 @@ class RidgeClassifier:
         Raises:
             ColumnNotFoundError: If a named column is missing.
         """
-        if self.target not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", self.target, ds.columns, hint="Pass an existing column.")
-            )
+        require_columns(ds, self.target)
         labels = [
             v.as_py() for v in ds.select(self.target).distinct().collect().column(self.target)
         ]
@@ -636,15 +617,7 @@ def _fold_moments(
     from batcher.api.dataset._build import split_key
     from batcher.plan.functions.aggregate import sum as sum_
 
-    for name in (*features, target):
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )
-    require_numeric(estimator, ds, features)
-    require_numeric(estimator, ds, [target], role="target")
+    require_fit_columns(estimator, ds, features, target, numeric_target=True)
 
     d = len(features)
     names = [*features, target]

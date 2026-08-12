@@ -14,6 +14,7 @@ import threading
 from typing import Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 
 __all__: list[str] = []
 
@@ -93,13 +94,7 @@ def _require_source_column(ds: Any, column: str, *, who: str, param: str) -> Non
     argument, or the columns that do exist. The same slip therefore reported two different
     ways depending on which modality you were decoding.
     """
-    if column in ds.columns:
-        return
-    from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-    raise ColumnNotFoundError(
-        unknown_message("column", column, ds.columns, hint=f"{who} reads {param}.")
-    )
+    require_columns(ds, column, hint=f"{who} reads {param}.")
 
 
 def _require_frames(num_frames: int, who: str) -> int:

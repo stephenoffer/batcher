@@ -41,6 +41,7 @@ from batcher.dist.executors.ray_runtime import (
 from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
 from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan, Sort
 
 
@@ -92,7 +93,7 @@ def _distributed_sort(
     sort_ir = json.dumps(
         {
             **sort.shape_ir(),
-            "input": {"op": "scan", "source_id": 0},
+            "input": task_scan_ir(),
         }
     )
     # A sort exchanges raw rows and sorts one bucket at a time, so the bucket count bounds
@@ -308,7 +309,7 @@ def _distributed_topn(
     # same sort+limit over the already-projected output, which is what makes re-applying it
     # to the union of the workers' answers the merge.
     local_ir = json.dumps({**sort.shape_ir(), "input": map_plan.to_ir()})
-    merge_ir = json.dumps({**sort.shape_ir(), "input": {"op": "scan", "source_id": 0}})
+    merge_ir = json.dumps({**sort.shape_ir(), "input": task_scan_ir()})
 
     work_dir = distributed_work_dir("batcher_dtopn_")
     try:

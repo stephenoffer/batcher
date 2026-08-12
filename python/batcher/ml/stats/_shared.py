@@ -3,7 +3,12 @@
 Small pieces that many modules need and none of them owns. They live here rather than
 being pasted into whichever module happened to be written first: `require_columns` had
 reached four verbatim copies across `splitting`, `metrics`, and `preprocessors` before
-they were collapsed onto this one.
+they were collapsed onto this one -- and then **thirty more** across the rest of `ml`,
+because six callers importing a helper is not visible from a module that has not imported
+it yet, while the four-line inline check is visible in every neighbour. The lesson worth
+carrying: a shared helper only wins once every site is actually routed through it, and the
+way to keep it that way is a test that fails on a new inline copy
+(`tests/unit/test_column_check_is_shared.py`).
 """
 
 from __future__ import annotations
@@ -13,10 +18,12 @@ from typing import TYPE_CHECKING
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from batcher.api.dataset import Dataset
     from batcher.plan.expr_ir import Expr
 
-__all__ = ["indicator", "require_columns", "scalar"]
+__all__ = ["indicator", "require_columns", "require_names", "scalar"]
 
 
 def indicator(name: str) -> Expr:
@@ -69,17 +76,47 @@ def require_columns(ds: Dataset, *names: str, hint: str = "Pass an existing colu
             >>> from batcher.ml.stats._shared import require_columns
             >>> require_columns(bt.from_pydict({"a": [1]}), "a")
     """
-    available = ds.columns
+    require_names(ds.columns, *names, hint=hint)
+
+
+def require_names(
+    available: Sequence[str], *names: str, hint: str = "Pass an existing column."
+) -> None:
+    """`require_columns` for a caller holding a column *list* rather than a `Dataset`.
+
+    The same check, one level down, because not every caller has a `Dataset`: a batch-level
+    UDF has ``batch.schema.names``, and a feature-spec validator has the projection it is about
+    to build. Both used to inline the check, and one of them then reported the *parameter* it
+    wanted rather than the columns that exist — which is the whole thing this error is for.
+
+    Args:
+        available: The column names that do exist, in their real order. Order matters: the
+            "did you mean" suggestion is drawn from it, and a set would scramble the tie-break.
+        *names: The column names that must be present.
+        hint: The remedy appended to the error.
+
+    Raises:
+        ColumnNotFoundError: On the first name that is not in `available`.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.ml.stats._shared import require_names
+            >>> require_names(["a", "b"], "a", "b")
+            >>> require_names(["text"], "txt")
+            Traceback (most recent call last):
+            batcher._internal.errors.hierarchy.ColumnNotFoundError: Unknown column 'txt'...
+    """
     # Membership against a set: the check runs per requested name, and `available` is the
     # relation's full width — a wide feature table turned a handful of name checks into a
-    # scan of thousands of columns each. The list is kept for the error message, which
+    # scan of thousands of columns each. The sequence is kept for the error message, which
     # needs the original order to suggest a close match.
     present = set(available)
     for name in names:
         if name not in present:
             from batcher._internal.errors import ColumnNotFoundError, unknown_message
 
-            raise ColumnNotFoundError(unknown_message("column", name, available, hint=hint))
+            raise ColumnNotFoundError(unknown_message("column", name, list(available), hint=hint))
 
 
 def scalar(ds: Dataset, name: str) -> float:

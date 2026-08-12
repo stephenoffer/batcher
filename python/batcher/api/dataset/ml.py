@@ -19,6 +19,7 @@ from batcher.api.dataset._dedup import (
     build_near_duplicates,
     build_similarity_join,
 )
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.logical import MapBatches
 
 if TYPE_CHECKING:
@@ -138,13 +139,7 @@ def _require_column(ds: Dataset, column: str, *, param: str) -> None:
     Turns the deferred, opaque failure a wrong column name would otherwise cause deep in the
     engine into an eager, actionable one at the API edge (``did you mean 'text'?``).
     """
-    if column in ds.columns:
-        return
-    from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-    raise ColumnNotFoundError(
-        unknown_message("column", column, ds.columns, hint=f"Pass an existing column to {param}.")
-    )
+    require_columns(ds, column, hint=f"Pass an existing column to {param}.")
 
 
 def _require_query_vector(ds: Dataset, query: list[float], column: str, *, method: str) -> None:

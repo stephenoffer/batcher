@@ -45,6 +45,7 @@ from batcher.dist.global_window.offsets import (
 from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
 from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan, Window
 
 __all__ = ["execute_global_window_disk"]
@@ -73,7 +74,7 @@ def execute_global_window_disk(
     # The reduce runs the window over its bucket as a single in-memory source 0. `to_ir()`
     # memoizes and hands back the plan's shared structures, so copy what is rewritten here.
     win_ir = dict(window.to_ir())
-    win_ir["input"] = {"op": "scan", "source_id": 0}
+    win_ir["input"] = task_scan_ir()
     win_ir["functions"] = list(win_ir["functions"])
     avg_helpers = inject_avg_helpers(window, win_ir)
     win_json = json.dumps(win_ir)

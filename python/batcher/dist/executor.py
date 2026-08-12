@@ -69,6 +69,7 @@ from batcher.dist.fleet.plan_id import with_query_shuffle_scope
 from batcher.dist.global_window.offsets import supports_ordered_bucket_offsets
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
+from batcher.plan.ir_specs import binary_task_ir
 from batcher.plan.logical import (
     Aggregate,
     AsofJoin,
@@ -1973,11 +1974,7 @@ def _asof_reducer_ir(asof: AsofJoin) -> dict:
     """IR for the per-bucket ASOF join of a left input (source 0) and right input
     (source 1). The node's own `shape_ir()` with the per-task scans substituted, so a new
     ASOF field crosses the cluster without anyone remembering to add it here."""
-    return {
-        **asof.shape_ir(),
-        "left": {"op": "scan", "source_id": 0},
-        "right": {"op": "scan", "source_id": 1},
-    }
+    return binary_task_ir(asof)
 
 
 def _distributed_asof(
@@ -2434,11 +2431,7 @@ def _range_join_reducer_ir(rj: RangeJoin) -> dict:
     """IR for the per-task range join of a left chunk (source 0) against the full right
     (source 1). The node's own `shape_ir()` with the per-task scans substituted, so a new
     field crosses the cluster without anyone remembering to add it here."""
-    return {
-        **rj.shape_ir(),
-        "left": {"op": "scan", "source_id": 0},
-        "right": {"op": "scan", "source_id": 1},
-    }
+    return binary_task_ir(rj)
 
 
 def _distributed_range_join(

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_names
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -85,13 +86,7 @@ def resolve_features(names: Sequence[str] | None, available: Sequence[str]) -> l
                 "feature shifts every later column onto the wrong slot"
             )
         seen.add(name)
-    missing = [f for f in feats if f not in set(available)]
-    if missing:
-        from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-        raise ColumnNotFoundError(
-            unknown_message("column", missing[0], list(available), hint="Pass a feature column.")
-        )
+    require_names(available, *feats, hint="Pass a feature column.")
     return feats
 
 

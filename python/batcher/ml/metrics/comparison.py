@@ -24,6 +24,7 @@ from batcher.ml.metrics.evaluate import (
     _resolve_task,
     _validate_metrics,
 )
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -88,13 +89,7 @@ def compare_models(
 
     if not predictions:
         raise PlanError("compare_models needs at least one model in predictions=")
-    missing = [c for c in predictions.values() if c not in ds.columns]
-    if missing:
-        from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-        raise ColumnNotFoundError(
-            unknown_message("column", missing[0], ds.columns, hint="Pass a prediction column.")
-        )
+    require_columns(ds, *predictions.values(), hint="Pass a prediction column.")
     first = next(iter(predictions.values()))
     resolved = _resolve_task(task, None if scores else first, first if scores else None)
     requested = list(metrics) if metrics is not None else list(METRIC_SETS[resolved])

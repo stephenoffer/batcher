@@ -38,7 +38,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher._internal.errors import PlanError, unknown_message
+from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir import Col, array, col, hash_rows
 
 if TYPE_CHECKING:
@@ -65,10 +66,12 @@ def _row_key(column: str, key: str | None) -> Expr:
 def _validate(
     ds: Dataset, column: str, threshold: float, num_perm: int, bands: int, key: str | None
 ) -> int:
-    if column not in ds.columns:
-        raise PlanError(f"near_duplicates(): unknown column {column!r}")
-    if key is not None and key not in ds.columns:
-        raise PlanError(f"near_duplicates(): unknown key column {key!r}")
+    # Through the shared check, which was the one column check in this file composing no
+    # message at all: `unknown column 'txt'` named neither what does exist nor the obvious
+    # `'text'` a character away, on the argument a user is most likely to mistype.
+    require_columns(ds, column, hint="near_duplicates() reads this text column.")
+    if key is not None:
+        require_columns(ds, key, hint="near_duplicates() groups rows by this key column.")
     if not 0.0 < threshold <= 1.0:
         raise PlanError(f"near_duplicates(): threshold must be in (0, 1], got {threshold}")
     if num_perm < 1 or bands < 1:
@@ -282,28 +285,17 @@ def build_similarity_join(
     rows_per_band = _validate_similarity_join(
         left, right, left_on, right_on, threshold, num_bits, bands
     )
-    # The canonical unknown-name shape, the same one `left_on`/`right_on` raise a few lines
-    # up. These two were the only column checks in this file still hand-rolling their own
-    # phrasing, so a user who mistyped `left_key` got a bare message with no suggestion and
-    # no list of what does exist, while mistyping `left_on` got both.
-    if left_key is not None and left_key not in left.columns:
-        raise PlanError(
-            unknown_message(
-                "column",
-                left_key,
-                left.columns,
-                hint="Pass an existing column to left_key.",
-            )
-        )
-    if right_key is not None and right_key not in right.columns:
-        raise PlanError(
-            unknown_message(
-                "column",
-                right_key,
-                right.columns,
-                hint="Pass an existing column to right_key.",
-            )
-        )
+    # The shared column check, the same one `left_on`/`right_on` go through a few lines up.
+    # These two were the last checks in this file composing the message themselves, so a user
+    # who mistyped `left_key` got a bare message with no suggestion and no list of what does
+    # exist, while mistyping `left_on` got both. They also raised the *wider* `PlanError`
+    # where every other column check raises `ColumnNotFoundError` — which is a `PlanError`
+    # and a `KeyError`, so `except KeyError` around a dedup call caught the neighbouring
+    # mistake and not this one.
+    if left_key is not None:
+        require_columns(left, left_key, hint="Pass an existing column to left_key.")
+    if right_key is not None:
+        require_columns(right, right_key, hint="Pass an existing column to right_key.")
 
     # One `seed` for both sides: signatures are only comparable when they were projected
     # onto the *same* hyperplanes.

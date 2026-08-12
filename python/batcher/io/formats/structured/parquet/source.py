@@ -23,6 +23,7 @@ from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.structured import _parquet_native
 from batcher.io.formats.structured.parquet import _native_stream
+from batcher.io.predicate import to_pyarrow_expression
 from batcher.io.splits import FileSplit, Split, parquet_row_group_splits
 from batcher.io.splits.parquet import _parquet_footer
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
@@ -164,7 +165,7 @@ class ParquetSource(FileSource):
         # expressible here, so this is not expected to be None — but a superset is still a
         # correct answer, so an absent expression degrades to pruning alone rather than
         # failing. Built once and shared: it is immutable and thread-safe.
-        pa_filter = self._pa_filter(predicate)
+        pa_filter = to_pyarrow_expression(predicate)
 
         def _read_one(f: str) -> list[pa.RecordBatch] | None:
             # `[]` row-groups = every row-group in the file; the reader prunes from there.
@@ -280,14 +281,6 @@ class ParquetSource(FileSource):
             return
         yield from pf.iter_batches(columns=projection)
 
-    @staticmethod
-    def _pa_filter(predicate: dict | None) -> Any:
-        if predicate is None:
-            return None
-        from batcher.io.predicate import to_pyarrow_expression
-
-        return to_pyarrow_expression(predicate)
-
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
@@ -336,7 +329,7 @@ class ParquetSource(FileSource):
             native = self._native_read_filtered(projection, predicate)
             if native is not None:
                 return native
-        pa_filter = self._pa_filter(predicate)
+        pa_filter = to_pyarrow_expression(predicate)
         if pa_filter is None:
             batched = self._native_read_many(projection)
             return batched if batched is not None else super().read(projection)
@@ -411,7 +404,7 @@ class ParquetSource(FileSource):
         if self._schema_mode != "strict":
             yield from super().iter_batches(projection)
             return
-        pa_filter = self._pa_filter(predicate)
+        pa_filter = to_pyarrow_expression(predicate)
         if pa_filter is None:
             yield from super().iter_batches(projection)
             return

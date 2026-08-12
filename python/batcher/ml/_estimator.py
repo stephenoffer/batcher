@@ -58,6 +58,7 @@ __all__ = [
     "Estimator",
     "argmax_prediction",
     "linear_score",
+    "require_fit_columns",
     "require_fitted",
     "require_numeric",
     "require_rows",
@@ -248,3 +249,54 @@ def require_numeric(
             "categorical column first with OrdinalEncoder, OneHotEncoder or TargetEncoder, "
             "and parse a date or a string of digits into a numeric column."
         )
+
+
+def require_fit_columns(
+    estimator: object,
+    ds: Dataset,
+    features: Sequence[str],
+    target: str | None = None,
+    *,
+    numeric_target: bool = False,
+) -> None:
+    """Check everything a `fit` needs of its columns, in the one order that reads well.
+
+    Every estimator here opened `fit` with the same three checks, spelled out in eight lines
+    each: that every named column exists, that the features are numeric, and — for a regressor
+    but not a classifier — that the target is too. Ten modules carried a copy, and the copies
+    were uniform in what they *did* while disagreeing on nothing at all, which is the signature
+    of a helper that was never written rather than a difference worth keeping.
+
+    The order matters and is the reason this is one call rather than three. "That column does
+    not exist" must come before "that column is not numeric": a typo'd feature name has *no*
+    type, so checking numeracy first either passes it through (`require_numeric` skips an
+    absent column deliberately) or reports the wrong problem, and either way the message the
+    user needs — ``did you mean 'price'?`` — never appears.
+
+    Args:
+        estimator: The estimator doing the checking, named in the message.
+        ds: The dataset about to be fitted.
+        features: The feature columns, which must exist and be numeric.
+        target: The column being predicted, which must exist. `None` for an unsupervised fit.
+        numeric_target: Whether `target` must also be numeric. True for a regressor; false for
+            a classifier, whose label is legitimately a string.
+
+    Raises:
+        ColumnNotFoundError: If a named column is not in `ds`.
+        PlanError: If a column is present but cannot be used as a number.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> from batcher.ml._estimator import require_fit_columns
+            >>> ds = bt.from_pydict({"x": [1.0], "y": [2.0]})
+            >>> require_fit_columns("Ridge", ds, ["x"], "y", numeric_target=True)
+    """
+    from batcher.ml.stats._shared import require_columns
+
+    named = [*features, target] if target is not None else list(features)
+    require_columns(ds, *named)
+    require_numeric(estimator, ds, features)
+    if target is not None and numeric_target:
+        require_numeric(estimator, ds, [target], role="target")

@@ -376,9 +376,11 @@ class ParquetDatasetSource:
         Passing it became load-bearing once date-valued partition keys started reading as
         `date32`: ``filter(col("day") == "2024-01-02")`` — the spelling that worked while
         the key was text, and the one SQL uses — is a `date32`-against-string comparison.
+
+        Unlike the four wrappers this outlived, it does something: it binds the schema. The
+        `predicate is None` guard it also carried is gone, because `to_pyarrow_expression`
+        answers that itself now.
         """
-        if predicate is None:
-            return None
         from batcher.io.predicate import to_pyarrow_expression
 
         return to_pyarrow_expression(predicate, self.schema())

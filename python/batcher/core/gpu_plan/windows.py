@@ -27,15 +27,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher.core.gpu_plan.backend import Unsupported, conform_empty_dtype, sortable_key
+from batcher.plan.ir_tags import WINDOW_FILL, WINDOW_OFFSET_VALUE, WINDOW_RANKING
 
 if TYPE_CHECKING:
     from batcher.core.gpu_plan.backend import DfBackend
 
 __all__ = ["supported_window", "window"]
 
-_RANKING = frozenset({"row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile"})
-_VALUE = frozenset({"lag", "lead", "first_value", "last_value", "nth_value"})
-_FILL = frozenset({"forward_fill", "backward_fill"})
+# The engine's own window vocabulary, imported rather than restated. This module used to
+# carry its own three copies, and a copy is precisely how the device tier falls behind: a
+# window function added to `plan.ir_tags` would be translated by no branch here while
+# `supported_window` kept claiming the shape, so the tier would produce a wrong column
+# instead of declining. `.claude/rules/device-tier.md`: derive a rule, never restate one.
+_RANKING = WINDOW_RANKING
+_VALUE = WINDOW_OFFSET_VALUE
+_FILL = WINDOW_FILL
 # Whole-partition reductions, as the backend `GroupBy` method that computes them.
 _PARTITION_AGG = {
     "sum": "sum", "avg": "mean", "min": "min", "max": "max", "count": "count",

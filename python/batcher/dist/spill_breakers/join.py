@@ -31,6 +31,7 @@ from batcher.dist.spill.buckets import (
     split_salt,
 )
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import Join
 
 # The grace recursion is `dist.spill.buckets`': same depth bound, same width, same salt as the
@@ -95,8 +96,8 @@ def stream_spilling_join(
     join_ir = json.dumps(
         {
             **join.shape_ir(),
-            "left": {"op": "scan", "source_id": 0},
-            "right": {"op": "scan", "source_id": 1},
+            "left": task_scan_ir(),
+            "right": task_scan_ir(1),
         }
     )
     n_buckets = _fd_safe(num_partitions)

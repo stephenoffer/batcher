@@ -12,21 +12,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any
 
 import pyarrow as pa
 
 from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
-from batcher.io.formats.sql._common import (
-    probe_is_typed,
-    push_down,
-    require_module,
-    schema_probe,
-)
-
-if TYPE_CHECKING:
-    from batcher.io.splits import Split
+from batcher.io.formats.sql._common import require_module
+from batcher.io.formats.sql._source_base import SingleResultQuerySource
 
 __all__ = ["ClickHouseSource"]
 
@@ -104,7 +97,7 @@ class _ClickHouseSplit:
 
 @SOURCES.register("clickhouse")
 @dataclass(frozen=True, slots=True)
-class ClickHouseSource:
+class ClickHouseSource(SingleResultQuerySource):
     """A relation read from ClickHouse as Arrow.
 
     Args:
@@ -120,10 +113,6 @@ class ClickHouseSource:
     Raises:
         BackendError: If `clickhouse-connect` is not installed.
     """
-
-    # Predicate pushdown: Kyber's pushed predicate → an appended SQL WHERE (the
-    # server filters before returning Arrow). Class var, not a dataclass field.
-    supports_predicate: ClassVar[bool] = True
 
     query: str
     host: str
@@ -145,45 +134,8 @@ class ClickHouseSource:
         params.update(self.client_kwargs)
         return params
 
-    def _split(
-        self, predicate: dict | None = None, projection: list[str] | None = None
-    ) -> _ClickHouseSplit:
-        """The split, with the pushdown already folded into its SQL (see `push_down`)."""
-        return _ClickHouseSplit(self._params(), push_down(self.query, predicate, projection))
-
-    def schema(self) -> pa.Schema:
-        """The relation's columns, from a zero-row probe rather than the whole query.
-
-        See `schema_probe`: this used to execute the full query and discard every row.
-        """
-        probed = _ClickHouseSplit(self._params(), schema_probe(self.query)).schema()
-        return probed if probe_is_typed(probed) else self._split().schema()
-
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return self._split(predicate, projection).read(projection)
-
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        yield from self._split(predicate, projection).iter_batches(projection)
-
-    def row_count(self) -> int | None:
-        return None
+    def _split_for(self, sql: str) -> _ClickHouseSplit:
+        return _ClickHouseSplit(self._params(), sql)
 
     def identity(self) -> str:
         return f"clickhouse:{self.host}:{self.query}"
-
-    def splits(
-        self,
-        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
-        predicate: dict | None = None,
-        projection: list[str] | None = None,
-    ) -> list[Split]:
-        """One split, whose SQL already carries the pushdown — so the worker's query is filtered.
-
-        Without this, the worker rebuilt an *unfiltered* query from the split and ClickHouse
-        streamed the whole table for the engine's `Filter` to discard.
-        """
-        return [self._split(predicate, projection)]

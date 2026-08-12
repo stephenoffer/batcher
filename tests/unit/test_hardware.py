@@ -906,7 +906,7 @@ def test_an_iscsi_lun_is_not_an_ssd(monkeypatch):
 def test_a_local_sas_disk_is_still_classified_by_its_medium(monkeypatch):
     monkeypatch.setattr(storage, "_sys_block_name", lambda path: "sdb")
     monkeypatch.setattr(os.path, "realpath", lambda p: "/sys/devices/pci0000:00/0000:00:17.0/ata1")
-    monkeypatch.setattr(storage, "_read_int", lambda p: 1)
+    monkeypatch.setattr(storage, "read_optional_int", lambda p: 1)
     storage.device_class.cache_clear()
     assert storage.device_class("/scratch") == "rotational"
 

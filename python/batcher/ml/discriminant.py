@@ -22,8 +22,8 @@ from batcher._internal.errors import PlanError
 from batcher.ml._estimator import (
     argmax_prediction,
     linear_score,
+    require_fit_columns,
     require_fitted,
-    require_numeric,
 )
 from batcher.plan.expr_ir.constructors import col, lit
 
@@ -177,14 +177,7 @@ class QuadraticDiscriminantAnalysis:
         """
         import numpy as np
 
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
-        require_numeric(self, ds, self.features)
+        require_fit_columns(self, ds, self.features, self.target)
         labels, counts, means, covariances = class_moments(ds, self.features, self.target)
         total = sum(counts.values())
         self.classes_, self.means_, self.precision_, self.log_prior_ = [], {}, {}, {}
@@ -318,14 +311,7 @@ class LinearDiscriminantAnalysis:
         """
         import numpy as np
 
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
-        require_numeric(self, ds, self.features)
+        require_fit_columns(self, ds, self.features, self.target)
         labels, counts, class_means, covariances = class_moments(ds, self.features, self.target)
         total = sum(counts.values())
         d = len(self.features)

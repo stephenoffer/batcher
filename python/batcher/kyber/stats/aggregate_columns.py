@@ -10,6 +10,7 @@ the key column's bounds forward. Kept here as one cohesive family.
 from __future__ import annotations
 
 from batcher.plan.expr_ir import Col
+from batcher.plan.ir_tags import COUNTING_AGGS
 from batcher.plan.logical import Aggregate
 from batcher.plan.stats import ColumnStat, Provenance, RelStats
 
@@ -205,7 +206,7 @@ def grouped_aggregate_columns(node: Aggregate, child: RelStats) -> dict[str, Col
 # between them: `min`/`max` return an actual value, and an average of values inside `[lo, hi]`
 # is inside `[lo, hi]`. So the child column's bounds bound the aggregate's output too.
 _ORDER_BOUNDED_AGGS = frozenset({"min", "max", "mean", "avg", "median"})
-_COUNTING_AGGS = frozenset({"count", "count_star", "count_distinct"})
+_COUNTING_AGGS = COUNTING_AGGS
 
 
 def _grouped_aggregate_bounds(node: Aggregate, child: RelStats) -> dict[str, ColumnStat]:

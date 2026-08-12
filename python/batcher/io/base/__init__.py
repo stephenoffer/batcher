@@ -10,6 +10,11 @@ to v1's duplicated, mixin-heavy readers).
 
 The `Source`/`Sink` protocols themselves live in `io.source`/`io.sink`; these
 bases structurally satisfy them. `Split` lives in `io.splits`.
+
+The query backends have their own spine, `io.formats.sql._source_base.SingleResultQuerySource`,
+and it lives there rather than here because it is written against SQL-string rewriting
+(`push_down`, `schema_probe`) — format specifics this neutral package deliberately does not
+know. Look for it there when you are adding a database connector rather than a file format.
 """
 
 from __future__ import annotations

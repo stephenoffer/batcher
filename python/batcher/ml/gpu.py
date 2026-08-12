@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from batcher._internal.accelerators import VISIBLE_DEVICE_ENVS
 from batcher._internal.errors import PlanError
 from batcher._internal.hardware import INFERENCE_INFLIGHT_DEPTH_MAX, available_cpu_count
 from batcher._internal.logging import note_suppressed
@@ -504,12 +505,6 @@ def _nvml_handles() -> tuple[Any, ...]:
         return ()
 
 
-# The env vars a scheduler pins a GPU actor's *visible* devices through, in priority order:
-# NVIDIA/HIP honor CUDA_VISIBLE_DEVICES; AMD ROCm adds HIP_ / ROCR_VISIBLE_DEVICES. The first
-# one set names this process's devices — a host is one vendor, so checking all is safe.
-_VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
-
-
 def _visible_device_indices(n_handles: int) -> tuple[int, ...]:
     """Physical device indices this process can actually see, honoring the vendor visibility env.
 
@@ -535,7 +530,7 @@ def _visible_device_indices(n_handles: int) -> tuple[int, ...]:
     resolved = tuple(i for i in visible_device_indices() if i < n_handles)
     if resolved:
         return resolved
-    for env in _VISIBLE_DEVICE_ENVS:
+    for env in VISIBLE_DEVICE_ENVS:
         raw = os.environ.get(env, "").strip()
         if not raw:
             continue
