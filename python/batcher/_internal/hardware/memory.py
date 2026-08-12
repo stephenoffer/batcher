@@ -13,6 +13,7 @@ import glob
 import os
 
 from batcher._internal.hardware.cgroup import cgroup_v2_dirs, read_cgroup_bytes
+from batcher._internal.hardware.sysfs import read_int
 
 __all__ = [
     "hugepage_bytes",
@@ -100,7 +101,7 @@ def hugepage_bytes() -> int:
             page_kib = int(os.path.basename(pool).removeprefix("hugepages-").removesuffix("kB"))
         except ValueError:
             continue
-        count = _read_int(os.path.join(pool, "nr_hugepages"))
+        count = read_int(os.path.join(pool, "nr_hugepages"))
         if page_kib > 0 and count > 0:
             total += page_kib * 1024 * count
     return total
@@ -148,15 +149,6 @@ def swap_configured() -> bool:
             return len([line for line in f.read().splitlines() if line.strip()]) > 1
     except OSError:
         return False
-
-
-def _read_int(path: str) -> int:
-    """An integer from a `/sys` file, or `0` when absent or unparseable."""
-    try:
-        with open(path) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return 0
 
 
 @functools.lru_cache(maxsize=1)

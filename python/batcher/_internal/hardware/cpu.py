@@ -22,6 +22,7 @@ from batcher._internal.hardware.cgroup import (
     cgroup_pressure,
     cgroup_throttled_ratio,
 )
+from batcher._internal.hardware.sysfs import read_optional_int
 
 __all__ = [
     "INFERENCE_INFLIGHT_DEPTH_MAX",
@@ -317,12 +318,10 @@ def cpu_thermal_throttle_count() -> int | None:
     seen = False
     for directory in _thermal_throttle_dirs():
         for name in ("core_throttle_count", "package_throttle_count"):
-            try:
-                with open(f"{directory}/{name}") as handle:
-                    total += int(handle.read().strip())
+            count = read_optional_int(f"{directory}/{name}")
+            if count is not None:
+                total += count
                 seen = True
-            except (OSError, ValueError):
-                continue
     return total if seen else None
 
 

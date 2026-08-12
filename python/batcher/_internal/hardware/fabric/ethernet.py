@@ -34,6 +34,8 @@ import glob
 import os
 from dataclasses import dataclass
 
+from batcher._internal.hardware.sysfs import read_text
+
 __all__ = [
     "ETHERNET_SYSFS_ROOT",
     "EthernetLink",
@@ -68,22 +70,13 @@ class EthernetLink:
     address: str = ""
 
 
-def _read(path: str) -> str:
-    """One sysfs attribute, stripped, or `""` when it cannot be read."""
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
 def _speed_gbps(iface_dir: str) -> float:
     """Negotiated line rate in Gb/s, or `0.0`.
 
     The kernel publishes megabits per second, and returns `-1` for an interface that is down,
     is virtual, or whose driver does not implement the query. All three are unknown.
     """
-    raw = _read(os.path.join(iface_dir, "speed"))
+    raw = read_text(os.path.join(iface_dir, "speed"))
     try:
         mbps = int(raw)
     except ValueError:
@@ -140,8 +133,8 @@ def ethernet_links() -> tuple[EthernetLink, ...]:
             EthernetLink(
                 name=name,
                 speed_gbps=_speed_gbps(iface_dir),
-                up=_read(os.path.join(iface_dir, "operstate")) == "up"
-                and _read(os.path.join(iface_dir, "carrier")) == "1",
+                up=read_text(os.path.join(iface_dir, "operstate")) == "up"
+                and read_text(os.path.join(iface_dir, "carrier")) == "1",
                 bonded=bond,
                 address=_pci_address(iface_dir),
             )

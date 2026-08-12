@@ -21,6 +21,12 @@ Organized by the question each module answers:
 * `profile` — one assembled record of all of it, plus the fingerprint that names this
   machine class so learned parameters do not blend across unlike hardware.
 
+Underneath all of them, `sysfs` is the one reader: almost every probe here answers its
+question by reading a single `/sys` or `/proc` attribute, where every failure mode means
+*unknown* rather than *error*. It names the choice each caller has to make — whether an
+unreadable file is the same as a zero (a capacity) or its opposite (a counter) — because eight
+hand-rolled copies of that read had drifted onto three different answers.
+
 Device *inventory* — what accelerator is attached and how to reach it — lives one module over
 in `accelerators`, beside the model-to-VRAM table it belongs with, and is re-exported here so
 every existing caller and probe-reset hook keeps its import path.

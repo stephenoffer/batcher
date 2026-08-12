@@ -38,13 +38,14 @@ import os
 from dataclasses import dataclass
 
 from batcher._internal.hardware.amd.devices import (
+    _MICRO,
+    _MILLI,
     AMD_PCI_VENDOR,
     AMDGPU_SYSFS_ROOT,
     _hwmon_dir,
     _pci_vendor,
-    _read_int,
-    _read_text,
 )
+from batcher._internal.hardware.sysfs import read_float, read_int, read_text
 
 __all__ = [
     "AmdTelemetry",
@@ -153,7 +154,7 @@ def _current_clock_mhz(path: str) -> int:
     the last line is the *highest* level the part supports, which on an idle device is not the
     one it is running at, and reporting it would show every idle board at its boost clock.
     """
-    for line in _read_text(path).splitlines():
+    for line in read_text(path).splitlines():
         if not line.rstrip().endswith("*"):
             continue
         parts = line.split()
@@ -172,7 +173,7 @@ def _pcie_bw(device_dir: str) -> tuple[int, int, int]:
 
     This is the read that costs a millisecond: the kernel samples the counters when asked.
     """
-    raw = _read_text(os.path.join(device_dir, "pcie_bw")).split()
+    raw = read_text(os.path.join(device_dir, "pcie_bw")).split()
     if len(raw) < 3:
         return (0, 0, 0)
     try:
@@ -205,33 +206,37 @@ def amd_telemetry() -> tuple[AmdTelemetry, ...]:
             continue
         hwmon = _hwmon_dir(device_dir)
         received, sent, payload = _pcie_bw(device_dir)
-        visible_total = int(_read_int(os.path.join(device_dir, "mem_info_vis_vram_total")))
-        busy = int(_read_int(os.path.join(device_dir, "mem_busy_percent")))
+        visible_total = read_int(os.path.join(device_dir, "mem_info_vis_vram_total"))
+        busy = read_int(os.path.join(device_dir, "mem_busy_percent"))
         out.append(
             AmdTelemetry(
                 index=index,
                 card=os.path.basename(card_dir),
                 memory_busy_percent=busy,
                 visible_vram_total_bytes=visible_total,
-                visible_vram_used_bytes=int(
-                    _read_int(os.path.join(device_dir, "mem_info_vis_vram_used"))
+                visible_vram_used_bytes=read_int(
+                    os.path.join(device_dir, "mem_info_vis_vram_used")
                 ),
                 # amdgpu's hwmon numbering: 1 is the edge sensor `devices` already reads, 2 is
                 # the junction, 3 is the memory stack. Reading them by number rather than by
                 # label because the labels are absent on several kernels that publish the
                 # values.
                 junction_temperature_c=(
-                    _read_int(os.path.join(hwmon, "temp2_input"), 1000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "temp2_input"), scale=_MILLI) if hwmon else 0.0
                 ),
                 memory_temperature_c=(
-                    _read_int(os.path.join(hwmon, "temp3_input"), 1000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "temp3_input"), scale=_MILLI) if hwmon else 0.0
                 ),
-                fan_rpm=int(_read_int(os.path.join(hwmon, "fan1_input"))) if hwmon else 0,
+                fan_rpm=read_int(os.path.join(hwmon, "fan1_input")) if hwmon else 0,
                 power_cap_min_watts=(
-                    _read_int(os.path.join(hwmon, "power1_cap_min"), 1_000_000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "power1_cap_min"), scale=_MICRO)
+                    if hwmon
+                    else 0.0
                 ),
                 power_cap_max_watts=(
-                    _read_int(os.path.join(hwmon, "power1_cap_max"), 1_000_000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "power1_cap_max"), scale=_MICRO)
+                    if hwmon
+                    else 0.0
                 ),
                 sclk_mhz=_current_clock_mhz(os.path.join(device_dir, "pp_dpm_sclk")),
                 mclk_mhz=_current_clock_mhz(os.path.join(device_dir, "pp_dpm_mclk")),

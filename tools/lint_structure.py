@@ -79,6 +79,15 @@ DIR_ALLOW: dict[str, str] = {
         "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
         "to lift out; this entry is debt, not a design"
     ),
+    "python/batcher/_internal/hardware": (
+        "13 modules against a cap of 12: one per hardware question (cgroup, cpu, cache, memory, "
+        "topology, isa, engine, storage, profile, nvml, mig) plus `probes` and the 13th, "
+        "`sysfs`. `sysfs` is the shared kernel-pseudo-file reader that replaced EIGHT copies of "
+        "the same `try: open(...) except OSError` spread across this directory, `amd/`, and "
+        "`fabric/` — three of which had silently drifted onto different meanings for an "
+        "unreadable file. Every one of those callers must be able to see it, so the package root "
+        "is the only home; nesting it would put it below half its callers"
+    ),
     "benchmarks/cluster": (
         "standalone cluster benchmark scripts, run as `python benchmarks/cluster/<x>.py` — so "
         "their shared `_ray_env` bootstrap must be a SIBLING module (only the script's own "

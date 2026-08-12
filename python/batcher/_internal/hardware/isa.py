@@ -19,6 +19,8 @@ from __future__ import annotations
 import functools
 import platform
 
+from batcher._internal.hardware.sysfs import read_int
+
 __all__ = [
     "cpu_features",
     "cpu_model_name",
@@ -109,12 +111,7 @@ def _sve_vector_bits() -> int:
     trusted: it would have to come from a kernel reporting something this code does not
     understand, and a fabricated vector width propagates into the machine fingerprint.
     """
-    try:
-        with open(_SVE_VECTOR_LENGTH_PATH) as f:
-            vector_bytes = int(f.read().strip())
-    except (OSError, ValueError):
-        return 0
-    bits = vector_bytes * 8
+    bits = read_int(_SVE_VECTOR_LENGTH_PATH) * 8
     return bits if 128 <= bits <= 2048 and bits % 128 == 0 else 0
 
 

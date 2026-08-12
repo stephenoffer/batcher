@@ -26,6 +26,8 @@ import functools
 import glob
 import os
 
+from batcher._internal.hardware.sysfs import read_text
+
 __all__ = [
     "affinity_cpu_ids",
     "cpus_per_numa_node",
@@ -72,11 +74,7 @@ def read_cpu_list(path: str) -> set[int]:
     Returns:
         The CPU ids it names, empty when the file is absent or unreadable.
     """
-    try:
-        with open(path) as f:
-            return parse_cpu_list(f.read())
-    except OSError:
-        return set()
+    return parse_cpu_list(read_text(path))
 
 
 def affinity_cpu_ids() -> set[int] | None:

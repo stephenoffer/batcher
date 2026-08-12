@@ -31,6 +31,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from batcher._internal.hardware.sysfs import read_optional_int
+
 __all__ = [
     "ERROR_COUNTERS",
     "PortCounters",
@@ -69,20 +71,6 @@ _DATA_COUNTERS: tuple[tuple[str, str], ...] = (
 
 #: The kernel's data counters count four-octet words, not bytes.
 _OCTET_WORD = 4
-
-
-def _read_counter(path: str) -> int | None:
-    """One counter file as an int, or `None` when absent or unreadable.
-
-    `None` rather than `0`: a counter the driver does not publish and a counter that reads
-    zero mean opposite things, and collapsing them would report an unreadable fabric as a
-    flawless one.
-    """
-    try:
-        with open(path) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,11 +134,11 @@ def port_counters() -> tuple[PortCounters, ...]:
         base = os.path.join(RDMA_SYSFS_ROOT, device.name, "ports", str(device.port), "counters")
         data: dict[str, int | None] = {}
         for filename, name in _DATA_COUNTERS:
-            raw = _read_counter(os.path.join(base, filename))
+            raw = read_optional_int(os.path.join(base, filename))
             data[name] = None if raw is None else raw * _OCTET_WORD
         errors = {}
         for filename, name in ERROR_COUNTERS:
-            value = _read_counter(os.path.join(base, filename))
+            value = read_optional_int(os.path.join(base, filename))
             if value is not None:
                 errors[name] = value
         out.append(

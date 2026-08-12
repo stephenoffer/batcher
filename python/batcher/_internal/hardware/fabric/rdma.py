@@ -33,6 +33,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from batcher._internal.hardware.sysfs import read_text
+
 __all__ = [
     "RDMA_SYSFS_ROOT",
     "RdmaDevice",
@@ -64,15 +66,6 @@ _ACTIVE_STATE = "ACTIVE"
 #: `siw`) resolves to something that is not one, and reads as "no address" rather than as a
 #: fabricated one.
 _ADDRESS_RE = re.compile(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]")
-
-
-def _read_text(path: str) -> str:
-    """The stripped contents of a `/sys` file, or `""` when it cannot be read."""
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
 
 
 def _parse_rate_gbps(raw: str) -> float:
@@ -183,9 +176,9 @@ def rdma_devices() -> tuple[RdmaDevice, ...]:
     out: list[RdmaDevice] = []
     for device_dir in sorted(glob.glob(os.path.join(RDMA_SYSFS_ROOT, "*"))):
         name = os.path.basename(device_dir)
-        node_guid = _read_text(os.path.join(device_dir, "node_guid"))
+        node_guid = read_text(os.path.join(device_dir, "node_guid"))
         pci = _pci_address(device_dir)
-        numa = _read_text(os.path.join(device_dir, "device", "numa_node"))
+        numa = read_text(os.path.join(device_dir, "device", "numa_node"))
         try:
             numa_node = int(numa)
         except ValueError:
@@ -196,10 +189,10 @@ def rdma_devices() -> tuple[RdmaDevice, ...]:
                 RdmaDevice(
                     name=name,
                     port=port,
-                    link_layer=_read_text(os.path.join(port_dir, "link_layer")),
-                    rate_gbps=_parse_rate_gbps(_read_text(os.path.join(port_dir, "rate"))),
-                    state=_parse_state(_read_text(os.path.join(port_dir, "state"))),
-                    partition_key=_read_text(os.path.join(port_dir, "pkeys", "0")),
+                    link_layer=read_text(os.path.join(port_dir, "link_layer")),
+                    rate_gbps=_parse_rate_gbps(read_text(os.path.join(port_dir, "rate"))),
+                    state=_parse_state(read_text(os.path.join(port_dir, "state"))),
+                    partition_key=read_text(os.path.join(port_dir, "pkeys", "0")),
                     node_guid=node_guid,
                     pci_address=pci,
                     numa_node=numa_node,
