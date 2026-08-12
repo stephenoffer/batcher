@@ -40,6 +40,7 @@ sources. Nothing executes, and nothing records runtime metadata.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from batcher.plan.logical import (
@@ -74,11 +75,11 @@ if TYPE_CHECKING:
 __all__ = [
     "STREAM_CLASSIFIED",
     "blocking_operators",
-    "emits_incrementally",
     "has_unbounded_input",
     "is_blocking_under_stream",
     "is_unbounded_scan",
     "retains_unbounded_state",
+    "unbounded_scan_ids",
     "unbounded_source_ids",
     "unbounded_state_operators",
 ]
@@ -88,8 +89,10 @@ __all__ = [
 #: Membership is the contract, not the answer: a node here has been reasoned about, and
 #: the reasoning is in `is_blocking_under_stream` / `retains_unbounded_state`. A node
 #: *not* here would silently take the permissive default from both, which is how a
-#: leaking operator ships. The exhaustiveness test walks `LogicalPlan.__subclasses__`
-#: against this set, so adding a node without deciding fails the build.
+#: leaking operator ships. The exhaustiveness test walks the `plan.logical` modules against
+#: this set — deliberately not `LogicalPlan.__subclasses__()`, which reports two classes per
+#: node because `@dataclass(slots=True)` builds a replacement and leaves the original
+#: registered — so adding a node without deciding fails the build.
 STREAM_CLASSIFIED: frozenset[type[LogicalPlan]] = frozenset(
     {
         # --- stateless and row-wise: stream freely, retain nothing -----------------
@@ -121,12 +124,42 @@ STREAM_CLASSIFIED: frozenset[type[LogicalPlan]] = frozenset(
 )
 
 
+def unbounded_scan_ids(plan: LogicalPlan, sources: Sequence[object]) -> frozenset[int]:
+    """The `source_id`s of every scan in `plan` reading a source that never ends.
+
+    The one implementation. Boundedness is answered from the bound source itself
+    (`io.source.is_bounded`), never from a row estimate — an unknown row count means "not
+    estimated", which a finite source reports just as readily as a stream.
+
+    Takes the sources directly rather than an `OptimizerContext`, because that is all the
+    question needs and building a context is not free: it loads learned statistics,
+    calibrates the cost model, and measures per-source read throughput. A caller outside
+    the rule loop — `explain()`, a launcher diagnostic — would be paying the optimizer's
+    setup to ask whether a source ends. `unbounded_source_ids` is the thin context-shaped
+    adapter the rules use.
+
+    Args:
+        plan: The plan to walk.
+        sources: The bound inputs, positionally indexed by `Scan.source_id`.
+
+    Returns:
+        The set of unbounded source ids, empty for a wholly bounded plan.
+    """
+    from batcher.io.source import is_bounded
+
+    bound = list(sources or [])
+    return frozenset(
+        n.source_id
+        for n in walk(plan)
+        if isinstance(n, Scan)
+        # An unbound or relabeled scan is assumed bounded, the safe default.
+        and 0 <= n.source_id < len(bound)
+        and not is_bounded(bound[n.source_id])
+    )
+
+
 def is_unbounded_scan(node: LogicalPlan, ctx: OptimizerContext) -> bool:
     """Whether `node` is a `Scan` of a source that never ends.
-
-    Answered from the bound source itself (`io.source.is_bounded`), not from a row
-    estimate — an unknown row count means "not estimated", which a finite source can
-    report just as easily as a stream.
 
     Args:
         node: The plan node to test.
@@ -135,18 +168,11 @@ def is_unbounded_scan(node: LogicalPlan, ctx: OptimizerContext) -> bool:
     Returns:
         True only when `node` is a scan of a declared-unbounded source.
     """
-    from batcher.io.source import is_bounded
-
-    if not isinstance(node, Scan):
-        return False
-    sources = ctx.sources or []
-    if not 0 <= node.source_id < len(sources):
-        return False  # an unbound or relabeled scan — assume bounded, the safe default
-    return not is_bounded(sources[node.source_id])
+    return isinstance(node, Scan) and bool(unbounded_scan_ids(node, ctx.sources or []))
 
 
 def unbounded_source_ids(plan: LogicalPlan, ctx: OptimizerContext) -> frozenset[int]:
-    """The `source_id`s of every unbounded scan in `plan`.
+    """The `source_id`s of every unbounded scan in `plan` — the rules' spelling.
 
     Args:
         plan: The plan to walk.
@@ -155,7 +181,7 @@ def unbounded_source_ids(plan: LogicalPlan, ctx: OptimizerContext) -> frozenset[
     Returns:
         The set of unbounded source ids, empty for a wholly bounded plan.
     """
-    return frozenset(n.source_id for n in walk(plan) if is_unbounded_scan(n, ctx))
+    return unbounded_scan_ids(plan, ctx.sources or [])
 
 
 def has_unbounded_input(plan: LogicalPlan, ctx: OptimizerContext) -> bool:
@@ -238,22 +264,6 @@ def blocking_operators(plan: LogicalPlan) -> list[LogicalPlan]:
         The blocking nodes, in an unspecified order (empty when the plan can stream).
     """
     return [n for n in walk(plan) if is_blocking_under_stream(n)]
-
-
-def emits_incrementally(plan: LogicalPlan, ctx: OptimizerContext) -> bool:
-    """Whether `plan` can produce output before its input is exhausted.
-
-    Args:
-        plan: The plan to classify.
-        ctx: The optimizer context carrying the bound sources.
-
-    Returns:
-        True for a bounded plan (which always terminates) or an unbounded plan with no
-        blocking operator; False when a stream feeds an operator that can never emit.
-    """
-    if not has_unbounded_input(plan, ctx):
-        return True
-    return not blocking_operators(plan)
 
 
 def retains_unbounded_state(node: LogicalPlan) -> bool:

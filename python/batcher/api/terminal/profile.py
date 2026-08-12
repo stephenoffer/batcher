@@ -202,6 +202,72 @@ def _io_throughput_decisions(sources: list[Source], hub) -> list:
     return out
 
 
+def _streaming_decisions(plan: LogicalPlan, sources: list[Source]) -> list:
+    """What `explain()` should say about a plan whose input never ends.
+
+    Every number in an `explain()` of a streaming plan is a placeholder: the row estimate is
+    the `unknown_rows` sentinel with `DEFAULT` provenance, which a stream shares with any
+    bounded source whose size merely could not be measured. So the rendering said
+    ``est≈1,000,000,000,000 (default)`` and nothing at all about the two things that decide
+    whether the query works — whether it can emit before its input ends, and whether its
+    state is bounded by something that advances. Both are pure functions of the plan and both
+    were already computed (`kyber.streaming`), and neither reached the reader.
+
+    Silent on a wholly bounded plan, where the questions do not arise.
+
+    Args:
+        plan: The logical plan being explained.
+        sources: Its bound sources, to tell a stream from a bounded relation.
+
+    Returns:
+        Zero to three `Decision`s: the unbounded inputs, the blocking operators, and the
+        operators whose state nothing releases.
+    """
+    from batcher.kyber.streaming import (
+        blocking_operators,
+        unbounded_scan_ids,
+        unbounded_state_operators,
+    )
+    from batcher.plan.profile import Decision
+
+    unbounded = unbounded_scan_ids(plan, sources)
+    if not unbounded:
+        return []
+    out = [
+        Decision(
+            "kyber",
+            "streaming",
+            f"{len(unbounded)} unbounded source(s) — row estimates are placeholders, not sizes",
+            {"unbounded_source_ids": sorted(unbounded)},
+        )
+    ]
+    blocking = sorted({type(n).__name__.lower() for n in blocking_operators(plan)})
+    if blocking:
+        out.append(
+            Decision(
+                "kyber",
+                "streaming",
+                f"cannot emit until the input ends: {', '.join(blocking)} — this plan will not "
+                "stream",
+                {"blocking_operators": blocking},
+            )
+        )
+    else:
+        out.append(Decision("kyber", "streaming", "emits incrementally — no blocking operator", {}))
+    leaking = sorted({type(n).__name__.lower() for n in unbounded_state_operators(plan)})
+    if leaking:
+        out.append(
+            Decision(
+                "kyber",
+                "streaming",
+                f"retains state nothing releases: {', '.join(leaking)} — bounded only by "
+                "memory.streaming_state_max_bytes",
+                {"unbounded_state_operators": leaking},
+            )
+        )
+    return out
+
+
 def _logical_op_profiles(
     plan: LogicalPlan, metric_ops: list[dict] | None = None
 ) -> list[OpProfile]:
@@ -290,7 +356,13 @@ def _udf_planned_profile(plan: LogicalPlan, sources: list[Source], hub) -> Query
     )
     return QueryProfile(
         ops=tuple(_logical_op_profiles(plan)),
-        decisions=(note, *_io_throughput_decisions(sources, hub)),
+        decisions=(
+            note,
+            *_io_throughput_decisions(sources, hub),
+            # A `map_batches` pipeline over a topic is the shape most likely to be a stream,
+            # so the branch that cannot lower to IR is the one that needs this most.
+            *_streaming_decisions(plan, sources),
+        ),
         logical_ir=None,
         optimized_ir=None,
     )
@@ -323,7 +395,11 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
     )
     return QueryProfile(
         ops=build_op_profiles(opt.ir, opt.ops, None),
-        decisions=(*build_side_decisions(decisions), *_io_throughput_decisions(sources, hub)),
+        decisions=(
+            *build_side_decisions(decisions),
+            *_io_throughput_decisions(sources, hub),
+            *_streaming_decisions(plan, sources),
+        ),
         logical_ir=plan.to_ir(),
         optimized_ir=opt.ir,
     )

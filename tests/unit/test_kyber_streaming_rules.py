@@ -15,10 +15,10 @@ from batcher.kyber.optimizer import Optimizer
 from batcher.kyber.streaming import (
     STREAM_CLASSIFIED,
     blocking_operators,
-    emits_incrementally,
     has_unbounded_input,
     is_blocking_under_stream,
     retains_unbounded_state,
+    unbounded_scan_ids,
     unbounded_state_operators,
 )
 from batcher.plan.expr_ir import col, lit
@@ -282,7 +282,7 @@ def test_bounded_plan_is_never_reported_unbounded():
     ctx = Optimizer(None, [], None)._context()
     plan = _source()._plan
     assert not has_unbounded_input(plan, ctx)
-    assert emits_incrementally(plan, ctx)
+    assert unbounded_scan_ids(plan, []) == frozenset()
 
 
 # --- push_filter_into_stream_join_side, and what an outer join forbids ----------------

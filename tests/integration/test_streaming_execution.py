@@ -107,16 +107,31 @@ def test_streaming_write_is_chosen_only_for_lazy_sources(tmp_path):
 @pytest.mark.integration
 def test_unbounded_breaker_error_names_offending_node():
     """An unbounded source under a breaker that must materialize raises a `PlanError`
-    that names the offending top-level operator, so the message is actionable rather
-    than a generic "must materialize"."""
+    that names the *blocking* operator, so the message is actionable rather than a
+    generic "must materialize".
+
+    It used to name the plan's root ("top-level Sort"), which is the culprit only when the
+    breaker happens to be at the root. `Aggregate(Sort(scan))` reported the aggregate — the
+    one operator in that query that does stream. The refusal now asks Kyber which nodes
+    cannot emit (`kyber.streaming.blocking_operators`), so the case below still names the
+    sort and the deeper case names it too.
+    """
     from batcher._internal.errors import PlanError
 
     def factory():
         yield pa.RecordBatch.from_pydict({"x": [3, 1, 2]})
 
-    ds = bt.from_batches(factory, pa.schema([("x", pa.int64())]), bounded=False).sort("x")
-    with pytest.raises(PlanError, match="top-level Sort"):
-        list(ds.iter_batches())
+    def stream():
+        return bt.from_batches(factory, pa.schema([("x", pa.int64())]), bounded=False)
+
+    with pytest.raises(PlanError, match="its sort cannot emit"):
+        list(stream().sort("x").iter_batches())
+
+    # The case the root-naming version got wrong: the blocking operator is *under* a
+    # streamable one, and it is the sort that has to be named.
+    nested = stream().sort("x").group_by("x").agg(n=bt.count())
+    with pytest.raises(PlanError, match="its sort cannot emit"):
+        list(nested.iter_batches())
 
 
 @pytest.mark.integration

@@ -157,6 +157,45 @@ def test_a_filter_between_the_limit_and_the_breaker_does_not_cap_it():
     assert _warnings_for(_stream().distinct().filter(col("k") > 0).limit(5)) != []
 
 
+# --- explain() answers the streaming questions too -----------------------------------
+
+
+def test_explain_reports_what_a_streaming_plan_will_do():
+    """Every number in an `explain()` of a streaming plan is a placeholder.
+
+    The row estimate is the `unknown_rows` sentinel with `DEFAULT` provenance, which a
+    stream shares with any bounded source whose size merely could not be measured. So the
+    rendering said ``est≈1,000,000,000,000 (default)`` and nothing about the two things that
+    decide whether the query works. Both were already computed and neither reached the
+    reader.
+    """
+    out = _stream().group_by("k").agg(n=bt.count()).explain()
+    assert "unbounded source" in out
+    assert "emits incrementally" in out
+    assert "retains state nothing releases: aggregate" in out
+
+
+def test_explain_names_the_blocking_operator_for_a_plan_that_cannot_stream():
+    out = _stream().sort("k").explain()
+    assert "cannot emit until the input ends: sort" in out
+    assert "will not stream" in out
+
+
+def test_explain_of_a_bounded_plan_is_unchanged():
+    """The questions do not arise for a bounded input, so nothing may be added to its plan."""
+    out = _bounded().group_by("k").agg(n=bt.count()).explain()
+    assert "streaming" not in out
+    assert "unbounded" not in out
+
+
+def test_explain_reports_a_streaming_udf_pipeline_too():
+    """A `map_batches` pipeline over a topic is the shape most likely to be a stream, and it
+    takes the branch that cannot lower to IR — so it is the one that needs this most."""
+    out = _stream().map_batches(lambda b: b).explain()
+    assert "unbounded source" in out
+    assert "emits incrementally" in out
+
+
 # --- the launcher actually asks ------------------------------------------------------
 
 
