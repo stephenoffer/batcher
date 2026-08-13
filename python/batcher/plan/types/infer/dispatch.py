@@ -27,7 +27,7 @@ from batcher.plan.types.infer.collections import (
 )
 from batcher.plan.types.infer.scalars import datefunc_type, strfunc_type
 from batcher.plan.types.lattice import promote
-from batcher.plan.types.media import imagefunc_type, videofunc_type
+from batcher.plan.types.media import audiofunc_type, imagefunc_type, videofunc_type
 from batcher.plan.types.registry import resolve_dtype
 from batcher.plan.types.sequence import seqfunc_type
 
@@ -48,6 +48,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
     type. The schema passed in is the operator's *input* schema (already widened at
     the scan leaf), so a bare ``Col`` reports the engine's post-widening type.
     """
+    from batcher.plan.expr_ir.audio import AudioFunc
     from batcher.plan.expr_ir.core import (
         Aliased,
         Binary,
@@ -139,6 +140,8 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return pa.binary()
     if isinstance(expr, VideoFunc):
         return videofunc_type(expr)
+    if isinstance(expr, AudioFunc):
+        return audiofunc_type(expr)
     if isinstance(expr, SeqFunc):
         return seqfunc_type(expr.fn)
     if isinstance(expr, ListSimhash):

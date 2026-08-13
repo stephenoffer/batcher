@@ -133,12 +133,50 @@ def test_a_cropped_region_is_binary_too(frame):
     assert infer_type(col("b").image.crop(col("id"), 0, _W, _H), schema) == pa.binary()
 
 
-def test_an_unrecognised_image_op_stays_unknown():
+def test_a_tensor_op_without_its_shape_stays_unknown():
     """`None` must remain the answer for anything not verified, since a wrong type is
-    worse than no type."""
+    worse than no type.
+
+    A decoded-tensor op is typed *by its arguments*, so the one without them is genuinely
+    unknown -- and it is the honest remaining case now that every named image op resolves.
+    """
     from batcher.plan.expr_ir.image import ImageFunc
 
-    assert imagefunc_type(ImageFunc("decode", col("b"))) is None
+    assert imagefunc_type(ImageFunc("to_tensor", col("b"))) is None
+    assert imagefunc_type(ImageFunc("center_crop", col("b"), width=_W)) is None
+
+
+def test_a_decoded_header_is_the_struct_the_kernel_declares(frame):
+    """`decode` was left untyped on the grounds that a header is a handful of bytes.
+
+    That measured the wrong cost. `available_schema` resolves a projection all-or-nothing,
+    so one untyped column discards the resolved type of *every column beside it* -- and a
+    single `.image.decode()` was enough to throw away the tensor width the rest of this
+    file exists to compute.
+    """
+    expr = col("b").image.decode()
+    produced = frame.select(x=expr).collect().schema.field("x").type
+    assert imagefunc_type(expr) == produced
+    assert pa.types.is_struct(produced)
+
+
+def test_an_untyped_column_no_longer_blinds_the_ones_beside_it(frame):
+    """The amplification the two fixes above exist to remove.
+
+    A projection's `available_schema` is all-or-nothing. Before `.audio` and `decode` were
+    typed, ``select(tensor, waveform)`` reported **both** columns as `null`: the audio
+    column had no type, so the image column's -- which the engine knows exactly -- was
+    discarded with it. An audio column beside an image one is not an exotic shape; it is
+    what a video pipeline looks like the moment it reads the sound track.
+    """
+    both = frame.select(
+        tens=col("b").image.to_tensor(_W, _H),
+        meta=col("b").image.decode(),
+    )
+    schema = both._plan.available_schema()
+    assert schema is not None
+    assert schema.field("tens").type == imagefunc_type(col("b").image.to_tensor(_W, _H))
+    assert pa.types.is_struct(schema.field("meta").type)
 
 
 def test_the_width_reaches_the_morsel_cap(frame):
@@ -190,7 +228,17 @@ def test_a_still_from_a_clip_is_binary_not_a_tensor(frame):
 
     assert videofunc_type(col("b").video.thumbnail(320)) == pa.binary()
     assert videofunc_type(col("b").video.frame_at(1.5, 320)) == pa.binary()
-    assert videofunc_type(col("b").video.decode()) is None
+    # `decode` is the clip's header struct, not `None`: an untyped column discards the
+    # resolved type of every column beside it in the same projection.
+    assert videofunc_type(col("b").video.decode()) == pa.struct(
+        [
+            pa.field("width", pa.int32(), nullable=False),
+            pa.field("height", pa.int32(), nullable=False),
+            pa.field("num_frames", pa.int64(), nullable=False),
+            pa.field("duration_secs", pa.float64(), nullable=False),
+            pa.field("fps", pa.float64(), nullable=False),
+        ]
+    )
 
 
 def test_a_narrow_plan_is_unchanged(frame):
