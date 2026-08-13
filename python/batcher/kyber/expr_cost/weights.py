@@ -233,23 +233,23 @@ _BY_CLASS_NAME: dict[str, float] = {
     # which a single class-level number cannot express. `VideoFunc` keeps a flat estimate
     # because CI builds the engine without the `video` cargo feature, so its kernels
     # cannot be run and therefore cannot be measured the way everything else here was.
-    # It sits at the image decode class, which is a floor rather than a measurement: a
-    # sampled clip decodes several frames, so the true cost is higher, and the number has
-    # to be at least this or the optimizer would schedule a video decode ahead of an image
-    # one it can actually price.
-    "VideoFunc": 16_000_000.0,
+    # It sits at the cost of decoding and resizing *one* image frame, which is a floor
+    # rather than a measurement: a sampled clip decodes several frames, so the true cost is
+    # higher, and the number has to be at least this or the optimizer would schedule a
+    # video decode ahead of an image one it can actually price.
+    "VideoFunc": 5_000_000.0,
     # `crop` is its own node rather than an `ImageFunc` because its window is four
     # sub-expressions, and that is exactly how it slipped past the family table: it fell
     # through to `_DEFAULT_COST` and was priced at 5.0 -- cheaper than a regex, for an op
     # that decodes a JPEG, crops it and re-encodes the result. Measured at 2,957 us/row on
-    # this file's reference frame, which is ~15M units on that run's calibration; the entry
-    # is scaled to the `thumbnail` figure already in `_IMAGE_COST` so the two stay
-    # consistent, and it lands just below it, in the decode-and-re-encode band where it
-    # belongs. No specific plan change is claimed for this entry: the probes tried were
+    # this file's reference frame, and 1,686 us/row on the compressible one the rest of
+    # this table is measured on -- so it lands just below `thumbnail`, in the
+    # decode-and-re-encode band where it belongs. No specific plan change is claimed for
+    # this entry: the probes tried were
     # decided by selectivity or by `filter_split`'s gain gate rather than by the crop's
     # own cost. It is corrected because 5.0 is simply the wrong number for a JPEG decode,
     # and because `filter_split` and `cse` read it.
-    "ImageCrop": 11_000_000.0,
+    "ImageCrop": 8_500_000.0,
 }
 
 # Still unpriced, and visible here rather than silently defaulting: `GeoFunc`,
@@ -277,14 +277,22 @@ _BY_CLASS_NAME: dict[str, float] = {
 # read (~15 us/row) *below* a regex (~10 ns/row), so `filter_split` would have run the
 # header probe first and paid it on every row.
 #
-# `benchmarks/scenarios/media_op_cost.py` re-measures all of them, so the table has a
-# reproducer rather than only a provenance claim. Expect its absolute numbers to differ:
-# it synthesizes a structured, JPEG-compressible frame (what a camera produces) where
-# these were taken on incompressible noise (a decoder's worst case), which moves every
-# image figure by roughly a fifth. What carries over, and what the optimizer reads, is the
-# ordering and the size of the gaps between the bands below. Entries inside a band -- the
-# four header reads, or the three hashes -- are within measurement noise of each other and
-# are not meant to be distinguishable.
+# `benchmarks/scenarios/media_op_cost.py` prints exactly these numbers, so the table has a
+# reproducer rather than only a provenance claim. It measures on a structured,
+# JPEG-compressible frame -- what a camera produces, rather than the incompressible noise
+# that is a decoder's worst case -- and it chooses each op's row count so the op's own work
+# dominates the per-call fixed cost.
+#
+# Both of those corrections mattered, and an earlier revision of this block had neither.
+# Measured at a few hundred rows the cheap end reads several times high (`image.format` is
+# 7.5 us/row at 200 rows against 0.45 at 25,600), and content moves the decode-bound ops
+# much further than it moves the rest: `dhash` runs ~8x faster on a compressible frame,
+# while `blur` barely moves, because its work is in the filter rather than in the decode.
+# Correcting both left every ordering here unchanged and brought the cheap and
+# decode-bound entries down by 4-15x.
+#
+# Entries within a band -- the four header reads, or `ahash` and `dhash` -- are within
+# measurement noise of each other and are not meant to be distinguishable.
 #
 # The family used to carry one flat 500.0 for every op, and the measurements say that was
 # wrong by more than two orders of magnitude *inside* the family:
@@ -305,88 +313,88 @@ _BY_CLASS_NAME: dict[str, float] = {
 # despite living beside the ones that are -- proving an image is grayscale means looking
 # at its pixels, so it costs a full decode while `has_alpha` next to it costs nothing.
 
-_IMAGE_DEFAULT = 16_000_000.0  # an untabulated image op: assume it decodes (the safe direction)
+_IMAGE_DEFAULT = 14_000_000.0  # an untabulated image op: assume it decodes (the safe direction)
 _IMAGE_COST: dict[str, float] = {
     # Header only -- no pixel is decoded (`bc-expr::eval::media::image::probe`).
-    "format": 51_000.0,
-    "aspect_ratio": 62_000.0,
-    "has_alpha": 78_000.0,
-    "exif_orientation": 80_000.0,
-    "decode": 87_000.0,
+    "format": 3_400.0,
+    "aspect_ratio": 12_000.0,
+    "has_alpha": 10_000.0,
+    "exif_orientation": 19_000.0,
+    "decode": 12_000.0,
     # Perceptual hashes: decode, downsample hard, compare cells.
-    "ahash": 4_000_000.0,
-    "dhash": 4_100_000.0,
-    "phash": 4_300_000.0,
+    "ahash": 430_000.0,
+    "dhash": 430_000.0,
+    "phash": 830_000.0,
     # Decode and resize to a tensor.
-    "to_tensor": 8_500_000.0,
-    "to_grayscale": 8_800_000.0,
-    "center_crop": 9_900_000.0,
-    "resize": 12_000_000.0,
-    "thumbnail": 13_000_000.0,
-    "letterbox": 14_000_000.0,
+    "to_tensor": 5_000_000.0,
+    "to_grayscale": 4_900_000.0,
+    "center_crop": 6_100_000.0,
+    "resize": 6_600_000.0,
+    "thumbnail": 12_000_000.0,
+    "letterbox": 10_000_000.0,
     # Decode and walk every pixel.
-    "is_grayscale": 15_000_000.0,
-    "brightness": 16_000_000.0,
-    "colorfulness": 16_000_000.0,
-    "entropy": 16_000_000.0,
-    "mean_color": 17_000_000.0,
-    "sharpness": 17_000_000.0,
+    "is_grayscale": 13_000_000.0,
+    "brightness": 14_000_000.0,
+    "colorfulness": 14_000_000.0,
+    "entropy": 14_000_000.0,
+    "mean_color": 15_000_000.0,
+    "sharpness": 15_000_000.0,
     # Decode and re-encode. `encode` varies with the target container (JPEG ~4,150 us,
     # PNG ~6,520); the entry is the midpoint, since the format is a plan-time constant
     # this table is not indexed by.
-    "encode": 27_000_000.0,
+    "encode": 17_000_000.0,
     "to_tensor_f32": 27_000_000.0,
-    "convert": 32_000_000.0,
-    "auto_orient": 32_000_000.0,
-    "flip_vertical": 33_000_000.0,
-    "adjust_brightness": 34_000_000.0,
-    "rotate": 35_000_000.0,
-    "posterize": 36_000_000.0,
-    "solarize": 36_000_000.0,
-    "adjust_saturation": 36_000_000.0,
-    "flip_horizontal": 37_000_000.0,
-    "pad": 37_000_000.0,
-    "invert": 37_000_000.0,
-    "autocontrast": 38_000_000.0,
-    "equalize": 38_000_000.0,
-    "adjust_contrast": 40_000_000.0,
-    "adjust_hue": 40_000_000.0,
+    "convert": 16_000_000.0,
+    "auto_orient": 16_000_000.0,
+    "flip_vertical": 20_000_000.0,
+    "adjust_brightness": 23_000_000.0,
+    "rotate": 22_000_000.0,
+    "posterize": 21_000_000.0,
+    "solarize": 21_000_000.0,
+    "adjust_saturation": 24_000_000.0,
+    "flip_horizontal": 20_000_000.0,
+    "pad": 29_000_000.0,
+    "invert": 22_000_000.0,
+    "autocontrast": 26_000_000.0,
+    "equalize": 24_000_000.0,
+    "adjust_contrast": 27_000_000.0,
+    "adjust_hue": 25_000_000.0,
     # Convolutions over the full plane -- the priciest ops in the family by a wide margin.
-    "blur": 67_000_000.0,
-    "sharpen": 69_000_000.0,
+    "blur": 49_000_000.0,
+    "sharpen": 59_000_000.0,
 }
 
-_AUDIO_DEFAULT = 5_300_000.0  # an untabulated audio op: assume it materializes a waveform
+_AUDIO_DEFAULT = 5_200_000.0  # an untabulated audio op: assume it materializes a waveform
 _AUDIO_COST: dict[str, float] = {
     # Decode PCM and reduce to one scalar -- no waveform is materialized, which is the
     # ~800 us/row difference between these and `to_waveform`.
-    "decode": 1_100_000.0,
-    "dbfs": 1_200_000.0,
-    "rms": 1_200_000.0,
-    "peak_dbfs": 1_200_000.0,
-    "clipping_ratio": 1_300_000.0,
-    "silence_ratio": 1_300_000.0,
-    "zero_crossing_rate": 1_300_000.0,
-    "encode_wav": 1_800_000.0,
-    "slice": 2_700_000.0,
+    "decode": 770_000.0,
+    "dbfs": 830_000.0,
+    "rms": 840_000.0,
+    "peak_dbfs": 820_000.0,
+    "clipping_ratio": 860_000.0,
+    "silence_ratio": 850_000.0,
+    "zero_crossing_rate": 900_000.0,
+    "encode_wav": 1_300_000.0,
+    "slice": 2_300_000.0,
     # One STFT, reduced to a scalar per frame.
-    "spectral_rolloff": 3_600_000.0,
-    "spectral_centroid": 3_700_000.0,
-    "spectral_flatness": 3_700_000.0,
-    "spectral_bandwidth": 3_900_000.0,
-    "pad_or_trim": 4_000_000.0,
+    "spectral_rolloff": 2_900_000.0,
+    "spectral_centroid": 3_000_000.0,
+    "spectral_flatness": 3_100_000.0,
+    "spectral_bandwidth": 3_100_000.0,
+    "pad_or_trim": 3_700_000.0,
     # Decode and hand back the whole signal.
-    "to_waveform": 5_300_000.0,
-    "trim_silence": 5_400_000.0,
-    "peak_normalize": 5_400_000.0,
-    "pre_emphasis": 5_500_000.0,
-    "rms_normalize": 5_600_000.0,
+    "to_waveform": 5_200_000.0,
+    "trim_silence": 5_100_000.0,
+    "peak_normalize": 5_100_000.0,
+    "pre_emphasis": 5_300_000.0,
+    "rms_normalize": 5_200_000.0,
     # STFT and filterbank front ends.
-    "spectrogram": 8_800_000.0,
-    "mel_spectrogram": 14_000_000.0,
-    "mfcc": 21_000_000.0,
+    "spectrogram": 8_500_000.0,
+    "mel_spectrogram": 16_000_000.0,
+    "mfcc": 20_000_000.0,
     # Band-limited sinc resampling is the most expensive audio op measured.
-    "resample": 25_000_000.0,
+    "resample": 24_000_000.0,
 }
 
 

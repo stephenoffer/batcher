@@ -25,11 +25,14 @@ The corpus is synthesized, so no network, cloud store or fixture file is needed.
 match the reference inputs the weights table names: a 512x512 JPEG and a 3-second 16 kHz
 mono WAV. Media cost scales with resolution and duration far more strongly than a string
 function's does with string length, so changing `--size` or `--seconds` moves every number
-and only the *ranking* carries over.
+and only the *ranking* carries over. Image *content* matters as much as size and not
+uniformly: a decode-bound op such as `dhash` runs several times faster on a compressible
+frame than on incompressible noise, while a convolution such as `blur` barely moves,
+because its work is in the filter rather than in the decode.
 
 Run:
     python benchmarks/scenarios/media_op_cost.py
-    python benchmarks/scenarios/media_op_cost.py --size 1024 --rows 100 --runs 5
+    python benchmarks/scenarios/media_op_cost.py --size 1024 --runs 5
     python benchmarks/scenarios/media_op_cost.py --family audio
 """
 
@@ -46,6 +49,11 @@ import time
 # `units` column below applies that directly, so a drift shows up as a number that no
 # longer matches `weights.py` rather than as a ranking someone has to eyeball.
 _UNITS_PER_US = 48.0 / 0.00954
+
+# Row counts an op climbs through until one timed pass is long enough to trust. Capped so
+# the corpus stays holdable: 8,192 512x512 JPEGs is already several hundred megabytes, and
+# the cheapest ops are within ~30% of their converged value there.
+_SIZES = (64, 256, 1024, 4096, 8192)
 
 
 def _jpeg(size: int, seed: int) -> bytes:
@@ -162,27 +170,53 @@ def _audio_ops(rate: int) -> dict:
     }
 
 
-def _per_row_us(dataset, build, rows: int, runs: int) -> float:
+def _sized(corpus: list, n: int, cache: dict) -> object:
+    """A dataset of `n` rows drawn from `corpus`, built once per size and reused.
+
+    Building it per op -- let alone per timing attempt -- dominated the measurement: a
+    corpus of thousands of 512x512 JPEGs is hundreds of megabytes to assemble, and every
+    op was assembling its own.
+    """
+    import batcher as bt
+
+    if n not in cache:
+        cache[n] = bt.from_pydict({"k": [corpus[i % len(corpus)] for i in range(n)]})
+    return cache[n]
+
+
+def _per_row_us(corpus: list, build, runs: int, budget_s: float, cache: dict) -> float:
     """Best-of-`runs` microseconds per row for one expression, less a bare projection.
 
     Subtracting the bare projection is what makes this the *function's own* work rather
     than the function plus the cost of reading a wide binary column, and it is the same
     correction the rest of the weights table was measured with.
+
+    The row count is chosen per op rather than fixed, because no single one is right for
+    both ends of this range. At 200 rows the cheap header probes are dominated by per-call
+    fixed cost and read several times high -- `image.format` measures 7.5 us/row at 200
+    rows against 0.45 at 25,600 -- while at 25,600 rows one convolution op takes minutes.
+    So each op climbs through `_SIZES` until a timed pass clears `budget_s`, or until the
+    corpus would be too large to hold, whichever comes first.
     """
     import batcher as bt
 
-    def timed(make) -> float:
-        make().collect()  # warm: first call pays plan build and any one-time setup
-        best = float("inf")
-        for _ in range(runs):
-            start = time.perf_counter()
-            make().collect()
-            best = min(best, time.perf_counter() - start)
-        return best
+    for n in _SIZES:
+        dataset = _sized(corpus, n, cache)
 
-    bare = timed(lambda: dataset.select(x=bt.col("k")))
-    full = timed(lambda: dataset.select(x=build(bt.col("k"))))
-    return max(0.0, (full - bare)) / rows * 1e6
+        def timed(make, d=dataset) -> float:
+            make(d).collect()  # warm: first call pays plan build and one-time setup
+            best = float("inf")
+            for _ in range(runs):
+                started = time.perf_counter()
+                make(d).collect()
+                best = min(best, time.perf_counter() - started)
+            return best
+
+        full = timed(lambda d: d.select(x=build(bt.col("k"))))
+        if full >= budget_s or n == _SIZES[-1]:
+            bare = timed(lambda d: d.select(x=bt.col("k")))
+            return max(0.0, full - bare) / n * 1e6
+    raise AssertionError("unreachable: the loop returns on its last size")
 
 
 def _report(title: str, timings: dict[str, float]) -> None:
@@ -198,7 +232,12 @@ def _report(title: str, timings: dict[str, float]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Per-row cost of each media expression")
-    parser.add_argument("--rows", type=int, default=200, help="rows per measurement")
+    parser.add_argument(
+        "--budget",
+        type=float,
+        default=0.15,
+        help="seconds one timed pass must reach before a per-row figure is trusted",
+    )
     parser.add_argument("--runs", type=int, default=3, help="best-of-N timed repeats")
     parser.add_argument("--size", type=int, default=512, help="source JPEG edge, in pixels")
     parser.add_argument("--seconds", type=float, default=3.0, help="clip length, in seconds")
@@ -216,24 +255,23 @@ def main() -> int:
     print(f"engine: {bt.versions().get('engine_profile', 'unknown')}")
 
     if args.family in ("image", "both"):
-        corpus = [_jpeg(args.size, i) for i in range(min(args.rows, 16))]
-        rows = [corpus[i % len(corpus)] for i in range(args.rows)]
-        dataset = bt.from_pydict({"k": rows})
+        corpus = [_jpeg(args.size, i) for i in range(16)]
+        cache: dict = {}
         timings = {}
         for name, build in _image_ops(args.size).items():
             try:
-                timings[name] = _per_row_us(dataset, build, args.rows, args.runs)
+                timings[name] = _per_row_us(corpus, build, args.runs, args.budget, cache)
             except Exception as exc:  # an op this engine build lacks must not abort the rest
                 print(f"  (image.{name} skipped: {type(exc).__name__}: {str(exc)[:60]})")
         _report(f".image on a {args.size}x{args.size} JPEG", timings)
 
     if args.family in ("audio", "both"):
-        clip = _wav(args.seconds, args.rate)
-        dataset = bt.from_pydict({"k": [clip] * args.rows})
         timings = {}
+        cache = {}
+        clips = [_wav(args.seconds, args.rate)]
         for name, build in _audio_ops(args.rate).items():
             try:
-                timings[name] = _per_row_us(dataset, build, args.rows, args.runs)
+                timings[name] = _per_row_us(clips, build, args.runs, args.budget, cache)
             except Exception as exc:
                 print(f"  (audio.{name} skipped: {type(exc).__name__}: {str(exc)[:60]})")
         _report(f".audio on a {args.seconds:g}s {args.rate} Hz mono WAV", timings)
