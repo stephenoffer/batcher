@@ -117,3 +117,58 @@ def test_undecodable_rows_stay_null_on_every_worker(frames):
 
     assert local > 0, "the fixture must contain undecodable bytes for this to mean anything"
     assert distributed == local
+
+
+def test_an_aggregate_over_a_decoded_column_merges_correctly(frames):
+    """The one media shape whose distributed equivalence is *not* structural.
+
+    Everything above is a per-row projection: no partial state, nothing a shuffle can
+    reorder, which is what the module docstring means by "structural". An aggregate over
+    a decoded column is the opposite. The decode runs per partition, its output is
+    shuffled by the group key, and the partials are then merged -- so this is the first
+    case where the mergeable algebra actually has to hold over a column the media kernels
+    produced, and the first where a wrong answer would be a real merge bug rather than a
+    dropped extension type.
+
+    Grouped by a decoded *header* fact rather than an arbitrary key, because that is the
+    shape a corpus audit is written in: "how bright is the average image at each width".
+    """
+    query = frames.filter(col("b").is_not_null()).with_columns(
+        w=col("b").image.decode().struct.field("width"),
+        bright=col("b").image.brightness(),
+    )
+    grouped = query.group_by("w").agg(
+        n=col("bright").count(),
+        lo=col("bright").min(),
+        hi=col("bright").max(),
+    )
+
+    local = grouped.collect().sort_by("w").to_pydict()
+    distributed = grouped.collect(distributed=True, num_workers=4).sort_by("w").to_pydict()
+
+    assert local["w"], "the fixture must produce several widths for this to mean anything"
+    assert distributed["w"] == local["w"]
+    assert distributed["n"] == local["n"]
+    # `min`/`max` are exact under any merge order, so these compare exactly rather than
+    # approximately -- unlike a `sum`/`mean`, which float reassociation may move.
+    assert distributed["lo"] == local["lo"]
+    assert distributed["hi"] == local["hi"]
+
+
+def test_a_decoded_column_survives_a_join_across_workers(frames):
+    """A media-derived column used as a join key, which the shuffle repartitions by.
+
+    `dhash` is the join key a near-duplicate pass is built on, so this is the shape that
+    matters rather than an arbitrary one: if the hash were computed differently on two
+    workers -- a different downsample, a different rounding -- the join would silently
+    match fewer rows on a cluster than on one node, and nothing else here would see it.
+    """
+    hashed = frames.filter(col("b").is_not_null()).select(h=col("b").image.dhash())
+    other = hashed.select(h2=col("h"))
+    joined = hashed.join(other, left_on="h", right_on="h2")
+
+    local = joined.collect().num_rows
+    distributed = joined.collect(distributed=True, num_workers=4).num_rows
+
+    assert local > 0
+    assert distributed == local
