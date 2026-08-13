@@ -1,8 +1,8 @@
 """Every expression node with sub-expressions must be known to the optimizer's walker.
 
-`plan/expr_rewrite/traverse.py` dispatches on exact node type through two hand-maintained
-tables: `_EXPR_KIDS` says what a node's sub-expressions are, and `_EXPR_REBUILD` says how
-to put one back together. A node type absent from `_EXPR_KIDS` is **treated as a leaf**,
+`plan/expr_rewrite/traverse.py` dispatches on exact node type through two tables:
+`_EXPR_KIDS` says what a node's sub-expressions are, and `_EXPR_REBUILD` says how to put
+one back together. A node type absent from `_EXPR_KIDS` is **treated as a leaf**,
 silently and by design — that is what makes the dispatch O(1) for `Col` and `Lit`, which
 are most of every tree.
 
@@ -176,3 +176,109 @@ def test_a_rigid_transform_survives_repeated_projection_merging():
     last = again.to_pydict()
     for name in ("qx", "qy", "qz", "qw"):
         assert last[name][0] == pytest.approx(first[name][0], abs=1e-12), name
+
+
+# --- A rebuild must carry the node's own parameters across ---------------------------
+
+
+def _representative_nodes() -> dict[type, object]:
+    """One constructed instance per node type, from the IR snapshot's corpus.
+
+    The snapshot already builds a representative of every node — including, now, the
+    parameterized form of each multimodal node — so the corpus is shared rather than
+    restated here.
+    """
+    from tests.unit.test_ir_snapshot import _representatives
+
+    by_type: dict[type, object] = {}
+    for node in _representatives().values():
+        # `setdefault` keeps the *first* representative of a type; the media nodes list
+        # their bare `decode` form first, so ask for the richest one instead.
+        current = by_type.get(type(node))
+        if current is None or _parameter_count(node) > _parameter_count(current):
+            by_type[type(node)] = node
+    return by_type
+
+
+def _parameter_count(node: object) -> int:
+    """How many of `node`'s non-sub-expression fields are actually set."""
+    return sum(
+        1
+        for name in node_base.scalar_fields_of(type(node))
+        if getattr(node, name, None) not in (None, False)
+    )
+
+
+def test_rebuilding_a_node_preserves_every_parameter_it_carries():
+    """`_EXPR_REBUILD` must return the *same node with new children*, not a partial copy.
+
+    This is the guard the three existing tables tests did not provide. Each of them asks
+    whether a node type is *present* in the tables; none asked whether the rebuilt node
+    still carries its own fields. So `_EXPR_REBUILD` could — and did — hold entries like
+    ``ImageFunc(e.fn, k[0], width=e.width, height=e.height)``, silently dropping
+    `mean`/`std`/`channels_first`/`format`/`fill`.
+
+    The consequences were graded from loud to invisible. `.image.encode("jpeg")` lost
+    its format and the engine refused the batch outright. `.image.to_tensor_f32(...)`
+    lost its per-channel normalization and `.audio.mel_spectrogram(...)` its filterbank
+    sizes: right column type, right shape, quietly wrong numbers feeding a model. An
+    ordinary ``select(...).select(...)`` was enough to trigger either, because that is
+    what makes `merge_projections` rebuild the node.
+    """
+    dropped: dict[str, list[str]] = {}
+    for node_type, rep in _representative_nodes().items():
+        kids_of = _EXPR_KIDS.get(node_type)
+        if kids_of is None:
+            continue
+        kids = kids_of(rep)
+        if not kids:
+            continue
+        # Rebuild with the node's *own* children: nothing but the parameters can differ.
+        rebuilt = _EXPR_REBUILD[node_type](rep, kids)
+        lost = [
+            name
+            for name in node_base.scalar_fields_of(node_type)
+            if getattr(rebuilt, name, None) != getattr(rep, name, None)
+        ]
+        if lost:
+            dropped[node_type.__name__] = lost
+
+    assert not dropped, (
+        "rebuilding these nodes lost their own parameters, so any optimizer rewrite "
+        f"silently reverts them to defaults: {dropped}"
+    )
+
+
+def test_every_declared_child_is_reachable_from_the_kids_table():
+    """A `child()` field the tables do not descend into is invisible to column pruning.
+
+    `VideoFunc.second` is the case that motivated this: `.video.frame_at(col("ts"), ...)`
+    names the moment it wants a still from, so `second` is a sub-expression over the
+    enclosing relation exactly as `input` is — but `_EXPR_KIDS` yielded only `input`, so
+    the optimizer could not see that the expression reads `ts`.
+
+    The two element-scoped bodies are the deliberate exceptions: they close over
+    ``element()`` rather than over the relation, so `expr_ir.walk` stops at them too.
+    """
+    scoped_out = {("ListTransform", "func"), ("ListFilter", "pred")}
+
+    unreachable: list[str] = []
+    for node_type, rep in _representative_nodes().items():
+        kids_of = _EXPR_KIDS.get(node_type)
+        if kids_of is None:
+            continue
+        reached = {id(k) for k in kids_of(rep)}
+        for name, is_list in node_base.child_fields_of(node_type):
+            if (node_type.__name__, name) in scoped_out:
+                continue
+            value = getattr(rep, name, None)
+            if value is None:
+                continue  # an optional sub-expression this representative does not set
+            declared = list(value) if is_list else [value]
+            if any(id(v) not in reached for v in declared):
+                unreachable.append(f"{node_type.__name__}.{name}")
+
+    assert not unreachable, (
+        "these declared sub-expressions are not yielded by `_EXPR_KIDS`, so the "
+        f"optimizer cannot see the columns they read: {sorted(unreachable)}"
+    )

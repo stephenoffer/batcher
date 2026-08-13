@@ -30,7 +30,17 @@ from typing import Any, ClassVar, TypeVar
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr
 
-__all__ = ["IRNode", "child", "child_fields", "children", "expr_node", "literal", "scalar"]
+__all__ = [
+    "IRNode",
+    "child",
+    "child_fields",
+    "child_fields_of",
+    "children",
+    "expr_node",
+    "literal",
+    "scalar",
+    "scalar_fields_of",
+]
 
 _T = TypeVar("_T")
 
@@ -226,6 +236,55 @@ class IRNode(Expr):
         return out
 
 
+def child_fields_of(cls: type) -> tuple[tuple[str, bool], ...]:
+    """The ``(field_name, is_list)`` of each sub-expression field of an `IRNode` *class*.
+
+    The class-level form of `child_fields`, for callers that have the type rather than an
+    instance — the expression-rewrite tables build their per-class traversal plans from
+    this at import time, before any node of that type exists.
+
+    Args:
+        cls: An `IRNode` subclass.
+
+    Returns:
+        One ``(name, is_list)`` pair per `child`/`children` field, in declaration order.
+        Empty for a node that predates the declarative base (`InList`, `Aliased`), which
+        declares no field metadata to read and so must be handled explicitly by callers.
+    """
+    out = cls.__dict__.get(_CHILDREN_ATTR)
+    if out is None:
+        if not dataclasses.is_dataclass(cls):
+            return ()
+        out = tuple(
+            (f.name, spec.kind is _Kind.CHILDREN)
+            for f in fields(cls)
+            if (spec := f.metadata.get(_META)) is not None
+            and spec.kind in (_Kind.CHILD, _Kind.CHILDREN)
+        )
+        setattr(cls, _CHILDREN_ATTR, out)
+    return out
+
+
+def scalar_fields_of(cls: type) -> tuple[str, ...]:
+    """The names of `cls`'s non-sub-expression fields — its `scalar`/`literal` parameters.
+
+    The complement of `child_fields_of`. A rewrite that rebuilds a node from new children
+    must carry every one of these across unchanged; naming them here is what lets that be
+    derived from the node's own declaration rather than restated per node type.
+
+    Args:
+        cls: An `IRNode` subclass.
+
+    Returns:
+        The parameter field names, in declaration order. Empty for a node that predates
+        the declarative base, for the reason given on `child_fields_of`.
+    """
+    if not dataclasses.is_dataclass(cls):
+        return ()
+    kids = {name for name, _ in child_fields_of(cls)}
+    return tuple(f.name for f in fields(cls) if f.name not in kids)
+
+
 def child_fields(node: IRNode) -> tuple[tuple[str, bool], ...]:
     """The ``(field_name, is_list)`` of each sub-expression field of an `IRNode`.
 
@@ -241,17 +300,7 @@ def child_fields(node: IRNode) -> tuple[tuple[str, bool], ...]:
     expression they visit, and each call otherwise rebuilt the field tuple and re-probed
     every field's metadata to rediscover a fixed answer.
     """
-    cls = type(node)
-    out = cls.__dict__.get(_CHILDREN_ATTR)
-    if out is None:
-        out = tuple(
-            (f.name, spec.kind is _Kind.CHILDREN)
-            for f in fields(cls)
-            if (spec := f.metadata.get(_META)) is not None
-            and spec.kind in (_Kind.CHILD, _Kind.CHILDREN)
-        )
-        setattr(cls, _CHILDREN_ATTR, out)
-    return out
+    return child_fields_of(type(node))
 
 
 def expr_node(cls: type[_T]) -> type[_T]:

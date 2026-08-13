@@ -2,13 +2,21 @@
 
 One table says what an expression node's sub-expressions are (`_EXPR_KIDS`) and one says
 how to rebuild it from new ones (`_EXPR_REBUILD`). Every traversal in the package is built
-on this pair, so a new `Expr` node type is taught to the whole optimizer by adding two
-entries here rather than by extending an `isinstance` ladder in each rule.
+on this pair, so a new `Expr` node type is taught to the whole optimizer by registering it
+here rather than by extending an `isinstance` ladder in each rule.
+
+Registering it is naming it in `_REGULAR`: both entries are then *derived* from the
+node's own `child`/`scalar` declarations, the same declarations `expr_ir.walk` reads.
+That is deliberate. When the pair was hand-written per node type, the hand-written
+version drifted from the declaration it was copying, and a rebuild that quietly dropped
+a node's own parameters is invisible to every gate — see the note above `_derived`.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
+from operator import attrgetter
 from typing import Any
 
 from batcher.plan.expr_ir import (
@@ -61,6 +69,7 @@ from batcher.plan.expr_ir.func_nodes import (
 )
 from batcher.plan.expr_ir.image import ImageCrop, ImageFunc
 from batcher.plan.expr_ir.namespaces.sequence import SeqFunc
+from batcher.plan.expr_ir.node_base import child_fields_of
 from batcher.plan.expr_ir.nodes import HashRows, MakeStruct, Sequence
 from batcher.plan.expr_ir.video import VideoFunc
 
@@ -84,144 +93,145 @@ def _make_struct_rebuild(e: MakeStruct, kids: tuple[Expr, ...]) -> Expr:
     return MakeStruct([(name, kid) for (name, _value), kid in zip(e.fields, kids, strict=True)])
 
 
-# Exact-type → (children, rebuild) dispatch for `transform_expr_up`. `_EXPR_KIDS` yields
-# a node's direct sub-expressions; `_EXPR_REBUILD` reconstructs the node from rewritten
-# children (called only when a child actually changed). Leaves (Col, Lit, AggExpr, …)
-# are intentionally absent from both.
-_EXPR_KIDS: dict[type, Callable[[Any], tuple[Expr, ...]]] = {
-    Binary: lambda e: (e.left, e.right),
-    Not: lambda e: (e.input,),
-    Cast: lambda e: (e.input,),
-    IsNull: lambda e: (e.input,),
-    IsNotNull: lambda e: (e.input,),
-    IsNan: lambda e: (e.input,),
-    IsInf: lambda e: (e.input,),
-    InList: lambda e: (e.input,),
-    MathExpr: lambda e: (e.input,),
-    DateFunc: lambda e: (e.input,),
-    DateTrunc: lambda e: (e.input,),
-    ListFunc: lambda e: (e.input,),
-    ListGet: lambda e: (e.input,),
-    ListSimhash: lambda e: (e.input,),
-    ListContains: lambda e: (e.input,),
-    ListSlice: lambda e: (e.input,),
-    StructField: lambda e: (e.input,),
-    ListJoin: lambda e: (e.input,),
-    StrFunc: lambda e: (e.input,),
-    SeqFunc: lambda e: (e.input,),
-    ImageFunc: lambda e: (e.input,),
-    # All five, not just `input`. A crop window is *data* — the whole point of this node
-    # is that a detector's predicted box varies per row — so `x`/`y`/`width`/`height`
-    # reference the outer relation's columns exactly as `input` does. Omitting them made
-    # the optimizer blind to those columns, and `select(box).select(crop(box))` died in
-    # `merge_projections` with a `ColumnNotFoundError` naming the box columns.
-    ImageCrop: lambda e: (e.input, e.x, e.y, e.width, e.height),
-    Coalesce: lambda e: tuple(e.inputs),
-    Greatest: lambda e: tuple(e.inputs),
-    HashRows: lambda e: tuple(e.inputs),
-    Least: lambda e: tuple(e.inputs),
-    Array: lambda e: tuple(e.elements),
-    GeoFunc: lambda e: tuple(e.args),
-    SpatialFunc: lambda e: tuple(e.args),
-    MakeTemporal: lambda e: tuple(e.args),
-    NullIf: lambda e: (e.left, e.right),
-    Math2Expr: lambda e: (e.left, e.right),
-    ListBinary: lambda e: (e.left, e.right),
-    ListSet: lambda e: (e.left, e.right),
-    ListZip: lambda e: (e.left, e.right),
-    ListPosition: lambda e: (e.input,),
-    MapFunc: lambda e: (e.input,),
-    ConvertTimezone: lambda e: (e.input,),
-    DateOffset: lambda e: (e.input,),
-    Strftime: lambda e: (e.input,),
-    Strptime: lambda e: (e.input,),
-    WindowStart: lambda e: (e.input,),
-    WindowBuckets: lambda e: (e.input,),
-    # `func`/`pred` are element-scoped sub-expressions (they close over `element()`,
-    # not over the outer relation's columns), so a rewrite of the outer projection
-    # must not descend into them. `walk.remap_columns` draws the line in the same place.
-    ListTransform: lambda e: (e.input,),
-    ListFilter: lambda e: (e.input,),
-    Aliased: lambda e: (e.inner,),
-    AudioFunc: lambda e: (e.input,),
-    VideoFunc: lambda e: (e.input,),
-    MakeStruct: lambda e: tuple(value for _name, value in e.fields),
-    Sequence: lambda e: (e.start, e.stop, e.step),
-    Case: _case_kids,
+# --- The traversal plan is derived, not restated --------------------------------------
+#
+# Every node already declares which of its fields hold sub-expressions (`child`/
+# `children`) and which hold parameters (`scalar`/`literal`), and `expr_ir.walk` reads
+# that declaration rather than repeating it. These two tables used to repeat it, as a
+# hand-written lambda pair per node type -- and the repetition drifted. Three of the
+# multimodal nodes rebuilt themselves without their own parameters, so a rewrite turned
+# `.image.encode("jpeg")` into an `encode` with no format (a hard engine error),
+# stripped `.image.to_tensor_f32`'s `mean`/`std` normalization and
+# `.audio.mel_spectrogram`'s filterbank sizes (right shapes, silently wrong numbers),
+# and hid `.video.frame_at`'s per-row timestamp from column pruning. An ordinary
+# two-step projection was enough to trigger all of it, and the three tests guarding
+# these tables all passed throughout, because each checks that a node type is *present*
+# and none checked that a rebuilt node still carries its own fields.
+#
+# So the plan is derived from the same field metadata. A rebuild that drops a parameter
+# is now unrepresentable rather than merely tested for.
+
+
+def _optional_children(cls: type, names: tuple[str, ...]) -> frozenset[str]:
+    """Those of `names` declared with a ``None`` default -- children a node may not have."""
+    defaults = {f.name: f.default for f in dataclasses.fields(cls)}
+    return frozenset(n for n in names if defaults.get(n) is None)
+
+
+def _derived(
+    cls: type, *, exclude: frozenset[str] = frozenset()
+) -> tuple[Callable[[Any], tuple[Expr, ...]], Callable[[Any, tuple[Expr, ...]], Expr]]:
+    """`cls`'s ``(children, rebuild)`` pair, read off its own field declarations.
+
+    `exclude` drops a declared sub-expression from the traversal, for the nodes whose
+    body is scoped to something other than the enclosing relation.
+
+    Args:
+        cls: An `IRNode` subclass whose sub-expression fields are plain fields.
+        exclude: Field names to treat as opaque rather than descend into.
+
+    Returns:
+        The children accessor and the rebuild function for `cls`.
+    """
+    spec = tuple((n, is_list) for n, is_list in child_fields_of(cls) if n not in exclude)
+    names = tuple(n for n, _ in spec)
+    list_names = frozenset(n for n, is_list in spec if is_list)
+    optional = _optional_children(cls, names)
+
+    def rebuild(e: Any, kids: tuple[Expr, ...]) -> Expr:
+        # `replace` copies every field it is not given, so the node's parameters ride
+        # along by construction -- that is the whole point of deriving this.
+        supplied = iter(kids)
+        updates: dict[str, Any] = {}
+        for name, is_list in spec:
+            current = getattr(e, name)
+            if current is None and name in optional:
+                continue
+            if is_list:
+                updates[name] = [next(supplied) for _ in current]
+            else:
+                updates[name] = next(supplied)
+        return dataclasses.replace(e, **updates)
+
+    if list_names or optional:
+
+        def kids_of(e: Any) -> tuple[Expr, ...]:
+            out: list[Expr] = []
+            for name, is_list in spec:
+                value = getattr(e, name)
+                if value is None and name in optional:
+                    continue
+                if is_list:
+                    out.extend(value)
+                else:
+                    out.append(value)
+            return tuple(out)
+
+        return kids_of, rebuild
+
+    # `attrgetter` with two or more names returns the tuple directly, so the multi-child
+    # nodes now reach their children with no Python frame at all -- `transform_expr_up`
+    # is the optimizer's hottest function and this is its first call.
+    if len(names) == 1:
+        get_one = attrgetter(names[0])
+        return (lambda e: (get_one(e),)), rebuild
+    return attrgetter(*names), rebuild
+
+
+# Node types whose traversal is exactly their declaration: every `child`/`children`
+# field is a sub-expression over the enclosing relation, and every other field is a
+# parameter to carry across a rebuild unchanged.
+_REGULAR: tuple[type, ...] = (
+    Array, AudioFunc, Binary, Cast, Coalesce, ConvertTimezone, DateFunc, DateOffset,
+    DateTrunc, GeoFunc, Greatest, HashRows, ImageCrop, ImageFunc, IsInf, IsNan,
+    IsNotNull, IsNull, Least, ListBinary, ListContains, ListFunc, ListGet, ListJoin,
+    ListPosition, ListSet, ListSimhash, ListSlice, ListZip, MakeTemporal, Math2Expr,
+    MathExpr, MapFunc, Not, NullIf, SeqFunc, Sequence, SpatialFunc, Strftime, Strptime,
+    StrFunc, StructField, VideoFunc, WindowBuckets, WindowStart,
+)  # fmt: skip
+
+# `func`/`pred` are element-scoped sub-expressions -- they close over `element()`, not
+# over the outer relation's columns -- so a rewrite of the outer projection must not
+# descend into them. `walk.referenced_columns` and `walk.remap_columns` draw the line in
+# the same place. Everything else about these two nodes derives as usual.
+_SCOPED_OUT: dict[type, frozenset[str]] = {
+    ListTransform: frozenset({"func"}),
+    ListFilter: frozenset({"pred"}),
 }
 
-_EXPR_REBUILD: dict[type, Callable[[Any, tuple[Expr, ...]], Expr]] = {
-    Binary: lambda e, k: Binary(e.op, k[0], k[1]),
-    Not: lambda _e, k: Not(k[0]),
-    Cast: lambda e, k: Cast(k[0], e.dtype, try_cast=e.try_cast),
-    IsNull: lambda _e, k: IsNull(k[0]),
-    IsNotNull: lambda _e, k: IsNotNull(k[0]),
-    IsNan: lambda _e, k: IsNan(k[0]),
-    IsInf: lambda _e, k: IsInf(k[0]),
-    InList: lambda e, k: InList(k[0], e.values),
-    MathExpr: lambda e, k: MathExpr(e.fn, k[0]),
-    DateFunc: lambda e, k: DateFunc(e.fn, k[0]),
-    DateTrunc: lambda e, k: DateTrunc(k[0], e.unit),
-    ListFunc: lambda e, k: ListFunc(e.fn, k[0]),
-    ListGet: lambda e, k: ListGet(k[0], e.index),
-    ListSimhash: lambda e, k: ListSimhash(k[0], e.num_bits, e.seed),
-    ListContains: lambda e, k: ListContains(k[0], e.value),
-    ListSlice: lambda e, k: ListSlice(k[0], e.offset, e.length),
-    StructField: lambda e, k: StructField(k[0], e.field),
-    ListJoin: lambda e, k: ListJoin(k[0], e.separator),
-    StrFunc: lambda e, k: StrFunc(
-        e.fn,
-        k[0],
-        pattern=e.pattern,
-        replacement=e.replacement,
-        start=e.start,
-        length=e.length,
-    ),
-    # The two `k`s here are unrelated: the lambda's `k` is this table's rebuilt-children
-    # tuple, and the keyword `k=` is the node's own k-mer length.
-    SeqFunc: lambda e, k: SeqFunc(
-        e.fn,
-        k[0],
-        k=e.k,
-        window=e.window,
-        frame=e.frame,
-        offset=e.offset,
-        alphabet=e.alphabet,
-        pattern=e.pattern,
-        to_stop=e.to_stop,
-    ),
-    ImageFunc: lambda e, k: ImageFunc(e.fn, k[0], width=e.width, height=e.height),
-    ImageCrop: lambda _e, k: ImageCrop(k[0], k[1], k[2], k[3], k[4]),
-    Coalesce: lambda _e, k: Coalesce(list(k)),
-    Greatest: lambda _e, k: Greatest(list(k)),
-    HashRows: lambda e, k: HashRows(list(k), e.seed),
-    Least: lambda _e, k: Least(list(k)),
-    Array: lambda _e, k: Array(list(k)),
-    GeoFunc: lambda e, k: GeoFunc(e.fn, list(k)),
-    SpatialFunc: lambda e, k: SpatialFunc(e.fn, list(k)),
-    MakeTemporal: lambda e, k: MakeTemporal(e.fn, list(k)),
-    NullIf: lambda _e, k: NullIf(k[0], k[1]),
-    Math2Expr: lambda e, k: Math2Expr(e.fn, k[0], k[1]),
-    ListBinary: lambda e, k: ListBinary(e.fn, k[0], k[1]),
-    ListSet: lambda e, k: ListSet(e.fn, k[0], k[1]),
-    ListZip: lambda e, k: ListZip(e.fn, k[0], k[1]),
-    ListPosition: lambda e, k: ListPosition(k[0], e.value),
-    MapFunc: lambda e, k: MapFunc(e.fn, k[0], e.key),
-    ConvertTimezone: lambda e, k: ConvertTimezone(k[0], e.from_tz, e.to_tz),
-    DateOffset: lambda e, k: DateOffset(k[0], e.months, e.days, e.micros),
-    Strftime: lambda e, k: Strftime(k[0], e.format),
-    Strptime: lambda e, k: Strptime(k[0], e.format),
-    WindowStart: lambda e, k: WindowStart(k[0], e.width_micros, e.origin_micros),
-    WindowBuckets: lambda e, k: WindowBuckets(k[0], e.width_micros, e.slide_micros),
-    ListTransform: lambda e, k: ListTransform(k[0], e.func),
-    ListFilter: lambda e, k: ListFilter(k[0], e.pred),
-    Aliased: lambda e, k: Aliased(k[0], e.name),
-    AudioFunc: lambda e, k: AudioFunc(e.fn, k[0], e.rate),
-    VideoFunc: lambda e, k: VideoFunc(e.fn, k[0]),
-    MakeStruct: _make_struct_rebuild,
-    Sequence: lambda _e, k: Sequence(k[0], k[1], k[2]),
-    Case: _case_rebuild,
-}
+# Exact-type -> (children, rebuild) dispatch for `transform_expr_up`. `_EXPR_KIDS` yields
+# a node's direct sub-expressions; `_EXPR_REBUILD` reconstructs the node from rewritten
+# children (called only when a child actually changed). Leaves (Col, Lit, AggExpr, ...)
+# are intentionally absent from both.
+_EXPR_KIDS: dict[type, Callable[[Any], tuple[Expr, ...]]] = {}
+_EXPR_REBUILD: dict[type, Callable[[Any, tuple[Expr, ...]], Expr]] = {}
+
+for _cls in _REGULAR:
+    _EXPR_KIDS[_cls], _EXPR_REBUILD[_cls] = _derived(_cls)
+for _cls, _excluded in _SCOPED_OUT.items():
+    _EXPR_KIDS[_cls], _EXPR_REBUILD[_cls] = _derived(_cls, exclude=_excluded)
+del _cls, _excluded
+
+# The four that cannot be derived. `InList` and `Aliased` predate the declarative base
+# and carry their own `to_ir`, so they have no field metadata to read; `Case` and
+# `MakeStruct` nest their sub-expressions inside tuples, a shape the per-field
+# declaration cannot describe.
+_EXPR_KIDS.update(
+    {
+        InList: lambda e: (e.input,),
+        Aliased: lambda e: (e.inner,),
+        MakeStruct: lambda e: tuple(value for _name, value in e.fields),
+        Case: _case_kids,
+    }
+)
+_EXPR_REBUILD.update(
+    {
+        InList: lambda e, k: InList(k[0], e.values),
+        Aliased: lambda e, k: Aliased(k[0], e.name),
+        MakeStruct: _make_struct_rebuild,
+        Case: _case_rebuild,
+    }
+)
 
 
 def transform_expr_up(expr: Expr, rule: ExprRule) -> Expr:

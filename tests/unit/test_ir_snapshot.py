@@ -199,8 +199,36 @@ def _representatives() -> dict[str, Any]:
         # A crop's window is four *sub-expressions*, not four scalars, so it is the one
         # multimodal node whose wire shape can drift without any `ImageFunc` case moving.
         "image_crop": ImageCrop(Col("img"), Col("x"), Col("y"), Lit(64), Lit(64)),
+        # The parameterized forms, one per group of optional slots. A bare `decode` was
+        # the only representative of each of these three nodes, so every optional slot
+        # they own was unlocked -- and `_EXPR_REBUILD` was silently dropping all of them
+        # (`.image.encode` came back with no format, `.audio.mel_spectrogram` with no
+        # filterbank sizes). A golden that only ever saw `decode` could not see it.
+        "image_tensor_f32": ImageFunc(
+            "to_tensor_f32",
+            Col("img"),
+            width=224,
+            height=224,
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+            channels_first=True,
+        ),
+        "image_encode": ImageFunc("encode", Col("img"), format="jpeg"),
+        "image_letterbox": ImageFunc("letterbox", Col("img"), width=640, height=640, fill=114),
         "audio": AudioFunc("decode", Col("clip")),
+        "audio_mel": AudioFunc(
+            "mel_spectrogram", Col("clip"), rate=16000, n_fft=400, hop_length=160, n_mels=80
+        ),
+        "audio_mfcc": AudioFunc(
+            "mfcc", Col("clip"), rate=16000, n_fft=400, hop_length=160, n_mels=80, n_mfcc=13
+        ),
+        "audio_trim": AudioFunc("trim_silence", Col("clip"), threshold_db=-40),
         "video": VideoFunc("decode", Col("clip")),
+        "video_frames": VideoFunc("frames", Col("clip"), num_frames=8, width=224, height=224),
+        # `second` is a *child*, not a scalar: the row names the moment it wants a still
+        # from. That made it the one media slot a rebuild could drop and a column walk
+        # could miss, so it is represented explicitly.
+        "video_frame_at": VideoFunc("frame_at", Col("clip"), width=256, second=Col("ts")),
         # --- sequence -----------------------------------------------------------
         # Three representatives, because the node's eight argument slots are used by
         # disjoint subsets of the family and only a bare op proves the rest stay off the
