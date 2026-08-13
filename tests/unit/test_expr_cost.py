@@ -225,10 +225,17 @@ def test_a_header_probe_is_not_priced_as_a_decode():
     """
     from batcher.plan.expr_ir.image import ImageFunc
 
-    header = expr_cost_factor(ImageFunc("decode", bt.col("s")))
-    decode = expr_cost_factor(ImageFunc("sharpness", bt.col("s")))
-    assert header < 20.0, "a header read must not be priced as a full decode"
-    assert decode > 50 * header
+    # Asserted on the *raw* cost, not the factor. `expr_cost_factor` clamps at 1000 so no
+    # one expression can dominate the row-count term in join ordering, and every media op
+    # is far above that ceiling -- so the factor cannot tell these apart and is not meant
+    # to. The rules that order media work (`filter_split`, `cse`) read the raw cost, which
+    # is where the resolution has to be.
+    header = expr_cost(ImageFunc("decode", bt.col("s")))
+    decode = expr_cost(ImageFunc("sharpness", bt.col("s")))
+    assert header < decode / 50, "a header read must not be priced as a full decode"
+    # ...and both must still outrank the priciest non-media scalar, since even reading a
+    # container header costs far more per row than a regex over a short string.
+    assert header > expr_cost(bt.col("s").str.regexp_matches("^a"))
 
 
 @pytest.mark.unit

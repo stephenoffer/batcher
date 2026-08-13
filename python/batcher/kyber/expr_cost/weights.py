@@ -233,7 +233,11 @@ _BY_CLASS_NAME: dict[str, float] = {
     # which a single class-level number cannot express. `VideoFunc` keeps a flat estimate
     # because CI builds the engine without the `video` cargo feature, so its kernels
     # cannot be run and therefore cannot be measured the way everything else here was.
-    "VideoFunc": 500.0,
+    # It sits at the image decode class, which is a floor rather than a measurement: a
+    # sampled clip decodes several frames, so the true cost is higher, and the number has
+    # to be at least this or the optimizer would schedule a video decode ahead of an image
+    # one it can actually price.
+    "VideoFunc": 16_000_000.0,
 }
 
 # --- Media, measured ------------------------------------------------------------------
@@ -243,6 +247,25 @@ _BY_CLASS_NAME: dict[str, float] = {
 # reference inputs are a **512x512 JPEG** and a **3-second 16 kHz mono WAV**; media cost
 # scales with resolution and duration far more strongly than a string function's does with
 # string length, so these are rankings within a family, not absolute predictions.
+#
+# The numbers are large because the unit is small, and getting that scale right is the
+# whole point rather than a presentational choice. One unit is ~0.2 ns/row, fixed by an
+# entry already in this file: `regexp_matches` is 48.0 units and measures 9.5 ns/row net
+# of a bare projection. A 512x512 JPEG decode really is tens of millions of times a
+# vectorized numeric comparison, and a table that rounds that to a friendlier number is
+# not being conservative, it is being wrong in a direction that matters -- an earlier
+# revision of this block anchored the family at 500.0 and thereby priced an image header
+# read (~15 us/row) *below* a regex (~10 ns/row), so `filter_split` would have run the
+# header probe first and paid it on every row.
+#
+# `benchmarks/scenarios/media_op_cost.py` re-measures all of them, so the table has a
+# reproducer rather than only a provenance claim. Expect its absolute numbers to differ:
+# it synthesizes a structured, JPEG-compressible frame (what a camera produces) where
+# these were taken on incompressible noise (a decoder's worst case), which moves every
+# image figure by roughly a fifth. What carries over, and what the optimizer reads, is the
+# ordering and the size of the gaps between the bands below. Entries inside a band -- the
+# four header reads, or the three hashes -- are within measurement noise of each other and
+# are not meant to be distinguishable.
 #
 # The family used to carry one flat 500.0 for every op, and the measurements say that was
 # wrong by more than two orders of magnitude *inside* the family:
@@ -263,88 +286,88 @@ _BY_CLASS_NAME: dict[str, float] = {
 # despite living beside the ones that are -- proving an image is grayscale means looking
 # at its pixels, so it costs a full decode while `has_alpha` next to it costs nothing.
 
-_IMAGE_DEFAULT = 500.0  # an untabulated image op: assume it decodes (the safe direction)
+_IMAGE_DEFAULT = 16_000_000.0  # an untabulated image op: assume it decodes (the safe direction)
 _IMAGE_COST: dict[str, float] = {
     # Header only -- no pixel is decoded (`bc-expr::eval::media::image::probe`).
-    "format": 1.5,
-    "aspect_ratio": 2.0,
-    "has_alpha": 2.5,
-    "exif_orientation": 2.5,
-    "decode": 3.0,
+    "format": 51_000.0,
+    "aspect_ratio": 62_000.0,
+    "has_alpha": 78_000.0,
+    "exif_orientation": 80_000.0,
+    "decode": 87_000.0,
     # Perceptual hashes: decode, downsample hard, compare cells.
-    "ahash": 125.0,
-    "dhash": 129.0,
-    "phash": 134.0,
+    "ahash": 4_000_000.0,
+    "dhash": 4_100_000.0,
+    "phash": 4_300_000.0,
     # Decode and resize to a tensor.
-    "to_tensor": 265.0,
-    "to_grayscale": 272.0,
-    "center_crop": 306.0,
-    "resize": 371.0,
-    "thumbnail": 405.0,
-    "letterbox": 424.0,
+    "to_tensor": 8_500_000.0,
+    "to_grayscale": 8_800_000.0,
+    "center_crop": 9_900_000.0,
+    "resize": 12_000_000.0,
+    "thumbnail": 13_000_000.0,
+    "letterbox": 14_000_000.0,
     # Decode and walk every pixel.
-    "is_grayscale": 478.0,
-    "brightness": 492.0,
-    "colorfulness": 492.0,
-    "entropy": 510.0,
-    "mean_color": 520.0,
-    "sharpness": 521.0,
+    "is_grayscale": 15_000_000.0,
+    "brightness": 16_000_000.0,
+    "colorfulness": 16_000_000.0,
+    "entropy": 16_000_000.0,
+    "mean_color": 17_000_000.0,
+    "sharpness": 17_000_000.0,
     # Decode and re-encode. `encode` varies with the target container (JPEG ~4,150 us,
     # PNG ~6,520); the entry is the midpoint, since the format is a plan-time constant
     # this table is not indexed by.
-    "encode": 830.0,
-    "to_tensor_f32": 848.0,
-    "convert": 996.0,
-    "auto_orient": 1003.0,
-    "flip_vertical": 1025.0,
-    "adjust_brightness": 1069.0,
-    "rotate": 1093.0,
-    "posterize": 1105.0,
-    "solarize": 1114.0,
-    "adjust_saturation": 1128.0,
-    "flip_horizontal": 1136.0,
-    "pad": 1157.0,
-    "invert": 1161.0,
-    "autocontrast": 1169.0,
-    "equalize": 1176.0,
-    "adjust_contrast": 1230.0,
-    "adjust_hue": 1252.0,
+    "encode": 27_000_000.0,
+    "to_tensor_f32": 27_000_000.0,
+    "convert": 32_000_000.0,
+    "auto_orient": 32_000_000.0,
+    "flip_vertical": 33_000_000.0,
+    "adjust_brightness": 34_000_000.0,
+    "rotate": 35_000_000.0,
+    "posterize": 36_000_000.0,
+    "solarize": 36_000_000.0,
+    "adjust_saturation": 36_000_000.0,
+    "flip_horizontal": 37_000_000.0,
+    "pad": 37_000_000.0,
+    "invert": 37_000_000.0,
+    "autocontrast": 38_000_000.0,
+    "equalize": 38_000_000.0,
+    "adjust_contrast": 40_000_000.0,
+    "adjust_hue": 40_000_000.0,
     # Convolutions over the full plane -- the priciest ops in the family by a wide margin.
-    "blur": 2096.0,
-    "sharpen": 2156.0,
+    "blur": 67_000_000.0,
+    "sharpen": 69_000_000.0,
 }
 
-_AUDIO_DEFAULT = 170.0  # an untabulated audio op: assume it materializes a waveform
+_AUDIO_DEFAULT = 5_300_000.0  # an untabulated audio op: assume it materializes a waveform
 _AUDIO_COST: dict[str, float] = {
     # Decode PCM and reduce to one scalar -- no waveform is materialized, which is the
     # ~800 us/row difference between these and `to_waveform`.
-    "decode": 35.0,
-    "dbfs": 36.0,
-    "rms": 38.0,
-    "peak_dbfs": 38.0,
-    "clipping_ratio": 39.0,
-    "silence_ratio": 39.0,
-    "zero_crossing_rate": 40.0,
-    "encode_wav": 57.0,
-    "slice": 83.0,
+    "decode": 1_100_000.0,
+    "dbfs": 1_200_000.0,
+    "rms": 1_200_000.0,
+    "peak_dbfs": 1_200_000.0,
+    "clipping_ratio": 1_300_000.0,
+    "silence_ratio": 1_300_000.0,
+    "zero_crossing_rate": 1_300_000.0,
+    "encode_wav": 1_800_000.0,
+    "slice": 2_700_000.0,
     # One STFT, reduced to a scalar per frame.
-    "spectral_rolloff": 112.0,
-    "spectral_centroid": 114.0,
-    "spectral_flatness": 116.0,
-    "spectral_bandwidth": 120.0,
-    "pad_or_trim": 123.0,
+    "spectral_rolloff": 3_600_000.0,
+    "spectral_centroid": 3_700_000.0,
+    "spectral_flatness": 3_700_000.0,
+    "spectral_bandwidth": 3_900_000.0,
+    "pad_or_trim": 4_000_000.0,
     # Decode and hand back the whole signal.
-    "to_waveform": 166.0,
-    "trim_silence": 167.0,
-    "peak_normalize": 168.0,
-    "pre_emphasis": 170.0,
-    "rms_normalize": 172.0,
+    "to_waveform": 5_300_000.0,
+    "trim_silence": 5_400_000.0,
+    "peak_normalize": 5_400_000.0,
+    "pre_emphasis": 5_500_000.0,
+    "rms_normalize": 5_600_000.0,
     # STFT and filterbank front ends.
-    "spectrogram": 274.0,
-    "mel_spectrogram": 422.0,
-    "mfcc": 663.0,
+    "spectrogram": 8_800_000.0,
+    "mel_spectrogram": 14_000_000.0,
+    "mfcc": 21_000_000.0,
     # Band-limited sinc resampling is the most expensive audio op measured.
-    "resample": 790.0,
+    "resample": 25_000_000.0,
 }
 
 
