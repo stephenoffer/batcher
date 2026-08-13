@@ -238,7 +238,26 @@ _BY_CLASS_NAME: dict[str, float] = {
     # to be at least this or the optimizer would schedule a video decode ahead of an image
     # one it can actually price.
     "VideoFunc": 16_000_000.0,
+    # `crop` is its own node rather than an `ImageFunc` because its window is four
+    # sub-expressions, and that is exactly how it slipped past the family table: it fell
+    # through to `_DEFAULT_COST` and was priced at 5.0 -- cheaper than a regex, for an op
+    # that decodes a JPEG, crops it and re-encodes the result. Measured at 2,957 us/row on
+    # this file's reference frame, which is ~15M units on that run's calibration; the entry
+    # is scaled to the `thumbnail` figure already in `_IMAGE_COST` so the two stay
+    # consistent, and it lands just below it, in the decode-and-re-encode band where it
+    # belongs. No specific plan change is claimed for this entry: the probes tried were
+    # decided by selectivity or by `filter_split`'s gain gate rather than by the crop's
+    # own cost. It is corrected because 5.0 is simply the wrong number for a JPEG decode,
+    # and because `filter_split` and `cse` read it.
+    "ImageCrop": 11_000_000.0,
 }
+
+# Still unpriced, and visible here rather than silently defaulting: `GeoFunc`,
+# `SpatialFunc`, `SeqFunc`, `MakeTemporal`, `HashRows`, `ListSimhash` and `ListZip` have no
+# entry above, so `own_cost` gives each of them `_DEFAULT_COST`. That is a guess for whole
+# families (geometry predicates, rigid-body transforms, genomics) whose per-row work spans
+# at least as wide a range as the media ones did, and pricing them needs the same
+# measurement pass rather than a plausible-looking number written here.
 
 # --- Media, measured ------------------------------------------------------------------
 #

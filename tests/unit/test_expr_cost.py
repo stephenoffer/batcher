@@ -267,6 +267,24 @@ def test_media_costs_are_ranked_by_what_the_kernel_actually_does():
 
 
 @pytest.mark.unit
+def test_a_per_row_crop_is_priced_as_a_decode():
+    """`ImageCrop` is a separate node, and that is how it escaped the family table.
+
+    Its window is four sub-expressions rather than four scalars -- the whole point being
+    that a detector's predicted box varies per row -- so it is not an `ImageFunc` and the
+    per-function table above never saw it. It fell through to `_DEFAULT_COST` and was
+    priced at 5.0: cheaper than a regex, for an op that decodes a JPEG, crops it and
+    re-encodes the result (measured at 2,957 us/row on this file's reference frame).
+    """
+    from batcher.plan.expr_ir.image import ImageCrop
+
+    crop = ImageCrop(bt.col("img"), bt.col("x"), bt.col("y"), Lit(64), Lit(64))
+    assert expr_cost(crop) > expr_cost(bt.col("s").str.sha256())
+    # It belongs in the decode-and-re-encode band, beside the ops it actually resembles.
+    assert expr_cost(crop) > 0.5 * expr_cost(bt.col("img").image.thumbnail(64))
+
+
+@pytest.mark.unit
 def test_measured_function_costs_are_ranked_correctly():
     """The table is calibrated against measurement (see `weights`); these orderings are
     the ones a guessed table gets wrong, so they are pinned.
