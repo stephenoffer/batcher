@@ -228,10 +228,123 @@ _BY_CLASS_NAME: dict[str, float] = {
     "WindowStart": 5.0,
     "WindowBuckets": 5.0,
     # Media decode dwarfs every scalar op; costing it high is what makes Kyber push
-    # filters below an image/audio/video expression.
-    "ImageFunc": 500.0,
-    "AudioFunc": 500.0,
+    # filters below an image/audio/video expression. `ImageFunc`/`AudioFunc` are priced
+    # per function below -- the spread *within* each family is two orders of magnitude,
+    # which a single class-level number cannot express. `VideoFunc` keeps a flat estimate
+    # because CI builds the engine without the `video` cargo feature, so its kernels
+    # cannot be run and therefore cannot be measured the way everything else here was.
     "VideoFunc": 500.0,
+}
+
+# --- Media, measured ------------------------------------------------------------------
+#
+# On the same normalization as the rest of the file, and by the same method: each op run
+# as the sole expression of a projection, with a bare column projection subtracted. The
+# reference inputs are a **512x512 JPEG** and a **3-second 16 kHz mono WAV**; media cost
+# scales with resolution and duration far more strongly than a string function's does with
+# string length, so these are rankings within a family, not absolute predictions.
+#
+# The family used to carry one flat 500.0 for every op, and the measurements say that was
+# wrong by more than two orders of magnitude *inside* the family:
+#
+#     image.format / has_alpha / aspect_ratio / decode      10-17 us/row   (header only)
+#     image.dhash / phash / ahash                          800-860 us/row
+#     image.brightness / sharpness / entropy              3150-3330 us/row
+#     image.blur / sharpen                                    ~13,600 us/row
+#
+# `probe.rs` reads the container header and never decodes a pixel, so `has_alpha` is ~200x
+# cheaper than `sharpness` -- and `filter_split` orders conjuncts by exactly this number
+# (Krishnamurthy-Boral-Zaniolo rank), so with both at 500.0 it could not tell the header
+# probe from the full decode and had no reason to run the cheap one first.
+#
+# Two results are worth keeping because a guessed table gets them backwards:
+# `to_tensor_f32` is ~3.2x `to_tensor` (the float conversion and normalization cost more
+# than the decode-and-resize they follow), and `is_grayscale` is **not** a header fact
+# despite living beside the ones that are -- proving an image is grayscale means looking
+# at its pixels, so it costs a full decode while `has_alpha` next to it costs nothing.
+
+_IMAGE_DEFAULT = 500.0  # an untabulated image op: assume it decodes (the safe direction)
+_IMAGE_COST: dict[str, float] = {
+    # Header only -- no pixel is decoded (`bc-expr::eval::media::image::probe`).
+    "format": 1.5,
+    "aspect_ratio": 2.0,
+    "has_alpha": 2.5,
+    "exif_orientation": 2.5,
+    "decode": 3.0,
+    # Perceptual hashes: decode, downsample hard, compare cells.
+    "ahash": 125.0,
+    "dhash": 129.0,
+    "phash": 134.0,
+    # Decode and resize to a tensor.
+    "to_tensor": 265.0,
+    "to_grayscale": 272.0,
+    "center_crop": 306.0,
+    "resize": 371.0,
+    "thumbnail": 405.0,
+    "letterbox": 424.0,
+    # Decode and walk every pixel.
+    "is_grayscale": 478.0,
+    "brightness": 492.0,
+    "colorfulness": 492.0,
+    "entropy": 510.0,
+    "mean_color": 520.0,
+    "sharpness": 521.0,
+    # Decode and re-encode. `encode` varies with the target container (JPEG ~4,150 us,
+    # PNG ~6,520); the entry is the midpoint, since the format is a plan-time constant
+    # this table is not indexed by.
+    "encode": 830.0,
+    "to_tensor_f32": 848.0,
+    "convert": 996.0,
+    "auto_orient": 1003.0,
+    "flip_vertical": 1025.0,
+    "adjust_brightness": 1069.0,
+    "rotate": 1093.0,
+    "posterize": 1105.0,
+    "solarize": 1114.0,
+    "adjust_saturation": 1128.0,
+    "flip_horizontal": 1136.0,
+    "pad": 1157.0,
+    "invert": 1161.0,
+    "autocontrast": 1169.0,
+    "equalize": 1176.0,
+    "adjust_contrast": 1230.0,
+    "adjust_hue": 1252.0,
+    # Convolutions over the full plane -- the priciest ops in the family by a wide margin.
+    "blur": 2096.0,
+    "sharpen": 2156.0,
+}
+
+_AUDIO_DEFAULT = 170.0  # an untabulated audio op: assume it materializes a waveform
+_AUDIO_COST: dict[str, float] = {
+    # Decode PCM and reduce to one scalar -- no waveform is materialized, which is the
+    # ~800 us/row difference between these and `to_waveform`.
+    "decode": 35.0,
+    "dbfs": 36.0,
+    "rms": 38.0,
+    "peak_dbfs": 38.0,
+    "clipping_ratio": 39.0,
+    "silence_ratio": 39.0,
+    "zero_crossing_rate": 40.0,
+    "encode_wav": 57.0,
+    "slice": 83.0,
+    # One STFT, reduced to a scalar per frame.
+    "spectral_rolloff": 112.0,
+    "spectral_centroid": 114.0,
+    "spectral_flatness": 116.0,
+    "spectral_bandwidth": 120.0,
+    "pad_or_trim": 123.0,
+    # Decode and hand back the whole signal.
+    "to_waveform": 166.0,
+    "trim_silence": 167.0,
+    "peak_normalize": 168.0,
+    "pre_emphasis": 170.0,
+    "rms_normalize": 172.0,
+    # STFT and filterbank front ends.
+    "spectrogram": 274.0,
+    "mel_spectrogram": 422.0,
+    "mfcc": 663.0,
+    # Band-limited sinc resampling is the most expensive audio op measured.
+    "resample": 790.0,
 }
 
 
@@ -266,6 +379,10 @@ def own_cost(expr: Expr) -> float:
         return _STR_COST.get(expr.fn, _STR_DEFAULT)
     if cls == "DateFunc":
         return _DATE_COST.get(expr.fn, _DATE_DEFAULT)
+    if cls == "ImageFunc":
+        return _IMAGE_COST.get(expr.fn, _IMAGE_DEFAULT)
+    if cls == "AudioFunc":
+        return _AUDIO_COST.get(expr.fn, _AUDIO_DEFAULT)
     return _BY_CLASS_NAME.get(cls, _DEFAULT_COST)
 
 

@@ -204,13 +204,59 @@ def test_baseline_predicate_has_factor_one():
 @pytest.mark.unit
 def test_factor_is_clamped_at_both_ends():
     # A bare column floors at 0.2. The ceiling sits above the priciest *measured* scalar
-    # function, so real costs pass through untruncated; only the unmeasured media-decode
-    # estimate is bounded.
+    # function, so real costs pass through untruncated; a full media decode is what
+    # reaches it.
     from batcher.plan.expr_ir.image import ImageFunc
 
     assert expr_cost_factor(bt.col("x")) == pytest.approx(0.2)
     assert expr_cost_factor(bt.col("s").str.sha256()) > 200.0  # not truncated
-    assert expr_cost_factor(ImageFunc("decode", bt.col("s"), None, None)) == pytest.approx(1000.0)
+    assert expr_cost_factor(ImageFunc("sharpness", bt.col("s"))) == pytest.approx(1000.0)
+
+
+@pytest.mark.unit
+def test_a_header_probe_is_not_priced_as_a_decode():
+    """`.image` used to carry one flat cost for every op, so the ceiling caught them all.
+
+    It is wrong by more than two orders of magnitude *inside* the family: `decode` and the
+    `probe` ops read the container header and never touch a pixel (~15 us/row), while
+    `sharpness` decodes and walks the whole luma plane (~3,300 us/row). Pricing them alike
+    meant the optimizer had no reason to run the cheap one first -- see
+    `test_a_cheap_media_predicate_runs_before_an_expensive_one`.
+    """
+    from batcher.plan.expr_ir.image import ImageFunc
+
+    header = expr_cost_factor(ImageFunc("decode", bt.col("s")))
+    decode = expr_cost_factor(ImageFunc("sharpness", bt.col("s")))
+    assert header < 20.0, "a header read must not be priced as a full decode"
+    assert decode > 50 * header
+
+
+@pytest.mark.unit
+def test_media_costs_are_ranked_by_what_the_kernel_actually_does():
+    """The orderings a guessed table gets wrong, pinned. See `weights` for the numbers.
+
+    `to_tensor_f32` costing more than `to_tensor` is the counter-intuitive one: the float
+    conversion and per-channel normalization cost more than the decode-and-resize they
+    follow. `is_grayscale` is the other -- it sits beside the header-only probes but
+    proving an image is grayscale means looking at its pixels.
+    """
+    from batcher.plan.expr_ir.audio import AudioFunc
+    from batcher.plan.expr_ir.image import ImageFunc
+
+    img = lambda fn, **kw: expr_cost(ImageFunc(fn, bt.col("s"), **kw))  # noqa: E731
+    aud = lambda fn: expr_cost(AudioFunc(fn, bt.col("s")))  # noqa: E731
+
+    # Header reads are trivial next to anything that decodes.
+    assert img("has_alpha") < img("dhash") < img("brightness") < img("blur")
+    # A perceptual hash downsamples hard, so it is far cheaper than a full-plane measure.
+    assert img("dhash") < 0.5 * img("sharpness")
+    # Normalizing to float costs more than the decode-and-resize before it.
+    assert img("to_tensor_f32") > 2 * img("to_tensor")
+    # Grayscale-in-fact is a pixel question, not a header one.
+    assert img("is_grayscale") > 50 * img("has_alpha")
+    # Audio: a scalar reduction never materializes the signal, so it is cheaper than one
+    # that does; the STFT front ends are dearer again, and resampling dearest.
+    assert aud("rms") < aud("to_waveform") < aud("mel_spectrogram") < aud("resample")
 
 
 @pytest.mark.unit
