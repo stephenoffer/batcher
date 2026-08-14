@@ -305,3 +305,19 @@ def test_measured_function_costs_are_ranked_correctly():
 @pytest.mark.unit
 def test_factor_scales_with_expense():
     assert expr_cost_factor(bt.col("s").str.regexp_matches("^a")) > 50
+
+
+@pytest.mark.unit
+def test_the_vector_ops_an_embedding_dedup_is_built_from_are_priced():
+    """`simhash` is the blocking key a near-duplicate pass over an image corpus uses.
+
+    It had no cost entry at all, so it defaulted to 5.0 -- four orders of magnitude under a
+    measured ~45 us/row on a 384-dimension embedding. Anything that reads the raw cost
+    (`filter_split`, `cse`) therefore treated building a signature over every embedding in
+    a corpus as cheaper than a regex.
+    """
+    simhash = expr_cost(bt.col("v").list.simhash())
+    assert simhash > 1000 * expr_cost(bt.col("s").str.regexp_matches("^a"))
+    # Element-wise vector arithmetic is far cheaper than hashing, but still not a scalar.
+    assert expr_cost(bt.col("v").list.add(bt.col("v"))) < simhash
+    assert expr_cost(bt.col("v").list.add(bt.col("v"))) > expr_cost(bt.col("a") + bt.col("b"))

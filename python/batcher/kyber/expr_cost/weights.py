@@ -250,14 +250,36 @@ _BY_CLASS_NAME: dict[str, float] = {
     # own cost. It is corrected because 5.0 is simply the wrong number for a JPEG decode,
     # and because `filter_split` and `cse` read it.
     "ImageCrop": 8_500_000.0,
+    # Vector work over an embedding, at a **384-dimension** reference -- the size a
+    # sentence/image embedding model of the MiniLM class emits, and what these two ops
+    # exist for. Both are exactly linear in the list length (and `simhash` additionally in
+    # `num_bits`, its default 64 here), so scale by hand for a different width: `simhash`
+    # is ~117 ns per dimension per row and `list.add` ~3.7 ns per element. Measured at 5.1M
+    # rows, which is where they stop falling on this box; the entry `ListSimhash` replaced
+    # was 5.0, some four orders of magnitude out, on the op an image-corpus
+    # near-duplicate pass is built from.
+    "ListSimhash": 230_000.0,
+    "ListZip": 7_100.0,
+    # Hashing two Int64 columns into one digest -- 6.5 ns/row, so genuinely cheap, but not
+    # the 5.0 units it was defaulting to.
+    "HashRows": 33.0,
 }
 
 # Still unpriced, and visible here rather than silently defaulting: `GeoFunc`,
-# `SpatialFunc`, `SeqFunc`, `MakeTemporal`, `HashRows`, `ListSimhash` and `ListZip` have no
-# entry above, so `own_cost` gives each of them `_DEFAULT_COST`. That is a guess for whole
-# families (geometry predicates, rigid-body transforms, genomics) whose per-row work spans
-# at least as wide a range as the media ones did, and pricing them needs the same
-# measurement pass rather than a plausible-looking number written here.
+# `SpatialFunc`, `SeqFunc` and `MakeTemporal` have no entry above, so `own_cost` gives each
+# of them `_DEFAULT_COST`. That is a guess for whole families (geometry predicates,
+# rigid-body transforms, genomics) whose per-row work spans at least as wide a range as the
+# media ones did, and pricing them needs the same measurement pass rather than a
+# plausible-looking number written here.
+#
+# One thing that pass will need, learned the hard way while measuring the three entries
+# above. A scalar or list kernel parallelizes only *across* morsels, so on a 96-core box it
+# needs well past 96 x 16,384 = 1.5M rows before every core has work and the per-row figure
+# stops falling: `list.simhash` reads 1,380,000 ns/row at 20k rows, 87,000 at 320k, and
+# settles near 3,750 (at 32 dimensions) only past 2.5M. Measure below that and the number is
+# not a small factor out, it is orders. The media families are the exception and are why
+# this was not obvious -- their kernels fan out over rows *within* a morsel (`map_rows` in
+# `bc-expr::eval::media`), so they converge in the low thousands of rows.
 
 # --- Media, measured ------------------------------------------------------------------
 #
