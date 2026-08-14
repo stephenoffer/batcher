@@ -41,6 +41,7 @@ from batcher.kyber.stats.selectivity.scalars import (
     discrete_step_mass,
     estimation_col_side,
     fraction_left_below_right,
+    mcv_fraction_below,
 )
 from batcher.plan.expr_ir import (
     Binary,
@@ -527,11 +528,15 @@ def _range_selectivity(
         return budget * cfg.range_selectivity if pair is None else pair
     col, value, col_on_left = side
     x = _ordinal(value)
-    if x is None:
+    if x is None and mcv_fraction_below((mcv or {}).get(col), value) is None:
         return budget * cfg.range_selectivity
     frac_le = _fraction_below_quantiles(value, quantiles.get(col))
     if frac_le is None:
         frac_le = _fraction_below_bounds(x, bounds.get(col))
+    if frac_le is None:
+        # No ordinal CDF — a string column. Its measured values are a sample of the
+        # distribution on the order that does exist.
+        frac_le = mcv_fraction_below((mcv or {}).get(col), value)
     if frac_le is None:
         return budget * cfg.range_selectivity
     eff = op if col_on_left else ORDERING_FLIP[op]

@@ -31,6 +31,7 @@ from batcher.kyber.stats.selectivity.scalars import (
     _ordinal,
     _point_mass,
     estimation_col_side,
+    mcv_fraction_below,
     non_null_mass,
 )
 from batcher.plan.expr_ir import (
@@ -338,7 +339,7 @@ def _range_union_selectivity(
         return None
     q = quantiles.get(col)
     bnd = bounds.get(col)
-    if not q and bnd is None:
+    if not q and bnd is None and not mcv.get(col):
         return None
     budget = non_null_mass(col, nulls)
     below, above = 0.0, 0.0
@@ -351,6 +352,8 @@ def _range_union_selectivity(
         frac = _fraction_below_quantiles(value, q)
         if frac is None:
             frac = _fraction_below_bounds(_ordinal(value), bnd)
+        if frac is None:
+            frac = mcv_fraction_below(mcv.get(col), value)
         if frac is None:
             return None
         point = _point_mass(col, value, ndv, mcv, non_null=budget) / budget if budget else 0.0
@@ -435,7 +438,11 @@ def _range_column(expr: Expr) -> str | None:
     if not (isinstance(expr, Binary) and expr.op in ORDERING_COMPARISONS):
         return None
     side = estimation_col_side(expr)
-    if side is None or _ordinal(side[1]) is None:
+    if side is None:
+        return None
+    # A string literal has no ordinal, but `_interval_selectivity` can still place it against
+    # the column's measured values — which is exactly the shape `starts_with` is rewritten to.
+    if _ordinal(side[1]) is None and not isinstance(side[1], str):
         return None
     return side[0]
 
@@ -463,7 +470,8 @@ def _interval_selectivity(
         return None
     q = quantiles.get(col)
     bnd = bounds.get(col)
-    if not q and bnd is None:
+    col_mcv = mcv.get(col)
+    if not q and bnd is None and not col_mcv:
         return None
     # The grid and the bounds describe the non-null values, so the interval's mass is a share
     # of those; `budget` returns it to a share of the relation. A `BETWEEN` is NULL, and so
@@ -480,6 +488,9 @@ def _interval_selectivity(
         frac = _fraction_below_quantiles(value, q)
         if frac is None:
             frac = _fraction_below_bounds(x, bnd)
+        if frac is None:
+            # A string column has no ordinal CDF; its measured values supply one.
+            frac = mcv_fraction_below(col_mcv, value)
         if frac is None:
             return None
         # Both the interpolated CDF and the boundary mass are held in the conditional

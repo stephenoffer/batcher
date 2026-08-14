@@ -15,7 +15,7 @@ import math
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-from batcher.kyber.stats.distribution import residual_eq_frequency
+from batcher.kyber.stats.distribution import residual_mass
 from batcher.plan.expr_ir import Binary, Cast, Col, Expr, Lit
 from batcher.plan.stats import AXIS_NUMERIC, ordinal_with_axis
 
@@ -174,7 +174,18 @@ def _point_mass(
     d = ndv.get(col)
     if not d or d <= 0:
         return 0.0
-    return residual_eq_frequency(d, col_mcv, default=0.0, non_null=non_null)
+    residual = residual_mass(col_mcv, non_null)
+    remaining = d - len(col_mcv or {})
+    if remaining <= 0.0 or residual <= 0.0:
+        # The table enumerates the whole column, so a value it does not list carries **no**
+        # mass. `residual_eq_frequency` answers the rarest listed frequency here instead, and
+        # is right to: as an *equality* estimate it must not claim a predicate matches exactly
+        # nothing. A CDF boundary is a different question, and borrowing that floor subtracts a
+        # whole value's worth from an interval that does not contain the value — which is how
+        # `LIKE 'red%'`, rewritten to `s >= 'red' AND s < 'ree'`, collapsed from 1,636 rows to
+        # 56: the mass of the absent `'ree'` was subtracted from both of its bounds.
+        return 0.0
+    return min(non_null / d, residual / remaining)
 
 
 def non_null_mass(col: str | None, nulls: Mapping[str, float] | None) -> float:
@@ -292,6 +303,54 @@ def discrete_step_mass(bound: tuple[Any, Any] | None) -> float | None:
     if lo is None or hi is None or hi < lo:
         return None
     return 1.0 / (hi - lo + 1)
+
+
+def mcv_fraction_below(col_mcv: Mapping[str, float] | None, value: Any) -> float | None:
+    """`P(v <= value | v is not NULL)` read off the measured values, for an unordered axis.
+
+    A string has no float ordinal — deliberately, because a string column's footer bounds may
+    be byte-truncated and an ordinal built from them is not sound for *pruning*, where a wrong
+    answer drops rows. So `s >= 'blue'` had no CDF at all and took Selinger's 1/3 constant: 2,667
+    rows estimated against 6,420 actual, and `NOT (s < 'zzz')` — which matches nothing, since
+    every value is below `'zzz'` — estimated 2,667 against 0.
+
+    Strings do have a total order, though, and the most-common-value table is a *measured
+    sample* of the distribution on it. Summing the listed frequencies at or below the literal
+    and reading that as a share of the listed mass is the ordinary way to use a sample: exact
+    when the table enumerates the column (which is the case for the low-cardinality string
+    columns range predicates on strings actually target — a status, a country, a category), and
+    a sample estimate otherwise. Nothing here is used for pruning, so the truncation argument
+    does not apply.
+
+    This also restores an estimate the optimizer had been destroying. `starts_with(s, p)` is
+    rewritten into the sargable range `s >= p AND s < p⁺`, which bypassed the measured-match
+    rule in `patterns` and landed on the very constant this fixes — so a text predicate that
+    estimated exactly before optimization estimated at a third of the table after it.
+
+    Restricted to a string literal: the table is keyed by `str(value)`, so comparing keys
+    lexicographically is only meaningful when the values *are* strings (`"10" < "9"`).
+
+    Args:
+        col_mcv: The column's measured `{value: frequency}` table.
+        value: The literal being compared against.
+
+    Returns:
+        The conditional fraction at or below `value`, in `[0, 1]`, or None when the table
+        cannot answer (no table, a non-string literal, or no measured mass).
+    """
+    if not col_mcv or not isinstance(value, str):
+        return None
+    covered = 0.0
+    below = 0.0
+    for key, freq in col_mcv.items():
+        if not isinstance(key, str) or freq <= 0.0:
+            continue
+        covered += freq
+        if key <= value:
+            below += freq
+    if covered <= 0.0:
+        return None
+    return max(0.0, min(1.0, below / covered))
 
 
 def _fraction_below_bounds(x: float, bound: tuple[Any, Any] | None) -> float | None:
