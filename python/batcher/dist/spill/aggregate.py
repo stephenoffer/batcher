@@ -28,7 +28,7 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source, _single_source
-from batcher.dist.executors.plan_analysis import empty_result_table
+from batcher.dist.executors.plan_analysis import empty_result_table, restore_declared_types
 from batcher.dist.spill.buckets import (
     GRACE_DEPTH,
     GRACE_SUB_BUCKETS,
@@ -130,7 +130,14 @@ def spill_collect(
         cols = plan.input.available_columns()
         group_keys = tuple(Projection(alias=c, expr=col(c)) for c in cols)
         equiv = Aggregate(input=plan.input, group_keys=group_keys, aggregates=())
-        return execute_spilling_aggregate(equiv, sources, num_partitions)
+        # The lowering is what loses the column type. A whole-row `DISTINCT` keeps an
+        # extension-typed column in memory, but as a group-by its keys come back as plain
+        # storage, so the declared schema is handed down to be restored at the end. Only
+        # this shape: a group-by the *user* wrote returns storage single-node too, and
+        # restoring there would make the spilled result disagree the other way.
+        return execute_spilling_aggregate(
+            equiv, sources, num_partitions, declared=empty_result_table(plan, cols).schema
+        )
     # The ordering/binary breakers live in `spill_breakers` (imported lazily so this
     # module stays import-cycle-free: `spill_breakers` depends on this one's helpers).
     if isinstance(plan, (Join, Sort, Window)):
@@ -199,8 +206,14 @@ def execute_spilling_aggregate(
     sources: list[Source],
     num_partitions: int = 16,
     spill_dir: str | None = None,
+    declared: pa.Schema | None = None,
 ) -> pa.Table:
-    """Aggregate `agg` out-of-core, spilling hash-partitioned partials to disk."""
+    """Aggregate `agg` out-of-core, spilling hash-partitioned partials to disk.
+
+    `declared` is the output schema to restore onto the result, for a caller whose operator
+    types a column differently from the group-by this lowers it to. Only the whole-row
+    `DISTINCT` lowering passes it; see there.
+    """
     nat = engine()
     cfg_json = active_config().engine_config_json()
     group_keys_json, aggregates_json = agg_spec_json(agg)
@@ -240,7 +253,10 @@ def execute_spilling_aggregate(
             )
 
         if out:
-            return pa.Table.from_batches(out)
+            # Same reason the distributed reducer restores them: a group-key round trip
+            # hands an extension-typed column back as its plain storage.
+            table = pa.Table.from_batches(out)
+            return restore_declared_types(table, declared) if declared is not None else table
         # Empty input. A *global* aggregate over zero rows still returns exactly one row
         # (`count() -> 0`, `median() -> NULL`), which is what both the single-node engine
         # and DuckDB do — so it cannot take the zero-row `_empty_table` path.

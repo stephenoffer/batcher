@@ -459,3 +459,57 @@ def _empty_agg_table(agg: Aggregate) -> pa.Table:
     """The typed, zero-row result of an aggregate that saw no rows."""
     names = [k.alias for k in agg.group_keys] + [s.alias for s in agg.aggregates]
     return empty_result_table(agg, names)
+
+
+def restore_declared_types(table: pa.Table, declared: pa.Schema) -> pa.Table:
+    """Re-wrap `table`'s columns in the extension types `declared` says they have.
+
+    A distributed or spilled result must carry the same column *types* as the single-node
+    one -- that is the invariant, not a nicety -- and there is one place the engine loses
+    them. An Arrow **extension** type survives an in-memory run, because the FFI boundary
+    passes it through unnormalized, but a group-key round trip hands the column back as its
+    plain storage; the storage then picks up the boundary's ordinary narrow-type widening on
+    the way out. So a `fixed_shape_tensor(uint8, [2, 2, 3])` comes back from a spilled or
+    distributed ``DISTINCT`` as `fixed_size_list<int64>[12]`: the same numbers, eight times
+    the width, and no longer a tensor. Nothing downstream complains -- it is a valid column
+    of a different type -- and a model handed it sees a flat vector where it expected an
+    image.
+
+    The declared schema is already computed at both call sites (`empty_result_table`, which
+    is where an empty result gets its types from), so this only spends it on the non-empty
+    result too.
+
+    Deliberately narrow. It re-wraps only where `declared` names an extension type the
+    column can actually be cast into, and leaves everything else exactly as the engine
+    returned it. A column it cannot convert is passed through rather than raised on, because
+    the current behaviour is a wrong *type*, and turning that into a failed query would be a
+    worse trade than the one this is fixing.
+
+    Args:
+        table: The result the engine handed back.
+        declared: The operator's own output schema, carrying its real column types.
+
+    Returns:
+        `table`, with any extension-typed column restored to the declared type.
+    """
+    if table.num_columns != len(declared):
+        return table  # a shape this does not understand; leave it alone
+    columns, changed = [], False
+    for column, field in zip(table.columns, declared, strict=True):
+        wanted = field.type
+        # Duck-typed on `storage_type`, the way `plan.types.widths` does it and for the
+        # reason its docstring gives: `pa.types.is_*` cannot see through an extension
+        # label, and `isinstance(t, pa.ExtensionType)` is narrower than it looks -- it is
+        # false for the *canonical* types, including `arrow.fixed_shape_tensor`, which is
+        # a `BaseExtensionType`. That is precisely the column this exists to restore.
+        storage_type = getattr(wanted, "storage_type", None)
+        if column.type == wanted or not isinstance(storage_type, pa.DataType):
+            columns.append(column)
+            continue
+        try:
+            storage = column.combine_chunks().cast(storage_type)
+            columns.append(pa.chunked_array([pa.ExtensionArray.from_storage(wanted, storage)]))
+            changed = True
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+            columns.append(column)
+    return pa.Table.from_arrays(columns, schema=declared) if changed else table
