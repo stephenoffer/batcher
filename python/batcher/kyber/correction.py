@@ -57,9 +57,11 @@ def correction_factor(logs: list[float], min_samples: int, max_factor: float) ->
     way to the clamp and hold it there for the rest of the window. Clipping the input bounds
     any single sample's influence to one window slot's worth.
 
-    **Weight by recency.** Samples decay exponentially with a half-life of half the window,
-    so the correction follows a real shift in the data rather than averaging it against a
-    stale regime.
+    **Weight by recency.** Samples decay exponentially with a half-life of one full window
+    (`_HALF_LIFE_FRACTION`), so the correction follows a real shift in the data rather than
+    averaging it against a stale regime. The gentleness is deliberate and the constant states
+    why: at half a window the residual of an alternating sequence reaches 8%, which is a
+    correction invented out of pure noise.
 
     **Shrink toward no correction.** The weighted mean `μ̂` has standard error `s/√n_eff`
     over the weighted sample. Under a normal prior centered on zero (no correction) with
