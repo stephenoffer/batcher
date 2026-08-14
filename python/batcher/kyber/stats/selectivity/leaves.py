@@ -54,7 +54,7 @@ from batcher.plan.expr_ir import (
     Lit,
     StrFunc,
 )
-from batcher.plan.ir_tags import COMPARISON_OPS, ORDERING_FLIP
+from batcher.plan.ir_tags import COMPARISON_OPS, ORDERING_COMPARISONS, ORDERING_FLIP
 from batcher.plan.stats import AXIS_NUMERIC
 
 # Boolean-valued string predicates whose match fraction is a fixed prior — the pattern is
@@ -350,6 +350,81 @@ def _from_cdf(eff: str, frac_le: float, eq: float, total: float = 1.0) -> float:
     return clamp01(raw)
 
 
+def date_part_comparison(expr: Binary) -> tuple[tuple[int, int], float, bool] | None:
+    """`(domain, literal_ordinal, part_on_left)` for a `date_part(col) OP literal`, else None.
+
+    The single reading of that shape, shared by the per-conjunct estimate and by the interval
+    combiner that folds `month(d) >= 3 AND month(d) <= 5` into one range.
+    """
+    if isinstance(expr.left, DateFunc) and isinstance(expr.right, Lit):
+        dom, value, on_left = _date_part_domain(expr.left), expr.right.value, True
+    elif isinstance(expr.right, DateFunc) and isinstance(expr.left, Lit):
+        dom, value, on_left = _date_part_domain(expr.right), expr.left.value, False
+    else:
+        return None
+    if dom is None:
+        return None
+    x = _ordinal(value)
+    return None if x is None else (dom, x, on_left)
+
+
+def date_part_key(expr: Expr) -> str | None:
+    """A grouping key for the bounded date part a comparison reads, else None.
+
+    `month(d)` and `hour(ts)` are *derived* fields, so `_range_column` — which wants a bare
+    `Col` — never grouped two comparisons on one of them, and `WHERE MONTH(d) BETWEEN 3 AND 5`
+    combined by backoff as if the two bounds were independent predicates.
+    """
+    if not (isinstance(expr, Binary) and expr.op in ORDERING_COMPARISONS):
+        return None
+    if date_part_comparison(expr) is None:
+        return None
+    part = expr.left if isinstance(expr.left, DateFunc) else expr.right
+    if not isinstance(part, DateFunc):
+        return None
+    inner = _estimation_column(part.input)
+    return f"{part.fn}({inner.name})" if inner is not None else None
+
+
+def date_part_interval_selectivity(
+    comps: list[Binary], nulls: dict[str, float] | None = None
+) -> float | None:
+    """Same-date-part range conjuncts as one interval over the field's discrete domain.
+
+    `MONTH(d) >= 3 AND MONTH(d) <= 5` selects three of twelve equiprobable months. Estimated
+    as two independent conjuncts it came out at 2,282 rows against 1,296 actual, because each
+    bound alone really does keep most or half of the year and neither mentions the width
+    between them — the same error the same-column interval rule already corrects for a bare
+    column, applied to the derived field.
+
+    Business-hours (`HOUR(ts) BETWEEN 9 AND 17`), seasonal and weekday windows are all this
+    shape, and they are exactly the temporal filters the year/decade sargable rewrite
+    deliberately leaves alone, so this is the only place they get sharpened.
+    """
+    if len(comps) < 2:
+        return None
+    budget = min((_non_null_budget(c, nulls) for c in comps), default=1.0)
+    lower_cdf, upper_cdf, domain = 0.0, 1.0, None
+    for comp in comps:
+        read = date_part_comparison(comp)
+        if read is None:
+            return None
+        dom, x, on_left = read
+        if domain is not None and dom != domain:
+            return None
+        domain = dom
+        lo, hi = dom
+        n = float(hi - lo + 1)
+        xf = math.floor(x)
+        frac_le = 0.0 if xf < lo else (1.0 if xf >= hi else (xf - lo + 1) / n)
+        eff = comp.op if on_left else ORDERING_FLIP[comp.op]
+        if eff in ("lt", "le"):
+            upper_cdf = min(upper_cdf, frac_le if eff == "le" else frac_le - 1.0 / n)
+        else:
+            lower_cdf = max(lower_cdf, frac_le - 1.0 / n if eff == "ge" else frac_le)
+    return clamp01(budget * (upper_cdf - lower_cdf))
+
+
 def _date_part_range_selectivity(
     expr: Binary, op: str, nulls: dict[str, float] | None = None
 ) -> float | None:
@@ -361,17 +436,10 @@ def _date_part_range_selectivity(
     neither side is a bounded date part or the literal has no linear order (a `monthname`
     string), so those defer to the normal path.
     """
-    if isinstance(expr.left, DateFunc) and isinstance(expr.right, Lit):
-        dom, value, col_on_left = _date_part_domain(expr.left), expr.right.value, True
-    elif isinstance(expr.right, DateFunc) and isinstance(expr.left, Lit):
-        dom, value, col_on_left = _date_part_domain(expr.right), expr.left.value, False
-    else:
+    read = date_part_comparison(expr)
+    if read is None:
         return None
-    if dom is None:
-        return None
-    x = _ordinal(value)
-    if x is None:
-        return None
+    dom, x, col_on_left = read
     # `month(NULL)` is NULL, so the extraction keeps only the rows its argument has a value on.
     eff = op if col_on_left else ORDERING_FLIP[op]
     return _discrete_uniform_range(x, eff, dom[0], dom[1], _non_null_budget(expr, nulls))

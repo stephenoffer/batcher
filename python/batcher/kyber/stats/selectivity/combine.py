@@ -23,6 +23,8 @@ from batcher.kyber.stats.selectivity.leaves import (
     _null_mass,
     _range_selectivity,
     _str_func_selectivity,
+    date_part_interval_selectivity,
+    date_part_key,
 )
 from batcher.kyber.stats.selectivity.scalars import (
     _estimation_column,
@@ -419,12 +421,26 @@ def _conjunct_selectivities(
         selectivity, consumed = contained
         sels.append(selectivity)
         remaining = [c for c in conjuncts if not any(c is used for used in consumed)]
+    parts: dict[str, list[Binary]] = {}
     for c in remaining:
         col = _range_column(c)
         if col is not None:
             ranges.setdefault(col, []).append(c)  # type: ignore[arg-type]
+            continue
+        # `month(d)` and `hour(ts)` are derived fields, so `_range_column` never grouped two
+        # comparisons on one — and `MONTH(d) BETWEEN 3 AND 5` combined as if its two bounds
+        # were independent predicates.
+        part = date_part_key(c)
+        if part is not None:
+            parts.setdefault(part, []).append(c)  # type: ignore[arg-type]
         else:
             others.append(c)
+    for comps in parts.values():
+        combined = date_part_interval_selectivity(comps, nulls)
+        if combined is None:
+            others.extend(comps)
+        else:
+            sels.append(combined)
     sels += [predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in others]
     for col, comps in ranges.items():
         combined = _interval_selectivity(col, comps, quantiles, bounds, ndv, mcv, nulls)
