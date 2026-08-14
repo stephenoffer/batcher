@@ -22,9 +22,11 @@ Two neighbouring cases are deliberately *not* fixed here, and are pinned as they
   where `materialize_reduce_output` types the result from the IPC file it wrote rather
   than from the operator's declared schema -- one line in
   `dist/executors/partition_io/_sources.py`;
-* a **group-by the user wrote** loses the extension type single-node as well, so
-  restoring only the spilled side would make spill disagree with single-node in the
-  other direction. See `test_a_group_by_on_a_tensor_key_is_left_alone_deliberately`.
+* a **group-by the user wrote**, and a **join carrying a tensor payload**, lost the
+  extension type single-node as well -- so restoring only the spilled side would have
+  made spill disagree with single-node in the other direction. Both are now restored
+  once at the boundary every relational result passes through, which is what lets all
+  three paths agree instead of being repaired one at a time.
 """
 
 from __future__ import annotations
@@ -74,32 +76,44 @@ def test_a_spilled_distinct_keeps_the_tensor_type(num_partitions):
     assert rows(spilled) == rows(in_memory)
 
 
-def test_a_group_by_on_a_tensor_key_is_left_alone_deliberately():
-    """The neighbouring case, pinned as it is rather than fixed, because it is not the same bug.
+def test_a_group_by_on_a_tensor_key_keeps_it_on_both_paths():
+    """The case that first had to be left alone, now fixed at the boundary instead.
 
-    A `DISTINCT` keeps the extension type single-node and lost it when spilled, so the two
-    disagreed and restoring the declared schema makes them agree. A group-by the *user*
-    wrote loses it single-node **too** -- it comes back as the plain storage -- so restoring
-    the spilled side would have made spill disagree with single-node in the opposite
-    direction, which is the invariant this is supposed to protect.
+    Restoring the type per operator could only ever fix one path at a time: a group-by the
+    user wrote lost the extension type single-node *as well*, so repairing just the spilled
+    side would have traded one mismatch for another. Doing it once where every relational
+    result passes through means single-node, spilled and distributed all get the same
+    answer, and none of them can disagree with another.
 
-    What is left is a real discrepancy of its own: the two paths return the same storage
-    layout at different widths, and neither matches the schema the plan declares. That is
-    engine-side, in how a group key round-trips, and is deeper than the lowering fixed here.
-    This test exists so that whoever fixes it sees this expectation fail and updates both.
+    This test was originally written to assert the *unfixed* shape, so that whoever fixed
+    it would see it fail. That is what happened.
     """
     dataset = bt.from_arrow(_tensor_table())
     query = dataset.group_by("t").agg(n=bt.col("k").count())
 
-    in_memory = query.collect().schema.field("t").type
-    spilled = query.collect(spill=True, num_partitions=4).schema.field("t").type
-
     declared = query._plan.available_schema().arrow.field("t").type
-    assert isinstance(declared, pa.FixedShapeTensorType), "the plan still declares a tensor"
-    assert not isinstance(in_memory, pa.FixedShapeTensorType), (
-        "single-node group-by now keeps the tensor type -- fix the spilled side to match"
-    )
-    assert not isinstance(spilled, pa.FixedShapeTensorType)
+    in_memory = query.collect()
+    spilled = query.collect(spill=True, num_partitions=4)
+
+    assert isinstance(declared, pa.FixedShapeTensorType)
+    assert in_memory.schema.field("t").type == declared
+    assert spilled.schema.field("t").type == declared
+    assert spilled.num_rows == in_memory.num_rows
+
+
+def test_a_join_carrying_a_tensor_keeps_it():
+    """A join is the other hash-keyed operator that dropped the label.
+
+    Joining a decoded frame to anything -- detections to images, labels to clips -- is
+    ordinary, and the payload came back as plain storage.
+    """
+    dataset = bt.from_arrow(_tensor_table())
+    right = dataset.select(k2=bt.col("k")).distinct()
+    joined = dataset.join(right, left_on="k", right_on="k2").select("t")
+
+    declared = joined._plan.available_schema().arrow.field("t").type
+    assert isinstance(declared, pa.FixedShapeTensorType)
+    assert joined.collect().schema.field("t").type == declared
 
 
 def test_a_decoded_image_keeps_its_shape_through_a_spill():

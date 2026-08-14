@@ -130,11 +130,9 @@ def spill_collect(
         cols = plan.input.available_columns()
         group_keys = tuple(Projection(alias=c, expr=col(c)) for c in cols)
         equiv = Aggregate(input=plan.input, group_keys=group_keys, aggregates=())
-        # The lowering is what loses the column type. A whole-row `DISTINCT` keeps an
-        # extension-typed column in memory, but as a group-by its keys come back as plain
-        # storage, so the declared schema is handed down to be restored at the end. Only
-        # this shape: a group-by the *user* wrote returns storage single-node too, and
-        # restoring there would make the spilled result disagree the other way.
+        # The lowering is what loses the column type: a whole-row `DISTINCT` keeps an
+        # extension-typed column, but as a group-by its keys come back as plain storage.
+        # `DISTINCT`'s own schema is the one to restore, not the group-by's.
         return execute_spilling_aggregate(
             equiv, sources, num_partitions, declared=empty_result_table(plan, cols).schema
         )
@@ -210,9 +208,16 @@ def execute_spilling_aggregate(
 ) -> pa.Table:
     """Aggregate `agg` out-of-core, spilling hash-partitioned partials to disk.
 
-    `declared` is the output schema to restore onto the result, for a caller whose operator
-    types a column differently from the group-by this lowers it to. Only the whole-row
-    `DISTINCT` lowering passes it; see there.
+    `declared` is the output schema to restore onto the result. It defaults to the
+    aggregate's own, and the whole-row `DISTINCT` lowering overrides it with `DISTINCT`'s,
+    because the two disagree about the key columns' types and `DISTINCT`'s is the one a
+    caller asked for.
+
+    Restoring it matters because an Arrow **extension** type -- what every tensor column
+    carries -- does not survive a group-key round trip: the key comes back as its plain
+    storage, which then picks up the FFI boundary's narrow-type widening. Without this an
+    explicit ``collect(spill=True)`` returns a different column *type* from the same query
+    run in memory, which is the one thing a spilled result may not do.
     """
     nat = engine()
     cfg_json = active_config().engine_config_json()
@@ -256,7 +261,7 @@ def execute_spilling_aggregate(
             # Same reason the distributed reducer restores them: a group-key round trip
             # hands an extension-typed column back as its plain storage.
             table = pa.Table.from_batches(out)
-            return restore_declared_types(table, declared) if declared is not None else table
+            return restore_declared_types(table, declared or _empty_table(agg).schema)
         # Empty input. A *global* aggregate over zero rows still returns exactly one row
         # (`count() -> 0`, `median() -> NULL`), which is what both the single-node engine
         # and DuckDB do — so it cannot take the zero-row `_empty_table` path.
