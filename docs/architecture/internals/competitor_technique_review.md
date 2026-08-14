@@ -1304,6 +1304,46 @@ missing turned out to be present under Polars-style spellings that the SQL front
 maps. That is the strongest evidence in this document for the coverage claim, and it is the
 reason the remaining list is short enough to read.
 
+### 10n. `top_k` means two different things, and one of them is silent
+
+Found while checking whether `bottom_k` was worth adding (Polars has it, Batcher does not). It
+is not the missing name that matters:
+
+```
+values = [5, 1, 1, 1, 9, 2, 2]
+
+Dataset.top_k(2, by="x")   ->  [9, 5]      the two highest-ranked rows
+Expr.top_k(2)              ->  [1, 2]      the two most FREQUENT values
+Polars  top_k(2)           ->  [9, 5]
+DuckDB  approx_top_k(x, 2) ->  [1, 2]
+```
+
+Both Batcher spellings are individually correct and individually documented — `Dataset.top_k`
+follows Polars, `Expr.top_k` follows DuckDB's `approx_top_k` and its docstring says so. The
+defect is that **one name means two different things across the two surfaces of one API**, and
+the mismatch is silent: a Polars migrant reaching for `bt.col("x").top_k(2)` expecting the
+largest values gets a frequency ranking, of the right type and a plausible length, with no
+error.
+
+That places it in this repository's worst category rather than its naming-nit category — a
+wrong answer no gate can see. The `compat` guidance machinery cannot help either: it fires from
+`Expr.__getattr__` for names Batcher does **not** carry, and this name is carried.
+
+**Not fixed here, because the fix is a public-API decision rather than a defect repair**, and
+`plan/expr_ir/core.py` is another session's open file. The options, in the order this pass would
+rank them:
+
+1. Rename the aggregate to `most_frequent` (what it computes) and leave `top_k` to mean what it
+   means everywhere else. It is the only option that removes the ambiguity rather than
+   documenting it.
+2. Keep both and make `Expr.top_k`'s docstring open by contrasting itself with `Dataset.top_k`,
+   which today it does not mention.
+3. Add `Expr.bottom_k` — **do not do this first**. Whichever meaning it took would deepen the
+   collision, and the question of which meaning it should take is the same question as 1.
+
+Recorded rather than built for the same reason 10b was: the cost of guessing is larger than the
+cost of writing it down, and this one needs an owner's decision rather than a patch.
+
 ### 10i. The optimizer pass list — one real gap, and it settles 10g
 
 The sweep above compared *execution operators*. This compares **optimizer passes**, which is
