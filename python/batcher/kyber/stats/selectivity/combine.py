@@ -272,21 +272,93 @@ def _combine_disjuncts(
     `x IN (1, 2)`). Cross-column disjuncts are assumed independent and combined by
     `1 - ∏(1 - sᵢ)` — the exact N-ary generalization of the old pairwise `a + b - a·b`, so a
     disjunction across different columns is unchanged.
+
+    Same-column *range* disjuncts are not independent either, and are united as half-lines by
+    `_range_union_selectivity` rather than multiplied.
     """
     groups: dict[str, float] = {}
-    others: list[float] = []
+    ranges: dict[str, list[Binary]] = {}
+    others: list[Expr] = []
     for d in disjuncts:
         col = _same_column_membership(d)
-        sel = predicate_selectivity(d, ndv, cfg, quantiles, mcv, bounds, nulls)
         if col is not None:
-            groups[col] = groups.get(col, 0.0) + sel  # disjoint values → sum
+            groups[col] = groups.get(col, 0.0) + predicate_selectivity(
+                d, ndv, cfg, quantiles, mcv, bounds, nulls
+            )  # disjoint values → sum
+            continue
+        range_col = _range_column(d)
+        if range_col is not None:
+            ranges.setdefault(range_col, []).append(d)  # type: ignore[arg-type]
         else:
-            others.append(sel)
-    terms = [min(1.0, g) for g in groups.values()] + others
+            others.append(d)
+    terms = [min(1.0, g) for g in groups.values()]
+    terms += [predicate_selectivity(d, ndv, cfg, quantiles, mcv, bounds, nulls) for d in others]
+    for col, comps in ranges.items():
+        united = _range_union_selectivity(col, comps, quantiles, bounds, ndv, mcv, nulls)
+        if united is None:
+            terms += [
+                predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in comps
+            ]
+        else:
+            terms.append(united)
     product = 1.0
-    for s in terms:
-        product *= 1.0 - s
+    for term in terms:
+        product *= 1.0 - term
     return 1.0 - product
+
+
+def _range_union_selectivity(
+    col: str,
+    comps: list[Binary],
+    quantiles: dict[str, Any],
+    bounds: dict[str, tuple[Any, Any]],
+    ndv: dict[str, float],
+    mcv: dict[str, dict[str, float]],
+    nulls: dict[str, float] | None = None,
+) -> float | None:
+    """Selectivity of an OR of same-column range comparisons, as one union of half-lines.
+
+    The disjunctive twin of `_interval_selectivity`, and it corrects the same class of error.
+    Two range predicates on one column are the tightest possible *positive* correlation:
+    `x < 50 OR x < 70` is exactly `x < 70`, and `x < 10 OR x > 90` is the pair of tails. The
+    independent-union rule `1 - ∏(1 - sᵢ)` assumes they overlap only by chance, so it invents
+    survivors that are not there — measured at 17,001 rows against 14,055 actual for
+    `x < 50 OR x < 70` over 20,000 rows, and the error grows with the number of disjuncts.
+
+    Each comparison is a half-line, so the union collapses to two numbers: the largest upper
+    CDF among the `<`/`<=` bounds and the largest tail mass among the `>`/`>=` ones. Their sum
+    is the union's mass, capped at the non-null budget — and the cap is exactly right, because
+    the two sides sum past the budget precisely when the half-lines overlap and cover
+    everything.
+
+    Returns None when the column has fewer than two comparisons or no CDF to interpolate
+    against, so those defer to the per-disjunct estimate exactly as before.
+    """
+    if len(comps) < 2:
+        return None
+    q = quantiles.get(col)
+    bnd = bounds.get(col)
+    if not q and bnd is None:
+        return None
+    budget = non_null_mass(col, nulls)
+    below, above = 0.0, 0.0
+    for c in comps:
+        side = estimation_col_side(c)
+        if side is None:
+            return None
+        _, value, col_on_left = side
+        eff = c.op if col_on_left else ORDERING_FLIP[c.op]
+        frac = _fraction_below_quantiles(value, q)
+        if frac is None:
+            frac = _fraction_below_bounds(_ordinal(value), bnd)
+        if frac is None:
+            return None
+        point = _point_mass(col, value, ndv, mcv, non_null=budget) / budget if budget else 0.0
+        if eff in ("lt", "le"):  # a lower half-line: keep the most permissive ceiling
+            below = max(below, frac if eff == "le" else frac - point)
+        else:  # gt / ge → an upper half-line: keep the largest tail
+            above = max(above, 1.0 - (frac - point if eff == "ge" else frac))
+    return clamp01(budget * min(1.0, below + above))
 
 
 def _same_column_membership(expr: Expr) -> str | None:

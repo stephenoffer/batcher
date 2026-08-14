@@ -15,6 +15,11 @@ from typing import Any
 from batcher._internal.mathx import clamp01
 from batcher.config import CardinalityConfig
 from batcher.kyber.stats.distribution import mcv_join_rows, residual_eq_frequency
+from batcher.kyber.stats.selectivity.arithmetic import (
+    invert_arithmetic,
+    modulo_domain,
+    symmetric_interval,
+)
 from batcher.kyber.stats.selectivity.patterns import (
     anchored_selectivity,
     like_selectivity,
@@ -27,6 +32,7 @@ from batcher.kyber.stats.selectivity.scalars import (
     _dedup,
     _estimation_column,
     _fraction_below_bounds,
+    _fraction_below_on_axis,
     _fraction_below_quantiles,
     _mcv_lookup,
     _ordinal,
@@ -48,6 +54,7 @@ from batcher.plan.expr_ir import (
     StrFunc,
 )
 from batcher.plan.ir_tags import COMPARISON_OPS, ORDERING_FLIP
+from batcher.plan.stats import AXIS_NUMERIC
 
 # Boolean-valued string predicates whose match fraction is a fixed prior — the pattern is
 # implicit in the function (`contains` is always a substring, `starts_with` always anchored).
@@ -364,7 +371,19 @@ def _date_part_range_selectivity(
     x = _ordinal(value)
     if x is None:
         return None
-    lo, hi = dom
+    # `month(NULL)` is NULL, so the extraction keeps only the rows its argument has a value on.
+    eff = op if col_on_left else ORDERING_FLIP[op]
+    return _discrete_uniform_range(x, eff, dom[0], dom[1], _non_null_budget(expr, nulls))
+
+
+def _discrete_uniform_range(x: float, eff: str, lo: int, hi: int, budget: float) -> float:
+    """A comparison against a value drawn uniformly from the integers `[lo, hi]`.
+
+    The shared body behind a bounded date part (12 months, 7 weekdays, 24 hours) and a
+    modulo residue (`k` buckets): in both the domain is known exactly and the distribution
+    over it is uniform, so the CDF is `(floor(x) - lo + 1)/n` and every value carries `1/n`.
+    Stating it once keeps `month(d) < 6` and `id % 12 < 6` from drifting apart.
+    """
     n = float(hi - lo + 1)
     xf = math.floor(x)
     if xf < lo:
@@ -373,10 +392,46 @@ def _date_part_range_selectivity(
         frac_le = 1.0
     else:
         frac_le = (xf - lo + 1) / n
-    eff = op if col_on_left else ORDERING_FLIP[op]
-    # `month(NULL)` is NULL, so the extraction keeps only the rows its argument has a value on.
-    budget = _non_null_budget(expr, nulls)
     return _from_cdf(eff, budget * frac_le, budget / n, total=budget)
+
+
+def _abs_range_selectivity(
+    expr: Binary,
+    quantiles: dict[str, Any],
+    bounds: dict[str, tuple[Any, Any]],
+    budget: float,
+) -> float | None:
+    """`abs(col) OP literal` from the two CDF points it really names, else None.
+
+    `|x| < v` is `-v < x < v`, so its mass is `F(v) - F(-v)` — two reads of the same
+    histogram the bare column would have used. On a zero-centred distribution the difference
+    from the range constant is large: `abs(delta) < 1` over a standard normal keeps 68% of the
+    rows against the constant's 33%.
+
+    A negative bound is a certainty rather than an unknown: no absolute value is below it, and
+    every one is at or above it. Returns None — deferring to the constant — when the shape does
+    not match or the column has no CDF to read.
+    """
+    interval = symmetric_interval(expr)
+    if interval is None:
+        return None
+    column, bound, eff = interval
+    inner = _estimation_column(column)
+    if inner is None:
+        return None
+    if bound < 0.0:
+        return 0.0 if eff in ("lt", "le") else budget
+    grid, bnd = quantiles.get(inner.name), bounds.get(inner.name)
+
+    def cdf(x: float) -> float | None:
+        got = _fraction_below_on_axis(x, AXIS_NUMERIC, grid)
+        return _fraction_below_bounds(x, bnd) if got is None else got
+
+    upper, lower = cdf(bound), cdf(-bound)
+    if upper is None or lower is None:
+        return None
+    inside = budget * max(0.0, upper - lower)
+    return inside if eff in ("lt", "le") else clamp01(budget - inside)
 
 
 def _column_pair_selectivity(
@@ -451,6 +506,21 @@ def _range_selectivity(
     if date_part is not None:
         return date_part
     budget = _non_null_budget(expr, nulls)
+    # `id % 10 < 3` ranges over a known uniform domain, whatever `id` looks like.
+    residue = modulo_domain(expr)
+    if residue is not None:
+        modulus, literal, mod_on_left = residue
+        x = _ordinal(literal)
+        if x is not None:
+            eff = op if mod_on_left else ORDERING_FLIP[op]
+            return _discrete_uniform_range(x, eff, 0, int(modulus) - 1, budget)
+    absolute = _abs_range_selectivity(expr, quantiles, bounds, budget)
+    if absolute is not None:
+        return absolute
+    # `x + 1 < 100` is a statement about `x`; read it as one rather than as an unknown.
+    inverted = invert_arithmetic(expr)
+    if inverted is not None:
+        return _range_selectivity(inverted, inverted.op, cfg, quantiles, bounds, ndv, mcv, nulls)
     side = estimation_col_side(expr)
     if side is None:
         pair = _column_pair_selectivity(expr, op, cfg, bounds, nulls)
@@ -520,7 +590,14 @@ def _equality_selectivity(
     join-key-shaped column.
     """
     budget = _non_null_budget(expr, nulls)
+    residue = modulo_domain(expr)
+    if residue is not None:
+        return budget / residue[0]  # one of `k` equiprobable residues
     side = estimation_col_side(expr)
+    if side is None:
+        inverted = invert_arithmetic(expr)
+        if inverted is not None:
+            return _equality_selectivity(inverted, ndv, cfg, mcv, bounds, nulls)
     if side is not None:
         col, value, _ = side
         if _outside_bounds(value, (bounds or {}).get(col)):
