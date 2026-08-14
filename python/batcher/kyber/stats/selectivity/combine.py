@@ -24,12 +24,13 @@ from batcher.kyber.stats.selectivity.leaves import (
     _str_func_selectivity,
 )
 from batcher.kyber.stats.selectivity.scalars import (
+    _estimation_column,
     _fraction_below_bounds,
     _fraction_below_quantiles,
     _mcv_lookup,
     _ordinal,
     _point_mass,
-    comparison_col_side,
+    estimation_col_side,
     non_null_mass,
 )
 from batcher.plan.expr_ir import (
@@ -295,10 +296,12 @@ def _same_column_membership(expr: Expr) -> str | None:
     the same column, so an OR of them sums. A range/`OR`/opaque disjunct returns None and is
     combined by the independent-union rule instead.
     """
-    if isinstance(expr, InList) and isinstance(expr.input, Col):
-        return expr.input.name
+    if isinstance(expr, InList):
+        inner = _estimation_column(expr.input)
+        if inner is not None:
+            return inner.name
     if isinstance(expr, Binary) and expr.op == "eq":
-        side = comparison_col_side(expr)
+        side = estimation_col_side(expr)
         if side is not None:
             return side[0]
     return None
@@ -359,7 +362,7 @@ def _range_column(expr: Expr) -> str | None:
     """
     if not (isinstance(expr, Binary) and expr.op in ORDERING_COMPARISONS):
         return None
-    side = comparison_col_side(expr)
+    side = estimation_col_side(expr)
     if side is None or _ordinal(side[1]) is None:
         return None
     return side[0]
@@ -396,7 +399,7 @@ def _interval_selectivity(
     budget = non_null_mass(col, nulls)
     lower_cdf, upper_cdf = 0.0, 1.0
     for c in comps:
-        side = comparison_col_side(c)
+        side = estimation_col_side(c)
         if side is None:
             return None
         _, value, col_on_left = side

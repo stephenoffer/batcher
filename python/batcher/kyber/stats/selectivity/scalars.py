@@ -16,7 +16,7 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 from batcher.kyber.stats.distribution import residual_eq_frequency
-from batcher.plan.expr_ir import Binary, Col, Lit
+from batcher.plan.expr_ir import Binary, Cast, Col, Expr, Lit
 from batcher.plan.stats import AXIS_NUMERIC, ordinal_with_axis
 
 # Comparison operators flip when the column is on the right (`literal < col` ≡ `col > literal`).
@@ -33,10 +33,62 @@ def comparison_col_side(expr: Binary) -> tuple[str, Any, bool] | None:
 
 def _column_of_comparison(expr: Binary) -> str | None:
     """The column name in a `col OP literal` (or `literal OP col`) comparison."""
-    if isinstance(expr.left, Col) and isinstance(expr.right, Lit):
-        return expr.left.name
-    if isinstance(expr.right, Col) and isinstance(expr.left, Lit):
-        return expr.right.name
+    side = estimation_col_side(expr)
+    return None if side is None else side[0]
+
+
+# A cast to a boolean collapses the whole value domain onto two values, so the source
+# column's distinct count says nothing about the result's — `1/ndv` over a million-value
+# column would price `cast(x AS BOOLEAN) = true` at a millionth of the rows when the truth
+# is around half. Every other target keeps the source's distribution recognisable: a numeric
+# widening is exact, a narrowing or a truncation can only *merge* values (so `1/ndv` becomes
+# a floor rather than a wrong number), and a cast to text preserves distinctness exactly.
+_OPAQUE_CAST_DTYPES = frozenset({"bool", "boolean"})
+
+
+def _estimation_column(expr: Expr) -> Col | None:
+    """The column an operand ultimately reads, seeing through a value-preserving cast.
+
+    **For estimation only.** `comparison_col_side` deliberately does *not* do this, and must
+    not: it feeds zone-map and bloom pruning, where reading a `Cast`'s literal against the
+    source column's index is a proof of absence drawn from the wrong value domain — the one
+    place in the optimizer where a bug deletes rows rather than mis-sizing a buffer. Here the
+    cost of being wrong is a worse plan, so the trade is the opposite one.
+
+    Without this, `cast(x AS DOUBLE) = 5.0` had no column at all and fell to the flat
+    cold-start constant: measured at 2,000 rows against 197 actual, a 10x over-estimate on a
+    shape SQL produces constantly (an implicit widening in a comparison, a `CAST` written to
+    satisfy a type checker). The source column's statistics describe that expression closely —
+    exactly for an order- and distinctness-preserving cast, and as a bound otherwise.
+
+    A `try_cast` is excluded: it turns a failed conversion into a NULL, so it changes the null
+    fraction the budget is computed from rather than just relabelling values.
+    """
+    if isinstance(expr, Col):
+        return expr
+    if isinstance(expr, Cast) and not expr.try_cast and expr.dtype not in _OPAQUE_CAST_DTYPES:
+        return _estimation_column(expr.input)
+    return None
+
+
+def estimation_col_side(expr: Binary) -> tuple[str, Any, bool] | None:
+    """`(column, literal, col_on_left)` for a comparison, seeing through a cast.
+
+    The estimation-side twin of `comparison_col_side` (see `_estimation_column` for why the
+    two must stay separate).
+
+    Args:
+        expr: The comparison to read.
+
+    Returns:
+        The column name, the literal it is compared against, and whether the column was on
+        the left, or None when this is not a column-to-literal comparison.
+    """
+    left, right = _estimation_column(expr.left), _estimation_column(expr.right)
+    if left is not None and isinstance(expr.right, Lit):
+        return left.name, expr.right.value, True
+    if right is not None and isinstance(expr.left, Lit):
+        return right.name, expr.left.value, False
     return None
 
 

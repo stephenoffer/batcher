@@ -18,19 +18,22 @@ from batcher.kyber.stats.distribution import mcv_join_rows, residual_eq_frequenc
 from batcher.kyber.stats.selectivity.patterns import (
     anchored_selectivity,
     like_selectivity,
+    measured_match_fraction,
     regex_selectivity,
+    wildcard_prior,
 )
 from batcher.kyber.stats.selectivity.scalars import (
     _column_of_comparison,
     _dedup,
+    _estimation_column,
     _fraction_below_bounds,
     _fraction_below_quantiles,
     _mcv_lookup,
     _ordinal,
     _outside_bounds,
     _point_mass,
-    comparison_col_side,
     discrete_step_mass,
+    estimation_col_side,
     fraction_left_below_right,
 )
 from batcher.plan.expr_ir import (
@@ -94,14 +97,29 @@ def _str_func_selectivity(
     A string predicate over a NULL is NULL, so it keeps none of the null rows: every prior
     below describes the *non-null* strings and is scaled to the whole relation by
     `_non_null_budget`.
+
+    A prior is only ever the fallback. When the column has a measured most-common-value table
+    the predicate is *evaluated* against the values in it, and the prior applies to the mass
+    the table does not cover (`measured_match_fraction`) — which on the low-cardinality string
+    columns these predicates actually filter is almost none of it.
     """
     budget = _non_null_budget(expr, nulls)
     reader = _PATTERN_READERS.get(expr.fn)
     if reader is not None:
-        return budget * reader(expr, ndv, cfg, mcv)
+        # A wildcard `LIKE` can be decided against the measured values; a wildcard-free one is
+        # equality, which the reader already answers from the same table, and a regex is not
+        # matched here at all (see `measured_match_fraction`).
+        prior = wildcard_prior(expr, cfg)
+        if prior is not None:
+            measured = measured_match_fraction(expr, mcv, prior, budget)
+            if measured is not None:
+                return measured
+        return reader(expr, ndv, cfg, mcv, budget)
     pattern_sel = _STR_PATTERN_SELECTIVITY.get(expr.fn)
     if pattern_sel is not None:
-        return budget * pattern_sel(cfg)
+        prior = pattern_sel(cfg)
+        measured = measured_match_fraction(expr, mcv, prior, budget)
+        return budget * prior if measured is None else measured
     return budget * cfg.default_filter_selectivity
 
 
@@ -141,9 +159,10 @@ def _in_list_selectivity(
     budget = _non_null_budget(expr, nulls)
     if dom is not None:  # `month(d) IN (6,7,8)` → k of n equiprobable field values
         return min(1.0, budget * k / float(dom[1] - dom[0] + 1))
-    if not isinstance(expr.input, Col):
+    inner = _estimation_column(expr.input)
+    if inner is None:
         return min(1.0, budget * k * cfg.eq_selectivity)
-    name = expr.input.name
+    name = inner.name
     bound = (bounds or {}).get(name)
     if bound is not None:
         distinct = [v for v in distinct if not _outside_bounds(v, bound)]
@@ -432,7 +451,7 @@ def _range_selectivity(
     if date_part is not None:
         return date_part
     budget = _non_null_budget(expr, nulls)
-    side = comparison_col_side(expr)
+    side = estimation_col_side(expr)
     if side is None:
         pair = _column_pair_selectivity(expr, op, cfg, bounds, nulls)
         return budget * cfg.range_selectivity if pair is None else pair
@@ -501,7 +520,7 @@ def _equality_selectivity(
     join-key-shaped column.
     """
     budget = _non_null_budget(expr, nulls)
-    side = comparison_col_side(expr)
+    side = estimation_col_side(expr)
     if side is not None:
         col, value, _ = side
         if _outside_bounds(value, (bounds or {}).get(col)):
