@@ -514,16 +514,15 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     """
     inner, local, local_cols, corr, local_preds = _exists_shape(tr, node)
 
-    # A single *inequality* correlation (`a.x < b.y`) is a range semi/anti join: not an
-    # equi-key, so it never reaches `corr`, and before this it raised. See `subquery.range`.
-    from batcher._sql.parser.subquery.range import decorrelate_inequality_exists
+    # A pure inequality correlation, or an equality carrying one alongside it, each has its
+    # own plan and neither is the semi join below. See `subquery.specialized`.
+    from batcher._sql.parser.subquery.specialized import decorrelate_correlated_exists
 
-    if not corr:
-        ranged = decorrelate_inequality_exists(
-            tr, ds, inner, local_preds, local, local_cols, negate
-        )
-        if ranged is not None:
-            return ranged
+    special = decorrelate_correlated_exists(
+        tr, ds, inner, corr, local_preds, local, local_cols, negate
+    )
+    if special is not None:
+        return special
 
     if not corr:
         # Uncorrelated: emptiness test → keep or drop every outer row.

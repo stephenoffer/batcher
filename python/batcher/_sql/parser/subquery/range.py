@@ -23,7 +23,7 @@ from sqlglot import expressions as exp
 
 from batcher.api._join_helpers import range_semi_join
 
-__all__ = ["decorrelate_inequality_exists"]
+__all__ = ["_inequality_correlation", "decorrelate_inequality_exists"]
 
 
 # sqlglot comparison -> the wire op, oriented `outer OP inner`, plus the reading when the

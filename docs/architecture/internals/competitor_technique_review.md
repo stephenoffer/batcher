@@ -1107,7 +1107,7 @@ between the two:
 asserting that each framed answer *differs* from its running one, because a frame test whose
 two answers coincide proves nothing — it caught two of its own cases doing exactly that.
 
-### 10k. Correlated `EXISTS` with a *mixed* equality-and-inequality correlation
+### 10k. Correlated `EXISTS` with a *mixed* equality-and-inequality correlation — **landed**
 
 Added 2026-08-06, from reading DuckDB's `src/execution/operator/join/`, which no pass had
 enumerated. Its delimited joins (`physical_delim_join.cpp`, plus the left/right variants) are
@@ -1136,6 +1136,40 @@ Recorded at this length for the same reason 10b is: the error message overstates
 limitation, and a reader who trusted it would rebuild machinery that already exists. Correlated
 *scalar* subqueries and correlated `IN` both work too, and were also checked rather than
 assumed.
+
+**Built 2026-08-13** as `_sql/parser/subquery/specialized.py`, and the entry's own prescription
+turned out to be the wrong plan. It said the fix "needs a semi-join with a residual predicate
+rather than a parser edit". The engine has no such operator and should not grow one for this:
+`bc_ir::RangeOp` deliberately excludes `=` (an equality is a hash join), and a semi join emits
+no right columns, so there is nothing for a residual to read. Adding an equi-prefix to
+`RangeJoin` would be a two-sided IR change for one SQL shape.
+
+The general decorrelation needs no engine change at all. Tag each outer row, inner-join on the
+equality keys, apply the inequality as an ordinary filter on the joined rows, and reduce the
+survivors to the set of tags that matched. **The tag is the load-bearing part**: without it the
+final `DISTINCT` runs over outer *values* and collapses two identical outer rows into one,
+where `EXISTS` must keep both — the same trap `test_correlated_exists_preserves_outer_duplicates`
+already pins for the `range` path. The cost is that the join materializes matching pairs the
+filter then discards, where a semi join would stop at the first match; that is the price of the
+shape having had no plan at all, and it is bounded by the equality keys rather than being a
+cross product.
+
+Two things the work turned up that the entry did not predict:
+
+- **`NOT EXISTS` with a mixed correlation was refused too.** The table above tabulated
+  `NOT EXISTS` only for the equality-only case, so the row read as working. Both are fixed.
+- **The refusal was one dispatch away from a bug of its own.** `core._apply_exists` tested the
+  two specialized shapes in two separate blocks, and the second had to go before the
+  *uncorrelated* branch while the first went after it. Consolidating them into one call
+  (`decorrelate_correlated_exists`) and then placing it wrongly silently sent every
+  inequality-only `EXISTS` down the uncorrelated path — caught by the regression case in the
+  new differential file, which exists precisely because every neighbouring shape already
+  worked.
+
+The boundary is now stated rather than implied: a correlation on an *expression*
+(`x.v < t1.v + 100`) is still refused, because `RangeCondition` carries column names on both
+sides, and `test_a_correlation_on_an_expression_is_still_declined` pins that it refuses rather
+than mis-plans.
 
 ### 10i. The optimizer pass list — one real gap, and it settles 10g
 
@@ -1348,11 +1382,12 @@ implements it, so the next reader can settle it with one grep instead of one day
    because **the failure is not skew at all** — twenty-five evenly-sized ranges on ninety-six
    cores are perfectly balanced and still leave seventy-one cores idle, which a skew test
    cannot see and which is exactly the shape `ORDER BY <a 25-value column>` produces.
-5a. **Correlated `EXISTS` with a mixed equality-and-inequality correlation (item 10k).** One
-   shape, precisely bounded: equality-only, inequality-only and `NOT EXISTS` all work and
-   match DuckDB, and only a predicate carrying *both* falls through to `_reject_correlated`.
-   Small and well-defined, but it needs a semi-join with a residual predicate rather than a
-   parser edit, which is why it sits here rather than being done alongside 10j.
+5a. ~~Correlated `EXISTS` with a mixed equality-and-inequality correlation (item 10k).~~
+   **Landed** as `_sql/parser/subquery/specialized.py`. This entry's reason for deferring it —
+   "it needs a semi-join with a residual predicate rather than a parser edit" — was wrong, and
+   wrong in the expensive direction: it deferred a front-end change by describing it as an
+   engine one. The general decorrelation is a row tag, a join, a filter and a distinct, needs
+   no new operator, and `NOT EXISTS` was broken for this shape too. See 10k.
 6a. **A sorted-input aggregate and adjacent dedup (item 10f).** **The detection half is built
    (2026-08-13); the memory half — the reason this was ranked first — is not.**
 
