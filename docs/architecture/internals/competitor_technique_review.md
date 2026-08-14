@@ -1217,6 +1217,93 @@ needs a composite key inside an aggregate; the `IN` path already accepts a row v
 vocabulary exists on one side of the front-end and not the other, which is the same shape of
 gap as 10j.
 
+### 10m. The whole function catalog, enumerated rather than sampled — 367 of 516
+
+Run 2026-08-14. Every earlier pass compared *operators*, *optimizer passes* or *streaming
+nodes*. None compared the widest surface either engine has: the scalar and aggregate function
+catalog. DuckDB exposes its own (`duckdb_functions()`), so this one can be enumerated instead
+of sampled, which is the only pass here that is exhaustive over its surface rather than
+representative.
+
+**Method.** Take DuckDB's distinct scalar + aggregate function names, drop what is not
+user-facing (`__internal_*`, `duckdb_*`, `pragma_*`, `variant_*`, the ~160 `icu_collate_*`
+locale entries, and operator spellings), leaving **516**. Call each from Batcher's SQL across
+thirteen argument shapes, and count a name unreachable only when *every* shape reports an
+unknown function.
+
+**Result: 367 reachable, 149 not.** Of the 149, most are DuckDB-specific plumbing rather than
+portable SQL — sequences (`nextval`, `currval`), settings and transactions (`current_setting`,
+`txid_current`), logging, `enum_*`, `union_*`, `bar`, `stats`, `switch`, and `st_*` spellings
+Batcher already serves under its own names.
+
+**Read the count with the correction attached, because the first version of this entry was
+wrong by 2.4x.** Probing each function with a *single* argument reported **362** unreachable.
+That number is an artifact: Batcher answers a known function called at the wrong arity with
+`unknown function 'gcd'`, so a one-argument probe of a two-argument function reads exactly like
+a missing one. `gcd(x)` says unknown; `gcd(n, 4)` returns an answer. Probing across arities cut
+the figure to 149. **Any future probe of this surface has to vary arity**, and the same caution
+applies to reading Batcher's error message as evidence of anything.
+
+That error message is itself the smallest finding here and worth fixing on its own account: it
+reports an arity mismatch as a missing function, which sends a user to `bt.register_function`
+for something the engine already computes. It is the same class as 10b — an error that
+overstates the limitation — and it misled a probe written by someone who knew to be careful.
+
+**One true "the engine has it and SQL cannot spell it" case** was found, which is the 10j shape:
+`hash` exists as an `Expr` method and no SQL spelling reaches it, while `md5`/`sha1`/`sha256`
+are reachable from both. The reverse also occurs (`md5` is reachable from SQL and is not a
+bare `Expr` method), so the two surfaces have drifted in both directions rather than one.
+
+**Everything else in the 149 is absent from both surfaces**, checked against the `Expr` API
+rather than assumed. Grouped, and worth having in roughly this order:
+
+- `printf`/`format` — no format-string function on either surface.
+- The list higher-order tail: `list_reduce`, `list_zip`, `list_aggregate`, `list_resize`,
+  `list_where`. `list_transform` and `list_filter` are both built, so this is a partial family.
+- The struct vocabulary: `struct_insert`, `struct_values`, `struct_concat`, `struct_extract_at`.
+  The `.struct` accessor has **three** methods against `.list`'s 74, which is the widest
+  namespace asymmetry on the surface.
+- `to_json` / `from_json` / `row_to_json`.
+- Interval constructors (`to_seconds`, `to_minutes`, `to_months`, …) and `age`, `datepart`.
+- `signbit`, `bit_position`, `set_bit`; `strip_accents`, `nfc_normalize`, the grapheme-aware
+  string ops; `like_escape` (the `ESCAPE` clause).
+
+### The same pass across Polars and Ray Data, and why its raw numbers are worthless
+
+Polars' `Expr` surface (432 names across its accessors) and Ray Data's `Dataset` (93 methods)
+were enumerated the same way and diffed against Batcher's — 692 `Expr` names and 177 `Dataset`
+methods. **Do not read those diffs as gaps.** A bare-name diff reported 138 Polars names and 63
+Ray Data names "missing", and a verified sample of thirty found the great majority to be
+spelling or placement differences:
+
+- Ray Data's `select_columns`, `rename_columns`, `drop_columns`, `add_column`,
+  `random_shuffle`, `random_sample`, `take`, `write_parquet`, `materialize`,
+  `iter_torch_batches` and `train_test_split` are all present under Batcher's own names.
+- `num_blocks`, `zip` and `input_files` are **deliberate refusals** whose error messages name
+  the alternative ("Spelled `ds.repartition`", "There is no positional column …").
+- Polars' `Expr.list.explode` is `ds.explode` — a Dataset-level operation here.
+- `streaming_split` **is** built (`ml/loader/lazy.py`, exported from `batcher.ml`), exactly as
+  10h says. The probe missed it by looking for a `Dataset` method rather than a module
+  function, and briefly "found" a gap that 10h had already settled.
+
+What survived verification is short, and every entry was called before it was written down:
+**`bottom_k`** (while `top_k` is built — the cleanest asymmetry on the surface), `null_count`,
+`cum_prod`, `implode`, `hist`, `list.index_of`, `json.decode`, `str.extract_groups`.
+
+**The methodological finding is worth more than the list, because three different probe designs
+each produced false gaps, and all three erred the same way — overstating what is missing.** A
+one-argument call read an arity error as a missing function (2.4x). A bare-name diff read a
+spelling difference as an absence (roughly 5x). An attribute probe read a module-level function
+as an absence. A pass over a competitor's surface is not evidence until each survivor has been
+*called*; the cost of not doing that is a backlog of work that is already done, which is the
+failure this document has recorded against itself three times already.
+
+**The headline, though, is the 367.** Batcher's `Expr` surface is 236 methods plus roughly 450
+across ten accessor namespaces, and the great majority of DuckDB names this pass first read as
+missing turned out to be present under Polars-style spellings that the SQL front-end already
+maps. That is the strongest evidence in this document for the coverage claim, and it is the
+reason the remaining list is short enough to read.
+
 ### 10i. The optimizer pass list — one real gap, and it settles 10g
 
 The sweep above compared *execution operators*. This compares **optimizer passes**, which is
