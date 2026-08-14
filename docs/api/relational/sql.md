@@ -182,7 +182,9 @@ rather than approximate. Compute them in a separate subquery and join.
 ### Subqueries
 
 Set-membership subqueries are folded into joins, so they run as one plan rather than once per
-row. `= ANY` and `= SOME` are `IN`; `<> ALL` is `NOT IN`; all four spell the same predicate.
+row. `= ANY` and `= SOME` are `IN`; `<> ALL` is `NOT IN`; all four spell the same predicate. The
+left-hand side may be an expression rather than a bare column, and `NOT IN` keeps SQL's
+three-valued answer when the subquery yields a NULL.
 
 ```python
 vip = bt.from_pydict({"category": ["a", "c"]})

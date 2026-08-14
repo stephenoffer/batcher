@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1345 Python modules across 203 packages and 264 Rust files across 15 crates.
+Covering 1346 Python modules across 203 packages and 264 Rust files across 15 crates.
 
 ## How to use this map
 
@@ -827,8 +827,9 @@ Subquery handling and decorrelation for the SQL translator.
 
 | module | lines | what it is |
 |---|---|---|
-| `core.py` | 637 | Subquery handling and decorrelation for the SQL translator. |
+| `core.py` | 640 | Subquery handling and decorrelation for the SQL translator. |
 | `correlation.py` | 166 | Correlation analysis for SQL subqueries: which references reach out of a subquery. |
+| `in_expr.py` | 53 | `IN (subquery)` where the left-hand side is an *expression* rather than a bare column. |
 | `neq.py` | 224 | Correlated ``<>``-residual EXISTS/NOT EXISTS decorrelation (TPC-H q21 shape). |
 | `quantified.py` | 106 | Quantified comparison predicates — ``x = ANY (SELECT ...)`` and ``x <> ALL (...)``. |
 | `range.py` | 118 | Correlated **inequality** EXISTS/NOT EXISTS decorrelation — a range semi/anti join. |

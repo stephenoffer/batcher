@@ -1171,6 +1171,52 @@ The boundary is now stated rather than implied: a correlation on an *expression*
 sides, and `test_a_correlation_on_an_expression_is_still_declined` pins that it refuses rather
 than mis-plans.
 
+### 10l. A construct-by-construct SQL probe — 35 of 38, and three that raise
+
+Run 2026-08-14, after 10k, on the reasoning that made 10j and 10k productive: **reading a
+competitor's implementation of something Batcher already has is what makes an internal gap
+visible**, and the gap is usually at the seam between the SQL front-end and an engine that can
+already do the work. 10j found seven window aggregates the engine computed and SQL could not
+spell; 10k found one correlation shape out of four. So this pass stopped reading source and
+asked the question directly: **38 SQL constructs, run against both engines, compared.**
+
+The result is the strongest evidence in this document for the "coverage is broad" claim, and it
+is worth stating before the gaps. Thirty-five answered and matched, including several this
+document would not have assumed: `FILTER` on an aggregate, `string_agg`/`array_agg` with an
+inner `ORDER BY`, `INTERSECT ALL` and `EXCEPT ALL`, `QUALIFY`, `LATERAL`, `IS NOT DISTINCT
+FROM` as a join condition, `DISTINCT ON`, `WITH RECURSIVE`, `GROUP BY ALL`, `ORDER BY ALL`,
+`SELECT * REPLACE`, named windows, and a `RANGE` window frame.
+
+Three raised where DuckDB answered:
+
+| construct | status |
+|---|---|
+| `<expr> IN (SELECT …)` — an expression, not a column, on the left | **Fixed** (`subquery/in_expr.py`) |
+| `EXCLUDE CURRENT ROW` / `TIES` / `GROUP` on a window frame | open, engine work |
+| `count(DISTINCT (a, b))` — a row value inside an aggregate | open, front-end |
+
+**The one that was fixed is the one worth reading**, because the restriction was not where it
+looked. `_apply_in_subquery` reads the left side as a *column name* so it can hand it to a
+semi/anti join; an expression has no name to hand over. Everything past that point — the
+correlation split, the multi-column row value, and the three-valued `NOT IN` — was already
+general. So the fix names the value (evaluate it into a synthetic column, rewrite the predicate
+to name that column, recurse once into the case that does not come back) rather than adding a
+second `IN`.
+
+That choice is load-bearing rather than tidy. `x NOT IN (S)` is **not** an anti join when `S`
+can yield NULL — `_not_in_antijoin` implements the three-valued answer — and a separate
+implementation for expressions would have had to restate that rule, would have looked correct
+on every input without a NULL, and is exactly the "second implementation of the same semantics"
+this repository's defects cluster in. Routing back through the one path makes restating it
+impossible.
+
+The two left open are recorded rather than built, with their reasons. Frame `EXCLUDE` needs the
+window kernels to skip rows inside a frame, which is engine work and not a parser edit — the
+one case in this table where the deferral reason is real, unlike 10k's. `count(DISTINCT (a,b))`
+needs a composite key inside an aggregate; the `IN` path already accepts a row value, so the
+vocabulary exists on one side of the front-end and not the other, which is the same shape of
+gap as 10j.
+
 ### 10i. The optimizer pass list — one real gap, and it settles 10g
 
 The sweep above compared *execution operators*. This compares **optimizer passes**, which is

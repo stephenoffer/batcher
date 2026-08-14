@@ -248,7 +248,10 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     ):
         left_keys = [e.name for e in target.expressions]
     else:
-        raise NotImplementedError("IN (subquery) supports a plain column or a row value of columns")
+        # An expression has no name to hand a join; `in_expr` names it and comes back here.
+        from batcher._sql.parser.subquery.in_expr import in_over_expression
+
+        return in_over_expression(tr, ds, node, negate=negate)
     how = "anti" if negate else "semi"
 
     # Split the subquery WHERE into correlation equalities and local predicates.
