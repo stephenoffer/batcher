@@ -880,7 +880,8 @@ class StatsEstimator:
         Each join type is derived from the *inner* estimate rather than sharing it:
 
         * `inner` — the Selinger containment estimate (`_inner_join_rows`).
-        * `semi` — the left rows whose key matches: ``|L| x min(1, d_R/d_L)``.
+        * `semi` — the left rows whose key matches: ``|L| x min(1, d_R/d_L)``, bounded by how
+          far the two key ranges actually overlap.
         * `anti` — the complement, ``|L| - |semi|``. Semi and anti *partition* `|L|`, so
           returning `|L|` for both (as this did) is impossible unless one is empty; it
           costed a near-empty anti-join at full width.
@@ -911,8 +912,11 @@ class StatsEstimator:
         # matters most — a `LEFT JOIN` to a dimension that fans out — where the true size is
         # `inner + unmatched` and can be several times larger. Under-estimating an outer join
         # is the direction that under-sizes its hash table.
-        unmatched_left = left.rows * (1.0 - _match_fraction(left_ndv, right_ndv))
-        unmatched_right = right.rows * (1.0 - _match_fraction(right_ndv, left_ndv))
+        # Same correction as the semi/anti split: a key that lies outside the other side's
+        # range is unmatched however favourable the distinct-count ratio looks.
+        overlap = self._key_overlap_factor(node, left, right)
+        unmatched_left = left.rows * (1.0 - min(_match_fraction(left_ndv, right_ndv), overlap))
+        unmatched_right = right.rows * (1.0 - min(_match_fraction(right_ndv, left_ndv), overlap))
         if node.join_type == "left":
             return max(inner + unmatched_left, left.rows), Provenance.DEFAULT
         if node.join_type == "right":
@@ -956,12 +960,26 @@ class StatsEstimator:
             # tight upper bound for both. The complement identity is deliberately not applied
             # here — it would report one of the two as empty on no evidence.
             return left.rows, Provenance.DEFAULT
-        matched = join_match_fraction(left_ndv, right_ndv)
+        # Containment alone says every left key is present whenever `d_R >= d_L`, which is
+        # true of two key domains that barely overlap. Only the keys in the intersection can
+        # match, so the overlap bounds the fraction that does.
+        matched = min(
+            join_match_fraction(left_ndv, right_ndv),
+            self._key_overlap_factor(node, left, right),
+        )
         semi = max(0.0, min(left.rows, left.rows * matched))
         semi = min(left.rows, max(semi, self._semi_skew_floor(node, left, right)))
         if node.join_type == "semi":
             return semi, Provenance.DEFAULT
-        return max(0.0, left.rows - semi), Provenance.DEFAULT
+        anti = max(0.0, left.rows - semi)
+        if anti <= 0.0 < left.rows:
+            # Containment and uniformity are assumptions, and an assumption may not assert
+            # emptiness — only a proof may (the same rule `_MIN_INEQUALITY_SELECTIVITY`
+            # encodes, and the reason a provably disjoint key pair is a *separate* branch).
+            # Estimating "no rows at all" from a ratio is what makes the cost model treat a
+            # live subtree as dead.
+            return min(1.0, left.rows), Provenance.DEFAULT
+        return anti, Provenance.DEFAULT
 
     def _semi_skew_floor(self, node: Join, left: RelStats, right: RelStats) -> float:
         """Left rows guaranteed to survive a semi-join because their (hot) key is in `R`.
@@ -1082,6 +1100,38 @@ class StatsEstimator:
         so an overlap computed from them is not sound. Never scales *up*, and never below the
         skew floor the measured hot values already prove.
         """
+        factor = self._key_overlap_factor(node, left, right)
+        if factor >= 1.0:
+            return rows
+        floor = self._skew_matched_rows(node, left, right)
+        return max(rows * factor, floor)
+
+    def _key_overlap_factor(self, node: Join, left: RelStats, right: RelStats) -> float:
+        """How much of the join can survive the two key ranges only partly overlapping.
+
+        Only keys inside the intersection of the two `[min, max]` ranges can match, so this
+        bounds *any* estimate of how many rows find a partner — the inner size, the semi/anti
+        split, and an outer join's unmatched term alike. It used to bound only the inner
+        estimate, and the omission produced the worst single estimate in the join model: a
+        left key spanning `[0, 2000)` against a right key spanning `[1000, 3000)` has every
+        left key "contained" by the ratio test (`d_R >= d_L`), so the semi-join was priced at
+        the whole of `L` and the anti-join at **exactly zero rows** against 11,397 actual.
+
+        A zero is the worst possible answer to be wrong by: build-side choice, join order,
+        broadcast sizing and the adaptive gate all read it as "this subtree is empty".
+
+        Only trusted for ordinal bounds (`_ordinal`-mappable), for the same reason
+        `_join_keys_range_disjoint` is: a string column's footer bounds may be byte-truncated,
+        so an overlap computed from them is not sound.
+
+        Args:
+            node: The join whose keys are compared.
+            left: The left input's statistics.
+            right: The right input's statistics.
+
+        Returns:
+            The binding overlap fraction, in `[0, 1]`; 1.0 when nothing can be established.
+        """
         factor = 1.0
         for lk, rk in zip(node.left_keys, node.right_keys, strict=False):
             lstat, rstat = left.columns.get(lk), right.columns.get(rk)
@@ -1104,10 +1154,7 @@ class StatsEstimator:
             ]
             if fractions:
                 factor = min(factor, max(fractions))
-        if factor >= 1.0:
-            return rows
-        floor = self._skew_matched_rows(node, left, right)
-        return max(rows * factor, floor)
+        return factor
 
     def _skew_matched_rows(self, node: Join, left: RelStats, right: RelStats) -> float:
         """A lower bound on an equi-join's output from matching heavy-hitter key values.
