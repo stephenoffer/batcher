@@ -235,3 +235,43 @@ def test_mfcc_matches_torchaudio():
     assert exp.shape == got.shape, (exp.shape, got.shape)
     rel = np.linalg.norm(got - exp) / (np.linalg.norm(exp) + 1e-12)
     assert rel < 5e-3, f"relative error {rel:.4f} too high — a convention likely differs"
+
+
+def test_audio_ops_survive_streaming_and_multiple_batches():
+    """Batching must not change what a per-row audio kernel returns, or its column type.
+
+    The counterpart of the image and video checks. `collect()` hands the engine one batch
+    and `iter_batches()` hands it several; the kernels are per-row, so the values cannot
+    legitimately differ. What can differ is not visible in the values: a batch containing
+    only unusable rows is the shape that makes a kernel widen an all-`Null` column, and the
+    single-batch path may never produce one. The fixture puts a null and an undecodable row
+    next to each other so a small batch is entirely bad.
+    """
+    import pyarrow as pa
+
+    rate = 8000
+    rows = [
+        _wav(rate, [0, 1000, -1000, 2000]),
+        None,
+        b"not audio at all",
+        _wav(rate, [500, -500, 250, -250, 125]),
+        _wav(rate, [0, 0, 0, 0]),
+        None,
+    ]
+    ds = bt.from_arrow(pa.table({"clip": pa.array(rows, type=pa.binary())}))
+    cases = {
+        "meta": lambda c: c.audio.decode(),
+        "waveform": lambda c: c.audio.to_waveform(),
+        "resampled": lambda c: c.audio.resample(4000),
+        "crossings": lambda c: c.audio.zero_crossing_rate(),
+    }
+    for name, build in cases.items():
+        query = ds.select(x=build(col("clip")))
+        whole = query.collect()
+        batches = list(query.iter_batches(batch_size=2))
+
+        streamed = [row for batch in batches for row in batch.column("x").to_pylist()]
+        assert streamed == whole.column("x").to_pylist(), name
+        assert len(batches) > 1, f"{name}: batch_size=2 over six rows must span batches"
+        for batch in batches:
+            assert batch.schema.field("x").type == whole.schema.field("x").type, name
