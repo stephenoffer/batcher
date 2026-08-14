@@ -30,6 +30,25 @@
 //! exact scan that exits at the first violating chunk cannot be fooled that way, and costs the
 //! same on the input it rejects as the sample did.
 //!
+//! # What it is worth, measured end to end rather than at this function
+//!
+//! Read this before quoting a number from here. At the level of one `partial()` call over 6M
+//! rows this path is worth **6.0x** on an all-distinct sorted integer key, 1.56x on a sorted
+//! string key and 1.40x on a sorted composite one. **Almost none of that survives to the
+//! query.** An A/B of two builds over the same data measured 1.0-1.2x on those same shapes,
+//! and at full parallelism the difference sat inside the noise band.
+//!
+//! The reason is that the engine morselizes: it never makes the 6M-row call the microbenchmark
+//! made. At 16,384 rows the hash paths are already good and this is worth 1.1-1.2x, which is a
+//! few percent of a query that also scans, accumulates, combines and finalizes. The honest
+//! claim is a **small win on sorted input and free on everything else** — rejection measured
+//! 1.00x at 6M rows and 0.97x at morsel size, which is what makes it safe to attempt
+//! unconditionally, and which is the property worth defending here rather than the 6x.
+//!
+//! This is the second time this document's mechanism-level probe disagreed with the query (see
+//! `competitor_technique_review.md`, 10g). A ratio measured at the function is a fact about the
+//! function.
+//!
 //! # What the caller gets
 //!
 //! The same `(group_ids, num_groups, group_columns)` triple every other path in

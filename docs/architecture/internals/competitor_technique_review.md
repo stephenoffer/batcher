@@ -47,7 +47,13 @@ at a competitor's file listing.
 low-cardinality half of item 9 and the one capability gap in 10h. **10f — a sorted-input
 aggregate, the memory-shaped one — is the last of the three still open**, and it remains the
 most interesting item here, because its win is bounded state rather than speed: it is the one
-shape that turns a spilling aggregate into a streaming one. What is left below it is either
+shape that turns a spilling aggregate into a streaming one.
+
+**Update, 2026-08-13.** 10f is now *half* built: the run-scanning group assignment is in
+(`agg/group/runs.rs`), and it is worth 1.0-1.2x rather than the 6.0x its microbenchmark
+promised — the discrepancy, and the A/B method that exposed it, are recorded in 10f and are
+more useful than the feature. **The bounded-state half is still open, and it is still the
+reason this item ranks where it does.** What is left below it is either
 large and invasive (`StringView`), a boundary-crossing planner decision (dictionary survival,
 top-K to the scan), or waiting on a quiet box. See the backlog for the per-item evidence.
 
@@ -438,7 +444,7 @@ What is **not** there is the edge to the scan. The bound skips morsels the engin
 read; nothing derived from it reaches a Parquet reader, so no row group is pruned and no I/O is
 avoided. That is the expensive half for `ORDER BY x LIMIT k` over a large file on disk, and it
 is what item 4 should now be read as meaning. It needs the predicate republished through the
-`runtime_filter.rs` transport and then through `io/predicate.py`'s pushdown, which is a
+`runtime_filter.rs` transport and then through `io/predicate/`'s pushdown, which is a
 boundary-crossing change rather than a data-plane one.
 
 ## 5. Skew detected from measured sizes
@@ -849,7 +855,7 @@ previous run's, so a first-seen shape gets a prior rather than a measurement, an
 data volume changed run-to-run gets a stale one. Spark, with no learning at all, uses the
 fresher number for this one decision.
 
-### 10f. Sortedness is tracked, and no operator specializes on it
+### 10f. Sortedness is tracked, and no operator specializes on it — **half built, and the win was not where this entry said**
 
 Polars' streaming engine carries a sortedness flag and has **operators that consume it**:
 `nodes/sorted_group_by.rs`, `nodes/sorted_unique.rs`, `nodes/is_first_distinct.rs`,
@@ -890,6 +896,61 @@ second semantics — invariant #7, and the exact shape of "a stateful operator t
 single-node and silently caps at one machine" — and agreement across all three executors. So
 it wants a session that can run the distributed suite, which is the one thing a contended box
 cannot currently do.
+
+**Built and measured, 2026-08-13 — and the result is a caution, not a victory.**
+`bc_runtime::agg::group::runs` now assigns group ids by scanning runs of equal adjacent values
+instead of hashing, and `assign_groups` tries it first. Because `assign_groups` is shared, this
+reaches every `GROUP BY`, every `DISTINCT` and every partitioned window at once.
+
+Two things about it are worth keeping; one is worth *not* repeating.
+
+**Worth keeping (1): it proves the ordering instead of being told.** Polars reads a flag —
+a promise from the planner or the user. The equivalent source here would be
+`RelStats.sorted_by`, which for a lakehouse table is metadata **nothing enforces on write**.
+Believing it when false is not a slow answer but a silently wrong one: one key split across two
+non-adjacent runs is emitted as two groups. So the scan establishes monotonicity itself, on
+every aggregate, declared or not. It is a stronger design than the one it was copied from, and
+it is the reason no IR flag and no Kyber rule were needed for this half.
+
+**Worth keeping (2): a sampled gate is not a cheap exact scan, and the difference is 4x.** The
+first implementation gated on a fixed 64-pair prefix before committing to a detection pass. A
+key cycling `0,1,…,99,0,1,…` is ordered across any short prefix, so the gate passed it and paid
+for a full pass that then failed — **0.24x, four times slower than simply hashing**, on input
+that is not sorted at all. Replacing the gate with a chunked scan that exits at the first
+violating chunk took every unsorted shape to exactly **1.00x**. Rejection being free is what
+makes this safe to attempt unconditionally, and it is the property to defend if anyone
+re-tunes it.
+
+**Not worth repeating: the number this was first justified with.** At the level of one
+`partial()` call over 6M rows the path measures **6.0x** on an all-distinct sorted integer key,
+1.56x on a sorted string key, 1.40x on a sorted composite one. An A/B of two *builds* over the
+same data then measured **1.0-1.2x** end to end, and at full parallelism the difference sat
+inside the noise band. The engine morselizes, so it never makes the 6M-row call the
+microbenchmark made; at 16,384 rows the win is 1.1-1.2x, which is a few percent of a query that
+also scans, accumulates, combines and finalizes.
+
+That is **10g happening again to someone who had read 10g** — a mechanism-level probe
+disagreeing with the query. The correction that worked, and which the next measurement here
+should copy: A/B two builds in *one process* over identical data. Cross-run timings on this box
+disagreed with themselves by 30%, and two shapes where the path *declines* read as faster with
+it enabled, which is impossible and is what exposed the noise.
+
+So this half is a **small win on sorted input and free on everything else**, tested against the
+hash oracle in `runs.rs` and against DuckDB in
+`tests/differential/test_diff_agg_sorted_input.py` (which includes the case that matters most:
+a key sorted *within* each morsel but not across them, where runs must stay partials and only
+`combine` may make them groups).
+
+**What remains open is the half this entry called the reason to rank it: memory.** The state is
+still `O(groups)`, because bounded state needs the streaming aggregate to *emit* a group when
+its run closes, and that is not a detection problem, it is a soundness one. A group emitted
+early is unrecoverable if a later batch reintroduces its key, and per-batch verification cannot
+prevent that — it only detects it afterwards. So early emission is sound only where the
+ordering is a fact about the *plan* (a `Sort` the engine itself performed) rather than a claim
+about the data, and that distinction — not the adjacency scan — is what the remaining work has
+to get right. `stream/breaker.rs` is where it lands: the streaming aggregate does not spill, it
+refuses (`"the streaming aggregate does not spill"`), so bounding its state is what converts a
+refused query into a completed one.
 
 ### 10g. A caution about probing this optimizer with a stopwatch
 
@@ -1258,22 +1319,31 @@ implements it, so the next reader can settle it with one grep instead of one day
    match DuckDB, and only a predicate carrying *both* falls through to `_reject_correlated`.
    Small and well-defined, but it needs a semi-join with a residual predicate rather than a
    parser edit, which is why it sits here rather than being done alongside 10j.
-6a. **A sorted-input aggregate and adjacent dedup (item 10f).** **The highest-value item still
-   open, and it was missing from this list entirely** until 2026-08-06 — it was argued in
-   section 10f and then never written down as work, which is how the last of the sweep's three
-   genuine openings ended up ranked nowhere. Re-verified open: nothing in `crates/` implements
-   it and no Kyber rule rewrites `Aggregate`/`Distinct` on a sorted input.
+6a. **A sorted-input aggregate and adjacent dedup (item 10f).** **The detection half is built
+   (2026-08-13); the memory half — the reason this was ranked first — is not.**
 
-   It is first among the remaining because its win is **memory, not speed**: a sorted group-by
-   has `O(1)` state, so it is the one shape that turns a spilling aggregate into a streaming
-   one, and Polars ships four operators that consume the property
-   (`sorted_group_by`, `sorted_unique`, `is_first_distinct`, `merge_sorted`). Batcher already
-   tracks and propagates the property; nothing consumes it.
+   Built: `bc_runtime::agg::group::runs` assigns group ids by scanning runs instead of hashing,
+   tried first inside `assign_groups`, so it reaches `GROUP BY`, `DISTINCT` and the partitioned
+   window together. It needed **no IR flag and no Kyber rule**, because it proves the ordering
+   rather than reading `sorted_by` — see 10f for why trusting that declaration would have been
+   a wrong-answer risk rather than a slow one. Worth **1.0-1.2x end to end** on sorted input and
+   measured 1.00x on everything else; the 6.0x in the microbenchmark did not survive to the
+   query, and 10f records why.
 
-   Sequence it behind a session that can run the distributed suite. The algorithm is a scan
-   over adjacent runs; the cost is the contract around it — a two-sided IR change in one
-   commit, and a mergeable form, without which it works perfectly on one node and silently
-   caps there.
+   Still open, and it is the part with the value: **bounded state**. A sorted group-by has
+   `O(1)` state, which is the one shape that turns an aggregate the streaming path *refuses*
+   (`stream/breaker.rs`: "the streaming aggregate does not spill") into one it completes.
+   Polars ships four operators that consume the property (`sorted_group_by`, `sorted_unique`,
+   `is_first_distinct`, `merge_sorted`).
+
+   The remaining cost is **not** the adjacency scan, which is now written and tested. It is a
+   soundness question the earlier drafts of this entry did not name: a group emitted when its
+   run closes cannot be taken back if a later batch reintroduces its key, and per-batch
+   verification detects that only *after* the row has gone downstream. So early emission is
+   sound only where the ordering is a fact about the **plan** — a `Sort` the engine itself
+   performed — rather than a claim about the data. Decide that first; the IR flag, the
+   mergeable form and the three executors follow from it, and a session that can run the
+   distributed suite is still the right place for them.
 7. **An adaptive-width sort key for the per-range sort (item 9).** Proven
    permutation-identical and worth 1.69x on high-cardinality 27-char keys, but a *fixed*
    4-byte head loses 0.78-0.87x on two other shapes, so the width has to come from the sample

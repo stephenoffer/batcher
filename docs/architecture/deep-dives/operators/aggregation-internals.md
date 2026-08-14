@@ -18,6 +18,7 @@ Which strategy runs depends on the key, and the dispatch falls into three famili
 
 | Family | Taken when | How the group id is found | Cost |
 |---|---|---|---|
+| Sorted runs | tried first, on any key the engine can prove arrives in sorted order | compare each row with its predecessor; equal keys are adjacent, so a run is a group | no hashing and no table |
 | Dense direct map | a non-nullable integer-like key whose value span fits the dense budget: dictionary codes, dense ids, enums, and the canonical bits of a non-null `Float64` | one linear pass for `(min, max)`, then `value - min` through a direct-indexed table | no hashing at all |
 | Typed hash | a single `Int64`, `Utf8`/`Binary`, or non-null `Float64` key, and multi-column keys the engine can pack natively | hash the native values or bytes directly | one hash, no encode |
 | Row encoding | everything else: nullable floats, and mixed multi-column keys the packers decline | Arrow's `RowConverter` into a comparable byte string, then hash | a per-row encode and an allocation |
@@ -29,6 +30,68 @@ canonicalization in `keys.rs`, so the fast path and the encoder agree on group i
 
 The fast paths exist because that per-row encode is the difference between a group-by that
 keeps up with DuckDB and one that doesn't.
+
+### When the key arrives sorted
+
+Sorted input makes equal keys adjacent, so a row's group is decided by comparing it with the
+row before it. `crates/bc-runtime/src/agg/group/runs.rs` does that, and `assign_groups` tries
+it before any hash path, because it replaces hashing rather than speeding it up.
+
+The interesting part is where the engine gets the ordering from. It does not take anyone's word
+for it. A sort key declared on a lakehouse table is metadata that nothing enforces on write, and
+an aggregate that believes a false declaration does not return a slow answer, it returns a wrong
+one: the same key, split across two non-adjacent runs, is emitted as two groups. So the engine
+establishes the ordering itself, on every aggregate, whether or not anything declared it.
+
+Establishing it is affordable because the check is chunked and stops at the first chunk holding
+a violation. Unordered input is rejected after a few hundred rows, which is why this is
+attempted unconditionally instead of being gated on a plan flag. A sampled check would be
+cheaper still and is not safe: a key cycling `0,1,…,99,0,1,…` is ordered across any short
+prefix, so sampling accepts it and then pays for a full detection pass that fails.
+
+Either direction counts, since descending input clusters equal keys just as well as ascending.
+A key containing nulls declines, because a null compares as null under `<`, which reads as
+unordered.
+
+Nothing about this changes the answer. Group ids come out in the same first-seen order the hash
+paths produce, and float keys are canonicalized first so `-0.0` groups with `0.0` and every NaN
+groups together, exactly as `GROUP BY` requires:
+
+```python
+import batcher as bt
+from batcher import col
+
+# A time-ordered ingest: the key arrives sorted, so the runs are the groups.
+events = bt.from_pydict(
+    {
+        "day": [1, 1, 1, 2, 2, 3, 3, 3, 3],
+        "amount": [5.0, 3.0, 2.0, 8.0, 1.0, 4.0, 4.0, 2.0, 6.0],
+    }
+)
+print(events.group_by("day").agg(total=col("amount").sum()).sort("day").to_pydict())
+```
+
+```text
+{'day': [1, 2, 3], 'total': [10.0, 9.0, 16.0]}
+```
+
+The same query over the same rows shuffled returns the same groups and the same totals; only
+the path that found them differs.
+
+Because `assign_groups` is shared, `DISTINCT` and the partitioned window get this at the same
+time, without either operator knowing about it.
+
+Worth stating plainly, because the mechanism measures far better than the query does: this is a
+**small** win. One `partial` call over 6M sorted rows is up to 6x faster, but the engine
+morselizes and never makes that call, so an A/B of two builds over the same data measures
+1.0-1.2x end to end. What the design buys reliably is that it costs nothing when it does not
+apply — unordered input measured at parity — which is what makes attempting it on every
+aggregate the right default.
+
+The state is still proportional to the group count. A sorted group-by can in principle hold one
+group at a time, by emitting each group when its run closes, and that is not built: a group
+emitted early cannot be withdrawn if a later batch reintroduces its key, so it is sound only
+where the ordering is a fact about the plan rather than a claim about the data.
 
 ## Step 2: accumulate (`partial`)
 
