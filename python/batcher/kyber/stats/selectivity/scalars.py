@@ -228,8 +228,26 @@ def _outside_bounds(value: Any, bound: tuple[Any, Any] | None) -> bool:
     x = _ordinal(value)
     lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
     if x is None or lo is None or hi is None:
-        return False
+        return _outside_string_bounds(value, bound)
     return x < lo or x > hi
+
+
+def _outside_string_bounds(value: Any, bound: tuple[Any, Any]) -> bool:
+    """Whether a string literal falls outside a string column's `[min, max]`.
+
+    A string has no float ordinal, so the check above declines and `col = 'zzz'` over a column
+    whose values end at `'violet'` kept a fifth of the table rather than nothing.
+
+    Sound despite the truncation caveat that keeps strings off the ordinal axis elsewhere: a
+    Parquet writer truncates a `min` downwards and a `max` upwards, so the stored pair is
+    always a *superset* of the real range and a literal outside it is genuinely absent. And
+    Python compares `str` by code point while the engine compares UTF-8 bytes, which is the
+    same order — UTF-8 is defined so that byte order and code-point order agree.
+    """
+    lo, hi = bound
+    if not (isinstance(value, str) and isinstance(lo, str) and isinstance(hi, str)):
+        return False
+    return value < lo or value > hi
 
 
 def _fraction_below_quantiles(value: Any, q: dict[str, Any] | None) -> float | None:

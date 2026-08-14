@@ -110,3 +110,54 @@ def test_the_estimate_tracks_the_executed_row_count():
         assert estimated == pytest.approx(executed, rel=0.1), (
             f"{predicate!r}: estimated {estimated:.1f} against {executed}"
         )
+
+
+# --- a string literal outside the measured bounds ---------------------------------
+
+
+_BOUNDS = {"s": ("amber", "violet")}
+
+
+@pytest.mark.parametrize("absent", ["zzz", "aaa", "Aardvark"])
+def test_a_string_outside_the_bounds_matches_nothing(absent):
+    """`_outside_bounds` declined every string, so `s = 'zzz'` kept a fifth of the table.
+
+    Sound despite the truncation caveat that keeps strings off the ordinal axis elsewhere: a
+    Parquet writer truncates a `min` downwards and a `max` upwards, so the stored pair is a
+    *superset* of the real range. Python compares `str` by code point and the engine by UTF-8
+    bytes, which is the same order.
+    """
+    assert sel(bt.col("s") == absent, _NDV, _CFG, None, _MCV, _BOUNDS) == pytest.approx(0.0)
+
+
+def test_an_in_list_drops_only_the_out_of_range_literals():
+    listed = sel(bt.col("s").is_in(["zzz", "red"]), _NDV, _CFG, None, _MCV, _BOUNDS)
+    assert listed == pytest.approx(0.2)
+
+
+def test_a_string_inside_the_bounds_is_unaffected():
+    assert sel(bt.col("s") == "red", _NDV, _CFG, None, _MCV, _BOUNDS) == pytest.approx(0.2)
+
+
+def test_the_complement_keeps_everything():
+    assert sel(bt.col("s") != "zzz", _NDV, _CFG, None, _MCV, _BOUNDS) == pytest.approx(1.0)
+
+
+def test_a_parquet_source_carries_the_string_bounds_this_relies_on(tmp_path):
+    """The fix is only reachable because real sources record string min/max."""
+    target = str(tmp_path / "t.parquet")
+    bt.from_pydict({"s": [_COLOURS[i % 5] for i in range(500)]}).write.parquet(target)
+    dataset = bt.read.parquet(target)
+    stats = dataset._sources[0].statistics()
+    assert stats.columns["s"].min == "amber"
+    assert stats.columns["s"].max == "violet"
+    absent = dataset.filter(bt.col("s") == "zzz")
+    estimated = (
+        StatsEstimator(
+            absent._sources, {}, _CFG, source_stats=[s.statistics() for s in absent._sources]
+        )
+        .estimate(absent._plan)
+        .rows
+    )
+    assert estimated == pytest.approx(0.0)
+    assert absent.count() == 0
