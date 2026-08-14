@@ -191,3 +191,19 @@ def test_sorted_key_group_by_after_an_explicit_sort(duck):
     duck.register("t", t)
     out = bt.from_arrow(t).sort("g").group_by("g").agg(s=col("x").sum()).collect()
     assert_same(out, duck.sql("SELECT g, sum(x) AS s FROM t GROUP BY g"))
+
+
+def test_sorted_key_single_node_equals_distributed(duck):
+    """The run assignment must stay a *partial*, so many machines answer as one does.
+
+    This is the invariant a sorted-input specialization is most likely to break. Runs are
+    found per batch, and a distributed run finds them per partition, so the same key can be
+    the last run of one partition and the first of another. Only `combine` may merge them --
+    if runs were ever treated as final groups, this is where the extra rows would appear.
+    """
+    t = _sorted_int()
+    duck.register("t", t)
+    ds = bt.from_arrow(t).group_by("g").agg(s=col("x").sum(), n=col("x").count())
+    expected = duck.sql("SELECT g, sum(x) AS s, count(x) AS n FROM t GROUP BY g")
+    assert_same(ds.collect(), expected)
+    assert_same(ds.collect(distributed=True), expected)
