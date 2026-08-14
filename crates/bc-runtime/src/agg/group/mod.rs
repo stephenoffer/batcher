@@ -5,6 +5,9 @@
 //!
 //! - [`assign`] — the per-morsel hot path (and correctness reference) that maps each row
 //!   to a dense group id.
+//! - [`runs`] — the same assignment for a key that arrives sorted, done by scanning runs of
+//!   equal adjacent values instead of hashing. It *verifies* the ordering rather than being
+//!   told about it, so it is safe to attempt on any input.
 //! - [`combine`] — the high-cardinality `combine` fast path the executor reaches once the
 //!   concatenated partials cross the radix-parallel threshold. It hash-radix partitions
 //!   by key so every row of a group lands in one partition, then groups *and* merges each
@@ -13,6 +16,7 @@
 mod assign;
 mod combine;
 mod hash;
+mod runs;
 
 pub(crate) use assign::{assign_groups, dense_budget};
 pub use combine::concat_disjoint;
