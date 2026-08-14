@@ -86,16 +86,23 @@ def _str_func_selectivity(
     ndv: dict[str, float],
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]],
+    nulls: dict[str, float] | None = None,
 ) -> float:
     """Selectivity of a boolean string predicate, from its function and (where it carries
-    one) its pattern."""
+    one) its pattern.
+
+    A string predicate over a NULL is NULL, so it keeps none of the null rows: every prior
+    below describes the *non-null* strings and is scaled to the whole relation by
+    `_non_null_budget`.
+    """
+    budget = _non_null_budget(expr, nulls)
     reader = _PATTERN_READERS.get(expr.fn)
     if reader is not None:
-        return reader(expr, ndv, cfg, mcv)
+        return budget * reader(expr, ndv, cfg, mcv)
     pattern_sel = _STR_PATTERN_SELECTIVITY.get(expr.fn)
     if pattern_sel is not None:
-        return pattern_sel(cfg)
-    return cfg.default_filter_selectivity
+        return budget * pattern_sel(cfg)
+    return budget * cfg.default_filter_selectivity
 
 
 def _in_list_selectivity(
@@ -104,6 +111,7 @@ def _in_list_selectivity(
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]] | None = None,
     bounds: dict[str, tuple[Any, Any]] | None = None,
+    nulls: dict[str, float] | None = None,
 ) -> float:
     """`col IN (v1, …, vk)` — the union of `k` equality predicates.
 
@@ -120,17 +128,21 @@ def _in_list_selectivity(
     * a literal with a measured most-common-value frequency contributes that frequency
       instead of the uniform `1/ndv`, which is where `1/ndv` is most wrong.
 
-    Falls back to `k * eq_selectivity` when the column's distinct count is unknown.
+    Falls back to `k * eq_selectivity` when the column's distinct count is unknown. Every
+    branch is scaled by `_non_null_budget`: `col IN (...)` is NULL where `col` is, so it keeps
+    none of the null rows (which is what the `NOT IN` complement in `_null_mass` already
+    assumed).
     """
     distinct = _dedup(expr.values)
     k = len(distinct)
     if k == 0:
         return 0.0  # `x IN ()` matches nothing
     dom = _date_part_domain(expr.input)
+    budget = _non_null_budget(expr, nulls)
     if dom is not None:  # `month(d) IN (6,7,8)` → k of n equiprobable field values
-        return min(1.0, k / float(dom[1] - dom[0] + 1))
+        return min(1.0, budget * k / float(dom[1] - dom[0] + 1))
     if not isinstance(expr.input, Col):
-        return min(1.0, k * cfg.eq_selectivity)
+        return min(1.0, budget * k * cfg.eq_selectivity)
     name = expr.input.name
     bound = (bounds or {}).get(name)
     if bound is not None:
@@ -142,7 +154,11 @@ def _in_list_selectivity(
     # A literal the MCV table does not list gets the *residual* uniform frequency — what is
     # left once the measured top values have taken their mass — not the whole column's
     # `1/ndv`, which prices a rare value as if it were average (see `residual_eq_frequency`).
-    uniform = residual_eq_frequency(column_ndv, col_mcv, cfg.eq_selectivity)
+    # A measured MCV frequency is already a share of *all* rows; the uniform residual is put
+    # in that same space by `non_null`, so the two are summable.
+    uniform = residual_eq_frequency(
+        column_ndv, col_mcv, budget * cfg.eq_selectivity, non_null=budget
+    )
     total = 0.0
     for value in distinct:
         freq = _mcv_lookup(col_mcv, value)
@@ -197,6 +213,33 @@ def _measured_null_fraction(expr: Expr, nulls: dict[str, float]) -> float | None
     return max(0.0, min(1.0, max(measured)))
 
 
+def _non_null_budget(expr: Expr, nulls: dict[str, float] | None) -> float:
+    """The share of rows on which every column `expr` reads holds a value rather than NULL.
+
+    The probability budget a leaf's value-distribution estimate is spread over. `ndv` counts
+    distinct **non-null** values (the HLL sketch skips nulls), a quantile grid is built over
+    the non-null values, and `[min, max]` bound them — so each of those answers a probability
+    *conditioned on the column being non-null*. A comparison over a NULL is NULL, and a SQL
+    filter keeps only TRUE, so those rows are dropped: the unconditional selectivity is the
+    conditional one times this budget.
+
+    Without it every positive predicate over a nullable column was over-estimated by exactly
+    `1 / (1 - f_null)` — 1.4x on a 30%-null column, 10x on a 90%-null one — and that error
+    flows straight into join order, build-side choice and broadcast sizing. The complement
+    side already subtracted the same mass (`_null_mass`, used by `!=` and `NOT`), so the two
+    halves of a predicate and its negation disagreed about how many rows even existed.
+
+    Uses the *largest* measured null fraction among the referenced columns — the Fréchet
+    lower bound on the joint null mass, and so the largest defensible budget, which keeps
+    this from ever shrinking an estimate more than the measurements prove. An unmeasured
+    column contributes nothing, exactly as `_null_mass` assumes for the complement.
+    """
+    if not nulls:
+        return 1.0
+    fraction = _measured_null_fraction(expr, nulls)
+    return 1.0 if fraction is None else max(0.0, min(1.0, 1.0 - fraction))
+
+
 # Date/time field extractions with a small, bounded, ~uniform domain `[lo, hi]` (inclusive).
 # A predicate on the extracted field — `month(d) = 6`, `hour(ts) < 9`, `dayofweek(d) IN (0,6)`
 # — is otherwise blunt: `month(d) = 6` fell to the flat `eq_selectivity` (0.1) when the true
@@ -236,10 +279,10 @@ def _date_part_cardinality(expr: Binary) -> float | None:
     return None
 
 
-def _from_cdf(eff: str, frac_le: float, eq: float) -> float:
+def _from_cdf(eff: str, frac_le: float, eq: float, total: float = 1.0) -> float:
     """One comparison's selectivity from `F(x) = P(v <= x)` and `eq = P(v = x)`.
 
-    The mapping is `le: F`, `lt: F - eq`, `gt: 1 - F`, `ge: 1 - F + eq`. Splitting on the
+    The mapping is `le: F`, `lt: F - eq`, `gt: total - F`, `ge: total - F + eq`. Splitting on the
     boundary's point mass is what distinguishes strict from non-strict: treating `lt` as `le`
     (and `ge` as `gt`) drops that mass entirely, so `x <= 5` and `x < 5` estimated identically —
     wrong by a whole distinct value on a low-cardinality integer or date column, which is exactly
@@ -254,7 +297,12 @@ def _from_cdf(eff: str, frac_le: float, eq: float) -> float:
     Args:
         eff: The comparison, normalized so the column is on the left.
         frac_le: `P(v <= x)`, from a quantile grid, from bounds, or from a known domain.
+            Already scaled into the same space as `total`.
         eq: `P(v = x)`, the mass sitting exactly on the boundary.
+        total: The mass the complement is taken over — the column's non-null fraction. A
+            comparison is NULL, not TRUE, on a NULL operand, so `col > x` keeps at most the
+            non-null rows. Taking the complement over a flat 1 handed every one of the null
+            rows to the `gt`/`ge` side.
 
     Returns:
         The fraction of rows the comparison keeps, in `[0, 1]`.
@@ -265,9 +313,9 @@ def _from_cdf(eff: str, frac_le: float, eq: float) -> float:
     elif eff == "lt":
         raw = frac_le - eq
     elif eff == "gt":
-        raw = 1.0 - floor_le
+        raw = total - floor_le
     else:  # ge
-        raw = 1.0 - frac_le + eq
+        raw = total - frac_le + eq
     # `F` and `eq` come from different estimators — a quantile grid or bounds interpolation for
     # one, an MCV frequency for the other — so their difference is not confined to `[0, 1]`. A
     # skewed column whose measured mass at `x` exceeds the interpolated `F(x)` made `lt` negative
@@ -275,7 +323,9 @@ def _from_cdf(eff: str, frac_le: float, eq: float) -> float:
     return clamp01(raw)
 
 
-def _date_part_range_selectivity(expr: Binary, op: str) -> float | None:
+def _date_part_range_selectivity(
+    expr: Binary, op: str, nulls: dict[str, float] | None = None
+) -> float | None:
     """`date_part(col) OP literal` range selectivity over the field's discrete uniform domain.
 
     The domain is the integers `[lo, hi]` (12 months, 7 weekdays, 24 hours…), so the CDF is
@@ -305,11 +355,17 @@ def _date_part_range_selectivity(expr: Binary, op: str) -> float | None:
     else:
         frac_le = (xf - lo + 1) / n
     eff = op if col_on_left else ORDERING_FLIP[op]
-    return _from_cdf(eff, frac_le, 1.0 / n)
+    # `month(NULL)` is NULL, so the extraction keeps only the rows its argument has a value on.
+    budget = _non_null_budget(expr, nulls)
+    return _from_cdf(eff, budget * frac_le, budget / n, total=budget)
 
 
 def _column_pair_selectivity(
-    expr: Binary, op: str, cfg: CardinalityConfig, bounds: dict[str, tuple[Any, Any]]
+    expr: Binary,
+    op: str,
+    cfg: CardinalityConfig,
+    bounds: dict[str, tuple[Any, Any]],
+    nulls: dict[str, float] | None = None,
 ) -> float | None:
     """`col OP col` selectivity, from both columns' bounds where they are known.
 
@@ -332,13 +388,19 @@ def _column_pair_selectivity(
     Correlation is still not modelled, so this does not make such a predicate exact — two
     dates a few days apart are far from independent. It gets the estimate onto the right side
     of a half, and turns non-overlapping spans into the certainties they already are.
+
+    Both halves are scaled by `_non_null_budget`, because a comparison needs a value on each
+    side: over a 30%-null column the maximum-entropy answer is 0.35 of the relation, not 0.5.
+    That keeps `sel(p) + sel(NOT p) = 1 - f_null`, the identity the `NOT` path already uses.
     """
     if not (isinstance(expr.left, Col) and isinstance(expr.right, Col)):
         return None
+    # `a < b` is NULL when *either* side is, so both must hold a value for the row to survive.
+    budget = _non_null_budget(expr, nulls)
     p_lt = fraction_left_below_right(bounds.get(expr.left.name), bounds.get(expr.right.name))
     if p_lt is None:
-        return cfg.default_filter_selectivity
-    return p_lt if op in ("lt", "le") else 1.0 - p_lt
+        return budget * cfg.default_filter_selectivity
+    return budget * (p_lt if op in ("lt", "le") else 1.0 - p_lt)
 
 
 def _range_selectivity(
@@ -349,6 +411,7 @@ def _range_selectivity(
     bounds: dict[str, tuple[Any, Any]],
     ndv: dict[str, float] | None = None,
     mcv: dict[str, dict[str, float]] | None = None,
+    nulls: dict[str, float] | None = None,
 ) -> float:
     """`col < literal` (and `<=`/`>`/`>=`) selectivity, from the sharpest source available.
 
@@ -365,25 +428,30 @@ def _range_selectivity(
     already known. Values are mapped to a common ordinal first (`_ordinal`), so a
     `datetime.date`/`datetime`/`Decimal` literal interpolates against bounds of the same
     type instead of falling through as "non-numeric"."""
-    date_part = _date_part_range_selectivity(expr, op)
+    date_part = _date_part_range_selectivity(expr, op, nulls)
     if date_part is not None:
         return date_part
+    budget = _non_null_budget(expr, nulls)
     side = comparison_col_side(expr)
     if side is None:
-        pair = _column_pair_selectivity(expr, op, cfg, bounds)
-        return cfg.range_selectivity if pair is None else pair
+        pair = _column_pair_selectivity(expr, op, cfg, bounds, nulls)
+        return budget * cfg.range_selectivity if pair is None else pair
     col, value, col_on_left = side
     x = _ordinal(value)
     if x is None:
-        return cfg.range_selectivity
+        return budget * cfg.range_selectivity
     frac_le = _fraction_below_quantiles(value, quantiles.get(col))
     if frac_le is None:
         frac_le = _fraction_below_bounds(x, bounds.get(col))
     if frac_le is None:
-        return cfg.range_selectivity
+        return budget * cfg.range_selectivity
     eff = op if col_on_left else ORDERING_FLIP[op]
     bound = bounds.get(col)
-    eq = _point_mass(col, value, ndv or {}, mcv or {})
+    # The grid and the bounds describe the non-null values, so `F` is conditional on the
+    # column holding one; `budget` lifts it to a share of the whole relation, which is the
+    # space `_point_mass` (and a measured MCV frequency) already answers in.
+    frac_le = budget * frac_le
+    eq = _point_mass(col, value, ndv or {}, mcv or {}, non_null=budget)
     if eq == 0.0 and not _outside_bounds(value, bound):
         # Nothing has measured a distinct count. On a *discrete* column the bounds still imply
         # one — the step the CDF is already divided by — and without it the strict and
@@ -392,8 +460,8 @@ def _range_selectivity(
         # Only for a literal the column can actually hold: the mass at a value outside the
         # bounds is zero, and claiming a step there makes `d < <above the max>` fall short of the
         # certain 1.0 and `d >= <above the max>` rise above the certain 0.0.
-        eq = discrete_step_mass(bound) or 0.0
-    return _from_cdf(eff, frac_le, eq)
+        eq = budget * (discrete_step_mass(bound) or 0.0)
+    return _from_cdf(eff, frac_le, eq, total=budget)
 
 
 def _equality_selectivity(
@@ -402,6 +470,7 @@ def _equality_selectivity(
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]],
     bounds: dict[str, tuple[Any, Any]] | None = None,
+    nulls: dict[str, float] | None = None,
 ) -> float:
     """`col = literal` (or `col = col`) selectivity.
 
@@ -417,6 +486,12 @@ def _equality_selectivity(
     `1/ndv` is most wrong. Otherwise keep `~1/ndv(col)` when the distinct count is
     known (uniformity assumption), else a small default.
 
+    Every branch that reads the *value* distribution is scaled by `_non_null_budget`: `ndv`
+    counts non-null distinct values, so `1/ndv` is `P(col = v | col IS NOT NULL)` and
+    reporting it unconditionally over-states the predicate by `1 / (1 - f_null)`. A measured
+    MCV frequency is the exception — it is already a share of every row — and is returned as
+    it stands.
+
     A **column = column** equality (a residual filter comparing two columns of one
     relation — a self-join residual, a de-normalized cross-column check) is the Selinger
     containment case: under uniformity the match fraction is ``1 / max(d_a, d_b)``. With
@@ -425,6 +500,7 @@ def _equality_selectivity(
     fell through to the flat `eq_selectivity`, a ~10x over-estimate on a low-cardinality
     join-key-shaped column.
     """
+    budget = _non_null_budget(expr, nulls)
     side = comparison_col_side(expr)
     if side is not None:
         col, value, _ = side
@@ -432,20 +508,22 @@ def _equality_selectivity(
             return 0.0
         freq = _mcv_lookup(mcv.get(col), value)
         if freq is not None:
+            # Measured as a share of *all* rows, so it is already unconditional — scaling it
+            # by the budget a second time would subtract the null rows twice.
             return freq
     # `month(d) = 6` etc.: one of ~n equiprobable field values, whatever the literal's type.
     period = _date_part_cardinality(expr)
     if period is not None:
-        return 1.0 / period
+        return budget / period
     if isinstance(expr.left, Col) and isinstance(expr.right, Col):
-        return _column_pair_equality(expr.left.name, expr.right.name, ndv, cfg, mcv)
+        return _column_pair_equality(expr.left.name, expr.right.name, ndv, cfg, mcv, budget)
     col = _column_of_comparison(expr)
     if col is not None and col in ndv and ndv[col] > 0:
         # Not a listed most-common value (that branch returned above), so the literal draws
         # from the residual mass the MCV table leaves — strictly below `1/ndv` on any skewed
         # column, which is exactly where the uniform estimate is most wrong.
-        return residual_eq_frequency(ndv[col], mcv.get(col), cfg.eq_selectivity)
-    return cfg.eq_selectivity
+        return residual_eq_frequency(ndv[col], mcv.get(col), cfg.eq_selectivity, non_null=budget)
+    return budget * cfg.eq_selectivity
 
 
 def _column_pair_equality(
@@ -454,6 +532,7 @@ def _column_pair_equality(
     ndv: dict[str, float],
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]],
+    non_null: float = 1.0,
 ) -> float:
     """`col_a = col_b` selectivity over one relation, sharpened by measured skew.
 
@@ -465,11 +544,15 @@ def _column_pair_equality(
     identity `mcv_join_rows` applies to a join, evaluated here as a fraction rather than a
     row count. It can only be used when *both* tables are present; otherwise the plain
     containment ratio stands.
+
+    `non_null` is the share of rows on which both columns hold a value; the equality is NULL,
+    and so dropped, on the rest. The MCV-decomposed term needs no scaling — those frequencies
+    are already shares of every row.
     """
     counts = [ndv[c] for c in (left, right) if c in ndv and ndv[c] > 0]
     if not counts:
-        return cfg.eq_selectivity
-    uniform = 1.0 / max(counts)
+        return non_null * cfg.eq_selectivity
+    uniform = non_null / max(counts)
     left_mcv, right_mcv = mcv.get(left), mcv.get(right)
     if not left_mcv or not right_mcv or left not in ndv or right not in ndv:
         return uniform

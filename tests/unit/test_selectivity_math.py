@@ -85,8 +85,12 @@ def test_a_predicate_and_its_negation_lose_the_null_rows():
 
 
 def test_inequality_drops_nulls():
-    # `x != 5` is TRUE only where x is non-null and unequal.
-    assert _s(bt.col("x") != 5, nulls=_NULLS) == pytest.approx(1.0 - 0.30 - 0.1)
+    # `x != 5` is TRUE only where x is non-null and unequal. The equality prior describes the
+    # *value* distribution, so it applies to the 70% of rows that hold a value: `x = 5` keeps
+    # `0.70 * 0.1`, and the inequality keeps the rest of that 70%.
+    non_null = 1.0 - _NULLS["x"]
+    assert _s(bt.col("x") == 5, nulls=_NULLS) == pytest.approx(non_null * 0.1)
+    assert _s(bt.col("x") != 5, nulls=_NULLS) == pytest.approx(non_null * (1.0 - 0.1))
 
 
 def test_is_null_uses_the_measured_null_fraction():
@@ -387,13 +391,25 @@ def test_negated_boolean_column_complements_the_true_fraction():
 
 def test_not_in_subtracts_the_null_mass():
     # `col NOT IN (...)` is NULL where col is NULL, so those rows are dropped like `NOT p`.
-    got = sel(~InList(bt.col("x"), (1, 2, 3)), {"x": 10.0}, _CFG, None, None, None, {"x": 0.3})
-    assert got == pytest.approx((1.0 - 0.3) - 0.3)
+    # `IN` itself keeps `3/10` of the rows that *hold a value*, so the two halves partition
+    # the non-null mass rather than the whole relation.
+    nulls = {"x": 0.3}
+    non_null = 1.0 - 0.3
+    positive = sel(InList(bt.col("x"), (1, 2, 3)), {"x": 10.0}, _CFG, None, None, None, nulls)
+    negated = sel(~InList(bt.col("x"), (1, 2, 3)), {"x": 10.0}, _CFG, None, None, None, nulls)
+    assert positive == pytest.approx(non_null * 0.3)
+    assert negated == pytest.approx(non_null * 0.7)
+    assert positive + negated == pytest.approx(non_null)
 
 
 def test_not_like_subtracts_the_null_mass():
-    got = sel(~bt.col("x").str.contains("a"), {}, _CFG, None, None, None, {"x": 0.3})
-    assert got == pytest.approx((1.0 - 0.3) - _CFG.substring_selectivity)
+    nulls = {"x": 0.3}
+    non_null = 1.0 - 0.3
+    positive = sel(bt.col("x").str.contains("a"), {}, _CFG, None, None, None, nulls)
+    negated = sel(~bt.col("x").str.contains("a"), {}, _CFG, None, None, None, nulls)
+    assert positive == pytest.approx(non_null * _CFG.substring_selectivity)
+    assert negated == pytest.approx(non_null * (1.0 - _CFG.substring_selectivity))
+    assert positive + negated == pytest.approx(non_null)
 
 
 def test_not_in_without_null_info_is_unchanged():

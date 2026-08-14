@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import datetime
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from batcher.kyber.stats.distribution import residual_eq_frequency
@@ -100,6 +100,7 @@ def _point_mass(
     value: Any,
     ndv: dict[str, float],
     mcv: dict[str, dict[str, float]],
+    non_null: float = 1.0,
 ) -> float:
     """`P(col = value)` — the probability mass sitting exactly on a range boundary.
 
@@ -108,6 +109,11 @@ def _point_mass(
     list (`residual_eq_frequency`) rather than the whole column's `1/ndv`. Zero when the
     distinct count is unknown, which degrades the strict/non-strict distinction back to none
     rather than inventing a mass.
+
+    The answer is a share of **all** rows, nulls included, which is the same space the CDF
+    it is subtracted from lives in (`_from_cdf`). A measured MCV frequency is already in that
+    space; the residual is put there by `non_null`, the fraction of rows the column is not
+    NULL on.
     """
     col_mcv = mcv.get(col)
     freq = _mcv_lookup(col_mcv, value)
@@ -116,7 +122,35 @@ def _point_mass(
     d = ndv.get(col)
     if not d or d <= 0:
         return 0.0
-    return residual_eq_frequency(d, col_mcv, default=0.0)
+    return residual_eq_frequency(d, col_mcv, default=0.0, non_null=non_null)
+
+
+def non_null_mass(col: str | None, nulls: Mapping[str, float] | None) -> float:
+    """The fraction of rows on which `col` holds a value rather than NULL.
+
+    The budget every value-distribution statistic is spread over. `ndv` counts distinct
+    *non-null* values (the sketch skips nulls), a quantile grid is built over the non-null
+    values, and `[min, max]` bounds them — so each of those answers a probability
+    *conditioned on the column being non-null*, and reporting it unconditionally over-states
+    every predicate on a nullable column by `1 / (1 - f_null)`.
+
+    Returns 1 for an unmeasured column, which is what `_null_mass` already assumes for the
+    complement side: an unmeasured column is usually null-free, and inventing a null fraction
+    would shrink every estimate on no evidence.
+
+    Args:
+        col: The column name, or None when the predicate reads no single column.
+        nulls: The measured `{column: null_fraction}` map.
+
+    Returns:
+        The non-null fraction, in `[0, 1]`.
+    """
+    if col is None or not nulls:
+        return 1.0
+    f = nulls.get(col)
+    if f is None:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 - f))
 
 
 def _outside_bounds(value: Any, bound: tuple[Any, Any] | None) -> bool:

@@ -18,6 +18,7 @@ from batcher.kyber.stats.selectivity.leaves import (
     _equality_selectivity,
     _in_list_selectivity,
     _measured_null_fraction,
+    _non_null_budget,
     _null_mass,
     _range_selectivity,
     _str_func_selectivity,
@@ -29,6 +30,7 @@ from batcher.kyber.stats.selectivity.scalars import (
     _ordinal,
     _point_mass,
     comparison_col_side,
+    non_null_mass,
 )
 from batcher.plan.expr_ir import (
     Binary,
@@ -102,15 +104,15 @@ def _raw_predicate_selectivity(
             coalesced = _coalesce_equality_selectivity(expr, ndv, cfg, mcv, nulls)
             if coalesced is not None:
                 return coalesced
-            return _equality_selectivity(expr, ndv, cfg, mcv, bounds)
+            return _equality_selectivity(expr, ndv, cfg, mcv, bounds, nulls)
         if op == "ne":
             # `col != v` is TRUE only where `col` is non-null and unequal. The null rows
             # are dropped, so the complement is taken over `1 - f_null`, not over 1.
             return (1.0 - _null_mass(expr, nulls)) - _equality_selectivity(
-                expr, ndv, cfg, mcv, bounds
+                expr, ndv, cfg, mcv, bounds, nulls
             )
         if op in ORDERING_COMPARISONS:
-            return _range_selectivity(expr, op, cfg, quantiles, bounds, ndv, mcv)
+            return _range_selectivity(expr, op, cfg, quantiles, bounds, ndv, mcv, nulls)
     if isinstance(expr, Not):
         inner = predicate_selectivity(expr.input, ndv, cfg, quantiles, mcv, bounds, nulls)
         return (1.0 - _null_mass(expr.input, nulls)) - inner
@@ -121,15 +123,15 @@ def _raw_predicate_selectivity(
         measured = _measured_null_fraction(expr, nulls)
         return 1.0 - (cfg.null_selectivity if measured is None else measured)
     if isinstance(expr, InList):
-        return _in_list_selectivity(expr, ndv, cfg, mcv, bounds)
+        return _in_list_selectivity(expr, ndv, cfg, mcv, bounds, nulls)
     if isinstance(expr, StrFunc):
-        return _str_func_selectivity(expr, ndv, cfg, mcv)
+        return _str_func_selectivity(expr, ndv, cfg, mcv, nulls)
     if isinstance(expr, ListContains):
         # The third container the same containment question is asked of, after a string and
         # a JSON document. It reached no branch at all and took the trailing "no information"
         # default, so `list.contains(x)` was estimated to keep ten times as many rows as
         # `str.contains(x)` — a difference in the *container's type*, not in the question.
-        return cfg.substring_selectivity
+        return _non_null_budget(expr, nulls) * cfg.substring_selectivity
     if isinstance(expr, Lit) and isinstance(expr.value, bool):
         # A constant predicate keeps everything or nothing — never the 0.5 "unknown" default.
         # (The folder usually removes these, but a `CASE` arm reaches here as a literal.)
@@ -172,7 +174,9 @@ def _raw_predicate_selectivity(
         freq = _mcv_lookup(mcv.get(expr.name), True)
         if freq is not None:
             return freq
-        return cfg.default_filter_selectivity
+        # A NULL flag is neither TRUE nor FALSE, so it is dropped: the even split is over the
+        # rows that carry a value, not over the whole relation.
+        return non_null_mass(expr.name, nulls) * cfg.default_filter_selectivity
     return cfg.default_filter_selectivity
 
 
@@ -216,6 +220,9 @@ def _coalesce_equality_selectivity(
     if coal is None or not coal.inputs or not isinstance(coal.inputs[0], Col):
         return None
     inner = coal.inputs[0]
+    # Deliberately *not* passed `nulls`: `COALESCE` has already replaced `x`'s null rows with
+    # the fill, and the branch below adds them back explicitly when the fill matches. Scaling
+    # here as well would remove them and then re-add a share of them.
     base = _equality_selectivity(Binary("eq", inner, lit), ndv, cfg, mcv)
     fill = coal.inputs[1] if len(coal.inputs) > 1 else None
     if isinstance(fill, Lit) and fill.value == lit.value:
@@ -334,7 +341,7 @@ def _conjunct_selectivities(
             others.append(c)
     sels = [predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in others]
     for col, comps in ranges.items():
-        combined = _interval_selectivity(col, comps, quantiles, bounds, ndv, mcv)
+        combined = _interval_selectivity(col, comps, quantiles, bounds, ndv, mcv, nulls)
         if combined is not None:
             sels.append(combined)
         else:
@@ -365,6 +372,7 @@ def _interval_selectivity(
     bounds: dict[str, tuple[Any, Any]],
     ndv: dict[str, float],
     mcv: dict[str, dict[str, float]],
+    nulls: dict[str, float] | None = None,
 ) -> float | None:
     """Selectivity of a set of same-column range comparisons as one interval.
 
@@ -382,6 +390,10 @@ def _interval_selectivity(
     bnd = bounds.get(col)
     if not q and bnd is None:
         return None
+    # The grid and the bounds describe the non-null values, so the interval's mass is a share
+    # of those; `budget` returns it to a share of the relation. A `BETWEEN` is NULL, and so
+    # dropped, on every null row.
+    budget = non_null_mass(col, nulls)
     lower_cdf, upper_cdf = 0.0, 1.0
     for c in comps:
         side = comparison_col_side(c)
@@ -395,13 +407,17 @@ def _interval_selectivity(
             frac = _fraction_below_bounds(x, bnd)
         if frac is None:
             return None
+        # Both the interpolated CDF and the boundary mass are held in the conditional
+        # (non-null) space here, so they subtract coherently; the single scaling is applied
+        # to the interval's width at the end.
+        point = _point_mass(col, value, ndv, mcv, non_null=budget) / budget if budget else 0.0
         if eff in ("lt", "le"):  # upper bound: keep the smallest (tightest ceiling)
-            cdf = frac if eff == "le" else frac - _point_mass(col, value, ndv, mcv)
+            cdf = frac if eff == "le" else frac - point
             upper_cdf = min(upper_cdf, cdf)
         else:  # gt / ge → lower bound: keep the largest (tightest floor)
-            cdf = frac - _point_mass(col, value, ndv, mcv) if eff == "ge" else frac
+            cdf = frac - point if eff == "ge" else frac
             lower_cdf = max(lower_cdf, cdf)
-    return clamp01(upper_cdf - lower_cdf)
+    return clamp01(budget * (upper_cdf - lower_cdf))
 
 
 def _exponential_backoff(sels: list[float]) -> float:
