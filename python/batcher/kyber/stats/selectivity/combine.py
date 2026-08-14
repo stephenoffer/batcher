@@ -14,6 +14,7 @@ from typing import Any
 
 from batcher._internal.mathx import clamp01
 from batcher.config import CardinalityConfig
+from batcher.kyber.stats.selectivity.arithmetic import interval_containment
 from batcher.kyber.stats.selectivity.leaves import (
     _equality_selectivity,
     _in_list_selectivity,
@@ -411,13 +412,20 @@ def _conjunct_selectivities(
     """
     ranges: dict[str, list[Binary]] = {}
     others: list[Expr] = []
-    for c in conjuncts:
+    sels: list[float] = []
+    contained = _interval_containment_selectivity(conjuncts, bounds, nulls)
+    remaining = conjuncts
+    if contained is not None:
+        selectivity, consumed = contained
+        sels.append(selectivity)
+        remaining = [c for c in conjuncts if not any(c is used for used in consumed)]
+    for c in remaining:
         col = _range_column(c)
         if col is not None:
             ranges.setdefault(col, []).append(c)  # type: ignore[arg-type]
         else:
             others.append(c)
-    sels = [predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in others]
+    sels += [predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in others]
     for col, comps in ranges.items():
         combined = _interval_selectivity(col, comps, quantiles, bounds, ndv, mcv, nulls)
         if combined is not None:
@@ -427,6 +435,59 @@ def _conjunct_selectivities(
                 predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in comps
             )
     return sels
+
+
+def _interval_containment_selectivity(
+    conjuncts: list[Expr],
+    bounds: dict[str, tuple[Any, Any]],
+    nulls: dict[str, float],
+) -> tuple[float, list[Expr]] | None:
+    """`probe BETWEEN lower AND upper` over three *columns*, estimated from the interval width.
+
+    The temporal-validity lookup — `WHERE ts >= valid_from AND ts < valid_to` — which is the
+    whole of an SCD-2 point-in-time join, an IP-range or version lookup, and the payload of a
+    range join. It is the one conjunction where independence is structurally wrong rather than
+    merely imprecise: `lower` and `upper` are the two ends of *one* interval and move together,
+    so each bound alone really does cut about half the rows while the pair cuts far more.
+
+    With the probe independent of the interval, the exact answer is an expectation, not a
+    product::
+
+        P(lower <= probe <= upper) = E[F(upper) - F(lower)] = (E[upper] - E[lower]) / range(probe)
+
+    under a uniform probe — the interval's *mean width* as a share of the probe's span, which
+    is the quantity neither conjunct mentions. Measured on a 100-wide interval inside a
+    1,000-wide domain: 0.247 estimated against 0.101 actual, and the formula gives 0.100.
+
+    Means are taken as bound midpoints, which is what uniformity already assumes everywhere
+    else here. Declines (None) unless all three columns have ordinal bounds and the probe's
+    span is positive, so anything unusual keeps the per-conjunct estimate.
+    """
+    match = interval_containment(list(conjuncts))
+    if match is None:
+        return None
+    probe, lower, upper, consumed = match
+    spans = [_ordinal_span(bounds.get(name)) for name in (probe, lower, upper)]
+    if any(span is None for span in spans):
+        return None
+    (p_lo, p_hi), (l_lo, l_hi), (u_lo, u_hi) = spans  # type: ignore[misc]
+    width = p_hi - p_lo
+    if width <= 0.0:
+        return None
+    mean_width = ((u_lo + u_hi) / 2.0) - ((l_lo + l_hi) / 2.0)
+    # Each of the three operands must hold a value for the comparison to be TRUE.
+    budget = min(non_null_mass(name, nulls) for name in (probe, lower, upper))
+    return clamp01(budget * mean_width / width), consumed
+
+
+def _ordinal_span(bound: tuple[Any, Any] | None) -> tuple[float, float] | None:
+    """A column's `[min, max]` as a pair of ordinals, or None when it is not comparable."""
+    if bound is None or bound[0] is None or bound[1] is None:
+        return None
+    lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
+    if lo is None or hi is None or hi < lo:
+        return None
+    return lo, hi
 
 
 def _range_column(expr: Expr) -> str | None:

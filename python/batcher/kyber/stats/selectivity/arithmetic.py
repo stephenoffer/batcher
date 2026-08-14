@@ -28,7 +28,12 @@ from typing import Any
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit, MathExpr
 from batcher.plan.ir_tags import ORDERING_FLIP
 
-__all__ = ["invert_arithmetic", "modulo_domain", "symmetric_interval"]
+__all__ = [
+    "interval_containment",
+    "invert_arithmetic",
+    "modulo_domain",
+    "symmetric_interval",
+]
 
 # The comparisons whose direction reverses when both sides are multiplied by a negative
 # number, or when the column moves to the other side of the operator.
@@ -182,3 +187,56 @@ def symmetric_interval(expr: Binary) -> tuple[Expr, float, str] | None:
     if op not in ORDERING_FLIP:
         return None
     return inner.input, literal, op
+
+
+def interval_containment(conjuncts: list) -> tuple[str, str, str, list] | None:
+    """`(probe, lower, upper, consumed)` for a `probe BETWEEN lower AND upper` over *columns*.
+
+    The temporal-validity lookup: `WHERE ts >= valid_from AND ts < valid_to`. It is the whole
+    of an SCD-2 point-in-time join (`ds.scd`), an IP-range or version-range lookup, and the
+    payload of every range join — and it is the one conjunction where independence is not
+    merely imprecise but structurally wrong, because `lower` and `upper` are the two ends of
+    *one* interval and move together.
+
+    Estimated as two independent comparisons, `t >= lo AND t <= hi` over a 100-wide interval
+    inside a 1,000-wide domain came out at 0.247 of the join against 0.101 actual: both halves
+    look like coin flips because each bound alone really does cut about half the rows. What
+    decides the answer is the interval's *width*, which neither conjunct mentions.
+
+    Returns None unless exactly this shape is present: two column-to-column ordering
+    comparisons sharing one probe column, bounding it below and above by two *different*
+    columns. Anything else keeps the ordinary per-conjunct estimate.
+
+    Args:
+        conjuncts: The conjuncts of one `AND`.
+
+    Returns:
+        The probe, lower-bound and upper-bound column names plus the conjuncts consumed, or
+        None when the shape does not match.
+    """
+    constraints = []
+    for conjunct in conjuncts:
+        if not (isinstance(conjunct, Binary) and conjunct.op in ORDERING_FLIP):
+            continue
+        left, right = conjunct.left, conjunct.right
+        if isinstance(left, Col) and isinstance(right, Col) and left.name != right.name:
+            constraints.append((left.name, conjunct.op, right.name, conjunct))
+    if len(constraints) < 2:
+        return None
+    for probe in {c[0] for c in constraints} | {c[2] for c in constraints}:
+        lower = upper = None
+        used: list = []
+        for a, op, b, node in constraints:
+            if a == probe and b != probe:
+                bound, other = ("lower", b) if op in ("ge", "gt") else ("upper", b)
+            elif b == probe and a != probe:
+                bound, other = ("lower", a) if op in ("le", "lt") else ("upper", a)
+            else:
+                continue
+            if bound == "lower" and lower is None:
+                lower, _ = other, used.append(node)
+            elif bound == "upper" and upper is None:
+                upper, _ = other, used.append(node)
+        if lower is not None and upper is not None and lower != upper:
+            return probe, lower, upper, used
+    return None
