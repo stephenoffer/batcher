@@ -1140,11 +1140,16 @@ class StatsEstimator:
         decomposed = self._mcv_join_rows(node, left, right, left_ndv, right_ndv)
         if decomposed is not None:
             return self._range_scaled(node, left, right, decomposed)
+        # An equi-join matches only rows whose key holds a value, so the sizes that meet in
+        # the ratio are the non-null ones. Without this the estimate did not move at all as
+        # the null fraction rose — over-stating a join on two 60%-null keys by 6.6x.
+        left_rows = left.rows * _key_non_null(node.left_keys, left)
+        right_rows = right.rows * _key_non_null(node.right_keys, right)
         ndvs = [v for v in (left_ndv, right_ndv) if v is not None and v > 0]
         if ndvs:
             # With only one side's ndv known, `max(d_L, d_R) >= d_known`, so dividing by
             # the known one over-estimates — the safe direction (over-budget, never OOM).
-            selinger = min(left.rows * right.rows / max(ndvs), left.rows * right.rows)
+            selinger = min(left_rows * right_rows / max(ndvs), left_rows * right_rows)
             # ...but only up to the **unique-key bound**, which is not a heuristic: if one
             # side's key is unique, every row of the other side matches at most one row, so
             # the result cannot exceed that other side's rows. Over-budgeting is the safe
@@ -1162,8 +1167,10 @@ class StatsEstimator:
             capped = min(selinger, _unique_key_row_cap(left, right, left_ndv, right_ndv))
             return self._range_scaled(node, left, right, max(capped, skew))
         # No distinct counts at all: assume the key is ~unique on the smaller side, so the
-        # result is ≈ the larger side.
-        return max(left.rows, right.rows, skew)
+        # result is ≈ the larger side — but never more than the two sides' *matchable* rows
+        # could produce between them. That cartesian bound is not a heuristic, and it is what
+        # makes an all-null key join to nothing instead of to the larger side's row count.
+        return min(max(left_rows, right_rows, skew), left_rows * right_rows)
 
     def _mcv_join_rows(
         self,
@@ -1192,6 +1199,8 @@ class StatsEstimator:
             rstat.mcv,
             left_ndv or lstat.ndv,
             right_ndv or rstat.ndv,
+            _key_non_null(node.left_keys, left),
+            _key_non_null(node.right_keys, right),
         )
 
     def _range_scaled(self, node: Join, left: RelStats, right: RelStats, rows: float) -> float:
@@ -1673,6 +1682,25 @@ def _ordinal_range(stat: ColumnStat) -> tuple[float, float] | None:
     if lo is None or hi is None or hi < lo:
         return None
     return lo, hi
+
+
+def _key_non_null(keys: tuple, stats: RelStats) -> float:
+    """The share of rows whose whole join key holds a value.
+
+    A row matches only when **every** key column is non-null (`NULL = NULL` is not true), so
+    the binding figure is the *smallest* non-null share across the key's columns. An
+    unmeasured column contributes 1, which is the assumption the rest of the estimator makes
+    for a missing null count.
+    """
+    if not keys or stats.rows <= 0:
+        return 1.0
+    shares = []
+    for name in keys:
+        stat = stats.columns.get(name)
+        if stat is None or stat.null_count is None:
+            continue
+        shares.append(1.0 - min(1.0, max(0.0, stat.null_count / stats.rows)))
+    return min(shares) if shares else 1.0
 
 
 def _provably_empty(stats: RelStats) -> bool:

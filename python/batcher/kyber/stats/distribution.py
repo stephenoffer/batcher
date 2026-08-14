@@ -270,6 +270,8 @@ def mcv_join_rows(
     right_mcv: Mapping[str, float] | None,
     left_ndv: float | None,
     right_ndv: float | None,
+    left_non_null: float = 1.0,
+    right_non_null: float = 1.0,
 ) -> float | None:
     """Equi-join output rows, decomposing the key distribution into skew and residual.
 
@@ -296,6 +298,12 @@ def mcv_join_rows(
     one of its right-side rows — and that shape is common: a fact table skewed toward one
     customer joined to a dimension skewed toward a different one.
 
+    A NULL key is not a value and never matches, so the residual each side's unlisted values
+    share is its **non-null** mass. Spreading the whole of `1 - Σ f` over them instead hands
+    the null rows to the join: measured on a single-key join over two 60%-null keys, the
+    estimate was 172,134 rows against 26,181 actual and did not move at all as the null
+    fraction rose, because every null row was still being matched against every other.
+
     The model's one real assumption is that a value listed on one side but not the other has
     only residual frequency on that side. A frequency table records heavy hitters, so a value
     just below the threshold is priced slightly low; that is the standard trade every
@@ -309,13 +317,17 @@ def mcv_join_rows(
         right_mcv: Right key's measured frequency table.
         left_ndv: Left key's distinct count.
         right_ndv: Right key's distinct count.
+        left_non_null: Share of left rows whose key holds a value. A NULL key matches nothing
+            in an equi-join, so it is not part of the residual the unlisted values share.
+        right_non_null: The same for the right key.
 
     Returns:
         The estimated output rows, or None when either side has no usable MCV table.
     """
     if not left_mcv or not right_mcv:
         return None
-    m_left, m_right = residual_mass(left_mcv), residual_mass(right_mcv)
+    m_left = residual_mass(left_mcv, left_non_null)
+    m_right = residual_mass(right_mcv, right_non_null)
     n_left = _residual_domain(left_ndv, len(left_mcv))
     n_right = _residual_domain(right_ndv, len(right_mcv))
     # Per-value probability inside each side's residual, 0 when the MCV table already
