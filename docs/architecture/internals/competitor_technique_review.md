@@ -904,13 +904,22 @@ reaches every `GROUP BY`, every `DISTINCT` and every partitioned window at once.
 
 Two things about it are worth keeping; one is worth *not* repeating.
 
-**Worth keeping (1): it proves the ordering instead of being told.** Polars reads a flag —
-a promise from the planner or the user. The equivalent source here would be
-`RelStats.sorted_by`, which for a lakehouse table is metadata **nothing enforces on write**.
-Believing it when false is not a slow answer but a silently wrong one: one key split across two
-non-adjacent runs is emitted as two groups. So the scan establishes monotonicity itself, on
-every aggregate, declared or not. It is a stronger design than the one it was copied from, and
-it is the reason no IR flag and no Kyber rule were needed for this half.
+**Worth keeping (1): it establishes the ordering instead of trusting or buying it.** The first
+draft of this entry said Polars "reads a flag", which is wrong, and the correction is the most
+useful thing in this section. Polars' planner *tracks* sortedness
+(`polars-plan/src/plans/optimizer/sortedness.rs`), derives it from a `Sort` in the plan or an
+explicit user hint, and deliberately does **not** derive it from a scan — `IR::Scan => None`.
+When the keys are not already sorted, `try_build_sorted_group_by` **inserts a `Sort`** and runs
+the same node. Polars therefore either knows the order because the plan produced it, or pays to
+create it. Neither is careless, and this document should not have implied otherwise.
+
+Batcher's equivalent declaration is `RelStats.sorted_by`, and that one *does* carry a lakehouse
+table's declared sort key — metadata **nothing enforces on write**. Believing it when false is
+not a slow answer but a silently wrong one: one key split across two non-adjacent runs is
+emitted as two groups. So this takes a third option Polars cannot take as cheaply, because it
+sits below the planner: establish the ordering per batch, which costs nothing when it does not
+hold, needs no `Sort`, and is the reason **no IR flag and no Kyber rule were needed** for this
+half.
 
 **Worth keeping (2): a sampled gate is not a cheap exact scan, and the difference is 4x.** The
 first implementation gated on a fixed 64-pair prefix before committing to a detection pass. A
@@ -951,6 +960,31 @@ about the data, and that distinction — not the adjacency scan — is what the 
 to get right. `stream/breaker.rs` is where it lands: the streaming aggregate does not spill, it
 refuses (`"the streaming aggregate does not spill"`), so bounding its state is what converts a
 refused query into a completed one.
+
+**And the value of that half is smaller than this entry has claimed since 2026-08-04, which is
+worth settling before anyone spends a session on it.** The claim has been that a sorted
+group-by "turns a spilling aggregate into a streaming one". Check what it is being compared
+against: the *materializing* aggregate already spills — `bc_runtime::agg::spill` is real and
+`spill_split.rs`, `join_par.rs`, `window_spill.rs`, `distinct_on_spill.rs` and `dist.rs` all
+use it. Large aggregates are therefore not failing today; they are paying disk. So the prize is
+**avoiding a spill**, not rescuing a query, everywhere except the narrower case where the
+streaming path was chosen and then refused.
+
+That reframes the cost/benefit sharply, because of the soundness constraint above. Early
+emission is sound only when the ordering is a fact about the plan, and the way to *make* it a
+fact is to sort. **Polars is the precedent to read here, not Spark**, and it is a closer one
+than this document realized: `try_build_sorted_group_by` inserts a `Sort` when the keys are not
+already ordered, which is exactly the design the paragraph above arrives at. Note what Polars
+does with it, though — behind `POLARS_FORCE_SORTED_GROUP_BY` when the keys are *not* already
+sorted, and taken unasked when they are. That gating is the honest reading of the trade:
+sorting in order to avoid a spill costs at least as much as the spill it removes, so it pays
+where the plan was going to sort anyway and is opt-in otherwise.
+
+What is left that is unambiguously worth having is therefore narrow and should be scoped that
+way: an aggregate **directly above a `Sort` the engine itself performed**, where the ordering
+is free and already paid for. Anything wider needs a number first — specifically, the cost of
+sorting against the cost of the spill it removes, on a shape where the streaming aggregate
+currently refuses.
 
 ### 10g. A caution about probing this optimizer with a stopwatch
 

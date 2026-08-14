@@ -8,14 +8,22 @@
 //!
 //! # Why this verifies rather than trusts
 //!
-//! Polars ships the same specialization (`nodes/sorted_group_by.rs`) and reaches it from a
-//! *flag* on the column — a promise made by the planner or by the user. A promise is exactly
-//! what this module refuses to take. Sortedness would otherwise come from `RelStats.sorted_by`,
-//! which for a lakehouse table is a declaration in table metadata that nothing enforces on
-//! write; believing it when it is false does not produce a slow answer, it produces a **wrong**
-//! one, silently, because one key split across two non-adjacent runs is emitted as two groups.
+//! Polars ships the same specialization (`polars-stream/src/nodes/sorted_group_by.rs`) and
+//! answers the same question differently, in a way worth stating accurately because it is a
+//! *good* answer rather than a careless one. Its planner tracks sortedness
+//! (`polars-plan/src/plans/optimizer/sortedness.rs`) and derives it from a `Sort` in the plan
+//! or an explicit user hint — and pointedly **not** from a scan, where `IR::Scan => None`. When
+//! the keys are not already sorted it does not guess: `try_build_sorted_group_by` **inserts a
+//! `Sort`** and uses the same node. So Polars either knows the order because the plan produced
+//! it, or it creates it.
 //!
-//! So the property is *established*, on every aggregate, whether or not anything declared it:
+//! This module takes the third option, which is available because it sits lower down. Batcher's
+//! equivalent declaration would be `RelStats.sorted_by`, and unlike Polars' sources that one
+//! *does* carry a lakehouse table's declared sort key — metadata nothing enforces on write.
+//! Believing it when false does not produce a slow answer, it produces a **wrong** one,
+//! silently, because one key split across two non-adjacent runs is emitted as two groups. So
+//! rather than trust that or pay for a sort, the ordering is *established* per batch, which
+//! costs nothing when it does not hold and needs no planner support at all:
 //!
 //! 1. Adjacent rows are compared with arrow's vectorized kernels, **in chunks**, and the scan
 //!    stops at the first chunk containing a violation. Unordered input is rejected after one
