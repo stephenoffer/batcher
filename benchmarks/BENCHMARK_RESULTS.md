@@ -1,5 +1,156 @@
 # Batcher CPU benchmark results
 
+## Auditing the benchmark itself: the correctness gate could not see a sort, five ClickBench queries are not executed, and Spark was measured on a configuration nobody would run (2026-08-15)
+
+A benchmark that flatters the engine it measures is worse than no benchmark, so this session
+stopped and audited the harness against the engines rather than the engines against each
+other. Five findings, four of them fixed here and one that is a property of the design and is
+now written down instead of left to be discovered.
+
+### 1. The gate compared row multisets, so a sort that never happened still passed
+
+`harness.compare` canonicalizes both results and **sorts them on every column** before
+comparing, which is right for a query that asked for no order and is a hole for every query
+that did:
+
+```python
+>>> results_match(pa.table({"c": ["a", "b", "c"]}), pa.table({"c": ["c", "a", "b"]}))
+(True, 'ok')
+```
+
+An engine that ran `SELECT l_comment FROM lineitem ORDER BY l_comment` and returned the rows
+untouched passed the gate and was then **timed** — reported as a win on a sort it did not
+perform. This is precisely the failure `CLAUDE.md` names ("never assert a sort with an
+order-independent comparison"), sitting in the harness that judges the engine, and it covered
+the four `ops-ordering` cases plus every `ORDER BY ... LIMIT` in TPC-H, TPC-DS and ClickBench.
+
+`harness/order.py` now checks each engine's result for **monotonicity in its own order**
+against the query's `ORDER BY`, parsed from the SQL (and declared on the four native cases).
+Two deliberate omissions keep a false failure impossible: ties are unspecified by SQL, so
+positions are never compared between engines, and null *placement* differs by engine (DuckDB
+puts nulls last in both directions, PostgreSQL splits by direction) so any pair whose deciding
+key is null on either side is skipped. A key that cannot be resolved to an output column stops
+the check there rather than guessing.
+
+**Nothing failed.** All 203 cases — 99 TPC-DS, 43 ClickBench, 22 TPC-H, 19 operators, 15 H2O,
+5 JSON — pass the order check, for Batcher and for every comparator. So this closed a hole
+rather than catching a defect, which is the outcome worth having and not the one worth
+assuming: the check was proved to work on constructed unsorted, tied, null-bearing and
+descending inputs first.
+
+Writing it did produce one bug of its own, and it is instructive. Treating "one side is null"
+as a *tie* passed the pair to the next key, which then judged it — and nine TPC-DS queries
+"failed", **for DuckDB exactly as loudly as for Batcher**. A checker that accuses the oracle is
+announcing its own defect; had it accused only Batcher it would have looked like a finding.
+
+### 2. Five ClickBench queries and two operator cases are answered, not executed
+
+Batcher answers an unfiltered aggregate over an immutable in-memory relation from a recorded
+column statistic instead of running the plan. The statistic is computed **by the first run of
+that query** and read back by every later one, and the harness times best-of-5:
+
+| | run 1 | run 2 | run 3+ | fresh source each run |
+|---|---:|---:|---:|---:|
+| `SUM(l_extendedprice)` over 6M rows | 178 ms | 0.83 | **0.13** | 5.0 |
+| `COUNT(*) WHERE l_quantity > 30` | 30 ms | 1.27 | **0.22** | 6.1 |
+
+Instrumenting `metadata_aggregate_table` over every registered case, **7 of 7 runs** are
+answered this way for `op-global-sum`, `op-filter-count` and ClickBench `q01`-`q05`. Every one
+of them is **exact** — they match DuckDB, including the two `COUNT(DISTINCT)`s — so this is a
+reporting problem and not a correctness one. But `op-global-sum` reads *0.1 ms against DuckDB's
+1.3*, and the honest figure for computing that sum is ~5 ms, which is 3.8x **slower** than
+DuckDB, not 13x faster.
+
+It is a real engine capability and a real user-visible latency, so it is not removed. What
+changes is that the geomean is quoted both ways:
+
+| suite | as reported | excluding the metadata-answered cases |
+|---|---:|---:|
+| ClickBench (43) | 0.607x | **0.772x** over 38 |
+| operators (19) | 0.662x | **0.765x** over 17 |
+
+The five ClickBench cases average **0.097x** between them. Quote the second column when the
+claim is about execution speed. (`cb-q06`, `MIN`/`MAX` over a date, is *not* in that set: DuckDB
+answers it from its own zone maps, so that one is a fair fight.)
+
+### 3. DuckDB pays a result-to-Arrow conversion that Batcher does not
+
+Every engine is asked for a `pyarrow.Table`, and Batcher's engine emits Arrow natively while
+DuckDB converts out of its own vectors. On H2O `join` q5 (9M rows, 13 columns):
+
+| | ms |
+|---|---:|
+| full query -> Arrow | 242.8 |
+| scanning the *already-materialized* result -> Arrow | **125.4** |
+| counting that same result (no conversion) | 1.0 |
+
+So roughly **half** of DuckDB's number on a large-result query is the conversion. This is not
+fixed, and the reason is worth stating: `to_arrow_table()` is DuckDB's *cheapest* full
+materialization — `CREATE TABLE AS` costs 3,023 ms on the same query — so the harness already
+hands it its best option. The benchmark's contract is "produce the answer in the common
+interchange format", and Batcher wins part of the large-result cases because its native format
+*is* that format (invariant #3). That is a genuine architectural advantage rather than a
+measurement artifact, but a reader comparing these numbers against a published DuckDB result
+would be misled, so: **on a query returning millions of rows, discount the comparator by the
+conversion.** Small-result queries — most of TPC-H and ClickBench — are unaffected.
+
+### 4. Spark was measured on a configuration nobody would run
+
+Three handicaps, none of which change who wins and all of which a fair comparison has to
+remove anyway:
+
+* **A pandas round trip.** `_to_arrow` did `pa.Table.from_pandas(sdf.toPandas())`. With Arrow
+  transfer enabled, `toPandas()` already collects Arrow and converts it to pandas, which the
+  outer call converts straight back — two full materializations charged to Spark per run.
+  `DataFrame.toArrow()` (PySpark 4.0+) stops at the first.
+* **`spark.sql.shuffle.partitions = 8`** on a 96-core box, leaving 88 cores idle through every
+  shuffle. Measured at 8 / 96 / 200: q18 **960 / 697 / 710 ms**, q1 456 / 370 / 403, q9
+  1,136 / 1,060 / 1,040. Now one partition per core.
+* **Re-reading Parquet on every query** while DuckDB queried native tables and Batcher and
+  Polars queried resident Arrow. `CACHE TABLE` at registration is the untimed counterpart of
+  DuckDB's `CREATE TABLE AS`: q9 **1,136 -> 658 ms**, q6 131 -> 95.
+
+Together, TPC-H sf1: q9 998 -> 682 ms, q18 935 -> 647, q14 418 -> 263, q16 515 -> 897 (worse,
+and inside its own spread). Spark remains 20-50x behind at this scale, which is what local-mode
+Spark on 6M rows is — its floor is ~90 ms of fixed per-query cost — but it is now behind on a
+configuration that can be defended.
+
+Spark had never actually run in this environment (`available()` was False: the wheel is
+installed, the JVM was not), so every Spark comparison in this file predates a JVM being
+present here. One is now installed.
+
+### 5. `duckdb_arrow` was documented as reported and was in no default run
+
+The README's methodology says both DuckDB bars are reported — `duckdb` on its native
+compressed store ("DuckDB at its best") and `duckdb_arrow` on the same zero-copy Arrow Batcher
+executes over ("the like-for-like execution bar"). The default lineup contained only the first.
+That was not flattering — the native store is the *harder* bar — but the stated methodology was
+not what ran. Both are now in the default single-node lineup:
+
+| TPC-H sf1 | geomean | wins |
+|---|---:|---|
+| `b/duckdb` (native store) | 0.822x | 15/22 |
+| `b/duckdb_arrow` (same Arrow input) | **0.286x** | 22/22 |
+
+`b/duckdb` stays the number to quote. `b/duckdb_arrow` is what separates DuckDB's storage
+engine from its execution engine, and on identical bytes Batcher's execution is 3.5x faster.
+
+### What the audit did not find
+
+Worth recording, because each was checked rather than assumed: every engine gets the identical
+warm-up (one correctness run, then one warm-up and five timed); the operator mix fans **one**
+SQL string to every SQL engine including Batcher, so there is no hand-tuned Batcher pipeline
+racing a comparator's SQL; the float tolerance (`atol` 1.5e-6, `rtol` 1e-9) is tight enough that
+TPC-H's ~1e8 revenues are compared to one part in 10^9; and `cannot_run` — the mechanism that
+excludes an engine from a case — is used four times, all for Daft being `SIGKILL`ed on an
+ordered 6M-row window, all disclosed in the run's own `PARTIAL` lines.
+
+Two asymmetries that remain and favour Batcher, both inherent rather than fixable: Batcher's
+`Session` carries a plan cache and a learned-stats loop across the suite's repeated runs, which
+DuckDB and Polars have no counterpart to; and the harness reports **best-of-5 of the same
+query**, which is the standard methodology and is exactly the shape a memoizing engine wins.
+Read these numbers as warm, repeated-query numbers, because that is what they are.
+
 ## Twelve ways the engine threw away work it had already done — TPC-DS 1.510x -> 1.18x, TPC-H 0.962x -> 0.83x, seven ClickBench queries that could not run at all, and q45 from 7.34x to 1.02x (2026-08-14)
 
 Every single-node suite measured on the 96-core / 184 GiB box against DuckDB's native

@@ -47,7 +47,15 @@ _ADAPTERS: dict[str, Engine] = {
 # it among the systems Batcher positions against, so a default run must not emit a column
 # that reads as a published comparison. Pass `--engines ...,ray` to measure against it
 # deliberately.
-_DEFAULT_SINGLE = ("batcher", "duckdb", "polars", "pyarrow", "daft")
+# `duckdb_arrow` is in the default lineup because the README's own methodology says both
+# DuckDB bars are reported — `duckdb` on its native compressed store ("DuckDB at its best")
+# and `duckdb_arrow` on the same zero-copy Arrow Batcher executes over ("the like-for-like
+# execution bar") — and a bar no default run measures is a bar nobody reads. Leaving it out
+# was not flattering: the native store is the *harder* of the two for Batcher, so the
+# headline `b/duckdb` ratio understated the engine while the claim that both were reported
+# went unmet. `b/duckdb` remains the number to quote; `b/duckdb_arrow` is what separates
+# DuckDB's storage engine from its execution engine.
+_DEFAULT_SINGLE = ("batcher", "duckdb", "duckdb_arrow", "polars", "pyarrow", "daft")
 _DEFAULT_MULTI = ("batcher", "daft")
 
 

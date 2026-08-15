@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 ordering = suite("ops-ordering", dataset="operators")
 
 
-@ordering.case("op-sort-limit")
+@ordering.case("op-sort-limit", ordered_by="l_extendedprice DESC, l_orderkey, l_linenumber")
 def sort_limit(ctx: Context):
     """Top-100 line items by extended price, tie-broken for a deterministic result."""
     sql = (
@@ -50,7 +50,7 @@ def sort_limit(ctx: Context):
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
 
-@ordering.case("op-sort-string")
+@ordering.case("op-sort-string", ordered_by="l_comment")
 def sort_string(ctx: Context):
     """Full sort on one high-cardinality string key — the shape with no coverage until now.
 
@@ -75,7 +75,7 @@ def sort_string(ctx: Context):
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
 
-@ordering.case("op-sort-string-lowcard")
+@ordering.case("op-sort-string-lowcard", ordered_by="l_shipmode")
 def sort_string_lowcard(ctx: Context):
     """Full sort on a low-cardinality string key, where range-partitioning has little to cut on.
 
@@ -96,7 +96,7 @@ def sort_string_lowcard(ctx: Context):
     return with_native(ctx, sql_fanout(ctx, sql), pyarrow=pyarrow, ray=ray)
 
 
-@ordering.case("op-sort-string-limit")
+@ordering.case("op-sort-string-limit", ordered_by="l_comment, l_orderkey, l_linenumber")
 def sort_string_limit(ctx: Context):
     """Top-100 by a string key, tie-broken so the surviving rows are a single answer.
 

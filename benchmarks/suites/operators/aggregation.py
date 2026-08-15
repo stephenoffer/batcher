@@ -72,7 +72,20 @@ def groupby_2key(ctx: Context):
 
 @agg.case("op-global-sum")
 def global_sum(ctx: Context):
-    """Global SUM(l_extendedprice) — a single mergeable reduction."""
+    """Global SUM(l_extendedprice) — a single mergeable reduction.
+
+    **Batcher does not execute this case, and its number must not be read as if it did.**
+    An unfiltered aggregate over a bare column of an immutable in-memory relation is
+    answered from a recorded column statistic, and that statistic is computed by the
+    *first* run and read back by every later one — so the harness's best-of-5 measures a
+    memo lookup (0.1 ms) where DuckDB scans the column (1.3 ms). Computing the sum takes
+    Batcher ~5 ms, which is 3.8x slower than DuckDB rather than 13x faster.
+
+    The shortcut is a real capability and a real user-visible latency, so it stays; what
+    must not happen is quoting 0.10x as an execution ratio. `op-filter-count` below and
+    ClickBench q01-q05 are the same shape; `BENCHMARK_RESULTS.md` carries the suite
+    geomeans with and without them.
+    """
     sql = "SELECT SUM(l_extendedprice) AS s FROM lineitem"
 
     def pyarrow(t: pa.Table) -> pa.Table:
@@ -86,7 +99,11 @@ def global_sum(ctx: Context):
 
 @agg.case("op-filter-count")
 def filter_count(ctx: Context):
-    """COUNT(*) WHERE l_quantity > 25 — a streaming filter reduced to a scalar."""
+    """COUNT(*) WHERE l_quantity > 25 — a streaming filter reduced to a scalar.
+
+    Answered from a memoized statistic on every run, exactly as `op-global-sum` above is,
+    and with the same caveat: 0.22 ms measured against ~6.1 ms to actually count.
+    """
     sql = "SELECT COUNT(*) AS n FROM lineitem WHERE l_quantity > 25"
 
     def pyarrow(t: pa.Table) -> pa.Table:

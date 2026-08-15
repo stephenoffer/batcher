@@ -112,7 +112,13 @@ def _session():
         .appName("batcher-bench")
         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
         .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "8")
+        # One shuffle partition per core. Spark's own default is 200, which is sized for a
+        # cluster and adds task overhead here; the 8 this used to pin was the opposite error
+        # and left 88 of 96 cores idle through every shuffle stage. Measured on TPC-H sf1 at
+        # 8 / 96 / 200 partitions: q18 **960 / 697 / 710 ms**, q1 456 / 370 / 403, q9
+        # 1,136 / 1,060 / 1,040 — the core count is at or near the best on every query, and
+        # it is the figure that travels to a machine of a different size.
+        .config("spark.sql.shuffle.partitions", str(os.cpu_count() or 8))
         # S3A: pin the region and let the connector's *default* credential chain resolve
         # creds (env vars + instance profile), same as the AWS CLI / DuckDB loader. The
         # provider is deliberately left unset: hadoop-aws 3.4 uses AWS SDK v2, whose
@@ -125,16 +131,49 @@ def _session():
 
 
 def _to_arrow(sdf) -> pa.Table:
-    """Materialize a Spark DataFrame as an Arrow table (pandas bridge for portability)."""
-    return pa.Table.from_pandas(sdf.toPandas(), preserve_index=False)
+    """Materialize a Spark DataFrame as an Arrow table.
+
+    Every engine here is asked for a `pyarrow.Table`, so whatever each spends getting to one
+    is inside its timing. Spark's must therefore be its *cheapest* path to Arrow, and going
+    through pandas — which is what this did — is not it: with
+    `spark.sql.execution.arrow.pyspark.enabled` on, `toPandas()` already collects Arrow
+    batches and then converts them to pandas, which `pa.Table.from_pandas` converts straight
+    back. That is two full materializations of the result charged to Spark for nothing, on
+    every timed run, and on a large result it is the larger part of the measurement.
+
+    `DataFrame.toArrow()` (PySpark 4.0+) stops at the Arrow table. Older PySpark keeps the
+    pandas bridge, because there the private `_collect_as_arrow` is the only alternative and
+    a benchmark must not reach into an engine's internals to make it look better.
+    """
+    to_arrow = getattr(sdf, "toArrow", None)
+    return (
+        to_arrow()
+        if to_arrow is not None
+        else pa.Table.from_pandas(sdf.toPandas(), preserve_index=False)
+    )
 
 
 def _register_parquet(spark, name: str, table: pa.Table) -> None:
-    """Write `table` to a temp Parquet file and expose it to Spark SQL as `name`."""
+    """Write `table` to a temp Parquet file, expose it to Spark SQL as `name`, and cache it.
+
+    The Parquet round-trip is Spark's real ingest path and avoids `createDataFrame`'s
+    row-by-row serialization through the driver JVM (see the module docstring). But left at
+    that, the temp view is a *scan*, so every timed query re-opened and re-decoded the file
+    while DuckDB queried its native tables and Batcher and Polars queried resident Arrow.
+    That is not the same benchmark: Spark alone was being charged an I/O pass per run.
+
+    `CACHE TABLE` is eager, so the materialization lands here — untimed, exactly like
+    DuckDB's `CREATE TABLE AS` ingest and Batcher's already-resident Arrow. Measured on
+    TPC-H sf1, uncached against cached: **q9 1,136 -> 658 ms**, q6 131 -> 95, q1 456 -> 394.
+
+    A corpus too large for Spark's storage fraction is evicted and recomputed, which is
+    Spark's own behaviour and degrades to what this did before rather than failing.
+    """
     path = os.path.join(_scratch(), f"{name}.parquet")
     if not os.path.exists(path):
         pq.write_table(table, path)
     spark.read.parquet(path).createOrReplaceTempView(name)
+    spark.sql(f"CACHE TABLE {name}")
 
 
 class SparkEngine(Engine):

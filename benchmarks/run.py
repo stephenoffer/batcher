@@ -244,7 +244,9 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
     results = []
     for case in cases:
         print(f"running {case.name} ...", flush=True)
-        results.append(compare(case.name, case.build(ctx), names, runs=runs))
+        results.append(
+            compare(case.name, case.build(ctx), names, runs=runs, ordered_by=case.ordered_by)
+        )
     if args.isolate_case is not None:
         for result in results:
             emit_result(result)

@@ -2799,7 +2799,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/finalize.rs` | 63 | The finalize dispatch — turning each aggregate's merged partial into its output column. |
 | `agg/fused.rs` | 638 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1370 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 535 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/combine.rs` | 542 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
@@ -2812,7 +2812,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 428 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 287 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `error.rs` | 112 | The crate's error type: how the stateful runtime structures report failure. |
-| `gather.rs` | 635 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
+| `gather.rs` | 749 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 246 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
