@@ -393,6 +393,23 @@ pub(crate) fn hash_join_indices_impl(
         ));
     }
 
+    // Three-or-more-`Int64`-key fast path: the same raw-value treatment as the one- and
+    // two-column cases above, for the composite surrogate key a star-schema fact-to-fact
+    // join carries. See [`I64xNKeys`]. No radix arm: its scalar key must be `Copy`, and an
+    // N-column key has no such value.
+    if let Some(keys) = I64xNKeys::try_new(left_keys, right_keys) {
+        return Ok(build_probe_flat(
+            &keys,
+            left_rows,
+            right_rows,
+            &left_null,
+            &right_null,
+            join_type,
+            use_bloom,
+            bloom_fp_rate,
+        ));
+    }
+
     // Single string/binary key fast path: hash and compare the raw bytes instead of
     // encoding every row of both sides through the `RowConverter`. See [`BytesKeys`].
     with_bytes_keys!(left_keys, right_keys, |keys| {
@@ -571,6 +588,86 @@ impl JoinKeys for I64x2Keys<'_> {
     }
     fn right_eq_left(&self, r: usize, l: usize) -> bool {
         self.right.0[r] == self.left.0[l] && self.right.1[r] == self.left.1[l]
+    }
+}
+
+/// N-`Int64`-key fast path (three columns or more): the raw value slices of every key
+/// column, per side.
+///
+/// [`I64Keys`] and [`I64x2Keys`] cover one and two columns; a *third* fell all the way to
+/// [`RowConverter`], and that cliff is where the star-schema fact-to-fact join lives. TPC-DS
+/// joins `store_sales` to `store_returns` on
+/// `(ticket_number, item_sk, customer_sk)` — three surrogate keys — and encoding the 2.75 M-row
+/// probe side into arrow's escaped row format cost **127 ms against 9.5 ms for the same join
+/// on two of the three keys**, a 13x cliff for one extra column. Nine TPC-DS queries carry a
+/// three-or-more-column equi-join.
+///
+/// Hashing walks the columns per row rather than a packed value, because an `i64` triple does
+/// not fit a register and packing would need value ranges nothing here measures. That still
+/// leaves the per-row work as N loads and N hasher writes, against the row encoder's fresh
+/// allocation plus a byte-slice compare on every chain walk. The same [`build_probe`] loop
+/// drives it, so it is bit-identical to the row-encoded oracle — only the key accessor differs.
+struct I64xNKeys<'a> {
+    right: Vec<&'a [i64]>,
+    left: Vec<&'a [i64]>,
+}
+
+impl<'a> I64xNKeys<'a> {
+    /// `Some` when both sides are the same number (three or more) of `Int64` columns.
+    fn try_new(left_keys: &'a [ArrayRef], right_keys: &'a [ArrayRef]) -> Option<Self> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::DataType;
+        if left_keys.len() < 3 || left_keys.len() != right_keys.len() {
+            return None;
+        }
+        if left_keys
+            .iter()
+            .chain(right_keys)
+            .any(|k| k.data_type() != &DataType::Int64)
+        {
+            return None;
+        }
+        let cols = |keys: &'a [ArrayRef]| -> Option<Vec<&'a [i64]>> {
+            keys.iter()
+                .map(|a| {
+                    a.as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map(|c| c.values().as_ref())
+                })
+                .collect()
+        };
+        Some(Self {
+            right: cols(right_keys)?,
+            left: cols(left_keys)?,
+        })
+    }
+
+    #[inline]
+    fn hash_at(state: &ahash::RandomState, cols: &[&[i64]], i: usize) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = state.build_hasher();
+        for col in cols {
+            hasher.write_i64(col[i]);
+        }
+        hasher.finish()
+    }
+}
+
+impl JoinKeys for I64xNKeys<'_> {
+    fn hash_right(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        Self::hash_at(state, &self.right, i)
+    }
+    fn hash_left(&self, state: &ahash::RandomState, i: usize) -> u64 {
+        Self::hash_at(state, &self.left, i)
+    }
+    fn right_eq_right(&self, a: usize, b: usize) -> bool {
+        self.right.iter().all(|c| c[a] == c[b])
+    }
+    fn right_eq_left(&self, r: usize, l: usize) -> bool {
+        self.right
+            .iter()
+            .zip(&self.left)
+            .all(|(rc, lc)| rc[r] == lc[l])
     }
 }
 
@@ -1779,9 +1876,22 @@ pub fn broadcast_hash_join_indices(
 fn null_mask(keys: &[ArrayRef], rows: usize) -> Vec<bool> {
     let mut combined: Option<NullBuffer> = None;
     for key in keys {
-        if key.null_count() != 0 {
-            combined = NullBuffer::union(combined.as_ref(), key.nulls());
+        // `logical_nulls`, never `nulls`. A column whose values are *all* null arrives as
+        // arrow's `Null` type, which encodes nullity in the type itself and carries no
+        // validity buffer at all — so `nulls()` is `None` and `null_count()` is **0** for a
+        // column in which every single value is null. Reading it that way made every null
+        // key look like a valid, equal key, and an equi-join on such a column produced the
+        // full cartesian product where SQL requires no rows at all (`NULL = NULL` is
+        // unknown). `logical_nulls` is arrow's answer to exactly this: it materializes the
+        // nullity a type implies, so `Null`, dictionary and run-end arrays all report the
+        // nulls they logically hold.
+        let Some(nulls) = key.logical_nulls() else {
+            continue;
+        };
+        if nulls.null_count() == 0 {
+            continue;
         }
+        combined = NullBuffer::union(combined.as_ref(), Some(&nulls));
     }
     match combined {
         None => vec![false; rows],
@@ -2271,6 +2381,38 @@ mod tests {
     /// The single-`Int64`-key fast path (`I64Keys`) must produce exactly the relation
     /// the row-encoded path (`RowKeys`) does, for every join type — including duplicate
     /// keys (cross products), unmatched rows, and null keys. Driving `build_probe` with
+    /// An all-null key column is arrow's `Null` type, which carries no validity buffer: it
+    /// reports `null_count() == 0` while every value in it is null. Reading nullity that way
+    /// made a join match null against null and return the full cartesian product, where SQL
+    /// requires no rows at all — and it did so only on the streaming path, so `collect()` was
+    /// right and `iter_batches()` was silently wrong on the same query.
+    #[test]
+    fn an_all_null_key_column_is_masked_even_though_it_carries_no_validity_buffer() {
+        use arrow::array::NullArray;
+
+        let keys: Vec<ArrayRef> = vec![Arc::new(NullArray::new(3))];
+        assert_eq!(
+            keys[0].null_count(),
+            0,
+            "the trap: arrow reports no nulls here"
+        );
+        assert_eq!(
+            keys[0].logical_null_count(),
+            3,
+            "while every value is logically null"
+        );
+        assert_eq!(null_mask(&keys, 3), vec![true, true, true]);
+    }
+
+    /// A key with a validity buffer is unaffected, which is what keeps the streaming probe's
+    /// fast path (no mask allocated for a never-null foreign key) intact.
+    #[test]
+    fn a_typed_key_still_masks_exactly_its_nulls() {
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))];
+        assert_eq!(keys[0].logical_null_count(), 1);
+        assert_eq!(null_mask(&keys, 3), vec![false, true, false]);
+    }
+
     /// each key implementation over the same inputs pins that equivalence directly.
     #[test]
     fn i64_fast_path_matches_row_encoded() {
@@ -2313,6 +2455,52 @@ mod tests {
                     sorted_pairs(&fast),
                     sorted_pairs(&slow),
                     "i64 vs row mismatch for {jt:?} bloom={bloom}"
+                );
+            }
+        }
+    }
+
+    /// The three-column integer fast path must match the row-encoded oracle for every join
+    /// type. The cases that matter are the ones a per-column hash could get wrong where the
+    /// row encoding cannot: rows agreeing on a *prefix* of the key but not the whole of it,
+    /// a permuted key tuple (`(1,2,3)` against `(3,2,1)` — the columns must not commute), a
+    /// duplicate key on both sides, and a null in one column only.
+    #[test]
+    fn i64xn_fast_path_matches_row_encoded() {
+        let col = |v: Vec<Option<i64>>| -> ArrayRef { Arc::new(Int64Array::from(v)) };
+        let left: Vec<ArrayRef> = vec![
+            col(vec![Some(1), Some(1), Some(3), Some(2), None, Some(1)]),
+            col(vec![Some(2), Some(2), Some(2), Some(2), Some(2), Some(9)]),
+            col(vec![Some(3), Some(4), Some(1), Some(2), Some(3), Some(3)]),
+        ];
+        let right: Vec<ArrayRef> = vec![
+            col(vec![Some(1), Some(3), Some(1), Some(2), Some(1), None]),
+            col(vec![Some(2), Some(2), Some(2), Some(2), Some(9), Some(2)]),
+            col(vec![Some(3), Some(1), Some(3), Some(9), Some(3), Some(3)]),
+        ];
+        let ln = null_mask(&left, 6);
+        let rn = null_mask(&right, 6);
+        let fastkeys = I64xNKeys::try_new(&left, &right).expect("three Int64 columns per side");
+        let conv = RowConverter::new(vec![SortField::new(DataType::Int64); 3]).unwrap();
+        let rowkeys = RowKeys {
+            right: conv.convert_columns(&right).unwrap(),
+            left: conv.convert_columns(&left).unwrap(),
+        };
+        for jt in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::Semi,
+            JoinType::Anti,
+        ] {
+            for bloom in [false, true] {
+                let fast = build_probe_flat(&fastkeys, 6, 6, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                let slow = build_probe_flat(&rowkeys, 6, 6, &ln, &rn, jt, bloom, BLOOM_FP_RATE);
+                assert_eq!(
+                    sorted_pairs(&fast),
+                    sorted_pairs(&slow),
+                    "i64xN vs row mismatch for {jt:?} bloom={bloom}"
                 );
             }
         }

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import pyarrow as pa
 
@@ -133,6 +133,10 @@ class ClickHouseSource(SingleResultQuerySource):
             params["database"] = self.database
         params.update(self.client_kwargs)
         return params
+
+    #: ClickHouse spells a row cap `LIMIT n`, and delimits identifiers ANSI-style.
+    supports_limit: ClassVar[bool] = True
+    sql_dialect: ClassVar[str] = "clickhouse"
 
     def _split_for(self, sql: str) -> _ClickHouseSplit:
         return _ClickHouseSplit(self._params(), sql)

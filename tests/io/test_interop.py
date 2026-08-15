@@ -160,18 +160,30 @@ def test_from_huggingface_roundtrip():
 
 
 def test_optional_adapter_missing_dep_raises_backenderror(monkeypatch):
-    """A missing optional framework surfaces a typed BackendError with a hint."""
-    import builtins
+    """A missing optional framework surfaces a typed error carrying a working install hint.
 
-    from batcher._internal.errors import BackendError
+    Faked at `importlib.import_module`, which is what `_internal.optional.require` calls. This
+    test used to patch `builtins.__import__` — the hook a bare ``import polars`` statement goes
+    through and `importlib.import_module` does **not** — so once the adapters moved onto the
+    shared guard the fake stopped intercepting anything, and on a machine with polars installed
+    the test passed by taking the success path. Patching what the code actually calls is the
+    difference between a test that checks the failure and one that cannot see it.
+    """
+    from batcher._internal import optional
+    from batcher._internal.errors import BackendError, MissingDependencyError
 
-    real_import = builtins.__import__
+    real = optional.importlib.import_module
 
     def _no_polars(name, *args, **kwargs):
         if name == "polars":
             raise ImportError("no polars")
-        return real_import(name, *args, **kwargs)
+        return real(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", _no_polars)
-    with pytest.raises(BackendError, match=r"\[polars\]"):
+    monkeypatch.setattr(optional.importlib, "import_module", _no_polars)
+    with pytest.raises(MissingDependencyError, match=r"\[polars\]") as caught:
         from_polars(object())
+    # One error, three contracts: the engine's handlers catch it, `except ImportError` around an
+    # optional import catches it, and the install command is a field rather than prose to parse.
+    assert isinstance(caught.value, BackendError)
+    assert isinstance(caught.value, ImportError)
+    assert caught.value.install == "pip install 'batcher-engine[polars]'"

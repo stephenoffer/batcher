@@ -70,6 +70,21 @@ enum FusedAcc<'a> {
         precision: u8,
         scale: i8,
     },
+    /// An integer `mean`'s sum half over a no-null `Int64` column, accumulated into the exact
+    /// 128-bit state (`agg::MEAN_INT_ACCUMULATOR`) *from the `Int64` input*. Widening the
+    /// column first would route this to `SumDecimal`, which reads 16 bytes per row instead of
+    /// 8 and pays a `checked_add` the integer sum provably cannot need — see
+    /// `accum::mean_sum_i128` for why `i128` cannot overflow here.
+    MeanSumI64NoNull {
+        v: &'a [i64],
+        sums: Vec<i128>,
+    },
+    /// The nullable counterpart of [`FusedAcc::MeanSumI64NoNull`].
+    MeanSumI64 {
+        v: &'a Int64Array,
+        sums: Vec<i128>,
+        valid: Vec<bool>,
+    },
     /// `count(*)` — every row counts, no value column.
     CountStar {
         counts: Vec<i64>,
@@ -192,6 +207,21 @@ impl FusedAcc<'_> {
                     }
                 })
             }
+            FusedAcc::MeanSumI64NoNull { v, sums } => {
+                // Unchecked by proof, not by omission: `i128` holds `n · 2^63` for every
+                // addressable `n` (`accum::mean_sum_i128`).
+                block_loop!(ids, start, end, |i, g| {
+                    sums[g] += v[i] as i128;
+                })
+            }
+            FusedAcc::MeanSumI64 { v, sums, valid } => {
+                block_loop!(ids, start, end, |i, g| {
+                    if v.is_valid(i) {
+                        sums[g] += v.value(i) as i128;
+                        valid[g] = true;
+                    }
+                })
+            }
             FusedAcc::CountStar { counts } | FusedAcc::CountNoNull { counts } => {
                 block_loop!(ids, start, end, |i, g| {
                     let _ = i;
@@ -305,6 +335,11 @@ impl FusedAcc<'_> {
                 scale,
                 ..
             } => masked_decimal(sums, valid, precision, scale)?,
+            FusedAcc::MeanSumI64NoNull { sums, .. } => {
+                let n = sums.len();
+                mean_int_state(sums, vec![true; n])?
+            }
+            FusedAcc::MeanSumI64 { sums, valid, .. } => mean_int_state(sums, valid)?,
             FusedAcc::CountStar { counts }
             | FusedAcc::CountNoNull { counts }
             | FusedAcc::CountNull { counts, .. } => Arc::new(Int64Array::from(counts)),
@@ -354,10 +389,43 @@ fn classify<'a>(call: &'a AggCall, num_groups: usize) -> Option<Vec<FusedAcc<'a>
         AggFunc::Max => Some(vec![minmax_acc(call.values.as_ref()?, num_groups, false)?]),
         AggFunc::Mean => {
             let v = call.values.as_ref()?;
-            Some(vec![sum_acc(v, num_groups)?, count_acc(v, num_groups)])
+            Some(vec![mean_sum_acc(v, num_groups)?, count_acc(v, num_groups)])
         }
         _ => None,
     }
+}
+
+/// The sum half of a fused `mean`: an integer input accumulates into the exact 128-bit state
+/// straight from its `Int64` column, everything else is the ordinary [`sum_acc`].
+///
+/// This is the fused mirror of `accum::mean_sum_i128`, and it exists for the same reason: an
+/// `AVG` needs a sum wider than its input, and the cheap way to get one is a wider
+/// *accumulator*, not a widened copy of the column.
+fn mean_sum_acc(values: &ArrayRef, num_groups: usize) -> Option<FusedAcc<'_>> {
+    if !matches!(values.data_type(), DataType::Int64) {
+        return sum_acc(values, num_groups);
+    }
+    let v = values.as_primitive::<Int64Type>();
+    Some(if v.null_count() == 0 {
+        FusedAcc::MeanSumI64NoNull {
+            v: v.values(),
+            sums: vec![0; num_groups],
+        }
+    } else {
+        FusedAcc::MeanSumI64 {
+            v,
+            sums: vec![0; num_groups],
+            valid: vec![false; num_groups],
+        }
+    })
+}
+
+/// Materialize an integer `mean`'s sum state, in the one type `finalize_mean` reads it as.
+fn mean_int_state(sums: Vec<i128>, valid: Vec<bool>) -> Result<ArrayRef, RuntimeError> {
+    let DataType::Decimal128(precision, scale) = super::MEAN_INT_ACCUMULATOR else {
+        unreachable!("MEAN_INT_ACCUMULATOR is a Decimal128 by construction")
+    };
+    masked_decimal(sums, valid, precision, scale)
 }
 
 fn count_acc(values: &ArrayRef, num_groups: usize) -> FusedAcc<'_> {
@@ -405,6 +473,8 @@ fn sum_acc(values: &ArrayRef, num_groups: usize) -> Option<FusedAcc<'_>> {
                 }
             }
         }
+        // No no-null arm for decimal, unlike the two above: it was built, measured and
+        // removed — see `accum::sum_acc`'s decimal arm for the numbers.
         DataType::Decimal128(p, s) => FusedAcc::SumDecimal {
             v: values.as_primitive::<Decimal128Type>(),
             sums: vec![0; num_groups],
@@ -496,6 +566,32 @@ pub(super) fn run_fused(
         return Ok(()); // not enough actually fused (e.g. unsupported dtypes)
     }
 
+    // Every *value-independent* counter in this batch computes the identical vector, so one
+    // of them runs and the rest are filled from it.
+    //
+    // `CountStar` and `CountNoNull` share one update arm — `counts[g] += 1`, with the row
+    // index explicitly discarded — so their result depends on nothing but `group_ids`. They
+    // arrive in bulk because **`Mean` expands to `[sum, count]`**: `avg(v1), avg(v2), avg(v3)`
+    // over null-free columns is three sums and three *identical* counts, and h2o-groupby q4 is
+    // exactly that shape over 10M rows — 30M increments to produce three copies of one
+    // 100-element vector. `count(*)` beside a `count(<null-free col>)` is the same identity.
+    //
+    // Exact, not an approximation: the arm cannot read a value, so a copy is what the loop
+    // would have computed. The copy is `num_groups` i64s once per duplicate, against a row per
+    // row of the morsel.
+    let counter_ids: Vec<usize> = (0..accs.len())
+        .filter(|&i| {
+            matches!(
+                accs[i],
+                FusedAcc::CountStar { .. } | FusedAcc::CountNoNull { .. }
+            )
+        })
+        .collect();
+    let (owner, duplicates) = match counter_ids.split_first() {
+        Some((&first, rest)) if !rest.is_empty() => (Some(first), rest.to_vec()),
+        _ => (None, Vec::new()),
+    };
+
     // The fused scan, blocked: each accumulator sweeps one cache-resident block of
     // `group_ids` with its own tight monomorphic loop, then the next accumulator sweeps the
     // same block. That keeps both properties rather than trading one for the other — the
@@ -504,8 +600,27 @@ pub(super) fn run_fused(
     // which is what a plain accumulator-outer loop would do.
     for start in (0..group_ids.len()).step_by(FUSE_BLOCK_ROWS) {
         let end = (start + FUSE_BLOCK_ROWS).min(group_ids.len());
-        for acc in accs.iter_mut() {
+        for (i, acc) in accs.iter_mut().enumerate() {
+            if duplicates.contains(&i) {
+                continue; // filled from `owner` below — see the note above
+            }
             acc.update_block(group_ids, start, end)?;
+        }
+    }
+
+    // Fill the skipped counters from the one that ran.
+    if let Some(owner) = owner {
+        let counted = match &accs[owner] {
+            FusedAcc::CountStar { counts } | FusedAcc::CountNoNull { counts } => counts.clone(),
+            _ => unreachable!("owner is a counter by construction"),
+        };
+        for &d in &duplicates {
+            match &mut accs[d] {
+                FusedAcc::CountStar { counts } | FusedAcc::CountNoNull { counts } => {
+                    counts.clone_from(&counted);
+                }
+                _ => unreachable!("duplicates are counters by construction"),
+            }
         }
     }
 
@@ -740,6 +855,50 @@ mod tests {
         assert_cols_eq(&want[0], &got[0]);
     }
 
+    /// A decimal sum past `i128` errors rather than wrapping to a negative amount, the same
+    /// way `fused_sum_overflow_still_errors` pins the `Int64` sum. Nothing covered the
+    /// decimal arm's `checked_add` before.
+    #[test]
+    fn fused_decimal_sum_overflow_errors() {
+        let d: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![i128::MAX, 1])
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        );
+        let group_ids = [0u32, 0];
+        let calls = vec![
+            AggCall::new(AggFunc::Sum, Some(d.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+        ];
+        let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
+        let r = run_fused(&calls, &group_ids, 1, &mut out);
+        assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
+    }
+
+    #[test]
+    fn fused_int_mean_matches_per_call_with_and_without_nulls() {
+        // The fused `mean` accumulates an `Int64` column into the 128-bit state directly,
+        // where the per-call path reaches the same state through `accum::mean_sum_i128`.
+        // Both must produce the identical sum column — including which groups are valid,
+        // which is the half a no-null fast path is easiest to get wrong. Magnitudes are past
+        // 2^53 so an f64 accumulator anywhere in either path would show up as a difference.
+        let big = 1i64 << 62;
+        for values in [
+            vec![Some(big), Some(-big), Some(3), Some(1)],
+            vec![Some(big), None, None, Some(1)],
+        ] {
+            let v: ArrayRef = Arc::new(Int64Array::from(values));
+            let group_ids = [0u32, 1, 0, 1];
+            let calls = vec![
+                AggCall::new(AggFunc::Mean, Some(v.clone())),
+                AggCall::new(AggFunc::CountStar, None),
+            ];
+            let want = per_call(&calls, &group_ids, 2);
+            let got = fused(&calls, &group_ids, 2);
+            assert_cols_eq(&want[0], &got[0]);
+        }
+    }
+
     #[test]
     fn below_threshold_is_noop() {
         // A single fusable call leaves `out` untouched (per-call path handles it).
@@ -764,5 +923,62 @@ mod tests {
         assert!(out[0].is_none(), "median not fused");
         assert!(out[1].is_some(), "sum fused");
         assert!(out[2].is_some(), "count fused");
+    }
+
+    /// Several means over null-free columns share ONE count vector, and the shared answer is
+    /// the one the per-call kernel computes.
+    ///
+    /// `Mean` expands to `[sum, count]`, so `avg(a), avg(b), avg(c)` is three sums and three
+    /// counts that cannot differ — the count arm discards the row index. h2o-groupby q4 is this
+    /// shape over 10M rows. Held against `per_call`, which runs each count for real.
+    #[test]
+    fn identical_counts_are_shared_and_still_equal_per_call() {
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6]));
+        let b: ArrayRef = Arc::new(Float64Array::from(vec![9.0, 8.0, 7.0, 6.0, 5.0, 4.0]));
+        let c: ArrayRef = Arc::new(Float64Array::from(vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5]));
+        let calls = vec![
+            AggCall::new(AggFunc::Mean, Some(a.clone())),
+            AggCall::new(AggFunc::Mean, Some(b.clone())),
+            AggCall::new(AggFunc::Mean, Some(c.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+        ];
+        let ids = [0u32, 1, 0, 2, 2, 1]; // uneven groups, so a wrong share is visible
+        let f = fused(&calls, &ids, 3);
+        for (x, y) in f.iter().zip(per_call(&calls, &ids, 3)) {
+            assert_cols_eq(x, &y);
+        }
+        // And the three means' count halves really are the same vector.
+        assert_eq!(f[0][1].as_ref(), f[1][1].as_ref());
+        assert_eq!(f[1][1].as_ref(), f[2][1].as_ref());
+        assert_eq!(
+            f[3][0].as_ref(),
+            f[0][1].as_ref(),
+            "count(*) is that vector too"
+        );
+    }
+
+    /// A count over a column that *has* nulls is a different vector and must never be shared.
+    ///
+    /// The sharing keys on the accumulator variant (`CountNull` is excluded by construction),
+    /// and this is what fails if that ever keys on the function instead.
+    #[test]
+    fn a_nullable_count_is_never_shared() {
+        let dense: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
+        let holey: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3), None]));
+        let calls = vec![
+            AggCall::new(AggFunc::Mean, Some(dense.clone())),
+            AggCall::new(AggFunc::Count, Some(holey.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+        ];
+        let ids = [0u32, 0, 1, 1];
+        let f = fused(&calls, &ids, 2);
+        for (x, y) in f.iter().zip(per_call(&calls, &ids, 2)) {
+            assert_cols_eq(x, &y);
+        }
+        assert_ne!(
+            f[1][0].as_ref(),
+            f[2][0].as_ref(),
+            "count(holey) must not have been filled from count(*)"
+        );
     }
 }

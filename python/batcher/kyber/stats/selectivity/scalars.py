@@ -371,8 +371,18 @@ def mcv_fraction_below(col_mcv: Mapping[str, float] | None, value: Any) -> float
     return max(0.0, min(1.0, below / covered))
 
 
-def _fraction_below_bounds(x: float, bound: tuple[Any, Any] | None) -> float | None:
+def _fraction_below_bounds(x: float | None, bound: tuple[Any, Any] | None) -> float | None:
     """The fraction of rows ≤ `x` assuming values spread uniformly over `[min, max]`.
+
+    `x` is a literal already placed on its axis by `_ordinal`, which answers `None` for a
+    value with no linear order — so `None` reaches here and means "this literal cannot be
+    interpolated", the same answer an unusable `bound` gives. It is not hypothetical or
+    defensive: `EventDate >= '2013-07-01'` compares a `date32` column against a **string**
+    literal, which SQL casts at execution and `_ordinal` places on no axis at all. Every
+    caller already handles `None` by falling through to the measured-values CDF, but two of
+    the three passed the unplaced literal in without checking, and the comparison below
+    raised `TypeError: '<' not supported between 'NoneType' and 'float'` — taking down seven
+    ClickBench queries (q36-q42) at *plan* time, before a row was read.
 
     **Counted discretely for a discrete column** (see `_is_discrete`). The continuous form
     `(x - lo) / (hi - lo)` answers a flat `0` at `x == lo`, because it cannot tell "below the
@@ -391,7 +401,7 @@ def _fraction_below_bounds(x: float, bound: tuple[Any, Any] | None) -> float | N
     the endpoint problem is real but unfixable from bounds alone: there is no "next" value to
     divide by.
     """
-    if bound is None:
+    if x is None or bound is None:
         return None
     lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
     if lo is None or hi is None:

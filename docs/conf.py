@@ -127,8 +127,6 @@ exclude_patterns = [
     ".DS_Store",
     "requirements.txt",
     "Makefile",
-    # Build helpers, not documentation pages.
-    "architecture/internals/README_PDF_GENERATION.md",
     # Standalone formal paper, rendered to PDF by internals/generate_pdf.py rather
     # than as a site page. It carries its own internal cross-reference scheme.
     "architecture/internals/mathematical_foundations.md",

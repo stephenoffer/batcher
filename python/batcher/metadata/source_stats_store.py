@@ -28,31 +28,73 @@ _NAMESPACE = "io.source_stats"
 _JSON_SCALARS = (int, float, str, bool)
 
 
-def save_source_stats(hub: MetadataHub, identity: str, stats: SourceStatistics) -> None:
-    """Persist `stats` for a source `identity`. Best-effort; never raises."""
+def save_source_stats(
+    hub: MetadataHub, identity: str, stats: SourceStatistics, *, version: str | None = None
+) -> None:
+    """Persist `stats` for a source `identity`. Best-effort; never raises.
+
+    `version` is the source's content token at the moment of writing (see
+    `io.stats.file_identity.files_version`). It is what lets a later read tell "these
+    statistics describe the bytes I am about to read" from "these statistics describe
+    whatever used to be at this path", which for a *membership index* is the difference
+    between skipping data and deleting rows. An entry saved without one is still readable;
+    it simply cannot satisfy a versioned load.
+
+    Args:
+        hub: The metadata hub to persist into.
+        identity: The source's stable identity, the key the statistics are filed under.
+        stats: The statistics to persist.
+        version: The source's content version, when the caller can compute one.
+    """
     import contextlib
 
     with contextlib.suppress(Exception):  # persistence must never break a write
-        hub.save_params(f"{_NAMESPACE}:{identity}", _encode(stats))
+        hub.save_params(f"{_NAMESPACE}:{identity}", _encode(stats, version))
 
 
-def load_source_stats(hub: MetadataHub, identity: str) -> SourceStatistics | None:
-    """Load persisted statistics for a source `identity`, or None if absent."""
+def load_source_stats(
+    hub: MetadataHub, identity: str, *, require_version: str | None = None
+) -> SourceStatistics | None:
+    """Load persisted statistics for a source `identity`, or None if absent.
+
+    With `require_version`, an entry is returned only when it was saved under exactly that
+    content version — so an entry describing a path some *other* writer has since rewritten
+    is not returned at all, rather than returned and trusted. An entry saved before versions
+    were recorded carries none and therefore never matches, which is the safe direction: it
+    falls back to whatever the caller does without persisted statistics.
+
+    Args:
+        hub: The metadata hub to read from.
+        identity: The source's stable identity.
+        require_version: The content version the entry must have been saved under. Omit to
+            accept any entry, which is sound only for facets that merely inform cost.
+
+    Returns:
+        The persisted statistics, or None when absent, unreadable, or version-mismatched.
+    """
     try:
         blob = hub.load_params(f"{_NAMESPACE}:{identity}")
     except Exception as exc:
         note_suppressed("metadata", "load source stats", exc)
         return None
-    return _decode(blob) if blob else None
+    if not blob:
+        return None
+    if require_version is not None and blob.get("version") != require_version:
+        return None
+    return _decode(blob)
 
 
-def _encode(stats: SourceStatistics) -> dict[str, Any]:
+def _encode(stats: SourceStatistics, version: str | None = None) -> dict[str, Any]:
     columns: dict[str, Any] = {}
     for name, col in stats.columns.items():
         encoded = _encode_column(col)
         if encoded:
             columns[name] = encoded
     return {
+        # The content version these statistics describe, when the writer could compute one.
+        # `_decode` ignores it; only `load_source_stats(require_version=...)` reads it, and
+        # its absence simply means a versioned load cannot be satisfied from this entry.
+        "version": version,
         "row_count": stats.row_count,
         "byte_size": stats.byte_size,
         "exact_rows": stats.exact_rows,

@@ -19,6 +19,7 @@ import importlib.util
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -189,6 +190,28 @@ def _isolate_metadata_hub():
     reset_default_hub()
     yield
     reset_default_hub()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_topology_cache():
+    """Drop the windowed cluster-shape reads around every test.
+
+    `scaling._LIVE_TTL_S` reuses `ray.nodes()` and the per-node free-CPU figures for 50 ms,
+    which is what keeps a distributed query from making nineteen O(nodes) GCS round trips.
+    A unit test stubs the topology and asserts on what the scheduler decides, and it runs in
+    well under 50 ms — so without this the second test to stub a *different* cluster would be
+    answered from the first one's snapshot. That is a test reading process state rather than
+    the code under test, and it fails in whichever order happens to run second.
+
+    Looked up in `sys.modules` rather than imported, for two reasons. Importing it would pull
+    the whole package into a pure-Python test that never asked for it (half a second, once per
+    session). And it cannot be needed: only code that imported the module can have populated
+    the window, so clearing it after each test that did is enough to keep it out of the next.
+    """
+    yield
+    scaling = sys.modules.get("batcher.dist.executors.ray_runtime.scaling")
+    if scaling is not None:
+        scaling._reset_topology_cache()
 
 
 #: Env var naming a directory mounted on **every** node of the Ray cluster under test.

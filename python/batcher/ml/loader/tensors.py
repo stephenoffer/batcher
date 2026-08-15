@@ -11,8 +11,6 @@ import warnings
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
-from batcher.interop.arrays import uniform_list_to_matrix
-
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -22,47 +20,33 @@ __all__ = ["column_to_tensor"]
 def column_to_tensor(array: pa.Array) -> Any | None:
     """Convert one Arrow column to a torch tensor, or ``None`` if not tensorizable.
 
-    A `FixedShapeTensor` column becomes a shaped tensor; numeric columns convert; strings and
-    other types return ``None`` so the caller drops them. The tensor owns **writable** memory
-    decoupled from the (immutable) Arrow buffer, because a training loop mutates batches in
-    place — sharing the buffer is "undefined behavior" per torch, and can corrupt the source.
+    A `FixedShapeTensor` or uniform-width list column becomes a shaped ``(n, W...)`` tensor;
+    numeric and boolean columns convert; strings, ragged tensors and other types return
+    ``None`` so the caller drops them. The tensor owns **writable** memory decoupled from the
+    (immutable) Arrow buffer, because a training loop mutates batches in place — sharing the
+    buffer is "undefined behavior" per torch, and can corrupt the source.
+
+    The Arrow-to-NumPy step is `interop.arrays._column_to_numpy`, not a second implementation
+    of it. This function used to restate the tensor-column, fixed-size-list and uniform-list
+    cases itself, and the two copies had already drifted: only one of them kept a nullable
+    boolean column numeric, so the same column tensorized on the lazy path and disappeared on
+    this one.
+
+    Args:
+        array: The Arrow column to convert.
+
+    Returns:
+        A ``torch.Tensor`` over the column's values, or ``None`` when its type has no
+        tensor equivalent.
     """
     import numpy as np
-    import pyarrow as pa
     import torch
 
-    # Collapse a ChunkedArray so an extension array exposes its typed `to_numpy_ndarray`.
-    if isinstance(array, pa.ChunkedArray):
-        array = array.combine_chunks()
+    from batcher.interop.arrays import _column_to_numpy
 
-    if hasattr(array, "to_numpy_ndarray"):  # FixedShapeTensor extension array
-        nd = array.to_numpy_ndarray()
-    elif pa.types.is_fixed_size_list(array.type) and pa.types.is_primitive(array.type.value_type):
-        # A feature/embedding vector stored as FixedSizeList<T, W> → an (n, W) tensor.
-        # `to_numpy` would give an object array of per-row arrays; reshape the flat child
-        # buffer instead, so the column is a real 2-D tensor rather than silently dropped.
-        w = array.type.list_size
-        n = len(array)
-        # Slice the child by (offset, length) instead of `flatten()`, which drops null
-        # rows and would return fewer than `n` rows — silently misaligning this column
-        # against its siblings (a feature row sliding out from under its label).
-        child = array.values.slice(array.offset * w, n * w).to_numpy(zero_copy_only=False)
-        if child.dtype.kind not in "biuf":
-            return None
-        nd = child.reshape(n, w)
-    elif (matrix := uniform_list_to_matrix(array)) is not None:
-        # The *same* feature matrix, stored as a plain `List<T>` — which is what
-        # `from_pydict`, a Parquet or JSON read, and `collect_list` all produce. One
-        # implementation, in `interop.arrays`, because the converter path
-        # (`to_numpy_batches`) needs exactly this too and a second copy would drift.
-        nd = matrix
-    else:
-        try:
-            nd = array.to_numpy(zero_copy_only=False)
-        except (ValueError, TypeError):
-            return None
-        if nd.dtype.kind not in "biuf":  # bool/int/uint/float only
-            return None
+    nd = _column_to_numpy(array)
+    if nd.dtype.kind not in "biuf":  # bool/int/uint/float only
+        return None
     # `copy=True` guarantees an owned, contiguous, writable buffer (Arrow's is read-only).
     return torch.from_numpy(np.array(nd, copy=True))
 

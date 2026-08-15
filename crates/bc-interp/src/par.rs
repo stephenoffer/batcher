@@ -474,15 +474,102 @@ fn max_useful_workers(opts: &ExecOptions, sources: &[Vec<RecordBatch>]) -> usize
 /// to `InList` instead of an n-deep `OR` chain, and the indicator sums fold balanced.
 const WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
 
-pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
-    static POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
-    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = pools
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(pool) = guard.get(&width) {
-        return Ok(Arc::clone(pool));
+/// Worker threads the pool cache may hold **in total**, across every cached width.
+///
+/// The cache is keyed by width, and the width is *data-dependent*: `auto_width` and the
+/// streaming executor's `useful_workers` both derive it from the morsel count, so a process
+/// that runs a variety of query sizes asks for a variety of widths. Keyed-by-width with no
+/// bound therefore grows one pool per distinct width ever requested, and never gives one
+/// back — on a 96-core box that is 96 pools holding `1 + 2 + … + 96 = 4,656` worker threads,
+/// each with [`WORKER_STACK_BYTES`] reserved. Nothing in a single query notices; a long-lived
+/// process does, and the two long-lived processes here are the ones that matter most: a Ray
+/// worker actor, and a streaming query whose micro-batch volume moves with the stream.
+///
+/// Four times the core count leaves room for several concurrent queries at different widths —
+/// including two near-full-width ones, which is the case that would otherwise thrash — while
+/// bounding the idle-thread footprint at something a process can carry indefinitely. The
+/// floor keeps a single-core container able to cache a handful of small pools.
+fn max_cached_pool_threads() -> usize {
+    (bc_arrow::usable_cores() * 4).max(32)
+}
+
+/// One cached pool: the pool itself, and the tick at which it was last handed out.
+struct CachedPool {
+    pool: Arc<rayon::ThreadPool>,
+    last_used: u64,
+}
+
+/// The width-keyed pool cache, bounded by [`max_cached_pool_threads`].
+#[derive(Default)]
+struct PoolCache {
+    pools: HashMap<usize, CachedPool>,
+    /// Monotonic tick, bumped on every lookup, so eviction can pick the least recently used.
+    clock: u64,
+    /// Worker threads across `pools`, kept in step with it so eviction needs no scan.
+    threads: usize,
+}
+
+impl PoolCache {
+    /// Drop least-recently-used pools until `want` more threads fit inside the budget.
+    ///
+    /// Evicting is safe while a query is running on the pool: `pool_for` hands back an `Arc`
+    /// and `install` holds it for the duration, so removing the cache's reference only means
+    /// the *next* request for that width builds a fresh pool. A pool wider than the whole
+    /// budget still gets built — one pool must always be servable — it simply arrives with
+    /// the cache emptied ahead of it.
+    fn make_room(&mut self, want: usize, budget: usize) {
+        while !self.pools.is_empty() && self.threads + want > budget {
+            let Some(victim) = self
+                .pools
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(width, _)| *width)
+            else {
+                break;
+            };
+            self.pools.remove(&victim);
+            self.threads -= victim;
+        }
     }
+
+    /// The pool of exactly `width`, cached or freshly built, evicting to stay under `budget`.
+    fn get_or_build(
+        &mut self,
+        width: usize,
+        budget: usize,
+    ) -> Result<Arc<rayon::ThreadPool>, InterpError> {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(cached) = self.pools.get_mut(&width) {
+            cached.last_used = now;
+            return Ok(Arc::clone(&cached.pool));
+        }
+        let pool = Arc::new(build_pool(width)?);
+        self.make_room(width, budget);
+        self.threads += width;
+        self.pools.insert(
+            width,
+            CachedPool {
+                pool: Arc::clone(&pool),
+                last_used: now,
+            },
+        );
+        Ok(pool)
+    }
+}
+
+pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
+    static POOLS: OnceLock<Mutex<PoolCache>> = OnceLock::new();
+    let pools = POOLS.get_or_init(|| Mutex::new(PoolCache::default()));
+    pools
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_build(width, max_cached_pool_threads())
+}
+
+/// Build one rayon pool of exactly `width` threads, with the engine's stack size and the
+/// opt-in pinning handler.
+fn build_pool(width: usize) -> Result<rayon::ThreadPool, InterpError> {
     let mut builder = rayon::ThreadPoolBuilder::new()
         .num_threads(width)
         .stack_size(WORKER_STACK_BYTES);
@@ -493,13 +580,7 @@ pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpErr
     if pin_threads_enabled() {
         builder = builder.start_handler(pin_current_thread);
     }
-    let pool = Arc::new(
-        builder
-            .build()
-            .map_err(|_| InterpError::ThreadPool(width))?,
-    );
-    guard.insert(width, Arc::clone(&pool));
-    Ok(pool)
+    builder.build().map_err(|_| InterpError::ThreadPool(width))
 }
 
 /// Whether worker-thread CPU pinning is enabled — read once from the
@@ -3895,6 +3976,9 @@ mod tests {
                     std: None,
                     channels_first: false,
                     format: None,
+                    mode: None,
+                    quality: None,
+                    factor: None,
                     fill: None,
                 },
                 alias: "img".into(),
@@ -3969,6 +4053,58 @@ mod tests {
         let c = pool_for(2).unwrap();
         assert!(!Arc::ptr_eq(&a, &c), "a different width gets its own pool");
         assert_eq!(c.current_num_threads(), 2);
+    }
+
+    /// The pool cache never grows past its thread budget, however many distinct widths a
+    /// process asks for.
+    ///
+    /// Keyed by width with no bound, a process that ran a variety of query sizes accumulated
+    /// one pool per width forever: on a 96-core box, 96 pools holding 4,656 worker threads at
+    /// 32 MiB of reserved stack each, with nothing ever giving one back. The width is derived
+    /// from the morsel count, so "a variety of query sizes" is the ordinary case for the two
+    /// long-lived processes here — a Ray worker actor and a streaming query.
+    #[test]
+    fn pool_cache_stays_inside_its_thread_budget() {
+        let budget = 16;
+        let mut cache = PoolCache::default();
+        for width in 1..=8 {
+            cache.get_or_build(width, budget).unwrap();
+            assert!(
+                cache.threads <= budget,
+                "cache holds {} threads over a budget of {budget}",
+                cache.threads
+            );
+        }
+        // Unbounded, this loop would have cached 1+2+…+8 = 36 threads.
+        assert!(cache.threads <= budget);
+        assert!(cache.pools.len() < 8, "nothing was evicted");
+    }
+
+    /// Eviction takes the least recently *used* pool, not the oldest one, so a width a
+    /// streaming query keeps asking for survives a burst of one-off widths around it.
+    #[test]
+    fn pool_cache_evicts_the_least_recently_used_width() {
+        let budget = 8;
+        let mut cache = PoolCache::default();
+        let hot = cache.get_or_build(4, budget).unwrap();
+        cache.get_or_build(2, budget).unwrap();
+        // Touch the wide one again so the narrow one is now the stale entry.
+        cache.get_or_build(4, budget).unwrap();
+        cache.get_or_build(3, budget).unwrap();
+        assert!(
+            Arc::ptr_eq(&hot, &cache.get_or_build(4, budget).unwrap()),
+            "the width in continuous use was evicted"
+        );
+    }
+
+    /// A pool wider than the whole budget is still built — one pool must always be servable.
+    #[test]
+    fn a_pool_wider_than_the_budget_is_still_served() {
+        let mut cache = PoolCache::default();
+        cache.get_or_build(2, 4).unwrap();
+        let wide = cache.get_or_build(6, 4).unwrap();
+        assert_eq!(wide.current_num_threads(), 6);
+        assert_eq!(cache.pools.len(), 1, "the budget did not clear the cache");
     }
 
     /// The fused linear pipeline (Scan→Filter→Project) is bit-identical to both the

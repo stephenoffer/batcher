@@ -44,14 +44,14 @@ sort                            est≈1 (default)
     hash_join                   est≈3 (default)
       scan                      est≈3 (exact)
       filter                    est≈1 (default)
-        scan                    est≈6 (exact)
+        scan                    est≈6 (exact) pushed[status = paid]
 
 decisions:
   - [kyber/selection] join build side: left≈1 right≈3 [default] → swap build→left + broadcast
 ```
 :::
 
-Read it inside out: the leaves run first. Three things to look at.
+Read it inside out: the leaves run first. Four things to look at.
 
 The **tree shape** is the optimized plan, not the one you typed. `filter` sits directly
 above the `orders` scan, below the join, so the predicate was pushed down. If you write a
@@ -63,6 +63,11 @@ The **estimate and its provenance** are the `est≈N (source)` column. `exact` m
 row count came from real metadata: a file footer, or an in-memory table. `default` means
 the optimizer had nothing and used a heuristic. A plan full of `(default)` is a plan
 making decisions in the dark.
+
+The **pushed filter** is the `pushed[...]` note on a scan: the predicate the plan handed
+that source to apply for itself, rather than reading the rows and filtering them after.
+A scan with no note received nothing. See {doc}`pushdown` for which predicate shapes each
+source can take.
 
 The **decisions** block is the optimizer narrating itself. Here Kyber compared the two
 sides, found the filtered orders side smaller, and swapped the build side of the hash
@@ -88,12 +93,12 @@ print(q.explain())
 --- cold
 aggregate                       est≈1 (default)
   filter                        est≈1 (default)
-    scan                        est≈6 (exact)
+    scan                        est≈6 (exact) pushed[status = paid]
 
 --- after one run
 aggregate                       est≈3 (learned)
   filter                        est≈3 (default)
-    scan                        est≈6 (exact)
+    scan                        est≈6 (exact) pushed[status = paid]
 
 decisions:
   - [core/io] source read at 6 MB/s (learned)

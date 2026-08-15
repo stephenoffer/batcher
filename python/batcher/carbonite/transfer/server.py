@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher._internal.native import engine
+from batcher.plan.types import total_logical_bytes
 
 if TYPE_CHECKING:
     from batcher.carbonite.transfer.tls import ShuffleTlsMaterial
@@ -119,7 +120,7 @@ class FlightShuffleServer:
     def publish(self, ticket: ShuffleTicket, batches: list[pa.RecordBatch]) -> None:
         """Expose `batches` under `ticket` for reducers to fetch."""
         batches = list(batches)
-        nbytes = sum(b.nbytes for b in batches)
+        nbytes = total_logical_bytes(batches)
         with self._bytes_lock:
             self._bytes_published += nbytes
         self._srv.publish(str(ticket), batches)
@@ -143,7 +144,7 @@ class FlightShuffleServer:
 
     def _add_local_bytes(self, batches: list[pa.RecordBatch]) -> None:
         """Charge `batches` to the off-network served total, under the counter lock."""
-        nbytes = sum(b.nbytes for b in batches)
+        nbytes = total_logical_bytes(batches)
         with self._bytes_lock:
             self._bytes_served_locally += nbytes
 
@@ -243,7 +244,7 @@ class FlightShuffleServer:
         token: str | None = None,
         shm: bool = False,
         replicas: list[list[str]] | None = None,
-    ) -> tuple[pa.RecordBatch | None, list[int]]:
+    ) -> tuple[pa.RecordBatch | None, list[tuple[int, str]]]:
         """Concurrently fetch + `combine` the aggregate partials from every source.
 
         Fetches every `(addr, ticket)` at once (bounded by `fan_in`), folding each into
@@ -298,7 +299,7 @@ class FlightShuffleServer:
         token: str | None = None,
         shm: bool = False,
         replicas: list[list[str]] | None = None,
-    ) -> tuple[list[str], list[int]]:
+    ) -> tuple[list[str], list[tuple[int, str]]]:
         """Concurrently fetch every source's bucket and spill each to an IPC file under
         `spill_dir`, returning `(paths, unreachable)`.
 
@@ -338,7 +339,7 @@ class FlightShuffleServer:
         token: str | None = None,
         shm: bool = False,
         replicas: list[list[str]] | None = None,
-    ) -> tuple[list[pa.RecordBatch], list[int]]:
+    ) -> tuple[list[pa.RecordBatch], list[tuple[int, str]]]:
         """Concurrently fetch every source's raw batches into one list (window/sort/join).
 
         Like `gather_combine` but without a fold — the reducer needs the whole bucket
@@ -388,7 +389,7 @@ class ShuffleClient:
             batches = self._client.fetch(addr, str(ticket), token=token)
         else:
             batches = self._client.fetch(addr, str(ticket), credits, token)
-        _add_bytes_fetched(sum(b.nbytes for b in batches))
+        _add_bytes_fetched(total_logical_bytes(batches))
         return batches
 
     @property
@@ -437,7 +438,7 @@ def fetch(addr: str, ticket: ShuffleTicket, credits: int | None = None) -> list[
         if credits is None
         else flight_fetch(addr, str(ticket), credits)
     )
-    _add_bytes_fetched(sum(b.nbytes for b in batches))
+    _add_bytes_fetched(total_logical_bytes(batches))
     return batches
 
 

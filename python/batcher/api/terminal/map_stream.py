@@ -10,12 +10,14 @@ execution state, so both layers import them without a cycle.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from time import monotonic
 
 import pyarrow as pa
 
 from batcher.core.udf.sizing import _CPU_STREAM_BATCH_BYTES
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.types import retained_bytes
 
 __all__ = ["max_map_workers", "peek_stream", "stream_map_aggregate", "stream_windowed"]
 
@@ -84,6 +86,7 @@ def stream_windowed(
     target_rows: int,
     batch_size: int | None,
     projection: list[str] | None = None,
+    latency_seconds: float | None = None,
 ) -> Iterator[pa.RecordBatch]:
     """Stream `source` through `run_window` in windows of ~`target_rows` rows or `_WINDOW_BYTES`.
 
@@ -110,6 +113,21 @@ def stream_windowed(
     `projection` is the column list Kyber decided the pipeline needs (`None` = every column,
     which is what an undeclared `map_batches` requires). It narrows what is decoded per
     window, so a wide source costs what the `fn` actually reads rather than what it stores.
+
+    `latency_seconds` bounds how long a partially-filled window may wait, and is what makes
+    this loop usable on an **unbounded** source. Both size bounds above describe how much
+    data a window holds, which is the right question for a bounded input and the wrong one
+    for a stream: a stream is bounded in *rate*, so "4,000,000 rows or 128 MiB" is a
+    duration, and at 2,000 rows/s it is 33 minutes before the first row is emitted. With a
+    latency bound the window also closes on age, so a slow stream stays responsive while a
+    fast one still fills whole windows and keeps its throughput. `None` (the default, and
+    what a bounded source passes) restores the pure size-based window exactly.
+
+    The age is measured from the first batch buffered into the current window and checked
+    only when a batch arrives, so it never interrupts a blocking read — a source silent for
+    a minute flushes on its next batch rather than on a timer. Cutting a window early cannot
+    change a result: `map_batches` makes no promise about how rows are grouped into calls,
+    and the size bounds already vary that grouping with row width and worker count.
     """
     from batcher.io.source import iter_source
 
@@ -133,13 +151,17 @@ def stream_windowed(
     buf: list[pa.RecordBatch] = []
     rows = 0
     nbytes = 0
+    opened = 0.0
     for batch in iter_source(source, projection, None):
         if batch.num_rows == 0:
             continue
+        if not buf and latency_seconds is not None:
+            opened = monotonic()
         buf.append(batch)
         rows += batch.num_rows
-        nbytes += batch.nbytes
-        if rows >= target_rows or nbytes >= _WINDOW_BYTES:
+        nbytes += retained_bytes(batch)
+        aged = latency_seconds is not None and monotonic() - opened >= latency_seconds
+        if rows >= target_rows or nbytes >= _WINDOW_BYTES or aged:
             yield from flush(buf)
             buf = []
             rows = 0

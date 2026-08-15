@@ -144,8 +144,22 @@ class MultiLevelGroupBy:
         afterwards, which does two things at once: the null carries the column's own
         type (so every level's schema matches and the union is legal), and it is a
         constant key, so the level collapses to the groups of its active keys.
+
+        The grand total takes the ungrouped aggregate instead, because a `GROUP BY` on
+        constant keys is not the same relation as SQL's `GROUP BY ()`. They agree on
+        every non-empty input and disagree on the empty one: grouping yields one group
+        per distinct key value, so *no* rows when there are no rows, where the grand
+        total is defined to yield exactly one. A rollup whose input a filter happened to
+        empty lost its total line with no error. The keys still have to carry their own
+        types for the union above to be legal, which `nullif(max(k), max(k))` gives —
+        always NULL, typed as `k`, and an aggregate, so it is legal with no GROUP BY.
         """
         active = set(level)
+        if not active:
+            nulls: dict[str, AggExpr | Expr] = {
+                k: nullif(col(k).max(), col(k).max()) for k in self._keys
+            }
+            return self._ds.agg(**named, **nulls).select(*self._keys, *named)
         keyed = {k: col(k) if k in active else nullif(col(k), col(k)) for k in self._keys}
         grouped = self._ds.group_by(**keyed).agg(**named)
         return grouped.select(*self._keys, *named)

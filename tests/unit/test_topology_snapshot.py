@@ -3,8 +3,11 @@
 A distributed query reads the cluster shape from several scheduling helpers (transport
 choice, placement strategy, node-class selector, spread heuristic). Each is an O(nodes)
 `ray.nodes()` RPC, so at thousands of nodes the redundant reads add up. `topology_scope()`
-snapshots the shape once; readers inside it share that snapshot. Outside a scope every
-reader reads live (unchanged behavior). These assert both, with a call-counting fake Ray.
+snapshots the shape once; readers inside it share that snapshot. Outside a scope readers
+share a short *window* (`scaling._LIVE_TTL_S`) instead, which is what keeps the phases the
+scope deliberately does not cover -- the autoscale wait and the worker clamp -- from making
+an O(nodes) round trip apiece. These assert both, with a call-counting fake Ray, plus the
+property the window rests on: that it is shorter than the fastest poller's interval.
 """
 
 from __future__ import annotations
@@ -54,25 +57,62 @@ def test_scope_reads_topology_once(monkeypatch):
     assert len(c1) == 500 and sum(1 for c in c1 if c["gpus"] > 0) == 5
 
 
-def test_no_scope_reads_live_each_time(monkeypatch):
+def test_no_scope_shares_one_read_inside_the_window(monkeypatch):
+    """Unscoped readers inside `_LIVE_TTL_S` share one read, rather than one RPC each.
+
+    The scope covers only the placement phase, by design — the autoscale wait and the worker
+    clamp ahead of it must see the cluster grow. Everything outside it therefore read live,
+    and a `collect(distributed=True)` made nineteen O(nodes) GCS round trips where two were
+    the snapshot. The window collapses the other seventeen.
+    """
     from batcher.dist.executors.ray_runtime import scaling
 
     calls = _install_counting_ray(monkeypatch, n_nodes=50)
     scaling.cluster_topology()
     scaling.alive_node_count()
     scaling.node_classes()
-    # No scope active → each helper reads live (unchanged behavior).
-    assert calls["nodes"] == 3
+    assert calls["nodes"] == 1
 
 
-def test_scope_restores_live_reads_after_exit(monkeypatch):
+def test_the_window_expires_rather_than_pinning_the_topology(monkeypatch):
+    """It is a window, not a cache: a later read sees a cluster that has since changed.
+
+    Asserted by expiring the entry rather than by sleeping, so the test says what it means
+    and does not cost `_LIVE_TTL_S` of wall clock.
+    """
+    from batcher.dist.executors.ray_runtime import scaling
+
+    calls = _install_counting_ray(monkeypatch, n_nodes=10)
+    scaling.alive_node_count()
+    scaling.alive_node_count()
+    assert calls["nodes"] == 1
+    scaling._reset_topology_cache()
+    scaling.alive_node_count()
+    assert calls["nodes"] == 2
+
+
+def test_the_window_is_shorter_than_the_fastest_poller():
+    """The safety property the window rests on, pinned so a future edit cannot break it.
+
+    `readiness._await_autoscale` sleeps `max(0.1, autoscale_poll_s)` between reads and is the
+    one loop whose correctness depends on observing the cluster grow. A window at or above
+    that floor could answer a poll from the previous poll's snapshot, and the wait would
+    conclude the autoscaler had stalled while nodes were arriving.
+    """
+    from batcher.dist.executors.ray_runtime import scaling
+
+    assert scaling._LIVE_TTL_S < 0.1
+
+
+def test_scope_and_window_are_independent(monkeypatch):
     from batcher.dist.executors.ray_runtime import scaling
 
     calls = _install_counting_ray(monkeypatch, n_nodes=10)
     with scaling.topology_scope():
         scaling.alive_node_count()
     assert calls["nodes"] == 1
-    scaling.alive_node_count()  # back to live
+    scaling._reset_topology_cache()
+    scaling.alive_node_count()  # back to a live read once the window is gone
     assert calls["nodes"] == 2
 
 

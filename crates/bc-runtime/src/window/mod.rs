@@ -25,6 +25,7 @@
 pub mod frame;
 
 mod agg;
+mod coerce;
 mod fill;
 mod parallel;
 mod partition_agg;
@@ -1004,11 +1005,19 @@ fn running_aggregate(
         return crate::window::agg::running(func, ordered, order_rows, values, num_rows);
     }
     if func == WindowFn::Count {
+        // Resolved once rather than per row: `is_valid` on an `Arc<dyn Array>` is a virtual
+        // call, and — the reason this is `logical_nulls` — it reports every row of a
+        // `Null`-typed column as *valid*, since such a column carries no validity buffer and
+        // the default `is_null` reads one. The running `COUNT(v) OVER (… ORDER BY …)` over an
+        // all-null column therefore counted 1, 2, 3, … where the oracle answers 0. See the
+        // matching note in `partition_agg::broadcast_partition_aggregate`.
+        let nulls = values.logical_nulls();
+        let is_valid = |i: usize| nulls.as_ref().is_none_or(|n| n.is_valid(i));
         let mut out = vec![0i64; num_rows];
         for part in ordered {
             let (mut acc, mut gs) = (0i64, 0usize);
             for pos in 0..part.len() {
-                if values.is_valid(part[pos]) {
+                if is_valid(part[pos]) {
                     acc += 1;
                 }
                 if peer_boundary(part, order_rows, pos) {
@@ -1021,6 +1030,28 @@ fn running_aggregate(
         }
         return Ok(Arc::new(Int64Array::from(out)));
     }
+    // The type-preserving pair, for any column the numeric kernels below cannot read:
+    // select the winning row per prefix rather than widen the values, so
+    // `MIN(order_date) OVER (PARTITION BY c ORDER BY t)` answers with a DATE instead of
+    // failing. See `crate::window::coerce`.
+    if crate::window::coerce::is_extreme(func)
+        && !matches!(
+            values.data_type(),
+            DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Boolean
+        )
+    {
+        return crate::window::coerce::running_extreme(
+            func,
+            ordered,
+            values,
+            num_rows,
+            |p, pos| peer_boundary(p, order_rows, pos),
+        );
+    }
+    // Reducing aggregates take the canonical width; a narrow integer or float reaches here
+    // from a mid-plan `CAST` and errored outright before.
+    let widened = crate::window::coerce::widened_or_original(values)?;
+    let values = &widened;
     match values.data_type() {
         DataType::Int64 => running_numeric_i64(func, ordered, order_rows, values, num_rows),
         DataType::Float64 => running_numeric_f64(func, ordered, order_rows, values, num_rows),

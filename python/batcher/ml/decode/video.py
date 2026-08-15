@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError
 from batcher._internal.native import engine_features
+from batcher._internal.optional import require
 from batcher.ml.decode.stage import (
     _bounded_map,
     _require_frames,
@@ -191,10 +191,7 @@ def _decode_video_bytes(
     """
     import io
 
-    try:
-        import av
-    except ImportError as exc:  # pragma: no cover - optional extra
-        raise PlanError("video decode needs PyAV: pip install 'batcher-engine[video]'") from exc
+    av = require("av", feature="Video decode", provides="PyAV", extra="video")
     with av.open(io.BytesIO(data)) as container:
         stream = container.streams.video[0]
         if seek:

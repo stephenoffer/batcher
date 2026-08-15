@@ -31,7 +31,6 @@ from __future__ import annotations
 import hashlib
 import math
 import platform
-import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -351,21 +350,15 @@ def _reset_profile() -> None:
 def _scratch_dir() -> str:
     """The directory whose device class describes where this machine spills.
 
-    The same three-step resolution the spill paths use — configured root, measured local
-    scratch, system tempdir — because the fingerprint is meant to name the machine a learned
-    spill threshold was measured on. Reading the tempdir instead described the container's
-    overlay while the spill landed on the node's NVMe, which merged two machine classes that
-    behave nothing alike.
+    `site.spill_scratch_dir` is that answer, and this defers to it rather than restating it,
+    because the fingerprint is meant to name the machine a learned spill threshold was measured
+    on. Reading the tempdir instead described the container's overlay while the spill landed on
+    the node's NVMe, which merged two machine classes that behave nothing alike — and a second
+    copy of the resolution is how the two drift back apart.
     """
-    from batcher._internal.site import local_scratch_root
+    from batcher._internal.site import spill_scratch_dir
 
-    try:
-        from batcher.config import active_config
-
-        configured = active_config().memory.spill_dir
-    except Exception:  # pragma: no cover - config unavailable this early in a process
-        configured = None
-    return configured or local_scratch_root() or tempfile.gettempdir()
+    return spill_scratch_dir()
 
 
 def _fabric_class() -> str:

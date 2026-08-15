@@ -11,6 +11,7 @@ guessed at is usually not the one costing the time.
 | {doc}`Reading query plans <explain-plans>` | `explain()`, what each operator line means, and how to find the expensive one |
 | {doc}`Best practices <best-practices>` | The patterns that follow from keeping per-row work out of Python |
 | {doc}`Reading a very large table <large-tables>` | What changes once planning a table costs more than reading it |
+| {doc}`Filter and column pushdown <pushdown>` | Which parts of a query the data source runs itself, and what stops that happening |
 
 ## See also
 
@@ -25,4 +26,5 @@ caching
 explain-plans
 best-practices
 large-tables
+pushdown
 ```

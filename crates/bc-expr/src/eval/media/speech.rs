@@ -6,15 +6,18 @@
 //! into Python to loop over samples. A minute of 16 kHz audio is a million floats; a corpus
 //! of them is the reason the decode already lives in the data plane.
 //!
-//! Each takes encoded audio bytes and decodes once, so `trim_silence().mel_spectrogram()`
-//! costs two decodes today. That is the same shape every other op in this module has, and it
-//! is the honest trade for keeping each one independently usable.
+//! Each takes a [`Signal`], so it reads either an encoded column or an already-decoded
+//! waveform. That is what makes them composable: they hand back a waveform, and requiring a
+//! container to read one meant `trim_silence()` produced a value nothing else here could
+//! consume. Chained on a waveform they also cost no second decode. The ops that genuinely
+//! need a sample rate — resampling, slicing by time, the spectral front ends — still take a
+//! container, because that is the only thing that carries one.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Builder, GenericBinaryArray, OffsetSizeTrait};
+use arrow::array::{ArrayRef, Float64Builder};
 
-use super::audio::{build_f32_list_column, decode_pcm, Decoded};
+use super::audio::{build_f32_list_column, Signal};
 use super::map_rows;
 use crate::ExprError;
 
@@ -34,18 +37,15 @@ fn amplitude_for(threshold_db: f64) -> f32 {
 /// acoustic model reads — an utterance with its pauses removed is not the same utterance.
 /// A clip that is quiet throughout trims to empty rather than to itself, which is what makes
 /// a silent-recording filter possible (`list.len() == 0`).
-pub(crate) fn trim_silence<O: OffsetSizeTrait>(
-    bytes: &GenericBinaryArray<O>,
+pub(crate) fn trim_silence(
+    clips: &Signal<'_>,
     threshold_db: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
     // -40 dBFS: the conventional default, quiet enough to keep a soft consonant and loud
     // enough to drop room tone.
     let cutoff = amplitude_for(threshold_db.unwrap_or(-40) as f64);
-    let rows: Vec<Option<Vec<f32>>> = map_rows(bytes.len(), |i| {
-        if bytes.is_null(i) {
-            return None;
-        }
-        let Decoded { samples, .. } = decode_pcm(bytes.value(i))?;
+    let rows: Vec<Option<Vec<f32>>> = map_rows(clips.len(), |i| {
+        let samples = clips.samples(i)?;
         let first = samples.iter().position(|s| s.abs() > cutoff);
         match first {
             None => Some(Vec::new()),
@@ -69,14 +69,9 @@ pub(crate) fn trim_silence<O: OffsetSizeTrait>(
 /// It is peak normalization, not loudness (LUFS) normalization — it equalizes the maximum,
 /// not the perceived level, so a clip with one loud click stays quiet everywhere else.
 /// An all-zero clip is returned unchanged rather than divided by zero.
-pub(crate) fn peak_normalize<O: OffsetSizeTrait>(
-    bytes: &GenericBinaryArray<O>,
-) -> Result<ArrayRef, ExprError> {
-    let rows: Vec<Option<Vec<f32>>> = map_rows(bytes.len(), |i| {
-        if bytes.is_null(i) {
-            return None;
-        }
-        let Decoded { mut samples, .. } = decode_pcm(bytes.value(i))?;
+pub(crate) fn peak_normalize(clips: &Signal<'_>) -> Result<ArrayRef, ExprError> {
+    let rows: Vec<Option<Vec<f32>>> = map_rows(clips.len(), |i| {
+        let mut samples = clips.samples(i)?;
         let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         if peak > 0.0 {
             let gain = 1.0 / peak;
@@ -97,14 +92,9 @@ pub(crate) fn peak_normalize<O: OffsetSizeTrait>(
 /// good first-pass filter over a corpus that has not been curated.
 ///
 /// A clip shorter than two samples has no adjacent pair and yields null.
-pub(crate) fn zero_crossing_rate<O: OffsetSizeTrait>(
-    bytes: &GenericBinaryArray<O>,
-) -> Result<ArrayRef, ExprError> {
-    let rows: Vec<Option<f64>> = map_rows(bytes.len(), |i| {
-        if bytes.is_null(i) {
-            return None;
-        }
-        let Decoded { samples, .. } = decode_pcm(bytes.value(i))?;
+pub(crate) fn zero_crossing_rate(clips: &Signal<'_>) -> Result<ArrayRef, ExprError> {
+    let rows: Vec<Option<f64>> = map_rows(clips.len(), |i| {
+        let samples = clips.samples(i)?;
         if samples.len() < 2 {
             return None;
         }

@@ -57,27 +57,45 @@ def _bounded_map(
     submission also makes `timeout` meaningful per call rather than per batch, because a
     call is submitted only once a worker is free to start it, so its submit time is its
     start time. `on_timeout` supplies the value to yield instead of raising.
+
+    A `timeout` is served by one guarded daemon thread per call rather than by the shared
+    pool, because a timed-out call is abandoned and keeps running. Parked in the shared
+    fixed-size pool it held its worker forever, and `_POOLS` is module-level — so once
+    `workers` fetches had hung, *every* later download in the process timed out on a full
+    queue however healthy its URL was, and the stage returned nulls and timeout errors for
+    good data. Silent, permanent, and process-wide. `call_with_timeout` keeps a hung call's
+    cost to the call that earned it; the untimed path still shares the pool.
     """
+    import functools
     import time
     from collections import deque
-    from concurrent.futures import TimeoutError as FuturesTimeout
 
-    pool = _shared_pool(workers)
+    from batcher._internal.concurrency.timeout import start_call
+
     pending: deque[tuple[float, Any]] = deque()
+    # Both branches start the call at submit time, so `workers` of them are in flight at
+    # once and a deadline measured from submit time measures the call itself.
+    if timeout is None:
+        pool = _shared_pool(workers)
+        submit: Any = lambda item: pool.submit(fn, item)  # noqa: E731
+    else:
+        submit = lambda item: start_call(  # noqa: E731
+            functools.partial(fn, item), name="bt-media"
+        )
 
     def _take() -> Any:
-        submitted, future = pending.popleft()
+        submitted, handle = pending.popleft()
         if timeout is None:
-            return future.result()
+            return handle.result()
         try:
-            return future.result(timeout=max(timeout - (time.monotonic() - submitted), 0.0))
-        except FuturesTimeout:
+            return handle.result(max(timeout - (time.monotonic() - submitted), 0.0))
+        except TimeoutError:
             if on_timeout is None:
                 raise
             return on_timeout()
 
     for item in items:
-        pending.append((time.monotonic(), pool.submit(fn, item)))
+        pending.append((time.monotonic(), submit(item)))
         if len(pending) >= workers:
             yield _take()
     while pending:

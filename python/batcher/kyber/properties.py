@@ -15,6 +15,12 @@ they are the two every mature optimizer reasons about:
     groups locally and needs no second shuffle. `dist` already exploits exactly that, but
     it re-derives it inline from the node types instead of asking for the property.
 
+    A distribution can also arrive without the engine arranging it. A table partitioned on
+    disk hands each partition's rows to one worker, which is the same guarantee reached by
+    storage rather than by a shuffle, so `clustered_on` carries it and `satisfies` treats
+    the two identically. That one is not derivable from the plan — it depends on the splits
+    the read gets — so it is supplied by `dist` rather than computed here.
+
 This module is the one place those are computed, so a rule asks a question rather than
 re-deriving an answer. It decides; it never executes and never rewrites — `kyber`'s lane.
 
@@ -28,6 +34,7 @@ already delivered, which is what lets redundant work be removed and a shuffle be
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from batcher.plan.expr_ir import Col
@@ -39,11 +46,13 @@ from batcher.plan.logical import (
     Limit,
     LogicalPlan,
     Project,
+    Scan,
 )
 from batcher.plan.stats import RelStats, SortOrder, orderings_satisfy
 
 __all__ = [
     "PhysicalProperties",
+    "clustered_on",
     "delivered",
     "hash_partitioned_on",
     "project_ordering",
@@ -59,10 +68,19 @@ class PhysicalProperties:
     placement, so a descending ordering is as expressible as an ascending one.
     `hash_partitioned_on` is the key set whose equal values are guaranteed to share a
     partition; empty means "no guarantee", which is always the safe answer.
+
+    `clustered_on` is the same guarantee reached a different way: equal values share a
+    partition because the *storage layout* already put them there — the table is partitioned
+    by those columns, and the scheduler assigned each partition's splits to one worker —
+    rather than because a shuffle hashed them together. The two are kept as separate fields because
+    their provenance is what a reader needs (one is a decision the engine made, the other a
+    fact about the table on disk), and `satisfies` then treats them identically, since
+    "equal keys are co-located" is the only thing a consumer skipping an exchange needs.
     """
 
     ordering: tuple[SortOrder, ...] = ()
     hash_partitioned_on: tuple[str, ...] = ()
+    clustered_on: tuple[str, ...] = ()
 
 
 def satisfies(
@@ -99,10 +117,13 @@ def satisfies(
         True iff no extra sort or shuffle is needed.
     """
     ordered = orderings_satisfy(have.ordering, want.ordering, non_nullable=non_nullable)
-    partitioned = not want.hash_partitioned_on or (
-        bool(have.hash_partitioned_on)
-        and set(have.hash_partitioned_on) <= set(want.hash_partitioned_on)
-    )
+    required = set(want.hash_partitioned_on) | set(want.clustered_on)
+    # Either delivered partitioning discharges the requirement on its own, so they are
+    # tested separately rather than unioned: a relation hash-partitioned on `(a)` and
+    # clustered on `(b)` satisfies a grouping by `(a, c)` through the first alone, and
+    # unioning the two into `{a, b}` would wrongly demand `b` in the grouping as well.
+    delivered = [set(k) for k in (have.hash_partitioned_on, have.clustered_on) if k]
+    partitioned = not required or any(keys <= required for keys in delivered)
     return ordered and partitioned
 
 
@@ -188,6 +209,47 @@ def hash_partitioned_on(node: LogicalPlan) -> tuple[str, ...]:
         # column; if one is dropped or computed the partitioning still physically holds but can
         # no longer be *named*, so it is unclaimed (costing at most a needless shuffle).
         return _rename_keys(hash_partitioned_on(node.input), node.items)
+    return ()
+
+
+def clustered_on(
+    node: LogicalPlan, scan_clustering: Mapping[int, tuple[str, ...]]
+) -> tuple[str, ...]:
+    """The columns `node`'s output is value-clustered by, given what its scans deliver.
+
+    The value-partitioning twin of `hash_partitioned_on`, and the answer to roadmap item 7
+    ("plan on the layout a table already has"). A partitioned table hands every row carrying
+    a given partition value to one worker, so those values are already co-located — the exact
+    condition a shuffle would establish, discovered for free by the read. A consumer grouping
+    on a *superset* of these columns therefore computes complete groups locally and needs no
+    exchange.
+
+    The clustering a scan delivers is not derivable from the plan: it depends on the split set
+    the read will actually use and on how the scheduler assigns it, which only `dist` can see.
+    So it is supplied per source id rather than guessed here (`io.splits.clustering` is what
+    checks it, and `dist.executors.partition_io` what establishes it) — this function only
+    propagates a fact it is handed.
+
+    Propagation follows the same reasoning as `hash_partitioned_on`, one rule at a time:
+    `Filter`, `Limit` and `Distinct` only *remove* rows, and removing a row never moves
+    another one to a different worker; a `Project` is map-only, so the clustering survives
+    under the output names (and is unclaimed if a clustering column is dropped or computed,
+    costing at most a needless shuffle). Everything else is unclaimed.
+
+    Args:
+        node: The plan node whose output clustering is in question.
+        scan_clustering: Per source id, the columns that source's read is value-partitioned
+            by. A source absent from the mapping delivers no clustering.
+
+    Returns:
+        The guaranteed value-clustering key set, or an empty tuple.
+    """
+    if isinstance(node, Scan):
+        return tuple(scan_clustering.get(node.source_id, ()))
+    if isinstance(node, Filter | Limit | Distinct):
+        return clustered_on(node.input, scan_clustering)
+    if isinstance(node, Project):
+        return _rename_keys(clustered_on(node.input, scan_clustering), node.items)
     return ()
 
 

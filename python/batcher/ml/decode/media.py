@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher._internal.logging import note_suppressed
+from batcher._internal.optional import require
 from batcher.ml.decode.stage import _require_size
 
 if TYPE_CHECKING:
@@ -20,26 +21,53 @@ if TYPE_CHECKING:
 __all__ = ["audio_dataset", "image_tensor_dataset"]
 
 
+#: How a decoded image is made to fit the requested shape. Every entry produces the same
+#: fixed-shape ``(H, W, 3)`` uint8 column; they differ in what they do to an image whose
+#: aspect ratio is not already the target's, which is a choice with no safe default.
+_FIT_MODES = ("stretch", "letterbox", "center_crop")
+
+
 def image_tensor_dataset(
     ds: Dataset,
     *,
     size: tuple[int, int] | None,
+    fit: str = "stretch",
     source_column: str = "bytes",
     output_column: str = "image",
 ) -> Dataset:
     """Decode an image-bytes column into a ``(H, W, 3)`` uint8 tensor column.
 
-    The decode/resize runs natively (``col(source).image.to_tensor``), and the engine
-    tags the output column with the canonical ``arrow.fixed_shape_tensor`` extension
+    The decode/resize runs natively (``col(source).image.to_tensor`` and friends), and the
+    engine tags the output column with the canonical ``arrow.fixed_shape_tensor`` extension
     metadata, so it crosses the FFI already shaped as an ``(N, H, W, 3)`` training tensor
     — no per-batch re-type pass. Staying a pure ``with_columns`` (no ``map_batches``) is
     what keeps the decode on the fully-parallel native path instead of the slower
     opaque-UDF path, the difference that made image ingest the pipeline bottleneck.
+
+    `fit` decides what happens to an image that is not already at the target ratio, which
+    every one of these does differently and none of which is universally right:
+
+    * ``"stretch"`` squashes it. Fine for a classifier trained the same way, and a silent
+      distortion otherwise — no shape assertion downstream can see it.
+    * ``"letterbox"`` scales the whole image inside the box and pads the remainder, so
+      every pixel survives at its true ratio. The object-detection default, because
+      stretching moves each predicted box off its object.
+    * ``"center_crop"`` keeps the centre at native resolution and discards the border,
+      which is where the missed detections live but also where most of the clutter is.
     """
     from batcher.plan.expr_ir import col
 
     height, width = _require_size(size, "read.images(decode=True)")
-    return ds.with_columns(**{output_column: col(source_column).image.to_tensor(width, height)})
+    if fit not in _FIT_MODES:
+        raise PlanError(f"read.images(fit=...) must be one of {list(_FIT_MODES)}, got {fit!r}")
+    source = col(source_column)
+    if fit == "letterbox":
+        tensor = source.image.letterbox(width, height)
+    elif fit == "center_crop":
+        tensor = source.image.center_crop(width, height)
+    else:
+        tensor = source.image.to_tensor(width, height)
+    return ds.with_columns(**{output_column: tensor})
 
 
 def audio_dataset(
@@ -109,10 +137,7 @@ def _decode_audio_bytes(
         return None
     import io
 
-    try:
-        import soundfile as sf
-    except ImportError as exc:  # pragma: no cover - optional extra
-        raise PlanError("audio needs soundfile: pip install 'batcher-engine[audio]'") from exc
+    sf = require("soundfile", feature="Audio decode", provides="soundfile", extra="audio")
     try:
         wave, native_sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
     except Exception:

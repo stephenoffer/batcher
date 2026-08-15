@@ -5458,6 +5458,23 @@ class Lit(Expr):
             tagged = {"timestamp": micros}
         elif isinstance(v, _dt.date):
             tagged = {"date": (v - _dt.date(1970, 1, 1)).days}
+        elif isinstance(v, _dt.time):
+            # Lowered as a cast from its ISO text, which is exactly what the SQL parser
+            # emits for ``TIME '01:02:03'``. Not a tagged literal like `date` and
+            # `timestamp` above, because `bc_expr::Literal` has no `Time` variant — giving
+            # it one would be a two-sided IR change across the FFI for something the engine
+            # already evaluates correctly by this route.
+            #
+            # Until this existed, ``col("t") > time(1, 0)`` raised ``unsupported literal
+            # type: time`` while ``WHERE t > TIME '01:00:00'`` answered it — the same query,
+            # over the same engine, working through one front-end and not the other.
+            if v.tzinfo is not None:
+                raise TypeError(
+                    "a time literal cannot carry a timezone: arrow's time64 has no zone, "
+                    "so the offset would be silently dropped. Use a datetime for an "
+                    "instant, or a naive time for a wall-clock time of day."
+                )
+            return Cast(Lit(v.isoformat()), "time").to_ir()
         else:  # pragma: no cover - guarded by typing
             raise TypeError(f"unsupported literal type: {type(v).__name__}")
         out = {"e": ExprTag.LIT, "value": tagged}

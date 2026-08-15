@@ -33,6 +33,8 @@ from collections.abc import Callable, Iterable, Iterator
 
 import pyarrow as pa
 
+from batcher.plan.types import retained_bytes
+
 __all__ = ["ordered_readahead"]
 
 # A queue slot count high enough that a producer is never woken per batch, low enough
@@ -98,7 +100,7 @@ class _FileStream:
     def _run(self, path: str, iter_file: Callable[[str], Iterator[pa.RecordBatch]]) -> None:
         try:
             for batch in iter_file(path):
-                if not self._acquire(batch.nbytes):
+                if not self._acquire(retained_bytes(batch)):
                     return
                 # A bounded queue can also park a producer, so the same abandonment check
                 # has to cover the hand-off itself, not only the credit.
@@ -146,7 +148,10 @@ class _FileStream:
             finally:
                 # Released *after* the consumer is done with the batch, so the bound
                 # covers data the pipeline still holds, not merely data in the queue.
-                self.release(item.nbytes)
+                # The figure must be the one `_run` charged — `retained_bytes`, which is
+                # what the batch actually pins and is total on every Arrow layout — or the
+                # counter drifts and the budget stops binding.
+                self.release(retained_bytes(item))
 
 
 def ordered_readahead(

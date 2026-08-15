@@ -1,4 +1,13 @@
-"""Plain-text source — one row per line or one row per whole file."""
+"""Plain-text source — one row per line or one row per whole file.
+
+A text corpus is not one encoding. Scraped pages, exported logs and anything a Windows
+editor touched are a mixture, and the two read modes here used to *disagree* about what
+that means: line mode's Arrow-backed splitter replaced the bytes it could not decode and
+returned the row, while file mode's Python decode raised `UnicodeDecodeError` and lost the
+whole read. One source, one file, two answers — one of them silent. `errors` now says which
+behaviour is wanted and both modes honour it, and `on_error` decides whether one unreadable
+file costs the corpus.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +17,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import FormatError
 from batcher.io.base._lines import iter_line_blocks, one_array
+from batcher.io.base._tolerance import ErrorPolicy
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
@@ -30,22 +40,83 @@ _TEXT_BLOCK_BYTES = 1 << 20  # 1 MiB
 _TEXT_LINES_PER_BATCH = 16_384
 
 
+def _check_error_handler(errors: str) -> None:
+    """Reject an unknown codec error handler here, not a million rows into the scan.
+
+    Python only looks a handler up when it first has to *use* one, so a typo like
+    ``errors="replce"`` reads a clean corpus perfectly and then fails on the first
+    undecodable byte with `LookupError: unknown error handler name` — from inside a
+    decoder, with no mention of the parameter that named it. Looking it up at construction
+    turns that into a `FormatError` naming the argument, before anything is read.
+    """
+    import codecs
+
+    try:
+        codecs.lookup_error(errors)
+    except LookupError as exc:
+        raise FormatError(
+            f"TextSource errors must be a codec error handler such as 'strict' or "
+            f"'replace', got {errors!r}"
+        ) from exc
+
+
 @SOURCES.register("text")
 class TextSource:
     """Text files as rows. `mode="line"` → one row per line (with `line_number`);
     `mode="file"` → one row per whole file. Each split is a single file.
     """
 
-    __slots__ = ("_encoding", "_files_cache", "_fs", "_mode", "_path")
+    __slots__ = ("_encoding", "_errors", "_files_cache", "_fs", "_mode", "_path", "_tolerance")
 
-    def __init__(self, path: str, *, mode: str = "line", encoding: str = "utf-8") -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        mode: str = "line",
+        encoding: str = "utf-8",
+        errors: str = "replace",
+        on_error: str = "raise",
+    ) -> None:
+        """Open a text corpus.
+
+        Args:
+            path: A text file, directory, or glob.
+            mode: ``"line"`` for one row per line (with ``line_number``), ``"file"`` for
+                one row per whole file.
+            encoding: The text encoding to decode with.
+            errors: What to do with bytes `encoding` cannot decode — any of Python's codec
+                error handlers, most usefully ``"replace"`` (the default: substitute
+                U+FFFD and keep the row) or ``"strict"`` (fail the file). The default is
+                ``"replace"`` because that is what line mode has always silently done, and
+                because a corpus that loses a whole file to one stray byte is the more
+                surprising of the two behaviours.
+            on_error: ``"raise"`` (default) or ``"skip"``, which drops an unreadable file
+                and records it in `corrupt_files`.
+
+        Raises:
+            FormatError: If `mode` is not ``"line"`` or ``"file"``.
+        """
         if mode not in ("line", "file"):
             raise FormatError(f"TextSource mode must be 'line' or 'file', got {mode!r}")
+        _check_error_handler(errors)
         self._path = path
         self._fs = resolve_filesystem(path)
         self._mode = mode
         self._encoding = encoding
+        self._errors = errors
+        # A text corpus at scale always holds a few unreadable members — a permissions
+        # error, a truncated object, a file that is not text at all under `errors="strict"`.
+        self._tolerance = ErrorPolicy(on_error)
         self._files_cache: list[str] | None = None
+
+    def corrupt_files(self) -> list[str]:
+        """The paths this source skipped, in failure order (empty unless `on_error="skip"`).
+
+        Returns:
+            The skipped paths. A skipped file leaves no row, so this is the only way to
+            tell a clean read from a partial one.
+        """
+        return self._tolerance.skipped()
 
     def _files(self) -> list[str]:
         if self._files_cache is None:
@@ -60,7 +131,7 @@ class TextSource:
 
     def _read_text(self, path: str) -> str:
         with self._fs.open(path) as fh:
-            return fh.read().decode(self._encoding)
+            return fh.read().decode(self._encoding, errors=self._errors)
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         from batcher.io._concurrent import read_each_file
@@ -72,16 +143,50 @@ class TextSource:
             # Python list of every line *and* one batch of them all at once — three copies
             # of a multi-GB log.
             for f in files:
-                yield from self._iter_line_batches(f, projection)
+                # Tolerance wraps the *whole* file's stream, not each batch: a file that
+                # fails mid-way has already yielded rows, and re-yielding a partial file
+                # under `skip` would be worse than dropping it — it would silently emit
+                # half a document as if it were all of it. `_tolerant_lines` therefore
+                # buffers nothing and simply stops the file at the first failure, after
+                # recording it.
+                yield from self._tolerant_lines(f, projection)
             return
         # File mode: a row is a whole file, so the file is resident either way. Read a
         # chunk of files concurrently so a many-file scan isn't one serial open per file
         # on a high-latency store, while staying bounded to one chunk and in file order.
         for start in range(0, len(files), _TEXT_READ_CHUNK):
             chunk = files[start : start + _TEXT_READ_CHUNK]
-            texts = read_each_file(self._fs, chunk, lambda _fs, p: self._read_text(p))
+            texts = read_each_file(self._fs, chunk, lambda _fs, p: self._safe_text(p))
             for f, data in zip(chunk, texts, strict=True):
+                if data is None:  # unreadable and tolerated — contributes no row
+                    continue
                 yield self._build_batch(f, data, projection)
+
+    def _safe_text(self, path: str) -> str | None:
+        """One file's whole text, or `None` when it was unreadable and that was tolerated."""
+        try:
+            return self._read_text(path)
+        except Exception as exc:
+            self._tolerance.tolerate(path, exc, format_name="text")
+            return None
+
+    def _tolerant_lines(self, path: str, projection: list[str] | None) -> Iterator[pa.RecordBatch]:
+        """`_iter_line_batches` with a per-file failure recorded rather than raised.
+
+        The generator is stepped by hand so a failure *between* batches is caught: a plain
+        `try` around a `yield from` would also swallow an exception raised by the consumer
+        downstream, which is not this reader's to tolerate.
+        """
+        batches = self._iter_line_batches(path, projection)
+        while True:
+            try:
+                batch = next(batches)
+            except StopIteration:
+                return
+            except Exception as exc:
+                self._tolerance.tolerate(path, exc, format_name="text")
+                return
+            yield batch
 
     def _iter_line_batches(
         self, path: str, projection: list[str] | None
@@ -126,7 +231,12 @@ class TextSource:
         splitter reads UTF-8 and nothing else; a `latin-1` or `utf-16` file is decoded here
         exactly as it always was.
         """
-        if self._encoding.lower().replace("-", "").replace("_", "") in ("utf8", "u8", "utf"):
+        # The Arrow splitter reads UTF-8 and *replaces* what it cannot decode, so it can
+        # only serve the request when replacement is what was asked for. Under any other
+        # handler — `strict` above all — the Python decoder below is the one that keeps the
+        # promise, and taking the fast path anyway is how the two modes came to disagree.
+        utf8 = self._encoding.lower().replace("-", "").replace("_", "") in ("utf8", "u8", "utf")
+        if utf8 and self._errors == "replace":
             with self._fs.open(path) as fh:
                 yield from iter_line_blocks(fh, splitlines=True)
             return
@@ -155,7 +265,7 @@ class TextSource:
         """
         import codecs
 
-        decoder = codecs.getincrementaldecoder(self._encoding)()
+        decoder = codecs.getincrementaldecoder(self._encoding)(self._errors)
         carry = ""
         with self._fs.open(path) as fh:
             while True:

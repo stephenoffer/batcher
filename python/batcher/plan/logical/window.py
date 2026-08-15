@@ -12,7 +12,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir import Expr
+from batcher.plan.expr_ir import Col, Expr
 from batcher.plan.ir_tags import (
     FRAME_UNITS,
     WINDOW_AGGREGATES,
@@ -59,6 +59,33 @@ def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataTyp
     if fn.func in WINDOW_VALUE or fn.func in {"min", "max"}:
         return t
     return None
+
+
+def _validate_window_input_types(source: LogicalPlan, functions: tuple) -> None:
+    """Reject a window function over an input type it cannot mean anything over.
+
+    The window twin of `plan.logical.aggregate._validate_agg_input_types`, sharing its rule
+    (`plan.types.domains`) because the window form of an aggregate computes the same
+    statistic over a frame and so has the same input domain. Runs on the same terms too: at
+    build time when the input's types are known, silently when they are not.
+    """
+    from batcher.plan.types.domains import window_domain_error
+
+    schema = source.available_schema()
+    if schema is None:
+        return
+    for fn in functions:
+        if fn.input is None:
+            continue
+        dt = infer_type(fn.input, schema)
+        if dt is None:
+            continue
+        label = (
+            f"column {fn.input.name!r}" if isinstance(fn.input, Col) else f"{fn.alias!r}'s input"
+        )
+        problem = window_domain_error(fn.func, label, widen(dt))
+        if problem is not None:
+            raise PlanError(problem)
 
 
 #: Fixed order for the error message; membership is `FRAME_UNITS`, which is the wire
@@ -201,6 +228,13 @@ class WindowFuncSpec:
         return item
 
 
+def _key_label(expr: Expr) -> str:
+    """How to name a window key in an error: its column, or the expression's rendering."""
+    from batcher.plan.expr_ir import Col
+
+    return expr.name if isinstance(expr, Col) else str(expr)
+
+
 @dataclass(frozen=True, slots=True)
 class Window(LogicalPlan):
     """Window functions: partition, order within partition, append one column per
@@ -241,6 +275,20 @@ class Window(LogicalPlan):
             _validate_refs(expr, available, what="window partition key")
         for key in self.order_keys:
             _validate_refs(key.expr, available, what="window order key")
+        # A window partitions and orders through the same row encoder `group_by` keys on,
+        # so a `map` in either key list fails the same way and is refused the same way.
+        from batcher.plan.logical.base import validate_key_domains
+
+        validate_key_domains(
+            self.input,
+            [(e, _key_label(e)) for e in self.partition_keys],
+            operation="over(partition_by=...)",
+        )
+        validate_key_domains(
+            self.input,
+            [(k.expr, _key_label(k.expr)) for k in self.order_keys],
+            operation="over(order_by=...)",
+        )
         for fn in self.functions:
             if fn.func in WINDOW_RANKING and not self.order_keys:
                 # Spark rejects this too (WINDOW_FUNCTION_FRAME_NOT_ORDERED), for the reason
@@ -271,6 +319,7 @@ class Window(LogicalPlan):
                 )
             if fn.input is not None:
                 _validate_refs(fn.input, available, what=f"window function {fn.alias!r}")
+        _validate_window_input_types(self.input, self.functions)
         # Aliases must not collide with input columns or each other.
         seen = set(self.input.available_columns())
         for fn in self.functions:

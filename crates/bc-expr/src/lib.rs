@@ -148,10 +148,34 @@ pub enum Expr {
         std: Option<Vec<f64>>,
         #[serde(default)]
         channels_first: bool,
-        /// `Encode` only: the target container format.
+        /// The container every bytes-out op re-encodes into (`png` when absent).
+        ///
+        /// It used to be `Encode`'s alone, with `Convert` borrowing the slot for a colour
+        /// *mode*. That left every other bytes-out op — `resize`, `thumbnail`,
+        /// `auto_orient`, and now fifteen more — hard-wired to PNG, which for photographic
+        /// content is both several times slower to write and several times larger than the
+        /// JPEG it was decoded from. A resize step that silently inflates a corpus is not
+        /// a resize step anyone wants, so the slot is now universal and `Convert` has its
+        /// own `mode`.
         #[serde(default)]
         format: Option<String>,
-        /// `Letterbox` only: the byte value the leftover canvas is filled with.
+        /// `Convert` only: the target colour mode (`L`/`LA`/`RGB`/`RGBA`).
+        #[serde(default)]
+        mode: Option<String>,
+        /// Encoder quality for the lossy containers, 1..=100 (JPEG's default is 75).
+        /// Ignored by the lossless ones, where there is nothing to trade.
+        #[serde(default)]
+        quality: Option<i64>,
+        /// The one scalar knob the photometric and hashing ops take, named per op:
+        /// `rotate`'s degrees, `adjust_*`'s factor, `blur`/`sharpen`'s sigma/amount,
+        /// `posterize`'s bit count, `solarize`'s threshold, `autocontrast`'s cutoff.
+        ///
+        /// One slot rather than six, because they are mutually exclusive by construction —
+        /// an op reads exactly one — and six `Option<f64>`s on the wire would be five nulls
+        /// in every image plan.
+        #[serde(default)]
+        factor: Option<f64>,
+        /// `Letterbox`/`Pad` only: the byte value the leftover canvas is filled with.
         #[serde(default)]
         fill: Option<i64>,
     },
@@ -178,9 +202,21 @@ pub enum Expr {
         /// `Mfcc` only: number of cepstral coefficients to keep.
         #[serde(default)]
         n_mfcc: Option<i64>,
-        /// `TrimSilence` only: the silence floor in dBFS (negative), defaulting to -40.
+        /// `TrimSilence`/`SilenceRatio`: the silence floor in dBFS (negative), defaulting
+        /// to -40. `RmsNormalize` reuses it as its *target* level, defaulting to -20.
         #[serde(default)]
         threshold_db: Option<i64>,
+        /// The one fractional knob the newer ops take, named per op: `PreEmphasis`'s
+        /// coefficient, `ClippingRatio`'s full-scale fraction, `SpectralRolloff`'s energy
+        /// percentile. One slot rather than three, because an op reads exactly one.
+        #[serde(default)]
+        factor: Option<f64>,
+        /// `Slice` only: where the window starts, in seconds.
+        #[serde(default)]
+        offset_secs: Option<f64>,
+        /// `Slice`/`PadOrTrim`: how long the window is, in seconds.
+        #[serde(default)]
+        duration_secs: Option<f64>,
     },
 
     /// A crop over an image column whose window is **four sub-expressions rather than
@@ -1261,6 +1297,107 @@ pub enum ImageFunc {
     /// live. `fill` defaults to 114, the YOLO family's grey. Null/undecodable → null.
     /// → FixedSizeList&lt;UInt8&gt; of `height * width * 3`.
     Letterbox,
+    /// `rotate(degrees)` → the image turned by a multiple of 90 degrees, re-encoded.
+    /// Only right angles: a free rotation resamples every pixel and leaves a border no
+    /// caller asked for, while 90/180/270 is a transposition that is exact and lossless.
+    /// Negative and >360 values are normalized (`-90` == `270`). Null/undecodable → null.
+    Rotate,
+    /// `flip_horizontal()` → the image mirrored left-to-right, re-encoded. The single
+    /// most-used training-time augmentation, and the one that must happen *before* the
+    /// tensor step so a detector's boxes can be flipped with it.
+    FlipHorizontal,
+    /// `flip_vertical()` → the image mirrored top-to-bottom, re-encoded.
+    FlipVertical,
+    /// `pad(width, height, fill)` → the image centered on a `(width, height)` canvas
+    /// filled with `fill`, **without** scaling. The difference from `Letterbox` is that
+    /// nothing is resampled: a canvas smaller than the image crops it. This is what makes
+    /// a corpus of unequal-size crops batchable without touching a single pixel value.
+    Pad,
+    /// `adjust_brightness(factor)` → every channel scaled by `factor` and clamped.
+    /// `1.0` is the identity, `0.0` black, `2.0` twice as bright — the same convention as
+    /// `PIL.ImageEnhance.Brightness`, so an augmentation policy ports over unchanged.
+    AdjustBrightness,
+    /// `adjust_contrast(factor)` → each channel pushed away from (or toward) the image's
+    /// mean luma by `factor`. `1.0` identity, `0.0` a flat grey field.
+    /// Matches `PIL.ImageEnhance.Contrast`.
+    AdjustContrast,
+    /// `adjust_saturation(factor)` → each pixel interpolated between its grey (Rec.601)
+    /// and its colour by `factor`. `0.0` is grayscale, `1.0` identity, `>1` more vivid.
+    /// Matches `PIL.ImageEnhance.Color`.
+    AdjustSaturation,
+    /// `adjust_hue(degrees)` → every hue rotated by `degrees` around the colour wheel,
+    /// saturation and value untouched. The colour-jitter axis the other three cannot
+    /// express, and the one a robustness sweep varies.
+    AdjustHue,
+    /// `blur(sigma)` → a Gaussian blur of standard deviation `sigma` pixels. Both an
+    /// augmentation and a curation tool: blurring a copy and comparing hashes separates
+    /// images that carry fine detail from ones that are already soft.
+    Blur,
+    /// `sharpen(amount)` → an unsharp mask: the image plus `amount` times the difference
+    /// between it and a Gaussian blur of it. `amount` 0 is the identity.
+    Sharpen,
+    /// `invert()` → the photographic negative of each colour channel (alpha untouched).
+    Invert,
+    /// `posterize(bits)` → each channel reduced to its top `bits` bits (1..=8). One of the
+    /// AutoAugment/RandAugment primitives, and a cheap way to make a corpus's colour
+    /// quantization uniform. `8` is the identity.
+    Posterize,
+    /// `solarize(threshold)` → every channel value at or above `threshold` (0..=255)
+    /// inverted, the rest left alone. The other AutoAugment primitive.
+    Solarize,
+    /// `equalize()` → per-channel histogram equalization, so the tonal range is used
+    /// evenly. What rescues an under-exposed scan without a model in the loop.
+    Equalize,
+    /// `autocontrast(cutoff)` → each channel linearly rescaled so its darkest and
+    /// brightest surviving values hit 0 and 255, ignoring the bottom and top `cutoff`
+    /// percent of the histogram. `PIL.ImageOps.autocontrast`. Gentler than `Equalize`:
+    /// it stretches the range without redistributing within it.
+    ///
+    /// Spelled `autocontrast` on the wire rather than the derived `auto_contrast`: it is
+    /// `PIL.ImageOps.autocontrast`'s own name, and the vocabulary is worth more than the
+    /// consistency of a rename rule.
+    #[serde(rename = "autocontrast")]
+    AutoContrast,
+    /// `phash()` → a 64-bit **DCT** perceptual hash (→ Int64, reinterpreted like
+    /// [`ImageFunc::Dhash`]). Where `dhash` compares adjacent pixels, this keeps the 8x8
+    /// lowest-frequency DCT coefficients of a 32x32 luma reduction and thresholds them at
+    /// their median — the standard `pHash`. It survives rotation-free re-encoding, heavy
+    /// rescaling, and moderate cropping far better than `dhash`, which is why a dedup pass
+    /// over a scraped corpus usually wants this one and a *fast* pre-filter wants `dhash`.
+    Phash,
+    /// `ahash()` → a 64-bit **average** hash (→ Int64): an 8x8 luma reduction thresholded
+    /// at its own mean. The cheapest of the three and the least discriminating; it exists
+    /// because a Hamming pre-filter wants a hash that costs almost nothing.
+    Ahash,
+    /// `entropy()` → the Shannon entropy of the luma histogram in bits, 0..=8 (→ Float64).
+    /// A blank tile is ~0, a photograph 6-8. Complementary to `Brightness`, which cannot
+    /// tell a mid-grey placeholder from a scene, and cheaper than `Sharpness`.
+    Entropy,
+    /// `colorfulness()` → the Hasler-Süsstrunk colourfulness metric (→ Float64). It
+    /// separates a genuinely colour image from a scan, a line drawing, or a sepia-toned
+    /// duplicate, which no luma measure can see. Roughly 0 for grey, 15+ for vivid.
+    Colorfulness,
+    /// `mean_color()` → struct `{r, g, b}` of Float64 channel means in 0..=255. The
+    /// cheapest colour summary there is: it makes "find the images on a white background"
+    /// and "cluster a corpus by palette" ordinary predicates. Null/undecodable → null.
+    MeanColor,
+    /// `is_grayscale()` → whether every pixel has R == G == B (→ Boolean). A corpus is
+    /// full of greyscale images *stored* as RGB, which no header field reports and which
+    /// silently triples the cost of every downstream tensor.
+    IsGrayscale,
+    /// `aspect_ratio()` → width / height as Float64, from the **header** alone. The
+    /// orientation and letterboxing decisions of a whole pipeline hang on it, and paying
+    /// a full decode to learn it is what made people skip the check.
+    AspectRatio,
+    /// `has_alpha()` → whether the image's colour type carries an alpha channel
+    /// (→ Boolean), from the header alone. The flag that decides whether a corpus needs
+    /// flattening before a model that takes 3 channels.
+    HasAlpha,
+    /// `format()` → the container format's lowercase name (`"png"`, `"jpeg"`, `"gif"`,
+    /// `"bmp"`, `"webp"`, …) as Utf8, sniffed from the magic bytes rather than from a file
+    /// extension — which is how a corpus full of `.jpg` files that are really PNGs gets
+    /// found. Null when the bytes match no known container.
+    Format,
 }
 
 /// Element-wise arithmetic between two equal-length numeric `List` columns (the `.list`
@@ -1347,6 +1484,81 @@ pub enum AudioFunc {
     /// Emitted as a `List<Float32>` row-major `(n_mfcc, n_frames)`. Numerically matches
     /// `torchaudio.transforms.MFCC` defaults. Null/undecodable → null.
     Mfcc,
+    /// `rms()` → the root-mean-square amplitude of the clip, 0..=1 (→ Float64). The level
+    /// measure that actually tracks perceived loudness, unlike the peak: a recording with
+    /// one door slam has a peak of 1.0 and an RMS that still says "quiet".
+    Rms,
+    /// `dbfs()` → the RMS level in decibels relative to full scale (→ Float64, negative).
+    /// The unit every audio tool states a level in, so a threshold ported from one is
+    /// meaningful here. A digitally silent clip yields null rather than `-inf`, because an
+    /// infinity silently passes every `< threshold` filter written to find quiet clips.
+    Dbfs,
+    /// `peak_dbfs()` → the loudest single sample in dBFS (→ Float64, negative). Paired with
+    /// [`AudioFunc::Dbfs`] it is the crest factor, which is what separates a compressed,
+    /// broadcast-loud recording from a natural one.
+    PeakDbfs,
+    /// `clipping_ratio()` → the fraction of samples at or above `factor` of full scale
+    /// (→ Float64, default 0.99). The corpus-hygiene measure for audio: a clip recorded
+    /// too hot is distorted in a way no level normalization can undo, and it is invisible
+    /// to every other statistic here because normalizing makes it *look* well-levelled.
+    ClippingRatio,
+    /// `silence_ratio(threshold_db)` → the fraction of samples quieter than the threshold
+    /// (→ Float64, default -40 dBFS). Where `trim_silence` removes the ends, this measures
+    /// the whole clip, so a recording that is mostly dead air is one predicate away.
+    SilenceRatio,
+    /// `rms_normalize(threshold_db)` → the waveform scaled so its RMS sits at the target
+    /// level (default -20 dBFS), as a mono `List<Float32>`. The loudness-matching
+    /// counterpart of `PeakNormalize`, and usually the one you want: peak normalization
+    /// equalizes the *maximum*, so a clip with one loud click stays quiet everywhere else.
+    /// Clamped so the result cannot clip. A digitally silent clip is returned unchanged.
+    RmsNormalize,
+    /// `pre_emphasis(factor)` → the first-order high-pass `y[n] = x[n] − a·x[n−1]`
+    /// (default `a = 0.97`), as a mono `List<Float32>`. The standard filter every classical
+    /// ASR front end applies before framing, to flatten the spectral tilt of voiced speech.
+    PreEmphasis,
+    /// `pad_or_trim(duration_secs, rate)` → the waveform resampled to `rate` and forced to
+    /// exactly `duration_secs` — truncated if longer, zero-padded if shorter — as a mono
+    /// `List<Float32>`.
+    ///
+    /// The op that makes a clip corpus batchable. Whisper requires exactly 30 seconds at
+    /// 16 kHz and every other fixed-input audio model requires something like it, so
+    /// without this a pipeline either loops in Python or hands the model rows of unequal
+    /// length. Because the length is a query parameter rather than a property of the data,
+    /// the output column has a knowable fixed width.
+    PadOrTrim,
+    /// `slice(offset_secs, duration_secs)` → the region of the clip starting at
+    /// `offset_secs` and running `duration_secs`, as a mono `List<Float32>`. A window past
+    /// the end of the clip yields an empty list rather than null: an empty region is a fact
+    /// about the window, not a failure to read the clip.
+    Slice,
+    /// `spectrogram(rate, n_fft, hop_length)` → the **linear** power spectrogram as a
+    /// `List<Float32>` of `(n_fft/2+1) * n_frames` in row-major `(freq, frame)` order.
+    /// The mel spectrogram's unwarped sibling: a mel filterbank is tuned to speech, and a
+    /// music, bioacoustic or machine-fault model wants the frequencies themselves.
+    Spectrogram,
+    /// `spectral_centroid(rate, n_fft, hop_length)` → the energy-weighted mean frequency in
+    /// Hz, averaged over frames (→ Float64). The standard "brightness" descriptor, and the
+    /// cheapest way to separate speech from music from noise without a model.
+    SpectralCentroid,
+    /// `spectral_rolloff(rate, n_fft, hop_length, factor)` → the frequency below which
+    /// `factor` of the spectral energy lies (default 0.85), averaged over frames
+    /// (→ Float64). Where the centroid reports the middle of the spectrum, this reports its
+    /// edge, which is what distinguishes a band-limited telephone recording from a
+    /// full-band one — the single most useful thing to know about a scraped speech corpus.
+    SpectralRolloff,
+    /// `spectral_bandwidth(rate, n_fft, hop_length)` → the energy-weighted spread of
+    /// frequencies about the centroid, in Hz, averaged over frames (→ Float64).
+    SpectralBandwidth,
+    /// `spectral_flatness()` → the ratio of the geometric to the arithmetic mean of the
+    /// power spectrum, 0..=1, averaged over frames (→ Float64). The tonality measure: a
+    /// pure tone is near 0, white noise near 1. It is what finds the dead channels and
+    /// hiss-only recordings that every other measure reports as ordinary audio.
+    SpectralFlatness,
+    /// `encode_wav(rate)` → the (optionally resampled) mono waveform as a 16-bit PCM WAV
+    /// container (→ Binary). The op that closes the loop: without it a trimmed, normalized
+    /// or resampled clip can only leave the engine as a list of floats, so writing a
+    /// cleaned corpus back to storage as audio meant a Python encode per row.
+    EncodeWav,
 }
 
 /// Video-decode operations for the `.video` namespace. Requires the `video` cargo

@@ -30,8 +30,9 @@ from batcher.io.base._paths import normalize_path
 from batcher.io.base._transient import with_retry
 from batcher.io.filesystem import FileSystem, resolve_filesystem
 from batcher.io.manifest import WriteManifest, WrittenFile
+from batcher.plan.types import total_retained_bytes
 
-__all__ = ["FileSink"]
+__all__ = ["FileSink", "stream_part_concurrency"]
 
 
 # How many files a write to an **object store** publishes at once. A PUT is tens of
@@ -68,6 +69,34 @@ _STREAM_PART_MEMORY_SHARE = 8
 # idea rather than two. See `FileSink.write` for why retrying a write is safe.
 _WRITE_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_WRITE_RETRY_ATTEMPTS", "3")))
 _WRITE_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_WRITE_RETRY_BACKOFF_S", "0.5")))
+
+
+def stream_part_concurrency(part_bytes: int, directory: str) -> int:
+    """How many output files of `part_bytes` each to keep in flight, given where they go.
+
+    Two bounds, and which one binds depends on the destination and the part size. An object
+    store is latency-bound, so throughput tracks requests in flight rather than cores; local
+    disk is bandwidth-bound, so oversubscribing it buys nothing and costs resident buffers.
+    Either way the parts in flight are held live while their encoders run, so a share of
+    machine memory caps the count for a large part.
+
+    Shared by both streaming writers — `FileSink.write_stream_parts` and the training-shard
+    writer — because they are making the same decision about the same storage. Two copies of
+    this sizing would drift, and the one that drifted low would quietly serialize a write.
+
+    Args:
+        part_bytes: What one in-flight part pins in memory.
+        directory: The destination, which decides whether concurrency is bounded by cores
+            (local disk) or by requests in flight (an object store).
+
+    Returns:
+        The number of parts to write concurrently, at least 1.
+    """
+    by_place = _write_concurrency(_MAX_STREAM_PARTS_IN_FLIGHT, directory)
+    if part_bytes <= 0:
+        return 1
+    budget = machine_memory_bytes() // _STREAM_PART_MEMORY_SHARE
+    return max(1, min(by_place, budget // part_bytes))
 
 
 class FileSink(ABC):
@@ -449,12 +478,11 @@ class FileSink(ABC):
         Returns:
             The number of parts to encode concurrently, at least 1.
         """
-        by_place = _write_concurrency(_MAX_STREAM_PARTS_IN_FLIGHT, directory)
-        part_bytes = sum(b.nbytes for b in part)
-        if part_bytes <= 0:
-            return 1
-        budget = machine_memory_bytes() // _STREAM_PART_MEMORY_SHARE
-        return max(1, min(by_place, budget // part_bytes))
+        # What a part *pins*, not what it addresses: the parts in flight are held live
+        # while their encoders run, and a part cut zero-copy out of a larger table keeps
+        # the whole parent resident. `nbytes` also raises outright on the Arrow view
+        # layouts, which would turn a memory estimate into a failed write.
+        return stream_part_concurrency(total_retained_bytes(part), directory)
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any | None:  # noqa: ARG002 (extension-point args used by overrides)
         """Open an incremental writer over `fh`, or None to buffer (the default).

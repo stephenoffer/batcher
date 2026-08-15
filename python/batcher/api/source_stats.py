@@ -24,6 +24,7 @@ from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.io.source import Source
 from batcher.plan.ir_tags import RUNNING_AGGREGATES
+from batcher.plan.types import logical_bytes
 
 if TYPE_CHECKING:
     from batcher.metadata.hub import MetadataHub
@@ -133,10 +134,8 @@ def collect_source_stats(
     learned separately and lazily (`seed_column_ndv`), so it is unaffected. File sources
     always take the full path — their footer stats are already cheap.
     """
-    from dataclasses import replace
 
     from batcher.io.source import source_statistics
-    from batcher.metadata.source_stats_store import load_source_stats
 
     out = []
     for s in sources:
@@ -170,13 +169,83 @@ def collect_source_stats(
             out.append(narrowed)
             continue
         stats = source_statistics(s)
-        if stats is None and hub is not None:
-            cached = load_source_stats(hub, ident)
-            stats = replace(cached, exact_rows=False) if cached is not None else None
+        if hub is not None:
+            stats = _with_persisted(stats, hub, ident, key)
         if stable and key:
             _SOURCE_STATS_CACHE[key] = stats
         out.append(stats)
     return out
+
+
+#: Column facets a connector's own `statistics()` can never supply, so a persisted entry is
+#: the only place they can come from. Deliberately *not* `min`/`max`/`null_count`/row
+#: counts: the live source is authoritative for those, and blending a remembered bound into
+#: a footer-derived one would let a stale extreme decide a prune.
+_PERSISTED_ONLY_FACETS = ("ndv", "bloom", "mcv", "quantiles", "avg_bytes")
+
+
+def _with_persisted(stats, hub: MetadataHub, identity: str, key: str | None):
+    """`stats`, enriched with the facets Batcher remembered from writing this path.
+
+    Two things reach the optimizer only this way, and until the merge below neither
+    reached it at all:
+
+    * the **membership bloom** (`optimizer.build_bloom_index`), which is the one index that
+      can refute a point lookup *inside* `[min, max]` — the case a zone map is blind to;
+    * a measured **distinct count** for a footerless format, which no CSV or JSON header
+      carries and which join ordering degrades to `max(|L|, |R|)` without.
+
+    They were stranded by a fallback that only fired when the source declared *nothing*:
+    ``if stats is None``. That was true when only Parquet and ORC implemented
+    `statistics()`, and stopped being true when the `FileSource` base gained a generic one —
+    every file source now declares at least a byte size, so the branch became unreachable
+    and the persisted entry was never read again for any format. Nothing failed; the index
+    was simply built on every write and consulted on none.
+
+    Merging rather than substituting is what fixes it: the live statistics stay
+    authoritative for everything they know (row count, byte size, bounds, null counts,
+    ordering), and the persisted entry contributes only `_PERSISTED_ONLY_FACETS`, for
+    columns it has and the live statistics do not.
+
+    **The merge is version-gated and the fallback is not**, which is the asymmetry to keep.
+    A bloom is consulted to *prove absence*, so a bloom describing a previous version of the
+    path deletes rows that exist — a wrong answer, not a slow plan. `key` carries the
+    source's content version (`_cache_key`), so requiring the entry to have been saved under
+    that exact version makes a stale index simply invisible. The no-statistics fallback
+    keeps its old unversioned behaviour because what it yields there is marked
+    `exact_rows=False` and informs cost only.
+    """
+    from dataclasses import replace
+
+    from batcher.metadata.source_stats_store import load_source_stats
+    from batcher.plan.stats import Provenance
+
+    if stats is None:
+        cached = load_source_stats(hub, identity)
+        return replace(cached, exact_rows=False) if cached is not None else None
+    if key is None or "@" not in key:
+        return stats  # no content version to pin the entry to → nothing safe to merge
+    remembered = load_source_stats(hub, identity, require_version=key.rsplit("@", 1)[1])
+    if remembered is None or not remembered.columns:
+        return stats
+    merged = dict(stats.columns)
+    changed = False
+    for name, extra in remembered.columns.items():
+        live = merged.get(name)
+        fill = {
+            facet: getattr(extra, facet)
+            for facet in _PERSISTED_ONLY_FACETS
+            if getattr(extra, facet) is not None and (live is None or getattr(live, facet) is None)
+        }
+        if not fill:
+            continue
+        # A remembered distinct count is an HLL estimate whatever the live bundle's tag
+        # says, so it carries its own SKETCH tag and can never answer a `count_distinct`.
+        if "ndv" in fill:
+            fill["ndv_provenance"] = Provenance.SKETCH
+        merged[name] = replace(live, **fill) if live is not None else replace(extra, **fill)
+        changed = True
+    return replace(stats, columns=merged) if changed else stats
 
 
 def _resident_subset_stats(source: Source, need_columns: set[str]):
@@ -292,27 +361,32 @@ def column_bounds_needed(plan: LogicalPlan) -> set[str]:
     """
     from batcher.plan.expr_ir import Col, referenced_columns
     from batcher.plan.logical import Aggregate, AsofJoin, Filter, Join, Sort
-    from batcher.plan.visitor import walk
+    from batcher.plan.visitor import walk_with_base_names
 
+    # Names come off the plan and are looked up in a *source's* schema, so each is resolved
+    # back through renaming projections first — otherwise every aliased or self-joined table
+    # (`date_dim d1, date_dim d2`) contributes names no source carries and all four rules
+    # above go blind on it. See `walk_with_base_names`.
     needed: set[str] = set()
-    for node in walk(plan):
+    for node, base in walk_with_base_names(plan):
+        found: set[str] = set()
         if isinstance(node, Filter):
-            needed |= referenced_columns(node.predicate)
+            found = referenced_columns(node.predicate)
         elif isinstance(node, Join):
-            needed |= set(node.left_keys) | set(node.right_keys)
+            found = set(node.left_keys) | set(node.right_keys)
         elif isinstance(node, AsofJoin):
             # The `on` key is an ordering column (a range bound prunes the right side), and the
             # `by` keys are equi-keys like a hash join's.
-            needed |= {node.left_on, node.right_on}
-            needed |= set(node.left_by) | set(node.right_by)
+            found = {node.left_on, node.right_on} | set(node.left_by) | set(node.right_by)
         elif isinstance(node, Aggregate):
             for key in node.group_keys:
-                needed |= referenced_columns(key.expr)
+                found |= referenced_columns(key.expr)
             for spec in node.aggregates:
                 if spec.agg.func in RUNNING_AGGREGATES and spec.agg.input is not None:
-                    needed |= referenced_columns(spec.agg.input)
+                    found |= referenced_columns(spec.agg.input)
         elif isinstance(node, Sort):
-            needed |= {k.expr.name for k in node.keys if isinstance(k.expr, Col)}
+            found = {k.expr.name for k in node.keys if isinstance(k.expr, Col)}
+        needed |= {base.get(name, name) for name in found}
     return needed
 
 
@@ -408,6 +482,13 @@ def persist_written_source_stats(table: pa.Table, path: str, fmt: str) -> None:
     over a footerless format still finds an exact row count and per-column distinct
     estimates. Best-effort; never breaks a write.
 
+    The **content version** of what was just written is recorded alongside, because the
+    reader's merge (`_with_persisted`) requires one before it will trust a membership
+    bloom: an index describing a previous version of a path proves the absence of values
+    that are now present, which deletes rows. Recording it here is what makes the entry
+    usable at all — an entry with no version is readable but can only serve the weaker,
+    cost-only fallback.
+
     Value-bearing statistics for governed columns are dropped first — see
     `_value_bearing_columns_to_redact`.
     """
@@ -437,11 +518,37 @@ def persist_written_source_stats(table: pa.Table, path: str, fmt: str) -> None:
             if ndv.get(name) or (blooms.get(name) and name not in redacted)
         }
         stats = SourceStatistics(
-            row_count=table.num_rows, byte_size=table.nbytes, columns=columns, exact_rows=True
+            row_count=table.num_rows,
+            byte_size=logical_bytes(table),
+            columns=columns,
+            exact_rows=True,
         )
-        save_source_stats(core.default_hub(), f"{fmt}:{path}", stats)
+        save_source_stats(
+            core.default_hub(), f"{fmt}:{path}", stats, version=_written_version(path)
+        )
     except Exception as exc:  # pragma: no cover - persistence must never break a write
         note_suppressed("api", "persist source statistics", exc)
+
+
+def _written_version(path: str) -> str | None:
+    """The content version of what was just written to `path`, as the reader will see it.
+
+    Computed through `files_version`, the same function `FileSource.stats_version` calls, so
+    the token the writer stores is the token the reader compares against by construction
+    rather than by two implementations agreeing. `path` is a single file here — this is only
+    reached on the single-file write branch, the partitioned one writing many — so the
+    one-element listing is the whole relation.
+
+    A path that cannot be identified yields None, and the entry is then saved without a
+    version, which makes it unusable for the merge and leaves it serving cost only.
+    """
+    try:
+        from batcher.io.filesystem import resolve_filesystem
+        from batcher.io.stats.file_identity import files_version
+
+        return files_version([path], resolve_filesystem(path))
+    except Exception:
+        return None
 
 
 def _build_bloom_index(table: pa.Table, cols: list[str]) -> dict[str, bytes]:

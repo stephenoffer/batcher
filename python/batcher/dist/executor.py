@@ -37,6 +37,7 @@ from batcher.dist.executors.plan_analysis import _empty_agg_table as _empty_agg_
 from batcher.dist.executors.plan_analysis import (
     _has_breaker,
     _is_linear_map_pipeline,
+    _is_row_wise,
     _single_source,
     _split_at,
     empty_result_table,
@@ -773,6 +774,227 @@ def _fusable_join_aggregate(agg: Aggregate) -> bool:
     )
 
 
+def _partition_aligned_aggregate(agg: Aggregate, sources, workers: int, hub) -> tuple[str, ...]:
+    """Whether `agg`'s groups are already whole inside one worker's read — no shuffle at all.
+
+    **Exchange elimination against the layout a table already has on disk**, the storage-side
+    twin of `_fusable_join_aggregate`. A partitioned table — a Hive directory tree, a Delta
+    table — reads splits that each hold their partition columns constant, and the scheduler
+    assigns the splits sharing a value together, so equal partition-column values are already
+    co-located. An aggregate whose group keys *cover* those columns therefore has every group
+    entirely inside one partition: each worker folds its own partitions to final groups and
+    the driver concatenates them. No map barrier, no shuffle, no reduce barrier — and, because
+    nothing is combined across partitions, a non-mergeable aggregate is correct here too.
+
+    Kyber owns "what distribution does this relation already have"
+    (`kyber.properties.clustered_on`); `dist` supplies the one part of the answer only it can
+    see — what the split set actually guarantees — and schedules against the result.
+
+    Three conditions, each load-bearing:
+
+    * every split of the read declares the same clustering columns, verified rather than
+      taken on trust (`io.splits.declared_clustering`), and the splits sharing a value are
+      assigned together (`io.splits.group_by_clustering`), which is what makes the guarantee
+      hold for a reader that splits per data *file* rather than per partition;
+    * every clustering column is a group key, so no group straddles two partitions. Getting
+      this backwards reports each half of a split group as a finished group: a wrong answer,
+      at cluster scale, that every single-node test passes;
+    * the grouping keeps enough of the read's parallelism to be worth the exchange it saves.
+      A value cannot be in two places, so a partition is one assignable unit however many
+      files it holds; `scan_clustering_for` prices that against what the shuffle would have
+      had, from measurements rather than a guess.
+
+    Args:
+        agg: The aggregate under consideration.
+        sources: The query's bound sources.
+        workers: The fleet width.
+        hub: The metadata hub (only to match the executor's partition count).
+
+    Returns:
+        The clustering columns to assign by, or an empty tuple when the aggregate must
+        shuffle. The columns are what the executor needs -- it assigns whole groups of them
+        -- so returning them rather than a bare yes/no is what keeps the decision and the
+        assignment reading the same answer.
+    """
+    # Bare-column keys only, and a *subset* of the keys is enough: grouping by
+    # `(day, year(ts))` refines grouping by `(day)`, so every one of its groups is still
+    # inside one `day` directory. A computed key simply contributes nothing to the cover.
+    group_cols = tuple(gk.expr.name for gk in agg.group_keys if isinstance(gk.expr, Col))
+    if not group_cols:
+        return ()  # a global aggregate has one group spanning every worker: it must combine
+    return _keys_cover_the_layout(agg.input, group_cols, sources, workers, hub)
+
+
+def _partition_aligned_distinct(distinct: Distinct, sources, workers: int, hub) -> tuple[str, ...]:
+    """Whether `distinct`'s duplicate groups are already whole inside one worker's read.
+
+    The same elimination as `_partition_aligned_aggregate`, for the same reason: a dedup is a
+    group-by that keeps one row per group, so it needs no exchange exactly when no group
+    straddles a worker. A whole-row `DISTINCT` groups on every column, which contains the
+    clustering columns by definition, so any clustered layout aligns it; a `DISTINCT ON`
+    aligns only when its keys cover the clustering.
+
+    A `limit` is the one shape excluded outright: keeping `n` rows per partition and
+    concatenating keeps `n x partitions` rows, which is the per-partition-limit bug the
+    aggregate path documents, not a shuffle-free plan.
+
+    Args:
+        distinct: The dedup under consideration.
+        sources: The query's bound sources.
+        workers: The fleet width.
+        hub: The metadata hub (only to match the executor's partition count).
+
+    Returns:
+        The clustering columns to assign by, or an empty tuple when the dedup must shuffle.
+    """
+    if distinct.limit is not None:
+        return ()
+    keys = distinct.keys or tuple(distinct.input.available_columns())
+    if not keys:
+        return ()
+    return _keys_cover_the_layout(distinct.input, keys, sources, workers, hub)
+
+
+def _partition_aligned_window(window: Window, sources, workers: int, hub) -> tuple[str, ...]:
+    """Whether every window partition is already whole inside one worker's read.
+
+    The window form of the same elimination. A window computes each partition independently
+    -- a rank, a running total, a lag -- so the only thing the shuffle establishes is that a
+    partition's rows are all on one worker. A table partitioned on disk by a column the
+    window partitions by has already established it, and `ROW_NUMBER() OVER (PARTITION BY
+    day ...)` over a directory-per-day table is a common enough shape to be worth the check.
+
+    The frame and the ordering need no attention: both are *within* a partition, so a worker
+    holding whole partitions computes them exactly. A `rank_limit` is likewise per-partition,
+    unlike the `Distinct` limit that had to be excluded.
+
+    Args:
+        window: The window under consideration.
+        sources: The query's bound sources.
+        workers: The fleet width.
+        hub: The metadata hub (only to match the executor's partition count).
+
+    Returns:
+        The clustering columns to assign by, or an empty tuple when the window must shuffle.
+    """
+    keys = tuple(k.name for k in window.partition_keys if isinstance(k, Col))
+    if not keys:
+        return ()  # one partition over all rows: nothing to co-locate it by
+    return _keys_cover_the_layout(window.input, keys, sources, workers, hub)
+
+
+def _partition_local_chain(node: LogicalPlan) -> bool:
+    """Whether every operator between `node` and its scan computes *within* a clustering group.
+
+    `clustered_on` answers a different question, and the difference is the trap. It says where
+    rows *are* -- which worker holds them -- and by that measure a `Limit` is transparent: it
+    removes rows, and removing one never moves another. That is a true statement about
+    distribution and `hash_partitioned_on` makes the identical one.
+
+    It is not the property a shuffle-free plan needs. That plan runs the whole sub-tree
+    independently on each partition and concatenates, so it also needs every operator in the
+    chain to *mean the same thing* applied per partition. `Limit` does not:
+    `limit(100).group_by(k)` run per partition keeps a hundred rows on each of them, which is
+    the per-partition-limit defect the shuffle path's own guard documents.
+
+    `Distinct` does, which is what this predicate is for. A dedup only ever collapses rows that
+    agree, and rows that agree on the clustering columns are on one worker, so a per-partition
+    dedup of a clustered relation is already global. That makes `COUNT(DISTINCT x) GROUP BY
+    day` over a day-partitioned table shuffle-free -- and it is a common enough query to be
+    worth the distinction. A `Distinct` carrying a limit is a limit, and is refused as one.
+
+    Args:
+        node: The root of the chain, exclusive of the operator being scheduled.
+
+    Returns:
+        True when running the chain per partition computes what running it once would.
+    """
+    if isinstance(node, Scan):
+        return True
+    if isinstance(node, Distinct):
+        return node.limit is None and _partition_local_chain(node.input)
+    if _is_row_wise(node):
+        return _partition_local_chain(node.input)
+    return False
+
+
+def _note_exchange_eliminated(operator: str, columns: tuple[str, ...]) -> None:
+    """Report that an operator ran with no exchange because the layout already partitioned it.
+
+    Published as a `Decision`, so it lands in `explain(analyze=True)` and the live job view
+    beside Kyber's and Carbonite's, rather than only in a log nobody enabled. Without it the
+    optimization is **unobservable from outside**: the shuffle path returns exactly the same
+    rows, so the only visible difference is a wall-clock number, and a user has no way to tell
+    whether their table's layout is being used or silently ignored.
+
+    Never raises: this describes work already decided on.
+
+    The task count the read runs at is already carried by the ordinary progress events, so
+    what is added here is only the part nothing else can say: *why* there is no shuffle stage.
+
+    Args:
+        operator: The operator that skipped its exchange (`aggregate`, `distinct`, `window`).
+        columns: The clustering columns the layout supplied.
+    """
+    try:
+        from batcher._internal import events
+        from batcher.plan.profile import Decision
+
+        cols = ", ".join(columns)
+        events.publish(
+            events.DECISION,
+            **Decision(
+                subsystem="core",
+                category="exchange",
+                summary=f"{operator} needs no shuffle: the table is already partitioned by {cols}",
+                detail={"operator": operator, "clustered_on": list(columns)},
+            ).to_dict(),
+        )
+    except Exception as exc:  # pragma: no cover - observation must never fail a query
+        note_suppressed("dist", "report the eliminated exchange", exc)
+
+
+def _keys_cover_the_layout(
+    node: LogicalPlan, keys: tuple[str, ...], sources, workers: int, hub
+) -> tuple[str, ...]:
+    """Whether grouping `node` by `keys` needs no exchange, given the layout it reads.
+
+    The shared core of the two callers above: ask `dist` what the read's split set actually
+    guarantees, ask Kyber to propagate that up to `node`, and check the containment.
+
+    Args:
+        node: The relation being grouped.
+        keys: The grouping (or dedup) key columns, as bare column names.
+        sources: The query's bound sources.
+        workers: The fleet width.
+        hub: The metadata hub (only to match the executor's partition count).
+
+    Returns:
+        The clustering columns to assign by, or an empty tuple when a group could straddle two
+        partitions, or when the chain below `node` would not mean the same thing run per
+        partition (`_partition_local_chain`).
+    """
+    from batcher.dist.executors.map import scan_clustering_for
+    from batcher.kyber.properties import PhysicalProperties, clustered_on, satisfies
+
+    ids = scanned_source_ids(node)
+    if len(ids) != 1 or not _partition_local_chain(node):
+        return ()
+    sid = next(iter(ids))
+    cols = scan_clustering_for(node, sources, workers, hub)
+    if not cols:
+        return ()
+    # `cols` names the columns at the SCAN; `clustered_on` renames them through the
+    # projections between the scan and `node`, and that renamed form is what the keys must
+    # cover. The executor assigns by the scan-level names, since that is what the splits
+    # declare, so the two are returned and consumed separately on purpose.
+    ok = satisfies(
+        PhysicalProperties(clustered_on=clustered_on(node, {sid: cols})),
+        PhysicalProperties(hash_partitioned_on=tuple(keys)),
+    )
+    return cols if ok else ()
+
+
 def _aggregate_over_join(agg: Aggregate) -> bool:
     """Whether `agg` is an aggregate over a join of two single sources (any join type or
     group keys) — the general case `_fusable_join_aggregate` does not cover.
@@ -1312,6 +1534,29 @@ def _dispatch(
     agg_split = _split_at(plan, Aggregate)
     if agg_split is not None:
         above, agg = agg_split
+        # The table's layout already partitions it by the group keys, so every group is
+        # complete inside one partition and there is nothing to exchange: run the aggregate
+        # itself as the per-partition plan and concatenate.
+        #
+        # Checked FIRST, ahead of the DISTINCT branches below, because the shape it most often
+        # rescues is one of theirs. `COUNT(DISTINCT x) GROUP BY day` lowers to an aggregate
+        # over a `Distinct`, and a dedup is partition-local over a clustered relation -- rows
+        # that agree are already on one worker -- so the whole thing folds with no shuffle at
+        # all. Reached only when `_partition_local_chain` holds, which is what keeps a `Limit`
+        # in the chain out.
+        #
+        # `hub=None` deliberately: what comes back is one row per group, and learning that as
+        # the *source's* cardinality would teach the optimizer that a thousand-partition table
+        # holds a thousand rows. The distributed `LIMIT` path above withholds it for the same
+        # reason.
+        if _single_source(agg.input):
+            aligned = _partition_aligned_aggregate(agg, sources, workers, hub)
+            if aligned:
+                from batcher.dist.executors.map import _distributed_map
+
+                _note_exchange_eliminated("aggregate", aligned)
+                table = _distributed_map(agg, sources, workers, None, cluster_by=aligned)
+                return table if not above else _apply_above(above, table)
         # Aggregate over a DISTINCT (the `count_distinct → distinct + count` rewrite, or a
         # user `distinct().agg(...)`) must be caught BEFORE the map/shuffle aggregate path:
         # that path runs `agg.input` as a per-partition map prefix, but a DISTINCT has GLOBAL
@@ -1567,6 +1812,18 @@ def _dispatch(
     if distinct_split is not None:
         above, distinct = distinct_split
         if _single_source(distinct.input) and not _has_breaker(distinct.input):
+            # The table's layout already groups the duplicates: every row that could be a
+            # duplicate of another is in the same directory, hence on the same worker. Dedup
+            # per partition and concatenate -- see `_partition_aligned_aggregate` for why the
+            # hub is withheld (the output is one row per key, not the source's row count).
+            aligned = _partition_aligned_distinct(distinct, sources, workers, hub)
+            if aligned:
+                from batcher.dist.executors.map import _distributed_map
+
+                _note_exchange_eliminated("distinct", aligned)
+
+                table = _distributed_map(distinct, sources, workers, None, cluster_by=aligned)
+                return table if not above else _apply_above(above, table)
             from batcher.dist.executors.distinct import _distributed_distinct
 
             return _distributed_distinct(
@@ -1604,6 +1861,25 @@ def _dispatch(
 
                 return execute_global_window_disk(above, window, sources, workers, hub)
             if window.partition_keys:
+                # The table's layout already holds each window partition whole on one worker,
+                # so there is nothing to exchange: window each partition where it was read and
+                # concatenate. Checked before the computed-key hoist, which only matters for a
+                # shuffle that has to read keys by column.
+                aligned = _partition_aligned_window(window, sources, workers, hub)
+                if aligned:
+                    from batcher.dist.executors.map import _distributed_map
+
+                    _note_exchange_eliminated("window", aligned)
+
+                    # The hub is passed here where the aggregate and dedup paths withhold it,
+                    # and the difference is the operator's row arithmetic: a window emits one
+                    # row per input row, so what comes back IS the source's (post-filter) row
+                    # count and is the same measurement any other map pipeline records. An
+                    # aggregate returns one row per group, which learned as a source
+                    # cardinality would teach the optimizer that a thousand-partition table
+                    # holds a thousand rows.
+                    table = _distributed_map(window, sources, workers, hub, cluster_by=aligned)
+                    return table if not above else _apply_above(above, table)
                 hoisted = _hoist_computed_window_keys(window)
                 if hoisted is not None:
                     window, drop_keys = hoisted

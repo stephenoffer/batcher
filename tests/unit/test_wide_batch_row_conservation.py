@@ -6,9 +6,12 @@ use, so a table carrying more than 2 GiB of them comes back as *several* batches
 taking the first silently discards every row after it. No error, no warning, a shorter
 result — on exactly the wide payload columns a multimodal or embedding pipeline moves.
 
-The engine already fixed this in the inference pool and the UDF apply path, and documented
-why at length in both. Four more sites still had it: the Delta change-feed reader, the
-protobuf reader, the distributed spill scratch buffer, and the streaming producer.
+Nine sites had reached this conclusion separately. Six wrote a local fix — the inference
+pool, the UDF apply path, the Delta change-feed reader, the protobuf reader, the distributed
+spill scratch buffer, and the streaming producer — in five different spellings; three still
+had the bug, in the streaming distinct, in `iter_batches`' exact re-chunker, and in the
+keyed-state fold. All nine now go through `plan.types.one_batch`, so the property is stated
+once and `tests/unit/test_batch_compaction.py` guards the spelling from regrowing.
 
 Allocating 2 GiB per test is not reasonable, so these pin the *contract* instead: the
 compaction step conserves rows and column values for a many-chunk table, and does it
@@ -31,22 +34,56 @@ def _chunked(rows: int, chunks: int) -> pa.Table:
     return pa.table({"s": pa.chunked_array(arrays)})
 
 
-def test_the_delta_change_feed_compactor_conserves_every_row() -> None:
-    from batcher.io.formats.lakehouse.delta.stream import _one_batch
+def test_the_shared_compactor_conserves_every_row() -> None:
+    """What the Delta change feed, the protobuf reader and six others now all call."""
+    from batcher.plan.types import one_batch
 
     table = _chunked(600, 6)
-    batch = _one_batch(table)
+    batch = one_batch(table)
 
     assert isinstance(batch, pa.RecordBatch)
     assert batch.num_rows == table.num_rows
     assert batch.column("s").to_pylist() == table.column("s").to_pylist()
 
 
-def test_the_delta_compactor_passes_a_single_chunk_through_without_a_copy() -> None:
-    from batcher.io.formats.lakehouse.delta.stream import _one_batch
+def test_the_shared_compactor_passes_a_single_chunk_through_without_a_copy() -> None:
+    from batcher.plan.types import one_batch
 
     table = _chunked(10, 1)
-    assert _one_batch(table).num_rows == 10
+    assert one_batch(table).num_rows == 10
+
+
+def test_the_streaming_rechunker_conserves_rows_across_an_emit_boundary() -> None:
+    """`iter_batches(batch_size=...)` cut each emitted batch with the truncating spelling.
+
+    The re-chunker is the last thing between the engine and the user's loop, so a row it
+    drops is a row the query never returned.
+    """
+    from batcher.api.terminal.stream.rebatch import _rebatch_exact
+
+    source = [pa.record_batch({"s": [f"row-{c}-{i}" for i in range(30)]}) for c in range(7)]
+    out = list(_rebatch_exact(iter(source), 40))
+
+    assert sum(b.num_rows for b in out) == 210
+    assert [v for b in out for v in b.column("s").to_pylist()] == [
+        v for b in source for v in b.column("s").to_pylist()
+    ]
+
+
+def test_the_keyed_state_grouper_conserves_a_group_it_hands_the_user() -> None:
+    """The per-key slice handed to a `transform_with_state` function is compacted too."""
+    from batcher.core.streaming.keyed_state import _group_by
+
+    batches = [
+        pa.record_batch(
+            {"k": pa.array([c % 3] * 40, type=pa.int64()), "s": [f"v{c}-{i}" for i in range(40)]}
+        )
+        for c in range(6)
+    ]
+    seen = {key: rows.num_rows for key, rows in _group_by(batches, ["k"])}
+
+    assert sum(seen.values()) == 240
+    assert set(seen) == {(0,), (1,), (2,)}
 
 
 @pytest.mark.parametrize("chunks", [1, 2, 7])

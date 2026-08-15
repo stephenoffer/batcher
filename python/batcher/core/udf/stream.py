@@ -43,6 +43,7 @@ from batcher.core.udf.sizing import (
 from batcher.io.schema.evolution import normalize_batch, unify_schemas
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.profile import StageRecorder, metered, stage_kind
+from batcher.plan.types import total_logical_bytes
 
 __all__ = [
     "linear_map_chain",
@@ -188,7 +189,7 @@ def _stage_recorder_hook(
             rows_in=sub.num_rows,
             rows_out=sum(b.num_rows for b in out),
             elapsed_ns=elapsed_ns,
-            result_bytes=sum(b.nbytes for b in out),
+            result_bytes=total_logical_bytes(out),
             backend=backend,
         )
 

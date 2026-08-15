@@ -165,6 +165,36 @@ class ConnectorXSource(SingleResultQuerySource):
     partition_on: str | None = None
     num_partitions: int = 1
 
+    @property
+    def sql_dialect(self) -> str:
+        """The scheme naming this connection's dialect, for identifier delimiting.
+
+        Per-instance for the same reason `supports_limit` is: one ConnectorX reader fronts
+        PostgreSQL, MySQL and SQL Server, and the three delimit identifiers three
+        different ways.
+        """
+        return self.conn_uri.partition("://")[0]
+
+    @property
+    def supports_limit(self) -> bool:
+        """Whether this URI's backend accepts a trailing ``LIMIT n``.
+
+        Per-instance rather than per-class, because ConnectorX is one reader in front of
+        many dialects: the same class serves PostgreSQL, which takes `LIMIT`, and SQL
+        Server and Oracle, which do not. The scheme is the only thing that distinguishes
+        them, and it is already parsed.
+
+        A capped read fans out exactly as an uncapped one does: with `partition_on` set,
+        each of the `num_partitions` sub-queries carries the cap, so the driver returns at
+        most `num_partitions * n` rows. That is more than the plan asked for and never
+        less, which is the direction a row cap is allowed to be wrong in — the engine's
+        own `Limit` truncates.
+        """
+        from batcher.io.formats.sql.uri import supports_limit_clause
+
+        scheme = self.conn_uri.partition("://")[0]
+        return bool(scheme) and supports_limit_clause(scheme)
+
     def _split_for(self, sql: str) -> _ConnectorXSplit:
         """The split for a real read, carrying ConnectorX's own range-partitioning."""
         return _ConnectorXSplit(self.conn_uri, sql, self.partition_on, self.num_partitions)

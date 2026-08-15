@@ -2,8 +2,9 @@
 
 Covers the pure extraction functions in `batcher.io.stats` directly (no engine):
 
-  - the Parquet footer's provenance discipline (ndv never rides an EXACT column;
-    a NaN float bound is dropped; null_count summed exactly),
+  - the Parquet footer's provenance discipline (an ndv rides an EXACT column but is
+    tagged so it can never answer one; a NaN float bound is dropped; null_count summed
+    exactly),
   - the Delta manifest's partition-value EXACT stats and numeric-exact bounds,
   - the per-row-group pruning bounds and range-pruning row count,
   - the ORC footer's exact row count.
@@ -61,15 +62,41 @@ def _finalize(acc, schema, *, single_row_group=True):
 # --- Parquet footer provenance discipline -----------------------------------
 
 
-def test_ndv_never_on_exact_column():
-    # A numeric column with a footer distinct_count stays EXACT for min/max/null,
-    # but its (estimate) ndv is dropped so it can never answer an exact distinct.
+def test_footer_ndv_rides_an_exact_column_without_becoming_exact():
+    """A footer distinct_count survives beside EXACT bounds, tagged as the estimate it is.
+
+    The invariant is that an estimate can never answer an exact `count_distinct`, and it
+    used to be kept by *dropping* the ndv from any EXACT bundle. That cost it on precisely
+    the numeric and temporal columns join keys are made of. `ndv_provenance` exists to keep
+    the same invariant without the loss — `ndv_is_exact` is the gate every answer path
+    reads (`shortcuts.facts`, `metadata_answer._exact_col`) — so the assertion is on the
+    gate rather than on the absence of the value.
+    """
     acc = _ColAcc()
     _accumulate(acc, _FakeCol(_FakeStats(0, 99, 0, distinct_count=50)))
     col = _finalize(acc, pa.schema([pa.field("c", pa.int64())]))["c"]
     assert col.provenance is Provenance.EXACT
     assert col.min == 0 and col.max == 99 and col.null_count == 0
-    assert col.ndv is None  # the estimate is not exposed on an EXACT bundle
+    assert col.ndv == 50.0
+    assert not col.ndv_is_exact  # informs cost and cardinality; answers nothing
+
+
+def test_footer_ndv_cannot_answer_an_exact_distinct_count():
+    """The consequence of the tag, at the layer that actually answers a terminal.
+
+    `ColumnFacts.ndv` is what an exact `n_unique()`/`count_distinct()` reads and must stay
+    empty; `approx_ndv` is the separate channel an explicitly-approximate terminal uses.
+    Asserting the tag alone would not show that the two are wired to different fields.
+    """
+    from batcher.kyber.shortcuts.facts import facts_from_relstats
+    from batcher.plan.stats import RelStats
+
+    acc = _ColAcc()
+    _accumulate(acc, _FakeCol(_FakeStats(0, 99, 0, distinct_count=50)))
+    cols = _finalize(acc, pa.schema([pa.field("c", pa.int64())]))
+    facts = facts_from_relstats(RelStats(rows=100.0, provenance=Provenance.EXACT, columns=cols))
+    assert facts.col("c").ndv is None
+    assert facts.col("c").approx_ndv == 50
 
 
 def test_ndv_kept_on_inexact_string_column():

@@ -111,6 +111,85 @@ def _reset_drain_cache() -> None:
     _drain_cache = None
 
 
+# How long an *unscoped* cluster-shape read is reused, and the reason the number is this
+# small rather than this large.
+#
+# `topology_scope()` collapses the placement phase's reads into one, but it deliberately
+# covers only that phase — the autoscale wait and the worker clamp ahead of it must see the
+# cluster grow. Everything outside the scope therefore still read live, and measured against
+# a local cluster one `collect(distributed=True)` made **19 O(nodes) GCS round trips**: 12
+# `ray.nodes()` (5 from `cluster_topology`, 5 from `_alive_nodes`, 2 building the snapshot)
+# and 7 `available_resources_per_node`. Two of the nineteen were the snapshot the design
+# intends; the other seventeen re-asked the same question inside the same few milliseconds.
+#
+# The comment those reads were written under says `ray.nodes()` is a cheap RPC, and on a
+# cluster of tens of nodes it is. It is not a property of the call, though — it is a property
+# of the cluster: the reply carries one record per node, with its resource dict, so the cost
+# is O(nodes) in GCS work, network and Python deserialization. At a hundred thousand nodes
+# nineteen of them per query is the whole query.
+#
+# **50 ms, because that is provably below the fastest poller.** The autoscale wait polls at
+# `max(0.1, autoscale_poll_s)` (`readiness._await_autoscale`), so a window half that size
+# cannot serve a cached answer to the one loop whose correctness depends on seeing growth;
+# it is also two orders of magnitude longer than the burst of reads a single query makes.
+# The window is per component, so a caller that wants only the node list does not pay for
+# the free-CPU read it never asked for.
+_LIVE_TTL_S = 0.05
+
+#: `(monotonic_deadline, value)` per live read, or `None` before the first. One entry per
+#: read rather than one for the cluster shape as a whole, because the readers genuinely
+#: differ: `_alive_nodes` wants only the node list, and folding `cluster_resources()` into
+#: the same entry would make a caller that never asked for totals fail on a Ray build (or a
+#: test stub) that does not expose them.
+_nodes_cache: tuple[float, list[dict]] | None = None
+_resources_cache: tuple[float, dict] | None = None
+_free_cpus_cache: tuple[float, dict[str, float] | None] | None = None
+
+
+def _live_alive_nodes() -> list[dict]:
+    """Alive node records, reused for `_LIVE_TTL_S`.
+
+    Unlocked for the same reason `_read_draining` is: a race costs two identical GCS reads,
+    and a lock would serialize every topology question in the process to prevent that.
+    """
+    global _nodes_cache
+    import time
+
+    import ray
+
+    cached = _nodes_cache
+    now = time.monotonic()
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    nodes = [n for n in ray.nodes() if n.get("Alive", True)]
+    _nodes_cache = (now + _LIVE_TTL_S, nodes)
+    return nodes
+
+
+def _live_cluster_resources() -> dict:
+    """Total cluster resources, reused for `_LIVE_TTL_S`."""
+    global _resources_cache
+    import time
+
+    import ray
+
+    cached = _resources_cache
+    now = time.monotonic()
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    resources = ray.cluster_resources()
+    _resources_cache = (now + _LIVE_TTL_S, resources)
+    return resources
+
+
+def _reset_topology_cache() -> None:
+    """Drop the cached live reads (tests, and any caller wanting a fresh probe)."""
+    global _nodes_cache, _resources_cache, _free_cpus_cache
+    _nodes_cache = None
+    _resources_cache = None
+    _free_cpus_cache = None
+
+
 def draining_node_ids() -> frozenset[str]:
     """Hex ids of nodes Ray has marked for drain, or empty when that cannot be read.
 
@@ -155,15 +234,10 @@ def _schedulable(nodes: list[dict]) -> list[dict]:
 
 
 def _read_topology() -> _Topology:
-    import ray
-
     from batcher.dist.executors.ray_runtime.capacity import _live_free_cpus_by_node
 
     return _Topology(
-        [n for n in ray.nodes() if n.get("Alive", True)],
-        ray.cluster_resources(),
-        _read_draining(),
-        _live_free_cpus_by_node(),
+        _live_alive_nodes(), _live_cluster_resources(), _read_draining(), _live_free_cpus_by_node()
     )
 
 
@@ -214,13 +288,12 @@ def _worker_eligible(nodes: list[dict]) -> list[dict]:
 
 def _alive_nodes() -> list[dict]:
     """Worker-eligible alive node records (head excluded) — from the active snapshot if any,
-    else a live `ray.nodes()`. Head-excluded so every fan-out sizing agrees with placement."""
+    else a `_LIVE_TTL_S`-windowed `ray.nodes()`. Head-excluded so every fan-out sizing agrees
+    with placement."""
     snap = _TOPOLOGY.get()
     if snap is not None:
         return _worker_eligible(snap.alive_nodes)
-    import ray
-
-    return _worker_eligible([n for n in ray.nodes() if n.get("Alive", True)])
+    return _worker_eligible(_live_alive_nodes())
 
 
 def alive_node_count() -> int:
@@ -236,18 +309,16 @@ def alive_node_count() -> int:
 def cluster_topology() -> dict:
     """Live cluster shape: alive node count + total CPUs/GPUs. Ray must be up.
 
-    Read on demand (not cached) so it stays correct as the autoscaler grows or shrinks the
-    cluster — `ray.nodes()`/`ray.cluster_resources()` are cheap RPCs — unless a
-    `topology_scope()` is active (the placement/transport phase), where every reader shares
-    one snapshot.
+    Tracks autoscaler growth and shrink: inside a `topology_scope()` (the placement/transport
+    phase) every reader shares one snapshot, and outside it the read is windowed by
+    `_LIVE_TTL_S` — short enough that the autoscale poll loop, which sleeps at least twice
+    that long between reads, always sees a fresh cluster.
     """
     snap = _TOPOLOGY.get()
     if snap is not None:
         nodes = _worker_eligible(snap.alive_nodes)
     else:
-        import ray
-
-        nodes = _worker_eligible([n for n in ray.nodes() if n.get("Alive", True)])
+        nodes = _worker_eligible(_live_alive_nodes())
     # CPU/GPU/memory summed over the worker-eligible nodes (head excluded), so a CPU- or
     # memory-driven fit never counts a resource no worker will run on — consistent with the
     # head-excluded `nodes`. `min_node_memory` is the smallest worker node's RAM: the

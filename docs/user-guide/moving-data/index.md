@@ -41,6 +41,12 @@ Delta, Iceberg, and Hudi tables.
 Windows, watermarks, exactly-once.
 :::
 
+:::{grid-item-card} {octicon}`clock;1.1em` When a stream emits
+:link: /user-guide/moving-data/streaming-emission
+:link-type: doc
+Which shapes emit as rows arrive.
+:::
+
 :::{grid-item-card} {octicon}`pulse;1.1em` Monitoring a stream
 :link: /user-guide/moving-data/streaming-monitoring
 :link-type: doc
@@ -64,6 +70,7 @@ custom-connectors
 cloud-storage
 lakehouse
 streaming
+streaming-emission
 streaming-stateful
 streaming-monitoring
 ```

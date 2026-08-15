@@ -370,6 +370,39 @@ print(nested.explode("tags").to_pydict())
 # {'id': [1, 1, 2], 'tags': ['x', 'y', 'z']}
 ```
 
+A nested column can be a **key** too, with one exception. Grouping, `DISTINCT`, joins,
+windows and `UNION`(distinct) all identify rows by encoding the key columns into a single
+comparable byte string, and that encoding is defined for lists, structs, lists of structs
+and dictionary-encoded columns but not for maps: a map's entries have no canonical order,
+so there is no stable way to tell two maps apart. A map used as a key is refused with a
+{py:exc}`PlanError <batcher.PlanError>` naming the column, and the refusal covers a map
+nested inside a struct or a list as well.
+
+```python
+import pyarrow as pa
+
+# `from_pydict` infers a struct from a dict, so a genuine map column needs the type.
+maps = bt.from_arrow(
+    pa.table(
+        {"m": pa.array([[("a", 1)], [("a", 2)]], type=pa.map_(pa.string(), pa.int64())),
+         "v": pa.array([1, 2], pa.int64())}
+    )
+)
+print(maps.group_by("v").agg(n=bt.count()).to_pydict())
+# {'v': [1, 2], 'n': [1, 1]}
+
+try:
+    maps.group_by("m").agg(n=bt.count())
+except bt.PlanError as exc:
+    print(str(exc).split(" — ")[0])
+# group_by(): column 'm' is map<string, int64>, and a map cannot be a key
+```
+
+Key on something derived from the map instead, such as `col("m").map.keys()`,
+`col("m").map.values()`, or a specific lookup. Sorting *by* a map column is unaffected,
+because a sort compares values directly rather than through that encoder, and carrying a
+map through a query that does not key on it was never restricted.
+
 A fixed-shape tensor column (every row the same N-dimensional shape) is Arrow's
 canonical tensor type, so the shape travels with the data across the FFI edge and
 arrives at a model stage correctly shaped. See {doc}`multimodal </ml/preparing/multimodal/index>`.

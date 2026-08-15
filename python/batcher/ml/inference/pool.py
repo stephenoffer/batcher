@@ -127,15 +127,13 @@ def _run_with_oom_retry(
         mid = batch.num_rows // 2
         left, left_ms = _run_with_oom_retry(worker, batch.slice(0, mid), on_oom)
         right, right_ms = _run_with_oom_retry(worker, batch.slice(mid), on_oom)
-        import pyarrow as pa
+        from batcher.plan.types import one_batch
 
-        # Concatenate the halves into a single batch. `concat_batches` keeps every
-        # row (and raises a clear error on a genuine >2 GiB offset overflow) — unlike
-        # `Table.from_batches(...).combine_chunks().to_batches()[0]`, which splits into
-        # multiple batches at the 32-bit offset limit and would then silently DROP all
-        # but the first, losing rows for large binary/string/list inference outputs.
-        out = pa.concat_batches([left, right])
-        return out, left_ms + right_ms
+        # Concatenate the halves into a single batch. `one_batch` is the shared compaction:
+        # it keeps every row and raises a clear error on a genuine offset overflow rather
+        # than returning a prefix, which a large binary, string or list inference output
+        # can reach.
+        return one_batch([left, right]), left_ms + right_ms
 
 
 class _DynamicBatcher:

@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.errors import BackendError, MissingDependencyError
 from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.sql._common import (
@@ -73,9 +73,14 @@ def _import_driver(module_name: str) -> Any:
     try:
         return importlib.import_module(module_name)
     except ImportError as exc:
-        raise BackendError(
-            f"DB-API driver {module_name!r} is not installed; install it with "
-            f"pip install {module_name}"
+        # The one guard in the tree that cannot use `_internal.optional.require`, and the
+        # reason is real: a DB-API driver is named by the *user* in the connection URI, so
+        # there is no Batcher extra to point at and the honest hint is the driver's own name.
+        # It still raises the typed class, so `except ImportError` behaves as it does for
+        # every other optional dependency.
+        raise MissingDependencyError(
+            f"DB-API driver {module_name!r} is not installed.",
+            hint=f"pip install {module_name}",
         ) from exc
 
 

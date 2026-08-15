@@ -12,6 +12,7 @@ contract is in the package docstring.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from batcher.config import active_config
@@ -38,16 +39,77 @@ _BAND = 8.0
 
 
 # Reusable primitive 2 — an OLS two-line crossover (generalizing gpu/adaptive.py).
-def _fold_ols(hub: MetadataHub, namespace: str, bucket: str, x: float, y: float) -> None:
+def _fold_ols(
+    hub: MetadataHub,
+    namespace: str,
+    bucket: str,
+    x: float,
+    y: float,
+    *,
+    below: str = "",
+    above: str = "",
+) -> None:
     """Fold one `(x, y)` observation into a bucket's fitted line. Best-effort.
 
     Scoped to the machine class. A crossover is the row count at which one strategy overtakes
     another, and that point is a ratio of two per-row costs — so it moves with the hardware
     even when the ranking does not. Learn "the GPU wins above 200k rows" on an A100 beside a
     slow host CPU, and the same fit is badly wrong on a fast CPU beside a T4.
+
+    `below`/`above` name the crossover this bucket feeds, so the plan cache is invalidated on
+    **the threshold moving** rather than on the fit's accumulators drifting. A plan reads the
+    threshold and nothing else, and the accumulators move on every timed join, so the drift
+    test invalidated *every memoized plan in the process* — the learned generation is global —
+    on a run that changed no decision at all.
     """
     s = hub.get_keyed_param(scoped(namespace), bucket) or {}
-    plan_cache.record_write(hub, scoped(namespace), bucket, ols_update(s, x, y))
+    updated = ols_update(s, x, y)
+    decides = None
+    if below and above:
+
+        def decides(candidate: object, _b: str = below, _a: str = above) -> object:
+            return _crossover_step(hub, namespace, bucket, candidate, _b, _a)
+
+    plan_cache.record_write(hub, scoped(namespace), bucket, updated, decides=decides)
+
+
+#: Relative step at which a moved crossover counts as a different decision. The same
+#: materiality the rest of the learning loop uses (`learning.is_material_change`), applied to
+#: a *continuous* threshold: quantizing it to geometric steps of this size is what turns
+#: "the number moved" into "the number left the band a plan was chosen in".
+_XOVER_STEP = 0.10
+
+
+def _crossover_step(
+    hub: MetadataHub, namespace: str, bucket: str, candidate: object, below: str, above: str
+) -> object:
+    """The crossover this fit implies, quantized to `_XOVER_STEP` — or `None` when unusable.
+
+    `candidate` stands in for `bucket`'s stored value, so the decision is evaluated against
+    what the store *would* hold. Both buckets are read, because a crossover is a property of
+    the pair.
+
+    Deliberately **unclamped**, where the reader clamps to a band around its default. The
+    reader's clamp is monotone, so the unclamped value moves whenever the clamped one does:
+    reading it here can only invalidate a plan the clamp would have spared, never miss one it
+    would not. Over-invalidating costs a re-plan; under-invalidating serves a stale plan, and
+    this side of that trade is the safe one — which is also what lets this stay free of the
+    rule module that owns the default.
+    """
+    try:
+        fits = {
+            name: _fit(
+                (candidate if name == bucket else hub.get_keyed_param(scoped(namespace), name))
+                or {}
+            )
+            for name in (below, above)
+        }
+    except Exception:  # pragma: no cover - a decision test must never break a query
+        return None
+    xover = _crossover_of(fits.get(below), fits.get(above), None)
+    if xover is None or xover <= 0.0:
+        return None
+    return math.floor(math.log(xover) / math.log(1.0 + _XOVER_STEP))
 
 
 _fit = fit_ols
@@ -73,6 +135,20 @@ def _solve_crossover(
         above = _fit(hub.get_keyed_param(scoped(namespace), cheap_above) or {})
     except Exception:  # pragma: no cover
         return None
+    return _crossover_of(below, above, default)
+
+
+def _crossover_of(
+    below: tuple[float, float] | None,
+    above: tuple[float, float] | None,
+    default: float | None,
+) -> float | None:
+    """Where two fitted lines cross, clamped to the band around `default`, or `None`.
+
+    Split from `_solve_crossover` so the plan cache's decision test can evaluate the same
+    threshold against a *candidate* fit it has not written yet. `default=None` skips the
+    clamp — see `_crossover_step` for why that direction is the safe one.
+    """
     if below is None or above is None:
         return None
     a_b, b_b = below
@@ -83,6 +159,8 @@ def _solve_crossover(
     xover = (a_a - a_b) / (b_b - b_a)
     if xover <= 0.0:
         return None
+    if default is None:
+        return xover
     return min(max(xover, default / _BAND), default * _BAND)
 
 
@@ -99,7 +177,15 @@ def record_broadcast_timing(
     ):
         return
     try:
-        _fold_ols(hub, _NS_BCAST, strategy, float(build_bytes), float(wall_ms))
+        _fold_ols(
+            hub,
+            _NS_BCAST,
+            strategy,
+            float(build_bytes),
+            float(wall_ms),
+            below="broadcast",
+            above="shuffle",
+        )
     except Exception:  # pragma: no cover
         return
 
@@ -123,7 +209,15 @@ def record_sort_merge_timing(
     if hub is None or build_rows <= 0.0 or wall_ms <= 0.0 or strategy not in ("hash", "sort_merge"):
         return
     try:
-        _fold_ols(hub, _NS_SMJ, strategy, float(build_rows), float(wall_ms))
+        _fold_ols(
+            hub,
+            _NS_SMJ,
+            strategy,
+            float(build_rows),
+            float(wall_ms),
+            below="hash",
+            above="sort_merge",
+        )
     except Exception:  # pragma: no cover
         return
 

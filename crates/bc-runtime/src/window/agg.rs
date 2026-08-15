@@ -178,9 +178,10 @@ pub(crate) fn broadcast(
             Ok(Arc::new(out))
         }
         WindowFn::CountDistinct => {
+            let reader = KeyReader::new(values)?;
             let mut state: Vec<HashSet<Key>> = (0..num_groups).map(|_| HashSet::new()).collect();
             for (i, &g) in group_ids.iter().enumerate() {
-                if let Some(k) = key_at(values, i)? {
+                if let Some(k) = reader.key(values, i)? {
                     state[g as usize].insert(k);
                 }
             }
@@ -289,12 +290,13 @@ pub(crate) fn running(
             Ok(Arc::new(Int64Array::from(out)))
         }
         WindowFn::CountDistinct => {
+            let reader = KeyReader::new(values)?;
             let mut out = vec![0i64; num_rows];
             for part in ordered {
                 let mut seen: HashSet<Key> = HashSet::new();
                 let mut group_start = 0usize;
                 for pos in 0..part.len() {
-                    if let Some(k) = key_at(values, part[pos])? {
+                    if let Some(k) = reader.key(values, part[pos])? {
                         seen.insert(k);
                     }
                     if peer_end(part, order_rows, pos) {
@@ -333,6 +335,62 @@ enum Key {
     Float(u64),
     Bool(bool),
     Str(String),
+    /// A row-encoded value, for every type the four cases above do not name.
+    Encoded(Box<[u8]>),
+}
+
+/// The distinct-key reader for one value column.
+///
+/// `COUNT(DISTINCT x)` only needs to tell two values apart, so it is the one aggregate here
+/// with no reason to care about `x`'s type — yet it was the one that rejected the most types.
+/// `COUNT(DISTINCT order_date) OVER (…)` failed on every temporal and decimal column while
+/// `COUNT(DISTINCT order_date) … GROUP BY` answered, because [`key_at`] could only name
+/// `Int64`/`Float64`/`Boolean`/`Utf8`.
+///
+/// Anything else is encoded once per column with Arrow's `RowConverter` — the same mechanism
+/// [`crate::window::coerce::select_extreme`] uses for `MIN`/`MAX`, so "the same value" means
+/// here what it means there and in the group assigner. The four named types keep their
+/// direct keys: they are the common case, and encoding them would allocate per row where
+/// they currently do not.
+enum KeyReader {
+    /// One of the four types [`key_at`] reads directly.
+    Direct,
+    /// Row-encoded bytes, built once for the whole column.
+    Encoded(arrow::row::Rows),
+    /// A `Null`-typed column: every row is null, so no key is ever produced. `RowConverter`
+    /// has no sort field for `Null`, and building one would be pointless work regardless.
+    AllNull,
+}
+
+impl KeyReader {
+    fn new(values: &ArrayRef) -> Result<Self, RuntimeError> {
+        use arrow::datatypes::DataType;
+        match values.data_type() {
+            DataType::Int64 | DataType::Float64 | DataType::Boolean | DataType::Utf8 => {
+                Ok(Self::Direct)
+            }
+            DataType::Null => Ok(Self::AllNull),
+            other => {
+                let conv =
+                    arrow::row::RowConverter::new(vec![arrow::row::SortField::new(other.clone())])?;
+                let rows = conv.convert_columns(std::slice::from_ref(values))?;
+                Ok(Self::Encoded(rows))
+            }
+        }
+    }
+
+    fn key(&self, values: &ArrayRef, i: usize) -> Result<Option<Key>, RuntimeError> {
+        match self {
+            Self::Direct => key_at(values, i),
+            Self::AllNull => Ok(None),
+            Self::Encoded(rows) => {
+                if !values.is_valid(i) {
+                    return Ok(None);
+                }
+                Ok(Some(Key::Encoded(rows.row(i).as_ref().into())))
+            }
+        }
+    }
 }
 
 fn key_at(values: &ArrayRef, i: usize) -> Result<Option<Key>, RuntimeError> {
@@ -581,4 +639,60 @@ fn slide<T: Clone, G: Fn(usize) -> Option<T>, F: Fn(&T, &T) -> T + Copy>(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Date32Array, Decimal128Array, Int64Array, NullArray};
+
+    /// `COUNT(DISTINCT d) OVER (PARTITION BY k)` over a `Date32` column counts distinct dates.
+    ///
+    /// The four directly-keyed types never reached the encoder, so this is the case that
+    /// used to raise `UnsupportedWindow` while the same aggregate under a `GROUP BY`
+    /// answered — see [`KeyReader`].
+    #[test]
+    fn count_distinct_counts_dates() {
+        // Two partitions: rows 0..3 are group 0 (dates 100, 100, 200 -> 2 distinct),
+        // rows 3..5 are group 1 (date 300, NULL -> 1 distinct).
+        let values: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(100),
+            Some(100),
+            Some(200),
+            Some(300),
+            None,
+        ]));
+        let out = broadcast(WindowFn::CountDistinct, &[0, 0, 0, 1, 1], 2, &values).unwrap();
+        let out = out.as_primitive::<Int64Type>();
+        assert_eq!(out.values(), &[2, 2, 2, 1, 1]);
+    }
+
+    /// The same, for a `Decimal128` column — the other type family that raised.
+    #[test]
+    fn count_distinct_counts_decimals() {
+        let values: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(100), Some(250), Some(100)])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let out = broadcast(WindowFn::CountDistinct, &[0, 0, 0], 1, &values).unwrap();
+        assert_eq!(out.as_primitive::<Int64Type>().values(), &[2, 2, 2]);
+    }
+
+    /// An all-`Null` column has no distinct values, and must say `0` rather than raise.
+    /// `RowConverter` has no sort field for `Null`, which is why it gets its own arm.
+    #[test]
+    fn count_distinct_over_an_all_null_column_is_zero() {
+        let values: ArrayRef = Arc::new(NullArray::new(3));
+        let out = broadcast(WindowFn::CountDistinct, &[0, 0, 1], 2, &values).unwrap();
+        assert_eq!(out.as_primitive::<Int64Type>().values(), &[0, 0, 0]);
+    }
+
+    /// The directly-keyed types still take the direct path and still agree.
+    #[test]
+    fn count_distinct_still_counts_int64_directly() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2), None]));
+        let out = broadcast(WindowFn::CountDistinct, &[0, 0, 0, 0], 1, &values).unwrap();
+        assert_eq!(out.as_primitive::<Int64Type>().values(), &[2, 2, 2, 2]);
+    }
 }

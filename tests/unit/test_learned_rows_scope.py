@@ -72,3 +72,53 @@ def test_record_execution_on_a_scan_does_not_poison_a_later_scan() -> None:
     small = bt.from_arrow(pa.table({"id": pa.array(range(10), pa.int64())}))
     estimate = _estimate(small, hub.load_keyed_params("kyber.stats"))
     assert estimate.rows == 10
+
+
+def test_a_settled_estimate_stops_invalidating_memoized_plans():
+    """The generation follows the *stored* estimate, not the raw observation.
+
+    A signature is structural, so two queries of the same shape share one learned row count
+    and feed it different numbers. Judged against the raw observation, that entry is
+    "materially changed" on every single execution — and the learned generation is
+    **process-global**, so every such execution invalidated every memoized plan in the
+    session. Measured on TPC-DS at scale 1 with sixty of the suite's queries already run:
+    q77's signature held 100 while q77 measured 44 every time, and q77 re-planned for 131 ms
+    of its 268 ms on every run, forever.
+
+    Judged against the smoothed value the estimator actually reads, the entry settles: the
+    step shrinks as evidence accrues, and once it is inside the materiality band the
+    invalidation stops. The estimate keeps moving; the *re-planning* does not.
+    """
+    from batcher.kyber import learning
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends.in_process import InProcessBackend
+
+    hub = MetadataHub(InProcessBackend())
+    plan = bt.from_pydict({"a": list(range(50))}).filter(bt.col("a") > 0)._plan
+
+    learning.record_execution(hub, plan, 100)
+    # Alternate two observations of the same shape, as two colliding queries would.
+    for i in range(12):
+        learning.record_execution(hub, plan, 44 if i % 2 else 100)
+
+    before = learning.generation()
+    for i in range(10):
+        learning.record_execution(hub, plan, 44 if i % 2 else 100)
+    assert learning.generation() == before, "a settled estimate is still re-planning the session"
+
+
+def test_a_real_cardinality_shift_still_invalidates():
+    """The other half: an estimate that genuinely moves must still drop the memo."""
+    from batcher.kyber import learning
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends.in_process import InProcessBackend
+
+    hub = MetadataHub(InProcessBackend())
+    plan = bt.from_pydict({"a": list(range(50))}).filter(bt.col("a") > 0)._plan
+    for _ in range(8):
+        learning.record_execution(hub, plan, 100)
+
+    before = learning.generation()
+    for _ in range(8):  # the relation grew by two orders of magnitude
+        learning.record_execution(hub, plan, 10_000)
+    assert learning.generation() != before, "a real shift served a stale plan"

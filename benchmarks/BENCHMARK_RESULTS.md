@@ -1,5 +1,962 @@
 # Batcher CPU benchmark results
 
+## Twelve ways the engine threw away work it had already done — TPC-DS 1.510x -> 1.18x, TPC-H 0.962x -> 0.83x, seven ClickBench queries that could not run at all, and q45 from 7.34x to 1.02x (2026-08-14)
+
+Every single-node suite measured on the 96-core / 184 GiB box against DuckDB's native
+compressed store, then twelve findings landed and every suite was measured again — repeatedly,
+because several of these numbers move by more than the change would. The findings are unrelated
+in mechanism and identical in shape: in each one the engine computed something correct and then
+discarded it, re-derived it, or refused to look at it. The table below is the state after the
+first seven; findings 8 through 12 landed after it and carry their own before/after, because what
+they move is the *tail* and the reachability of a decision rather than a headline geomean.
+
+| suite | n | before | after (two rounds on the final code) | |
+|---|---:|---:|---|---|
+| JSON | 5 | 0.265x | **0.263 / 0.282** | win |
+| operators | 19 | 0.679x | **0.675 / 0.684** | win |
+| ClickBench | 43 | 0.605x over **36** | **0.647 / 0.627** over 43 | win |
+| TPC-H sf1 | 22 | 0.962x | **0.840 / 0.859** | win |
+| h2o-join | 5 | 0.978x | **0.960 / 0.953** | ~parity |
+| h2o-groupby | 10 | 1.204x | **1.196 / 1.168** | lose |
+| TPC-DS sf1 | 98 | 1.510x | **1.184 / 1.201** | lose |
+
+**Read the spread before reading the movement.** Both "after" columns are the same binary, run
+twice, and four suites move by 1-3% between the two rounds — earlier rounds put JSON at
+0.271 / 0.228 / 0.257 and operators at 0.658 / 0.689 / 0.698, which is the same story. So for
+JSON, operators, h2o-join and h2o-groupby the honest statement is that nothing here moved them.
+Two suites moved by far more than that spread — **TPC-H 0.96 -> 0.85** and **TPC-DS 1.51 ->
+1.19** — and ClickBench's "before" is a geomean over the 36 queries that *could* run, so its
+row is not a like-for-like ratio at all.
+
+Gated: Rust green (`just check`, `just test-rust`, clippy `-D warnings`, `cargo fmt`), unit
+**18,805 passed / 0 failed** with `test_map_batches_footprint` deselected, differential
+**11,139 passed / 0 failed** (2 xfail), and `lint-py` / `lint-layers` / `lint-structure` /
+`lint-tests` / `map` clean. That one deselected file is another session's in-flight work, proved
+rather than assumed: its two tests pass against committed `HEAD` in a sandbox, and they still
+fail in this working tree with **every** change of mine reverted (`kyber/annotate.py` is staged
+here by someone else).
+
+One caution about the milliseconds in this section: several rounds were measured while builds
+and test suites from this and other sessions were running on the same box, which inflates
+absolute times. The batcher/DuckDB *ratios* are unaffected — both engines ran under the same
+contention within a round — and a timing-sensitive unit test
+(`test_hive_partition_write::test_cost_does_not_grow_with_the_partition_count`) failed once for
+exactly that reason and passes alone.
+
+### 1. The statistics seeding could not see an aliased table
+
+`seed_column_ndv` reads column names off the plan and looks them up in a **source's schema**.
+The SQL front-end disambiguates `date_dim d1, date_dim d2` by projecting every column of each
+scan to `d1__d_quarter_name` / `d2__d_quarter_name` — and no such name is in `date_dim`'s
+schema, so for any aliased or self-joined table it matched nothing, sketched nothing, and went
+silently blind. `column_bounds_needed`, which fetches the min/max a zone map prunes on, had the
+same bug for the same reason.
+
+TPC-DS q17 filters `d1.d_quarter_name = '2001Q1'`, which keeps **91 of 73,049 rows**. With no
+distinct count the estimator took the flat equality default and predicted 7,305 — 80x high —
+and that estimate is what put `store_sales ⋈ item` (a 498 MB intermediate carrying
+`i_item_desc`) ahead of the 91-row date filter that reduces the fact table 20x.
+
+`plan.visitor.walk_with_base_names` resolves each referenced name back through renaming
+projections to the base column it stands for, and both callers use it rather than a second copy
+of the walk.
+
+### 2. A join on three integer keys fell off a cliff a join on two does not
+
+`bc_runtime::join` had raw-value key paths for one and two `Int64` columns and dropped to
+arrow's `RowConverter` — a per-row encode into a fresh buffer, plus a byte-slice compare on
+every chain walk — for a third. The streaming broadcast probe refused the shape outright, so
+the executor also materialized the whole probe relation instead of streaming it.
+
+Three integer keys is the star-schema fact-to-fact join: TPC-DS joins `store_sales` to
+`store_returns` on `(ticket_number, item_sk, customer_sk)`. The same join against the same
+2,761-row build side, at scale 1:
+
+| join keys | Batcher | DuckDB |
+|---|---:|---:|
+| 1 (`ticket_number`) | 8.6 ms | 4.9 |
+| 2 (`+ item_sk`) | 9.2 ms | 5.8 |
+| 3 (`+ customer_sk`) | **127.2 ms** | 7.3 |
+
+`I64xNKeys` closes it with a per-column hash and a per-column equality walk, driven by the same
+`build_probe` loop, so it is the row-encoded oracle bit for bit. The three-key join is now
+**5.6 ms**, level with the two-key one.
+
+### 3. Seven ClickBench queries died in the planner, before a row was read
+
+`EventDate >= '2013-07-01'` compares a `date32` column against a **string** literal, which the
+engine casts at execution. The estimator does not cast — it places a literal on a number line
+with `_ordinal`, which answers `None` for a string, while the column's bounds are dates. Two of
+the three call sites passed that `None` straight into the interpolation, which compared it
+against a float and raised `TypeError: '<' not supported between 'NoneType' and 'float'`.
+
+ClickBench q36-q42 all carry the `EventDate >= '...' AND EventDate <= '...'` idiom, so the whole
+family failed at plan time. They now run, and six of the seven beat DuckDB.
+
+### 4. Every query paid for every query before it
+
+A session's per-query cost grew with its own history, which is the opposite of what a learning
+loop is for. One fixed probe query, in one process, with more and more of the TPC-DS suite
+replayed around it:
+
+| other queries run first | 0 | 25 | 50 | 75 | 100 |
+|---|---:|---:|---:|---:|---:|
+| before | 9.4 ms | 12.7 | 14.9 | 18.2 | **21.5** |
+| after | 9.0 ms | 9.9 | 10.7 | 10.9 | **12.7** |
+
+`measured_fold` and `learning._cardinality_corrections` both absorbed new feedback rows
+incrementally and then **rebuilt their whole summary** — a median or a geometric mean per
+signature, across every signature the session had ever seen, on every query. Only the signatures
+whose sample window actually moved are re-derived now.
+
+### 5. The plan cache invalidated itself on numbers no plan reads
+
+The learned generation is **process-global**, so one query that never settles costs the whole
+session its plan cache. Four separate values were moving it on runs that changed no decision.
+
+* **The join-strategy bandit's mean.** Its reward is the query's own latency, so a slow run
+  wrote a materially different mean, which invalidated the plan, which made the next run pay the
+  optimizer again and stay slow. A two-table star join sat at **26 ms for twelve consecutive
+  runs** and then dropped to **4.7 ms** — and the arm the bandit chose was `broadcast` on every
+  one of those runs.
+* **The OLS crossover fits**, for the same reason: a plan reads the threshold, never the
+  accumulators underneath it.
+* **The calibrated cost coefficients**, which *are* the cache key. `hash_build_row` swung by
+  over 40% between refits, which is wider than the half-octave bucket built to absorb it, so it
+  alternated buckets forever.
+* **A learned row count**, judged against the raw observation instead of the smoothed value the
+  estimator reads. A plan signature is structural, so two queries of one shape share an entry and
+  feed it different numbers: q77's held 100 while q77 measured 44 on every execution.
+
+`plan_cache.record_write` now takes a `decides` callback and compares **the decision**; the
+calibration damps its own fit toward the live one; `record_execution` compares the stored
+estimate. In a session with sixty other TPC-DS queries already run, **q77 268 -> 131 ms and q80
+402 -> 154 ms**.
+
+### 6. `UNION` ran its branches one at a time; `UNION ALL` does not
+
+The streaming executor runs a `UNION ALL`'s branches across the pool and excluded the
+deduplicating form, on the stated grounds that returning early there would skip the dedup. It
+would have — so the dedup is applied there now. The branches are exactly as independent either
+way.
+
+Measured on TPC-DS q49's three channel branches at scale 1: as `UNION ALL` the query ran in
+28 ms, and the identical branches under `UNION` in **129 ms** — 4.6x, for a dedup over forty
+rows.
+
+### 7. The materializing aggregate rebuilt its hash table once per morsel
+
+`agg_par` gave each 16,384-row morsel its own hash table and handed the merge every one of
+them. That is fine when a morsel holds few distinct keys and ruinous in the band where the
+group count fills a morsel's table without filling a worker's share: 610 tables of 10,000
+groups each, merged pairwise. `chunked_partials` splits the input by worker rather than by
+morsel, so a thread builds one table over its whole slice. The 10,000-group case went from
+**63.3 ms to 41.1**.
+
+It is taken only where a sample says it pays (`chunking_pays`, a 0.25 merge ceiling), because
+the per-morsel form is the better one when the groups are few enough that every table is tiny.
+
+That moved the executor crossover an order of magnitude, so the routing threshold had to move
+with it. One `Int64` key with `g` distinct values over 10 M rows and one `SUM`, arms alternated
+across rounds so box drift cannot be read as a result (milliseconds, best of four):
+
+| groups | streaming | materializing |
+|---|---:|---:|
+| 500 | **9.8** | 11.2 |
+| 1,000 | **9.2** | 16.2 |
+| 2,000 | **10.1** | 16.3 |
+| 3,000 | **11.8** | 19.3 |
+| **4,000** | 15.7 | **13.9** |
+| 8,000 | 20.1 | **17.8** |
+| 25,000 | 35.4 | **24.4** |
+| 50,000 | 43.3 | **24.2** |
+| 400,000 | 26.7 | **23.8** |
+| 2,000,000 | 30.9 | **29.0** |
+
+`MATERIALIZE_AGG_MIN_GROUPS` was **50,000**, picked as the midpoint of a 1e4..1e5 bracket whose
+interior nobody had measured; the crossover is actually between 3,000 and 4,000, and it is
+4,000 now — the first swept point past it, which leaves every measured near-tie where it was.
+
+### Tried, measured, and reverted: bumping the learned generation when a correction appears
+
+A cardinality correction is the one plan-relevant learned value that never announces itself. It
+lives inside `_cardinality_corrections` rather than in the keyed store `plan_cache.record_write`
+guards, so a plan memoized on its first run is one chosen from the structural estimate alone and
+then kept forever. h2o `groupby` q9 estimates ~100 groups structurally and 10,000 once
+corrected; Kyber routes the executor off that estimate, keeps the 100-group choice, and pays
+62 ms where the other executor takes 44. Bumping the generation on a correction fixed exactly
+that — **q9 62 -> 44 ms, q2 50 -> 39**.
+
+It was reverted because the generation is **global**. A mixed workload meets new signatures
+continuously, so "bump once per signature" is still a steady stream of bumps, and each one drops
+every memoized plan in the process. Measured on TPC-DS at scale 1 with fifty-five other queries
+of the suite run first, **q34 went from 17 ms to 85-210** and the suite's spread widened. Two
+h2o queries at ~0.5x against one TPC-DS query at 5x is not a trade worth making. The fix it
+wants is a plan cache keyed by the corrections its own plan reads rather than by one global
+counter; until then a correction is silent, and the reasoning sits in the code so the next
+session does not re-run the experiment.
+
+### 8. The cost model never converged, so the plan cache could not hold a plan
+
+Finding 5 stopped four *learned scalars* from moving the plan-cache key on runs that changed
+no decision. It did not ask the obvious next question: does the **cost fit itself** ever settle?
+It does not. Eight identical runs of TPC-DS q77 in one session, with nothing else running:
+
+| run | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| anchor `k` (work units/ms) | 1.78e4 | 3.04e4 | 3.67e4 | 4.19e4 | 4.56e4 | 4.87e4 | 5.13e4 | 5.32e4 |
+| `hash_build_row` | 2.0 | 2.0 | 4.0 | 5.9 | 7.9 | 9.8 | — | — |
+
+Every coefficient is `k x measured_ms / basis`, so the global anchor multiplies all of them —
+and the anchor was the ratio of *summed* default work to *summed* measured time over the whole
+op-stats history. A ratio of sums is work-weighted, so it is set by the largest operators, and
+those are exactly the ones whose first execution is slow and every later one is not. The cold
+samples never age out, so the anchor creeps toward the warm value for as long as the session
+runs. `hash_build_row` rode it from 2.0 to 9.8 — a cost model five times off reality, and a
+plan-cache key that moved on **every single execution**, so q77 re-planned every run: ~200 ms
+of optimizer against DuckDB's 21 ms for the whole query.
+
+Three changes, each attacking a different reason the key would not sit still:
+
+* **The anchor is the median sample's ratio, not the ratio of the totals.** Over the same
+  history it reads 9.7e3 / 9.8e3 / 9.2e3 / 9.5e3 / 9537 / 9537 / 9537 — it settles.
+* **A fit that disagrees with the live one by more than an octave is taken whole.** Damping
+  every move alike made the *approach* the problem: a coefficient starting 30x from its settled
+  value walks there geometrically and crosses a key bucket on each of the eight refits it takes
+  to arrive. Nothing about a 2x discrepancy looks like the ~40% wander the damping exists for.
+* **The key's buckets are an octave wide**, matching that threshold, so a coefficient the
+  estimator treats as unchanged is one the key ignores.
+
+**q80 now hits the memo from its third run and holds it** — 165 ms, stable, where it used to
+alternate hit/miss forever. q77 hits on roughly a third of runs instead of never. Across the
+98-query suite, measured against the two rounds before it: **31 queries faster, 31 slower,
+median ratio 0.9995**, total wall time **4,345 / 4,518 ms -> 4,286**, with the gain concentrated
+where it was predicted (queries over 100 ms: median 0.981; q5 294 -> 171 ms, q22 221 -> 197,
+q80 258 -> 235, q77 231 -> 217). **No suite geomean moves outside its own spread**, which is
+the honest summary and is why this section carries its own numbers rather than restating the
+table above:
+
+| suite | before (two rounds) | after |
+|---|---|---:|
+| JSON | 0.263 / 0.282 | 0.259 |
+| operators | 0.675 / 0.684 | 0.677 |
+| ClickBench | 0.647 / 0.627 | 0.639 |
+| TPC-H sf1 | 0.840 / 0.859 | 0.879 |
+| h2o-join | 0.960 / 0.953 | 0.976 |
+| h2o-groupby | 1.196 / 1.168 | 1.219 |
+| TPC-DS sf1 | 1.184 / 1.201 | 1.189 |
+
+So the claim is: this fixes a divergence in the learning loop and pays for itself on the
+expensive queries. It does not move a headline number, and the two suites that read slightly
+worse (TPC-H, h2o-groupby) are within the run-to-run spread every earlier round showed.
+
+### Tried, measured, and reverted: a no-null fast path for the decimal `SUM`
+
+`sum_acc` and the fused accumulator each keep a no-null arm for `Int64` and `Float64` — walk
+the values slice, skip the per-row validity lookup and the per-row `valid` write — and neither
+kept one for `Decimal128`. That looked like a plain omission in the arm that carries the money:
+`l_extendedprice`, `ss_ext_sales_price` and every `sum(price * (1 - discount))` are decimal and
+declared NOT NULL, and a query summing four of them at once is exactly what takes the fused
+path. Both arms were built (`SumDecimalNoNull`) and both are gone again.
+
+**It moves nothing, and the box's own noise is larger than the effect.** Four fused decimal
+sums over 10 M rows into 100 groups, three runs of the *same* binary: **12.7 / 13.0 / 15.2 ms**,
+against **14.7** with the arms removed. TPC-H q1 is this shape over `l_extendedprice` and read
+**16.8 ms either way**. A decimal column is 16 bytes a row, so the loop is bound by the load,
+not by a perfectly-predicted branch on a validity buffer that is `None`.
+
+The same attempt also reached for the whole-column reduction the `Int64` and `Float64` global
+sums use (`arrow::compute::sum_checked` over `Decimal128`, which would let `global_partial`
+skip its group-id buffer). **That one is a real regression** and was caught by the same A/B:
+four global decimal sums went **3.7 ms -> 12.5**. Arrow's checked decimal reduction is slower
+than the scatter it replaced, which is why the decimal arm keeps the scatter.
+
+What survives is the coverage the attempt exposed: nothing exercised a *nullable* decimal sum,
+an empty one, or a fused decimal sum across morsels, so `tests/differential/test_diff_decimal.py`
+now does — including through `iter_batches`.
+
+### And one kernel: `corr` over a null-free column
+
+`covar_state` reads six accumulators over two passes and paid a per-row validity lookup on both.
+It splits once on nullability now, and both arms run over raw value slices.
+
+### 9. The guard that decides between the two executors was reading the whole catalog
+
+`materialize_fits` in `bc_py::prepare_exec` asks whether the materializing executor's
+footprint is affordable, and answered it by summing **every source bound to the session** —
+sources cross the boundary positionally, so a query naming three tables is handed all
+twenty-four. At scale 1 that is 1.76 GB, the `x8` headroom makes it 14.1 GB, and the envelope
+is 7.73 GB: **false for every TPC-DS query at every size.** Not a guard that rarely fired, one
+that could not. What it gates is mostly Kyber's grouped-aggregate verdict — computed, shipped,
+shape-checked by the engine, and then discarded here — which is to say the
+`MATERIALIZE_AGG_MIN_GROUPS` retuning two sections up had never once applied to this suite.
+
+Asking the question about the plan's own scans (`RelOp::scanned_source_ids`) moved **TPC-H
+0.879 -> 0.826** and **TPC-DS 1.189 -> 1.157**, each below all three preceding rounds, with no
+single query moving more than a few ms — which is what making a decision *reachable* looks
+like, as against changing one.
+
+### 10. `LEFT JOIN ... WHERE key IS NULL` built the whole outer join and then discarded it
+
+The anti-join, written the way SQL has always spelled it. `outer_to_inner_join` already handled
+the opposite predicate (one that *rejects* null-extended rows); nothing handled this one, so the
+plan materialized every matched row, filtered them all out, and carried the right-hand columns
+through both steps. TPC-DS q78 does it three times — store, catalog and web sales each against
+their returns.
+
+`left_join_null_key_to_antijoin` rewrites it when the `IS NULL` names a **right-hand join key**,
+which is exactly when it is provable: an equi-join tests `l.k = r.k`, which is *unknown* and
+never true when `r.k` is null, so a null right key after the join means "unmatched" and nothing
+else. An `IS NULL` on a right *payload* column carries no such guarantee and is left alone —
+`test_is_null_on_a_payload_column_is_not_an_antijoin` holds that line against DuckDB.
+
+Two things it had to learn from the plan rather than assume: the predicate names a
+`__jk_r<n>` *copy* of the key rather than the key (so the right child's own renames are followed
+one hop), and the shape only exists after PUSHDOWN has moved the filter onto the join, so the
+rule runs there rather than in REWRITE. Measured on q78, rule on against rule off in the same
+process: **225 / 228 ms against 234** — real, small, and honestly below the suite's own spread.
+It is kept because the plan it produces is the right one and because the win grows with what the
+right side carries: here projection pushdown had already pruned that side to its key.
+
+### 11. The second optimize of a reused subplan could never hit the memo
+
+`api.subplan_reuse` runs a repeated subtree once, binds the result as an `InMemorySource`, and
+then the *rewritten* plan is optimized again. That second optimize could never be cached:
+`plan_cache._source_keys` refuses an `ephemeral` source because its `id()`-based key "could
+never be read again" — which was true, and made a full optimizer run a **fixed per-execution
+cost** of every query that reuses a subplan. TPC-DS q77's two lookups read `hit, none` on every
+run, forever.
+
+An ephemeral relation is short-lived, not anonymous. What the engine derives it can *name*: the
+subplan's content key over the data-stable keys of the sources it reads
+(`subplan_reuse._derivation`). Two runs of one query derive the same relation from the same
+inputs, so they ask for the same key and the entry is read back. The keepalive that pins
+`id()`-keyed sources is skipped for these — it exists against address reuse, which a derivation
+key does not have — so caching a plan over one does not hold its materialized rows resident.
+
+Measured on q77 in one warm process: both lookups hit, and the query settles at **92-102 ms
+where it had alternated 101 / 244 / 296**. The name is `derivation`, not `provenance`, because
+`ColumnStat.provenance` already means something else here (how much a statistic is trusted).
+
+### 12. A nine-value subquery was answered with a join
+
+TPC-DS q45 filters on `SUBSTRING(ca_zip,1,5) IN (...) OR i_item_id IN (SELECT i_item_id FROM
+item WHERE i_item_sk IN (2,3,…,29))`. Under an `OR` that subquery cannot become a semi-join, so
+the front-end builds a **mark join**: materialize the outer probe, LEFT JOIN the distinct set,
+collapse the null-extension back to a boolean. That is the right shape for a set of any size and
+the wrong one for a set of **nine**.
+
+The set is materialized either way — the mark-join path already collects it once, to ask whether
+it holds a NULL — so a small one can be handed to `Expr.is_in` instead, which implements exactly
+the three-valued `IN` the marker's `CASE` was reconstructing by hand. Nothing about the
+semantics is re-derived: nulls go into the list verbatim and `NOT` over the result is `NOT IN`.
+
+**q45: 125.7 -> 18.3 ms, from 7.34x DuckDB to 1.02x.** (Hand-inlining the same set gives 8.8 ms,
+so ~9 ms of what is left is the subquery being re-collected on every execution — memoizing that
+is the obvious next step.)
+
+Two things fall out of it. `_INLINE_SET_MAX = 256` is what keeps a large set on the join, because
+the inlined form probes a hash set per row and rides inside the plan. And `SELECT x IN (SELECT
+…)` — a membership test in *value* position, which the scalar translator had always refused with
+`NotImplementedError` for want of a relation to join against — now answers, because a collected
+set needs no relation.
+
+### Where the suites stand after 9 and 10
+
+| suite | earlier rounds | now |
+|---|---|---:|
+| JSON | 0.263 / 0.282 / 0.259 | **0.224** |
+| operators | 0.675 / 0.684 / 0.677 | **0.652** |
+| ClickBench | 0.647 / 0.627 / 0.639 | **0.616** |
+| TPC-H sf1 | 0.840 / 0.859 / 0.879 | **0.829** |
+| h2o-join | 0.960 / 0.953 / 0.976 | **0.920** |
+| h2o-groupby | 1.196 / 1.168 / 1.219 | 1.209 |
+| TPC-DS sf1 | 1.184 / 1.201 / 1.189 | 1.179 |
+
+Five of the seven are at their best recorded figure. The two that are not are the two Batcher
+still loses, and both sit inside their own run-to-run spread rather than having moved.
+
+### What those did to the queries they were found on
+
+| query | before | after | |
+|---|---:|---:|---|
+| tpcds-q17 | 364.6 ms | **43.9** | 16.4x -> 2.1x |
+| tpcds-q50 | 180.7 | **22.4** | 10.9x -> 1.4x |
+| tpcds-q49 | 218.8 | **31.9** | 9.7x -> 1.5x |
+| tpcds-q96 | 21.3 | **12.7** | 4.8x -> 3.1x |
+| tpcds-q80 | 505.2 | **257.3** | 14.6x -> 7.4x |
+| tpcds-q77 | 370.4 | **238.0** | 29.4x -> 18.0x |
+| tpch-q12 | 26.9 | **15.6** | 1.63x -> 0.84x |
+| tpch-q14 | 18.2 | **10.5** | 1.17x -> 0.69x |
+| tpch-q19 | 32.2 | **17.4** | 0.86x -> 0.47x |
+
+### What is still open
+
+**TPC-DS is four queries.** q77 (16.4x), q5 (7.8x), q45 (8.3x) and q80 (6.5x) carry most of what
+is left: drop those four and the suite's geomean is **1.087x** rather than 1.184x. q77 and q80
+are the ROLLUP-over-`UNION ALL`-of-CTEs shape, and both spend more time planning than executing
+even warm. Finding 8 stabilized q80's memo and roughly a third of q77's; what remains on q77 is
+**not** one villain, which is worth stating because it looks like one. Its profile is dominated
+by `subplan_reuse._materialize` (190 ms of a 235 ms run), but nearly all of that is the shared
+subtree's *own execution*, which happens either way: turning common-subplan reuse off entirely
+(`optimizer.common_subplan_max_bytes = 0`) moves the query 94.7 -> 79.9 ms against DuckDB's 18,
+so the rewrite costs ~15 ms — an extra engine round trip and a second optimize that can never be
+memoized, because the materialized intermediate is `ephemeral` and keyed by object identity. The
+same A/B reads q5 200 -> 188, q45 130 -> 122 and q80 unchanged, and the reuse still earns its
+place elsewhere (q14 5.5x, q73 4.9x). Giving that intermediate a *provenance* key — the
+subplan's content key over its inputs' keys, which is what actually determines its contents —
+would make the second optimize cacheable and is the next thing to try. q45 is the `OR` between
+a `SUBSTRING(...) IN (...)` and an `IN (subquery)`, which the SQL front-end lowers to a mark
+join (`_sql/parser/subquery/core.py::_in_marker`) attached before the residual filters; there is
+no rewrite that evaluates an uncorrelated subquery once and folds it to an `InList`.
+
+**h2o-groupby is the string group key.** q2 (`sum(v1) BY id1, id2`, two string keys, 2.71x), q4
+(8.3 ms against DuckDB's 4.0, and ~2 ms of that is the fixed control plane below, 2.05x), q9
+(`corr` by a string and an int, 1.65x) and q8 (1.64x) are where it sits; the integer-keyed
+questions win, three of them by 20-45%. Group *assignment* dominates those, and
+`combine_ndv`'s exponential backoff structurally under-estimates the count when the keys are
+independent — q9's 10,000 groups are estimated at ~100 — which the correction loop learns and
+the global plan-cache generation then prevents from ever reaching a memoized plan (above).
+
+**The fixed per-query control plane is ~1.2 ms**, which is most of what tpch-q6 (6.3 vs 4.5) and
+op-groupby-sum (6.1 vs 3.3) lose by. Measured directly: a grouped aggregate over a 1,000-row
+table, warm, costs **1.19 ms** end to end of which the engine call is **0.3 ms**, so ~0.9 ms is
+Python. Two things about that number are worth writing down. It is **1.7 ms with the event log
+on**, which is the default and which every benchmark here disables (`benchmarks/engines/batcher.py`)
+— a user's first query is therefore half a millisecond slower than anything in this file. And
+what is left is *diffuse*: no single call is more than ~15% of it, so there is no bug to fix,
+only a Python path to make cheaper. `execution.fast_path` exists and is off by default because
+it opts out of the learning loop; making the ordinary path cheaper is the work that is not done.
+
+**tpcds-q67 still FAILS** the correctness gate on `rank()` tie order — `rk` row 9 reads 81
+against DuckDB's 79, and which row it lands on moves between runs, which is what a tie-order
+difference looks like. Unchanged by anything here, and the same failure this file has recorded
+before. Every other query in every suite passes, so the geomeans above are over 98 TPC-DS
+queries rather than 99.
+
+### Does any of this only work on one node?
+
+Everything above was found and measured on a single box, which is exactly the condition under
+which an engine acquires optimizations that do not survive being spread out. Each one, against
+the question "what happens at N nodes":
+
+| change | where it runs | at N nodes |
+|---|---|---|
+| alias-aware ndv/bounds seeding | driver, per query | unchanged — it reads the plan, not the data, and the sketches it seeds are `bc-sketches` mergeables |
+| `I64xNKeys` composite join keys | `bc-runtime`, per partition | **improves** — a shuffle join gives each worker 1/N of the build, and this is the per-partition kernel |
+| `KeyShape::I64xN` streaming probe | `bc-interp`, per morsel | unchanged — morsels are per worker either way |
+| incremental learning folds | driver, per query | unchanged — the cost was per *query history*, never per node |
+| plan-cache decision keys | driver | unchanged — the key already carries the fleet's hardware profile, so one fleet's plan is never served to another |
+| parallel `UNION DISTINCT` | `bc-interp`, per node | unchanged — `dist/executors/union.py` derives its own dedup as a mergeable aggregate |
+| `covar_pairs` null-free split | `bc-runtime` kernel | unchanged — inside `partial`, which is what a worker runs |
+| `chunked_partials` | `bc-interp`, per node | **improves** — it emits one `agg::Partial` per *thread* instead of per morsel, and those are the states a shuffle ships; same type, same `combine`, fewer of them |
+| calibration anchor + tracking + octave buckets | driver | **improves** — the fit is already per machine *class* (`hw_fingerprint`), and N workers feed the same class N times the samples, so the median anchor settles sooner |
+| scanned-source footprint guard | `bc-py`, per call | **improves** — a worker is handed its own shard, and the smaller the shard the more readily the materializing hand-off is affordable |
+| `left_join_null_key_to_antijoin` | Kyber, plan level | **improves** — `anti` is in `LEFT_DRIVEN_JOINS`, so the distributed planner may broadcast the right side and shard the left; the left join it replaces shipped the matched right columns as well |
+
+Two things are **not** distributed today, and both are honest gaps rather than oversights:
+
+* **Kyber's materializing-aggregate verdict never reaches a worker.** `prefer_materializing_aggregate`
+  rides on `Config.engine_config_json_with(...)`, which the single-node path calls;
+  `dist/executors/ray_runtime/lifecycle.py::engine_config_json` builds the worker's config from
+  the plain `engine_config_json()` and does not carry it. So `MATERIALIZE_AGG_MIN_GROUPS`,
+  measured and retuned above, applies to one node only. Shipping it is a small change and a
+  *wrong* one as it stands: the threshold is in groups, the estimate is global, and after a hash
+  shuffle a worker holds roughly 1/N of the groups — so the flag has to be re-derived per shard
+  rather than forwarded.
+* **The plan cache and the learned state live in the driver's process.** That is the existing
+  architecture (`MetadataHub`), not something added here, and it is why the cost-model work
+  above helps a cluster only through the driver's planning.
+
+Nothing above holds state that grows with node count, and nothing assumes a single address
+space. The one genuinely single-node *decision* is named in the first bullet.
+
+## An integer `AVG` widened its whole input column to 128 bits to reach a 128-bit accumulator — h2o-gb-q4 15.2 -> 9.2 ms, and the keyless form of the same query was answering from an f64 statistic (2026-08-13)
+
+Two defects in one aggregate, found from opposite ends. The first is a cost: `AVG` over an
+integer column is summed exactly, and the way it reached its exact accumulator was to
+`arrow::compute::cast` the entire column to `Decimal128(38, 0)` before touching it. The second
+is a wrong answer: the *keyless* form of that same query never reaches the accumulator at all,
+because an unfiltered `AVG` over a bare column is answered from a recorded statistic, and that
+statistic was computed in `double`.
+
+### The widening: 16 bytes written per row to read 8
+
+`agg::widen_mean_inputs` cast every `Mean` call's `Int64` input up front, per morsel, so both
+the grouped and global paths could share one sum-state type. The state does need 128 bits — an
+`i64` running sum overflows on IDs, nanosecond timestamps or cents, which is why the exact
+accumulator exists — but the *input* never did. The cast allocated and wrote 16 bytes per row
+to read 8, and then handed the result to `Decimal128`'s scatter, which carries a validity
+branch, a `checked_add` and a `valid[g]` write per row where the integer path has a branch-free
+no-null form.
+
+`accum::mean_sum_i128` and `fused::MeanSumI64*` now accumulate the `Int64` column straight into
+`i128` group slots. The state they produce is byte-identical to what the cast plus the decimal
+scatter produced, so `combine`, `finalize_mean`, spill and the distributed reduce are unchanged
+— this is invariant #7's `partial`/`combine`/`finalize` with a cheaper `partial` and nothing
+else touched. **The `checked_add` is dropped by proof, not by omission**: the widest sum of `n`
+`i64` values is `n · 2^63`, and `i128` holds that for every `n` a machine can address.
+
+Measured by **alternating the two engines** on the 96-core / 184 GiB box — four baseline runs
+and three with the change, interleaved, so box drift cannot be read as a result. h2o-groupby,
+1e7 rows, best-of-5. The box is shared with other sessions, which is exactly why the arms are
+interleaved rather than run back to back:
+
+| query | baseline x4 | with the change x3 | DuckDB |
+|---|---|---|---:|
+| `h2o-gb-q4` (`avg(v1:v3) by id4`) | 15.2 / 14.4 / 16.0 / 15.8 | **9.2 / 9.4 / 8.1** | 4.6 |
+| q1 | 26.9 / 10.4 / 10.9 / 10.4 | 10.7 / 12.0 / 11.7 | 17.9 |
+| q2 | 48.4 / 60.3 / 51.5 / 52.8 | 53.0 / 63.1 / 52.1 | 18.2 |
+| q3 | 65.1 / 57.6 / 64.1 / 56.9 | 58.9 / 59.9 / 65.2 | 44.3 |
+| q5 | 41.3 / 39.6 / 42.4 / 40.5 | 41.0 / 43.5 / 43.7 | 62.1 |
+| q6 | 89.4 / 96.0 / *780.2* / 94.0 | 93.9 / 95.9 / 92.2 | 123.4 |
+| q7 | 56.9 / 58.4 / *188.8* / 62.0 | 60.0 / 64.0 / 57.1 | 45.5 |
+| q8 | 111.8 / 120.0 / *247.6* / 114.9 | 114.0 / 116.8 / 111.5 | 66.3 |
+| q9 | 67.8 / 67.0 / 69.3 / 72.1 | 71.4 / 77.9 / 69.0 | 27.3 |
+| q10 | 187.8 / 193.2 / 200.6 / 179.9 | 202.3 / 187.0 / 187.1 | 355.8 |
+
+**q4 is the only row whose two arms do not overlap**, and it is the only row that should move:
+two of its three `mean`s are over integers, and the third is a float this does not touch. Its
+ratio against DuckDB goes **3.3x -> 1.9x**. Every other question sits inside the baseline's own
+run-to-run spread, which is the result — a targeted fix that moves one shape and nothing else.
+
+Suite geomean `b/duckdb`: **1.32-1.38x -> 1.23-1.30x**, or about 6% on the middle of each range.
+
+The three italicised cells are one contaminated baseline run (a neighbouring session spiked the
+box mid-round: q6 read 780 ms against ~93 ms in all six other runs of the identical query).
+They are shown rather than dropped because that round's geomean is 1.641x, and pairing it
+against a treatment run would have credited this change with someone else's contention — the
+reason the arms alternate, demonstrated.
+
+What remains on q4 is the storage gap this file has recorded for h2o-groupby all along: Batcher
+moves ~320 MB of `Int64`, DuckDB perhaps an eighth of that, compressed and narrow.
+
+### The keyless form was answered from a `double`, and tagged EXACT
+
+Writing the differential test for the above turned up something the perf work would never have
+shown, and that the suite cannot see: **`SELECT AVG(v) FROM t` returned a wrong number.**
+
+```
+v = [2^62, -2^62, 3, 2^62 + 1, -2^62]      Batcher 0.0      DuckDB 0.8
+```
+
+An unfiltered `AVG` over a bare column of an immutable in-memory relation is answered from
+`InMemorySource.column_mean` instead of executing (the metadata shortcut this file recorded at
+`sum` 2.60 ms -> answered). That function was `pc.mean(...)`, which accumulates an integer
+column in `double` — lossless only while the running sum stays under 2^53. The values above are
+each exactly representable and the true mean is a small number; f64 loses the small addends to
+the large ones and reports `0.0`. The answer is tagged `Provenance.EXACT` and *replaces*
+execution, so nothing downstream can tell.
+
+It reproduced identically on the engine built before any of this session's changes, so it is
+pre-existing, not introduced here. It is also narrow in a way worth stating precisely, because
+it is what kept it hidden: it needs the aggregate list to be **only** means over bare columns
+of a scan. `AVG(v)` alone is wrong; `AVG(v), COUNT(v)` is right, a filter makes it right, and
+`AVG(v + 0)` makes it right — each of those declines the shortcut.
+
+`column_sum` next door had the guard all along ("returned only when exactly representable"), so
+the two now agree about integers from opposite directions: it refuses an inexact total, and
+`column_mean` computes an exact one. The exact sum is taken in `int64` whenever the column's own
+`min`/`max` prove `non_null · max(|min|, |max|) < 2^63`, and only otherwise in the 128-bit
+accumulator — because the wide one is *not* cheap: casting a 6M-row `int64` column to
+`decimal128` and summing measured **112 ms**, against the 5.7 ms the inexact `pc.mean` cost —
+which would have cost the shortcut its entire reason to exist. The bounded form measures
+**5.4 ms**, slightly under the inexact version it replaces.
+
+Covered by `tests/differential/test_diff_agg_int_mean_exactness.py`, which pins all three code
+paths a query picks by shape alone (fused multi-aggregate, per-call scatter, whole-column
+reduction) plus `collect`/`spill`/`iter_batches`, against DuckDB — whose `HUGEINT` sum is the
+oracle for exactly this reason. Three of its four cases pass on the old engine; the fourth is
+the one above.
+
+### Baseline this was measured against, and what did not move
+
+Every single-node suite re-run on a release build first, since the tree was shipping a debug
+engine again. `b/duckdb` geomean against DuckDB's native store:
+
+| suite | n | baseline | with the change |
+|---|---:|---:|---:|
+| json | 5 | 0.283x win | 0.269x |
+| ClickBench | 43 | 0.623x win | 0.644x |
+| operators | 19 | — | 0.776x win |
+| TPC-H sf1 | 22 | 1.024x | 1.045x |
+| h2o-join | 5 | 1.189x | 1.089x |
+| h2o-groupby | 10 | 1.319-1.384x | **1.229-1.301x** |
+| TPC-DS sf1 | 99 | — | 1.548x |
+
+Against the other engines, on the same runs: operators is 0.140x vs Polars, 0.051x vs PyArrow
+and 0.149x vs Daft; ClickBench 0.318x / 0.275x; TPC-H 0.544x / 0.493x; h2o-groupby 0.468x /
+0.492x. **DuckDB on its native store is the only engine in the lineup that beats Batcher on any
+suite**, and only on three of seven.
+
+TPC-DS is the standing loss and this run reproduces it rather than explaining it: 99/99 complete,
+geomean 1.548x, faster on 27/99, and the deficit is concentrated where this file already put it
+— q17 (781 ms), q77 (367 ms), q80 (487 ms), q50, q49, q5. q77 at 367 ms is a plan-cache *miss*
+(90 ms on a hit), which is the calibration-fingerprint flap recorded above with two fix attempts
+already measured and rejected. Run on a box other sessions held at load 30-60, so read the
+ratios as indicative and the 99/99 completion as the fact.
+
+Its one `FAILED` is `tpcds-q67`, `column 'rk' row 8: 92 vs 90` — the benchmark's own
+decimal→float cast, diagnosed at length below. The moving row number across sessions
+(row 4: 23 vs 21, row 16: 8 vs 6, now row 8: 92 vs 90) is that diagnosis' signature, not
+non-determinism. A full-lineup run instead dies at `tpcds-q64` with exit 137: Daft is
+SIGKILLed there and the kill takes the runner, which is also already recorded. Dropping Daft
+from the lineup is what completes the suite.
+
+The ClickBench/json/TPC-H columns are a *different* box state, not a result: that sweep ran
+while other sessions held the box at load 18-20, and no query in any of the three uses an
+integer `AVG`. Read the h2o-groupby row, which is the interleaved A/B, and treat the rest as
+"nothing moved". **No correctness failure is Batcher's** in any suite: the `FAILED` rows are
+`duckdb != daft` (tpch-q6, tpch-q15, cb-q03) and the `PARTIAL`s are Daft/Polars SQL gaps and
+Daft OOMs, exactly as recorded before.
+
+### Handed over, not fixed: a multi-key join is estimated 2,200x too high, and it is what TPC-DS q17 costs
+
+Found while checking whether the TPC-DS deficit is anything like the h2o one. It is not — it is
+the optimizer, and the arithmetic is specific enough to act on. **Not implemented here**: the
+blast radius is every join order in every suite, so it wants its own session and its own full
+re-measurement, not a tail-end change to this one.
+
+`tpcds-q17` on an idle box, standalone (best of six, warm): **978 ms against DuckDB's 20 ms —
+49x**, and stable across runs, so it is not the plan-cache flap recorded above. The query is an
+8-way join whose true answer at sf1 is **zero rows**. Batcher takes a second to establish that,
+building an ~11,000,000-row intermediate on the way (`explain` reports
+`left≈10,999,380 right≈4,217`).
+
+The cause is one estimate. `store_returns ⋈ catalog_sales` joins on **two** keys
+(`customer_sk`, `item_sk`):
+
+| | rows |
+|---|---:|
+| Kyber's estimate | 584,881 |
+| textbook **one**-key formula (`|l|·|r| / max ndv`, customer only) | 4,582,009 |
+| textbook **two**-key independent formula (divide by both ndvs) | **255** |
+| **truth** (counted) | **265** |
+
+The independent per-key product lands within **4%**; Kyber is over by **2,200x**. Measured
+inputs, not assumed: `sr` 277,776 rows with non-null keys, `cs` 1,434,418; ndv customer
+86,959 / 79,641; ndv item 17,997 / 18,000.
+
+`stats/estimator.py` is where it goes wrong, and it is structural rather than a bad constant —
+three of its refinement paths open with `if len(node.left_keys) != 1 or len(node.right_keys) !=
+1: return None` (lines ~1099, ~1189, ~1291), so a multi-key equi-join drops out of every one of
+them and lands on a default. What multi-key handling exists (`_ordinal`-range overlap) computes
+a *range* factor, which is ~1.0 for two overlapping surrogate keys and reduces nothing. That is
+why the plan explains as `(default)` at almost every join while the scans under it are
+`(exact)`.
+
+Two cautions for whoever takes it. Independence across keys is the assumption JOB exists to
+punish, so it should be applied with a floor and verified against JOB (113 queries) as well as
+TPC-DS. And this file already records two optimizer changes in this area (wider fingerprint
+buckets, EWMA-damped refits) that were **measured and rejected** — so measure first.
+
+### The distributed suite failed against the shared cluster, and it was the cluster
+
+Worth recording because it cost an hour and the diagnosis is not the obvious one.
+`test_distributed_equals_single_node[base-agg_float_key]` failed in the first gate run, then
+**hung past ten minutes** on a re-run of that single test. It is a *float* group key, which an
+integer-`AVG` change cannot reach, and the reason is in `.claude/rules/concurrent-agents.md`:
+the long-lived cluster's workers hold the **installed** `_native.abi3.so`, which was a *debug*
+build from hours earlier, while the driver ran a release engine from a sandbox. So
+"distributed == single-node" was comparing two different builds of the engine to each other.
+
+`RAY_ADDRESS=local` is the whole diagnosis, and the numbers are unambiguous:
+
+| | result |
+|---|---|
+| baseline engine, fresh local Ray | passes, 14 s |
+| this change, fresh local Ray | passes, 14 s |
+| shared cluster | failed, then hung >10 min on the same single test |
+| **whole selection, fresh local Ray** | **2,414 passed / 0 failed in 128 s** |
+
+The same selection took 2,400 s to reach 336 tests against the shared cluster. Anyone reading a
+red distributed result here should run that env var before reading anything else into it.
+
+Gated: differential **2,414 passed / 0 failed** (`-k "agg or mean or avg or metadata or
+shortcut"`, fresh Ray), `cargo test --workspace --exclude bc-py` green, clippy `-D warnings`
+clean on `bc-runtime`, `cargo fmt` clean, ruff clean, `lint-layers` 6/6, `lint-structure`,
+`lint-tests`, `lint-docstrings` and `lint-guardrails` all clean. No IR tag and no FFI signature
+changed; the `Mean` state type is the same `Decimal128(38, 0)` it was.
+
+## A `GROUP BY` over a table's own partition columns was hash-shuffling rows the layout had already co-located — 4.2x on Parquet, 2.5x on Delta (2026-08-13)
+
+Roadmap item 7 of `docs/architecture/internals/competitive_architecture.md` ("plan on the
+layout a table already has") is now closed for aggregation, deduplication and windowing.
+`SourceStatistics.partition_keys` reached the optimizer and nothing planned on it, so a
+`GROUP BY day` over a directory-per-day table shuffled every row across the network to
+rediscover a partitioning the directory names already stated.
+
+A Hive-partitioned Parquet dataset is read one `PartitionDirSplit` per top-level directory,
+and a split is assigned to one worker whole. So equal partition values are already on one
+worker when the read finishes, and an aggregate whose group keys cover those columns has every
+group complete inside one partition: each worker folds its own directories to final groups and
+the driver concatenates. No map barrier, no transfer, no reduce barrier.
+
+Delta and Iceberg reach the same place from the other direction, and are the reason this
+generalized beyond Hive trees. Its log names one data file per split, so six partitions written in three
+appends are eighteen splits and the split set proves nothing on its own. Grouping splits by
+their recorded partition values and assigning **whole groups** establishes the same
+co-location at any split granularity, and the fine per-file splits survive inside the group,
+so nothing is lost from the read.
+
+Measured with `benchmarks/internals/partition_aligned.py`, which runs the same query both ways
+and compares the rows before reporting either time. 8,000,000 rows, 8 workers, `GROUP BY` the
+partition column; best of three warm runs, repeated three times on a box at load ~12 (spread
+under 4% on Parquet, ~15% on Delta) — both reader families, because they split differently:
+
+| layout | splits | aligned | shuffled | ratio |
+|---|---:|---:|---:|---:|
+| Hive Parquet, one directory per partition | 16 | **200 ms** | 850 ms | **4.2x** |
+| Delta, four data files per partition | 64 | **310 ms** | 780 ms | **2.3x** |
+| Hive Parquet, `COUNT(DISTINCT v)` | 16 | **490 ms** | 1,020 ms | **2.1x** |
+
+Floors rather than headlines: the engine under them was a *debug* build, which slows the local
+aggregation both paths do while leaving the shuffle's orchestration alone, so a release engine
+should widen the gaps rather than close them. The ratio is a property of the shape — it is the
+exchange removed, so it grows with the data the shuffle no longer moves, and a `GROUP BY` on a
+column the table is not partitioned by is unaffected.
+
+### The guard on when to take it took three tries, and only measurement caught the third
+
+The aligned plan gives up exactly one thing: a partition is one assignable unit however many
+files it holds, so a fleet wider than the layout runs fewer tasks than the shuffle would. Two
+rules were written for that on intuition and both were wrong, in opposite directions.
+
+`benchmarks/internals/partition_aligned.py --sweep` varies the partition count against a fixed
+8-worker fleet, forcing the aligned path so the losing cases are visible:
+
+| partitions (8 workers) | 1 | 2 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|---:|
+| Hive tree, one split per partition | 0.95x | 1.33x | 2.35x | 4.44x | 4.10x |
+| Delta, four data files per partition | **0.62x** | 1.30x | 2.44x | 2.69x | 2.64x |
+
+The **first** rule demanded full retention (`groups >= workers`). That refuses every Hive case
+above — a directory reader splits one-per-partition, so grouping costs it nothing and the
+shuffle would have run the identical tasks — and it threw away the measured 2.35x at four
+partitions.
+
+The **second** was the ratio `min(groups, workers) / min(splits, workers)`, floored at a
+quarter. It accepts the **0.62x**, and the reason is worth keeping: Delta at one partition
+keeps a quarter of the shuffle's parallelism and loses 1.6x, while Delta at two partitions
+keeps the *same quarter* and wins 1.3x. Both losses in the table are the column where the
+aligned plan has **one task**, which no ratio distinguishes.
+
+The **third** is both conditions together (`dist/executors/map.py`): at least two tasks unless
+the shuffle would not have had two either, and at least a quarter of what the shuffle would
+have run. The first rules out the serial plan; the second keeps a two-partition table off a
+five-hundred-worker fleet, which the sweep's fixed width cannot reach but arithmetic can. Every
+point in the table is decided correctly by the pair.
+
+### `COUNT(DISTINCT)` was the shape that needed the second half of the rule
+
+It lowers to an aggregate over a `Distinct`, and the dispatcher caught the `Distinct` first, so
+the aligned check never saw it. A dedup is *partition-local* over a clustered relation — it only
+collapses rows that agree, and rows agreeing on the partition columns are on one worker — so
+the whole query folds with no shuffle. The check now runs ahead of the `DISTINCT` branches.
+The row above understates the case: `v` holds a thousand distinct values, and the shuffle
+removed carries the **deduped** rows, so the gap grows with the column's cardinality — which is
+the regime the `_staged_aggregate_over_distinct` comment calls "the whole query" at 15M keys.
+
+Making that safe needed a distinction the clustering property does not draw, and the trap is
+worth stating because it looks like a contradiction. A `Limit` between the scan and the
+aggregate does **not** move a row between workers, so the relation is still clustered — the
+property is true. But `limit(100).group_by(day)` run per partition keeps a hundred rows on each
+of them, which is a different query. Clustering says where rows *are*; it does not say a
+per-partition computation is *complete*. `dist/executor.py::_partition_local_chain` is the
+second predicate, and it admits only `Filter`, `Project` and an unlimited `Distinct`.
+
+### Verified
+
+`tests/integration/test_distributed_partition_aligned.py` (26 tests, on a 4-worker local Ray)
+holds every shape against the single-node result, including `median`/`n_unique` — the
+non-mergeable aggregates, which are the most direct evidence the groups really were whole,
+since nothing merges them. One test monkeypatches both shuffle executors to raise, and every
+other one subscribes to the scheduler's exchange decision and asserts **which plan ran** — the
+shuffle path returns the same rows, so a test that checks only the rows passes just as happily
+when the optimization silently stops firing. Adding that assertion immediately caught four
+tests that were exercising the fallback while claiming to cover the aligned path.
+
+## The TPC-H scale sweep: against DuckDB's *engine* the win holds at sf10 (0.397x), against its *storage* it does not (1.461x) — and sf100 q9 still OOMs (2026-08-12)
+
+sf1 and sf10 measured on the idle 96-core / 184 GiB box; sf100 read as lazy native scans
+from a local normalized mirror (`tools/mirror_bench_data.py`, 24 GB), isolated per query and
+capped at 64 GB so an over-large query spills rather than taking the node down.
+
+| scale | `b/duckdb` (native store) | `b/duckdb_arrow` (same Arrow) |
+|---|---:|---:|
+| sf1 | **0.944x** win | 0.341x (recorded) |
+| sf10 | **1.461x** lose | **0.397x** win |
+
+**The sf10 loss is DuckDB's storage layer, not its engine.** Given the identical Arrow input
+both engines are handed, Batcher is **2.5x faster** at sf10 — and that margin *holds* with
+scale (0.341x → 0.397x) rather than eroding. What DuckDB adds on the native bar is its own
+compressed columnar format: zone maps, late materialization and a scan that never builds the
+rows a filter is about to discard. That is a storage advantage this engine has chosen not to
+have (Arrow is the only columnar contract, invariant #3), so the native-bar number is a
+statement about file formats as much as about execution, and it should be quoted with its
+sibling or not at all.
+
+Per query, the two bars disagree most exactly where the joins are widest:
+
+| query | b/duckdb | b/duckdb_arrow |
+|---|---:|---:|
+| q5 | 4.28x | **0.20x** |
+| q7 | 2.70x | **0.39x** |
+| q9 | 4.11x | 1.13x |
+| q13 | 2.74x | 1.88x |
+| q15 | **0.23x** | **0.05x** |
+
+q5 is 4.28x on one bar and 0.20x on the other — a 21x spread on one query. Any claim drawn
+from one bar alone is an artefact of which bar was picked.
+
+### sf100: q9 is OOM-killed, and the rest does not finish in three hours
+
+21 of 22 queries ran; **`tpch-q9` was killed by SIGKILL inside its isolated subprocess** even
+at a 64 GB cap in scan mode, and the suite hit a 3-hour wall at 21/22 before printing a table,
+so there is no sf100 geomean here. Two things are established rather than guessed: the
+`≥100M rows` OOM row on `competitive_architecture.md`'s scorecard still reproduces at sf100 on
+q9, and `--isolate` contains it — one KILLED row instead of every result after it. The memory
+guard never fired and the node was never at risk (42 GB free at exit).
+
+Anyone re-running this should budget more than three hours, or run it in halves.
+
+## Post-recovery baseline: all five single-node suites reproduce their recorded figures, and the control plane is re-measured at 1.0-1.7 ms (2026-08-12)
+
+The box lost its Rust toolchain, `target/`, the built engine and `~/bench-data` outright. This
+run exists to establish that the rebuilt environment measures the same engine the earlier
+entries did, before anything is read into the numbers. Sequential, never two suites at once, on
+the idle 96-core / 184 GiB box, geomean `b/duckdb` against DuckDB's **native** store.
+
+| suite | n | this run | recorded | |
+|---|---:|---:|---:|---|
+| ClickBench | 43 | **0.635x** | 0.625-0.633x | win |
+| operators | 19 | **0.666x** | 0.675x | win |
+| h2o-join | 5 | **0.943x** | 0.898-1.003x | win |
+| TPC-H sf1 | 22 | **0.944x** | 0.944-0.963x | win |
+| h2o-groupby | 10 | **1.247x** | 1.226-1.250x | lose |
+
+Every one lands inside its recorded range, so the toolchain reinstall is not a variable in
+anything measured after this. **No correctness failure is Batcher's**: `tpch-q6` and `cb-q03`
+report `duckdb != daft`, and the `PARTIAL` rows are Daft/Polars SQL gaps (`regexp_replace`,
+`date_trunc`, `SUBSTRING(... FROM ...)`). Batcher matches the oracle on 22/22 and 43/43.
+
+### The control plane, measured rather than quoted
+
+`internals/small_query_latency.py`, 20,000-row probe, best-of-60:
+
+| columns | best ms |
+|---:|---:|
+| 1 | 0.995 |
+| 16 | 1.125 |
+| 105 | 1.131 |
+
+Intercept **0.995 ms**, slope **1.3 us/column**; 105 columns at 1M rows is 1.675 ms. That is the
+fixed cost every query pays, and it is what the short-query losses are made of — subtract it and
+`op-groupby-sum` goes 1.30x -> ~1.00x and `tpch-q6` 1.41x -> ~1.18x. It explains **none** of the
+large ones: `h2o-gb-q4` (12.5 ms) only moves 2.81x -> 2.56x, and `h2o-join-q5` (525.9 ms) not at
+all.
+
+### Where the remaining loss actually is, by shape rather than by suite
+
+`h2o-join` splits cleanly on key type: q1-q3 join on **integer** keys and win (0.37x, 0.62x,
+0.64x); q4 joins on a **factor/string** key and q5 carries five string columns through, and they
+lose 2.10x and 2.42x. The same line runs through `operators` (`sort-string` 1.10x,
+`-lowcard` 1.28x, `-limit` 1.36x) and `h2o-groupby` (q2 on `id1,id2` 2.32x, q3 on `id3` 1.37x).
+This is the `competitive_architecture.md` string row, and **both of its remedies are already
+measured losses** — dictionary survival past the leaf reverted at 0.63x, partial `StringView`
+known to lose. Do not re-derive them.
+
+The one large loss that is *not* strings is `h2o-gb-q4` (2.81x): three `mean`s over 100 groups,
+where group assignment is a dense direct-map and nearly free, so the per-aggregate update is the
+whole query. Its integer `mean` now sums into an exact `Decimal128(38,0)` rather than f64 — a
+deliberate trade made because the f64 running sum returned a *wrong* answer on ordinary
+magnitudes, not a regression to revert. The suite geomean is unchanged across that change.
+
+### Checked and ruled out this session, so they are not re-attempted
+
+Dense/direct-map group ids (already implemented, 8.0 -> 4.0 ns/row at 1 group); the dense path
+being skipped on nullable-*typed* keys (the gate is `null_count() == 0`, the actual count, so it
+already applies); integer `mean` falling out of the fused multi-aggregate path (`fused.rs` has a
+`SumDecimal` arm and still fuses it).
+
+## The distributed driver asked the GCS the same O(nodes) question 21 times per query — 21 -> 3 (2026-08-11)
+
+Recorded run on a local Ray cluster (`RAY_ADDRESS=local`) on the 96-core / 184 GiB box, via
+the new `benchmarks/internals/driver_overhead.py`. That benchmark exists because the figure
+that decides whether a fleet of a hundred thousand nodes works is not wall clock — it is how
+many times per query the driver makes a call whose *reply* carries one record per node.
+
+| per distributed query | before | after | |
+|---|---:|---:|---|
+| `ray.nodes()` | 12.0 | 1.0 | |
+| `ray.cluster_resources()` | 2.0 | 1.0 | |
+| `available_resources_per_node()` | 7.0 | 1.0 | |
+| **O(nodes) round trips** | **21.0** | **3.0** | 7.0x |
+
+Same query both times (`group_by("k").agg(sum)` over 50,000 rows, 1,000 keys), 10 timed runs
+after 3 warmups. These counts are exact rather than timed, which is the point of measuring
+them: they are the same on a laptop and on ten thousand nodes, so they can be projected
+instead of extrapolated. At 100,000 nodes the driver deserialized **2.1 M node records per
+query** before and 300 K after.
+
+Driver CPU is deliberately **not** quoted here. The box carried three other agents' suites
+for the whole session (load average 15-25), and the driver spends most of a distributed query
+blocked on workers, so the wall-clock and CPU figures the benchmark prints moved by more
+between repeats of the same build than between builds. The round-trip counts did not move at
+all.
+
+### Why there were twenty-one
+
+`topology_scope()` already collapses the placement phase's reads into one snapshot, and it is
+correct that it covers only that phase: the autoscale wait and the worker clamp ahead of it
+must see the cluster grow. Everything outside it read live, and the reads outside it
+outnumbered the ones inside seventeen to two. The comment they were written under says
+`ray.nodes()` is a cheap RPC, which is true of the call and false of the reply.
+
+Unscoped reads are now windowed for 50 ms (`scaling._LIVE_TTL_S`), per component so a caller
+wanting only the node list does not also pay for the free-CPU read. 50 ms because
+`readiness._await_autoscale` sleeps `max(0.1, autoscale_poll_s)` between polls, so the window
+is provably below the interval of the one loop whose correctness depends on observing growth
+— pinned by a test rather than left to the comment.
+
+### Found beside it and not yet landed: 38 remote-function definitions per query
+
+The same benchmark counts `ray.remote()` definitions, and the driver builds **38 per query**.
+`_ensure_ray` is called three times and the resource signature *alternates* — once with the
+placeholder `num_cpus=1.0` that transport resolution passes before the envelope is known,
+then with the real grant. The "already wrapped?" check holds a single current signature, so
+it misses on two of the three and rebuilds all nineteen task functions each time.
+`ray.remote()` disassembles the function's bytecode, and the first `.remote()` after it
+exports the definition to the GCS every driver in the fleet shares. Keeping the wrappers per
+signature takes it to **0 rebuilds per query** in steady state (2.60 -> 0.13 ms in
+`_wrap_tasks` itself), but it edits `lifecycle.py`, which is carrying another session's
+uncommitted spill-budget work — so it lands separately rather than sweeping that up.
+
+### Single-node, separately: event-log retention was a directory scan
+
+`observability.event_log` is on by default and each write pruned the log directory with a
+`glob` + `sort` every 64 writes. At the default cap of 200 that measured **0.184 ms per
+query** — 11% of a small query's whole control plane, and more than assembling the document
+and JSON-encoding it put together. Retention now keeps the window in memory: one `popleft`
+and one `unlink`, with a reconciling scan every 512 writes so a sibling process's documents
+are still collected. On a warm `filter -> select` over 100 rows, the event-log write went
+0.465 -> 0.338 ms and the whole control plane 1.68 -> 1.55 ms.
+
+### What is left on the single-node path, stated so it is not re-derived
+
+A warm `collect()` on 100 rows is ~1.55 ms, attributed by thread CPU: engine call and Arrow
+build ~0.29, event log ~0.34, learned-stats close-out ~0.15, optimize (a plan-cache hit)
+~0.10, admission ~0.07, common-subplan verdict ~0.06, `ResourceManager` construction ~0.05
+(built three times per query), pipeline signature ~0.04, source resolution ~0.02. Nothing
+above is a single large item, and the derivation half of it is already memoized.
+
+The path that *is* 20x cheaper exists and is off by default:
+`api/orchestration/fast_path.py` plus the `prepared` memo answer the same query in **0.236
+ms**. It gets there by not doing two things this path does — the learned-stats write side and
+observability — so closing the gap is a question about those two, not about shaving the
+list above. Its gate also admits only `InMemorySource`, so no query that reads a file can
+reach it today.
+
 ## TPC-DS's worst queries were not executing slowly — the analysis that finds a repeated subplan was being executed as the plan. q80 1,155 -> 465 ms (2026-08-11)
 
 ### Every suite, before and after, on an idle 96-core / 184 GiB box
@@ -10608,6 +11565,24 @@ a source cannot be resolved the function returns None and that source is left al
 is precisely the behavior every derived table had before, so an unresolvable case cannot
 regress.
 
+### `COUNT(DISTINCT)` was the shape that needed the second half of the rule
+
+It lowers to an aggregate over a `Distinct`, and the dispatcher caught the `Distinct` first, so
+the aligned check never saw it. A dedup is *partition-local* over a clustered relation — it only
+collapses rows that agree, and rows agreeing on the partition columns are on one worker — so
+the whole query folds with no shuffle. The check now runs ahead of the `DISTINCT` branches.
+The row above understates the case: `v` holds a thousand distinct values, and the shuffle
+removed carries the **deduped** rows, so the gap grows with the column's cardinality — which is
+the regime the `_staged_aggregate_over_distinct` comment calls "the whole query" at 15M keys.
+
+Making that safe needed a distinction the clustering property does not draw, and the trap is
+worth stating because it looks like a contradiction. A `Limit` between the scan and the
+aggregate does **not** move a row between workers, so the relation is still clustered — the
+property is true. But `limit(100).group_by(day)` run per partition keeps a hundred rows on each
+of them, which is a different query. Clustering says where rows *are*; it does not say a
+per-partition computation is *complete*. `dist/executor.py::_partition_local_chain` is the
+second predicate, and it admits only `Filter`, `Project` and an unlimited `Distinct`.
+
 ### Verified
 
 A controlled probe of 7 shapes, run against the pre-fix and post-fix translator on the same
@@ -10654,6 +11629,24 @@ join that worked before takes exactly its old path; membership only decides the 
 previously failed. Where neither orientation resolves, or both do (a name both sides own),
 the written order is kept — the long-standing behavior, which the same-name-key path handles
 downstream.
+
+### `COUNT(DISTINCT)` was the shape that needed the second half of the rule
+
+It lowers to an aggregate over a `Distinct`, and the dispatcher caught the `Distinct` first, so
+the aligned check never saw it. A dedup is *partition-local* over a clustered relation — it only
+collapses rows that agree, and rows agreeing on the partition columns are on one worker — so
+the whole query folds with no shuffle. The check now runs ahead of the `DISTINCT` branches.
+The row above understates the case: `v` holds a thousand distinct values, and the shuffle
+removed carries the **deduped** rows, so the gap grows with the column's cardinality — which is
+the regime the `_staged_aggregate_over_distinct` comment calls "the whole query" at 15M keys.
+
+Making that safe needed a distinction the clustering property does not draw, and the trap is
+worth stating because it looks like a contradiction. A `Limit` between the scan and the
+aggregate does **not** move a row between workers, so the relation is still clustered — the
+property is true. But `limit(100).group_by(day)` run per partition keeps a hundred rows on each
+of them, which is a different query. Clustering says where rows *are*; it does not say a
+per-partition computation is *complete*. `dist/executor.py::_partition_local_chain` is the
+second predicate, and it admits only `Filter`, `Project` and an unlimited `Distinct`.
 
 ### Verified
 
@@ -10743,6 +11736,24 @@ arm untouched, so nothing on the hot path moves.
 `-D warnings`; `cargo fmt --check` clean. Four new `#[cfg(test)]` cases cover the string
 literal against a `Date32` column, the float literal against an `Int64` column, a mixed set
 that must keep every member, and a homogeneous set that must stay on the fast path.
+
+### `COUNT(DISTINCT)` was the shape that needed the second half of the rule
+
+It lowers to an aggregate over a `Distinct`, and the dispatcher caught the `Distinct` first, so
+the aligned check never saw it. A dedup is *partition-local* over a clustered relation — it only
+collapses rows that agree, and rows agreeing on the partition columns are on one worker — so
+the whole query folds with no shuffle. The check now runs ahead of the `DISTINCT` branches.
+The row above understates the case: `v` holds a thousand distinct values, and the shuffle
+removed carries the **deduped** rows, so the gap grows with the column's cardinality — which is
+the regime the `_staged_aggregate_over_distinct` comment calls "the whole query" at 15M keys.
+
+Making that safe needed a distinction the clustering property does not draw, and the trap is
+worth stating because it looks like a contradiction. A `Limit` between the scan and the
+aggregate does **not** move a row between workers, so the relation is still clustered — the
+property is true. But `limit(100).group_by(day)` run per partition keeps a hundred rows on each
+of them, which is a different query. Clustering says where rows *are*; it does not say a
+per-partition computation is *complete*. `dist/executor.py::_partition_local_chain` is the
+second predicate, and it admits only `Filter`, `Project` and an unlimited `Distinct`.
 
 ### Verified end to end
 
@@ -11533,3 +12544,232 @@ path; `collect(transport="disk")` reports the operators today.
   looks identical to a clean pass. Always check for the `N passed` line.
 - **Rebuild with `--release`** — the installed engine is a release build and a debug rebuild
   silently invalidates every timing measured beside it.
+
+## A learned sort grid was shared by every single-source sort in the process (2026-08-13)
+
+Found by probing the operator x execution-mode cross-product rather than by a failing test:
+a distributed `sort` on a **string** column raised, from inside a Ray task, after two
+retries, on the path CI never executes.
+
+```
+File "batcher/dist/executors/partition_io/ranges.py", line 270, in bucketize
+    return nat.range_partition_batches_str(...)
+TypeError: argument 'boundaries': 'float' object cannot be converted to 'PyString'
+```
+
+**Cause.** `sort_shape_key(map_ir, key_name)` hashed the mapped plan IR and the key's column
+*name*. A mapped prefix that is a bare scan serializes to `{"op": "scan", "source_id": 0}` — a
+*positional* index into this plan's own source list, carrying no schema and no source
+identity. Every single-source sort in the process therefore produced the same digest and
+shared one grid. Two ways that hurts:
+
+**1. Wrong type — it raises.** `sort("k")` over a `float64` column and over a `string` column
+hash identically, so the second loads the first's grid and a float boundary list reaches the
+string range partitioner. The reverse direction fails inside NumPy instead.
+
+**2. Wrong relation — it silently serializes the reduce.** Two tables with the same schema and
+the same key column but disjoint ranges share a grid, so every key of the second falls past
+the last boundary of the first. Measured over 4,000 rows into 8 buckets:
+
+| grid used | bucket loads | idle reducers |
+|---|---|---|
+| its own | `[547, 479, 481, 485, 502, 473, 487, 546]` | 0 of 8 |
+| the other table's | `[0, 0, 0, 0, 0, 0, 0, 4000]` | **7 of 8** |
+
+The rows are correct and the sort is no longer distributed. Nothing raises, so nothing would
+ever have caught it. This is the case to keep in mind when reading the module's safety
+argument ("a grid that no longer describes the data costs *balance* and can never cost a
+row") — that is true, and "balance" can mean the entire fan-out.
+
+This is the one way a learned grid can do more than cost balance, which is what the whole
+safety argument in `dist/sort_boundaries.py` rests on ("a grid that no longer describes the
+data costs *balance* and can never cost a row"). That claim is true for a stale grid of the
+right type and false for a grid of the wrong one.
+
+**Fix.** Two layers, in `dist/sort_boundaries.py` and its four call sites (`executors/sort`,
+`flight_sort`, `global_window/disk`, `global_window/flight`):
+
+1. `sort_key_identity(source, key_name)` — the source's own key from
+   `plan.source_stats.source_stats_key` plus the key column's Arrow type — joins the digest.
+   That is the same correction `kyber.signature` already made for learned statistics when it
+   put `Scan.source_key` in its scan token instead of the positional id, and it is built from
+   the same helper so the two cannot drift. A real table keeps its identity across runs, so a
+   second `Dataset` over the same Parquet file still hits and the optimization is preserved;
+   an in-memory relation gets a per-instance serial, so two unrelated relations of the same
+   shape no longer collide (and correspondingly no longer share a grid across instances,
+   which is the honest answer for data with no cross-run life);
+2. `load_learned_grids(shape_key, expect_strings)` re-checks the stored grid's element type
+   on load, so an entry written under the old colliding digest re-samples instead of raising.
+
+**Verified** on a local 3-worker Ray cluster (`RAY_ADDRESS=local`), 400-row sorts, both
+directions and both sort orders:
+
+| Suite | At HEAD | With the fix |
+|---|---|---|
+| `test_distributed_sort_key_type_collision.py` (new, 6 tests) | `TypeError` as above | 6 passed |
+| `test_sort_boundary_learning.py` (6 new behavioral tests) | fail | 15 passed |
+| operator x mode matrix (4 key types x 10 ops x 5 modes) | 4 mismatches | 0 mismatches |
+| `test_dist_hunt_sort_buckets`, `test_distributed_skewed_sort`, `test_distributed_temporal_sort` (isolated) | pass | pass |
+
+**Environment note.** Running several Ray integration *modules* in one pytest process fails
+here with `RuntimeEnvSetupError: Failed to download runtime_env file package ... from the
+GCS`, because the first module's teardown shuts Ray down and the re-init loses the
+`py_modules` package. Identical counts at HEAD and with the fix (14 failed, 7 passed both
+ways), so it is environmental. Run these files one process at a time.
+
+---
+
+## Multimodal ingest and curation, after the `.image`/`.audio` surface expansion
+
+**What was measured and why.** The `.image` namespace went from 15 operations to 39 and
+`.audio` from 8 to 23, and every one of them sits on the per-row decode path. Two questions
+follow: did the ingest hot path regress, and is the *new* surface actually faster than what
+a user would otherwise write.
+
+**Environment.** 96-core node, engine built `--release` (`bt.versions()["engine_profile"]`
+checked as `release` before timing). The box was **shared**: load average 12.8-14.3 with
+18-22 other pytest processes belonging to concurrent sessions. Numbers are best-of-3 and
+reproduced across two independent runs, so the ratios are sound; the absolute figures are a
+floor rather than a peak, and are not comparable to the 5,693 img/s recorded earlier on an
+otherwise-idle machine.
+
+**A note on why this needed re-running.** The first pass measured a **debug** engine —
+`just build` is `maturin develop` with no `--release`, which is right for tests and
+meaningless for timing. It reported batcher at 788 img/s against Daft's 2,496, i.e. 0.32x,
+and reading that as a regression would have been wrong in both directions. `engine_profile`
+is the check that catches it, and it is now checked before every number below.
+
+### Decode + resize ingest (2,000 JPEG frames, 640x480 -> 224x224)
+
+`benchmarks/scenarios/image_decode.py`. Correctness gate: every engine must return the same
+frame count at the same output shape before its timing is reported.
+
+| Engine | Run 1 | Run 2 | Throughput | Batcher's lead |
+|---|---:|---:|---:|:---:|
+| **Batcher** | 657.7 ms | 583.7 ms | 3,041-3,427 img/s | baseline |
+| Daft 0.7.23 | 880.3 ms | 761.8 ms | 2,272-2,625 img/s | **1.31-1.34x** |
+| Ray Data 2.56 | 2,678.5 ms | 2,684.7 ms | 745-747 img/s | **4.07-4.60x** |
+
+**No regression.** The comparable earlier entry on this corpus recorded 645.0 ms / 3,101
+img/s; this measures 583.7-657.7 ms on a machine carrying 18-22 competing test processes.
+The 39-op vocabulary costs the ingest path nothing, which is what the shared `Output`
+encoder and the untouched `to_tensor` kernel predict.
+
+### Curation and augmentation (entropy + phash + horizontal flip, same 2,000 frames)
+
+`benchmarks/scenarios/image_decode.py --suite curate`. The comparison here is **a per-row
+Pillow loop**, not another engine, and that is the honest lineup rather than a convenient
+one: neither Daft nor Ray Data has a native entropy measure, perceptual hash, or
+photometric adjustment, so a `map_batches`/UDF over PIL is what a user of either writes.
+The baseline computes the same three things the way the Python ecosystem computes them.
+
+| Engine | Run 1 | Run 2 | Throughput | Batcher's lead |
+|---|---:|---:|---:|:---:|
+| **Batcher** (native expressions) | 1,321.3 ms | 1,298.0 ms | 1,514-1,541 img/s | baseline |
+| Pillow per-row loop | 7,611.5 ms | 7,361.3 ms | 263-272 img/s | **5.67-5.76x** |
+
+The gap is the whole argument for putting these in the data plane. The loop is not a
+strawman — it is three correct measures on bytes already in memory, with no I/O timed
+against the engine's — but it runs under the GIL on one core, where the native path fans
+every row across the machine.
+
+### What is *not* claimed
+
+- **Audio has no engine to compare against.** Daft has no native audio surface and Ray Data
+  decodes through a Python UDF, so the `.audio` operations are measured against a
+  `soundfile` loop (`benchmarks/scenarios/audio_decode.py`) and nothing else. "Faster than
+  the alternative" is true; "faster than a competitor" has no referent. On the same 96-core
+  node, release build: decode **19.8x** faster than the per-clip `soundfile` loop
+  (20.4 ms against 405.8 ms for 2,000 clips), and resample to 16 kHz at **1.0x** — parity
+  with `soxr`, the SIMD SoX resampler `librosa` itself calls. Parity is the right result to
+  report there and it is worth saying plainly: the native sinc kernel matches a
+  best-in-class C resampler rather than beating it, and the win on that op is that it stays
+  in the data plane rather than that it is faster.
+- **The 15 new `.audio` operations are not separately benchmarked.** `librosa` is not
+  installed on this machine, so the only comparison available for the spectral descriptors
+  and level measures would be a numpy baseline of my own writing — which measures how well I
+  write numpy, not how fast the engine is.
+- **The video kernels were not measured.** This machine has no FFmpeg, so the `video` cargo
+  feature does not build here and its kernels cannot be run, let alone timed.
+- **These are single-node numbers.** Nothing here says anything about the distributed media
+  path.
+
+### Distributed equivalence for the expanded media surface
+
+CI installs no Ray, so this path is never exercised by the PR gate and a recorded run is the
+only evidence it works. Verified on a **fresh 4-worker local Ray cluster**
+(`RAY_ADDRESS=local python -m pytest tests/integration/test_distributed_media.py`):
+**33 passed in 26.1 s**, up from the 11 the file carried before.
+
+Coverage is by *output shape* rather than by operation — the kernels share their assembly
+code, so what a distributed run can break is the shape a column comes back in, not any
+individual op's arithmetic. Nine shapes are checked on images (fixed-shape tensor, encoded
+blob, encoded blob in a **non-default container**, three digests, scalar measure, struct,
+boolean flag, header fact) and nine `.audio` operations, which previously had **no
+distributed coverage at all**.
+
+Three of those are worth naming because they are the ones a row-count check cannot see:
+
+- `phash`/`ahash`/`dhash` must be **bit**-identical across workers. A hash computed two ways
+  is a near-duplicate join that silently matches fewer rows on a cluster than on one node.
+- `pad_or_trim` produces one width (800 samples) on every worker. A worker resolving the
+  target from its own partition rather than from the query would emit two widths, and the
+  concatenated result would be unbatchable with no error anywhere.
+- The `trim_silence → rms_normalize → encode_wav` chain round-trips across workers. Its
+  middle two kernels read a *decoded* column rather than bytes, which is the composability
+  seam the single-node tests cover and the cluster had never exercised.
+
+A note on the `just lint-skips` ratchet: it is over budget across every category in this
+tree (`batcher._native` +713, `duckdb` +585, `other` +273, `ray` +89) while several sessions
+add tests concurrently. The additions recorded here are 87 native-gated and 22 ray-gated. The
+budget was deliberately **not** raised, because `--update` would bake in every session's
+increase under one change.
+
+### Two fixes on the media read path: 1.3x -> 1.9x against Daft
+
+Profiling the 1.31x margin above found that most of the gap was not decode at all. Two
+things on the *read* side were costing more than the kernels they fed.
+
+**1. The header parse ran whether or not anyone read it.** `MediaSource` extracted
+per-file metadata (a Pillow / soundfile / PyAV header open, in Python) whenever `with_meta`
+was on — the default — with no regard for the projection. So the namespace's most common
+pipeline, `read.images(decode=True, size=...)` then `select("image")`, opened every file a
+second time to fill width/height/mode/format columns the projection had already dropped.
+`_effective_meta` now mirrors `_effective_materialize`: a projection naming none of the
+metadata columns skips the parse entirely, and they come back all-null, which is what the
+`.select` discards anyway. Counted rather than timed in
+`tests/io/test_media_source_metadata.py`, because a timing assertion on a shared box is a
+flaky test that says nothing about why it got faster.
+
+**2. Local reads were pooled, and pooling made them slower.** `_read_chunk` fanned every
+chunk across a 64-thread pool unconditionally. That is right for an object store, where a
+read is a round trip; it is wrong for a local file, where it is a syscall on page cache.
+Measured directly on 2,000 local JPEGs (38.7 MB):
+
+| Read strategy | Time | Throughput |
+|---|---:|---:|
+| serial | **52.2 ms** | 782 MB/s |
+| 8-thread pool | 117.8 ms | 329 MB/s |
+| 16-thread pool | 117.6 ms | 329 MB/s |
+| 64-thread pool | 130.4 ms | 297 MB/s |
+
+The pool was making the read **2.5x slower** on the machine most people develop on.
+`io._concurrent.read_each_file` had already measured exactly this for footer reads and owns
+the local-vs-remote split for every other connector in the tree; this reader simply was not
+using it. It does now. Batcher's own `read.images` byte read went from **191.8 ms to
+77.3 ms**.
+
+**Result, on the unmodified `benchmarks/scenarios/image_decode.py`** (release build,
+96 cores, load 13-17 with other sessions running — a *busier* box than the 1.3x measurement
+above, so the gain is not contention):
+
+| Engine | Run 1 | Run 2 | Throughput | Batcher's lead |
+|---|---:|---:|---:|:---:|
+| **Batcher** | 417.7 ms | 430.2 ms | 4,649-4,788 img/s | baseline |
+| Daft 0.7.23 | 779.7 ms | 844.5 ms | 2,368-2,565 img/s | **1.87-1.96x** (was 1.31-1.34x) |
+| Ray Data 2.56 | 2,762.2 ms | 2,730.6 ms | 724-732 img/s | **6.35-6.61x** (was 4.07-4.60x) |
+
+Projecting only the decoded tensor — the like-for-like shape with Daft's pipeline, which
+produces the image column and nothing else — reaches **324.4 ms / 6,165 img/s**. The
+benchmark's own figure is kept as the headline because it is what a user gets by typing the
+obvious thing, and it has Batcher building eight columns against Daft's two.

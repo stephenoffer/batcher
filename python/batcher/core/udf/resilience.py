@@ -25,18 +25,22 @@ is discarded), not killed. Use `timeout_s` as a guard so one hung external call 
 the whole query — not as a resource kill. The multiprocessing path (reserved for CPU-bound
 pure-Python `fn`s, which do not make flaky external calls) is left unwrapped; retries there
 would re-run a deterministic bug.
+
+That abandonment is why the call is bounded by `_internal.concurrency.call_with_timeout`
+rather than a `ThreadPoolExecutor`: an executor's atexit hook joins every worker thread it
+ever started, so an abandoned call wedged the process at exit — see that module for the full
+account, and for why the guarded call also has to carry the caller's context.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any
 
 import pyarrow as pa
 
+from batcher._internal.concurrency.timeout import call_with_timeout
 from batcher._internal.logging import note_suppressed
 from batcher.plan.logical import MapBatches
 
@@ -95,20 +99,17 @@ def wrap_resilient(call: Callable[[pa.RecordBatch], Any], op: MapBatches) -> Cal
     def _run(batch: pa.RecordBatch) -> Any:
         if timeout is None:
             return call(batch)
-        # A fresh single-thread executor per attempt: on timeout the running thread cannot be
-        # cancelled, so it is abandoned (`shutdown(wait=False)`) and the query proceeds. Reusing
-        # one executor would queue the retry behind the hung call and defeat the timeout.
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(call, batch)
-        try:
-            return future.result(timeout=timeout)
-        except FutureTimeoutError:
-            raise TimeoutError(
+        # A fresh guarded call per attempt, never a shared one: reusing a worker would queue
+        # the retry behind the hung call and defeat the timeout.
+        return call_with_timeout(
+            lambda: call(batch),
+            timeout=timeout,
+            name=f"batcher-udf-{fn_name}",
+            on_timeout=lambda: (
                 f"map_batches fn {fn_name!r} exceeded timeout of {timeout:g}s on a "
                 f"{batch.num_rows}-row batch"
-            ) from None
-        finally:
-            pool.shutdown(wait=False)
+            ),
+        )
 
     def _resilient(batch: pa.RecordBatch) -> Any:
         attempt = 0

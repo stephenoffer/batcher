@@ -21,9 +21,11 @@ executing:
     bounds are dropped (null_count stays exact); an exact `min()`/`max()` then
     falls back to execution rather than returning a wrong extreme.
   - Parquet's `distinct_count` is an *estimate* (the format does not guarantee
-    exactness), so it is never placed on an `EXACT` column — that would let an
-    approximate distinct wrongly answer `count_distinct`. It is kept only on
-    already-inexact columns, where it can inform cost / `approx_count_distinct`.
+    exactness), so it carries its own `SKETCH` tag and can never answer an exact
+    `count_distinct`. That tag is what lets it sit beside EXACT bounds instead of
+    being refused by them — which is where a join key's distinct count is most
+    wanted and used to be dropped. Only a single-row-group file reports one: per-chunk
+    counts are not additive, so neither summing nor taking the last is the answer.
 """
 
 from __future__ import annotations
@@ -372,15 +374,18 @@ def _finalize_columns(
         # and no NaN poisoning (which would make the bound unordered).
         is_exact = exact_minmax and a.null_known and not a.nan_seen
         cmin, cmax = (None, None) if a.nan_seen else (a.min, a.max)
-        # Parquet's distinct_count is an estimate; never expose it on an EXACT
-        # column (that would let it answer an exact count_distinct). Keep it only
-        # on already-inexact columns for cost / approx_count_distinct, and only
-        # from a single row group (per-chunk counts are not additive).
-        ndv = (
-            float(a.distinct)
-            if (not is_exact and single_row_group and a.distinct is not None)
-            else None
-        )
+        # Parquet's distinct_count is an estimate (the format does not guarantee it), so it
+        # must never answer an exact `count_distinct` — but it rides *beside* exact bounds
+        # rather than being refused by them. That is what `ndv_provenance` is for, and until
+        # it existed the only way to keep the promise was a `not is_exact` guard here that
+        # dropped the count whenever the bundle was EXACT — discarding it on precisely the
+        # numeric and temporal columns join keys are made of, and leaving join ordering to
+        # fall back on `max(|L|, |R|)` for every one of them.
+        #
+        # Still only from a single row group: per-chunk distinct counts are not additive
+        # (the same value may appear in every chunk), so summing them over-counts and
+        # taking the last chunk's under-counts.
+        ndv = float(a.distinct) if (single_row_group and a.distinct is not None) else None
         columns[name] = ColumnStat(
             min=cmin,
             max=cmax,
@@ -395,5 +400,9 @@ def _finalize_columns(
             # answered from the footer on precisely the columns most real tables are made of —
             # before this, the exact answer was discarded because it sat next to an inexact one.
             null_count_provenance=Provenance.EXACT if a.null_known else Provenance.DEFAULT,
+            # The footer's distinct count is a writer's estimate whatever the bounds beside
+            # it are worth, so it carries SKETCH and can only ever inform cost and
+            # cardinality — which is the whole reason it may now sit on an EXACT bundle.
+            ndv_provenance=Provenance.SKETCH if ndv is not None else None,
         )
     return columns

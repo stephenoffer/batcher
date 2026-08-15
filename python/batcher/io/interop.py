@@ -13,8 +13,17 @@ The conversion is **batch-granular and zero-copy where the framework allows it**
 native Arrow bridges). Per-row Python is never used to move data.
 
 ``from_arrow`` / ``from_pydict`` / ``from_numpy`` are CORE (only pyarrow / numpy).
-Every other adapter does a deferred optional import and raises `BackendError`
-with the right ``pip install 'batcher-engine[<extra>]'`` hint if the framework is absent.
+Every other adapter defers its import through `_internal.optional.require`, the engine's one
+optional-dependency guard, so an absent framework raises `MissingDependencyError` naming the
+framework and the exact ``pip install`` that fixes it.
+
+Going through `require` rather than a local helper closes two gaps this module had. Its own
+guard raised a plain `BackendError`, so ``except ImportError`` around ``bt.from_pandas(df)``
+did not catch what the identical spelling around ``bt.read.parquet(...)`` does, and the error
+carried no `install` field for a caller wanting to surface the command its own way. And two of
+the hints named extras that **did not exist** — ``batcher-engine[spark]`` and ``[dask]`` — so
+the one actionable thing in the message was a command that fails; both are now declared in
+`pyproject.toml`.
 """
 
 from __future__ import annotations
@@ -23,7 +32,8 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError, PlanError
+from batcher._internal.errors import PlanError
+from batcher._internal.optional import require
 from batcher.io.source import InMemorySource, IteratorSource, Source
 
 if TYPE_CHECKING:
@@ -76,10 +86,6 @@ def _table_from_rows(rows: list[dict[str, Any]]) -> pa.Table:
         for k in row:
             keys.setdefault(k)
     return pa.table({k: [row.get(k) for row in rows] for k in keys})
-
-
-def _missing(framework: str, extra: str) -> BackendError:
-    return BackendError(f"{framework} interop needs: pip install 'batcher-engine[{extra}]'")
 
 
 # ---- CORE adapters (no optional dependency) ------------------------------
@@ -162,19 +168,13 @@ def from_pandas(df: Any) -> Source:
     column (or the index name) into the public schema as a phantom extra column; call
     ``df.reset_index()`` first to ingest the index as a real column.
     """
-    try:
-        import pandas  # noqa: F401
-    except ImportError as exc:
-        raise _missing("pandas", "pandas") from exc
+    require("pandas", feature="pandas interop", provides="pandas", extra="pandas")
     return _source_from_table(pa.Table.from_pandas(df, preserve_index=False))
 
 
 def from_polars(df: Any) -> Source:
     """Build a `Source` from a Polars `DataFrame` via its zero-copy Arrow export."""
-    try:
-        import polars  # noqa: F401
-    except ImportError as exc:
-        raise _missing("polars", "polars") from exc
+    require("polars", feature="Polars interop", provides="polars", extra="polars")
     return _source_from_table(df.to_arrow())
 
 
@@ -185,10 +185,7 @@ def from_huggingface(hf_dataset: Any) -> Source:
     is taken directly (zero-copy) — falling back to ``with_format('arrow')`` for
     dataset views that do not expose ``.data`` directly.
     """
-    try:
-        import datasets  # noqa: F401
-    except ImportError as exc:
-        raise _missing("huggingface", "huggingface") from exc
+    require("datasets", feature="HuggingFace interop", provides="datasets", extra="huggingface")
     data = getattr(hf_dataset, "data", None)
     table = getattr(data, "table", None)
     if isinstance(table, pa.Table):
@@ -204,10 +201,7 @@ def from_torch(dataset_or_tensors: Any) -> Source:
     iterable `Dataset` of tensor rows is stacked column-wise. No per-row Python
     crosses into the engine — only the bulk NumPy buffers do.
     """
-    try:
-        import torch
-    except ImportError as exc:
-        raise _missing("torch", "torch") from exc
+    torch = require("torch", feature="PyTorch interop", provides="torch", extra="torch")
 
     def _np(t: Any) -> Any:
         return t.detach().cpu().numpy()
@@ -229,10 +223,7 @@ def from_tf(tf_dataset: Any) -> Source:
     Each element's tensors are converted to NumPy and concatenated column-wise;
     dict-structured elements keep their feature names as column names.
     """
-    try:
-        import tensorflow  # noqa: F401
-    except ImportError as exc:
-        raise _missing("tensorflow", "tensorflow") from exc
+    require("tensorflow", feature="TensorFlow interop", provides="tensorflow", extra="tensorflow")
     columns = _stack_tf_dataset(tf_dataset)
     return from_pydict(columns)
 
@@ -244,10 +235,7 @@ def from_spark(spark_df: Any) -> Source:
     ``_collect_as_arrow``/``toPandas`` Arrow bridge. The collect is eager —
     Spark drives its own distributed read up to this boundary.
     """
-    try:
-        import pyspark  # noqa: F401
-    except ImportError as exc:
-        raise _missing("spark", "spark") from exc
+    require("pyspark", feature="Spark interop", provides="PySpark", extra="spark")
     to_arrow = getattr(spark_df, "toArrow", None)
     if callable(to_arrow):
         return _source_from_table(to_arrow())
@@ -260,10 +248,7 @@ def from_dask(ddf: Any) -> Source:
     Returns an `IteratorSource` that computes one partition at a time (bounded
     memory), converting each pandas partition to an Arrow batch lazily.
     """
-    try:
-        import dask  # noqa: F401
-    except ImportError as exc:
-        raise _missing("dask", "dask") from exc
+    require("dask", feature="Dask interop", provides="dask", extra="dask")
     schema = pa.Schema.from_pandas(ddf._meta)
 
     def _factory() -> Iterator[pa.RecordBatch]:
@@ -281,10 +266,7 @@ def from_ray_dataset(ray_dataset: Any) -> Source:
     into the engine (bounded memory), not collected to the driver. Ray stays a
     scheduling/transfer detail — bulk data does not round-trip the Ray object store.
     """
-    try:
-        import ray  # noqa: F401
-    except ImportError as exc:
-        raise _missing("ray", "ray") from exc
+    require("ray", feature="Ray Dataset interop", provides="Ray", extra="ray")
 
     schema: pa.Schema | None = None
     for block in ray_dataset.iter_batches(batch_format="pyarrow"):

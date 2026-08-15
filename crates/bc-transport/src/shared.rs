@@ -38,21 +38,8 @@ use memmap2::Mmap;
 ///
 /// A directory this process does not own cannot be tightened; that is tolerated rather
 /// than fatal, because the files written inside are created 0600 regardless.
-#[cfg(unix)]
 pub(crate) fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    // Best-effort tightening of a pre-existing directory this process may not own.
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    fs::create_dir_all(dir)
+    bc_arrow::create_private_dir(dir)
 }
 
 /// The directory same-node workers exchange shm partitions through, or `None` when no
@@ -106,14 +93,7 @@ fn shm_path(addr: &str, ticket: &str) -> Option<PathBuf> {
 
 /// Create `path` for writing with owner-only permissions, truncating any existing file.
 pub(crate) fn create_private_file(path: &std::path::Path) -> std::io::Result<File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
+    bc_arrow::create_private_file(path)
 }
 
 /// The marker naming the process that owns a peer directory.

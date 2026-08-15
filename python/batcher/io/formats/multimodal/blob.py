@@ -24,6 +24,7 @@ import tempfile
 import pyarrow as pa
 import pyarrow.fs as pafs
 
+from batcher.io._concurrent import read_each_file
 from batcher.io.filesystem import resolve_filesystem
 
 __all__ = [
@@ -88,20 +89,32 @@ def offload_blob_bytes(
     """
     fs, base = _fs_for(root)
     payloads = batch.column(src).to_pylist()
-    uris: list[str | None] = []
-    for data in payloads:
-        if data is None:
-            uris.append(None)
-            continue
-        digest = hashlib.sha256(data).hexdigest()
-        path = f"{base}/{digest}"
-        # Local writes need the directory to exist; remote object stores ignore it.
-        if isinstance(fs, pafs.LocalFileSystem):
-            fs.create_dir(base, recursive=True)
+    # Local writes need the directory to exist; remote object stores ignore it. Once per
+    # batch, not once per row: it was inside the loop, so a batch of a thousand payloads
+    # made a thousand `create_dir` syscalls for a directory that exists after the first.
+    if isinstance(fs, pafs.LocalFileSystem):
+        fs.create_dir(base, recursive=True)
+
+    # Content addressing dedupes *within* the batch too: two rows carrying the same
+    # payload hash the same, so the write happens once and both get the same handle.
+    digests = [None if data is None else hashlib.sha256(data).hexdigest() for data in payloads]
+    pending: dict[str, bytes] = {}
+    for digest, data in zip(digests, payloads, strict=True):
+        if digest is not None:
+            pending.setdefault(digest, data)
+
+    def _write(_fs: pafs.FileSystem, path: str) -> None:
+        digest = path.rsplit("/", 1)[-1]
         if fs.get_file_info(path).type == pafs.FileType.NotFound:
-            with fs.open_output_stream(path) as out:
-                out.write(data)
-        uris.append(_handle(root, digest))
+            with fs.open_output_stream(path) as stream:
+                stream.write(pending[digest])
+
+    # Each payload is one round trip against the store, and the write releases the GIL, so
+    # a serial loop leaves an offload latency-bound on a single connection — on the one
+    # path whose entire purpose is moving *large* payloads. `read_each_file` owns the
+    # remote-concurrent / local-serial split, measured once and shared.
+    read_each_file(fs, [f"{base}/{d}" for d in pending], _write)
+    uris: list[str | None] = [None if d is None else _handle(root, d) for d in digests]
 
     out = batch
     # Null the payload column (the bytes are out of line now), then add the handles.
@@ -151,13 +164,22 @@ def read_blob_bytes(
         is null).
     """
     uris = batch.column(uri_col).to_pylist()
-    blobs: list[bytes | None] = []
-    for u in uris:
-        if u is None:
-            blobs.append(None)
-            continue
-        with resolve_filesystem(u).open(u) as fh:
-            blobs.append(fh.read())
+    present = [u for u in uris if u is not None]
+    # One filesystem for the batch, resolved from the first handle rather than per row.
+    # Handles in a batch share a store by construction — they came from one `offload` with
+    # one root — and re-resolving per row rebuilt a client (and re-read credentials) for
+    # every payload.
+    fs = resolve_filesystem(present[0]) if present else None
+
+    def _read(_fs: object, uri: str) -> bytes:
+        with fs.open(uri) as fh:  # type: ignore[union-attr]
+            return fh.read()
+
+    # Concurrent for a remote store: each payload is a round trip, and a serial loop over a
+    # batch of handles is the read half of the same bottleneck the offload had. Local reads
+    # stay serial, which `read_each_file` measured and owns.
+    fetched = dict(zip(present, read_each_file(fs, present, _read), strict=True)) if present else {}
+    blobs: list[bytes | None] = [None if u is None else fetched[u] for u in uris]
     # `large_binary` (64-bit offsets) so a batch of GB payloads can't overflow the
     # 2 GB limit of 32-bit `binary` — the whole point is large per-row payloads.
     arr = pa.array(blobs, pa.large_binary())

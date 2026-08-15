@@ -369,12 +369,16 @@ def test_the_spill_cost_model_prices_the_disk_the_engine_will_actually_use(monke
         "batcher._internal.hardware.storage.device_class",
         lambda path: seen.append(path) or "network",
     )
-    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: "/ephemeral")
+    # Patched at its *definition* site (`site.scratch`), not the `site` re-export: the
+    # resolution now runs inside `site.spill_scratch_dir`, which reads the module-level
+    # name. A patch on the re-export silently stops applying and the test keeps passing
+    # while testing nothing.
+    monkeypatch.setattr("batcher._internal.site.scratch.local_scratch_root", lambda: "/ephemeral")
     assert storage_cost.spill_device_factor() == storage_cost.SPILL_DEVICE_FACTOR["network"]
     assert seen == ["/ephemeral"]
     # And with no local volume it falls back to the tempdir, as before.
     seen.clear()
-    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    monkeypatch.setattr("batcher._internal.site.scratch.local_scratch_root", lambda: None)
     storage_cost.spill_device_factor()
     assert seen and seen[0] != "/ephemeral"
 

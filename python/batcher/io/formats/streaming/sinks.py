@@ -22,6 +22,7 @@ from typing import Any, Protocol, runtime_checkable
 import pyarrow as pa
 
 from batcher._internal.registry import Registry
+from batcher.plan.types import retained_bytes
 
 __all__ = [
     "STREAM_SINKS",
@@ -258,10 +259,10 @@ class MemoryStreamSink:
         _MEMORY_SCHEMA.setdefault(self._name, table.schema)
         if self._replace:
             _MEMORY[self._name] = [table]
-            self._held = table.nbytes
+            self._held = retained_bytes(table)
         else:
             _MEMORY[self._name].append(table)
-            self._held += table.nbytes
+            self._held += retained_bytes(table)
         _check_memory_sink_size(self._name, self._held, replaces=self._replace)
         return None
 

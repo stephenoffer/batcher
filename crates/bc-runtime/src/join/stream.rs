@@ -25,7 +25,7 @@
 //!   exactly one morsel and no build-side-unmatched rows are emitted, so morsels are
 //!   independent. `Right`/`Full` must reconcile unmatched build rows across every morsel and
 //!   keep the materialized path.
-//! * **Integer keys** (one or two `Int64` columns — the analytical join shape after the FFI
+//! * **Integer keys** (any number of `Int64` columns — the analytical join shape after the FFI
 //!   boundary normalizes narrow integers). A row-encoded key would need its `RowConverter`
 //!   shared across morsels; until that is threaded through, those joins fall back.
 //!
@@ -35,7 +35,8 @@
 use arrow::array::ArrayRef;
 
 use super::{
-    null_mask, use_probe_bloom_with, I64Keys, I64x2Keys, JoinIndices, JoinTable, JoinType,
+    null_mask, use_probe_bloom_with, I64Keys, I64x2Keys, I64xNKeys, JoinIndices, JoinTable,
+    JoinType,
 };
 
 /// The build-side key shape a [`BroadcastProbe`] was built for. Each morsel's probe keys
@@ -46,19 +47,22 @@ enum KeyShape {
     I64,
     /// Two `Int64` columns.
     I64x2,
+    /// Three or more `Int64` columns, carrying how many — a probe morsel presenting a
+    /// *different* count is a different shape and must be refused, not silently truncated.
+    I64xN(usize),
 }
 
 impl KeyShape {
     /// The shape of `keys`, or `None` if it is not an integer fast-path shape.
     fn of(keys: &[ArrayRef]) -> Option<Self> {
         use arrow::datatypes::DataType;
-        if keys.iter().any(|k| k.data_type() != &DataType::Int64) {
+        if keys.is_empty() || keys.iter().any(|k| k.data_type() != &DataType::Int64) {
             return None;
         }
         match keys.len() {
             1 => Some(Self::I64),
             2 => Some(Self::I64x2),
-            _ => None,
+            n => Some(Self::I64xN(n)),
         }
     }
 }
@@ -79,8 +83,8 @@ fn is_probe_driven(join_type: JoinType) -> bool {
 /// [`BroadcastProbe::new`] re-checks all of this and returns `None` if it disagrees; this
 /// exists so a caller weighing the streaming path against a shuffle can find out **without
 /// first paying to materialize the build side**. The conditions are the module's: a
-/// probe-driven join type, one or two `Int64` key columns, and a build that stays under the
-/// cache-radix cliff.
+/// probe-driven join type, `Int64` key columns, and a build that stays under the cache-radix
+/// cliff.
 pub fn streaming_supported(
     join_type: JoinType,
     key_types: &[&arrow::datatypes::DataType],
@@ -89,7 +93,7 @@ pub fn streaming_supported(
     use arrow::datatypes::DataType;
     is_probe_driven(join_type)
         && build_rows <= super::RADIX_MIN_BUILD_ROWS_BROADCAST
-        && matches!(key_types.len(), 1 | 2)
+        && !key_types.is_empty()
         && key_types.iter().all(|t| *t == &DataType::Int64)
 }
 
@@ -175,6 +179,10 @@ impl BroadcastProbe {
                 let keys = I64x2Keys::try_new(build_keys, build_keys)?;
                 JoinTable::build(&keys, build_rows, &build_null, use_bloom, bloom_fp_rate)
             }
+            KeyShape::I64xN(_) => {
+                let keys = I64xNKeys::try_new(build_keys, build_keys)?;
+                JoinTable::build(&keys, build_rows, &build_null, use_bloom, bloom_fp_rate)
+            }
         };
         Some(Self {
             table,
@@ -204,8 +212,15 @@ impl BroadcastProbe {
         // morsel — hundreds of times per join — and a foreign-key probe (`l_orderkey`, never
         // null) hits the `None` arm, skipping a 16 KB `vec![false; 16384]` allocate-and-zero
         // that `probe_range` would only ever read as `false`.
-        let probe_null =
-            (probe_keys.iter().any(|k| k.null_count() != 0)).then(|| null_mask(probe_keys, rows));
+        //
+        // `logical_null_count`, not `null_count`: an all-null column is arrow's `Null` type,
+        // which holds no validity buffer, so `null_count()` reports **0** for a column in
+        // which every value is null. This guard then skipped the mask and the probe matched
+        // null against null — a cartesian product where SQL requires no rows. The fast path
+        // is unchanged: for an array with a validity buffer `logical_nulls` hands back that
+        // same buffer, so a never-null foreign key still allocates nothing.
+        let probe_null = (probe_keys.iter().any(|k| k.logical_null_count() != 0))
+            .then(|| null_mask(probe_keys, rows));
         let mut left = super::IndexBuf::with_capacity(rows);
         let mut right = super::IndexBuf::with_capacity(rows);
         match self.shape {
@@ -223,6 +238,18 @@ impl BroadcastProbe {
             }
             KeyShape::I64x2 => {
                 let keys = I64x2Keys::try_new(probe_keys, &self.build_keys)?;
+                self.table.probe_range(
+                    &keys,
+                    0..rows,
+                    probe_null.as_deref(),
+                    self.join_type,
+                    &mut left,
+                    &mut right,
+                    None,
+                );
+            }
+            KeyShape::I64xN(_) => {
+                let keys = I64xNKeys::try_new(probe_keys, &self.build_keys)?;
                 self.table.probe_range(
                     &keys,
                     0..rows,
@@ -289,6 +316,60 @@ mod tests {
         assert_eq!(idx.right.iter().collect::<Vec<_>>(), vec![Some(1), Some(2)]);
     }
 
+    /// A three-column integer key streams too — the star-schema fact-to-fact shape
+    /// (`store_sales ⋈ store_returns` on ticket/item/customer). Before [`I64xNKeys`] this
+    /// returned `None`, so the caller materialized the whole probe relation.
+    #[test]
+    fn three_column_integer_keys_stream() {
+        let build = vec![i64s(&[1, 1, 2]), i64s(&[7, 8, 7]), i64s(&[5, 5, 6])];
+        let whole = vec![
+            i64s(&[1, 2, 1, 1]),
+            i64s(&[8, 7, 8, 7]),
+            i64s(&[5, 6, 9, 5]),
+        ];
+        let probe = BroadcastProbe::new(&build, JoinType::Inner, 4, 0.01, 1 << 16).unwrap();
+        let idx = probe.probe(&whole).unwrap();
+        // (1,8,5)→build 1; (2,7,6)→build 2; (1,8,9) matches nothing; (1,7,5)→build 0.
+        // The third probe row is what a prefix-only comparison would wrongly match.
+        assert_eq!(
+            idx.left.iter().collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(3)]
+        );
+        assert_eq!(
+            idx.right.iter().collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(0)]
+        );
+    }
+
+    /// Splitting a three-key probe into morsels emits exactly what one whole probe does.
+    #[test]
+    fn three_column_morsels_match_the_whole_relation() {
+        let build = vec![i64s(&[1, 2, 3]), i64s(&[1, 2, 3]), i64s(&[1, 2, 3])];
+        let whole = vec![
+            i64s(&[3, 1, 9, 2, 1]),
+            i64s(&[3, 1, 9, 2, 4]),
+            i64s(&[3, 1, 9, 2, 1]),
+        ];
+        let morsels = [
+            vec![i64s(&[3, 1]), i64s(&[3, 1]), i64s(&[3, 1])],
+            vec![i64s(&[9, 2, 1]), i64s(&[9, 2, 4]), i64s(&[9, 2, 1])],
+        ];
+        let probe = BroadcastProbe::new(&build, JoinType::Inner, 5, 0.01, 1 << 16).unwrap();
+        let all = probe.probe(&whole).unwrap();
+
+        let mut left: Vec<Option<u32>> = Vec::new();
+        let mut right: Vec<Option<u32>> = Vec::new();
+        let mut base = 0u32;
+        for morsel in &morsels {
+            let part = probe.probe(morsel).unwrap();
+            left.extend(part.left.iter().map(|l| l.map(|v| v + base)));
+            right.extend(part.right.iter());
+            base += morsel[0].len() as u32;
+        }
+        assert_eq!(left, all.left.iter().collect::<Vec<_>>());
+        assert_eq!(right, all.right.iter().collect::<Vec<_>>());
+    }
+
     /// `Right`/`Full` must see every morsel before emitting unmatched build rows, so they
     /// are refused and the caller keeps the materialized path.
     #[test]
@@ -311,14 +392,28 @@ mod tests {
         assert!(BroadcastProbe::new(&ok, JoinType::Inner, 1, 0.01, 1 << 16).is_some());
     }
 
-    /// A non-integer or wide key falls back rather than silently taking a different path.
+    /// A non-integer key, or a mix of one integer and one string, falls back rather than
+    /// silently taking a different path. Key *width* is no longer a reason to refuse.
     #[test]
     fn unsupported_key_shapes_are_refused() {
         use arrow::array::StringArray;
         let strings: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
         assert!(BroadcastProbe::new(&[strings], JoinType::Inner, 1, 0.01, 1 << 16).is_none());
-        let three = vec![i64s(&[1]), i64s(&[1]), i64s(&[1])];
-        assert!(BroadcastProbe::new(&three, JoinType::Inner, 1, 0.01, 1 << 16).is_none());
+        let mixed: Vec<ArrayRef> = vec![i64s(&[1]), Arc::new(StringArray::from(vec!["a"]))];
+        assert!(BroadcastProbe::new(&mixed, JoinType::Inner, 1, 0.01, 1 << 16).is_none());
+        assert!(BroadcastProbe::new(&[], JoinType::Inner, 1, 0.01, 1 << 16).is_none());
+    }
+
+    /// A probe presenting a different *number* of key columns than the table was built for
+    /// is refused rather than compared on a prefix.
+    #[test]
+    fn a_probe_of_the_wrong_key_width_is_refused() {
+        let build = vec![i64s(&[1]), i64s(&[2]), i64s(&[3])];
+        let probe = BroadcastProbe::new(&build, JoinType::Inner, 1, 0.01, 1 << 16).unwrap();
+        assert!(!probe.accepts(&[i64s(&[1]), i64s(&[2])]));
+        assert!(probe
+            .probe(&[i64s(&[1]), i64s(&[2]), i64s(&[3]), i64s(&[4])])
+            .is_none());
     }
 
     /// An empty morsel probes to nothing without panicking (the tail of a relation whose

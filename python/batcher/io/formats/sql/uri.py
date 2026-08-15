@@ -197,6 +197,254 @@ class ParsedURI:
         return kwargs
 
 
+#: Schemes whose server accepts a trailing ``LIMIT n``.
+#:
+#: Deliberately an allow-list rather than a deny-list, because the two ways of being
+#: wrong here are not symmetric. Failing to cap a read costs the rows it would have
+#: skipped; emitting a cap the server cannot parse turns a working query into a syntax
+#: error. So a scheme absent from this set — including one added later, and including
+#: `mssql` and `oracle`, which spell the same thing as ``TOP`` and ``FETCH FIRST`` — is
+#: read uncapped, exactly as every scheme was before row-cap pushdown existed.
+#:
+#: ODBC is not routed by scheme at all (its DSN names a driver, not a dialect), which is
+#: why `ODBCSource` never caps.
+_LIMIT_CLAUSE_SCHEMES: frozenset[str] = frozenset(
+    {
+        # PostgreSQL and its wire-protocol family.
+        "postgres",
+        "postgresql",
+        "cockroach",
+        "cockroachdb",
+        "timescaledb",
+        "alloydb",
+        "greenplum",
+        "yugabyte",
+        "yugabytedb",
+        "risingwave",
+        "materialize",
+        "questdb",
+        "crate",
+        "cratedb",
+        "redshift",
+        # MySQL and its wire-protocol family.
+        "mysql",
+        "mariadb",
+        "singlestore",
+        "memsql",
+        "tidb",
+        "starrocks",
+        "doris",
+        "percona",
+        # Everything else that spells a row cap `LIMIT n`.
+        "sqlite",
+        "duckdb",
+        "clickhouse",
+        "snowflake",
+        "bigquery",
+        "trino",
+    }
+)
+
+
+#: How each dialect family delimits an identifier: ``(open, close)``.
+#:
+#: MySQL is the reason this cannot be one constant. ANSI double quotes only delimit an
+#: identifier there under ``ANSI_QUOTES``, which is off by default — so ``"user"`` is a
+#: *string literal*, and quoting a column that way would silently select the constant
+#: ``'user'`` for every row instead of failing. Backticks are unambiguous on MySQL and its
+#: wire-protocol family, brackets on SQL Server, double quotes everywhere else here.
+_QUOTE_STYLES: dict[str, tuple[str, str]] = {
+    "backtick": ("`", "`"),
+    "bracket": ("[", "]"),
+    "ansi": ('"', '"'),
+}
+
+#: Schemes that delimit with backticks rather than ANSI double quotes.
+_BACKTICK_SCHEMES: frozenset[str] = frozenset(
+    {
+        "mysql",
+        "mariadb",
+        "singlestore",
+        "memsql",
+        "tidb",
+        "starrocks",
+        "doris",
+        "percona",
+        "bigquery",
+    }
+)
+
+#: Schemes that delimit with square brackets.
+_BRACKET_SCHEMES: frozenset[str] = frozenset({"mssql", "sqlserver"})
+
+#: Schemes that delimit with ANSI double quotes.
+_ANSI_QUOTE_SCHEMES: frozenset[str] = frozenset(
+    {
+        "postgres",
+        "postgresql",
+        "cockroach",
+        "cockroachdb",
+        "timescaledb",
+        "alloydb",
+        "greenplum",
+        "yugabyte",
+        "yugabytedb",
+        "risingwave",
+        "materialize",
+        "questdb",
+        "crate",
+        "cratedb",
+        "redshift",
+        "sqlite",
+        "duckdb",
+        "clickhouse",
+        "snowflake",
+        "trino",
+        "oracle",
+    }
+)
+
+
+#: Schemes whose ``ORDER BY`` accepts an explicit ``NULLS FIRST`` / ``NULLS LAST``.
+#:
+#: Required, not cosmetic. Servers disagree about where a null sorts by default — SQLite
+#: puts nulls *first* on an ascending order where PostgreSQL and DuckDB put them last — so
+#: a top-N pushed without saying which would ask the server for a different "first n" than
+#: the engine would compute, and return the wrong rows rather than merely reading extra
+#: ones. Measured on sqlite 3.52: ``ORDER BY k LIMIT 2`` over ``[3, NULL, 1, NULL, 2]``
+#: yields ``[NULL, NULL]`` there and ``[1, 2]`` in DuckDB; with ``NULLS LAST`` both give
+#: ``[1, 2]``, which is what Batcher's own sort gives.
+#:
+#: MySQL and SQL Server have no such clause at all, so a top-N simply does not push to
+#: them and the read is unordered and uncapped, exactly as it was.
+_NULLS_ORDER_SCHEMES: frozenset[str] = frozenset(
+    {
+        "postgres",
+        "postgresql",
+        "cockroach",
+        "cockroachdb",
+        "timescaledb",
+        "alloydb",
+        "greenplum",
+        "yugabyte",
+        "yugabytedb",
+        "risingwave",
+        "materialize",
+        "questdb",
+        "crate",
+        "cratedb",
+        "redshift",
+        "sqlite",
+        "duckdb",
+        "clickhouse",
+        "snowflake",
+        "bigquery",
+        "trino",
+        "oracle",
+    }
+)
+
+
+def supports_nulls_ordering(scheme: str) -> bool:
+    """Whether `scheme` accepts ``ORDER BY x NULLS FIRST|LAST``.
+
+    Args:
+        scheme: A connection-URI scheme, with or without a ``+driver`` suffix.
+
+    Returns:
+        True when a top-N may be pushed to this backend.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.formats.sql.uri import supports_nulls_ordering
+            >>> supports_nulls_ordering("postgresql")
+            True
+            >>> supports_nulls_ordering("mysql")
+            False
+    """
+    return _normalize_scheme(scheme) in _NULLS_ORDER_SCHEMES
+
+
+def quote_identifier(name: str, scheme: str) -> str:
+    """`name` delimited for `scheme`, or unchanged when the dialect is unknown.
+
+    Column names reach the server verbatim otherwise, and three ordinary names break that
+    way. A reserved word (``order``, ``user``, ``key``, ``value``, ``date``) is a syntax
+    error. A name holding a space is worse than an error: ``SELECT my col`` parses as the
+    column ``my`` *aliased* to ``col``, so the query succeeds and returns the wrong column
+    under the right name. And an unaliased aggregate in a user's own query yields a result
+    column literally called ``count(*)``, which unquoted is re-parsed as a function call.
+
+    Quoting is safe here precisely because the names are not the user's free text: a
+    projection comes from the plan, which was validated against the schema the *server*
+    reported, so it already carries the server's own spelling and case. That is what makes
+    the case-folding question moot — an unquoted identifier folds, but there is nothing to
+    fold it to that differs from what is already written.
+
+    An unrecognized scheme is returned unchanged rather than guessed at, for the same
+    reason `supports_limit_clause` is an allow-list: quoting with the wrong delimiter is a
+    new failure, while not quoting is the behavior every read already had.
+
+    Args:
+        name: The identifier to delimit.
+        scheme: A connection-URI scheme, with or without a ``+driver`` suffix.
+
+    Returns:
+        The delimited identifier, or `name` unchanged for an unknown dialect.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.formats.sql.uri import quote_identifier
+            >>> quote_identifier("order", "postgresql")
+            '"order"'
+            >>> quote_identifier("order", "mysql")
+            '`order`'
+            >>> quote_identifier("order", "some-unknown-database")
+            'order'
+    """
+    style = _quote_style(scheme)
+    if style is None:
+        return name
+    open_char, close_char = _QUOTE_STYLES[style]
+    # Doubling the closing delimiter is how all three dialect families escape it.
+    return f"{open_char}{name.replace(close_char, close_char * 2)}{close_char}"
+
+
+def _quote_style(scheme: str) -> str | None:
+    """The delimiter family for `scheme`, or None when it is not recognized."""
+    normalized = _normalize_scheme(scheme)
+    if normalized in _BACKTICK_SCHEMES:
+        return "backtick"
+    if normalized in _BRACKET_SCHEMES:
+        return "bracket"
+    if normalized in _ANSI_QUOTE_SCHEMES:
+        return "ansi"
+    return None
+
+
+def supports_limit_clause(scheme: str) -> bool:
+    """Whether `scheme`'s server accepts a trailing ``LIMIT n``.
+
+    Args:
+        scheme: A connection-URI scheme, with or without a ``+driver`` suffix.
+
+    Returns:
+        True when a row cap can be appended to a query for this backend.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.formats.sql.uri import supports_limit_clause
+            >>> supports_limit_clause("postgresql+psycopg2")
+            True
+            >>> supports_limit_clause("mssql")
+            False
+    """
+    return _normalize_scheme(scheme) in _LIMIT_CLAUSE_SCHEMES
+
+
 def known_schemes() -> tuple[str, ...]:
     """Every connection-URI scheme Batcher can route, sorted.
 

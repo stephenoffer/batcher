@@ -12,6 +12,9 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from batcher._internal.optional import require
+from batcher.plan.types import retained_bytes
+
 if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
 
@@ -64,14 +67,7 @@ def to_jax(ds: Dataset, columns: list[str] | None) -> dict[str, Any]:
     columns reshaped to ``(n, *shape)``) and wraps it with ``jax.numpy.asarray``. Raises
     `BackendError` if JAX is not installed.
     """
-    try:
-        import jax.numpy as jnp
-    except ImportError as exc:  # pragma: no cover - optional extra
-        from batcher._internal.errors import BackendError
-
-        msg = "Dataset.to_jax() needs JAX installed (pip install jax)"
-        raise BackendError(msg) from exc
-
+    jnp = require("jax.numpy", feature="Dataset.to_jax()", provides="JAX", extra="jax")
     return {name: jnp.asarray(arr) for name, arr in to_numpy(ds, columns).items()}
 
 
@@ -142,7 +138,7 @@ def _ray_blocks(
     pending_bytes = 0
     for batch in ds.iter_batches(batch_size, distributed=distributed):
         pending.append(batch)
-        pending_bytes += batch.nbytes
+        pending_bytes += retained_bytes(batch)
         if pending_bytes >= block_bytes:
             yield pa.Table.from_batches(pending)
             pending = []
@@ -165,14 +161,8 @@ def to_ray_dataset(
     coalesced into Ray-sized Arrow blocks and put into the object store one block at a
     time, so the driver's footprint is one block rather than the whole result.
     """
-    try:
-        import ray
-        import ray.data
-    except ImportError as exc:  # pragma: no cover - optional extra
-        from batcher._internal.errors import BackendError
-
-        msg = "Dataset.to_ray_dataset() needs Ray installed (pip install 'batcher-engine[ray]')"
-        raise BackendError(msg) from exc
+    ray = require("ray", feature="Dataset.to_ray_dataset()", provides="Ray", extra="ray")
+    require("ray.data", feature="Dataset.to_ray_dataset()", provides="Ray", extra="ray")
 
     target = int(block_size_bytes) if block_size_bytes else _ray_target_block_bytes()
     refs = [ray.put(block) for block in _ray_blocks(ds, batch_size, target, distributed)]

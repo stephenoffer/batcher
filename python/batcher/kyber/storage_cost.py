@@ -18,14 +18,11 @@ of storage-device trivia.
 
 from __future__ import annotations
 
-import tempfile
-
 from batcher._internal.hardware.storage import (
     SPILL_DEVICE_FACTOR,
     SPILL_DEVICE_FACTOR_DEFAULT,
     device_cost_factor,
 )
-from batcher.config import active_config
 
 __all__ = ["SPILL_DEVICE_FACTOR", "SPILL_DEVICE_FACTOR_DEFAULT", "spill_device_factor"]
 
@@ -74,7 +71,6 @@ def spill_device_factor(storage_class: str = "") -> float:
     """
     if storage_class:
         return SPILL_DEVICE_FACTOR.get(storage_class, SPILL_DEVICE_FACTOR_DEFAULT)
-    from batcher._internal.site import local_scratch_root
+    from batcher._internal.site import spill_scratch_dir
 
-    spill_dir = active_config().memory.spill_dir or local_scratch_root() or tempfile.gettempdir()
-    return device_cost_factor(spill_dir)
+    return device_cost_factor(spill_scratch_dir())

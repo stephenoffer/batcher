@@ -251,3 +251,81 @@ def test_measured_jit_speedup_ignores_mixed_tier_rows():
         ]
     }  # fmt: skip
     assert _measured_jit_speedup(mixed, cfg.optimizer.cost_coeffs, cfg) is None
+
+
+def test_a_noisy_refit_settles_instead_of_alternating():
+    """Successive fits of the same quantity must converge, not oscillate.
+
+    The coefficients are the plan cache's key (`plan_cache._bucketed` buckets them), so a fit
+    that swings run to run is not merely an imprecise estimate — it is a cache miss on every
+    execution. Measured on TPC-DS q77 at scale 1, `hash_build_row` alternated between adjacent
+    half-octave buckets on consecutive refits (over 40%), the memo never hit once, and the
+    query paid 135 ms of optimizer time on every run against 13 ms for DuckDB's whole query.
+
+    This feeds alternating-cost evidence for one family and asserts the published fit stops
+    moving: the estimator is damped toward the live one, so noise averages out while a real
+    shift still lands (the next test).
+    """
+    cfg = active_config()
+    hub = _hub()
+    _record(hub, "filter", 40, rows=1_000_000, t_ms=10.0)
+    seen = [calibrate(hub, cfg).filter_row]
+    for i in range(8):
+        # Alternate the measured cost by ±40% — noise, not a trend.
+        _record(hub, "filter", _RECALIBRATE_AFTER + 1, rows=1_000_000, t_ms=14.0 if i % 2 else 6.0)
+        seen.append(calibrate(hub, cfg).filter_row)
+    tail = seen[-4:]
+    spread = (max(tail) - min(tail)) / max(tail)
+    assert spread < 0.10, f"the fit is still swinging: {tail}"
+
+
+def test_a_real_shift_still_reaches_the_published_fit():
+    """Damping must slow a genuine change, not refuse it.
+
+    The boundary of the test above: a coefficient whose measured cost moves and *stays* moved
+    has to arrive, or the loop has stopped learning. It takes a few refits instead of one,
+    which is the whole trade.
+    """
+    cfg = active_config()
+    hub = _hub()
+    # A second family holds the global ms-to-work-unit anchor still, so what moves below is
+    # `filter`'s cost *relative* to `scan` — which is the only thing a cost model ranks on.
+    _record(hub, "scan", 40, rows=1_000_000, t_ms=10.0)
+    _record(hub, "filter", 40, rows=1_000_000, t_ms=5.0)
+    cold = calibrate(hub, cfg).filter_row
+    for _ in range(10):
+        _record(hub, "scan", _RECALIBRATE_AFTER, rows=1_000_000, t_ms=10.0)
+        _record(hub, "filter", _RECALIBRATE_AFTER, rows=1_000_000, t_ms=50.0)
+        warm = calibrate(hub, cfg).filter_row
+    assert warm > cold * 2.0, f"a 10x relative shift never reached the fit: {cold} -> {warm}"
+
+
+def test_the_anchor_settles_as_history_accumulates():
+    """A stationary workload must fit a stationary anchor, however long it runs.
+
+    Every coefficient is `k x measured_ms / basis`, so the global work-per-ms anchor `k`
+    multiplies all of them: an anchor that walks makes every fit walk, which moves the plan
+    cache's key, which re-plans an identical query on every execution. That is what TPC-DS
+    q77 did — the anchor climbed 1.78e4 -> 5.32e4 over eight identical runs, taking
+    `hash_build_row` from 2.0 to 9.8 with it, and the memo never hit once.
+
+    The shape that does it is a **cold start inside a work-weighted average**. The first
+    execution of anything is slow (cold caches, first-touch allocation, no compiled
+    expression yet); every execution after it is not. A ratio of summed work to summed time
+    is dominated by the heaviest operators, so those first slow samples keep dragging the
+    anchor and it creeps toward the warm value for as long as the session runs. A per-sample
+    median crosses over as soon as most samples are warm and then stops.
+    """
+    cfg = active_config()
+    hub = _hub()
+    # Round 0 is cold: the heavy scan-bound family measures 5x what it will measure once warm.
+    _record(hub, "scan", _RECALIBRATE_AFTER, rows=8_000_000, t_ms=200.0)
+    _record(hub, "filter", _RECALIBRATE_AFTER, rows=10_000, t_ms=0.05)
+    fits = [calibrate(hub, cfg).filter_row]
+    for _ in range(7):
+        _record(hub, "scan", _RECALIBRATE_AFTER, rows=8_000_000, t_ms=40.0)
+        _record(hub, "filter", _RECALIBRATE_AFTER, rows=10_000, t_ms=0.05)
+        fits.append(calibrate(hub, cfg).filter_row)
+    tail = fits[-4:]
+    spread = (max(tail) - min(tail)) / max(tail)
+    assert spread < 0.05, f"the fit is still walking as history grows: {fits}"

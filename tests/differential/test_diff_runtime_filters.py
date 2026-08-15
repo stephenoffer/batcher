@@ -35,7 +35,7 @@ from batcher.io.source import InMemorySource, source_statistics
 from batcher.kyber.optimizer import Optimizer
 from batcher.plan.expr_ir import Col, IsNotNull
 from batcher.plan.expr_rewrite import split_conjuncts
-from batcher.plan.logical import Filter, Limit, Scan
+from batcher.plan.logical import Filter, Join, Limit, Scan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import SourceStatistics
 from batcher.plan.stats import ColumnStat, Provenance
@@ -111,6 +111,22 @@ def _pushed_not_null(ds, name: str = "k") -> bool:
 
 def _empty_marked(ds) -> bool:
     return any(isinstance(n, Limit) and n.n == 0 for n in walk(_optimized(ds)))
+
+
+def _preserved_side_emptied(ds) -> bool:
+    """Whether an *outer* join's preserved side is pruned to empty — which would be wrong.
+
+    `_empty_marked` walks the whole plan for any `Limit(0)`, so it cannot tell a join whose
+    **result** is empty from one where only the *inner* side was pruned. Emptying the inner
+    side of an outer join is correct and worth doing: an all-null right key matches nothing,
+    so the right scan is skipped entirely and every left row is emitted null-extended. Asked
+    the coarse question, a `LEFT JOIN` that had correctly skipped its right side looked
+    identical to one that had lost its left rows.
+    """
+    root = _optimized(ds)
+    if not isinstance(root, Join):
+        return _empty_marked(ds)
+    return any(isinstance(n, Limit) and n.n == 0 for n in walk(root.left))
 
 
 class _DeclaredSource(InMemorySource):
@@ -385,7 +401,8 @@ def test_all_null_key_left_join_keeps_its_left_rows(duck):
     _reg(duck, "lnr", nulls)
     right = _declared(nulls, {"k": ColumnStat(null_count=2, provenance=Provenance.EXACT)})
     ds = bt.from_arrow(left).join(right, on="k", how="left")
-    assert not _empty_marked(ds)
+    # The right side may be (correctly) pruned to empty; what must survive is the left.
+    assert not _preserved_side_emptied(ds)
     assert_same(
         ds.collect(),
         duck.sql(

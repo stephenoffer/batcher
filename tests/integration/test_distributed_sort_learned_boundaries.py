@@ -75,17 +75,30 @@ def test_the_second_run_reuses_a_grid_rather_than_sampling_again(monkeypatch):
     SAMPLE barrier, a grid means it skipped it. The first distributed run must sample (there
     is nothing to reuse yet) and the second must not.
     """
+    import batcher.dist.executors.sort as disk_sort
     import batcher.dist.flight_sort as flight_sort
 
     verdicts: list[bool] = []
-    real_load = flight_sort.load_learned_grids
 
-    def watched(shape_key):
-        grids = real_load(shape_key)
-        verdicts.append(grids is not None)
-        return grids
+    # BOTH sort executors are watched, because which one runs is a property of the
+    # environment rather than of the query: `transport="auto"` resolves to the Flight
+    # shuffle when a fleet can be stood up and to the disk executor otherwise. Spying on
+    # `flight_sort` alone reported `[]` on any machine that took the disk path -- a red test
+    # that says nothing about the loop it is meant to pin.
+    #
+    # `*args` rather than the bare `shape_key` the loader once took: it now also receives the
+    # relation-and-type identity, so a grid measured for one table or one key type is never
+    # handed to another (`dist/sort_boundaries.sort_shape_key`). A spy pinned to the old
+    # arity would fail with a TypeError from inside a Ray task, which is a property of the spy.
+    for module in (flight_sort, disk_sort):
+        real_load = module.load_learned_grids
 
-    monkeypatch.setattr(flight_sort, "load_learned_grids", watched)
+        def watched(shape_key, *args, _real=real_load, **kwargs):
+            grids = _real(shape_key, *args, **kwargs)
+            verdicts.append(grids is not None)
+            return grids
+
+        monkeypatch.setattr(module, "load_learned_grids", watched)
 
     query = bt.from_arrow(_data(20_000)).sort("k")
     query.collect(distributed=True)

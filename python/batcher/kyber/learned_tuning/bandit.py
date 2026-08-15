@@ -105,6 +105,7 @@ def record_arm(
     reward_ms: float,
     *,
     invalidates_plans: bool = True,
+    arms: tuple[str, ...] | None = None,
 ) -> None:
     """Fold one measured `reward_ms` for `arm` into the per-`key` bandit statistics.
 
@@ -119,6 +120,11 @@ def record_arm(
     contract exists to prevent: an arm's mean moves on **every** execution, so every execution
     would invalidate every memoized plan. Measured on TPC-H q8 at sf10, that alone halved the
     plan cache's hit rate, and a hit is worth 160 ms against 350 ms there.
+
+    `arms` names the arm set the plan chooses from. Given it, the cache is invalidated only
+    when **the chosen arm changes** rather than when the stored mean drifts — see
+    `plan_cache.record_write`'s `decides`, which documents the twelve-run feedback loop the
+    drift test produced. Omitted, the value-drift test stands.
     """
     if hub is None or reward_ms <= 0.0 or not arm:
         return
@@ -131,7 +137,8 @@ def record_arm(
         stats = {a: _decayed(v) for a, v in stored.items() if isinstance(v, dict)}
         stats[arm] = _welford_update(stats.get(arm), reward_ms)
         if invalidates_plans:
-            plan_cache.record_write(hub, scoped(namespace), key, stats)
+            decides = None if arms is None else (lambda s, a=arms: _chosen_arm(s, a))
+            plan_cache.record_write(hub, scoped(namespace), key, stats, decides=decides)
         else:
             hub.put_keyed_param(scoped(namespace), key, stats)
     except Exception as exc:  # pragma: no cover - learning must never break a query
@@ -290,12 +297,27 @@ def learned_arm(
         return None
     try:
         stats = hub.get_keyed_param(scoped(namespace), key) or {}
-        total = sum(float(s.get("n", 0.0)) for s in stats.values() if isinstance(s, dict))
-        if total < min_total:
-            return None
-        return ucb1_best_arm(stats, arms)
+        return _chosen_arm(stats, arms, min_total=min_total)
     except Exception:  # pragma: no cover
         return None
+
+
+def _chosen_arm(
+    stats: object, arms: tuple[str, ...], *, min_total: int = _MIN_ARM_TOTAL
+) -> str | None:
+    """The arm these statistics select, or `None` while the evidence is too thin.
+
+    The one function that turns stored arm statistics into the value a *plan* reads, so the
+    reader (`learned_arm`) and the plan cache's invalidation test (`record_arm`'s `decides`)
+    cannot disagree about what the decision is — which is the whole point of comparing
+    decisions rather than the numbers underneath them.
+    """
+    if not isinstance(stats, dict):
+        return None
+    total = sum(float(s.get("n", 0.0)) for s in stats.values() if isinstance(s, dict))
+    if total < min_total:
+        return None
+    return ucb1_best_arm(stats, arms)
 
 
 # Decision family — join strategy (bandit over hash / broadcast / sort_merge).
@@ -321,7 +343,7 @@ def record_join_strategy(
     """
     mrows = max(0.0, input_rows) / 1e6
     reward = wall_ms / mrows if mrows > 0.0 else wall_ms
-    record_arm(hub, _NS_ARM, signature, strategy, reward)
+    record_arm(hub, _NS_ARM, signature, strategy, reward, arms=JOIN_ARMS)
 
 
 def learned_join_strategy(

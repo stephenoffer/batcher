@@ -39,7 +39,13 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.dist.shuffle_io import distributed_work_dir, read_ipc
-from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
+from batcher.dist.sort_boundaries import (
+    load_learned_grids,
+    persist_grids,
+    sort_key_identity,
+    sort_key_is_string,
+    sort_shape_key,
+)
 from batcher.io.source import Source
 from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan, Sort
@@ -154,8 +160,15 @@ def _distributed_sort(
         # and can never cost a row or an ordering (see `dist/sort_boundaries.py`). The
         # *grids* persist rather than the boundaries because the bucket count moves between
         # runs, so a stored boundary list would be the wrong length.
-        shape_key = sort_shape_key(map_ir, key_name)
-        grids = load_learned_grids(shape_key)
+        # WHICH relation and WHICH type: a bare-scan `map_ir` is a positional source id with
+        # no schema, so every single-source sort in the process hashed alike and shared one
+        # grid — a wrong-typed one raises in the range partitioner, and a wrong-relation one
+        # silently puts the whole input in a single bucket. See
+        # `dist/sort_boundaries.sort_shape_key`. `expect_strings` re-checks on load, so an
+        # entry written under the old colliding digest re-samples instead of raising.
+        key_is_str = sort_key_is_string(sources[sid], key_name)
+        shape_key = sort_shape_key(map_ir, key_name, sort_key_identity(sources[sid], key_name))
+        grids = load_learned_grids(shape_key, key_is_str)
         if grids is None:
             grids = gather_with_backups(
                 [_sample_for(w) for w in range(len(partitions))],

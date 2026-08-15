@@ -233,6 +233,8 @@ single-file, correctness-gated head-to-heads that synthesize their own local cor
 ```bash
 python benchmarks/scenarios/image_decode.py       # JPEG decode+resize vs Daft
 python benchmarks/scenarios/point_cloud_load.py   # LiDAR .npy -> torch tensors
+python benchmarks/scenarios/training/shard_loader_throughput.py  # shard corpus -> torch
+python benchmarks/scenarios/training/shard_write_throughput.py   # writing that corpus
 python benchmarks/scenarios/audio_decode.py       # native audio decode vs a soundfile loop
 python benchmarks/scenarios/robotics/sweep_transform.py  # LiDAR sweep -> world frame, vs NumPy
 ```

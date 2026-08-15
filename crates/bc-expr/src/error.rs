@@ -36,7 +36,13 @@ pub enum ExprError {
     /// A scalar argument that deserialized fine but cannot produce a defined result
     /// (a zero-width chunk, an overlap wider than the chunk). The control plane
     /// validates these at the API edge; this guards a hand-written IR document.
-    #[error("string function {func}: {reason}")]
+    ///
+    /// The message names `func` and nothing else. It used to open with "string function",
+    /// which was true of the first callers and of none of the ones added since: the image,
+    /// audio, geometry and spatial kernels all raise it, so a bad `n_fft` was reported as
+    /// "string function audio.Spectrogram: ..." — a family name that sends the reader
+    /// looking through the wrong half of the engine.
+    #[error("{func}: {reason}")]
     InvalidArgument { func: String, reason: String },
 
     /// The key material itself is deliberately absent from this message: an error
@@ -65,10 +71,10 @@ pub enum ExprError {
     #[error("invalid regular expression: {pattern}")]
     InvalidRegex { pattern: String },
 
-    #[error("image function {func} expected a Binary argument, got {got}")]
+    #[error("media function {func} expected a Binary argument, got {got}")]
     ExpectedBinary { func: String, got: String },
 
-    #[error("image function {func} requires a {arg} argument")]
+    #[error("media function {func} requires a {arg} argument")]
     MissingImageArg { func: String, arg: &'static str },
 
     /// A target dimension (width/height) that is not a positive value representable as a

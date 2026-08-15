@@ -45,6 +45,10 @@ A bounded source can also `collect()`. An unbounded one cannot, since it would n
 finish, and it raises a clear {py:exc}`PlanError <batcher.PlanError>` if a terminal tries to materialize it. Use
 {py:obj}`ds.is_streaming <batcher.Dataset.is_streaming>` to check which you have.
 
+Not every shape emits while a stream is still running: an unwatermarked
+`group_by(...).agg(...)`, an uncapped `distinct()` and a top-N fold their input and emit once,
+at end of input. {doc}`/user-guide/moving-data/streaming-emission` is the whole list.
+
 ## Reading streams
 
 Streaming sources are unbounded relations behind the same {py:obj}`bt.read <batcher.read>` namespace as

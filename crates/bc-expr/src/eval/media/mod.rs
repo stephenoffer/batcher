@@ -13,9 +13,11 @@ pub(crate) mod image;
 pub(crate) mod mel;
 pub(crate) mod video;
 
+mod level;
+mod spectral;
 mod speech;
 
-pub(crate) use audio::eval_audio;
+pub(crate) use audio::{eval_audio, AudioArgs};
 pub(crate) use image::{eval_image, eval_image_crop, Bounds};
 pub(crate) use video::{eval_video, VideoArgs};
 

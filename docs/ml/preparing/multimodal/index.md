@@ -12,6 +12,8 @@ batches and parallelizes across the cluster.
 |---|---|
 | {doc}`/ml/preparing/multimodal/decoding` | Getting the bytes, and turning them into tensors. |
 | {doc}`/ml/preparing/multimodal/video` | Sampling frames, pulling stills, and reading a clip without decoding it. |
+| {doc}`/ml/preparing/multimodal/audio` | Measuring how a corpus was recorded, levelling it, and turning it into features. |
+| {doc}`/ml/preparing/multimodal/augmenting` | Turning and re-colouring images, and fingerprinting them for deduplication. |
 | {doc}`/ml/preparing/multimodal/curating` | A scraped corpus is mostly rows that decode perfectly and teach a model nothing. |
 | {doc}`/ml/preparing/multimodal/pipelines` | What changes once media is a column: what it costs to move, how it reaches a model, and how it is retrieved. |
 
@@ -27,6 +29,8 @@ batches and parallelizes across the cluster.
 
 decoding
 video
+audio
+augmenting
 curating
 pipelines
 ```

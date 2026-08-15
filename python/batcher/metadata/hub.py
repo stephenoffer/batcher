@@ -349,6 +349,18 @@ class MetadataHub:
     # Delegated to `LearnedParams`, which owns the two storage shapes and the parsed-read
     # cache over them. The Hub keeps these names because they are the seam every tuning loop
     # in the tree calls through.
+    @property
+    def params_version(self) -> int:
+        """A monotonic counter that bumps on every learned-parameter write, any namespace.
+
+        The counterpart of `version` for the *parameter* store rather than the operator
+        history. Together the two are the whole change signal for anything derived from this
+        hub, which is what lets a consumer fold the store once and reuse the fold until
+        something is actually written. See `LearnedParams.writes` for why neither the
+        per-namespace generation nor the cached view's identity can serve.
+        """
+        return self._params.writes
+
     def load_params(self, namespace: str) -> dict[str, Any]:
         """Every learned parameter under `namespace`, or an empty dict.
 

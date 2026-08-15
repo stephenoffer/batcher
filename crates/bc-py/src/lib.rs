@@ -270,9 +270,19 @@ fn prepare_exec(
     // still fits, and the materializing executor's breakers spill on top of that; a large input
     // keeps the bounded streaming path. Correctness is identical either way (both executors are
     // checked against the sequential oracle) — this trades only memory headroom for speed.
+    // **The sources this plan scans, not every source bound to the session**
+    // (`RelOp::scanned_source_ids`). Judged by the catalog, a session holding the 24 TPC-DS
+    // tables made every query look like 1.76 GB, which the `x8` below turns into 14.1 GB
+    // against a 7.73 GB envelope — so `materialize_fits` was false for *every* TPC-DS query at
+    // every size and what it gates, mostly Kyber's grouped-aggregate verdict, could not fire at
+    // all. Suite geomeans against the three rounds before it (0.840/0.859/0.879 and
+    // 1.184/1.201/1.189): **TPC-H 0.826, TPC-DS 1.157**, each below every one of them.
+    let scanned = plan.scanned_source_ids();
     let src_bytes: usize = sources
         .iter()
-        .flatten()
+        .enumerate()
+        .filter(|(i, _)| scanned.contains(i))
+        .flat_map(|(_, relation)| relation.iter())
         .map(|b| b.get_array_memory_size())
         .sum();
     //
@@ -283,9 +293,6 @@ fn prepare_exec(
     // it can only be read off the build sides once they exist — so the two halves meet by the
     // executor reporting `PreferMaterializing` and this side honoring it (see `run_materializing`).
     let materialize_fits = budget > 0 && src_bytes.saturating_mul(8) < budget;
-    // Two independent reasons the materializing executor is the better answer, sharing one
-    // envelope guard: a plan streaming cannot shard (a repeated source), and a join-free
-    // grouped aggregation, which streaming computes correctly but for about twice the CPU.
     // Two independent reasons the materializing executor is the better answer, sharing one
     // envelope guard. The first is structural and the engine can see it: a plan streaming
     // cannot shard (a repeated source). The second is a *cardinality* question the engine

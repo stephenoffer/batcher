@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 
 from batcher._internal.logging import note_suppressed
@@ -87,7 +88,14 @@ def store(key: str | None, result: Any, sources: list | None, max_entries: int) 
     """Cache `result` under `key`, evicting the least recently used entry past the cap."""
     if key is None or max_entries <= 0:
         return
-    _CACHE[key] = (result, tuple(sources or ()))
+    # The keepalive pins the sources whose `id()` the key used, so an address cannot be
+    # recycled underneath a live entry. A derivation-keyed source is named by *how it was
+    # derived* rather than by its address, so pinning it would buy nothing and cost the whole
+    # materialized intermediate staying resident until the entry is evicted.
+    _CACHE[key] = (
+        result,
+        tuple(s for s in (sources or ()) if not getattr(s, "derivation", None)),
+    )
     _CACHE.move_to_end(key)
     while len(_CACHE) > max_entries:
         _CACHE.popitem(last=False)
@@ -336,12 +344,27 @@ _BUCKET_HYSTERESIS = 0.25
 _BUCKET_STATE: dict[tuple, int] = {}
 _BUCKET_STATE_MAX = 4096
 
+#: Buckets per octave for the quantities `_bucketed` fingerprints — the fitted cost
+#: coefficients and the measured CPU shares — as against a read-cost factor.
+#:
+#: One, where `_READ_COST_BUCKETS` is two, and the difference is which quantity is being
+#: fingerprinted. A read-cost factor is a ratio between sources that settles once measured; a
+#: cost coefficient sits inside a feedback loop — it is fit from the operators the plan ran,
+#: and the plan it produces decides which operators run next. On TPC-DS q77 that loop does not
+#: reach a fixed point at all: with the anchor settled and a genuine shift landing in one refit
+#: (`calibration._tracked`), `filter_row`, `hash_probe_row` and `project_row` still walk ~10% a
+#: run in one direction, so half-octave buckets kept re-keying the memo on drift that changes
+#: no plan. An octave is also exactly where `_tracked` stops damping, which is what makes the
+#: pair coherent: **a coefficient the estimator treats as genuinely changed is a coefficient the
+#: key follows, and nothing smaller is.**
+_COEFF_BUCKETS = 1
+
 
 def _sticky_bucket(state_key: tuple, name: str, value: float) -> int:
-    """`value`'s half-octave bucket, kept at its previous one inside the deadband."""
+    """`value`'s octave bucket, kept at its previous one inside the deadband."""
     if value <= 0.0:
         return 0
-    raw = math.log2(value) * _READ_COST_BUCKETS
+    raw = math.log2(value) * _COEFF_BUCKETS
     key = (*state_key, name)
     previous = _BUCKET_STATE.get(key)
     if previous is not None and abs(raw - previous) < 0.5 + _BUCKET_HYSTERESIS:
@@ -366,10 +389,11 @@ def _bucketed(fit: object, state_key: tuple = ()) -> str:
     climbed by 76 per run forever. Fingerprinting the *values* is stable by construction —
     it moves when a coefficient crosses a bucket and not when a refit merely happened.
 
-    Buckets are ``round(log2(v) * _READ_COST_BUCKETS)``, so a coefficient must move ~40% to
-    change the key — the same threshold, and the same trade, the read-cost factors take: keyed
-    on the raw value the memo would miss on every query, keyed on nothing a plan would freeze
-    at whichever coefficients were in force when it was first cached.
+    Buckets are ``round(log2(v) * _COEFF_BUCKETS)``, so a coefficient must roughly double or
+    halve to change the key — the same trade the read-cost factors take at half that width, for
+    the reason `_COEFF_BUCKETS` gives: keyed on the raw value the memo would miss on every
+    query, keyed on nothing a plan would freeze at whichever coefficients were in force when it
+    was first cached.
 
     Bucketing is necessary and **not sufficient**: see `_BUCKET_HYSTERESIS` for why a
     coefficient that wanders across a bucket edge defeats it, and what the deadband adds.
@@ -498,8 +522,12 @@ def _source_keys(sources: list | None) -> list[str] | None:
         key = source_stats_key(source)
         if key is None:
             return None  # an unkeyable source: never cache a plan built over it
-        if getattr(source, "ephemeral", False):
-            return None  # a key that cannot recur: the entry could never be read again
+        if getattr(source, "ephemeral", False) and not getattr(source, "derivation", None):
+            # A key that cannot recur: the entry could never be read again. An ephemeral
+            # relation *with* a derivation key is the exception the rule was missing — it
+            # names how the engine derived it, so the next run of the same query derives the
+            # same relation and asks for the same key.
+            return None
         keys.append(key)
     return keys
 
@@ -559,7 +587,14 @@ _DERIVED_RATIOS: tuple[tuple[str, str], ...] = (
 )
 
 
-def record_write(hub: Any, namespace: str, key: str, value: object) -> None:
+def record_write(
+    hub: Any,
+    namespace: str,
+    key: str,
+    value: object,
+    *,
+    decides: Callable[[object], object] | None = None,
+) -> None:
     """Write a learned value, invalidating memoized plans when it *materially* changed.
 
     Every value `kyber.learned_tuning` stores feeds a plan decision — which join strategy the
@@ -573,9 +608,25 @@ def record_write(hub: Any, namespace: str, key: str, value: object) -> None:
     would mean never reusing a plan. So the write is compared against its prior and only a
     change large enough to flip a decision advances the generation. Over-bumping costs a
     re-plan; under-bumping leaves a stale plan, so anything unrecognized is treated as material.
+
+    `decides` closes the gap between those two sentences. It maps a stored value to **the
+    decision a plan actually reads from it**, and when supplied the write invalidates only if
+    that decision changed — which is the exact condition, not a proxy for it.
+
+    The value-drift proxy is not merely imprecise here, it is self-sustaining. A bandit arm's
+    reward is the query's own latency, so a slow run writes a mean that differs by more than
+    the materiality threshold, which invalidates the plan, which makes the next run pay the
+    optimizer again, which keeps it slow. Measured on a two-table star join over TPC-DS at
+    scale 1: `optimize` ran twice per query at ~12 ms against ~2 ms of execution, and the
+    query sat at **26 ms for twelve consecutive runs** before the arm's discounted mean
+    settled inside the threshold — then dropped to **4.7 ms** and stayed there. The arm the
+    bandit would have chosen was `broadcast` on every one of those runs.
     """
     prior = hub.get_keyed_param(namespace, key)
-    if _materially_differs(prior, value):
+    material = (
+        _materially_differs(prior, value) if decides is None else decides(prior) != decides(value)
+    )
+    if material:
         learning.bump_generation()
     hub.put_keyed_param(namespace, key, value)
 

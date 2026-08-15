@@ -59,6 +59,7 @@ class _State:
 
     consumed: int  # `MetadataHub.signed_appends` as of the last fold
     window: int  # the per-signature sample window this state was built for
+    min_samples: int  # the confidence gate this state's `result` was computed under
     samples: dict[str, deque[float]] = field(default_factory=dict)
     result: dict[str, float] = field(default_factory=dict)
 
@@ -117,36 +118,64 @@ def fold_measured(
         appends = hub.signed_appends
         folds = _STATE.setdefault(hub, {})
         state = folds.get(what)
-        if state is None or state.window != window or state.consumed > appends:
-            # First fold, a reconfigured window, or a counter that moved backwards (a fresh
-            # backend behind the hub): rebuild from whatever history is retained.
-            state = _State(consumed=0, window=window)
+        if (
+            state is None
+            or state.window != window
+            or state.min_samples != min_samples
+            or state.consumed > appends
+        ):
+            # First fold, a reconfigured window or gate, or a counter that moved backwards (a
+            # fresh backend behind the hub): rebuild from whatever history is retained.
+            state = _State(consumed=0, window=window, min_samples=min_samples)
             folds[what] = state
         fresh = appends - state.consumed
         if fresh <= 0:
             return state.result
         # The Hub's view is bounded, so a cursor left far enough behind can name more rows
         # than remain; absorb whatever is still there.
+        touched: set[str] = set()
         for row in rows[-fresh:] if fresh < len(rows) else rows:
-            _absorb(state, row, sample_of)
+            _absorb(state, row, sample_of, touched)
         state.consumed = appends
-        state.result = {
-            s: sum(v) / len(v)
-            for s, v in state.samples.items()
-            if len(v) >= min_samples and is_concentrated(v, _MAX_REL_SPREAD)
-        }
+        # Recompute **only the signatures this round changed**. The absorption above was
+        # already incremental; the summary was not, and rebuilding it walked every signature
+        # the session had ever seen — computing a median per signature, per query, forever.
+        # That put a cost proportional to the session's cumulative history back on the
+        # critical path, which is the exact thing the incremental cursor exists to remove.
+        # Measured on TPC-DS at scale 1, replaying the suite in one session: a probe query
+        # cost 9.4 ms with nothing else run and 21.5 ms after 100 other queries — and this
+        # rebuild, across the two quantities folded here and the correction factors next
+        # door, was most of the difference.
+        #
+        # A signature's entry is *removed* when it no longer qualifies, not left behind: the
+        # window is bounded, so new observations evict old ones and a shape whose samples
+        # have spread out must stop reporting a mean nobody should trust.
+        for sig in touched:
+            values = state.samples[sig]
+            if len(values) >= min_samples and is_concentrated(values, _MAX_REL_SPREAD):
+                state.result[sig] = sum(values) / len(values)
+            else:
+                state.result.pop(sig, None)
         return state.result
     except Exception as exc:  # pragma: no cover - learning must never break planning
         note_suppressed("kyber", f"read measured {what}", exc)
         return {}
 
 
-def _absorb(state: _State, row: dict, sample_of: Callable[[dict], float | None]) -> None:
-    """Fold one feedback row into `state`, or skip it.
+def _absorb(
+    state: _State,
+    row: dict,
+    sample_of: Callable[[dict], float | None],
+    touched: set[str],
+) -> None:
+    """Fold one feedback row into `state`, recording whose window it changed.
 
     A row carrying no signature has nothing to be attributed to, and a signature past the cap
     is dropped rather than growing the fold without bound. What makes a *sample* admissible is
     the caller's judgement, not this function's.
+
+    `touched` collects the signatures whose sample window this call altered, so the caller
+    re-summarizes those and leaves the rest of the fold alone.
     """
     sig = row.get("signature")
     if not sig:
@@ -157,3 +186,4 @@ def _absorb(state: _State, row: dict, sample_of: Callable[[dict], float | None])
     if sig not in state.samples and len(state.samples) >= _MAX_TRACKED_SIGNATURES:
         return
     state.samples.setdefault(sig, deque(maxlen=state.window)).append(sample)
+    touched.add(sig)

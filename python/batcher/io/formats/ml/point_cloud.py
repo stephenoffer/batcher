@@ -28,6 +28,7 @@ from typing import IO, TYPE_CHECKING, Any, ClassVar
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
 
@@ -40,15 +41,12 @@ __all__ = ["PointCloudSource"]
 
 
 def _np() -> Any:
-    # Deferred so `import batcher` (which eagerly imports every IO format to self-register)
-    # never pulls numpy. numpy is not a core dependency, and a module-scope import here made
-    # the whole package — and the docs autodoc build that imports it — fail without numpy
-    # installed. Matches the sibling `numpy` format's accessor.
-    try:
-        import numpy as np
-    except ImportError as exc:  # numpy is near-ubiquitous but kept optional/deferred
-        raise BackendError("reading point-cloud files needs numpy: pip install numpy") from exc
-    return np
+    """The numpy module, deferred for the reason the sibling `numpy` format documents.
+
+    It used to say "matches the sibling `numpy` format's accessor" and then restate the
+    accessor — which is the tell: two functions that must match should be one call.
+    """
+    return require("numpy", feature="Reading point-cloud files", provides="numpy", extra="numpy")
 
 
 _SUFFIXES = (".bin", ".pcd", ".ply")

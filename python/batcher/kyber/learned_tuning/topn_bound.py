@@ -132,6 +132,60 @@ def _bound_key(sort: Sort, column: str, descending: bool, k: int) -> str:
     return hashlib.sha1(payload.encode(), usedforsecurity=False).hexdigest()[:16]
 
 
+def _bound_is_comparable(node: LogicalPlan, column: str, bound: Any) -> bool:
+    """Whether `column >= bound` is a comparison the engine can actually evaluate.
+
+    The bound is keyed by `plan_signature`, which identifies the *relation* (its scan token
+    carries `Scan.source_key`) but not its column **types** — the schema is deliberately not
+    in the IR. A source keeps its key when its schema changes, so a path rewritten with a
+    different type for the same column reads back the previous run's bound, and the seeded
+    plan becomes `Filter(x >= 42)` over a string column:
+
+        RuntimeError: Invalid argument error: Invalid comparison operation: Utf8 >= Int64
+
+    That is a *raised query*, and it contradicts the guarantee this module is built on —
+    "the cost of a stale bound is one wasted cheap scan". The verification in `api` cannot
+    catch it either: it counts the survivors of a plan that never ran. Overwriting a Parquet
+    path with a new schema is ordinary in a medallion pipeline, so this is reachable without
+    anything exotic.
+
+    Comparability is asked of `plan.types.promote` — the engine's own never-lossy type
+    lattice — rather than by classifying types here, so this agrees with what the engine
+    will do by construction: `None` means no common supertype exists (int against string,
+    timestamp against int, date against string), and anything else is a comparison the
+    engine performs. An int bound against a float column still seeds, which is the point of
+    using the lattice rather than requiring equality.
+
+    Unknown types answer **True**, preserving the previous behavior: `available_schema` is
+    `None` for a plan whose type analysis is not certain, and a bound that cannot be checked
+    is no worse off than it was before this guard existed.
+
+    Args:
+        node: The top-N's input, whose schema the predicate is evaluated against.
+        column: The sort key the bound is on.
+        bound: The remembered k-th best value.
+
+    Returns:
+        Whether the seeded predicate would type-check.
+    """
+    import pyarrow as pa
+
+    from batcher.plan.types import infer_type, promote
+
+    schema = node.available_schema()
+    if schema is None:
+        return True
+    column_type = infer_type(Col(column), schema)
+    if column_type is None:
+        return True
+    try:
+        bound_type = pa.scalar(bound).type
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as exc:
+        note_suppressed("kyber", "type the learned top-n bound", exc)
+        return False
+    return promote(column_type, bound_type) is not None
+
+
 def _bound_predicate(column: str, descending: bool, value: Any) -> Expr:
     """`column >= value` for a descending top-N, `column <= value` for an ascending one.
 
@@ -171,6 +225,8 @@ def seed_topn_bound(plan: LogicalPlan, hub: MetadataHub | None) -> TopNSeed | No
         signature = _bound_key(sort, column, descending, k)
         bound = hub.get_keyed_param(_TOPN_NAMESPACE, signature)
         if bound is None:
+            return None
+        if not _bound_is_comparable(sort.input, column, bound):
             return None
 
         guarded = Filter(sort.input, _bound_predicate(column, descending, bound))

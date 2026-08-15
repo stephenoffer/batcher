@@ -615,13 +615,14 @@ def _stream_broadcast_join(
     A plain helper (not a Ray task), so the chunked-probe logic is unit-testable in
     process; `_broadcast_join_task` wires it to partition IO on the worker.
     """
-    import pyarrow as pa
-
     nat = engine()
     from batcher.dist.executors.ray_runtime import execute_metered
+    from batcher.dist.shuffle_io import IpcWriter
 
-    sink = writer = None
-    rows = 0
+    # `IpcWriter`, not a bare `pa.ipc.new_stream`: this output lands in the shuffle scratch
+    # dir, which is a shared cluster mount whenever the cluster can span nodes, so it needs
+    # the owner-only open and the codec that path implies like every other artifact there.
+    writer = IpcWriter(out_path)
     try:
         for chunk in _byte_chunks(left_batches, chunk_bytes):
             left_rows = nat.execute_plan(left_ir, [chunk], engine_config)
@@ -629,19 +630,11 @@ def _stream_broadcast_join(
             if metrics_sink is not None and metrics_json:
                 metrics_sink.append(metrics_json)
             for b in joined:
-                if not b.num_rows:
-                    continue
-                if writer is None:
-                    sink = pa.OSFile(out_path, "wb")
-                    writer = pa.ipc.new_stream(sink, b.schema)
-                writer.write_batch(b)
-                rows += b.num_rows
+                if b.num_rows:
+                    writer.write(b)
     finally:
-        if writer is not None:
-            writer.close()
-        if sink is not None:
-            sink.close()
-    return out_path if rows else None
+        writer.close()
+    return out_path if writer.num_rows else None
 
 
 def _byte_chunks(batches, target_bytes: int):
@@ -765,23 +758,34 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
     # the direct in-memory join (no spill overhead).
     budget = reduce_envelope(engine_config).budget
     total = sum(_safe_file_size(p) for p in (*left_paths, *right_paths))
+    path = _os.path.join(work_dir, f"join_reduce_{reducer_id}.arrow")
     if budget and total > budget:
-        from batcher.dist.spill_breakers import reduce_join_paths_spilling
+        from batcher.dist.shuffle_io import IpcWriter
+        from batcher.dist.spill_breakers import iter_join_paths_spilling
 
         jd = _json.loads(join_ir)
         n_sub = max(2, -(-total // budget))  # ceil(total / budget): each pair ~ one budget
-        result = reduce_join_paths_spilling(
-            join_ir,
-            list(jd["left_keys"]),
-            list(jd["right_keys"]),
-            left_paths,
-            right_paths,
-            work_dir,
-            n_sub,
-            engine_config,
-        )
+        # Straight from the sub-bucket join into the output file. The list form held every
+        # pair's output at once, which is the larger half of a join and the half this branch
+        # exists to bound — the inputs were already streamed one pair at a time. Peak here is
+        # one pair's output, and the file that gets written is byte-identical either way.
+        writer = IpcWriter(path)
+        try:
+            for batch in iter_join_paths_spilling(
+                join_ir,
+                list(jd["left_keys"]),
+                list(jd["right_keys"]),
+                left_paths,
+                right_paths,
+                work_dir,
+                n_sub,
+                engine_config,
+            ):
+                writer.write(batch)
+        finally:
+            writer.close()
         # The out-of-core branch joins sub-bucket pairs internally; it reports no metrics.
-        metrics_json = ""
+        return (path, writer.num_rows, "") if writer.num_rows else (None, 0, "")
     else:
         left: list = []
         for p in left_paths:
@@ -810,7 +814,6 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
     rows = sum(b.num_rows for b in result) if result else 0
     if rows == 0:
         return (None, 0, metrics_json)
-    path = _os.path.join(work_dir, f"join_reduce_{reducer_id}.arrow")
     write_ipc(result, path)
     return (path, rows, metrics_json)
 

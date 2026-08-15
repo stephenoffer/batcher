@@ -239,8 +239,13 @@ def test_the_predicate_and_projection_are_in_the_sql_the_worker_runs(name: str, 
     split = SOURCES.get(name)(**kwargs).splits(predicate=_RANGE, projection=["id", "amt"])[0]
     sql = " ".join(split.query.split())
 
-    assert "WHERE amt > 100" in sql, f"the predicate never reached the SQL: {sql}"
-    assert "SELECT id, amt" in sql, f"the projection never reached the SQL: {sql}"
+    # Identifiers reach a backend that knows its dialect *delimited* (`"amt"`, `` `amt` ``,
+    # `[amt]`), because an undelimited reserved word or a name holding a space is a syntax
+    # error or, worse, silently the wrong column. Which delimiter is that backend's
+    # business; what this asserts is that the predicate and projection reached the SQL.
+    bare = sql.translate(str.maketrans("", "", '"`[]'))
+    assert "WHERE amt > 100" in bare, f"the predicate never reached the SQL: {sql}"
+    assert "SELECT id, amt" in bare, f"the projection never reached the SQL: {sql}"
     assert "*" not in sql.split("AS _bc")[0].replace("SELECT * FROM (", "", 1) or True
 
 

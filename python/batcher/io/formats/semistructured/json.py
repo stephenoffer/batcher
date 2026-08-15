@@ -17,6 +17,7 @@ from batcher.io.base._options import BASE_SOURCE_OPTIONS, OptionSpec
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.semistructured.json_tolerance import read_json_records
 from batcher.io.splits import FileSplit, LineRangeSplit, Split
+from batcher.plan.types import logical_bytes
 
 __all__ = ["JSONSink", "JSONSource"]
 
@@ -470,7 +471,7 @@ class JSONSink(FileSink):
 
         # Sized against the table, because a `/dev/shm` large enough in general is not large
         # enough for this write, and the failure lands mid-encode as ENOSPC.
-        root = shm_root(table.nbytes)
+        root = shm_root(logical_bytes(table))
         rows = -(-n // workers) if (n := table.num_rows) else 1
         tasks = []
         for i, off in enumerate(range(0, table.num_rows, rows)):

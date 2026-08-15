@@ -20,6 +20,7 @@ from batcher._internal.errors import IOError
 from batcher._internal.paths import open_private, private_dir
 
 __all__ = [
+    "IpcWriter",
     "distributed_work_dir",
     "read_ipc",
     "reduce_envelope",
@@ -224,6 +225,131 @@ def _on_shared_mount(path: str) -> bool:
     )
 
 
+class IpcWriter:
+    """One Arrow IPC stream file, opened on its first batch and closed exactly once.
+
+    Every distributed artifact Batcher writes — a mapper's shuffle bucket, a broadcast
+    join's incremental output, a grace re-split's sub-bucket — is the same object: an
+    Arrow IPC stream, on a scratch path that is often a shared cluster mount, holding the
+    query's actual rows. Opening one correctly means three things at once, and each call
+    site that opened its own got a different subset of them:
+
+    - **Owner-only at `open`**, via `open_private`, because a shared mount is shared with
+      other tenants and a later `chmod` leaves a window in which the rows are readable.
+    - **The codec the link deserves**, via :func:`shuffle_ipc_options`, because a scratch
+      dir on a network filesystem carries every byte twice and an uncompressed stream
+      there is the one shuffle sending raw bytes over the wire.
+    - **Opened lazily**, because the partition phase holds every writer at once, so a
+      bucket that receives no rows must cost no file descriptor.
+
+    Two call sites had none of the three (`pa.OSFile(path, "wb")` straight into
+    `pa.ipc.new_stream`), which is exactly the drift
+    `tests/integration/test_artifact_permissions.py` exists to catch: the helpers are
+    obviously correct in isolation and what rots is a *new* write site that forgets them.
+
+    Empty batches are written like any other — skipping them is a caller's policy, not
+    this writer's, and `write_ipc` depends on a schema-only file still existing.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> import tempfile, os
+            >>> from batcher.dist.shuffle_io import IpcWriter, read_ipc
+            >>> batch = pa.record_batch({"a": pa.array([1, 2], type=pa.int64())})
+            >>> path = os.path.join(tempfile.mkdtemp(), "part-0.arrow")
+            >>> with IpcWriter(path) as writer:
+            ...     writer.write(batch)
+            >>> read_ipc(path)[0].num_rows
+            2
+    """
+
+    __slots__ = ("_num_rows", "_opened", "_path", "_sink", "_writer")
+
+    def __init__(self, path: str) -> None:
+        """Name the file without creating it.
+
+        Args:
+            path: Where the stream will be written, once there is something to write.
+        """
+        self._path = path
+        self._sink: object | None = None
+        self._writer: pa.ipc.RecordBatchStreamWriter | None = None
+        self._num_rows = 0
+        # Separate from `_writer`, which `close` clears: whether a *file exists* has to
+        # survive the close, or a second `close()` would report the bucket as empty and
+        # the caller would record `None` for a path that is on disk with rows in it.
+        self._opened = False
+
+    @property
+    def path(self) -> str:
+        """The path this writer was named with, whether or not it has been opened."""
+        return self._path
+
+    @property
+    def num_rows(self) -> int:
+        """Rows written so far."""
+        return self._num_rows
+
+    @property
+    def is_open(self) -> bool:
+        """Whether a file has been created yet."""
+        return self._opened
+
+    def open(self, schema: pa.Schema) -> None:
+        """Create the file and its stream, if this writer has not opened one yet.
+
+        Args:
+            schema: The stream's schema. Ignored on a writer that is already open, so a
+                caller may call this unconditionally.
+        """
+        if self._writer is not None:
+            return
+        # `open_private` first, so the rows are never world-readable even briefly; the
+        # options are read from the path, so the decision costs a string comparison.
+        self._sink = pa.PythonFile(open_private(self._path), mode="w")
+        self._writer = pa.ipc.new_stream(
+            self._sink, schema, options=shuffle_ipc_options(self._path)
+        )
+        self._opened = True
+
+    def write(self, batch: pa.RecordBatch) -> None:
+        """Append one batch, opening the file from its schema on the first call.
+
+        Args:
+            batch: The batch to append.
+        """
+        if self._writer is None:
+            self.open(batch.schema)
+        self._writer.write_batch(batch)
+        self._num_rows += batch.num_rows
+
+    def close(self) -> str | None:
+        """Finalize the stream. Idempotent.
+
+        Returns:
+            The path when a file was created, `None` when this writer never opened one —
+            which is what a caller collecting per-bucket paths records for an empty
+            bucket.
+        """
+        writer, sink = self._writer, self._sink
+        self._writer = None
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            self._sink = None
+            if sink is not None:
+                sink.close()
+        return self._path if self._opened else None
+
+    def __enter__(self) -> IpcWriter:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
 def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
     """Write record batches to an Arrow IPC stream file. Returns `path`."""
     if not batches:
@@ -231,12 +357,9 @@ def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
             f"cannot write an Arrow IPC shuffle file to {path!r} with no batches: the "
             "stream needs at least one to take its schema from"
         )
-    with (
-        pa.PythonFile(open_private(path), mode="w") as sink,
-        pa.ipc.new_stream(sink, batches[0].schema, options=shuffle_ipc_options(path)) as writer,
-    ):
+    with IpcWriter(path) as writer:
         for b in batches:
-            writer.write_batch(b)
+            writer.write(b)
     return path
 
 
@@ -286,39 +409,22 @@ def write_ipc_round_robin(
     producing output, so the distributed result is unchanged); only which worker
     reads which batch differs.
     """
-    n = len(paths)
-    sinks: list[object | None] = [None] * n
-    writers: list[object | None] = [None] * n
+    writers = [IpcWriter(path) for path in paths]
     schema: pa.Schema | None = None
-
-    def _open(j: int, sch: pa.Schema) -> None:
-        # Owner-only, like every other shuffle artifact: these files hold the query's rows
-        # on a scratch path that may be a shared cluster mount.
-        sinks[j] = pa.PythonFile(open_private(paths[j]), mode="w")
-        writers[j] = pa.ipc.new_stream(sinks[j], sch, options=shuffle_ipc_options(paths[j]))
-
     try:
         for i, b in enumerate(batches):
             if schema is None:
                 schema = b.schema
-            j = i % n
-            if writers[j] is None:
-                _open(j, schema)
-            writers[j].write_batch(b)  # type: ignore[union-attr]
+            writers[i % len(writers)].write(b)
         if schema is None:
             schema = fallback_schema
         empty = pa.RecordBatch.from_pylist([], schema=schema)
-        for j in range(n):
-            if writers[j] is None:
-                _open(j, schema)
-                writers[j].write_batch(empty)  # type: ignore[union-attr]
+        for writer in writers:
+            if not writer.is_open:
+                writer.write(empty)
     finally:
-        for w in writers:
-            if w is not None:
-                w.close()  # type: ignore[attr-defined]
-        for s in sinks:
-            if s is not None:
-                s.close()
+        for writer in writers:
+            writer.close()
 
 
 def read_ipc(path: str) -> list[pa.RecordBatch]:

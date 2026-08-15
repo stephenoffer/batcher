@@ -96,6 +96,19 @@ class PhysicalPlan:
     # subset to its backend filter to skip I/O; the engine keeps the `Filter`
     # operator as a safe re-check, so an absent/partial translation is correct.
     source_predicates: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Per scan `source_id`, the most rows that source ever has to produce — a `Limit`
+    # reaching the scan through nothing but projections (row-cap pushdown). A source may
+    # stop early; one that ignores this reads what it always did, because the engine keeps
+    # its own `Limit`. Absent means "no cap", which is also what one unbounded scan of a
+    # source that another scan limits must produce. See
+    # `kyber.rules.source_limits.required_limits_per_source`.
+    source_limits: dict[int, int] = field(default_factory=dict)
+    # Per scan `source_id`, the ordering its row cap is taken *in* — one
+    # ``(column, descending, nulls_first)`` per sort key. Only ever set alongside a
+    # `source_limits` entry: ordering a source without capping it buys nothing and makes
+    # the server sort rows it would have streamed. A source that cannot express the
+    # ordering must also ignore the cap, since "the first n" is meaningless without it.
+    source_orderings: dict[int, tuple[tuple[str, bool, bool], ...]] = field(default_factory=dict)
     #: Kyber's verdict that this plan's grouped aggregate is cheaper materialized than
     #: streamed. Set from the estimated group count, which only the control plane has; the
     #: engine pairs it with its own memory-affordability check. See

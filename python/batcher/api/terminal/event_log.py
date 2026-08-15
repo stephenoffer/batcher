@@ -38,6 +38,7 @@ from typing import Any
 from batcher._internal.logging import note_suppressed
 from batcher._internal.paths import private_dir
 from batcher.plan.profile import ProfileCollector
+from batcher.plan.types import logical_bytes
 
 __all__ = [
     "event_log_collector",
@@ -358,7 +359,7 @@ def report_stream(batches: Iterator[Any], *, label: str, signature: str = "") ->
                 query_id=query_id,
                 name=label,
                 rows=batch.num_rows,
-                bytes=batch.nbytes,
+                bytes=logical_bytes(batch),
             )
             yield batch
     except GeneratorExit:

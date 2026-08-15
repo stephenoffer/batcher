@@ -123,7 +123,13 @@ impl SpillCodec {
     /// classifies the schema first; if the chosen compression is not compiled into
     /// this arrow build, it silently degrades to uncompressed (mirroring the Python
     /// `TieredSpillStore`), so a write never fails on codec.
-    fn write_options(self, schema: &Schema) -> IpcWriteOptions {
+    ///
+    /// Public because the spill store is not the only thing that writes an Arrow IPC file
+    /// full of a query's rows to a scratch path: the Flight aggregate reduce stages each
+    /// gathered bucket the same way, and it should reach the same answer rather than a
+    /// second one. Restating the policy is how a blob-bearing gather goes out uncompressed
+    /// while the identical rows are compressed on the spill path beside it.
+    pub fn write_options(self, schema: &Schema) -> IpcWriteOptions {
         let base = IpcWriteOptions::default();
         let codec = match self {
             Self::Auto => return Self::classify(schema).write_options(schema),
@@ -495,28 +501,14 @@ fn restrict_to_owner(dir: &std::path::Path) {
     #[cfg(not(unix))]
     let _ = dir;
 }
-
-/// Create a spill file readable only by the running user.
+/// Create `path` for writing, owner-only from the moment it exists.
 ///
-/// The mode is set in the `open` rather than by a following `chmod`: a chmod leaves a
-/// window in which the file is world-readable, and these files hold the query's actual
-/// rows. Non-unix falls back to a plain create, matching [`restrict_to_owner`]'s stance
-/// that the spill path stays platform-neutral.
+/// One line, delegating to [`bc_arrow::create_private_file`]: `bc-transport` needs the same
+/// thing for the shared-memory shuffle and `bc-py` for its gather staging files, and a spill
+/// file that is 0600 next to a shuffle file that is 0644 is the failure this whole property
+/// has. `bc-arrow` is the lowest crate all three see.
 fn create_private(path: &std::path::Path) -> std::io::Result<File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        File::create(path)
-    }
+    bc_arrow::create_private_file(path)
 }
 
 impl DiskSpillStore {

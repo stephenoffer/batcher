@@ -570,10 +570,18 @@ class Reader:
     def text(self, path: PathLike, **opts: Any) -> Dataset:
         r"""Read text file(s) as rows, one row per line by default.
 
+        A text corpus is rarely one encoding. Bytes that ``encoding`` cannot decode are
+        replaced with U+FFFD by default, in **both** read modes, and ``errors="strict"``
+        turns them into a per-file failure instead — which ``on_error="skip"`` will then
+        drop rather than losing the corpus to one file.
+
         Args:
             path: A text file, directory, or glob.
             mode: ``"line"`` for one row per line, or ``"file"`` for whole-file rows.
-            opts: Format-specific reader options forwarded to the source.
+            opts: Format-specific reader options forwarded to the source: ``encoding``
+                (default ``"utf-8"``), ``errors`` (``"replace"`` by default, or any Python
+                codec error handler such as ``"strict"``), and ``on_error``
+                (``"raise"``/``"skip"``).
 
         Returns:
             A lazy `Dataset` over the text source.
@@ -586,6 +594,12 @@ class Reader:
                 >>> _ = open(p, "w").write("hello\nworld\n")
                 >>> bt.read.text(p).select("line_number", "text").to_pydict()
                 {'line_number': [1, 2], 'text': ['hello', 'world']}
+
+                >>> d = tempfile.mkdtemp()
+                >>> legacy = os.path.join(d, "legacy.txt")
+                >>> _ = open(legacy, "wb").write("caf\xe9\n".encode("cp1252"))
+                >>> bt.read.text(d, encoding="cp1252").to_pydict()["text"]
+                ['café']
         """
         return _read(path, format="text", **opts)
 
@@ -601,6 +615,13 @@ class Reader:
         in ``warc_headers``, so a crawl's own extension fields stay reachable through
         ``.json``. ``.warc.gz`` is read transparently, including the per-record gzip
         members a crawler normally writes.
+
+        A ``response`` record's payload is the whole HTTP exchange, not the page: status
+        line, response headers, a blank line, then the body. Use ``http_body`` rather than
+        ``warc_content`` for the page — handing the raw payload to ``strip_html()``
+        extracts the server banner along with the prose, and nothing about the result says
+        so. ``http_status`` and ``http_content_type`` come out of the same split, so
+        dropping the 404s is a filter rather than a parse.
 
         Args:
             path: A ``.warc`` / ``.warc.gz`` file, directory, or glob.
@@ -650,19 +671,28 @@ class Reader:
         return _read(path, format="binary", **opts)
 
     def documents(self, path: PathLike, *, password: str | None = None, **opts: Any) -> Dataset:
-        """Read PDF document(s) — a file, directory, or glob — as extracted text rows.
+        """Read document(s) — a file, directory, or glob — as extracted text rows.
 
-        Needs the optional extra: ``pip install 'batcher-engine[pdf]'``.
+        Reads a **mixed** corpus in one scan: PDF, HTML (``.html``/``.htm``/``.xhtml``),
+        Markdown and plain text (``.md``/``.markdown``/``.rst``/``.txt``), Word
+        (``.docx``), PowerPoint (``.pptx``) and EPUB. Every row is
+        ``{path, page, text}``, where ``page`` means which part of the document the text
+        came from: a PDF page, a slide, an EPUB spine item. Formats with no pagination in
+        the file yield one row at ``page = 0`` rather than inventing one.
 
-        Extracting the text is skipped entirely when the ``text`` column is not projected,
-        so ``select("path", "page")`` and ``count()`` read the page tree and stop. Laying a
-        page out into reading order is most of the cost of this reader.
+        Only PDF needs a dependency: ``pip install 'batcher-engine[pdf]'``. The rest are
+        read with the standard library.
+
+        For PDFs, extracting the text is skipped entirely when the ``text`` column is not
+        projected, so ``select("path", "page")`` and ``count()`` read the page tree and
+        stop. Laying a page out into reading order is most of the cost of that reader.
 
         Args:
-            path: A PDF file, directory, or glob to read.
-            password: The user password for an encrypted corpus. A PDF encrypted for
+            path: A document file, directory, or glob to read.
+            password: The user password for an encrypted PDF corpus. A PDF encrypted for
                 *permissions* only opens without it.
-            opts: Format-specific reader options forwarded to the source.
+            opts: Format-specific reader options forwarded to the source, such as
+                ``on_error="skip"`` to drop unreadable documents.
 
         Returns:
             A lazy `Dataset` of extracted document text rows.
@@ -670,8 +700,16 @@ class Reader:
         Examples:
             .. doctest::
 
-                >>> import batcher as bt
-                >>> ds = bt.read.documents("docs/*.pdf")  # doctest: +SKIP
+                >>> import batcher as bt, os, tempfile
+                >>> d = tempfile.mkdtemp()
+                >>> _ = open(os.path.join(d, "a.html"), "w").write(
+                ...     "<h1>Title</h1><p>Body text.</p>"
+                ... )
+                >>> rows = bt.read.documents(d).select("page", "text").to_pydict()
+                >>> rows["page"]
+                [0]
+                >>> rows["text"][0].splitlines()
+                ['Title', '', 'Body text.']
         """
         return _read(path, format="documents", password=password, **opts)
 
@@ -856,6 +894,37 @@ class Reader:
         """
         return _read(path, format="hdf5", **opts)
 
+    def training_shards(self, path: PathLike, **opts: Any) -> Dataset:
+        """Read a training-shard corpus written by `Dataset.ml.write_shards`.
+
+        The relational view of a training corpus. `batcher.ml.shard_stream_loader` reads the
+        same directory *by sample index*, which is what a trainer needs; this reads it as
+        rows, which is what every question asked around a training run needs — class
+        balance, null labels, a join against the source table, a differential check that the
+        corpus matches what the features were fitted on.
+
+        The row count comes from the corpus index, so `Dataset.count` is answered without
+        reading a shard, and each shard is its own read task.
+
+        Args:
+            path: The shard directory (the one holding ``index.json``).
+            opts: Additional source options (``storage_options``, ``filesystem``).
+
+        Returns:
+            A lazy `Dataset` over the corpus, in the order it was written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> out = os.path.join(tempfile.mkdtemp(), "corpus")
+                >>> ds = bt.from_pydict({"x": [1, 2, 3, 4], "y": [0, 1, 0, 1]})
+                >>> _ = ds.ml.write_shards(out, rows_per_shard=2)
+                >>> bt.read.training_shards(out).to_pydict()["x"]
+                [1, 2, 3, 4]
+        """
+        return _read_table("training_shards", path, **opts)
+
     def zarr(self, path: PathLike, **opts: Any) -> Dataset:
         """Read a Zarr store (chunked n-dimensional arrays) by path.
 
@@ -883,6 +952,7 @@ class Reader:
         *,
         decode: bool = False,
         size: tuple[int, int] | None = None,
+        fit: str = "stretch",
         **opts: Any,
     ) -> Dataset:
         """List image file(s) as ``{uri, bytes, size, mime}`` + header-metadata rows.
@@ -891,14 +961,27 @@ class Reader:
         tensor column; decoding needs the optional extra:
         ``pip install 'batcher-engine[image]'``.
 
+        `fit` decides what a decode does to an image whose aspect ratio is not already the
+        target's. The default stretches it, which is what a classifier trained the same way
+        expects and a silent distortion for anything else — no assertion on the tensor's
+        shape can see it, because the shape is right either way.
+
         Args:
             path: An image file, directory, or glob.
             decode: If true, append the decoded ``image`` tensor column.
             size: ``(height, width)`` to resize decoded images to; implies ``decode``.
+            fit: How to reach that shape — ``"stretch"`` (squash to the exact size),
+                ``"letterbox"`` (scale the whole image inside the box and pad the
+                remainder, the object-detection choice since stretching moves every
+                predicted box), or ``"center_crop"`` (keep the centre at native resolution
+                and discard the border).
             opts: Format-specific reader options forwarded to the source.
 
         Returns:
             A lazy `Dataset` of image rows, optionally with a decoded tensor column.
+
+        Raises:
+            PlanError: If `fit` is not one of the three, or `size` is missing or invalid.
 
         Examples:
             .. doctest::
@@ -907,9 +990,15 @@ class Reader:
                 >>> ds = bt.read.images(  # doctest: +SKIP
                 ...     "s3://bucket/images/*.jpg", decode=True, size=(224, 224)
                 ... )
+
+                >>> detections = bt.read.images(  # doctest: +SKIP
+                ...     "s3://bucket/frames/", size=(640, 640), fit="letterbox"
+                ... )
         """
         ds = _read(path, format="images", **opts)
-        return _decode(ds, "image_tensor_dataset", size=size) if (decode or size) else ds
+        if not (decode or size):
+            return ds
+        return _decode(ds, "image_tensor_dataset", size=size, fit=fit)
 
     def audio(
         self,

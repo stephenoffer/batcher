@@ -302,3 +302,48 @@ def test_one_absurd_run_cannot_dominate_the_window():
     # outlier drags the mean all the way to the clamp and pins it there.
     logs = [0.0] * 5 + [math.log(1e9)]
     assert correction_factor(logs, 2, 10.0) < 3.0
+
+
+@pytest.mark.unit
+def test_only_the_signatures_that_moved_are_re_derived(narrow_window):
+    """Many shapes, one new observation: the answer is still the full recompute's.
+
+    The q-error *windows* were folded incrementally, but the factors derived from them were
+    not — every read re-ran the geometric mean for every shape the session had ever seen. On
+    a suite that issues a hundred distinct plans, that puts a cost proportional to cumulative
+    history on the critical path of each `optimize`: measured on TPC-DS at scale 1, a probe
+    query took 9.4 ms with nothing else run and 21.5 ms after 100 others in one session.
+
+    Deriving only the shapes whose window moved must not change any factor, including the
+    ones left alone, which is what this holds against a hub that folds the same history cold.
+    """
+    backend = InProcessBackend()
+    hub = MetadataHub(backend)
+    for shape in range(15):
+        for actual in (400, 1600):
+            _feed(hub, f"s{shape}", est=100, actual=actual)
+    _corrections(hub)  # summarize every shape, then move exactly one
+    _feed(hub, "s3", est=100, actual=25)
+
+    warm = _corrections(hub)
+    cold = _corrections(MetadataHub(backend))
+    assert warm.keys() == cold.keys()
+    for sig, factor in cold.items():
+        assert warm[sig] == pytest.approx(factor), sig
+
+
+@pytest.mark.unit
+def test_a_shape_that_stops_qualifying_loses_its_factor(narrow_window):
+    """A factor is deleted when the evidence no longer supports one, not left behind.
+
+    The full rebuild dropped a disqualified shape implicitly by not re-emitting it. An
+    incremental update has to delete it on purpose, and a stale correction is exactly the
+    kind of value that would otherwise steer plans forever.
+    """
+    hub = _hub()
+    for actual in (400, 1600):  # a consistent over-estimate → a real factor
+        _feed(hub, "sig", est=100, actual=actual)
+    assert "sig" in _corrections(hub)
+    for _ in range(6):  # the window fills with samples that agree the estimate was right
+        _feed(hub, "sig", est=100, actual=100)
+    assert "sig" not in _corrections(hub)

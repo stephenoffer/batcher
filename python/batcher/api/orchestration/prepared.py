@@ -128,8 +128,10 @@ class Prepared:
 
         phys = self.physical
         projections, predicates = phys.source_projections, phys.source_predicates
+        limits, orderings = phys.source_limits, phys.source_orderings
         batches = [
-            read_source(src, projections.get(i), predicates.get(i)) for i, src in enumerate(sources)
+            read_source(src, projections.get(i), predicates.get(i), limits.get(i), orderings.get(i))
+            for i, src in enumerate(sources)
         ]
         table = core.scan_only_result(self.logical, batches, predicates)
         if table is not None:

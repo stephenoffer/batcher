@@ -340,6 +340,36 @@ _BY_TYPE: dict[str, str] = {
 #: is localized on some systems and the number never is.
 _STORAGE_ERRNOS = frozenset({28, 30, 122, 5, 117})  # ENOSPC, EROFS, EDQUOT, EIO, EUCLEAN
 
+#: Exception types whose *message is data rather than diagnosis*, so scanning it for markers
+#: is a category error. A `KeyError`'s message is the key that was missing; a UDF doing
+#: ``config["timeout"]`` against a dict that lacks it raises exactly ``KeyError: 'timeout'``,
+#: which the marker scan read as the `timeout` category and declared retryable. That is the
+#: precise mistake this module's docstring calls the more expensive one: a deterministic bug
+#: retried across the fleet, burning the recovery budget and surfacing minutes later as a
+#: resource error with the real traceback gone. Every type here fails identically on every
+#: worker no matter what string it carries.
+#:
+#: Only the *text* scan is suppressed. The cause chain is still walked, so a genuine transient
+#: wrapped in one of these still classifies by its cause — and Ray's synthesized wrapper
+#: (``RayTaskError(TypeError)``) is not an exact name match, so a remote failure's formatted
+#: traceback is still scanned as before.
+_MESSAGE_IS_DATA: frozenset[str] = frozenset(
+    {
+        "AssertionError",
+        "AttributeError",
+        "IndentationError",
+        "IndexError",
+        "KeyError",
+        "NameError",
+        "NotImplementedError",
+        "StopIteration",
+        "SyntaxError",
+        "TypeError",
+        "UnboundLocalError",
+        "ZeroDivisionError",
+    }
+)
+
 
 def _chain(exc: BaseException):
     """The exception and everything it was raised from, without cycling."""
@@ -370,6 +400,8 @@ def failure_class(exc: BaseException) -> str:
             return _BY_TYPE[name]
         if getattr(cur, "errno", None) in _STORAGE_ERRNOS:
             return "storage"
+        if name in _MESSAGE_IS_DATA:
+            continue  # deterministic whatever it says; keep walking for a real cause
         # The type name *and* the message, because a remote failure arrives as Ray's own
         # wrapper class with the worker-side traceback — including the original exception's
         # name — formatted into the message. Matching the class name alone would see only

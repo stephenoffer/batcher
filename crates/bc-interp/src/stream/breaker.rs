@@ -6,8 +6,9 @@
 //! streaming removes is the *incidental* materialization of everything between them.
 //!
 //! Their input still arrives as a stream, so the subtree below a breaker never materializes more
-//! than a morsel at a time — and the aggregate does not even hold its input, folding it
-//! incrementally into state bounded by the group count.
+//! than a morsel at a time. Three of them do not hold their input at all, folding it into state
+//! bounded by their own *answer* instead (`super::folds`): the aggregate's groups, a top-N's `k`
+//! survivors, and a reducing dedup's distinct rows.
 //!
 //! Every kernel here is the one [`crate::execute`] calls. The breakers are not re-implemented;
 //! they are handed a collected input and left alone. That is what keeps the streaming executor a
@@ -17,21 +18,12 @@ use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use bc_ir::RelOp;
-use bc_runtime::agg;
-use rayon::prelude::*;
 
+use super::folds::{fold_partial_parallel, stream_distinct, stream_sample_n, stream_top_n};
+use super::union_all;
 use super::{build_with, finalize_partial, fold_partial, Ctx, Morsels};
 use crate::ops;
 use crate::InterpError;
-
-/// Morsels each worker gets per parallel fold round.
-///
-/// The round is the unit of buffering, so this is what the "streaming" aggregate holds of its
-/// input at once: `workers x` this many morsels. Two keeps every worker fed across a round
-/// boundary (one to fold, one queued) while leaving the buffer a small multiple of a morsel —
-/// at the 16,384-row default and 96 workers, a few hundred MB at the very widest, and
-/// proportional to the machine rather than to the relation.
-const PAR_FOLD_MORSELS_PER_WORKER: usize = 2;
 
 /// How many morsels a limited `DISTINCT` reads before deciding its early exit will not pay.
 ///
@@ -90,109 +82,6 @@ fn drain_within_budget(
         out.push(batch);
     }
     Ok(out)
-}
-
-/// [`fold_partial`], with the per-morsel `partial` step spread across `workers`.
-///
-/// The sequential fold is the right shape when this breaker is *inside* a sharded worker (there
-/// the parallelism is the shard, and `Ctx::workers` is 1 to say so). On the **un-sharded**
-/// fallback path it is not: that path is taken precisely when the plan could not be split — a
-/// self-join, or a hash join whose build side is past the per-morsel probe's ceiling — and the
-/// aggregate then folds the *whole* relation on one core while every other core idles. It is the
-/// dominant term when it happens: a 60M-row `lineitem` join-then-group-by measured 2.7 s, of
-/// which ~1.9 s was this loop.
-///
-/// Rounds are the only difference. Morsels are taken from the stream **in order** into a bounded
-/// buffer, `partial`-ed in parallel, and combined in that same order — so this is the mergeable
-/// algebra (invariant #7) with a wider `partial` step, exactly as the sharded aggregate in
-/// `stream::parallel` already runs it, and the accumulated partial folds in last on each round
-/// just as the sequential loop does.
-///
-/// Only the `partial` step fans out; the stream is still pulled one morsel at a time by this
-/// thread. That is deliberate — the pull is where the *upstream* pipeline runs, and on this path
-/// the upstream has either already materialized (the join fallback) or is un-shardable by
-/// construction, so pulling it from several threads would be unsound rather than merely
-/// unhelpful.
-///
-/// An oversized batch is **sliced here** rather than upstream. The un-shardable join emits its
-/// output as one relation-sized batch on purpose (splitting it there makes the next join's
-/// `materialize` copy the whole relation — see `materialized_join_from`), so without this the
-/// round would hold exactly one unit of work and fold on one core. Slicing is zero-copy and
-/// local to this fold, so it costs the pipeline nothing and buys the fan-out.
-fn fold_partial_parallel(
-    input: Morsels<'_>,
-    group_keys: &[bc_ir::ProjectionItem],
-    aggregates: &[bc_ir::AggregateItem],
-    jit: &std::sync::OnceLock<ops::AggJit>,
-    workers: usize,
-) -> Result<(Option<agg::Partial>, u64), InterpError> {
-    let funcs = ops::agg_funcs(aggregates);
-    let per_round = workers.saturating_mul(PAR_FOLD_MORSELS_PER_WORKER).max(2);
-    let mut buf: Vec<RecordBatch> = Vec::with_capacity(per_round);
-    let mut folded: Option<agg::Partial> = None;
-    let mut rows_in: u64 = 0;
-
-    for morsel in input {
-        let morsel = morsel?;
-        if morsel.num_rows() == 0 {
-            continue;
-        }
-        rows_in += morsel.num_rows() as u64;
-        for piece in slice_to_morsels(morsel) {
-            buf.push(piece);
-            if buf.len() >= per_round {
-                folded = Some(fold_round(
-                    &mut buf, group_keys, aggregates, jit, &funcs, folded,
-                )?);
-            }
-        }
-    }
-    if !buf.is_empty() {
-        folded = Some(fold_round(
-            &mut buf, group_keys, aggregates, jit, &funcs, folded,
-        )?);
-    }
-    Ok((folded, rows_in))
-}
-
-/// One batch as morsel-sized, in-order, **zero-copy** slices — itself when it already fits.
-///
-/// `RecordBatch::slice` shares the parent's buffers, so this changes only where the fold's units
-/// of work begin and end. Order is the slice order, which is the batch's own row order.
-fn slice_to_morsels(batch: RecordBatch) -> Vec<RecordBatch> {
-    let rows = batch.num_rows();
-    if rows <= bc_arrow::DEFAULT_MORSEL_ROWS {
-        return vec![batch];
-    }
-    (0..rows)
-        .step_by(bc_arrow::DEFAULT_MORSEL_ROWS)
-        .map(|start| batch.slice(start, bc_arrow::DEFAULT_MORSEL_ROWS.min(rows - start)))
-        .collect()
-}
-
-/// One round of [`fold_partial_parallel`]: `partial` every buffered morsel in parallel, then
-/// combine them (and the partial carried in from earlier rounds) into one.
-fn fold_round(
-    buf: &mut Vec<RecordBatch>,
-    group_keys: &[bc_ir::ProjectionItem],
-    aggregates: &[bc_ir::AggregateItem],
-    jit: &std::sync::OnceLock<ops::AggJit>,
-    funcs: &[agg::AggFunc],
-    carried: Option<agg::Partial>,
-) -> Result<agg::Partial, InterpError> {
-    // Compiled once per query, before the fan-out, and shared by every worker — the same
-    // `OnceLock` contract `fold_partial` documents. Compiling inside the `par_iter` would pay
-    // Cranelift's per-expression cost once per core.
-    let compiled = jit.get_or_init(|| ops::compile_agg(group_keys, aggregates, &buf[0]));
-    let mut partials: Vec<agg::Partial> = buf
-        .par_iter()
-        .map(|m| ops::eval_partial_jit(m, group_keys, aggregates, compiled))
-        .collect::<Result<Vec<_>, _>>()?;
-    buf.clear();
-    if let Some(prev) = carried {
-        partials.push(prev);
-    }
-    agg::combine(&partials, funcs).map_err(Into::into)
 }
 
 /// Run a breaker over its (streamed) input and return its materialized output.
@@ -268,7 +157,25 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
         }
 
         RelOp::Sort { input, keys, limit } => {
-            // A sort genuinely holds its input; over budget, the external (spilling) sort in
+            // Top-N (`ORDER BY … LIMIT k`) is **not** a breaker on this path: its state is the k
+            // rows it is keeping, so it folds the input away morsel by morsel and never holds it.
+            // `parallel_top_n` was already the mergeable top-N — reduce each morsel to its local
+            // top-k, merge the narrow survivors, break ties by original position — but it was
+            // handed a fully drained input, so a `SELECT … ORDER BY … LIMIT 10` over a hundred
+            // million rows still had all hundred million resident to keep ten. See `stream_top_n`.
+            if let Some(k) = limit {
+                let t = Instant::now();
+                let (kept, rows_in, held) = stream_top_n(build_with(input, ctx)?, keys, *k, ctx)?;
+                let out: Vec<RecordBatch> = kept.into_iter().collect();
+                if let (Some(m), Some(id)) = (ctx.meter, id) {
+                    // The peak is the fold's, not the input's — a genuinely smaller and truer
+                    // number than the drained path reported, and the one Carbonite should
+                    // reserve against.
+                    m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
+                }
+                return Ok(out);
+            }
+            // A full sort genuinely holds its input; over budget, the external (spilling) sort in
             // the materializing executor is the right tool, so give way to it — and give way
             // *while draining*, so the input that does not fit is never fully resident.
             let batches = drain_within_budget(
@@ -279,28 +186,18 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             let rows_in = crate::count_rows(&batches);
             let held = crate::batch_bytes(&batches);
             let t = Instant::now();
-            let out = match limit {
-                // Top-N: reduce each morsel to its local top-k in parallel and merge the narrow
-                // survivors — never concatenate or sort the whole input. `ops::parallel_top_n` is
-                // the mergeable top-N, result-identical to a full sort-then-slice (asserted by
-                // `parallel_top_n_matches_eager`), so this only changes throughput. The old path
-                // `materialize`d all N rows into one batch and ran a `LIMIT`-ed `lexsort` over
-                // every one of them — O(N) row-format encoding to keep k rows.
-                Some(k) if !batches.is_empty() => vec![ops::parallel_top_n(&batches, keys, *k)?],
-                // Full sort (no LIMIT), or the empty input: materialize, then try the parallel
-                // sample-sort (range-partition + per-range parallel sort for a large float / int
-                // / string key). It returns the ranges already in key order — their concatenation
-                // is the sorted relation — and is result-identical to the serial `sort_batch`
-                // oracle (`sample_sort` tests). It declines (`None`) for a small input, a top-N
-                // `LIMIT`, or an unsupported key, where the serial sort runs. Without this a large
-                // full sort ran arrow's single-threaded `lexsort` — ~16x DuckDB on a 6M-row sort.
-                _ => match ops::materialize(&batches) {
-                    Ok(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
-                        Some(sorted) => sorted,
-                        None => vec![ops::sort_batch(&combined, keys, *limit)?],
-                    },
-                    Err(_) => Vec::new(),
+            // Materialize, then try the parallel sample-sort (range-partition + per-range parallel
+            // sort for a large float / int / string key). It returns the ranges already in key
+            // order — their concatenation is the sorted relation — and is result-identical to the
+            // serial `sort_batch` oracle (`sample_sort` tests). It declines (`None`) for a small
+            // input or an unsupported key, where the serial sort runs. Without this a large full
+            // sort ran arrow's single-threaded `lexsort` — ~16x DuckDB on a 6M-row sort.
+            let out = match ops::materialize(&batches) {
+                Ok(combined) => match ops::parallel_sort_batch(&combined, keys, *limit)? {
+                    Some(sorted) => sorted,
+                    None => vec![ops::sort_batch(&combined, keys, *limit)?],
                 },
+                Err(_) => Vec::new(),
             };
             if let (Some(m), Some(id)) = (ctx.meter, id) {
                 // A sort genuinely does hold its input — it is a full breaker — so its peak is
@@ -429,20 +326,34 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
                 return Ok(out);
             }
 
-            let batches = drain_within_budget(
-                build_with(input, ctx)?,
-                ctx.budget,
-                "the streaming distinct does not spill",
-            )?;
-            if batches.is_empty() {
+            // A whole-row `DISTINCT` folds its input away round by round (`stream_distinct`)
+            // instead of holding it: the state is the surviving rows, which for the shape anyone
+            // writes a `DISTINCT` for is a small fraction of what produced it. `DISTINCT ON` keeps
+            // the drained path — `order` decides which row per key survives, and proving a fold
+            // preserves that is a different argument from the whole-row dedup's idempotence.
+            let (out, rows_in, held) = if keys.is_empty() {
+                stream_distinct(build_with(input, ctx)?, ctx)?
+            } else {
+                let batches = drain_within_budget(
+                    build_with(input, ctx)?,
+                    ctx.budget,
+                    "the streaming distinct does not spill",
+                )?;
+                let (rows_in, held) = (crate::count_rows(&batches), crate::batch_bytes(&batches));
+                match batches.is_empty() {
+                    true => (Vec::new(), rows_in, held),
+                    false => (
+                        ops::parallel_distinct_on(&batches, keys, order)?,
+                        rows_in,
+                        held,
+                    ),
+                }
+            };
+            // Nothing reached the operator at all: defer, so the oracle supplies the
+            // correctly-typed empty relation rather than a schema-less nothing.
+            if out.is_empty() {
                 return exec_deferred_breaker(plan, ctx);
             }
-            let rows_in = crate::count_rows(&batches);
-            let held = crate::batch_bytes(&batches);
-            let out = match keys.is_empty() {
-                true => ops::parallel_distinct(&batches)?,
-                false => ops::parallel_distinct_on(&batches, keys, order)?,
-            };
             if let (Some(m), Some(id)) = (ctx.meter, id) {
                 m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
             }
@@ -453,13 +364,31 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
         // same mergeable dedup as `Distinct`, so parallelize it here too rather than on the
         // single-threaded oracle. Branches are coerced to the common supertype first (exactly as
         // the oracle does), then deduped in parallel; over an envelope the spilling executor takes
-        // over (`check_budget`). `UNION ALL` (`distinct: false`) just streams the concat and stays
-        // on the deferred path below. Without this a large `UNION` ran single-threaded — ~6x DuckDB.
+        // over (`check_budget`). Without this a large `UNION` ran single-threaded — ~6x DuckDB.
         RelOp::Union {
             inputs,
             distinct: true,
         } => {
             let t = Instant::now();
+            // The concat half of a `UNION DISTINCT` is a `UNION ALL`, and the dedup half is a
+            // whole-row `DISTINCT`. Both already stream, so composing them streams: fold the
+            // union's morsels into the dedup's survivors and hold neither branch. The `None` id
+            // keeps the union's own metric a *breaker* record made below rather than a
+            // per-morsel pipeline one — this operator does hold state, unlike a `UNION ALL`.
+            //
+            // `build_union_all` declines when the branch types cannot be settled from a peeked
+            // morsel each, which is the one thing the drained path below can do that this
+            // cannot; that path stays for exactly those.
+            if let Some(stream) = union_all::build_union_all(inputs, ctx, None)? {
+                let (out, rows_in, held) = stream_distinct(stream, ctx)?;
+                if out.is_empty() {
+                    return exec_deferred_breaker(plan, ctx);
+                }
+                if let (Some(m), Some(id)) = (ctx.meter, id) {
+                    m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
+                }
+                return Ok(out);
+            }
             let inner = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget).with_mats(ctx.mats);
             let mut all = Vec::new();
             let mut held_so_far: u64 = 0;
@@ -488,16 +417,33 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             Ok(out)
         }
 
-        // Everything else — `Window`, `Sample`, `AsofJoin`, `UNION ALL` — is run by the
-        // sequential oracle over this subtree.
+        // A fixed-count `SAMPLE n` keeps the `n` smallest-hash rows of the whole relation, so it
+        // cannot be drawn per morsel — a per-morsel draw would keep `n` rows from *every* morsel,
+        // which is a different sample rather than a faster one. But it is a top-N by hash, and
+        // `sample_n_batches` already computes it with a bounded heap, so it folds exactly as the
+        // top-N does and its state is the `n` rows it is keeping. See `folds::stream_sample_n`.
+        RelOp::Sample {
+            input,
+            seed,
+            n: Some(n),
+            ..
+        } => {
+            let t = Instant::now();
+            let (out, rows_in, held) = stream_sample_n(build_with(input, ctx)?, *n, *seed, ctx)?;
+            if let (Some(m), Some(id)) = (ctx.meter, id) {
+                m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
+            }
+            Ok(out)
+        }
+
+        // Everything else — `Window` and `AsofJoin` — is run by the sequential oracle over this
+        // subtree.
         //
         // That is a deliberate boundary, not an oversight. Each has a reason its streaming form
-        // is more than a scheduling change: `Distinct` and `Window` need the spill-aware state the
-        // oracle already threads; `Sample` draws against the whole relation, so a per-morsel draw
-        // would be a *different* sample, not a faster one; `Union` must coerce its branches to a
-        // common supertype it cannot know until it has seen them; `AsofJoin` orders both sides.
-        // Handing them to the oracle keeps this executor honest — it streams what it can prove it
-        // may, and defers the rest rather than guessing.
+        // is more than a scheduling change: `Window` needs the spill-aware state the oracle
+        // already threads, and `AsofJoin` orders both sides. Handing them to the oracle keeps
+        // this executor honest — it streams what it can prove it may, and defers the rest rather
+        // than guessing.
         //
         // But the oracle materializes the whole subtree in RAM, so under a memory envelope it
         // would OOM exactly where the spilling parallel executor survives (`Distinct`,
@@ -522,29 +468,37 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
 /// (`budget == 0`) there is nothing to enforce and no spill path to prefer, so the subtree defers
 /// to the oracle unchanged.
 fn exec_deferred_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch>, InterpError> {
-    if ctx.budget == 0 {
-        return crate::execute(plan, ctx.sources);
-    }
+    let t = Instant::now();
+    let id = ctx.id(plan);
     let children = plan.children();
-    // Drain each child with a meter-less context: a deferred subtree reports no metrics on this
-    // tier (the oracle emits its own), and draining to measure must not change that. The drained
-    // batches are the same bytes the oracle would hold, so they are the honest quantity to budget.
-    let measure = Ctx::new(ctx.sources, ctx.cache, None, ctx.budget).with_mats(ctx.mats);
+    // Drain each child through **this** executor, whether or not there is an envelope to
+    // enforce. Handing the whole subtree to `crate::execute` instead — which is what the
+    // unbudgeted case used to do, and `budget == 0` is the default — threw away the streaming
+    // of everything below: the oracle is a tree-walk that returns every operator's full output,
+    // so a `WINDOW` over a chain of joins held every one of those joins' results at once, on a
+    // path whose entire purpose is not to. Only the deferred operator itself needs its input
+    // materialized, and only its own input.
+    let measure = Ctx::new(ctx.sources, ctx.cache, ctx.meter, ctx.budget).with_mats(ctx.mats);
     let mut drained: Vec<Vec<RecordBatch>> = Vec::with_capacity(children.len());
     let mut held: u64 = 0;
     for child in &children {
         // Budget against what the earlier children already hold: the oracle will hold all of
         // them at once, and draining a child that alone exceeds the envelope OOMs before the
-        // check below could hand the query to the executor that spills.
-        let remaining = ctx.budget.saturating_sub(held as usize);
+        // check below could hand the query to the executor that spills. `budget == 0` is
+        // "unbounded", where `drain_within_budget` is exactly `drain`.
+        let remaining = match ctx.budget {
+            0 => 0,
+            b => b.saturating_sub(held as usize).max(1),
+        };
         let batches = drain_within_budget(
             build_with(child, measure)?,
-            remaining.max(1),
+            remaining,
             "this streaming breaker does not spill",
         )?;
         held += crate::batch_bytes(&batches);
         drained.push(batches);
     }
+    let rows_in = drained.iter().map(|b| crate::count_rows(b)).sum::<u64>();
 
     // Within budget: run the oracle over the drained inputs, wired in as synthetic scans so the
     // top operator runs exactly once over exactly the rows the oracle would have produced —
@@ -555,7 +509,16 @@ fn exec_deferred_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch>,
     };
     let mut sources: Vec<Vec<RecordBatch>> = ctx.sources.to_vec();
     sources.extend(drained);
-    crate::execute(&rewritten, &sources)
+    let out = crate::execute(&rewritten, &sources)?;
+    if let (Some(m), Some(id)) = (ctx.meter, id) {
+        // The deferred operators used to report nothing at all on this tier: the oracle they
+        // are handed to emits into its own `ExecMetrics`, which this executor never reads. A
+        // `WINDOW` or an `ASOF JOIN` therefore left a hole in exactly the feedback Kyber
+        // re-plans from. Its peak genuinely is its held input plus its result — the operator
+        // materializes, that is why it is here — so the number is honest as well as present.
+        m.breaker(id, rows_in, 0, held, &out, t.elapsed().as_nanos() as u64);
+    }
+    Ok(out)
 }
 
 /// Clone a deferred breaker with each child subtree replaced by a `Scan` of a synthetic source

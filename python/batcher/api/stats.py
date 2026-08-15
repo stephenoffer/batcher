@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from batcher._internal.mathx import safe_div
+from batcher._internal.optional import require
 from batcher.plan.profile import QueryUsage
 
 if TYPE_CHECKING:
@@ -319,11 +320,12 @@ class RunStats:
         Raises:
             ImportError: If pandas is not installed.
         """
-        try:
-            import pandas as pd
-        except ImportError as exc:
-            msg = "RunStats.to_pandas() needs pandas — install it, or use to_dict() instead"
-            raise ImportError(msg) from exc
+        pd = require(
+            "pandas",
+            feature="RunStats.to_pandas()",
+            provides="pandas",
+            extra="pandas",
+        )
         return pd.DataFrame([o.to_dict() for o in self.ops])
 
     def __repr__(self) -> str:

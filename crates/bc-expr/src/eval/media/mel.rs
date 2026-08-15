@@ -126,33 +126,13 @@ pub(crate) fn mel_spectrogram(
     n_mels: usize,
 ) -> (Vec<f32>, usize) {
     let n_freqs = n_fft / 2 + 1;
-    let window = hann_periodic(n_fft);
     let fb = mel_filterbank(n_fft, n_mels, sample_rate, 0.0, sample_rate / 2.0);
-
-    // center=True: reflect-pad n_fft/2 each side, then frames start at 0, hop apart.
-    let padded = reflect_pad(signal, n_fft / 2);
-    let n_frames = if padded.len() < n_fft {
-        0
-    } else {
-        1 + (padded.len() - n_fft) / hop
-    };
-
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(n_fft);
-    let mut input = r2c.make_input_vec();
-    let mut spectrum = r2c.make_output_vec();
+    let stft = Stft::new(n_fft, hop);
+    let n_frames = stft.frame_count(signal);
 
     // Output laid out (n_mels, n_frames) row-major: mel band m, frame t → m*n_frames + t.
     let mut out = vec![0f32; n_mels * n_frames];
-    for t in 0..n_frames {
-        let start = t * hop;
-        for i in 0..n_fft {
-            input[i] = padded[start + i] * window[i];
-        }
-        // realfft overwrites `input`; that's fine, it is rebuilt every frame.
-        r2c.process(&mut input, &mut spectrum).expect("rfft length");
-        // Power spectrum |X|² per bin, then project through the mel filterbank.
-        let power: Vec<f32> = (0..n_freqs).map(|k| spectrum[k].norm_sqr()).collect();
+    stft.frames(signal, |t, power| {
         for (m, filt) in fb.iter().enumerate() {
             let mut acc = 0f32;
             for k in 0..n_freqs {
@@ -160,8 +140,85 @@ pub(crate) fn mel_spectrogram(
             }
             out[m * n_frames + t] = acc;
         }
-    }
+    });
     (out, n_frames)
+}
+
+/// The short-time Fourier transform every spectral feature in this module reads.
+///
+/// It exists as a type rather than as a loop inside [`mel_spectrogram`] because five
+/// different answers — the mel spectrogram, the MFCCs, the linear spectrogram, and the
+/// spectral centroid/rolloff/flatness/bandwidth scalars — are all the same framing, the
+/// same periodic Hann window, and the same reflect padding, read differently. Restating
+/// that in each of them is how two features of one clip come to disagree about which
+/// samples they looked at.
+///
+/// The conventions are `torchaudio`'s defaults, because the mel front end that has to match
+/// a pretrained model set them: a **periodic** Hann window, `center=True` reflect padding of
+/// `n_fft/2` on each side, and frames `hop` apart starting at sample 0.
+pub(crate) struct Stft {
+    n_fft: usize,
+    hop: usize,
+    window: Vec<f32>,
+}
+
+impl Stft {
+    pub(crate) fn new(n_fft: usize, hop: usize) -> Self {
+        Self {
+            n_fft,
+            hop,
+            window: hann_periodic(n_fft),
+        }
+    }
+
+    /// The number of bins one frame's power spectrum carries (`n_fft/2 + 1`).
+    pub(crate) fn n_freqs(&self) -> usize {
+        self.n_fft / 2 + 1
+    }
+
+    /// How many frames `signal` yields, without transforming any of them.
+    ///
+    /// Separate from [`Self::frames`] so a caller can size its output buffer before the
+    /// callback starts writing into it — which is what lets the mel projection write
+    /// directly into its final `(n_mels, n_frames)` layout instead of transposing later.
+    pub(crate) fn frame_count(&self, signal: &[f32]) -> usize {
+        let padded = signal.len() + 2 * (self.n_fft / 2);
+        if signal.is_empty() || padded < self.n_fft {
+            0
+        } else {
+            1 + (padded - self.n_fft) / self.hop
+        }
+    }
+
+    /// Call `f(frame_index, power_spectrum)` for each frame, in order.
+    ///
+    /// A callback rather than a returned `Vec<Vec<f32>>`: one FFT plan, one scratch buffer
+    /// and one power buffer serve the whole clip, so a minute of 16 kHz audio costs three
+    /// allocations rather than three thousand.
+    pub(crate) fn frames(&self, signal: &[f32], mut f: impl FnMut(usize, &[f32])) {
+        let n_frames = self.frame_count(signal);
+        if n_frames == 0 {
+            return;
+        }
+        let padded = reflect_pad(signal, self.n_fft / 2);
+        let mut planner = RealFftPlanner::<f32>::new();
+        let r2c = planner.plan_fft_forward(self.n_fft);
+        let mut input = r2c.make_input_vec();
+        let mut spectrum = r2c.make_output_vec();
+        let mut power = vec![0f32; self.n_freqs()];
+        for t in 0..n_frames {
+            let start = t * self.hop;
+            for i in 0..self.n_fft {
+                input[i] = padded[start + i] * self.window[i];
+            }
+            // realfft overwrites `input`; that is fine, it is rebuilt every frame.
+            r2c.process(&mut input, &mut spectrum).expect("rfft length");
+            for (k, p) in power.iter_mut().enumerate() {
+                *p = spectrum[k].norm_sqr();
+            }
+            f(t, &power);
+        }
+    }
 }
 
 /// `torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)` applied in place:

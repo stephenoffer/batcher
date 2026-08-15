@@ -18,7 +18,9 @@ ratios alongside the methodology above, not on their own:
 
 | Shape | Winner |
 |---|---|
-| Image decode → tensor | Batcher, 2.4× |
+| Image decode → tensor | Batcher, 1.9×–2.4× (machine-dependent) |
+| Image curation / augmentation | Batcher, 5.7× — Daft has no native equivalent |
+| Audio preprocessing | Batcher — Daft has no native audio surface |
 | Top-N / sort-limit | Batcher, 8x to 10x |
 | In-memory filter / sum kernels | Batcher, 6.7× / 18× |
 | Global aggregate, group-by, expression ETL | Tie |
@@ -47,6 +49,41 @@ This path started at about 350 img/s, and five fixes took it to 5,693. The one t
 for the comparison is the media-decode throttle: the per-row decode kernels ran serially, and
 the parallel executor capped its rayon pool to the morsel count. A small-JPEG corpus is a
 single morsel, so the entire decode ran on one core. See {doc}`/benchmarks/results/multimodal-ingest` for the rest.
+
+A later run of the same benchmark on a **busy** 96-core node (18 to 22 competing test
+processes, load average 13) measured 3,041 to 3,427 img/s against Daft's 2,272 to 2,625, so
+**1.3x**. Both numbers are real: contention costs the wider engine more than the narrower
+one, so read the lower figure as a floor.
+
+Profiling that 1.3x found that most of the remaining gap was not decode. Two things on the
+*read* side cost more than the kernels they fed: the per-file header parse ran regardless of
+whether the projection asked for it, and local file reads were fanned across a thread pool,
+which is right for an object store and **2.5x slower** than a serial loop for a syscall on
+page cache (2,000 local JPEGs: 52 ms serial, 118 ms on 8 threads, 130 ms on 64). Both are
+fixed. On the same busy node, load 13 to 17:
+
+| Engine | Time | Throughput | Batcher's lead |
+|---|---:|---:|:---:|
+| **Batcher** | 418-430 ms | 4,649-4,788 img/s | baseline |
+| Daft | 780-845 ms | 2,368-2,565 img/s | **1.9x** |
+
+Take the ratio you can reproduce on your own hardware rather than any of ours.
+
+## Curation and augmentation
+
+The comparison changes shape once the pipeline moves past decode. Daft has no native entropy
+measure, perceptual hash, or photometric adjustment, so the screening-and-augmentation pass a
+corpus needs is a per-row PIL UDF for a Daft user. Against that baseline — the same three
+measures, on the same bytes — Batcher's native expressions run **5.7x** faster
+(1,298 ms against 7,361 ms for 2,000 frames):
+
+```bash
+python benchmarks/scenarios/image_decode.py --suite curate
+```
+
+This is a vocabulary difference before it is a speed difference. `entropy`, `phash`,
+`ahash`, `colorfulness`, `mean_color`, `is_grayscale`, the eleven photometric adjustments
+and the geometry family are engine expressions here and user code there.
 
 ## In-memory kernels
 

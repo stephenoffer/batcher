@@ -505,5 +505,3 @@ def _unstreamable_reason(plan: LogicalPlan) -> str:
         "with_columns / map_batches, or a single top-level aggregate, distinct, limit or "
         "top-N over one of those."
     )
-
-

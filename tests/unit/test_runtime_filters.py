@@ -128,6 +128,18 @@ def _is_empty(plan) -> bool:
     return any(isinstance(n, Limit) and n.n == 0 for n in walk(plan))
 
 
+def _result_is_empty(plan) -> bool:
+    """Whether the plan's *result* is the empty marker, as opposed to some input being.
+
+    `_is_empty` walks the whole tree, which conflates two very different outcomes once a
+    rule can empty one side of a join. Emptying the non-preserved input of an outer join
+    is a *win* — those rows provably match nothing, so the join reads them for no reason —
+    while emptying the join itself deletes the preserved side's answer. Only the second is
+    a defect, and only the root can tell them apart.
+    """
+    return isinstance(plan, Limit) and plan.n == 0
+
+
 def _fact():
     return bt.from_pydict({"k": [1, 2, 2, 3], "v": [10, 20, 30, 40]})
 
@@ -473,10 +485,33 @@ def test_all_null_key_needs_exact_provenance():
 
 
 def test_all_null_key_does_not_empty_a_left_join():
-    # The preserved side's rows survive a no-match join — emptying an input deletes the answer.
+    """The preserved side survives: the *join* must not be folded away.
+
+    Its all-null right input may be — and now is, since `_is_null_status` decides the
+    `IS NOT NULL` that `filter_null_join_keys` pushes onto the non-preserved side. That is
+    sound and desirable: no right row can match a null key, so a left join over an empty
+    right emits exactly what one over an all-null right emits, every left row padded with
+    nulls, without reading the right at all. The hazard this guards is the *result* being
+    emptied, which `empty_join_from_all_null_key` excludes outer joins to avoid — so the
+    assertion is on the root, not on the presence of a marker anywhere in the tree.
+    """
     ds = _fact().join(_dim(), on="k", how="left")
     right = _kstat(3, null_count=3, provenance=Provenance.EXACT)
-    assert not _is_empty(_rewrite(ds, [None, right]))
+    plan = _rewrite(ds, [None, right])
+    assert not _result_is_empty(plan)
+    assert isinstance(plan, Join)
+
+
+def test_all_null_key_left_join_still_returns_the_preserved_side():
+    """The claim above, executed rather than asserted about a plan shape.
+
+    A wrong answer here is four missing rows, which no plan-shape assertion can see.
+    """
+    dim = bt.from_pydict({"k": [None, None, None], "w": [5, 6, 7]})
+    out = _fact().join(dim, on="k", how="left").collect().to_pydict()
+    assert out["k"] == [1, 2, 2, 3]
+    assert out["v"] == [10, 20, 30, 40]
+    assert out["w"] == [None, None, None, None]
 
 
 def test_disjoint_key_value_sets_empty_the_join():

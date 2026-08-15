@@ -125,3 +125,49 @@ def test_every_category_in_the_table_is_reachable_and_complete():
         # anything else would be a silent "give up" with no explanation attached.
         if not record.retryable:
             assert name == "application"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        KeyError("timeout"),
+        AssertionError("expected status 429, got 200"),
+        TypeError("cannot concat 'connection reset by peer' to int"),
+        AttributeError("'NoneType' object has no attribute 'cuda out of memory'"),
+        IndexError("list index out of range"),
+        ZeroDivisionError("division by zero"),
+    ],
+)
+def test_a_deterministic_error_is_not_retried_for_words_in_its_message(exc):
+    # The message of these types is *data*, not diagnosis: a `KeyError`'s message is the key
+    # that was missing, so a UDF doing `config["timeout"]` against a dict that lacks it
+    # raises exactly `KeyError: 'timeout'`. The marker scan read that as the `timeout`
+    # category and declared it retryable — the deterministic bug retried across the whole
+    # fleet that this module's docstring calls the more expensive mistake. Each of these
+    # fails identically on every worker no matter what string it carries.
+    assert c.failure_class(exc) == "application"
+    assert c.is_retryable(exc) is False
+
+
+def test_suppressing_the_text_scan_still_lets_a_wrapped_cause_win():
+    # Only the *text* scan is suppressed, never the chain walk: a real transient wrapped in
+    # a deterministic type must still classify by its cause, or the fix above would trade
+    # one misclassification for its mirror image.
+    try:
+        try:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        except ConnectionResetError as inner:
+            raise KeyError("timeout") from inner
+    except KeyError as exc:
+        assert c.failure_class(exc) == "network"
+        assert c.is_retryable(exc) is True
+
+
+def test_rays_synthesized_wrapper_is_still_scanned_by_text():
+    # Ray fuses the remote type into its wrapper's *name* (`RayTaskError(TypeError)`), which
+    # is not an exact match for a bare `TypeError`, so a remote failure's formatted
+    # worker-side traceback is still read exactly as it was before.
+    wrapper = type("RayTaskError(TypeError)", (RuntimeError,), {})
+    exc = wrapper("ray::task() ... RuntimeError: CUDA out of memory")
+    assert c.failure_class(exc) == "device_oom"
+    assert c.is_retryable(exc) is True

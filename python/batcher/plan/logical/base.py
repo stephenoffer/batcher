@@ -18,11 +18,17 @@ from typing import TYPE_CHECKING, Any
 from batcher._internal.errors import ColumnNotFoundError, PlanError
 from batcher.plan.expr_ir import Col, Expr
 from batcher.plan.expr_ir import referenced_columns as _referenced_columns
+from batcher.plan.types import infer_type, widen
 
 if TYPE_CHECKING:
     from batcher.plan.schema import SchemaRef
 
-__all__ = ["LogicalPlan", "SortKeySpec"]
+__all__ = [
+    "LogicalPlan",
+    "SortKeySpec",
+    "validate_dedup_keys",
+    "validate_key_domains",
+]
 
 # Sentinel distinguishing "not yet cached" from a cached `None` (an `available_schema`
 # that legitimately returns "unknown").
@@ -272,3 +278,54 @@ class SortKeySpec:
     expr: Expr
     descending: bool = False
     nulls_first: bool = False
+
+
+def validate_key_domains(source, keys, *, operation: str) -> None:
+    """Reject a key column whose type the row encoder cannot encode, at build time.
+
+    Grouping, `DISTINCT` and hash joins all identify rows through one encoder, so they share
+    one rule (`plan.types.domains.key_domain_error`) rather than three transcriptions of it.
+    Silent when the input's types are not known, exactly as `_validate_agg_input_types` is:
+    a plan that cannot be typed statically is not a plan to guess about.
+
+    Args:
+        source: The plan node the keys are resolved against.
+        keys: The key expressions (anything `infer_type` accepts).
+        operation: What is being attempted, named in the message.
+    """
+    from batcher.plan.types.domains import key_domain_error
+
+    schema = source.available_schema()
+    if schema is None:
+        return
+    for expr, label in keys:
+        dt = infer_type(expr, schema)
+        if dt is None:
+            continue
+        problem = key_domain_error(label, widen(dt), operation)
+        if problem is not None:
+            raise PlanError(problem)
+
+
+def validate_dedup_keys(node: LogicalPlan, keys, *, operation: str) -> None:
+    """Reject a dedup whose keys — or whose whole schema — the key encoder cannot encode.
+
+    The two set operations differ only in *which* columns are keys, and a caller should not
+    have to know that: a keyed `DISTINCT ON` keys on `keys`, while a whole-row `DISTINCT`
+    and a `UNION` with `distinct=True` collapse rows that agree everywhere and therefore key
+    on the entire schema. Empty `keys` means the whole relation, which is exactly what both
+    of those pass.
+
+    A `UNION` checks every branch rather than the first. The branches are positionally
+    aligned and type-coerced, so a `map` in any one of them is a `map` in the deduped
+    output, and checking only branch 0 would admit a union whose second branch carries one.
+
+    Args:
+        node: The relation being deduplicated.
+        keys: The key column names, or empty for "every column".
+        operation: What is being attempted, named in the message.
+    """
+    from batcher.plan.expr_ir import col as _col
+
+    names = tuple(keys) or tuple(node.available_columns())
+    validate_key_domains(node, [(_col(n), n) for n in names], operation=operation)

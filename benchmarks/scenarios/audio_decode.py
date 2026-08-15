@@ -167,8 +167,8 @@ def main() -> int:
     rspeedup = rpy_ms / rbt_ms if rbt_ms else float("inf")
     print(f"\n  resample to {_TARGET_SR} Hz ({rbt_frames:,} output frames):")
     print(f"  {'batcher (native sinc)':<26} {rbt_ms:>10.1f}")
-    print(f"  {'python (soundfile+librosa)':<26} {rpy_ms:>10.1f}")
-    print(f"\n  RESAMPLE: batcher is {rspeedup:.1f}x faster than soundfile+librosa.")
+    print(f"  {'python (soundfile+soxr)':<26} {rpy_ms:>10.1f}")
+    print(f"\n  RESAMPLE: batcher is {rspeedup:.1f}x faster than soundfile+soxr.")
     return 0
 
 

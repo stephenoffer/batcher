@@ -180,6 +180,9 @@ impl Expr {
                 std,
                 channels_first,
                 format,
+                mode,
+                quality,
+                factor,
                 fill,
             } => {
                 let arr = input.eval(batch)?;
@@ -193,6 +196,9 @@ impl Expr {
                         std: std.as_deref(),
                         channels_first: *channels_first,
                         format: format.as_deref(),
+                        mode: mode.as_deref(),
+                        quality: *quality,
+                        factor: *factor,
                         fill: *fill,
                     },
                 )
@@ -206,17 +212,25 @@ impl Expr {
                 n_mels,
                 n_mfcc,
                 threshold_db,
+                factor,
+                offset_secs,
+                duration_secs,
             } => {
                 let arr = input.eval(batch)?;
                 eval_audio(
                     *func,
                     &arr,
-                    *rate,
-                    *n_fft,
-                    *hop_length,
-                    *n_mels,
-                    *n_mfcc,
-                    *threshold_db,
+                    crate::eval::media::AudioArgs {
+                        rate: *rate,
+                        n_fft: *n_fft,
+                        hop: *hop_length,
+                        n_mels: *n_mels,
+                        n_mfcc: *n_mfcc,
+                        threshold_db: *threshold_db,
+                        factor: *factor,
+                        offset_secs: *offset_secs,
+                        duration_secs: *duration_secs,
+                    },
                 )
             }
             Expr::ImageCrop {

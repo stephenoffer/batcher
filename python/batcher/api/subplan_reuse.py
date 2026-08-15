@@ -24,6 +24,7 @@ terminal built on it. Deliberately not the other two routes, and neither is an o
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import threading
 import weakref
@@ -35,6 +36,7 @@ from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.io.source import InMemorySource, Source
 from batcher.plan.logical import LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
+from batcher.plan.types import logical_bytes, retained_bytes
 from batcher.plan.visitor import children, transform_up, walk
 
 __all__ = ["reuse_common_subplans"]
@@ -231,7 +233,12 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
         table = _materialize(appearances[0], srcs, ctx)
         if table is None:
             continue
-        held += table.nbytes
+        # `retained_bytes`: a cached subplan is *held* for the query's lifetime, so the
+        # figure the budget needs is what it pins, not what its rows address. A result cut
+        # zero-copy out of a larger table reports a fraction of what it keeps resident, and
+        # the budget would then admit several such tables and hold gigabytes under a
+        # 256 MiB cap — the OOM the cap exists to prevent, reached through the cap itself.
+        held += retained_bytes(table)
         if held > cfg.common_subplan_max_bytes:
             log_kv(
                 _log,
@@ -246,14 +253,21 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
         # this relation lives for one query, so an O(rows) min/max pass over it would be
         # recomputed and discarded on every run, and its identity must not seed a
         # distinct-count sketch that outlives it.
-        srcs.append(InMemorySource(_batches(table), zone_maps=False, ephemeral=True))
+        srcs.append(
+            InMemorySource(
+                _batches(table),
+                zone_maps=False,
+                ephemeral=True,
+                derivation=_derivation(appearances[0], srcs),
+            )
+        )
         plan = _replace_all(plan, appearances, Scan(sid, SchemaRef.from_arrow(table.schema)))
         log_kv(
             _log,
             logging.DEBUG,
             "subplan reused",
             rows=table.num_rows,
-            bytes=table.nbytes,
+            bytes=logical_bytes(table),
             op=type(appearances[0]).__name__,
         )
     return plan, srcs
@@ -375,6 +389,34 @@ def _materialize(target: LogicalPlan, sources: list[Source], ctx) -> pa.Table | 
         note_suppressed("api", "materialize a shared subplan", exc)
         return None
     return table if isinstance(table, pa.Table) else None
+
+
+def _derivation(target: LogicalPlan, sources: list[Source]) -> str | None:
+    """A name for *how* this intermediate was derived, or `None` if it cannot be named.
+
+    The relation lives for one execution, so it is `ephemeral` — but the next execution of the
+    same query derives the identical relation from the identical inputs, and this string says
+    so: the subplan's own content key over the data-stable keys of the sources it reads. That
+    is what lets `kyber.plan_cache` memoize the plan built *over* the intermediate, which is
+    otherwise the one optimize a repeated query can never skip. On TPC-DS q77 it is the second
+    of two, and it ran in full on every execution forever.
+
+    `None` — no caching, exactly as before — when any input cannot key itself, because then
+    two different relations could produce the same name. The safe direction is the one that
+    re-plans.
+    """
+    from batcher.plan.source_stats import source_stats_key
+    from batcher.plan.visitor import scanned_source_ids
+
+    parts = [target.content_key()]
+    for sid in sorted(scanned_source_ids(target)):
+        if sid >= len(sources):
+            return None
+        key = source_stats_key(sources[sid])
+        if key is None:
+            return None
+        parts.append(f"{sid}={key}")
+    return hashlib.blake2b("|".join(parts).encode(), digest_size=16).hexdigest()
 
 
 def _batches(table: pa.Table) -> list[pa.RecordBatch]:

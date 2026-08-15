@@ -93,6 +93,36 @@ def _pushdown(plan: LogicalPlan) -> list[str] | None:
     return kyber.required_columns_per_source(plan).get(0)
 
 
+def _window_latency(source: Source) -> float | None:
+    """How long a `map_batches` window may wait before flushing, or `None` for no bound.
+
+    Only an **unbounded** source gets a bound. `stream_windowed`'s row and byte budgets are
+    size questions, and over a bounded input they are the right ones: a whole window's worth
+    of rows is always on its way, so filling one costs nothing but memory the budget already
+    caps. Over a stream the same budgets are a *duration* — 4,000,000 rows at 2,000 rows/s is
+    33 minutes with no output and no diagnostic — because a stream is bounded in rate rather
+    than in size. Returning `None` for a bounded source keeps the batch path byte-for-byte as
+    it was, so the responsiveness is bought only where it is needed.
+
+    Non-positive configuration disables the bound rather than flushing every batch, which is
+    what makes `0` a way to restore the pure size-based window instead of a way to destroy
+    the UDF parallelism the window exists to create.
+
+    Args:
+        source: The bound input the window reads.
+
+    Returns:
+        The latency bound in seconds, or `None` when the window should close on size alone.
+    """
+    from batcher.config import active_config
+    from batcher.io.source import is_bounded
+
+    if is_bounded(source):
+        return None
+    latency = float(active_config().streaming.max_window_latency_seconds)
+    return latency if latency > 0.0 else None
+
+
 def _iter_streaming(
     plan: LogicalPlan, sources: list[Source], batch_size: int | None
 ) -> Iterator[pa.RecordBatch]:
@@ -143,7 +173,12 @@ def _iter_streaming(
             # `None` here and still reads everything, which is the only safe answer for a
             # black box.
             yield from stream_windowed(
-                source, run_window, target_rows, batch_size, projection=_pushdown(plan)
+                source,
+                run_window,
+                target_rows,
+                batch_size,
+                projection=_pushdown(plan),
+                latency_seconds=_window_latency(source),
             )
         finally:
             # `prebuild_factories` made this generator the models' owner, and `teardown_udf`

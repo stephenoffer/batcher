@@ -26,7 +26,6 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
 from batcher.config import active_config
 
 __all__ = ["ScanSource", "offset_windows", "rows_to_batches", "schema_from_rows"]
@@ -50,14 +49,12 @@ def require_driver(module: str, extra: str) -> Any:
     Raises:
         BackendError: If the driver is not installed.
     """
-    import importlib
+    from batcher._internal.optional import require
 
-    try:
-        return importlib.import_module(module)
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BackendError(
-            f"{module} is required for this source: pip install 'batcher-engine[{extra}]'"
-        ) from exc
+    # Through the one guard rather than a third copy of it: `require` raises
+    # `MissingDependencyError`, which is an `ImportError` as well as a `BackendError` and
+    # carries the install command in a field a caller can surface its own way.
+    return require(module, feature=f"The {extra} source", provides=module, extra=extra)
 
 
 def rows_to_batches(

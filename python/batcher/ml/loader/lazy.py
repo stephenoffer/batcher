@@ -10,7 +10,9 @@ hang the job.
 
 from __future__ import annotations
 
+import contextlib
 import warnings
+import weakref
 from collections.abc import Iterable, Iterator
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -19,11 +21,12 @@ from batcher._internal.errors import PlanError
 from batcher._internal.prefetch import prefetch
 from batcher.ml.loader.tensors import DeviceMover
 from batcher.ml.permutation import _mix64
+from batcher.plan.types import retained_bytes
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
-__all__ = ["iter_torch_batches", "streaming_split"]
+__all__ = ["cast_arrays", "iter_torch_batches", "numpy_batch_stream", "streaming_split"]
 
 DEFAULT_BATCH_ROWS = 1024
 # Ceiling on the *bytes* a local-shuffle block may hold, independent of the row count the
@@ -36,6 +39,11 @@ DEFAULT_BATCH_ROWS = 1024
 # OOM. Cutting a block early only *narrows* the shuffle window; it never drops or repeats a
 # row, so the stream's contents are unchanged.
 _SHUFFLE_BLOCK_MAX_BYTES = 256 << 20
+
+#: How long the fan-out producer parks on a full rank queue before re-checking whether every
+#: consumer has walked away. Only ever paid by a producer that has already filled its
+#: look-ahead, so it delays nothing anyone is waiting for.
+_ABANDON_POLL_SECONDS = 0.1
 
 
 def iter_torch_batches(
@@ -117,7 +125,8 @@ def iter_torch_batches(
     # Fail fast with an actionable install hint if torch is absent, before any work.
     require("torch", feature="iter_torch_batches", provides="torch", extra="torch")
 
-    from batcher.ml.converters import arrays_to_torch, to_numpy_batches
+    from batcher.interop.arrays import _warn_dropped_non_numeric
+    from batcher.ml.converters import arrays_to_torch
 
     if batch_size is not None and batch_size < 1:
         # Guard the edge with a typed error; otherwise a `batch_size=0` surfaces deep in
@@ -127,32 +136,149 @@ def iter_torch_batches(
         # Without a target width there is no such thing as a "short" batch, and silently
         # keeping the ragged tail is exactly the failure `drop_last` was asked to prevent.
         raise PlanError("drop_last requires an explicit batch_size")
+    if columns is not None:
+        # At the edge, before the query starts. A name that is not a column otherwise
+        # surfaced as a bare pyarrow `KeyError` on the first `next()` — past the point where
+        # the engine had begun reading, and with no suggestion of what was meant.
+        from batcher.ml.stats._shared import require_names
+
+        require_names(list(dataset.columns), *columns, hint="Pass an existing column.")
 
     if device == "auto":
         from batcher.ml.gpu import torch_device
 
         device = torch_device()
-    arrow_batches = dataset.iter_batches(batch_size)
-    if local_shuffle_buffer_size:
-        out_rows = batch_size or DEFAULT_BATCH_ROWS
-        numpy_stream = _shuffle_to_numpy(
-            arrow_batches, local_shuffle_buffer_size, out_rows, _epoch_seed(seed, epoch), columns
-        )
-    else:
-        numpy_stream = to_numpy_batches(arrow_batches, columns=columns)
-    if drop_last:
-        numpy_stream = _full_batches_only(numpy_stream, batch_size)
+    numpy_stream = numpy_batch_stream(
+        dataset,
+        batch_size=batch_size,
+        columns=columns,
+        local_shuffle_buffer_size=local_shuffle_buffer_size,
+        seed=seed,
+        epoch=epoch,
+        drop_last=drop_last,
+    )
     move = device if device not in (None, "cpu") else None
     to_torch = partial(arrays_to_torch, zero_copy=zero_copy)
     cast = _dtype_caster(dtypes)
     depth = prefetch_batches if prefetch_batches else 0
     mover = DeviceMover(move, pin_memory=pin_memory, depth=depth) if move is not None else None
 
+    warn = collate_fn is None  # a collate_fn receives every column, so nothing is dropped
+
     def _build(arrays: dict) -> Any:
+        nonlocal warn
+        if warn:
+            # Once, on the first batch. Every other conversion path in the package announces
+            # the columns it cannot tensorize; this one dropped a string `label`/`id` in
+            # silence, so a training loop read a `KeyError` — or trained on what was left.
+            _warn_dropped_non_numeric(arrays)
+            warn = False
         out = collate_fn(arrays) if collate_fn is not None else cast(to_torch(arrays))
         return out if mover is None else mover(out)
 
     yield from prefetch((_build(a) for a in numpy_stream), depth)
+
+
+def numpy_batch_stream(
+    dataset: Dataset,
+    *,
+    batch_size: int | None = None,
+    columns: list[str] | None = None,
+    local_shuffle_buffer_size: int | None = None,
+    seed: int = 0,
+    epoch: int = 0,
+    drop_last: bool = False,
+) -> Iterator[dict]:
+    """The engine's output as ``{column: ndarray}`` batches, shuffled and sized to order.
+
+    Everything a framework loader needs before the framework enters the picture: the read,
+    the optional local shuffle, the exact batch width, and the ragged tail. Shared rather
+    than restated, because the TensorFlow path needs precisely the same four decisions the
+    PyTorch one does — and when it did not have them, ``to_tf`` was the only loader in the
+    package with no shuffle, no `drop_last`, and no dtype control.
+
+    Args:
+        dataset: The dataset to stream, consumed incrementally.
+        batch_size: Rows per yielded batch (engine default when None).
+        columns: Subset to convert (default: every column).
+        local_shuffle_buffer_size: Shuffle within blocks of this many rows before batching.
+        seed: Seed for that shuffle, combined with `epoch`.
+        epoch: Reshuffles the local-shuffle order, so successive passes differ.
+        drop_last: Drop a final batch narrower than `batch_size`.
+
+    Yields:
+        One ``{column: numpy.ndarray}`` dict per batch.
+    """
+    from batcher.ml.converters import to_numpy_batches
+
+    arrow_batches = dataset.iter_batches(batch_size)
+    if local_shuffle_buffer_size:
+        out_rows = batch_size or DEFAULT_BATCH_ROWS
+        stream: Iterator[dict] = _shuffle_to_numpy(
+            arrow_batches, local_shuffle_buffer_size, out_rows, _epoch_seed(seed, epoch), columns
+        )
+    else:
+        stream = to_numpy_batches(arrow_batches, columns=columns)
+    if drop_last and batch_size:
+        stream = _full_batches_only(stream, batch_size)
+    return stream
+
+
+def cast_arrays(stream: Iterator[dict], dtypes: dict[str, str] | str | None) -> Iterator[dict]:
+    """Cast a ``{column: ndarray}`` stream to the requested dtypes, before any framework.
+
+    The NumPy-space twin of `_dtype_caster`, and it resolves names through the same
+    `batcher.ml.devices.resolve_dtype`, so ``"fp16"`` means the same thing to the
+    TensorFlow loader that it means to the PyTorch one. Casting here rather than in the
+    framework also halves what crosses into it: a float64 feature column narrowed to
+    float32 is half the bytes tf.data has to copy.
+
+    Args:
+        stream: The batches to cast.
+        dtypes: One dtype name for every column, a ``{column: dtype}`` mapping, or None.
+
+    Yields:
+        The same batches, with the named columns cast.
+
+    Raises:
+        PlanError: If a requested dtype has no numeric NumPy equivalent (``bfloat16``).
+    """
+    if dtypes is None:
+        yield from stream
+        return
+    import numpy as np
+
+    from batcher.ml.devices import resolve_dtype
+
+    def _numpy_dtype(name: str) -> Any:
+        resolved = resolve_dtype(name)
+        try:
+            dtype = np.dtype(resolved)
+        except TypeError:
+            dtype = None
+        # Both halves matter, and the second is the one that bites. `bfloat16` is a
+        # framework dtype NumPy has no native equivalent for — but with `ml_dtypes`
+        # installed (TensorFlow depends on it) `np.dtype("bfloat16")` *succeeds* and yields
+        # kind ``"V"``, a void/opaque type. Every numeric check downstream then rejects the
+        # column, so asking for bf16 silently emptied the batch and reported every column as
+        # "non-numeric, dropped" rather than saying the dtype was the problem.
+        if dtype is None or dtype.kind not in "biuf":
+            raise PlanError(
+                f"dtype {name!r} resolves to {resolved!r}, which has no numeric NumPy "
+                "equivalent; leave it unset and cast inside the framework instead"
+            )
+        return dtype
+
+    if isinstance(dtypes, str):
+        target = _numpy_dtype(dtypes)
+        for batch in stream:
+            yield {k: v.astype(target, copy=False) for k, v in batch.items()}
+        return
+    resolved = {col: _numpy_dtype(name) for col, name in dtypes.items()}
+    for batch in stream:
+        yield {
+            k: (v.astype(resolved[k], copy=False) if k in resolved else v) for k, v in batch.items()
+        }
 
 
 def _dtype_caster(dtypes: dict[str, str] | str | None) -> Any:
@@ -188,9 +314,14 @@ def _epoch_seed(seed: int, epoch: int) -> int:
 
 
 def _full_batches_only(stream: Any, batch_size: int) -> Iterator[dict]:
-    """Drop batches narrower than `batch_size` — the ragged tail DDP cannot balance."""
+    """Drop batches narrower than `batch_size` — the ragged tail DDP cannot balance.
+
+    Measured once per batch rather than per column: `all()` over an empty column dict is
+    ``True``, so a batch that had been projected down to no columns counted as full and a
+    zero-row batch reached the training step.
+    """
     for arrays in stream:
-        if all(len(a) >= batch_size for a in arrays.values()):
+        if _row_count(arrays) >= batch_size:
             yield arrays
 
 
@@ -311,56 +442,106 @@ def _round_robin_split(
     The dataset is read once; a producer thread distributes complete rounds of `world_size`
     batches (one per rank). A trailing partial round is dropped (with a warning) or completed
     by repeating batches from the front of the round, per `drop_last` — either way every rank
-    yields an equal count. A producer error surfaces to every consumer."""
+    yields an equal count. A producer error surfaces to every consumer.
+
+    Abandonment winds the producer down. A training script that early-stops, raises, or simply
+    stops iterating used to strand this thread on a full queue for the life of the process,
+    holding an open engine stream and ``queue_depth * world_size`` batches of GPU-bound
+    tensors — once per call, and a script that builds a loader per epoch leaks one per epoch.
+    The producer now parks with a timeout and re-checks a stop flag, which is the same
+    wind-down `batcher._internal.prefetch` performs for the single-stream case.
+    """
     import queue
+    import threading
 
     from batcher._internal.concurrency import start_context_thread
 
     queues: list[queue.Queue] = [queue.Queue(maxsize=queue_depth) for _ in range(world_size)]
     state: dict = {"error": None}
     done = object()
+    stop = threading.Event()
+    open_ranks = set(range(world_size))
+    lock = threading.Lock()
+
+    def _offer(index: int, item: Any) -> bool:
+        """Hand one batch to a rank, giving up if every consumer has walked away."""
+        while not stop.is_set():
+            try:
+                queues[index].put(item, timeout=_ABANDON_POLL_SECONDS)
+            except queue.Full:
+                continue
+            return True
+        return False
 
     def _producer() -> None:
+        batches = iter_torch_batches(dataset, **loader_kwargs)
         try:
             round_: list = []
-            for batch in iter_torch_batches(dataset, **loader_kwargs):
+            for batch in batches:
                 round_.append(batch)
                 if len(round_) == world_size:
                     for i, item in enumerate(round_):
-                        queues[i].put(item)
+                        if not _offer(i, item):
+                            return
                     round_ = []
             if round_ and drop_last:
                 _warn_dropped_round(len(round_))
             elif round_:  # pad the round cyclically; every rank still gets exactly one
                 for i in range(world_size):
-                    queues[i].put(round_[i % len(round_)])
+                    if not _offer(i, round_[i % len(round_)]):
+                        return
         except Exception as exc:  # surface to every consumer
             state["error"] = exc
         finally:
-            for q in queues:
-                q.put(done)
+            # Close the engine stream we were pulling; on the abandonment path nothing else
+            # runs its `finally`, so the source stays open until the process exits.
+            close = getattr(batches, "close", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    close()
+            for i in range(world_size):
+                _offer(i, done)
 
     # The producer runs a Batcher pipeline (`iter_torch_batches`), so it has to see the same
     # `Config` the caller does. A bare thread reads every context variable at its default,
     # which silently dropped a `config_context` around the loader.
     start_context_thread(_producer, name="batcher-loader-producer", daemon=True)
 
-    def _rank_iter(q: queue.Queue) -> Any:
-        while True:
-            item = q.get()
-            if item is done:
-                if state["error"] is not None:
-                    raise state["error"]
-                return
-            yield item
+    def _release(index: int) -> None:
+        """Note that rank `index` has no consumer left, and stop the producer at the last."""
+        with lock:
+            open_ranks.discard(index)
+            if not open_ranks:
+                stop.set()
 
-    return [_rank_iter(q) for q in queues]
+    def _rank_iter(index: int) -> Any:
+        q = queues[index]
+        try:
+            while True:
+                item = q.get()
+                if item is done:
+                    if state["error"] is not None:
+                        raise state["error"]
+                    return
+                yield item
+        finally:
+            _release(index)
+
+    iterators = [_rank_iter(i) for i in range(world_size)]
+    # Registered against the generator *object*, not its body: a rank the caller never
+    # started has no `finally` to run — closing an unstarted generator does not execute it —
+    # so a fleet abandoned before the first `next()` on some rank would never release, and
+    # the producer would park forever holding the engine stream open. This fires whichever
+    # way the iterator goes away.
+    for i, iterator in enumerate(iterators):
+        weakref.finalize(iterator, _release, i)
+    return iterators
 
 
 def _shuffle_to_numpy(
     batches: Any, buffer_rows: int, out_rows: int, seed: int, columns: Any
-) -> Any:
-    """Local-shuffle a batch stream and yield ``{column: ndarray}`` batches directly.
+) -> Iterator[dict]:
+    """Local-shuffle a batch stream and yield ``{column: ndarray}`` batches of `out_rows`.
 
     A streaming approximation of a global shuffle: fill a block of ~`buffer_rows`, permute it
     once, emit it in `out_rows` chunks, repeat. The shuffle happens in **NumPy space** (one
@@ -370,7 +551,19 @@ def _shuffle_to_numpy(
     The block is bounded by `_SHUFFLE_BLOCK_MAX_BYTES` as well as by `buffer_rows`, so the
     caller's row count cannot turn into an unbounded allocation when the rows turn out to be
     decoded images or long sequences. Whichever bound binds first cuts the block.
+
+    Block boundaries do **not** reach the caller: a block's trailing remainder is carried into
+    the next one, so every batch but the last holds exactly `out_rows` rows. Emitting the
+    remainder as its own short batch made the batch width jump around mid-epoch — with
+    ``buffer_rows=50000`` and ``batch_size=1024`` every 49th batch was 848 rows — and, far
+    worse, `drop_last` then discarded that batch rather than a ragged tail, silently dropping
+    ~2% of every epoch throughout the stream instead of a few rows at the end.
     """
+    return _rebatch(_shuffled_blocks(batches, buffer_rows, seed, columns), out_rows)
+
+
+def _shuffled_blocks(batches: Any, buffer_rows: int, seed: int, columns: Any) -> Iterator[dict]:
+    """Yield each accumulated block once, as whole permuted ``{column: ndarray}`` columns."""
     import numpy as np
     import pyarrow as pa
 
@@ -378,14 +571,11 @@ def _shuffle_to_numpy(
 
     rng = np.random.RandomState(seed)
 
-    def _emit(chunks: list) -> Any:
+    def _permute(chunks: list) -> dict:
         table = pa.Table.from_batches(chunks)
         names = list(table.column_names) if columns is None else list(columns)
-        cols = {name: _column_to_numpy(table.column(name)) for name in names}
         perm = rng.permutation(table.num_rows)
-        for start in range(0, table.num_rows, out_rows):
-            idx = perm[start : start + out_rows]
-            yield {name: arr[idx] for name, arr in cols.items()}
+        return {name: _column_to_numpy(table.column(name))[perm] for name in names}
 
     block: list = []
     rows = 0
@@ -393,9 +583,40 @@ def _shuffle_to_numpy(
     for b in batches:
         block.append(b)
         rows += b.num_rows
-        nbytes += b.nbytes
+        nbytes += retained_bytes(b)
         if rows >= buffer_rows or nbytes >= _SHUFFLE_BLOCK_MAX_BYTES:
-            yield from _emit(block)
+            yield _permute(block)
             block, rows, nbytes = [], 0, 0
     if block:
-        yield from _emit(block)
+        yield _permute(block)
+
+
+def _rebatch(blocks: Iterator[dict], out_rows: int) -> Iterator[dict]:
+    """Cut a stream of ``{column: ndarray}`` blocks into batches of exactly `out_rows`.
+
+    The trailing rows of a block are held over and concatenated onto the next one, so only
+    the final batch of the whole stream may be short.
+    """
+    import numpy as np
+
+    carry: dict | None = None
+    for block in blocks:
+        if carry is not None:
+            block = {name: np.concatenate([carry[name], arr]) for name, arr in block.items()}
+            carry = None
+        total = _row_count(block)
+        start = 0
+        while total - start >= out_rows:
+            yield {name: arr[start : start + out_rows] for name, arr in block.items()}
+            start += out_rows
+        if start < total:
+            carry = {name: arr[start:] for name, arr in block.items()}
+    if carry is not None and _row_count(carry):
+        yield carry
+
+
+def _row_count(arrays: dict) -> int:
+    """Rows in a ``{column: ndarray}`` batch — 0 when it carries no columns."""
+    for arr in arrays.values():
+        return len(arr)
+    return 0

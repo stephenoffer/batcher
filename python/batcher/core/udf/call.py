@@ -167,6 +167,27 @@ def _formatted(fn: Any, fmt: str) -> Any:
 
 
 def _coerce_udf_result(result: object) -> list[pa.RecordBatch]:
+    """Normalize a `map_batches` return to Arrow batches the engine can import.
+
+    Two steps, deliberately separate. `_coerce_parts` decides *what shape* the user
+    returned; `importable_batch` then respells any Arrow **layout** the FFI reader cannot
+    take. A UDF is the one place a column type is chosen by user code rather than by a
+    source, so it is exactly where a layout the engine has never seen arrives -- a
+    ``list_view`` built by a NumPy or Polars round-trip used to reach the user as
+    ``Extracting byte ranges not supported for type list_view<item: int64>``.
+
+    Args:
+        result: Whatever the user's `fn` returned.
+
+    Returns:
+        Record batches, every column of which arrow-rs can import.
+    """
+    from batcher.plan.types.layout import importable_batch
+
+    return [importable_batch(b) for b in _coerce_parts(result)]
+
+
+def _coerce_parts(result: object) -> list[pa.RecordBatch]:
     """Normalize a `map_batches` return to Arrow batches.
 
     Accepts, in the order a user is likely to produce them: a `RecordBatch`, a `Table`, a
@@ -201,12 +222,12 @@ def _coerce_udf_result(result: object) -> list[pa.RecordBatch]:
             _raise_unconvertible_column(columns, exc)
     framed = _frame_to_arrow(result)
     if framed is not None:
-        return _coerce_udf_result(framed)
+        return _coerce_parts(framed)
     parts = _iterable_parts(result)
     if parts is not None:
         out: list[pa.RecordBatch] = []
         for part in parts:
-            out.extend(_coerce_udf_result(part))
+            out.extend(_coerce_parts(part))
         return out
     raise TypeError(
         "map_batches function must return a pyarrow RecordBatch or Table, a "

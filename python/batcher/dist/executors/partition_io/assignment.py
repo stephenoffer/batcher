@@ -24,11 +24,18 @@ from __future__ import annotations
 import heapq
 import os
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TypeVar
 
 from batcher._internal.mathx import ceil_div
 
-__all__ = ["assign_splits", "balance_with_affinity", "has_affinity", "split_weights"]
+__all__ = [
+    "assign_clustered_splits",
+    "assign_splits",
+    "balance_with_affinity",
+    "has_affinity",
+    "split_weights",
+]
 
 # Split count past which a weight that is not already known is taken as 1 rather than
 # asked for. `FileSplit.row_count()` rebuilds a single-file reader and reads that file's
@@ -130,6 +137,83 @@ def assign_splits(
     if worker_addrs and has_affinity(splits):
         return balance_with_affinity(splits, workers, worker_addrs, _balance)
     return _balance(splits, workers)
+
+
+@dataclass(frozen=True, slots=True)
+class _ClusterGroup:
+    """Every split sharing one clustering value, bin-packed as a single indivisible unit.
+
+    `rows` is the sum of the members' *already known* row counts, exposed under the name
+    `split_weights` reads so a group balances by its real size. It is `None` when no member
+    knew its own count, which is the same "unknown, weigh as 1" the assignment gives any
+    split whose count would cost a metadata round trip -- and `row_count_needs_a_sweep`
+    ensures nothing goes looking for it, because a group's sweep is its whole partition's.
+    """
+
+    row_count_needs_a_sweep = True
+
+    splits: tuple[object, ...]
+    rows: int | None
+
+
+def assign_clustered_splits(
+    splits: list[S],
+    workers: int,
+) -> list[list[S]]:
+    """Divide `splits` among `workers` without ever separating two that share a value.
+
+    The assignment half of the co-location guarantee. A file-per-split reader (Delta,
+    Iceberg) emits many splits per partition value, so the split set alone never proves a
+    value sits on one worker; grouping the value's splits and bin-packing whole groups does,
+    at any split granularity, and the fine splits survive inside the group so the read
+    parallelism *within* a worker is unchanged.
+
+    Groups are packed by their summed row counts through the same balancer every other
+    assignment uses, so a heavy partition is still spread against light ones as well as an
+    indivisible unit can be.
+
+    The number of groups is a hard ceiling on parallelism -- a value cannot be in two places
+    -- which is why the caller checks it against the fleet width before choosing this path.
+
+    Args:
+        splits: The splits to assign. Every one must declare a clustering.
+        workers: How many groups to produce.
+
+    Returns:
+        One list of splits per bucket, at most one bucket per clustering group -- fewer than
+        `workers` when the layout has fewer partitions than the fleet has room for. A set that
+        declares no common
+        clustering falls back to plain load balancing -- there is no grouping to respect --
+        which no real caller reaches, because `partition_descriptors` refuses that set
+        outright rather than quietly assigning it under a plan that has no combine in it.
+    """
+    from batcher.io.splits import group_by_clustering
+
+    grouped = group_by_clustering(splits)
+    if grouped is None:
+        return _balance(splits, workers)
+    units = [_ClusterGroup(tuple(g), _summed_rows(g)) for g in grouped]
+    # Never more buckets than there are groups. `_balance` hands back exactly as many buckets
+    # as it is asked for, and an indivisible group cannot fill two, so asking for the caller's
+    # full partition count on a table with fewer partitions returns the surplus as *empty*
+    # buckets -- and every empty bucket still costs a task, a CPU reservation and a schema-only
+    # round trip. A 64-file, 16-partition Delta table asked for 64 and would have run 48 no-op
+    # tasks. The descriptor list length is the authority on how many partitions there are
+    # (`partition_descriptors`), so returning fewer is the supported way to say so.
+    return [
+        [s for unit in bucket for s in unit.splits]
+        for bucket in _balance(units, min(workers, len(units)))
+    ]
+
+
+def _summed_rows(splits: Sequence[object]) -> int | None:
+    """The splits' total row count, or None when not one of them already knew its own.
+
+    Only *known* counts are summed, never asked for: `_weight` documents why a count that
+    costs a footer read (or a subtree sweep) must not be requested during assignment.
+    """
+    known = [r for s in splits if (r := _known_weight(s)) is not None]
+    return sum(known) if known else None
 
 
 def has_affinity(splits: Sequence[object]) -> bool:

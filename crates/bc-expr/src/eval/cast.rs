@@ -405,17 +405,6 @@ fn parse_string_to_int(
     Ok(merged)
 }
 
-/// Cast a `Float16`/`Float32`/`Float64` array to a string `target`, normalizing the one case
-/// where arrow's formatter disagrees with DuckDB: a NaN renders as `nan`, not `NaN`. Every
-/// other value keeps arrow's shortest-round-trip string. Nulls pass through.
-///
-/// A negative zero keeps its sign. This previously rendered `-0.0` as `0.0`, on the stated
-/// grounds that DuckDB does — which is true only of a *constant-folded literal*
-/// (`SELECT (-0.0)::VARCHAR` → `0.0`, because the parser folds the sign away). For an actual
-/// `-0.0` in a column, DuckDB emits `-0.0`, as do Polars, Arrow's own formatter, and Python's
-/// `str`. The engine folds `-0.0` to `0.0` for *key identity* (grouping, joins, ordering);
-/// that is about which rows are equal, not about how a value is displayed, and `sign(x)` and
-/// `1/x` still distinguish the two. Rendering it away lost information every oracle keeps.
 /// Render a naive `Timestamp` array the way DuckDB's `CAST(... AS VARCHAR)` does.
 ///
 /// Built from arrow's own string, not from a re-derived calendar date: arrow already
@@ -467,6 +456,48 @@ fn duckdb_timestamp_text(s: &str) -> String {
     }
 }
 
+/// Rewrite one of arrow's float strings into the exponent spelling every other engine uses.
+///
+/// Arrow formats through Rust's `Display`, which writes a bare exponent: `1e300`, `1e-7`.
+/// DuckDB, Postgres, Python's `str`, Polars and C's `printf` all write a *signed*,
+/// two-digit-minimum exponent: `1e+300`, `1e-07`. The values are the same number, but the
+/// text is not, and text is the whole point of a cast to VARCHAR — it is what lands in a
+/// CSV/JSON file, what a `LIKE` matches, and what a downstream reader parses. So the
+/// divergence is silent in the engine and visible everywhere the data goes next.
+///
+/// The mantissa is left exactly as arrow wrote it (shortest round-trip); only the exponent
+/// tail is respelled, so this stays a formatting fix rather than a second float formatter.
+fn duckdb_float_text(s: &str) -> String {
+    let Some(e) = s.find(['e', 'E']) else {
+        return s.to_string();
+    };
+    let (mantissa, tail) = s.split_at(e);
+    let tail = &tail[1..];
+    let (neg, digits) = match tail.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, tail.strip_prefix('+').unwrap_or(tail)),
+    };
+    let sign = if neg { '-' } else { '+' };
+    // Two digits is the floor, not the width: a three-digit exponent keeps all three.
+    if digits.len() >= 2 {
+        format!("{mantissa}e{sign}{digits}")
+    } else {
+        format!("{mantissa}e{sign}0{digits}")
+    }
+}
+
+/// Cast a `Float16`/`Float32`/`Float64` array to a string `target`, normalizing the two cases
+/// where arrow's formatter disagrees with DuckDB: a NaN renders as `nan`, not `NaN`, and an
+/// exponent is signed and zero-padded to two digits (see [`duckdb_float_text`]). Every other
+/// value keeps arrow's shortest-round-trip string. Nulls pass through.
+///
+/// A negative zero keeps its sign. This previously rendered `-0.0` as `0.0`, on the stated
+/// grounds that DuckDB does — which is true only of a *constant-folded literal*
+/// (`SELECT (-0.0)::VARCHAR` → `0.0`, because the parser folds the sign away). For an actual
+/// `-0.0` in a column, DuckDB emits `-0.0`, as do Polars, Arrow's own formatter, and Python's
+/// `str`. The engine folds `-0.0` to `0.0` for *key identity* (grouping, joins, ordering);
+/// that is about which rows are equal, not about how a value is displayed, and `sign(x)` and
+/// `1/x` still distinguish the two. Rendering it away lost information every oracle keeps.
 fn float_to_string(
     arr: &ArrayRef,
     target: &arrow::datatypes::DataType,
@@ -483,7 +514,7 @@ fn float_to_string(
         if v.is_nan() {
             "nan".to_string()
         } else {
-            s.to_string()
+            duckdb_float_text(s)
         }
     };
     match target {
@@ -508,6 +539,58 @@ fn float_to_string(
 #[cfg(test)]
 mod narrowing_float_tests {
     use super::*;
+
+    /// `CAST(<double> AS VARCHAR)` must spell the exponent the way every other engine does:
+    /// signed, and at least two digits. Arrow's `Display` writes `1e300`/`1e-7`, which no
+    /// reader of the resulting CSV/JSON would produce and some will not parse.
+    #[test]
+    fn float_text_uses_a_signed_two_digit_exponent() {
+        let src = f64arr(vec![
+            Some(1e300),
+            Some(-1e300),
+            Some(1e-7),
+            Some(1e16),
+            Some(1e-300),
+            Some(0.1),
+            Some(-0.0),
+            Some(1e15),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            None,
+        ]);
+        let out = cast_expr(&src, &DataType::Utf8, false).unwrap();
+        let out = out.as_string::<i32>();
+        let got: Vec<Option<&str>> = (0..out.len())
+            .map(|i| (!out.is_null(i)).then(|| out.value(i)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some("1e+300"),
+                Some("-1e+300"),
+                Some("1e-07"),
+                Some("1e+16"),
+                Some("1e-300"),
+                Some("0.1"),
+                Some("-0.0"),
+                Some("1000000000000000.0"),
+                Some("nan"),
+                Some("inf"),
+                None,
+            ]
+        );
+    }
+
+    /// The respelling is textual and must not touch a mantissa that merely contains no
+    /// exponent, nor re-sign one that already carries a sign.
+    #[test]
+    fn float_text_respelling_is_idempotent_and_local() {
+        assert_eq!(duckdb_float_text("0.1"), "0.1");
+        assert_eq!(duckdb_float_text("-0.0"), "-0.0");
+        assert_eq!(duckdb_float_text("1e+16"), "1e+16");
+        assert_eq!(duckdb_float_text("1e-07"), "1e-07");
+        assert_eq!(duckdb_float_text("inf"), "inf");
+    }
     // Assertion-only type tags: unused in the lib target, so scoped to the tests that
     // need them rather than left at module scope as dead code under `-D warnings`.
     use arrow::datatypes::{DataType, Float32Type, Int64Type};

@@ -35,6 +35,7 @@ from batcher.metadata.udf_stats import (
     udf_cost_key,
 )
 from batcher.plan.logical import MapBatches
+from batcher.plan.types import total_retained_bytes
 
 __all__ = [
     "PROC_BATCHES_PER_WORKER",
@@ -273,7 +274,7 @@ def _byte_bounded(target: int, morsel: int, current: list[pa.RecordBatch]) -> in
     rows = sum(b.num_rows for b in current)
     if rows <= 0:
         return target
-    per_row = max(1, sum(b.nbytes for b in current) // rows)
+    per_row = max(1, total_retained_bytes(current) // rows)
     warn_if_row_is_unsplittable(per_row)  # this path's copy of the dead end; see `sizing`
     return max(morsel, min(target, max(1, _THREAD_COARSE_BATCH_BYTES // per_row)))
 

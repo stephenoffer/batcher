@@ -500,9 +500,22 @@ def push_filter_through_aggregate(node: Filter, _ctx: OptimizerContext) -> Logic
     expression over `x`. Only safe for predicates that touch group keys alone — a
     predicate on an aggregate output (e.g. `SUM(x) > 10`, a HAVING clause) genuinely
     needs the grouped result and cannot move below the aggregation.
+
+    A **keyless** aggregate is excluded, and the subset test alone does not exclude it. A
+    constant predicate references no columns, and the empty set is a subset of every set —
+    including the empty key set — so `HAVING (1) = 0` over `SELECT sum(v) FROM t` passed the
+    guard and moved below. That is the one aggregate shape where an empty input does not give
+    an empty output: a global aggregate emits exactly one row whatever it reads, so a filter
+    beneath it cannot remove the row that the same filter above it removes. `sum(v)` with a
+    false HAVING returned one row of NULL where DuckDB returns none.
+
+    The grouped case is sound for the same reason this one is not — zero input rows give zero
+    groups — so the guard is on the keys, not on the predicate being constant.
     """
     inner = node.input
     if not isinstance(inner, Aggregate):
+        return None
+    if not inner.group_keys:
         return None
     key_exprs = {k.alias: k.expr for k in inner.group_keys}
     if not referenced_columns(node.predicate) <= set(key_exprs):

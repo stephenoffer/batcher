@@ -15,17 +15,17 @@
 //! input."*
 //!
 //! * **Pipeline operators** — `Scan`, `Filter`, `Project`, `Unnest`, `Unpivot`, `RowId`,
-//!   `Limit`, and a hash join's **probe** side — are lazy adapters over their child's stream.
-//!   They transform one morsel and yield it. A linear run's peak memory is *one morsel per
-//!   stage*, not the whole relation.
-//! * **Breakers** — `Aggregate`, `Sort`, `Distinct`, `Window`, `Sample`, `AsofJoin`, `Union`,
-//!   and a hash join's **build** side — collect, because their semantics require it. They stay
-//!   breakers *on purpose*: they are the points where the adaptive layer measures actual
-//!   cardinalities and re-plans (CLAUDE.md invariant #10, the moat). Streaming the linear runs
-//!   *between* them is the whole point; the breakers are not the enemy, the incidental
-//!   materialization of everything else was.
+//!   `Limit`, `UNION ALL`, and a hash join's **probe** side — are lazy adapters over their
+//!   child's stream. They transform one morsel and yield it. A linear run's peak memory is *one
+//!   morsel per stage*, not the whole relation.
+//! * **Breakers** — `Aggregate`, `Sort`, `Distinct`, `Window`, `Sample`, `AsofJoin`,
+//!   `UNION DISTINCT`, and a hash join's **build** side — collect, because their semantics
+//!   require it. They stay breakers *on purpose*: they are the points where the adaptive layer
+//!   measures actual cardinalities and re-plans (CLAUDE.md invariant #10, the moat). Streaming
+//!   the linear runs *between* them is the whole point; the breakers are not the enemy, the
+//!   incidental materialization of everything else was.
 //!
-//! Two operators get more than a scheduling change, because their kernels already supported
+//! Several operators get more than a scheduling change, because their kernels already supported
 //! better and only the driver was in the way:
 //!
 //! * **The hash-join probe streams** (`bc_runtime::join::BroadcastProbe`): the build side is
@@ -36,6 +36,13 @@
 //! * **The aggregate folds incrementally** (`partial` → `combine`): its state is bounded by the
 //!   *group count*, not the input size. This is the mergeable algebra (invariant #7) applied to
 //!   the one place that was still reading its whole input into RAM first.
+//! * **Top-N and a whole-row `DISTINCT` fold the same way** (`stream::folds`): a
+//!   `ORDER BY … LIMIT k` keeps `k` rows and a reducing dedup keeps its survivors, so neither
+//!   needs the relation it read them from — and both were nonetheless being handed a fully
+//!   drained input.
+//! * **`UNION ALL` is not a breaker at all** (`stream::union_all`): its result *is* its branches
+//!   concatenated, so it yields each branch's morsels in turn once the branches' common column
+//!   types are settled from one peeked morsel each.
 //!
 //! **Identical to the oracle.** This is a new *scheduling* of the same operator semantics —
 //! exactly as `par` is to `execute`. It calls the same `ops::` and `bc-runtime` kernels, and it
@@ -47,20 +54,21 @@
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use bc_ir::{JoinType, RelOp};
-use bc_runtime::agg;
-
 use crate::ops;
 use crate::InterpError;
+use arrow::array::RecordBatch;
+use bc_ir::{JoinType, RelOp};
 
 mod breaker;
 mod builds;
+mod fanout;
+mod folds;
 mod meter;
 mod parallel;
 mod pipeline;
 mod probe_chunks;
 mod runtime_filter;
+mod union_all;
 
 pub use parallel::{
     execute_streaming_parallel, execute_streaming_parallel_metered,
@@ -70,6 +78,7 @@ pub use parallel::{
 
 use breaker::{drain, exec_breaker};
 pub(crate) use builds::{node_key, prebuild_joins, BuildCache, MatCache};
+pub(crate) use folds::{combine_and_finalize, finalize_partial, fold_partial};
 pub(crate) use meter::Meter;
 pub(crate) use pipeline::limit_stream;
 use pipeline::scan_stream;
@@ -175,14 +184,6 @@ impl<'a> Ctx<'a> {
 /// pipeline operator *is* an iterator adapter, and Rust's iterators already give the pull-based
 /// composition (`map`, `chain`, short-circuit) this executor is made of — for free, and lazily.
 pub(crate) type Morsels<'a> = Box<dyn Iterator<Item = Result<RecordBatch, InterpError>> + 'a>;
-
-/// How many partials the aggregate lets pile up before folding them together.
-///
-/// The fold has to be bounded or the "streaming" aggregate quietly re-materializes its input as
-/// a heap of per-morsel partials. Combining on *every* morsel would instead re-hash the whole
-/// running state once per morsel. Batching the fold keeps state at `O(groups)` while paying the
-/// combine only every `N` morsels.
-const AGG_FOLD_EVERY: usize = 32;
 
 /// Execute `plan` by streaming morsels through its linear runs.
 ///
@@ -317,14 +318,17 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
             index_alias,
         } => {
             let child = build_with(input, ctx)?;
-            Ok(Box::new(child.map(move |b| {
-                let b = b?;
+            // Sliced, because an unnest *multiplies* rows: a morsel of thousand-element lists is
+            // 16 million output rows in one batch, built whole before anything downstream sees it.
+            // The slice is sized from the measured fan-out, so a column of one-element lists pays
+            // one extra call and nothing else. See `fanout`.
+            Ok(fanout::fanout_stream(child, move |b| {
                 let rows_in = b.num_rows() as u64;
                 let t = std::time::Instant::now();
-                let out = ops::unnest_batch(&b, column, alias, *outer, index_alias.as_deref())?;
+                let out = ops::unnest_batch(b, column, alias, *outer, index_alias.as_deref())?;
                 ctx.morsel(id, rows_in, &out, t);
                 Ok(out)
-            })))
+            }))
         }
 
         // A *fractional* sample keeps a row iff a seeded hash of its values falls under the
@@ -363,14 +367,16 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
             value_name,
         } => {
             let child = build_with(input, ctx)?;
-            Ok(Box::new(child.map(move |b| {
-                let b = b?;
+            // Sliced for the same reason as the unnest above, with a fan-out that happens to be
+            // known — one output row per `on` column — but measured rather than restated, so
+            // there is one mechanism here and not two.
+            Ok(fanout::fanout_stream(child, move |b| {
                 let rows_in = b.num_rows() as u64;
                 let t = std::time::Instant::now();
-                let out = ops::unpivot_batch(&b, index, on, variable_name, value_name)?;
+                let out = ops::unpivot_batch(b, index, on, variable_name, value_name)?;
                 ctx.morsel(id, rows_in, &out, t);
                 Ok(out)
-            })))
+            }))
         }
 
         RelOp::RowId {
@@ -407,6 +413,19 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
                 Ok(b)
             })))
         }
+
+        // A `UNION ALL` is its branches concatenated, so it is a pipeline operator: yield each
+        // branch's morsels in turn and hold none of them. The oracle returns the whole
+        // concatenation as one `Vec`, which is what this used to inherit by deferring to it.
+        // `build_union_all` declines (`None`) when the branch types cannot be settled from one
+        // peeked morsel each, and the breaker path below answers those — see `union_all`.
+        RelOp::Union {
+            inputs,
+            distinct: false,
+        } => match union_all::build_union_all(inputs, ctx, id)? {
+            Some(stream) => Ok(stream),
+            None => Ok(Box::new(exec_breaker(plan, ctx)?.into_iter().map(Ok))),
+        },
 
         // ---- the hash join: build once, stream the probe --------------------------------
         RelOp::HashJoin {
@@ -674,107 +693,4 @@ fn materialized_join_from<'a>(
     // The one consumer that genuinely wants morsels — the aggregate, which folds them across the
     // pool — slices this itself, at zero copy, in `fold_partial_parallel`.
     Ok(Box::new(std::iter::once(Ok(out))))
-}
-
-/// Fold an aggregate's input **incrementally** into one `Partial` — `partial` each morsel,
-/// `combine` them — without ever holding the input.
-///
-/// `None` means the stream held no rows at all. That is not the same as "the aggregate is
-/// empty": a global `COUNT` over nothing is still one row containing `0`. Only the caller knows
-/// whether it is looking at a whole relation (defer to the oracle for that row) or at one shard
-/// of a parallel run (contribute nothing and let the other shards speak).
-///
-/// **Why a `Partial` and not a finished aggregate.** A finalized aggregate cannot be merged: two
-/// shards' `mean`s do not average to the relation's `mean`, and two `count`s do not compose with
-/// two `sum`s once the shape is lost. `partial`/`combine`/`finalize` is the mergeable algebra
-/// (invariant #7) — the *same* fold the distributed path runs across nodes — and it is
-/// associative, so folding morsel by morsel, or shard by shard, finalizes to exactly what one
-/// `partial` over the concatenated input would.
-pub(crate) fn fold_partial(
-    input: Morsels<'_>,
-    group_keys: &[bc_ir::ProjectionItem],
-    aggregates: &[bc_ir::AggregateItem],
-    jit: &std::sync::OnceLock<ops::AggJit>,
-) -> Result<(Option<agg::Partial>, u64), InterpError> {
-    let funcs = ops::agg_funcs(aggregates);
-    let mut partials: Vec<agg::Partial> = Vec::new();
-    let mut folded: Option<agg::Partial> = None;
-    let mut rows_in: u64 = 0;
-    // Compile the computed group-key and aggregate-input expressions once, from the first
-    // morsel that carries rows — the JIT fast path the materializing executor already uses,
-    // so arithmetic in aggregate inputs (`SUM(price * (1 - discount) * (1 + tax))`, the whole
-    // TPC-H q1 shape) is compiled once and reused across morsels instead of interpreted per
-    // row. `eval_jit` is bit-identical to the interpreter on its supported subset and falls
-    // back to it otherwise, so this changes throughput only — the streaming-oracle tests pin
-    // it against the same interpreter.
-    //
-    // The `OnceLock` is **shared across the shards** by the caller: `compile_agg` is a pure
-    // function of the plan and the schema, and every shard's post-child morsel has the same
-    // schema, so one compile serves all of them. Compiling per shard instead paid Cranelift's
-    // per-expression cost once per core (~90× on a big box), which measured as a real fraction
-    // of a low-cardinality aggregate — this hoists it to exactly one compile per query.
-
-    for morsel in input {
-        let morsel = morsel?;
-        if morsel.num_rows() == 0 {
-            continue;
-        }
-        rows_in += morsel.num_rows() as u64;
-        let jit = jit.get_or_init(|| ops::compile_agg(group_keys, aggregates, &morsel));
-        partials.push(ops::eval_partial_jit(&morsel, group_keys, aggregates, jit)?);
-        // Bounded: without this the "streaming" aggregate quietly re-materializes its input as a
-        // heap of per-morsel partials. Combining on *every* morsel would instead re-hash the
-        // whole running state once per morsel; batching the fold keeps state at O(groups).
-        if partials.len() >= AGG_FOLD_EVERY {
-            if let Some(prev) = folded.take() {
-                partials.push(prev);
-            }
-            folded = Some(agg::combine(&partials, &funcs)?);
-            partials.clear();
-        }
-    }
-
-    if let Some(prev) = folded.take() {
-        partials.push(prev);
-    }
-    if partials.is_empty() {
-        return Ok((None, rows_in));
-    }
-    Ok((Some(agg::combine(&partials, &funcs)?), rows_in))
-}
-
-/// `finalize` one (already combined) partial into the aggregate's output batch.
-pub(crate) fn finalize_partial(
-    merged: &agg::Partial,
-    group_keys: &[bc_ir::ProjectionItem],
-    aggregates: &[bc_ir::AggregateItem],
-) -> Result<Vec<RecordBatch>, InterpError> {
-    let funcs = ops::agg_funcs(aggregates);
-    let agg_cols = agg::finalize(&funcs, merged)?;
-    Ok(vec![ops::build_agg_batch(
-        group_keys,
-        aggregates,
-        &merged.group_columns,
-        &agg_cols,
-    )?])
-}
-
-/// Combine shard-level partials into one, then finalize — the parallel aggregate's tail.
-pub(crate) fn combine_and_finalize(
-    partials: &[agg::Partial],
-    group_keys: &[bc_ir::ProjectionItem],
-    aggregates: &[bc_ir::AggregateItem],
-) -> Result<Vec<RecordBatch>, InterpError> {
-    let funcs = ops::agg_funcs(aggregates);
-    // Keep the merge's hash-radix partitions as separate morsels rather than concatenating
-    // them into one. They are key-disjoint, so the rows and their order are exactly what one
-    // combined `Partial` would finalize to — but the concat is a second full copy of the
-    // grouped relation (on a high-cardinality string key, the largest term in the merge), and
-    // the next operator gets a batch per partition to fan back out over instead of one.
-    let merged = agg::combine_partitioned(partials, &funcs, 0)?;
-    let mut out = Vec::with_capacity(merged.len());
-    for part in &merged {
-        out.extend(finalize_partial(part, group_keys, aggregates)?);
-    }
-    Ok(out)
 }

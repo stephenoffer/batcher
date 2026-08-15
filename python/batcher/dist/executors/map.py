@@ -46,6 +46,7 @@ from batcher.dist.executors.ray_runtime import (
 from batcher.io.source import Source
 from batcher.plan.ir_specs import agg_spec_json
 from batcher.plan.logical import LogicalPlan, MapBatches
+from batcher.plan.visitor import scanned_source_ids
 
 # Smallest CPU share a task may request: a tiny partition gets a fraction of a core so
 # Ray packs many such tasks per core (high parallelism over many small files) instead of
@@ -593,6 +594,7 @@ def _distributed_map(
     *,
     preserve_order: bool = False,
     write_spec: dict | None = None,
+    cluster_by: tuple[str, ...] | None = None,
 ):
     """Run a linear map/inference pipeline across Ray workers, one partition each.
 
@@ -607,7 +609,14 @@ def _distributed_map(
     `preserve_order` partitions the source into contiguous source-ordered runs so the
     partition-index-assembled output reproduces the source's global row order. Callers that
     slice or number that output (distributed `LIMIT`, `with_row_index`) require it; the
-    default load-balanced assignment is fine for every order-independent map/scan."""
+    default load-balanced assignment is fine for every order-independent map/scan.
+
+    `cluster_by` assigns whole clustering groups, so no two splits sharing a value in those
+    columns land on different partitions. That is what lets `plan` be a **breaker** -- an
+    `Aggregate`, a `Distinct`, a partitioned `Window` -- rather than only a map: with every
+    group whole inside one partition, running the breaker per partition and concatenating is
+    the complete result, and no exchange is needed. See
+    `dist/executor.py::_partition_aligned_aggregate`."""
     _ensure_ray(workers)
     plan0, sid = _relabel_single_source(plan)
     num_gpus, wants_pool, concurrency, accelerator_type, resources = _map_resources(plan)
@@ -639,7 +648,12 @@ def _distributed_map(
     )
     proj, pred = _scan_pushdown(plan0)
     partitions = partition_descriptors(
-        sources[sid], n_parts, projection=proj, predicate=pred, preserve_order=preserve_order
+        sources[sid],
+        n_parts,
+        projection=proj,
+        predicate=pred,
+        preserve_order=preserve_order,
+        cluster_by=cluster_by,
     )
     if write_spec is not None:
         # A `num_files` layout names a total across the whole write, so each shard needs to
@@ -1015,6 +1029,136 @@ def _scan_pushdown(plan0: LogicalPlan) -> tuple[list[str] | None, dict | None]:
     always correct — this only ever narrows what is read, never what is computed.
     """
     return source_pushdown(plan0, 0)
+
+
+# When a shuffle-free plan is worth the parallelism it gives up. Grouping a partition's splits
+# into one assignable unit is the only thing the aligned plan costs, and it costs nothing at all
+# for a reader that already splits one-per-partition; it bites for a file-per-split reader
+# (Delta, Iceberg), where a partition is many files and the group is one.
+#
+# **Two conditions, because one is not enough**, and the second was found by measuring rather
+# than reasoning. `benchmarks/internals/partition_aligned.py --sweep` varies the partition count
+# against a fixed 8-worker fleet, forcing the aligned path so the losing cases are visible.
+# Writing `A` for the aligned plan's tasks, `min(groups, workers)`, and `S` for what the shuffle
+# would have had, `min(splits, workers)`:
+#
+#     reader                parts=1        2        4        8       16
+#     Hive tree (S == A)      0.95x    1.33x    2.35x    4.44x    4.10x
+#     Delta, 4 files/part     0.62x    1.30x    2.44x    2.69x    2.64x
+#
+# The two losses are the two rows where **A is 1**: the whole query runs on one worker. And a
+# ratio cannot see that, which is the trap. Delta at one partition has `A/S = 1/4` and loses
+# 1.6x; Delta at two has `A/S = 2/8`, the *same* quarter, and wins 1.3x. A rule written on the
+# ratio alone accepts the regression.
+#
+# So: at least two tasks, and at least a quarter of what the shuffle would have run. The first
+# rules out the serial plan; the second keeps a two-partition table off a five-hundred-worker
+# fleet, which the sweep's fixed width cannot reach but arithmetic can. Every measured point
+# above is decided correctly by the pair. (An earlier rule demanded full retention, `A >= S`,
+# which threw away the measured 2.35x and every Hive case; the one before that was the ratio
+# alone, which accepted the 0.62x.)
+_MIN_ALIGNED_TASKS = 2
+_MIN_PARALLELISM_RETENTION = 4
+
+
+def _source_clustering_columns(source) -> tuple[str, ...]:
+    """What `source` says its splits will hold constant, without planning a read.
+
+    The source-level form of the split protocol's `clustering_columns`, and deliberately the
+    same name: a source answers what its own splits will declare. Note this is *not*
+    `SourceStatistics.partition_keys`, which reports every partition column a table has —
+    a nested ``year=/month=`` tree answers ``(year, month)`` there and ``(year,)`` here,
+    because the year is what a split holds constant.
+
+    Duck-typed rather than required of `Source`: a connector that cannot answer cheaply simply
+    does not declare the method, and is treated as unclustered — which costs a missed
+    optimization, never a wrong answer.
+    """
+    fn = getattr(source, "clustering_columns", None)
+    if not callable(fn):
+        return ()
+    try:
+        return tuple(fn())
+    except Exception as exc:  # a source that cannot answer declares nothing
+        note_suppressed("dist", "read the source's declared clustering", exc)
+        return ()
+
+
+def scan_clustering_for(plan: LogicalPlan, sources, workers: int, hub=None) -> tuple[str, ...]:
+    """The columns the split set a `_distributed_map(plan, ...)` read would use is exactly
+    value-partitioned by — the storage layout's own answer to "what is this already
+    partitioned on".
+
+    A partitioned table — a Hive directory tree, a Delta or Iceberg table — reads splits that
+    each hold their partition columns constant. Grouping those splits by value and assigning
+    whole groups (`cluster_by`) puts every row with a given value on one worker, which is
+    exactly what a shuffle by those columns would have arranged. This function reports the
+    columns for which that holds; `io.splits.declared_clustering` is what checks that every
+    split in the set agrees on them, because the failure mode of over-claiming is a group
+    reported twice as two partial finals — a wrong answer at cluster scale and green on one
+    node.
+
+    The split set is planned with the **same** arguments `_distributed_map` will use — the
+    same partition count from `_adaptive_partition_count`, the same pushed projection and
+    predicate — so the set inspected here is the set the read will get, not a lookalike. That
+    is what makes this a fact rather than a forecast; do not simplify it to a fixed count.
+
+    Args:
+        plan: The single-source sub-plan the map stage would run per partition.
+        sources: The query's bound sources.
+        workers: The fleet width. Bounds both plans' parallelism, so it is what the
+            retention test is measured against.
+        hub: The metadata hub, only so the partition count matches the executor's.
+        min_splits: Report no clustering below this many splits. A caller skipping an
+            exchange trades the shuffle away for the read's own parallelism, and a table
+            whose whole content sits in three directories has three tasks' worth of it — so
+            a fleet wider than the layout is better served by shuffling. One (the default)
+            means "any layout will do"; a scheduler passes its fleet width.
+
+    Returns:
+        The clustering columns, or an empty tuple when the read guarantees none.
+    """
+    from batcher.dist.executors.partition_io._sources import _scan_splits
+    from batcher.io.splits import declared_clustering, group_by_clustering
+
+    ids = scanned_source_ids(plan)
+    if len(ids) != 1:
+        return ()
+    sid = next(iter(ids))
+    if sid >= len(sources):
+        return ()
+    # Ask the source whether a layout exists at all, BEFORE planning a read to find out. A
+    # split plan over a large dataset is real driver time -- measured at 25 ms for 500 flat
+    # Parquet files, and it scales with the file count -- and on a source that is not
+    # partitioned every millisecond of it is thrown away. Every source answers this from
+    # metadata it has already loaded: one memoized directory listing, the replayed Delta log,
+    # the Iceberg table's own spec. A necessary condition only; the split set is still checked.
+    if not _source_clustering_columns(sources[sid]):
+        return ()
+    plan0, _ = _relabel_single_source(plan)
+    proj, pred = _scan_pushdown(plan0)
+    n_parts = _adaptive_partition_count(sources[sid], plan, workers, hub)
+    try:
+        splits = _scan_splits(sources[sid], n_parts, pred, proj)
+    except Exception as exc:  # a source that cannot plan splits guarantees no clustering
+        note_suppressed("dist", "read the source's split layout", exc)
+        return ()
+    groups = group_by_clustering(splits)
+    if groups is None:
+        return ()
+    # The GROUP count, not the split count, is the parallelism a clustered read can supply: a
+    # value cannot be in two places, so however many files a partition holds, it is one task's
+    # worth of assignment. Weigh what that gives up against what the shuffle would have had --
+    # both capped by the fleet, since neither plan can use more workers than exist -- and
+    # decline when too much of it goes. See `_MIN_PARALLELISM_RETENTION` for the measurements.
+    fleet = max(1, workers)
+    aligned_tasks = min(len(groups), fleet)
+    shuffled_tasks = min(len(splits), fleet)
+    if aligned_tasks < min(_MIN_ALIGNED_TASKS, shuffled_tasks):
+        return ()  # a serial plan, where the shuffle had more than one task to spend
+    if aligned_tasks * _MIN_PARALLELISM_RETENTION < shuffled_tasks:
+        return ()
+    return declared_clustering(splits)
 
 
 def _adaptive_partition_count(source, plan, fallback: int, hub=None) -> int:

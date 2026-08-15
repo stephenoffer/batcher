@@ -98,13 +98,26 @@ def test_vectorized_ndjson_reads_back_with_the_same_types(name):
 def test_vectorized_ndjson_declines_rather_than_guessing():
     # Types with no Arrow rendering, and a control character with no short escape. Each
     # must return None so the caller falls back — never a partial or invalid document.
+    #
+    # Timestamps used to be on this list and are deliberately not any more: declining them
+    # sent every temporal column to the pandas encoder, which reads a timestamp column's
+    # raw integers as nanoseconds whatever its unit is, so a `timestamp[us]` was written
+    # divided by a million. They now render as ISO-8601 here — pinned by
+    # `test_io_json_temporal_precision.py`, which is a separate module precisely because
+    # the reference encoder these cases compare against is the one that was wrong.
     for table in (
-        pa.table({"t": pa.array([1, 2], pa.timestamp("ms"))}),
         pa.table({"a": pa.array([[1, 2], None])}),
         pa.table({"b": pa.array([b"x"], pa.binary())}),
         pa.table({"s": ["bell\x07here"]}),
     ):
         assert ndjson_vectorized(table) is None
+
+
+def test_vectorized_ndjson_now_renders_timestamps_itself():
+    # The other half of the change above: it accepts them rather than declining.
+    blob = ndjson_vectorized(pa.table({"t": pa.array([1, 2], pa.timestamp("ms"))}))
+    assert blob is not None
+    assert blob == b'{"t":"1970-01-01 00:00:00.001"}\n{"t":"1970-01-01 00:00:00.002"}\n'
 
 
 def test_vectorized_ndjson_empty_table_is_still_readable():

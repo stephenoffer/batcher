@@ -262,7 +262,10 @@ def test_drop_stays_lazy():
         ({"threshold": 1.5}, "threshold must be in"),
         ({"bands": 7}, "bands must divide num_perm"),
         ({"num_perm": 0}, "must be >= 1"),
-        ({"key": "nope"}, "unknown key column"),
+        # The shared `require_columns` check reports the name and the alternatives, and
+        # appends the caller's hint ("...groups rows by this key column"), rather than the
+        # bare "unknown key column" the inline copy used to raise.
+        ({"key": "nope"}, r"Unknown column 'nope'.*key column"),
     ],
 )
 def test_invalid_parameters_are_rejected(corpus, kwargs, match):

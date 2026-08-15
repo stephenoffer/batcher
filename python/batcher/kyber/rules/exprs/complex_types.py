@@ -192,22 +192,6 @@ def fold_list_length_of_array(node: Filter | Project, _ctx: OptimizerContext) ->
 # --- list-function algebra ----------------------------------------------------
 
 
-def _idempotent_list(fn: str):
-    """Build the leaf rewrite collapsing a doubled `fn`."""
-
-    def leaf(expr: Expr) -> Expr:
-        if (
-            isinstance(expr, ListFunc)
-            and expr.fn == fn
-            and isinstance(expr.input, ListFunc)
-            and expr.input.fn == fn
-        ):
-            return expr.input
-        return expr
-
-    return leaf
-
-
 # One rule per idempotent list function, over a shared body -- the registration shape
 # `extra/temporal_sargable` uses for its own cross-product family. `sort(sort(x))` is
 # `sort(x)`, and likewise for `unique`, `arg_sort`, `flatten`, and `normalize`: each maps

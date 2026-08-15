@@ -159,6 +159,39 @@ class PartitionDirSplit:
     part_value: str
     dataset_schema: pa.Schema
 
+    @property
+    def clustering_columns(self) -> tuple[str, ...]:
+        """The top-level partition column, whose value is constant across this whole subtree.
+
+        Read by `io.splits.clustering`, which turns "constant within a split" into "resident
+        on one worker" for a whole split set — the guarantee that lets a consumer grouping on
+        this column skip its shuffle.
+
+        The *top-level* column is the whole guarantee, not part of one. A nested
+        ``year=/month=`` tree emits one split per year, so grouping by ``(year, month)`` is
+        still covered — those groups sit inside ``year`` groups — while grouping by ``month``
+        alone is not co-located and never can be, because ``month=1`` lives under every year.
+        Splitting per leaf directory would not change that; it would only make a split's value
+        ``(year, month)``, which ``month`` alone still straddles.
+        """
+        return (self.part_name,)
+
+    @property
+    def clustering_value(self) -> tuple[Any, ...]:
+        """This subtree's partition value, typed, so distinctness is judged on values.
+
+        Typed rather than raw because the raw form is a directory name: ``x=01`` and ``x=1``
+        are two names for one integer, and comparing the names would call them distinct
+        partitions of the same value — exactly the over-claim this check exists to refuse.
+        Falls back to the raw string only when the value cannot be typed, which
+        keeps the comparison conservative (two spellings then read as two partitions and
+        the clustering is simply not claimed).
+        """
+        try:
+            return (self._typed_value(),)
+        except Exception:
+            return (self.part_value,)
+
     def _typed_value(self) -> Any:
         return typed_partition_value(
             self.part_value, self.dataset_schema.field(self.part_name).type
@@ -531,6 +564,31 @@ class ParquetDatasetSource:
 
     def identity(self) -> str:
         return f"parquet_dataset:{self._path}"
+
+    def clustering_columns(self) -> tuple[str, ...]:
+        """The columns this dataset's splits will hold constant, without enumerating them.
+
+        The cheap precondition for `io.splits.clustering`: a consumer asking whether it can
+        skip an exchange has to know before it plans a read, because planning one over a
+        50,000-file dataset is seconds of driver time it would then throw away. This costs one
+        already-memoized, non-recursive listing, and a flat dataset answers `()` from it.
+
+        Named for what the splits declare rather than for the table's partitioning, because
+        the two differ and confusing them is the trap. `SourceStatistics.partition_keys`
+        reports every partition column a nested tree has (``year``, ``month``); this reports
+        the one a *split* holds constant (``year``). A caller asking "can I skip the exchange"
+        needs the second.
+
+        A *necessary* condition only — that the layout exists, not that the split set delivers
+        it. `io.splits.declared_clustering` still checks the splits themselves.
+
+        Returns:
+            The top-level Hive partition column, or an empty tuple for a flat dataset.
+        """
+        if any(ch in self._path for ch in "*?["):
+            return ()  # a glob reads per-file splits, which record no partition value
+        dirs = self._partition_dirs()
+        return (dirs[0][1][0],) if dirs else ()
 
     def splits(
         self,

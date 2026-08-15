@@ -30,6 +30,9 @@ pub use isa::IsaFeatures;
 
 pub mod page_cache;
 
+pub mod private_fs;
+pub use private_fs::{create_private_dir, create_private_file};
+
 pub mod placement;
 pub use placement::pinning_order;
 

@@ -384,6 +384,82 @@ def test_reduce_join_paths_spilling_matches_direct(tmp_path, how):
     )
 
 
+def test_the_grace_reducer_does_not_hold_the_whole_join_output(tmp_path, monkeypatch):
+    """The out-of-core join streams its *output*, not just its input.
+
+    The sub-bucketing bounds the inputs and the per-pair join bounds the working set, but
+    every pair's output was then accumulated into one list before anything consumed it — on
+    the one branch taken precisely because the inputs did not fit, for the half of a join
+    that is generally the larger. Laziness is the property that fixes it, so laziness is
+    what this asserts: taking the first batch must not have joined every sub-bucket.
+    """
+    import json
+
+    from batcher._internal.native import engine
+    from batcher.config import active_config
+    from batcher.dist.executors.join import _join_reducer_ir
+    from batcher.dist.shuffle_io import write_ipc
+    from batcher.dist.spill_breakers import iter_join_paths_spilling
+
+    rng = np.random.default_rng(11)
+    left = pa.record_batch(
+        {
+            "k": rng.integers(0, 64, 4000).astype("int64"),
+            "v": rng.integers(0, 100, 4000).astype("int64"),
+        }
+    )
+    right = pa.record_batch(
+        {"k": pa.array(range(64), type=pa.int64()), "name": [f"n{i}" for i in range(64)]}
+    )
+    left_file = write_ipc([left], str(tmp_path / "l.arrow"))
+    right_file = write_ipc([right], str(tmp_path / "r.arrow"))
+
+    joined = bt.from_arrow(pa.Table.from_batches([left])).join(
+        bt.from_arrow(pa.Table.from_batches([right])), on="k"
+    )
+    join = _find_join(joined._plan)
+    join_ir = json.dumps(_join_reducer_ir(join))
+    cfg = active_config().engine_config_json()
+
+    # Count the per-sub-bucket joins. Patched at the definition site so the count sees the
+    # reducer's own `engine()` call, not a re-export.
+    real = engine()
+    joins = {"n": 0}
+
+    class Counting:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def execute_plan(self, ir, inputs, config):
+            if ir == join_ir:
+                joins["n"] += 1
+            return real.execute_plan(ir, inputs, config)
+
+    monkeypatch.setattr("batcher.dist.spill_breakers.join.engine", lambda: Counting())
+
+    n_sub = 8
+    stream = iter_join_paths_spilling(
+        join_ir,
+        list(join.left_keys),
+        list(join.right_keys),
+        [left_file],
+        [right_file],
+        str(tmp_path),
+        n_sub,
+        cfg,
+    )
+    first = next(stream)
+    assert first.num_rows, "the first sub-bucket produced nothing to measure with"
+    assert joins["n"] < n_sub, (
+        f"pulling one batch joined {joins['n']} of {n_sub} sub-buckets — the reducer is "
+        "materializing its whole output before yielding"
+    )
+    # Draining it still produces every row: laziness is a scheduling change, not a result one.
+    rows = first.num_rows + sum(b.num_rows for b in stream)
+    direct = real.execute_plan(join_ir, [[left], [right]], cfg)
+    assert rows == sum(b.num_rows for b in direct)
+
+
 @pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
 @pytest.mark.parametrize("empty_side", ["left", "right"])
 def test_reduce_join_paths_spilling_empty_side(tmp_path, how, empty_side):

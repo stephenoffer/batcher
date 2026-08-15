@@ -209,3 +209,89 @@ def test_registered_under_its_name():
 
     assert "warc" in SOURCES.names()
     assert SOURCES.get("warc") is WarcSource
+
+
+# ---- the HTTP envelope inside a response payload ---------------------------------
+
+
+def _record(warc_type: str, payload: bytes, uri: str = "http://example.com/") -> bytes:
+    """One WARC record: the version line, headers, a blank line, then `payload`."""
+    headers = (
+        f"WARC/1.0\r\nWARC-Type: {warc_type}\r\n"
+        f"WARC-Record-ID: <urn:uuid:{warc_type}>\r\n"
+        f"WARC-Target-URI: {uri}\r\nContent-Length: {len(payload)}\r\n\r\n"
+    ).encode()
+    return headers + payload + b"\r\n\r\n"
+
+
+_HTML = b"<html><body><p>Real content.</p></body></html>"
+
+
+@pytest.fixture
+def http_crawl(tmp_path):
+    """A crawl holding the record shapes a real one mixes."""
+    ok = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nServer: nginx\r\n\r\n"
+    gone = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
+    lf_only = b"HTTP/1.1 200 OK\nContent-Type: text/plain\n\nplain body"
+    (tmp_path / "c.warc").write_bytes(
+        _record("response", ok + _HTML)
+        + _record("response", gone + b"<html>gone</html>")
+        + _record("response", lf_only)
+        + _record("warcinfo", b"software: test-crawler\r\nformat: WARC 1.0")
+        + _record("resource", b"a plain text resource\n\nwith a second paragraph")
+    )
+    return tmp_path
+
+
+def test_the_http_envelope_is_separated_from_the_page(http_crawl):
+    """The defect this closes: `strip_html(warc_content)` extracts the server banner.
+
+    A `response` payload is the whole HTTP exchange, so the documented recipe — filter to
+    responses, hand the payload to `strip_html` — silently prefixed every page with
+    "HTTP/1.1 200 OK Content-Type: ... Server: ...". Nothing fails: the read succeeds, the
+    column is text, and the prefix looks like prose, so it reaches every text metric,
+    embedding and dedup hash downstream.
+    """
+    ds = bt.read.warc(str(http_crawl)).filter(bt.col("http_status") == 200)
+    body = ds.select(t=bt.col("http_body").str.strip_html()).collect().to_pydict()["t"]
+    assert "Real content." in body
+    assert not any("nginx" in text or "HTTP/1.1" in text for text in body), body
+
+
+def test_the_status_line_becomes_a_filterable_column(http_crawl):
+    """Dropping the 404s and redirects is the first thing every crawl pipeline does."""
+    got = bt.read.warc(str(http_crawl)).select("warc_type", "http_status").collect().to_pydict()
+    assert sorted(s for s in got["http_status"] if s is not None) == [200, 200, 404]
+
+
+def test_a_record_with_no_http_envelope_reports_none_rather_than_guessing(http_crawl):
+    """Splitting a non-HTTP payload at its first blank line truncates it silently.
+
+    A `warcinfo` block and a plain-text resource both have blank lines in them, and a
+    reader that trusted the record's declared content type rather than sniffing the start
+    line would cut each one short at its first paragraph break.
+    """
+    rows = bt.read.warc(str(http_crawl)).collect().to_pylist()
+    for row in rows:
+        if row["warc_type"] in ("warcinfo", "resource"):
+            assert row["http_status"] is None
+            assert row["http_content_type"] is None
+            assert row["http_body"] is None, "a non-HTTP payload must not be split"
+            assert b"second paragraph" in row["warc_content"] or row["warc_type"] == "warcinfo"
+
+
+def test_a_server_that_writes_bare_newlines_still_has_its_body_found(http_crawl):
+    """RFC 7230 says CRLF; real crawls contain hosts that write LF, and dropping their
+    bodies would silently lose every page from those hosts."""
+    rows = bt.read.warc(str(http_crawl)).collect().to_pylist()
+    plain = [r for r in rows if r["http_content_type"] == "text/plain"]
+    assert len(plain) == 1
+    assert plain[0]["http_body"] == b"plain body"
+
+
+def test_the_raw_payload_is_still_available(http_crawl):
+    """`http_body` is added beside `warc_content`, not instead of it: a provenance or
+    replay pass needs the exchange exactly as the crawler recorded it."""
+    rows = bt.read.warc(str(http_crawl)).collect().to_pylist()
+    responses = [r for r in rows if r["warc_type"] == "response"]
+    assert all(r["warc_content"].startswith(b"HTTP/1.1") for r in responses)

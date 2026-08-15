@@ -268,6 +268,213 @@ fn an_over_budget_breaker_gives_way_before_materializing_its_input() {
     );
 }
 
+/// A `Project` over source 0, so every morsel allocates fresh columns.
+///
+/// A scan over already-materialized sources yields zero-copy slices, so an operator that held
+/// all of them would allocate almost nothing and hide the very thing being measured. Every
+/// memory test below feeds its operator through this for that reason.
+fn computed_input() -> String {
+    r#"{"op":"project","input":{"op":"scan","source_id":0},"exprs":[
+           {"expr":{"e":"col","name":"k"},"alias":"k"},
+           {"expr":{"e":"binary","op":"mul","left":{"e":"col","name":"v"},
+                    "right":{"e":"lit","value":{"int":2}}},"alias":"v"}]}"#
+        .to_string()
+}
+
+/// Peak memory for a top-N must scale with `k`, not with the relation it selects from.
+///
+/// `ORDER BY … LIMIT 10` keeps ten rows. The streaming executor nonetheless drained its whole
+/// input first and only then reduced it, so the shape that most obviously does not need memory
+/// held all of it — on a hundred-million-row scan, a hundred million rows resident to return ten.
+/// `parallel_top_n` was already the mergeable top-N; only the driver was in the way.
+#[test]
+fn a_top_n_does_not_hold_the_relation_it_selects_from() {
+    let _measuring = measuring();
+    let plan: RelOp = serde_json::from_str(&format!(
+        r#"{{"op":"sort","input":{},
+             "keys":[{{"expr":{{"e":"col","name":"v"}},"descending":true,"nulls_first":false}}],
+             "limit":10}}"#,
+        computed_input()
+    ))
+    .unwrap();
+
+    let mut peaks = Vec::new();
+    for n in [1_000_000i64, 4_000_000] {
+        let srcs = vec![facts(n, 0)];
+        // The answer is checked as well as the peak: a top-N that keeps nothing is cheap and
+        // wrong, and this test would otherwise be delighted by it.
+        let mut rows = 0usize;
+        let peak = peak_delta(|| {
+            let out = std::hint::black_box(execute_streaming(&plan, &srcs, 0).unwrap());
+            rows = out.iter().map(|b| b.num_rows()).sum();
+        });
+        assert_eq!(rows, 10, "a LIMIT 10 must return ten rows");
+        peaks.push(peak);
+    }
+    assert!(
+        peaks[1] < peaks[0] * 2,
+        "a top-N's peak must not scale with its input: {} -> {} across a 4x growth",
+        peaks[0],
+        peaks[1]
+    );
+}
+
+/// A whole-row `DISTINCT` over a low-cardinality relation holds its survivors, not its input.
+///
+/// `facts` repeats its key every 100 rows, so the distinct row count is fixed while the input
+/// grows — which is the shape anyone writes a `DISTINCT` for, and the one where holding the
+/// input was pure waste.
+#[test]
+fn a_reducing_distinct_does_not_hold_its_input() {
+    let _measuring = measuring();
+    let plan: RelOp = serde_json::from_str(&format!(
+        r#"{{"op":"distinct","input":{},"keys":[],"order":[],"limit":null}}"#,
+        // Only the repeating key, so the survivors are 100 rows however long the input is.
+        r#"{"op":"project","input":{"op":"scan","source_id":0},"exprs":[
+               {"expr":{"e":"binary","op":"add","left":{"e":"col","name":"k"},
+                        "right":{"e":"lit","value":{"int":0}}},"alias":"k"}]}"#
+    ))
+    .unwrap();
+
+    let mut peaks = Vec::new();
+    for n in [1_000_000i64, 4_000_000] {
+        let srcs = vec![facts(n, 0)];
+        let mut rows = 0usize;
+        let peak = peak_delta(|| {
+            let out = std::hint::black_box(execute_streaming(&plan, &srcs, 0).unwrap());
+            rows = out.iter().map(|b| b.num_rows()).sum();
+        });
+        assert_eq!(rows, 100, "the key repeats every 100 rows");
+        peaks.push(peak);
+    }
+    assert!(
+        peaks[1] < peaks[0] * 2,
+        "a reducing DISTINCT's peak must not scale with its input: {} -> {} across a 4x growth",
+        peaks[0],
+        peaks[1]
+    );
+}
+
+/// `UNION ALL` yields its branches in turn and holds none of them.
+///
+/// Its result *is* the concatenation, so a caller collecting it holds that much either way —
+/// what this measures is that the operator itself adds nothing on top, which the deferred path
+/// did: it ran the whole subtree on the materializing oracle, holding every branch at once
+/// beneath its own copy of the concatenation.
+#[test]
+fn a_union_all_does_not_hold_its_branches() {
+    let _measuring = measuring();
+    let branch = |src: usize| {
+        format!(
+            r#"{{"op":"project","input":{{"op":"scan","source_id":{src}}},"exprs":[
+                   {{"expr":{{"e":"col","name":"k"}},"alias":"k"}},
+                   {{"expr":{{"e":"binary","op":"mul","left":{{"e":"col","name":"v"}},
+                            "right":{{"e":"lit","value":{{"int":2}}}}}},"alias":"v"}}]}}"#
+        )
+    };
+    // A `LIMIT` on top, so the *result* is bounded and the only thing a peak can measure is
+    // what the union itself holds. Streaming, the limit also stops the pull.
+    let plan: RelOp = serde_json::from_str(&format!(
+        r#"{{"op":"limit","input":{{"op":"union","inputs":[{},{}],"distinct":false}},
+             "n":5,"offset":0}}"#,
+        branch(0),
+        branch(1)
+    ))
+    .unwrap();
+
+    let mut peaks = Vec::new();
+    for n in [1_000_000i64, 4_000_000] {
+        let srcs = vec![facts(n, 0), facts(n, 0)];
+        let mut rows = 0usize;
+        let peak = peak_delta(|| {
+            let out = std::hint::black_box(execute_streaming(&plan, &srcs, 0).unwrap());
+            rows = out.iter().map(|b| b.num_rows()).sum();
+        });
+        assert_eq!(rows, 5, "the limit above the union must still bind");
+        peaks.push(peak);
+    }
+    assert!(
+        peaks[1] < peaks[0] * 2,
+        "a UNION ALL under a LIMIT must not hold its branches: {} -> {} across a 4x growth",
+        peaks[0],
+        peaks[1]
+    );
+}
+
+/// `UNION DISTINCT` over branches that reduce holds its survivors, not its branches.
+///
+/// It is the streamed concat composed with the streamed dedup, so it inherits both bounds: the
+/// branches are never held, and the dedup's state is the distinct rows. Before, every branch was
+/// drained in full and only then deduped.
+#[test]
+fn a_union_distinct_does_not_hold_its_branches() {
+    let _measuring = measuring();
+    // Project to the repeating key alone, so the answer is 100 rows however long the branches are.
+    let branch = |src: usize| {
+        format!(
+            r#"{{"op":"project","input":{{"op":"scan","source_id":{src}}},"exprs":[
+                   {{"expr":{{"e":"binary","op":"add","left":{{"e":"col","name":"k"}},
+                            "right":{{"e":"lit","value":{{"int":0}}}}}},"alias":"k"}}]}}"#
+        )
+    };
+    let plan: RelOp = serde_json::from_str(&format!(
+        r#"{{"op":"union","inputs":[{},{}],"distinct":true}}"#,
+        branch(0),
+        branch(1)
+    ))
+    .unwrap();
+
+    let mut peaks = Vec::new();
+    for n in [1_000_000i64, 4_000_000] {
+        let srcs = vec![facts(n, 0), facts(n, 0)];
+        let mut rows = 0usize;
+        let peak = peak_delta(|| {
+            let out = std::hint::black_box(execute_streaming(&plan, &srcs, 0).unwrap());
+            rows = out.iter().map(|b| b.num_rows()).sum();
+        });
+        assert_eq!(rows, 100, "both branches carry the same 100 distinct keys");
+        peaks.push(peak);
+    }
+    assert!(
+        peaks[1] < peaks[0] * 2,
+        "a reducing UNION DISTINCT must not hold its branches: {} -> {} across a 4x growth",
+        peaks[0],
+        peaks[1]
+    );
+}
+
+/// A fixed-count `SAMPLE n` holds the `n` rows it is keeping, not the relation it draws from.
+///
+/// `ds.sample(n=1000)` over a table too large to collect is precisely what a fixed-count sample
+/// is for, and it was the shape that held the whole table to return a thousand rows.
+#[test]
+fn a_fixed_count_sample_does_not_hold_the_relation_it_draws_from() {
+    let _measuring = measuring();
+    let plan: RelOp = serde_json::from_str(&format!(
+        r#"{{"op":"sample","input":{},"fraction":1.0,"seed":7,"n":100}}"#,
+        computed_input()
+    ))
+    .unwrap();
+
+    let mut peaks = Vec::new();
+    for n in [1_000_000i64, 4_000_000] {
+        let srcs = vec![facts(n, 0)];
+        let mut rows = 0usize;
+        let peak = peak_delta(|| {
+            let out = std::hint::black_box(execute_streaming(&plan, &srcs, 0).unwrap());
+            rows = out.iter().map(|b| b.num_rows()).sum();
+        });
+        assert_eq!(rows, 100, "a SAMPLE 100 must return a hundred rows");
+        peaks.push(peak);
+    }
+    assert!(
+        peaks[1] < peaks[0] * 2,
+        "a fixed-count sample's peak must not scale with its input: {} -> {} across a 4x growth",
+        peaks[0],
+        peaks[1]
+    );
+}
+
 /// A dimension whose *build side* is large but whose *join output* is not.
 ///
 /// Keys `0..rows`, of which only `0..100` match `facts`. The unmatched remainder inflates the

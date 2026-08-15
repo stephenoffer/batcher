@@ -476,9 +476,56 @@ fn a_grouped_count_distinct_over_a_filter_matches_the_oracle() {
     assert_multiset(&json, &[facts()]);
 }
 
+/// `UNION ALL` is its branches concatenated **in order**, so it is checked in order.
+///
+/// The multiset check this used to make could not see the property the streaming form actually
+/// has to preserve: it yields branch 0's morsels, then branch 1's, and a driver that interleaved
+/// them, or ran them backwards, would satisfy a multiset comparison exactly as well.
 #[test]
 fn union_matches_the_oracle() {
     let json = format!(r#"{{"op":"union","inputs":[{SCAN},{SCAN}],"distinct":false}}"#);
+    assert_ordered(&json, &[facts()]);
+}
+
+/// Two branches over *different* sources, so the concatenation order is observable as more than
+/// a doubling — the streamed union must still emit source 0's rows before source 1's.
+#[test]
+fn a_union_all_of_two_sources_matches_the_oracle_in_order() {
+    // Both branches narrowed to one `k` column, so the two sources are union-compatible.
+    let left = format!(
+        r#"{{"op":"project","input":{{"op":"scan","source_id":0}},
+             "exprs":[{{"expr":{},"alias":"k"}}]}}"#,
+        col("k")
+    );
+    let right = format!(
+        r#"{{"op":"project","input":{{"op":"scan","source_id":1}},
+             "exprs":[{{"expr":{},"alias":"k"}}]}}"#,
+        col("k")
+    );
+    let json = format!(r#"{{"op":"union","inputs":[{left},{right}],"distinct":false}}"#);
+    assert_ordered(&json, &[facts(), dim()]);
+}
+
+/// A `LIMIT` above a `UNION ALL` reads only as far into the branches as it needs. Which rows it
+/// returns depends on the emission order, so this is the shape where a union that streamed its
+/// branches in some other order would return different data rather than merely different-looking
+/// data.
+#[test]
+fn a_limit_over_a_union_all_matches_the_oracle_in_order() {
+    let union = format!(r#"{{"op":"union","inputs":[{SCAN},{SCAN}],"distinct":false}}"#);
+    let json = format!(r#"{{"op":"limit","input":{union},"n":7,"offset":0}}"#);
+    assert_ordered(&json, &[facts()]);
+}
+
+/// `UNION DISTINCT` composes the streamed concat with the streamed dedup. Its group order is a
+/// hash aggregate's and so unspecified, which is what the multiset comparison is for here.
+#[test]
+fn a_union_distinct_matches_the_oracle() {
+    let proj = format!(
+        r#"{{"op":"project","input":{SCAN},"exprs":[{{"expr":{},"alias":"k"}}]}}"#,
+        col("k")
+    );
+    let json = format!(r#"{{"op":"union","inputs":[{proj},{proj}],"distinct":true}}"#);
     assert_multiset(&json, &[facts()]);
 }
 
@@ -655,6 +702,44 @@ fn fractional_sample_is_independent_of_batch_boundaries() {
         rows(&one),
         rows(&many),
         "a fractional sample must select the same rows regardless of batch boundaries"
+    );
+}
+
+/// A **fixed-count** sample keeps the `n` smallest-hash rows of the whole relation, so it is
+/// folded rather than drawn per morsel — and the fold must pick the same `n` rows in the same
+/// order the single pass does. Checked in order for the same reason the fractional one is: this
+/// operator only ever drops rows, so a reordering is a defect a multiset comparison cannot see.
+#[test]
+fn fixed_count_sample_folds_and_matches_the_oracle_in_order() {
+    for (n, seed) in [(0usize, 7u64), (1, 7), (10, 3), (1000, 42), (10_000_000, 1)] {
+        let json =
+            format!(r#"{{"op":"sample","input":{SCAN},"fraction":1.0,"seed":{seed},"n":{n}}}"#);
+        assert_ordered(&json, &[facts()]);
+    }
+}
+
+/// …and it must not depend on where morsel boundaries fall, which is the property that separates
+/// a global fold from a per-morsel draw. A per-morsel draw would keep `n` rows from *every*
+/// morsel, so re-slicing the same rows would change the answer.
+#[test]
+fn fixed_count_sample_is_independent_of_batch_boundaries() {
+    let json = format!(r#"{{"op":"sample","input":{SCAN},"fraction":1.0,"seed":42,"n":25}}"#);
+    let p = plan(&json);
+    let one = execute_streaming(&p, &[facts()], 0).expect("single batch");
+    let split: Vec<RecordBatch> = facts()
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows())
+                .step_by(1000)
+                .map(|off| b.slice(off, 1000.min(b.num_rows() - off)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let many = execute_streaming(&p, &[split], 0).expect("many batches");
+    assert_eq!(
+        rows(&one),
+        rows(&many),
+        "a fixed-count sample must select the same rows regardless of batch boundaries"
     );
 }
 

@@ -61,7 +61,23 @@ def _mix64_vec(np: Any, x: Any) -> Any:
     return x ^ (x >> np.uint64(31))
 
 
-class _FeistelPermutation(Sequence[int]):
+class _KeyedPermutation(Sequence[int]):
+    """A computed bijection on ``[0, n)`` that can also map a whole NumPy array at once.
+
+    The two implementations below differ only in *locality*: `_FeistelPermutation` scatters
+    neighbouring positions across the whole corpus, and `_BlockPermutation` keeps them inside
+    one block. Callers switch on this base rather than on either concrete class, so a
+    permutation added later is vectorized by every caller without touching them.
+    """
+
+    __slots__ = ()
+
+    def take(self, indices: Any) -> Any:
+        """Map a whole NumPy `uint64` array of positions at once."""
+        raise NotImplementedError
+
+
+class _FeistelPermutation(_KeyedPermutation):
     """A keyed bijection on ``[0, n)``, computed per index in O(1) time and memory.
 
     A 4-round balanced Feistel network is a permutation of ``[0, 2^(2h))`` for *any*
@@ -147,8 +163,122 @@ class _FeistelPermutation(Sequence[int]):
         )
 
 
+class _BlockPermutation(_KeyedPermutation):
+    """A keyed bijection on ``[0, n)`` that shuffles **within blocks and between blocks**.
+
+    `_FeistelPermutation` shuffles perfectly and reads terribly. Every sample it hands out
+    is uniform over the whole corpus, so a batch of 1,024 samples lands in up to 1,024
+    different shards — and a shard is the unit a sharded corpus is *stored* and *cached* in.
+    With a corpus of 10,000 shards, a loader with any bounded shard cache therefore misses on
+    nearly every sample and reads a whole shard to use one row of it: the epoch reads the
+    corpus thousands of times over. The cache is not too small; a global shuffle simply has
+    no working set for it to hold.
+
+    So this permutes at two scales instead. The corpus is cut into blocks of `block` samples;
+    the *blocks* are permuted, and each block's rows are permuted *inside* it. Consecutive
+    positions therefore stay inside one block, and a block is sized to the shard cache — so
+    the loader reads each shard once per epoch while still seeing a different, seed-keyed
+    order every epoch. This is the ``py1b``/``py1e`` trade MosaicML-Streaming makes and the
+    reason WebDataset pairs a shard shuffle with a sample buffer: locality bought with a
+    shuffle that is random within a window rather than across the corpus.
+
+    Both scales are Feistel bijections, so the whole map is a bijection with no bookkeeping
+    and no materialized order: memory stays O(1) and a mid-epoch seek stays arithmetic. The
+    trailing ``n % block`` samples are a short final block, permuted among themselves.
+    """
+
+    __slots__ = ("_block", "_blocks", "_boundary", "_full", "_key", "_n", "_tail")
+
+    def __init__(self, n: int, block: int, key: int) -> None:
+        self._n = n
+        self._block = block
+        self._key = key & _U64
+        self._full = n // block
+        self._boundary = self._full * block
+        # The block order, and the order within the short trailing block. `None` where the
+        # domain has fewer than two entries and a permutation would be the identity anyway.
+        self._blocks = (
+            _FeistelPermutation(self._full, _mix64(self._key ^ 0x9E3779B97F4A7C15))
+            if self._full > 1
+            else None
+        )
+        tail = n - self._boundary
+        self._tail = (
+            _FeistelPermutation(tail, _mix64(self._key ^ 0xC2B2AE3D27D4EB4F)) if tail > 1 else None
+        )
+
+    def __len__(self) -> int:
+        return self._n
+
+    def _inner(self, index_block: int) -> _FeistelPermutation:
+        """The permutation of the rows *inside* index-block `index_block`.
+
+        Keyed on the block, so two blocks never share an order, and rebuilt per call rather
+        than cached: the object is four integers, and caching one per block would reintroduce
+        the O(number of blocks) state this design exists to avoid.
+        """
+        return _FeistelPermutation(
+            self._block, _mix64(self._key ^ ((index_block * 0x2545F4914F6CDD1D) & _U64))
+        )
+
+    def __getitem__(self, index: int) -> int:  # type: ignore[override]
+        """The shuffled sample at position `index`."""
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self._n))]  # type: ignore[return-value]
+        if index < 0:
+            index += self._n
+        if not 0 <= index < self._n:
+            raise IndexError(f"index {index} out of range for permutation of {self._n}")
+        if index >= self._boundary:  # the short trailing block, permuted among itself
+            offset = index - self._boundary
+            return self._boundary + (self._tail[offset] if self._tail is not None else offset)
+        position_block, offset = divmod(index, self._block)
+        j = self._blocks[position_block] if self._blocks is not None else position_block
+        return j * self._block + self._inner(j)[offset]
+
+    def take(self, indices: Any) -> Any:
+        """`__getitem__` over a whole NumPy array of positions at once.
+
+        Positions are grouped by their block, so the per-block Feistel runs once per block
+        rather than once per sample. A loader reads consecutive positions, so a batch spans
+        one or two blocks and this is one or two vectorized passes.
+        """
+        import numpy as np
+
+        pos = np.asarray(indices, dtype=np.uint64)
+        out = np.empty_like(pos)
+        boundary = np.uint64(self._boundary)
+        block = np.uint64(self._block)
+
+        tail_mask = pos >= boundary
+        if tail_mask.any():
+            offsets = pos[tail_mask] - boundary
+            out[tail_mask] = boundary + (
+                self._tail.take(offsets) if self._tail is not None else offsets
+            )
+        head_mask = ~tail_mask
+        if not head_mask.any():
+            return out
+        head = pos[head_mask]
+        position_blocks = head // block
+        offsets = head - position_blocks * block
+        target = self._blocks.take(position_blocks) if self._blocks is not None else position_blocks
+        mapped = np.empty_like(head)
+        # One vectorized Feistel per distinct target block, not per sample.
+        for j in np.unique(target):
+            in_block = target == j
+            mapped[in_block] = j * block + self._inner(int(j)).take(offsets[in_block])
+        out[head_mask] = mapped
+        return out
+
+
 def epoch_permutation(
-    num_samples: int, *, epoch: int = 0, seed: int = 0, shuffle: bool = True
+    num_samples: int,
+    *,
+    epoch: int = 0,
+    seed: int = 0,
+    shuffle: bool = True,
+    block_size: int | None = None,
 ) -> Sequence[int]:
     """The global sample order for one epoch, as a **lazy** sequence.
 
@@ -157,17 +287,29 @@ def epoch_permutation(
     of world size — the stable backbone every rank strides over, and the basis for both
     elasticity and O(1) resume. With ``shuffle=False`` it is ``range(num_samples)``.
 
+    `block_size` trades shuffle radius for **read locality**. Without it the order is
+    uniform over the whole corpus, which is ideal for convergence and pathological for a
+    sharded corpus on disk: consecutive samples land in unrelated shards, so a bounded shard
+    cache misses on nearly every one and the epoch reads the corpus many times over. With it,
+    the corpus is cut into blocks of `block_size` samples, the blocks are shuffled, and each
+    block is shuffled internally — so a batch stays inside one block, the working set is one
+    block wide, and each shard is read once per epoch. Size the block to the reader's cache
+    (a whole number of shards) and the shuffle is still random within a window far larger
+    than any batch.
+
     Args:
         num_samples: Size of the corpus.
         epoch: Reshuffles the order; pass the same value on every rank.
         seed: Reproduces the order across runs.
         shuffle: When false, the identity order.
+        block_size: Shuffle within blocks of this many samples (and shuffle the blocks)
+            instead of across the whole corpus. ``None`` shuffles globally.
 
     Returns:
         A lazy sequence that is a permutation of ``range(num_samples)``.
 
     Raises:
-        ValueError: If `num_samples` is negative.
+        ValueError: If `num_samples` is negative, or `block_size` is below 1.
 
     Examples:
         .. doctest::
@@ -178,10 +320,18 @@ def epoch_permutation(
             1000000000000
             >>> sorted(epoch_permutation(5, seed=1))  # still a permutation
             [0, 1, 2, 3, 4]
+            >>> blocked = epoch_permutation(8, seed=1, block_size=4)
+            >>> sorted(blocked[:4]) == [0, 1, 2, 3] or sorted(blocked[:4]) == [4, 5, 6, 7]
+            True
     """
     if num_samples < 0:
         raise ValueError("num_samples must be non-negative")
+    if block_size is not None and block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
     if not shuffle or num_samples <= 1:
         return range(num_samples)
     # One key per (seed, epoch): a new epoch reshuffles, the same pair reproduces.
-    return _FeistelPermutation(num_samples, _mix64(seed * 0x9E3779B1 + epoch))
+    key = _mix64(seed * 0x9E3779B1 + epoch)
+    if block_size is not None and block_size < num_samples:
+        return _BlockPermutation(num_samples, block_size, key)
+    return _FeistelPermutation(num_samples, key)

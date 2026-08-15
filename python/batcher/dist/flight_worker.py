@@ -31,6 +31,7 @@ from batcher._internal.native import engine
 from batcher.carbonite.transfer import ShuffleTicket
 from batcher.carbonite.transfer.codec import resolve_codec
 from batcher.kyber.cost.fabric import measured_fabric_gbps
+from batcher.plan.types import total_logical_bytes
 
 if TYPE_CHECKING:
     from batcher.config.config import ShuffleTlsConfig
@@ -568,7 +569,7 @@ try:
                 # *pull over the wire*, and Arrow IPC writes only the rows a batch
                 # addresses. A window's pinned parent costs this worker memory (which the
                 # store's own cap governs) but costs the transfer nothing.
-                self._bucket_bytes[r] = sum(b.nbytes for b in bucket)
+                self._bucket_bytes[r] = total_logical_bytes(bucket)
             return self.session.addr
 
         def replicate_buckets(

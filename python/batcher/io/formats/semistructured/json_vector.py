@@ -68,6 +68,11 @@ def _renderable(dtype: pa.DataType) -> bool:
         or pa.types.is_string(dtype)
         or pa.types.is_large_string(dtype)
         or pa.types.is_null(dtype)
+        # Temporal renders as an ISO-8601 string (see `_temporal`). Declining it sent every
+        # date/timestamp column to the pandas encoder, which wrote a *numerically wrong*
+        # number for every unit but nanoseconds.
+        or pa.types.is_timestamp(dtype)
+        or pa.types.is_date(dtype)
     )
 
 
@@ -82,6 +87,26 @@ def _strings(arr: pa.Array, pc: Any) -> pa.Array | None:
         for needle, replacement in _SHORT_ESCAPES:
             plain = pc.replace_substring(plain, needle, replacement)
     return pc.binary_join_element_wise('"', plain, '"', "")
+
+
+def _temporal(arr: pa.Array, pc: Any) -> pa.Array:
+    """An ISO-8601 JSON string for a date or timestamp array.
+
+    JSON has no temporal type, so the value has to be either a number or a string. It was
+    a number, and the number was wrong: this column declined here and fell through to the
+    pandas encoder, which reads *every* timestamp column's raw integers as nanoseconds. Only
+    `timestamp[ns]` came out right -- a `timestamp[us]` column (what the FFI boundary
+    normalizes to, so the common case) was divided by a million, writing `1709210096` for an
+    instant whose epoch-microsecond value is `1709210096123456`. Read back as any unit that
+    is a plausible reading of a bare number, that is the wrong instant, silently.
+
+    Arrow's cast to string is ISO-8601 at the column's own resolution, so it is exact for
+    every unit, and it is the spelling `msgpack` already writes and that DuckDB, Spark and
+    pandas' own ``date_format="iso"`` produce. The rendered text is digits and
+    ``- : . T + Z`` only, none of which JSON escapes, so the quotes go on directly rather
+    than through `_strings`' escape passes.
+    """
+    return pc.binary_join_element_wise('"', pc.cast(arr, pa.string()), '"', "")
 
 
 def _floats(arr: pa.Array, pc: Any) -> pa.Array:
@@ -110,6 +135,8 @@ def _values(arr: pa.Array, pc: Any) -> pa.Array | None:
         rendered = _floats(arr, pc)
     elif pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
         rendered = _strings(arr, pc)
+    elif pa.types.is_timestamp(dtype) or pa.types.is_date(dtype):
+        rendered = _temporal(arr, pc)
     else:  # bool and integer: Arrow's cast already emits the JSON spelling
         rendered = pc.cast(arr, pa.string())
     if rendered is None:

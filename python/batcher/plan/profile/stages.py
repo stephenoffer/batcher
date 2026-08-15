@@ -26,6 +26,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from batcher.plan.types import logical_bytes
+
 if TYPE_CHECKING:
     import pyarrow as pa
 
@@ -167,7 +169,7 @@ def metered(
             rows_in=0,
             rows_out=batch.num_rows,
             elapsed_ns=elapsed,
-            result_bytes=batch.nbytes,
+            result_bytes=logical_bytes(batch),
             backend=backend,
         )
         yield batch

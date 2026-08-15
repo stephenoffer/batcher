@@ -682,6 +682,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "async-stream",
+ "bc-arrow",
  "dashmap",
  "futures",
  "memmap2",

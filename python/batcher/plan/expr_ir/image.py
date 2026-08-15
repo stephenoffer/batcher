@@ -29,6 +29,37 @@ _IMAGE_FORMATS = frozenset({"png", "jpeg", "bmp", "gif"})
 _IMAGE_MODES = frozenset({"L", "LA", "RGB", "RGBA"})
 
 
+def _non_negative(func: str, value: float) -> float:
+    """Reject a negative enhancement factor at plan build, where it names the method."""
+    if value < 0:
+        raise PlanError(f"image.{func}(): factor must be >= 0, got {value}")
+    return float(value)
+
+
+def _container(func: str, format: str, quality: int | None) -> dict[str, object]:
+    """Validate an output container and quality, as the IR keywords they become.
+
+    Every bytes-out op takes the same pair, so the check lives once. Rejecting a bad
+    format here rather than in the engine is what turns a typo into a plan-build error
+    naming the caller's own method, instead of a per-row failure a million rows into a
+    scan.
+    """
+    if format not in _IMAGE_FORMATS:
+        raise PlanError(
+            f"image.{func}(): format must be one of {sorted(_IMAGE_FORMATS)}, got {format!r}"
+        )
+    if quality is not None and not 1 <= quality <= 100:
+        raise PlanError(f"image.{func}(): quality must be in 1..100, got {quality}")
+    args: dict[str, object] = {}
+    # Only ever set when it differs from the engine's default, so an unchanged plan keeps
+    # its exact wire shape: `format` is the stable contract, not a place to write "png".
+    if format != "png":
+        args["format"] = format
+    if quality is not None:
+        args["quality"] = quality
+    return args
+
+
 @expr_node
 class ImageCrop(IRNode):
     """A crop whose window is four sub-expressions rather than four constants.
@@ -69,10 +100,21 @@ class ImageFunc(IRNode):
     mean: list[float] | None = scalar(omit_none=True, default=None)
     std: list[float] | None = scalar(omit_none=True, default=None)
     channels_first: bool = scalar(omit_falsy=True, default=False)
-    # `encode` only: the target container; `convert` reuses the slot for its color mode.
-    # Omitted from the IR unless set, so every other image op's wire shape is unchanged.
+    # The container every bytes-out op re-encodes into (`png` when absent). It used to be
+    # `encode`'s alone, with `convert` borrowing it for a color mode -- which left `resize`,
+    # `thumbnail` and `auto_orient` hard-wired to PNG, several times larger and slower than
+    # the JPEG a photographic corpus arrived as. `convert` now has its own `mode`.
     format: str | None = scalar(omit_none=True, default=None)
-    # `letterbox` only: the byte the leftover canvas is filled with.
+    # `convert` only: the target color mode.
+    mode: str | None = scalar(omit_none=True, default=None)
+    # Encoder quality for the lossy containers, 1..100.
+    quality: int | None = scalar(omit_none=True, default=None)
+    # The one scalar knob the photometric and geometry ops take, named per op: `rotate`'s
+    # degrees, `adjust_*`'s factor, `blur`/`sharpen`'s sigma, `posterize`'s bit count,
+    # `solarize`'s threshold, `autocontrast`'s cutoff. One slot rather than six, because an
+    # op reads exactly one and six would be five nulls in every image plan.
+    factor: float | None = scalar(omit_none=True, default=None)
+    # `letterbox`/`pad` only: the byte the leftover canvas is filled with.
     fill: int | None = scalar(omit_none=True, default=None)
 
 
@@ -80,6 +122,13 @@ class ImageFunc(IRNode):
 # decode without reaching for a fixture file.
 _PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+# A 2x2 RGB PNG: red, green / blue, white. A 1x1 image has no geometry to flip, no colour
+# spread to measure and no histogram to equalize, so the ops added for curation and
+# augmentation need a picture with at least two of everything to show anything at all.
+_PNG_2X2 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC"
 )
 
 
@@ -203,7 +252,7 @@ class _ImageNamespace:
         bounds = [b if isinstance(b, Expr) else lit(int(b)) for b in (x, y, width, height)]
         return ImageCrop(self._e, *bounds)
 
-    def encode(self, format: str) -> ImageFunc:
+    def encode(self, format: str, *, quality: int | None = None) -> ImageFunc:
         """Re-encode each image in `format`, pixels unchanged.
 
         Normalizes a mixed-format corpus onto one codec, or trades a PNG for a smaller
@@ -213,13 +262,15 @@ class _ImageNamespace:
         Args:
             format: One of ``"png"``, ``"jpeg"``, ``"bmp"``, or ``"gif"``. WebP is
                 readable but not writable, so it is not offered.
+            quality: Encoder quality in ``1..100`` for the lossy containers. Ignored by
+                the lossless ones. Defaults to the encoder's own (75 for JPEG).
 
         Returns:
             An expression evaluating to the re-encoded bytes; null for null or
             undecodable input.
 
         Raises:
-            PlanError: If `format` is not a writable format.
+            PlanError: If `format` is not a writable format, or `quality` is out of range.
 
         Examples:
             .. doctest::
@@ -231,14 +282,14 @@ class _ImageNamespace:
                 >>> ds.select(m=jpeg.image.decode().struct.field("mode")).to_pydict()
                 {'m': ['RGB']}
         """
-        if format not in _IMAGE_FORMATS:
-            raise PlanError(
-                f"image.encode(): format must be one of {sorted(_IMAGE_FORMATS)}, got {format!r}"
-            )
-        return ImageFunc("encode", self._e, format=format)
+        # Unlike its neighbours, `encode` names the container as its whole purpose, so it
+        # is written even when it is the default -- the plan should say what was asked for.
+        return ImageFunc(
+            "encode", self._e, **{**_container("encode", format, quality), "format": format}
+        )
 
-    def convert(self, mode: str) -> ImageFunc:
-        """Convert each image to color `mode`, re-encoded as PNG.
+    def convert(self, mode: str, *, format: str = "png", quality: int | None = None) -> ImageFunc:
+        """Convert each image to color `mode`, re-encoded.
 
         The general form of :meth:`to_grayscale`, which is ``"L"`` plus a resize. This
         changes only the channels, which is what normalizing a corpus that mixes RGB and
@@ -252,13 +303,16 @@ class _ImageNamespace:
         Args:
             mode: One of ``"L"`` (grayscale), ``"LA"`` (grayscale + alpha), ``"RGB"``, or
                 ``"RGBA"``.
+            format: Container to write. Note that ``"jpeg"`` carries no alpha, so it
+                flattens ``"LA"``/``"RGBA"`` back to three channels.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
 
         Returns:
-            An expression evaluating to PNG bytes in `mode`; null for null or undecodable
-            input.
+            An expression evaluating to image bytes in `mode`; null for null or
+            undecodable input.
 
         Raises:
-            PlanError: If `mode` is not one of the four.
+            PlanError: If `mode` is not one of the four, or the container is not writable.
 
         Examples:
             .. doctest::
@@ -274,9 +328,7 @@ class _ImageNamespace:
             raise PlanError(
                 f"image.convert(): mode must be one of {sorted(_IMAGE_MODES)}, got {mode!r}"
             )
-        # `format` carries the target mode here and the target container for `encode`;
-        # neither function uses the other's meaning, so they share the one string slot.
-        return ImageFunc("convert", self._e, format=mode)
+        return ImageFunc("convert", self._e, mode=mode, **_container("convert", format, quality))
 
     def to_tensor(self, width: int, height: int) -> ImageFunc:
         """Decode and resize to ``(width, height)``, flattened to RGB8 pixels.
@@ -518,8 +570,10 @@ class _ImageNamespace:
         """
         return ImageFunc("sharpness", self._e)
 
-    def thumbnail(self, max_size: int) -> ImageFunc:
-        """Scale so the longest side is `max_size`, keeping the aspect ratio (→ PNG bytes).
+    def thumbnail(
+        self, max_size: int, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Scale so the longest side is `max_size`, keeping the aspect ratio.
 
         The aspect-preserving counterpart of :meth:`resize`, and the one to reach for when
         the output is for a person rather than a model. `resize` takes both dimensions, so
@@ -533,9 +587,15 @@ class _ImageNamespace:
 
         Args:
             max_size: Length of the longest side of the result, in pixels.
+            format: Container to write. One of ``"png"``, ``"jpeg"``, ``"bmp"``, ``"gif"``.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
 
         Returns:
-            An expression evaluating to PNG bytes; null for null or undecodable input.
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `format` is not writable or `quality` is out of range.
 
         Examples:
             .. doctest::
@@ -547,7 +607,9 @@ class _ImageNamespace:
                 >>> ds.select(d=small.image.decode()).to_pydict()["d"][0]["width"]
                 1
         """
-        return ImageFunc("thumbnail", self._e, width=max_size)
+        return ImageFunc(
+            "thumbnail", self._e, width=max_size, **_container("thumbnail", format, quality)
+        )
 
     def letterbox(self, width: int, height: int, *, fill: int = 114) -> ImageFunc:
         """Fit onto a ``(width, height)`` canvas keeping the aspect ratio, padding the rest.
@@ -591,8 +653,8 @@ class _ImageNamespace:
             raise PlanError(f"image.letterbox(): fill must be in 0..=255, got {fill}")
         return ImageFunc("letterbox", self._e, width=width, height=height, fill=fill)
 
-    def auto_orient(self) -> ImageFunc:
-        """Apply each image's EXIF orientation, re-encoded as PNG bytes.
+    def auto_orient(self, *, format: str = "png", quality: int | None = None) -> ImageFunc:
+        """Apply each image's EXIF orientation, re-encoded.
 
         A camera almost never rotates its sensor data. It records which way up it was held
         in the EXIF ``Orientation`` tag and leaves the pixels as the sensor read them, so a
@@ -615,6 +677,12 @@ class _ImageNamespace:
         An image that is already upright, or in a format that cannot carry orientation, is
         re-encoded unchanged.
 
+        Args:
+            format: Container to write. One of ``"png"``, ``"jpeg"``, ``"bmp"``, ``"gif"``.
+                The result carries no EXIF whichever is chosen, so the orientation cannot
+                be applied twice.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
         Returns:
             An expression evaluating to PNG bytes; null for null or undecodable input.
 
@@ -628,7 +696,7 @@ class _ImageNamespace:
                 >>> ds.select(d=upright.image.decode().struct.field("width")).to_pydict()
                 {'d': [1]}
         """
-        return ImageFunc("auto_orient", self._e)
+        return ImageFunc("auto_orient", self._e, **_container("auto_orient", format, quality))
 
     def exif_orientation(self) -> ImageFunc:
         """Read each image's EXIF orientation code, 1 through 8 (→ Int32).
@@ -658,16 +726,34 @@ class _ImageNamespace:
         """
         return ImageFunc("exif_orientation", self._e)
 
-    def resize(self, width: int, height: int) -> ImageFunc:
-        """Resize the image and re-encode it as PNG bytes.
+    def resize(
+        self, width: int, height: int, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Resize the image and re-encode it, stretching to the exact size asked for.
+
+        Use :meth:`thumbnail` when the aspect ratio must survive: this takes both
+        dimensions and so squashes anything not already at the target ratio, which no
+        shape assertion downstream can see.
+
+        `format` matters more than it looks. A photographic corpus arrives as JPEG, and
+        re-encoding it as PNG is both slower to write and several times larger — so a
+        resize step that was meant to shrink a dataset used to inflate it instead. Pass
+        the container the corpus should stay in.
 
         Args:
             width: Target width in pixels.
             height: Target height in pixels.
+            format: Container to write. One of ``"png"``, ``"jpeg"``, ``"bmp"``,
+                ``"gif"``.
+            quality: Encoder quality in ``1..100`` for the lossy containers. Ignored by
+                the lossless ones. Defaults to the encoder's own (75 for JPEG).
 
         Returns:
-            An expression evaluating to Binary PNG bytes; null for null or
+            An expression evaluating to Binary image bytes; null for null or
             undecodable input.
+
+        Raises:
+            PlanError: If `format` is not writable or `quality` is out of range.
 
         Examples:
             .. doctest::
@@ -678,5 +764,777 @@ class _ImageNamespace:
                 >>> small = bt.col("img").image.resize(2, 2)
                 >>> ds.select(d=small.image.decode()).to_pydict()
                 {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+
+                >>> jpeg = bt.col("img").image.resize(8, 8, format="jpeg", quality=60)
+                >>> ds.select(f=jpeg.image.format()).to_pydict()
+                {'f': ['jpeg']}
         """
-        return ImageFunc("resize", self._e, width=width, height=height)
+        return ImageFunc(
+            "resize",
+            self._e,
+            width=width,
+            height=height,
+            **_container("resize", format, quality),
+        )
+
+    # ---- geometry ---------------------------------------------------------
+    def rotate(self, degrees: int, *, format: str = "png", quality: int | None = None) -> ImageFunc:
+        """Turn the image by a multiple of 90 degrees, re-encoded.
+
+        Only right angles. A free rotation resamples every pixel and leaves a triangular
+        border in a color nobody chose, where a quarter turn is a transposition that is
+        exact and lossless — and "rotate this corpus upright" is what people actually
+        want. Use :meth:`auto_orient` when the turn should come from the camera's own
+        Exif tag rather than from a constant.
+
+        Args:
+            degrees: A multiple of 90. Negative and over-full-turn values are normalized,
+                so ``-90`` and ``270`` are the same rotation.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `degrees` is not a multiple of 90, or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> turned = bt.col("img").image.rotate(90)
+                >>> ds.select(d=turned.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        if degrees % 90 != 0:
+            raise PlanError(
+                "image.rotate(): degrees must be a multiple of 90 (a free rotation would "
+                f"resample every pixel and pad the corners), got {degrees}"
+            )
+        return ImageFunc(
+            "rotate",
+            self._e,
+            factor=float(degrees),
+            **_container("rotate", format, quality),
+        )
+
+    def flip_horizontal(self, *, format: str = "png", quality: int | None = None) -> ImageFunc:
+        """Mirror the image left-to-right, re-encoded.
+
+        The single most-used training-time augmentation. It belongs here rather than in a
+        loader because it must happen on the *image*, before the tensor step, so a
+        detector's boxes can be flipped alongside it.
+
+        Args:
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> flipped = bt.col("img").image.flip_horizontal()
+                >>> ds.select(d=flipped.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        return ImageFunc(
+            "flip_horizontal", self._e, **_container("flip_horizontal", format, quality)
+        )
+
+    def flip_vertical(self, *, format: str = "png", quality: int | None = None) -> ImageFunc:
+        """Mirror the image top-to-bottom, re-encoded.
+
+        Args:
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> flipped = bt.col("img").image.flip_vertical()
+                >>> ds.select(d=flipped.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        return ImageFunc("flip_vertical", self._e, **_container("flip_vertical", format, quality))
+
+    def pad(
+        self,
+        width: int,
+        height: int,
+        *,
+        fill: int = 0,
+        format: str = "png",
+        quality: int | None = None,
+    ) -> ImageFunc:
+        """Center the image on a ``(width, height)`` canvas without scaling it.
+
+        The difference from :meth:`letterbox` is that nothing is resampled: every surviving
+        pixel keeps its exact value. That is what an OCR, document or super-resolution
+        pipeline needs, and what a scaling pad quietly destroys. A canvas smaller than the
+        image crops it centrally rather than failing the row.
+
+        Args:
+            width: Canvas width in pixels.
+            height: Canvas height in pixels.
+            fill: The byte value (``0..255``, applied to all three channels) the leftover
+                canvas is filled with. Defaults to 0, black.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> padded = bt.col("img").image.pad(4, 4, fill=255)
+                >>> ds.select(d=padded.image.decode()).to_pydict()
+                {'d': [{'width': 4, 'height': 4, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        return ImageFunc(
+            "pad",
+            self._e,
+            width=width,
+            height=height,
+            fill=fill,
+            **_container("pad", format, quality),
+        )
+
+    # ---- photometric ------------------------------------------------------
+    def adjust_brightness(
+        self, factor: float, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Scale every color channel by `factor`, clamped to the byte range.
+
+        The `PIL.ImageEnhance.Brightness` convention, so an augmentation policy written
+        against torchvision ports over unchanged: ``1.0`` is the identity, ``0.0`` black,
+        ``2.0`` twice as bright.
+
+        Args:
+            factor: A non-negative multiplier.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `factor` is negative or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> dark = bt.col("img").image.adjust_brightness(0.5)
+                >>> ds.select(c=dark.image.mean_color()).to_pydict()
+                {'c': [{'r': 64.0, 'g': 64.0, 'b': 64.0}]}
+        """
+        return ImageFunc(
+            "adjust_brightness",
+            self._e,
+            factor=_non_negative("adjust_brightness", factor),
+            **_container("adjust_brightness", format, quality),
+        )
+
+    def adjust_contrast(
+        self, factor: float, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Push every channel away from the image's mean luma by `factor`.
+
+        `PIL.ImageEnhance.Contrast`: ``1.0`` is the identity and ``0.0`` collapses the
+        image to a flat field at its own average brightness.
+
+        Args:
+            factor: A non-negative multiplier.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `factor` is negative or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> flat = bt.col("img").image.adjust_contrast(0.0)
+                >>> ds.select(e=flat.image.entropy()).to_pydict()
+                {'e': [0.0]}
+        """
+        return ImageFunc(
+            "adjust_contrast",
+            self._e,
+            factor=_non_negative("adjust_contrast", factor),
+            **_container("adjust_contrast", format, quality),
+        )
+
+    def adjust_saturation(
+        self, factor: float, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Interpolate each pixel between its grey and its color by `factor`.
+
+        `PIL.ImageEnhance.Color`: ``0.0`` is grayscale, ``1.0`` the identity, and anything
+        above 1 more vivid. Unlike :meth:`convert` to ``"L"`` this keeps three channels, so
+        it is an augmentation rather than a format change.
+
+        Args:
+            factor: A non-negative multiplier.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `factor` is negative or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> grey = bt.col("img").image.adjust_saturation(0.0)
+                >>> ds.select(g=grey.image.is_grayscale()).to_pydict()
+                {'g': [True]}
+        """
+        return ImageFunc(
+            "adjust_saturation",
+            self._e,
+            factor=_non_negative("adjust_saturation", factor),
+            **_container("adjust_saturation", format, quality),
+        )
+
+    def adjust_hue(
+        self, degrees: float, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Rotate every hue around the color wheel, leaving saturation and value alone.
+
+        The color-jitter axis the other three adjustments cannot express, and the one a
+        robustness sweep varies. Degrees wrap, so ``-30`` and ``330`` are the same shift.
+
+        Args:
+            degrees: The rotation in degrees.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> shifted = bt.col("img").image.adjust_hue(180)
+                >>> ds.select(d=shifted.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        return ImageFunc(
+            "adjust_hue",
+            self._e,
+            factor=float(degrees),
+            **_container("adjust_hue", format, quality),
+        )
+
+    def blur(
+        self, sigma: float = 1.0, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Apply a Gaussian blur of standard deviation `sigma` pixels.
+
+        Both an augmentation and a curation tool: blurring a copy and comparing
+        :meth:`sharpness` separates images that carry fine detail from ones that are
+        already soft.
+
+        Args:
+            sigma: The blur radius in pixels. ``0`` is the identity.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `sigma` is negative or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> soft = bt.col("img").image.blur(2.0)
+                >>> ds.select(d=soft.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        return ImageFunc(
+            "blur",
+            self._e,
+            factor=_non_negative("blur", sigma),
+            **_container("blur", format, quality),
+        )
+
+    def sharpen(
+        self, amount: float = 1.0, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Apply an unsharp mask of strength `amount`.
+
+        The classical formula, ``image + amount * (image - blur(image))``, so ``0`` is the
+        identity and larger values push edge contrast harder.
+
+        Args:
+            amount: The strength of the mask. ``0`` is the identity.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `amount` is negative or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> crisp = bt.col("img").image.sharpen(1.5)
+                >>> ds.select(d=crisp.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        return ImageFunc(
+            "sharpen",
+            self._e,
+            factor=_non_negative("sharpen", amount),
+            **_container("sharpen", format, quality),
+        )
+
+    def invert(self, *, format: str = "png", quality: int | None = None) -> ImageFunc:
+        """Take the photographic negative of each color channel, alpha untouched.
+
+        Args:
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> negative = bt.col("img").image.invert()
+                >>> ds.select(e=negative.image.entropy()).to_pydict()
+                {'e': [2.0]}
+        """
+        return ImageFunc("invert", self._e, **_container("invert", format, quality))
+
+    def posterize(
+        self, bits: int = 4, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Reduce each color channel to its top `bits` bits.
+
+        One of the AutoAugment/RandAugment primitives, and a cheap way to make a corpus's
+        color quantization uniform. The low bits are masked off rather than rescaled, which
+        is what `PIL.ImageOps.posterize` does, so ``bits=1`` leaves only 0 and 128.
+
+        Args:
+            bits: How many high bits to keep, ``1..8``. ``8`` is the identity.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `bits` is outside ``1..8`` or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> flat = bt.col("img").image.posterize(1)
+                >>> ds.select(c=flat.image.mean_color()).to_pydict()
+                {'c': [{'r': 64.0, 'g': 64.0, 'b': 64.0}]}
+        """
+        if not 1 <= bits <= 8:
+            raise PlanError(f"image.posterize(): bits must be in 1..8, got {bits}")
+        return ImageFunc(
+            "posterize",
+            self._e,
+            factor=float(bits),
+            **_container("posterize", format, quality),
+        )
+
+    def solarize(
+        self, threshold: int = 128, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Invert every channel value at or above `threshold`, leaving the rest alone.
+
+        The other AutoAugment primitive.
+
+        Args:
+            threshold: The cutoff, ``0..255``. ``255`` leaves almost everything alone.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `threshold` is outside ``0..255`` or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> solar = bt.col("img").image.solarize(128)
+                >>> ds.select(c=solar.image.mean_color()).to_pydict()
+                {'c': [{'r': 0.0, 'g': 0.0, 'b': 0.0}]}
+        """
+        if not 0 <= threshold <= 255:
+            raise PlanError(f"image.solarize(): threshold must be in 0..255, got {threshold}")
+        return ImageFunc(
+            "solarize",
+            self._e,
+            factor=float(threshold),
+            **_container("solarize", format, quality),
+        )
+
+    def equalize(self, *, format: str = "png", quality: int | None = None) -> ImageFunc:
+        """Equalize each channel's histogram so the tonal range is used evenly.
+
+        What rescues an under-exposed scan without a model in the loop.
+        :meth:`autocontrast` is the gentler alternative: it stretches the range without
+        redistributing within it.
+
+        Args:
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> even = bt.col("img").image.equalize()
+                >>> ds.select(d=even.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        return ImageFunc("equalize", self._e, **_container("equalize", format, quality))
+
+    def autocontrast(
+        self, cutoff: float = 0.0, *, format: str = "png", quality: int | None = None
+    ) -> ImageFunc:
+        """Rescale each channel so its darkest and brightest surviving values hit 0 and 255.
+
+        `PIL.ImageOps.autocontrast`. A channel with no range left to stretch — a solid
+        field — is passed through untouched rather than divided by zero.
+
+        Args:
+            cutoff: The percent of each histogram tail to ignore before finding the
+                extremes, ``0..49``. A few percent makes the stretch robust to a handful
+                of stuck pixels.
+            format: Container to write.
+            quality: Encoder quality in ``1..100`` for the lossy containers.
+
+        Returns:
+            An expression evaluating to Binary image bytes; null for null or undecodable
+            input.
+
+        Raises:
+            PlanError: If `cutoff` is outside ``0..49`` or the container is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> stretched = bt.col("img").image.autocontrast()
+                >>> ds.select(d=stretched.image.decode()).to_pydict()
+                {'d': [{'width': 2, 'height': 2, 'channels': 3, 'mode': 'RGB'}]}
+        """
+        if not 0 <= cutoff <= 49:
+            raise PlanError(f"image.autocontrast(): cutoff must be in 0..49, got {cutoff}")
+        return ImageFunc(
+            "autocontrast",
+            self._e,
+            factor=float(cutoff),
+            **_container("autocontrast", format, quality),
+        )
+
+    # ---- perceptual hashes ------------------------------------------------
+    def phash(self) -> ImageFunc:
+        """Compute the 64-bit DCT perceptual hash, as an Int64.
+
+        The most robust of the three fingerprints here. Where :meth:`dhash` compares
+        adjacent pixels, this keeps the 8x8 lowest-frequency DCT coefficients of a 32x32
+        luma reduction and thresholds them at their median — the standard ``pHash``. It
+        survives re-encoding, heavy rescaling and moderate cropping far better, which is
+        why a dedup pass over a scraped corpus usually confirms with this one and
+        pre-filters with :meth:`ahash` or :meth:`dhash`.
+
+        Two images are near-duplicates when few bits differ, so
+        ``a.bitwise_xor(b).bit_count() <= 6`` is a similarity predicate the engine
+        evaluates as ordinary integer arithmetic.
+
+        Returns:
+            An expression evaluating to an Int64 digest (the 64 bits reinterpreted, not
+            clamped); null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> h = bt.col("img").image.phash()
+                >>> ds.select(stable=(h == bt.col("img").image.phash())).to_pydict()
+                {'stable': [True]}
+        """
+        return ImageFunc("phash", self._e)
+
+    def ahash(self) -> ImageFunc:
+        """Compute the 64-bit average hash, as an Int64.
+
+        An 8x8 luma reduction thresholded at its own mean: the cheapest of the three
+        fingerprints and the least discriminating. It exists because a Hamming pre-filter
+        over a large corpus wants a hash that costs almost nothing, with :meth:`phash`
+        confirming the survivors.
+
+        Returns:
+            An expression evaluating to an Int64 digest (the 64 bits reinterpreted, not
+            clamped); null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> h = bt.col("img").image.ahash()
+                >>> ds.select(stable=(h == bt.col("img").image.ahash())).to_pydict()
+                {'stable': [True]}
+        """
+        return ImageFunc("ahash", self._e)
+
+    # ---- curation measures ------------------------------------------------
+    def entropy(self) -> ImageFunc:
+        """Measure the Shannon entropy of the luma histogram, in bits.
+
+        The curation measure that separates the cases the other two confuse.
+        :meth:`brightness` cannot tell a mid-grey placeholder tile from a photograph of a
+        foggy road, because both average to the middle; :meth:`sharpness` cannot tell a
+        blank image from an out-of-focus one. This answers how much information is in the
+        tonal distribution at all: a solid field is 0 whatever shade it is, a two-tone logo
+        near 1, and a photograph of anything between 6 and 8.
+
+        Returns:
+            An expression evaluating to a Float64 in ``0..8``; null for null or
+            undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> ds.select(e=bt.col("img").image.entropy()).to_pydict()
+                {'e': [2.0]}
+        """
+        return ImageFunc("entropy", self._e)
+
+    def colorfulness(self) -> ImageFunc:
+        """Measure Hasler-Süsstrunk colorfulness — how much color the image actually has.
+
+        The measure no luma statistic can express. A sepia-toned duplicate, a line drawing,
+        a scanned page and a greyscale photograph stored as RGB all have ordinary
+        brightness, sharpness and entropy, and all of them are the wrong training data for
+        a model that is supposed to see color. Roughly 0 for anything grey and 15 or more
+        for a vivid scene.
+
+        Returns:
+            An expression evaluating to a non-negative Float64; null for null or
+            undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> vivid = ds.select(c=bt.col("img").image.colorfulness()).to_pydict()
+                >>> vivid["c"][0] > 15
+                True
+        """
+        return ImageFunc("colorfulness", self._e)
+
+    def mean_color(self) -> ImageFunc:
+        """Read the mean of each color channel as a struct ``{r, g, b}``.
+
+        The cheapest color summary there is, and the one that makes "find every product
+        shot on a white background" and "cluster this corpus by palette" ordinary
+        expressions rather than an embedding model. A struct rather than three functions
+        because all three come out of the same pass, exactly as :meth:`decode`'s four
+        header facts do.
+
+        Returns:
+            An expression evaluating to a struct of three Float64 channel means in
+            ``0..255``; null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> ds.select(c=bt.col("img").image.mean_color()).to_pydict()
+                {'c': [{'r': 127.5, 'g': 127.5, 'b': 127.5}]}
+
+                >>> red = bt.col("img").image.mean_color().struct.field("r")
+                >>> ds.select(r=red).to_pydict()
+                {'r': [127.5]}
+        """
+        return ImageFunc("mean_color", self._e)
+
+    def is_grayscale(self) -> ImageFunc:
+        """Test whether every pixel satisfies ``R == G == B``.
+
+        The fact no header carries. A corpus assembled from mixed sources is full of
+        greyscale images *stored* as three identical channels: :meth:`decode` reports
+        ``RGB``, :meth:`has_alpha` reports false, and nothing says that two thirds of every
+        tensor is a copy. Finding them is what lets a pipeline route them to a one-channel
+        model instead of paying three times the bandwidth for one channel of information.
+
+        Returns:
+            An expression evaluating to a Boolean; null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> ds.select(g=bt.col("img").image.is_grayscale()).to_pydict()
+                {'g': [False]}
+        """
+        return ImageFunc("is_grayscale", self._e)
+
+    # ---- header-only facts ------------------------------------------------
+    def aspect_ratio(self) -> ImageFunc:
+        """Read width divided by height, from the header alone.
+
+        The orientation and letterboxing decisions of a whole pipeline hang on this, and
+        paying a full decode to learn it is what made people skip the check. One header
+        read, like :meth:`decode`.
+
+        Returns:
+            An expression evaluating to a Float64; null for null or undecodable input, and
+            null rather than infinity for a zero-height image.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> ds.select(a=bt.col("img").image.aspect_ratio()).to_pydict()
+                {'a': [1.0]}
+        """
+        return ImageFunc("aspect_ratio", self._e)
+
+    def has_alpha(self) -> ImageFunc:
+        """Test whether the image carries an alpha channel, from the header alone.
+
+        The flag that decides whether a corpus needs flattening before a model that takes
+        three channels. Use :meth:`convert` to ``"RGB"`` to do the flattening.
+
+        Returns:
+            An expression evaluating to a Boolean; null for null or undecodable input.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> ds.select(a=bt.col("img").image.has_alpha()).to_pydict()
+                {'a': [False]}
+        """
+        return ImageFunc("has_alpha", self._e)
+
+    def format(self) -> ImageFunc:
+        """Read the container format's name, sniffed from the magic bytes.
+
+        From the bytes, never from the path. A corpus downloaded by content type is full of
+        files whose extension and container disagree, and every one of them is a row that
+        decodes fine and breaks whatever downstream step branched on the name. The name
+        shares a vocabulary with :meth:`encode`, so a value read out of this column can be
+        handed straight back to the encoder.
+
+        Returns:
+            An expression evaluating to a Utf8 container name such as ``"png"`` or
+            ``"jpeg"``; null for null input or bytes matching no known container. The name
+            is the one :meth:`encode` accepts and the one an image listing's ``format``
+            column reports for the same bytes, so the three cannot disagree.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.plan.expr_ir.image import _PNG_2X2
+                >>> ds = bt.from_pydict({"img": [_PNG_2X2]})
+                >>> ds.select(f=bt.col("img").image.format()).to_pydict()
+                {'f': ['png']}
+        """
+        return ImageFunc("format", self._e)

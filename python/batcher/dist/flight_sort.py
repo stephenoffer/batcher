@@ -47,7 +47,13 @@ from batcher.dist.fleet.plan_id import next_result_stage, next_stage_base
 from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
-from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
+from batcher.dist.sort_boundaries import (
+    load_learned_grids,
+    persist_grids,
+    sort_key_identity,
+    sort_key_is_string,
+    sort_shape_key,
+)
 from batcher.io.source import Source
 from batcher.plan.ir_specs import sort_keys_ir, task_scan_ir
 from batcher.plan.logical import LogicalPlan, Sort
@@ -290,8 +296,15 @@ def execute_sort_flight(
         # `dist/sort_boundaries.py`), so a grid that no longer fits the data costs balance
         # and never a row.
         _s = _t.perf_counter()
-        shape_key = sort_shape_key(map_ir, key_name)
-        grids = load_learned_grids(shape_key)
+        # WHICH relation and WHICH type: a bare-scan `map_ir` is a positional source id with
+        # no schema, so every single-source sort in the process hashed alike and shared one
+        # grid — a wrong-typed one raises in the range partitioner, and a wrong-relation one
+        # silently puts the whole input in a single bucket. See
+        # `dist/sort_boundaries.sort_shape_key`. `expect_strings` re-checks on load, so an
+        # entry written under the old colliding digest re-samples instead of raising.
+        key_is_str = sort_key_is_string(sources[sid], key_name)
+        shape_key = sort_shape_key(map_ir, key_name, sort_key_identity(sources[sid], key_name))
+        grids = load_learned_grids(shape_key, key_is_str)
         learned = grids is not None
         if not learned:
             # The grid is sized against the *bucket* count rather than fixed: `n_buckets`

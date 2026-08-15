@@ -13,6 +13,7 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
+from batcher.dist.executors.partition_io import range_partitionable
 from batcher.dist.executors.plan_analysis import _single_source
 from batcher.dist.spill import (
     _fd_safe,
@@ -60,13 +61,7 @@ def supports_spilling_sort(sort: Sort, sources: list[Source] | None = None) -> b
     # range partition rather than fail inside it.
     if idx < 0:
         return False
-    dt = schema.field(idx).type
-    return (
-        pa.types.is_integer(dt)
-        or pa.types.is_floating(dt)
-        or pa.types.is_string(dt)
-        or pa.types.is_large_string(dt)
-    )
+    return range_partitionable(schema.field(idx).type)
 
 
 def execute_spilling_sort(

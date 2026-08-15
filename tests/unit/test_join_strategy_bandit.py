@@ -147,7 +147,9 @@ def test_record_join_strategy_normalizes_by_input_rows():
     recorded: list[tuple[str, float]] = []
     original = bandit.record_arm
     try:
-        bandit.record_arm = lambda hub, ns, key, arm, reward: recorded.append((arm, reward))
+        # `**_` absorbs the keywords the caller passes for reasons this test is not about
+        # (`arms=`, which decides plan-cache invalidation); the reward is what is asserted.
+        bandit.record_arm = lambda hub, ns, key, arm, reward, **_: recorded.append((arm, reward))
         # 40 ms over 2M input rows => 20 ms per million rows.
         bandit.record_join_strategy(object(), "sig", "hash", 40.0, 2_000_000.0)
         # An unknown input size must fall back to the raw wall time, not divide by zero.
@@ -198,3 +200,66 @@ def test_variance_is_read_without_catastrophic_cancellation():
         _pull(stats, "hash", 1e6 + (i % 2))
     sd = math.sqrt(stats["hash"]["m2"] / stats["hash"]["n"])
     assert 0.4 < sd < 0.6, f"recovered sd {sd}, expected ~0.5"
+
+
+@pytest.mark.unit
+def test_a_drifting_mean_does_not_invalidate_a_plan_the_arm_has_not_changed():
+    """The arm the bandit picks is what a plan reads, so it is what must gate the memo.
+
+    The bandit's reward is the query's own latency, so the stored mean moves on every run.
+    Comparing that *value* against a materiality threshold made the plan cache invalidate
+    itself in a loop: a slow run wrote a materially different mean, that invalidated the
+    memoized plan, the next run paid the optimizer again and was slow. Measured on a
+    two-table star join over TPC-DS at scale 1, `optimize` ran twice per query at ~12 ms
+    against ~2 ms of execution and the query sat at **26 ms for twelve consecutive runs**
+    before the discounted mean settled inside the threshold — then dropped to 4.7 ms. The
+    chosen arm was `broadcast` on every one of those runs.
+
+    The generation is process-global, so this was never one query's problem: any query whose
+    mean drifted invalidated *every* memoized plan in the session.
+    """
+    from batcher.kyber import learning
+    from batcher.kyber.learned_tuning import bandit
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends.in_process import InProcessBackend
+
+    hub = MetadataHub(InProcessBackend())
+    # Enough evidence that the bandit is ranking rather than exploring, and a gap wide enough
+    # that no drift within it can change the winner.
+    for _ in range(6):
+        for arm, reward in (("broadcast", 10.0), ("hash", 900.0), ("sort_merge", 900.0)):
+            bandit.record_join_strategy(hub, "sig", arm, reward, 1e6)
+    assert bandit.learned_join_strategy(hub, "sig") == "broadcast"
+
+    before = learning.generation()
+    for reward in (11.0, 9.0, 12.5, 8.5, 13.0):  # ±30% drift, same winner throughout
+        bandit.record_join_strategy(hub, "sig", "broadcast", reward, 1e6)
+        assert bandit.learned_join_strategy(hub, "sig") == "broadcast"
+    assert learning.generation() == before, "a drifting mean re-planned a decided query"
+
+
+@pytest.mark.unit
+def test_an_arm_that_actually_changes_still_invalidates():
+    """The other half: when the winner flips, the memoized plan *must* be dropped.
+
+    This is the failure the write-through contract exists to prevent — the first version of
+    the plan cache let the bandit learn a better arm while serving the plan built on the old
+    one — so relaxing the test to a decision comparison must not relax it to nothing.
+    """
+    from batcher.kyber import learning
+    from batcher.kyber.learned_tuning import bandit
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends.in_process import InProcessBackend
+
+    hub = MetadataHub(InProcessBackend())
+    for _ in range(6):
+        for arm, reward in (("broadcast", 10.0), ("hash", 900.0), ("sort_merge", 900.0)):
+            bandit.record_join_strategy(hub, "sig", arm, reward, 1e6)
+    assert bandit.learned_join_strategy(hub, "sig") == "broadcast"
+
+    before = learning.generation()
+    # Broadcast becomes catastrophically slow; the winner has to move off it.
+    for _ in range(10):
+        bandit.record_join_strategy(hub, "sig", "broadcast", 500_000.0, 1e6)
+    assert bandit.learned_join_strategy(hub, "sig") != "broadcast"
+    assert learning.generation() != before, "a flipped arm served a stale plan"

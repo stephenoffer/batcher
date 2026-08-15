@@ -9,6 +9,12 @@ rewrites the first to an empty relation and drops the second, shrinking the plan
 and — because the row count then propagates exactly — letting `count()` answer `0`
 or the child's count from metadata alone.
 
+`_predicate_status` is the shared oracle, and it is shared on purpose: the scan-level
+skipping rules and the join-emptiness evidence in `rules/extra/runtime_filters/` all ask
+it rather than keeping a second copy of what a bound proves. So a shape taught here is
+taught to every one of them at once. It decides comparisons, `IS NULL`/`IS NOT NULL`
+(at both ends of the null count), and `IN` lists.
+
 Correctness is conservative: a rewrite fires only when the bounds *prove* the
 outcome. Min/max are valid bounds regardless of provenance (a filter or limit can
 only shrink a range), so they may always be used for pruning; but declaring a
@@ -23,7 +29,7 @@ from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
 from batcher.kyber.stats.selectivity import comparison_col_side
 from batcher.plan.bloom_index import BloomIndex
-from batcher.plan.expr_ir import Binary, Expr, IsNotNull, IsNull, Lit, Not
+from batcher.plan.expr_ir import Binary, Expr, InList, IsNotNull, IsNull, Lit, Not
 from batcher.plan.ir_tags import COMPARISON_FLIP, COMPARISON_OPS, LEFT_DRIVEN_JOINS
 from batcher.plan.logical import (
     Distinct,
@@ -209,6 +215,62 @@ def _predicate_status(expr: Expr, stats: RelStats) -> bool | None:
         return _is_null_status(expr.input, stats, negate=False)
     if isinstance(expr, IsNotNull):
         return _is_null_status(expr.input, stats, negate=True)
+    if isinstance(expr, InList):
+        return _in_list_status(expr, stats)
+    return None
+
+
+def _in_list_status(expr: InList, stats: RelStats) -> bool | None:
+    """`col IN (…)` decided from the column's bounds.
+
+    `prune_in_list_by_zonemap` and `prune_in_list_by_bloom` already narrow such a list
+    member by member, and an emptied list makes the *filter* empty — but they only see an
+    `InList` sitting as a top-level conjunct of a `Filter`. Everything else that consults
+    this oracle was blind to the shape: a refuted `IN` as one **disjunct** of an `OR` was
+    not dropped (`drop_filter_disjunct_refuted_by_zonemap`), and an `IN` constraining a
+    **join** side was not evidence that the side is empty
+    (`runtime_filters.evidence`). Deciding it here reaches all three from one definition.
+
+    Two outcomes are provable, on different evidence:
+
+    * **Empty** when no member survives the column's bounds — every one provably matches
+      nothing, so neither does their union. Bounds refute at any provenance, since a
+      row-shrinking operator only narrows the true range.
+    * **Always-true** when the column is a *constant* whose single value is in the list.
+      That needs `min == max` on an EXACT bundle and a proven-zero null count, exactly as
+      `_decide` requires for an always-true comparison: a NULL row makes `IN` evaluate to
+      NULL, which the filter drops, so dropping the filter would keep it.
+
+    Declines on a non-`Col` input, an empty list, or a float bound Python cannot order the
+    way the engine does. The bloom is deliberately *not* consulted here — `_bloom_refutes`
+    in `runtime_filters.evidence` owns the domain-guarded probe, and a second spelling of
+    an absence proof is how the two drift on the one path that deletes rows.
+    """
+    from batcher.plan.expr_ir import Col
+
+    if not isinstance(expr.input, Col) or not expr.values:
+        return None
+    col = stats.column(expr.input.name)
+    if col.min is None or col.max is None:
+        return None
+    if _float_order_is_ambiguous(col.min) or _float_order_is_ambiguous(col.max):
+        return None
+    # A decimal bound against a float literal is compared exactly by Python and in Float64
+    # by the engine, so no member of such a list may be reasoned about at all.
+    if any(
+        mismatched_exactness(col.min, v) or mismatched_exactness(col.max, v) for v in expr.values
+    ):
+        return None
+    try:
+        if all(v < col.min or v > col.max for v in expr.values):
+            return _FALSE
+        # Reaching here, some member lies inside `[min, max]`. On a *constant* column that
+        # member can only be the constant itself, so the predicate holds on every non-null
+        # row — and the zero null count is what lets "every non-null row" become "every row".
+        if col.min == col.max and col.null_count == 0 and col.provenance.is_exact:
+            return _TRUE
+    except TypeError:
+        return None  # incomparable literal/bound types → undecidable
     return None
 
 
@@ -246,16 +308,40 @@ def _or(left: bool | None, right: bool | None) -> bool | None:
 def _is_null_status(input_expr: Expr, stats: RelStats, *, negate: bool) -> bool | None:
     """`col IS NULL` / `IS NOT NULL` decided from a known null count.
 
-    Only a *zero* null count is decidable here (the common case): `IS NULL` is then
-    always-false (no nulls) and `IS NOT NULL` always-true.
+    Two ends of the range are decidable, and they need different evidence.
+
+    A **zero** null count (the common case) makes `IS NULL` always-false and `IS NOT NULL`
+    always-true. Zero is safe at any provenance: every operator that weakens provenance
+    here is row-shrinking, and dropping rows can only lower a null count, so a recorded
+    zero stays an upper bound on the real one.
+
+    An **all-null** column is the mirror — `IS NULL` keeps every row and `IS NOT NULL`
+    keeps none — and it is the shape that arrives from schema evolution, a sparse wide
+    table, or an outer join's padded side. It was undecidable here while the join rules
+    already proved exactly this fact about a key (`evidence._all_null_key`), so a
+    `WHERE col IS NOT NULL` over such a column scanned the relation to return nothing.
+
+    That direction needs an EXACT gate on both counts, which the zero case does not: the
+    conclusion rests on `null_count >= rows`, so an *over*-estimated null count or an
+    *under*-estimated row count would prove a column all-null that holds real values, and
+    the rewrite would delete them. Same evidence bar, and for the same reason, as
+    `_all_null_key`.
     """
     from batcher.plan.expr_ir import Col
 
     if not isinstance(input_expr, Col):
         return None
-    null_count = stats.column(input_expr.name).null_count
-    if null_count == 0:
+    stat = stats.column(input_expr.name)
+    if stat.null_count == 0:
         return _TRUE if negate else _FALSE
+    if (
+        stat.null_count is not None
+        and stat.null_count_is_exact
+        and stats.rows_exact
+        and stats.rows > 0
+        and stat.null_count >= stats.rows
+    ):
+        return _FALSE if negate else _TRUE
     return None
 
 
@@ -312,10 +398,18 @@ def _comparison_status(expr: Binary, stats: RelStats) -> bool | None:
     # definitive absence for a value that is present. Today a cross-domain comparison is
     # wrapped in a `Cast` (so `comparison_col_side` returns `None` and never reaches here),
     # but that is an implicit guard on a silent-wrong-answer path. Make it explicit.
-    if op == "eq" and col.bloom is not None and _same_bloom_domain(col, value):
+    if op in ("eq", "ne") and col.bloom is not None and _same_bloom_domain(col, value):
         index = BloomIndex.from_bytes(col.bloom)
         if index is not None and not index.contains(value):
-            return _FALSE
+            # Absence decides both spellings, but not on the same evidence. `col = v` keeps
+            # no row, and a filter drops the nulls anyway, so emptiness needs nothing more.
+            # `col != v` keeps every *non-null* row — a NULL row evaluates to NULL and the
+            # filter drops it — so calling it always-true additionally requires a proven-zero
+            # null count, exactly as `_decide` requires for the out-of-bounds `ne`.
+            if op == "eq":
+                return _FALSE
+            if col.null_count == 0:
+                return _TRUE
     if col.min is None or col.max is None:
         return None
     if _float_order_is_ambiguous(col.min) or _float_order_is_ambiguous(col.max):

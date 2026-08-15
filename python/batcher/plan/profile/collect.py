@@ -54,6 +54,10 @@ class ProfileCollector:
     # different trees: engine ops against the optimized IR, stages against the logical plan.
     # `api` picks whichever tree the plan actually has.
     stage_recorder: StageRecorder = field(default_factory=StageRecorder)
+    # Per scan `op_id`, what the plan handed that scan's source to apply itself, already
+    # rendered. Filled by the conductor beside `physical_ops`, since only it holds the
+    # `PhysicalPlan` the projections and predicates live on.
+    source_pushdown: dict[int, str] = field(default_factory=dict)
 
     def record_usage(self, doc: dict[str, Any] | None) -> None:
         """Fold one `ExecMetrics.query` block in, summing with anything already recorded.
@@ -70,7 +74,9 @@ class ProfileCollector:
     ) -> QueryProfile:
         """Assemble the collected planned + measured facts into a `QueryProfile`."""
         ir = self.optimized_ir or {}
-        ops = build_op_profiles(ir, self.physical_ops, self.metric_ops or None)
+        ops = build_op_profiles(
+            ir, self.physical_ops, self.metric_ops or None, self.source_pushdown
+        )
         worker_ops: tuple[OpProfile, ...] = ()
         # Folded into a local rather than into `self.usage`: assembling a profile is a read,
         # and a caller that assembles twice (a `stats()` after an `explain(analyze=True)`)
@@ -104,12 +110,23 @@ def build_op_profiles(
     ir: Mapping[str, Any],
     physical_ops: Sequence[PhysicalOp] = (),
     metric_ops: Sequence[Mapping[str, Any]] | None = None,
+    pushdown: Mapping[int, str] | None = None,
 ) -> tuple[OpProfile, ...]:
     """Join the planned `PhysicalOp`s and measured `ExecMetrics` dicts by `op_id`.
 
     `physical_ops` supply the estimate (indexed by `op_id`); `metric_ops` (raw
     `ExecMetrics`, or `None` for a planned-only profile) supply the measurement. An
     operator missing from either side keeps its defaults.
+
+    Args:
+        ir: The optimized plan IR, walked in the same pre-order that assigns `op_id`.
+        physical_ops: Kyber's per-operator annotations, indexed by `op_id`.
+        metric_ops: Measured `ExecMetrics` dicts, or None for a planned-only profile.
+        pushdown: Per `op_id`, what the plan handed to that scan's source, already
+            rendered. Absent for every non-scan operator.
+
+    Returns:
+        One `OpProfile` per operator, in plan pre-order.
     """
     planned = {int(op.op_id): op for op in physical_ops}
     measured = {int(m.get("op_id", -1)): m for m in (metric_ops or [])}
@@ -120,6 +137,7 @@ def build_op_profiles(
         est_rows = float(p.properties.est_rows) if p is not None else float("nan")
         provenance = str(p.properties.provenance) if p is not None else ""
         algorithm = p.algorithm if p is not None and p.algorithm else ""
+        pushed = (pushdown or {}).get(op_id, "")
         m = measured.get(op_id)
         if m is None:
             out.append(
@@ -130,6 +148,7 @@ def build_op_profiles(
                     est_rows=est_rows,
                     provenance=provenance,
                     algorithm=algorithm,
+                    pushed=pushed,
                 )
             )
             continue
@@ -141,6 +160,7 @@ def build_op_profiles(
                 est_rows=est_rows,
                 provenance=provenance,
                 algorithm=algorithm or ("spill" if m.get("spilled") else ""),
+                pushed=pushed,
                 measured=True,
                 rows_in=int(m.get("rows_in", 0)),
                 rows_out=int(m.get("rows_out", 0)),

@@ -22,6 +22,7 @@ from batcher.plan.logical.base import (
     _reject_duplicate_aliases,
     _validate_refs,
     available_column_set,
+    validate_key_domains,
 )
 from batcher.plan.logical.relational import Projection
 from batcher.plan.schema import SchemaRef
@@ -81,8 +82,55 @@ def _agg_output_type(agg: AggExpr, input_schema: SchemaRef) -> pa.DataType | Non
         t = infer_type(agg.input, input_schema)
         if t is None:
             return None
+        if pa.types.is_null(t):
+            # A `null`-typed input is the one case where these do not preserve their input:
+            # the accumulators have no null-typed slot to gather into, so they materialize
+            # the group's values as Int64 and the column comes back `int64` all-null. The
+            # column *does* survive as `null` when nothing aggregates it (a passthrough
+            # crosses the boundary untouched), so this is an aggregate rule and not a
+            # widening one — `widen` is right to leave `null` alone.
+            return pa.int64()
         return widen(t) if func in _AGG_WIDEN_INPUT else t
     return None  # histogram, list_agg, … — leave to the engine
+
+
+def _validate_agg_input_types(source: LogicalPlan, aggregates: tuple[AggregateSpec, ...]) -> None:
+    """Reject an aggregate over an input type it cannot mean anything over.
+
+    The type counterpart to `_validate_refs` above, and it runs on the same terms: at build
+    time when the input's types are known, silently when they are not. What it catches used
+    to surface two ways, both bad. A pair the accumulators reject (``SUM`` over a string)
+    reached the user as a raw ``RuntimeError`` from Rust *after the scan* -- hours in, on a
+    large job -- while `Dataset.schema` had been reporting an output type for it all along.
+    A pair they tolerate but cannot interpret (``PRODUCT`` over a timestamp, which
+    multiplies epoch microseconds; ``PRODUCT`` over a string, which returns all nulls)
+    reached them as a wrong answer with no diagnostic at all.
+
+    The rule lives in `plan.types.domains` beside the rest of the type vocabulary; this
+    is only the plan-tree half, resolving each aggregate's input expression to a type.
+    """
+    from batcher.plan.types.domains import aggregate_domain_error
+
+    schema = source.available_schema()
+    if schema is None:
+        return
+    for spec in aggregates:
+        expr = spec.agg.input
+        if expr is None:
+            continue
+        dt = infer_type(expr, schema)
+        if dt is None:
+            continue
+        problem = aggregate_domain_error(spec.agg.func, _input_label(expr, spec.alias), widen(dt))
+        if problem is not None:
+            raise PlanError(problem)
+
+
+def _input_label(expr, alias: str) -> str:
+    """How to name an aggregate's input in an error: its column, or the output it feeds."""
+    from batcher.plan.expr_ir import Col
+
+    return f"column {expr.name!r}" if isinstance(expr, Col) else f"the input to {alias!r}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +164,14 @@ class Aggregate(LogicalPlan):
                 )
             if spec.agg.input is not None:
                 _validate_refs(spec.agg.input, available, what=f"aggregate {spec.alias!r}")
+        _validate_agg_input_types(self.input, self.aggregates)
+        # A `map` key reaches the engine's row encoder as an internal "Row format support
+        # not yet implemented" dump, after the scan, naming neither the column nor the
+        # clause. Same argument as `_validate_agg_input_types` above, for the other half of
+        # a `group_by`.
+        validate_key_domains(
+            self.input, [(k.expr, k.alias) for k in self.group_keys], operation="group_by()"
+        )
         _reject_duplicate_aliases(
             [k.alias for k in self.group_keys] + [s.alias for s in self.aggregates],
             what="group_by().agg()",

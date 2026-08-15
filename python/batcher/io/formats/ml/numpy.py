@@ -14,7 +14,7 @@ from typing import IO, Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
 from batcher.plan.source_stats import SourceStatistics
@@ -28,11 +28,14 @@ _CHUNK_BYTES = max(1 << 20, int(os.environ.get("BATCHER_NUMPY_CHUNK_BYTES", str(
 
 
 def _np() -> Any:
-    try:
-        import numpy as np
-    except ImportError as exc:  # numpy is near-ubiquitous but kept optional/deferred
-        raise BackendError("reading NumPy files needs numpy: pip install numpy") from exc
-    return np
+    """The numpy module, deferred so `import batcher` never pulls it.
+
+    Deferred rather than module-scope because importing `batcher` eagerly imports every IO
+    format so each can self-register, and numpy is not a core dependency — a module-scope
+    import here made the whole package, and the autodoc build that imports it, fail without
+    numpy installed.
+    """
+    return require("numpy", feature="Reading NumPy files", provides="numpy", extra="numpy")
 
 
 def _array_to_arrow(arr: Any) -> pa.Array:

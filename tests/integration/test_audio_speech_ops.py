@@ -185,3 +185,62 @@ def test_null_and_undecodable_input_yields_null_rather_than_failing_the_batch(bu
     assert got[0] is not None
     assert got[1] is None
     assert got[2] is None
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda c: c.audio.resample(0),
+        lambda c: c.audio.resample(-16000),
+        lambda c: c.audio.resample("16k"),
+        lambda c: c.audio.mel_spectrogram(0),
+        lambda c: c.audio.mel_spectrogram(16000, n_fft=0),
+        lambda c: c.audio.mel_spectrogram(16000, hop_length=-1),
+        lambda c: c.audio.mel_spectrogram(16000, n_mels=0),
+        lambda c: c.audio.mfcc(16000, n_mfcc=0),
+        lambda c: c.audio.mfcc(16000, n_mels=8, n_mfcc=40),
+    ],
+)
+def test_bad_arguments_are_rejected_at_plan_build(build):
+    """A bad sample rate or STFT size is a caller bug, so it fails before any decode runs.
+
+    Every one of these was already documented as a bound ("must be positive",
+    "must be ``<= n_mels``") and none was enforced, so the engine caught them instead: a
+    mistyped rate surfaced as a `RuntimeError` from the data plane after the scan had run,
+    and in a distributed job after the work had been scheduled. `.video` has always
+    rejected its equivalents at plan build; this is `.audio` doing the same.
+    """
+    from batcher._internal.errors import PlanError
+
+    with pytest.raises(PlanError):
+        build(bt.col("clip"))
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda c: c.audio.resample(16000),
+        lambda c: c.audio.mel_spectrogram(16000),
+        lambda c: c.audio.mfcc(16000),
+        lambda c: c.audio.mfcc(16000, n_mels=40, n_mfcc=40),
+    ],
+)
+def test_valid_arguments_are_still_accepted(build):
+    """The guard rejects the bad values and nothing else, including the boundary case.
+
+    ``n_mfcc == n_mels`` keeps every coefficient the filterbank produces and is legal;
+    only asking for more than exist is not.
+    """
+    assert build(bt.col("clip")) is not None
+
+
+def test_a_numpy_integer_is_accepted_as_a_sample_rate():
+    """Coercion goes through `require_int`, so a NumPy scalar works where a Python int does.
+
+    Sample rates commonly arrive from an array or a dataframe column of metadata, where
+    they are `numpy.int64` rather than `int`. A guard that rejected those would be a
+    regression dressed as validation.
+    """
+    numpy = pytest.importorskip("numpy")
+
+    assert bt.col("clip").audio.resample(numpy.int64(16000)).to_ir()["rate"] == 16000

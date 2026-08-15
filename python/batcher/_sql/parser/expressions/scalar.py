@@ -300,6 +300,14 @@ def _scalar_subquery(tr, select_node) -> Expr:
             f"scalar subquery must return at most one row, got {table.num_rows}"
         )
     value = table.column(0)[0].as_py()
+    if value is None:
+        # One row whose value *is* NULL — a different case from the no-rows one above, and
+        # the one an ordinary threshold query hits: `WHERE x > (SELECT AVG(x) FROM t)` over
+        # an empty or all-null column returns a single NULL row, not zero rows. `lit(None)`
+        # has no wire form (the IR has no untyped null literal), so this raised a bare
+        # `TypeError: unsupported literal type: NoneType` from deep inside `to_ir` where
+        # DuckDB simply returns no rows.
+        return _typed_null(table.schema.field(0).type)
     return lit(value)
 
 
@@ -334,9 +342,20 @@ def _null_boolean() -> Expr:
 def _in(tr, node) -> Expr:
     items = node.expressions
     if node.args.get("query") is not None:
-        raise NotImplementedError(
-            "IN (subquery) must be handled at the WHERE level, not as a scalar"
-        )
+        # A membership test in *value* position — `SELECT x IN (SELECT …)`, or one buried in
+        # a CASE — has no relation to join against, which is why this used to refuse. It does
+        # not need one when the set is small: `subquery.core` already collects such a set and
+        # hands it to `Expr.is_in`, which is three-valued, so the same machinery answers here
+        # and returns an expression rather than a rewritten relation. A set past the inline cap
+        # still refuses, because the mark join it would need lives at the WHERE level.
+        from batcher._sql.parser.subquery.in_set import inline_in_subquery_values
+
+        values = inline_in_subquery_values(tr, node)
+        if values is None:
+            raise NotImplementedError(
+                "IN (subquery) must be handled at the WHERE level, not as a scalar"
+            )
+        return tr._scalar(node.this).is_in(values)
     if not items:
         raise NotImplementedError("IN requires an explicit value list")
     target = tr._scalar(node.this)

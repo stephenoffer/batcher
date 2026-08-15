@@ -185,8 +185,15 @@ def test_gather_concat_collects_remote_and_local_sources():
 
 
 def test_gather_concat_reports_unreachable_source():
-    """An unreachable peer is a *retryable* fault — reported as its source index
-    (the `("retry", srcs)` signal), never silently dropped to an empty bucket."""
+    """An unreachable peer is a *retryable* fault — reported as `(index, why)`
+    (the `("retry", srcs)` signal), never silently dropped to an empty bucket.
+
+    The *fault text* is half the contract, not decoration: `flight_worker._lost` logs it and
+    then reduces the pairs to indices, because an index alone once let a deterministic
+    ticket collision masquerade as worker loss (`shuffle did not recover after 3 attempts`,
+    three frames from its cause). This asserted the pre-pair shape, `[1]`, and could only
+    fail on a machine with Ray — which the PR gate does not have.
+    """
     producer = ShuffleSession()
     reducer = ShuffleSession()
     producer.publish(ShuffleTicket(8, 0, 0, 0), [pa.record_batch({"k": [1]})])
@@ -197,7 +204,11 @@ def test_gather_concat_reports_unreachable_source():
             ("127.0.0.1:1", ShuffleTicket(8, 0, 1, 0)),  # source 1: dead port
         ]
     )
-    assert unreachable == [1]  # the dead source's index, for driver recompute + retry
+    # The dead source's index, for driver recompute + retry, paired with the transport's
+    # own words for why. Asserted as (index, non-empty reason) rather than against the exact
+    # message, which is the transport's to word.
+    assert [src for src, _ in unreachable] == [1]
+    assert all(why for _, why in unreachable), f"a fault with no reason: {unreachable}"
 
 
 def test_gather_combine_matches_serial_combine_finalize():

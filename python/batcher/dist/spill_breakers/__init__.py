@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from batcher.dist.spill_breakers.join import (
     execute_spilling_join,
+    iter_join_paths_spilling,
     reduce_join_paths_spilling,
     stream_spilling_join,
     supports_spilling_join,
@@ -34,6 +35,7 @@ from batcher.dist.spill_breakers.window import (
 __all__ = [
     "execute_spilling_join",
     "execute_spilling_sort",
+    "iter_join_paths_spilling",
     "reduce_join_paths_spilling",
     "stage_and_partition",
     "stream_spilling_join",

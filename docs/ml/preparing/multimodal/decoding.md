@@ -45,6 +45,31 @@ audio = bt.read.audio("data/clips/", decode=True, sample_rate=16000)
 video = bt.read.video("data/videos/", decode=True, size=(112, 112), num_frames=8)
 ```
 
+### Which shape a decode reaches
+
+`size=(height, width)` says what shape every row must be; `fit` says how an image whose
+aspect ratio is not already that shape gets there. All three produce the same fixed-shape
+column, so nothing downstream can tell them apart — which is why the choice is worth
+making rather than inheriting.
+
+| `fit` | What happens to a mismatched ratio | Reach for it when |
+|---|---|---|
+| `"stretch"` (default) | squashed to the exact size | the model was trained the same way |
+| `"letterbox"` | scaled inside the box, remainder padded grey | detection: stretching moves every predicted box off its object |
+| `"center_crop"` | centre kept at native resolution, border discarded | the subject is centred and the border is clutter |
+
+```python
+# docs: skip
+import batcher as bt
+
+frames = bt.read.images("s3://bucket/frames/", size=(640, 640), fit="letterbox")
+```
+
+The default is a stretch because that is what the reader always did, and because it is
+right for a classifier. It is a *silent* distortion for anything else: the decode succeeds,
+the tensor is the right size, and a detector trained on letterboxed frames predicts every
+box in the wrong place with no error anywhere.
+
 Image and audio decode run natively in the engine. Audio goes through the pure-Rust
 `symphonia` decoder, and an explicit `sample_rate` resamples natively too, with a sinc
 resampler in the data plane. Only multi-channel output falls back to Python. Always

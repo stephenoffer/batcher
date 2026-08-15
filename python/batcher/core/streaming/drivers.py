@@ -31,6 +31,16 @@ from batcher.core.streaming.folds import (
 )
 from batcher.io.source import Source
 from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
+from batcher.plan.types import one_batch
+
+#: How many rows a streaming top-N round buffers per row of running state before it merges.
+#:
+#: The merge re-reads the running `limit` rows, so this bounds that overhead at roughly its
+#: reciprocal — a few percent — however large `limit` is, while keeping the round a small
+#: multiple of the result. It matches the engine-side fold's ratio deliberately: the two are the
+#: same reduction driven from different sides of the FFI boundary, and a reader comparing them
+#: should not have to work out whether the difference is meaningful.
+_TOPN_MERGE_RATIO = 16
 
 __all__ = [
     "stream_aggregate",
@@ -285,11 +295,11 @@ def stream_distinct_limit(
         rows = mapped if survivors is None else [survivors, *mapped]
         out = [b for b in nat.execute_plan(dedup_ir, [rows], cfg) if b.num_rows]
         # The operator caps its own output at `cap`, so concatenating is bounded by it.
-        survivors = (
-            pa.Table.from_batches(out).combine_chunks().to_batches()[0]
-            if len(out) > 1
-            else (out[0] if out else survivors)
-        )
+        # `one_batch`, because `combine_chunks().to_batches()[0]` splits at the 32-bit
+        # offset limit — a distinct over a text or blob column whose survivors exceed
+        # 2 GiB came back as several batches and every row after the first was dropped
+        # from the result, silently.
+        survivors = one_batch(out) if out else survivors
         if survivors is not None and survivors.num_rows >= cap:
             break  # no later row can displace one of the first `cap` distinct rows
 
@@ -357,10 +367,21 @@ def stream_topn(
     """Top-N (`sort` + `limit`) over a streaming source, with memory bounded by N.
 
     Top-N is mergeable — top-N of (A concat B) equals top-N of (top-N of A, B) — so the driver keeps
-    only the running best `limit` rows: each micro-batch is run through the sort
-    sub-plan, merged with the running best, and re-trimmed to `limit`. The final
-    running set is the global top-N, identical to sorting the whole input then
-    taking the first `limit` rows.
+    only the running best `limit` rows: batches are run through the sort sub-plan, merged
+    with the running best, and re-trimmed to `limit`. The final running set is the global
+    top-N, identical to sorting the whole input then taking the first `limit` rows.
+
+    **The merge happens per round, not per micro-batch.** Merging on every batch re-reads
+    and re-sorts the running `limit` rows once per batch, so a small source batch against a
+    large `limit` pays far more for the merge than for the rows it contributed — and it pays
+    two engine round-trips per batch to do it. A round buffers until it holds several times
+    `limit` rows, which bounds the merge overhead at a fraction of the round regardless of
+    `limit` while leaving peak memory at `limit` plus one round. It is the same reasoning,
+    and the same ratio, the engine's own streaming top-N fold uses.
+
+    Rounds cannot change the answer: the rows are still presented to the merge in arrival
+    order, with the running best ahead of them, which is what fixes both the survivors and
+    the order ties resolve in.
     """
     nat = engine()
 
@@ -376,17 +397,31 @@ def stream_topn(
     input_ir = json.dumps(sort.input.to_ir())
 
     running: list[pa.RecordBatch] = []
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    round_rows = max(limit * _TOPN_MERGE_RATIO, active_config().execution.morsel_rows)
     # The engine config is constant for the query, so read and serialize it once — not once
     # per micro-batch inside the loop (`stream_limit` already hoists it the same way).
     cfg_json = active_config().engine_config_json()
+
+    def merge(buffered: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+        """Run one round's batches through the input pipeline and fold them into `running`."""
+        rows = [b for b in nat.execute_plan(input_ir, [buffered], cfg_json) if b.num_rows]
+        merged = running + rows
+        if not merged:
+            return running
+        return [b for b in nat.execute_plan(sort_ir, [merged], cfg_json) if b.num_rows]
+
     for batch in _read(source, projection):
         if batch.num_rows == 0:
             continue
-        rows = [b for b in nat.execute_plan(input_ir, [[batch]], cfg_json) if b.num_rows]
-        merged = running + rows
-        if not merged:
-            continue
-        running = [b for b in nat.execute_plan(sort_ir, [merged], cfg_json) if b.num_rows]
+        pending.append(batch)
+        pending_rows += batch.num_rows
+        if pending_rows >= round_rows:
+            running = merge(pending)
+            pending, pending_rows = [], 0
+    if pending:
+        running = merge(pending)
 
     if not running:
         return

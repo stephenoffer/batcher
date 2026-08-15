@@ -214,6 +214,9 @@ class Distinct(LogicalPlan):
                 "distinct() over every column has no payload to order: an ordering only "
                 "chooses between rows that differ, and rows that agree on all columns do not"
             )
+        from batcher.plan.logical.base import validate_dedup_keys
+
+        validate_dedup_keys(self.input, self.keys, operation="distinct()")
         if self.limit is not None:
             if self.limit < 0:
                 raise PlanError(f"distinct(): limit must not be negative, got {self.limit}")
@@ -434,6 +437,11 @@ class Union(LogicalPlan):
     distinct: bool = False
 
     def __post_init__(self) -> None:
+        if self.distinct:
+            from batcher.plan.logical.base import validate_dedup_keys
+
+            for branch in self.inputs:
+                validate_dedup_keys(branch, (), operation="union(distinct=True)")
         if len(self.inputs) < 1:
             raise PlanError("union requires at least one input")
         cols = self.inputs[0].available_columns()

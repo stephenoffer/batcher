@@ -78,8 +78,17 @@ def _validate_key_types(
     the failure names the two columns instead of surfacing at execution as an opaque
     ``RowConverter column schema mismatch``.
     """
+    from batcher.plan.types.domains import key_domain_error
+
     pairs = _paired_key_types(left, right, left_keys, right_keys)
     for lk, rk, lt, rt in pairs:
+        # A type the row encoder cannot encode at all, which `equals` below would wave
+        # through whenever both sides carry it. Same reason this function exists: without
+        # it the refusal arrives from Rust after the scan as an internal row-format dump.
+        for name, dt in ((lk, lt), (rk, rt)):
+            problem = key_domain_error(name, dt, "join()")
+            if problem is not None:
+                raise PlanError(problem)
         if not lt.equals(rt):
             raise PlanError(
                 f"join key type mismatch: left {lk!r} is {lt} but right {rk!r} is {rt}, "
@@ -392,6 +401,17 @@ class AsofJoin(LogicalPlan):
             raise PlanError(f"asof_join right_on {self.right_on!r} not in right columns")
         if len(self.left_by) != len(self.right_by):
             raise PlanError("asof_join requires the same number of left/right `by` keys")
+        # The `by` keys are grouped through the same row encoder a hash join keys on, so a
+        # `map` there fails identically and is refused identically.
+        from batcher.plan.expr_ir import col as _col
+        from batcher.plan.logical.base import validate_key_domains
+
+        validate_key_domains(
+            self.left, [(_col(k), k) for k in self.left_by], operation="join_asof(by=...)"
+        )
+        validate_key_domains(
+            self.right, [(_col(k), k) for k in self.right_by], operation="join_asof(by=...)"
+        )
         if self.direction not in ASOF_DIRECTIONS:
             allowed = sorted(ASOF_DIRECTIONS)
             raise PlanError(f"asof_join direction must be one of {allowed}, got {self.direction!r}")

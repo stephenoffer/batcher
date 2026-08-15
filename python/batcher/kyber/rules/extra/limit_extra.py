@@ -36,10 +36,13 @@ may cross it, and each of these looks plausible and is wrong:
   `Sample` (which keeps a hash-selected subset, not a prefix), below `Distinct`, below an
   `Aggregate`/`Window` (both read the whole partition), and below `MapBatches` (opaque
   row count).
-* `push_limit_into_scan` — **no IR support**. `RelOp::Scan` carries only a `source_id`,
-  and the physical plan's source hand-off (`PhysicalPlan.source_projections` /
-  `source_predicates`) has no row-cap channel. A source-level `LIMIT` would be a
-  two-sided IR change (Python `to_ir` + Rust `serde`), which is out of scope for a rule.
+* `push_limit_into_scan` — **not a rule, and no longer missing**. It is not a plan
+  rewrite at all: the cap does not change the tree, it rides the physical plan's source
+  hand-off beside the projection and the predicate. `PhysicalPlan.source_limits` is that
+  channel and `kyber.rules.source_limits.required_limits_per_source` is the analysis that
+  fills it, so nothing here needs to move a `Limit`. (This entry used to say the change
+  was blocked on a two-sided IR change across the FFI. It was not: that hand-off is a
+  Python-side field on `PhysicalPlan`, and `RelOp::Scan` never had to learn anything.)
 * `limit_zero_to_empty` / `limit_of_limit` / `drop_limit_larger_than_provable_row_count` /
   `offset_zero_elimination` — already covered: `Limit(x, 0)` *is* the canonical empty
   relation (the estimator even tags it EXACT-0), `combine_limits` merges stacked limits,

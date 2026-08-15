@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Builder, GenericBinaryArray, OffsetSizeTrait};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Float64Builder, GenericBinaryArray, OffsetSizeTrait,
+};
 
 use super::super::map_rows;
 use crate::ExprError;
@@ -128,6 +130,191 @@ pub(crate) fn sharpness<O: OffsetSizeTrait>(
     Ok(build(rows))
 }
 
+/// `entropy()` → the Shannon entropy of the luma histogram, in bits (0..=8).
+///
+/// The third curation measure, and the one that separates the cases the other two confuse.
+/// `brightness` cannot tell a mid-grey placeholder tile from a photograph of a foggy road,
+/// because both average to the middle. `sharpness` cannot tell a blank image from an
+/// out-of-focus one at low resolution, because neither has second derivatives. Entropy
+/// answers "how much information is in the tonal distribution at all": a solid field is 0
+/// no matter what shade it is, a two-tone logo is near 1, and a photograph of anything
+/// lands between 6 and 8.
+///
+/// Measured on the same downsampled luma plane the other two use, so the three are
+/// comparable in one filter and cost one decode between them.
+pub(crate) fn entropy<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+) -> Result<ArrayRef, ExprError> {
+    let rows: Vec<Option<f64>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let (luma, _, _) = luma_plane(bytes.value(i))?;
+        let mut hist = [0u32; 256];
+        for v in &luma {
+            hist[*v as usize] += 1;
+        }
+        let n = luma.len() as f64;
+        let bits: f64 = hist
+            .iter()
+            .filter(|&&c| c > 0)
+            .map(|&c| {
+                let p = f64::from(c) / n;
+                -p * p.log2()
+            })
+            .sum();
+        // A single-valued plane sums `-1 * log2(1)` and lands on **negative** zero, which
+        // prints as `-0.0` and compares equal to `0.0` — a value that is not wrong but
+        // reads as a bug in every output a caller looks at.
+        Some(if bits == 0.0 { 0.0 } else { bits })
+    });
+    Ok(build(rows))
+}
+
+/// Decode and downsample to an RGB8 plane, the colour counterpart of [`luma_plane`].
+///
+/// Same `MEASURE_SIDE` bound and same never-upscale rule, so a colour measure and a luma
+/// measure of the same image see the same pixels — two curation measures disagreeing about
+/// what they looked at is a difference a caller finds by accident.
+fn rgb_plane(data: &[u8]) -> Option<image::RgbImage> {
+    let img = image::load_from_memory(data).ok()?;
+    let small = if img.width() > MEASURE_SIDE || img.height() > MEASURE_SIDE {
+        img.resize(
+            MEASURE_SIDE,
+            MEASURE_SIDE,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let rgb = small.into_rgb8();
+    (rgb.width() > 0 && rgb.height() > 0).then_some(rgb)
+}
+
+/// `colorfulness()` → the Hasler-Süsstrunk (2003) colourfulness metric.
+///
+/// The measure no luma statistic can express. A sepia-toned duplicate, a line drawing, a
+/// scanned page and a greyscale photograph stored as RGB all have ordinary brightness,
+/// sharpness and entropy, and all of them are the wrong training data for a model that is
+/// supposed to see colour. This scores roughly 0 for anything grey and 15 or more for a
+/// vivid scene, computed from the two opponent-colour axes:
+/// `sqrt(sigma_rg^2 + sigma_yb^2) + 0.3 * sqrt(mu_rg^2 + mu_yb^2)`.
+pub(crate) fn colorfulness<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+) -> Result<ArrayRef, ExprError> {
+    let rows: Vec<Option<f64>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let rgb = rgb_plane(bytes.value(i))?;
+        let n = (rgb.width() as f64) * (rgb.height() as f64);
+        let (mut srg, mut srg2, mut syb, mut syb2) = (0.0, 0.0, 0.0, 0.0);
+        for px in rgb.pixels() {
+            let (r, g, b) = (f64::from(px.0[0]), f64::from(px.0[1]), f64::from(px.0[2]));
+            let rg = r - g;
+            let yb = 0.5 * (r + g) - b;
+            srg += rg;
+            srg2 += rg * rg;
+            syb += yb;
+            syb2 += yb * yb;
+        }
+        let (mu_rg, mu_yb) = (srg / n, syb / n);
+        // Variances via the sum-of-squares identity, clamped at zero: the identity can go
+        // a hair negative on a perfectly uniform plane, and a NaN from `sqrt` would poison
+        // every comparison downstream.
+        let var_rg = (srg2 / n - mu_rg * mu_rg).max(0.0);
+        let var_yb = (syb2 / n - mu_yb * mu_yb).max(0.0);
+        Some((var_rg + var_yb).sqrt() + 0.3 * (mu_rg * mu_rg + mu_yb * mu_yb).sqrt())
+    });
+    Ok(build(rows))
+}
+
+/// `mean_color()` → struct `{r, g, b}` of Float64 channel means in 0..=255.
+///
+/// The cheapest colour summary there is, and the one that makes "find every product shot
+/// on a white background" and "cluster this corpus by palette" ordinary expressions rather
+/// than an embedding model. A struct rather than three ops because all three come out of
+/// the same pass, exactly as `decode`'s four header facts do.
+pub(crate) fn mean_color<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::StructArray;
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
+
+    let rows: Vec<Option<[f64; 3]>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let rgb = rgb_plane(bytes.value(i))?;
+        let n = (rgb.width() as f64) * (rgb.height() as f64);
+        let mut sums = [0.0f64; 3];
+        for px in rgb.pixels() {
+            for (c, s) in sums.iter_mut().enumerate() {
+                *s += f64::from(px.0[c]);
+            }
+        }
+        Some([sums[0] / n, sums[1] / n, sums[2] / n])
+    });
+    // A struct's children stay full length; the row's null bit is what marks it absent,
+    // so the zeros written for an unreadable row are never read.
+    let mut channels: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut valid = Vec::with_capacity(rows.len());
+    for row in rows {
+        let v = row.unwrap_or([0.0; 3]);
+        valid.push(row.is_some());
+        for (c, out) in channels.iter_mut().enumerate() {
+            out.push(v[c]);
+        }
+    }
+    let [r, g, b] = channels;
+    let fields = vec![
+        Arc::new(Field::new("r", DataType::Float64, false)),
+        Arc::new(Field::new("g", DataType::Float64, false)),
+        Arc::new(Field::new("b", DataType::Float64, false)),
+    ];
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Float64Array::from(r)),
+        Arc::new(Float64Array::from(g)),
+        Arc::new(Float64Array::from(b)),
+    ];
+    Ok(Arc::new(StructArray::new(
+        fields.into(),
+        columns,
+        Some(NullBuffer::from(valid)),
+    )))
+}
+
+/// `is_grayscale()` → whether every pixel satisfies R == G == B.
+///
+/// The fact no header carries. A corpus assembled from mixed sources is full of greyscale
+/// images *stored* as three identical channels: the mode says `RGB`, `has_alpha` says
+/// false, and nothing reports that two thirds of every tensor is a copy. Finding them is
+/// what lets a pipeline route them to a 1-channel model, or drop them from a colour
+/// dataset, instead of paying three times the bandwidth for one channel of information.
+///
+/// Measured on the downsampled plane, like its neighbours. That is a deliberate trade: a
+/// resample of a colour image cannot make it grey (the opponent channels survive
+/// averaging), so this does not produce false positives, while an image with a handful of
+/// stray coloured pixels — a watermark, a JPEG ringing artifact — may read as grey, which
+/// is the answer a curation query wants anyway.
+pub(crate) fn is_grayscale<O: OffsetSizeTrait>(
+    bytes: &GenericBinaryArray<O>,
+) -> Result<ArrayRef, ExprError> {
+    use arrow::array::BooleanArray;
+    use std::sync::Arc;
+
+    let rows: Vec<Option<bool>> = map_rows(bytes.len(), |i| {
+        if bytes.is_null(i) {
+            return None;
+        }
+        let rgb = rgb_plane(bytes.value(i))?;
+        Some(rgb.pixels().all(|p| p.0[0] == p.0[1] && p.0[1] == p.0[2]))
+    });
+    Ok(Arc::new(BooleanArray::from(rows)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,8 +402,99 @@ mod tests {
     #[test]
     fn a_null_or_undecodable_row_is_null_rather_than_an_error() {
         let arr = column(vec![None, Some(b"not an image".to_vec())]);
-        for out in [brightness(&arr).unwrap(), sharpness(&arr).unwrap()] {
+        for out in [
+            brightness(&arr).unwrap(),
+            sharpness(&arr).unwrap(),
+            entropy(&arr).unwrap(),
+            colorfulness(&arr).unwrap(),
+        ] {
             assert_eq!(values(&out), vec![None, None]);
         }
+        assert_eq!(mean_color(&arr).unwrap().null_count(), 2);
+        assert_eq!(is_grayscale(&arr).unwrap().null_count(), 2);
+    }
+
+    /// A colour PNG of a callable, so the colour measures have something to read.
+    fn rgb_png(size: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(size, size, |x, y| image::Rgb(f(x, y)));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// The case `brightness` cannot see: a mid-grey placeholder and a real scene have the
+    /// same mean and completely different information content.
+    #[test]
+    fn entropy_separates_a_flat_tile_from_a_textured_one() {
+        let flat = column(vec![Some(png_of(64, |_, _| 128))]);
+        let noisy = column(vec![Some(png_of(64, |x, y| {
+            ((x * 37 + y * 91) % 256) as u8
+        }))]);
+        let flat_bits = values(&entropy(&flat).unwrap())[0].unwrap();
+        let noisy_bits = values(&entropy(&noisy).unwrap())[0].unwrap();
+        assert!(
+            flat_bits < 1e-9,
+            "a solid field carries no information: {flat_bits}"
+        );
+        assert!(
+            noisy_bits > 5.0,
+            "textured image scored only {noisy_bits} bits"
+        );
+        assert!(
+            noisy_bits <= 8.0,
+            "entropy of a byte plane cannot exceed 8 bits"
+        );
+    }
+
+    /// The case no luma measure can see: grey and vivid images are equally bright.
+    #[test]
+    fn colorfulness_separates_grey_from_vivid() {
+        let grey = column(vec![Some(rgb_png(64, |x, _| [(x * 4) as u8; 3]))]);
+        let vivid = column(vec![Some(rgb_png(64, |x, y| {
+            [(x * 4) as u8, 255 - (x * 4) as u8, (y * 4) as u8]
+        }))]);
+        let grey_score = values(&colorfulness(&grey).unwrap())[0].unwrap();
+        let vivid_score = values(&colorfulness(&vivid).unwrap())[0].unwrap();
+        assert!(grey_score < 1.0, "a greyscale ramp scored {grey_score}");
+        assert!(
+            vivid_score > 10.0,
+            "a vivid image scored only {vivid_score}"
+        );
+    }
+
+    #[test]
+    fn mean_color_reports_each_channel() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Float64Type;
+
+        let arr = column(vec![Some(rgb_png(16, |_, _| [10, 200, 30]))]);
+        let out = mean_color(&arr).unwrap();
+        let st = out.as_struct();
+        let at = |name: &str| {
+            st.column_by_name(name)
+                .unwrap()
+                .as_primitive::<Float64Type>()
+                .value(0)
+        };
+        assert!((at("r") - 10.0).abs() < 0.5);
+        assert!((at("g") - 200.0).abs() < 0.5);
+        assert!((at("b") - 30.0).abs() < 0.5);
+    }
+
+    /// The fact no header carries: three identical channels stored as RGB.
+    #[test]
+    fn is_grayscale_sees_a_grey_image_stored_as_rgb() {
+        use arrow::array::AsArray;
+
+        let arr = column(vec![
+            Some(rgb_png(32, |x, _| [(x * 8) as u8; 3])),
+            Some(rgb_png(32, |x, y| [(x * 8) as u8, (y * 8) as u8, 0])),
+        ]);
+        let out = is_grayscale(&arr).unwrap();
+        let b = out.as_boolean();
+        assert!(b.value(0), "R == G == B was not recognized as grayscale");
+        assert!(!b.value(1), "a colour image was reported grayscale");
     }
 }

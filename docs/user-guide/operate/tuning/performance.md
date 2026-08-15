@@ -398,7 +398,7 @@ made along the way.
 ```text
 project                         est≈4 (learned)
   filter                        est≈4 (learned)
-    scan                        est≈6 (exact)
+    scan                        est≈6 (exact) pushed[status = active]
 
 decisions:
   - [core/io] source read at 40 MB/s (learned)

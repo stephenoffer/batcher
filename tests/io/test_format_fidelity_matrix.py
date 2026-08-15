@@ -142,8 +142,14 @@ LOSSY: dict[tuple[str, str], str] = {
     ("csv", "decimal"): "CSV is untyped text — a decimal is inferred back as a double",
     ("json", "float64"): "JSON has no NaN literal — NaN reads back null",
     ("json", "float_infinities"): "JSON has no Infinity literal — +-inf reads back null",
-    ("json", "date32"): "a date is written as epoch milliseconds and reads back int64",
-    ("json", "timestamp_us"): "a timestamp is written as epoch milliseconds and reads back int64",
+    # ISO-8601, as `msgpack` below writes and as DuckDB/Spark do. Arrow's JSON reader infers
+    # a bare date back as `timestamp[s]` and declines a sub-second instant entirely, leaving
+    # it a string -- a reader limit, not a writer one. These said "epoch milliseconds" while
+    # the writer actually emitted a *wrong number*: the pandas encoder it fell through to
+    # reads every timestamp column's raw integers as nanoseconds, so a `timestamp[us]` was
+    # divided by a million. The values are now exact at the column's own resolution.
+    ("json", "date32"): "a date is written as an ISO-8601 string and reads back timestamp[s]",
+    ("json", "timestamp_us"): "a timestamp is written as an ISO-8601 string and reads back string",
     ("json", "decimal"): "JSON numbers are doubles — a decimal loses its exact type",
     ("msgpack", "date32"): "a date is written as an ISO-8601 string and reads back string",
     ("msgpack", "timestamp_us"): "a timestamp is written as an ISO-8601 string",

@@ -254,25 +254,15 @@ class HardwareProfile:
 def _local_storage_class() -> str:
     """This machine's spill-device class, or `""` when it cannot be determined.
 
-    Resolved through the same three steps the spill paths themselves use — configured
-    `spill_dir`, else the node's measured local scratch volume, else a system tempdir — so the
-    class describes where bytes actually land rather than where the process happens to run.
-    Best-effort: an unreadable device reports `""`, which every consumer treats as "no opinion"
-    and prices exactly as it did before.
+    Resolved through `spill_scratch_dir` — the one answer to "which disk does this process
+    spill to" — so the class describes where bytes actually land rather than where the process
+    happens to run. Best-effort: an unreadable device reports `""`, which every consumer treats
+    as "no opinion" and prices exactly as it did before.
     """
     from batcher._internal.hardware.storage import device_class
+    from batcher._internal.site import spill_scratch_dir
 
-    try:
-        from batcher._internal.site import local_scratch_root
-        from batcher.config import active_config
-
-        configured = active_config().memory.spill_dir
-    except Exception:  # pragma: no cover - config unavailable this early in a process
-        return ""
-    import tempfile
-
-    path = configured or local_scratch_root() or tempfile.gettempdir()
-    found = device_class(path)
+    found = device_class(spill_scratch_dir())
     return "" if found == "unknown" else found
 
 

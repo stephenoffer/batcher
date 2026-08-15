@@ -21,6 +21,7 @@ import os
 import pyarrow as pa
 from pyarrow import ipc
 
+from batcher._internal.paths import open_private, private_dir
 from batcher.io.formats.streaming.checkpoint.location import CheckpointDir, is_local_location
 
 __all__ = ["StateStore"]
@@ -70,7 +71,11 @@ class StateStore:
 
         self._local = local_path(directory) if is_local_location(directory) else None
         if self._local is not None:
-            os.makedirs(self._local, exist_ok=True)
+            # A snapshot holds the running aggregate's *actual* group keys and values, and
+            # unlike spill or shuffle scratch it is durable — it outlives the query by
+            # design. `state/` is Batcher's own subdirectory of the checkpoint location, so
+            # tightening it protects the rows without touching the location the user named.
+            private_dir(self._local)
         # Built for both, because reads, listing and deletes go through it either way.
         self._dir = CheckpointDir(self._local if self._local is not None else directory)
 
@@ -107,7 +112,7 @@ class StateStore:
             return
         path = os.path.join(self._local, self._name(batch_id))
         tmp = f"{path}.tmp"
-        with open(tmp, "wb") as fh:
+        with open_private(tmp) as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
