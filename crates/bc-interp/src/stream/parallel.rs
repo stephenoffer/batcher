@@ -1421,15 +1421,31 @@ mod tests {
         }
     }
 
-    /// `workers()` resolves "all cores" from the machine, not from the global pool's width —
-    /// the other half of the same throttle: a Ray worker's global pool reports 1, which would
-    /// have shrunk the shard count to 1 even with the scoped pool in place.
+    /// The width resolves from the *machine*, not from the global pool's width — the other
+    /// half of the same throttle: a Ray worker's global pool reports 1, which would have shrunk
+    /// the shard count to 1 even with the scoped pool in place. And an explicit `parallelism` is
+    /// still honored verbatim, which is what lets the control plane bound a co-tenanted box.
+    ///
+    /// One definition serves both executors (`par::auto_width`). They used to derive it apart —
+    /// the pool from one function and the shard count from another — and a plan then ran N
+    /// shards on a pool of M, which measured worse than either width taken consistently.
     #[test]
     fn zero_parallelism_resolves_to_the_machines_cores() {
+        let plan = RelOp::Scan { source_id: 0 };
         let opts = crate::ExecOptions::default();
         assert_eq!(opts.parallelism, 0, "default is 'all cores'");
-        let expected = bc_arrow::usable_cores();
-        assert_eq!(opts.workers(), expected);
+        let width = crate::auto_width(&opts, &[vec![]], &plan);
+        assert!(
+            width >= 1 && width <= bc_arrow::usable_cores(),
+            "{width} threads against {} usable cores",
+            bc_arrow::usable_cores()
+        );
+
+        let pinned = crate::ExecOptions {
+            parallelism: 3,
+            ..crate::ExecOptions::default()
+        };
+        assert_eq!(crate::auto_width(&pinned, &[vec![]], &plan), 3);
     }
 
     /// The shard count never produces a sub-morsel shard, and a relation big enough to fill

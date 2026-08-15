@@ -48,7 +48,7 @@ pub use bc_runtime::agg::spill::SpillCodec;
 pub use error::InterpError;
 pub use metrics::{ExecMetrics, OpMetric, QueryMetrics, QueryStopwatch};
 pub use par::{
-    execute_parallel, execute_parallel_with, execute_parallel_with_metrics, ExecOptions,
+    auto_width, execute_parallel, execute_parallel_with, execute_parallel_with_metrics, ExecOptions,
 };
 pub use stream::{
     execute_streaming, execute_streaming_metered, execute_streaming_parallel,

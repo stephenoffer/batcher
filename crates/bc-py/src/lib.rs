@@ -88,7 +88,7 @@ fn execute_plan(
                 match bc_interp::execute_streaming_parallel_or_hand_off(
                     &plan,
                     &sources,
-                    opts.workers(),
+                    bc_interp::auto_width(&opts, &sources, &plan),
                     budget,
                     materialize_fits,
                     opts.cancel.as_ref(),
@@ -150,7 +150,7 @@ fn execute_plan_metered(
                 match bc_interp::execute_streaming_parallel_metered_or_hand_off(
                     &plan,
                     &sources,
-                    opts.workers(),
+                    bc_interp::auto_width(&opts, &sources, &plan),
                     budget,
                     materialize_fits,
                     opts.cancel.as_ref(),

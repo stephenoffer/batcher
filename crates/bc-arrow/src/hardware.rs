@@ -168,6 +168,30 @@ pub fn usable_cores() -> usize {
         .max(1)
 }
 
+/// Threads to run a **relational operator pipeline**: every physical core this process may
+/// use, plus a third of the SMT siblings among them.
+///
+/// [`usable_cores`] is the wrong figure for a query, and running all of it is the worse end of
+/// the SMT trade. A plan is not one kernel: it interleaves work that stalls on memory (hash
+/// build and probe, group assignment) with work that saturates bandwidth (gather, scan,
+/// concat). SMT hides the stalls of the first and doubles the cache pressure of the second, so
+/// the best width sits between the physical core count and the logical one.
+///
+/// The SMT *ratio* comes from the cached topology (a machine property that cannot change) and
+/// the *count* from a fresh [`usable_cores`] — deliberately, so this stays correct on a Ray
+/// worker whose CPU affinity is applied after the process starts, which is the hazard
+/// `ExecOptions::workers` documents. On a host with no SMT it is every usable core, and it
+/// never exceeds what a cgroup quota grants.
+pub fn operator_cores() -> usize {
+    let usable = usable_cores();
+    let smt = crate::CpuTopology::detect().smt_width();
+    if smt <= 1 {
+        return usable;
+    }
+    let physical = usable.div_ceil(smt);
+    (physical + (usable - physical) / 3).clamp(1, usable)
+}
+
 fn detect_raw() -> HardwareProfile {
     let logical_cores = usable_cores();
 
