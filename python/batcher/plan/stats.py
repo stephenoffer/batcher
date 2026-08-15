@@ -318,6 +318,33 @@ class ColumnStat:
     # rides alongside untrustworthy bounds — exactly as `ndv_provenance` lets a sketched distinct
     # count ride alongside exact ones.
     null_count_provenance: Provenance | None = None
+    # The provenance of `total_sum`/`mean` — the two facets derived from the column's actual
+    # *values* rather than from its extremes. The same lesson a third time, and in the same
+    # direction as `null_count_provenance`: the bundle's single tag was refusing an exact
+    # statistic because it sat beside an unknown one.
+    #
+    # An immutable in-memory relation computes its own sum and average on demand
+    # (`InMemorySource.column_sum` / `.column_mean`, memoized), and
+    # `metadata_answer.enrich` lifts them into the bundle so `SELECT sum(x) FROM t` is
+    # answered without a scan. But the conductor pre-collects that bundle with only the
+    # columns a `MIN`/`MAX` needs — an empty set for a `SUM` — so the bundle arrived tagged
+    # `DEFAULT`, and attaching an exactly-computed total to it left it `DEFAULT` too. The
+    # answer was then refused and the query executed in full: `sum` 2.60 ms and `mean`
+    # 2.54 ms over 6M rows against `min`'s 0.24 ms, which is the same query shape answered
+    # the same way and is what the enrichment was written to deliver.
+    #
+    # The tag also settles the NaN question these two facets otherwise inherit. A *recorded*
+    # sum (a catalog's, a sketch's) may have dropped NaN, so it needs `nan_safe`; a sum the
+    # source computed from the values did not, and equals what the engine computes. So a
+    # facet carrying its own EXACT tag is trusted directly, and one without it keeps the
+    # bundle's tag and the float gate exactly as before.
+    moments_provenance: Provenance | None = None
+
+    @property
+    def moments_are_exact(self) -> bool:
+        """True iff `total_sum`/`mean` may answer an exact `sum`/`avg`, whatever the bounds hold."""
+        tag = self.moments_provenance if self.moments_provenance is not None else self.provenance
+        return tag.is_exact
 
     @property
     def ndv_is_exact(self) -> bool:
@@ -366,6 +393,12 @@ class ColumnStat:
                 if self.null_count_provenance is not None
                 else self.provenance,
                 floor,
+            ),
+            # A row-shrinking operator invalidates a sum or an average outright — they are
+            # facts about a set of rows this one no longer is — so the facet tag weakens
+            # with the rest rather than surviving as a bound the way min/max do.
+            moments_provenance=(
+                None if self.moments_provenance is None else weakest(self.moments_provenance, floor)
             ),
         )
 

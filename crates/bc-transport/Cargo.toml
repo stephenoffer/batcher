@@ -7,6 +7,13 @@ license.workspace = true
 
 [dependencies]
 arrow.workspace = true
+# The DAG root, for `create_private_file`/`create_private_dir`. A published shm partition is
+# the query's actual rows on a world-writable mount, so it must be owner-only — and the spill
+# store and the gather staging files need exactly the same thing. The alternative was a third
+# copy of a nine-line `OpenOptions` builder, which is how one of them ends up 0644 while the
+# others are 0600. `bc-arrow` is the lowest crate all three see; it adds no third-party code
+# to a graph that already carries arrow, libc and chrono.
+bc-arrow.workspace = true
 # Arrow Flight (gRPC) inter-node transport. Pinned to 56.x to match arrow 56 so
 # the RecordBatch/Schema types are identical across the dependency graph.
 arrow-flight = "56"

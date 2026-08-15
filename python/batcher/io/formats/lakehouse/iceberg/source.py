@@ -13,6 +13,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import note_suppressed
 from batcher.io.catalog import CatalogSpec, resolve_catalog
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.lakehouse._arrow import engine_schema, normalize_engine_types
@@ -323,6 +324,7 @@ class IcebergSource:
             return [WholeSourceSplit(self)]
         if not tasks:
             return [WholeSourceSplit(self)]
+        clustering, spec_id = self._partition_clustering()
         return [
             IcebergTableSplit(
                 identifier=self._identifier,
@@ -331,9 +333,49 @@ class IcebergSource:
                 task=task,
                 rows=getattr(task.file, "record_count", None),
                 row_filter=self._row_filter,
+                # A file written under an OLDER partition spec carries a partition record with
+                # different fields in it, so reading it against the current spec's columns
+                # would group by the wrong thing. Such a file declares nothing, which makes
+                # `declared_clustering` refuse the whole set rather than half-trust it.
+                clustering=clustering
+                if clustering and getattr(task.file, "spec_id", None) == spec_id
+                else (),
             )
             for task in tasks
         ]
+
+    def clustering_columns(self) -> tuple[str, ...]:
+        """The columns this table's splits will hold constant, from the already-loaded metadata.
+
+        The cheap precondition for `io.splits.clustering` — see `ParquetDatasetSource` for why
+        a consumer must be able to ask before planning a read.
+
+        Returns:
+            The partition fields' source columns, or an empty tuple.
+        """
+        return self._partition_clustering()[0]
+
+    def _partition_clustering(self) -> tuple[tuple[str, ...], int | None]:
+        """The current spec's partition *source* columns, and the spec id they belong to.
+
+        Returns `((), None)` for an unpartitioned table, or when any partition field's source
+        column cannot be named — a partial set does not identify a partition, and a
+        half-identified one is exactly the over-claim that turns a skipped shuffle into a wrong
+        answer.
+        """
+        try:
+            table = self._table()
+            spec = table.spec()
+            if not spec.fields:
+                return (), None
+            schema = table.schema()
+            names = [schema.find_column_name(field.source_id) for field in spec.fields]
+            if any(n is None for n in names):
+                return (), None
+            return tuple(names), spec.spec_id
+        except Exception as exc:
+            note_suppressed("io", "read the Iceberg partition spec", exc)
+            return (), None
 
 
 class IcebergTableSplit:
@@ -368,7 +410,15 @@ class IcebergTableSplit:
     or resurrects deleted rows.
     """
 
-    __slots__ = ("_catalog", "_identifier", "_row_filter", "_rows", "_snapshot_id", "_task")
+    __slots__ = (
+        "_catalog",
+        "_clustering",
+        "_identifier",
+        "_row_filter",
+        "_rows",
+        "_snapshot_id",
+        "_task",
+    )
 
     def __init__(
         self,
@@ -379,7 +429,9 @@ class IcebergTableSplit:
         task: Any,
         rows: int | None = None,
         row_filter: Any = None,
+        clustering: tuple[str, ...] = (),
     ) -> None:
+        self._clustering = clustering
         self._identifier = identifier
         self._catalog = catalog
         self._snapshot_id = snapshot_id
@@ -393,6 +445,30 @@ class IcebergTableSplit:
         # the distributed read simply returns extra rows. Measured before this was
         # carried: single-node 10 rows, distributed 100, same query, no error.
         self._row_filter = row_filter
+
+    @property
+    def clustering_columns(self) -> tuple[str, ...]:
+        """The table's partition *source* columns, whose values this file holds constant.
+
+        The source columns, not the partition field names, and that is the whole point. Iceberg
+        stores `transform(column)` — `days(ts)`, `bucket(16, id)`, `truncate(4, name)` — so the
+        recorded value is not the column's. But every transform is a deterministic function of
+        it, so equal *column* values always produce equal partition values and therefore land in
+        the same file group. Claiming the source column is what lets `GROUP BY ts` over a
+        `days(ts)`-partitioned table skip its shuffle; claiming the partition field name would
+        name a column the query does not have.
+
+        Empty when the source declined to claim a clustering — an unpartitioned table, a
+        partition field whose source column cannot be named, or a file written under an older
+        partition spec. See `IcebergTableSource.splits`.
+        """
+        return self._clustering
+
+    @property
+    def clustering_value(self) -> tuple[Any, ...]:
+        """This file's partition values, in spec-field order — the key its splits group by."""
+        record = self._task.file.partition
+        return tuple(record[i] for i in range(len(record)))
 
     def _source(self) -> IcebergSource:
         return IcebergSource(

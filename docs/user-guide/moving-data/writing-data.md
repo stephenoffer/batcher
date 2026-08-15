@@ -72,6 +72,14 @@ and the generic `write(path, format=...)` reaches them all, each returning a
 | `write.snowflake(table, connection_kwargs=...)` | A Snowflake table | Snowflake account |
 | `write.mongo(collection, ...)` | A MongoDB collection | a running MongoDB |
 
+ORC stores timestamps as nanoseconds and nothing else, which bounds the instants it can
+hold to roughly 1677-09-21 through 2262-04-11. Writing a timestamp outside that range
+raises a `SchemaError` naming the column, rather than storing a different instant: the
+underlying conversion wraps rather than failing, so `2300-01-01` would otherwise be read
+back as `1715-06-13` from a file that reports success and is perfectly valid. Parquet,
+Arrow, and Avro hold the full range, so a column with far-future sentinels such as
+`9999-12-31`, or with pre-1677 historical dates, belongs in one of those.
+
 Delta, Iceberg, and Hudi table writes (transactional append and merge/upsert) are
 covered in {doc}`Lakehouse tables </user-guide/moving-data/lakehouse>`. The sinks that need an optional extra or
 a live service are shown but not executed:

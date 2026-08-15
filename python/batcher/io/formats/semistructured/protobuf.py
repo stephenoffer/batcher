@@ -24,6 +24,7 @@ from batcher._internal.optional import require
 from batcher.config import active_config
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
+from batcher.plan.types import one_batch
 
 __all__ = ["ProtobufSource"]
 
@@ -138,9 +139,7 @@ class ProtobufSource(FileSource):
         table = protarrow.messages_to_table(messages, self._message_cls)
         if projection is not None:
             table = table.select(projection)
-        # `to_batches()[0]` looks like "the table as one batch" and is not: `to_batches`
-        # splits at the 32-bit offset limit, so a buffer holding more than 2 GiB of string
-        # or `bytes` fields — which is what a protobuf payload column is — came back as
-        # several batches and taking the first silently dropped the rest.
-        batches = table.combine_chunks().to_batches()
-        return batches[0] if len(batches) == 1 else pa.concat_batches(batches)
+        # `one_batch`, not `to_batches()[0]`: the latter looks like "the table as one
+        # batch" and is not, because `to_batches` splits at the 32-bit offset limit — and a
+        # protobuf payload column is exactly the buffer that passes 2 GiB.
+        return one_batch(table)

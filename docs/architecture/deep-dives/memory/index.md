@@ -6,6 +6,7 @@ Start with the contract, then the accounting, then what happens when the account
 - {doc}`Tensor columns </architecture/deep-dives/memory/tensor-columns>`: how an image becomes a column without a Python round trip.
 - {doc}`The buffer pool </architecture/deep-dives/memory/buffer-pool>`: the process-wide byte account every allocation of consequence reserves against.
 - {doc}`Spilling </architecture/deep-dives/memory/spilling>`: staying alive when the data does not fit.
+- {doc}`On-disk artifacts </architecture/deep-dives/memory/on-disk-artifacts>`: everything a running query writes to disk, and the three properties each file has to have.
 
 ```{toctree}
 :hidden:
@@ -14,4 +15,5 @@ arrow-memory
 tensor-columns
 buffer-pool
 spilling
+on-disk-artifacts
 ```

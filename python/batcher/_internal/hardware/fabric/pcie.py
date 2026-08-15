@@ -25,6 +25,8 @@ import os
 import re
 from dataclasses import dataclass
 
+from batcher._internal.hardware.sysfs import read_text
+
 __all__ = [
     "PCIE_CLASSES",
     "PCIE_SYSFS_ROOT",
@@ -75,15 +77,6 @@ _GT_TO_GEN: dict[str, int] = {
 }
 
 _ADDRESS_RE = re.compile(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]")
-
-
-def _read_text(path: str) -> str:
-    """The stripped contents of a `/sys` file, or `""` when it cannot be read."""
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
 
 
 def _parse_gen(raw: str) -> int:
@@ -192,10 +185,10 @@ def pcie_link(address: str) -> PcieLink:
     base = os.path.join(PCIE_SYSFS_ROOT, address)
     return PcieLink(
         address=address,
-        gen=_parse_gen(_read_text(os.path.join(base, "current_link_speed"))),
-        width=_parse_width(_read_text(os.path.join(base, "current_link_width"))),
-        max_gen=_parse_gen(_read_text(os.path.join(base, "max_link_speed"))),
-        max_width=_parse_width(_read_text(os.path.join(base, "max_link_width"))),
+        gen=_parse_gen(read_text(os.path.join(base, "current_link_speed"))),
+        width=_parse_width(read_text(os.path.join(base, "current_link_width"))),
+        max_gen=_parse_gen(read_text(os.path.join(base, "max_link_speed"))),
+        max_width=_parse_width(read_text(os.path.join(base, "max_link_width"))),
         numa_node=device_numa_node(address),
     )
 
@@ -215,7 +208,7 @@ def device_numa_node(address: str) -> int:
         The NUMA node id, or `-1` on a single-node machine, off Linux, or when the kernel does
         not publish it. Callers read `-1` as "no preference".
     """
-    raw = _read_text(os.path.join(PCIE_SYSFS_ROOT, address, "numa_node"))
+    raw = read_text(os.path.join(PCIE_SYSFS_ROOT, address, "numa_node"))
     try:
         node = int(raw)
     except ValueError:

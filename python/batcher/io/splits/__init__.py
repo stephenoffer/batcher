@@ -12,11 +12,19 @@ Splits intentionally mirror the `Source` read surface (`schema`/`read`/
 source. The contract and the whole-source fallback live in `base`; the file-locator
 splits in `file`; the line-delimited byte range in `text`; the Parquet row-group
 split, its footer cache, and the shared dataset fragment index in `parquet`.
+`clustering` holds the optional guarantee a split set can make about *which* rows
+it groups together -- one split per Hive partition directory -- which is what lets a
+consumer grouping on those columns skip its shuffle entirely.
 """
 
 from __future__ import annotations
 
 from batcher.io.splits.base import Split, WholeSourceSplit
+from batcher.io.splits.clustering import (
+    clustering_of,
+    declared_clustering,
+    group_by_clustering,
+)
 from batcher.io.splits.file import (
     FileSplit,
     IpcFileSplit,
@@ -44,7 +52,10 @@ __all__ = [
     "Split",
     "TextRangeSplit",
     "WholeSourceSplit",
+    "clustering_of",
+    "declared_clustering",
     "fragment_index",
+    "group_by_clustering",
     "line_range_splits",
     "pack_files",
     "pack_row_groups",

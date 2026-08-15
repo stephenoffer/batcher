@@ -298,12 +298,10 @@ pub fn partial(
     calls: &[AggCall],
     num_rows: usize,
 ) -> Result<Partial, RuntimeError> {
-    // Widen a `Mean`'s Int64 input to Float64 once, up front, so both the global and
-    // grouped paths (and every fused/combine/distributed step downstream) carry an f64
-    // sum state uniformly. AVG is a float result, and the exact overflow-checked i64 SUM
-    // accumulator errors on a large-magnitude integer column (e.g. ClickBench `UserID`);
-    // an f64 accumulator can't overflow — matching DuckDB, which sums into a HUGEINT —
-    // at ~2^-52 relative rounding, far inside the differential tolerance. `SUM` itself is
+    // Widen a `Mean`'s Int64 input to a 128-bit accumulator once, up front, so both the
+    // global and grouped paths (and every fused/combine/distributed step downstream) carry
+    // one sum-state type. AVG needs a sum wider than the exact i64 `SUM` accumulator, which
+    // errors on a large-magnitude integer column (e.g. ClickBench `UserID`). `SUM` itself is
     // untouched (it keeps the exact i64 accumulator that errors rather than wrap).
     // Decode any dictionary-encoded value/ordering inputs to their plain value type before
     // the typed accumulator kernels (which downcast to a concrete array) run. Group *keys*
@@ -385,37 +383,56 @@ fn decode_dict_call_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, Ru
     Ok(Some(out))
 }
 
-/// Widen every `Mean` call's Int64 **or Decimal128/Decimal256** input to Float64,
-/// returning a fresh call list only when some widening happened (else `None`, so the
-/// common no-`AVG(int)` path allocates nothing). See the note in [`partial`] for why AVG
-/// sums in f64 while SUM stays i64.
+/// The 128-bit sum state an integer `Mean` accumulates into: `Decimal128(38, 0)` *is* an
+/// `i128`, so reusing it makes an exact AVG a wider *accumulator* rather than a new state
+/// type to thread through partial/fused/combine/spill/distributed.
 ///
-/// Decimal is widened for the same reason as integers, and additionally because the
-/// downstream `sum_acc`/`finalize_mean` kernels only understand Int64/Float64 sum state —
-/// without this, `avg`/`mean` over a `Decimal128` column raised "unsupported". DuckDB
-/// returns a DOUBLE average, which Float64 matches.
+/// 38 digits holds any `i64` sum: the widest possible is `2^63 · 2^63 = 2^126 ≈ 8.5e37`.
+///
+/// **The state is 128-bit; the input is not widened to reach it.** `accum::sum_acc` and
+/// `fused` accumulate an `Int64` column straight into `i128` group slots. Casting the whole
+/// column first — which is what this used to do — allocated and wrote 16 bytes per row to
+/// read 8, and then paid `Decimal128`'s scatter (a validity branch, a `checked_add` and a
+/// `valid[g]` write per row) where the integer path has a branch-free no-null form. On
+/// `AVG` over three 10M-row integer columns that widening was most of the query.
+pub(crate) const MEAN_INT_ACCUMULATOR: DataType = DataType::Decimal128(38, 0);
+
+/// Widen every `Mean` call's Decimal128/Decimal256 input to Float64. Returns a fresh call
+/// list only when some widening happened (else `None`, so the common path allocates nothing).
+///
+/// **An integer `Mean` sums exactly, and is deliberately *not* widened here.** Accumulating
+/// in Float64 is only lossless while every partial sum stays under 2^53, and an `i64` column
+/// routinely is not: `AVG` over `[-1, 2^62, -2^62, 2, -3, 0]` returned `-1/6` (or `0`,
+/// depending on the order the groups were reduced in) where the true mean is `-2/6`. The
+/// values were exactly representable — the *running sum* was not, so each large addend
+/// swallowed the small ones. That is a wrong answer, not a rounding difference, and it is
+/// silent: a column of IDs, nanosecond timestamps or cents hits it at ordinary magnitudes.
+/// DuckDB sums into a HUGEINT for exactly this reason. Batcher does too, but in the
+/// accumulator rather than in the input — see [`MEAN_INT_ACCUMULATOR`]. `finalize_mean`
+/// divides the exact sum by the count in f64, so only the final division rounds.
+///
+/// Decimal *is* widened to Float64: its sums are already exact in `sum_acc`, but they carry
+/// the *input's* declared precision, which a sum can exceed — and `avg` returns DOUBLE in
+/// DuckDB either way, so the promotion costs nothing a decimal AVG could have kept.
 fn widen_mean_inputs(calls: &[AggCall]) -> Result<Option<Vec<AggCall>>, RuntimeError> {
-    let needs_widen = |c: &AggCall| {
-        c.func == AggFunc::Mean
-            && c.values.as_ref().is_some_and(|v| {
-                matches!(
-                    v.data_type(),
-                    DataType::Int64 | DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-                )
-            })
+    // The accumulator each widened type takes, or `None` for a type that stays as it is.
+    let target = |c: &AggCall| -> Option<DataType> {
+        if c.func != AggFunc::Mean {
+            return None;
+        }
+        match c.values.as_ref()?.data_type() {
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => Some(DataType::Float64),
+            _ => None,
+        }
     };
-    if !calls.iter().any(needs_widen) {
+    if !calls.iter().any(|c| target(c).is_some()) {
         return Ok(None);
     }
     let mut out = Vec::with_capacity(calls.len());
     for c in calls {
-        let values = if needs_widen(c) {
-            Some(arrow::compute::cast(
-                c.values.as_ref().unwrap(),
-                &DataType::Float64,
-            )?)
-        } else {
-            c.values.clone()
+        let values = match target(c) {
+            Some(dt) => Some(arrow::compute::cast(c.values.as_ref().unwrap(), &dt)?),
+            None => c.values.clone(),
         };
         out.push(AggCall::with_key(c.func, values, c.key.clone()));
     }
@@ -968,6 +985,52 @@ mod tests {
         let out = finalize(&[AggFunc::Mean], &p).expect("finalize");
         let got = out[0].as_primitive::<Float64Type>().value(0);
         assert!((got - i64::MAX as f64).abs() < 1.0, "got {got}");
+    }
+
+    /// AVG over an integer column is **exact**, not "close in f64".
+    ///
+    /// These values are each exactly representable as an `f64`, so the old failure was not
+    /// about the inputs: accumulating them in `f64` let `2^62` swallow the neighbouring
+    /// `-1`, `2` and `-3`, and the answer came back `-1/6` (or `0`, depending on reduction
+    /// order) against a true `-2/6`. Nothing about that is a rounding tolerance.
+    #[test]
+    fn mean_over_int64_is_exact_under_cancellation() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(-1),
+            Some(1 << 62),
+            Some(-(1i64 << 62)),
+            Some(2),
+            None,
+            Some(-3),
+            Some(0),
+        ]));
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![7i64; 7]))];
+        let calls = [AggCall::new(AggFunc::Mean, Some(values))];
+        let p = partial(&keys, &calls, 7).expect("partial");
+        let out = finalize(&[AggFunc::Mean], &p).expect("finalize");
+        let got = out[0].as_primitive::<Float64Type>().value(0);
+        assert_eq!(got, -2.0 / 6.0, "AVG must be the exact sum over the count");
+    }
+
+    /// …and it stays exact once the input is split across partials and combined, which is
+    /// the distributed and multi-core shape of the same query.
+    #[test]
+    fn mean_over_int64_is_exact_across_a_combine() {
+        let key: ArrayRef = Arc::new(Int64Array::from(vec![7i64, 7]));
+        let mk = |a: i64, b: i64| {
+            let v: ArrayRef = Arc::new(Int64Array::from(vec![a, b]));
+            partial(
+                &[Arc::clone(&key)],
+                &[AggCall::new(AggFunc::Mean, Some(v))],
+                2,
+            )
+            .expect("p")
+        };
+        let parts = vec![mk(-1, 1 << 62), mk(-(1i64 << 62), 2), mk(-3, 0)];
+        let merged = combine(&parts, &[AggFunc::Mean]).expect("combine");
+        let out = finalize(&[AggFunc::Mean], &merged).expect("finalize");
+        let got = out[0].as_primitive::<Float64Type>().value(0);
+        assert_eq!(got, -2.0 / 6.0);
     }
 
     #[test]

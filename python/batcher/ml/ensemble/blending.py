@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
@@ -68,17 +69,7 @@ def blend_predictions(
     names = list(columns)
     if not names:
         raise PlanError("blend_predictions needs at least one prediction column")
-    available = ds.columns
-    present = set(available)
-    for name in names:
-        if name not in present:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message(
-                    "column", name, available, hint="Pass the models' prediction columns."
-                )
-            )
+    require_columns(ds, *names, hint="Pass the models' prediction columns.")
     if weights is None:
         share = [1.0 / len(names)] * len(names)
     else:
@@ -152,15 +143,7 @@ def majority_vote(
     names = list(columns)
     if not names:
         raise PlanError("majority_vote needs at least one prediction column")
-    available = ds.columns
-    present = set(available)
-    for name in names:
-        if name not in present:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, available, hint="Pass the models' label columns.")
-            )
+    require_columns(ds, *names, hint="Pass the models' label columns.")
     if weights is None:
         share = [1.0] * len(names)
     else:

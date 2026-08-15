@@ -1,4 +1,13 @@
-"""Image decode+resize ingest: batcher vs Ray Data vs Daft.
+"""Image ingest and curation: batcher vs Ray Data vs Daft vs a Pillow loop.
+
+Two suites, one corpus generator.
+
+``--suite decode`` is the ingest hot path (decode + resize to a model input) and has three
+real engines to compare. ``--suite curate`` is the screening-and-augmentation pass that
+follows it, and has only one honest comparison: a per-row Pillow loop. Neither Daft nor Ray
+Data has a native entropy measure, perceptual hash, or photometric adjustment, so what a
+user of either writes is a `map_batches`/UDF over PIL — which is exactly what the baseline
+below is, run on the same bytes.
 
 The physical-AI / computer-vision ingest hot path: read a corpus of JPEG frames, decode
 each, and resize to the model input (``224x224``) — the first stage of every vision
@@ -18,6 +27,7 @@ count** at the same **output size** before its throughput is trusted.
 Run:
     python benchmarks/scenarios/image_decode.py                 # 2,000 frames, 640x480 -> 224
     python benchmarks/scenarios/image_decode.py --frames 8000 --width 1280 --height 720
+    python benchmarks/scenarios/image_decode.py --suite curate  # screening + augmentation
 """
 
 from __future__ import annotations
@@ -88,6 +98,64 @@ def _daft(directory: str) -> int:
     return df.with_column("img", img).collect().count_rows()
 
 
+# --- curation suite ---------------------------------------------------------------
+#
+# One screening measure, one fingerprint, and one augmentation — the three shapes a
+# curation pass is made of, chosen because each stresses a different part of the kernel:
+# a reduction to a scalar, a reduction to a digest, and a bytes-to-bytes transform.
+
+
+def _paths(directory: str) -> list[str]:
+    return sorted(os.path.join(directory, f) for f in os.listdir(directory) if f.endswith(".jpg"))
+
+
+def _batcher_curate(directory: str) -> int:
+    """The whole pass as one lazy plan, with no Python between the stages."""
+    import batcher as bt
+
+    img = bt.col("bytes")
+    out = (
+        bt.read.images(os.path.join(directory, "*.jpg"))
+        .select(
+            detail=img.image.entropy(),
+            digest=img.image.phash(),
+            flipped=img.image.flip_horizontal(format="jpeg", quality=85),
+        )
+        .collect()
+    )
+    return out.num_rows
+
+
+def _pillow_curate(directory: str) -> int:
+    """What a Ray Data or Daft user writes for the same pass: a per-row PIL loop.
+
+    Deliberately not a strawman — it is the same three measures, computed the way the
+    Python ecosystem computes them, on bytes already in memory so no I/O is being timed
+    against the engine's. It runs under the GIL on one core, which is the point: the
+    comparison is a native columnar kernel against a per-row UDF, not two kernels.
+    """
+    import io
+
+    from PIL import Image
+
+    count = 0
+    for path in _paths(directory):
+        with open(path, "rb") as fh:
+            data = fh.read()
+        with Image.open(io.BytesIO(data)) as im:
+            small = im.convert("L").resize((128, 128))
+            # Shannon entropy of the luma histogram — PIL exposes it directly.
+            _ = small.entropy()
+            # An 8x8 average hash, the cheapest of the perceptual family.
+            tiny = list(small.resize((8, 8)).getdata())
+            mean = sum(tiny) / len(tiny)
+            _ = sum(1 << i for i, v in enumerate(tiny) if v > mean)
+            buf = io.BytesIO()
+            im.transpose(Image.FLIP_LEFT_RIGHT).save(buf, "JPEG", quality=85)
+        count += 1
+    return count
+
+
 def _best_ms(fn, directory: str, runs: int) -> tuple[float, int]:
     """Best-of-``runs`` wall-clock (ms) plus the frame count (checked identical)."""
     best = float("inf")
@@ -105,6 +173,12 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=480, help="source frame height")
     parser.add_argument("--width", type=int, default=640, help="source frame width")
     parser.add_argument("--runs", type=int, default=3, help="best-of-N timed repeats")
+    parser.add_argument(
+        "--suite",
+        choices=("decode", "curate"),
+        default="decode",
+        help="decode+resize ingest, or the screening/augmentation pass that follows it",
+    )
     args = parser.parse_args()
 
     directory = tempfile.mkdtemp(prefix="bt_img_")
@@ -112,8 +186,13 @@ def main() -> int:
         print(f"writing {args.frames} JPEGs at {args.width}x{args.height} ...", flush=True)
         n = _write_corpus(directory, args.frames, args.height, args.width)
 
+        lineup = (
+            (("batcher", _batcher), ("ray data", _ray), ("daft", _daft))
+            if args.suite == "decode"
+            else (("batcher", _batcher_curate), ("pillow loop", _pillow_curate))
+        )
         results: dict[str, tuple[float, int]] = {}
-        for name, fn in (("batcher", _batcher), ("ray data", _ray), ("daft", _daft)):
+        for name, fn in lineup:
             try:
                 results[name] = _best_ms(fn, directory, args.runs)
             except ImportError:
@@ -127,7 +206,12 @@ def main() -> int:
                 print(f"MISMATCH: {name} processed {count} of {n} frames")
                 return 1
 
-        print(f"\ncorpus: {n:,} frames, {args.width}x{args.height} -> {_TARGET[0]}x{_TARGET[1]}")
+        shape = (
+            f"-> {_TARGET[0]}x{_TARGET[1]}"
+            if args.suite == "decode"
+            else "-> entropy + phash + flip"
+        )
+        print(f"\ncorpus: {n:,} frames, {args.width}x{args.height} {shape}")
         print(f"(best-of-{args.runs})\n")
         print(f"  {'engine':<20} {'ms':>10} {'img/s':>10}")
         print(f"  {'-' * 42}")
@@ -136,7 +220,7 @@ def main() -> int:
         if "batcher" in results:
             bt_ms = results["batcher"][0]
             print()
-            for other in ("ray data", "daft"):
+            for other in ("ray data", "daft", "pillow loop"):
                 if other in results:
                     print(f"  batcher is {results[other][0] / bt_ms:.2f}x faster than {other}.")
         return 0

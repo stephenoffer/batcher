@@ -33,6 +33,8 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
+from batcher.config.env import truthy
+
 __all__ = [
     "STABILITY_VARS",
     "collective_findings",
@@ -115,12 +117,12 @@ def collective_findings(
             "collectives: asynchronous error handling is off, so a lost rank or a faulted "
             "device will hang the surviving ranks indefinitely instead of failing the task"
         )
-    if _is_on(ambient.get("NCCL_IB_DISABLE")) and _rdma_ports(rdma_ports) > 0:
+    if truthy(ambient.get("NCCL_IB_DISABLE")) and _rdma_ports(rdma_ports) > 0:
         out.append(
             "collectives: NCCL_IB_DISABLE is set on a node with RDMA ports, so collectives "
             "will fall back to TCP and leave the fabric idle"
         )
-    if _is_on(ambient.get("NCCL_SHM_DISABLE")):
+    if truthy(ambient.get("NCCL_SHM_DISABLE")):
         out.append(
             "collectives: NCCL_SHM_DISABLE is set, so same-node ranks will not use shared "
             "memory and intra-node collectives will run over the network stack"
@@ -128,11 +130,6 @@ def collective_findings(
     if not ambient.get("NCCL_DEBUG"):
         out.append("collectives: NCCL_DEBUG is unset, so a collective that aborts will not say why")
     return tuple(out)
-
-
-def _is_on(value: str | None) -> bool:
-    """Whether an environment flag is set to something the library reads as enabled."""
-    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _rdma_ports(given: int) -> int:

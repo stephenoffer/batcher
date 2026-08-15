@@ -39,21 +39,50 @@ pub(crate) fn covar_state(
     let yf = cast(y, &DataType::Float64)?;
     let xa = xf.as_primitive::<Float64Type>();
     let ya = yf.as_primitive::<Float64Type>();
-    // Two-pass within this partition: pass 1 accumulates the exact per-group sums, pass 2
-    // the centered products around the resulting mean. A single mean rounding followed by
-    // well-conditioned centered sums is far more accurate than a streaming (Welford)
-    // co-moment at a large offset — it matches DuckDB exactly for a single-partition
-    // aggregate (the common small-query path) — and the state still merges via Chan's
-    // parallel formula ([`merge_covar`]) across partitions/morsels.
+    // Split on nullability once, so the two passes below run over raw value slices with no
+    // per-row validity lookup. Both arms are `covar_pairs` monomorphized on a pair predicate,
+    // so the arithmetic is written once and the null-free arm is the same code with the test
+    // folded to a constant. `corr` reads six accumulators over two passes, which makes the
+    // per-row overhead this removes proportionally larger than on a scalar aggregate: the
+    // H2O `groupby` q9 (`corr(v1, v2)` over 10 M null-free rows) is the shape it serves.
+    let pairs = if xa.logical_null_count() == 0 && ya.logical_null_count() == 0 {
+        covar_pairs(xa.values(), ya.values(), group_ids, num_groups, |_| true)
+    } else {
+        covar_pairs(xa.values(), ya.values(), group_ids, num_groups, |i| {
+            xa.is_valid(i) && ya.is_valid(i)
+        })
+    };
+    Ok(pairs)
+}
+
+/// The two centred passes of [`covar_state`], over raw values with `keep` deciding a pair.
+///
+/// Two-pass within this partition: pass 1 accumulates the exact per-group sums, pass 2 the
+/// centered products around the resulting mean. A single mean rounding followed by
+/// well-conditioned centered sums is far more accurate than a streaming (Welford) co-moment
+/// at a large offset — it matches DuckDB exactly for a single-partition aggregate (the common
+/// small-query path) — and the state still merges via Chan's parallel formula
+/// ([`merge_covar`]) across partitions/morsels.
+///
+/// `xs`/`ys` are the arrays' value buffers, so a slot `keep` rejects may hold anything; it is
+/// read only where `keep` says a pair exists, which is exactly where the validity bitmaps say
+/// a value does.
+fn covar_pairs<F: Fn(usize) -> bool>(
+    xs: &[f64],
+    ys: &[f64],
+    group_ids: &[u32],
+    num_groups: usize,
+    keep: F,
+) -> Vec<ArrayRef> {
     let mut n = vec![0i64; num_groups];
     let mut sum_x = vec![NeumaierSum::default(); num_groups];
     let mut sum_y = vec![NeumaierSum::default(); num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
-        if xa.is_valid(i) && ya.is_valid(i) {
+        if keep(i) {
             let g = g as usize;
             n[g] += 1;
-            sum_x[g].add(xa.value(i));
-            sum_y[g].add(ya.value(i));
+            sum_x[g].add(xs[i]);
+            sum_y[g].add(ys[i]);
         }
     }
     let mut mean_x = vec![0f64; num_groups];
@@ -69,23 +98,23 @@ pub(crate) fn covar_state(
     let mut m2x = vec![0f64; num_groups];
     let mut m2y = vec![0f64; num_groups];
     for (i, &g) in group_ids.iter().enumerate() {
-        if xa.is_valid(i) && ya.is_valid(i) {
+        if keep(i) {
             let g = g as usize;
-            let dx = xa.value(i) - mean_x[g];
-            let dy = ya.value(i) - mean_y[g];
+            let dx = xs[i] - mean_x[g];
+            let dy = ys[i] - mean_y[g];
             c2[g] += dx * dy;
             m2x[g] += dx * dx;
             m2y[g] += dy * dy;
         }
     }
-    Ok(vec![
+    vec![
         Arc::new(Int64Array::from(n)),
         Arc::new(Float64Array::from(mean_x)),
         Arc::new(Float64Array::from(mean_y)),
         Arc::new(Float64Array::from(c2)),
         Arc::new(Float64Array::from(m2x)),
         Arc::new(Float64Array::from(m2y)),
-    ])
+    ]
 }
 
 /// Merge partial covar/corr states by group with Chan's parallel formula — the

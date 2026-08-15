@@ -214,9 +214,6 @@ def spill_scratch_dir() -> str:
     learned spill threshold described the container's overlay while the spill itself landed on
     the node's NVMe, which merged two machine classes that behave nothing alike.
 
-    (`_internal.hardware.profile._scratch_dir` is a third copy of this, left in place only
-    because that file is mid-edit elsewhere. It should call this.)
-
     Returns:
         A directory path. Not verified writable here — `local_scratch_root` only ever returns
         a volume it probed, and a configured root is the operator's own instruction.

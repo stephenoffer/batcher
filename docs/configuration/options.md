@@ -108,6 +108,7 @@ operator's state may hold is `memory.streaming_state_max_bytes`, in the `memory`
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `idle_poll_seconds` | `0.2` | How long a runner waits before asking an idle unbounded source for data again. Only an empty pass pays it. |
+| `max_window_latency_seconds` | `1.0` | Longest a `map_batches` streaming window may spend filling before it is flushed anyway. Unbounded sources only. `0` restores the size-only window. |
 | `progress_history` | `100` | Micro-batch progress records a query handle keeps for `recent_progress`. |
 | `watermark_idle_timeout_seconds` | `60.0` | How long a stream partition may deliver nothing before it stops holding the event-time watermark back. |
 | `backpressure_enabled` | `False` | Derive each trigger's admission cap from measured throughput instead of holding it at the source's configured limit. |
@@ -122,6 +123,28 @@ the cost of re-listing a directory or re-asking a broker for its partitions. Rai
 a stream is idle most of the time and the listing is expensive, such as a large cloud
 prefix. The single-node and distributed runners read the same value, so an idle stream
 behaves the same on one machine and on a cluster.
+
+`max_window_latency_seconds` is the one option here that exists because a size bound and a
+stream disagree. A `map_batches` pipeline only spreads across the worker pool when it is handed
+several batches at once, so the streaming iterator collects source batches into a window before
+applying the function. That window used to close on rows or on bytes, and both are the right
+question for a file and the wrong one for a stream: a stream is bounded in rate, so "four
+million rows" is a duration. At 2,000 rows a second the first output appeared after 33 minutes,
+and on a 10 rows a second device topic after about four days. Nothing was hung and nothing was
+leaking, so nothing said anything.
+
+The window now closes on size or on age, whichever comes first, which is the same rule Spark's
+`Trigger.ProcessingTime` and Flink's `bufferTimeout` apply for the same reason. A fast stream
+still fills whole windows and keeps its throughput; a slow one emits on the interval. Only an
+unbounded source is affected, so batch reads keep the pure size-based window and their existing
+throughput. Raise it to trade first-row latency for larger, more efficient windows, and set it
+to `0` to pin the old behavior.
+
+The age is measured from the first batch buffered into a window and checked when a batch
+arrives, never on a timer, so a source that blocks for a minute between batches flushes on its
+next arrival rather than mid-read. Cutting a window early cannot change a result: `map_batches`
+makes no promise about how rows are grouped into calls, and the size bounds already vary that
+grouping with row width and worker count.
 
 The `backpressure_*` options carry Spark's names and Spark's defaults, so tuning advice
 written for `spark.streaming.backpressure.pid.*` applies unchanged. They are off by default,

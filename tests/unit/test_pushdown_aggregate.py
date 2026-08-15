@@ -41,6 +41,33 @@ def test_pushdown_aggregate_unit_off_non_aggregate():
     assert push_filter_through_aggregate(plan, None) is None
 
 
+def test_a_constant_filter_is_not_pushed_below_a_keyless_aggregate():
+    """The one aggregate shape where an empty input does not give an empty output.
+
+    A constant predicate references no columns, and the empty set is a subset of every set
+    — including a keyless aggregate's empty key set — so the rule's "touches only group
+    keys" guard admitted it. A global aggregate emits exactly one row whatever it reads, so
+    a filter beneath it cannot remove the row the same filter above it removes.
+
+    Reached from SQL as `SELECT sum(v) FROM t HAVING <false>`, which is what a `ROLLUP`
+    level's `HAVING GROUPING(g) = 0` lowers to at the grand total; it returned one row of
+    NULL where DuckDB returns none.
+    """
+    plan = _t().agg(total=col("sal").sum()).filter(bt.lit(1) == bt.lit(0))._plan
+    assert push_filter_through_aggregate(plan, None) is None
+    ir = Optimizer().optimize(plan).ir
+    assert ir["op"] != "aggregate", "the filter must not end up beneath the aggregate"
+
+
+def test_a_key_predicate_is_still_pushed_when_keys_exist():
+    """The guard is on the keys, not on the predicate being constant — grouped still moves.
+
+    Zero input rows give zero groups, so the grouped case stays sound and stays optimized.
+    """
+    plan = _t().group_by("dept").agg(total=col("sal").sum()).filter(bt.lit(1) == bt.lit(1))._plan
+    assert isinstance(push_filter_through_aggregate(plan, None), Aggregate)
+
+
 # --- push_filter_through_sort -------------------------------------------------
 
 

@@ -211,13 +211,30 @@ def gpu_devices_absent() -> bool:
     return not any(os.path.exists(p) for p in ("/dev/kfd", "/dev/dxg"))
 
 
+#: The env vars a runtime uses to hand a process a *subset* of a node's accelerators, in
+#: priority order. NVIDIA and HIP both honor ``CUDA_VISIBLE_DEVICES``; AMD ROCm adds its own
+#: two. A host runs one vendor, so consulting all three is safe and the first one set wins.
+#: Ray sets the NVIDIA one on every task and actor holding a `num_gpus` grant, which is what
+#: makes this the normal case on a multi-device node rather than an exotic one.
+#:
+#: The one list, for the three callers that each had their own: this module enumerates devices,
+#: `hardware.devices.scope` pins and renumbers them, and `ml.gpu` attributes telemetry to them.
+#: A vendor variable added to one copy and not the others is a silent disagreement about which
+#: devices a process owns — the inventory says four, the sampler says one.
+VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+
 #: Values of `CUDA_VISIBLE_DEVICES` (and its AMD equivalents) that mean "no device at all".
 #: The empty string is the spelling this module already honored; `-1` is the one CUDA itself
 #: documents and the one every framework and CI script actually writes, and it was read as an
 #: ordinal list, so a run explicitly asked to stay off the GPU still paid the ~2 s `import
 #: torch` to be told there was nothing to accelerate — and still enumerated the node's devices
 #: through NVML afterwards.
-_NO_DEVICES = frozenset({"", "-1", "none", "void"})
+#:
+#: Shared with `hardware.devices.scope`, which pins and sizes against the same rule while this
+#: module enumerates. They were two copies, and the copy over there carried a comment saying it
+#: had to be "kept in step" by hand — the sort of instruction that holds until the day it does
+#: not, and then reports a masked-off node as a whole one on exactly one of the two paths.
+NO_DEVICE_TOKENS = frozenset({"", "-1", "none", "void"})
 
 #: The container-runtime variable, which is set *before* the process starts and decides which
 #: devices the NVIDIA container toolkit injects. `none` and `void` are its documented ways of
@@ -228,9 +245,9 @@ _CONTAINER_VISIBLE_VAR = "NVIDIA_VISIBLE_DEVICES"
 
 def _devices_masked_off() -> bool:
     """Whether an environment variable has definitively hidden every accelerator."""
-    for var in (*_VISIBLE_DEVICE_VARS, _CONTAINER_VISIBLE_VAR):
+    for var in (*VISIBLE_DEVICE_ENVS, _CONTAINER_VISIBLE_VAR):
         raw = os.environ.get(var)
-        if raw is not None and raw.strip().lower() in _NO_DEVICES:
+        if raw is not None and raw.strip().lower() in NO_DEVICE_TOKENS:
             return True
     return False
 
@@ -374,12 +391,6 @@ def _amd_inventory() -> list[dict[str, object]]:
     ]
 
 
-#: The env vars a runtime uses to hand a process a *subset* of a node's accelerators, per
-#: vendor. Ray sets the NVIDIA one on every task and actor holding a `num_gpus` grant, which
-#: is what makes this the normal case on a multi-device node rather than an exotic one.
-_VISIBLE_DEVICE_VARS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
-
-
 def _visible_devices(devices: list[dict[str, object]]) -> list[dict[str, object]]:
     """Restrict a driver-probed device list to the ones this process may actually use.
 
@@ -416,10 +427,10 @@ def _visible_devices(devices: list[dict[str, object]]) -> list[dict[str, object]
         The visible subset, renumbered from zero, or `devices` unchanged when visibility is
         not restricted or cannot be resolved at all.
     """
-    raw = next((os.environ[v] for v in _VISIBLE_DEVICE_VARS if v in os.environ), None)
+    raw = next((os.environ[v] for v in VISIBLE_DEVICE_ENVS if v in os.environ), None)
     if raw is None:
         return devices
-    if raw.strip().lower() in _NO_DEVICES:
+    if raw.strip().lower() in NO_DEVICE_TOKENS:
         # `-1` is CUDA's own documented "no devices", and it is what a framework or a CI script
         # writes to keep a run off the GPU. Only the empty string was recognized, so `-1` fell
         # through the ordinal parse (it is not `isdigit`), failed to resolve as a UUID, and hit

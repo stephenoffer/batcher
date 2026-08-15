@@ -41,6 +41,7 @@ _REEXPORTED = (_column_to_numpy, _require_torch, _warn_dropped_non_numeric, _wor
 
 __all__ = [
     "arrays_to_torch",
+    "tf_dataset_from_arrays",
     "to_numpy_batches",
     "to_tf",
     "to_tf_dataset",
@@ -134,18 +135,39 @@ def to_tf_dataset(
         MissingDependencyError: if `tensorflow` is not installed (naming ``pip install
             'batcher-engine[tensorflow]'``).
     """
+    return tf_dataset_from_arrays(to_numpy_batches(batches, columns=columns))
+
+
+def tf_dataset_from_arrays(arrays: Iterable[dict[str, Any]]) -> Any:
+    """Wrap a stream of ``{column: ndarray}`` batches as a ``tf.data.Dataset``.
+
+    Split out from `to_tf_dataset` so the TensorFlow path can consume the *same* prepared
+    stream the PyTorch one does (`batcher.ml.loader.lazy.numpy_batch_stream`) — shuffled,
+    sized, and tailed by shared code — instead of being the one loader in the package with
+    none of those options.
+
+    Args:
+        arrays: an iterable of ``{column: numpy.ndarray}`` batches.
+
+    Returns:
+        A ``tf.data.Dataset`` yielding one `{column: tensor}` dict per batch.
+
+    Raises:
+        MissingDependencyError: if `tensorflow` is not installed (naming ``pip install
+            'batcher-engine[tensorflow]'``).
+    """
     tf = require(
         "tensorflow", feature="TensorFlow conversion", provides="tensorflow", extra="tensorflow"
     )
 
-    def _numeric(arrays: dict[str, Any]) -> dict[str, Any]:
-        return {n: a for n, a in arrays.items() if a.dtype.kind in "biuf"}
+    def _numeric(batch: dict[str, Any]) -> dict[str, Any]:
+        return {n: a for n, a in batch.items() if a.dtype.kind in "biuf"}
 
     # ONE iterator, advanced exactly once for the signature probe and then resumed by the
-    # generator. Probing with a second `to_numpy_batches(...)` pass consumed batch 0 out of
-    # the one-shot source (`ds.iter_batches()`) and `from_generator` re-entered the
-    # already-advanced iterator, so every TF training run silently lost its first batch.
-    remaining = iter(to_numpy_batches(batches, columns=columns))
+    # generator. Probing with a second pass consumed batch 0 out of the one-shot source
+    # (`ds.iter_batches()`) and `from_generator` re-entered the already-advanced iterator,
+    # so every TF training run silently lost its first batch.
+    remaining = iter(arrays)
     first_arrays = next(remaining, None)
     if first_arrays is None:
         return tf.data.Dataset.from_tensor_slices({})
@@ -158,8 +180,8 @@ def to_tf_dataset(
         if not consumed:
             consumed.append(True)
             yield first
-            for arrays in remaining:
-                yield _numeric(arrays)
+            for batch in remaining:
+                yield _numeric(batch)
 
     consumed: list[bool] = []
     # The row axis is dynamic (``None``); every trailing axis is fixed by the column's

@@ -60,7 +60,11 @@ pub(crate) fn eval_math2(
     // (`round(2^53+1, 0)` came back as `2^53`). `floor`/`ceil` genuinely *do* yield
     // double in DuckDB, so only `round` needs this — the blanket promotion is right
     // for its neighbours and wrong here.
-    if matches!(func, Math2Func::Round) && matches!(l.data_type(), DataType::Int64) {
+    // Every integer width, not just `Int64`: a mid-plan `CAST(x AS SMALLINT)` produced an
+    // `Int16` that fell through to the float promotion below, so `round(CAST(i AS SMALLINT), 0)`
+    // came back DOUBLE while `round(i, 0)` came back BIGINT — the same expression typed two
+    // ways depending on an upstream cast.
+    if matches!(func, Math2Func::Round) && l.data_type().is_integer() {
         return round_int(l, r);
     }
     let lf = cast(l, &DataType::Float64)?;
@@ -128,7 +132,10 @@ fn next_after(from: f64, to: f64) -> f64 {
 /// intermediate cannot overflow on the way.
 fn round_int(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
     let ri = cast(r, &DataType::Int64)?;
-    let a = l.as_primitive::<Int64Type>();
+    // `l` is cast rather than downcast: the caller admits every integer width, and
+    // `as_primitive` on a narrower one panics rather than returning an error.
+    let li = cast(l, &DataType::Int64)?;
+    let a = li.as_primitive::<Int64Type>();
     let b = ri.as_primitive::<Int64Type>();
     // `binary` unions the two null buffers once instead of testing validity per row.
     let out: Int64Array = binary(a, b, round_i64)?;
@@ -345,6 +352,34 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             let f = cast(arr, &DataType::Float64)?;
             eval_math(func, &f)
         }
+        // Every other integer width. The FFI boundary normalizes Int8/16/32 to Int64 on the
+        // way *in*, which is why only `Int64` was handled — but a mid-plan `CAST(x AS
+        // SMALLINT)` mints an `Int16` the boundary never sees, and the arm below then
+        // rejected it. `floor(CAST(i AS SMALLINT))` failed the whole query with "Floor
+        // expected a numeric argument, got Int16", and so did every other function in this
+        // family after any narrowing cast. Promoting to the engine's canonical integer width
+        // and recursing reuses the `Int64` arms above verbatim, `abs`'s saturation included.
+        (
+            _,
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32,
+        ) => {
+            let i = cast(arr, &DataType::Int64)?;
+            eval_math(func, &i)
+        }
+        // `UInt64` holds values no `Int64` does, so it cannot take the promotion above.
+        // `abs`/`round` of an unsigned integer is that integer, exactly — returning it
+        // untouched keeps the values above `i64::MAX` that a float promotion would round.
+        (Abs | Round, DataType::UInt64) => Ok(Arc::clone(arr)),
+        // The narrow floats, and `UInt64` for the genuinely float-valued functions.
+        (_, DataType::Float16 | DataType::Float32 | DataType::UInt64) => {
+            let f = cast(arr, &DataType::Float64)?;
+            eval_math(func, &f)
+        }
         (_, other) => Err(ExprError::ExpectedType {
             func: format!("{func:?}"),
             want: "a numeric argument",
@@ -387,6 +422,11 @@ fn apply_unary(func: MathFunc, v: f64) -> f64 {
         Sinh => v.sinh(),
         Cosh => v.cosh(),
         Tanh => v.tanh(),
+        // std's routines are the FDLIBM ones, so they hold at the range ends where the
+        // `ln(x ± sqrt(x*x ∓ 1))` identities overflow or cancel.
+        Asinh => v.asinh(),
+        Acosh => v.acosh(),
+        Atanh => v.atanh(),
         Degrees => v.to_degrees(),
         Radians => v.to_radians(),
         Cot => 1.0 / v.tan(),

@@ -106,6 +106,44 @@ def sample_probs(n_buckets: int, n_samplers: int) -> list[float]:
     return [i / g for i in range(g + 1)]
 
 
+def range_partitionable(dtype: pa.DataType) -> bool:
+    """Whether a leading key of `dtype` can be range-partitioned into ordered buckets.
+
+    The answer is the intersection of what [`sample_key_grid`] can summarize (a numeric KLL
+    sketch or a lexical string grid) and what `bucketize`'s Rust range partitioner will route
+    (`RuntimeError::NonNumericRangeKey` otherwise). Anything else — Boolean, List, Struct,
+    Binary — has to stay on the materializing operator, which costs memory and never
+    correctness.
+
+    It is a function rather than a `frozenset` beside each caller for the reason this module
+    exists: every `supports_spilling_*` predicate is answering the same question about the
+    same two primitives, and when they each spelled it out they drifted. The global-window
+    predicate never grew the type test its sort sibling had, so a `rank()` over a Boolean
+    column collected fine and raised a bare Rust `RuntimeError` the moment the same plan was
+    streamed.
+
+    Args:
+        dtype: The Arrow type of the leading sort/order key.
+
+    Returns:
+        True when both the sampler and the partitioner handle this key type.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.dist.executors.partition_io import range_partitionable
+            >>> range_partitionable(pa.int64()), range_partitionable(pa.bool_())
+            (True, False)
+    """
+    return (
+        pa.types.is_integer(dtype)
+        or pa.types.is_floating(dtype)
+        or pa.types.is_string(dtype)
+        or pa.types.is_large_string(dtype)
+    )
+
+
 def sample_key_grid(
     batches: list[pa.RecordBatch], key_name: str, probs: list[float]
 ) -> list[float] | list[str]:

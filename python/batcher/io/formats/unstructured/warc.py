@@ -6,6 +6,14 @@ every web-scale crawler ship their output, which makes it the front door of an L
 pretraining corpus: fetch the crawl, filter to `response` records, pull the HTML out, and
 hand it to `.str.strip_html()` / `.str.chunk()` / the embedding path.
 
+A `response` record's payload is not the HTML. It is the whole HTTP exchange — status
+line, response headers, a blank line, *then* the body — so handing `warc_content` to
+`strip_html()` extracts `"HTTP/1.1 200 OK Content-Type: text/html Server: nginx ..."`
+followed by the page, and every text metric, embedding and dedup hash downstream is
+computed over a crawl's server banners. That is invisible: the read succeeds, the column
+is text, and the prefix looks like prose. `http_status`, `http_content_type` and
+`http_body` split the envelope off, which is what the paragraph above always meant.
+
 Read-only, and no third-party dependency — the format is simple enough that parsing it is
 smaller than a wrapper around a library would be, and `gzip` in the standard library
 already handles the per-record gzip members a `.warc.gz` concatenates.
@@ -47,6 +55,13 @@ WARC_SCHEMA = pa.schema(
         ("warc_identified_payload_type", pa.string()),
         ("warc_headers", pa.string()),
         ("warc_content", pa.large_binary()),
+        # The HTTP exchange inside a `response`/`request` payload, taken apart. Null for a
+        # record that carries no HTTP envelope (`warcinfo`, `metadata`, a raw resource).
+        # Int64, not Int32: the FFI boundary normalizes narrow integers to Int64 on the way
+        # back, so a source declaring Int32 declares a type the engine never hands out.
+        ("http_status", pa.int64()),
+        ("http_content_type", pa.string()),
+        ("http_body", pa.large_binary()),
     ]
 )
 
@@ -218,11 +233,70 @@ class WarcSource(FileSource):
             yield _batch(rows, projection)
 
 
+#: The end of an HTTP header block. `\r\n\r\n` per RFC 7230; a bare `\n\n` is accepted
+#: too because real crawls contain servers that write it, and refusing them would drop the
+#: body of every page from those hosts.
+_HTTP_HEADER_END = (b"\r\n\r\n", b"\n\n")
+
+
+def _split_http(payload: bytes) -> dict[str, Any]:
+    """Take a record payload apart into ``{http_status, http_content_type, http_body}``.
+
+    Only records that actually begin with an HTTP start line are split. Sniffing the start
+    line rather than trusting `Content-Type: application/http` is deliberate: crawls carry
+    records whose declared type and content disagree, and splitting a payload that is not
+    HTTP would silently truncate it at the first blank line — which for a plain-text
+    resource is the end of its first paragraph.
+
+    Returns all three as `None` for anything that is not an HTTP exchange, so the columns
+    say "this record had no envelope" rather than guessing.
+    """
+    absent: dict[str, Any] = {
+        "http_status": None,
+        "http_content_type": None,
+        "http_body": None,
+    }
+    # A response starts `HTTP/1.1 200 OK`; a request starts with its method and ends the
+    # line with the version. Both are HTTP envelopes and both have a body to separate.
+    line_end = payload.find(b"\n", 0, 256)
+    if line_end < 0:
+        return absent
+    start_line = payload[:line_end].rstrip(b"\r")
+    is_response = start_line.startswith(b"HTTP/")
+    if not is_response and b"HTTP/" not in start_line:
+        return absent
+
+    cut = min((i for i in (payload.find(m) for m in _HTTP_HEADER_END) if i >= 0), default=-1)
+    if cut < 0:
+        # Headers with no terminating blank line: a truncated fetch. The envelope is real,
+        # so report what was parsed from it and leave the body absent rather than handing
+        # back header bytes as if they were content.
+        head, body = payload, None
+    else:
+        # The blank line's own width, so the body starts after it rather than with it.
+        width = 4 if payload[cut : cut + 4] == b"\r\n\r\n" else 2
+        head, body = payload[:cut], payload[cut + width :]
+
+    status = None
+    if is_response:
+        parts = start_line.split(None, 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            status = int(parts[1])
+    content_type = None
+    for line in head.split(b"\n")[1:]:
+        name, sep, value = line.partition(b":")
+        if sep and name.strip().lower() == b"content-type":
+            content_type = value.strip().decode("latin-1") or None
+            break
+    return {"http_status": status, "http_content_type": content_type, "http_body": body}
+
+
 def _row(headers: dict[str, str], payload: bytes, path: str) -> dict[str, Any]:
     """One record's headers and payload as a row of `WARC_SCHEMA`."""
     row: dict[str, Any] = dict.fromkeys(WARC_SCHEMA.names)
     row["path"] = path
     row["warc_content"] = payload
+    row.update(_split_http(payload))
     extra: dict[str, str] = {}
     for name, value in headers.items():
         column = _TYPED_HEADERS.get(name)

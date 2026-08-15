@@ -23,6 +23,38 @@ __all__ = [
 ]
 
 
+def _union_streams_at_all(plan) -> bool:
+    """The three preconditions branch-wise and interleaved streaming share.
+
+    Concatenating and interleaving differ in exactly one thing — whether the branches end —
+    and agree on everything else. Stating the shared part once is not tidiness: the two
+    predicates carried the same three checks in the same order, and a fix applied to one
+    would have silently left the other running on a shape it could not handle.
+
+    - **UNION ALL only.** `UNION` (distinct) needs a global dedup, which is precisely the
+      whole-relation state neither path has.
+    - **One source per branch**, so each can be relabelled onto `sources[0]`
+      (`union_branch_sources`).
+    - **No type promotion due.** The materialized path lets the engine widen a column's type
+      across branches (Int32 with Int64 becomes Int64); streaming yields each branch's batches
+      as the engine produced them, so it applies only where every branch's types already
+      agree. Restating the promotion rule here would be a second copy of what the engine owns,
+      and two copies are what drift.
+
+    Args:
+        plan: The `Union` node being routed.
+
+    Returns:
+        True when the branches may be streamed independently in some order.
+    """
+    if plan.distinct or not union_branch_sources(plan):
+        return False
+    schemas = [branch.available_schema() for branch in plan.inputs]
+    if any(s is None for s in schemas):
+        return False  # an opaque branch (a UDF) — cannot prove the types already agree
+    return all(s.arrow.types == schemas[0].arrow.types for s in schemas[1:])
+
+
 def union_branch_sources(plan) -> list[tuple[LogicalPlan, int]]:
     """Each UNION branch paired with the single source id it scans, or `[]` if any branch
     does not scan exactly one.
@@ -53,20 +85,13 @@ def union_branch_sources(plan) -> list[tuple[LogicalPlan, int]]:
 def union_streams_branchwise(plan, sources: list[Source]) -> bool:
     """Whether this UNION's result equals its branches' streams concatenated in order.
 
-    Four preconditions, each of which is a wrong answer rather than a slow one if skipped:
+    Four preconditions, each of which is a wrong answer rather than a slow one if skipped.
+    Three are shared with interleaving and live in `_union_streams_at_all`; the fourth is
+    what separates the two:
 
-    - **UNION ALL only.** `UNION` (distinct) needs a global dedup, which is precisely the
-      whole-relation state this path does not have.
     - **Bounded sources only.** An unbounded branch never terminates, so branch `k + 1`
       would never emit and the "concatenation" would silently be branch 0 forever. Those
-      keep raising the explicit `PlanError` the router falls through to.
-    - **One source per branch**, so each can be relabelled onto `sources[0]`
-      (`union_branch_sources`).
-    - **No type promotion due.** The materialized path lets the engine widen a column's
-      type across branches (Int32 with Int64 becomes Int64); streaming yields each branch's
-      batches as the engine produced them, so it applies only where every branch's types
-      already agree. Restating the promotion rule here would be a second copy of what the
-      engine owns, and two copies are what drift.
+      take the interleaved path instead.
 
     Args:
         plan: The `Union` node being routed.
@@ -77,14 +102,7 @@ def union_streams_branchwise(plan, sources: list[Source]) -> bool:
     """
     from batcher.io.source import is_bounded
 
-    if plan.distinct or not all(is_bounded(s) for s in sources):
-        return False
-    if not union_branch_sources(plan):
-        return False
-    schemas = [branch.available_schema() for branch in plan.inputs]
-    if any(s is None for s in schemas):
-        return False  # an opaque branch (a UDF) — cannot prove the types already agree
-    return all(s.arrow.types == schemas[0].arrow.types for s in schemas[1:])
+    return all(is_bounded(s) for s in sources) and _union_streams_at_all(plan)
 
 
 def union_streams_interleaved(plan, sources: list[Source]) -> bool:
@@ -98,10 +116,8 @@ def union_streams_interleaved(plan, sources: list[Source]) -> bool:
 
     Interleaving is sound where concatenation is, minus the ordering claim — and UNION ALL
     never made one: it is a multiset union, so a row from whichever branch has one next is
-    as correct as any other order. The remaining preconditions are `union_streams_branchwise`'s
-    and hold for the same reasons: ALL rather than distinct (a global dedup is exactly the
-    whole-relation state this path lacks), one source per branch so each can be relabelled,
-    and types that already agree across branches so no promotion is due.
+    as correct as any other order. The remaining preconditions are the shared three in
+    `_union_streams_at_all`, and hold here for the same reasons.
 
     Args:
         plan: The `Union` node being routed.
@@ -113,14 +129,9 @@ def union_streams_interleaved(plan, sources: list[Source]) -> bool:
     """
     from batcher.io.source import is_bounded
 
-    if plan.distinct or all(is_bounded(s) for s in sources):
+    if all(is_bounded(s) for s in sources):
         return False  # all-bounded unions concatenate, which also preserves order
-    if not union_branch_sources(plan):
-        return False
-    schemas = [branch.available_schema() for branch in plan.inputs]
-    if any(s is None for s in schemas):
-        return False  # an opaque branch (a UDF) — cannot prove the types already agree
-    return all(s.arrow.types == schemas[0].arrow.types for s in schemas[1:])
+    return _union_streams_at_all(plan)
 
 
 def interleave(streams: list) -> object:

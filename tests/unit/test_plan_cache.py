@@ -271,8 +271,15 @@ def test_the_bucketed_fingerprint_absorbs_drift_but_not_a_real_move():
     # A few percent of drift — what a settled exponential average does every run — must not move.
     drifted = dataclasses.replace(base, filter_row=base.filter_row * 1.03)
     assert plan_cache._bucketed(drifted) == plan_cache._bucketed(base)
-    # A 40%+ move crosses a half-octave bucket and must.
-    moved = dataclasses.replace(base, filter_row=base.filter_row * 1.6)
+    # Nor does a 60% one. A cost coefficient sits in a feedback loop (it is fit from the
+    # operators the plan ran, and it picks the plan that runs next), so it walks by tens of
+    # percent in one direction for many runs without settling — see `_COEFF_BUCKETS`. Half-
+    # octave buckets re-keyed the memo on every one of those steps.
+    walked = dataclasses.replace(base, filter_row=base.filter_row * 1.6)
+    assert plan_cache._bucketed(walked) == plan_cache._bucketed(base)
+    # A doubling is a different claim about the machine, and the key follows it — the same
+    # threshold at which `calibration._tracked` stops damping and takes the fit whole.
+    moved = dataclasses.replace(base, filter_row=base.filter_row * 2.5)
     assert plan_cache._bucketed(moved) != plan_cache._bucketed(base)
     # A dict (the cpu-share medians) takes the same treatment, and a family appearing moves it.
     assert plan_cache._bucketed({"scan": 1.0}) == plan_cache._bucketed({"scan": 1.02})

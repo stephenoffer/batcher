@@ -206,3 +206,40 @@ def test_no_accelerator_warning_when_the_device_is_present_or_unknown(monkeypatc
         for w in recwarn
         if w.category is PerformanceWarning and "requested an accelerator" in str(w.message)
     ] == []
+
+
+def test_resident_cpu_sources_never_read_the_cluster(monkeypatch):
+    """A resident CPU-only plan answers "single-node" without a `cluster_topology()` RPC.
+
+    The answer was never in doubt — resident sources return `False` at every cluster size —
+    but it used to cost a GCS round-trip to confirm, on *every* terminal op in any process
+    where something had initialized Ray (an Anyscale workspace, a Daft/Ray Data comparison,
+    any Ray-using library). Pinned by making the read fail: a call would raise, and the
+    `except` arm would return the same `False` for the wrong reason, so the counter is what
+    makes this test able to fail.
+    """
+    calls = []
+
+    class _Ray:
+        @staticmethod
+        def is_initialized():
+            return True
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
+
+    def _counted():
+        calls.append(1)
+        return {"nodes": 4, "cpus": 32.0, "gpus": 4.0}
+
+    monkeypatch.setattr("batcher.dist.cluster_topology", _counted, raising=False)
+
+    resident = _Src(50_000_000)
+    resident.resident = True
+    assert resolve_distributed("auto", None, [resident]) is False
+    assert calls == []
+
+    # The GPU arm still has to read it: an accelerator stage distributes on capability, not
+    # size, and whether the cluster *has* accelerators is only knowable from the topology.
+    gpu = bt.from_pydict({"x": [1, 2, 3]}).map_batches(lambda b: b, num_gpus=1.0)
+    assert resolve_distributed("auto", gpu._plan, [resident]) is True
+    assert calls == [1]

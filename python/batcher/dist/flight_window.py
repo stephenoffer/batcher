@@ -45,6 +45,7 @@ from batcher.dist.flight_aggregate import _shuffle_credits
 from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan, Window
 
 __all__ = ["execute_keyed_shuffle_flight", "execute_window_flight"]
@@ -153,7 +154,7 @@ def execute_keyed_shuffle_flight(
 def _scan_rooted_ir(node: LogicalPlan) -> str:
     """`node`'s IR with its input replaced by a scan of source 0 — the reduce-side plan."""
     ir = node.to_ir()
-    ir["input"] = {"op": "scan", "source_id": 0}
+    ir["input"] = task_scan_ir()
     return json.dumps(ir)
 
 

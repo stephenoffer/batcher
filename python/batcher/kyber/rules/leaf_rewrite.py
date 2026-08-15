@@ -5,7 +5,12 @@ function that recognizes one algebraic shape and rewrites it, lifted to a plan n
 by applying it to every expression the node carries. This module owns the two pieces
 all of them need, so the hundred-odd rule bodies stay one function each.
 
-`rewrite_node` is the lifter. It is written around one performance fact: almost every
+`rewrite_node` is the lifter, and `node_expr_rule` wraps it into the `(node, ctx)` body a
+rule registers — the shape six `rules/exprs/` modules were each spelling out privately,
+because a rule *family* builds its leaf from a parameter and so cannot use the
+single-leaf `register_leaf_rule`.
+
+`rewrite_node` is written around one performance fact: almost every
 call is a no-op, because each rule matches a handful of shapes and passes over the
 rest, and there are hundreds of rules times hundreds of nodes times the fixpoint
 iterations. So it answers "nothing changed" by *object identity* first
@@ -60,6 +65,9 @@ from batcher.plan.visitor import transform_up
 __all__ = [
     "EXPR_NODES",
     "SAFE_BINARY_OPS",
+    "collapse_doubled_call",
+    "collapse_involution",
+    "node_expr_rule",
     "register_leaf_rule",
     "rewrite_node",
     "safe_expr",
@@ -143,6 +151,98 @@ def whole_plan_expr_rule(leaf: Callable[[Expr], Expr]):
     return apply
 
 
+def collapse_doubled_call(node_type: type, fn: str) -> Callable[[Expr], Expr]:
+    """The leaf rewrite for an **idempotent** unary function: ``f(f(x))`` -> ``f(x)``.
+
+    `StrFunc`, `ListFunc` and `DateFunc` all carry the same two fields — a function name and
+    one input — so "the outer call of a doubled application is redundant" is one rewrite over
+    a parameter, not one rewrite per family. Three modules had written it out: `sort`, `unique`,
+    `arg_sort`, `flatten` and `normalize` over lists, and `last_day` over dates.
+
+    Not every doubled call qualifies, which is why this takes the function name rather than
+    applying to all of them: it holds when `fn` maps its own output to itself. It does *not*
+    hold for a function carrying extra arguments that must also agree — ``lpad(lpad(s, n, f),
+    m, g)`` collapses only when the widths and fills match — so `text_algebra.lengths` keeps
+    its own leaf, which compares them.
+
+    Args:
+        node_type: The expression node class, such as `ListFunc`.
+        fn: The function name, matched on both the outer and the inner call.
+
+    Returns:
+        A leaf `Expr -> Expr` rewrite, unchanged on anything that does not match.
+    """
+
+    def leaf(expr: Expr) -> Expr:
+        if (
+            isinstance(expr, node_type)
+            and expr.fn == fn
+            and isinstance(expr.input, node_type)
+            and expr.input.fn == fn
+        ):
+            return expr.input
+        return expr
+
+    return leaf
+
+
+def collapse_involution(node_type: type, fn: str) -> Callable[[Expr], Expr]:
+    """The leaf rewrite for an **involution**: ``f(f(x))`` -> ``x``, dropping *both* calls.
+
+    The sibling of `collapse_doubled_call`, differing in one line and in the algebra behind it.
+    An idempotent function keeps the inner call because a single application is not the
+    identity; an involution is its own inverse, so the pair is. `reverse` is the case, over both
+    lists and strings, and the two were written out identically.
+
+    **Removing both calls can remove a coercion**, and a caller whose `fn` performs one must
+    guard for it — `text_algebra.strings` wraps this and rechecks that the result is already
+    `Utf8`, because `reverse` over a `Binary` column was also producing a string.
+
+    Args:
+        node_type: The expression node class, such as `StrFunc`.
+        fn: The function name, matched on both calls.
+
+    Returns:
+        A leaf `Expr -> Expr` rewrite, unchanged on anything that does not match.
+    """
+
+    def leaf(expr: Expr) -> Expr:
+        if (
+            isinstance(expr, node_type)
+            and expr.fn == fn
+            and isinstance(expr.input, node_type)
+            and expr.input.fn == fn
+        ):
+            return expr.input.input
+        return expr
+
+    return leaf
+
+
+def node_expr_rule(leaf: Callable[[Expr], Expr]):
+    """Lift a leaf `Expr -> Expr` rewrite into the `f(node, ctx)` body a node rule registers.
+
+    The node-level counterpart of `whole_plan_expr_rule`, and the last piece of the leaf-rule
+    shape that was still being written out by hand. Six modules in `rules/exprs/` each carried a
+    private ``_make_<family>_rule`` factory whose whole body was this closure, and
+    `register_leaf_rule` had a seventh copy inline as a default-argument lambda. The six existed
+    only because a *family* of rules — one per date part, one per shift direction — builds its
+    leaf from a parameter and so cannot use `register_leaf_rule`'s single-leaf shape.
+
+    Args:
+        leaf: The leaf rewrite, applied bottom-up to every sub-expression of the node.
+
+    Returns:
+        A `f(node, ctx) -> node | None` suitable for `node_rule`, returning `None` when nothing
+        changed so the driver's fixpoint terminates.
+    """
+
+    def apply(node: LogicalPlan, _ctx) -> LogicalPlan | None:
+        return rewrite_node(node, leaf)
+
+    return apply
+
+
 def rewrite_node(node: LogicalPlan, leaf: Callable[[Expr], Expr]) -> LogicalPlan | None:
     """Apply a leaf `Expr -> Expr` rewrite to every expression `node` carries.
 
@@ -202,7 +302,7 @@ def register_leaf_rule(
         node_rule(
             name,
             Phase.NORMALIZE if phase is None else phase,
-            lambda node, _ctx, _leaf=leaf: rewrite_node(node, _leaf),
+            node_expr_rule(leaf),
             matches=matches,
             expr_fn=leaf,
             expr_matches=expr_matches,

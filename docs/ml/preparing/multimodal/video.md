@@ -45,6 +45,31 @@ usable = clips.filter(
 The engine computes the struct once and reuses it, so naming two fields off it costs one
 header read rather than two.
 
+## Triaging a clip corpus from the listing alone
+
+`read.video` also emits per-file metadata columns from the container header, without
+opening a clip a second time and without decoding a frame: `fps`, `frames`, `width`,
+`height`, `duration`, `codec`, and `has_audio`.
+
+The last two are what a mixed corpus is actually split on. `codec` decides whether a
+hardware decoder can take a clip, so a directory mixing H.264 and VP9 partitions on it;
+`has_audio` decides whether a speech stage runs at all, and a clip with no soundtrack sent
+to one is a wasted GPU minute per row:
+
+```python
+# docs: skip
+import batcher as bt
+from batcher import col
+
+clips = bt.read.video("s3://bucket/clips/")
+transcribe = clips.filter(col("has_audio"))
+gpu_decodable = clips.filter(col("codec").is_in(["h264", "hevc"]))
+```
+
+A container with no video stream at all — an audio-only `.mp4`, an `.mkv` holding only
+subtitles — reports `width`, `height` and `codec` as null and `has_audio` as true. That is
+what tells it apart from a truncated file, which nulls everything.
+
 ## Sample frames for a model
 
 `frames` is the video counterpart of {py:meth}`.image.to_tensor <batcher.plan.expr_ir.image._ImageNamespace.to_tensor>`. It samples evenly-spaced frames

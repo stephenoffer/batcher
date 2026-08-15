@@ -50,51 +50,65 @@ shared = bt.read.delta_sharing("config.share#share.schema.table")
 grids = bt.read.zarr("s3://bucket/array.zarr")
 ```
 
-### Web crawls (WARC)
+## Web crawls (WARC)
 
 {py:meth}`bt.read.warc(path) <batcher.api.io_namespace.reader.Reader.warc>` reads the format every web-scale crawler ships, Common Crawl
 included. Each record becomes a row: the named WARC headers as typed columns, every other
 header as JSON in `warc_headers`, and the payload as `warc_content`. `.warc.gz` is read
 transparently, including the per-record gzip members a crawler normally writes.
 
-That makes a corpus-building pass a plain query. Filter to the response records, decode
-the payload, and hand it to the string accessors.
+A response record's payload is not the page. It is the whole HTTP exchange: the status
+line, the response headers, a blank line, and only then the body. `http_status`,
+`http_content_type` and `http_body` are that exchange taken apart, so a corpus-building
+pass is a filter and a projection rather than a parse.
+
+Use `http_body`, not `warc_content`. Handing the raw payload to `strip_html()` extracts
+`HTTP/1.1 200 OK Content-Type: text/html Server: nginx` along with the prose, and nothing
+about the result says so: the read succeeds, the column is text, and the prefix reads like
+a sentence. Every length metric, embedding and dedup hash downstream then sees the crawl's
+server banners.
 
 ```python
-import gzip
 import os
 import tempfile
 
-# Build a two-record crawl so the example runs without a download.
-def _record(kind, uri, body):
+# Build a small crawl so the example runs without a download.
+def _record(kind, uri, payload):
     head = (
         f"WARC/1.0\r\nWARC-Type: {kind}\r\nWARC-Target-URI: {uri}\r\n"
-        f"WARC-Date: 2024-03-15T13:45:30Z\r\nContent-Length: {len(body)}\r\n\r\n"
+        f"WARC-Date: 2024-03-15T13:45:30Z\r\nContent-Length: {len(payload)}\r\n\r\n"
     ).encode()
-    return head + body + b"\r\n\r\n"
+    return head + payload + b"\r\n\r\n"
+
+def _response(status, body):
+    return f"HTTP/1.1 {status}\r\nContent-Type: text/html\r\nServer: nginx\r\n\r\n".encode() + body
 
 crawl = os.path.join(tempfile.mkdtemp(), "segment.warc")
 with open(crawl, "wb") as fh:
-    fh.write(_record("response", "https://example.com/a", b"<html><p>Hello</p></html>"))
-    fh.write(_record("request", "https://example.com/a", b"GET /a HTTP/1.1"))
+    fh.write(_record("response", "https://example.com/a", _response("200 OK", b"<html><p>Hello</p></html>")))
+    fh.write(_record("response", "https://example.com/b", _response("404 Not Found", b"<html>gone</html>")))
+    fh.write(_record("request", "https://example.com/a", b"GET /a HTTP/1.1\r\n\r\n"))
 
 pages = (
     bt.read.warc(crawl)
-    .filter(bt.col("warc_type") == "response")
+    .filter(bt.col("http_status") == 200)
     .select(
         url=bt.col("warc_target_uri"),
-        text=bt.col("warc_content").cast("string").str.strip_html(),
+        text=bt.col("http_body").cast("string").str.strip_html(),
     )
 )
 print(pages.to_pydict())
 # {'url': ['https://example.com/a'], 'text': ['Hello']}
 ```
 
+`warc_content` is still there beside them, exactly as the crawler recorded it, because a
+provenance or replay pass needs the whole exchange.
+
 A WARC carries no index, so a reader cannot start in the middle of one: each file is one
 split. Parallelism therefore comes from the number of files, which is how crawls are
 published anyway, in many segments rather than one archive.
 
-### Avro unions
+## Avro unions
 
 Most Avro fields are written as `["null", T]`, which is Avro's spelling of "a nullable
 `T`". `read.avro` reads those as exactly that, a nullable Arrow column of `T`.
@@ -123,7 +137,7 @@ print(events.schema.field("v").type)
 Pick a branch out with the usual struct accessor, so `col("v").struct.field("member1")` is
 the string arm. Or `coalesce` the arms together once you know they are compatible.
 
-### PDF documents
+## PDF documents
 
 `read.documents` extracts a PDF corpus into `{path, page, text}`, one row per page. That
 shape is what makes the rest of a document pipeline relational: chunking, embedding, and
@@ -162,7 +176,7 @@ under `on_error="skip"` its text is null, distinguishable from a genuinely empty
 one bad page in a 900-page report does not cost the other 899. The document is recorded in
 `corrupt_files()`.
 
-### Point clouds and sensor arrays for robotics
+## Point clouds and sensor arrays for robotics
 
 `read.point_cloud` reads the native LiDAR and autonomous-driving point-cloud formats,
 `.pcd` (PCL/ROS), `.ply`, and raw KITTI-style `.bin`, with no third-party dependency.
@@ -194,7 +208,7 @@ print(above_ground.select("x", "z").to_pydict())
 # {'x': [4.0], 'z': [0.5]}
 ```
 
-### The LiDAR preprocessing chain is native
+## The LiDAR preprocessing chain is native
 
 Because the cloud is columnar, the standard per-frame preprocessing is engine operators
 end to end. No Python runs per point, and one lazy plan fuses the stages rather than
@@ -237,7 +251,7 @@ near = above_ground.with_columns(
 ).filter(col("rho") < 25)
 ```
 
-### Robot and vehicle logs (MCAP)
+## Robot and vehicle logs (MCAP)
 
 `read.mcap` reads the container format ROS 2 records into and autonomous-driving stacks
 exchange. One log multiplexes every sensor as timestamped messages on named *topics*,
@@ -276,7 +290,7 @@ A drive-day directory usually contains one recording that was cut short; pass
 `on_error="skip"` to drop it and keep the rest, then check `corrupt_files()` to see what
 was dropped.
 
-### Vehicle measurements and CAN (MDF4)
+## Vehicle measurements and CAN (MDF4)
 
 `read.mdf` reads ASAM MDF4 (`.mf4`), what automotive OEMs and test fleets log CAN/LIN
 signals and sensor channels to. A file holds several *channel groups*, each with **its own
@@ -307,7 +321,7 @@ braking = fused.filter(bt.col("speed") < 20)
 `MDFSource.signals()` and `MCAPSource.topics()` list what a file carries without reading
 data. That is the discovery step before a query names the handful of channels it wants.
 
-### Hive-partitioned Parquet directories
+## Hive-partitioned Parquet directories
 
 `read.parquet` already recognizes a Hive layout: point it at a directory whose children
 are `col=value` subdirectories and it recovers the partition columns from the layout and

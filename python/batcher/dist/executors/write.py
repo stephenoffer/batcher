@@ -32,6 +32,7 @@ from batcher.io.base._layout import FileLayout
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.types import logical_bytes, retained_bytes
 
 
 def _distributed_write(
@@ -184,7 +185,7 @@ def _shard_rows_per_file(table: pa.Table, layout: FileLayout | None) -> int | No
     """
     if layout is None:
         return None
-    return layout.rows_per_file(table.num_rows, table.nbytes)
+    return layout.rows_per_file(table.num_rows, logical_bytes(table))
 
 
 def _distributed_write_partitioned(
@@ -423,7 +424,7 @@ def _map_stream(nat: Any, map_ir: str, batches: Any, engine_config: str) -> Any:
     size = 0
     for batch in batches:
         chunk.append(batch)
-        size += batch.nbytes
+        size += retained_bytes(batch)
         if size >= _FOLD_CHUNK_BYTES:
             yield from nat.execute_plan(map_ir, [chunk], engine_config)
             chunk, size = [], 0
@@ -443,6 +444,6 @@ def _stream_rows_per_file(first: pa.RecordBatch, layout: FileLayout | None) -> i
         return None
     if layout.max_rows_per_file is not None:
         return layout.max_rows_per_file
-    if layout.target_bytes_per_file is not None and first.nbytes > 0:
-        return max(1, first.num_rows * layout.target_bytes_per_file // first.nbytes)
+    if layout.target_bytes_per_file is not None and (width := logical_bytes(first)) > 0:
+        return max(1, first.num_rows * layout.target_bytes_per_file // width)
     return None

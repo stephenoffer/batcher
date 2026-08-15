@@ -101,9 +101,11 @@ fn global_reduces_whole_column(call: &AggCall) -> bool {
         // Arrow's SIMD reduction, for the two types `sum_acc` routes to it. Decimal keeps the
         // exact `i128` scatter.
         AggFunc::Sum => matches!(dt, DataType::Int64 | DataType::Float64),
-        // `partial` widens a `Mean`'s input to `Float64` before this runs, so its `sum_acc` half
-        // always takes the fast path and its `count_non_null` half always does.
-        AggFunc::Mean => matches!(dt, DataType::Float64),
+        // A `Mean` over `Float64` reduces with arrow's SIMD kernel; over `Int64` it reduces
+        // into the exact 128-bit accumulator `sum_acc`'s `mean_int` arm supplies. Both are
+        // whole-column. A decimal `Mean` was widened to `Float64` by `widen_mean_inputs`
+        // before this runs, so it arrives here as the float case.
+        AggFunc::Mean => matches!(dt, DataType::Float64 | DataType::Int64),
         // Int64 and Decimal128 only: a float `MIN`/`MAX` must keep the scatter, whose comparator
         // ranks NaN the way the engine's float identity says and arrow's kernel does not.
         AggFunc::Min | AggFunc::Max => matches!(dt, DataType::Int64 | DataType::Decimal128(_, _)),
@@ -117,6 +119,14 @@ pub(crate) fn sum_acc(
     num_groups: usize,
     func: AggFunc,
 ) -> Result<ArrayRef, RuntimeError> {
+    // An integer `Mean` sums into a 128-bit accumulator rather than the `i64` one `Sum`
+    // keeps, because an `i64` running sum overflows on ordinary columns (IDs, nanosecond
+    // timestamps, cents) where the *mean* is perfectly ordinary. It reads the `Int64` column
+    // directly: the state is wider than the input, but nothing has to materialize a wider
+    // copy of the input to say so. See `super::MEAN_INT_ACCUMULATOR`.
+    if func == AggFunc::Mean && matches!(values.data_type(), DataType::Int64) {
+        return mean_sum_i128(values.as_primitive::<Int64Type>(), group_ids, num_groups);
+    }
     // Global-sum fast path: when there is a single group every row maps to it, so the
     // group sum equals the whole-column sum — arrow's SIMD reduction kernels beat the
     // scalar scatter loop below (the dominant cost of a global `SUM`/`COUNT`-derived
@@ -201,6 +211,15 @@ pub(crate) fn sum_acc(
         DataType::Decimal128(p, s) => {
             let arr = values.as_primitive::<Decimal128Type>();
             let mut sums = vec![0i128; num_groups];
+            // **No no-null arm here, and that is a measurement rather than an omission.** The
+            // `Int64` and `Float64` arms above each keep one, so the symmetry is tempting; it
+            // was built (both here and as a `SumDecimalNoNull` in `fused`) and it moved
+            // nothing. On 10 M rows into 100 groups, four fused decimal sums ran 12.7 / 13.0 /
+            // 15.2 ms across three runs of the *same* binary, against 14.7 with the arm
+            // removed — the effect is smaller than the box's own spread — and TPC-H q1, which
+            // is this exact shape over `l_extendedprice`, read 16.8 ms either way. A decimal
+            // column is 16 bytes a row, so this loop is bound by the load, not by the validity
+            // branch the arm deletes. See `benchmarks/BENCHMARK_RESULTS.md`.
             let mut valid = vec![false; num_groups];
             for (i, &g) in group_ids.iter().enumerate() {
                 if arr.is_valid(i) {
@@ -218,6 +237,65 @@ pub(crate) fn sum_acc(
             dtype: other.to_string(),
         }),
     }
+}
+
+/// Sum an `Int64` column into the exact 128-bit accumulator an integer `Mean` finalizes from.
+///
+/// **This never overflows, and therefore never checks.** The widest sum of `n` `i64` values is
+/// `n · 2^63`, and `i128` holds that for every `n` a machine can address (`n < 2^64`). That is
+/// what lets the no-null arm be a bare `+=` where the `Decimal128` scatter this replaced needed
+/// a `checked_add` per row — and why an integer `AVG` can read its `Int64` input directly
+/// instead of being handed a widened copy of it.
+///
+/// The state it returns is byte-identical to what casting the column to
+/// [`super::MEAN_INT_ACCUMULATOR`] and running the decimal scatter produced, so `combine`,
+/// `finalize_mean`, spill and the distributed reduce are all unchanged.
+fn mean_sum_i128(
+    arr: &Int64Array,
+    group_ids: &[u32],
+    num_groups: usize,
+) -> Result<ArrayRef, RuntimeError> {
+    let DataType::Decimal128(precision, scale) = super::MEAN_INT_ACCUMULATOR else {
+        unreachable!("MEAN_INT_ACCUMULATOR is a Decimal128 by construction")
+    };
+    // Whole-column reduction: with one group every row maps to it, so the group sum is the
+    // column sum and the group ids are never read. This arm is the one
+    // `global_reduces_whole_column` claims for `Mean`/`Int64`, and must stay its complement.
+    if num_groups == 1 {
+        let mut total: i128 = 0;
+        if arr.null_count() == 0 {
+            for &v in arr.values() {
+                total += v as i128;
+            }
+        } else {
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    total += arr.value(i) as i128;
+                }
+            }
+        }
+        // Null-only / empty input yields a null sum (SQL semantics), as `masked_*` does.
+        let any = arr.len() > arr.null_count();
+        return masked_decimal(vec![total], vec![any], precision, scale);
+    }
+    let mut sums = vec![0i128; num_groups];
+    if arr.null_count() == 0 {
+        // No-null fast path: no per-row validity branch and no per-row `valid` write — every
+        // group is non-empty (it exists because a row mapped to it) and all its values are
+        // non-null, so every group is valid.
+        for (&g, &v) in group_ids.iter().zip(arr.values()) {
+            sums[g as usize] += v as i128;
+        }
+        return masked_decimal(sums, vec![true; num_groups], precision, scale);
+    }
+    let mut valid = vec![false; num_groups];
+    for (i, &g) in group_ids.iter().enumerate() {
+        if arr.is_valid(i) {
+            sums[g as usize] += arr.value(i) as i128;
+            valid[g as usize] = true;
+        }
+    }
+    masked_decimal(sums, valid, precision, scale)
 }
 
 /// Build a masked `Decimal128Array` with the given precision/scale.
@@ -704,6 +782,35 @@ mod tests {
         let group_ids = [0u32, 0, 0];
         let out = sum_acc(&values, &group_ids, 1, AggFunc::Sum).unwrap();
         assert_eq!(out.as_primitive::<Int64Type>().value(0), 60);
+    }
+
+    /// A null value still suppresses nothing but itself, and a group whose every value is
+    /// null is null rather than zero — the property the fast path must not reach for.
+    #[test]
+    fn decimal_sum_with_nulls_keeps_sql_semantics() {
+        let values: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(500i128), None, None])
+                .with_precision_and_scale(7, 2)
+                .unwrap(),
+        );
+        let out = sum_acc(&values, &[0u32, 0, 1], 2, AggFunc::Sum).unwrap();
+        let out = out.as_primitive::<Decimal128Type>();
+        assert_eq!(out.value(0), 500);
+        assert!(out.is_null(1), "an all-null group sums to NULL, not 0");
+    }
+
+    /// `SUM` over no rows is NULL. A keyless aggregate over an empty input reaches this with
+    /// `num_groups == 1` and an empty id slice, and the no-null fast path — where every group
+    /// is valid because a row made it — must not claim that case.
+    #[test]
+    fn decimal_sum_over_no_rows_is_null() {
+        let values: ArrayRef = Arc::new(
+            Decimal128Array::from(Vec::<i128>::new())
+                .with_precision_and_scale(7, 2)
+                .unwrap(),
+        );
+        let out = sum_acc(&values, &[], 1, AggFunc::Sum).unwrap();
+        assert!(out.as_primitive::<Decimal128Type>().is_null(0));
     }
 
     #[test]

@@ -20,6 +20,7 @@ from batcher.io.formats.multimodal._batching import (
     probe_sizes,
 )
 from batcher.io.splits import Split, WholeSourceSplit
+from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["BinarySource"]
 
@@ -136,6 +137,28 @@ class BinarySource:
 
     def row_count(self) -> int | None:
         return len(self._files())
+
+    def statistics(self) -> SourceStatistics:
+        """Row count, total bytes and a `size` zone map — all from the listing.
+
+        A blob source declared only its row count, so the planner had no idea how *big* a
+        row was: `column_bytes` sees a `large_binary` column and answers with its 36-byte
+        type prior, which for a corpus of multi-megabyte blobs is wrong by orders of
+        magnitude and feeds broadcast eligibility, split sizing and spill budgeting. This
+        is the same gap `MediaSource.statistics` closes, and `BinarySource` is the
+        substrate the multimodal sources are built on — so the corpus that most needs the
+        figure is exactly the one that went without it.
+
+        `probe_sizes` is the stat the batching already performs to bound a chunk's memory,
+        so nothing here is a round trip the read was not making anyway.
+
+        Returns:
+            The statistics, with an exact row count and an exact `size` column stat.
+        """
+        from batcher.io.stats.file_listing import whole_file_statistics
+
+        files = self._files()
+        return whole_file_statistics(list(probe_sizes(files, self._fs.size)))
 
     def identity(self) -> str:
         # `suffix` selects *which files* the path expands to, so two sources on the same path

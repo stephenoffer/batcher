@@ -147,12 +147,24 @@ one-file read against the whole table's stats.
   Honor it in the reader if the format is columnar; ignoring it is correct but reads
   more than needed.
 - **Predicate** — `_file_splits` receives Kyber's pushed filter as its IR dict.
-  `io/predicate.py` translates that IR into whatever the backend speaks:
+  `io/predicate/` translates that IR into whatever the backend speaks:
   `to_pyarrow_expression`, `to_sql_where`, `to_iceberg_expression`, `to_mongo_filter`,
   `to_native_predicate`. A format with no statistics ignores the predicate — the
   engine's `Filter` re-checks every row regardless, so **ignoring a predicate is always
   correct and merely slower; mis-translating one is a correctness bug.** Translate
   conservatively and return `None` for anything you cannot represent exactly.
+- **Row cap** — a source declaring `supports_limit = True` also receives a `limit: int |
+  None`, the most rows the plan can use (`PhysicalPlan.source_limits`). It is a ceiling and
+  never a floor: returning more is correct, because the engine keeps its own `Limit`. Opt in
+  only where stopping early is genuinely cheaper *and* expressible — the SQL bases gate it
+  on the dialect (`sql.uri.supports_limit_clause`), because a `LIMIT` a server cannot parse
+  turns a working query into an error.
+- **Identifiers** — a SQL backend sets `sql_dialect` to its connection scheme, and
+  `SingleResultQuerySource` then delimits every pushed column name for that dialect
+  (`sql.uri.quote_identifier`). Leave it `""` when the dialect is genuinely unknowable (an
+  ODBC DSN names a driver, not a dialect): names then go out verbatim, which is what they
+  always did. Never pick a delimiter by guess — ANSI double quotes are a *string literal*
+  on MySQL, so the wrong one returns a constant for every row instead of failing.
 
 ## 7. Detection, credentials, filesystem, tolerance
 

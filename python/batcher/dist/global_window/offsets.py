@@ -56,8 +56,22 @@ def supports_ordered_bucket_offsets(window: Window) -> bool:
     """Whether `window` is a global window the ordered-bucket-offset algebra covers.
 
     Requires: no partition keys (global); exactly one plain-column order key (the column the
-    range partitioner cuts on); every function offsettable or `first_value`, with no explicit
-    frame; and aggregate/`first_value` inputs are plain columns.
+    range partitioner cuts on) *of a type that partitioner can cut*; every function
+    offsettable or `first_value`, with no explicit frame; and aggregate/`first_value` inputs
+    are plain columns.
+
+    The type test is the one this predicate was missing while its sort sibling
+    (`supports_spilling_sort`) had it, and both guard the same range partitioner. Without it
+    a `rank()` over a Boolean column passed the shape test, collected correctly, and then
+    raised a bare ``RuntimeError: range-partition key must be a numeric column`` the moment
+    the identical plan was streamed — a query that worked in batch failing in streaming,
+    which is precisely what one execution model is supposed to rule out. Declining here costs
+    memory (the materializing kernel runs instead), never correctness.
+
+    The key's type comes from `available_schema`, the plan layer's own static inference, so
+    the check needs no sources and no zero-row execution. An uninferable schema, or a derived
+    key absent from it, declines for the same reason `supports_spilling_sort` declines an
+    unknown key: stay out of the range partition rather than fail inside it.
 
     Args:
         window: The window operator to classify.
@@ -69,6 +83,8 @@ def supports_ordered_bucket_offsets(window: Window) -> bool:
         return False
     if len(window.order_keys) != 1 or not isinstance(window.order_keys[0].expr, Col):
         return False
+    if not _key_type_partitionable(window):
+        return False
     for fn in window.functions:
         if fn.frame is not None:
             return False
@@ -77,6 +93,25 @@ def supports_ordered_bucket_offsets(window: Window) -> bool:
         if fn.func in _NEEDS_COL_INPUT and not isinstance(fn.input, Col):
             return False
     return True
+
+
+def _key_type_partitionable(window: Window) -> bool:
+    """Whether the order key's statically-inferred type is one the partitioner can cut.
+
+    Imported inside the function on purpose: this module is the one part of
+    `dist.global_window` that `dist.executor` imports eagerly (see the package docstring on
+    the 0.44 s `import ray` that eager submodule loading used to cost), and
+    `executors.partition_io` is not on that budget.
+    """
+    from batcher.dist.executors.partition_io import range_partitionable
+
+    schema = window.input.available_schema()
+    if schema is None:
+        return False
+    index = schema.arrow.get_field_index(window.order_keys[0].expr.name)
+    if index < 0:
+        return False
+    return range_partitionable(schema.arrow.field(index).type)
 
 
 def inject_avg_helpers(window: Window, win_ir: dict) -> dict[str, tuple[str, str]]:

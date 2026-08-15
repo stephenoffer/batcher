@@ -4,6 +4,7 @@
   "decompose_linear_sum_aggregates@2",
   "drop_redundant_cross_key@2",
   "drop_redundant_distinct_build@2",
+  "left_join_null_key_to_antijoin@3",
   "join_to_semijoin@2",
   "outer_to_inner_join@2",
   "eliminate_left_join@3",

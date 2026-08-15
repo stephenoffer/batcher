@@ -32,7 +32,7 @@ from collections.abc import Iterator, Sequence
 
 from batcher._internal.errors import PlanError
 from batcher._internal.mathx import ceil_div
-from batcher.ml.permutation import _FeistelPermutation, epoch_permutation
+from batcher.ml.permutation import _KeyedPermutation, epoch_permutation
 
 __all__ = [
     "elastic_shard",
@@ -47,7 +47,12 @@ __all__ = [
 
 
 def epoch_order(
-    num_samples: int, *, epoch: int = 0, seed: int = 0, shuffle: bool = True
+    num_samples: int,
+    *,
+    epoch: int = 0,
+    seed: int = 0,
+    shuffle: bool = True,
+    shuffle_block_size: int | None = None,
 ) -> list[int]:
     """`epoch_permutation` materialized as a list — for callers that need random access.
 
@@ -65,11 +70,21 @@ def epoch_order(
         epoch: Selects this epoch's order (together with `seed`).
         seed: Keys the permutation.
         shuffle: Return the identity order instead when false.
+        shuffle_block_size: Shuffle within blocks of this many samples instead of across
+            the whole corpus, keeping neighbouring positions close in storage.
 
     Returns:
         Every index in ``[0, num_samples)``, in this epoch's order.
     """
-    return list(epoch_permutation(num_samples, epoch=epoch, seed=seed, shuffle=shuffle))
+    return list(
+        epoch_permutation(
+            num_samples,
+            epoch=epoch,
+            seed=seed,
+            shuffle=shuffle,
+            block_size=shuffle_block_size,
+        )
+    )
 
 
 def usable_length(total: int, world_size: int, *, drop_last: bool = True) -> int:
@@ -217,6 +232,7 @@ def rank_index_batches(
     shuffle: bool = True,
     drop_last: bool = True,
     global_consumed: int = 0,
+    shuffle_block_size: int | None = None,
 ) -> Iterator[list[int]]:
     """Stream this rank's sample indices for one epoch, `batch_size` at a time.
 
@@ -237,6 +253,11 @@ def rank_index_batches(
         shuffle: Stream the identity order instead when false.
         drop_last: Drop the epoch's tail and any partial final batch.
         global_consumed: Samples already consumed this epoch (the resume point).
+        shuffle_block_size: Shuffle within blocks of this many samples (and shuffle the
+            blocks) instead of across the whole corpus. A global shuffle scatters a batch
+            across every shard of a sharded corpus, so a bounded shard cache misses on
+            nearly every sample; a block sized to that cache reads each shard once per
+            epoch. ``None`` shuffles globally.
 
     Yields:
         Lists of `batch_size` sample indices into the corpus.
@@ -252,7 +273,9 @@ def rank_index_batches(
         raise PlanError("batch_size must be positive")
     import numpy as np
 
-    permutation = epoch_permutation(num_samples, epoch=epoch, seed=seed, shuffle=shuffle)
+    permutation = epoch_permutation(
+        num_samples, epoch=epoch, seed=seed, shuffle=shuffle, block_size=shuffle_block_size
+    )
     positions = _rank_positions(num_samples, world_size, rank, global_consumed, drop_last)
     total = len(positions)
     limit = (total // batch_size) * batch_size if drop_last else total
@@ -264,6 +287,6 @@ def rank_index_batches(
         # Positions beyond the corpus exist only in the padded (`drop_last=False`) tail,
         # where the epoch repeats samples from the front — hence the wrap.
         chunk %= np.uint64(num_samples)
-        if isinstance(permutation, _FeistelPermutation):
+        if isinstance(permutation, _KeyedPermutation):
             chunk = permutation.take(chunk)
         yield chunk.tolist()

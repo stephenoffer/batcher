@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml._estimator import require_fitted
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -157,13 +158,7 @@ class CalibratedClassifierCV:
         """
         from batcher.ml.splitting import stratified_kfold
 
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
+        require_columns(ds, *self.features, self.target)
 
         # Stratified folds, so a fold cannot come back without one of the classes - a fold of
         # a single class gives the calibrator a constant label to fit, which is worse than no

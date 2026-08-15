@@ -186,6 +186,29 @@ ds.to_pydict()
 print(ds.source.corrupt_files())
 ```
 
+A **third** failure is neither of those: bytes that are readable but not in the encoding
+you asked for. A text corpus assembled from scrapes, exports and legacy systems is a
+mixture, and a single stray byte is not a reason to lose a file. `read.text` replaces what
+it cannot decode with U+FFFD by default, in both `mode="line"` and `mode="file"`, and
+`errors="strict"` turns it into a per-file failure that `on_error="skip"` will then drop:
+
+```python
+import os
+import tempfile
+
+import batcher as bt
+
+d = tempfile.mkdtemp()
+with open(os.path.join(d, "legacy.txt"), "wb") as f:
+    _ = f.write("caf\xe9\n".encode("cp1252"))
+
+print(bt.read.text(d).to_pydict()["text"])
+print(bt.read.text(d, encoding="cp1252").to_pydict()["text"])
+```
+
+Replacement is a fallback, not an answer: if you know what the bytes are, naming the
+`encoding` is the fix.
+
 A **malformed row** is one record inside a file that is otherwise fine: a CSV row carrying
 a field the header does not have, or an NDJSON line that is not JSON at all. The file is
 readable, so `on_error` is the wrong answer for it — dropping the file discards every good

@@ -15,7 +15,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import argmax_prediction, require_fitted, require_numeric
+from batcher.ml._estimator import (
+    argmax_prediction,
+    require_fit_columns,
+    require_fitted,
+    require_numeric,
+)
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -302,14 +307,7 @@ class NearestCentroid:
         """
         from batcher.plan.functions.aggregate import mean as mean_
 
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
-        require_numeric(self, ds, self.features)
+        require_fit_columns(self, ds, self.features, self.target)
         grouped = (
             ds.group_by(self.target)
             .agg(**{name: mean_(col(name)) for name in self.features})

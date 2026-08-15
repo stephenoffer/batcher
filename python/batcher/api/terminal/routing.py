@@ -121,6 +121,15 @@ def _resolve_distributed(
 
         if not ray.is_initialized():
             return False
+        # Resident sources with no accelerator stage answer `False` below whatever the
+        # cluster looks like, so answer them *before* reading it. `cluster_topology()` is a
+        # GCS round-trip and this runs on every terminal op, so on a Ray-connected process
+        # every small in-memory query paid one — the shape a Daft/Ray comparison, a
+        # Ray-using library, or any Anyscale workspace puts every query into. The two
+        # conditions below are exactly the ones the post-topology arms test, so hoisting
+        # them changes only what the answer costs (see the reasoning at `resident` below).
+        if _resident_and_cpu_only(plan, sources):
+            return False
         from batcher import dist
 
         topology = dist.cluster_topology()
@@ -202,6 +211,34 @@ def _resolve_distributed(
             detail=str(e),
         )
         return False
+
+
+def _resident_and_cpu_only(plan: LogicalPlan | None, sources: list[Source] | None) -> bool:
+    """Whether `auto` can answer "single-node" without reading the cluster's topology.
+
+    Two of `_resolve_distributed`'s arms are decided by the plan and its sources alone, and
+    between them they cover the resident-data case completely: a plan with **no accelerator
+    stage** cannot take the GPU arm, and **resident sources** take the arm below it, which
+    returns `False` at every cluster size. So when both hold the answer is `False` however
+    many nodes are alive, and the `cluster_topology()` round-trip that used to precede them
+    only ever confirmed it.
+
+    That round-trip is not free and it is not rare. It runs on *every* terminal op in a
+    process where anything has initialized Ray, which is every Anyscale workspace, every
+    script that also uses Daft or Ray Data, and every Ray-using library — and a small query
+    over an in-memory table is precisely the shape where one RPC is a large share of the
+    whole answer.
+
+    Args:
+        plan: The logical plan about to run, or `None` when the caller has none.
+        sources: The plan's bound sources, or `None` when unknown.
+
+    Returns:
+        `True` when the routing decision is provably "single-node" with no cluster read.
+    """
+    if not sources or not all(getattr(s, "resident", False) for s in sources):
+        return False
+    return plan is None or not _plan_has_gpu_stage(plan)
 
 
 def _learned_size(plan: LogicalPlan | None) -> float | None:

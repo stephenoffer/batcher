@@ -55,8 +55,15 @@ from batcher.dist.global_window.offsets import (
     inject_avg_helpers,
 )
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
-from batcher.dist.sort_boundaries import load_learned_grids, persist_grids, sort_shape_key
+from batcher.dist.sort_boundaries import (
+    load_learned_grids,
+    persist_grids,
+    sort_key_identity,
+    sort_key_is_string,
+    sort_shape_key,
+)
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan, Window
 
 __all__ = ["execute_global_window_flight"]
@@ -92,7 +99,7 @@ def execute_global_window_flight(
     # before touching them — mutating the cached structures would corrupt every later use of
     # the same plan.
     win_ir = dict(window.to_ir())
-    win_ir["input"] = {"op": "scan", "source_id": 0}
+    win_ir["input"] = task_scan_ir()
     win_ir["functions"] = list(win_ir["functions"])
     # `avg` is offset through its running sum and count, so ask the kernel for those two
     # alongside it under private aliases; the driver reads them back per bucket and drops
@@ -131,8 +138,15 @@ def execute_global_window_flight(
         # never read on the driver. A learned grid for this shape skips the pass entirely; it
         # is safe even when stale, because boundaries decide only which bucket a row lands in
         # and the offset algebra is correct for any monotone boundary list.
-        shape_key = sort_shape_key(map_ir, key_name)
-        grids = load_learned_grids(shape_key)
+        # WHICH relation and WHICH type: a bare-scan `map_ir` is a positional source id with
+        # no schema, so every single-source sort in the process hashed alike and shared one
+        # grid — a wrong-typed one raises in the range partitioner, and a wrong-relation one
+        # silently puts the whole input in a single bucket. See
+        # `dist/sort_boundaries.sort_shape_key`. `expect_strings` re-checks on load, so an
+        # entry written under the old colliding digest re-samples instead of raising.
+        key_is_str = sort_key_is_string(sources[sid], key_name)
+        shape_key = sort_shape_key(map_ir, key_name, sort_key_identity(sources[sid], key_name))
+        grids = load_learned_grids(shape_key, key_is_str)
         if grids is None:
             # Sized against the bucket count, as the sort's is: a boundary is placed to
             # within `1/g` of a sampler's rows, so cutting more buckets than there are

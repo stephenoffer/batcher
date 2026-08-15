@@ -53,6 +53,7 @@ from batcher.plan.logical.transforms import (
     passthrough_renames,
     project_columns,
     remap_sources,
+    streaming_fold_target,
 )
 from batcher.plan.logical.window import Window, WindowFrame, WindowFuncSpec
 
@@ -97,4 +98,5 @@ __all__ = [
     "passthrough_renames",
     "project_columns",
     "remap_sources",
+    "streaming_fold_target",
 ]

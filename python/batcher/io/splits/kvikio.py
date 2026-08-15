@@ -29,8 +29,9 @@ action is to use the host path, which works.
 from __future__ import annotations
 
 import functools
-import os
 from dataclasses import dataclass
+
+from batcher.config.env import env_flag
 
 __all__ = [
     "KvikioStatus",
@@ -86,7 +87,7 @@ def _compat(kvikio) -> tuple[bool, str]:
     compat costs a caller the host path it would have used anyway, and being wrong toward direct
     costs it a slower read it believes is faster.
     """
-    if os.environ.get(_COMPAT_ENV, "").strip().lower() in ("1", "on", "true", "yes"):
+    if env_flag(_COMPAT_ENV):
         return (True, f"{_COMPAT_ENV} is set in the environment")
     defaults = getattr(kvikio, "defaults", None)
     if defaults is None:

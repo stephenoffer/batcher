@@ -90,11 +90,95 @@ def build_side_decisions(decisions: list) -> list[Decision]:
     return out
 
 
+#: How deep a pushed predicate renders. Higher than the node-subtitle default because the
+#: optimizer brackets a pushed set with derived bounds, and the interesting part — the
+#: column names — sits below the conjunction that adds.
+_PUSHED_MAX_DEPTH = 5
+
+#: Longest pushed-filter label. A conjunction of a dozen terms is a real plan and it must
+#: not wrap the operator tree it annotates.
+_PUSHED_MAX_CHARS = 90
+
+
+def pushdown_labels(opt) -> dict[int, str]:
+    """Per scan `op_id`, what the plan handed that scan's source, for `explain()`.
+
+    `explain()` printed a scan identically whether the plan had pushed a filter into it or
+    was reading the whole relation and filtering above — the two differ by the entire
+    table, and nothing in the output distinguished them. Every comparable engine says this
+    (Spark's ``PushedFilters:``, DuckDB's ``Filters:``), and it is the only way a user can
+    confirm that a filter they expected to prune actually reached the source.
+
+    Read as *offered*, not *applied*: `PhysicalPlan.source_predicates` is what the plan
+    hands down, and each backend then translates the subset it can express (see
+    `io.predicate`). A source that declines still shows the offer here, which is the
+    honest report — the alternative is asking every source what it did, which it cannot
+    answer until it runs. The same holds for the row cap (`source_limits`), which most
+    backends decline: a database is only sent a ``LIMIT`` when its dialect spells one.
+
+    The pushed *projection* is deliberately not shown. Whether a column list is pruning
+    anything is only knowable against the source's own schema, and reading that here would
+    put a probe round trip on the execution path to label a line — while the columns the
+    query keeps are already on the `project` node directly above.
+
+    Args:
+        opt: The `PhysicalPlan`, carrying `source_predicates` and `source_limits` per
+            scan `source_id`.
+
+    Returns:
+        A mapping from scan `op_id` to its label; scans the plan pushed nothing to are
+        absent.
+    """
+    from batcher.observe.dag.describe import expr_text
+    from batcher.plan.profile import walk_ir
+
+    labels: dict[int, str] = {}
+    for op_id, (_depth, node) in enumerate(walk_ir(opt.ir)):
+        if node.get("op") != "scan":
+            continue
+        source_id = node.get("source_id")
+        parts = []
+        predicate = opt.source_predicates.get(source_id)
+        if predicate:
+            parts.append(_elide(expr_text(predicate, max_depth=_PUSHED_MAX_DEPTH)))
+        cap = opt.source_limits.get(source_id)
+        if cap is not None:
+            ordering = opt.source_orderings.get(source_id)
+            parts.append(
+                f"top {cap:,} by {_ordering_text(ordering)}" if ordering else f"max {cap:,} rows"
+            )
+        if parts:
+            labels[op_id] = " · ".join(parts)
+    return labels
+
+
+def _ordering_text(ordering: tuple[tuple[str, bool, bool], ...]) -> str:
+    """A pushed top-N's sort keys, for the scan's label.
+
+    Shown because the ordering is what makes the cap *sound*: "max 2 rows" under a sort
+    reads like an unsound prefix, and naming the order it is taken in is the difference.
+    Null placement is printed only when it is not the default, so the common case stays
+    short while the case that changes which rows come back stays visible.
+    """
+    return ", ".join(
+        f"{column}{' desc' if descending else ''}{' nulls first' if nulls_first else ''}"
+        for column, descending, nulls_first in ordering
+    )
+
+
+def _elide(text: str) -> str:
+    """`text` cut to one readable line."""
+    if len(text) <= _PUSHED_MAX_CHARS:
+        return text
+    return text[: _PUSHED_MAX_CHARS - 1].rstrip() + "…"
+
+
 def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
     """Record the optimized plan + its join decisions into the profile collector."""
     prof.optimized_ir = opt.ir
     prof.logical_ir = plan.to_ir()
     prof.physical_ops = opt.ops
+    prof.source_pushdown = pushdown_labels(opt)
     prof.distributed = distributed
     prof.decisions.extend(build_side_decisions(decisions))
 
@@ -202,6 +286,72 @@ def _io_throughput_decisions(sources: list[Source], hub) -> list:
     return out
 
 
+def _streaming_decisions(plan: LogicalPlan, sources: list[Source]) -> list:
+    """What `explain()` should say about a plan whose input never ends.
+
+    Every number in an `explain()` of a streaming plan is a placeholder: the row estimate is
+    the `unknown_rows` sentinel with `DEFAULT` provenance, which a stream shares with any
+    bounded source whose size merely could not be measured. So the rendering said
+    ``est≈1,000,000,000,000 (default)`` and nothing at all about the two things that decide
+    whether the query works — whether it can emit before its input ends, and whether its
+    state is bounded by something that advances. Both are pure functions of the plan and both
+    were already computed (`kyber.streaming`), and neither reached the reader.
+
+    Silent on a wholly bounded plan, where the questions do not arise.
+
+    Args:
+        plan: The logical plan being explained.
+        sources: Its bound sources, to tell a stream from a bounded relation.
+
+    Returns:
+        Zero to three `Decision`s: the unbounded inputs, the blocking operators, and the
+        operators whose state nothing releases.
+    """
+    from batcher.kyber.streaming import (
+        blocking_operators,
+        unbounded_scan_ids,
+        unbounded_state_operators,
+    )
+    from batcher.plan.profile import Decision
+
+    unbounded = unbounded_scan_ids(plan, sources)
+    if not unbounded:
+        return []
+    out = [
+        Decision(
+            "kyber",
+            "streaming",
+            f"{len(unbounded)} unbounded source(s) — row estimates are placeholders, not sizes",
+            {"unbounded_source_ids": sorted(unbounded)},
+        )
+    ]
+    blocking = sorted({type(n).__name__.lower() for n in blocking_operators(plan)})
+    if blocking:
+        out.append(
+            Decision(
+                "kyber",
+                "streaming",
+                f"cannot emit until the input ends: {', '.join(blocking)} — this plan will not "
+                "stream",
+                {"blocking_operators": blocking},
+            )
+        )
+    else:
+        out.append(Decision("kyber", "streaming", "emits incrementally — no blocking operator", {}))
+    leaking = sorted({type(n).__name__.lower() for n in unbounded_state_operators(plan)})
+    if leaking:
+        out.append(
+            Decision(
+                "kyber",
+                "streaming",
+                f"retains state nothing releases: {', '.join(leaking)} — bounded only by "
+                "memory.streaming_state_max_bytes",
+                {"unbounded_state_operators": leaking},
+            )
+        )
+    return out
+
+
 def _logical_op_profiles(
     plan: LogicalPlan, metric_ops: list[dict] | None = None
 ) -> list[OpProfile]:
@@ -290,7 +440,13 @@ def _udf_planned_profile(plan: LogicalPlan, sources: list[Source], hub) -> Query
     )
     return QueryProfile(
         ops=tuple(_logical_op_profiles(plan)),
-        decisions=(note, *_io_throughput_decisions(sources, hub)),
+        decisions=(
+            note,
+            *_io_throughput_decisions(sources, hub),
+            # A `map_batches` pipeline over a topic is the shape most likely to be a stream,
+            # so the branch that cannot lower to IR is the one that needs this most.
+            *_streaming_decisions(plan, sources),
+        ),
         logical_ir=None,
         optimized_ir=None,
     )
@@ -322,8 +478,12 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
         plan, sources=sources, hub=hub, source_stats=source_stats
     )
     return QueryProfile(
-        ops=build_op_profiles(opt.ir, opt.ops, None),
-        decisions=(*build_side_decisions(decisions), *_io_throughput_decisions(sources, hub)),
+        ops=build_op_profiles(opt.ir, opt.ops, None, pushdown_labels(opt)),
+        decisions=(
+            *build_side_decisions(decisions),
+            *_io_throughput_decisions(sources, hub),
+            *_streaming_decisions(plan, sources),
+        ),
         logical_ir=plan.to_ir(),
         optimized_ir=opt.ir,
     )

@@ -23,6 +23,7 @@ from batcher._sql.parser.subquery.correlation import (
     _outer_key_reducer,
     _reject_correlated,
 )
+from batcher._sql.parser.subquery.in_set import in_marker as _in_marker
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import col, lit
 
@@ -248,7 +249,10 @@ def _apply_in_subquery(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     ):
         left_keys = [e.name for e in target.expressions]
     else:
-        raise NotImplementedError("IN (subquery) supports a plain column or a row value of columns")
+        # An expression has no name to hand a join; `in_expr` names it and comes back here.
+        from batcher._sql.parser.subquery.in_expr import in_over_expression
+
+        return in_over_expression(tr, ds, node, negate=negate)
     how = "anti" if negate else "semi"
 
     # Split the subquery WHERE into correlation equalities and local predicates.
@@ -424,84 +428,6 @@ def _exists_marker(tr, ds: Dataset, node, *, negate: bool):
     return ds, (exp.Not(this=ast) if negate else ast)
 
 
-def _in_marker(tr, ds: Dataset, node, *, negate: bool):
-    """`x IN (SELECT c …)` as a boolean *column*, for a predicate that cannot become a join.
-
-    The `IN` counterpart to `_exists_marker`, and it has to answer the two objections that
-    kept it from existing. Both are recorded in `_apply_single_predicate`, and neither is
-    waved away here:
-
-    * **Three-valued logic.** ``x IN (…)`` is NULL — not FALSE — when `x` is NULL, or when
-      the set holds a NULL and nothing matches. A bare existence bit cannot carry that, so
-      this builds the full three-way answer instead: matched ⇒ TRUE, else NULL when either
-      null source applies, else FALSE. Whether the set holds a NULL is one extra probe of
-      the (uncorrelated) inner relation, decided before the marker is built.
-    * **Name capture.** The earlier attempt rewrote to ``EXISTS (SELECT 1 FROM S WHERE
-      c = x)`` and wrote `x` as the user spelled it; for the ordinary
-      ``category IN (SELECT category FROM vip)`` that unqualified name rebound to the
-      *inner* relation, the predicate became ``category = category``, and every row
-      matched. Here the outer value is materialized into a synthesized ``__in<n>_v``
-      column and the inner key aliased to ``__in<n>_k``, so neither side can capture the
-      other regardless of what the two relations call their columns.
-
-    Only the **uncorrelated** single-column form is handled; anything else returns None and
-    the caller reports the original refusal. TPC-DS q45 is the uncorrelated form.
-
-    Args:
-        tr: The translator, used to plan the inner SELECT.
-        ds: The outer relation the marker is attached to.
-        node: The `In` AST node.
-        negate: True for `NOT IN`.
-
-    Returns:
-        `(ds, ast)` — the relation carrying the marker and the AST to substitute for the
-        `IN` node — or None when the shape is not markerizable.
-    """
-    target = node.this
-    if isinstance(target, exp.Tuple):
-        return None  # a row-value IN has no single probe column
-    inner = _in_subquery_select(node).copy()  # detach from the outer AST scope
-    try:
-        _reject_correlated(inner)
-    except NotImplementedError:
-        return None
-
-    n = getattr(tr, "_in_marker_n", 0)
-    tr._in_marker_n = n + 1
-    probe = f"{IN_MARKER_PREFIX}{n}_v"
-    key = f"{IN_MARKER_PREFIX}{n}_k"
-    marker = f"{IN_MARKER_PREFIX}{n}_m"
-
-    inner_ds = tr.statement(inner)
-    if len(inner_ds.columns) != 1:
-        return None
-    inner_ds = inner_ds.rename({inner_ds.columns[0]: key})
-    # Does the set hold a NULL? It decides whether an unmatched row is FALSE or NULL, and
-    # for an uncorrelated set it is one answer for the whole query. `limit(1)` stops at the
-    # first one rather than scanning the relation.
-    set_has_null = inner_ds.filter(col(key).is_null()).limit(1).collect().num_rows > 0
-
-    values = inner_ds.filter(col(key).is_not_null()).distinct().with_columns(**{marker: lit(True)})
-    ds = ds.with_columns(**{probe: tr._scalar(target)})
-    ds = ds.join(values, left_on=[probe], right_on=[key], how="left")
-    if key in ds.columns:
-        ds = ds.drop(key)
-    # Matched ⇒ the tag survives; unmatched ⇒ the left join null-extends it. Collapsing that
-    # to a real boolean here keeps the substituted AST a plain column reference.
-    ds = ds.with_columns(**{marker: col(marker).is_not_null()})
-
-    # `NULLIF(TRUE, TRUE)` is a *boolean* NULL. A bare `NULL` would lower to an Int64 one
-    # and clash with the CASE's boolean branches.
-    null_bool = exp.Nullif(this=exp.true(), expression=exp.true())
-    case = exp.case().when(exp.column(marker), exp.true())
-    if set_has_null:
-        ast = case.else_(null_bool)
-    else:
-        probe_is_null = exp.Is(this=exp.column(probe), expression=exp.Null())
-        ast = case.when(probe_is_null, null_bool).else_(exp.false())
-    return ds, exp.Paren(this=exp.Not(this=ast) if negate else ast)
-
-
 def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     """EXISTS / NOT EXISTS, correlated or not.
 
@@ -514,16 +440,15 @@ def _apply_exists(tr, ds: Dataset, node, *, negate: bool) -> Dataset:
     """
     inner, local, local_cols, corr, local_preds = _exists_shape(tr, node)
 
-    # A single *inequality* correlation (`a.x < b.y`) is a range semi/anti join: not an
-    # equi-key, so it never reaches `corr`, and before this it raised. See `subquery.range`.
-    from batcher._sql.parser.subquery.range import decorrelate_inequality_exists
+    # A pure inequality correlation, or an equality carrying one alongside it, each has its
+    # own plan and neither is the semi join below. See `subquery.specialized`.
+    from batcher._sql.parser.subquery.specialized import decorrelate_correlated_exists
 
-    if not corr:
-        ranged = decorrelate_inequality_exists(
-            tr, ds, inner, local_preds, local, local_cols, negate
-        )
-        if ranged is not None:
-            return ranged
+    special = decorrelate_correlated_exists(
+        tr, ds, inner, corr, local_preds, local, local_cols, negate
+    )
+    if special is not None:
+        return special
 
     if not corr:
         # Uncorrelated: emptiness test → keep or drop every outer row.

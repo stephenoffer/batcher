@@ -160,36 +160,77 @@ def _alias(key: Any) -> str:
     return expr_text(key.get("expr")) or "?"
 
 
-def expr_text(expr: Any, depth: int = 0) -> str:
+def expr_text(expr: Any, depth: int = 0, max_depth: int = 2) -> str:
     """A compact one-line rendering of a scalar expression, truncated when deep.
 
-    Deliberately shallow: this is a node subtitle, not an expression pretty-printer, and a
-    deeply nested predicate rendered in full would blow out the node box.
+    Deliberately shallow by default: this is a node subtitle, not an expression
+    pretty-printer, and a deeply nested predicate rendered in full would blow out the node
+    box. A caller rendering into a line rather than a box raises `max_depth`.
+
+    Two levels is not enough for a *pushed* predicate, which is why the default is not the
+    only option. The optimizer routinely brackets a set membership with the bounds it
+    derives for zone-map pruning, turning ``c IN (…)`` into a three-deep conjunction — and
+    truncating that at depth two elides the column names, leaving ``… ≤ … AND … IN (…)``,
+    which names nothing the reader was asking about.
 
     Args:
         expr: A scalar expression IR node.
         depth: Current recursion depth, used to truncate.
+        max_depth: Deepest level rendered before collapsing to ``"…"``.
 
     Returns:
         The rendered expression, ``"…"`` when truncated, or ``""`` for a non-expression.
     """
-    if not isinstance(expr, dict) or depth > 2:
+    if not isinstance(expr, dict) or depth > max_depth:
         return "…" if isinstance(expr, dict) else ""
     kind = expr.get("e")
     if kind == "col":
         return str(expr.get("name", "?"))
     if kind == "lit":
-        value = expr.get("value")
-        if isinstance(value, dict):
-            return str(next(iter(value.values()), "?"))
-        return str(value)
+        return _lit_text(expr.get("value"))
     if kind == "binary":
-        left = expr_text(expr.get("left"), depth + 1)
-        right = expr_text(expr.get("right"), depth + 1)
+        left = expr_text(expr.get("left"), depth + 1, max_depth)
+        right = expr_text(expr.get("right"), depth + 1, max_depth)
         return f"{left} {_OPERATORS.get(str(expr.get('op')), str(expr.get('op')))} {right}"
     if kind == "not":
-        return f"NOT {expr_text(expr.get('expr'), depth + 1)}"
+        # The operand is `input`, as it is on every other unary node. Reading `expr` here
+        # rendered every negated predicate as a bare ``NOT`` with nothing after it.
+        return f"NOT ({expr_text(expr.get('input'), depth + 1, max_depth)})"
+    if kind in ("is_null", "is_not_null"):
+        null_test = "IS NULL" if kind == "is_null" else "IS NOT NULL"
+        return f"{expr_text(expr.get('input'), depth + 1, max_depth)} {null_test}"
+    if kind == "in_list":
+        return _in_list_text(expr, depth, max_depth)
+    if kind == "str":
+        pattern = expr.get("pattern")
+        target = expr_text(expr.get("input"), depth + 1, max_depth)
+        shown = f"{target}, {pattern!r}" if isinstance(pattern, str) else target
+        return f"{expr.get('fn', 'str')}({shown})"
+    if kind == "cast":
+        return f"{expr_text(expr.get('input'), depth + 1, max_depth)}::{expr.get('dtype', '?')}"
     if kind == "call":
-        args = ", ".join(expr_text(a, depth + 1) for a in expr.get("args", []))
+        args = ", ".join(expr_text(a, depth + 1, max_depth) for a in expr.get("args", []))
         return f"{expr.get('name', '?')}({args})"
     return str(kind or "")
+
+
+#: Members of an `IN` list rendered before the rest are summarized as a count. A pushed set
+#: is routinely hundreds of keys long, and a node subtitle that prints all of them stops
+#: being a subtitle.
+_IN_LIST_SHOWN = 4
+
+
+def _lit_text(value: Any) -> str:
+    """A literal's display text, from either the tagged IR form or a bare Python value."""
+    if isinstance(value, dict):
+        return str(next(iter(value.values()), "?"))
+    return str(value)
+
+
+def _in_list_text(expr: dict[str, Any], depth: int, max_depth: int) -> str:
+    """``x IN (a, b, … 12 more)`` for a set-membership node."""
+    members = expr.get("set") or []
+    shown = ", ".join(_lit_text(m) for m in members[:_IN_LIST_SHOWN])
+    if len(members) > _IN_LIST_SHOWN:
+        shown += f", … {len(members) - _IN_LIST_SHOWN} more"
+    return f"{expr_text(expr.get('input'), depth + 1, max_depth)} IN ({shown})"

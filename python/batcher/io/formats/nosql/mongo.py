@@ -24,6 +24,7 @@ from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import PartitionSpec, ScanSource, require_driver
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.plan.source_stats import SourceStatistics
+from batcher.plan.types import logical_bytes
 
 __all__ = ["MongoSink", "MongoSource"]
 
@@ -296,7 +297,7 @@ class MongoSink:
         pymongo = require_driver("pymongo", "mongo")
         rows = table.to_pylist()
         if not rows:
-            return WrittenFile(path=path, rows=0, bytes=table.nbytes)
+            return WrittenFile(path=path, rows=0, bytes=logical_bytes(table))
         ops = [
             pymongo.ReplaceOne({self.key_field: row.get(self.key_field)}, row, upsert=True)
             for row in rows
@@ -315,7 +316,7 @@ class MongoSink:
             raise BackendError(f"mongo bulk upsert failed: {exc}") from exc
         finally:
             client.close()
-        return WrittenFile(path=path, rows=len(rows), bytes=table.nbytes)
+        return WrittenFile(path=path, rows=len(rows), bytes=logical_bytes(table))
 
     def write_partitioned(
         self,

@@ -41,6 +41,10 @@ pub(crate) use union_coerce::coerce_union_branches;
 /// its own copy would be a second answer to "what is this file", drifting silently the
 /// first time a format was added to one of them.
 pub use bc_expr::sniff_mime;
+// Re-exported so `bc-py` can name the spill codec policy without a direct `bc-runtime`
+// edge: the Flight gather stages its buckets as Arrow IPC exactly as the spill store does,
+// and one policy is the point.
+pub use bc_runtime::agg::spill::SpillCodec;
 pub use error::InterpError;
 pub use metrics::{ExecMetrics, OpMetric, QueryMetrics, QueryStopwatch};
 pub use par::{

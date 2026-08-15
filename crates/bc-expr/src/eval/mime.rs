@@ -109,6 +109,46 @@ pub(crate) fn sniff(data: &[u8]) -> Option<&'static str> {
         .or_else(|| matroska(head))
         .or_else(|| zip(head))
         .or_else(|| prefix(head))
+        // Last, and only after every binary magic has declined: the markup sniffs below
+        // scan for a token rather than matching a fixed prefix, so a binary format whose
+        // header happens to contain one must not reach them.
+        .or_else(|| markup(head))
+}
+
+/// The two text formats with no magic number, sniffed the way `file(1)` and every browser
+/// sniff them: by the first tag.
+///
+/// They are worth the special case because a scraped corpus is mostly HTML and because the
+/// alternative answer is null. `mime_type()` exists to identify bytes that never came from
+/// a file read — a download column, a blob — and those are exactly the bytes with no
+/// extension to fall back on, so reporting nothing for the most common web format on the
+/// one path that has no other option is the wrong half of the trade.
+///
+/// The scan is bounded to the leading window and skips leading whitespace and a byte-order
+/// mark, both of which real documents begin with. It deliberately does **not** guess from a
+/// bare `<`: an SVG, a plist and an RSS feed all start that way, and answering `text/html`
+/// for them would be worse than answering nothing.
+fn markup(head: &[u8]) -> Option<&'static str> {
+    let start = head
+        .strip_prefix([0xEF, 0xBB, 0xBF].as_slice())
+        .unwrap_or(head);
+    let first = start.iter().position(|b| !b.is_ascii_whitespace())?;
+    let trimmed = &start[first..];
+    // Only the first tag is considered, so an XML document whose *body* mentions `<html>`
+    // is still XML.
+    let window = &trimmed[..trimmed.len().min(64)];
+    for token in [b"<!doctype html".as_slice(), b"<html", b"<head", b"<body"] {
+        if starts_with_ignoring_case(window, token) {
+            return Some("text/html");
+        }
+    }
+    starts_with_ignoring_case(window, b"<?xml").then_some("application/xml")
+}
+
+/// ASCII-case-insensitive prefix match. HTML tag names are case-insensitive, and a corpus
+/// of hand-written pages contains `<HTML>` as often as `<html>`.
+fn starts_with_ignoring_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
 fn prefix(head: &[u8]) -> Option<&'static str> {
@@ -253,6 +293,53 @@ mod tests {
     /// — so the short cases have to be answered rather than panicked on.
     ///
     /// A truncated *container* header is a different matter from an unrecognized payload:
+    /// A scraped corpus is mostly HTML, and HTML has no magic number.
+    #[test]
+    fn markup_is_sniffed_from_its_first_tag() {
+        for page in [
+            b"<!DOCTYPE html><html><body>hi".as_slice(),
+            b"<html lang=\"en\">".as_slice(),
+            b"\n\n  <HTML>".as_slice(),
+            b"<head><title>t</title>".as_slice(),
+        ] {
+            assert_eq!(
+                sniff(page),
+                Some("text/html"),
+                "{:?}",
+                &page[..8.min(page.len())]
+            );
+        }
+        assert_eq!(
+            sniff(b"<?xml version=\"1.0\"?><rss/>"),
+            Some("application/xml")
+        );
+    }
+
+    /// A byte-order mark is what a Windows editor writes, and it is not part of the tag.
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_first_tag() {
+        let mut page = vec![0xEF, 0xBB, 0xBF];
+        page.extend_from_slice(b"<html>");
+        assert_eq!(sniff(&page), Some("text/html"));
+    }
+
+    /// Guessing from a bare `<` would claim an SVG, a plist and an RSS feed are HTML.
+    #[test]
+    fn other_angle_bracket_formats_are_not_claimed_as_html() {
+        assert_eq!(sniff(b"<svg xmlns=\"http://www.w3.org/2000/svg\">"), None);
+        assert_eq!(sniff(b"<rss version=\"2.0\">"), None);
+        assert_eq!(sniff(b"plain prose with no markup at all"), None);
+    }
+
+    /// The markup sniff runs last, so a binary header that happens to contain a tag-like
+    /// token is still identified by its magic number.
+    #[test]
+    fn a_binary_magic_still_wins_over_the_markup_scan() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(b"<html>");
+        assert_eq!(sniff(&png), Some("image/png"));
+    }
+
     /// `PK` alone is not yet a zip (the magic is four bytes) and a bare `ftyp` box carries
     /// no brand to read, so both are unrecognized. The EBML magic is complete at four
     /// bytes, so it identifies a Matroska file even with nothing after it — see

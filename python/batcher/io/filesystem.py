@@ -27,6 +27,7 @@ import pyarrow as pa
 import pyarrow.fs as pafs
 
 from batcher._internal.errors import IOError
+from batcher.config.env import truthy
 
 # The `FileSystem` protocol and its `pyarrow.fs` adapter live in a sibling module (the
 # interface, separate from this module's job of choosing a backend for a URI); re-exported
@@ -378,7 +379,7 @@ def _s3_with_options(uri: str) -> FileSystem:
         if key == "retry_max_attempts":
             attempts = max(1, int(value))
         elif key in _S3_BOOL_OPTS:
-            opts[key] = value.strip().lower() in ("1", "true", "yes", "on")
+            opts[key] = truthy(value)
         elif key in _S3_INT_OPTS:
             opts[key] = int(value)
         elif key in _S3_STR_OPTS:

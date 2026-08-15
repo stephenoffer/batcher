@@ -212,3 +212,77 @@ def test_a_map_batches_subtree_has_no_key_and_is_never_reused():
     q = mapped.group_by("k").agg(total=bt.col("v").sum())
     joined = q.join(q.select(bt.col("k").alias("hk")), left_on="k", right_on="hk")
     assert _call(_canonical(joined)) == []
+
+
+def _scan_source_ids(plan):
+    """Every `Scan`'s `source_id` in `plan`, in pre-order."""
+    from batcher.plan.logical import Scan
+    from batcher.plan.visitor import walk
+
+    return [n.source_id for n in walk(plan) if isinstance(n, Scan)]
+
+
+def test_the_analysis_matches_canonically_and_reports_original_nodes():
+    """The canonical form is an analysis artefact and must never be the plan that runs.
+
+    Collapsing every binding of one table onto one `source_id` is what makes the repeats
+    visible — and it is also what makes `bc_interp::streaming_parallelizes` false, since that
+    predicate is exactly "no source is scanned twice". A plan failing it is routed to the
+    *materializing* executor for its whole length, so returning the canonical plan to be run
+    silently changed the executor of every query with a table bound more than once. On a
+    snowflake schema that is most of them: TPC-DS q80 measured 1,010 ms against 151 ms once
+    the executed plan kept its own ids, q77 482 against 91, q5 473 against 199.
+
+    So the analysis has to do both halves at once, and this pins both: the appearances are
+    *matched* canonically (they are found at all, though one scans source 0 and the other
+    source 1), and they are *reported* as positions in the plan as written (the two subtrees
+    at those positions still carry their different bindings).
+    """
+    from batcher.api.subplan_reuse import _analyze
+    from batcher.config import active_config
+    from batcher.core import ExecutionContext, default_hub
+    from batcher.plan.visitor import walk
+
+    q = _shared_agg_join()
+    ctx = ExecutionContext(columns=list(q._plan.available_columns()), hub=default_hub())
+    verdict = _analyze(q._plan, list(q._sources), ctx, active_config().optimizer)
+    assert verdict, "the canonical shape must still be recognized"
+
+    nodes = list(walk(q._plan))
+    positions = verdict[0]
+    assert len(positions) >= 2, "both appearances must be located"
+    bindings = [tuple(_scan_source_ids(nodes[i])) for i in positions]
+    assert len(set(bindings)) == len(bindings), (
+        "the appearances are reported as the ORIGINAL subtrees, which differ in exactly the "
+        "binding the canonical form collapses"
+    )
+
+
+def test_a_recorded_verdict_is_served_instead_of_re_analyzing():
+    """The analysis is quadratic in plan size; re-deriving it per collect measured 404 ms on
+    TPC-DS q80 against a 151 ms query. A key with a verdict on file must not reach it."""
+    from batcher.api import subplan_reuse
+    from batcher.config import active_config
+    from batcher.core import ExecutionContext, default_hub
+
+    q = _shared_agg_join()
+    ctx = ExecutionContext(columns=list(q._plan.available_columns()), hub=default_hub())
+    cfg = active_config()
+    key = subplan_reuse._verdict_key(q._plan, list(q._sources), ctx, cfg, cfg.optimizer)
+    assert key is not None
+    subplan_reuse._record_verdict(key, list(q._sources), ())
+
+    calls: list[int] = []
+    original = subplan_reuse._analyze
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    subplan_reuse._analyze = counted
+    try:
+        plan, srcs = subplan_reuse.reuse_common_subplans(q._plan, list(q._sources), ctx)
+    finally:
+        subplan_reuse._analyze = original
+    assert calls == [], "a plan with a verdict on file must not be analyzed again"
+    assert plan is q._plan and len(srcs) == len(q._sources)

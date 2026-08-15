@@ -42,6 +42,7 @@ __all__ = [
     "passthrough_renames",
     "project_columns",
     "remap_sources",
+    "streaming_fold_target",
 ]
 
 
@@ -342,3 +343,43 @@ def is_streamable(plan: LogicalPlan) -> bool:
     if isinstance(plan, MapBatches) or is_partition_independent(plan):
         return is_streamable(plan.input)
     return False
+
+
+def streaming_fold_target(plan: LogicalPlan):
+    """The mergeable `Aggregate` this streaming plan folds through, or None.
+
+    One question — "is this operator `partial → combine → finalize` over a breaker-free
+    input?" — asked by every path that runs a stateful stream: the single-node processor,
+    the `iter_batches` router, and the distributed epoch gate. It lives in `plan` because
+    those three are in three packages that may not import one another, and because the
+    answer is a property of the plan rather than of who is running it.
+
+    A whole-column `Distinct` is a group-by over every column and returns its `Aggregate`
+    form. The single-node processor has always folded it that way (`Distinct.as_aggregate`),
+    while the distributed gate tested `isinstance(plan, Aggregate)` and so refused
+    `distinct()` on a cluster — a capability gap with no semantic cause, since the two paths
+    would have been running the identical node. Answering both from here is what keeps them
+    from disagreeing again.
+
+    Three `Distinct` shapes are deliberately *not* folded:
+
+    - a keyed `DISTINCT ON`, whose survivor carries columns the key does not determine, so
+      no group-by expresses it (`as_aggregate` raises rather than approximating);
+    - one carrying a fused `limit`, whose early exit an `Aggregate` cannot express;
+    - one over a plan with a pipeline breaker beneath it, which no per-batch fold reaches.
+
+    Args:
+        plan: The top-level streaming plan.
+
+    Returns:
+        The `Aggregate` to fold, or None when this plan is not a mergeable fold.
+    """
+    from batcher.plan.logical.aggregate import Aggregate
+
+    if isinstance(plan, Aggregate):
+        return plan if is_streamable(plan.input) else None
+    if isinstance(plan, Distinct):
+        if plan.keys or plan.limit is not None or not is_streamable(plan.input):
+            return None
+        return plan.as_aggregate()
+    return None

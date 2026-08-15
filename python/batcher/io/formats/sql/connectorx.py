@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar
 
 import pyarrow as pa
 
@@ -27,15 +26,10 @@ from batcher.io.formats.base import SOURCES
 from batcher.io.formats.sql._common import (
     apply_projection,
     connection_fingerprint,
-    probe_is_typed,
-    push_down,
     require_module,
-    schema_probe,
 )
+from batcher.io.formats.sql._source_base import SingleResultQuerySource
 from batcher.io.formats.sql.uri import redact_uri
-
-if TYPE_CHECKING:
-    from batcher.io.splits import Split
 
 __all__ = ["ConnectorXSource"]
 
@@ -141,7 +135,7 @@ class _ConnectorXSplit:
 
 @SOURCES.register("connectorx")
 @dataclass(frozen=True, slots=True)
-class ConnectorXSource:
+class ConnectorXSource(SingleResultQuerySource):
     """A relation read in parallel through ConnectorX.
 
     Args:
@@ -157,47 +151,61 @@ class ConnectorXSource:
         BackendError: If `connectorx` is not installed.
     """
 
-    # Predicate pushdown: Kyber's pushed predicate → an appended SQL WHERE around
-    # the base query (the database filters before returning Arrow). Class var, not
-    # a dataclass field.
-    supports_predicate: ClassVar[bool] = True
+    # One split, but for a different reason than the base's other backends. They are one
+    # split because the server vends no addressable result handles; ConnectorX *does*
+    # range-partition, only internally — a partitioned read fans the one logical query into
+    # `num_partitions` balanced sub-queries and merges them into a single Arrow table. That is
+    # driver parallelism, not independent slices the engine could each ship to a different
+    # worker without re-deriving disjoint ranges, which would mean the extra bound probes the
+    # design forbids. So the base's `splits` is right here, and `_probe_split_for` below is
+    # the one place the internal partitioning has to be suppressed.
 
     query: str
     conn_uri: str = field(repr=False)
     partition_on: str | None = None
     num_partitions: int = 1
 
-    def _split(
-        self, predicate: dict | None = None, projection: list[str] | None = None
-    ) -> _ConnectorXSplit:
-        """The split, with the pushdown already folded into its SQL (see `push_down`)."""
-        return _ConnectorXSplit(
-            self.conn_uri,
-            push_down(self.query, predicate, projection),
-            self.partition_on,
-            self.num_partitions,
-        )
+    @property
+    def sql_dialect(self) -> str:
+        """The scheme naming this connection's dialect, for identifier delimiting.
 
-    def schema(self) -> pa.Schema:
-        """The relation's columns, from a zero-row probe rather than the whole query.
-
-        See `schema_probe`: this used to execute the full query and discard every row.
+        Per-instance for the same reason `supports_limit` is: one ConnectorX reader fronts
+        PostgreSQL, MySQL and SQL Server, and the three delimit identifiers three
+        different ways.
         """
-        probed = _ConnectorXSplit(self.conn_uri, schema_probe(self.query), None, 1).schema()
-        return probed if probe_is_typed(probed) else self._split().schema()
+        return self.conn_uri.partition("://")[0]
 
-    def read(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> list[pa.RecordBatch]:
-        return self._split(predicate, projection).read(projection)
+    @property
+    def supports_limit(self) -> bool:
+        """Whether this URI's backend accepts a trailing ``LIMIT n``.
 
-    def iter_batches(
-        self, projection: list[str] | None = None, predicate: dict | None = None
-    ) -> Iterator[pa.RecordBatch]:
-        yield from self._split(predicate, projection).iter_batches(projection)
+        Per-instance rather than per-class, because ConnectorX is one reader in front of
+        many dialects: the same class serves PostgreSQL, which takes `LIMIT`, and SQL
+        Server and Oracle, which do not. The scheme is the only thing that distinguishes
+        them, and it is already parsed.
 
-    def row_count(self) -> int | None:
-        return None
+        A capped read fans out exactly as an uncapped one does: with `partition_on` set,
+        each of the `num_partitions` sub-queries carries the cap, so the driver returns at
+        most `num_partitions * n` rows. That is more than the plan asked for and never
+        less, which is the direction a row cap is allowed to be wrong in — the engine's
+        own `Limit` truncates.
+        """
+        from batcher.io.formats.sql.uri import supports_limit_clause
+
+        scheme = self.conn_uri.partition("://")[0]
+        return bool(scheme) and supports_limit_clause(scheme)
+
+    def _split_for(self, sql: str) -> _ConnectorXSplit:
+        """The split for a real read, carrying ConnectorX's own range-partitioning."""
+        return _ConnectorXSplit(self.conn_uri, sql, self.partition_on, self.num_partitions)
+
+    def _probe_split_for(self, sql: str) -> _ConnectorXSplit:
+        """Probe unpartitioned: fanning a `WHERE 1 = 0` into N sub-queries buys nothing.
+
+        The only override of this hook in the tree, and the reason it exists: every other
+        backend's split is already one query, so its probe is too.
+        """
+        return _ConnectorXSplit(self.conn_uri, sql, None, 1)
 
     def identity(self) -> str:
         """The learned-statistics key: the connection *and* the query, never the query alone.
@@ -207,26 +215,3 @@ class ConnectorXSource:
         table's cardinalities. Nothing errors — it is simply the wrong plan, from good code.
         """
         return f"connectorx:{_uri_fingerprint(self.conn_uri)}:{self.query}"
-
-    def splits(
-        self,
-        target_size: int | None = None,  # noqa: ARG002 (protocol signature)
-        predicate: dict | None = None,
-        projection: list[str] | None = None,
-    ) -> list[Split]:
-        """The independently-readable slices of this source.
-
-        ConnectorX owns range-partitioning itself: a partitioned read fans the
-        one logical query into ``num_partitions`` balanced sub-queries and merges
-        them into a single Arrow table. That is internal parallelism, not
-        independent slices we can each ship to a different worker without
-        re-deriving disjoint ranges (which would mean extra bound probes we
-        explicitly forbid). So the source is a single split that delegates its
-        parallelism to ConnectorX.
-
-        The pushdown is folded into the SQL the split carries, so the *worker's* query is the
-        filtered one. A predicate left outside the split never reaches the server: the worker
-        rebuilds an unfiltered read and the engine's `Filter` discards the rows after they have
-        already crossed the wire.
-        """
-        return [self._split(predicate, projection)]

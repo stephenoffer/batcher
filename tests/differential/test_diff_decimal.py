@@ -59,6 +59,139 @@ def test_decimal_sort_and_distinct(duck, t):
 
 
 @pytest.fixture
+def nullable(duck):
+    """A decimal column with nulls, one all-null group, and one group of a single value."""
+    tbl = pa.table(
+        {
+            "k": [1, 1, 2, 2, 3, 3],
+            "price": pa.array(
+                [
+                    D.Decimal("1.50"),
+                    None,
+                    None,
+                    None,
+                    D.Decimal("-4.25"),
+                    D.Decimal("0.00"),
+                ],
+                pa.decimal128(10, 2),
+            ),
+            "tax": pa.array(
+                [
+                    D.Decimal("0.10"),
+                    D.Decimal("0.20"),
+                    D.Decimal("0.30"),
+                    None,
+                    D.Decimal("0.50"),
+                    D.Decimal("0.60"),
+                ],
+                pa.decimal128(10, 2),
+            ),
+        }
+    )
+    duck.register("n", tbl)
+    return tbl
+
+
+def test_decimal_grouped_sum_with_nulls(duck, nullable):
+    """A null contributes nothing and an all-null group sums to NULL, not zero.
+
+    The engine takes a different accumulator arm for a null-free decimal column than for a
+    nullable one, and the two must agree with DuckDB on both.
+    """
+    out = (
+        bt.from_arrow(nullable)
+        .group_by("k")
+        .agg(s=col("price").sum(), t=col("tax").sum(), c=col("price").count())
+        .collect()
+    )
+    assert_same(
+        out,
+        duck.sql("SELECT k, SUM(price) s, SUM(tax) t, COUNT(price) c FROM n GROUP BY k"),
+    )
+
+
+def test_decimal_global_sum_with_nulls(duck, nullable):
+    out = bt.from_arrow(nullable).group_by().agg(s=col("price").sum()).collect()
+    assert_same(out, duck.sql("SELECT SUM(price) s FROM n"))
+
+
+def test_decimal_global_sum_of_no_rows_is_null(duck, nullable):
+    """`SUM` over an empty relation is NULL, not 0 — the case a no-null fast path that
+    declares every group valid would get wrong."""
+    out = (
+        bt.from_arrow(nullable)
+        .filter(col("k") > lit(99))
+        .group_by()
+        .agg(s=col("price").sum())
+        .collect()
+    )
+    assert_same(out, duck.sql("SELECT SUM(price) s FROM n WHERE k > 99"))
+
+
+def test_decimal_grouped_sum_of_no_rows_is_empty(duck, nullable):
+    out = (
+        bt.from_arrow(nullable)
+        .filter(col("k") > lit(99))
+        .group_by("k")
+        .agg(s=col("price").sum())
+        .collect()
+    )
+    assert_same(out, duck.sql("SELECT k, SUM(price) s FROM n WHERE k > 99 GROUP BY k"))
+
+
+def test_decimal_fused_sums_across_many_morsels(duck):
+    """Several decimal sums at once, over more rows than one morsel holds.
+
+    Two or more scalar aggregates take the *fused* accumulator, which keeps a separate
+    no-null arm; spanning morsels also exercises the combine that merges their partials.
+    """
+    n = 50_000
+    prices = pa.array(
+        [D.Decimal(f"{i % 997}.{i % 100:02d}") for i in range(n)], pa.decimal128(12, 2)
+    )
+    taxes = pa.array([D.Decimal(f"{i % 13}.{i % 7:02d}") for i in range(n)], pa.decimal128(12, 2))
+    tbl = pa.table({"k": [i % 37 for i in range(n)], "price": prices, "tax": taxes})
+    duck.register("big", tbl)
+    out = (
+        bt.from_arrow(tbl)
+        .group_by("k")
+        .agg(
+            s=col("price").sum(),
+            t=col("tax").sum(),
+            mn=col("price").min(),
+            c=col("price").count(),
+        )
+        .collect()
+    )
+    assert_same(
+        out,
+        duck.sql(
+            "SELECT k, SUM(price) s, SUM(tax) t, MIN(price) mn, COUNT(price) c FROM big GROUP BY k"
+        ),
+    )
+
+
+def test_decimal_fused_sums_across_many_morsels_streamed(duck):
+    """The same fused decimal sums read back one batch at a time.
+
+    `iter_batches` is a different executor path from `collect`, and the cross-product of
+    {collect, iter_batches} x {nulls, multi-morsel} is where an accumulator arm chosen per
+    batch can disagree with itself.
+    """
+    n = 40_000
+    prices = pa.array(
+        [None if i % 500 == 0 else D.Decimal(f"{i % 811}.{i % 100:02d}") for i in range(n)],
+        pa.decimal128(12, 2),
+    )
+    tbl = pa.table({"k": [i % 11 for i in range(n)], "price": prices})
+    duck.register("big2", tbl)
+    ds = bt.from_arrow(tbl).group_by("k").agg(s=col("price").sum(), c=col("price").count())
+    batches = list(ds.iter_batches())
+    out = pa.Table.from_batches(batches) if batches else ds.collect()
+    assert_same(out, duck.sql("SELECT k, SUM(price) s, COUNT(price) c FROM big2 GROUP BY k"))
+
+
+@pytest.fixture
 def mixed(duck):
     tbl = pa.table(
         {

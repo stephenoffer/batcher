@@ -13,19 +13,25 @@ import pytest
 import batcher as bt
 from batcher.kyber.optimizer import Optimizer
 from batcher.kyber.streaming import (
+    STREAM_CLASSIFIED,
     blocking_operators,
-    emits_incrementally,
     has_unbounded_input,
     is_blocking_under_stream,
     retains_unbounded_state,
+    unbounded_scan_ids,
+    unbounded_state_operators,
 )
 from batcher.plan.expr_ir import col, lit
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
     Filter,
+    Sample,
     Sort,
+    TransformWithState,
+    Union,
     WatermarkDedup,
+    Window,
 )
 from batcher.plan.visitor import walk
 
@@ -100,6 +106,102 @@ def test_distinct_blocks_under_a_stream():
     assert is_blocking_under_stream(Distinct(_source()._plan))
 
 
+def test_a_distinct_carrying_a_limit_settles_on_a_prefix():
+    """The fused early exit stops at `limit` distinct rows, so no last row is needed.
+
+    The same reasoning that makes a top-N `Sort` non-blocking, and the state it holds is
+    bounded by the same number.
+    """
+    capped = Distinct(_source()._plan, limit=10)
+    assert not is_blocking_under_stream(capped)
+    assert not retains_unbounded_state(capped)
+
+
+def test_distinct_retains_state_nothing_releases():
+    """One entry per distinct value, for the life of the query, with no eviction.
+
+    Reported as bounded until this test existed — the exact shape `WatermarkDedup` was
+    added to replace, and invisible to every bounded test because a bounded input
+    releases the set at end-of-input.
+    """
+    assert retains_unbounded_state(Distinct(_source()._plan))
+
+
+def test_a_distinct_union_blocks_and_leaks_but_union_all_does_neither():
+    """`UNION` dedupes the concatenation; `UNION ALL` is a pass-through of both branches."""
+    branches = (_source()._plan, _source()._plan)
+    assert is_blocking_under_stream(Union(branches, distinct=True))
+    assert retains_unbounded_state(Union(branches, distinct=True))
+    assert not is_blocking_under_stream(Union(branches, distinct=False))
+    assert not retains_unbounded_state(Union(branches, distinct=False))
+
+
+def test_a_fixed_count_sample_blocks_without_leaking():
+    """A reservoir holds exactly `n` rows — blocking, bounded, and the case that proves
+    the two properties are independent rather than two names for one thing."""
+    reservoir = Sample(_source()._plan, fraction=1.0, seed=7, n=100)
+    assert is_blocking_under_stream(reservoir)
+    assert not retains_unbounded_state(reservoir)
+
+
+def test_a_fraction_sample_streams_freely():
+    """A per-row seeded hash test — the same distinction `is_partition_independent` draws."""
+    fraction = Sample(_source()._plan, fraction=0.5, seed=7)
+    assert not is_blocking_under_stream(fraction)
+    assert not retains_unbounded_state(fraction)
+
+
+def test_a_full_sort_leaks_but_a_topn_is_bounded_by_its_limit():
+    assert retains_unbounded_state(Sort(_source()._plan, keys=(), limit=None))
+    assert not retains_unbounded_state(Sort(_source()._plan, keys=(), limit=10))
+
+
+def test_a_window_blocks_and_holds_every_partition_it_has_seen():
+    """A stream never closes a partition, so nothing releases the rows buffered for one."""
+    plan = _source().with_columns(r=col("v").sum().over(partition_by="k"))._plan
+    windows = [n for n in walk(plan) if isinstance(n, Window)]
+    assert windows, _shape(plan)
+    assert is_blocking_under_stream(windows[0])
+    assert retains_unbounded_state(windows[0])
+
+
+def test_transform_with_state_leaks_without_a_ttl_and_is_bounded_with_one():
+    """`ttl_micros == 0` means "never expire", which the node's own docstring names as
+    the shape this predicate is entitled to complain about — and which it did not."""
+
+    def fn(key, rows, state):  # pragma: no cover — never called, this is a plan-shape test
+        return rows, state
+
+    forever = TransformWithState(_source()._plan, fn, ("k",), ("k", "v"), ttl_micros=0)
+    expiring = TransformWithState(_source()._plan, fn, ("k",), ("k", "v"), ttl_micros=60_000_000)
+    assert retains_unbounded_state(forever)
+    assert not retains_unbounded_state(expiring)
+    # Neither blocks: state is emitted per key per micro-batch, not at end-of-input.
+    assert not is_blocking_under_stream(forever)
+    assert not is_blocking_under_stream(expiring)
+
+
+def test_the_watermark_bounded_nodes_neither_block_nor_leak():
+    """The three nodes that exist to emit on an advancing watermark rather than at
+    end-of-input. If one of these were classified as leaking, the streaming path would be
+    reporting its own bounded operators as unbounded."""
+    dedup = _dedup(_source()._plan)
+    assert not is_blocking_under_stream(dedup)
+    assert not retains_unbounded_state(dedup)
+    join = _stream_join()
+    assert not is_blocking_under_stream(join)
+    assert not retains_unbounded_state(join)
+
+
+def test_unbounded_state_operators_names_the_offenders():
+    """A caller reporting to a user wants the nodes, not a bare bool — the state-side
+    counterpart of `blocking_operators`."""
+    plan = Distinct(_source().group_by("k").agg(s=col("v").sum())._plan)
+    named = {type(n).__name__ for n in unbounded_state_operators(plan)}
+    assert named == {"Distinct", "Aggregate"}, named
+    assert unbounded_state_operators(_source()._plan) == []
+
+
 def test_grouped_aggregate_does_not_block():
     """A grouped aggregate emits a running result per group — the streamable case."""
     agg = _source().group_by("k").agg(s=col("v").sum())._plan
@@ -114,6 +216,63 @@ def test_grouped_aggregate_without_a_watermark_retains_unbounded_state():
     assert retains_unbounded_state(agg)
 
 
+def _logical_node_types() -> dict[str, type]:
+    """Every `LogicalPlan` node type defined under `batcher.plan.logical`.
+
+    Deliberately not `LogicalPlan.__subclasses__()`. Every node is a
+    `@dataclass(frozen=True, slots=True)`, and `slots=True` builds a *replacement* class
+    — leaving the original registered as a subclass forever. That walk reports 42
+    entries for 21 nodes, half of them classes nothing can ever instantiate, so a
+    membership test against it fails for reasons that have nothing to do with streaming.
+    Walking the modules names each node once.
+    """
+    import importlib
+    import pkgutil
+
+    import batcher.plan.logical as pkg
+    from batcher.plan.logical.base import LogicalPlan
+
+    found: dict[str, type] = {}
+    for info in pkgutil.iter_modules(pkg.__path__):
+        module = importlib.import_module(f"{pkg.__name__}.{info.name}")
+        for name, obj in vars(module).items():
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, LogicalPlan)
+                and obj is not LogicalPlan
+                and obj.__module__ == module.__name__
+            ):
+                found[name] = obj
+    return found
+
+
+def test_every_logical_node_is_classified_for_streaming():
+    """A node with no streaming decision silently takes the *permissive* default.
+
+    Both predicates end in `return False` — "streams fine, retains nothing" — so a node
+    added without a decision here claims a memory bound it may not have, and claims it
+    where no bounded test can contradict it. That is how `Distinct` came to report it
+    retained no state while holding one entry per distinct value forever. This is the
+    same "every tag is classified" contract the device tier runs on.
+    """
+    nodes = _logical_node_types()
+    assert len(nodes) >= 20, f"the node walk found only {sorted(nodes)} — it stopped working"
+    missing = sorted(name for name, cls in nodes.items() if cls not in STREAM_CLASSIFIED)
+    assert not missing, (
+        f"{missing} have no streaming classification. Decide in `kyber.streaming`: can the "
+        "operator emit before its input ends (`is_blocking_under_stream`), and does "
+        "anything ever release its state (`retains_unbounded_state`)? Then add it to "
+        "STREAM_CLASSIFIED."
+    )
+
+
+def test_stream_classified_names_only_real_nodes():
+    """The guard is only worth its weight if it cannot go stale in the other direction."""
+    live = set(_logical_node_types().values())
+    stale = sorted(cls.__name__ for cls in STREAM_CLASSIFIED if cls not in live)
+    assert not stale, f"{stale} are in STREAM_CLASSIFIED but no longer exist"
+
+
 def test_bounded_plan_is_never_reported_unbounded():
     """`has_unbounded_input` reads the bound source, not a row estimate.
 
@@ -123,7 +282,7 @@ def test_bounded_plan_is_never_reported_unbounded():
     ctx = Optimizer(None, [], None)._context()
     plan = _source()._plan
     assert not has_unbounded_input(plan, ctx)
-    assert emits_incrementally(plan, ctx)
+    assert unbounded_scan_ids(plan, []) == frozenset()
 
 
 # --- push_filter_into_stream_join_side, and what an outer join forbids ----------------

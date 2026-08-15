@@ -74,3 +74,72 @@ def test_a_reader_ignores_the_rows_that_are_not_its_own():
         )
     assert measured_selectivities(hub).keys() == {"sig"}
     assert measured_widths(hub).keys() == {"sig", "agg"}
+
+
+def _record(hub, sig, *, kind="filter", rows_out=100, result_bytes=None, selectivity=0.25, op=0):
+    hub.record(
+        OperatorFeedback(
+            op_id=OpId(op),
+            kind=kind,
+            n_actual=rows_out,
+            t_op_ms=1.0,
+            m_peak_bytes=0,
+            selectivity=selectivity,
+            batch_size=1,
+            n_input=rows_out,
+            signature=sig,
+            n_estimated=float(rows_out),
+            result_bytes=rows_out * 512 if result_bytes is None else result_bytes,
+        )
+    )
+
+
+def test_only_the_signatures_that_moved_are_re_summarized():
+    """Incremental by shape, not just by row — and the answer is the full rebuild's.
+
+    The fold absorbed rows incrementally but rebuilt its *summary* over every signature it
+    had ever seen, computing a median apiece, on every read. That put a cost proportional to
+    the session's cumulative history back on the critical path of each `optimize` — TPC-DS
+    at scale 1 measured a probe query at 9.4 ms cold and 21.5 ms after 100 other queries in
+    the same session, most of it here and in the correction fold next door.
+
+    What must not change is the answer, so this drives the incremental path (many shapes,
+    then one more observation of one of them) and holds it against a fold that has seen
+    exactly the same history in one go.
+    """
+    gate = max(3, active_config().optimizer.cardinality_correction_min_samples)
+    incremental = MetadataHub(InProcessBackend())
+    for shape in range(20):
+        for i in range(gate):
+            _record(incremental, f"s{shape}", selectivity=0.25, op=shape * 100 + i)
+    measured_selectivities(incremental)  # summarize, then move one shape only
+    for i in range(gate):
+        _record(incremental, "s7", selectivity=0.75, op=9000 + i)
+
+    whole = MetadataHub(InProcessBackend())
+    for shape in range(20):
+        for i in range(gate):
+            _record(whole, f"s{shape}", selectivity=0.25, op=shape * 100 + i)
+    for i in range(gate):
+        _record(whole, "s7", selectivity=0.75, op=9000 + i)
+
+    assert measured_selectivities(incremental) == measured_selectivities(whole)
+
+
+def test_a_shape_whose_samples_spread_out_stops_reporting():
+    """An entry is *removed* when its window stops being concentrated, not left stale.
+
+    The rebuild dropped a disqualified signature implicitly by not re-emitting it; an
+    incremental update has to delete it on purpose, and a mean nobody should trust is
+    exactly the kind of value that would otherwise persist forever.
+    """
+    gate = max(3, active_config().optimizer.cardinality_correction_min_samples)
+    window = active_config().optimizer.cardinality_correction_window
+    hub = MetadataHub(InProcessBackend())
+    for i in range(gate):
+        _record(hub, "sig", selectivity=0.25, op=i)
+    assert "sig" in measured_selectivities(hub)
+    # Fill the whole window with wildly spread values, so the concentration gate refuses it.
+    for i in range(window):
+        _record(hub, "sig", selectivity=0.01 if i % 2 else 0.99, op=1000 + i)
+    assert "sig" not in measured_selectivities(hub)

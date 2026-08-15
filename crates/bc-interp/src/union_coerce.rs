@@ -7,7 +7,7 @@
 //! restated, so the two cannot disagree about what `int64 ∪ float64` is.
 
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
 
 use crate::error::InterpError;
@@ -28,9 +28,36 @@ use crate::error::InterpError;
 pub(crate) fn coerce_union_branches(
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<RecordBatch>, InterpError> {
-    let Some(first) = batches.first() else {
+    let Some(schema) = union_target_schema(&batches)? else {
         return Ok(batches);
     };
+    batches
+        .iter()
+        .map(|b| cast_to_union_schema(b, &schema))
+        .collect()
+}
+
+/// The one schema every branch of a set operation must be cast to — or `None` when they
+/// already agree and no cast is due (the overwhelmingly common single-type union).
+///
+/// Split out of [`coerce_union_branches`] so the *streaming* UNION ALL can settle the target
+/// from one peeked morsel per branch and then cast each morsel as it flows, rather than
+/// holding every branch to concatenate. Both callers therefore promote by the same rule and
+/// build the same schema; a second copy of it is exactly what would let the streamed and
+/// materialized unions disagree about what `int64 ∪ float64` is.
+///
+/// Nullability follows the same rule as the types: a column is nullable if *any* branch's is.
+///
+/// Args:
+///   `branches`: one representative batch per branch (any batch will do — every batch of a
+///   branch carries that branch's schema), or every batch when the caller already holds them.
+pub(crate) fn union_target_schema(
+    branches: &[RecordBatch],
+) -> Result<Option<SchemaRef>, InterpError> {
+    let Some(first) = branches.first() else {
+        return Ok(None);
+    };
+    let batches = branches;
     let ncols = first.num_columns();
     // Fold the per-column supertype across every branch's schema.
     let mut target: Vec<DataType> = first
@@ -41,6 +68,15 @@ pub(crate) fn coerce_union_branches(
         .collect();
     let mut mismatch = false;
     for b in batches.iter().skip(1) {
+        // Same guard as `cast_to_union_schema`, and for the same reason: indexing past a
+        // narrower branch's columns panics, and this crate does not panic on user data.
+        if b.num_columns() != ncols {
+            return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+                "set-operation branches have different column counts: {} vs {ncols}",
+                b.num_columns()
+            ))
+            .into());
+        }
         for (c, t) in target.iter_mut().enumerate().take(ncols) {
             let bt = b.column(c).data_type();
             if bt != t {
@@ -67,7 +103,7 @@ pub(crate) fn coerce_union_branches(
         }
     }
     if !mismatch {
-        return Ok(batches);
+        return Ok(None);
     }
     // Rebuild a schema carrying the promoted types (a column is nullable if any branch's is).
     let base = first.schema();
@@ -80,22 +116,43 @@ pub(crate) fn coerce_union_branches(
                 .with_nullable(nullable)
         })
         .collect();
-    let schema = Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()));
-    batches
-        .into_iter()
-        .map(|b| {
-            let cols: Vec<ArrayRef> = (0..ncols)
-                .map(|c| {
-                    if b.column(c).data_type() == &target[c] {
-                        Ok(Arc::clone(b.column(c)))
-                    } else {
-                        Ok(arrow::compute::cast(b.column(c), &target[c])?)
-                    }
-                })
-                .collect::<Result<_, InterpError>>()?;
-            Ok(RecordBatch::try_new(Arc::clone(&schema), cols)?)
+    Ok(Some(Arc::new(Schema::new_with_metadata(
+        fields,
+        base.metadata().clone(),
+    ))))
+}
+
+/// Cast one branch batch to the union's target schema, sharing every column that already
+/// carries the target type rather than copying it.
+pub(crate) fn cast_to_union_schema(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+) -> Result<RecordBatch, InterpError> {
+    // A branch of a different *width* is a malformed plan rather than a coercible mismatch,
+    // and indexing past a batch's columns panics. Return the arrow error instead: this crate
+    // never panics on a path that can see user data.
+    if batch.num_columns() != schema.fields().len() {
+        return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+            "set-operation branches have different column counts: {} vs {}",
+            batch.num_columns(),
+            schema.fields().len()
+        ))
+        .into());
+    }
+    let cols: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(c, f)| {
+            let col = batch.column(c);
+            if col.data_type() == f.data_type() {
+                Ok(Arc::clone(col))
+            } else {
+                Ok(arrow::compute::cast(col, f.data_type())?)
+            }
         })
-        .collect()
+        .collect::<Result<_, InterpError>>()?;
+    Ok(RecordBatch::try_new(Arc::clone(schema), cols)?)
 }
 
 /// The common type two set-operation branch columns must both widen to, so neither side is

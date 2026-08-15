@@ -160,7 +160,7 @@ with 4 credits against 7.7 MiB/s with 16.
 
 It is the cold-start value, and only that. Once this process has completed a fetch, the
 starting window comes from the measured bandwidth-delay product instead — see
-[Measuring the window instead of probing for it](#measuring-the-window-instead-of-probing-for-it).
+{ref}`measuring the window instead of probing for it <bdp-window>`.
 
 ## AIMD
 
@@ -256,6 +256,7 @@ a window pinned at its ceiling reading `STARVED` is being throttled by the ceili
 same window reading `SATURATED` found its bandwidth-delay product.
 :::
 
+(bdp-window)=
 ## Measuring the window instead of probing for it
 
 Everything above is a *search*. Slow start doubles until something breaks, CUBIC recovers

@@ -14,6 +14,7 @@ a flat one loses the columns it is organized by, silently.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import Any
 
@@ -196,6 +197,22 @@ def _table_at(path: str) -> str | None:
     for marker, fmt in _TABLE_MARKERS:
         if os.path.isdir(os.path.join(root, marker)):
             return fmt
+    return _training_shards_at(root)
+
+
+def _training_shards_at(root: str) -> str | None:
+    """``"training_shards"`` if `root` is a corpus written by `write_shards`, else None.
+
+    Checked last, and on *two* signals rather than one. The manifest is called
+    ``index.json``, which is a name an unrelated directory can plausibly carry, so a
+    directory only claims the format when it also holds a shard the manifest would be
+    describing. A single generic marker here would hijack a plain directory read.
+    """
+    if not os.path.isfile(os.path.join(root, "index.json")):
+        return None
+    with contextlib.suppress(OSError):
+        if any(name.startswith("shard-") and name.endswith(".arrow") for name in os.listdir(root)):
+            return "training_shards"
     return None
 
 

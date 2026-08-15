@@ -226,8 +226,11 @@ def test_the_planner_knows_how_wide_a_sampled_clip_is():
     assert videofunc_type(frames) == pa.fixed_shape_tensor(pa.uint8(), (8, 224, 224, 3))
     assert videofunc_type(col("v").video.thumbnail(8)) == pa.binary()
     assert videofunc_type(col("v").video.frame_at(1.0, 8)) == pa.binary()
-    # A struct of header facts is a handful of bytes either way; not worth asserting.
-    assert videofunc_type(col("v").video.decode()) is None
+    # `decode` is the clip's header struct. It was left untyped on the grounds that a
+    # header is a handful of bytes either way -- but `available_schema` resolves a
+    # projection all-or-nothing, so one untyped column discards the resolved type of every
+    # column beside it, including the 1.2 MB tensor this test is about.
+    assert pa.types.is_struct(videofunc_type(col("v").video.decode()))
 
 
 def test_video_dataset_uses_the_native_kernel_when_the_engine_has_it():

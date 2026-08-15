@@ -27,7 +27,18 @@ __all__ = ["ImageSource"]
 class ImageSource(MediaSource):
     """One or more image files (directory or glob) as references + header meta."""
 
-    suffixes = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif")
+    # The listing is by extension, so an extension this tuple does not name is a file the
+    # source cannot see at all -- and the error a user gets is "no images files under
+    # <path>", which reads as an empty directory rather than as an unlisted format. That is
+    # what a corpus of iPhone photographs got: `.heic` is what every phone since 2017
+    # writes. The modern container formats are listed even where Pillow needs a plugin to
+    # decode them, because the rows are still worth having: `bytes`, `size` and `mime` come
+    # from the read, and an unparseable header nulls that file's metadata rather than
+    # dropping its row.
+    suffixes = (
+        ".png", ".jpg", ".jpeg", ".jfif", ".gif", ".bmp", ".webp", ".tiff", ".tif",
+        ".heic", ".heif", ".avif", ".ico", ".jp2", ".j2k", ".ppm", ".pgm",
+    )  # fmt: skip
     format_name = "images"
 
     __slots__ = ()
@@ -37,15 +48,25 @@ class ImageSource(MediaSource):
             ("width", pa.int64()),
             ("height", pa.int64()),
             ("mode", pa.string()),
+            ("format", pa.string()),
         ]
 
     def _extract_meta(self, data: bytes) -> dict[str, Any]:
         image = _pil_image()
         with image.open(io.BytesIO(data)) as img:
-            # `.size` / `.mode` are populated from the header; no `.load()` call,
-            # so pixel data is never decoded.
+            # `.size` / `.mode` / `.format` are populated from the header; no `.load()`
+            # call, so pixel data is never decoded. `format` is the *container* the bytes
+            # actually are, which is worth having beside `mime` because a corpus assembled
+            # by content type is full of files whose extension and container disagree --
+            # those rows decode fine and break whatever downstream step branched on the
+            # name. It costs nothing: the parse that produced the size produced it too.
             width, height = img.size
-            return {"width": width, "height": height, "mode": img.mode}
+            return {
+                "width": width,
+                "height": height,
+                "mode": img.mode,
+                "format": img.format.lower() if img.format else None,
+            }
 
 
 def _pil_image() -> Any:

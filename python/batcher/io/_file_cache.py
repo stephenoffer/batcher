@@ -18,6 +18,8 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 
+from batcher._internal.paths import private_dir
+
 __all__ = ["FileBytesCache", "get_file_cache"]
 
 
@@ -44,7 +46,11 @@ class FileBytesCache:
         # scan can't be told from a slow *uncached* scan. Measurement only — never behavior.
         self._hits = 0
         self._misses = 0
-        os.makedirs(cache_dir, exist_ok=True)
+        # `private_dir`, not `os.makedirs`: an entry here is a byte-for-byte copy of one of
+        # the user's data files, and the cache root is Batcher's own subdirectory of a node
+        # volume other tenants also mount. The *file* mode is not ours to set — the caller's
+        # `fetch` writes the bytes — so the directory is what protects them.
+        private_dir(cache_dir)
 
     def get_or_fetch(self, remote_path: str, fetch: Callable[[str], None]) -> str:
         """Return the local path of the cached copy of `remote_path`.

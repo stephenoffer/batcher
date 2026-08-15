@@ -121,6 +121,17 @@ def test_source_read_accepts_predicate(source_cls):
 # the SQL the split actually carries, not on the source's own `read()`.
 
 
+def _undelimited(sql: str) -> str:
+    """`sql` with identifier delimiters stripped, so one assertion covers every dialect.
+
+    A backend that knows its dialect delimits column names (`"x"`, `` `x` ``, ``[x]``),
+    because an undelimited reserved word or a name holding a space is a syntax error or,
+    worse, silently the wrong column. Which delimiter it picks is that backend's business;
+    what these assert is that the predicate and the projection reached the SQL at all.
+    """
+    return sql.translate(str.maketrans("", "", '"`[]'))
+
+
 @pytest.mark.parametrize(
     ("source_cls", "kwargs"), _SQL_SPLIT_SOURCES, ids=lambda v: getattr(v, "__name__", "")
 )
@@ -128,7 +139,7 @@ def test_split_sql_carries_pushdown(source_cls, kwargs):
     predicate = (bt.col("x") > 5).to_ir()
     splits = plan_splits(source_cls(**kwargs), predicate=predicate, projection=["x", "y"])
     assert len(splits) == 1
-    sql = splits[0].query
+    sql = _undelimited(splits[0].query)
     # The predicate reached the split's SQL, so the *server* does the filtering.
     assert "WHERE" in sql
     assert "x > 5" in sql

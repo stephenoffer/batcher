@@ -138,6 +138,58 @@ def test_every_file_sink_rolls_over_at_the_cap(tmp_path, fmt):
     assert got == list(range(1000))
 
 
+def _refuse_collect(monkeypatch, why: str) -> None:
+    """Make `_collect` fatal, so any materialization on the driver fails the test loudly."""
+    import batcher.api.terminal.core as terminal
+
+    def _no_collect(*_args, **_kwargs):
+        raise AssertionError(why)
+
+    monkeypatch.setattr(terminal, "_collect", _no_collect)
+
+
+@pytest.mark.parametrize(
+    ("shape", "expect_rows"),
+    [("sort", 900), ("group_by", 9)],
+)
+def test_a_capped_write_of_a_breaker_plan_also_streams(tmp_path, monkeypatch, shape, expect_rows):
+    """A breaker under a row cap streams too, not only a breaker-free pipeline.
+
+    `iter_batches` yields a top-level aggregate by folding one running state, and a
+    top-level sort from the out-of-core bucket pipeline — both in bounded memory. The write
+    path nonetheless asked only whether the plan was breaker-*free*, so `sort().write(...)`
+    and `group_by().agg().write(...)` collected the whole result onto the driver even under
+    a cap that says, in as many words, that it does not fit there.
+    """
+    import batcher as bt
+
+    src = str(tmp_path / "src.parquet")
+    pq.write_table(
+        pa.table({"v": list(range(1000)), "g": [i % 9 for i in range(1000)]}),
+        src,
+        row_group_size=100,
+    )
+    _refuse_collect(monkeypatch, f"the capped {shape} write materialized on the driver")
+
+    ds = bt.read.parquet(src).filter(bt.col("v") < 900)
+    ds = ds.sort("v") if shape == "sort" else ds.group_by("g").agg(n=bt.count())
+    out = str(tmp_path / "out")
+    manifest = ds.write.parquet(out, max_rows_per_file=250)
+    # The guard has done its job; reading the result back is an ordinary collect.
+    monkeypatch.undo()
+
+    assert manifest.total_rows == expect_rows
+    back = bt.read.parquet(out)
+    assert back.count() == expect_rows
+    if shape == "sort":
+        # The sort's answer survives the rollover. Compared as a multiset, because which
+        # rows land in which part file is the sink's business and the glob order is not the
+        # write order — what this asserts is that no row was lost or duplicated.
+        assert sorted(back.to_pydict()["v"]) == list(range(900))
+    else:
+        assert sum(back.to_pydict()["n"]) == 900
+
+
 def test_a_capped_write_over_a_file_source_never_materializes_the_result(tmp_path, monkeypatch):
     """The routing, not just the rollover.
 

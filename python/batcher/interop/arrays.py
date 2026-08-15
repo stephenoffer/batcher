@@ -182,7 +182,49 @@ def _column_to_numpy(column: pa.Array) -> np.ndarray:
     matrix = uniform_list_to_matrix(arr)
     if matrix is not None:
         return matrix
-    return arr.to_numpy(zero_copy_only=False)
+    return _flat_to_numpy(arr)
+
+
+def _flat_to_numpy(arr: pa.Array) -> np.ndarray:
+    """A plain (non-nested) Arrow column as NumPy, keeping a nullable numeric column numeric.
+
+    Arrow has no null in a NumPy integer or boolean array, so `to_numpy` widens a nullable
+    integer column to `float64` with NaN — and for a nullable **boolean** column it gives up
+    and returns an `object` array instead. Every tensor conversion above this drops a
+    non-numeric column, so a boolean column converted cleanly right up until the first batch
+    that happened to contain a null, and then **vanished from the batch dict mid-epoch**: the
+    training loop reads a `KeyError` on a key it had been reading for an hour, or quietly
+    trains on a batch with one feature missing.
+
+    Whether a column can become a tensor is a property of its *type*, not of which rows
+    happened to land in this batch. So a nullable boolean is widened the same way a nullable
+    integer already is — to `float64` with NaN — and the key set is the same for every batch.
+    The widening is announced, because a NaN in a label column is a silent trainer of nothing.
+    """
+    import pyarrow as pa
+
+    out = arr.to_numpy(zero_copy_only=False)
+    if out.dtype.kind in "biufc" or not (
+        pa.types.is_boolean(arr.type) or pa.types.is_integer(arr.type)
+    ):
+        if arr.null_count and pa.types.is_integer(arr.type):
+            _warn_null_widening(arr.type)
+        return out
+    _warn_null_widening(arr.type)
+    return arr.cast(pa.float64()).to_numpy(zero_copy_only=False)
+
+
+def _warn_null_widening(arrow_type: pa.DataType) -> None:
+    """Announce a nullable integer/boolean column widening to float with NaN."""
+    import warnings
+
+    warnings.warn(
+        f"a nullable {arrow_type} column has no NumPy/tensor equivalent, so it converts to "
+        "float64 with NaN for the nulls. Cast or fill it first "
+        "(`col(...).fill_null(0)`, or `ds.drop_null()`) if a NaN would be trained on.",
+        UserWarning,
+        stacklevel=4,
+    )
 
 
 def uniform_list_to_matrix(array: pa.Array) -> np.ndarray | None:

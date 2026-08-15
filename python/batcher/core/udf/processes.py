@@ -24,6 +24,7 @@ import pyarrow as pa
 from batcher._internal.errors import ExecutionError
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.mathx import ceil_div
+from batcher._internal.paths import open_private
 from batcher.core.udf.isolation import (
     ResourceLimits,
     child_initializer,
@@ -173,12 +174,12 @@ _SHM_COUNTER = 0
 def _write_shard(path: str, batches: list[pa.RecordBatch]) -> None:
     """Write one shard, private to the running user from the moment it exists.
 
-    The mode is set at `open` rather than by a following `chmod`: a chmod leaves a window
-    in which the file is readable, and the whole point is that it never is.
+    `open_private` sets the mode in the `open` call rather than by a following `chmod`: a
+    chmod leaves a window in which the file is readable, and the whole point of a shard on
+    `/dev/shm` — which is world-readable — is that it never is.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with (
-        os.fdopen(fd, "wb") as raw,
+        open_private(path) as raw,
         pa.PythonFile(raw, mode="w") as sink,
         pa.ipc.new_file(sink, batches[0].schema) as writer,
     ):

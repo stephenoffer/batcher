@@ -1,11 +1,21 @@
-"""Document format — PDF text extraction via `pypdf`, to Arrow.
+"""Document format — text extraction from PDF, HTML, Word, decks, EPUB and Markdown.
 
-`DocumentSource` extracts text from PDF files into the Arrow schema
+`DocumentSource` extracts text into the Arrow schema
 ``{path: str, page: int64, text: str}`` — one row per page, assembled at batch
 granularity (the unavoidable extraction for a non-tabular source). This is the
 ingest path for RAG / document-AI pipelines; downstream chunking, embedding, and
 search run as Rust expressions over the ``text`` column. Read-only; one file is one
 `Split`.
+
+It reads a **mixed** corpus, which is what a document corpus is. Reading only PDFs was a
+strange place to stop: the documents an organization has are PDFs, web pages, Word files,
+decks and Markdown, and a directory holding all five had to be split by extension outside
+the engine and re-joined afterwards. The non-PDF formats are read by `_extract`, which
+adds no dependency — they are ZIP archives of XML, or text.
+
+``page`` means the same thing throughout: which part of the document the text came from.
+A PDF page, a PPTX slide, an EPUB spine item. Formats with no pagination in the file — HTML,
+Markdown, Word — yield a single row at ``page = 0`` rather than inventing one.
 
 All `pypdf` imports are deferred — importing this module never requires the
 optional dependency. A missing dependency raises `BackendError` with a
@@ -14,7 +24,7 @@ optional dependency. A missing dependency raises `BackendError` with a
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import IO, Any
 
 import pyarrow as pa
@@ -23,6 +33,7 @@ from batcher._internal.errors import BackendError
 from batcher._internal.optional import require
 from batcher.io.base import FileSource
 from batcher.io.formats.base import SOURCES
+from batcher.io.formats.unstructured._extract import PAGE_EXTRACTORS, extractor_for
 
 __all__ = ["DocumentSource"]
 
@@ -48,13 +59,17 @@ def _require_pypdf() -> Any:
 
 @SOURCES.register("documents")
 class DocumentSource(FileSource):
-    """One or more PDF documents, one Arrow row per page.
+    """One or more documents, one Arrow row per page.
 
-    Produces ``{path: str, page: int64, text: str}`` — the per-page extracted text,
-    ready for downstream Rust chunking/embedding over the ``text`` column.
+    Reads PDF, HTML, Markdown/text, Word (`.docx`), PowerPoint (`.pptx`) and EPUB from the
+    same path, so a mixed corpus is one scan. Produces
+    ``{path: str, page: int64, text: str}`` — the per-page extracted text, ready for
+    downstream Rust chunking/embedding over the ``text`` column.
     """
 
-    suffix = ".pdf"
+    # PDF first: it is what `documents` meant before the others were added, so a corpus
+    # that is all PDFs keeps its exact listing order.
+    suffix = (".pdf", *sorted(PAGE_EXTRACTORS))
     format_name = "documents"
 
     __slots__ = ("_password",)
@@ -63,7 +78,7 @@ class DocumentSource(FileSource):
         """Open a PDF corpus, optionally supplying the password its files are locked with.
 
         Args:
-            path: A PDF file, directory, or glob.
+            path: A document file, directory, or glob.
             password: The user password for an encrypted corpus. A PDF encrypted for
                 *permissions* only carries an empty user password and opens without this;
                 one with a real password could not be read at all before, since there was
@@ -155,6 +170,10 @@ class DocumentSource(FileSource):
         page) and the document is recorded in `corrupt_files()`, rather than one bad page
         in a 900-page report costing the other 899.
         """
+        extractor = extractor_for(path)
+        if extractor is not None:
+            yield from self._iter_extracted(path, extractor, projection)
+            return
         pypdf = _require_pypdf()
         wants_text = projection is None or "text" in projection
         with self._fs.open(path) as fh:
@@ -178,6 +197,36 @@ class DocumentSource(FileSource):
                     paths, pages, texts = [], [], []
             if paths:
                 yield self._page_batch(paths, pages, texts, projection)
+
+    def _iter_extracted(
+        self,
+        path: str,
+        extractor: Callable[[bytes], list[str]],
+        projection: list[str] | None,
+    ) -> Iterator[pa.RecordBatch]:
+        """Read one non-PDF document by extracting its whole text, then batching the pages.
+
+        Whole-file rather than streaming, unlike the PDF path, because these formats are
+        whole-file by construction: a DOCX's prose is one XML part inside a ZIP, and an
+        HTML page has no seekable page boundary. The batching is still applied, so a book
+        with a thousand spine items does not arrive as one enormous batch.
+
+        Unlike the PDF reader there is no projection shortcut. Extraction here is reading a
+        ZIP member or running a parser over bytes already in hand, so it is not the ~90% of
+        the read that PDF layout is, and skipping it would only buy the walk it replaces.
+        """
+        try:
+            with self._fs.open(path) as fh:
+                pages = extractor(fh.read())
+        except Exception as exc:
+            # A document that cannot be parsed at all is a *file*-level failure, the same
+            # as an unopenable PDF: tolerated it contributes no rows, untolerated it raises.
+            self._errors.tolerate(path, exc, format_name=self.format_name)
+            return
+        for start in range(0, max(len(pages), 1), _PAGES_PER_BATCH):
+            window = pages[start : start + _PAGES_PER_BATCH]
+            numbers = list(range(start, start + len(window)))
+            yield self._page_batch([path] * len(window), numbers, list(window), projection)
 
     @staticmethod
     def _page_batch(

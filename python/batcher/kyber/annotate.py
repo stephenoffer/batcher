@@ -184,12 +184,32 @@ def _aggregate_resident_bytes(
 
 
 def _streaming_bytes(
-    node: LogicalPlan, width: float, morsel_rows: int, morsel_bytes: int, estimator=None
+    node: LogicalPlan,
+    width: float,
+    morsel_rows: int,
+    morsel_bytes: int,
+    estimator=None,
+    rows: float = float("inf"),
 ) -> int:
     """Bytes a non-materializing operator holds in flight.
 
     A genuine streaming operator holds about one morsel, and a morsel is byte-bounded
     (`carbonite.policies.morsel`), so `min(rows x width, morsel_bytes)` is right for it.
+
+    **`rows` is the operator's own estimate, and it is the cap this line above meant.** The
+    implementation read the *configured* `morsel_rows` instead, so a relation smaller than a
+    morsel was charged a whole one: at the 16,384-row default and a 52-byte row that is
+    851,968 bytes billed to an operator over **zero** rows. Three such ops (`Union` over two
+    `Scan`s) came to ~2.5 MB, which is how `SELECT * FROM t UNION ALL SELECT * FROM t` over an
+    *empty* table was refused under a 1 MiB envelope as "does not fit the memory envelope and
+    has no out-of-core path" — a query holding nothing, declined for want of a spill path it
+    could not need. `rows` defaults to infinity so a caller that cannot supply it keeps the
+    previous bound.
+
+    The cap is exact rather than a heuristic: an operator cannot hold more rows than exist,
+    and this branch already runs only when the row count is `known`. It moves the estimate
+    down, which is the direction that admits, so it is paired with the byte cap below that
+    still bounds a *large* relation at one morsel.
 
     **A row-*expanding* operator is not byte-bounded, and that was measured rather than
     assumed.** Exploding 4,000 rows of a `fixed_size_list<float32, 768>` produces a *single*
@@ -233,13 +253,15 @@ def _streaming_bytes(
     """
     from batcher.plan.logical import MapBatches
 
+    # A batch, a morsel and a fan-out are all bounded by the rows that actually exist.
+    held_rows = min(float(morsel_rows), max(rows, 0.0))
     batch_size = getattr(node, "batch_size", None) if isinstance(node, MapBatches) else None
     if batch_size:
-        return int(max(1, batch_size) * width)
+        return int(min(float(max(1, batch_size)), max(rows, 0.0)) * width)
     fanout = _fanout(node, estimator) if estimator is not None else 1.0
     if fanout > 1.0:
-        return int(morsel_rows * fanout * width)
-    return min(int(morsel_rows * width), morsel_bytes)
+        return int(held_rows * fanout * width)
+    return min(int(held_rows * width), morsel_bytes)
 
 
 def _fanout(node: LogicalPlan, estimator) -> float:
@@ -444,8 +466,9 @@ def annotate_ops(
             elif materializes:
                 mem = _resident_bytes(node, rows, width, estimator, morsel_rows)
             else:
-                # streaming: ~one morsel in flight, byte-bounded.
-                mem = _streaming_bytes(node, width, morsel_rows, morsel_bytes, estimator)
+                # streaming: ~one morsel in flight, byte-bounded — and never more rows than
+                # the operator actually has (`rows` is known on this branch).
+                mem = _streaming_bytes(node, width, morsel_rows, morsel_bytes, estimator, rows)
             # Desired parallelism: a breaker wants enough tasks that each handles
             # ~`target_rows` of the data it *shuffles* — its input volume, not its
             # (possibly tiny) grouped output. Streaming ops inherit the pipeline's

@@ -431,15 +431,26 @@ fn run_with_cache(
     // `run_with_cache`, so each one shards, pre-builds and meters as it would on its own — the
     // `Meter`'s counters are atomics precisely so concurrent workers can share it.
     //
-    // `UNION` (distinct) is deliberately excluded: it needs the dedup the fallback path applies
-    // over the concatenated result, and returning early here would skip it.
+    // **`UNION` (distinct) takes the same arm**, with the dedup applied here instead of by the
+    // fallback path. It was excluded on the grounds that returning early would skip that dedup,
+    // which is true and is why the dedup is now applied — the branches themselves are as
+    // independent under a distinct union as under an all one, and excluding it cost exactly what
+    // the paragraph above describes. Measured on TPC-DS q49's three channel branches at scale 1:
+    // as `UNION ALL` the query runs in **28 ms**, and the identical branches under `UNION` ran in
+    // **129 ms** — 4.6x, for a dedup over forty rows. The branches sum to 37 ms run one at a
+    // time, so the distinct union was not merely serial, it was losing each branch's own
+    // parallelism as well.
+    //
+    // `ops::parallel_distinct` is the same dedup `stream_distinct` reduces with, over the same
+    // coerced concatenation in the same branch order, so the surviving rows are identical; group
+    // order is unspecified for a hash dedup, which is the licence that path already runs under.
     //
     // The memory budget is **divided** among the branches rather than handed to each in full.
     // Branches now run at the same time, so their peaks are concurrent, and giving each the
     // whole envelope would authorize `branches x budget` — the one way this change could turn a
     // query that fitted into one that does not.
     if let RelOp::Union { inputs, distinct } = plan {
-        if !*distinct && inputs.len() > 1 && workers > 1 {
+        if inputs.len() > 1 && workers > 1 {
             let share = if budget == 0 {
                 0
             } else {
@@ -455,8 +466,18 @@ fn run_with_cache(
                 .collect::<Result<_, _>>()?;
             let all: Vec<RecordBatch> = per.into_iter().flatten().collect();
             // Promotable-but-different branch types (`int64 ∪ float64`) coerce to the union's
-            // advertised supertype, exactly as the sequential arm does.
-            return Ok(strip_empties(crate::coerce_union_branches(all)?));
+            // advertised supertype, exactly as the sequential arm does — and *before* the dedup,
+            // because two branches whose values are equal but whose types are not must dedup to
+            // one row, which is what the coercion makes them.
+            let all = crate::coerce_union_branches(all)?;
+            if !*distinct {
+                return Ok(strip_empties(all));
+            }
+            let all = strip_empties(all);
+            if all.is_empty() {
+                return Ok(all);
+            }
+            return Ok(strip_empties(ops::parallel_distinct(&all)?));
         }
     }
 

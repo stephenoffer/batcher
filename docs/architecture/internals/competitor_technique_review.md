@@ -47,7 +47,13 @@ at a competitor's file listing.
 low-cardinality half of item 9 and the one capability gap in 10h. **10f — a sorted-input
 aggregate, the memory-shaped one — is the last of the three still open**, and it remains the
 most interesting item here, because its win is bounded state rather than speed: it is the one
-shape that turns a spilling aggregate into a streaming one. What is left below it is either
+shape that turns a spilling aggregate into a streaming one.
+
+**Update, 2026-08-13.** 10f is now *half* built: the run-scanning group assignment is in
+(`agg/group/runs.rs`), and it is worth 1.0-1.2x rather than the 6.0x its microbenchmark
+promised — the discrepancy, and the A/B method that exposed it, are recorded in 10f and are
+more useful than the feature. **The bounded-state half is still open, and it is still the
+reason this item ranks where it does.** What is left below it is either
 large and invasive (`StringView`), a boundary-crossing planner decision (dictionary survival,
 top-K to the scan), or waiting on a quiet box. See the backlog for the per-item evidence.
 
@@ -438,7 +444,7 @@ What is **not** there is the edge to the scan. The bound skips morsels the engin
 read; nothing derived from it reaches a Parquet reader, so no row group is pruned and no I/O is
 avoided. That is the expensive half for `ORDER BY x LIMIT k` over a large file on disk, and it
 is what item 4 should now be read as meaning. It needs the predicate republished through the
-`runtime_filter.rs` transport and then through `io/predicate.py`'s pushdown, which is a
+`runtime_filter.rs` transport and then through `io/predicate/`'s pushdown, which is a
 boundary-crossing change rather than a data-plane one.
 
 ## 5. Skew detected from measured sizes
@@ -849,7 +855,7 @@ previous run's, so a first-seen shape gets a prior rather than a measurement, an
 data volume changed run-to-run gets a stale one. Spark, with no learning at all, uses the
 fresher number for this one decision.
 
-### 10f. Sortedness is tracked, and no operator specializes on it
+### 10f. Sortedness is tracked, and no operator specializes on it — **half built, and the win was not where this entry said**
 
 Polars' streaming engine carries a sortedness flag and has **operators that consume it**:
 `nodes/sorted_group_by.rs`, `nodes/sorted_unique.rs`, `nodes/is_first_distinct.rs`,
@@ -890,6 +896,95 @@ second semantics — invariant #7, and the exact shape of "a stateful operator t
 single-node and silently caps at one machine" — and agreement across all three executors. So
 it wants a session that can run the distributed suite, which is the one thing a contended box
 cannot currently do.
+
+**Built and measured, 2026-08-13 — and the result is a caution, not a victory.**
+`bc_runtime::agg::group::runs` now assigns group ids by scanning runs of equal adjacent values
+instead of hashing, and `assign_groups` tries it first. Because `assign_groups` is shared, this
+reaches every `GROUP BY`, every `DISTINCT` and every partitioned window at once.
+
+Two things about it are worth keeping; one is worth *not* repeating.
+
+**Worth keeping (1): it establishes the ordering instead of trusting or buying it.** The first
+draft of this entry said Polars "reads a flag", which is wrong, and the correction is the most
+useful thing in this section. Polars' planner *tracks* sortedness
+(`polars-plan/src/plans/optimizer/sortedness.rs`), derives it from a `Sort` in the plan or an
+explicit user hint, and deliberately does **not** derive it from a scan — `IR::Scan => None`.
+When the keys are not already sorted, `try_build_sorted_group_by` **inserts a `Sort`** and runs
+the same node. Polars therefore either knows the order because the plan produced it, or pays to
+create it. Neither is careless, and this document should not have implied otherwise.
+
+Batcher's equivalent declaration is `RelStats.sorted_by`, and that one *does* carry a lakehouse
+table's declared sort key — metadata **nothing enforces on write**. Believing it when false is
+not a slow answer but a silently wrong one: one key split across two non-adjacent runs is
+emitted as two groups. So this takes a third option Polars cannot take as cheaply, because it
+sits below the planner: establish the ordering per batch, which costs nothing when it does not
+hold, needs no `Sort`, and is the reason **no IR flag and no Kyber rule were needed** for this
+half.
+
+**Worth keeping (2): a sampled gate is not a cheap exact scan, and the difference is 4x.** The
+first implementation gated on a fixed 64-pair prefix before committing to a detection pass. A
+key cycling `0,1,…,99,0,1,…` is ordered across any short prefix, so the gate passed it and paid
+for a full pass that then failed — **0.24x, four times slower than simply hashing**, on input
+that is not sorted at all. Replacing the gate with a chunked scan that exits at the first
+violating chunk took every unsorted shape to exactly **1.00x**. Rejection being free is what
+makes this safe to attempt unconditionally, and it is the property to defend if anyone
+re-tunes it.
+
+**Not worth repeating: the number this was first justified with.** At the level of one
+`partial()` call over 6M rows the path measures **6.0x** on an all-distinct sorted integer key,
+1.56x on a sorted string key, 1.40x on a sorted composite one. An A/B of two *builds* over the
+same data then measured **1.0-1.2x** end to end, and at full parallelism the difference sat
+inside the noise band. The engine morselizes, so it never makes the 6M-row call the
+microbenchmark made; at 16,384 rows the win is 1.1-1.2x, which is a few percent of a query that
+also scans, accumulates, combines and finalizes.
+
+That is **10g happening again to someone who had read 10g** — a mechanism-level probe
+disagreeing with the query. The correction that worked, and which the next measurement here
+should copy: A/B two builds in *one process* over identical data. Cross-run timings on this box
+disagreed with themselves by 30%, and two shapes where the path *declines* read as faster with
+it enabled, which is impossible and is what exposed the noise.
+
+So this half is a **small win on sorted input and free on everything else**, tested against the
+hash oracle in `runs.rs` and against DuckDB in
+`tests/differential/test_diff_agg_sorted_input.py` (which includes the case that matters most:
+a key sorted *within* each morsel but not across them, where runs must stay partials and only
+`combine` may make them groups).
+
+**What remains open is the half this entry called the reason to rank it: memory.** The state is
+still `O(groups)`, because bounded state needs the streaming aggregate to *emit* a group when
+its run closes, and that is not a detection problem, it is a soundness one. A group emitted
+early is unrecoverable if a later batch reintroduces its key, and per-batch verification cannot
+prevent that — it only detects it afterwards. So early emission is sound only where the
+ordering is a fact about the *plan* (a `Sort` the engine itself performed) rather than a claim
+about the data, and that distinction — not the adjacency scan — is what the remaining work has
+to get right. `stream/breaker.rs` is where it lands: the streaming aggregate does not spill, it
+refuses (`"the streaming aggregate does not spill"`), so bounding its state is what converts a
+refused query into a completed one.
+
+**And the value of that half is smaller than this entry has claimed since 2026-08-04, which is
+worth settling before anyone spends a session on it.** The claim has been that a sorted
+group-by "turns a spilling aggregate into a streaming one". Check what it is being compared
+against: the *materializing* aggregate already spills — `bc_runtime::agg::spill` is real and
+`spill_split.rs`, `join_par.rs`, `window_spill.rs`, `distinct_on_spill.rs` and `dist.rs` all
+use it. Large aggregates are therefore not failing today; they are paying disk. So the prize is
+**avoiding a spill**, not rescuing a query, everywhere except the narrower case where the
+streaming path was chosen and then refused.
+
+That reframes the cost/benefit sharply, because of the soundness constraint above. Early
+emission is sound only when the ordering is a fact about the plan, and the way to *make* it a
+fact is to sort. **Polars is the precedent to read here, not Spark**, and it is a closer one
+than this document realized: `try_build_sorted_group_by` inserts a `Sort` when the keys are not
+already ordered, which is exactly the design the paragraph above arrives at. Note what Polars
+does with it, though — behind `POLARS_FORCE_SORTED_GROUP_BY` when the keys are *not* already
+sorted, and taken unasked when they are. That gating is the honest reading of the trade:
+sorting in order to avoid a spill costs at least as much as the spill it removes, so it pays
+where the plan was going to sort anyway and is opt-in otherwise.
+
+What is left that is unambiguously worth having is therefore narrow and should be scoped that
+way: an aggregate **directly above a `Sort` the engine itself performed**, where the ordering
+is free and already paid for. Anything wider needs a number first — specifically, the cost of
+sorting against the cost of the spill it removes, on a shape where the streaming aggregate
+currently refuses.
 
 ### 10g. A caution about probing this optimizer with a stopwatch
 
@@ -1012,7 +1107,7 @@ between the two:
 asserting that each framed answer *differs* from its running one, because a frame test whose
 two answers coincide proves nothing — it caught two of its own cases doing exactly that.
 
-### 10k. Correlated `EXISTS` with a *mixed* equality-and-inequality correlation
+### 10k. Correlated `EXISTS` with a *mixed* equality-and-inequality correlation — **landed**
 
 Added 2026-08-06, from reading DuckDB's `src/execution/operator/join/`, which no pass had
 enumerated. Its delimited joins (`physical_delim_join.cpp`, plus the left/right variants) are
@@ -1041,6 +1136,213 @@ Recorded at this length for the same reason 10b is: the error message overstates
 limitation, and a reader who trusted it would rebuild machinery that already exists. Correlated
 *scalar* subqueries and correlated `IN` both work too, and were also checked rather than
 assumed.
+
+**Built 2026-08-13** as `_sql/parser/subquery/specialized.py`, and the entry's own prescription
+turned out to be the wrong plan. It said the fix "needs a semi-join with a residual predicate
+rather than a parser edit". The engine has no such operator and should not grow one for this:
+`bc_ir::RangeOp` deliberately excludes `=` (an equality is a hash join), and a semi join emits
+no right columns, so there is nothing for a residual to read. Adding an equi-prefix to
+`RangeJoin` would be a two-sided IR change for one SQL shape.
+
+The general decorrelation needs no engine change at all. Tag each outer row, inner-join on the
+equality keys, apply the inequality as an ordinary filter on the joined rows, and reduce the
+survivors to the set of tags that matched. **The tag is the load-bearing part**: without it the
+final `DISTINCT` runs over outer *values* and collapses two identical outer rows into one,
+where `EXISTS` must keep both — the same trap `test_correlated_exists_preserves_outer_duplicates`
+already pins for the `range` path. The cost is that the join materializes matching pairs the
+filter then discards, where a semi join would stop at the first match; that is the price of the
+shape having had no plan at all, and it is bounded by the equality keys rather than being a
+cross product.
+
+Two things the work turned up that the entry did not predict:
+
+- **`NOT EXISTS` with a mixed correlation was refused too.** The table above tabulated
+  `NOT EXISTS` only for the equality-only case, so the row read as working. Both are fixed.
+- **The refusal was one dispatch away from a bug of its own.** `core._apply_exists` tested the
+  two specialized shapes in two separate blocks, and the second had to go before the
+  *uncorrelated* branch while the first went after it. Consolidating them into one call
+  (`decorrelate_correlated_exists`) and then placing it wrongly silently sent every
+  inequality-only `EXISTS` down the uncorrelated path — caught by the regression case in the
+  new differential file, which exists precisely because every neighbouring shape already
+  worked.
+
+The boundary is now stated rather than implied: a correlation on an *expression*
+(`x.v < t1.v + 100`) is still refused, because `RangeCondition` carries column names on both
+sides, and `test_a_correlation_on_an_expression_is_still_declined` pins that it refuses rather
+than mis-plans.
+
+### 10l. A construct-by-construct SQL probe — 35 of 38, and three that raise
+
+Run 2026-08-14, after 10k, on the reasoning that made 10j and 10k productive: **reading a
+competitor's implementation of something Batcher already has is what makes an internal gap
+visible**, and the gap is usually at the seam between the SQL front-end and an engine that can
+already do the work. 10j found seven window aggregates the engine computed and SQL could not
+spell; 10k found one correlation shape out of four. So this pass stopped reading source and
+asked the question directly: **38 SQL constructs, run against both engines, compared.**
+
+The result is the strongest evidence in this document for the "coverage is broad" claim, and it
+is worth stating before the gaps. Thirty-five answered and matched, including several this
+document would not have assumed: `FILTER` on an aggregate, `string_agg`/`array_agg` with an
+inner `ORDER BY`, `INTERSECT ALL` and `EXCEPT ALL`, `QUALIFY`, `LATERAL`, `IS NOT DISTINCT
+FROM` as a join condition, `DISTINCT ON`, `WITH RECURSIVE`, `GROUP BY ALL`, `ORDER BY ALL`,
+`SELECT * REPLACE`, named windows, and a `RANGE` window frame.
+
+Three raised where DuckDB answered:
+
+| construct | status |
+|---|---|
+| `<expr> IN (SELECT …)` — an expression, not a column, on the left | **Fixed** (`subquery/in_expr.py`) |
+| `EXCLUDE CURRENT ROW` / `TIES` / `GROUP` on a window frame | open, engine work |
+| `count(DISTINCT (a, b))` — a row value inside an aggregate | open, front-end |
+
+**The one that was fixed is the one worth reading**, because the restriction was not where it
+looked. `_apply_in_subquery` reads the left side as a *column name* so it can hand it to a
+semi/anti join; an expression has no name to hand over. Everything past that point — the
+correlation split, the multi-column row value, and the three-valued `NOT IN` — was already
+general. So the fix names the value (evaluate it into a synthetic column, rewrite the predicate
+to name that column, recurse once into the case that does not come back) rather than adding a
+second `IN`.
+
+That choice is load-bearing rather than tidy. `x NOT IN (S)` is **not** an anti join when `S`
+can yield NULL — `_not_in_antijoin` implements the three-valued answer — and a separate
+implementation for expressions would have had to restate that rule, would have looked correct
+on every input without a NULL, and is exactly the "second implementation of the same semantics"
+this repository's defects cluster in. Routing back through the one path makes restating it
+impossible.
+
+The two left open are recorded rather than built, with their reasons. Frame `EXCLUDE` needs the
+window kernels to skip rows inside a frame, which is engine work and not a parser edit — the
+one case in this table where the deferral reason is real, unlike 10k's. `count(DISTINCT (a,b))`
+needs a composite key inside an aggregate; the `IN` path already accepts a row value, so the
+vocabulary exists on one side of the front-end and not the other, which is the same shape of
+gap as 10j.
+
+### 10m. The whole function catalog, enumerated rather than sampled — 367 of 516
+
+Run 2026-08-14. Every earlier pass compared *operators*, *optimizer passes* or *streaming
+nodes*. None compared the widest surface either engine has: the scalar and aggregate function
+catalog. DuckDB exposes its own (`duckdb_functions()`), so this one can be enumerated instead
+of sampled, which is the only pass here that is exhaustive over its surface rather than
+representative.
+
+**Method.** Take DuckDB's distinct scalar + aggregate function names, drop what is not
+user-facing (`__internal_*`, `duckdb_*`, `pragma_*`, `variant_*`, the ~160 `icu_collate_*`
+locale entries, and operator spellings), leaving **516**. Call each from Batcher's SQL across
+thirteen argument shapes, and count a name unreachable only when *every* shape reports an
+unknown function.
+
+**Result: 367 reachable, 149 not.** Of the 149, most are DuckDB-specific plumbing rather than
+portable SQL — sequences (`nextval`, `currval`), settings and transactions (`current_setting`,
+`txid_current`), logging, `enum_*`, `union_*`, `bar`, `stats`, `switch`, and `st_*` spellings
+Batcher already serves under its own names.
+
+**Read the count with the correction attached, because the first version of this entry was
+wrong by 2.4x.** Probing each function with a *single* argument reported **362** unreachable.
+That number is an artifact: Batcher answers a known function called at the wrong arity with
+`unknown function 'gcd'`, so a one-argument probe of a two-argument function reads exactly like
+a missing one. `gcd(x)` says unknown; `gcd(n, 4)` returns an answer. Probing across arities cut
+the figure to 149. **Any future probe of this surface has to vary arity**, and the same caution
+applies to reading Batcher's error message as evidence of anything.
+
+That error message is itself the smallest finding here and worth fixing on its own account: it
+reports an arity mismatch as a missing function, which sends a user to `bt.register_function`
+for something the engine already computes. It is the same class as 10b — an error that
+overstates the limitation — and it misled a probe written by someone who knew to be careful.
+
+**One true "the engine has it and SQL cannot spell it" case** was found, which is the 10j shape:
+`hash` exists as an `Expr` method and no SQL spelling reaches it, while `md5`/`sha1`/`sha256`
+are reachable from both. The reverse also occurs (`md5` is reachable from SQL and is not a
+bare `Expr` method), so the two surfaces have drifted in both directions rather than one.
+
+**Everything else in the 149 is absent from both surfaces**, checked against the `Expr` API
+rather than assumed. Grouped, and worth having in roughly this order:
+
+- `printf`/`format` — no format-string function on either surface.
+- The list higher-order tail: `list_reduce`, `list_zip`, `list_aggregate`, `list_resize`,
+  `list_where`. `list_transform` and `list_filter` are both built, so this is a partial family.
+- The struct vocabulary: `struct_insert`, `struct_values`, `struct_concat`, `struct_extract_at`.
+  The `.struct` accessor has **three** methods against `.list`'s 74, which is the widest
+  namespace asymmetry on the surface.
+- `to_json` / `from_json` / `row_to_json`.
+- Interval constructors (`to_seconds`, `to_minutes`, `to_months`, …) and `age`, `datepart`.
+- `signbit`, `bit_position`, `set_bit`; `strip_accents`, `nfc_normalize`, the grapheme-aware
+  string ops; `like_escape` (the `ESCAPE` clause).
+
+### The same pass across Polars and Ray Data, and why its raw numbers are worthless
+
+Polars' `Expr` surface (432 names across its accessors) and Ray Data's `Dataset` (93 methods)
+were enumerated the same way and diffed against Batcher's — 692 `Expr` names and 177 `Dataset`
+methods. **Do not read those diffs as gaps.** A bare-name diff reported 138 Polars names and 63
+Ray Data names "missing", and a verified sample of thirty found the great majority to be
+spelling or placement differences:
+
+- Ray Data's `select_columns`, `rename_columns`, `drop_columns`, `add_column`,
+  `random_shuffle`, `random_sample`, `take`, `write_parquet`, `materialize`,
+  `iter_torch_batches` and `train_test_split` are all present under Batcher's own names.
+- `num_blocks`, `zip` and `input_files` are **deliberate refusals** whose error messages name
+  the alternative ("Spelled `ds.repartition`", "There is no positional column …").
+- Polars' `Expr.list.explode` is `ds.explode` — a Dataset-level operation here.
+- `streaming_split` **is** built (`ml/loader/lazy.py`, exported from `batcher.ml`), exactly as
+  10h says. The probe missed it by looking for a `Dataset` method rather than a module
+  function, and briefly "found" a gap that 10h had already settled.
+
+What survived verification is short, and every entry was called before it was written down:
+**`bottom_k`** (while `top_k` is built — the cleanest asymmetry on the surface), `null_count`,
+`cum_prod`, `implode`, `hist`, `list.index_of`, `json.decode`, `str.extract_groups`.
+
+**The methodological finding is worth more than the list, because three different probe designs
+each produced false gaps, and all three erred the same way — overstating what is missing.** A
+one-argument call read an arity error as a missing function (2.4x). A bare-name diff read a
+spelling difference as an absence (roughly 5x). An attribute probe read a module-level function
+as an absence. A pass over a competitor's surface is not evidence until each survivor has been
+*called*; the cost of not doing that is a backlog of work that is already done, which is the
+failure this document has recorded against itself three times already.
+
+**The headline, though, is the 367.** Batcher's `Expr` surface is 236 methods plus roughly 450
+across ten accessor namespaces, and the great majority of DuckDB names this pass first read as
+missing turned out to be present under Polars-style spellings that the SQL front-end already
+maps. That is the strongest evidence in this document for the coverage claim, and it is the
+reason the remaining list is short enough to read.
+
+### 10n. `top_k` means two different things, and one of them is silent
+
+Found while checking whether `bottom_k` was worth adding (Polars has it, Batcher does not). It
+is not the missing name that matters:
+
+```
+values = [5, 1, 1, 1, 9, 2, 2]
+
+Dataset.top_k(2, by="x")   ->  [9, 5]      the two highest-ranked rows
+Expr.top_k(2)              ->  [1, 2]      the two most FREQUENT values
+Polars  top_k(2)           ->  [9, 5]
+DuckDB  approx_top_k(x, 2) ->  [1, 2]
+```
+
+Both Batcher spellings are individually correct and individually documented — `Dataset.top_k`
+follows Polars, `Expr.top_k` follows DuckDB's `approx_top_k` and its docstring says so. The
+defect is that **one name means two different things across the two surfaces of one API**, and
+the mismatch is silent: a Polars migrant reaching for `bt.col("x").top_k(2)` expecting the
+largest values gets a frequency ranking, of the right type and a plausible length, with no
+error.
+
+That places it in this repository's worst category rather than its naming-nit category — a
+wrong answer no gate can see. The `compat` guidance machinery cannot help either: it fires from
+`Expr.__getattr__` for names Batcher does **not** carry, and this name is carried.
+
+**Not fixed here, because the fix is a public-API decision rather than a defect repair**, and
+`plan/expr_ir/core.py` is another session's open file. The options, in the order this pass would
+rank them:
+
+1. Rename the aggregate to `most_frequent` (what it computes) and leave `top_k` to mean what it
+   means everywhere else. It is the only option that removes the ambiguity rather than
+   documenting it.
+2. Keep both and make `Expr.top_k`'s docstring open by contrasting itself with `Dataset.top_k`,
+   which today it does not mention.
+3. Add `Expr.bottom_k` — **do not do this first**. Whichever meaning it took would deepen the
+   collision, and the question of which meaning it should take is the same question as 1.
+
+Recorded rather than built for the same reason 10b was: the cost of guessing is larger than the
+cost of writing it down, and this one needs an owner's decision rather than a patch.
 
 ### 10i. The optimizer pass list — one real gap, and it settles 10g
 
@@ -1253,27 +1555,37 @@ implements it, so the next reader can settle it with one grep instead of one day
    because **the failure is not skew at all** — twenty-five evenly-sized ranges on ninety-six
    cores are perfectly balanced and still leave seventy-one cores idle, which a skew test
    cannot see and which is exactly the shape `ORDER BY <a 25-value column>` produces.
-5a. **Correlated `EXISTS` with a mixed equality-and-inequality correlation (item 10k).** One
-   shape, precisely bounded: equality-only, inequality-only and `NOT EXISTS` all work and
-   match DuckDB, and only a predicate carrying *both* falls through to `_reject_correlated`.
-   Small and well-defined, but it needs a semi-join with a residual predicate rather than a
-   parser edit, which is why it sits here rather than being done alongside 10j.
-6a. **A sorted-input aggregate and adjacent dedup (item 10f).** **The highest-value item still
-   open, and it was missing from this list entirely** until 2026-08-06 — it was argued in
-   section 10f and then never written down as work, which is how the last of the sweep's three
-   genuine openings ended up ranked nowhere. Re-verified open: nothing in `crates/` implements
-   it and no Kyber rule rewrites `Aggregate`/`Distinct` on a sorted input.
+5a. ~~Correlated `EXISTS` with a mixed equality-and-inequality correlation (item 10k).~~
+   **Landed** as `_sql/parser/subquery/specialized.py`. This entry's reason for deferring it —
+   "it needs a semi-join with a residual predicate rather than a parser edit" — was wrong, and
+   wrong in the expensive direction: it deferred a front-end change by describing it as an
+   engine one. The general decorrelation is a row tag, a join, a filter and a distinct, needs
+   no new operator, and `NOT EXISTS` was broken for this shape too. See 10k.
+6a. **A sorted-input aggregate and adjacent dedup (item 10f).** **The detection half is built
+   (2026-08-13); the memory half — the reason this was ranked first — is not.**
 
-   It is first among the remaining because its win is **memory, not speed**: a sorted group-by
-   has `O(1)` state, so it is the one shape that turns a spilling aggregate into a streaming
-   one, and Polars ships four operators that consume the property
-   (`sorted_group_by`, `sorted_unique`, `is_first_distinct`, `merge_sorted`). Batcher already
-   tracks and propagates the property; nothing consumes it.
+   Built: `bc_runtime::agg::group::runs` assigns group ids by scanning runs instead of hashing,
+   tried first inside `assign_groups`, so it reaches `GROUP BY`, `DISTINCT` and the partitioned
+   window together. It needed **no IR flag and no Kyber rule**, because it proves the ordering
+   rather than reading `sorted_by` — see 10f for why trusting that declaration would have been
+   a wrong-answer risk rather than a slow one. Worth **1.0-1.2x end to end** on sorted input and
+   measured 1.00x on everything else; the 6.0x in the microbenchmark did not survive to the
+   query, and 10f records why.
 
-   Sequence it behind a session that can run the distributed suite. The algorithm is a scan
-   over adjacent runs; the cost is the contract around it — a two-sided IR change in one
-   commit, and a mergeable form, without which it works perfectly on one node and silently
-   caps there.
+   Still open, and it is the part with the value: **bounded state**. A sorted group-by has
+   `O(1)` state, which is the one shape that turns an aggregate the streaming path *refuses*
+   (`stream/breaker.rs`: "the streaming aggregate does not spill") into one it completes.
+   Polars ships four operators that consume the property (`sorted_group_by`, `sorted_unique`,
+   `is_first_distinct`, `merge_sorted`).
+
+   The remaining cost is **not** the adjacency scan, which is now written and tested. It is a
+   soundness question the earlier drafts of this entry did not name: a group emitted when its
+   run closes cannot be taken back if a later batch reintroduces its key, and per-batch
+   verification detects that only *after* the row has gone downstream. So early emission is
+   sound only where the ordering is a fact about the **plan** — a `Sort` the engine itself
+   performed — rather than a claim about the data. Decide that first; the IR flag, the
+   mergeable form and the three executors follow from it, and a session that can run the
+   distributed suite is still the right place for them.
 7. **An adaptive-width sort key for the per-range sort (item 9).** Proven
    permutation-identical and worth 1.69x on high-cardinality 27-char keys, but a *fixed*
    4-byte head loses 0.78-0.87x on two other shapes, so the width has to come from the sample

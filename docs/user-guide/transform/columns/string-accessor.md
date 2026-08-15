@@ -85,7 +85,7 @@ right distance for fixed-width codes. `jaccard(target)` scores the overlap of tw
 values' character sets. `hamming` raises on unequal lengths rather than comparing a
 prefix, because a prefix comparison answers a caller's mistake with a plausible number.
 
-### Paths and URLs
+## Paths and URLs
 
 Text columns often hold a file path or a URL component rather than prose. {py:meth}`parse_path <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_path>`
 splits a path into its parts, and {py:meth}`parse_filename <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_filename>`, {py:meth}`parse_dirname <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_dirname>` and {py:meth}`parse_dirpath <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_dirpath>`
@@ -122,7 +122,7 @@ Other `.str` methods include `lower`, `trim`, `lstrip`, `rstrip`, `reverse`,
 `substr`, `right`, `repeat`, `lpad`, `rpad`, `position`, `split`, `replace`,
 `initcap`, `hex`, `base64`, `from_base64`, `unhex`, and `translate`.
 
-### Recasing identifiers
+## Recasing identifiers
 
 Column names, event names, and enum values arrive from upstream systems in whatever
 convention that system used. {py:meth}`to_case(style) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.to_case>` normalizes them. One splitter finds the
@@ -144,7 +144,7 @@ print(out.to_pydict())
 The styles are `snake`, `upper_snake`, `camel`, `pascal`, `kebab`, `upper_kebab`,
 `title`, `sentence`, `dot`, and `train`.
 
-### Compressed payloads inside a column
+## Compressed payloads inside a column
 
 Compressed bytes arrive inside columns, not only inside files: a gzipped JSON body in a
 Kafka record, a zstd-framed blob in a warehouse table. {py:meth}`compress(codec) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.compress>` and
@@ -189,7 +189,7 @@ trip: `a_b_c` becomes `aBC`, which reads back as two words. Prefer a separator s
 the result will be parsed again.
 :::
 
-### Regex
+## Regex
 
 Alongside the single-match {py:meth}`regexp_matches <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_matches>`, {py:meth}`regexp_replace <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_replace>`, and {py:meth}`regexp_extract <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_extract>`,
 three methods work over *every* match in a string: {py:meth}`regexp_count <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_count>` tallies the
@@ -222,7 +222,7 @@ print(out.to_pydict())
 # {'parts': [['alpha', 'beta', 'gamma'], ['one two   three']], 'words': [['alpha,', 'beta;gamma'], ['one', 'two', 'three']]}
 ```
 
-### Building strings from several columns
+## Building strings from several columns
 
 Two top-level helpers assemble one string from many expressions.
 {py:obj}`bt.format_string(template, *exprs) <batcher.format_string>` interpolates
@@ -239,7 +239,7 @@ print(out.to_pydict())
 # {'label': ['Ann x1', 'bob x2', 'CARL x3'], 'key': ['Ann-1', 'bob-2', 'CARL-3']}
 ```
 
-### Parsing text into dates
+## Parsing text into dates
 
 Parsing string columns into temporal types also lives on `.str`:
 {py:meth}`to_date(format) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.to_date>` yields a `Date` and {py:meth}`to_datetime(format) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.to_datetime>` a `Timestamp`, each

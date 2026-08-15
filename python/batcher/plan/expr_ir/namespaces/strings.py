@@ -14,7 +14,7 @@ from typing import Any
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.constructors import lit, nullif
-from batcher.plan.expr_ir.core import AggExpr, Cast, Expr, Lit
+from batcher.plan.expr_ir.core import AggExpr, Binary, Cast, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
 from batcher.plan.expr_ir.nodes import ListJoin
@@ -231,6 +231,12 @@ class _StrNamespace:
         family, EPUB), and the archive and columnar formats (gzip, zstd, bzip2, xz, zip,
         Parquet, Arrow, Avro, SQLite).
 
+        HTML and XML have no magic number, so they are sniffed from the first tag the way
+        `file(1)` and every browser sniff them. That is worth the special case here more
+        than anywhere else: a scraped corpus is mostly HTML, and a download column is
+        exactly the case with no filename to fall back on. A bare ``<`` is deliberately not
+        guessed from, because an SVG, a plist and an RSS feed all start that way.
+
         Null for unrecognized bytes rather than ``application/octet-stream``, because those
         are different claims: an expression sees only bytes, and a caller that also has a
         filename may still identify the row. Combine with :meth:`~batcher.Expr.coalesce` to
@@ -247,6 +253,10 @@ class _StrNamespace:
                 >>> blobs = bt.from_pydict({"b": [b"\x89PNG\r\n\x1a\n" + bytes(8), b"nope"]})
                 >>> blobs.select(bt.col("b").str.mime_type().alias("m")).to_pydict()
                 {'m': ['image/png', None]}
+
+                >>> pages = bt.from_pydict({"b": [b"<!DOCTYPE html><p>hi", b"<?xml ?>"]})
+                >>> pages.select(bt.col("b").str.mime_type().alias("m")).to_pydict()
+                {'m': ['text/html', 'application/xml']}
 
                 >>> # Route a mixed blob corpus without a UDF.
                 >>> images = blobs.filter(bt.col("b").str.mime_type().str.starts_with("image/"))
@@ -757,7 +767,7 @@ class _StrNamespace:
 
         Note the divergence from Polars: with ``chars=None`` this strips the ASCII **space**
         only, following SQL ``TRIM`` (and DuckDB), not the whole whitespace class. Tabs and
-        newlines survive. Pass them explicitly — ``strip_chars(" \t\n")`` — when the input
+        newlines survive. Pass them explicitly — ``strip_chars(" \\t\\n")`` — when the input
         may carry them, which scraped and CSV text usually does.
 
         Args:
@@ -1052,7 +1062,7 @@ class _StrNamespace:
         """Uppercase the first character and lowercase the rest (pandas ``str.capitalize``).
 
         Unlike :meth:`initcap`, which title-cases *every* word, this only touches the
-        first character of the whole string.
+        first character of the whole string. NULL in, NULL out.
 
         Returns:
             A Utf8 expression of the capitalized string.
@@ -1061,13 +1071,17 @@ class _StrNamespace:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"s": ["hELLO wORLD"]})
+                >>> ds = bt.from_pydict({"s": ["hELLO wORLD", None]})
                 >>> ds.select(r=bt.col("s").str.capitalize()).to_pydict()
-                {'r': ['Hello world']}
+                {'r': ['Hello world', None]}
         """
-        from batcher.plan.functions.string import concat
-
-        return concat(self.left(1).str.upper(), self.substr(2).str.lower())
+        # `Binary("concat", ...)` is the `||` operator, which *propagates* NULL. The
+        # `concat()` function this used to call is the DuckDB one, which deliberately
+        # coalesces NULL to the empty string — so `capitalize(NULL)` returned `''` while
+        # every other string method returned NULL. That was a silent wrong answer, not an
+        # error, and `''` is also the correct answer for an empty-string *input*, so the
+        # two cases were indistinguishable downstream.
+        return Binary("concat", self.left(1).str.upper(), self.substr(2).str.lower())
 
     def remove_punctuation(self) -> StrFunc:
         """Drop every character that is not a word character or whitespace.
@@ -2599,7 +2613,7 @@ class _StrNamespace:
         """Trim from both ends — the pandas ``str.strip`` spelling of :meth:`trim`.
 
         Unlike Python's ``str.strip()``, the no-argument form removes the ASCII **space**
-        only, following SQL ``TRIM``. Pass ``strip(" \t\n")`` to also drop tabs and newlines.
+        only, following SQL ``TRIM``. Pass ``strip(" \\t\\n")`` to also drop tabs and newlines.
 
         Args:
             chars: The characters to strip; the ASCII space when ``None``.

@@ -280,15 +280,27 @@ pub(crate) fn decide(
     };
 
     // Sample: partial the first `n` morsels and read the reduction they achieved.
-    let n = sample_size(rayon::current_num_threads(), morsels.len());
+    let threads = rayon::current_num_threads().max(1);
+    let n = sample_size(threads, morsels.len());
     let sampled = partials(&morsels[..n], group_keys, aggregates, jit)?;
     let rows_in: usize = morsels[..n].iter().map(|b| b.num_rows()).sum();
     let total_rows: usize = morsels.iter().map(|b| b.num_rows()).sum();
     if let Some(width) = width_from_sample(&sampled, rows_in, n, total_rows) {
+        let groups = groups_from_sample(&sampled, rows_in, n, total_rows);
+        // The sample says a *morsel* does not reduce — but a morsel is 16,384 rows, and a
+        // group count well under that reduces enormously over a whole worker's share. Both
+        // readings are right and they choose different shapes, so the group count decides
+        // between them. See [`chunked_partials`].
+        if chunking_pays(threads, groups, total_rows) {
+            return Ok(AggPlan::Partials {
+                partials: chunked_partials(morsels, group_keys, aggregates, jit, threads)?,
+                groups,
+            });
+        }
         return Ok(AggPlan::Partition {
             keys: keys.to_vec(),
             width,
-            groups: groups_from_sample(&sampled, rows_in, n, total_rows),
+            groups,
         });
     }
 
@@ -302,6 +314,70 @@ pub(crate) fn decide(
         partials: all,
         groups,
     })
+}
+
+/// Partial rows the merge may inherit, as a fraction of the input, before chunking is not
+/// worth its concatenation.
+///
+/// Chunking replaces the partition path's hash-and-gather over the whole relation with one
+/// contiguous copy per worker, and pays for it with a `combine` over `workers x groups`
+/// partial rows. So the question is only ever how big that merge is relative to the relation
+/// it saves gathering, and a quarter is the point past which the merge is the larger of the
+/// two — at which point the gather it avoids is no longer the expensive half.
+const CHUNK_MERGE_CEILING: f64 = 0.25;
+
+/// Whether one partial per worker beats partitioning, for a group count this size.
+fn chunking_pays(threads: usize, groups: usize, total_rows: usize) -> bool {
+    if groups == 0 || total_rows == 0 || threads < 2 {
+        return false;
+    }
+    (threads as f64) * (groups as f64) <= CHUNK_MERGE_CEILING * (total_rows as f64)
+}
+
+/// One partial per **worker** rather than per morsel: concatenate each worker's share and
+/// hash it once, into one table.
+///
+/// The reducing path builds a hash table per 16,384-row morsel, and the sample rejects it
+/// when a morsel's partial keeps too many of its rows. That test is right about the morsel
+/// and blind to the *relation*: a `GROUP BY` producing 10,000 groups fills a morsel's table
+/// almost completely — 0.61 rows kept per input row, three times the ceiling — while
+/// reducing 10 M rows to 10 thousand. So the aggregate was routed to the partition path,
+/// which hashes and **gathers the entire relation** to avoid a merge that a worker-sized
+/// table makes small: 96 workers x 10,000 groups is 960 k partial rows against the 6.1 M a
+/// per-morsel partial hands the same merge, and against 10 M rows gathered.
+///
+/// Measured on the H2O `groupby` suite at its 1e7-row tier, this is the 10,000-group band
+/// specifically, and it is where the suite loses: `sum(v1) BY id1, id2` ran at **2.86x**
+/// DuckDB on two string keys and 2.02x on two integer ones, while the same query at 100
+/// groups (0.92x) and at 100,000 (1.44x / 0.82x) sits either side of it.
+///
+/// The partials are the same partials — `eval_partial_jit` over a contiguous slice of the
+/// same rows, in the same order — so `combine`, `finalize`, the spill path and the
+/// distributed reduce are untouched. This is invariant #7's `partial` computed over a bigger
+/// unit, and nothing else.
+pub(crate) fn chunked_partials(
+    morsels: &[RecordBatch],
+    group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
+    jit: &AggJit,
+    chunks: usize,
+) -> Result<Vec<agg::Partial>, InterpError> {
+    let per = morsels.len().div_ceil(chunks.max(1)).max(1);
+    let schema = morsels[0].schema();
+    morsels
+        .par_chunks(per)
+        .map(|chunk| {
+            // One morsel is already contiguous; concatenating it would copy it for nothing.
+            match chunk {
+                [only] => ops::eval_partial_jit(only, group_keys, aggregates, jit),
+                many => {
+                    let joined = arrow::compute::concat_batches(&schema, many)
+                        .map_err(crate::error::InterpError::from)?;
+                    ops::eval_partial_jit(&joined, group_keys, aggregates, jit)
+                }
+            }
+        })
+        .collect()
 }
 
 /// One partial per morsel — the reducing path's first step, and the fallback when the

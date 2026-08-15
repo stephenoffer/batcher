@@ -24,6 +24,7 @@ from batcher.config.config import (
     DistributedConfig,
     MetadataConfig,
 )
+from batcher.config.env import TRUE_TOKENS
 
 __all__ = [
     "AUTOSCALE_WAIT_AUTO",
@@ -48,7 +49,7 @@ AUTOSCALE_WAIT_DEFAULT_S = 180.0
 # orchestrators surface. Detection is env-var only — never a metadata-service network
 # call on a hot path — so a deployment with no signal sets `BATCHER_SPOT=1` (or passes
 # `resilience="spot"`). Truthy means spot.
-_SPOT_TRUE = frozenset({"1", "true", "yes", "on", "spot", "preemptible", "preempt"})
+_SPOT_TRUE = TRUE_TOKENS | frozenset({"spot", "preemptible", "preempt"})
 _SPOT_FLAG_VARS = ("BATCHER_SPOT", "RAY_SPOT")
 _SPOT_LIFECYCLE_VARS = ("RAY_NODE_TYPE_NAME", "NODE_LIFECYCLE", "INSTANCE_LIFECYCLE")
 

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from batcher.config.accelerator import CACHE_DTYPE_BYTES
+
 __all__ = [
     "DEFAULT_BLOCK_TOKENS",
     "KvCacheBudget",
@@ -35,9 +37,10 @@ __all__ = [
     "paged_tokens",
 ]
 
-#: Bytes per element for the cache dtypes a serving engine offers. FP8 KV cache halves the
-#: cache against FP16 at a small quality cost, and is the single largest lever on concurrency.
-_DTYPE_BYTES = {"fp32": 4, "float32": 4, "fp16": 2, "float16": 2, "bf16": 2, "fp8": 1, "int8": 1}
+#: Bytes per element, imported rather than restated: `config.accelerator` validates a
+#: `kv_cache_dtype` against exactly this table's keys, and a dtype it accepted but this one
+#: lacked would size at zero bytes.
+_DTYPE_BYTES = CACHE_DTYPE_BYTES
 
 #: Tokens in one cache block under paged attention. Every serving engine that pages allocates
 #: in whole blocks, so a sequence occupies a multiple of this many tokens' worth of cache

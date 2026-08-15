@@ -19,6 +19,7 @@ from batcher.api.dataset._dedup import (
     build_near_duplicates,
     build_similarity_join,
 )
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.logical import MapBatches
 
 if TYPE_CHECKING:
@@ -138,13 +139,7 @@ def _require_column(ds: Dataset, column: str, *, param: str) -> None:
     Turns the deferred, opaque failure a wrong column name would otherwise cause deep in the
     engine into an eager, actionable one at the API edge (``did you mean 'text'?``).
     """
-    if column in ds.columns:
-        return
-    from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-    raise ColumnNotFoundError(
-        unknown_message("column", column, ds.columns, hint=f"Pass an existing column to {param}.")
-    )
+    require_columns(ds, column, hint=f"Pass an existing column to {param}.")
 
 
 def _require_query_vector(ds: Dataset, query: list[float], column: str, *, method: str) -> None:
@@ -2556,6 +2551,7 @@ class DatasetML:
         columns: list[str] | None = None,
         global_consumed: int = 0,
         collate_fn: object = None,
+        shuffle_block_size: int | None = None,
     ):
         """Feed this dataset to one training rank as a `torch` ``IterableDataset``.
 
@@ -2581,6 +2577,9 @@ class DatasetML:
             collate_fn: Custom collation over each rank batch's `pyarrow.Table`. Also the
                 escape hatch for columns that do not tensorize (string labels or ids),
                 which are otherwise dropped from the yielded batch.
+            shuffle_block_size: Shuffle within blocks of this many samples rather than
+                across the whole corpus, matching the order `shard_stream_loader` gives the
+                same corpus written with that shard size.
 
         Returns:
             A `torch.utils.data.IterableDataset` yielding this rank's batches.
@@ -2612,6 +2611,74 @@ class DatasetML:
             columns=columns,
             global_consumed=global_consumed,
             collate_fn=collate_fn,
+            shuffle_block_size=shuffle_block_size,
+        )
+
+    def write_shards(
+        self,
+        directory: str,
+        *,
+        rows_per_shard: int = 65_536,
+        batch_size: int | None = None,
+        distributed: bool | str = False,
+        resume: bool = False,
+        write_concurrency: int | None = None,
+    ):
+        """Write this dataset as a training-shard corpus `shard_stream_loader` can stream.
+
+        The on-ramp to the larger-than-memory training path (the MosaicML ``MDSWriter`` /
+        WebDataset ``ShardWriter`` role). `stream_loader` keeps one rank's whole shard of the
+        corpus resident, which stops scaling once a rank's share exceeds RAM; a shard corpus
+        removes that ceiling, and this is how one gets written. The rows stream out of the
+        engine and into fixed-size Arrow-IPC shards plus an ``index.json``, so writing a
+        corpus larger than memory needs no more memory than one shard.
+
+        Shards are plain Arrow IPC files, so the same corpus reads back relationally with
+        ``bt.read.arrow(f"{directory}/*.arrow")`` — this is a layout, not a private format.
+
+        Args:
+            directory: Where to write the shards and their index.
+            rows_per_shard: Rows in every shard but the last. Larger shards mean fewer, more
+                sequential reads and a coarser default shuffle block; smaller ones let a
+                bounded shard cache hold more of the corpus.
+            batch_size: Rows per batch read out of the engine (engine default when None).
+                Independent of `rows_per_shard`, which the writer repacks to exactly.
+            distributed: Produce the rows on a Ray cluster rather than in this process.
+                The *writing* stays here and stays sequential, because shard boundaries have
+                to be deterministic for a global row index to mean anything — but the read,
+                the decode and every transform ahead of it fan out.
+            resume: Continue a previous, interrupted write rather than starting over. The
+                manifest is republished as the write proceeds, so a corpus left behind by a
+                crash is both readable and resumable, and the rows already written are
+                skipped from this dataset rather than re-encoded. Requires the dataset to
+                produce the same rows in the same order, which a shuffled global order
+                already assumes of it.
+            write_concurrency: Shards to publish at once. Defaults to a size derived from
+                the destination and the measured shard size — cores for local disk, requests
+                in flight for an object store, where publishing one shard at a time makes a
+                large corpus spend most of its time waiting on round trips.
+
+        Returns:
+            The `batcher.io.formats.ml.ShardIndex` describing what was written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, os, tempfile
+                >>> ds = bt.from_pydict({"x": list(range(10)), "y": [1.0] * 10})
+                >>> out = os.path.join(tempfile.mkdtemp(), "corpus")
+                >>> index = ds.ml.write_shards(out, rows_per_shard=4)
+                >>> index.total_rows, len(index.shard_paths)
+                (10, 3)
+        """
+        from batcher.io.formats.ml.shards import write_shards
+
+        return write_shards(
+            self._ds.iter_batches(batch_size, distributed=distributed),
+            directory,
+            rows_per_shard=rows_per_shard,
+            resume=resume,
+            write_concurrency=write_concurrency,
         )
 
     def iter_torch_batches(
@@ -2816,15 +2883,32 @@ class DatasetML:
         *,
         batch_size: int | None = None,
         columns: list[str] | None = None,
+        dtypes: dict[str, str] | str | None = None,
+        local_shuffle_buffer_size: int | None = None,
+        seed: int = 0,
+        epoch: int = 0,
+        drop_last: bool = False,
     ):
         """Stream this dataset to a ``tf.data.Dataset`` of ``{column: tensor}`` batches.
 
         The TensorFlow counterpart of `to_torch`, built over the public batch iterator so
-        nothing materializes. Non-numeric columns are dropped. Requires `tensorflow`.
+        nothing materializes. It takes the same shuffle, batch-width and dtype options,
+        because it prepares its stream with the same code the PyTorch loader does — this
+        was the one loader in the package with none of them. Non-numeric columns are
+        dropped. Requires `tensorflow`.
 
         Args:
             batch_size: Rows per yielded batch (engine default when None).
             columns: The columns to keep; defaults to all numeric columns.
+            dtypes: Cast the yielded tensors — one dtype name for every column, or a
+                ``{column: dtype}`` mapping. Abbreviations (``"fp16"``) are accepted.
+            local_shuffle_buffer_size: Shuffle within blocks of this many rows before
+                batching, a streaming approximation of a global shuffle. None disables it.
+            seed: Seed for that shuffle, combined with `epoch`.
+            epoch: Reshuffles the local-shuffle order so successive passes over the same
+                dataset differ. Without it every epoch replays one order.
+            drop_last: Drop a final batch narrower than `batch_size`, so a ragged tail never
+                reaches a fixed-shape graph. Requires `batch_size`.
 
         Returns:
             A ``tf.data.Dataset`` yielding one ``{column: tensor}`` dict per batch.
@@ -2833,13 +2917,23 @@ class DatasetML:
             .. doctest::
 
                 >>> import batcher as bt  # doctest: +SKIP
-                >>> tf_ds = ds.ml.to_tf(batch_size=256)  # doctest: +SKIP
+                >>> tf_ds = ds.ml.to_tf(batch_size=256, local_shuffle_buffer_size=8192)
                 >>> model.fit(tf_ds)  # doctest: +SKIP
         """
         _require_columns(self._ds, columns, param="columns")
-        from batcher.ml.converters import to_tf_dataset
+        from batcher.ml.converters import tf_dataset_from_arrays
+        from batcher.ml.loader.lazy import cast_arrays, numpy_batch_stream
 
-        return to_tf_dataset(self._ds.iter_batches(batch_size), columns=columns)
+        stream = numpy_batch_stream(
+            self._ds,
+            batch_size=batch_size,
+            columns=columns,
+            local_shuffle_buffer_size=local_shuffle_buffer_size,
+            seed=seed,
+            epoch=epoch,
+            drop_last=drop_last,
+        )
+        return tf_dataset_from_arrays(cast_arrays(stream, dtypes))
 
     def to_numpy_batches(
         self,

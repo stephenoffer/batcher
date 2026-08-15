@@ -35,7 +35,7 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node
+from batcher.kyber.rules.leaf_rewrite import collapse_doubled_call, node_expr_rule, rewrite_node
 from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_ir.func_nodes import DateFunc, DateOffset, DateTrunc
 from batcher.plan.logical import Filter, LogicalPlan, Project
@@ -149,16 +149,6 @@ def _part_through_trunc(part: str):
     return leaf
 
 
-def _make_part_rule(part: str):
-    """The node-local `f(node, ctx)` closure for one date part."""
-    leaf = _part_through_trunc(part)
-
-    def apply(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_node(node, leaf)
-
-    return apply
-
-
 # One registered rule per date part, over a single shared body -- the pattern
 # `extra/temporal_sargable` established for its `(extraction, operator)` cross-product.
 # Registering per part rather than as one blanket rule is what makes `explain` name the
@@ -177,7 +167,7 @@ DATE_PART_THROUGH_TRUNC_RULES = [
         node_rule(
             f"{part}_through_finer_trunc",
             Phase.NORMALIZE,
-            _make_part_rule(part),
+            node_expr_rule(_part_through_trunc(part)),
             matches=(Filter, Project),
             expr_fn=_part_through_trunc(part),
             expr_matches=(DateFunc,),
@@ -187,15 +177,8 @@ DATE_PART_THROUGH_TRUNC_RULES = [
 ]
 
 
-def _last_day_idempotent(expr: Expr) -> Expr:
-    if (
-        isinstance(expr, DateFunc)
-        and expr.fn == "last_day"
-        and isinstance(expr.input, DateFunc)
-        and expr.input.fn == "last_day"
-    ):
-        return expr.input
-    return expr
+#: `last_day(last_day(t))` -> `last_day(t)`, through the shared idempotent factory.
+_last_day_idempotent = collapse_doubled_call(DateFunc, "last_day")
 
 
 @rule(

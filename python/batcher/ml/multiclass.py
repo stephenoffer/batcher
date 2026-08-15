@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml._estimator import argmax_prediction, require_fitted
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir import col, lit, when
 
 if TYPE_CHECKING:
@@ -146,13 +147,7 @@ class OneVsRestClassifier:
             PlanError: If the target has fewer than two classes, or more than `max_classes`.
             ColumnNotFoundError: If a named column is missing.
         """
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
+        require_columns(ds, *self.features, self.target)
         labels = [
             v.as_py()
             for v in ds.select(self.target)

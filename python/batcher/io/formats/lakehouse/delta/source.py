@@ -20,6 +20,7 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import note_suppressed
 from batcher.io.formats.base import SOURCES
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
@@ -53,6 +54,23 @@ class DeltaFileSplit:
     storage_options: dict[str, str] | None = field(repr=False)
     version: int | None
     rows: int | None = None
+    #: This file's partition values, in the table's partition-column order, or `()` for an
+    #: unpartitioned table. Read off the add action the driver already had, so it costs
+    #: nothing, and turned into a co-location guarantee by `io.splits.clustering`: every row
+    #: in this file shares them, so grouping the files that share them onto one worker makes
+    #: a `GROUP BY` over those columns need no shuffle.
+    partition_columns: tuple[str, ...] = ()
+    partition_values: tuple[Any, ...] = ()
+
+    @property
+    def clustering_columns(self) -> tuple[str, ...]:
+        """The partition columns this file holds constant. See `io.splits.clustering`."""
+        return self.partition_columns
+
+    @property
+    def clustering_value(self) -> tuple[Any, ...]:
+        """This file's partition values, the key its splits are grouped by."""
+        return self.partition_values
 
     def _snapshot(self) -> Any:
         from batcher.io.formats.lakehouse.delta._snapshot import open_snapshot
@@ -194,8 +212,12 @@ class DeltaSource:
         return self._snapshot().add_actions()
 
     def _pa_filter(self, predicate: dict | None) -> Any:
-        if predicate is None:
-            return None
+        """The pushed filter, typed against the snapshot's schema. `None` in, `None` out.
+
+        Kept where the four wrappers like it were deleted, because this one does something:
+        it reads `self._snapshot().schema()`. The `predicate is None` guard is `to_pyarrow_
+        expression`'s job now.
+        """
         from batcher.io.predicate import to_pyarrow_expression
 
         # Pass the table schema so a temporal literal is typed to its column — without it,
@@ -323,6 +345,21 @@ class DeltaSource:
                 ref = "latest"
         return f"delta:{self._table_uri}@{ref}"
 
+    def clustering_columns(self) -> tuple[str, ...]:
+        """The columns this table's splits will hold constant, from the already-replayed log.
+
+        The cheap precondition for `io.splits.clustering` — see `ParquetDatasetSource` for why
+        a consumer must be able to ask before planning a read.
+
+        Returns:
+            The partition columns in declared order, or an empty tuple.
+        """
+        try:
+            return tuple(self._snapshot().partition_columns())
+        except Exception as exc:
+            note_suppressed("io", "read the Delta partition columns", exc)
+            return ()
+
     def splits(
         self,
         target_size: int | None = None,  # noqa: ARG002 — protocol signature; Delta splits per file
@@ -351,15 +388,26 @@ class DeltaSource:
                 paths = snapshot.file_paths()
             version = snapshot.version
             rows_by_path = snapshot.rows_by_path()
+            part_cols = tuple(snapshot.partition_columns())
+            part_values = snapshot.partition_values_by_path()
         except Exception:
             return [WholeSourceSplit(self)]
         if not paths:
             # Provably empty: keep one split so the scan still yields a typed, zero-row
             # result rather than an absent one.
             return [WholeSourceSplit(self)]
+        # A file with no recorded values declares no clustering, and `declared_clustering`
+        # then refuses the whole set — which is the right answer, since a file whose
+        # partition is unknown could hold any of them.
         return [
             DeltaFileSplit(
-                self._table_uri, path, self._storage_options, version, rows_by_path.get(path)
+                self._table_uri,
+                path,
+                self._storage_options,
+                version,
+                rows_by_path.get(path),
+                part_cols if path in part_values else (),
+                part_values.get(path, ()),
             )
             for path in paths
         ]

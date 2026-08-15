@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_names
 
 if TYPE_CHECKING:
     import numpy as np
@@ -155,12 +156,7 @@ def mmr_rerank_udf(
 
 def _require(batch: pa.RecordBatch, name: str) -> None:
     """Fail naming the columns the batch does have, rather than with an index error."""
-    if name not in batch.schema.names:
-        from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-        raise ColumnNotFoundError(
-            unknown_message("column", name, list(batch.schema.names), hint="Pass a list column.")
-        )
+    require_names(batch.schema.names, name, hint="Pass a list column.")
 
 
 def _require_grouped_candidates(batch: pa.RecordBatch, embedding_column: str) -> None:

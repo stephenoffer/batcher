@@ -115,3 +115,52 @@ def test_a_narrow_source_is_unaffected_by_the_byte_term(corpus) -> None:
     plan = bt.read.images(corpus)._plan
     # The default 256 MiB budget dwarfs this corpus, so bytes imply a single task.
     assert _byte_partition_count(ImageSource(corpus), plan, 10) == 1
+
+
+# --- the blob substrate underneath ------------------------------------------------
+#
+# `BinarySource` is what the media sources are built on, and it had the *same* gap: an
+# exact row count and nothing else, so `column_bytes` priced its `large_binary` column at
+# the 36-byte type prior whatever the corpus actually held. Both now derive the identical
+# shape from the identical inputs through `io.stats.file_listing.whole_file_statistics`,
+# which is the point of these — a second copy in a second format package is the one way
+# the two could drift apart.
+
+
+@pytest.fixture
+def blobs(tmp_path):
+    """Three files of very different sizes, so a per-row byte figure is falsifiable."""
+    for i, n in enumerate((100, 5_000, 200_000)):
+        (tmp_path / f"f{i}.bin").write_bytes(b"x" * n)
+    return tmp_path
+
+
+def test_blob_source_reports_listing_statistics(blobs) -> None:
+    from batcher.io.formats.unstructured.binary import BinarySource
+
+    stats = BinarySource(str(blobs)).statistics()
+    assert stats.row_count == 3
+    assert stats.exact_rows
+    assert stats.byte_size == 205_100
+
+
+def test_blob_source_declares_its_bytes_as_row_content(blobs) -> None:
+    """Without this the width estimator ignores `byte_size` and keeps the 36-byte prior.
+
+    One row *is* one file here, so `byte_size / row_count` is the width outright — the
+    distinction `SourceStatistics.content_byte_size` exists to draw against a columnar
+    source, whose stored size measures something else.
+    """
+    from batcher.io.formats.unstructured.binary import BinarySource
+
+    assert BinarySource(str(blobs)).statistics().content_byte_size
+
+
+def test_blob_source_size_bounds_are_exact(blobs) -> None:
+    """They are the values themselves, not per-chunk bounds, so `WHERE size > ...` prunes."""
+    from batcher.io.formats.unstructured.binary import BinarySource
+
+    size = BinarySource(str(blobs)).statistics().columns["size"]
+    assert (size.min, size.max) == (100, 200_000)
+    assert size.provenance.is_exact
+    assert size.null_count == 0

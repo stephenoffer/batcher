@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections import deque
 
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.types import one_batch
 
 __all__ = ["ProducerActor", "coalesce", "consumer_batch_rows"]
 
@@ -161,7 +162,6 @@ try:
             no more rows to wait for — and the result is unchanged either way, because the
             stage is breaker-free and its output is the concatenation of its inputs'.
             """
-            import pyarrow as pa
 
             from batcher import core
             from batcher.io.source import InMemorySource
@@ -186,13 +186,10 @@ try:
                 nxt = self._pending.popleft()
                 held.append(nxt)
                 rows += nxt.num_rows
-            if len(held) == 1:
-                return held[0]
-            # `concat_batches` rather than `combine_chunks().to_batches()[0]`: the latter
-            # splits at the 32-bit offset limit, so a published morsel holding more than
-            # 2 GiB of string or binary data came back as several batches and taking the
-            # first silently dropped every row after it.
-            return pa.concat_batches(held)
+            # `one_batch` is the shared compaction: it keeps every row and raises rather
+            # than returning a prefix when a published morsel genuinely exceeds the 32-bit
+            # offset limit, which more than 2 GiB of string or binary data does.
+            return one_batch(held)
 
         def release(self, ticket) -> None:
             """Evict a published morsel once its consumer has fetched it — frees one

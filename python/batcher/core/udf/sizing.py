@@ -27,6 +27,7 @@ import pyarrow as pa
 from batcher._internal.logging import note_suppressed
 from batcher.metadata.hardware_scope import scoped
 from batcher.plan.logical import MapBatches
+from batcher.plan.types import retained_bytes
 
 __all__ = [
     "cpu_batch_rows",
@@ -92,7 +93,7 @@ def gpu_batch_rows(batch: pa.RecordBatch, row_cap: int = _GPU_STREAM_BATCH_ROWS)
     """
     if batch.num_rows <= 0:
         return row_cap
-    per_row = max(1, batch.nbytes // batch.num_rows)
+    per_row = max(1, retained_bytes(batch) // batch.num_rows)
     warn_if_row_is_unsplittable(per_row)
     by_bytes = _GPU_STREAM_BATCH_BYTES // per_row
     return max(_GPU_STREAM_BATCH_MIN, min(row_cap, by_bytes))
@@ -189,7 +190,7 @@ def cpu_batch_rows(batch: pa.RecordBatch, morsel: int) -> int:
     only shards the morsel, so the concatenated output is identical to the plain morsel path."""
     if batch.num_rows <= 0:
         return morsel
-    per_row = max(1, batch.nbytes // batch.num_rows)
+    per_row = max(1, retained_bytes(batch) // batch.num_rows)
     warn_if_row_is_unsplittable(per_row)
     by_bytes = _CPU_STREAM_BATCH_BYTES // per_row
     return max(1, min(morsel, by_bytes))

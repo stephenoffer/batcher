@@ -27,6 +27,7 @@ from batcher.io.base._layout import FileLayout
 from batcher.io.manifest import WriteManifest
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.types import logical_bytes
 
 __all__ = [
     "_collect",
@@ -403,10 +404,17 @@ def _count(plan: LogicalPlan, sources: list[Source], _columns: list[str]) -> int
     `global_count_plan`): projection pushdown reads only the filter/key columns and a count
     over a `Filter` fuses into one `count_if` pass, so no result rows are materialized.
     """
-    from batcher.api.terminal.metadata_answer import global_count_plan
+    from batcher.api.terminal.metadata_answer import global_count_plan, pushed_count
 
     source_stats = _shared_source_stats(plan, sources)
     answer = metadata_count(plan, sources, source_stats)
+    if answer is not None:
+        _record_count_selectivity(plan, sources, answer)
+        return answer
+    # A source that can count itself, asked only now: the free answers have declined, and
+    # the remaining option is to read the relation to count it. One `COUNT(*)` round trip
+    # beats transferring every column of every row to produce an integer.
+    answer = pushed_count(plan, sources)
     if answer is not None:
         _record_count_selectivity(plan, sources, answer)
         return answer
@@ -579,6 +587,17 @@ def _streaming_write_eligible(
     `num_files` and `target_bytes_per_file` genuinely need the whole result — both are
     computed from its total size — so they stay on the collect path, as does
     `partition_by`, which has to fan rows out by key.
+
+    A plan with a **breaker** (a sort, a join, a group-by) streams too, but only under a
+    `max_rows_per_file` cap. The router (`_iter_batches`) yields such plans in bounded
+    memory — a top-level aggregate or top-N folds, a sort / join / window comes off the
+    out-of-core bucket pipeline, a UNION ALL goes branch by branch — so the read side is not
+    what stops it. The *write* side is: a single-file write ends by persisting the result's
+    statistics for a later read of this path, and computing those needs the whole table. The
+    cap is exactly the case where it would not have persisted them anyway (that write goes
+    to the parts path), so nothing is given up there — and it is the caller most likely to
+    need this, since capping the file size usually means the result does not fit on the
+    driver, which is what the cap used to force it to do.
     """
     from batcher.io.source import InMemorySource, MaterializedSource
     from batcher.plan.logical import is_streamable
@@ -591,7 +610,7 @@ def _streaming_write_eligible(
         return False
     if max_rows_per_file is not None and not hasattr(sink, "write_stream_parts"):
         return False
-    if not is_streamable(plan):
+    if not is_streamable(plan) and max_rows_per_file is None:
         return False
     return not all(isinstance(s, InMemorySource | MaterializedSource) for s in sources)
 
@@ -1000,7 +1019,8 @@ def _write(
     # Resolve the layout to a per-file row cap now that the size is known (no extra
     # counting pass): split into `num_files`, or size files to `target_bytes_per_file`
     # using the materialized byte size.
-    if (max_rows_per_file := layout.rows_per_file(table.num_rows, table.nbytes)) is not None or (
+    max_rows_per_file = layout.rows_per_file(table.num_rows, logical_bytes(table))
+    if max_rows_per_file is not None or (
         directory
         or partition_by
         or _sink_owns_its_layout(sink, path)
@@ -1165,13 +1185,30 @@ def _narrowed_limit(plan: LogicalPlan, limit: int) -> LogicalPlan:
 def _is_bounded_peek(plan) -> bool:
     """Whether `plan` is a `LIMIT n` whose result is finite even over an endless source.
 
-    Only over a breaker-free input: the router streams that and stops the moment it has n
-    rows. Over a sort the answer is finite too and unreachable, because top-N is not known
-    until the last row has arrived.
-    """
-    from batcher.plan.logical import Limit, is_streamable
+    Two inputs qualify, and both for the same reason: the router has a driver that stops
+    reading the moment the answer is settled.
 
-    return isinstance(plan, Limit) and is_streamable(plan.input)
+    - A **breaker-free** input — filter / select / map_batches — where the first `n` rows
+      out are the answer.
+    - A whole-column **`DISTINCT`**, where the first `n` distinct rows are. Once `n` of
+      them have been seen, every later row is either a duplicate or arrives too late to
+      displace one, so the read stops there (`core.streaming.stream_distinct_limit`).
+      `distinct().head(20)` is how anyone finds out what values a topic carries, and it
+      was refused while `filter().head(20)` beside it was not — a difference the caller had
+      no way to predict, since both terminate and both hold `n` rows.
+
+    Over a *sort* the answer is finite too and still unreachable, because top-N is not
+    known until the last row has arrived. A **keyed** `DISTINCT ON` likewise stays out: its
+    survivor per key can be replaced by a later row, so no prefix settles it.
+    """
+    from batcher.plan.logical import Distinct, Limit, is_streamable
+
+    if not isinstance(plan, Limit):
+        return False
+    inner = plan.input
+    if is_streamable(inner):
+        return True
+    return isinstance(inner, Distinct) and not inner.keys and is_streamable(inner.input)
 
 
 def _peek_schema(plan) -> pa.Schema:

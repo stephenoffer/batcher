@@ -86,6 +86,41 @@ class TestShuffleScratch:
         write_ipc([batch], str(root / "part-0.arrow"))
         assert_private(root / "part-0.arrow", "shuffle IPC file")
 
+    def test_the_shared_writer_is_private(self, tmp_path: Path) -> None:
+        """`IpcWriter` is the one place a distributed artifact's stream is opened."""
+        from batcher.dist.shuffle_io import IpcWriter
+
+        batch = pa.record_batch({"a": pa.array([1, 2], type=pa.int64())})
+        path = tmp_path / "spool.arrow"
+        with IpcWriter(str(path)) as writer:
+            writer.write(batch)
+        assert_private(path, "IpcWriter output")
+
+    def test_grace_resplit_subbuckets_are_private(self, tmp_path: Path) -> None:
+        """The out-of-core join's sub-bucket files hold the join's own rows.
+
+        This one opened `pa.OSFile(path, "wb")` directly, so its sub-buckets landed 0644
+        on whatever scratch the query was using — a shared cluster mount included.
+        """
+        from batcher._internal.native import engine
+        from batcher.dist.shuffle_io import write_ipc
+        from batcher.dist.spill_breakers.join import _spill_paths_to_subbuckets
+
+        batch = pa.record_batch(
+            {
+                "k": pa.array([i % 7 for i in range(200)], type=pa.int64()),
+                "v": pa.array(range(200), type=pa.int64()),
+            }
+        )
+        source = write_ipc([batch], str(tmp_path / "in-0.arrow"))
+        out_paths, _ = _spill_paths_to_subbuckets(
+            engine(), [source], ["k"], 4, str(tmp_path), "sub"
+        )
+        assert any(out_paths), "the re-split produced no sub-buckets to check"
+        for path in out_paths:
+            if path is not None:
+                assert_private(path, "grace re-split sub-bucket")
+
     def test_round_robin_output_is_private(self, tmp_path: Path) -> None:
         from batcher.dist.shuffle_io import write_ipc_round_robin
 
@@ -94,6 +129,55 @@ class TestShuffleScratch:
         write_ipc_round_robin([batch], batch.schema, paths)
         for path in paths:
             assert_private(path, "round-robin shuffle file")
+
+
+class TestStreamingCheckpoint:
+    """A checkpoint is the one at-rest surface that *outlives* the query by design."""
+
+    def test_a_state_snapshot_is_private(self, tmp_path: Path) -> None:
+        """The snapshot holds the running aggregate's own group keys and values."""
+        from batcher.io.formats.streaming.checkpoint.state_store import StateStore
+
+        root = tmp_path / "ckpt" / "state"
+        store = StateStore(str(root))
+        store.snapshot(
+            7,
+            pa.record_batch(
+                {
+                    "user": pa.array(["alice", "bob"]),
+                    "spend_cents": pa.array([1234, 99], type=pa.int64()),
+                }
+            ),
+        )
+        assert_tree_private(root, "checkpoint state")
+        # And it still reads back — tightening the mode must not move the contract.
+        assert store.restore(7).num_rows == 2
+
+    def test_no_temporary_file_is_left_readable(self, tmp_path: Path) -> None:
+        """The snapshot lands via a `.tmp` rename, so the temp file is the real window."""
+        from batcher.io.formats.streaming.checkpoint.state_store import StateStore
+
+        root = tmp_path / "state"
+        store = StateStore(str(root))
+        store.snapshot(1, pa.record_batch({"k": pa.array([1], type=pa.int64())}))
+        assert not list(root.glob("*.tmp")), "a temp snapshot survived the rename"
+        assert_tree_private(root, "checkpoint state")
+
+
+class TestFileCache:
+    def test_cached_remote_files_are_private(self, tmp_path: Path) -> None:
+        """A cache entry is a byte-for-byte copy of one of the user's data files.
+
+        The cache root is Batcher's own subdirectory of a node volume other tenants also
+        mount, and the entry's own mode belongs to the caller's `fetch` — so the directory
+        is what has to protect the bytes.
+        """
+        from batcher.io._file_cache import FileBytesCache
+
+        root = tmp_path / "batcher_file_cache"
+        cache = FileBytesCache(str(root), max_bytes=1 << 20)
+        cache.get_or_fetch("s3://bucket/data.parquet", lambda p: Path(p).write_bytes(b"rows"))
+        assert_private(root, "file cache root")
 
 
 class TestEventLog:

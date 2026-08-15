@@ -108,10 +108,28 @@ class LearnedParams:
         # entry — as opposed to merged up from the legacy single-blob shape. `_unchanged`
         # only elides a redundant write for a key in here, so a legacy entry still migrates.
         self._keyed_stored: dict[str, set[str]] = {}
+        # Every write that changed something, across every namespace. See `writes`.
+        self._writes = 0
 
     def __repr__(self) -> str:
         """How many namespaces are resident — the question asked when a cache looks cold."""
         return f"LearnedParams(namespaces={len(self._generations)})"
+
+    @property
+    def writes(self) -> int:
+        """Count of writes that changed the store, across every namespace.
+
+        The per-namespace `_generations` counter cannot serve as a change signal for a
+        *reader*, and neither can the identity of the dict `load_keyed` hands back:
+        `put_keyed` deliberately patches that dict in place and leaves the generation alone,
+        because the write *is* the new value of one entry and re-parsing the namespace on the
+        next query would be pure waste. Both choices are right for the cache they serve and
+        both make "has anything changed since I last looked?" unanswerable from outside.
+
+        This answers it in one integer, monotonic and cheap, so a consumer that folds the
+        whole store into a derived bundle can reuse the fold until a write actually lands.
+        """
+        return self._writes
 
     # --- whole-namespace blob ----------------------------------------------
     def load(self, namespace: str) -> dict[str, Any]:
@@ -165,6 +183,7 @@ class LearnedParams:
         # namespace's generation moves.
         generation = self._generation(namespace) + 1
         self._generations[namespace] = generation
+        self._writes += 1
         # The blob view *can* be patched, because this write is its new whole value. Parsed
         # back rather than cached as `params`, so the view holds exactly what a reader of the
         # store would see and never aliases an object the caller still owns and may mutate.
@@ -243,6 +262,7 @@ class LearnedParams:
             return
         blob = encoded(f"{namespace}.{key}", value)
         self._backend.put(LEARNED_PARAMS, (namespace, key), blob)
+        self._writes += 1
         self._generation(namespace)  # register on the eviction roster before caching under it
         self._keyed_stored.setdefault(namespace, set()).add(key)
         # Patch the parsed view rather than invalidating it: this write *is* the new value of

@@ -179,6 +179,9 @@ def test_image_source_header_only_meta(tmp_path):
     assert (rows["b.png"]["width"], rows["b.png"]["height"]) == (8, 2)
     assert rows["a.png"]["mode"] == "RGB"
     assert rows["a.png"]["mime"] == "image/png"
+    # The container the bytes actually are, from the same header parse. A corpus assembled
+    # by content type is full of files whose extension and container disagree.
+    assert rows["a.png"]["format"] == "png"
 
 
 def test_image_source_corrupt_header_yields_null_meta(tmp_path):
@@ -207,7 +210,15 @@ def test_video_source_schema():
     from batcher.io.formats.multimodal.video import VideoSource
 
     names = VideoSource.__new__(VideoSource)._meta_fields()
-    assert [n for n, _ in names] == ["fps", "frames", "width", "height", "duration"]
+    assert [n for n, _ in names] == [
+        "fps",
+        "frames",
+        "width",
+        "height",
+        "duration",
+        "codec",
+        "has_audio",
+    ]
 
 
 def test_embedding_source_npy_fixed_size_list(tmp_path):
@@ -271,3 +282,59 @@ def test_sizes_learned_from_the_read_equal_what_a_stat_would_say(tmp_path):
     source = ImageSource(str(tmp_path))
     source.read()
     assert source._size_cache == {f: source._fs.size(f) for f in source._files()}
+
+
+# ---- blob offload: content addressing and the fan-out ----------------------
+
+
+def test_offload_writes_a_repeated_payload_once(tmp_path):
+    """Content addressing dedupes *within* a batch, not only across batches.
+
+    Two rows carrying the same payload hash the same, so the store holds one object and
+    both rows get the same handle. A per-row write loop would have written it twice.
+    """
+    from batcher.io.formats.multimodal.blob import offload_blob_bytes
+
+    root = str(tmp_path / "store")
+    batch = pa.RecordBatch.from_pydict(
+        {"id": [1, 2, 3], "bytes": [b"same", b"same", b"other"]},
+        schema=pa.schema([("id", pa.int64()), ("bytes", pa.large_binary())]),
+    )
+    out = offload_blob_bytes(batch, root=root)
+    uris = out.column("uri").to_pylist()
+    assert uris[0] == uris[1] != uris[2]
+    assert len(list((tmp_path / "store").iterdir())) == 2
+
+
+def test_offload_and_materialize_are_inverses_and_keep_row_order(tmp_path):
+    """The property the fan-out must not break: row *i* gets back row *i*'s payload.
+
+    Both halves now read and write concurrently, so order is no longer implied by the loop
+    that produced it — it is a promise `read_each_file` keeps and this asserts.
+    """
+    from batcher.io.formats.multimodal.blob import materialize_and_drop_handle, offload_blob_bytes
+
+    payloads = [f"payload-{i}".encode() for i in range(32)]
+    payloads[7] = None  # a null payload stays null through both directions
+    batch = pa.RecordBatch.from_pydict(
+        {"id": list(range(32)), "bytes": payloads},
+        schema=pa.schema([("id", pa.int64()), ("bytes", pa.large_binary())]),
+    )
+    offloaded = offload_blob_bytes(batch, root=str(tmp_path / "store"))
+    assert offloaded.column("bytes").null_count == 32, "the payload column is emptied"
+
+    restored = materialize_and_drop_handle(offloaded)
+    assert restored.schema.names == batch.schema.names, "the handle column is dropped"
+    assert restored.column("bytes").to_pylist() == payloads
+    assert restored.column("id").to_pylist() == list(range(32))
+
+
+def test_a_batch_of_only_null_payloads_needs_no_store(tmp_path):
+    """The empty case the fan-out must not trip over: nothing to resolve a filesystem from."""
+    from batcher.io.formats.multimodal.blob import read_blob_bytes
+
+    batch = pa.RecordBatch.from_pydict(
+        {"uri": [None, None]}, schema=pa.schema([("uri", pa.string())])
+    )
+    out = read_blob_bytes(batch)
+    assert out.column("bytes").to_pylist() == [None, None]

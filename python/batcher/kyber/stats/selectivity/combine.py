@@ -14,21 +14,28 @@ from typing import Any
 
 from batcher._internal.mathx import clamp01
 from batcher.config import CardinalityConfig
+from batcher.kyber.stats.selectivity.arithmetic import interval_containment
 from batcher.kyber.stats.selectivity.leaves import (
     _equality_selectivity,
     _in_list_selectivity,
     _measured_null_fraction,
+    _non_null_budget,
     _null_mass,
     _range_selectivity,
     _str_func_selectivity,
+    date_part_interval_selectivity,
+    date_part_key,
 )
 from batcher.kyber.stats.selectivity.scalars import (
+    _estimation_column,
     _fraction_below_bounds,
     _fraction_below_quantiles,
     _mcv_lookup,
     _ordinal,
     _point_mass,
-    comparison_col_side,
+    estimation_col_side,
+    mcv_fraction_below,
+    non_null_mass,
 )
 from batcher.plan.expr_ir import (
     Binary,
@@ -102,15 +109,15 @@ def _raw_predicate_selectivity(
             coalesced = _coalesce_equality_selectivity(expr, ndv, cfg, mcv, nulls)
             if coalesced is not None:
                 return coalesced
-            return _equality_selectivity(expr, ndv, cfg, mcv, bounds)
+            return _equality_selectivity(expr, ndv, cfg, mcv, bounds, nulls)
         if op == "ne":
             # `col != v` is TRUE only where `col` is non-null and unequal. The null rows
             # are dropped, so the complement is taken over `1 - f_null`, not over 1.
             return (1.0 - _null_mass(expr, nulls)) - _equality_selectivity(
-                expr, ndv, cfg, mcv, bounds
+                expr, ndv, cfg, mcv, bounds, nulls
             )
         if op in ORDERING_COMPARISONS:
-            return _range_selectivity(expr, op, cfg, quantiles, bounds, ndv, mcv)
+            return _range_selectivity(expr, op, cfg, quantiles, bounds, ndv, mcv, nulls)
     if isinstance(expr, Not):
         inner = predicate_selectivity(expr.input, ndv, cfg, quantiles, mcv, bounds, nulls)
         return (1.0 - _null_mass(expr.input, nulls)) - inner
@@ -121,15 +128,15 @@ def _raw_predicate_selectivity(
         measured = _measured_null_fraction(expr, nulls)
         return 1.0 - (cfg.null_selectivity if measured is None else measured)
     if isinstance(expr, InList):
-        return _in_list_selectivity(expr, ndv, cfg, mcv, bounds)
+        return _in_list_selectivity(expr, ndv, cfg, mcv, bounds, nulls)
     if isinstance(expr, StrFunc):
-        return _str_func_selectivity(expr, ndv, cfg, mcv)
+        return _str_func_selectivity(expr, ndv, cfg, mcv, nulls)
     if isinstance(expr, ListContains):
         # The third container the same containment question is asked of, after a string and
         # a JSON document. It reached no branch at all and took the trailing "no information"
         # default, so `list.contains(x)` was estimated to keep ten times as many rows as
         # `str.contains(x)` — a difference in the *container's type*, not in the question.
-        return cfg.substring_selectivity
+        return _non_null_budget(expr, nulls) * cfg.substring_selectivity
     if isinstance(expr, Lit) and isinstance(expr.value, bool):
         # A constant predicate keeps everything or nothing — never the 0.5 "unknown" default.
         # (The folder usually removes these, but a `CASE` arm reaches here as a literal.)
@@ -172,7 +179,9 @@ def _raw_predicate_selectivity(
         freq = _mcv_lookup(mcv.get(expr.name), True)
         if freq is not None:
             return freq
-        return cfg.default_filter_selectivity
+        # A NULL flag is neither TRUE nor FALSE, so it is dropped: the even split is over the
+        # rows that carry a value, not over the whole relation.
+        return non_null_mass(expr.name, nulls) * cfg.default_filter_selectivity
     return cfg.default_filter_selectivity
 
 
@@ -216,6 +225,9 @@ def _coalesce_equality_selectivity(
     if coal is None or not coal.inputs or not isinstance(coal.inputs[0], Col):
         return None
     inner = coal.inputs[0]
+    # Deliberately *not* passed `nulls`: `COALESCE` has already replaced `x`'s null rows with
+    # the fill, and the branch below adds them back explicitly when the fill matches. Scaling
+    # here as well would remove them and then re-add a share of them.
     base = _equality_selectivity(Binary("eq", inner, lit), ndv, cfg, mcv)
     fill = coal.inputs[1] if len(coal.inputs) > 1 else None
     if isinstance(fill, Lit) and fill.value == lit.value:
@@ -264,21 +276,95 @@ def _combine_disjuncts(
     `x IN (1, 2)`). Cross-column disjuncts are assumed independent and combined by
     `1 - ∏(1 - sᵢ)` — the exact N-ary generalization of the old pairwise `a + b - a·b`, so a
     disjunction across different columns is unchanged.
+
+    Same-column *range* disjuncts are not independent either, and are united as half-lines by
+    `_range_union_selectivity` rather than multiplied.
     """
     groups: dict[str, float] = {}
-    others: list[float] = []
+    ranges: dict[str, list[Binary]] = {}
+    others: list[Expr] = []
     for d in disjuncts:
         col = _same_column_membership(d)
-        sel = predicate_selectivity(d, ndv, cfg, quantiles, mcv, bounds, nulls)
         if col is not None:
-            groups[col] = groups.get(col, 0.0) + sel  # disjoint values → sum
+            groups[col] = groups.get(col, 0.0) + predicate_selectivity(
+                d, ndv, cfg, quantiles, mcv, bounds, nulls
+            )  # disjoint values → sum
+            continue
+        range_col = _range_column(d)
+        if range_col is not None:
+            ranges.setdefault(range_col, []).append(d)  # type: ignore[arg-type]
         else:
-            others.append(sel)
-    terms = [min(1.0, g) for g in groups.values()] + others
+            others.append(d)
+    terms = [min(1.0, g) for g in groups.values()]
+    terms += [predicate_selectivity(d, ndv, cfg, quantiles, mcv, bounds, nulls) for d in others]
+    for col, comps in ranges.items():
+        united = _range_union_selectivity(col, comps, quantiles, bounds, ndv, mcv, nulls)
+        if united is None:
+            terms += [
+                predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in comps
+            ]
+        else:
+            terms.append(united)
     product = 1.0
-    for s in terms:
-        product *= 1.0 - s
+    for term in terms:
+        product *= 1.0 - term
     return 1.0 - product
+
+
+def _range_union_selectivity(
+    col: str,
+    comps: list[Binary],
+    quantiles: dict[str, Any],
+    bounds: dict[str, tuple[Any, Any]],
+    ndv: dict[str, float],
+    mcv: dict[str, dict[str, float]],
+    nulls: dict[str, float] | None = None,
+) -> float | None:
+    """Selectivity of an OR of same-column range comparisons, as one union of half-lines.
+
+    The disjunctive twin of `_interval_selectivity`, and it corrects the same class of error.
+    Two range predicates on one column are the tightest possible *positive* correlation:
+    `x < 50 OR x < 70` is exactly `x < 70`, and `x < 10 OR x > 90` is the pair of tails. The
+    independent-union rule `1 - ∏(1 - sᵢ)` assumes they overlap only by chance, so it invents
+    survivors that are not there — measured at 17,001 rows against 14,055 actual for
+    `x < 50 OR x < 70` over 20,000 rows, and the error grows with the number of disjuncts.
+
+    Each comparison is a half-line, so the union collapses to two numbers: the largest upper
+    CDF among the `<`/`<=` bounds and the largest tail mass among the `>`/`>=` ones. Their sum
+    is the union's mass, capped at the non-null budget — and the cap is exactly right, because
+    the two sides sum past the budget precisely when the half-lines overlap and cover
+    everything.
+
+    Returns None when the column has fewer than two comparisons or no CDF to interpolate
+    against, so those defer to the per-disjunct estimate exactly as before.
+    """
+    if len(comps) < 2:
+        return None
+    q = quantiles.get(col)
+    bnd = bounds.get(col)
+    if not q and bnd is None and not mcv.get(col):
+        return None
+    budget = non_null_mass(col, nulls)
+    below, above = 0.0, 0.0
+    for c in comps:
+        side = estimation_col_side(c)
+        if side is None:
+            return None
+        _, value, col_on_left = side
+        eff = c.op if col_on_left else ORDERING_FLIP[c.op]
+        frac = _fraction_below_quantiles(value, q)
+        if frac is None:
+            frac = _fraction_below_bounds(_ordinal(value), bnd)
+        if frac is None:
+            frac = mcv_fraction_below(mcv.get(col), value)
+        if frac is None:
+            return None
+        point = _point_mass(col, value, ndv, mcv, non_null=budget) / budget if budget else 0.0
+        if eff in ("lt", "le"):  # a lower half-line: keep the most permissive ceiling
+            below = max(below, frac if eff == "le" else frac - point)
+        else:  # gt / ge → an upper half-line: keep the largest tail
+            above = max(above, 1.0 - (frac - point if eff == "ge" else frac))
+    return clamp01(budget * min(1.0, below + above))
 
 
 def _same_column_membership(expr: Expr) -> str | None:
@@ -288,10 +374,12 @@ def _same_column_membership(expr: Expr) -> str | None:
     the same column, so an OR of them sums. A range/`OR`/opaque disjunct returns None and is
     combined by the independent-union rule instead.
     """
-    if isinstance(expr, InList) and isinstance(expr.input, Col):
-        return expr.input.name
+    if isinstance(expr, InList):
+        inner = _estimation_column(expr.input)
+        if inner is not None:
+            return inner.name
     if isinstance(expr, Binary) and expr.op == "eq":
-        side = comparison_col_side(expr)
+        side = estimation_col_side(expr)
         if side is not None:
             return side[0]
     return None
@@ -326,15 +414,36 @@ def _conjunct_selectivities(
     """
     ranges: dict[str, list[Binary]] = {}
     others: list[Expr] = []
-    for c in conjuncts:
+    sels: list[float] = []
+    contained = _interval_containment_selectivity(conjuncts, bounds, nulls)
+    remaining = conjuncts
+    if contained is not None:
+        selectivity, consumed = contained
+        sels.append(selectivity)
+        remaining = [c for c in conjuncts if not any(c is used for used in consumed)]
+    parts: dict[str, list[Binary]] = {}
+    for c in remaining:
         col = _range_column(c)
         if col is not None:
             ranges.setdefault(col, []).append(c)  # type: ignore[arg-type]
+            continue
+        # `month(d)` and `hour(ts)` are derived fields, so `_range_column` never grouped two
+        # comparisons on one — and `MONTH(d) BETWEEN 3 AND 5` combined as if its two bounds
+        # were independent predicates.
+        part = date_part_key(c)
+        if part is not None:
+            parts.setdefault(part, []).append(c)  # type: ignore[arg-type]
         else:
             others.append(c)
-    sels = [predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in others]
+    for comps in parts.values():
+        combined = date_part_interval_selectivity(comps, nulls)
+        if combined is None:
+            others.extend(comps)
+        else:
+            sels.append(combined)
+    sels += [predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in others]
     for col, comps in ranges.items():
-        combined = _interval_selectivity(col, comps, quantiles, bounds, ndv, mcv)
+        combined = _interval_selectivity(col, comps, quantiles, bounds, ndv, mcv, nulls)
         if combined is not None:
             sels.append(combined)
         else:
@@ -342,6 +451,59 @@ def _conjunct_selectivities(
                 predicate_selectivity(c, ndv, cfg, quantiles, mcv, bounds, nulls) for c in comps
             )
     return sels
+
+
+def _interval_containment_selectivity(
+    conjuncts: list[Expr],
+    bounds: dict[str, tuple[Any, Any]],
+    nulls: dict[str, float],
+) -> tuple[float, list[Expr]] | None:
+    """`probe BETWEEN lower AND upper` over three *columns*, estimated from the interval width.
+
+    The temporal-validity lookup — `WHERE ts >= valid_from AND ts < valid_to` — which is the
+    whole of an SCD-2 point-in-time join, an IP-range or version lookup, and the payload of a
+    range join. It is the one conjunction where independence is structurally wrong rather than
+    merely imprecise: `lower` and `upper` are the two ends of *one* interval and move together,
+    so each bound alone really does cut about half the rows while the pair cuts far more.
+
+    With the probe independent of the interval, the exact answer is an expectation, not a
+    product::
+
+        P(lower <= probe <= upper) = E[F(upper) - F(lower)] = (E[upper] - E[lower]) / range(probe)
+
+    under a uniform probe — the interval's *mean width* as a share of the probe's span, which
+    is the quantity neither conjunct mentions. Measured on a 100-wide interval inside a
+    1,000-wide domain: 0.247 estimated against 0.101 actual, and the formula gives 0.100.
+
+    Means are taken as bound midpoints, which is what uniformity already assumes everywhere
+    else here. Declines (None) unless all three columns have ordinal bounds and the probe's
+    span is positive, so anything unusual keeps the per-conjunct estimate.
+    """
+    match = interval_containment(list(conjuncts))
+    if match is None:
+        return None
+    probe, lower, upper, consumed = match
+    spans = [_ordinal_span(bounds.get(name)) for name in (probe, lower, upper)]
+    if any(span is None for span in spans):
+        return None
+    (p_lo, p_hi), (l_lo, l_hi), (u_lo, u_hi) = spans  # type: ignore[misc]
+    width = p_hi - p_lo
+    if width <= 0.0:
+        return None
+    mean_width = ((u_lo + u_hi) / 2.0) - ((l_lo + l_hi) / 2.0)
+    # Each of the three operands must hold a value for the comparison to be TRUE.
+    budget = min(non_null_mass(name, nulls) for name in (probe, lower, upper))
+    return clamp01(budget * mean_width / width), consumed
+
+
+def _ordinal_span(bound: tuple[Any, Any] | None) -> tuple[float, float] | None:
+    """A column's `[min, max]` as a pair of ordinals, or None when it is not comparable."""
+    if bound is None or bound[0] is None or bound[1] is None:
+        return None
+    lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
+    if lo is None or hi is None or hi < lo:
+        return None
+    return lo, hi
 
 
 def _range_column(expr: Expr) -> str | None:
@@ -352,8 +514,12 @@ def _range_column(expr: Expr) -> str | None:
     """
     if not (isinstance(expr, Binary) and expr.op in ORDERING_COMPARISONS):
         return None
-    side = comparison_col_side(expr)
-    if side is None or _ordinal(side[1]) is None:
+    side = estimation_col_side(expr)
+    if side is None:
+        return None
+    # A string literal has no ordinal, but `_interval_selectivity` can still place it against
+    # the column's measured values — which is exactly the shape `starts_with` is rewritten to.
+    if _ordinal(side[1]) is None and not isinstance(side[1], str):
         return None
     return side[0]
 
@@ -365,6 +531,7 @@ def _interval_selectivity(
     bounds: dict[str, tuple[Any, Any]],
     ndv: dict[str, float],
     mcv: dict[str, dict[str, float]],
+    nulls: dict[str, float] | None = None,
 ) -> float | None:
     """Selectivity of a set of same-column range comparisons as one interval.
 
@@ -380,11 +547,16 @@ def _interval_selectivity(
         return None
     q = quantiles.get(col)
     bnd = bounds.get(col)
-    if not q and bnd is None:
+    col_mcv = mcv.get(col)
+    if not q and bnd is None and not col_mcv:
         return None
+    # The grid and the bounds describe the non-null values, so the interval's mass is a share
+    # of those; `budget` returns it to a share of the relation. A `BETWEEN` is NULL, and so
+    # dropped, on every null row.
+    budget = non_null_mass(col, nulls)
     lower_cdf, upper_cdf = 0.0, 1.0
     for c in comps:
-        side = comparison_col_side(c)
+        side = estimation_col_side(c)
         if side is None:
             return None
         _, value, col_on_left = side
@@ -394,14 +566,21 @@ def _interval_selectivity(
         if frac is None:
             frac = _fraction_below_bounds(x, bnd)
         if frac is None:
+            # A string column has no ordinal CDF; its measured values supply one.
+            frac = mcv_fraction_below(col_mcv, value)
+        if frac is None:
             return None
+        # Both the interpolated CDF and the boundary mass are held in the conditional
+        # (non-null) space here, so they subtract coherently; the single scaling is applied
+        # to the interval's width at the end.
+        point = _point_mass(col, value, ndv, mcv, non_null=budget) / budget if budget else 0.0
         if eff in ("lt", "le"):  # upper bound: keep the smallest (tightest ceiling)
-            cdf = frac if eff == "le" else frac - _point_mass(col, value, ndv, mcv)
+            cdf = frac if eff == "le" else frac - point
             upper_cdf = min(upper_cdf, cdf)
         else:  # gt / ge → lower bound: keep the largest (tightest floor)
-            cdf = frac - _point_mass(col, value, ndv, mcv) if eff == "ge" else frac
+            cdf = frac - point if eff == "ge" else frac
             lower_cdf = max(lower_cdf, cdf)
-    return clamp01(upper_cdf - lower_cdf)
+    return clamp01(budget * (upper_cdf - lower_cdf))
 
 
 def _exponential_backoff(sels: list[float]) -> float:

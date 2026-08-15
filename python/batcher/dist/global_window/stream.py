@@ -35,6 +35,7 @@ from batcher.dist.spill import _fd_safe, map_projection
 from batcher.dist.spill.buckets import read_reserved_bucket, spill_scratch
 from batcher.dist.spill_breakers import stage_and_partition
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import Window
 
 __all__ = ["stream_spilling_global_window"]
@@ -62,7 +63,7 @@ def stream_spilling_global_window(
     # touching them — mutating the cached structures would corrupt every later use of the
     # same plan.
     win_ir = dict(window.to_ir())
-    win_ir["input"] = {"op": "scan", "source_id": 0}
+    win_ir["input"] = task_scan_ir()
     win_ir["functions"] = list(win_ir["functions"])
     # `avg` is offset through its running sum and count, so ask the kernel for those two
     # alongside it under private aliases; they are read back per bucket and dropped before

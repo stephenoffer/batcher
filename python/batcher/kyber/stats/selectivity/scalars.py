@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import datetime
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
-from batcher.kyber.stats.distribution import residual_eq_frequency
-from batcher.plan.expr_ir import Binary, Col, Lit
+from batcher.kyber.stats.distribution import residual_mass
+from batcher.plan.expr_ir import Binary, Cast, Col, Expr, Lit
 from batcher.plan.stats import AXIS_NUMERIC, ordinal_with_axis
 
 # Comparison operators flip when the column is on the right (`literal < col` ≡ `col > literal`).
@@ -33,10 +33,62 @@ def comparison_col_side(expr: Binary) -> tuple[str, Any, bool] | None:
 
 def _column_of_comparison(expr: Binary) -> str | None:
     """The column name in a `col OP literal` (or `literal OP col`) comparison."""
-    if isinstance(expr.left, Col) and isinstance(expr.right, Lit):
-        return expr.left.name
-    if isinstance(expr.right, Col) and isinstance(expr.left, Lit):
-        return expr.right.name
+    side = estimation_col_side(expr)
+    return None if side is None else side[0]
+
+
+# A cast to a boolean collapses the whole value domain onto two values, so the source
+# column's distinct count says nothing about the result's — `1/ndv` over a million-value
+# column would price `cast(x AS BOOLEAN) = true` at a millionth of the rows when the truth
+# is around half. Every other target keeps the source's distribution recognisable: a numeric
+# widening is exact, a narrowing or a truncation can only *merge* values (so `1/ndv` becomes
+# a floor rather than a wrong number), and a cast to text preserves distinctness exactly.
+_OPAQUE_CAST_DTYPES = frozenset({"bool", "boolean"})
+
+
+def _estimation_column(expr: Expr) -> Col | None:
+    """The column an operand ultimately reads, seeing through a value-preserving cast.
+
+    **For estimation only.** `comparison_col_side` deliberately does *not* do this, and must
+    not: it feeds zone-map and bloom pruning, where reading a `Cast`'s literal against the
+    source column's index is a proof of absence drawn from the wrong value domain — the one
+    place in the optimizer where a bug deletes rows rather than mis-sizing a buffer. Here the
+    cost of being wrong is a worse plan, so the trade is the opposite one.
+
+    Without this, `cast(x AS DOUBLE) = 5.0` had no column at all and fell to the flat
+    cold-start constant: measured at 2,000 rows against 197 actual, a 10x over-estimate on a
+    shape SQL produces constantly (an implicit widening in a comparison, a `CAST` written to
+    satisfy a type checker). The source column's statistics describe that expression closely —
+    exactly for an order- and distinctness-preserving cast, and as a bound otherwise.
+
+    A `try_cast` is excluded: it turns a failed conversion into a NULL, so it changes the null
+    fraction the budget is computed from rather than just relabelling values.
+    """
+    if isinstance(expr, Col):
+        return expr
+    if isinstance(expr, Cast) and not expr.try_cast and expr.dtype not in _OPAQUE_CAST_DTYPES:
+        return _estimation_column(expr.input)
+    return None
+
+
+def estimation_col_side(expr: Binary) -> tuple[str, Any, bool] | None:
+    """`(column, literal, col_on_left)` for a comparison, seeing through a cast.
+
+    The estimation-side twin of `comparison_col_side` (see `_estimation_column` for why the
+    two must stay separate).
+
+    Args:
+        expr: The comparison to read.
+
+    Returns:
+        The column name, the literal it is compared against, and whether the column was on
+        the left, or None when this is not a column-to-literal comparison.
+    """
+    left, right = _estimation_column(expr.left), _estimation_column(expr.right)
+    if left is not None and isinstance(expr.right, Lit):
+        return left.name, expr.right.value, True
+    if right is not None and isinstance(expr.left, Lit):
+        return right.name, expr.left.value, False
     return None
 
 
@@ -100,6 +152,7 @@ def _point_mass(
     value: Any,
     ndv: dict[str, float],
     mcv: dict[str, dict[str, float]],
+    non_null: float = 1.0,
 ) -> float:
     """`P(col = value)` — the probability mass sitting exactly on a range boundary.
 
@@ -108,6 +161,11 @@ def _point_mass(
     list (`residual_eq_frequency`) rather than the whole column's `1/ndv`. Zero when the
     distinct count is unknown, which degrades the strict/non-strict distinction back to none
     rather than inventing a mass.
+
+    The answer is a share of **all** rows, nulls included, which is the same space the CDF
+    it is subtracted from lives in (`_from_cdf`). A measured MCV frequency is already in that
+    space; the residual is put there by `non_null`, the fraction of rows the column is not
+    NULL on.
     """
     col_mcv = mcv.get(col)
     freq = _mcv_lookup(col_mcv, value)
@@ -116,7 +174,46 @@ def _point_mass(
     d = ndv.get(col)
     if not d or d <= 0:
         return 0.0
-    return residual_eq_frequency(d, col_mcv, default=0.0)
+    residual = residual_mass(col_mcv, non_null)
+    remaining = d - len(col_mcv or {})
+    if remaining <= 0.0 or residual <= 0.0:
+        # The table enumerates the whole column, so a value it does not list carries **no**
+        # mass. `residual_eq_frequency` answers the rarest listed frequency here instead, and
+        # is right to: as an *equality* estimate it must not claim a predicate matches exactly
+        # nothing. A CDF boundary is a different question, and borrowing that floor subtracts a
+        # whole value's worth from an interval that does not contain the value — which is how
+        # `LIKE 'red%'`, rewritten to `s >= 'red' AND s < 'ree'`, collapsed from 1,636 rows to
+        # 56: the mass of the absent `'ree'` was subtracted from both of its bounds.
+        return 0.0
+    return min(non_null / d, residual / remaining)
+
+
+def non_null_mass(col: str | None, nulls: Mapping[str, float] | None) -> float:
+    """The fraction of rows on which `col` holds a value rather than NULL.
+
+    The budget every value-distribution statistic is spread over. `ndv` counts distinct
+    *non-null* values (the sketch skips nulls), a quantile grid is built over the non-null
+    values, and `[min, max]` bounds them — so each of those answers a probability
+    *conditioned on the column being non-null*, and reporting it unconditionally over-states
+    every predicate on a nullable column by `1 / (1 - f_null)`.
+
+    Returns 1 for an unmeasured column, which is what `_null_mass` already assumes for the
+    complement side: an unmeasured column is usually null-free, and inventing a null fraction
+    would shrink every estimate on no evidence.
+
+    Args:
+        col: The column name, or None when the predicate reads no single column.
+        nulls: The measured `{column: null_fraction}` map.
+
+    Returns:
+        The non-null fraction, in `[0, 1]`.
+    """
+    if col is None or not nulls:
+        return 1.0
+    f = nulls.get(col)
+    if f is None:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 - f))
 
 
 def _outside_bounds(value: Any, bound: tuple[Any, Any] | None) -> bool:
@@ -131,8 +228,26 @@ def _outside_bounds(value: Any, bound: tuple[Any, Any] | None) -> bool:
     x = _ordinal(value)
     lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
     if x is None or lo is None or hi is None:
-        return False
+        return _outside_string_bounds(value, bound)
     return x < lo or x > hi
+
+
+def _outside_string_bounds(value: Any, bound: tuple[Any, Any]) -> bool:
+    """Whether a string literal falls outside a string column's `[min, max]`.
+
+    A string has no float ordinal, so the check above declines and `col = 'zzz'` over a column
+    whose values end at `'violet'` kept a fifth of the table rather than nothing.
+
+    Sound despite the truncation caveat that keeps strings off the ordinal axis elsewhere: a
+    Parquet writer truncates a `min` downwards and a `max` upwards, so the stored pair is
+    always a *superset* of the real range and a literal outside it is genuinely absent. And
+    Python compares `str` by code point while the engine compares UTF-8 bytes, which is the
+    same order — UTF-8 is defined so that byte order and code-point order agree.
+    """
+    lo, hi = bound
+    if not (isinstance(value, str) and isinstance(lo, str) and isinstance(hi, str)):
+        return False
+    return value < lo or value > hi
 
 
 def _fraction_below_quantiles(value: Any, q: dict[str, Any] | None) -> float | None:
@@ -208,8 +323,66 @@ def discrete_step_mass(bound: tuple[Any, Any] | None) -> float | None:
     return 1.0 / (hi - lo + 1)
 
 
-def _fraction_below_bounds(x: float, bound: tuple[Any, Any] | None) -> float | None:
+def mcv_fraction_below(col_mcv: Mapping[str, float] | None, value: Any) -> float | None:
+    """`P(v <= value | v is not NULL)` read off the measured values, for an unordered axis.
+
+    A string has no float ordinal — deliberately, because a string column's footer bounds may
+    be byte-truncated and an ordinal built from them is not sound for *pruning*, where a wrong
+    answer drops rows. So `s >= 'blue'` had no CDF at all and took Selinger's 1/3 constant: 2,667
+    rows estimated against 6,420 actual, and `NOT (s < 'zzz')` — which matches nothing, since
+    every value is below `'zzz'` — estimated 2,667 against 0.
+
+    Strings do have a total order, though, and the most-common-value table is a *measured
+    sample* of the distribution on it. Summing the listed frequencies at or below the literal
+    and reading that as a share of the listed mass is the ordinary way to use a sample: exact
+    when the table enumerates the column (which is the case for the low-cardinality string
+    columns range predicates on strings actually target — a status, a country, a category), and
+    a sample estimate otherwise. Nothing here is used for pruning, so the truncation argument
+    does not apply.
+
+    This also restores an estimate the optimizer had been destroying. `starts_with(s, p)` is
+    rewritten into the sargable range `s >= p AND s < p⁺`, which bypassed the measured-match
+    rule in `patterns` and landed on the very constant this fixes — so a text predicate that
+    estimated exactly before optimization estimated at a third of the table after it.
+
+    Restricted to a string literal: the table is keyed by `str(value)`, so comparing keys
+    lexicographically is only meaningful when the values *are* strings (`"10" < "9"`).
+
+    Args:
+        col_mcv: The column's measured `{value: frequency}` table.
+        value: The literal being compared against.
+
+    Returns:
+        The conditional fraction at or below `value`, in `[0, 1]`, or None when the table
+        cannot answer (no table, a non-string literal, or no measured mass).
+    """
+    if not col_mcv or not isinstance(value, str):
+        return None
+    covered = 0.0
+    below = 0.0
+    for key, freq in col_mcv.items():
+        if not isinstance(key, str) or freq <= 0.0:
+            continue
+        covered += freq
+        if key <= value:
+            below += freq
+    if covered <= 0.0:
+        return None
+    return max(0.0, min(1.0, below / covered))
+
+
+def _fraction_below_bounds(x: float | None, bound: tuple[Any, Any] | None) -> float | None:
     """The fraction of rows ≤ `x` assuming values spread uniformly over `[min, max]`.
+
+    `x` is a literal already placed on its axis by `_ordinal`, which answers `None` for a
+    value with no linear order — so `None` reaches here and means "this literal cannot be
+    interpolated", the same answer an unusable `bound` gives. It is not hypothetical or
+    defensive: `EventDate >= '2013-07-01'` compares a `date32` column against a **string**
+    literal, which SQL casts at execution and `_ordinal` places on no axis at all. Every
+    caller already handles `None` by falling through to the measured-values CDF, but two of
+    the three passed the unplaced literal in without checking, and the comparison below
+    raised `TypeError: '<' not supported between 'NoneType' and 'float'` — taking down seven
+    ClickBench queries (q36-q42) at *plan* time, before a row was read.
 
     **Counted discretely for a discrete column** (see `_is_discrete`). The continuous form
     `(x - lo) / (hi - lo)` answers a flat `0` at `x == lo`, because it cannot tell "below the
@@ -228,7 +401,7 @@ def _fraction_below_bounds(x: float, bound: tuple[Any, Any] | None) -> float | N
     the endpoint problem is real but unfixable from bounds alone: there is no "next" value to
     divide by.
     """
-    if bound is None:
+    if x is None or bound is None:
         return None
     lo, hi = _ordinal(bound[0]), _ordinal(bound[1])
     if lo is None or hi is None:

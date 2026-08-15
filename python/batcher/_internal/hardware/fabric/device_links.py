@@ -157,7 +157,10 @@ def device_cpu_affinity(address: str) -> tuple[int, ...]:
         entirely to the far socket — where binding would be a hang, not an optimization), or on
         a machine with no NUMA information.
     """
-    raw = _read_local_cpulist(address)
+    from batcher._internal.hardware.fabric.pcie import PCIE_SYSFS_ROOT
+    from batcher._internal.hardware.topology import read_cpu_list
+
+    raw = read_cpu_list(os.path.join(PCIE_SYSFS_ROOT, address, "local_cpulist"))
     if not raw:
         return ()
     getaffinity = getattr(os, "sched_getaffinity", None)
@@ -165,18 +168,6 @@ def device_cpu_affinity(address: str) -> tuple[int, ...]:
         with contextlib.suppress(OSError):
             raw &= set(getaffinity(0))
     return tuple(sorted(raw))
-
-
-def _read_local_cpulist(address: str) -> set[int]:
-    """The CPU set the kernel says is local to a PCI device, empty when unpublished."""
-    from batcher._internal.hardware.fabric.pcie import PCIE_SYSFS_ROOT
-    from batcher._internal.hardware.topology import _parse_cpu_list
-
-    try:
-        with open(os.path.join(PCIE_SYSFS_ROOT, address, "local_cpulist")) as f:
-            return _parse_cpu_list(f.read())
-    except OSError:
-        return set()
 
 
 def visible_device_indices() -> tuple[int, ...]:

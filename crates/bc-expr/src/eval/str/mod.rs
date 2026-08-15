@@ -121,6 +121,18 @@ pub(crate) fn eval_str(
             coerced = cast(arr, &DataType::Utf8)?;
             &coerced
         }
+        // The other physical spellings of a string. `bc_py::normalize_to` folds `LargeUtf8`
+        // and `Utf8View` into `Utf8` on the way *in*, which is why only `Utf8` was
+        // downcast here — but a mid-plan `CAST(s AS large_string)` mints a `LargeUtf8` the
+        // boundary never sees, and from there **every** function in this family failed
+        // ("string function Upper expected a Utf8 argument, got LargeUtf8"). They differ
+        // only in offset width (and, for the view layout, in where the bytes live); the
+        // values are the same, so re-laying them out behind a 32-bit offset buffer is
+        // exactly the normalization the boundary already performs.
+        DataType::LargeUtf8 | DataType::Utf8View => {
+            coerced = cast(arr, &DataType::Utf8)?;
+            &coerced
+        }
         _ => arr,
     };
     let s =

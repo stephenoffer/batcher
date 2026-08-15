@@ -37,7 +37,20 @@ const INITIAL_PROBE_ROWS: usize = 256;
 
 /// Floor on the adaptive slice, so an enormous fan-out cannot drive the engine to one probe call
 /// per row. At a fan-out of 20,000 this still holds the index buffers to ~1.3M entries.
+///
+/// This floor is affordable **only because the probe's output is re-morselized afterwards**
+/// ([`PendingProbe`]): what it lets overshoot is the `JoinIndices`, two `u32` arrays at 8 bytes
+/// per output row, and the gathered batch is bounded separately. A caller whose emitted batch is
+/// *final* carries every output column instead, so the same floor would let a 1,000x fan-out emit
+/// a 64,000-row wide batch — see [`ProbeSlicer::for_final_output`].
 const MIN_PROBE_SLICE: usize = 64;
+
+/// Floor for a caller that emits what the kernel returned, with no re-morselization behind it.
+///
+/// One row is the true floor there: a single input row's output is indivisible by slicing, so
+/// nothing smaller is expressible, and the per-call cost is proportional to the output the call
+/// produces rather than fixed.
+const MIN_FINAL_SLICE: usize = 1;
 
 // The opening slice must be smaller than a morsel, or the first probe of a fanned-out join is
 // the unbounded one this exists to prevent. A `const` assertion so raising the constant fails
@@ -60,12 +73,31 @@ const _: () = assert!(MIN_PROBE_SLICE <= INITIAL_PROBE_ROWS);
 #[derive(Debug)]
 pub(crate) struct ProbeSlicer {
     rows: usize,
+    /// Smallest slice this caller may be driven to. It is a property of *the caller*, not of the
+    /// measurement, because it encodes what the overshoot past it costs — see [`MIN_PROBE_SLICE`]
+    /// against [`MIN_FINAL_SLICE`].
+    min_rows: usize,
 }
 
 impl ProbeSlicer {
+    /// For a join: the probe's output is re-morselized by [`PendingProbe`], so the slice may stop
+    /// shrinking at [`MIN_PROBE_SLICE`] and let the *index* arrays overshoot by a bounded factor.
     pub(crate) fn new() -> Self {
         Self {
             rows: INITIAL_PROBE_ROWS,
+            min_rows: MIN_PROBE_SLICE,
+        }
+    }
+
+    /// For a caller that emits the kernel's batch as-is (`super::fanout`: unnest, unpivot).
+    ///
+    /// Nothing re-morselizes behind it, so the emitted batch is exactly `slice x fanout` rows of
+    /// every output column and the join's 64-row floor would be the whole bug this slicing exists
+    /// to prevent: at a fan-out of 1,000 it emits 64,000 wide rows per call.
+    pub(crate) fn for_final_output() -> Self {
+        Self {
+            rows: INITIAL_PROBE_ROWS,
+            min_rows: MIN_FINAL_SLICE,
         }
     }
 
@@ -83,7 +115,7 @@ impl ProbeSlicer {
         // rows) never inflates the slice past what the target allows.
         let fanout = rows_out.div_ceil(rows_in).max(1);
         self.rows = (bc_arrow::DEFAULT_MORSEL_ROWS / fanout)
-            .clamp(MIN_PROBE_SLICE, bc_arrow::DEFAULT_MORSEL_ROWS);
+            .clamp(self.min_rows, bc_arrow::DEFAULT_MORSEL_ROWS);
     }
 }
 

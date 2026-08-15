@@ -74,11 +74,25 @@ def free_cpus_by_node() -> dict[str, float] | None:
 
 
 def _live_free_cpus_by_node() -> dict[str, float] | None:
-    """The unsnapshotted read behind `free_cpus_by_node`, and what fills the snapshot."""
+    """The unsnapshotted read behind `free_cpus_by_node`, and what fills the snapshot.
+
+    Windowed by `scaling._LIVE_TTL_S` like the node list, and for the same measurement: this
+    was seven `available_resources_per_node` round trips per distributed query, each O(nodes)
+    in GCS work and deserialization, all asking the same question within a few milliseconds.
+    See that constant for why the window is 50 ms and why that is safe.
+    """
+    import time
+
+    from batcher.dist.executors.ray_runtime import scaling
+
+    cached = scaling._free_cpus_cache
+    now = time.monotonic()
+    if cached is not None and now < cached[0]:
+        return cached[1]
     try:
         from ray._private.state import available_resources_per_node
 
-        return {
+        free: dict[str, float] | None = {
             node_id: float(res.get("CPU", 0.0))
             for node_id, res in available_resources_per_node().items()
         }
@@ -86,7 +100,9 @@ def _live_free_cpus_by_node() -> dict[str, float] | None:
         # A private Ray API, so a version that moves it must degrade rather than fail: the
         # caller falls back to nameplate sizing, which is what it did before this existed.
         note_suppressed("dist", "read per-node free CPU", exc)
-        return None
+        free = None
+    scaling._free_cpus_cache = (now + scaling._LIVE_TTL_S, free)
+    return free
 
 
 def placeable_workers(

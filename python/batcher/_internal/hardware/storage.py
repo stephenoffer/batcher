@@ -21,6 +21,8 @@ import functools
 import glob
 import os
 
+from batcher._internal.hardware.sysfs import read_optional_int
+
 __all__ = [
     "FLASH_SPILL_MBPS",
     "SPILL_DEVICE_FACTOR",
@@ -85,15 +87,6 @@ def _sys_block_name(path: str) -> str:
     return os.path.basename(target)
 
 
-def _read_int(path: str) -> int | None:
-    """An integer from a `/sys` file, or `None` when absent or unparseable."""
-    try:
-        with open(path) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
-
-
 @functools.lru_cache(maxsize=8)
 def device_class(path: str) -> str:
     """A coarse class for the device behind `path`, for sizing and for fingerprinting.
@@ -154,7 +147,7 @@ def _class_of_device(name: str, depth: int) -> str:
             return _slowest_backing_class(name, depth) or fallback
     if _is_remote_scsi(name):
         return "network"
-    rotational = _read_int(f"/sys/block/{name}/queue/rotational")
+    rotational = read_optional_int(f"/sys/block/{name}/queue/rotational")
     if rotational is None:
         return "unknown"
     return "rotational" if rotational else "ssd"

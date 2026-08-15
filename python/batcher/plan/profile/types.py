@@ -180,6 +180,14 @@ class OpProfile:
     est_rows: float = float("nan")
     provenance: str = ""
     algorithm: str = ""
+    #: What the plan handed to this scan's *source* to apply for itself — the pushed filter
+    #: and the column projection, already rendered. Empty for every operator that is not a
+    #: scan, and for a scan the plan pushed nothing to.
+    #:
+    #: Carried as finished text rather than as the predicate IR because rendering an
+    #: expression lives in `observe`, which this layer may not import. The caller that has
+    #: both (`api.terminal.profile`) does the rendering and passes the result down.
+    pushed: str = ""
     # Measured (Core/engine); valid only when `measured`.
     measured: bool = False
     rows_in: int = 0
@@ -270,6 +278,7 @@ class OpProfile:
             "est_rows": None if math.isnan(self.est_rows) else self.est_rows,
             "provenance": self.provenance,
             "algorithm": self.algorithm,
+            "pushed": self.pushed,
             "measured": self.measured,
             "rows_in": self.rows_in,
             "rows_out": self.rows_out,
@@ -503,8 +512,13 @@ class QueryProfile:
         est = "est≈?" if math.isnan(o.est_rows) else f"est≈{o.est_rows:,.0f}"
         prov = f" ({o.provenance})" if o.provenance else ""
         algo = f" [{o.algorithm}]" if o.algorithm else ""
+        # What the source was asked to do itself. Every other engine's EXPLAIN says this
+        # (Spark's `PushedFilters:`, DuckDB's `Filters:`), and without it a reader has no
+        # way to tell a pushed-down filter from one the engine is applying over a full
+        # scan — the two plans print identically while differing by the whole table.
+        pushed = f" pushed[{o.pushed}]" if o.pushed else ""
         if not analyze or not o.measured:
-            return f"{label:<32}{est}{prov}{algo}"
+            return f"{label:<32}{est}{prov}{algo}{pushed}"
         share = (o.elapsed_ms / self.total_ms * 100.0) if self.total_ms else 0.0
         err = "" if math.isnan(o.est_error) else f" ({o.est_error:.1f}x)"
         # Show the measured spill *volume* when known, not just the fact of spilling — the
@@ -521,7 +535,7 @@ class QueryProfile:
             f"{label:<32}{est} actual={o.rows_out:,}{err}"
             f"  {o.elapsed_ms:.1f}ms ({share:.0f}%){cpu}"
             f"  out={human_bytes(o.result_bytes)}{rss}  {o.backend}{spill}"
-            f"{_hardware_flags(o)}"
+            f"{_hardware_flags(o)}{pushed}"
         )
 
     def to_dict(self) -> dict[str, Any]:

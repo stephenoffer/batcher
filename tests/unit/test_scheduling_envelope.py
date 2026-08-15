@@ -263,7 +263,7 @@ def test_envelope_picks_pack_only_for_a_small_local_shuffle_that_fits_a_node():
 
 def test_resolve_placement_strategy_against_live_nodes(monkeypatch):
     ray = pytest.importorskip("ray")
-    from batcher.dist.executors.ray_runtime import scheduling
+    from batcher.dist.executors.ray_runtime import scaling, scheduling
 
     pack = SchedulingEnvelope(placement_strategy="PACK")
     spread = SchedulingEnvelope(placement_strategy="SPREAD")
@@ -273,8 +273,10 @@ def test_resolve_placement_strategy_against_live_nodes(monkeypatch):
     # SPREAD over >1 node → SPREAD; no envelope → SPREAD default.
     assert scheduling._resolve_placement_strategy(spread) == "SPREAD"
     assert scheduling._resolve_placement_strategy(None) == "SPREAD"
-    # SPREAD on a single node buys nothing → degrade to PACK.
+    # SPREAD on a single node buys nothing → degrade to PACK. The node list is read through
+    # the `_LIVE_TTL_S` window, so drop it after shrinking the cluster mid-test.
     monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True}])
+    scaling._reset_topology_cache()
     assert scheduling._resolve_placement_strategy(spread) == "PACK"
 
 
@@ -341,7 +343,10 @@ def test_node_classes_and_cpu_only_can_host(monkeypatch):
     assert scaling.cpu_only_can_host(32, 1.0) is False
 
     # A homogeneous CPU cluster → no GPU nodes to avoid ⇒ no restriction (False).
+    # The live reads are windowed for `_LIVE_TTL_S`, so a cluster swapped *within* one test is
+    # invisible until the window drops; production never changes shape that fast, tests do.
     monkeypatch.setattr(ray, "nodes", lambda: [{"Alive": True, "Resources": {"CPU": 8.0}}])
+    scaling._reset_topology_cache()
     assert scaling.cpu_only_can_host(4, 1.0) is False
 
 
@@ -357,6 +362,7 @@ def test_engine_config_json_folds_envelope_budget():
     from batcher.config import MemoryConfig
     from batcher.dist.executors.ray_runtime import (
         engine_config_json,
+        lifecycle,
         reset_scheduling_envelope,
         set_scheduling_envelope,
     )
@@ -372,7 +378,12 @@ def test_engine_config_json_folds_envelope_budget():
     token = set_scheduling_envelope(env)
     try:
         cfg = json.loads(engine_config_json())
-        assert cfg["memory_budget_bytes"] == 4 << 20  # envelope grant enables spill
+        # The grant enables spill, with headroom above it: the grant is Ray's *reservation*
+        # and a point estimate, so making it the spill threshold too meant any under-estimate
+        # spilled. `_SPILL_HEADROOM` lifts the threshold and leaves the reservation alone.
+        assert cfg["memory_budget_bytes"] >= 4 << 20
+        assert cfg["memory_budget_bytes"] == lifecycle._spill_budget(4 << 20, 4)
+        assert cfg["memory_budget_bytes"] < default_budget  # still bounded, still spills
         # The other knobs are still the driver's config (not lost in the merge).
         assert cfg["morsel_rows"] == base["morsel_rows"]
     finally:
@@ -397,6 +408,7 @@ def test_engine_config_json_takes_tighter_of_envelope_and_global_cap():
     from batcher.config import Config, MemoryConfig, config_context
     from batcher.dist.executors.ray_runtime import (
         engine_config_json,
+        lifecycle,
         reset_scheduling_envelope,
         set_scheduling_envelope,
     )
@@ -411,7 +423,9 @@ def test_engine_config_json_takes_tighter_of_envelope_and_global_cap():
         )
         token = set_scheduling_envelope(small)
         try:
-            assert json.loads(engine_config_json())["memory_budget_bytes"] == 1 << 20
+            budget = json.loads(engine_config_json())["memory_budget_bytes"]
+            assert budget == min(global_cap, lifecycle._spill_budget(1 << 20, 4))
+            assert budget <= global_cap  # the cap is never exceeded by the headroom
         finally:
             reset_scheduling_envelope(token)
 

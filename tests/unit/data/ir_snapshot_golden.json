@@ -57,6 +57,40 @@
       "name": "clip"
     }
   },
+  "audio_mel": {
+    "e": "audio",
+    "fn": "mel_spectrogram",
+    "hop_length": 160,
+    "input": {
+      "e": "col",
+      "name": "clip"
+    },
+    "n_fft": 400,
+    "n_mels": 80,
+    "rate": 16000
+  },
+  "audio_mfcc": {
+    "e": "audio",
+    "fn": "mfcc",
+    "hop_length": 160,
+    "input": {
+      "e": "col",
+      "name": "clip"
+    },
+    "n_fft": 400,
+    "n_mels": 80,
+    "n_mfcc": 13,
+    "rate": 16000
+  },
+  "audio_trim": {
+    "e": "audio",
+    "fn": "trim_silence",
+    "input": {
+      "e": "col",
+      "name": "clip"
+    },
+    "threshold_db": -40
+  },
   "binary": {
     "e": "binary",
     "left": {
@@ -295,6 +329,26 @@
       "name": "y"
     }
   },
+  "image_encode": {
+    "e": "image",
+    "fn": "encode",
+    "format": "jpeg",
+    "input": {
+      "e": "col",
+      "name": "img"
+    }
+  },
+  "image_letterbox": {
+    "e": "image",
+    "fill": 114,
+    "fn": "letterbox",
+    "height": 640,
+    "input": {
+      "e": "col",
+      "name": "img"
+    },
+    "width": 640
+  },
   "image_simple": {
     "e": "image",
     "fn": "decode",
@@ -302,6 +356,27 @@
       "e": "col",
       "name": "img"
     }
+  },
+  "image_tensor_f32": {
+    "channels_first": true,
+    "e": "image",
+    "fn": "to_tensor_f32",
+    "height": 224,
+    "input": {
+      "e": "col",
+      "name": "img"
+    },
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "width": 224
   },
   "image_to_tensor": {
     "e": "image",
@@ -851,6 +926,30 @@
       "e": "col",
       "name": "clip"
     }
+  },
+  "video_frame_at": {
+    "e": "video",
+    "fn": "frame_at",
+    "input": {
+      "e": "col",
+      "name": "clip"
+    },
+    "second": {
+      "e": "col",
+      "name": "ts"
+    },
+    "width": 256
+  },
+  "video_frames": {
+    "e": "video",
+    "fn": "frames",
+    "height": 224,
+    "input": {
+      "e": "col",
+      "name": "clip"
+    },
+    "num_frames": 8,
+    "width": 224
   },
   "window_buckets": {
     "e": "window_buckets",

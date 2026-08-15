@@ -28,7 +28,13 @@ __all__ = ["AudioSource"]
 class AudioSource(MediaSource):
     """One or more audio files (directory or glob) as references + header meta."""
 
-    suffixes = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
+    # Extensions this tuple does not name are invisible to the listing, and the resulting
+    # error reads as an empty directory. Opus in particular is what every modern voice
+    # recording and every WebRTC capture is stored as.
+    suffixes = (
+        ".wav", ".flac", ".ogg", ".oga", ".opus", ".mp3", ".aiff", ".aif",
+        ".m4a", ".m4b", ".aac", ".wma", ".au", ".caf",
+    )  # fmt: skip
     format_name = "audio"
 
     __slots__ = ()

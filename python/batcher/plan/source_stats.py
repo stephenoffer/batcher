@@ -154,6 +154,13 @@ def source_stats_key(source: object) -> str | None:
     if not callable(identity):
         return None
     prefix = _tenant_prefix()
+    # A relation the engine *derived* names how it was derived. That string is data-stable in
+    # the only sense that matters here — re-running the same subplan over the same inputs
+    # rebuilds the same rows — so what one run measures from it, the next run reads back, and
+    # a plan built over it can be memoized. Only `api.subplan_reuse` sets it.
+    derivation = getattr(source, "derivation", None)
+    if derivation:
+        return f"{prefix}derived:{derivation}"
     if not getattr(source, "stable_stats_identity", True):
         return f"{prefix}obj:{_instance_serial(source)}"
     try:
@@ -243,6 +250,17 @@ class SourceStatistics:
     # against the estimate. So a columnar connector leaves this False and the width estimator
     # keeps its type-derived answer; re-tuning the threshold against a sharper width is a
     # separate, benchmark-driven change.
+    #
+    # The obvious refinement — read a *per-column* `total_uncompressed_size` from the footer
+    # and divide by the value count, which sounds like it measures exactly what
+    # `ColumnStat.avg_bytes` means — is worse still, and wrong in the dangerous direction.
+    # That figure sizes the column's **encoded pages**, and a repetitive string column is
+    # dictionary-encoded: 1,000 rows of a 200-byte string measure 658 bytes in the footer,
+    # giving 0.66 B/row against a true 200. A 300x *under*-estimate, on precisely the wide
+    # string columns a width estimate exists to get right, in the direction that under-sizes
+    # a buffer rather than over-sizing it. Filtering on the chunk's `encodings` does not
+    # rescue it: pyarrow lists `RLE_DICTIONARY` for a plain integer column too. There is no
+    # cheap footer route to a materialized width — measure it (`inmemory_stats`) or leave it.
     content_byte_size: bool = False
 
     def is_empty(self) -> bool:

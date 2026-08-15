@@ -708,6 +708,25 @@ impl RelOp {
         count
     }
 
+    /// The `source_id`s this plan reads, each once however many times it is scanned.
+    ///
+    /// Sources cross the FFI boundary positionally — a call carries every source bound to the
+    /// session, named by this plan or not — so any question of the form "how much data is this
+    /// query holding" has to be asked of the scans rather than of that list. `bc-py`'s
+    /// executor-routing guard is the caller that needs it, and it lives here because the
+    /// question is about a `RelOp` and nothing else.
+    pub fn scanned_source_ids(&self) -> std::collections::HashSet<usize> {
+        let mut ids = std::collections::HashSet::new();
+        let mut stack: Vec<&RelOp> = vec![self];
+        while let Some(node) = stack.pop() {
+            if let RelOp::Scan { source_id } = node {
+                ids.insert(*source_id);
+            }
+            stack.extend(node.children());
+        }
+        ids
+    }
+
     /// The expressions this node evaluates itself, ignoring its inputs.
     ///
     /// Split out of [`Self::contains_media_decode`] so that walk can be a flat worklist

@@ -69,7 +69,7 @@ from batcher.plan.expr_ir.nodes import (
     NullIf,
     WindowExpr,
 )
-from batcher.plan.expr_ir.walk import referenced_columns, remap_columns
+from batcher.plan.expr_ir.walk import referenced_columns, remap_columns, temporal_inputs
 
 __all__ = [
     "AggExpr",
@@ -116,5 +116,6 @@ __all__ = [
     "nullif",
     "referenced_columns",
     "remap_columns",
+    "temporal_inputs",
     "when",
 ]

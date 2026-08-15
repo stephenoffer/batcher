@@ -38,6 +38,7 @@ from batcher.plan.expr_ir import (
     referenced_columns,
     remap_columns,
 )
+from batcher.plan.expr_rewrite.algebra import combine_conjuncts, split_conjuncts
 from batcher.plan.ir_tags import COMPARISON_OPS
 from batcher.plan.logical import (
     Aggregate,
@@ -57,6 +58,7 @@ __all__ = [
     "drop_redundant_distinct_build",
     "eliminate_left_join",
     "join_to_semijoin",
+    "left_join_null_key_to_antijoin",
     "outer_to_inner_join",
     "runtime_join_filter",
 ]
@@ -126,6 +128,145 @@ def drop_redundant_distinct_build(node: Join, _ctx: OptimizerContext) -> Logical
         node.output,
         node.strategy,
     )
+
+
+@rule(name="left_join_null_key_to_antijoin", phase=Phase.PUSHDOWN, matches=(Project, Aggregate))
+def left_join_null_key_to_antijoin(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Project_left-only(Filter(Left Join(L, R), r_key IS NULL))` → `Project(Anti Join(L, R))`.
+
+    The anti-join written the way SQL has always spelled it: outer-join, then keep the rows
+    that did not match. `outer_to_inner_join` next door handles the opposite predicate — one
+    that *rejects* null-extended rows — and there was nothing for this one, so the plan built
+    the whole outer join, materialized every matched row with its right-hand columns, and then
+    threw those rows away one predicate later.
+
+    That is the dominant cost of TPC-DS q78, which does it three times (store, catalog and web
+    sales each anti-joined against their returns). Measured at scale 1, the `store_sales LEFT
+    JOIN store_returns` alone ran **281 ms and produced a 200 MB intermediate**, with the filter
+    above it a further 273 ms — against 57 ms for DuckDB's entire query.
+
+    **Exact when the `IS NULL` names a right-hand join key, and only then.** After a left join
+    a row has a null right key in one of two ways: it matched nothing, or it matched a right row
+    whose key is null. The second cannot happen — an equi-join tests `l.k = r.k`, which is
+    *unknown*, never true, when `r.k` is null — so a null right key means exactly "unmatched",
+    which is what an anti-join returns. The same argument covers a composite key: a match needs
+    every key equal, so a null in any one of them rules the row out. An `IS NULL` on a right
+    *payload* column carries no such guarantee (a matched row may simply hold a null there) and
+    is left alone.
+
+    Anti-join output is left columns only, so this also requires that nothing above reads a
+    right-hand column — the consumer is matched here, rather than the filter alone, precisely
+    so that can be checked instead of assumed.
+
+    Runs in PUSHDOWN, not REWRITE, because the shape does not exist until pushdown builds it:
+    the query writes `WHERE ... IS NULL` above a join with `date_dim` and the predicate only
+    reaches the outer join once it has been pushed there. `eliminate_left_join` sits in this
+    phase for the same reason.
+    """
+    filt = node.input
+    if not isinstance(filt, Filter):
+        return None
+    # The SQL front-end does not leave a filter sitting on its join: it renames the join keys
+    # to `__jk_*` and projects them away again, so a `LEFT JOIN ... WHERE key IS NULL` arrives
+    # as filter-over-projection-over-projection-over-join. Those projections rename and pass
+    # through and nothing else, so they are walked rather than given up on — but only while
+    # every item is a pass-through, since a computed column has no single source to follow.
+    chain: list[Project] = []
+    join: LogicalPlan = filt.input
+    while isinstance(join, Project):
+        if len(passthrough_renames(join.items)) != len(join.items):
+            return None
+        chain.append(join)
+        join = join.input
+    if not isinstance(join, Join) or join.join_type != "left":
+        return None
+
+    def at_join(name: str) -> str | None:
+        """`name`, as the filter sees it, translated to the join's own output alias."""
+        for proj in chain:
+            renamed = passthrough_renames(proj.items).get(name)
+            if renamed is None:
+                return None
+            name = renamed
+        return name
+
+    right_by_alias = {o.alias: o.name for o in join.output if o.side == "right"}
+    left_aliases = {o.alias for o in join.output if o.side == "left"}
+    right_keys = set(join.right_keys)
+    # The right side rarely exposes its key under the key's own name. `Dataset.join` copies
+    # each key to a synthetic `__jk_r<n>` so it survives into the output, and the filter names
+    # that copy — so a *pass-through copy of a key is a key*, and following the right child's
+    # own renames one hop is what makes this rule fire on the query it was written for.
+    right_copies = passthrough_renames(join.right.items) if isinstance(join.right, Project) else {}
+
+    def is_right_key(name: str | None) -> bool:
+        source = right_by_alias.get(name or "")
+        return source in right_keys or right_copies.get(source or "") in right_keys
+
+    conjuncts = split_conjuncts(filt.predicate)
+    unmatched = [
+        c
+        for c in conjuncts
+        if isinstance(c, IsNull)
+        and isinstance(c.input, Col)
+        and is_right_key(at_join(c.input.name))
+    ]
+    if not unmatched:
+        return None
+    # Every surviving reference must resolve to the left side: the right columns cease to
+    # exist, and a name that resolves to nothing is one this cannot reason about.
+    # Identity, not `in`: `Expr.__eq__` builds a comparison expression rather than answering
+    # a bool, so membership on a list of predicates raises instead of filtering.
+    remaining = [c for c in conjuncts if not any(c is u for u in unmatched)]
+    used: set[str] = _consumer_columns(node)
+    for pred in remaining:
+        used |= referenced_columns(pred)
+    if any((at_join(name) or "") not in left_aliases for name in used):
+        return None
+    rebuilt: LogicalPlan = Join(
+        join.left,
+        join.right,
+        join.left_keys,
+        join.right_keys,
+        "anti",
+        tuple(o for o in join.output if o.side == "left"),
+        join.strategy,
+    )
+    # Rebuild the walked projections without the right-hand columns they carried, bottom-up:
+    # at each level a projection keeps exactly the items whose source column still exists.
+    surviving = left_aliases
+    for proj in reversed(chain):
+        renames = passthrough_renames(proj.items)
+        kept = tuple(item for item in proj.items if renames[item.alias] in surviving)
+        if not kept:
+            return None
+        surviving = {item.alias for item in kept}
+        rebuilt = dataclasses.replace(proj, input=rebuilt, items=kept)
+    if remaining:
+        rebuilt = Filter(rebuilt, combine_conjuncts(remaining))
+    return dataclasses.replace(node, input=rebuilt)
+
+
+def _consumer_columns(node: LogicalPlan) -> set[str]:
+    """Every column the node above the filter reads.
+
+    Two shapes sit there in practice and both must be readable, because the check they feed
+    is what keeps a right-hand column from being dropped out from under its reader: a
+    `Project` (the DataFrame spelling) and an `Aggregate` (the SQL one — `LEFT JOIN ... WHERE
+    key IS NULL GROUP BY ...` is how TPC-DS q78 writes it three times over).
+    """
+    used: set[str] = set()
+    if isinstance(node, Project):
+        for item in node.items:
+            used |= referenced_columns(item.expr)
+    elif isinstance(node, Aggregate):
+        for key in node.group_keys:
+            used |= referenced_columns(key.expr)
+        for spec in node.aggregates:
+            for operand in (spec.agg.input, spec.agg.input2):
+                if operand is not None:
+                    used |= referenced_columns(operand)
+    return used
 
 
 @rule(name="join_to_semijoin", phase=Phase.REWRITE, matches=(Distinct,))

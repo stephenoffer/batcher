@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import ConfigError
+from batcher._internal.optional import require
 
 if TYPE_CHECKING:
     from batcher.config.config import Config
@@ -169,10 +170,6 @@ def _parse(text: str, suffix: str) -> Any:
 
         return tomllib.loads(text)
     if suffix in (".yaml", ".yml"):
-        try:
-            import yaml
-        except ImportError as exc:
-            msg = "reading a YAML config needs pyyaml — install it with `pip install pyyaml`"
-            raise ConfigError(msg) from exc
+        yaml = require("yaml", feature="Reading a YAML config", provides="PyYAML", extra="yaml")
         return yaml.safe_load(text)
     return json.loads(text)

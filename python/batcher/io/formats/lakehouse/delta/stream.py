@@ -32,6 +32,7 @@ from batcher.io.formats.lakehouse._time import normalize_timestamp
 from batcher.io.formats.lakehouse.delta._snapshot import require_deltalake
 from batcher.io.splits import Split, WholeSourceSplit
 from batcher.plan.source_stats import SourceStatistics
+from batcher.plan.types import one_batch
 
 __all__ = ["DeltaChangeFeedSource", "DeltaStreamSource"]
 
@@ -67,20 +68,7 @@ def _shape(batch: pa.RecordBatch, projection: list[str] | None, cdf: bool) -> pa
         table = table.select(projection)
     if table.num_rows == 0:
         return None
-    return _one_batch(table)
-
-
-def _one_batch(table: pa.Table) -> pa.RecordBatch:
-    """`table` as a single `RecordBatch`, keeping every row.
-
-    `combine_chunks().to_batches()[0]` looks like it does this and does not: `to_batches`
-    splits at the 32-bit offset limit, so a commit carrying more than 2 GiB of string or
-    binary data comes back as several batches and taking the first **silently drops the
-    rest**. `concat_batches` keeps them all, and raises a clear error rather than losing
-    rows if the span genuinely cannot be one batch.
-    """
-    batches = table.combine_chunks().to_batches()
-    return batches[0] if len(batches) == 1 else pa.concat_batches(batches)
+    return one_batch(table)
 
 
 @SOURCES.register("delta_stream")

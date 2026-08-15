@@ -22,6 +22,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -107,13 +108,7 @@ class FeatureSpec:
             chosen = [c for c in ds.columns if c not in set(exclude)]
         else:
             chosen = list(features)
-            unknown = [c for c in chosen if c not in schema]
-            if unknown:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", unknown[0], ds.columns, hint="Pass a real column.")
-                )
+            require_columns(ds, *chosen, hint="Pass a real column.")
         return cls(chosen, {name: schema[name] for name in chosen})
 
     def validate(self, ds: Dataset, *, check_dtypes: bool = True) -> None:

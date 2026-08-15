@@ -99,12 +99,19 @@ What runs natively (data plane, parallel, per-row-null-tolerant), with the kerne
 
 | Capability | Where | Note |
 |---|---|---|
-| Image decode → resized `uint8` tensor | `bc-expr/.../media/image.rs::to_tensor` | DCT-scaled JPEG + SIMD resize |
-| Image decode → **normalized `f32` tensor** (`/255`, per-channel mean/std, HWC/CHW) | `image.rs::to_tensor_f32` | the torchvision `ToTensor`+`Normalize` step, in-engine |
-| Image **center-crop** (torchvision-style zero-pad) | `image.rs::center_crop` | the crop half of resize→crop→tensor |
-| Image **grayscale** (Rec.601 luma → 1 channel) | `image.rs::to_grayscale` | color-convert for 1-channel models |
-| Perceptual hash (dHash) for image dedup | `image.rs::dhash` | Hamming-thresholded near-dup |
+| Image decode → resized `uint8` tensor | `bc-expr/.../media/image/mod.rs::to_tensor` | DCT-scaled JPEG + SIMD resize |
+| Image decode → **normalized `f32` tensor** (`/255`, per-channel mean/std, HWC/CHW) | `image/mod.rs::to_tensor_f32` | the torchvision `ToTensor`+`Normalize` step, in-engine |
+| Image **center-crop** (torchvision-style zero-pad) | `image/mod.rs::center_crop` | the crop half of resize→crop→tensor |
+| Image **grayscale** (Rec.601 luma → 1 channel) | `image/mod.rs::to_grayscale` | color-convert for 1-channel models |
+| Image **geometry**: rotate (right angles), flip H/V, pad-without-scaling, letterbox | `image/transform.rs` | the augmentation half; `letterbox` is the detection preprocessing |
+| Image **photometric**: brightness/contrast/saturation/hue, blur, sharpen, invert, posterize, solarize, equalize, autocontrast | `image/transform.rs` | `PIL.ImageEnhance` + AutoAugment conventions, so a torchvision policy ports unchanged |
+| Perceptual hashes for image dedup: **dHash, pHash (DCT), aHash** | `image/mod.rs::dhash`, `image/hash.rs` | Hamming-thresholded near-dup; block on `ahash`, confirm with `phash` |
+| Image **curation measures**: brightness, sharpness, entropy, colourfulness, mean colour, is-grayscale | `image/quality.rs` | the screens that find rows which decode perfectly and teach a model nothing |
+| Image **header facts**: aspect ratio, alpha, container (magic-byte sniffed) | `image/probe.rs` | one header read, no pixels |
 | Audio decode / mono / resample (sinc) | `media/audio.rs` | WAV/FLAC (symphonia) |
+| Audio **level and hygiene**: rms, dBFS, peak dBFS, clipping ratio, silence ratio | `media/level.rs` | recording-quality triage as a predicate |
+| Audio **shaping**: rms-normalize, pre-emphasis, `pad_or_trim`, slice, **WAV encode** | `media/level.rs` | `pad_or_trim` is what makes a clip corpus batchable (Whisper's fixed 30 s) |
+| **Linear spectrogram** and spectral descriptors (centroid, rolloff, bandwidth, flatness) | `media/spectral.rs` | rolloff finds the band-limited-then-upsampled recordings nothing else sees |
 | **Mel power spectrogram** (STFT + HTK filterbank) | `media/mel.rs` | matches `torchaudio.transforms.MelSpectrogram` to 1e-6 |
 | **MFCC** (mel → AmplitudeToDB → DCT-II) | `media/mel.rs::mfcc` | matches `torchaudio.transforms.MFCC` to 1e-6 |
 | Vector distances: cosine, dot, L2, **L1, Hamming** | `eval/list.rs`, `list_ops/coerce.rs` | accept `FixedSizeList` (the tensor type), `f32` fast path |
@@ -120,17 +127,26 @@ training, where Batcher does not compete — see ceilings):
 
 - **Daft** is the closest. It has native URL-download, image decode/resize/crop/`to_mode`,
   a variable-shape tensor type, and embedding/cosine expressions — a strong multimodal surface.
-  Batcher's image surface now **covers Daft's completely**: center-crop, offset `crop`,
-  `encode` (png/jpeg/bmp/gif), and `convert` over the full `L`/`LA`/`RGB`/`RGBA` palette,
-  with the four header facts (`width`/`height`/`channels`/`mode`) from **one** read where
-  Daft spends a call per fact. It leads on **audio**: Daft has **no native
-  mel-spectrogram / MFCC** (per-row UDFs), which Batcher does in-engine (both torchaudio-matched).
+  Batcher's image surface **covers Daft's and now goes past it**: alongside center-crop,
+  offset `crop`, `encode` (png/jpeg/bmp/gif) and `convert` over the full
+  `L`/`LA`/`RGB`/`RGBA` palette, the geometry, photometric, hashing and curation families in
+  the table above have no Daft equivalent — a Daft user writes each of them as a per-row PIL
+  UDF. Header facts come from **one** read where Daft spends a call per fact. Measured on
+  that difference: the entropy + pHash + flip pass runs **5.7x** faster than the Pillow loop
+  it replaces (`benchmarks/scenarios/image_decode.py --suite curate`, 96 cores, release
+  build). On the shared ingest path — 2,000 JPEGs decoded and resized to 224², the operation
+  both engines have natively — Batcher leads by **1.9x** after two read-path fixes (a
+  header parse that ignored the projection, and local reads fanned across a thread pool
+  that made them 2.5x slower than a serial loop); it was 1.3x before them. It leads on **audio** by a wider margin: Daft has **no native audio surface at
+  all**, where Batcher has 23 operations including torchaudio-matched mel-spectrogram/MFCC.
   The variable-shape tensor gap this bullet used to record is closed too: mixed-resolution
   arrays are carried as a column (`io/formats/ml/ragged.py`), so the two gaps it named are
   both gone. Daft still leads on decoding *into* that type from more source formats.
 - **Ray Data** has good CPU preprocessors (scalers/encoders/imputers) and a tensor type, but
   multimodal decode is a torch/PIL **UDF per batch**, not an engine expression; **no native
-  mel-spectrogram**; fuzzy-match/minhash are user code.
+  mel-spectrogram**; fuzzy-match/minhash are user code. That shows up in the one comparison
+  both engines can run natively: `read_images` at 724-747 img/s against Batcher's
+  4,649-4,788 on the same 2,000-frame corpus, **6.4-6.6x**.
 - **BigQuery ML** has the richest *SQL-level* ML (learned `ML.STANDARD_SCALER` etc.,
   `VECTOR_SEARCH`, `AI.GENERATE`). Batcher now has **vector search in SQL** — the two-arg
   vector functions (`list_cosine_similarity`/`list_distance`/`list_dot_product`, DuckDB-matched)
@@ -775,18 +791,44 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
    and refuse, loudly, the shapes that cannot be honoured (the distributed watermark gate and the
    unwindowed-watermark refusal both do).
 6. **Decouple tasks from nodes**; turn on speculation and skew splitting by default.
-7. **Plan on the layout a table already has.** `SourceStatistics.partition_keys` reaches the
-   optimizer and **nothing plans on it** — its only consumer is the user-facing
-   `ds.meta.storage.partition_keys()`. A Hive-partitioned table is already clustered by its
-   partition column, so a `GROUP BY day` over a directory-per-day table has every group wholly
-   inside one directory and needs no exchange at all; today it hash-shuffles every row. The
-   condition is `partition columns ⊆ group keys` **and** whole directories assigned to workers
-   (which `PartitionDirSplit` gives and the per-file fragment path does not), so it is a
-   dispatcher decision rather than a rewrite. The machinery to skip a shuffle over an
-   already-partitioned relation exists for *intermediates* (`dist/fleet/source.py`); what is
-   missing is applying it to the partitioning a table has on disk. Note the failure mode
-   before implementing: getting the condition wrong reports partial groups as final, which is
-   a wrong answer at cluster scale and green everywhere else.
+7. **~~Plan on the layout a table already has~~ (done for aggregate, distinct and window —
+   4.2x).** A partitioned table — a Hive Parquet tree, a Delta table — has every group of its
+   partition columns wholly inside one worker, so a `GROUP BY day` over a directory-per-day
+   table needs no exchange at all. It used to hash-shuffle every row to rediscover a
+   partitioning the layout already stated. `kyber/properties.py::clustered_on` propagates the
+   clustering; `dist/executor.py::_partition_aligned_aggregate` / `_partition_aligned_distinct`
+   / `_partition_aligned_window` schedule against it. 8M rows over 16 partitions on 8 workers:
+   850 → 200 ms on Parquet (**4.2x**), 780 → 310 ms on Delta (**2.3x**), and 1,020 → 490 ms
+   for `COUNT(DISTINCT)` (**2.1x**, growing with the column's cardinality),
+   `benchmarks/internals/partition_aligned.py`.
+
+   The failure mode this item warned about — reporting partial groups as final, a wrong answer
+   at cluster scale and green everywhere else — is closed by *verifying* rather than declaring.
+   `io/splits/clustering.py` checks that every split of the set the read will actually use
+   declares the same columns, and **establishes** the half no single split can promise — that a
+   value is on one worker — by grouping splits by value and assigning whole groups. That
+   grouping is what makes it work for a file-per-split lakehouse reader, where one partition is
+   hundreds of splits and the split set alone proves nothing. Values are compared typed, so
+   `x=01` and `x=1` are not read as two partitions of one value, and the executor re-checks the
+   splits it is about to assign, **raising** rather than silently falling back to a plan that no
+   longer has a combine in it.
+
+   Hive Parquet trees, Delta and Iceberg all declare a clustering. Iceberg needs one extra
+   guard the others do not, because it is the only format whose partitioning can evolve under an
+   existing table: a file written before a spec change carries the *old* spec's partition
+   fields, so any file whose `spec_id` is not the current one declares nothing and the whole set
+   is refused.
+
+   A nested `year=/month=` tree is clustered on the year, which is the *complete* guarantee
+   and not a partial one: `GROUP BY year, month` is aligned through the containment, and
+   `GROUP BY month` alone is not co-located by any split granularity, since `month=1` lives
+   under every year.
+
+   **Remaining on this ceiling: joins.** A join whose two sides are partitioned by the join key
+   is co-partitioned on disk and could skip its shuffle on the same argument, but it needs both
+   sides to agree on the layout — a materially stronger condition than either single-input
+   operator has to meet, and it needs a co-assignment that pairs the two sides' groups rather
+   than bin-packing each independently.
 
 Until 1–2 land, the defensible positioning is narrower than the current one, and *still strong*:
 

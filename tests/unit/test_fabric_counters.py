@@ -273,7 +273,11 @@ def test_the_fingerprint_describes_the_disk_the_engine_spills_to(monkeypatch, tm
     # which merged two machine classes that behave nothing alike.
     from batcher._internal.hardware import profile
 
-    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: "/ephemeral")
+    # Patched at its *definition* site (`site.scratch`), not the `site` re-export: the
+    # resolution now runs inside `site.spill_scratch_dir`, which reads the module-level
+    # name. A patch on the re-export silently stops applying and the test keeps passing
+    # while testing nothing.
+    monkeypatch.setattr("batcher._internal.site.scratch.local_scratch_root", lambda: "/ephemeral")
     assert profile._scratch_dir() == "/ephemeral"
-    monkeypatch.setattr("batcher._internal.site.local_scratch_root", lambda: None)
+    monkeypatch.setattr("batcher._internal.site.scratch.local_scratch_root", lambda: None)
     assert profile._scratch_dir() not in ("", "/ephemeral")

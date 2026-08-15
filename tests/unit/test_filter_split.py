@@ -126,3 +126,28 @@ def test_materialize_cost_gates_the_rewrite():
     node = _filter((bt.col("x") > 5) & bt.col("s").str.regexp_matches("^a"))
     pricey = _config_with(filter_split_materialize_cost=1e9)
     assert split_expensive_filter(node, _ctx(pricey)) is None
+
+
+@pytest.mark.unit
+def test_a_cheap_media_predicate_runs_before_an_expensive_one():
+    """Two `.image` predicates of the same shape must be ordered by what they cost.
+
+    `.image` carried one flat cost for every function, so this rule could not tell a
+    header read from a full decode and ordered by selectivity alone. Both conjuncts here
+    are ``expr > literal``, so their estimated selectivity is identical by construction
+    and cost is the only thing that can separate them -- and with the flat table the
+    engine ran `sharpness` (a decode plus a walk of the whole luma plane, ~3,300 us/row)
+    on *every* row and `dhash` (~820 us/row) only on the survivors, which is exactly
+    backwards.
+    """
+    node = _filter(
+        (bt.col("s").image.sharpness() > bt.lit(0.001)) & (bt.col("s").image.dhash() > bt.lit(0))
+    )
+    out = split_expensive_filter(node, _ctx())
+
+    assert isinstance(out, Filter) and isinstance(out.input, Filter), "expected a split"
+    outer = split_conjuncts(out.predicate)
+    inner = split_conjuncts(out.input.predicate)
+    # The inner filter runs first, so the cheaper op belongs there.
+    assert "sharpness" in str(outer[0].to_ir())
+    assert "dhash" in str(inner[0].to_ir())

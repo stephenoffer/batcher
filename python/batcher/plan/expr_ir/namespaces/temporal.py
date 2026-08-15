@@ -1197,7 +1197,7 @@ class _DtNamespace:
         return self.truncate("year")
 
     def days_in_year(self) -> Expr:
-        """Days in this date's year — 366 in a leap year, else 365 (→ Int64).
+        """Days in this date's year — 366 in a leap year, else 365 (→ Int64). NULL in, NULL out.
 
         Returns:
             An Int64 expression of the year's length in days.
@@ -1211,8 +1211,12 @@ class _DtNamespace:
                 >>> ds.select(r=bt.col("d").dt.days_in_year()).to_pydict()
                 {'r': [366, 365]}
         """
-
-        return when(self.is_leap_year()).then(lit(366)).otherwise(lit(365))
+        # Arithmetic rather than `when(is_leap_year()).then(366).otherwise(365)`: a NULL date
+        # makes `is_leap_year()` NULL, which is not *true*, so the CASE fell through to its
+        # ELSE and answered 365 for a row that has no year at all — a silent wrong answer
+        # where the neighbouring `days_in_month` returns NULL. Adding to a NULL propagates,
+        # and it is one kernel rather than a three-branch CASE.
+        return self.is_leap_year().cast("int64") + 365
 
     def week_of_month(self) -> Expr:
         """Which week of the month the date falls in, 1-5 (→ Int64).

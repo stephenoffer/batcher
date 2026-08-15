@@ -119,11 +119,15 @@ def test_relational_explain_is_byte_identical() -> None:
     number was derived, and neither a uniformity assumption over known bounds nor a damped
     combination of *unmeasured* distinct counts is a proof, even when it lands on the right
     answer.
+
+    The scan carries a `pushed[...]` note because the plan hands `a > 1` to the source to
+    apply for itself. It says what was *offered*, not what the source did with it — an
+    in-memory source ignores it entirely, and the `Filter` above is kept regardless.
     """
     expected = (
         "aggregate                       est≈3 (default)\n"
         "  filter                        est≈3 (default)\n"
-        "    scan                        est≈4 (exact)"
+        "    scan                        est≈4 (exact) pushed[a > 1]"
     )
     assert _relational_plan().explain() == expected
 

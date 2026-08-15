@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir import col
 
 if TYPE_CHECKING:
@@ -126,12 +127,7 @@ class TransformedTargetRegressor:
         Raises:
             ColumnNotFoundError: If the target column is missing.
         """
-        if self.target not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", self.target, ds.columns, hint="Pass the target column.")
-            )
+        require_columns(ds, self.target, hint="Pass the target column.")
         self.model.fit(self._forward(ds))
         return self
 

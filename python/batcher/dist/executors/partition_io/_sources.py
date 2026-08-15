@@ -24,7 +24,12 @@ import pickle
 
 import pyarrow as pa
 
-from batcher.dist.executors.partition_io.assignment import assign_splits, has_affinity
+from batcher._internal.errors import ExecutionError
+from batcher.dist.executors.partition_io.assignment import (
+    assign_clustered_splits,
+    assign_splits,
+    has_affinity,
+)
 from batcher.dist.executors.scan_read import (
     _SCAN_PREFETCH,
     _SPLIT_TARGET_BYTES,
@@ -256,6 +261,7 @@ def partition_descriptors(
     preserve_order: bool = False,
     worker_addrs: list[str] | None = None,
     max_partitions: int | None = None,
+    cluster_by: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Partition a source into `workers` in-memory descriptors — no shared filesystem.
 
@@ -281,6 +287,13 @@ def partition_descriptors(
     read is a zero-copy local-store hit instead of a network fetch of bytes already in
     that process. Load-only balancing is kept for storage-backed splits (every worker is
     equidistant from object storage) and whenever locality would unbalance the stage.
+
+    `cluster_by` assigns whole *clustering groups* instead of individual splits, so no two
+    splits sharing a value ever land on different workers. That is what lets a consumer
+    grouping on those columns skip its exchange (see `io.splits.clustering`), and it is
+    checked rather than assumed: the columns the planned splits declare must be exactly the
+    ones the caller was promised, or this raises. A silent fallback here would be a wrong
+    answer, because the caller has already chosen a plan with no combine in it.
 
     `max_partitions` raises the descriptor count above `workers` — the shuffle's task
     granularity, sized by `map_partitions`. It is a **ceiling, not a target**: the count is
@@ -329,9 +342,22 @@ def partition_descriptors(
     n_parts = workers
     if max_partitions is not None and not (worker_addrs and has_affinity(splits)):
         n_parts = max(workers, min(max_partitions, len(splits)))
-    for group in assign_splits(
-        splits, n_parts, preserve_order=preserve_order, worker_addrs=worker_addrs
-    ):
+    if cluster_by is not None:
+        from batcher.io.splits import declared_clustering
+
+        got = declared_clustering(splits)
+        if got != cluster_by:
+            raise ExecutionError(
+                f"the planned splits for this read declare clustering {got or '()'}, but the "
+                f"shuffle-free plan chosen for it requires {cluster_by}. This is an engine "
+                f"invariant, not a user error: report it with the source type and the query."
+            )
+        assigned = assign_clustered_splits(splits, n_parts)
+    else:
+        assigned = assign_splits(
+            splits, n_parts, preserve_order=preserve_order, worker_addrs=worker_addrs
+        )
+    for group in assigned:
         if group:
             descriptors.append({"splits": group, "projection": projection, "predicate": predicate})
         else:

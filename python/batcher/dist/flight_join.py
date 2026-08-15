@@ -40,7 +40,7 @@ from batcher.dist.flight_worker import current_plan_id
 from batcher.dist.shuffle_replication import replicate_shuffle_output, retire_replicas
 from batcher.dist.skew import join_skew_key, resolve_hot_keys, salting_preserves_result
 from batcher.io.source import Source
-from batcher.plan.ir_specs import agg_spec_json
+from batcher.plan.ir_specs import agg_spec_json, task_scan_ir
 from batcher.plan.logical import Aggregate, Join, LogicalPlan
 
 __all__ = ["execute_join_flight"]
@@ -123,8 +123,8 @@ def execute_join_flight(
     join_ir = json.dumps(
         {
             **join.shape_ir(),
-            "left": {"op": "scan", "source_id": 0},
-            "right": {"op": "scan", "source_id": 1},
+            "left": task_scan_ir(),
+            "right": task_scan_ir(1),
         }
     )
     # A fused aggregate's group keys/aggregates (over the join output columns), shipped to

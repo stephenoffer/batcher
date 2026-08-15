@@ -24,15 +24,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher.kyber.stats.distribution import residual_eq_frequency
+from batcher.kyber.stats.distribution import residual_eq_frequency, residual_mass
 from batcher.kyber.stats.selectivity.scalars import _mcv_lookup
 from batcher.plan.expr_ir import Col
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from batcher.config import CardinalityConfig
     from batcher.plan.expr_ir import StrFunc
 
-__all__ = ["anchored_selectivity", "like_selectivity", "regex_selectivity"]
+__all__ = [
+    "anchored_selectivity",
+    "like_selectivity",
+    "measured_match_fraction",
+    "pattern_has_wildcard",
+    "regex_selectivity",
+    "wildcard_prior",
+]
 
 
 def anchored_selectivity(cfg: CardinalityConfig) -> float:
@@ -79,9 +88,15 @@ def _equality_selectivity(
     ndv: dict[str, float],
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]],
+    non_null: float = 1.0,
 ) -> float:
-    """The equality estimate for `col = literal` — a measured skew frequency, else `1/ndv`."""
-    estimate = cfg.eq_selectivity
+    """The equality estimate for `col = literal` — a measured skew frequency, else `1/ndv`.
+
+    Returned as a share of every row. A measured frequency already is one; the `1/ndv` and
+    cold-start branches describe the non-null values only, so `non_null` puts them in the
+    same space (see `residual_eq_frequency`).
+    """
+    estimate = non_null * cfg.eq_selectivity
     if isinstance(expr.input, Col):
         name = expr.input.name
         col_mcv = (mcv or {}).get(name)
@@ -90,7 +105,7 @@ def _equality_selectivity(
             return freq
         d = ndv.get(name)
         if d and d > 0:
-            estimate = residual_eq_frequency(d, col_mcv, cfg.eq_selectivity)
+            estimate = residual_eq_frequency(d, col_mcv, cfg.eq_selectivity, non_null=non_null)
     return estimate
 
 
@@ -99,6 +114,7 @@ def like_selectivity(
     ndv: dict[str, float],
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]],
+    non_null: float = 1.0,
 ) -> float:
     """`col LIKE pattern` selectivity, read from where the wildcards fall.
 
@@ -125,9 +141,34 @@ def like_selectivity(
     """
     pat = expr.pattern
     if not isinstance(pat, str):
-        return cfg.substring_selectivity
-    if not any(w in pat for w in _LIKE_WILDCARDS):
-        return _equality_selectivity(expr, pat, ndv, cfg, mcv)
+        return non_null * cfg.substring_selectivity
+    prior = wildcard_prior(expr, cfg)
+    if prior is None:  # no wildcard at all: the predicate is equality
+        return _equality_selectivity(expr, pat, ndv, cfg, mcv, non_null)
+    return non_null * prior
+
+
+def wildcard_prior(expr: StrFunc, cfg: CardinalityConfig) -> float | None:
+    """The shape prior for a `LIKE` pattern that carries a wildcard, else None.
+
+    The single reading of where the wildcards fall — an anchored run at exactly one end is
+    `prefix_selectivity`, anything else is `substring_selectivity`. `like_selectivity` uses it
+    to pick a prior and `leaves` uses it to decide whether a pattern is refinable against the
+    measured values, so the two cannot disagree about which shape a pattern has.
+
+    None means "not a wildcard pattern": the predicate is plain equality (or the pattern is
+    not a plan-time string), which the equality estimator answers instead.
+
+    Args:
+        expr: The `like`/`ilike` predicate.
+        cfg: The cardinality config carrying the two priors.
+
+    Returns:
+        The conditional shape prior, or None when the pattern carries no wildcard.
+    """
+    pat = expr.pattern
+    if not isinstance(pat, str) or not pattern_has_wildcard(pat):
+        return None
     if "_" not in pat:
         body = pat.strip("%")
         # An anchored match: the single wildcard run sits at exactly one end.
@@ -141,6 +182,7 @@ def regex_selectivity(
     ndv: dict[str, float],
     cfg: CardinalityConfig,
     mcv: dict[str, dict[str, float]],
+    non_null: float = 1.0,
 ) -> float:
     """`regexp_matches(col, pattern)` selectivity, read from the pattern's anchors.
 
@@ -169,7 +211,7 @@ def regex_selectivity(
     """
     pat = expr.pattern
     if not isinstance(pat, str) or not pat:
-        return cfg.substring_selectivity
+        return non_null * cfg.substring_selectivity
     starts = pat.startswith("^")
     # `\$` is an escaped literal dollar, not an end anchor — a price search, not a
     # whole-value match. Tested *before* the anchor check, so a pattern whose only apparent
@@ -177,12 +219,123 @@ def regex_selectivity(
     # being read as anchored.
     ends = pat.endswith("$") and not (len(pat) >= 2 and pat[-2] == "\\")
     if not (starts or ends):
-        return cfg.substring_selectivity
+        return non_null * cfg.substring_selectivity
     body = pat[1:] if starts else pat
     body = body[:-1] if ends else body
     if not body:
-        return cfg.substring_selectivity  # a bare anchor matches everything
+        return non_null * cfg.substring_selectivity  # a bare anchor matches everything
     literal = not any(c in _REGEX_META for c in body)
     if starts and ends and literal:
-        return _equality_selectivity(expr, body, ndv, cfg, mcv)
-    return anchored_selectivity(cfg)
+        return _equality_selectivity(expr, body, ndv, cfg, mcv, non_null)
+    return non_null * anchored_selectivity(cfg)
+
+
+# --- deciding a text predicate against the values that were measured ---------
+
+# The text predicates whose match can be decided against a stored value with plain string
+# operations. `regexp_matches` is deliberately absent: the engine matches with Rust's `regex`
+# crate, which has no backtracking and is linear in the subject, while this would have to use
+# Python's `re`, which backtracks. A pattern that is perfectly well-behaved in the engine
+# (`(a+)+$` is linear there) can take exponential time here — and it would take it *in the
+# planner*, turning a cost estimate into a hang. A regex keeps its pattern-shape prior.
+_VALUE_MATCHERS: dict[str, Callable[[str, str], bool]] = {
+    "contains": lambda value, needle: needle in value,
+    "starts_with": lambda value, prefix: value.startswith(prefix),
+    "ends_with": lambda value, suffix: value.endswith(suffix),
+    "like": lambda value, pattern: _like_matches(value, pattern),
+    "ilike": lambda value, pattern: _like_matches(value.lower(), pattern.lower()),
+}
+
+
+def pattern_has_wildcard(pattern: object) -> bool:
+    """Whether a `LIKE` pattern contains a wildcard (so it is not plain equality)."""
+    return isinstance(pattern, str) and any(w in pattern for w in _LIKE_WILDCARDS)
+
+
+def _like_matches(value: str, pattern: str) -> bool:
+    """SQL `LIKE`: `%` matches any run of characters, `_` exactly one.
+
+    A two-pointer scan with a single restart point rather than a translation to a regex.
+    Both are O(n·m) in the worst case, but this one has no recursion and no backtracking
+    stack, so a pattern like `%a%a%a%a%b` cannot turn a plan-time estimate into a hang the
+    way the regex translation of the same pattern can.
+    """
+    v = p = 0
+    star = -1
+    resume = 0
+    while v < len(value):
+        if p < len(pattern) and pattern[p] in ("_", value[v]):
+            v += 1
+            p += 1
+        elif p < len(pattern) and pattern[p] == "%":
+            star = p
+            resume = v
+            p += 1
+        elif star >= 0:
+            p = star + 1
+            resume += 1
+            v = resume
+        else:
+            return False
+    while p < len(pattern) and pattern[p] == "%":
+        p += 1
+    return p == len(pattern)
+
+
+def measured_match_fraction(
+    expr: StrFunc,
+    mcv: dict[str, dict[str, float]] | None,
+    prior: float,
+    non_null: float = 1.0,
+) -> float | None:
+    """A text predicate's selectivity decided against the column's *measured* values.
+
+    A prior for `contains`/`starts_with`/`LIKE` is a statement about text in general, and the
+    columns these predicates actually filter are the ones a prior describes worst: `status`,
+    `country`, `category`, `event_type` hold a handful of values, all of them in the
+    most-common-value table. The predicate can simply be *evaluated* on each of them.
+
+    So the estimate splits into a part that is known and a part that is guessed::
+
+        Σ f(v) over the listed values the pattern matches  +  residual_mass · prior
+
+    The first term is exact — those frequencies were measured — and the second applies the
+    prior only to the mass the table does not cover. On a column whose table enumerates
+    nearly all of the mass the answer is nearly exact; on a high-cardinality free-text column
+    the table covers little and this degrades smoothly to the prior it started from.
+
+    That gap was the single worst estimate in the selectivity model. Measured on a five-value
+    string column where four values contain `"a"`: `str.contains("a")` was estimated at
+    `substring_selectivity` — 5% of the rows — against 80% actual, a 16x under-estimate, and
+    an under-estimate is the dangerous direction because it sizes hash tables and picks build
+    sides.
+
+    Args:
+        expr: The string predicate.
+        mcv: Measured most-common-value frequencies by column name.
+        prior: The shape prior to apply to the uncovered mass.
+        non_null: The share of rows the column holds a value on, which bounds the table's
+            residual (see `residual_mass`).
+
+    Returns:
+        The refined selectivity, or None when there is no table, no plain-string matcher for
+        this function, or no readable pattern — in each case the caller keeps its prior.
+    """
+    if not isinstance(expr.input, Col) or not isinstance(expr.pattern, str):
+        return None
+    table = (mcv or {}).get(expr.input.name)
+    if not table:
+        return None
+    matcher = _VALUE_MATCHERS.get(expr.fn)
+    if matcher is None:
+        return None
+    if expr.fn in ("like", "ilike") and "\\" in expr.pattern:
+        return None  # an escape sequence this matcher does not implement
+    matched = 0.0
+    for value, freq in table.items():
+        try:
+            if matcher(value, expr.pattern):
+                matched += max(0.0, float(freq))
+        except (TypeError, ValueError, AttributeError):  # pragma: no cover - odd MCV key
+            return None
+    return min(1.0, matched + residual_mass(table, non_null) * prior)

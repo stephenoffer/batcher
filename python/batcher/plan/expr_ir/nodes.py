@@ -232,15 +232,16 @@ class WindowExpr(Expr):
 
     def over(
         self,
-        partition_by: Iterable[Any] = (),
-        order_by: Iterable[Any] = (),
+        partition_by: Iterable[Any] | None = (),
+        order_by: Iterable[Any] | None = (),
         frame: FrameSpec | None = None,
     ) -> WindowExpr:
         """Bind this window function to a partition/order (and optional frame).
 
         Lets a value-function constructor read fluently:
-        ``lag(col("x"), 2).over(partition_by=["g"], order_by=["t"])``. Returns a new
-        `WindowExpr`; the original is unchanged."""
+        ``lag(col("x"), 2).over(partition_by=["g"], order_by=["t"])``. Either key list
+        may be ``None``, meaning none — SQL's unpartitioned ``OVER (ORDER BY t)``.
+        Returns a new `WindowExpr`; the original is unchanged."""
         from batcher.plan.expr_ir.core import normalize_key_list
 
         return WindowExpr(

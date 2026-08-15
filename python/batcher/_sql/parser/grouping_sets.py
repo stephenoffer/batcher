@@ -224,16 +224,33 @@ def _grouping_level_node(node, active: dict, every: dict):
     the SELECT list become NULL so every level shares one output schema."""
     m = node.copy()
     inactive = {k: v for k, v in every.items() if k not in active}
+    # The grand total is `GROUP BY ()`, which is **not** a GROUP BY on constant keys.
+    # They agree on every non-empty input and disagree on the empty one: grouping yields
+    # one group per distinct key value, so zero rows when there are no rows, where the
+    # standard's `GROUP BY ()` yields exactly one row of aggregates over nothing. So
+    # `SELECT i, sum(j) FROM t GROUP BY ROLLUP(i)` over an empty `t` returned nothing
+    # where DuckDB (and Postgres, and the standard) return one all-NULL total row — and
+    # a report whose input a WHERE clause happened to empty lost its total line silently.
+    grand_total = not active
 
     def typed_null(e):
         # NULLIF(e, e) is a NULL *of the expression's type*; used both as a
         # (constant) group key — so it survives aggregation and the output
         # schema matches across levels — and as the projected value.
-        return exp.Nullif(this=e.copy(), expression=e.copy())
+        #
+        # At the grand total there is no GROUP BY, so a bare `e` is not a legal
+        # projection: wrap it in MAX first. `NULLIF(MAX(e), MAX(e))` is still NULL and
+        # still carries `e`'s type, and being an aggregate it is legal with no GROUP BY
+        # — including over zero rows, where MAX is NULL.
+        inner = exp.Max(this=e.copy()) if grand_total else e.copy()
+        return exp.Nullif(this=inner, expression=inner.copy())
 
-    group_exprs = [e.copy() for e in active.values()]
-    group_exprs += [typed_null(e) for e in inactive.values()]
-    m.set("group", exp.Group(expressions=group_exprs))
+    if grand_total:
+        m.set("group", None)
+    else:
+        group_exprs = [e.copy() for e in active.values()]
+        group_exprs += [typed_null(e) for e in inactive.values()]
+        m.set("group", exp.Group(expressions=group_exprs))
 
     # GROUPING(x, y, ...) is a per-level constant: the integer whose bits mark which
     # of its arguments are rolled up (inactive) in this level, first argument the

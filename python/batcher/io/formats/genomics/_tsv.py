@@ -23,6 +23,7 @@ from typing import IO, Any
 import pyarrow as pa
 
 from batcher.io.base._lines import iter_decoded_lines
+from batcher.plan.types import one_batch
 
 #: The "no value" tokens all three formats spell the same way. `.` is each specification's
 #: own missing marker — BED's absent strand, GFF's absent score or phase, VCF's absent field
@@ -69,14 +70,11 @@ def parse_block(
             strings_can_be_null=True,
         ),
     )
-    batches = table.to_batches()
     # `read_csv` can return several batches for a large block; combine so the caller's
-    # batch boundaries are the ones it asked for.
-    return (
-        batches[0]
-        if len(batches) == 1
-        else pa.Table.from_batches(batches, schema=table.schema).combine_chunks().to_batches()[0]
-    )
+    # batch boundaries are the ones it asked for. Through `one_batch`, because the
+    # spelling this replaces dropped every row past the 32-bit offset limit — reachable on
+    # a block of long sequence or annotation strings.
+    return one_batch(table)
 
 
 def iter_record_batches(

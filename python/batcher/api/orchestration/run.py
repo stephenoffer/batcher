@@ -446,9 +446,47 @@ def _run_relational(
     # key nothing ever reads. One resolution, one ambient scope, both halves inside it.
     hardware = distributed_hardware() if distributed else None
     with planning_for(getattr(hardware, "fingerprint", "") or ""):
-        return _run_relational_scoped(
+        table, decisions = _run_relational_scoped(
             plan, sources, ctx, hardware, started, distributed=distributed, materialize=materialize
         )
+    return _as_declared(plan, table), decisions
+
+
+def _as_declared(plan: LogicalPlan, table: pa.Table | Source) -> pa.Table | Source:
+    """Give the result the extension types the plan says it has.
+
+    An Arrow **extension** type is a label on a storage layout, and the operators that
+    rebuild a column through the hash/key machinery return the storage without it. A join
+    carrying a decoded image, or a group-by keyed on one, hands back
+    `fixed_size_list<uint8>[12]` where `Dataset.schema` says
+    `fixed_shape_tensor(uint8, [2, 2, 3])` -- the same numbers under a type that is no
+    longer a tensor. Nothing downstream complains, and a model handed it sees a flat vector.
+
+    Restoring it here rather than per operator is deliberate: this is the one place every
+    relational result passes through, so every path gets the same answer and none of them
+    can disagree with another. Fixing it per operator is what made the spilled `DISTINCT`
+    repair have to be scoped so narrowly -- repairing one path while its neighbours kept
+    the old shape would have traded one mismatch for another.
+
+    This is a boundary guarantee, not the engine fix. The kernels still drop the label; what
+    this does is stop that being visible to a caller, using the schema the planner already
+    computed and `Dataset.schema` already promises.
+
+    Args:
+        plan: The logical plan whose declared schema the result must match.
+        table: The result, or a `Source` for an unmaterialized run.
+
+    Returns:
+        `table`, with any extension-typed column restored.
+    """
+    if not isinstance(table, pa.Table):
+        return table  # an unmaterialized `Source`: nothing to re-wrap yet
+    declared = plan.available_schema()
+    if declared is None:
+        return table  # the planner could not type this shape; leave it exactly as it is
+    from batcher.dist.executors.plan_analysis import restore_declared_types
+
+    return restore_declared_types(table, declared.arrow)
 
 
 def _run_relational_scoped(

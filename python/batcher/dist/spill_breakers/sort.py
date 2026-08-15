@@ -13,6 +13,7 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source
+from batcher.dist.executors.partition_io import range_partitionable
 from batcher.dist.executors.plan_analysis import _single_source
 from batcher.dist.spill import (
     _fd_safe,
@@ -27,7 +28,7 @@ from batcher.dist.spill.buckets import (
 )
 from batcher.io.source import Source
 from batcher.plan.expr_ir import Col
-from batcher.plan.ir_specs import sort_keys_ir
+from batcher.plan.ir_specs import sort_keys_ir, task_scan_ir
 from batcher.plan.logical import Sort
 
 
@@ -60,13 +61,7 @@ def supports_spilling_sort(sort: Sort, sources: list[Source] | None = None) -> b
     # range partition rather than fail inside it.
     if idx < 0:
         return False
-    dt = schema.field(idx).type
-    return (
-        pa.types.is_integer(dt)
-        or pa.types.is_floating(dt)
-        or pa.types.is_string(dt)
-        or pa.types.is_large_string(dt)
-    )
+    return range_partitionable(schema.field(idx).type)
 
 
 def execute_spilling_sort(
@@ -201,7 +196,7 @@ def stream_spilling_sort(
     map_plan, sid = _relabel_single_source(sort.input)
     map_ir = json.dumps(map_plan.to_ir())
     keys_ir = sort_keys_ir(sort.keys)
-    scan = {"op": "scan", "source_id": 0}
+    scan = task_scan_ir()
     sort_ir = json.dumps({"op": "sort", "input": scan, "keys": keys_ir, "limit": sort.limit})
 
     with spill_scratch("batcher_sort_spill_", spill_dir) as store:

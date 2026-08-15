@@ -73,6 +73,9 @@ class _QErrorState:
     consumed: int  # `MetadataHub.signed_appends` as of the last fold
     window: int  # the configured per-signature sample window this state was built for
     samples: dict[str, deque[float]] = field(default_factory=dict)
+    #: Signatures whose window changed since the correction factors were last summarized,
+    #: so only those are re-derived. Owned by `_cardinality_corrections`, which clears it.
+    dirty: set[str] = field(default_factory=set)
 
 
 # Per-hub incremental q-error windows, keyed weakly so a dropped hub evicts its state.
@@ -150,15 +153,40 @@ def _smooth(prior: float, observed: float, n_obs: int) -> float:
     return alpha * observed + (1.0 - alpha) * prior
 
 
+#: The assembled bundle per hub, valid while the hub's two change counters stand still.
+#: Weakly keyed so a dropped hub evicts its own entry.
+_BUNDLE_CACHE: weakref.WeakKeyDictionary[MetadataHub, tuple[int, int, dict[str, Any]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
 def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
     """Load the learned per-signature statistics (`{sig: {"rows": float}}`).
 
     Reassembled from the per-key store, so the shape consumers expect is unchanged, plus
     the derived `CARDINALITY_CORRECTION_KEY` entry folded in from the measured
     per-operator q-error history (`op_stats`).
+
+    **The result is read-only and shared**, and reassembled only when the hub has actually
+    changed — `hub.version` covers the operator history the folds below read, and
+    `hub.params_version` covers the parameter store. Every consumer treats it as a lookup
+    table, which is what makes sharing sound.
+
+    Reassembling per call made a session's per-query cost grow with its own history, which
+    is the opposite of what a learning loop is for. The work is O(learned signatures) with a
+    fresh dict allocated per signature, and it runs several times per query — twice before
+    the optimizer (the ndv seeding and the metadata-answer attempt), once inside it, and
+    once in the close-out. Measured on TPC-DS at scale 1, replaying the suite in one
+    session: the same probe query took **9.4 ms with nothing else run and 21.5 ms after 100
+    other queries had run**, and this function was 57% of the growth. Nothing about the
+    probe changed — only how much the process remembered.
     """
     if hub is None:
         return {}
+    fingerprint = (hub.version, hub.params_version)
+    cached = _BUNDLE_CACHE.get(hub)
+    if cached is not None and cached[:2] == fingerprint:
+        return cached[2]
     stats = dict(hub.load_keyed_params(_NAMESPACE))
     corrections = _cardinality_corrections(hub)
     if corrections:
@@ -183,6 +211,7 @@ def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
     udf_costs = load_udf_row_seconds_table(hub)
     if udf_costs:
         stats[UDF_ROW_SECONDS_KEY] = udf_costs
+    _BUNDLE_CACHE[hub] = (*fingerprint, stats)
     return stats
 
 
@@ -235,11 +264,44 @@ def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:
     except Exception as exc:  # pragma: no cover - learning must never break planning
         note_suppressed("kyber", "read learned cardinality corrections", exc)
         return {}
-    out: dict[str, float] = {}
-    for sig, log_qs in samples.items():
-        factor = correction_factor(list(log_qs), min_samples, max_factor)
+    # Re-derive only the signatures whose q-error window actually moved. `_q_error_samples`
+    # was already incremental; this summary was not, so every query re-computed a geometric
+    # mean for every shape the session had *ever* run — a cost proportional to cumulative
+    # history, on the critical path of each optimize. The memo above hides it only while the
+    # hub stands still, and the hub moves on every query. Measured on TPC-DS at scale 1: a
+    # probe query cost 9.4 ms cold and 21.5 ms after 100 other queries in the same session.
+    state = _QERROR_CACHE[hub]
+    stale = cached is None or cached[1] != fingerprint
+    out: dict[str, float] = {} if stale else cached[2]
+    for sig in samples if stale else state.dirty:
+        log_qs = samples.get(sig)
+        # A signature can be evicted from the window map by the tracking cap while still
+        # named here; it then has no evidence left and must not keep its old factor.
+        factor = 1.0 if log_qs is None else correction_factor(list(log_qs), min_samples, max_factor)
+        # **A correction appearing does not move the learned generation, and it was tried.**
+        # It is the one plan-relevant value that never announces itself — it lives in this
+        # fold rather than in the keyed-parameter store `plan_cache.record_write` guards — so
+        # a plan memoized on the first run is one chosen from the structural estimate alone
+        # and kept. That is a real cost: H2O `groupby` q9 is estimated at ~100 groups
+        # structurally and 10,000 once corrected, Kyber picks the executor for the shape from
+        # that estimate (`MATERIALIZE_AGG_MIN_GROUPS`), and it keeps the 100-group choice —
+        # 62 ms against the 44 ms the other executor takes. Bumping here fixed exactly that,
+        # q9 62 -> 44 ms and q2 50 -> 39.
+        #
+        # It also cost more than it bought, because the generation is **global**. A mixed
+        # workload meets new signatures continuously, so "bump once per signature" is still a
+        # steady stream of bumps, and each one drops *every* memoized plan in the process.
+        # Measured on TPC-DS at scale 1 with fifty-five other queries of the suite run first,
+        # q34 went from **17 ms to 85-210** and the suite's ratio spread widened. Two h2o
+        # queries at ~0.5x against one TPC-DS query at 5x is not a trade worth making.
+        #
+        # The fix this wants is a plan cache keyed by *the corrections its own plan reads*
+        # rather than by one global counter. Until then, a correction is silent.
         if factor != 1.0:
             out[sig] = factor
+        else:
+            out.pop(sig, None)
+    state.dirty.clear()
     _CORRECTION_CACHE[hub] = (hub.version, fingerprint, out)
     return out
 
@@ -301,9 +363,15 @@ def _absorb_q_error(state: _QErrorState, row: dict[str, Any]) -> None:
         if len(state.samples) >= _MAX_TRACKED_SIGNATURES:
             # Oldest-inserted eviction (dicts preserve insertion order), so a session
             # issuing unboundedly many distinct plan shapes cannot grow this map forever.
-            del state.samples[next(iter(state.samples))]
+            # The evicted signature is marked dirty so the incremental summary in
+            # `_cardinality_corrections` re-derives it, finds no evidence, and drops its
+            # factor — a whole-map rebuild used to do that implicitly.
+            evicted = next(iter(state.samples))
+            del state.samples[evicted]
+            state.dirty.add(evicted)
         bucket = state.samples[sig] = deque(maxlen=state.window)
     bucket.append(math.log(actual / est))
+    state.dirty.add(sig)
 
 
 def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: int) -> None:
@@ -311,6 +379,22 @@ def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: in
 
     Reads and writes only this signature's own key, so a concurrent record for a
     different shape cannot clobber it (no whole-blob lost-update race).
+
+    **The generation moves on the *stored* value, not on the observation.** What a plan reads
+    is the smoothed estimate; the raw count is one sample of it, and smoothing exists precisely
+    so a single sample does not move the estimate by its own distance. Comparing the sample
+    against the prior therefore invalidates on drift the estimate absorbed — the same mistake
+    `plan_cache.record_write` documents for the bandit, in the one place that does not route
+    through it.
+
+    It is not a small effect, because a signature is *structural*: two queries of the same
+    shape share one entry (see the scan-collision note in `kyber.signature`), so the estimate
+    is fed alternating observations and never settles on either. Measured on TPC-DS at scale 1
+    with sixty other queries of the suite already run in the session, q77's signature held 100
+    while q77 measured 44 on every execution — a 56% "change" each time — so **every run of
+    q77 invalidated every memoized plan in the process**, and q77 re-planned for 131 ms of its
+    268 ms. The learned generation is global; one query that never settles costs the whole
+    session its plan cache.
     """
     if hub is None:
         return
@@ -318,13 +402,14 @@ def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: in
         sig = plan_signature(plan)
         entry = dict(hub.get_keyed_param(_NAMESPACE, sig) or {})  # preserve sibling keys
         prior = entry.get("rows")
-        if _is_material(prior, float(output_rows)):
-            _bump_generation()
-        entry["rows"] = (
+        updated = (
             float(output_rows)
             if prior is None
             else _smooth(prior, float(output_rows), entry.get("n_obs", 0))
         )
+        if _is_material(prior, updated):
+            _bump_generation()
+        entry["rows"] = updated
         entry["n_obs"] = entry.get("n_obs", 0) + 1
         hub.put_keyed_param(_NAMESPACE, sig, entry)
     except Exception as exc:  # pragma: no cover - learning must never break execution

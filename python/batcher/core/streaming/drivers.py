@@ -31,10 +31,21 @@ from batcher.core.streaming.folds import (
 )
 from batcher.io.source import Source
 from batcher.plan.logical import Aggregate, Distinct, Limit, Sort
+from batcher.plan.types import one_batch
+
+#: How many rows a streaming top-N round buffers per row of running state before it merges.
+#:
+#: The merge re-reads the running `limit` rows, so this bounds that overhead at roughly its
+#: reciprocal — a few percent — however large `limit` is, while keeping the round a small
+#: multiple of the result. It matches the engine-side fold's ratio deliberately: the two are the
+#: same reduction driven from different sides of the FFI boundary, and a reader comparing them
+#: should not have to work out whether the difference is meaningful.
+_TOPN_MERGE_RATIO = 16
 
 __all__ = [
     "stream_aggregate",
     "stream_distinct",
+    "stream_distinct_limit",
     "stream_keyed_state",
     "stream_limit",
     "stream_topn",
@@ -219,6 +230,83 @@ def stream_distinct(
     yield from stream_aggregate(distinct.as_aggregate(), source, batch_size, projection=projection)
 
 
+def stream_distinct_limit(
+    distinct: Distinct,
+    source: Source,
+    batch_size: int | None = None,
+    *,
+    projection: list[str] | None = None,
+) -> Iterator[pa.RecordBatch]:
+    """The first `distinct.limit` distinct rows of a stream, then stop reading.
+
+    "Show me the first fifty distinct values off this topic" is how anyone inspects an
+    unfamiliar stream, and it is bounded in every way that matters: the state is `limit`
+    rows, and the read stops as soon as that many distinct rows exist. An uncapped
+    `stream_distinct` can do neither — it holds one entry per distinct value forever and
+    finalizes only at an end-of-input a stream never reaches — so the router refused the
+    capped form along with the uncapped one, and a query that terminates in bounded memory
+    was answered with "this plan must materialize".
+
+    **The early exit is sound because the survivors are the first `limit` in input order.**
+    Once that many distinct rows have been seen, every later row is either a duplicate (which
+    changes nothing) or a new distinct row that arrived later and therefore cannot displace
+    one of them. That is the same rule the engine's own fused `Distinct(limit)` follows and
+    the same one `kyber.rules.extra.topn_limit.fuse_limit_into_distinct` documents, which is
+    why the two agree on *which* rows come back and not merely on how many.
+
+    The dedup itself is the engine's `Distinct` operator, run over the accumulated survivors
+    concatenated with the newly-mapped batch. Re-running the real operator is what keeps this
+    from being a second definition of what `DISTINCT` means: the alternative — folding
+    through the group-by hash state the way `stream_distinct` does — returns the rows in
+    hash-bucket order, which is not input order and so is not the same answer.
+
+    Args:
+        distinct: A whole-column `Distinct` carrying a `limit`, over a breaker-free input.
+        source: The stream to read.
+        batch_size: Optional output rebatching.
+        projection: The columns the plan needs, from Kyber.
+
+    Yields:
+        One logical result of at most `distinct.limit` rows, rebatched by `batch_size`.
+    """
+    from batcher.plan.logical import Scan
+    from batcher.plan.schema import SchemaRef
+
+    cap = distinct.limit
+    if cap is None or cap <= 0:
+        return
+    nat = engine()
+    cfg = active_config().engine_config_json()
+    input_ir = json.dumps(distinct.input.to_ir())
+
+    survivors: pa.RecordBatch | None = None
+    dedup_ir: str | None = None
+    for batch in _read(source, projection):
+        if batch.num_rows == 0:
+            continue
+        mapped = [b for b in nat.execute_plan(input_ir, [[batch]], cfg) if b.num_rows]
+        if not mapped:
+            continue
+        if dedup_ir is None:
+            # Built from the *mapped* schema, not the source's: the input pipeline may
+            # project, rename, or compute columns, and the dedup runs over what it produced.
+            capped = Distinct(Scan(0, SchemaRef.from_arrow(mapped[0].schema)), limit=cap)
+            dedup_ir = json.dumps(capped.to_ir())
+        rows = mapped if survivors is None else [survivors, *mapped]
+        out = [b for b in nat.execute_plan(dedup_ir, [rows], cfg) if b.num_rows]
+        # The operator caps its own output at `cap`, so concatenating is bounded by it.
+        # `one_batch`, because `combine_chunks().to_batches()[0]` splits at the 32-bit
+        # offset limit — a distinct over a text or blob column whose survivors exceed
+        # 2 GiB came back as several batches and every row after the first was dropped
+        # from the result, silently.
+        survivors = one_batch(out) if out else survivors
+        if survivors is not None and survivors.num_rows >= cap:
+            break  # no later row can displace one of the first `cap` distinct rows
+
+    if survivors is not None and survivors.num_rows:
+        yield from _rebatch(survivors, batch_size)
+
+
 def stream_limit(
     limit: Limit,
     source: Source,
@@ -279,10 +367,21 @@ def stream_topn(
     """Top-N (`sort` + `limit`) over a streaming source, with memory bounded by N.
 
     Top-N is mergeable — top-N of (A concat B) equals top-N of (top-N of A, B) — so the driver keeps
-    only the running best `limit` rows: each micro-batch is run through the sort
-    sub-plan, merged with the running best, and re-trimmed to `limit`. The final
-    running set is the global top-N, identical to sorting the whole input then
-    taking the first `limit` rows.
+    only the running best `limit` rows: batches are run through the sort sub-plan, merged
+    with the running best, and re-trimmed to `limit`. The final running set is the global
+    top-N, identical to sorting the whole input then taking the first `limit` rows.
+
+    **The merge happens per round, not per micro-batch.** Merging on every batch re-reads
+    and re-sorts the running `limit` rows once per batch, so a small source batch against a
+    large `limit` pays far more for the merge than for the rows it contributed — and it pays
+    two engine round-trips per batch to do it. A round buffers until it holds several times
+    `limit` rows, which bounds the merge overhead at a fraction of the round regardless of
+    `limit` while leaving peak memory at `limit` plus one round. It is the same reasoning,
+    and the same ratio, the engine's own streaming top-N fold uses.
+
+    Rounds cannot change the answer: the rows are still presented to the merge in arrival
+    order, with the running best ahead of them, which is what fixes both the survivors and
+    the order ties resolve in.
     """
     nat = engine()
 
@@ -298,17 +397,31 @@ def stream_topn(
     input_ir = json.dumps(sort.input.to_ir())
 
     running: list[pa.RecordBatch] = []
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    round_rows = max(limit * _TOPN_MERGE_RATIO, active_config().execution.morsel_rows)
     # The engine config is constant for the query, so read and serialize it once — not once
     # per micro-batch inside the loop (`stream_limit` already hoists it the same way).
     cfg_json = active_config().engine_config_json()
+
+    def merge(buffered: list[pa.RecordBatch]) -> list[pa.RecordBatch]:
+        """Run one round's batches through the input pipeline and fold them into `running`."""
+        rows = [b for b in nat.execute_plan(input_ir, [buffered], cfg_json) if b.num_rows]
+        merged = running + rows
+        if not merged:
+            return running
+        return [b for b in nat.execute_plan(sort_ir, [merged], cfg_json) if b.num_rows]
+
     for batch in _read(source, projection):
         if batch.num_rows == 0:
             continue
-        rows = [b for b in nat.execute_plan(input_ir, [[batch]], cfg_json) if b.num_rows]
-        merged = running + rows
-        if not merged:
-            continue
-        running = [b for b in nat.execute_plan(sort_ir, [merged], cfg_json) if b.num_rows]
+        pending.append(batch)
+        pending_rows += batch.num_rows
+        if pending_rows >= round_rows:
+            running = merge(pending)
+            pending, pending_rows = [], 0
+    if pending:
+        running = merge(pending)
 
     if not running:
         return

@@ -18,7 +18,16 @@ from batcher.plan.expr_ir.core import (
     InList,
     Lit,
 )
-from batcher.plan.expr_ir.func_nodes import ListFilter, ListTransform
+from batcher.plan.expr_ir.func_nodes import (
+    ConvertTimezone,
+    DateFunc,
+    DateOffset,
+    DateTrunc,
+    ListFilter,
+    ListTransform,
+    Strftime,
+    WindowStart,
+)
 from batcher.plan.expr_ir.node_base import IRNode, child_fields
 from batcher.plan.expr_ir.nodes import (
     Case,
@@ -377,3 +386,75 @@ def broadcast_aggregate_leaves(expr: Expr | AggExpr) -> Expr:
             return expr
         return dataclasses.replace(expr, **updates)
     return expr
+
+
+#: The nodes that read a column *as an instant*, and so need a temporal (or epoch-numeric)
+#: input. `Strptime` and `MakeTemporal` are deliberately absent: they *produce* a temporal
+#: value from a string or from integer parts, so their input is not one.
+_TEMPORAL_READERS = (DateFunc, DateTrunc, DateOffset, Strftime, ConvertTimezone, WindowStart)
+
+
+def temporal_inputs(expr: Expr) -> list[Expr]:
+    """The input sub-expression of every date/time node inside `expr`.
+
+    What a caller does with them is a type question (`plan.types.domains`); this only
+    finds them. Returns a list rather than a set because the inputs are expressions, which
+    are not hashable by value, and there are never many.
+
+    The common case is a bare `Col` or a `Lit`, which returns an empty list without
+    allocating -- this runs on the per-column projection path, where `Project` on a wide
+    relation calls it once per output column.
+
+    Args:
+        expr: The expression to inspect.
+
+    Returns:
+        The inputs of the temporal nodes it contains, outermost first.
+    """
+    if isinstance(expr, (Col, Lit)):
+        return []
+    # Memoized on the (immutable) node, like `referenced_columns` and for the same reason:
+    # the optimizer rebuilds a `Project` on every fixpoint iteration and each rebuild
+    # re-validates its items. A tuple, so a caller cannot mutate the shared answer — the
+    # bug that made `referenced_columns` return a `frozenset`.
+    cached = expr.__dict__.get("_c_temporal_inputs")
+    if cached is not None:
+        return list(cached)
+    found: list[Expr] = []
+    _collect_temporal_inputs(expr, found)
+    expr.__dict__["_c_temporal_inputs"] = tuple(found)
+    return found
+
+
+def _collect_temporal_inputs(expr: Expr, out: list[Expr]) -> None:
+    """Walk `expr`, appending each temporal node's input to `out`.
+
+    Descends through the generic `IRNode` child declaration for the same reason
+    `_referenced_columns_impl` does: a per-type cascade silently misses any node kind
+    nobody added an arm for, and here a miss means a rule that quietly stops applying.
+    """
+    if isinstance(expr, _TEMPORAL_READERS):
+        out.append(expr.input)
+    if isinstance(expr, Aliased):
+        _collect_temporal_inputs(expr.inner, out)
+        return
+    if isinstance(expr, InList):
+        _collect_temporal_inputs(expr.input, out)
+        return
+    if isinstance(expr, Case):
+        _collect_temporal_inputs(expr.otherwise, out)
+        for cond, then in expr.branches:
+            _collect_temporal_inputs(cond, out)
+            _collect_temporal_inputs(then, out)
+        return
+    if isinstance(expr, MakeStruct):
+        for _name, value in expr.fields:
+            _collect_temporal_inputs(value, out)
+        return
+    if isinstance(expr, IRNode):
+        for name, is_list in child_fields(expr):
+            value = getattr(expr, name)
+            if value is None:
+                continue
+            for sub in value if is_list else (value,):
+                _collect_temporal_inputs(sub, out)

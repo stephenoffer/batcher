@@ -96,6 +96,7 @@ These read media and document files as rows of bytes plus metadata, decoding onl
 | {py:meth}`bt.read.video(path, decode=False) <batcher.api.io_namespace.reader.Reader.video>` | video files (+ frames when decoded) | `video` |
 | {py:meth}`bt.read.documents(path) <batcher.api.io_namespace.reader.Reader.documents>` | PDF document(s) as text rows | `pdf` |
 | {py:meth}`bt.read.webdataset(path) <batcher.api.io_namespace.reader.Reader.webdataset>` | WebDataset `.tar` shard(s) | |
+| {py:meth}`bt.read.training_shards(path) <batcher.api.io_namespace.reader.Reader.training_shards>` | a training corpus written by {py:meth}`ds.ml.write_shards <batcher.api.dataset.ml.DatasetML.write_shards>` | |
 
 ## Writers
 

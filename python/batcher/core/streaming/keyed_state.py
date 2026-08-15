@@ -47,6 +47,7 @@ from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.plan.logical import TransformWithState
 from batcher.plan.streaming import StateOperatorProgress
+from batcher.plan.types import one_batch
 
 __all__ = ["KeyedStateFold"]
 
@@ -309,8 +310,10 @@ def _as_batch(produced: Any) -> pa.RecordBatch | None:
     if isinstance(produced, pa.RecordBatch):
         return produced
     if isinstance(produced, pa.Table):
-        batches = produced.combine_chunks().to_batches()
-        return batches[0] if batches else None
+        # `one_batch`, because `to_batches()[0]` splits at the 32-bit offset limit: a user
+        # function that returned more than 2 GiB of string or blob data had every row past
+        # the first piece dropped from the operator's output.
+        return one_batch(produced)
     return pa.record_batch(produced)
 
 
@@ -366,6 +369,6 @@ def _group_by(batches: list[pa.RecordBatch], keys: list[str]):
         if end <= start:
             continue
         key = tuple(column[start].as_py() for column in columns)
-        rows = table.slice(start, end - start).combine_chunks().to_batches()
-        if rows:
-            yield key, rows[0]
+        rows = one_batch(table.slice(start, end - start))
+        if rows is not None:
+            yield key, rows

@@ -549,6 +549,20 @@ pub(crate) fn eval_date_offset(
     // the array plumbing and the type-specific errors.
     let offset = TypedOffset::new(months, days, micros);
 
+    // A text column is parsed as a timestamp first, and an all-null one typed as an instant —
+    // the same two hoists `eval_date` does, for the same reason. `offset_by` was the one member
+    // of the family that had neither, so `col('s').dt.offset_by('1d')` over a string column
+    // failed with `unknown cast target type: offset_by on Utf8` while `year`, `truncate` and
+    // `strftime` over that same column all answered. That made the family's uniformity — which
+    // is what the hoist in `eval_date` exists to establish — false at exactly one node.
+    if matches!(
+        arr.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
+    ) {
+        let parsed = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+        return eval_date_offset(&parsed, months, days, micros);
+    }
+
     match arr.data_type() {
         DataType::Date32 => {
             if micros != 0 {

@@ -7,7 +7,10 @@
 //! are null or fail to decode yields a null result (corrupt inputs don't fail
 //! the batch), matching the multimodal source's header-metadata convention.
 
+mod hash;
+mod probe;
 mod quality;
+mod transform;
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -24,10 +27,10 @@ use crate::{ExprError, ImageFunc};
 
 mod reencode;
 
-pub(crate) use reencode::Bounds;
 use reencode::{
     auto_orient, convert, crop_dynamic, encode, exif_orientation, letterbox, resize, thumbnail,
 };
+pub(crate) use reencode::{Bounds, Output};
 
 /// Evaluate an image function over a Binary or LargeBinary array of encoded image bytes.
 ///
@@ -48,8 +51,15 @@ pub(crate) struct ImageArgs<'a> {
     pub mean: Option<&'a [f64]>,
     pub std: Option<&'a [f64]>,
     pub channels_first: bool,
+    /// The container every bytes-out op writes; `png` when absent.
     pub format: Option<&'a str>,
-    /// `letterbox` only: the byte the leftover canvas is filled with.
+    /// `convert` only: the target colour mode.
+    pub mode: Option<&'a str>,
+    /// Encoder quality for the lossy containers, 1..=100.
+    pub quality: Option<i64>,
+    /// The single scalar knob the photometric ops take; named per op.
+    pub factor: Option<f64>,
+    /// `letterbox`/`pad` only: the byte the leftover canvas is filled with.
     pub fill: Option<i64>,
 }
 
@@ -67,7 +77,9 @@ pub(crate) fn eval_image(
         DataType::Binary => eval_image_sized::<i32>(func, arr, args, norm),
         DataType::LargeBinary => eval_image_sized::<i64>(func, arr, args, norm),
         other => Err(ExprError::ExpectedBinary {
-            func: format!("{func:?}"),
+            // Namespaced, because `Decode` alone is a name three namespaces share and the
+            // error otherwise reported an image failure without saying it was one.
+            func: format!("image.{func:?}"),
             got: other.to_string(),
         }),
     }
@@ -148,22 +160,49 @@ fn eval_image_sized<O: OffsetSizeTrait>(
             func: format!("{func:?}"),
             got: arr.data_type().to_string(),
         })?;
+    // Every bytes-out op writes the same container, resolved once for the batch so an
+    // unknown format name is one plan error rather than n identical per-row failures.
+    let out = Output::resolve(func, args.format, args.quality)?;
     match func {
         ImageFunc::Decode => decode_dims(bytes),
         ImageFunc::ToTensor => to_tensor(bytes, width, height),
         ImageFunc::ToTensorF32 => to_tensor_f32(bytes, width, height, &norm),
         ImageFunc::CenterCrop => center_crop(bytes, width, height),
         ImageFunc::ToGrayscale => to_grayscale(bytes, width, height),
-        ImageFunc::Resize => resize(bytes, width, height),
-        ImageFunc::Encode => encode(bytes, args.format),
-        ImageFunc::Convert => convert(bytes, args.format),
+        ImageFunc::Resize => resize(bytes, width, height, out),
+        ImageFunc::Encode => encode(bytes, out),
+        ImageFunc::Convert => convert(bytes, args.mode, out),
         ImageFunc::Dhash => dhash(bytes),
         ImageFunc::Brightness => quality::brightness(bytes),
         ImageFunc::Sharpness => quality::sharpness(bytes),
-        ImageFunc::AutoOrient => auto_orient(bytes),
+        ImageFunc::AutoOrient => auto_orient(bytes, out),
         ImageFunc::ExifOrientation => exif_orientation(bytes),
-        ImageFunc::Thumbnail => thumbnail(bytes, width),
+        ImageFunc::Thumbnail => thumbnail(bytes, width, out),
         ImageFunc::Letterbox => letterbox(bytes, args),
+        ImageFunc::Pad => transform::pad(bytes, args, out),
+        ImageFunc::Rotate
+        | ImageFunc::FlipHorizontal
+        | ImageFunc::FlipVertical
+        | ImageFunc::AdjustBrightness
+        | ImageFunc::AdjustContrast
+        | ImageFunc::AdjustSaturation
+        | ImageFunc::AdjustHue
+        | ImageFunc::Blur
+        | ImageFunc::Sharpen
+        | ImageFunc::Invert
+        | ImageFunc::Posterize
+        | ImageFunc::Solarize
+        | ImageFunc::Equalize
+        | ImageFunc::AutoContrast => transform::eval(func, bytes, args.factor, out),
+        ImageFunc::Phash => hash::phash(bytes),
+        ImageFunc::Ahash => hash::ahash(bytes),
+        ImageFunc::Entropy => quality::entropy(bytes),
+        ImageFunc::Colorfulness => quality::colorfulness(bytes),
+        ImageFunc::MeanColor => quality::mean_color(bytes),
+        ImageFunc::IsGrayscale => quality::is_grayscale(bytes),
+        ImageFunc::AspectRatio => probe::aspect_ratio(bytes),
+        ImageFunc::HasAlpha => probe::has_alpha(bytes),
+        ImageFunc::Format => probe::format(bytes),
     }
 }
 
@@ -694,6 +733,9 @@ mod tests {
             std: None,
             channels_first: false,
             format: None,
+            mode: None,
+            quality: None,
+            factor: None,
             fill: None,
         }
     }
@@ -1051,7 +1093,7 @@ mod tests {
                 ImageFunc::Convert,
                 &arr,
                 ImageArgs {
-                    format: Some(mode),
+                    mode: Some(mode),
                     ..args(None, None)
                 },
             )
@@ -1083,7 +1125,7 @@ mod tests {
             ImageFunc::Convert,
             &arr,
             ImageArgs {
-                format: Some("L"),
+                mode: Some("L"),
                 ..args(None, None)
             },
         )
@@ -1114,7 +1156,7 @@ mod tests {
             ImageFunc::Convert,
             &arr,
             ImageArgs {
-                format: Some("CMYK"),
+                mode: Some("CMYK"),
                 ..args(None, None)
             }
         )

@@ -24,7 +24,8 @@ from batcher.io.source import Source, iter_source
 from batcher.plan.expr_ir import Binary, Col, Expr, InList, Not
 from batcher.plan.logical import Aggregate, Filter, Join, LogicalPlan
 from batcher.plan.source_stats import source_stats_key
-from batcher.plan.visitor import walk
+from batcher.plan.types import logical_bytes
+from batcher.plan.visitor import walk_with_base_names
 
 __all__ = [
     "collect_source_metadata",
@@ -161,20 +162,23 @@ def ndv_columns(plan: LogicalPlan) -> set[str]:
     60M-row `lineitem`'s sixteen columns blow any sane cell budget, while its three join
     keys fit comfortably.
 
-    Names are taken from the plan as written, so a join key renamed by an intervening
-    projection is simply not matched against the source schema and falls back to the
-    post-run learner. Conservative in the right direction: a missed column costs a worse
-    first plan, never a wrong answer.
+    Names are resolved back through renaming projections to the **base** column each one
+    stands for (`walk_with_base_names`), because the caller matches them against a source's
+    own schema. Taking the names as written instead silently seeded nothing at all for an
+    aliased table — see that function for what it cost TPC-DS q17.
     """
     wanted: set[str] = set()
-    for node in walk(plan):
+    for node, base in walk_with_base_names(plan):
         if isinstance(node, Join):
-            wanted.update(node.left_keys)
-            wanted.update(node.right_keys)
+            wanted.update(base.get(k, k) for k in (*node.left_keys, *node.right_keys))
         elif isinstance(node, Aggregate):
-            wanted.update(k.expr.name for k in node.group_keys if isinstance(k.expr, Col))
+            wanted.update(
+                base.get(k.expr.name, k.expr.name)
+                for k in node.group_keys
+                if isinstance(k.expr, Col)
+            )
         elif isinstance(node, Filter):
-            wanted.update(_equality_columns(node.predicate))
+            wanted.update(base.get(c, c) for c in _equality_columns(node.predicate))
     return wanted
 
 
@@ -363,7 +367,7 @@ def _learn_row_bytes(hub, resolved, sources) -> None:
             # that is `None` by construction, which is worse than not checking it.
             widths: dict[str, float] = {}
             for name in names:
-                total = sum(b.column(name).nbytes for b in batches)
+                total = sum(logical_bytes(b.column(name)) for b in batches)
                 if total > 0:
                     widths[name] = total / rows
             if widths:

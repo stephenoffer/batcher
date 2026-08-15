@@ -44,6 +44,22 @@ _WIDEN_NARROW: dict[pa.DataType, pa.DataType] = {
 }
 
 
+def _unimportable_targets(schema: pa.Schema) -> dict[str, pa.DataType]:
+    """Cast targets for the columns arrow-rs's FFI reader cannot import at all.
+
+    Distinct from the narrow-widening below in *kind*, which is why it is applied
+    unconditionally rather than skipped under ``shrink_output_dtypes``. Widening is an
+    optimization -- the Rust boundary does it anyway, so doing it here only saves a repeated
+    cast. A list-view layout never reaches that boundary: arrow-rs's C Data Interface reader
+    rejects it, so the query dies with a raw ``ArrowException`` while `Dataset.schema` (which
+    reads `plan.types.widen`) reports the ``list`` it would have arrived as. See
+    `plan.types.layout`.
+    """
+    from batcher.plan.types.layout import importable_type
+
+    return {f.name: t for f in schema if (t := importable_type(f.type)) is not None}
+
+
 def _widen_schema(schema: pa.Schema, targets: dict[str, pa.DataType]) -> pa.Schema:
     """`schema` with each `targets` column retyped to its widened type (metadata only)."""
     return pa.schema([f.with_type(targets[f.name]) if f.name in targets else f for f in schema])
@@ -110,6 +126,14 @@ class InMemorySource:
     a stage boundary's statistics out of the cross-query learned store — see
     `api.terminal._metadata.seed_column_ndv` for what recording them did instead.
 
+    `derivation` is the escape hatch from that, and only the engine sets it: a string naming
+    *how this relation was derived* — the subplan's content key over its inputs' own keys — for
+    an intermediate the engine will derive again, identically, on the next run of the same
+    query. An object keyed that way is ephemeral in lifetime and stable in identity, which is
+    exactly what a memo needs: `kyber.plan_cache` will cache a plan built over it (see
+    `_source_keys`), where an `id()`-keyed relation could only ever be written and never read
+    back. `api.subplan_reuse` is the one caller.
+
     Examples:
         .. doctest::
 
@@ -136,6 +160,7 @@ class InMemorySource:
         "_targets",
         "_valuecount_cache",
         "_zone_maps",
+        "derivation",
         "ephemeral",
     )
     bounded = True
@@ -157,12 +182,14 @@ class InMemorySource:
         *,
         zone_maps: bool = True,
         ephemeral: bool = False,
+        derivation: str | None = None,
     ) -> None:
         if not batches:
             raise PlanError("InMemorySource needs at least one record batch, for its schema")
         self._batches = batches
         self._zone_maps = zone_maps
         self.ephemeral = ephemeral
+        self.derivation = derivation
         # `batches` is fixed for the source's life, so its row count and shape key are too.
         # Both are asked for several times per query and each answer walked every batch —
         # the key also re-rendering the whole schema to a string. Resolved on first use.
@@ -171,12 +198,14 @@ class InMemorySource:
         src_schema = batches[0].schema
         if active_config().execution.shrink_output_dtypes:
             self._targets: dict[str, pa.DataType] = {}
-            self._schema = src_schema
         else:
             self._targets = {
                 f.name: t for f in src_schema if (t := _widen_narrow_type(f.type)) is not None
             }
-            self._schema = _widen_schema(src_schema, self._targets) if self._targets else src_schema
+        # Applied last, and on both paths, so a layout that cannot cross the FFI at all is
+        # respelled even where the optional widening is deliberately left to Rust.
+        self._targets.update(_unimportable_targets(src_schema))
+        self._schema = _widen_schema(src_schema, self._targets) if self._targets else src_schema
         self._cache: dict[tuple[int, str], pa.Array] = {}
         self._stats: object | None = None
         self._ndv_cache: dict[str, int | None] = {}
@@ -421,9 +450,13 @@ class InMemorySource:
         key = (bi, name)
         arr = self._cache.get(key)
         if arr is None:
-            import pyarrow.compute as pc
+            from batcher.plan.types.layout import importable_array
 
-            arr = pc.cast(col, target)
+            # `importable_array`, not `pc.cast`: it *is* `cast` for every ordinary widening,
+            # and the hand-rolled rebuild for a list-view layout — which pyarrow's own cast
+            # gets wrong, emitting a `list` whose offsets buffer is a slot short (see
+            # `plan.types.layout`).
+            arr = importable_array(col, target)
             self._cache[key] = arr
         return arr
 

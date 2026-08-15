@@ -11,6 +11,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use arrow::array::AsArray;
 use arrow::array::{
     Array, ArrayRef, Float32Builder, Float64Array, GenericBinaryArray, Int32Array, Int64Array,
     ListBuilder, OffsetSizeTrait, StructArray,
@@ -27,28 +28,63 @@ use symphonia::core::probe::Hint;
 use super::map_rows;
 use crate::{AudioFunc, ExprError};
 
-/// Evaluate an audio function over a Binary array of encoded audio bytes. `rate` is the
-/// target sample rate for [`AudioFunc::Resample`]/[`AudioFunc::MelSpectrogram`] (ignored by
-/// the others); `n_fft`/`hop`/`n_mels` parameterize the mel spectrogram only.
-#[allow(clippy::too_many_arguments)]
+/// The scalar arguments an audio function may carry, gathered into one struct.
+///
+/// They arrived as eight positional parameters behind an
+/// `#[allow(clippy::too_many_arguments)]`, and the new framing ops push it past eleven — at
+/// which point a caller swapping `offset_secs` and `duration_secs` is a silent bug the
+/// compiler cannot see. Named fields make each call site read as what it is, exactly as
+/// `ImageArgs` does for the image side.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AudioArgs {
+    /// The target sample rate: `Resample`'s output rate, and the analysis rate every
+    /// spectral op resamples to first.
+    pub rate: Option<i64>,
+    pub n_fft: Option<i64>,
+    pub hop: Option<i64>,
+    pub n_mels: Option<i64>,
+    pub n_mfcc: Option<i64>,
+    /// `trim_silence`/`silence_ratio`'s floor, and `rms_normalize`'s target.
+    pub threshold_db: Option<i64>,
+    /// The one fractional knob, named per op.
+    pub factor: Option<f64>,
+    /// `slice` only: where the window starts.
+    pub offset_secs: Option<f64>,
+    /// `slice`/`pad_or_trim`: how long the window is.
+    pub duration_secs: Option<f64>,
+}
+
+/// Evaluate an audio function over a Binary array of encoded audio bytes.
 pub(crate) fn eval_audio(
     func: AudioFunc,
     arr: &ArrayRef,
-    rate: Option<i64>,
-    n_fft: Option<i64>,
-    hop: Option<i64>,
-    n_mels: Option<i64>,
-    n_mfcc: Option<i64>,
-    threshold_db: Option<i64>,
+    args: AudioArgs,
 ) -> Result<ArrayRef, ExprError> {
-    let mel = MelParams::resolve(func, rate, n_fft, hop, n_mels, n_mfcc)?;
+    let mel = MelParams::resolve(
+        func,
+        args.rate,
+        args.n_fft,
+        args.hop,
+        args.n_mels,
+        args.n_mfcc,
+    )?;
     // An all-null column is typed `Null`, not `Binary`; see `widen_null_column`.
     if let Some(nulls) = super::widen_null_column(arr) {
-        return eval_audio_sized::<i32>(func, &nulls, rate, mel, threshold_db);
+        return eval_audio_sized::<i32>(func, &nulls, args, mel);
+    }
+    // A waveform column rather than encoded containers. The ops that need no sample rate
+    // read it directly — which is what makes the namespace composable, since every waveform
+    // op hands one back — and `encode_wav` is given its rate, so it reads one too. Anything
+    // that needs a rate the column cannot carry says so, by name.
+    if let DataType::List(field) = arr.data_type() {
+        if matches!(field.data_type(), DataType::Float32) {
+            let clips = Signal::Waveform(arr.as_list::<i32>());
+            return eval_waveform(func, &clips, arr, args);
+        }
     }
     match arr.data_type() {
-        DataType::Binary => eval_audio_sized::<i32>(func, arr, rate, mel, threshold_db),
-        DataType::LargeBinary => eval_audio_sized::<i64>(func, arr, rate, mel, threshold_db),
+        DataType::Binary => eval_audio_sized::<i32>(func, arr, args, mel),
+        DataType::LargeBinary => eval_audio_sized::<i64>(func, arr, args, mel),
         other => Err(ExprError::ExpectedBinary {
             // Namespaced, because `Decode` alone is a name three namespaces share and the
             // error otherwise reported an audio failure as an image one.
@@ -121,13 +157,48 @@ impl MelParams {
 /// `eval_audio` for one offset width. Both are supported because a media source stores
 /// payloads as `LargeBinary` — 32-bit offsets cap an array at 2 GB total, which a batch of
 /// audio files reaches.
+/// The ops a waveform column can answer, and a clear refusal for the ones it cannot.
+fn eval_waveform(
+    func: AudioFunc,
+    clips: &Signal<'_>,
+    arr: &ArrayRef,
+    args: AudioArgs,
+) -> Result<ArrayRef, ExprError> {
+    use super::{level, speech};
+
+    match func {
+        AudioFunc::Rms
+        | AudioFunc::Dbfs
+        | AudioFunc::PeakDbfs
+        | AudioFunc::ClippingRatio
+        | AudioFunc::SilenceRatio => level::measure(func, clips, args),
+        AudioFunc::RmsNormalize | AudioFunc::PreEmphasis => level::shape(func, clips, args),
+        AudioFunc::TrimSilence => speech::trim_silence(clips, args.threshold_db),
+        AudioFunc::PeakNormalize => speech::peak_normalize(clips),
+        AudioFunc::ZeroCrossingRate => speech::zero_crossing_rate(clips),
+        AudioFunc::EncodeWav => level::encode_waveform(arr, args),
+        // Resampling, slicing by time and every spectral front end are defined against a
+        // sample rate, and a waveform column carries none. Saying which op and what to do
+        // is the whole point: the alternative reads as a type error about a column the
+        // caller never typed.
+        other => Err(ExprError::InvalidArgument {
+            func: format!("audio.{other:?}"),
+            reason: "takes encoded audio bytes, not a waveform; a waveform column carries no \
+                     sample rate. Apply this before decoding, or re-encode the waveform \
+                     first with `.audio.encode_wav(rate)`"
+                .to_string(),
+        }),
+    }
+}
+
 fn eval_audio_sized<O: OffsetSizeTrait>(
     func: AudioFunc,
     arr: &ArrayRef,
-    rate: Option<i64>,
+    args: AudioArgs,
     mel: Option<MelParams>,
-    threshold_db: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
+    use super::{level, spectral};
+
     let bytes = arr
         .as_any()
         .downcast_ref::<GenericBinaryArray<O>>()
@@ -135,16 +206,42 @@ fn eval_audio_sized<O: OffsetSizeTrait>(
             func: format!("{func:?}"),
             got: arr.data_type().to_string(),
         })?;
+    // The rate-independent ops fall through to `eval_waveform`, which is the *same*
+    // implementation the waveform path uses — so a level measure cannot mean one thing on
+    // an encoded column and another on a decoded one.
     match func {
         AudioFunc::Decode => decode_meta(bytes),
         AudioFunc::ToWaveform => to_waveform(bytes),
-        AudioFunc::Resample => resample(bytes, rate),
+        AudioFunc::Resample => resample(bytes, args.rate),
         // `resolve` guaranteed `Some` for these variants.
         AudioFunc::MelSpectrogram => mel_spectrogram_col(bytes, mel.expect("mel params")),
         AudioFunc::Mfcc => mfcc_col(bytes, mel.expect("mfcc params")),
-        AudioFunc::TrimSilence => super::speech::trim_silence(bytes, threshold_db),
-        AudioFunc::PeakNormalize => super::speech::peak_normalize(bytes),
-        AudioFunc::ZeroCrossingRate => super::speech::zero_crossing_rate(bytes),
+        AudioFunc::PadOrTrim => level::pad_or_trim(bytes, args),
+        AudioFunc::Slice => level::slice(bytes, args),
+        AudioFunc::EncodeWav => level::encode_wav(bytes, args),
+        AudioFunc::Spectrogram => spectral::spectrogram(bytes, args),
+        AudioFunc::SpectralCentroid
+        | AudioFunc::SpectralRolloff
+        | AudioFunc::SpectralBandwidth
+        | AudioFunc::SpectralFlatness => spectral::descriptor(func, bytes, args),
+        _ => eval_waveform(func, &encoded_signal(bytes), arr, args),
+    }
+}
+
+/// A [`Signal`] over an encoded column, whichever offset width it uses.
+fn encoded_signal<O: OffsetSizeTrait>(bytes: &GenericBinaryArray<O>) -> Signal<'_> {
+    use std::any::Any;
+
+    // `O` is one of exactly two types and the caller already matched on the column's data
+    // type to choose it, so this downcast cannot fail; it exists only because a generic
+    // parameter cannot be matched on directly.
+    let any: &dyn Any = bytes;
+    match any.downcast_ref::<GenericBinaryArray<i32>>() {
+        Some(narrow) => Signal::Narrow(narrow),
+        None => Signal::Wide(
+            any.downcast_ref::<GenericBinaryArray<i64>>()
+                .expect("a binary column is either 32- or 64-bit"),
+        ),
     }
 }
 
@@ -211,6 +308,65 @@ pub(super) fn build_f32_list_column(rows: Vec<Option<Vec<f32>>>) -> ArrayRef {
         }
     }
     Arc::new(builder.finish())
+}
+
+/// Per-row access to a clip's mono samples, whichever way the column holds them.
+///
+/// The namespace's ops split cleanly in two. Some need a **sample rate** — resampling,
+/// slicing by time, every spectral front end — and a rate comes only from a container, so
+/// those require encoded bytes. The rest are pure functions of the samples: how loud the
+/// clip is, how much of it is silent, what a first-order filter does to it. Those had no
+/// reason to require a container, and requiring one made the namespace non-composable:
+/// `trim_silence()` hands back a waveform, and nothing could read it back.
+///
+/// This is what closes that. A kernel written against `Signal` works on either shape, so
+/// `col("clip").audio.trim_silence().audio.rms_normalize().audio.encode_wav(16000)` is one
+/// expression rather than three impossible ones — and, since the waveform is already
+/// decoded, each extra step costs no second decode.
+pub(super) enum Signal<'a> {
+    Narrow(&'a GenericBinaryArray<i32>),
+    Wide(&'a GenericBinaryArray<i64>),
+    Waveform(&'a arrow::array::ListArray),
+}
+
+impl Signal<'_> {
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Narrow(a) => a.len(),
+            Self::Wide(a) => a.len(),
+            Self::Waveform(a) => a.len(),
+        }
+    }
+
+    /// One row's mono samples, or `None` for a null or undecodable row.
+    pub(super) fn samples(&self, i: usize) -> Option<Vec<f32>> {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Float32Type;
+
+        match self {
+            Self::Narrow(a) => (!a.is_null(i))
+                .then(|| decode_pcm(a.value(i)))?
+                .map(|d| d.samples),
+            Self::Wide(a) => (!a.is_null(i))
+                .then(|| decode_pcm(a.value(i)))?
+                .map(|d| d.samples),
+            Self::Waveform(a) => {
+                if a.is_null(i) {
+                    return None;
+                }
+                let values = a.value(i);
+                let f = values.as_primitive::<Float32Type>();
+                // A null *element* is silence. Nulling the whole clip because one sample was
+                // absent would discard a recording over a single missing frame, which no
+                // upstream op in this namespace produces.
+                Some(
+                    (0..f.len())
+                        .map(|k| if f.is_null(k) { 0.0 } else { f.value(k) })
+                        .collect(),
+                )
+            }
+        }
+    }
 }
 
 /// A decoded mono signal: sample rate (Hz) and the channel-averaged f32 samples.
@@ -382,7 +538,7 @@ fn resample<O: OffsetSizeTrait>(
 /// independent length `ceil(n * dst / src)` — the same length librosa produces — so a
 /// decoded frame count agrees across engines and the result is reproducible. `src == dst`
 /// (or an empty signal) is an exact passthrough.
-fn resample_signal(samples: &[f32], src: u32, dst: u32) -> Vec<f32> {
+pub(super) fn resample_signal(samples: &[f32], src: u32, dst: u32) -> Vec<f32> {
     if samples.is_empty() || src == dst || src == 0 {
         return samples.to_vec();
     }
@@ -417,7 +573,14 @@ mod tests {
     /// `eval_audio` for the non-mel ops, which ignore the mel params — keeps their tests
     /// readable at three arguments.
     fn ea(func: AudioFunc, arr: &ArrayRef, rate: Option<i64>) -> Result<ArrayRef, ExprError> {
-        eval_audio(func, arr, rate, None, None, None, None, None)
+        eval_audio(
+            func,
+            arr,
+            AudioArgs {
+                rate,
+                ..AudioArgs::default()
+            },
+        )
     }
 
     /// Build a minimal mono 16-bit PCM WAV from `samples` at `sample_rate`.

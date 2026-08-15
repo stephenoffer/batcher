@@ -33,7 +33,7 @@ import dataclasses
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY, rule
 from batcher.kyber.rule import Phase, node_rule
-from batcher.kyber.rules.leaf_rewrite import rewrite_node, safe_expr
+from batcher.kyber.rules.leaf_rewrite import node_expr_rule, rewrite_node, safe_expr
 from batcher.plan.expr_ir import Binary, Case, Expr, Greatest, Least, Lit, Not
 from batcher.plan.expr_rewrite import combine_conjuncts, expr_key, split_conjuncts
 from batcher.plan.logical import Filter, LogicalPlan, Project
@@ -95,15 +95,6 @@ def _push_foldable(op: str):
     return leaf
 
 
-def _make_push_rule(op: str):
-    leaf = _push_foldable(op)
-
-    def apply(node: Filter | Project, _ctx: OptimizerContext) -> LogicalPlan | None:
-        return rewrite_node(node, leaf)
-
-    return apply
-
-
 # One rule per pushable operator, over a shared body.
 #
 # `(CASE WHEN c THEN 1 ELSE 2 END) = 1 -> CASE WHEN c THEN TRUE ELSE FALSE END`. When
@@ -121,7 +112,7 @@ PUSH_FOLDABLE_INTO_CASE_RULES = [
         node_rule(
             f"push_{op}_into_case_branches",
             Phase.NORMALIZE,
-            _make_push_rule(op),
+            node_expr_rule(_push_foldable(op)),
             matches=(Filter, Project),
             expr_fn=_push_foldable(op),
             expr_matches=(Binary,),

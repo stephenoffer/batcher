@@ -25,6 +25,7 @@ import pyarrow as pa
 from batcher._internal.mathx import safe_div
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.config import active_config
+from batcher.plan.types import logical_bytes
 from batcher.plan.types import retained_bytes as _retained_bytes
 
 __all__ = ["CacheStore", "current_result_cache", "reset_result_cache", "result_cache"]
@@ -66,7 +67,7 @@ def _compacted(table: pa.Table, retained: int) -> tuple[pa.Table, int]:
     Returns:
         The table to store and the bytes to account for it.
     """
-    if retained < _COMPACT_FLOOR_BYTES or retained < table.nbytes * _COMPACT_RATIO:
+    if retained < _COMPACT_FLOOR_BYTES or retained < logical_bytes(table) * _COMPACT_RATIO:
         return table, retained
     try:
         compact = table.take(pa.array(range(table.num_rows), type=pa.int64()))

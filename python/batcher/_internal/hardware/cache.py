@@ -18,6 +18,7 @@ import functools
 import glob
 import os
 
+from batcher._internal.hardware.sysfs import read_int, read_text
 from batcher._internal.hardware.topology import affinity_cpu_ids, parse_cpu_list
 
 __all__ = [
@@ -37,24 +38,6 @@ def _parse_cache_size(raw: str) -> int:
         return int(raw[:-1] if mult > 1 else raw) * mult
     except ValueError:
         return 0
-
-
-def _read_int(path: str) -> int:
-    """An integer from a `/sys` file, or `0` when absent or unparseable."""
-    try:
-        with open(path) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return 0
-
-
-def _read_str(path: str) -> str:
-    """A trimmed string from a `/sys` file, or `""` when absent."""
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
 
 
 def _usable_cpus() -> list[int]:
@@ -77,23 +60,23 @@ def _cpu_cache_domain(cpu_id: int) -> tuple[dict[str, int], set[int]]:
     domain: set[int] = set()
     deepest = 0
     for idx in sorted(glob.glob(f"/sys/devices/system/cpu/cpu{cpu_id}/cache/index*")):
-        level = _read_int(os.path.join(idx, "level"))
-        kind = _read_str(os.path.join(idx, "type"))
+        level = read_int(os.path.join(idx, "level"))
+        kind = read_text(os.path.join(idx, "type"))
         if level <= 0 or kind == "Instruction":
             continue
-        size = _parse_cache_size(_read_str(os.path.join(idx, "size")))
+        size = _parse_cache_size(read_text(os.path.join(idx, "size")))
         if size <= 0:
             continue
         # "Unified" at level 1 is rare but real (some ARM cores); treat it as the d-cache,
         # since a unified L1 is the cache a data working set actually contends for.
         key = f"l{level}d" if level == 1 else f"l{level}"
         sizes[key] = max(sizes.get(key, 0), size)
-        line = _read_int(os.path.join(idx, "coherency_line_size"))
+        line = read_int(os.path.join(idx, "coherency_line_size"))
         if line > 0:
             sizes["line"] = max(sizes.get("line", 0), line)
         if level >= deepest:
             deepest = level
-            domain = parse_cpu_list(_read_str(os.path.join(idx, "shared_cpu_list")))
+            domain = parse_cpu_list(read_text(os.path.join(idx, "shared_cpu_list")))
     return sizes, domain
 
 

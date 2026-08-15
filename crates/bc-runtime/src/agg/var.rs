@@ -252,6 +252,22 @@ pub(crate) fn finalize_mean(sum: &ArrayRef, count: &ArrayRef) -> Result<ArrayRef
                 );
             }
         }
+        // The exact 128-bit accumulator an integer AVG sums into (`MEAN_INT_ACCUMULATOR`).
+        // The whole sum is carried exactly to here, so the single division below is the
+        // only rounding in the aggregate — which is what makes `AVG` over large integers
+        // correct rather than merely close. `scale` is 0 for that accumulator; honouring a
+        // non-zero one anyway keeps this correct if a decimal sum state ever reaches it.
+        DataType::Decimal128(_, scale) => {
+            let sums = sum.as_primitive::<arrow::datatypes::Decimal128Type>();
+            let divisor = 10f64.powi(*scale as i32);
+            for i in 0..counts.len() {
+                push_mean(
+                    &mut b,
+                    sums.is_valid(i).then(|| sums.value(i) as f64 / divisor),
+                    counts.value(i),
+                );
+            }
+        }
         other => {
             return Err(RuntimeError::UnsupportedAggregate {
                 func: "mean".to_string(),

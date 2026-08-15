@@ -8,6 +8,9 @@ the budget. These are the LLM-API / vector-DB / flaky-model resilience knobs.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import time
 
 import pyarrow as pa
@@ -100,6 +103,46 @@ def test_timeout_raises_on_a_hung_call():
         bt.from_pydict({"x": [1]}).map_batches(slow, timeout=0.2).collect()
     # The query returned promptly rather than waiting out the 5s sleep.
     assert time.perf_counter() - t0 < 3.0
+
+
+def test_timed_out_call_does_not_hold_the_process_open_at_exit():
+    """A still-hanging timed-out call must not stop the interpreter from exiting.
+
+    The regression this pins is invisible to every assertion made *inside* the query.
+    `timeout` raised on schedule and the results were correct, but the abandoned call ran
+    on a `ThreadPoolExecutor` whose atexit hook joins every worker thread it ever started
+    — so the process computed its answer and then hung forever waiting on precisely the
+    call the timeout existed to escape. A job that never terminates is a worse failure
+    than the one being guarded against.
+
+    `test_timeout_raises_on_a_hung_call` above cannot see it: its `fn` sleeps 5s, so the
+    atexit join does complete and only delays the exit. Catching it needs a `fn` that
+    outlives the test and an assertion on *process exit*, not on the query.
+    """
+    script = textwrap.dedent(
+        """
+        import time
+        import batcher as bt
+
+        def hangs(batch):
+            time.sleep(600)      # far longer than the subprocess is given to exit
+            return batch
+
+        try:
+            bt.from_pydict({"x": [1]}).map_batches(hangs, timeout=0.2).collect()
+        except Exception:
+            pass
+        print("QUERY DONE", flush=True)
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=90,  # a TimeoutExpired here IS the regression
+    )
+    assert "QUERY DONE" in proc.stdout
+    assert proc.returncode == 0
 
 
 def test_timeout_is_retried_then_recovers():

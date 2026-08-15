@@ -7,6 +7,7 @@ is exactly the full join — bounded by one bucket pair rather than the whole bu
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 
 import pyarrow as pa
 
@@ -31,6 +32,7 @@ from batcher.dist.spill.buckets import (
     split_salt,
 )
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import Join
 
 # The grace recursion is `dist.spill.buckets`': same depth bound, same width, same salt as the
@@ -95,8 +97,8 @@ def stream_spilling_join(
     join_ir = json.dumps(
         {
             **join.shape_ir(),
-            "left": {"op": "scan", "source_id": 0},
-            "right": {"op": "scan", "source_id": 1},
+            "left": task_scan_ir(),
+            "right": task_scan_ir(1),
         }
     )
     n_buckets = _fd_safe(num_partitions)
@@ -151,7 +153,7 @@ def stream_spilling_join(
             )
 
 
-def reduce_join_paths_spilling(
+def iter_join_paths_spilling(
     join_ir: str,
     left_keys: list[str],
     right_keys: list[str],
@@ -162,7 +164,7 @@ def reduce_join_paths_spilling(
     engine_config: str,
     left_schema: pa.Schema | None = None,
     right_schema: pa.Schema | None = None,
-) -> list[pa.RecordBatch]:
+) -> Iterator[pa.RecordBatch]:
     """Reduce a co-partitioned shuffle join in bounded memory from on-disk buckets.
 
     Each input path is one mapper's contribution to this reducer's bucket. Both sides
@@ -178,6 +180,13 @@ def reduce_join_paths_spilling(
     null-extend the present side against a schema-bearing empty, and without the fallback
     that side comes through untyped and the null-extension is lost. When a side has data,
     its inferred schema wins and the fallback is unused.
+
+    **Yields** rather than returning a list, because the output is the half this operator was
+    not bounding. The sub-bucketing bounds the *inputs* and the per-pair join bounds the
+    working set, but every pair's output was then accumulated into one list before anything
+    consumed it — and a join's output is generally larger than either input, on the one branch
+    that is taken precisely because the inputs did not fit. Peak is now one pair's output.
+    `reduce_join_paths_spilling` is the list form, for the callers that genuinely need one.
     """
     nat = engine()
     from batcher.dist.shuffle_io import read_ipc
@@ -191,7 +200,6 @@ def reduce_join_paths_spilling(
     )
     left_schema = left_data_schema or left_schema
     right_schema = right_data_schema or right_schema
-    out: list[pa.RecordBatch] = []
     for i in range(n):
         if left_sub[i] is None and right_sub[i] is None:
             continue
@@ -206,10 +214,21 @@ def reduce_join_paths_spilling(
         # `parallelism` to avoid.
         left_b = read_ipc(left_sub[i]) if left_sub[i] else _maybe_empty(left_schema)
         right_b = read_ipc(right_sub[i]) if right_sub[i] else _maybe_empty(right_schema)
-        out.extend(
+        yield from (
             rb for rb in nat.execute_plan(join_ir, [left_b, right_b], engine_config) if rb.num_rows
         )
-    return out
+
+
+def reduce_join_paths_spilling(*args, **kwargs) -> list[pa.RecordBatch]:
+    """[`iter_join_paths_spilling`] drained into a list, for a caller that needs one.
+
+    Takes and means exactly the same arguments. Prefer the iterator wherever the consumer can
+    take a batch at a time — this form reintroduces the peak the iterator exists to remove.
+
+    Returns:
+        Every batch the out-of-core join produced.
+    """
+    return list(iter_join_paths_spilling(*args, **kwargs))
 
 
 def _maybe_empty(schema: pa.Schema | None) -> list[pa.RecordBatch]:
@@ -234,36 +253,32 @@ def _spill_paths_to_subbuckets(nat, paths, key_names, n, work_dir, tag):
     """
     import os
 
-    from batcher.dist.shuffle_io import read_ipc
+    from batcher.dist.shuffle_io import IpcWriter, read_ipc
 
-    writers: list = [None] * n
-    sinks: list = [None] * n
-    out_paths: list[str | None] = [None] * n
+    # One `IpcWriter` per sub-bucket, named but not opened: a sub-bucket that receives no
+    # row costs no file descriptor, and every one that does gets the owner-only open and
+    # the shared-mount codec the rest of the shuffle scratch dir gets.
+    writers = [IpcWriter(os.path.join(work_dir, f"{tag}_{i}.arrow")) for i in range(n)]
     schema: pa.Schema | None = None
     key_idx: list[int] = []
-    for p in paths:
-        batches = read_ipc(p)
-        if not batches:
-            continue
-        if schema is None:
-            schema = batches[0].schema
-            key_idx = [schema.get_field_index(k) for k in key_names]
-        for i, bucket in enumerate(
-            nat.partition_batches_salted(batches, key_idx, n, _SUBBUCKET_SALT)
-        ):
-            for b in bucket:
-                if not b.num_rows:
-                    continue
-                if writers[i] is None:
-                    out_paths[i] = os.path.join(work_dir, f"{tag}_{i}.arrow")
-                    sinks[i] = pa.OSFile(out_paths[i], "wb")
-                    writers[i] = pa.ipc.new_stream(sinks[i], schema)
-                writers[i].write_batch(b)
-    for w, s in zip(writers, sinks, strict=True):
-        if w is not None:
-            w.close()
-        if s is not None:
-            s.close()
+    try:
+        for p in paths:
+            batches = read_ipc(p)
+            if not batches:
+                continue
+            if schema is None:
+                schema = batches[0].schema
+                key_idx = [schema.get_field_index(k) for k in key_names]
+            for i, bucket in enumerate(
+                nat.partition_batches_salted(batches, key_idx, n, _SUBBUCKET_SALT)
+            ):
+                for b in bucket:
+                    if b.num_rows:
+                        writers[i].write(b)
+    finally:
+        for writer in writers:
+            writer.close()
+    out_paths: list[str | None] = [w.path if w.is_open else None for w in writers]
     return out_paths, schema
 
 

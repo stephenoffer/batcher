@@ -29,6 +29,7 @@ from batcher._internal.errors import ResourceError
 from batcher._internal.paths import open_private
 from batcher.carbonite.spill import disk
 from batcher.carbonite.spill.handle import SpillHandle, SpillTier
+from batcher.plan.types import logical_bytes
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -158,7 +159,7 @@ class BucketWriter:
         promises: the IPC stream carries the dictionary once, and the reader reconstructs one
         values array shared by every batch.
         """
-        total = batch.nbytes
+        total = logical_bytes(batch)
         for column in batch.columns:
             total -= _recounted_dictionary_bytes(column, self._seen_dictionaries)
         return max(total, 0)
@@ -439,7 +440,7 @@ def _recounted_dictionary_bytes(array: pa.Array, seen: set[int]) -> int:
         if ident is None:
             return 0
         if ident in seen:
-            return values.nbytes
+            return logical_bytes(values)
         seen.add(ident)
         return _recounted_dictionary_bytes(values, seen)
     if isinstance(array, pa.StructArray):

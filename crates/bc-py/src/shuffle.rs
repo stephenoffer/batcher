@@ -548,19 +548,56 @@ pub(crate) fn combine_finalize_spilling(
     Ok(PyArrowType(out))
 }
 
+/// Buffer in front of a gather staging file.
+///
+/// Arrow's `StreamWriter` issues a separate `write` per IPC message *and per buffer within
+/// it* — a batch with `k` columns costs on the order of `2k` syscalls, each typically a few
+/// KB of validity/offset data. Written straight to a `File` that is one syscall per buffer,
+/// and a gathered reducer bucket is thousands of morsels over a dozen columns: hundreds of
+/// thousands of syscalls spent on data that coalesces into a handful of large writes. This
+/// is the same reasoning, and very nearly the same number, as
+/// `bc_runtime::agg::spill`'s per-partition write buffer — the difference is that only one
+/// of these files is open at a time here, so it does not have to share a total budget.
+///
+/// Buffering is invisible to the reader: the IPC bytes are identical, so it is pure
+/// throughput.
+const GATHER_WRITE_BUF: usize = 1 << 20;
+
 /// Write one source's fetched batches to a fresh Arrow-IPC stream file under `dir`.
+///
+/// Owner-only, buffered, and compressed by the same policy the spill store uses — all three
+/// of which this had none of. A gathered bucket is the query's actual rows staged on a
+/// node-local path other tenants mount, so `File::create`'s 0644 was the one at-rest surface
+/// the permissions pass missed; the codec is chosen from the schema by
+/// `SpillCodec::Auto`, so a blob-bearing bucket is compressed and an ordinary
+/// numeric one is not, exactly as it would be if the same rows had spilled instead of
+/// gathered.
 fn write_gather_file(
     dir: &std::path::Path,
     seq: usize,
     batches: &[RecordBatch],
+    codec: bc_interp::SpillCodec,
 ) -> Result<PathBuf, InterpError> {
     let path = dir.join(format!("gather-{seq}.arrow"));
-    let file = std::fs::File::create(&path).map_err(ArrowError::from)?;
-    let mut w = StreamWriter::try_new(file, &batches[0].schema()).map_err(InterpError::from)?;
+    let file = bc_arrow::create_private_file(&path).map_err(ArrowError::from)?;
+    let schema = batches[0].schema();
+    let mut w = StreamWriter::try_new_with_options(
+        std::io::BufWriter::with_capacity(GATHER_WRITE_BUF, file),
+        &schema,
+        codec.write_options(&schema),
+    )
+    .map_err(InterpError::from)?;
     for b in batches {
         w.write(b).map_err(InterpError::from)?;
     }
+    // `finish` flushes the IPC end-of-stream marker into the BufWriter; the buffer itself is
+    // flushed when the writer is dropped — but a drop swallows an I/O error, and a truncated
+    // staging file reads back as a short bucket rather than a failure. So flush explicitly.
     w.finish().map_err(InterpError::from)?;
+    w.into_inner()
+        .map_err(InterpError::from)?
+        .into_inner()
+        .map_err(|e| InterpError::from(ArrowError::from(e.into_error())))?;
     Ok(path)
 }
 
@@ -600,7 +637,7 @@ pub(crate) fn gather_to_files(
                 if batches.is_empty() {
                     return Ok(());
                 }
-                let path = write_gather_file(&dir, seq, &batches)?;
+                let path = write_gather_file(&dir, seq, &batches, bc_interp::SpillCodec::Auto)?;
                 seq += 1;
                 paths.push(path.to_string_lossy().into_owned());
                 Ok(())

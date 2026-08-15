@@ -29,7 +29,7 @@ def devices():
 @pytest.fixture(autouse=True)
 def _unpinned(monkeypatch):
     """Start every case from an unpinned process, whatever the host actually sets."""
-    for var in accelerators._VISIBLE_DEVICE_VARS:
+    for var in accelerators.VISIBLE_DEVICE_ENVS:
         monkeypatch.delenv(var, raising=False)
 
 

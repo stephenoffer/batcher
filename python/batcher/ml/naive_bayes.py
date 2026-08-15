@@ -17,7 +17,11 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
-from batcher.ml._estimator import argmax_prediction, require_fitted, require_numeric
+from batcher.ml._estimator import (
+    argmax_prediction,
+    require_fit_columns,
+    require_fitted,
+)
 from batcher.plan.expr_ir.constructors import col, lit, when
 
 if TYPE_CHECKING:
@@ -111,14 +115,7 @@ class GaussianNB:
         from batcher.plan.functions.aggregate import mean as mean_
         from batcher.plan.functions.statistics import var_pop
 
-        for name in (*self.features, self.target):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
-        require_numeric(self, ds, self.features)
+        require_fit_columns(self, ds, self.features, self.target)
         total = ds.count()
         global_variance = ds.agg(
             **{f"v{i}": var_pop(col(name)) for i, name in enumerate(self.features)}
@@ -502,11 +499,4 @@ def _check_columns(
     ds: Dataset, features: Sequence[str], target: str, estimator: object = "naive Bayes"
 ) -> None:
     """Raise naming the closest match for a missing column, or the type of an unusable one."""
-    for name in (*features, target):
-        if name not in ds.columns:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-            )
-    require_numeric(estimator, ds, features)
+    require_fit_columns(estimator, ds, features, target)

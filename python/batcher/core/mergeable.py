@@ -29,6 +29,7 @@ import pyarrow as pa
 
 from batcher._internal.native import engine
 from batcher.plan.ir_specs import agg_spec_json
+from batcher.plan.types import retained_bytes
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -66,8 +67,14 @@ class RunningAggregate:
         return self._running is None
 
     def nbytes(self) -> int:
-        """The in-memory size of the running state (0 when empty)."""
-        return 0 if self._running is None else self._running.nbytes
+        """The in-memory size of the running state (0 when empty).
+
+        Callers compare this against a state budget to decide when to spill or emit, so it
+        reports what the running batch *pins* rather than what its rows address, and it is
+        total on every Arrow layout — a bare `nbytes` raises on the view types, which would
+        turn "how big is my state" into a failed query.
+        """
+        return 0 if self._running is None else retained_bytes(self._running)
 
     def partial(self, rows: Sequence[pa.RecordBatch]) -> pa.RecordBatch:
         """Partial-aggregate `rows` without folding them in.

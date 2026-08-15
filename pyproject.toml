@@ -131,9 +131,30 @@ lightgbm = ["lightgbm>=4"]
 catboost = ["catboost>=1.2"]
 onnx = ["onnxruntime>=1.17"]
 sklearn = ["scikit-learn>=1.3", "joblib>=1.3"]
-# --- Framework interop (Ray Data `from_*` parity) ---
+# --- Optional dependencies of a public feature that had no extra to name ---
+# Each of these was reached through a guard whose install hint pointed at something that does
+# not exist: a bare `pip install numpy`/`pyyaml`/`jax` where every other optional dependency in
+# the engine says `batcher-engine[<extra>]`, and — worst — `pip install 'batcher[oidc]'`, which
+# names neither a real extra nor this distribution (it is `batcher-engine`). The feature behind
+# each is public and documented, so declaring the extra is what the message should have been
+# pointing at; see `_internal.optional.require`, the one guard they now all go through.
+numpy = ["numpy>=1.24"]
+yaml = ["pyyaml>=6"]
+jax = ["jax>=0.4"]
+oidc = ["pyjwt[crypto]>=2.8"]
+# `ds.ml.infer("<model id>")` — a headline feature — pointed at `batcher-engine[transformers]`
+# while only `st` (sentence-transformers) was declared. Found by
+# `tests/unit/test_optional_guard_is_shared.py`, which now fails on any undeclared extra.
+transformers = ["transformers>=4.40"]
 pandas = ["pandas>=2"]
 huggingface = ["datasets>=2.18"]
+# `from_spark` and `from_dask` told users to `pip install 'batcher-engine[spark]'` and
+# `[dask]` for years and neither extra existed, so the one actionable thing in the error was
+# a command that fails. They are declared here rather than removed from the message: both
+# adapters are public API with their own migration guide, so an extra is what the message
+# should have been pointing at all along.
+spark = ["pyspark>=3.5"]
+dask = ["dask[dataframe]>=2024.1"]
 # --- Convenience bundles (self-referencing extras use the distribution name) ---
 lakehouse = ["batcher-engine[delta,iceberg,hudi,delta-sharing]"]
 warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]

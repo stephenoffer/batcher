@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 
 from batcher._internal.logging import note_suppressed
@@ -63,8 +64,13 @@ _CACHE: OrderedDict[str, tuple[Any, tuple]] = OrderedDict()
 
 
 def clear() -> None:
-    """Drop every cached plan. For tests and for a hub reset."""
+    """Drop every cached plan. For tests and for a hub reset.
+
+    The bucket deadband goes with them: it is state *about* the keys, so leaving it behind
+    would let one test's coefficients hold another's bucket.
+    """
     _CACHE.clear()
+    _BUCKET_STATE.clear()
 
 
 def lookup(key: str | None) -> Any | None:
@@ -82,7 +88,14 @@ def store(key: str | None, result: Any, sources: list | None, max_entries: int) 
     """Cache `result` under `key`, evicting the least recently used entry past the cap."""
     if key is None or max_entries <= 0:
         return
-    _CACHE[key] = (result, tuple(sources or ()))
+    # The keepalive pins the sources whose `id()` the key used, so an address cannot be
+    # recycled underneath a live entry. A derivation-keyed source is named by *how it was
+    # derived* rather than by its address, so pinning it would buy nothing and cost the whole
+    # materialized intermediate staying resident until the entry is evicted.
+    _CACHE[key] = (
+        result,
+        tuple(s for s in (sources or ()) if not getattr(s, "derivation", None)),
+    )
     _CACHE.move_to_end(key)
     while len(_CACHE) > max_entries:
         _CACHE.popitem(last=False)
@@ -96,6 +109,7 @@ def cache_key(
     kind: str = "full",
     source_stats: list | None = None,
     hardware: Any = None,
+    learned: bool = True,
 ) -> str | None:
     """A key identifying this exact optimization, or `None` when it must not be cached.
 
@@ -109,10 +123,32 @@ def cache_key(
     so they must not collide). The parts are joined with reserved delimiters none of them
     contain (hex digests, `id:`/`obj:<int>` source keys, a fixed `kind`), so the flat string
     is as injective as hashing the tuple was — without the per-lookup serialization.
+
+    `learned=False` drops the four **learned** fields — the generation, the calibration
+    fingerprint, the measured read costs and the source statistics — leaving a key that moves
+    only when the plan, the config, the hub or the sources do. It is emphatically **not** for
+    the optimizer memo, whose whole purpose is to re-plan when the numbers move. It is for a
+    caller whose decision is orders of magnitude less sensitive than a plan and whose analysis
+    is orders of magnitude more expensive than a lookup, which in this codebase is exactly one
+    caller: `api.subplan_reuse`, whose verdict is "does this subtree repeat, and is
+    materializing it worth an engine round trip". Keyed with the learned fields it never once
+    hit inside a mixed workload — every query in the suite moves the generation for every other
+    — and the 400 ms analysis ran on every execution forever.
     """
     source_ids = _source_keys(sources)
     if source_ids is None:
         return None
+    if not learned:
+        return "|".join(
+            (
+                kind,
+                plan_key,
+                _config_key(config),
+                str(id(hub)),
+                _hardware_key(hardware),
+                repr(source_ids),
+            )
+        )
     # Injectivity: the first nine fields are all `|`-free (a fixed `kind`, three hex digests,
     # three integers, and two comma-joined vectors whose free-form members are sanitized to an
     # alphanumeric alphabet by `_sanitized`), so a `|`-split recovers them and everything after
@@ -280,12 +316,67 @@ def _calibration_epoch(hub: Any) -> str:
         return "-"
     from batcher.kyber import calibration, cpu_shares
 
-    coeffs = _bucketed(calibration.live_coefficients(hub))
-    shares = _bucketed(cpu_shares.live_shares(hub))
+    coeffs = _bucketed(calibration.live_coefficients(hub), (id(hub), "coeffs"))
+    shares = _bucketed(cpu_shares.live_shares(hub), (id(hub), "shares"))
     return f"{coeffs},{shares}"
 
 
-def _bucketed(fit: object) -> str:
+#: How far past a bucket's edge a coefficient must move before the key follows it.
+#:
+#: Bucketing alone is not enough, and the reason is the shape of the data rather than the
+#: width of the bucket. A coefficient is re-fit from measured operator times, so it does not
+#: settle on a value — it wanders inside a band. A coefficient whose band *straddles* an edge
+#: therefore alternates buckets forever however wide the buckets are, and the key alternates
+#: with it. Measured on TPC-DS q80 with half-octave buckets already in force: `hash_build_row`
+#: crossed 8 <-> 9 and `hash_probe_row` 0 <-> 2 run after run, so the plan cache alternated
+#: hit/miss indefinitely on an identical query (~140 ms of re-optimization on every miss, and
+#: the *reuse* verdict cache keyed on the same string never hit at all — 400 ms more).
+#:
+#: A quarter-bucket deadband turns "which bucket is nearest" into "has it left the bucket it
+#: was in", which is the question a cache key wants: a wandering value keeps its bucket, and a
+#: genuinely drifting one still moves as soon as it is properly inside the next.
+_BUCKET_HYSTERESIS = 0.25
+
+#: Last bucket emitted per `(state key, coefficient name)`, so the deadband above has
+#: something to be sticky about. Bounded and cleared wholesale — a dropped entry costs one
+#: bucket re-derivation, and a wrong one costs a slightly stale plan, exactly as the bucketing
+#: itself does.
+_BUCKET_STATE: dict[tuple, int] = {}
+_BUCKET_STATE_MAX = 4096
+
+#: Buckets per octave for the quantities `_bucketed` fingerprints — the fitted cost
+#: coefficients and the measured CPU shares — as against a read-cost factor.
+#:
+#: One, where `_READ_COST_BUCKETS` is two, and the difference is which quantity is being
+#: fingerprinted. A read-cost factor is a ratio between sources that settles once measured; a
+#: cost coefficient sits inside a feedback loop — it is fit from the operators the plan ran,
+#: and the plan it produces decides which operators run next. On TPC-DS q77 that loop does not
+#: reach a fixed point at all: with the anchor settled and a genuine shift landing in one refit
+#: (`calibration._tracked`), `filter_row`, `hash_probe_row` and `project_row` still walk ~10% a
+#: run in one direction, so half-octave buckets kept re-keying the memo on drift that changes
+#: no plan. An octave is also exactly where `_tracked` stops damping, which is what makes the
+#: pair coherent: **a coefficient the estimator treats as genuinely changed is a coefficient the
+#: key follows, and nothing smaller is.**
+_COEFF_BUCKETS = 1
+
+
+def _sticky_bucket(state_key: tuple, name: str, value: float) -> int:
+    """`value`'s octave bucket, kept at its previous one inside the deadband."""
+    if value <= 0.0:
+        return 0
+    raw = math.log2(value) * _COEFF_BUCKETS
+    key = (*state_key, name)
+    previous = _BUCKET_STATE.get(key)
+    if previous is not None and abs(raw - previous) < 0.5 + _BUCKET_HYSTERESIS:
+        return previous
+    bucket = round(raw)
+    if len(_BUCKET_STATE) >= _BUCKET_STATE_MAX:
+        _BUCKET_STATE.clear()
+    _BUCKET_STATE[key] = bucket
+    return bucket
+
+
+def _bucketed(fit: object, state_key: tuple = ()) -> str:
     """A coefficient set as half-octave buckets, so drift does not move the key.
 
     The same device as `_read_cost_key`, applied to the fit itself instead of to *when* it was
@@ -298,10 +389,16 @@ def _bucketed(fit: object) -> str:
     climbed by 76 per run forever. Fingerprinting the *values* is stable by construction —
     it moves when a coefficient crosses a bucket and not when a refit merely happened.
 
-    Buckets are ``round(log2(v) * _READ_COST_BUCKETS)``, so a coefficient must move ~40% to
-    change the key — the same threshold, and the same trade, the read-cost factors take: keyed
-    on the raw value the memo would miss on every query, keyed on nothing a plan would freeze
-    at whichever coefficients were in force when it was first cached.
+    Buckets are ``round(log2(v) * _COEFF_BUCKETS)``, so a coefficient must roughly double or
+    halve to change the key — the same trade the read-cost factors take at half that width, for
+    the reason `_COEFF_BUCKETS` gives: keyed on the raw value the memo would miss on every
+    query, keyed on nothing a plan would freeze at whichever coefficients were in force when it
+    was first cached.
+
+    Bucketing is necessary and **not sufficient**: see `_BUCKET_HYSTERESIS` for why a
+    coefficient that wanders across a bucket edge defeats it, and what the deadband adds.
+    `state_key` names whose buckets are being kept sticky; the default `()` is for callers
+    with nothing to be sticky about (tests, and any use where one fit is fingerprinted once).
     """
     if fit is None:
         return "-"
@@ -317,9 +414,7 @@ def _bucketed(fit: object) -> str:
             if isinstance(getattr(fit, f.name), (int, float))
             and not isinstance(getattr(fit, f.name), bool)
         )
-    return ";".join(
-        f"{n}:{round(math.log2(v) * _READ_COST_BUCKETS) if v > 0.0 else 0}" for n, v in values
-    )
+    return ";".join(f"{n}:{_sticky_bucket(state_key, n, v)}" for n, v in values)
 
 
 # Digest memo for `_source_stats_key`, keyed by the statistics object's identity.
@@ -427,8 +522,12 @@ def _source_keys(sources: list | None) -> list[str] | None:
         key = source_stats_key(source)
         if key is None:
             return None  # an unkeyable source: never cache a plan built over it
-        if getattr(source, "ephemeral", False):
-            return None  # a key that cannot recur: the entry could never be read again
+        if getattr(source, "ephemeral", False) and not getattr(source, "derivation", None):
+            # A key that cannot recur: the entry could never be read again. An ephemeral
+            # relation *with* a derivation key is the exception the rule was missing — it
+            # names how the engine derived it, so the next run of the same query derives the
+            # same relation and asks for the same key.
+            return None
         keys.append(key)
     return keys
 
@@ -488,7 +587,14 @@ _DERIVED_RATIOS: tuple[tuple[str, str], ...] = (
 )
 
 
-def record_write(hub: Any, namespace: str, key: str, value: object) -> None:
+def record_write(
+    hub: Any,
+    namespace: str,
+    key: str,
+    value: object,
+    *,
+    decides: Callable[[object], object] | None = None,
+) -> None:
     """Write a learned value, invalidating memoized plans when it *materially* changed.
 
     Every value `kyber.learned_tuning` stores feeds a plan decision — which join strategy the
@@ -502,9 +608,25 @@ def record_write(hub: Any, namespace: str, key: str, value: object) -> None:
     would mean never reusing a plan. So the write is compared against its prior and only a
     change large enough to flip a decision advances the generation. Over-bumping costs a
     re-plan; under-bumping leaves a stale plan, so anything unrecognized is treated as material.
+
+    `decides` closes the gap between those two sentences. It maps a stored value to **the
+    decision a plan actually reads from it**, and when supplied the write invalidates only if
+    that decision changed — which is the exact condition, not a proxy for it.
+
+    The value-drift proxy is not merely imprecise here, it is self-sustaining. A bandit arm's
+    reward is the query's own latency, so a slow run writes a mean that differs by more than
+    the materiality threshold, which invalidates the plan, which makes the next run pay the
+    optimizer again, which keeps it slow. Measured on a two-table star join over TPC-DS at
+    scale 1: `optimize` ran twice per query at ~12 ms against ~2 ms of execution, and the
+    query sat at **26 ms for twelve consecutive runs** before the arm's discounted mean
+    settled inside the threshold — then dropped to **4.7 ms** and stayed there. The arm the
+    bandit would have chosen was `broadcast` on every one of those runs.
     """
     prior = hub.get_keyed_param(namespace, key)
-    if _materially_differs(prior, value):
+    material = (
+        _materially_differs(prior, value) if decides is None else decides(prior) != decides(value)
+    )
+    if material:
         learning.bump_generation()
     hub.put_keyed_param(namespace, key, value)
 

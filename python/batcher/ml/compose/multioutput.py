@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml._estimator import require_fitted
+from batcher.ml.stats._shared import require_columns
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -160,13 +161,7 @@ class MultiOutputRegressor:
         Raises:
             ColumnNotFoundError: If a named column is missing.
         """
-        for name in (*self.features, *self.targets):
-            if name not in ds.columns:
-                from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-                raise ColumnNotFoundError(
-                    unknown_message("column", name, ds.columns, hint="Pass an existing column.")
-                )
+        require_columns(ds, *self.features, *self.targets)
         self.estimators_ = [
             self.estimator(
                 self.features, target, output_column=self._column(target), **self.params

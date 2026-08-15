@@ -29,6 +29,7 @@ from batcher.core.udf.call import (
 from batcher.core.udf.lifecycle import build_udf_callable, teardown_udf
 from batcher.core.udf.resilience import wrap_resilient
 from batcher.plan.logical import MapBatches
+from batcher.plan.types import one_batch
 
 __all__ = ["apply_udf", "rechunk"]
 
@@ -369,11 +370,10 @@ def _apply_udf_autobatch(op: MapBatches, batches: list[pa.RecordBatch]) -> list[
         coerced = _coerce_udf_result(call(batch))
         if not coerced:
             return batch.slice(0, 0)
-        # `concat_batches` keeps every row and raises a clear error on a genuine >2 GiB
-        # offset overflow, unlike `Table.from_batches(...).combine_chunks().to_batches()[0]`,
-        # which splits at the 32-bit offset limit and then silently drops all but the first
-        # batch — losing rows for large binary/string/list inference outputs.
-        return coerced[0] if len(coerced) == 1 else pa.concat_batches(coerced)
+        # `one_batch` is the shared compaction: it keeps every row and raises a clear error
+        # on a genuine offset overflow rather than returning a prefix, which is reachable
+        # from a large binary, string or list inference output.
+        return one_batch(coerced)
 
     pool = InferencePool(
         lambda: worker,

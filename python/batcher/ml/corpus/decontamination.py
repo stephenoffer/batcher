@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -172,9 +173,4 @@ def contamination_rate(
 
 def _require_column(ds: Dataset, column: str) -> None:
     """Fail at the API edge, naming the columns that do exist."""
-    if column not in ds.columns:
-        from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-        raise ColumnNotFoundError(
-            unknown_message("column", column, ds.columns, hint="Pass an existing text column.")
-        )
+    require_columns(ds, column, hint="Pass an existing text column.")

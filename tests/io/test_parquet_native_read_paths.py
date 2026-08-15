@@ -33,6 +33,7 @@ from batcher.io.formats.structured import _parquet_native
 from batcher.io.formats.structured.parquet import _native_stream
 from batcher.io.formats.structured.parquet._native_stream import row_group_windows
 from batcher.io.formats.structured.parquet.source import ParquetSource
+from batcher.io.predicate import to_pyarrow_expression
 
 pytestmark = pytest.mark.integration
 
@@ -181,7 +182,7 @@ def test_native_and_pyarrow_filtered_paths_agree(tmp_path):
     native = src._native_read_filtered(None, predicate)
     assert native is not None, "the native filtered read should be available for local files"
 
-    pa_filter = src._pa_filter(predicate)
+    pa_filter = to_pyarrow_expression(predicate)
     pyarrow_rows = _rows(
         [b for f in src._files() for b in src._read_table(f, None, pa_filter).to_batches()]
     )

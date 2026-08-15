@@ -224,9 +224,12 @@ def read_source(
     source: Source,
     projection: list[str] | None = None,
     predicate: dict | None = None,
+    limit: int | None = None,
+    ordering: tuple[tuple[str, bool, bool], ...] | None = None,
 ) -> list[pa.RecordBatch]:
     """Read `source` with projection, passing a pushed `predicate` only to sources
-    that declare ``supports_predicate``.
+    that declare ``supports_predicate``, and a row cap only to those declaring
+    ``supports_limit``.
 
     The engine retains its `Filter` operator regardless, so a source that ignores
     (or partially applies) the predicate still produces correct results — pushdown
@@ -240,11 +243,33 @@ def read_source(
     yields none — so the boundary normalizes it here rather than asking every connector
     to remember. Reading nothing is routine: an incremental batch with no new rows, a
     table whose rows were all deleted, a partition pruned away entirely.
+
+    Args:
+        source: The relation to read.
+        projection: Columns the scan must produce, or None for all of them.
+        predicate: Kyber's pushed predicate, or None.
+        limit: The most rows the plan needs from this source
+            (`PhysicalPlan.source_limits`), or None for no cap. A ceiling and never a
+            floor: a source free to return more is still correct, because the engine keeps
+            its own `Limit`.
+        ordering: The ordering `limit` is taken in (`PhysicalPlan.source_orderings`), for
+            a top-N. Unlike `limit` this is not free to ignore *selectively*: a source
+            that cannot apply the ordering must not apply the cap either, since the first
+            n of an unordered read is not the first n of a sorted one.
+
+    Returns:
+        The source's batches, never an empty list.
     """
+    # Both extras are opt-in per source and passed only when the source declares them, so
+    # a connector that never heard of either keeps the plain two-argument `read`.
+    extras: dict[str, object] = {}
     if predicate is not None and getattr(source, "supports_predicate", False):
-        batches = source.read(projection, predicate=predicate)  # type: ignore[call-arg]
-    else:
-        batches = source.read(projection)
+        extras["predicate"] = predicate
+    if limit is not None and getattr(source, "supports_limit", False):
+        extras["limit"] = limit
+    if ordering and getattr(source, "supports_ordering", False):
+        extras["ordering"] = ordering
+    batches = source.read(projection, **extras)  # type: ignore[call-arg]
     if batches:
         return batches
     schema = source.schema()

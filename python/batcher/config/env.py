@@ -20,13 +20,18 @@ dressed up as tidying.
 
 Adding a knob means adding a line here. If a setting deserves validation, a profile, or a
 place in the docs, it does not belong in this file at all — it belongs in `Config`.
+
+It also holds the one *reading* of a boolean knob (`truthy` / `env_flag`), for the reason the
+declaration list exists: seven independent spellings of "is this string yes" had accumulated,
+and one of them accepted only ``"1"`` — so a diagnostic flag set to ``true`` was silently off.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Final
 
-__all__ = ["ENV_KNOBS"]
+__all__ = ["ENV_KNOBS", "FALSE_TOKENS", "TRUE_TOKENS", "env_flag", "falsy", "truthy"]
 
 #: `BATCHER_*` variable -> what it controls. Grouped by the subsystem that reads it.
 ENV_KNOBS: Final[dict[str, str]] = {
@@ -86,3 +91,90 @@ ENV_KNOBS: Final[dict[str, str]] = {
     # --- optimizer diagnostics --------------------------------------------------------
     "BATCHER_VERIFY_EXPR_MATCHES": "cross-check the expression dispatch index (debug only)",
 }
+
+
+#: Strings that mean "yes" to a boolean env var or connection option, and their negations.
+#:
+#: There were **seven** spellings of this in the tree: two named sets (`config.config`,
+#: `plan.functions.security`), three inline tuples (`io.filesystem`, `io.splits.kvikio`,
+#: `carbonite.resilience.collectives`), a superset for spot-instance detection
+#: (`config.profiles`), and — the reason this matters rather than merely being untidy — one
+#: knob compared against the bare string ``"1"``. On that one, `BATCHER_VERIFY_EXPR_MATCHES=true`
+#: silently did nothing, which is the worst possible failure for a *diagnostic* flag: the
+#: operator believes verification is on and it is not.
+TRUE_TOKENS: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+FALSE_TOKENS: Final[frozenset[str]] = frozenset({"0", "false", "no", "off"})
+
+
+def truthy(raw: str | None) -> bool:
+    """Whether a string spells "yes" — the one reading of a boolean knob or option.
+
+    Case- and whitespace-insensitive. Anything unrecognized is `False`, including `None`, so
+    an unset variable and a variable set to nonsense agree: a knob nobody deliberately turned
+    on stays off.
+
+    Args:
+        raw: The value as the environment or the option map supplied it.
+
+    Returns:
+        `True` when `raw` names one of `TRUE_TOKENS`.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config.env import truthy
+            >>> truthy("YES"), truthy(" on "), truthy("0"), truthy(None)
+            (True, True, False, False)
+    """
+    return raw is not None and raw.strip().lower() in TRUE_TOKENS
+
+
+def falsy(raw: str | None) -> bool:
+    """Whether a string spells "no" *explicitly*, as opposed to being unset or unrecognized.
+
+    Not the negation of `truthy`: the three-way distinction is what a `bool | str` config field
+    needs. ``runtime_bloom_join = "auto"`` is neither true nor false and must stay the string
+    it is, so a caller asks both questions and keeps the value when both say no.
+
+    Args:
+        raw: The value as the environment or the option map supplied it.
+
+    Returns:
+        `True` when `raw` names one of `FALSE_TOKENS`.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.config.env import falsy, truthy
+            >>> falsy("off"), falsy("auto"), truthy("auto")
+            (True, False, False)
+    """
+    return raw is not None and raw.strip().lower() in FALSE_TOKENS
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable, one way across the whole engine.
+
+    Args:
+        name: The variable's name. It must be declared in `ENV_KNOBS`, which
+            `tests/unit/test_env_knobs.py` checks.
+        default: What an *unset* variable means. A variable that is set but unrecognized is
+            `False` regardless, per `truthy`.
+
+    Returns:
+        The flag's value.
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> from batcher.config.env import env_flag
+            >>> os.environ["BATCHER_VERIFY_EXPR_MATCHES"] = "yes"
+            >>> env_flag("BATCHER_VERIFY_EXPR_MATCHES")
+            True
+            >>> del os.environ["BATCHER_VERIFY_EXPR_MATCHES"]
+            >>> env_flag("BATCHER_VERIFY_EXPR_MATCHES", default=True)
+            True
+    """
+    raw = os.environ.get(name)
+    return default if raw is None else truthy(raw)

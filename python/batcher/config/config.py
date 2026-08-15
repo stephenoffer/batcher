@@ -25,6 +25,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
 from batcher.config.accelerator import AcceleratorConfig
+from batcher.config.env import falsy, truthy
 from batcher.config.fault_tolerance import FaultToleranceConfig
 
 __all__ = [
@@ -467,6 +468,30 @@ class StreamingConfig:
     # distributed runners share this value, so an idle stream behaves the same on one
     # machine and on a cluster.
     idle_poll_seconds: float = 0.2
+    # Longest a `map_batches` streaming window may spend filling before it is flushed
+    # anyway, in seconds. Applies ONLY to an unbounded (streaming) source; a bounded one
+    # keeps the pure size-based window, so batch throughput is unchanged.
+    #
+    # `stream_windowed` batches source batches into a window before applying the UDF,
+    # because a `map_batches` pipeline only fans across the worker pool when it is handed
+    # several batches at once. It closed that window on rows (`target_rows_per_task`,
+    # 4,000,000) or bytes (128 MiB) — both *size* bounds, and a stream is not bounded in
+    # size but in rate. The result was that first output waited for four million rows to
+    # arrive: at 2,000 rows/s that is 33 minutes, and on a 10 rows/s device topic about
+    # 4.6 days. The pipeline was not hung and not leaking; it was buffering, and nothing
+    # said so.
+    #
+    # A time bound is what every streaming engine uses for the same reason (Spark's
+    # `Trigger.ProcessingTime`, Flink's `bufferTimeout`): flush on size *or* age, whichever
+    # comes first, so throughput still governs a fast stream while a slow one stays
+    # responsive. The window is only ever cut *earlier*, and `map_batches` makes no
+    # guarantee about how rows are grouped into calls (the existing window already varies
+    # with row width and worker count), so this cannot change a result.
+    #
+    # One second is Spark's own default trigger cadence, and it is checked when a batch
+    # arrives rather than on a timer — a source that blocks for a minute between batches
+    # flushes on the next arrival, not mid-read.
+    max_window_latency_seconds: float = 1.0
     # Micro-batch progress records a `StreamingQuery` handle retains for
     # `recent_progress`. Bounded because a query that runs for a week at a 200ms
     # cadence produces three million of them; Spark's `recentProgress` is bounded the
@@ -2645,13 +2670,9 @@ class Config:
         return f"Config({shown}{more})"
 
 
-_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
-_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
-
-
 def _coerce(raw: str, to: object) -> object:
     if to is bool:
-        return raw.strip().lower() in _TRUE_TOKENS
+        return truthy(raw)
     if to is int:
         return int(raw)
     if to is float:
@@ -2663,8 +2684,8 @@ def _coerce(raw: str, to: object) -> object:
     # while the string literal "auto" happened to pass. Enabling/disabling the feature via
     # env raised `ConfigError`; a string-valued sentinel like "auto" still passes through.
     members = [a for a in typing.get_args(to) if a is not type(None)]
-    if bool in members and raw.strip().lower() in (_TRUE_TOKENS | _FALSE_TOKENS):
-        return raw.strip().lower() in _TRUE_TOKENS
+    if bool in members and (truthy(raw) or falsy(raw)):
+        return truthy(raw)
     if str in members:
         return raw
     return raw

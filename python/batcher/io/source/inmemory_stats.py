@@ -256,7 +256,10 @@ def _dictionary_width(col: pa.ChunkedArray | pa.Array) -> float | None:
         Estimated decoded bytes per row, or `None` for an empty dictionary.
     """
     chunks = col.chunks if isinstance(col, pa.ChunkedArray) else [col]
-    total = sum(c.dictionary.nbytes for c in chunks)
+    # `logical_bytes` for the same reason `_avg_bytes_of` uses it below: a dictionary's
+    # *values* array is an ordinary Arrow array and can itself be a view layout, so a bare
+    # `nbytes` raises out of statistics collection and kills the query.
+    total = sum(logical_bytes(c.dictionary) for c in chunks)
     entries = sum(len(c.dictionary) for c in chunks)
     return total / entries if entries else None
 

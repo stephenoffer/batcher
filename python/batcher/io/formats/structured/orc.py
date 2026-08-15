@@ -20,6 +20,7 @@ from batcher._internal.optional import require
 from batcher.io.base import FileSink, FileSource
 from batcher.io.filesystem import resolve_filesystem
 from batcher.io.formats.base import SINKS, SOURCES
+from batcher.io.predicate import to_pyarrow_expression
 from batcher.io.splits import Split
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.plan.source_stats import SourceStatistics
@@ -43,6 +44,60 @@ def _require_orc() -> Any:
     return require(
         "pyarrow.orc", feature="ORC support", provides="pyarrow built with ORC", extra="all"
     )
+
+
+def _reject_unrepresentable_timestamps(data: pa.Table | pa.RecordBatch) -> None:
+    """Raise rather than let ORC silently rewrite a timestamp it cannot hold.
+
+    **ORC stores timestamps as nanoseconds and nothing else**, so `pyarrow.orc` converts
+    every other precision on the way in. A value outside the nanosecond epoch range —
+    roughly 1677-09-21 to 2262-04-11 — does not fail that conversion, it *wraps*: writing
+    ``2300-01-01`` and reading it back returns ``1715-06-13 00:25:26.290448384``. No error
+    is raised at any point, by pyarrow or by ORC, and the file is valid.
+
+    That is the worst failure this engine can have — a write that reports success and
+    stores different data — and it is not hypothetical input: a far-future sentinel
+    (``9999-12-31``) and pre-1677 historical dates are both ordinary. Parquet, Arrow and
+    Avro all round-trip these exactly, so a user meeting it in ORC has no reason to suspect
+    the format.
+
+    Checked from the column's min and max rather than by scanning it: `min_max` is one
+    vectorized pass and the bounds decide the whole column, so the cost is a kernel per
+    timestamp column per batch rather than anything per row. Columns already in nanoseconds
+    need no check — they are what ORC stores.
+
+    Args:
+        data: The table or batch about to be written.
+
+    Raises:
+        SchemaError: If a timestamp column holds a value ORC would wrap.
+    """
+    import pyarrow.compute as pc
+
+    from batcher._internal.errors import SchemaError
+
+    for field in data.schema:
+        if not pa.types.is_timestamp(field.type) or field.type.unit == "ns":
+            continue
+        column = data.column(field.name)
+        if len(column) == 0:
+            continue
+        bounds = pc.min_max(column)
+        for edge in ("min", "max"):
+            value = bounds[edge]
+            if not value.is_valid:
+                continue  # an all-null column has no bound to exceed
+            try:
+                value.cast(pa.timestamp("ns", field.type.tz))
+            except Exception as exc:
+                raise SchemaError(
+                    f"column {field.name!r} holds {value.as_py()}, which ORC cannot store: "
+                    f"ORC keeps timestamps in nanoseconds, and values outside "
+                    f"1677-09-21..2262-04-11 wrap silently rather than failing. "
+                    f"Write this column to Parquet, Arrow or Avro, which hold it exactly, "
+                    f"or cast it to a type ORC can represent (for example a date, or a "
+                    f"string) before writing ORC."
+                ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,18 +279,10 @@ class ORCSource(FileSource):
                     batch = batch.select(projection)
                 yield batch
 
-    @staticmethod
-    def _pa_filter(predicate: dict | None) -> Any:
-        if predicate is None:
-            return None
-        from batcher.io.predicate import to_pyarrow_expression
-
-        return to_pyarrow_expression(predicate)
-
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
-        flt = self._pa_filter(predicate)
+        flt = to_pyarrow_expression(predicate)
         if flt is None:
             return super().read(projection)
         import pyarrow.dataset as pads
@@ -246,7 +293,7 @@ class ORCSource(FileSource):
     def iter_batches(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> Iterator[pa.RecordBatch]:
-        flt = self._pa_filter(predicate)
+        flt = to_pyarrow_expression(predicate)
         if flt is None:
             yield from super().iter_batches(projection)
             return
@@ -348,6 +395,7 @@ class ORCSink(FileSink):
 
     def _write_file(self, table: pa.Table, fh: IO[Any]) -> None:
         orc = _require_orc()
+        _reject_unrepresentable_timestamps(table)
         orc.write_table(table, fh, compression=self.compression, stripe_size=self.stripe_size)
 
     def _open_stream_writer(self, fh: IO[Any], schema: pa.Schema) -> Any:  # noqa: ARG002 (ORCWriter infers the schema from the first write)
@@ -358,6 +406,7 @@ class ORCSink(FileSink):
         return orc.ORCWriter(fh, compression=self.compression, stripe_size=self.stripe_size)
 
     def _write_batch(self, writer: Any, batch: pa.RecordBatch) -> None:
+        _reject_unrepresentable_timestamps(batch)
         writer.write(pa.Table.from_batches([batch]))
 
     def _close_stream_writer(self, writer: Any) -> None:

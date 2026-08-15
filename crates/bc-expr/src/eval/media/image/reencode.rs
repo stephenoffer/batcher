@@ -19,6 +19,7 @@ pub(super) fn resize<O: OffsetSizeTrait>(
     bytes: &GenericBinaryArray<O>,
     width: Option<i64>,
     height: Option<i64>,
+    out: Output,
 ) -> Result<ArrayRef, ExprError> {
     let w = dim("resize", "width", width)?;
     let h = dim("resize", "height", height)?;
@@ -35,28 +36,24 @@ pub(super) fn resize<O: OffsetSizeTrait>(
             ),
         });
     }
-    let out: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
+    let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
             None
         } else {
-            resize_png(bytes.value(i), w, h)
+            resize_one(bytes.value(i), w, h, out)
         }
     });
-    Ok(Arc::new(BinaryArray::from_iter(out)))
+    Ok(Arc::new(BinaryArray::from_iter(rows)))
 }
 
-/// Decode, resize to `(w, h)`, and re-encode as PNG; `None` on any failure.
-fn resize_png(data: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+/// Decode, resize to `(w, h)`, and re-encode; `None` on any failure.
+fn resize_one(data: &[u8], w: u32, h: u32, out: Output) -> Option<Vec<u8>> {
     let raw = decode_rgb_resized(data, w, h)?;
     let img = image::RgbImage::from_raw(w, h, raw)?;
-    let mut buf = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .ok()?;
-    Some(buf.into_inner())
+    out.write(image::DynamicImage::ImageRgb8(img))
 }
 
-/// The container formats `encode` can write. Mirrored by `_IMAGE_FORMATS` in
+/// The container formats this namespace can write. Mirrored by `_IMAGE_FORMATS` in
 /// `plan/expr_ir/image.py`, which rejects a typo at plan-build time.
 ///
 /// WebP is decodable but not listed: `image` 0.25 reads WebP and does not write it, so
@@ -73,39 +70,97 @@ fn encode_format(name: &str) -> Option<image::ImageFormat> {
     })
 }
 
+/// How every bytes-out image op writes its result: which container, and at what quality.
+///
+/// This exists because the container used to be a property of *one* op. `encode(format)`
+/// took a name; every other bytes-out op wrote PNG unconditionally. For a photographic
+/// corpus that is the wrong default twice over — PNG is slower to write than JPEG and
+/// several times larger — so `resize`, `thumbnail` and `auto_orient` each turned a
+/// compressed input into a much bigger output, and the only way back was a second
+/// `.image.encode("jpeg")` pass that decoded and re-encoded the whole column again.
+/// Resolving the container once, here, is what lets an op emit the format the caller
+/// actually wants in the single decode it was already doing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Output {
+    fmt: image::ImageFormat,
+    /// 1..=100 for the lossy containers; `None` means the encoder's own default (75).
+    quality: Option<u8>,
+}
+
+impl Output {
+    /// Validate the format name and quality once for the whole batch.
+    ///
+    /// Once, not per row: an unknown name is a caller's typo, and reporting it n times
+    /// tells them nothing the first one did not. `func` names the op in the error, since
+    /// `format` is now reachable from every bytes-out op rather than only `encode`.
+    pub(super) fn resolve(
+        func: crate::ImageFunc,
+        format: Option<&str>,
+        quality: Option<i64>,
+    ) -> Result<Self, ExprError> {
+        let fmt = match format {
+            None => image::ImageFormat::Png,
+            Some(name) => encode_format(name).ok_or_else(|| ExprError::InvalidArgument {
+                func: format!("{func:?}"),
+                reason: format!(
+                    "unknown image format {name:?}; expected one of {}",
+                    ENCODE_FORMATS.join(", ")
+                ),
+            })?,
+        };
+        let quality = match quality {
+            None => None,
+            Some(q) if (1..=100).contains(&q) => Some(q as u8),
+            Some(q) => {
+                return Err(ExprError::InvalidArgument {
+                    func: format!("{func:?}"),
+                    reason: format!("quality must be in 1..=100, got {q}"),
+                })
+            }
+        };
+        Ok(Self { fmt, quality })
+    }
+
+    /// Whether this container can carry an alpha channel.
+    ///
+    /// JPEG cannot, so an RGBA image is flattened rather than failing the row — the same
+    /// decision `encode` always made, lifted here so all eighteen bytes-out ops make it.
+    fn keeps_alpha(&self) -> bool {
+        !matches!(self.fmt, image::ImageFormat::Jpeg)
+    }
+
+    /// Encode one image, or `None` if the encoder refuses it (the null-row convention).
+    pub(super) fn write(&self, img: image::DynamicImage) -> Option<Vec<u8>> {
+        let img = if self.keeps_alpha() {
+            img
+        } else {
+            image::DynamicImage::ImageRgb8(img.into_rgb8())
+        };
+        let mut out = Vec::new();
+        match (self.fmt, self.quality) {
+            (image::ImageFormat::Jpeg, Some(q)) => {
+                let enc =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut out), q);
+                img.write_with_encoder(enc).ok()?;
+            }
+            _ => img.write_to(&mut Cursor::new(&mut out), self.fmt).ok()?,
+        }
+        Some(out)
+    }
+}
+
 /// `encode(format)` → the same pixels re-encoded in `format`.
 pub(super) fn encode<O: OffsetSizeTrait>(
     bytes: &GenericBinaryArray<O>,
-    format: Option<&str>,
+    out: Output,
 ) -> Result<ArrayRef, ExprError> {
-    let name = format.ok_or(ExprError::MissingImageArg {
-        func: "encode".to_string(),
-        arg: "format",
-    })?;
-    // Validate once, before any row: an unknown format is a plan error, and raising it
-    // per row would emit the same message n times.
-    let fmt = encode_format(name).ok_or_else(|| ExprError::InvalidArgument {
-        func: "encode".to_string(),
-        reason: format!(
-            "unknown image format {name:?}; expected one of {}",
-            ENCODE_FORMATS.join(", ")
-        ),
-    })?;
     let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
             return None;
         }
-        let img = image::load_from_memory(bytes.value(i)).ok()?;
-        // JPEG has no alpha channel, so an RGBA source is flattened to RGB rather than
-        // failing the row. Every other target keeps whatever the decoder produced.
-        let img = if matches!(fmt, image::ImageFormat::Jpeg) {
-            image::DynamicImage::ImageRgb8(img.into_rgb8())
-        } else {
-            img
-        };
-        let mut out = Vec::new();
-        img.write_to(&mut Cursor::new(&mut out), fmt).ok()?;
-        Some(out)
+        // `Output::write` flattens for a container with no alpha channel, so an RGBA
+        // source re-encodes as JPEG rather than failing the row.
+        out.write(image::load_from_memory(bytes.value(i)).ok()?)
     });
     Ok(assemble_binary(rows))
 }
@@ -130,6 +185,7 @@ const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) fn thumbnail<O: OffsetSizeTrait>(
     bytes: &GenericBinaryArray<O>,
     max_size: Option<i64>,
+    out: Output,
 ) -> Result<ArrayRef, ExprError> {
     let max = dim("thumbnail", "max_size", max_size)?;
     let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
@@ -149,11 +205,7 @@ pub(super) fn thumbnail<O: OffsetSizeTrait>(
         } else {
             image::DynamicImage::ImageRgb8(resize_rgb(&img.into_rgb8(), tw, th)?)
         };
-        let mut buf = Vec::new();
-        scaled
-            .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-            .ok()?;
-        Some(buf)
+        out.write(scaled)
     });
     Ok(assemble_binary(rows))
 }
@@ -217,7 +269,7 @@ pub(super) fn letterbox<O: OffsetSizeTrait>(
 /// Rounded rather than truncated, and floored at one pixel: truncation drops a very wide
 /// image's short side to zero, and a zero-dimension resize is an error rather than a
 /// degenerate image, so a panorama would fail the row instead of thumbnailing.
-fn fit_within(sw: u32, sh: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+pub(super) fn fit_within(sw: u32, sh: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if sw <= max_w && sh <= max_h {
         return (sw, sh);
     }
@@ -263,17 +315,18 @@ fn resize_rgb(img: &image::RgbImage, w: u32, h: u32) -> Option<image::RgbImage> 
 /// The result is PNG, which carries no Exif, so the orientation cannot be applied twice.
 pub(super) fn auto_orient<O: OffsetSizeTrait>(
     bytes: &GenericBinaryArray<O>,
+    out: Output,
 ) -> Result<ArrayRef, ExprError> {
     let rows: Vec<Option<Vec<u8>>> = map_rows(bytes.len(), |i| {
         if bytes.is_null(i) {
             return None;
         }
-        oriented_png(bytes.value(i))
+        oriented(bytes.value(i), out)
     });
     Ok(assemble_binary(rows))
 }
 
-fn oriented_png(data: &[u8]) -> Option<Vec<u8>> {
+fn oriented(data: &[u8], out: Output) -> Option<Vec<u8>> {
     let mut decoder = image::ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .ok()?
@@ -301,10 +354,7 @@ fn oriented_png(data: &[u8]) -> Option<Vec<u8>> {
     let orientation = image::ImageDecoder::orientation(&mut decoder).ok()?;
     let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
     img.apply_orientation(orientation);
-    let mut buf = Vec::new();
-    img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-        .ok()?;
-    Some(buf)
+    out.write(img)
 }
 
 /// `exif_orientation()` → the Exif orientation code, 1 through 8.
@@ -347,6 +397,7 @@ pub(super) const COLOR_MODES: [&str; 4] = ["L", "LA", "RGB", "RGBA"];
 pub(super) fn convert<O: OffsetSizeTrait>(
     bytes: &GenericBinaryArray<O>,
     mode: Option<&str>,
+    out: Output,
 ) -> Result<ArrayRef, ExprError> {
     let mode = mode.ok_or(ExprError::MissingImageArg {
         func: "convert".to_string(),
@@ -370,7 +421,7 @@ pub(super) fn convert<O: OffsetSizeTrait>(
         // Rec.709. `to_grayscale` and `dhash` both use Rec.601, and two functions in one
         // namespace disagreeing about what grey means is a bug a caller would find by
         // accident. On RGB(10, 200, 30) the two answers are 147 and 124.
-        let out = match mode {
+        let converted = match mode {
             "L" => {
                 let rgb = img.into_rgb8();
                 let (w, h) = rgb.dimensions();
@@ -389,16 +440,13 @@ pub(super) fn convert<O: OffsetSizeTrait>(
             "RGB" => image::DynamicImage::ImageRgb8(img.into_rgb8()),
             _ => image::DynamicImage::ImageRgba8(img.into_rgba8()),
         };
-        let mut buf = Vec::new();
-        out.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-            .ok()?;
-        Some(buf)
+        out.write(converted)
     });
     Ok(assemble_binary(rows))
 }
 
 /// Collect per-row byte buffers into a `Binary` column (`None` → null).
-fn assemble_binary(rows: Vec<Option<Vec<u8>>>) -> ArrayRef {
+pub(super) fn assemble_binary(rows: Vec<Option<Vec<u8>>>) -> ArrayRef {
     use arrow::array::BinaryBuilder;
     let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 512);
     for row in rows {

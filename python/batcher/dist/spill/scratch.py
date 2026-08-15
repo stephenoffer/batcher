@@ -17,6 +17,7 @@ from batcher.carbonite.spill import TieredSpillStore
 from batcher.config import active_config
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
+from batcher.plan.types import logical_bytes, one_batch
 
 
 def _work_dir(spill_dir: str | None, prefix: str) -> tuple[str, bool]:
@@ -130,11 +131,10 @@ def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
             return None
         # One buffered batch needs no copy; a run is compacted into a single 0-offset
         # batch so the engine sees one contiguous chunk, not a chain of tiny ones.
-        # `concat_batches` rather than `combine_chunks().to_batches()[0]`: the latter
-        # splits at the 32-bit offset limit, so a flush holding more than 2 GiB of string
-        # or binary data — a spilled multimodal or embedding column — came back as several
-        # batches and taking the first silently dropped every row after it.
-        out = pending[0] if len(pending) == 1 else pa.concat_batches(pending)
+        # `one_batch` is the shared compaction: it keeps every row and raises rather than
+        # returning a prefix when a flush genuinely exceeds the 32-bit offset limit, which
+        # a spilled multimodal or embedding column can.
+        out = one_batch(pending)
         pending.clear()
         pending_bytes = 0
         return out
@@ -143,7 +143,13 @@ def _iter_spill_morsels(source: Source, projection: list[str] | None = None):
         n = batch.num_rows
         if n == 0:
             continue
-        nbytes = batch.nbytes
+        # `logical_bytes`, not `batch.nbytes`: this is the single tap every out-of-core
+        # phase reads through, and a bare `nbytes` *raises* on the Arrow view layouts
+        # (`string_view`/`binary_view`/`list_view`) that a Parquet reader with view types
+        # on, DuckDB, Polars, or any Velox-backed producer hands over. A spilling query
+        # over such a column died in the sizing arithmetic — before a byte was spilled —
+        # with an ArrowTypeError naming a layout the user never chose.
+        nbytes = logical_bytes(batch)
         if nbytes >= _SPILL_INPUT_CHUNK_BYTES:
             # Emit any buffered small batches first (order-preserving), then split.
             buffered = _flush()

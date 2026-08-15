@@ -223,3 +223,38 @@ def test_image_null_bytes_yield_null(fn):
     expr = bt.col("img").image.decode() if fn == "decode" else bt.col("img").image.to_tensor(2, 2)
     out = ds.select(r=expr).collect()
     assert out.column("r")[0].as_py() is None
+
+
+def test_image_ops_survive_streaming_and_multiple_batches():
+    """Batching must not change what a per-row image kernel returns, or its column type.
+
+    `collect()` hands the engine one batch; `iter_batches()` hands it several. The kernels
+    are per-row, so the values cannot legitimately differ -- which is exactly why this is
+    worth asserting rather than assuming, because the two things that *can* differ are
+    invisible in the values. A decoded tensor carries its shape as Arrow extension
+    metadata, and metadata is what a boundary drops; and a batch that happens to contain
+    only unusable rows is the shape that makes a kernel widen a `Null` column, which the
+    single-batch path may never produce.
+
+    The fixture puts a null and an undecodable row in the middle so at least one batch is
+    all-bad at a small batch size.
+    """
+    rows = [_png(4, 3), None, b"not an image", _png(2, 5), _png(6, 6), None]
+    ds = bt.from_arrow(pa.table({"b": pa.array(rows, type=pa.binary())}))
+    cases = {
+        "tensor": lambda c: c.image.to_tensor(4, 4),
+        "meta": lambda c: c.image.decode(),
+        "bright": lambda c: c.image.brightness(),
+        "hash": lambda c: c.image.dhash(),
+        "encoded": lambda c: c.image.encode("png"),
+    }
+    for name, build in cases.items():
+        query = ds.select(x=build(bt.col("b")))
+        whole = query.collect()
+        batches = list(query.iter_batches(batch_size=2))
+
+        streamed = [row for batch in batches for row in batch.column("x").to_pylist()]
+        assert streamed == whole.column("x").to_pylist(), name
+        assert len(batches) > 1, f"{name}: batch_size=2 over six rows must span batches"
+        for batch in batches:
+            assert batch.schema.field("x").type == whole.schema.field("x").type, name

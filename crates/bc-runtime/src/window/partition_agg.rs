@@ -52,7 +52,16 @@ pub(crate) fn broadcast_partition_aggregate(
         // `values` is an `Arc<dyn Array>`; calling `is_valid` on it per row is a virtual call
         // the optimizer cannot see through. Resolve the null buffer once — a null-free column
         // then counts every row with no check at all.
-        match values.nulls() {
+        //
+        // `logical_nulls`, not `nulls`: a `Null`-typed column (every value null, which is what
+        // an untyped literal or an empty relation produces) carries *no* validity buffer at
+        // all, because its type already says every row is null. `nulls()` returns `None` for
+        // it — indistinguishable from a column with no nulls — so `COUNT(v) OVER (…)` counted
+        // every row where DuckDB and this engine's own `GROUP BY` both answer 0. That was a
+        // silent wrong answer rather than an error. `logical_nulls()` materializes the
+        // all-null buffer the type implies, and returns exactly what `nulls()` did for every
+        // other type.
+        match values.logical_nulls() {
             None => {
                 for &g in group_ids {
                     counts[g as usize] += 1;
@@ -73,6 +82,21 @@ pub(crate) fn broadcast_partition_aggregate(
     if crate::window::agg::is_extended_aggregate(func) {
         return crate::window::agg::broadcast(func, group_ids, num_groups, values);
     }
+    // `MIN`/`MAX` preserve their input's type, so a column the numeric kernels below cannot
+    // read is answered by selecting the winning row instead of widening the values —
+    // `MIN(order_date) OVER (PARTITION BY customer)` returns a DATE, where before it failed.
+    if crate::window::coerce::is_extreme(func)
+        && !matches!(
+            values.data_type(),
+            DataType::Int64 | DataType::Float64 | DataType::Utf8 | DataType::Boolean
+        )
+    {
+        return crate::window::coerce::select_extreme(func, group_ids, num_groups, values);
+    }
+    // The reducing aggregates take the canonical width instead: a narrow integer or float
+    // reaches here from a mid-plan `CAST`, and every one of them errored outright.
+    let widened = crate::window::coerce::widened_or_original(values)?;
+    let values = &widened;
     match values.data_type() {
         DataType::Int64 => grouped_i64(func, group_ids, num_groups, values),
         DataType::Float64 => grouped_f64(func, group_ids, num_groups, values),

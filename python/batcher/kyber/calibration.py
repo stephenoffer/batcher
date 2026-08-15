@@ -11,7 +11,10 @@ Method. Each operator family's dominant cost term is `coeff x basis(rows)` (e.g.
 filter ~ `filter_row x rows_in`, sort ~ `sort_row x n·log₂n`). Measurements are in
 milliseconds; coefficients are in abstract work units, so we anchor the two with a
 single global factor `k` (work units per ms) chosen to preserve the default model's
-overall scale — when reality matches the defaults, calibration is a no-op. Each
+overall scale — when reality matches the defaults, calibration is a no-op. `k` is the
+**median** sample's ratio of default work to measured time rather than the ratio of the
+two totals, because a total is set by the biggest operators in an ever-growing history
+and therefore never settles (`_anchor`). Each
 coefficient is then `median(k x t_ms / basis)` over its samples, **shrunk toward the
 shipped default in proportion to how little evidence there is** (`shrink`), and clamped
 to within a configured factor of that default, so timing noise can never produce a
@@ -34,6 +37,7 @@ from statistics import median
 from batcher._internal.logging import note_suppressed
 from batcher._internal.mathx import clamp_factor
 from batcher.config import Config, CostCoefficients, active_config
+from batcher.kyber.learning import is_material_change
 from batcher.metadata import MetadataHub
 
 __all__ = ["calibrate", "live_coefficients", "shrink"]
@@ -197,8 +201,94 @@ def calibrate(
     except Exception as exc:  # pragma: no cover - calibration must never break planning
         note_suppressed("kyber", "load calibrated cost coefficients", exc)
         coeffs = defaults
+    # Only against a fit of the *same* fingerprint. One hub serves several machine classes
+    # across a session (a driver planning for its workers, then for itself), and the whole
+    # point of the class being in the key is that those answers are different — blending them
+    # would hand each the other's measurements.
+    if cached is not None and cached[1] == fingerprint:
+        coeffs = _settled(cached[2], coeffs)
     _CALIB_CACHE[hub] = (version, fingerprint, coeffs)
     return coeffs
+
+
+def _settled(prior: CostCoefficients, fresh: CostCoefficients) -> CostCoefficients:
+    """Blend a fresh fit into the live one, and **keep the live object** when nothing moved.
+
+    Successive fits estimate the same stationary quantity from different windows of the same
+    history, so averaging them reduces the estimator's variance — which is exactly the
+    treatment `learning._smooth` gives every other learned scalar, applied here for a second
+    reason on top of accuracy.
+
+    That reason is the plan cache. The coefficients *are* its key
+    (`plan_cache._bucketed`), so a fit that wanders inside its own noise band is not a neutral
+    event: it moves the key, the memo misses, and the query re-plans. Bucketing the key with a
+    deadband was supposed to absorb that and could not, because the wander is larger than the
+    bucket: measured on TPC-DS q77 at scale 1, `hash_build_row` swung between adjacent
+    half-octave buckets on consecutive refits — over 40% — so the memo never hit once and the
+    query paid **135 ms of optimizer time on every execution**, against 13 ms for DuckDB's
+    whole query. `project_row` did the same on q5.
+
+    Damping the estimate is the fix that addresses the cause rather than widening the tolerance
+    around it: a coefficient that is genuinely moving still gets there, in a few refits instead
+    of one, and a coefficient that is merely noisy stops moving at all. When the blend changes
+    nothing material, the *previous object* is returned unchanged, so a caller comparing
+    identity (and the key derived from it) sees a fit that has settled.
+
+    **A move of more than an octave is taken whole, and that is the difference between damping
+    and dawdling.** Damping every move alike makes the *approach* the problem: a coefficient
+    whose first, cold-start fit is 30x its settled value walks toward it geometrically, crosses
+    a half-octave key bucket on each of the eight refits it takes to arrive, and misses the memo
+    every one of them — which is q77 again, in slow motion instead of at random. Nothing about
+    a 2x-or-worse discrepancy looks like timing noise (the wander this damps was measured at
+    ~40%, well inside an octave), so the estimator has no reason to disbelieve it: it lands in
+    one refit and the key stops moving. Inside an octave the blend is exactly as before.
+    """
+    blended = dataclasses.replace(
+        fresh,
+        **{
+            name: _tracked(getattr(prior, name), getattr(fresh, name))
+            for name in _numeric_fields(fresh)
+        },
+    )
+    if all(
+        not is_material_change(getattr(prior, name), getattr(blended, name))
+        for name in _numeric_fields(blended)
+    ):
+        return prior
+    return blended
+
+
+def _tracked(prior: float, fresh: float) -> float:
+    """`fresh` when it disagrees with `prior` by more than an octave, else the damped blend.
+
+    The cost of the rule, stated plainly: a family with few samples *can* jump an octave on
+    noise, and then it lands whole. `sort_row` was seen moving three buckets in one refit on
+    TPC-DS q77, where a query sorts a handful of rows and the fit has almost nothing to go on.
+    Two things bound that — `shrink` pulls a thin sample back toward the shipped default before
+    it ever reaches here, and `clamp_factor` caps how far from that default any fit can land —
+    so the damage is a briefly mispriced family inside a fixed envelope, against the certainty
+    of a memo that never hits while a cold-start fit walks to its settled value.
+    """
+    if prior > 0.0 and fresh > 0.0 and not (0.5 <= fresh / prior <= 2.0):
+        return fresh
+    return _ALPHA * fresh + (1.0 - _ALPHA) * prior
+
+
+#: Weight the newest fit carries in the blend above. One third is a ~3-refit memory: fast
+#: enough that a real change in the machine or the engine lands within a few queries, slow
+#: enough that the run-to-run swing measured on `hash_build_row` damps below the bucket the
+#: plan cache keys on.
+_ALPHA = 1.0 / 3.0
+
+
+def _numeric_fields(coeffs: CostCoefficients) -> list[str]:
+    """The coefficient names that carry a real number (every field, today — but not by fiat)."""
+    return [
+        f.name
+        for f in dataclasses.fields(coeffs)
+        if isinstance(getattr(coeffs, f.name), (int, float))
+        and not isinstance(getattr(coeffs, f.name), bool)
+    ]
 
 
 def _calibrate(
@@ -222,19 +312,9 @@ def _calibrate(
     if not usable:
         return defaults
 
-    # Global anchor k (work units per ms): chosen so the default model's total work
-    # over all usable samples equals their total measured ms. This keeps calibrated
-    # coefficients on the same scale as the untouched defaults.
-    total_default_work = 0.0
-    total_ms = 0.0
-    for kind, samples in usable.items():
-        c0 = getattr(defaults, _KIND_COEFF[kind])
-        for rin, rout, t, factor in samples:
-            total_default_work += c0 * _basis(kind, rin, rout) * factor
-            total_ms += t
-    if total_default_work <= 0.0 or total_ms <= 0.0:
+    k = _anchor(usable, defaults)
+    if k is None:
         return defaults
-    k = total_default_work / total_ms
 
     updates: dict[str, float] = {}
     for kind, samples in usable.items():
@@ -255,6 +335,39 @@ def _calibrate(
         updates["jit_speedup"] = speedup
 
     return dataclasses.replace(defaults, **updates) if updates else defaults
+
+
+def _anchor(
+    usable: dict[str, list[tuple[float, float, float, float]]],
+    defaults: CostCoefficients,
+) -> float | None:
+    """Work units per millisecond: the scale that puts a fitted coefficient beside a default one.
+
+    Every fitted coefficient is `k x measured_ms / basis`, so `k` is what keeps a *fitted*
+    family comparable to an *unfitted* one — a family below the sample floor keeps its shipped
+    default, and the two are compared inside one plan cost. It is the typical sample's ratio of
+    default-model work to measured time.
+
+    **The median, not the ratio of the two totals, and that difference is the whole point.**
+    A ratio of sums is a work-weighted mean, so it is set by the largest operators in the
+    history — the full-table scans — whose measured time is also the most variable, and every
+    execution appends more of them. Measured on TPC-DS q77 at scale 1, run after identical run
+    in one session, the summed anchor read **1.78e4 -> 3.04 -> 3.67 -> 4.19 -> 4.56 -> 4.87 ->
+    5.13 -> 5.32e4** and was still climbing; `hash_build_row` rode it from 2.0 to 9.8 and the
+    plan-cache key moved with it, so the query re-planned on **every** execution (~200 ms of
+    optimizer against DuckDB's 21 ms for the whole query). The per-sample median over the same
+    history reads **9.7e3 / 9.8e3 / 9.2e3 / 9.5e3 / 9537 / 9537 / 9537** — it settles, and a
+    settled fit is what lets the memo hit at all. Robustness here is not a statistical nicety;
+    it is the difference between a learning loop that converges and one that walks.
+    """
+    ratios = [
+        c0 * basis * factor / t
+        for kind, samples in usable.items()
+        if (c0 := getattr(defaults, _KIND_COEFF[kind])) > 0.0
+        for rin, rout, t, factor in samples
+        if t > 0.0 and (basis := _basis(kind, rin, rout)) > 0.0
+    ]
+    return median(ratios) if ratios else None
 
 
 def _measured_jit_speedup(

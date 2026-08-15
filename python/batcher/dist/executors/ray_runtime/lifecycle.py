@@ -89,10 +89,65 @@ def engine_config_json(num_cpus: float | None = None) -> str:
 
     if env is not None and env.memory_bytes > 0:
         existing = int(cfg.get("memory_budget_bytes", 0) or 0)
-        cfg["memory_budget_bytes"] = (
-            env.memory_bytes if existing <= 0 else min(existing, env.memory_bytes)
-        )
+        budget = _spill_budget(env.memory_bytes, env.n_tasks)
+        cfg["memory_budget_bytes"] = budget if existing <= 0 else min(existing, budget)
     return json.dumps(cfg)
+
+
+#: How much of an estimate a worker may exceed before it starts spilling.
+#:
+#: `SchedulingEnvelope.memory_bytes` is doing two jobs. It is Ray's `memory=` **reservation**,
+#: where it must be the honest expected footprint or the scheduler over-packs the node; and it
+#: is the engine's **spill threshold**, where being the honest expected footprint means any
+#: under-estimate spills. Those want different numbers, and using one for both makes a
+#: too-low estimate cost a disk round trip rather than a little over-packing.
+#:
+#: A too-low estimate is the ordinary case, not the exception: the grant is
+#: `learned_plan_peak // n_tasks`, a *point* estimate from a cardinality model, and a join's
+#: build side is exactly what such a model gets wrong. Measured on TPC-H sf1
+#: `lineitem ⋈ orders` grouped by `o_orderpriority`, distributed on one node: Kyber sized the
+#: peak at **31 MB**, the worker spilled its way through the join, and the query took
+#: **19.9 s**. The identical run with the spill threshold lifted took **11.5 s** — 1.73x, for
+#: memory that was there the whole time (the box has 184 GiB).
+#:
+#: The factor is where that query's curve flattens, not a round number. Sweeping the
+#: per-worker budget on it, best of two each:
+#:
+#: | budget | 31 MiB | 125 MiB | **512 MiB** | 2 GiB | 8 GiB | 32 GiB |
+#: |---|---:|---:|---:|---:|---:|---:|
+#: | wall | 23.6 s | 19.3 s | **11.2 s** | 11.7 s | 11.6 s | 12.6 s |
+#:
+#: 512 MiB is 16x the estimate and is the whole of the win; past it the curve is flat and the
+#: 32 GiB point is *slower*, which is why this is a bounded multiple rather than "give the
+#: worker the node".
+#:
+#: Only the *threshold* is lifted. The reservation Ray packs against is untouched, so
+#: placement still reflects what the task is expected to need, and the ceiling below keeps
+#: the headroom inside one task's share of one node — so a worker still spills rather than
+#: taking the node down, which is the invariant this number exists to serve.
+_SPILL_HEADROOM = 16.0
+
+
+def _spill_budget(granted: int, n_tasks: int) -> int:
+    """The engine's spill threshold for a worker granted `granted` bytes.
+
+    `_SPILL_HEADROOM` times the grant, capped at **one task's share of one node's usable
+    memory** — dividing by the cluster-wide fan-out rather than the per-node one, which
+    under-states the share whenever the fleet spans nodes. That is the safe direction for a
+    ceiling: it can only make the headroom smaller than the worker could have afforded, never
+    larger than the node has. A budget that cannot be bounded (no cgroup reading, a test stub)
+    keeps the grant unchanged rather than guessing.
+    """
+    from batcher.carbonite.memory.probe import available_bytes
+
+    try:
+        available = int(available_bytes() or 0)
+    except Exception:  # pragma: no cover - a probe that cannot read the host
+        return granted
+    if available <= 0:
+        return granted
+    share = int(available * active_config().memory.soft_limit) // max(1, n_tasks)
+    return max(granted, min(int(granted * _SPILL_HEADROOM), share))
 
 
 # Names of the module-level Ray task functions, keyed by the module they live in.
@@ -127,6 +182,44 @@ _TASK_FUNCS: dict[str, tuple[str, ...]] = {
 # resource signature the task fns are currently wrapped with.
 _originals: dict[tuple[str, str], object] = {}
 _wrapped_resources: tuple | None = None
+
+# Every wrapper built so far, keyed by the signature it was built under. Rebinding is
+# cheap; *building* a wrapper is not, and a query does not settle on one grant. Measured
+# against a local cluster, a single `collect(distributed=True)` calls `_ensure_ray` three
+# times and the signature alternates -- once with the placeholder `num_cpus=1.0` that
+# transport resolution passes before the envelope is known, then with the real grant -- so
+# the "is it already wrapped?" check missed on two of the three and rebuilt all nineteen
+# task functions each time. `ray.remote()` is not a cheap decorator: it disassembles the
+# function's bytecode and the first `.remote()` after it exports the definition to the GCS,
+# which measured **2.6 ms of driver CPU per query** and, more importantly, put ~38 function
+# exports per query onto a control plane every driver in the fleet shares.
+#
+# Keyed by signature rather than replaced, because the alternation is the normal case: a
+# cache of one entry is a cache that misses every time the grant flaps back.
+_WRAPPERS: dict[tuple, dict[tuple[str, str], object]] = {}
+
+#: Distinct resource signatures whose wrappers are retained. A grant is derived from the
+#: envelope, so a workload of many shapes produces many; past this the least recently used
+#: signature is dropped and rebuilt if it returns.
+_MAX_WRAPPED_SIGNATURES = 16
+
+
+def _hashable(value):
+    """`value` with every dict and list turned into a tuple, so it can key a cache.
+
+    A grant is not flat. `scheduling.task_options` puts a **nested dict** under `resources`
+    for a custom accelerator (`TPU`, `neuron_cores`, an operator's own named resource), and
+    `fault_options` carries a list. The previous signature was only ever compared with `==`,
+    where that is fine; keying a cache on it needs it hashable, and a `TypeError` here would
+    fail the query rather than merely miss the cache.
+    """
+    if isinstance(value, dict):
+        return tuple(sorted((k, _hashable(v)) for k, v in value.items()))
+    if isinstance(value, list | tuple):
+        return tuple(_hashable(v) for v in value)
+    return value
+
+
 # Guards the module-global rebind in `_wrap_tasks`: two concurrent distributed
 # queries with different envelopes must not interleave their re-wraps and hand one
 # query's tasks the other's resource grant.
@@ -467,7 +560,11 @@ def _wrap_tasks(ray, resources: dict) -> None:
     restart/retry (`max_restarts`/`max_task_retries`). Idempotent per signature: the
     unwrapped originals are cached on first sight, and tasks are re-wrapped only when
     the resource grant *or* the fault config changes — so successive queries with
-    different envelopes each get correctly-resourced, correctly-resilient tasks."""
+    different envelopes each get correctly-resourced, correctly-resilient tasks.
+
+    Returning to a signature seen before is a **rebind**, not a rebuild: the wrappers are
+    kept per signature in `_WRAPPERS`, which is what keeps a query's own alternation between
+    grants off the GCS. See that constant for the measurement."""
     global _wrapped_resources
     import importlib
     import inspect
@@ -475,13 +572,16 @@ def _wrap_tasks(ray, resources: dict) -> None:
     task_fault = fault_options()
     actor_fault = actor_fault_options()
     signature = (
-        tuple(sorted(resources.items())),
-        tuple(sorted(task_fault.items())),
-        tuple(sorted(actor_fault.items())),
+        _hashable(resources),
+        _hashable(task_fault),
+        _hashable(actor_fault),
     )
     with _wrap_lock:
         if _originals and signature == _wrapped_resources:
             return
+        built = _WRAPPERS.pop(signature, None)  # popped and re-inserted below: LRU order
+        if built is None:
+            built = {}
         for mod_name, fn_names in _TASK_FUNCS.items():
             module = importlib.import_module(mod_name)
             for fn_name in fn_names:
@@ -490,9 +590,15 @@ def _wrap_tasks(ray, resources: dict) -> None:
                 if original is None:
                     original = getattr(module, fn_name)
                     _originals[key] = original
-                fault = actor_fault if inspect.isclass(original) else task_fault
-                wrapper = ray.remote(**resources, **fault)(original)
+                wrapper = built.get(key)
+                if wrapper is None:
+                    fault = actor_fault if inspect.isclass(original) else task_fault
+                    wrapper = ray.remote(**resources, **fault)(original)
+                    built[key] = wrapper
                 setattr(module, fn_name, wrapper)
+        _WRAPPERS[signature] = built  # newest position, whether rebuilt or reused
+        while len(_WRAPPERS) > _MAX_WRAPPED_SIGNATURES:
+            _WRAPPERS.pop(next(iter(_WRAPPERS)))
         _wrapped_resources = signature
 
 
@@ -518,7 +624,13 @@ def _single_node(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
         return _single_node_with_udfs(plan, sources)
     physical = kyber.optimize(plan)
     resolved = [
-        read_source(src, physical.source_projections.get(i), physical.source_predicates.get(i))
+        read_source(
+            src,
+            physical.source_projections.get(i),
+            physical.source_predicates.get(i),
+            physical.source_limits.get(i),
+            physical.source_orderings.get(i),
+        )
         for i, src in enumerate(sources)
     ]
     batches = core.execute_local(physical, resolved)

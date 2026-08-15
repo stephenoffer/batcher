@@ -34,6 +34,7 @@ from batcher.dist.executors.ray_runtime import (
     shuffle_partitions,
 )
 from batcher.io.source import Source
+from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import LogicalPlan
 
 __all__ = ["keyed_row_shuffle", "scan_rooted_ir"]
@@ -47,7 +48,7 @@ def scan_rooted_ir(node: LogicalPlan) -> str:
     keeps the operator's own encoding in `plan`, where the wire contract lives.
     """
     ir = node.to_ir()
-    ir["input"] = {"op": "scan", "source_id": 0}
+    ir["input"] = task_scan_ir()
     return json.dumps(ir)
 
 

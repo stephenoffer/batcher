@@ -182,7 +182,9 @@ rather than approximate. Compute them in a separate subquery and join.
 ### Subqueries
 
 Set-membership subqueries are folded into joins, so they run as one plan rather than once per
-row. `= ANY` and `= SOME` are `IN`; `<> ALL` is `NOT IN`; all four spell the same predicate.
+row. `= ANY` and `= SOME` are `IN`; `<> ALL` is `NOT IN`; all four spell the same predicate. The
+left-hand side may be an expression rather than a bare column, and `NOT IN` keeps SQL's
+three-valued answer when the subquery yields a NULL.
 
 ```python
 vip = bt.from_pydict({"category": ["a", "c"]})
@@ -219,6 +221,37 @@ out = bt.sql(
 print(out.to_pydict())
 # {'id': [1, 3, 5]}
 ```
+
+A correlated `EXISTS` becomes a semi join (an anti join for `NOT EXISTS`), and the correlation
+may mix an equality with an inequality. Equalities become the join keys and the inequality is
+applied to the joined rows, so a query that asks "is there a row in the other table with the
+same key and a larger value" runs as one plan.
+
+```python
+limits = bt.from_pydict({"category": ["a", "b"], "cap": [25.0, 15.0]})
+
+out = bt.sql(
+    """
+    SELECT id, category, amount
+    FROM events
+    WHERE EXISTS (
+        SELECT 1 FROM limits
+        WHERE limits.category = events.category AND limits.cap > events.amount
+    )
+    ORDER BY id
+    """,
+    events=events,
+    limits=limits,
+)
+print(out.to_pydict())
+```
+
+```text
+{'id': [1], 'category': ['a'], 'amount': [10.0]}
+```
+
+Both sides of a correlation must be plain columns. A correlation on an expression, such as
+`limits.cap > events.amount + 5`, raises instead of translating.
 
 Two forms raise rather than translate, both because the honest answer needs SQL's third
 truth value and the natural rewrite cannot express it:

@@ -18,6 +18,8 @@ from collections.abc import Iterator
 
 import pyarrow as pa
 
+from batcher.plan.types import one_batch
+
 __all__ = ["_rebatch_exact"]
 
 
@@ -52,15 +54,19 @@ def _rebatch_exact(batches: Iterator[pa.RecordBatch], batch_size: int) -> Iterat
         table = pa.Table.from_batches(buf)
         offset = 0
         while table.num_rows - offset >= batch_size:
-            yield table.slice(offset, batch_size).combine_chunks().to_batches()[0]
+            # `one_batch`, not `combine_chunks().to_batches()[0]`: `batch_size` rows of a
+            # wide string or blob column can exceed the 32-bit offset limit, and the
+            # spelling this replaces then yielded only the first piece — dropping rows out
+            # of `iter_batches` with nothing to show for it.
+            yield one_batch(table.slice(offset, batch_size))
             offset += batch_size
         rest = table.slice(offset)
         # Compacted, so the carried remainder is one small batch rather than a view that
         # pins the whole emitted round's buffers until the next flush.
-        buf = rest.combine_chunks().to_batches() if rest.num_rows else []
+        buf = [one_batch(rest)] if rest.num_rows else []
         rows = rest.num_rows
     if buf:
-        yield from pa.Table.from_batches(buf).combine_chunks().to_batches()
+        yield one_batch(buf)
 
 
 def _take(

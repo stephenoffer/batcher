@@ -334,9 +334,25 @@ def make_processor(
     `source` is passed through to a windowed aggregation, which needs to know how the
     stream is partitioned before it can take a watermark as the minimum over those
     partitions rather than the maximum over rows.
+
+    The aggregate shape is recognized by `plan.logical.streaming_fold_target`, which is the
+    same predicate the `iter_batches` router and the distributed epoch gate ask. The two used
+    to disagree: this function accepted any top-level `Aggregate` **without checking what was
+    beneath it**, while the router required a breaker-free input. So
+    ``ds.distinct().agg(n=count())`` written to a sink built an `AggregateProcessor` whose
+    fold re-ran the `Distinct` inside each micro-batch — deduplicating per batch and counting
+    the results — and returned 3 where the same query collected returns 2. No error, no
+    warning, and no bounded test can see it because `iter_batches` took the materializing path
+    for the same plan and got the right answer.
     """
     from batcher._internal.errors import PlanError
-    from batcher.plan.logical import Aggregate, Distinct, TransformWithState, is_streamable
+    from batcher.plan.logical import (
+        Aggregate,
+        Distinct,
+        TransformWithState,
+        is_streamable,
+        streaming_fold_target,
+    )
 
     if isinstance(plan, TransformWithState):
         if output_mode != OutputMode.APPEND:
@@ -360,6 +376,17 @@ def make_processor(
             "the key."
         )
     if isinstance(plan, (Aggregate, Distinct)):
+        fold = streaming_fold_target(plan)
+        if fold is None:
+            raise PlanError(
+                f"a streaming {type(plan).__name__.lower()} needs a breaker-free input "
+                "(filter / select / map_batches over one source); this plan has another "
+                f"pipeline breaker beneath it ({type(plan.input).__name__.lower()}), which "
+                "the running fold would re-run inside every micro-batch — deduplicating, "
+                "sorting or joining each batch on its own rather than the whole stream, and "
+                "returning a different answer than the same query collected. Materialize the "
+                "inner result to a bounded source first, or aggregate directly over the scan."
+            )
         if output_mode == OutputMode.APPEND:
             from batcher.core.streaming import _window_key
 
@@ -374,7 +401,7 @@ def make_processor(
                 "exploded bt.window(col('ts'), '1h', '30m') for overlapping windows), or "
                 "output_mode 'complete'/'update'"
             )
-        agg = plan if isinstance(plan, Aggregate) else _distinct_as_aggregate(plan)
+        agg = fold
         # `run_batch` is present here only for a `map → agg`: the conductor builds it from
         # the aggregate's *input* precisely so the UDF runs in Python and the fold sees
         # mapped batches. Without it the fold would try to lower a `MapBatches` node.
@@ -394,11 +421,6 @@ def make_processor(
         "this plan cannot be streamed to a sink (it has a pipeline breaker other than "
         "a top-level aggregation); restructure to a streamable shape"
     )
-
-
-def _distinct_as_aggregate(distinct) -> Aggregate:
-    """A `Distinct` is a group-by over all columns — reuse the aggregate fold."""
-    return distinct.as_aggregate()
 
 
 def _joinable(schema: pa.Schema) -> bool:

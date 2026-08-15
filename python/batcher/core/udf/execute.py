@@ -26,6 +26,7 @@ from batcher.io.schema.evolution import reconcile_batches
 from batcher.plan.logical import LogicalPlan, MapBatches, Scan
 from batcher.plan.profile import StageRecorder, logical_op_ids, stage_kind
 from batcher.plan.schema import SchemaRef
+from batcher.plan.types import total_logical_bytes
 from batcher.plan.visitor import children, scanned_source_ids, with_children
 
 __all__ = [
@@ -299,7 +300,7 @@ def _record_stage(
         rows_in=sum(b.num_rows for b in inputs),
         rows_out=sum(b.num_rows for b in out),
         elapsed_ns=elapsed_ns,
-        result_bytes=sum(b.nbytes for b in out),
+        result_bytes=total_logical_bytes(out),
         # Where the stage ran, so a reader of the profile can tell a GPU forward from the CPU
         # decode feeding it — the distinction the whole CPU:GPU-ratio conversation turns on.
         backend="gpu" if getattr(node, "num_gpus", 0) > 0 else "",

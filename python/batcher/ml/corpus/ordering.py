@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
@@ -37,12 +38,7 @@ _MEGABATCH = "__bt_megabatch"
 
 def _require_column(ds: Dataset, column: str) -> None:
     """Fail at the API edge, naming the columns that do exist."""
-    if column not in ds.columns:
-        from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-        raise ColumnNotFoundError(
-            unknown_message("column", column, ds.columns, hint="Pass an existing column.")
-        )
+    require_columns(ds, column)
 
 
 def _length_of(ds: Dataset, column: str):

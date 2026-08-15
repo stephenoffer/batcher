@@ -24,6 +24,10 @@ from batcher.kyber.rules.projections import (
     required_predicates_per_source,
 )
 from batcher.kyber.rules.selection import BuildSideDecision
+from batcher.kyber.rules.source_limits import (
+    required_limits_per_source,
+    required_orderings_per_source,
+)
 from batcher.kyber.spill_rates import learned_spill_factor
 from batcher.metadata import MetadataHub
 from batcher.metadata.io_stats import relative_read_cost
@@ -190,6 +194,8 @@ class Optimizer:
             ),
             source_projections=required_columns_per_source(plan),
             source_predicates=_source_predicates(logical, plan),
+            source_limits=required_limits_per_source(plan),
+            source_orderings=required_orderings_per_source(plan),
             prefer_materializing_aggregate=_prefers_materializing_aggregate(plan, ctx),
         )
         return phys, plan, ctx.notes.get("build_side_decisions", [])
@@ -266,18 +272,35 @@ def _format_plan(node: LogicalPlan, est: CardinalityEstimator, depth: int = 0) -
 #: Estimated groups at or above which a join-free grouped aggregate is cheaper on the
 #: materializing executor than on the streaming one.
 #:
-#: Measured on the H2O `groupby` suite at its own 1e7-row tier, streaming against
-#: materializing: 100 groups 31.8 vs 36.3 ms and 10,000 groups 141 vs 196 ms (streaming
-#: wins), against 100,000 groups 185 vs 94 ms and 1e7 groups 1,569 vs 715 ms (materializing
-#: wins, by 2.0x and 2.2x). Both executors parallelize and both return the identical answer;
-#: what changes is CPU spent — streaming burned roughly twice as much at the high end, and
-#: below ~1e4 groups its per-morsel pre-aggregation collapses the relation early enough that
-#: holding the whole input buys nothing.
+#: Both executors parallelize this shape and both return the identical answer; what changes
+#: is the CPU spent. Swept directly — one `Int64` key with `g` distinct values over 10 M rows
+#: and one `SUM`, arms alternated so box drift cannot be read as a result (milliseconds,
+#: best of four):
 #:
-#: The crossover is therefore somewhere in 1e4..1e5 and this sits at its midpoint. Stated
-#: plainly because it is an interpolation, not a measurement: the two sides of the bracket
-#: are measured and the point between them is not.
-MATERIALIZE_AGG_MIN_GROUPS = 50_000
+#: | groups | streaming | materializing |
+#: |---|---:|---:|
+#: | 500 | **9.8** | 11.2 |
+#: | 1,000 | **9.2** | 16.2 |
+#: | 2,000 | **10.1** | 16.3 |
+#: | 3,000 | **11.8** | 19.3 |
+#: | **4,000** | 15.7 | **13.9** |
+#: | 8,000 | 20.1 | **17.8** |
+#: | 25,000 | 35.4 | **24.4** |
+#: | 50,000 | 43.3 | **24.2** |
+#: | 400,000 | 26.7 | **23.8** |
+#: | 2,000,000 | 30.9 | **29.0** |
+#:
+#: The crossover sits between 3,000 and 4,000, and this is the first swept point on the far
+#: side of it — the conservative choice, since it leaves every measured near-tie where it was.
+#:
+#: It used to be 50,000, chosen as the midpoint of a 1e4..1e5 bracket whose interior had not
+#: been measured. What moved the crossover down an order of magnitude is
+#: `bc_interp::agg_par::chunked_partials`: the materializing aggregate used to build one hash
+#: table per 16,384-row morsel and hand the merge every one of them, which is ruinous in
+#: exactly the band where the group count fills a morsel's table without filling a worker's
+#: share. Building one table per worker instead took the 10,000-group case from 63.3 ms to
+#: 41.1, and with that the executor that was losing this band now wins it.
+MATERIALIZE_AGG_MIN_GROUPS = 4_000
 
 
 def _prefers_materializing_aggregate(plan: LogicalPlan, ctx: OptimizerContext) -> bool:

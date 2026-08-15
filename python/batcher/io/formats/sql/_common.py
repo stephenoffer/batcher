@@ -14,20 +14,18 @@ stays Arrow-only on the worker.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import ModuleType
 from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
-
 __all__ = [
     "apply_predicate",
     "apply_projection",
     "connection_fingerprint",
+    "count_query",
     "probe_is_typed",
     "push_down",
     "require_module",
@@ -76,26 +74,29 @@ def connection_fingerprint(material: Mapping[str, Any]) -> str:
 
 
 def require_module(module: str, *, extra: str) -> ModuleType:
-    """Import an optional driver module, or raise a typed install hint.
+    """Import a database driver, or raise a typed install hint naming its extra.
+
+    A thin adapter over `_internal.optional.require`, the engine's one optional-dependency
+    guard, kept under this name because thirteen SQL backends call it. It was a *fourth* copy
+    of that guard — beside `nosql.base._driver`, `dbapi.source._import_driver` and `require`
+    itself — and each copy phrased the failure differently while `require`'s already carried
+    the `install` field and was already an `ImportError`, so ``except ImportError`` around an
+    optional read worked in some backends and not others.
 
     Args:
-        module: The importable module name (e.g. ``"adbc_driver_manager"``).
-        extra: The Batcher extra that provides it (e.g. ``"sql"``).
+        module: Importable driver module name, e.g. ``"snowflake.connector"``.
+        extra: The Batcher extra that installs it.
 
     Returns:
         The imported module.
 
     Raises:
-        BackendError: If the module is not installed, with a `pip install`
-            instruction for the relevant extra.
+        MissingDependencyError: If the driver is not installed. It is both a `BackendError`
+            and an `ImportError`, so handlers written against either spelling still catch it.
     """
-    try:
-        return importlib.import_module(module)
-    except ImportError as exc:  # pragma: no cover - exercised only without the driver
-        raise BackendError(
-            f"{module!r} is required for this source; install it with "
-            f"pip install 'batcher-engine[{extra}]'"
-        ) from exc
+    from batcher._internal.optional import require
+
+    return require(module, feature=f"The {extra} source", provides=module, extra=extra)
 
 
 def wrap_subquery(query: str, *, table: str | None = None) -> str:
@@ -109,15 +110,31 @@ def wrap_subquery(query: str, *, table: str | None = None) -> str:
     return f"(\n{inner}\n) AS _bc"
 
 
-def apply_projection(query: str, projection: list[str] | None, *, table: str | None = None) -> str:
+def _identity(name: str) -> str:
+    """The default identifier rendering: verbatim, as every caller had before quoting."""
+    return name
+
+
+def apply_projection(
+    query: str,
+    projection: list[str] | None,
+    *,
+    table: str | None = None,
+    quote: Callable[[str], str] = _identity,
+) -> str:
     """Rewrite a read to select only `projection` columns.
 
     Returns ``SELECT <cols> FROM (<query>) AS _bc``; with no projection returns
-    ``SELECT * FROM (<query>) AS _bc``. Column names are emitted verbatim — the
-    caller is responsible for trusted/identifier-safe column names (they come
-    from the plan's projection-pushdown, not user free-text).
+    ``SELECT * FROM (<query>) AS _bc``.
+
+    `quote` delimits each column for the target dialect. Emitted verbatim by default,
+    which is what a caller that cannot identify its dialect must keep doing — and which
+    breaks on three ordinary names. A reserved word (``order``, ``user``, ``date``) is a
+    syntax error; a name holding a space is worse, because ``SELECT my col`` parses as the
+    column ``my`` aliased to ``col`` and returns the wrong column under the right name.
+    See `uri.quote_identifier`.
     """
-    cols = ", ".join(projection) if projection else "*"
+    cols = ", ".join(quote(c) for c in projection) if projection else "*"
     return f"SELECT {cols} FROM {wrap_subquery(query, table=table)}"
 
 
@@ -144,6 +161,40 @@ def schema_probe(query: str | None, *, table: str | None = None) -> str:
         SQL returning zero rows with the query's full schema.
     """
     return f"SELECT * FROM {wrap_subquery(query, table=table)} WHERE 1 = 0"
+
+
+#: Alias the row-count query gives its single value.
+#:
+#: No leading underscore, deliberately: Oracle rejects an unquoted identifier that starts
+#: with one, so ``AS _bc_n`` is a syntax error there rather than a portable alias. The
+#: caller reads the value positionally anyway — servers fold an unquoted alias's case
+#: (Oracle and Snowflake upper-case it), so selecting it back by the name written here
+#: would fail on exactly the backends that accepted the query.
+COUNT_COLUMN = "bc_n"
+
+
+def count_query(query: str | None, *, table: str | None = None) -> str:
+    """`query` shaped to return its row count and nothing else.
+
+    The sibling of `schema_probe`, and it exists for the same reason: `ds.count()` on a
+    warehouse relation had no way to ask the server how many rows there are, so it counted
+    them the only way it could — by reading the relation. Worse than it sounds, because a
+    ``COUNT(*)`` needs no columns at all and the projection that would have narrowed the
+    read is empty, which `apply_projection` renders as ``SELECT *``. So counting a table
+    transferred every column of every row of it, to return one integer.
+
+    ``SELECT COUNT(*) FROM (…)`` is ANSI and needs no dialect gate the way a row cap does:
+    every backend these connectors reach accepts it, and the server answers from an index
+    or its own statistics rather than a scan.
+
+    Args:
+        query: The base read, or ``None`` when counting `table` directly.
+        table: The table name, when the read is a plain table rather than a query.
+
+    Returns:
+        SQL returning one row with one column, `COUNT_COLUMN`.
+    """
+    return f"SELECT COUNT(*) AS {COUNT_COLUMN} FROM {wrap_subquery(query, table=table)}"
 
 
 def probe_is_typed(schema: pa.Schema) -> bool:
@@ -183,6 +234,9 @@ def push_down(
     *,
     table: str | None = None,
     extra_where: str | None = None,
+    limit: int | None = None,
+    order_by: tuple[tuple[str, bool, bool], ...] | None = None,
+    quote: Callable[[str], str] = _identity,
 ) -> str:
     """`query` with Kyber's pushed projection and predicate folded into the SQL itself.
 
@@ -221,19 +275,62 @@ def push_down(
             applied at the same depth as the predicate, and for the same reason: a
             partition fragment layered above the projection would reference a partition
             column the projection had already dropped.
+        limit: The most rows the plan needs from this read (`PhysicalPlan.source_limits`),
+            appended as a trailing ``LIMIT``. Outermost, unlike the predicate: it counts
+            the rows the read *returns*, so it has to sit above the filter rather than
+            below it. Callers pass this only for a backend whose dialect accepts the
+            clause (`uri.supports_limit_clause`).
+        order_by: The ordering a pushed row cap is taken in, one
+            ``(column, descending, nulls_first)`` per key — a *top-N* rather than a
+            prefix. Emitted with an explicit ``NULLS`` clause, without which the server's
+            "first n" and the engine's disagree wherever they place a null, and the read
+            returns the wrong rows rather than merely extra ones. Callers pass this only
+            for a dialect that accepts the clause (`uri.supports_nulls_ordering`).
+        quote: How to delimit a column name for the target dialect
+            (`uri.quote_identifier`). Applies to the projection and to the pushed
+            predicate alike, since a reserved-word column breaks both.
 
     Returns:
         The SQL to send to the server.
     """
     from batcher.io.predicate import to_sql_where
 
-    where = to_sql_where(predicate) if predicate is not None else None
+    where = to_sql_where(predicate, quote=quote) if predicate is not None else None
     if extra_where is not None:
         # Parenthesized: the fragment may contain a bare OR (`k < 5 OR k IS NULL`), which
         # would otherwise bind looser than the AND and silently widen the partition to
         # every row with a NULL key — duplicating those rows across every split.
         where = f"({where}) AND ({extra_where})" if where else f"({extra_where})"
     if where is None:
-        return apply_projection(query, projection, table=table)
-    filtered = f"SELECT * FROM {wrap_subquery(query, table=table)} WHERE {where}"
-    return apply_projection(filtered, projection)
+        shaped = apply_projection(query, projection, table=table, quote=quote)
+    else:
+        filtered = f"SELECT * FROM {wrap_subquery(query, table=table)} WHERE {where}"
+        shaped = apply_projection(filtered, projection, quote=quote)
+    return _capped(_ordered(shaped, order_by, quote), limit)
+
+
+def _ordered(
+    sql: str,
+    order_by: tuple[tuple[str, bool, bool], ...] | None,
+    quote: Callable[[str], str],
+) -> str:
+    """`sql` with a trailing ``ORDER BY``, when the cap above it is a top-N.
+
+    The ``NULLS`` clause is always explicit. Left to the server's default it is not a
+    style question: SQLite sorts nulls first on an ascending order where PostgreSQL and
+    DuckDB sort them last, so the same ``ORDER BY k LIMIT 2`` asks two servers for
+    different rows, and only one of them matches what the engine would have computed.
+    """
+    if not order_by:
+        return sql
+    keys = ", ".join(
+        f"{quote(column)} {'DESC' if descending else 'ASC'} "
+        f"NULLS {'FIRST' if nulls_first else 'LAST'}"
+        for column, descending, nulls_first in order_by
+    )
+    return f"{sql} ORDER BY {keys}"
+
+
+def _capped(sql: str, limit: int | None) -> str:
+    """`sql` with a trailing row cap, when the plan asked for one."""
+    return sql if limit is None else f"{sql} LIMIT {int(limit)}"

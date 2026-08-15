@@ -30,6 +30,7 @@ import json
 import time
 from dataclasses import dataclass, field
 
+from batcher._internal.optional import require
 from batcher.governance.authn.base import AuthenticationError
 from batcher.governance.principal import Principal
 
@@ -284,16 +285,11 @@ class JwtVerifier:
             MissingDependencyError: If `pyjwt` is not installed.
             AuthenticationError: If the token fails any check.
         """
-        try:
-            import jwt
-            from jwt import PyJWKClient
-        except ImportError as exc:  # pragma: no cover - exercised by the extras matrix
-            from batcher._internal.errors import MissingDependencyError
-
-            raise MissingDependencyError(
-                "JwtVerifier needs PyJWT, which is not installed.",
-                hint="pip install 'batcher[oidc]' (or pip install pyjwt[crypto]).",
-            ) from exc
+        # Through the one guard: the hand-rolled hint named `batcher[oidc]`, which is neither
+        # a real extra nor this distribution (it is `batcher-engine`), so the single actionable
+        # line in the error was a command that fails.
+        jwt = require("jwt", feature="JwtVerifier", provides="PyJWT", extra="oidc")
+        PyJWKClient = jwt.PyJWKClient
 
         try:
             signing_key = PyJWKClient(self.jwks_url).get_signing_key_from_jwt(credential)

@@ -115,7 +115,12 @@ def start_streaming_query(
     """
     from batcher import core
     from batcher._internal.errors import PlanError
+    from batcher.api.streaming._diagnostics import warn_if_state_is_unbounded
 
+    # Before any routing, because the memory profile is a property of the plan rather than
+    # of which launcher runs it — and because the whole value of saying it here is saying it
+    # before the first row rather than when the state has reached the envelope.
+    warn_if_state_is_unbounded(plan, sources)
     if len(sources) > 1 or _is_driver_shape(plan):
         return _start_driver_stream(plan, sources, sink, trigger, output_mode, name, checkpoint)
     output_mode = OutputMode.validate(output_mode)

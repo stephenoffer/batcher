@@ -51,6 +51,8 @@ import os
 import re
 from dataclasses import dataclass, field, replace
 
+from batcher._internal.hardware.sysfs import read_float, read_int, read_text
+
 __all__ = [
     "AMDGPU_SYSFS_ROOT",
     "AMD_PCI_VENDOR",
@@ -72,6 +74,12 @@ AMDGPU_SYSFS_ROOT = "/sys/class/drm"
 #: it carries the integrated display device too, so the vendor check is what keeps this from
 #: reporting a laptop's iGPU as a datacenter accelerator.
 AMD_PCI_VENDOR = 0x1002
+
+#: hwmon publishes fixed-point figures as integers in SI submultiples: temperatures in
+#: millidegrees, power in microwatts. Named so the divisor at each call site says which unit
+#: the kernel used rather than leaving a bare `1_000_000.0` to be read as "a million of what".
+_MILLI = 1000.0
+_MICRO = 1_000_000.0
 
 #: A `ras/<block>_err_count` file reports two labeled counts. The block names differ by part
 #: and by kernel version, so the blocks are discovered by glob rather than listed.
@@ -194,38 +202,9 @@ class AmdDevice:
         return self.temperature_limit_c - self.temperature_c
 
 
-def _read_text(path: str) -> str:
-    """One sysfs attribute's contents, stripped, or `""` when it cannot be read.
-
-    Sysfs reads fail in three ordinary ways that are all "unknown" rather than an error: the
-    attribute does not exist on this driver version, the container did not mount the tree, and
-    the driver returns `EINVAL` for a figure the part does not support.
-    """
-    try:
-        with open(path) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
-def _read_int(path: str, scale: float = 1.0) -> float:
-    """One numeric sysfs attribute, divided by `scale`, or `0.0`."""
-    raw = _read_text(path)
-    if not raw:
-        return 0.0
-    try:
-        return int(raw) / scale
-    except ValueError:
-        return 0.0
-
-
 def _pci_vendor(device_dir: str) -> int:
     """The PCI vendor ID behind a DRM node, or `0` when unreadable."""
-    raw = _read_text(os.path.join(device_dir, "vendor"))
-    try:
-        return int(raw, 16)
-    except ValueError:
-        return 0
+    return read_int(os.path.join(device_dir, "vendor"), base=16)
 
 
 def _pci_address(device_dir: str) -> str:
@@ -256,7 +235,7 @@ def _ras_counts(device_dir: str) -> tuple[RasCounts, ...]:
     blocks: list[RasCounts] = []
     for path in sorted(glob.glob(os.path.join(device_dir, "ras", "*_err_count"))):
         name = os.path.basename(path)[: -len("_err_count")]
-        counts = {kind: int(value) for kind, value in _RAS_LINE.findall(_read_text(path))}
+        counts = {kind: int(value) for kind, value in _RAS_LINE.findall(read_text(path))}
         if counts:
             blocks.append(
                 RasCounts(
@@ -290,29 +269,31 @@ def _probe() -> tuple[AmdDevice, ...]:
                 index=index,
                 card=os.path.basename(card_dir),
                 address=_pci_address(device_dir),
-                name=_read_text(os.path.join(device_dir, "product_name")),
-                unique_id=_read_text(os.path.join(device_dir, "unique_id")),
-                serial_number=_read_text(os.path.join(device_dir, "serial_number")),
-                memory_total_bytes=int(_read_int(os.path.join(device_dir, "mem_info_vram_total"))),
-                memory_used_bytes=int(_read_int(os.path.join(device_dir, "mem_info_vram_used"))),
-                busy_percent=int(_read_int(os.path.join(device_dir, "gpu_busy_percent"))),
+                name=read_text(os.path.join(device_dir, "product_name")),
+                unique_id=read_text(os.path.join(device_dir, "unique_id")),
+                serial_number=read_text(os.path.join(device_dir, "serial_number")),
+                memory_total_bytes=read_int(os.path.join(device_dir, "mem_info_vram_total")),
+                memory_used_bytes=read_int(os.path.join(device_dir, "mem_info_vram_used")),
+                busy_percent=read_int(os.path.join(device_dir, "gpu_busy_percent")),
                 temperature_c=(
-                    _read_int(os.path.join(hwmon, "temp1_input"), 1000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "temp1_input"), scale=_MILLI) if hwmon else 0.0
                 ),
                 temperature_limit_c=(
-                    _read_int(os.path.join(hwmon, "temp1_crit"), 1000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "temp1_crit"), scale=_MILLI) if hwmon else 0.0
                 ),
                 power_watts=(
-                    _read_int(os.path.join(hwmon, "power1_average"), 1_000_000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "power1_average"), scale=_MICRO)
+                    if hwmon
+                    else 0.0
                 ),
                 power_cap_watts=(
-                    _read_int(os.path.join(hwmon, "power1_cap"), 1_000_000.0) if hwmon else 0.0
+                    read_float(os.path.join(hwmon, "power1_cap"), scale=_MICRO) if hwmon else 0.0
                 ),
                 ras=_ras_counts(device_dir),
-                compute_partition=_read_text(
+                compute_partition=read_text(
                     os.path.join(device_dir, "current_compute_partition")
                 ).upper(),
-                memory_partition=_read_text(
+                memory_partition=read_text(
                     os.path.join(device_dir, "current_memory_partition")
                 ).upper(),
             )

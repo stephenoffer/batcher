@@ -16,7 +16,8 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 
-from batcher.plan.logical import LogicalPlan, Scan
+from batcher.plan.expr_ir import Col
+from batcher.plan.logical import Aggregate, Join, LogicalPlan, Project, Scan
 
 __all__ = [
     "children",
@@ -24,6 +25,7 @@ __all__ = [
     "transform_down",
     "transform_up",
     "walk",
+    "walk_with_base_names",
     "with_children",
 ]
 
@@ -213,3 +215,90 @@ def walk(node: LogicalPlan):
     yield node
     for child in children(node):
         yield from walk(child)
+
+
+def walk_with_base_names(node: LogicalPlan) -> list[tuple[LogicalPlan, dict[str, str]]]:
+    """Every node, paired with the map from the names it references to their base columns.
+
+    A plan's column names are not a source's column names. The SQL front-end disambiguates
+    `date_dim d1, date_dim d2` by projecting every column of each scan to `d1__<name>` /
+    `d2__<name>`, and a `SELECT a AS b` renames one. So an analysis that reads names *off a
+    plan* and then looks them up in a **source's schema** — which is what deciding "sketch
+    this column's distinct count" and "fetch this column's min/max" both do — matches
+    nothing for any aliased table, and goes silently blind rather than failing.
+
+    That is not a corner case: it cost TPC-DS q17 its whole join order.
+    `d1.d_quarter_name = '2001Q1'` keeps 91 of `date_dim`'s 73,049 rows, but with no distinct
+    count the estimator used the flat equality default and predicted 7,305 — so the plan put
+    `store_sales ⋈ item` (a 498 MB intermediate) ahead of the 91-row filter that reduces the
+    fact table 20x.
+
+    Each pair's map is keyed by the names visible *at that node's input*, so a caller
+    translates a name with `mapping.get(name, name)` — an absent name stands for itself. Only
+    a chain of plain `Col` projections and join pass-throughs is followed; a column computed
+    by an expression has no single base column and is dropped.
+
+    A join's two sides are merged into one map. Their *inputs* may share a column name (only
+    the join's *output* aliases are guaranteed distinct), so a collision resolves to one side
+    arbitrarily. That is sound for every caller here, which unions the results and matches
+    them against each source's own schema by name — a name that belongs to neither side's
+    source simply matches nothing.
+
+    Args:
+        node: The plan to walk.
+
+    Returns:
+        `(node, name → base name)` for every node, children before parents.
+    """
+    pairs: list[tuple[LogicalPlan, dict[str, str]]] = []
+    _base_names(node, pairs)
+    return pairs
+
+
+#: The map a leaf reports: a `Scan` reads its source's own column names, so every name it
+#: sees stands for itself. Shared and never written to, like every map this walk hands up.
+_NO_NAMES: dict[str, str] = {}
+
+
+def _base_names(
+    node: LogicalPlan, pairs: list[tuple[LogicalPlan, dict[str, str]]]
+) -> dict[str, str]:
+    """Record `node`'s input-name map into `pairs` and return its *output* name map."""
+    kids = children(node)
+    maps = [_base_names(child, pairs) for child in kids]
+    # One child hands its map straight up rather than into a copy of itself, and that is
+    # most of this walk's cost: a plan is mostly unary (filter, project, sort, limit), so
+    # copying at every level makes the work quadratic in the depth of a chain that renames
+    # nothing. Every map here is built fresh by the branches below and only ever read
+    # afterwards, so sharing one is safe — nothing mutates a map it did not build.
+    if len(maps) == 1:
+        merged = maps[0]
+    elif not maps:
+        merged = _NO_NAMES
+    else:
+        merged = {}
+        for m in maps:
+            merged.update(m)
+    pairs.append((node, merged))
+
+    if isinstance(node, Project):
+        return {
+            item.alias: merged.get(item.expr.name, item.expr.name)
+            for item in node.items
+            if isinstance(item.expr, Col)
+        }
+    if isinstance(node, Join):
+        left, right = maps[0], maps[1]
+        return {
+            o.alias: (left if o.side == "left" else right).get(o.name, o.name) for o in node.output
+        }
+    if isinstance(node, Aggregate):
+        return {
+            key.alias: merged.get(key.expr.name, key.expr.name)
+            for key in node.group_keys
+            if isinstance(key.expr, Col)
+        }
+    # Everything else either shapes rows without renaming columns (filter, sort, limit,
+    # distinct) or combines relations that already agree on their names (union), so the
+    # names its consumers see are the ones its input carried.
+    return merged

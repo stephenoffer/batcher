@@ -148,3 +148,80 @@ def test_a_stale_bound_falls_back_and_still_returns_the_true_top_k():
     assert filtered.collect().num_rows < seed.k
     # And the query as written still answers correctly.
     assert seeded_rows.collect().num_rows == 10
+
+
+# --- a bound must not outlive the column's TYPE ---------------------------------------
+#
+# The bound is keyed by `plan_signature`, which identifies the relation (its scan token
+# carries `Scan.source_key`) but not its column *types* — the schema is deliberately absent
+# from the IR. A source keeps its key when its schema changes, so overwriting a Parquet path
+# with a new type for the same column read back the previous run's bound and seeded
+# `Filter(x >= 42)` over a string column:
+#
+#     RuntimeError: Invalid argument error: Invalid comparison operation: Utf8 >= Int64
+#
+# A *raised query*, which is exactly what this module's guarantee rules out ("the cost of a
+# stale bound is one wasted cheap scan"). The `api` verification cannot catch it either: it
+# counts the survivors of a plan that never ran. Reproduced end to end by writing the same
+# path twice with different schemas.
+
+
+def _typed_plan(values, arrow_type, k=10):
+    schema = pa.schema([("x", arrow_type), ("p", pa.int64())])
+    table = pa.table({"x": values, "p": np.arange(len(values), dtype="int64")}, schema=schema)
+    return bt.from_arrow(table).sort("x", descending=True).limit(k)._plan
+
+
+def test_a_bound_of_an_incomparable_type_is_declined_rather_than_seeded():
+    """An int bound must not be applied to a string column."""
+    hub = _hub()
+    ints = _typed_plan(list(range(1000)), pa.int64())
+    record_topn_bound(
+        hub,
+        ints,
+        pa.table({"x": np.arange(990, 1000, dtype="int64"), "p": np.zeros(10, "int64")}),
+    )
+    assert seed_topn_bound(ints, hub) is not None, "the fixture must have learned a bound"
+
+    # Same relation shape, same column name, different type. The stored bound is unusable.
+    strings = _typed_plan([f"v{i:04d}" for i in range(1000)], pa.string())
+    assert seed_topn_bound(strings, hub) is None
+
+
+def test_a_string_bound_is_declined_for_a_numeric_column():
+    """The other direction, which fails the same way."""
+    hub = _hub()
+    strings = _typed_plan([f"v{i:04d}" for i in range(1000)], pa.string())
+    record_topn_bound(
+        hub,
+        strings,
+        pa.table(
+            {"x": [f"v{i:04d}" for i in range(990, 1000)], "p": np.zeros(10, "int64")},
+            schema=pa.schema([("x", pa.string()), ("p", pa.int64())]),
+        ),
+    )
+    assert seed_topn_bound(strings, hub) is not None
+
+    ints = _typed_plan(list(range(1000)), pa.int64())
+    assert seed_topn_bound(ints, hub) is None
+
+
+def test_a_widening_type_change_still_seeds():
+    """The guard asks the engine's own lattice, not for type equality.
+
+    An `int64` bound against a `float64` column is a comparison the engine performs, so
+    declining it would give up the optimization on an ordinary widening.
+    """
+    from batcher.plan.types import promote
+
+    assert promote(pa.float64(), pa.int64()) is not None  # the premise
+
+    hub = _hub()
+    ints = _typed_plan(list(range(1000)), pa.int64())
+    record_topn_bound(
+        hub,
+        ints,
+        pa.table({"x": np.arange(990, 1000, dtype="int64"), "p": np.zeros(10, "int64")}),
+    )
+    floats = _typed_plan([float(i) for i in range(1000)], pa.float64())
+    assert seed_topn_bound(floats, hub) is not None

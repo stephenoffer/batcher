@@ -73,10 +73,10 @@ __all__ = [
 #: (null for a NaN or an infinity, so strict only on an integer).
 STRICT_MATH_FNS = frozenset(
     {
-        "abs", "acos", "asin", "atan", "cbrt", "ceil", "cos", "cosh", "cot", "csc",
-        "degrees", "even", "exp", "floor", "gamma", "lgamma", "ln", "log10", "log2",
-        "radians", "rint", "round", "sec", "sign", "sin", "sinh", "sqrt", "tan",
-        "tanh", "trunc",
+        "abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "cbrt", "ceil",
+        "cos", "cosh", "cot", "csc", "degrees", "even", "exp", "floor", "gamma",
+        "lgamma", "ln", "log10", "log2", "radians", "rint", "round", "sec", "sign",
+        "sin", "sinh", "sqrt", "tan", "tanh", "trunc",
     }
 )  # fmt: skip
 

@@ -30,29 +30,40 @@ __all__ = [
 ]
 
 
-def residual_mass(mcv: Mapping[str, float] | None) -> float:
+def residual_mass(mcv: Mapping[str, float] | None, non_null: float = 1.0) -> float:
     """The probability mass *not* covered by a column's most-common-value table.
 
-    `1 - Σ f(v)` over the measured top values, clamped to `[0, 1]`. This is the mass the
-    uniformity assumption may legitimately be applied to; applying it to the whole column
+    `non_null - Σ f(v)` over the measured top values, clamped to `[0, 1]`. This is the mass
+    the uniformity assumption may legitimately be applied to; applying it to the whole column
     (as a bare `1/ndv` does) double-counts the skew the MCV table already accounts for.
+
+    `non_null` is the budget the *value* distribution is spread over, and it is not 1 on a
+    nullable column. A NULL is not a value: the distinct count comes from a sketch that skips
+    nulls (`bc_sketches::HyperLogLog::add_array`), and an MCV frequency is measured as a share
+    of *all* rows. So on a 30%-null column the unlisted values share `0.7 - Σ f`, not
+    `1 - Σ f` — the latter hands the null rows to the non-null values and inflates every
+    equality estimate that reads it.
 
     Args:
         mcv: The measured `{str(value): frequency}` table, or None.
+        non_null: The fraction of rows on which the column is not NULL. Defaults to 1 for
+            the callers that have no measured null count, which is the old behaviour.
 
     Returns:
         The residual (non-MCV) probability mass, in `[0, 1]`.
     """
+    budget = max(0.0, min(1.0, non_null))
     if not mcv:
-        return 1.0
+        return budget
     covered = sum(f for f in mcv.values() if f > 0.0)
-    return max(0.0, min(1.0, 1.0 - covered))
+    return max(0.0, min(1.0, budget - covered))
 
 
 def residual_eq_frequency(
     ndv: float | None,
     mcv: Mapping[str, float] | None,
     default: float,
+    non_null: float = 1.0,
 ) -> float:
     """`P(col = v)` for a value that is *known not to be* one of the top values.
 
@@ -60,7 +71,7 @@ def residual_eq_frequency(
     an MCV table exists it says two things: the top `k` values carry `Σ f` of the mass, and
     the remaining `d - k` values share what is left. So a value absent from the table occurs
 
-    ``(1 - Σ f) / (d - k)``
+    ``(non_null - Σ f) / (d - k)``
 
     times, which is strictly below `1/d` whenever the column is skewed at all — often by an
     order of magnitude. Estimating such a value at `1/d` is the single largest systematic
@@ -76,17 +87,22 @@ def residual_eq_frequency(
         ndv: The column's distinct count, if known.
         mcv: The measured most-common-value table, if any.
         default: The cold-start equality selectivity to use when `ndv` is unknown.
+        non_null: The fraction of rows on which the column is not NULL — the budget the
+            value distribution is spread over (see `residual_mass`). The returned frequency
+            is a share of *all* rows, so a nullable column's values are each correspondingly
+            rarer.
 
     Returns:
         The estimated frequency of a non-most-common value, in `[0, 1]`.
     """
     if not ndv or ndv <= 0:
         return default
-    uniform = 1.0 / ndv
+    budget = max(0.0, min(1.0, non_null))
+    uniform = budget / ndv
     if not mcv:
         return uniform
     remaining_values = ndv - len(mcv)
-    residual = residual_mass(mcv)
+    residual = residual_mass(mcv, budget)
     if remaining_values <= 0.0 or residual <= 0.0:
         # The table already enumerates the whole column. A value outside it is then at most
         # as frequent as the rarest value the table lists, which is a far better bound than
@@ -254,6 +270,8 @@ def mcv_join_rows(
     right_mcv: Mapping[str, float] | None,
     left_ndv: float | None,
     right_ndv: float | None,
+    left_non_null: float = 1.0,
+    right_non_null: float = 1.0,
 ) -> float | None:
     """Equi-join output rows, decomposing the key distribution into skew and residual.
 
@@ -280,6 +298,12 @@ def mcv_join_rows(
     one of its right-side rows — and that shape is common: a fact table skewed toward one
     customer joined to a dimension skewed toward a different one.
 
+    A NULL key is not a value and never matches, so the residual each side's unlisted values
+    share is its **non-null** mass. Spreading the whole of `1 - Σ f` over them instead hands
+    the null rows to the join: measured on a single-key join over two 60%-null keys, the
+    estimate was 172,134 rows against 26,181 actual and did not move at all as the null
+    fraction rose, because every null row was still being matched against every other.
+
     The model's one real assumption is that a value listed on one side but not the other has
     only residual frequency on that side. A frequency table records heavy hitters, so a value
     just below the threshold is priced slightly low; that is the standard trade every
@@ -293,13 +317,17 @@ def mcv_join_rows(
         right_mcv: Right key's measured frequency table.
         left_ndv: Left key's distinct count.
         right_ndv: Right key's distinct count.
+        left_non_null: Share of left rows whose key holds a value. A NULL key matches nothing
+            in an equi-join, so it is not part of the residual the unlisted values share.
+        right_non_null: The same for the right key.
 
     Returns:
         The estimated output rows, or None when either side has no usable MCV table.
     """
     if not left_mcv or not right_mcv:
         return None
-    m_left, m_right = residual_mass(left_mcv), residual_mass(right_mcv)
+    m_left = residual_mass(left_mcv, left_non_null)
+    m_right = residual_mass(right_mcv, right_non_null)
     n_left = _residual_domain(left_ndv, len(left_mcv))
     n_right = _residual_domain(right_ndv, len(right_mcv))
     # Per-value probability inside each side's residual, 0 when the MCV table already

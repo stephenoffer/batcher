@@ -1384,8 +1384,10 @@ class _ListNamespace:
     def join(self, separator: str) -> ListJoin:
         """Concatenate each list's elements into one string, joined by ``separator``.
 
-        Elements are cast to text and null elements are skipped. A null or empty
-        list yields null (→ Utf8).
+        Elements are cast to text and null elements are skipped, matching DuckDB
+        ``array_to_string``. An **empty** list yields the empty string, while a **null**
+        list -- and a list whose elements are *all* null, which leaves nothing to join --
+        yields null (→ Utf8).
 
         Args:
             separator: The text inserted between consecutive elements.
@@ -1400,6 +1402,10 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [["x", "y", "z"], ["q"]]})
                 >>> ds.select(bt.col("a").list.join("-").alias("r")).to_pydict()
                 {'r': ['x-y-z', 'q']}
+
+                >>> ds = bt.from_pydict({"a": [[], None, [None]]})
+                >>> ds.select(bt.col("a").list.join("-").alias("r")).to_pydict()
+                {'r': ['', None, None]}
         """
         return ListJoin(self._e, separator)
 

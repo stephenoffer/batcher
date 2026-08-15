@@ -57,7 +57,7 @@ DIR_ALLOW: dict[str, str] = {
         "`plan/functions/metrics/model/`, so do not go looking for one"
     ),
     "benchmarks/gpu_backend": (
-        "13 GPU benchmark scripts against a cap of 12. Each is a standalone `python "
+        "14 GPU benchmark scripts against a cap of 12. Each is a standalone `python "
         "benchmarks/gpu_backend/<name>.py` entry point a reader runs by name, so grouping them "
         "into subdirectories would change every invocation in the docs and the results file to "
         "hide a count. Split by what is being measured (kernel / cluster / energy) if it grows "
@@ -75,9 +75,19 @@ DIR_ALLOW: dict[str, str] = {
         "ml/tabular already are — this entry is debt, not a design"
     ),
     "python/batcher/kyber": (
-        "OVER BUDGET AND TRACKED: 21 modules against a cap of 12. The learned-adaptive family "
+        "OVER BUDGET AND TRACKED: 23 modules against a cap of 12, and GROWING (21 when this "
+        "entry was written). The learned-adaptive family "
         "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
         "to lift out; this entry is debt, not a design"
+    ),
+    "python/batcher/_internal/hardware": (
+        "13 modules against a cap of 12: one per hardware question (cgroup, cpu, cache, memory, "
+        "topology, isa, engine, storage, profile, nvml, mig) plus `probes` and the 13th, "
+        "`sysfs`. `sysfs` is the shared kernel-pseudo-file reader that replaced EIGHT copies of "
+        "the same `try: open(...) except OSError` spread across this directory, `amd/`, and "
+        "`fabric/` — three of which had silently drifted onto different meanings for an "
+        "unreadable file. Every one of those callers must be able to see it, so the package root "
+        "is the only home; nesting it would put it below half its callers"
     ),
     "benchmarks/cluster": (
         "standalone cluster benchmark scripts, run as `python benchmarks/cluster/<x>.py` — so "
@@ -576,6 +586,19 @@ def stale_allowlist_entries() -> list[str]:
         ]
         if len(files) <= DIR_MAX_FILES:
             stale.append(f"{rel}/: now at {len(files)} files, within the {DIR_MAX_FILES} cap")
+            continue
+        # An exemption that still applies can still be lying. Several reasons here open by
+        # stating the count they were written against ("21 modules against a cap of 12"),
+        # and nothing re-read them as the directory grew: `kyber` said 21 while holding 23,
+        # and `benchmarks/gpu_backend` said 13 while holding 14. The entry stays valid, so
+        # the check above never fires, and the justification quietly stops being true —
+        # which is how tracked debt becomes permanent debt. Hold the prose to the number.
+        claimed = re.search(r"(\d+)\s+[\w\s-]*?against a cap", _reason)
+        if claimed and int(claimed.group(1)) != len(files):
+            stale.append(
+                f"{rel}/: reason claims {claimed.group(1)} files but the directory holds "
+                f"{len(files)} — update the reason, or split the directory"
+            )
     return stale
 
 

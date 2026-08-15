@@ -12,7 +12,12 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from batcher.plan.types import DEFAULT_VARLEN_BYTES, column_bytes, schema_row_bytes
+from batcher.plan.types import (
+    DEFAULT_VARLEN_BYTES,
+    column_bytes,
+    projected_row_bytes,
+    schema_row_bytes,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -134,3 +139,34 @@ def test_schema_row_bytes_sums_the_columns():
     # not the 64 B/row a flat per-row constant would have charged it.
     schema = pa.schema([pa.field("k", pa.int64()), pa.field("v", pa.int64())])
     assert schema_row_bytes(schema) == 16.0
+
+
+def test_projected_row_bytes_sums_only_the_projected_columns():
+    # The whole point of the projected form: a query naming one column of a wide relation
+    # is sized by that column, and never by a walk of the other 104.
+    schema = pa.schema(
+        [pa.field("a", pa.int64()), pa.field("b", pa.float64()), pa.field("c", pa.string())]
+    )
+    assert projected_row_bytes(schema, ["a"]) == 8.0
+    assert projected_row_bytes(schema, ["a", "b"]) == 16.0
+    assert projected_row_bytes(schema, ["c"]) == column_bytes(pa.string())
+
+
+def test_projected_row_bytes_with_no_projection_is_the_whole_schema():
+    schema = pa.schema([pa.field("a", pa.int64()), pa.field("b", pa.float64())])
+    assert projected_row_bytes(schema, None) == schema_row_bytes(schema)
+    assert projected_row_bytes(schema, []) == schema_row_bytes(schema)
+
+
+def test_projected_row_bytes_ignores_a_name_the_schema_does_not_carry():
+    # The caller is sizing a read. A projection naming a column the source lacks means the
+    # plan's column resolution and this schema disagree — a reason to under-estimate a byte
+    # total, never to fail the query at its memory guard.
+    schema = pa.schema([pa.field("a", pa.int64())])
+    assert projected_row_bytes(schema, ["a", "missing"]) == 8.0
+
+
+def test_projected_row_bytes_repeats_are_charged_per_reference():
+    # A projection is a list of reads, so naming a column twice reads it twice.
+    schema = pa.schema([pa.field("a", pa.int64())])
+    assert projected_row_bytes(schema, ["a", "a"]) == 16.0

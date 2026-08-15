@@ -37,6 +37,64 @@ Both measure a downsampled copy, so the cost per image does not depend on its re
 matters for sharpness specifically: at full resolution sensor noise reads as high-frequency
 detail, and a blurry 50-megapixel photograph would score like a sharp one.
 
+## What the listing knows before anything decodes
+
+`read.images` emits `width`, `height`, `mode` and `format` per file, read from the header
+during the same pass that fetched the bytes. `format` is the container the bytes *actually*
+are, which is worth having beside `mime` for the same reason
+{py:meth}`.image.format() <batcher.plan.expr_ir.image._ImageNamespace.format>` is: a corpus
+assembled by content type is full of files whose extension and container disagree, and those
+rows decode fine and break whatever downstream step branched on the name.
+
+The listing is by file extension, so a format the source does not name is invisible to it —
+the read returns nothing and the error reads as an empty directory rather than as an
+unlisted format. `.heic`, `.avif`, `.jfif`, `.jp2` and the rest are listed for that reason,
+even where Pillow needs a plugin to decode them: the rows are still worth having, because
+`bytes`, `size` and `mime` come from the read itself and an unparseable header nulls that
+file's metadata columns rather than dropping its row.
+
+## The rows a luma measure cannot see
+
+Brightness and sharpness both read the grey channel, so three classes of useless row get
+past them. Each has its own measure, and all three read the same downsampled copy the other
+two do, so adding them to a filter costs nothing beyond the decode already being paid.
+
+{py:meth}`.image.entropy() <batcher.plan.expr_ir.image._ImageNamespace.entropy>` is the
+Shannon entropy of the luma histogram, in bits. It separates the case brightness cannot: a
+mid-grey placeholder tile and a photograph of a foggy road have the same mean, and
+completely different information content. A solid field scores 0 whatever shade it is, a
+two-tone logo near 1, and a photograph of anything between 6 and 8.
+
+{py:meth}`.image.colorfulness() <batcher.plan.expr_ir.image._ImageNamespace.colorfulness>`
+is the Hasler-Süsstrunk metric. A sepia-toned duplicate, a line drawing and a scanned page
+all have ordinary brightness, sharpness and entropy, and all of them are the wrong training
+data for a model meant to see colour. Roughly 0 for anything grey, 15 or more for a vivid
+scene.
+
+{py:meth}`.image.is_grayscale() <batcher.plan.expr_ir.image._ImageNamespace.is_grayscale>`
+finds the greyscale images *stored* as three identical channels. No header reports it:
+`decode()` says `RGB`, `has_alpha()` says false, and nothing says that two thirds of every
+tensor is a copy. Finding them is what lets a pipeline route them to a one-channel model
+instead of paying three times the bandwidth for one channel of information.
+
+{py:meth}`.image.mean_color() <batcher.plan.expr_ir.image._ImageNamespace.mean_color>`
+reports the three channel means as a struct. It is the cheapest colour summary there is, and
+it makes "find every product shot on a white background" and "cluster this corpus by
+palette" ordinary expressions rather than an embedding model.
+
+```python
+# docs: skip
+from batcher import col, lit
+
+background = col("bytes").image.mean_color()
+usable = photos.filter(
+    (col("bytes").image.entropy() > lit(4.0))          # not a placeholder tile
+    & (col("bytes").image.colorfulness() > lit(5.0))   # not a scan or a line drawing
+    & ~col("bytes").image.is_grayscale()               # not grey stored as RGB
+)
+on_white = photos.filter(background.struct.field("r") > lit(240.0))
+```
+
 ## Orienting photographs
 
 A camera does not rotate its sensor data. It records which way up it was held in the EXIF

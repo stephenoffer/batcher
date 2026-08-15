@@ -28,7 +28,7 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.dist.executor import _relabel_single_source, _single_source
-from batcher.dist.executors.plan_analysis import empty_result_table
+from batcher.dist.executors.plan_analysis import empty_result_table, restore_declared_types
 from batcher.dist.spill.buckets import (
     GRACE_DEPTH,
     GRACE_SUB_BUCKETS,
@@ -130,7 +130,12 @@ def spill_collect(
         cols = plan.input.available_columns()
         group_keys = tuple(Projection(alias=c, expr=col(c)) for c in cols)
         equiv = Aggregate(input=plan.input, group_keys=group_keys, aggregates=())
-        return execute_spilling_aggregate(equiv, sources, num_partitions)
+        # The lowering is what loses the column type: a whole-row `DISTINCT` keeps an
+        # extension-typed column, but as a group-by its keys come back as plain storage.
+        # `DISTINCT`'s own schema is the one to restore, not the group-by's.
+        return execute_spilling_aggregate(
+            equiv, sources, num_partitions, declared=empty_result_table(plan, cols).schema
+        )
     # The ordering/binary breakers live in `spill_breakers` (imported lazily so this
     # module stays import-cycle-free: `spill_breakers` depends on this one's helpers).
     if isinstance(plan, (Join, Sort, Window)):
@@ -199,8 +204,21 @@ def execute_spilling_aggregate(
     sources: list[Source],
     num_partitions: int = 16,
     spill_dir: str | None = None,
+    declared: pa.Schema | None = None,
 ) -> pa.Table:
-    """Aggregate `agg` out-of-core, spilling hash-partitioned partials to disk."""
+    """Aggregate `agg` out-of-core, spilling hash-partitioned partials to disk.
+
+    `declared` is the output schema to restore onto the result. It defaults to the
+    aggregate's own, and the whole-row `DISTINCT` lowering overrides it with `DISTINCT`'s,
+    because the two disagree about the key columns' types and `DISTINCT`'s is the one a
+    caller asked for.
+
+    Restoring it matters because an Arrow **extension** type -- what every tensor column
+    carries -- does not survive a group-key round trip: the key comes back as its plain
+    storage, which then picks up the FFI boundary's narrow-type widening. Without this an
+    explicit ``collect(spill=True)`` returns a different column *type* from the same query
+    run in memory, which is the one thing a spilled result may not do.
+    """
     nat = engine()
     cfg_json = active_config().engine_config_json()
     group_keys_json, aggregates_json = agg_spec_json(agg)
@@ -240,7 +258,10 @@ def execute_spilling_aggregate(
             )
 
         if out:
-            return pa.Table.from_batches(out)
+            # Same reason the distributed reducer restores them: a group-key round trip
+            # hands an extension-typed column back as its plain storage.
+            table = pa.Table.from_batches(out)
+            return restore_declared_types(table, declared or _empty_table(agg).schema)
         # Empty input. A *global* aggregate over zero rows still returns exactly one row
         # (`count() -> 0`, `median() -> NULL`), which is what both the single-node engine
         # and DuckDB do — so it cannot take the zero-row `_empty_table` path.

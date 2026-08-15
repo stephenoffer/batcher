@@ -37,7 +37,7 @@ use crate::keys::canon_f64;
 /// again here — and the second gather produced a column equal, element for element, to the
 /// one it read. The arrays returned may be slices where `take` would have returned fresh
 /// buffers; that is invisible to every consumer, which reads them through `Array`.
-fn group_columns(
+pub(super) fn group_columns(
     keys: &[ArrayRef],
     reps: Vec<u32>,
     num_rows: usize,
@@ -61,6 +61,17 @@ pub(crate) fn assign_groups(
     if group_keys.is_empty() {
         // Global aggregate: a single group over all rows.
         return Ok((vec![0; num_rows], 1, Vec::new()));
+    }
+    // Sorted-key short-circuit, tried before any hash path because it replaces hashing
+    // outright: when equal keys are adjacent, a row's group is decided by comparing it with
+    // its predecessor, so there is no table to build and no probe to pay. It is attempted on
+    // every aggregate rather than gated on a planner flag, because it *establishes* the
+    // ordering (see `runs`) instead of trusting a `sorted_by` declaration that nothing
+    // enforces on write — and unordered input declines within a few comparisons. The ids and
+    // first-seen representatives are identical to the hash paths below, so this is a pure
+    // short-circuit.
+    if let Some(assigned) = super::runs::assign_groups_runs(group_keys, num_rows)? {
+        return Ok(assigned);
     }
     // Fast path: a single integer key column hashes its native values directly,
     // skipping the RowConverter encoding pass (a per-row allocation + copy) that the

@@ -92,10 +92,25 @@ def test_a_columnar_source_is_deliberately_not_trusted():
 
 def test_the_file_listing_connectors_declare_it():
     # The flag is only useful if the sources whose rows *are* files actually set it.
+    #
+    # Asserted against the two places that *produce* the flag, not by grepping each
+    # connector's source: `multimodal.media` and `unstructured.binary` now both derive their
+    # statistics from the shared `whole_file_statistics`, so a text search for the literal
+    # found nothing in either and passed only for as long as the copies existed. What the
+    # connectors do with it is covered end to end, over real files, in
+    # `test_media_source_statistics.py`.
+    from batcher.io.stats.file_listing import whole_file_statistics
+
+    # One row per file, size known from the listing → the byte figure is row content.
+    assert whole_file_statistics([100, 5_000, 200_000]).content_byte_size is True
+    # And with no files at all, where there is no total to describe.
+    assert whole_file_statistics([]).content_byte_size is True
+
+    # `unstructured.text` is line-oriented rather than one-row-per-file, so it does not go
+    # through the helper and declares the flag itself; it is still a source whose bytes are
+    # row content.
     import inspect
 
-    from batcher.io.formats.multimodal import media
     from batcher.io.formats.unstructured import text
 
-    for mod in (media, text):
-        assert "content_byte_size=True" in inspect.getsource(mod)
+    assert "content_byte_size=True" in inspect.getsource(text)

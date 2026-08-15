@@ -24,6 +24,7 @@ terminal built on it. Deliberately not the other two routes, and neither is an o
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import threading
 import weakref
@@ -35,36 +36,60 @@ from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.io.source import InMemorySource, Source
 from batcher.plan.logical import LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
-from batcher.plan.visitor import children, transform_up
+from batcher.plan.types import logical_bytes, retained_bytes
+from batcher.plan.visitor import children, transform_up, walk
 
 __all__ = ["reuse_common_subplans"]
 
 _log = get_logger("api.subplan_reuse")
 
-#: Plans already known to have nothing worth reusing, so a re-issued query does not re-derive
-#: it. Bounded, and holding only the fact — never a materialized result, which would be a data
-#: cache and is `Dataset.cache()`'s job.
+#: The analysis's **verdict** for a plan already analyzed, so a re-issued query does not
+#: re-derive it. Bounded, and holding only the decision — never a materialized result, which
+#: would be a data cache and is `Dataset.cache()`'s job.
+#:
+#: A verdict is the pre-order **positions** of each chosen subtree's appearances, and the
+#: empty list is the (much commoner) "nothing repeats". Positions rather than nodes or keys
+#: because the key below carries `plan.content_key()` — the plan's whole lowered IR — so an
+#: entry can only be served to a plan with the identical tree, where position `i` of the
+#: pre-order walk is the identical node. That makes a hit cost one `walk`, against the
+#: canonical rebuild plus a `structural_key` per node plus a `CostModel` pass over the plan
+#: that deriving it costs: measured on TPC-DS q80, **404 ms per collect** (337 ms of analysis
+#: and 67 ms of canonicalization) against a whole query that runs in 151 ms.
+#:
+#: Caching the positive verdict is what makes that saving reachable at all. Only rejections
+#: were cached before, on the reasoning that a plan with something to reuse pays the analysis
+#: once and then the materialization dominates — true when the analysis was believed to be a
+#: walk, and false by two orders of magnitude on a snowflake query.
 #:
 #: The analysis is not the cheap walk its docstring claimed. `_one_id_per_source` rebuilds the
 #: plan whenever one source object is bound twice (every self-join, and TPC-H q8's two
 #: `nation` bindings), and the fresh nodes defeat `content_key`'s per-instance memo, so every
-#: `collect()` re-keyed every node. Measured warm at scale 1: **q8 16.2 ms, q5 6.5 ms, q9
-#: 7.2 ms — 37%, 18% and 12% of those queries' entire wall time, to conclude "nothing
+#: `collect()` re-keyed every node. Measured warm at scale 1: **TPC-H q8 16.2 ms, q5 6.5 ms,
+#: q9 7.2 ms — 37%, 18% and 12% of those queries' entire wall time, to conclude "nothing
 #: repeats"** each time.
 #:
-#: The verdict is keyed the way Kyber keys the optimizer memo (`plan_cache.cache_key`), which
-#: is what makes caching a *cost-based* rejection sound as well as a structural one: that key
-#: already folds in the learned generation, the calibration epoch, the measured read costs and
-#: the source statistics, so it moves exactly when the numbers the rejection was taken on move.
-#: Restating a narrower key here would have meant either re-deriving the analysis on every call
-#: or serving a verdict that had outlived its evidence.
-_NO_REUSE: OrderedDict[tuple, tuple[weakref.ref, ...]] = OrderedDict()
-_NO_REUSE_MAX = 256
-_NO_REUSE_LOCK = threading.Lock()
+#: The verdict is keyed with Kyber's own key builder but **without its learned fields**
+#: (`learned=False`), so it moves with the plan, the config, the hub and the sources and not
+#: with the generation counter or the calibration fingerprint. Carrying those was the obvious
+#: choice and it is measurably the wrong one: inside a mixed workload every query moves the
+#: generation for every other, so the key never repeated and the analysis ran in full on every
+#: execution forever. TPC-DS q80 in isolation is 97 ms with the verdict served and 848 ms
+#: inside the suite without it.
+#:
+#: What that trades away is small and stated plainly: a verdict taken under one set of
+#: estimates can outlive them, so a subtree that stops being worth materializing keeps being
+#: materialized until the plan, config or sources change. That costs a slower query, never a
+#: wrong one — and the decision is far less sensitive than a plan, since it asks only whether
+#: a subtree repeats and whether materializing it beats an engine round trip.
+_VERDICTS: OrderedDict[tuple, tuple[tuple[weakref.ref, ...], tuple[tuple[int, ...], ...]]] = (
+    OrderedDict()
+)
+_VERDICTS_MAX = 256
+_VERDICTS_LOCK = threading.Lock()
 
 
-def _no_reuse_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) -> tuple | None:
-    """The cache key for "this plan has nothing to reuse", or `None` if it cannot be keyed.
+def _verdict_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) -> tuple | None:
+    """The cache key for this plan's reuse verdict, or `None` if it cannot be keyed.
 
     Kyber's own optimizer-memo key carries the plan fingerprint, the config, the hub and every
     learned input; `kind` separates this question from the optimizer's so the two cannot
@@ -87,7 +112,7 @@ def _no_reuse_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) ->
             config,
             ctx.hub,
             kind="subplan_reuse",
-            source_stats=ctx.source_stats,
+            learned=False,
         )
     except Exception as exc:  # pragma: no cover - an unkeyable plan simply is not cached
         note_suppressed("api", "key the common-subplan verdict", exc)
@@ -97,38 +122,43 @@ def _no_reuse_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) ->
     return (base, tuple(id(s) for s in sources), cfg.common_subplan_max_bytes, cfg.row_bytes)
 
 
-def _known_no_reuse(key: tuple | None, sources: list[Source]) -> bool:
-    """Whether `key` is a recorded "nothing to reuse" verdict for *these* source objects."""
+def _known_verdict(key: tuple | None, sources: list[Source]):
+    """The recorded verdict for `key` over *these* source objects, or `None` if there is none.
+
+    A verdict is a tuple of per-target appearance-position tuples; the empty tuple is
+    "nothing worth reusing", which is why the caller must distinguish it from `None`.
+    """
     if key is None:
-        return False
-    with _NO_REUSE_LOCK:
-        held = _NO_REUSE.get(key)
-        if held is None:
-            return False
+        return None
+    with _VERDICTS_LOCK:
+        entry = _VERDICTS.get(key)
+        if entry is None:
+            return None
+        held, verdict = entry
         if len(held) != len(sources) or any(
             r() is not s for r, s in zip(held, sources, strict=True)
         ):
             # A recycled `id()` landed on a different object: drop the entry rather than
             # serve one plan's verdict for another's.
-            del _NO_REUSE[key]
-            return False
-        _NO_REUSE.move_to_end(key)
-    return True
+            del _VERDICTS[key]
+            return None
+        _VERDICTS.move_to_end(key)
+    return verdict
 
 
-def _record_no_reuse(key: tuple | None, sources: list[Source]) -> None:
-    """Record that `key`'s plan has nothing worth reusing. Best-effort."""
+def _record_verdict(key: tuple | None, sources: list[Source], verdict) -> None:
+    """Record this plan's reuse verdict. Best-effort."""
     if key is None:
         return
     try:
         held = tuple(weakref.ref(s) for s in sources)
     except TypeError:  # pragma: no cover - a source that cannot be weakly referenced
         return
-    with _NO_REUSE_LOCK:
-        _NO_REUSE[key] = held
-        _NO_REUSE.move_to_end(key)
-        while len(_NO_REUSE) > _NO_REUSE_MAX:
-            _NO_REUSE.popitem(last=False)
+    with _VERDICTS_LOCK:
+        _VERDICTS[key] = (held, verdict)
+        _VERDICTS.move_to_end(key)
+        while len(_VERDICTS) > _VERDICTS_MAX:
+            _VERDICTS.popitem(last=False)
 
 
 def reuse_common_subplans(
@@ -166,7 +196,6 @@ def reuse_common_subplans(
 def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, list[Source]]:
     from batcher.config import active_config
     from batcher.io.source import is_bounded
-    from batcher.kyber.common_subplan import common_subplans
 
     config = active_config()
     cfg = config.optimizer
@@ -180,28 +209,18 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
     # and it is what most plans hit.
     if not children(plan):
         return plan, sources
-    key = _no_reuse_key(plan, sources, ctx, config, cfg)
-    if _known_no_reuse(key, sources):
+    key = _verdict_key(plan, sources, ctx, config, cfg)
+    verdict = _known_verdict(key, sources)
+    if verdict is None:
+        verdict = _analyze(plan, sources, ctx, cfg)
+        _record_verdict(key, sources, verdict)
+    if not verdict:
+        # Hand back the plan as written — including when the analysis built a canonical form
+        # to look at. That form is semantically identical, but it is only built to make
+        # repeats *visible*, and returning it when nothing repeats would perturb plan
+        # identity (the result-cache key, learned-stats signatures) for no gain at all.
         return plan, sources
-
-    from batcher.api.source_stats import build_estimator
-
-    canonical = _one_id_per_source(plan, sources)
-    targets = common_subplans(
-        canonical,
-        lambda: build_estimator(sources, ctx.hub),
-        max_bytes=cfg.common_subplan_max_bytes,
-        row_bytes=cfg.row_bytes,
-    )
-    if not targets:
-        # Hand back the plan as written. The canonical form is semantically identical, but
-        # it is only built to make repeats *visible*, and returning it when nothing repeats
-        # would perturb plan identity (the result-cache key, learned-stats signatures) for
-        # no gain at all.
-        _record_no_reuse(key, sources)
-        return plan, sources
-    plan = canonical
-
+    nodes = list(walk(plan))
     srcs = list(sources)
     # The estimator bounded each candidate on its own; this bounds what they hold *together*,
     # which is the quantity that actually competes with the running query for memory. Three
@@ -209,11 +228,17 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
     # the query ends. Charged on the materialized size rather than the estimate, so a target
     # whose estimate was optimistic stops the ones after it instead of compounding.
     held = 0
-    for target in targets:
-        table = _materialize(target, srcs, ctx)
+    for positions in verdict:
+        appearances = [nodes[i] for i in positions]
+        table = _materialize(appearances[0], srcs, ctx)
         if table is None:
             continue
-        held += table.nbytes
+        # `retained_bytes`: a cached subplan is *held* for the query's lifetime, so the
+        # figure the budget needs is what it pins, not what its rows address. A result cut
+        # zero-copy out of a larger table reports a fraction of what it keeps resident, and
+        # the budget would then admit several such tables and hold gigabytes under a
+        # 256 MiB cap — the OOM the cap exists to prevent, reached through the cap itself.
+        held += retained_bytes(table)
         if held > cfg.common_subplan_max_bytes:
             log_kv(
                 _log,
@@ -228,17 +253,79 @@ def _reuse(plan: LogicalPlan, sources: list[Source], ctx) -> tuple[LogicalPlan, 
         # this relation lives for one query, so an O(rows) min/max pass over it would be
         # recomputed and discarded on every run, and its identity must not seed a
         # distinct-count sketch that outlives it.
-        srcs.append(InMemorySource(_batches(table), zone_maps=False, ephemeral=True))
-        plan = _replace_all(plan, target, Scan(sid, SchemaRef.from_arrow(table.schema)))
+        srcs.append(
+            InMemorySource(
+                _batches(table),
+                zone_maps=False,
+                ephemeral=True,
+                derivation=_derivation(appearances[0], srcs),
+            )
+        )
+        plan = _replace_all(plan, appearances, Scan(sid, SchemaRef.from_arrow(table.schema)))
         log_kv(
             _log,
             logging.DEBUG,
             "subplan reused",
             rows=table.num_rows,
-            bytes=table.nbytes,
-            op=type(target).__name__,
+            bytes=logical_bytes(table),
+            op=type(appearances[0]).__name__,
         )
     return plan, srcs
+
+
+def _analyze(plan: LogicalPlan, sources: list[Source], ctx, cfg) -> tuple[tuple[int, ...], ...]:
+    """Which subtrees to materialize, as pre-order positions in `plan`'s own walk.
+
+    The analysis runs over a **canonical** form of the plan, in which every binding of one
+    source object points at that object's first index — the whole reason
+    `_one_id_per_source` exists, since two subtrees reading the same table through different
+    bindings are otherwise not structurally equal.
+
+    That canonical form is an **analysis artefact and must not be executed**. Collapsing the
+    bindings is also what makes `bc_interp::streaming_parallelizes` false — that predicate is
+    "no source is scanned twice", and a plan failing it is routed to the *materializing*
+    executor for its whole length. Returning the canonical plan to be run therefore changed
+    the executor of every query with a table bound more than once, which on a snowflake
+    schema is most of them: TPC-DS q80 1,010 -> **151 ms**, q77 482 -> **91 ms**, q5
+    473 -> **199 ms** once the executed plan keeps its own source ids. The reuse itself was
+    never at fault — q14 (5.5x) and q73 (4.9x) keep their wins either way.
+
+    So the appearances are *located* through the canonical tree and reported as positions in
+    the original one. `walk` is pre-order and the two trees differ only in the `source_id`
+    **field** of their `Scan`s, so the two walks are the same sequence of nodes and position
+    `i` names the same subtree in both — an exact correspondence, not a heuristic.
+
+    Args:
+        plan: The plan as written.
+        sources: Its bound inputs, positionally.
+        ctx: The execution context, for the hub the estimator reads.
+        cfg: The optimizer config, for the size budget and the row-width fallback.
+
+    Returns:
+        One position tuple per chosen subtree, outermost first; empty when nothing repeats.
+    """
+    from batcher.api.source_stats import build_estimator
+    from batcher.kyber.common_subplan import common_subplans, structural_key
+
+    canonical = _one_id_per_source(plan, sources)
+    targets = common_subplans(
+        canonical,
+        lambda: build_estimator(sources, ctx.hub),
+        max_bytes=cfg.common_subplan_max_bytes,
+        row_bytes=cfg.row_bytes,
+    )
+    if not targets:
+        return ()
+    keys = [structural_key(node) for node in walk(canonical)]
+    out: list[tuple[int, ...]] = []
+    for target in targets:
+        want = structural_key(target)
+        if want is None:  # pragma: no cover - an opaque subtree is never a candidate
+            continue
+        positions = tuple(i for i, k in enumerate(keys) if k == want)
+        if positions:
+            out.append(positions)
+    return tuple(out)
 
 
 def _one_id_per_source(plan: LogicalPlan, sources: list[Source]) -> LogicalPlan:
@@ -304,25 +391,54 @@ def _materialize(target: LogicalPlan, sources: list[Source], ctx) -> pa.Table | 
     return table if isinstance(table, pa.Table) else None
 
 
+def _derivation(target: LogicalPlan, sources: list[Source]) -> str | None:
+    """A name for *how* this intermediate was derived, or `None` if it cannot be named.
+
+    The relation lives for one execution, so it is `ephemeral` — but the next execution of the
+    same query derives the identical relation from the identical inputs, and this string says
+    so: the subplan's own content key over the data-stable keys of the sources it reads. That
+    is what lets `kyber.plan_cache` memoize the plan built *over* the intermediate, which is
+    otherwise the one optimize a repeated query can never skip. On TPC-DS q77 it is the second
+    of two, and it ran in full on every execution forever.
+
+    `None` — no caching, exactly as before — when any input cannot key itself, because then
+    two different relations could produce the same name. The safe direction is the one that
+    re-plans.
+    """
+    from batcher.plan.source_stats import source_stats_key
+    from batcher.plan.visitor import scanned_source_ids
+
+    parts = [target.content_key()]
+    for sid in sorted(scanned_source_ids(target)):
+        if sid >= len(sources):
+            return None
+        key = source_stats_key(sources[sid])
+        if key is None:
+            return None
+        parts.append(f"{sid}={key}")
+    return hashlib.blake2b("|".join(parts).encode(), digest_size=16).hexdigest()
+
+
 def _batches(table: pa.Table) -> list[pa.RecordBatch]:
     """`table` as batches, never empty — an empty relation still carries its types."""
     return table.to_batches() or [pa.RecordBatch.from_pylist([], schema=table.schema)]
 
 
-def _replace_all(plan: LogicalPlan, target: LogicalPlan, repl: LogicalPlan) -> LogicalPlan:
-    """Replace *every* subtree computing what `target` computes, not just this object.
+def _replace_all(plan: LogicalPlan, appearances: list, repl: LogicalPlan) -> LogicalPlan:
+    """Replace every node in `appearances` with `repl`.
 
-    `adaptive.plan_surgery.replace` matches on object identity, which is right for the stage
-    loop: it executes one specific node it just located. Here the whole point is the other
-    appearances, which are equal subtrees built independently — `agg.join(agg.filter(...))`
-    shares the object, a SQL `WITH` referenced twice does not, and both must collapse. So
-    the match is on the IR, the exact form the engine would execute.
+    Matched on **object identity**, because `appearances` holds the very nodes of `plan`
+    that `_analyze` located, read back by position. Identity is what keeps the rewrite exact
+    once the
+    canonical form is no longer the thing being rewritten: two original subtrees may be
+    equal *canonically* and not equal as written (they scan different bindings of one
+    table), and it is precisely those that must both be replaced — which the canonical match
+    already established and a structural match on the original plan could not.
 
-    Bottom-up, so a rewritten child is in place before its parent is compared; `target`
-    itself is by construction not nested in another target (`common_subplans` returns
-    non-overlapping subtrees), so no appearance is rewritten twice.
+    Bottom-up, and `transform_up` returns the same object for an unchanged subtree, so a
+    node's identity survives until it is either replaced or one of its descendants is. No
+    appearance is a descendant of another (`common_subplans` returns non-overlapping
+    subtrees), so every identity in `appearances` is still present when it is reached.
     """
-    from batcher.kyber.common_subplan import structural_key
-
-    want = structural_key(target)
-    return transform_up(plan, lambda node: repl if structural_key(node) == want else node)
+    ids = {id(node) for node in appearances}
+    return transform_up(plan, lambda node: repl if id(node) in ids else node)

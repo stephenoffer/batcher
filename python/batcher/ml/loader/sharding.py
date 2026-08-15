@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from batcher.ml.permutation import _FeistelPermutation, epoch_permutation
+from batcher.ml.permutation import _KeyedPermutation, epoch_permutation
 from batcher.ml.streaming_sampler.ordering import _rank_positions
 
 if TYPE_CHECKING:
@@ -43,6 +43,7 @@ def gather_rank_shard(
     shuffle: bool,
     drop_last: bool,
     global_consumed: int,
+    shuffle_block_size: int | None = None,
 ) -> tuple[pa.Table, np.ndarray]:
     """Stream `dataset` and keep only `rank`'s rows, with the order to read them back in.
 
@@ -56,6 +57,8 @@ def gather_rank_shard(
         shuffle: use the identity order instead when false.
         drop_last: drop the epoch's tail remainder rather than padding it.
         global_consumed: samples already processed this epoch (the resume point).
+        shuffle_block_size: shuffle within blocks of this many samples rather than across
+            the whole corpus, so the gathering pass stays local to a window of rows.
 
     Returns:
         A ``(table, order)`` pair: `table` holds only this rank's rows, and ``order[k]`` is the
@@ -73,6 +76,7 @@ def gather_rank_shard(
         shuffle=shuffle,
         drop_last=drop_last,
         global_consumed=global_consumed,
+        shuffle_block_size=shuffle_block_size,
     )
     schema = None
     chunks: list = []
@@ -87,7 +91,15 @@ def gather_rank_shard(
         if hi > lo:
             chunks.append(batch.take(pa.array(sorted_wanted[lo:hi] - offset)))
         offset += batch.num_rows
-    table = pa.Table.from_batches(chunks) if chunks else pa.table({}, schema=schema)
+    # `pa.table({}, schema=schema)` raises on a non-empty schema, so a rank that legitimately
+    # draws no rows (world_size above the corpus size, or a fully consumed resume point) used
+    # to crash instead of yielding an empty epoch. `empty_table` keeps the columns.
+    if chunks:
+        table = pa.Table.from_batches(chunks)
+    elif schema is not None:
+        table = schema.empty_table()
+    else:  # the stream yielded nothing at all, so there is no schema to preserve
+        table = pa.table({})
     # `chunks` is in `sorted_wanted` order; invert the sort to get back to epoch order.
     order = np.empty(len(wanted), dtype=np.int64)
     order[gather] = np.arange(len(wanted), dtype=np.int64)
@@ -104,6 +116,7 @@ def _rank_indices(
     shuffle: bool,
     drop_last: bool,
     global_consumed: int,
+    shuffle_block_size: int | None = None,
 ) -> np.ndarray:
     """This rank's corpus indices for the epoch, in epoch order — `elastic_shard` in NumPy.
 
@@ -120,7 +133,9 @@ def _rank_indices(
     # Positions at or past the corpus exist only in the padded (`drop_last=False`) tail, where
     # the epoch repeats samples from the front — the same wrap `epoch_positions` applies.
     pos = np.where(pos < num_rows, pos, (pos - num_rows) % num_rows)
-    permutation = epoch_permutation(num_rows, epoch=epoch, seed=seed, shuffle=shuffle)
-    if isinstance(permutation, _FeistelPermutation):
+    permutation = epoch_permutation(
+        num_rows, epoch=epoch, seed=seed, shuffle=shuffle, block_size=shuffle_block_size
+    )
+    if isinstance(permutation, _KeyedPermutation):
         return permutation.take(pos.astype(np.uint64)).astype(np.int64)
     return pos

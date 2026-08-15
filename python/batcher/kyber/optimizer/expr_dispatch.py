@@ -19,9 +19,9 @@ All three read the same `Rule.expr_matches`/`Rule.expr_ops` declarations, and
 
 from __future__ import annotations
 
-import os
 from bisect import bisect_right
 
+from batcher.config.env import env_flag
 from batcher.kyber.rule import Rule
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.logical import LogicalPlan
@@ -45,7 +45,7 @@ __all__ = [
 # nothing a normal test would notice. With this on, every filtered chain is also run
 # unfiltered and the two results compared, so a declaration that skips a leaf which *would*
 # have rewritten the expression fails loudly on whatever expression the corpus produced.
-VERIFY_EXPR_MATCHES = os.environ.get("BATCHER_VERIFY_EXPR_MATCHES") == "1"
+VERIFY_EXPR_MATCHES = env_flag("BATCHER_VERIFY_EXPR_MATCHES")
 
 
 #: `id(rules) -> (rules, {Expr type: rule indices})`, the expression-type inversion of a

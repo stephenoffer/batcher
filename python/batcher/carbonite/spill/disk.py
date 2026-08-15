@@ -28,8 +28,8 @@ from enum import IntEnum
 
 import pyarrow as pa
 
-from batcher._internal.errors import IOError as BatcherIOError
 from batcher._internal.logging import note_suppressed
+from batcher._internal.optional import require
 
 __all__ = [
     "DISK_FLOOR_BYTES",
@@ -65,12 +65,12 @@ def fsspec_open(path: str, mode: str):
     Raises:
         IOError: If `fsspec` is not installed.
     """
-    try:
-        import fsspec
-    except ImportError as exc:  # pragma: no cover - exercised only without the extra
-        raise BatcherIOError(
-            f"spilling to object storage ({path!r}) needs fsspec — install the 'cloud' extra"
-        ) from exc
+    fsspec = require(
+        "fsspec",
+        feature=f"Spilling to object storage ({path!r})",
+        provides="fsspec",
+        extra="cloud",
+    )
     return fsspec.open(path, mode)
 
 

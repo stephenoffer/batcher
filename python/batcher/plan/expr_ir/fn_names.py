@@ -272,10 +272,10 @@ As with `GEO_FNS` the argument count is not stated here; it lives in
 
 MATH_FNS: Final[frozenset[str]] = frozenset(
     {
-        "abs", "acos", "asin", "atan", "bit_count", "cbrt", "ceil", "cos", "cosh",
-        "cot", "degrees", "exp", "factorial", "floor", "ln", "log10", "log2",
-        "radians", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh", "trunc",
-        "csc", "even", "gamma", "lgamma", "rint", "sec",
+        "abs", "acos", "acosh", "asin", "asinh", "atan", "atanh", "bit_count",
+        "cbrt", "ceil", "cos", "cosh", "cot", "degrees", "exp", "factorial", "floor",
+        "ln", "log10", "log2", "radians", "round", "sign", "sin", "sinh", "sqrt",
+        "tan", "tanh", "trunc", "csc", "even", "gamma", "lgamma", "rint", "sec",
     }
 )  # fmt: skip
 
@@ -290,17 +290,35 @@ MATH_FNS: Final[frozenset[str]] = frozenset(
 
 IMAGE_FNS: Final[frozenset[str]] = frozenset(
     {
+        # Decode and tensor shaping.
         "decode", "to_tensor", "to_tensor_f32", "to_grayscale", "center_crop",
-        "resize", "encode", "convert", "dhash", "brightness", "sharpness",
-        "auto_orient", "exif_orientation", "thumbnail", "letterbox",
+        # Bytes-to-bytes geometry and container changes.
+        "resize", "encode", "convert", "thumbnail", "letterbox", "pad",
+        "rotate", "flip_horizontal", "flip_vertical", "auto_orient",
+        # Photometric adjustment (the augmentation vocabulary).
+        "adjust_brightness", "adjust_contrast", "adjust_saturation", "adjust_hue",
+        "blur", "sharpen", "invert", "posterize", "solarize", "equalize", "autocontrast",
+        # Perceptual fingerprints, for near-duplicate detection.
+        "dhash", "phash", "ahash",
+        # Curation measures and header-only facts.
+        "brightness", "sharpness", "entropy", "colorfulness", "mean_color",
+        "is_grayscale", "exif_orientation", "aspect_ratio", "has_alpha", "format",
     }
 )  # fmt: skip
 """The `.image` vocabulary, mirroring `bc_expr::ImageFunc`'s serde tags exactly."""
 
 AUDIO_FNS: Final[frozenset[str]] = frozenset(
     {
-        "decode", "to_waveform", "resample", "trim_silence", "peak_normalize",
-        "zero_crossing_rate", "mel_spectrogram", "mfcc",
+        # Decode and resample.
+        "decode", "to_waveform", "resample",
+        # Level and hygiene measures — what a corpus's recording quality looks like.
+        "rms", "dbfs", "peak_dbfs", "clipping_ratio", "silence_ratio", "zero_crossing_rate",
+        # Waveform shaping — putting a clip into the form a model or a writer needs.
+        "trim_silence", "peak_normalize", "rms_normalize", "pre_emphasis",
+        "pad_or_trim", "slice", "encode_wav",
+        # Spectral front ends and descriptors.
+        "mel_spectrogram", "mfcc", "spectrogram",
+        "spectral_centroid", "spectral_rolloff", "spectral_bandwidth", "spectral_flatness",
     }
 )  # fmt: skip
 """The `.audio` vocabulary, mirroring `bc_expr::AudioFunc`'s serde tags exactly."""

@@ -32,7 +32,12 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-__all__ = ["logical_bytes", "retained_bytes", "total_retained_bytes"]
+__all__ = [
+    "logical_bytes",
+    "retained_bytes",
+    "total_logical_bytes",
+    "total_retained_bytes",
+]
 
 
 def logical_bytes(data: Any) -> int:
@@ -76,6 +81,24 @@ def logical_bytes(data: Any) -> int:
             return 0
     except (AttributeError, TypeError, ValueError):
         return 0
+
+
+def total_logical_bytes(items: Iterable[Any]) -> int:
+    """Logical bytes across a sequence of batches or tables.
+
+    The counterpart of `total_retained_bytes` for the sites that *report* a size or size a
+    payload by what its rows address — a transfer's wire cost, a profile's `result_bytes`,
+    a shuffle counter. It exists for the same reason: `sum(b.nbytes for b in batches)` is
+    the shape those call sites reach for, and it raises on the Arrow view layouts, so the
+    named helper is what keeps a bare `nbytes` from being written back in.
+
+    Args:
+        items: The Arrow objects to measure.
+
+    Returns:
+        The total logical byte count.
+    """
+    return sum(logical_bytes(item) for item in items)
 
 
 def retained_bytes(data: Any) -> int:

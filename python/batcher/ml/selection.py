@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
+from batcher.ml.stats._shared import require_columns
 from batcher.plan.expr_ir.constructors import col
 
 if TYPE_CHECKING:
@@ -46,13 +47,7 @@ __all__ = ["constant_columns", "correlated_columns", "feature_profile", "feature
 def _numeric_columns(ds: Dataset, columns: list[str] | None) -> list[str]:
     """The requested columns, or every numeric column when none are named."""
     if columns is not None:
-        missing = [c for c in columns if c not in ds.columns]
-        if missing:
-            from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-            raise ColumnNotFoundError(
-                unknown_message("column", missing[0], ds.columns, hint="Pass an existing column.")
-            )
+        require_columns(ds, *columns)
         return list(columns)
     numeric = ds.select_dtypes("number").columns
     if not numeric:
@@ -243,12 +238,7 @@ def feature_report(
     """
     import batcher as bt
 
-    if target not in ds.columns:
-        from batcher._internal.errors import ColumnNotFoundError, unknown_message
-
-        raise ColumnNotFoundError(
-            unknown_message("column", target, ds.columns, hint="Pass the label column.")
-        )
+    require_columns(ds, target, hint="Pass the label column.")
     names = [c for c in _numeric_columns(ds, columns) if c != target]
     outcome = col(target) == bt.lit(positive)
     scores = ds.agg(

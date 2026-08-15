@@ -263,13 +263,25 @@ def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionCont
     for i, src in enumerate(sources):
         read_started = time.perf_counter()
         predicate = opt.source_predicates.get(i)
-        batches = read_source(src, opt.source_projections.get(i), predicate)
+        limit = opt.source_limits.get(i)
+        batches = read_source(
+            src, opt.source_projections.get(i), predicate, limit, opt.source_orderings.get(i)
+        )
         elapsed_ms = (time.perf_counter() - read_started) * 1000.0
 
         batches_per_source.append(batches)
         declared = declared_row_count(src)
         scanned = sum(b.num_rows for b in batches)
-        complete.append(predicate is None and declared is not None and scanned == declared)
+        # `limit` joins `predicate` here, for the same belt-and-braces reason `predicate`
+        # is already here: `scanned == declared` would catch a capped read on its own,
+        # since a source that stopped early returns fewer rows than it declares. But the
+        # cost of the two mistakes is lopsided — a missing row count merely leaves Kyber
+        # estimating, while a wrong one is recorded as *exact* and mis-plans the relation
+        # on every later run — so a scan that was offered a subset is not asked to prove
+        # it read everything.
+        complete.append(
+            predicate is None and limit is None and declared is not None and scanned == declared
+        )
 
         identity = _source_identity(src)
         record_source_io(
