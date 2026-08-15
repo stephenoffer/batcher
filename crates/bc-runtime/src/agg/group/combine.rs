@@ -98,6 +98,13 @@ fn gather(
             DataType::Date64 => arrow::datatypes::Date64Type,
         }
     }
+    // A string key is the *other* common high-cardinality group key, and arrow's `interleave`
+    // costs it what it costs any variable-width column: `MutableArrayData::extend` per row,
+    // through the sixteen-byte pair vector below. `gather_strings` reads the same two planes
+    // the primitive path does and fills one output buffer across cores.
+    if let Some(out) = crate::gather::gather_strings(cols, part_of, row_of) {
+        return Ok(out);
+    }
     let pairs = pairs.get_or_insert_with(|| {
         part_of
             .iter()

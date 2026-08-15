@@ -393,6 +393,120 @@ where
         .with_data_type(arr.data_type().clone())
 }
 
+/// Gather one output column from *several* string sources addressed by two `u32` planes:
+/// output row `k` is `cols[part_of[k]]` at row `row_of[k]`. `None` for anything that is not a
+/// uniform `Utf8`/`LargeUtf8` set, or whose characters overflow the offset width.
+///
+/// This is `arrow::compute::interleave` for the one type where it costs what a `take` of the
+/// same size costs: it builds through `MutableArrayData::extend`, a call and bounds checks per
+/// row to copy a handful of bytes, and it wants a materialized `&[(usize, usize)]` — sixteen
+/// bytes of index per output row where the planes are eight. The aggregate `combine` already
+/// avoids both for primitive columns and had nothing for string keys, which is the *common*
+/// high-cardinality group key: `interleave_bytes` was 6% of H2O `groupby` q2 (`sum(v1) BY id1,
+/// id2`, two string keys, 10,000 groups over 10M rows) and is on every `GROUP BY <string>`
+/// that reaches the parallel merge.
+///
+/// Same three phases as [`take_strings_parallel`], and for the same reason — a row's output
+/// offset is the running sum of the ones before it, which is a prefix sum and therefore
+/// decomposable. The only difference is that a row's bytes are found through a second plane.
+pub fn gather_strings(cols: &[&dyn Array], part_of: &[u32], row_of: &[u32]) -> Option<ArrayRef> {
+    let dt = cols.first()?.data_type();
+    if !cols.iter().all(|c| c.data_type() == dt) {
+        return None;
+    }
+    match dt {
+        DataType::Utf8 => Some(Arc::new(gather_strings_of::<i32>(cols, part_of, row_of)?)),
+        DataType::LargeUtf8 => Some(Arc::new(gather_strings_of::<i64>(cols, part_of, row_of)?)),
+        _ => None,
+    }
+}
+
+fn gather_strings_of<O: OffsetSizeTrait>(
+    cols: &[&dyn Array],
+    part_of: &[u32],
+    row_of: &[u32],
+) -> Option<GenericStringArray<O>> {
+    let arrs: Vec<&GenericStringArray<O>> = cols
+        .iter()
+        .map(|a| a.as_any().downcast_ref::<GenericStringArray<O>>())
+        .collect::<Option<_>>()?;
+    let n = part_of.len();
+
+    // Phase 1 (parallel): each row's source span, and each chunk's byte total. The span is
+    // recorded so phase 3 reads a sequentially-addressed scratch array rather than chasing
+    // `offsets[row_of[k]]` through a cold buffer a second time. Which *array* it came from is
+    // not recorded — `part_of` is already a sequential read in phase 3.
+    let mut spans: Vec<(u32, u32)> = vec![(0, 0); n];
+    let chunk_totals: Vec<Option<usize>> = spans
+        .par_chunks_mut(TAKE_CHUNK_ROWS)
+        .zip(part_of.par_chunks(TAKE_CHUNK_ROWS))
+        .zip(row_of.par_chunks(TAKE_CHUNK_ROWS))
+        .map(|((out, parts), rows)| {
+            let mut total = 0usize;
+            for (slot, (&p, &r)) in out.iter_mut().zip(parts.iter().zip(rows)) {
+                let offsets = arrs.get(p as usize)?.value_offsets();
+                let start = offsets.get(r as usize)?.as_usize();
+                let len = offsets.get(r as usize + 1)?.as_usize() - start;
+                *slot = (u32::try_from(start).ok()?, u32::try_from(len).ok()?);
+                total += len;
+            }
+            Some(total)
+        })
+        .collect();
+    let chunk_totals: Vec<usize> = chunk_totals.into_iter().collect::<Option<_>>()?;
+
+    // Phase 2: exclusive prefix sum over chunks, and the offset-width check, once per chunk.
+    let mut bases: Vec<usize> = Vec::with_capacity(chunk_totals.len());
+    let mut running = 0usize;
+    for &t in &chunk_totals {
+        bases.push(running);
+        running += t;
+    }
+    O::from_usize(running)?;
+
+    // Phase 3: carve the output into the ranges phase 2 reserved and fill each in parallel.
+    let mut values = vec![0u8; running];
+    let mut rest = values.as_mut_slice();
+    let mut dsts: Vec<&mut [u8]> = Vec::with_capacity(chunk_totals.len());
+    for &t in &chunk_totals {
+        let (head, tail) = rest.split_at_mut(t);
+        dsts.push(head);
+        rest = tail;
+    }
+    let mut offsets: Vec<O> = vec![O::usize_as(0); n + 1];
+    offsets[1..]
+        .par_chunks_mut(TAKE_CHUNK_ROWS)
+        .zip(spans.par_chunks(TAKE_CHUNK_ROWS))
+        .zip(part_of.par_chunks(TAKE_CHUNK_ROWS))
+        .zip(dsts.into_par_iter().zip(bases.par_iter()))
+        .for_each(|(((offs, rows), parts), (dst, &base))| {
+            let mut at = 0usize;
+            for ((slot, &(start, len)), &p) in offs.iter_mut().zip(rows).zip(parts) {
+                let (start, len) = (start as usize, len as usize);
+                dst[at..at + len]
+                    .copy_from_slice(&arrs[p as usize].value_data()[start..start + len]);
+                at += len;
+                *slot = O::usize_as(base + at);
+            }
+        });
+
+    // A gathered row is null exactly when its source row is, which is what `interleave` also
+    // produces. Built only when some source actually has nulls, matching arrow.
+    let nulls = arrs.iter().any(|a| a.null_count() > 0).then(|| {
+        NullBuffer::from_iter(
+            part_of
+                .iter()
+                .zip(row_of)
+                .map(|(&p, &r)| arrs[p as usize].is_valid(r as usize)),
+        )
+    });
+    Some(GenericStringArray::<O>::new(
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        values.into(),
+        nulls,
+    ))
+}
+
 /// How far ahead [`take_strings`] prefetches the *offset* pair for an upcoming row.
 ///
 /// Far enough that the fetch completes before the loop arrives — a last-level miss is on the
@@ -777,6 +891,57 @@ mod tests {
         let words: Vec<String> = (0..23).map(|i| format!("v{i}")).collect();
         let dict: DictionaryArray<Int32Type> = (0..rows).map(|i| words[i % 23].as_str()).collect();
         assert_matches_arrow(&dict, &indices);
+    }
+
+    /// The plane-addressed string gather must equal `arrow::compute::interleave` row for row.
+    ///
+    /// Sized past a chunk boundary and given varying widths, empty rows and nulls, because the
+    /// per-chunk prefix sum is what a fixed-width test cannot exercise: with every row the same
+    /// length a chunk's byte total is its row count times a constant, and a wrong base would
+    /// still land on a value boundary. Sources of *different lengths* matter too — a row's
+    /// coordinates name an array and a row inside it, and a single flattened offset would read
+    /// the wrong array without ever going out of bounds.
+    #[test]
+    fn the_plane_addressed_string_gather_equals_interleave() {
+        let a = StringArray::from(vec![Some("alpha"), None, Some(""), Some("dd")]);
+        let b = StringArray::from(vec![Some("z"), Some("yyyyyyyy"), None]);
+        let c = StringArray::from(
+            (0..TAKE_CHUNK_ROWS + 5)
+                .map(|i| (i % 6 != 0).then(|| "q".repeat(i % 23)))
+                .collect::<Vec<Option<String>>>(),
+        );
+        let lens = [a.len(), b.len(), c.len()];
+        let rows = TAKE_CHUNK_ROWS * 2 + 3;
+        let part_of: Vec<u32> = (0..rows).map(|i| (i % 3) as u32).collect();
+        let row_of: Vec<u32> = (0..rows)
+            .map(|i| ((i * 7919) % lens[i % 3]) as u32)
+            .collect();
+
+        let cols: Vec<&dyn Array> = vec![&a, &b, &c];
+        let pairs: Vec<(usize, usize)> = part_of
+            .iter()
+            .zip(&row_of)
+            .map(|(&p, &r)| (p as usize, r as usize))
+            .collect();
+        let want = arrow::compute::interleave(&cols, &pairs).unwrap();
+        let got = gather_strings(&cols, &part_of, &row_of).expect("the string plane path");
+        assert_eq!(want.as_ref(), got.as_ref());
+    }
+
+    /// Anything the plane-addressed gather does not model must decline rather than guess.
+    #[test]
+    fn the_plane_addressed_gather_declines_what_it_does_not_model() {
+        let s = StringArray::from(vec!["a", "b"]);
+        let i = Int64Array::from(vec![1, 2]);
+        let l = LargeStringArray::from(vec!["a", "b"]);
+        let planes = ([0u32, 1], [0u32, 1]);
+        // A non-string column, and a mixed Utf8/LargeUtf8 set, both fall back to `interleave`.
+        assert!(gather_strings(&[&i, &i], &planes.0, &planes.1).is_none());
+        assert!(gather_strings(&[&s, &l], &planes.0, &planes.1).is_none());
+        assert!(gather_strings(&[], &[], &[]).is_none());
+        // The types it does model still answer.
+        assert!(gather_strings(&[&s, &s], &planes.0, &planes.1).is_some());
+        assert!(gather_strings(&[&l, &l], &planes.0, &planes.1).is_some());
     }
 
     /// The parallel and serial paths must agree with each other, not just each with arrow.
