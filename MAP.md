@@ -2728,8 +2728,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `errors.rs` | 90 | Classified shuffle-fetch exceptions at the PyO3 boundary. |
 | `flight.rs` | 667 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `hardware.rs` | 193 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `hardware.rs` | 245 | What the engine's own process knows about its hardware and its allocator. |
+| `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 510 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 136 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
@@ -2753,7 +2753,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `lib.rs` | 713 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 374 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/external_sort.rs` | 451 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
-| `ops/joins.rs` | 606 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
+| `ops/joins.rs` | 539 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 247 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 260 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1535 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
@@ -2812,7 +2812,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 428 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 287 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `error.rs` | 112 | The crate's error type: how the stateful runtime structures report failure. |
-| `gather.rs` | 474 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
+| `gather.rs` | 635 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length string columns. |
 | `join/asof.rs` | 246 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 175 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 304 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |

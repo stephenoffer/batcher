@@ -710,6 +710,7 @@ fn engine_features() -> Vec<&'static str> {
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    hardware::tune_allocator();
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
     // The build profile, so the benchmark harness can refuse to report a timing taken
     // against an unoptimized engine. `just build` (the dev profile) sets no `opt-level`

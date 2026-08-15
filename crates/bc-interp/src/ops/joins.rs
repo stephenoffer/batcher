@@ -198,89 +198,22 @@ pub(crate) fn gather_join_output(
     )?)
 }
 
-/// Rows to gather below which splitting a single column across threads costs more than the
-/// `concat` it adds. A few morsels' worth of `take` is already memory-bound on one core.
-const GATHER_CHUNK_MIN_ROWS: usize = 8 * bc_arrow::DEFAULT_MORSEL_ROWS;
-
-/// Whether `concat`-ing chunk-wise `take` results reproduces a single `take` *exactly*, in
-/// representation and not merely in logical value.
-///
-/// Flat, self-describing types do. A **dictionary** does not: `take` re-indexes keys against
-/// the original dictionary, while `concat` over several dictionary chunks may unify them into a
-/// different dictionary — logically the same values behind a different encoding. Nested types
-/// (list/struct/union/map) and run-end encoding carry the same class of representational
-/// question. None of that is worth reasoning about per type for a scheduling optimization, so
-/// the chunked path is opt-in for the flat types where the identity is obvious, and everything
-/// else takes the single-shot gather — slower on one column, and unambiguously correct.
-fn chunkable(dt: &arrow::datatypes::DataType) -> bool {
-    use arrow::datatypes::DataType as D;
-    matches!(
-        dt,
-        D::Boolean
-            | D::Int8
-            | D::Int16
-            | D::Int32
-            | D::Int64
-            | D::UInt8
-            | D::UInt16
-            | D::UInt32
-            | D::UInt64
-            | D::Float16
-            | D::Float32
-            | D::Float64
-            | D::Utf8
-            | D::LargeUtf8
-            | D::Binary
-            | D::LargeBinary
-            | D::Date32
-            | D::Date64
-            | D::Time32(_)
-            | D::Time64(_)
-            | D::Timestamp(_, _)
-            | D::Duration(_)
-            | D::Interval(_)
-            | D::Decimal128(_, _)
-            | D::Decimal256(_, _)
-    )
-}
-
-/// One output column's gather, split across threads when it is large enough to pay for the
-/// concatenation that rejoins it.
+/// One output column's gather.
 ///
 /// Parallelizing across *columns* alone leaves the common narrow join (two or three output
-/// columns) using two or three cores on a 16-core box, and the gather is the dominant cost. A
-/// chunked `take` fixes that: `take` is positional — `out[i] = source[indices[i]]` — so taking
-/// contiguous index ranges and concatenating them in order reproduces the single-shot result
-/// exactly. Order is preserved by construction, not by convention, which matters because a
-/// `LIMIT` over this join must return the same rows on every executor.
+/// columns) using two or three cores on a 96-core box, and the gather is the dominant cost —
+/// on a 20M-row self-join this loop was 2.1s of a 4.0s join. Splitting a single column across
+/// threads is therefore essential, and it lives in `bc_runtime::gather::take_column`, which
+/// fills one output buffer from disjoint parallel chunks for the fixed-width and string types
+/// and falls back to a chunked `take` + `concat` for the rest.
+///
+/// It used to be done *here* instead, by chunking the index list and concatenating — which
+/// reached every core but wrote every value twice, and, because each chunk was `rows/threads`
+/// rows, kept every chunk under the runtime's own parallel threshold so the single-buffer
+/// paths there could never run. One gather entry point, taking the best route it has for the
+/// type, is both faster and one implementation rather than two.
 fn gather_column(source: &dyn Array, indices: &UInt32Array) -> Result<ArrayRef, InterpError> {
-    let rows = indices.len();
-    let width = rayon::current_num_threads();
-    if width < 2 || rows < GATHER_CHUNK_MIN_ROWS || !chunkable(source.data_type()) {
-        return Ok(bc_runtime::gather::take_column(source, indices)?);
-    }
-    let chunk = rows.div_ceil(width);
-    let pieces: Vec<ArrayRef> = (0..rows)
-        .step_by(chunk)
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|start| -> Result<ArrayRef, InterpError> {
-            let slice = indices.slice(start, chunk.min(rows - start));
-            Ok(bc_runtime::gather::take_column(source, &slice)?)
-        })
-        .collect::<Result<_, _>>()?;
-    let refs: Vec<&dyn Array> = pieces.iter().map(|p| p.as_ref()).collect();
-    // `bc_runtime::gather::concat_columns`, not arrow's `concat` — the reassembly is not free
-    // for the column type that most needs the parallel gather above it. Arrow's `concat` drives
-    // `MutableArrayData::extend` once per row, so stitching a `Utf8` column's chunks back
-    // together is a *serial* copy of every byte the parallel `take` just produced, and it
-    // dominates: on the sf10 60M x 15M join, gathering one string build-side column ran the
-    // whole `hash_join` at 40% CPU and 741 ms, against 339 ms at 69% for the same join gathering
-    // an integer column instead. `concat_columns` sums the lengths into the offset buffer and
-    // copies each input's bytes into its own disjoint output slice across cores, and delegates
-    // to arrow for every type (and every offset overflow) it does not fast-path — so this is the
-    // same bytes in the same order, only assembled on more than one core.
-    Ok(bc_runtime::gather::concat_columns(&refs)?)
+    Ok(bc_runtime::gather::take_column(source, indices)?)
 }
 
 /// The schema a join's gathered output carries: one nullable field per `output` column,
@@ -690,61 +623,6 @@ mod tests {
             &UInt32Array::from(vec![0u32, 1, 2]),
             rows
         ));
-    }
-
-    /// The chunked gather must reproduce the single-shot gather **exactly**, not merely as a
-    /// multiset — it is what preserves join output order, and a `LIMIT` above the join turns any
-    /// reordering into wrong rows rather than a slow query. Sized past `GATHER_CHUNK_MIN_ROWS`
-    /// so the chunked arm actually runs; nulls and strings are included because the offset and
-    /// validity buffers are exactly where a chunk boundary would go wrong.
-    #[test]
-    fn a_chunked_gather_equals_the_single_shot_gather() {
-        let n = GATHER_CHUNK_MIN_ROWS * 2 + 7; // deliberately not a multiple of the chunk size
-        let ints: ArrayRef = Arc::new(Int64Array::from(
-            (0..n as i64)
-                .map(|i| if i % 5 == 0 { None } else { Some(i) })
-                .collect::<Vec<_>>(),
-        ));
-        let strs: ArrayRef = Arc::new(arrow::array::StringArray::from(
-            (0..n)
-                .map(|i| {
-                    if i % 7 == 0 {
-                        None
-                    } else {
-                        Some(format!("v{i}"))
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ));
-        // A permutation with repeats, so this is a real gather rather than the identity.
-        let idx = UInt32Array::from(
-            (0..n)
-                .map(|i| ((i * 2654435761) % n) as u32)
-                .collect::<Vec<_>>(),
-        );
-        for source in [ints, strs] {
-            let single = bc_runtime::gather::take_column(source.as_ref(), &idx).unwrap();
-            let chunked = gather_column(source.as_ref(), &idx).unwrap();
-            assert_eq!(chunked.len(), single.len());
-            assert_eq!(&chunked, &single, "chunked gather diverged from the oracle");
-        }
-    }
-
-    /// A dictionary column must decline the chunked path: `concat` may unify chunk dictionaries
-    /// into an encoding a single `take` would never produce.
-    #[test]
-    fn a_dictionary_column_is_not_chunked() {
-        use arrow::datatypes::DataType as D;
-        assert!(!chunkable(&D::Dictionary(
-            Box::new(D::Int32),
-            Box::new(D::Utf8)
-        )));
-        assert!(!chunkable(&D::List(Arc::new(ArrowField::new(
-            "i",
-            D::Int64,
-            true
-        )))));
-        assert!(chunkable(&D::Int64) && chunkable(&D::Utf8));
     }
 
     fn int_batch(name: &str, vals: Vec<i64>) -> RecordBatch {
