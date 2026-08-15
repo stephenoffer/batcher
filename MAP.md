@@ -1569,7 +1569,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `gpu_transform.py` | 313 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 176 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 239 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
-| `scan_only.py` | 125 | A bare scan needs no engine — the reader has already produced the plan's output. |
+| `scan_only.py` | 162 | A bare scan needs no engine — the reader has already produced the plan's output. |
 | `stats.py` | 189 | Column-statistics measurement — Core's lane. |
 | `streaming_runner.py` | 345 | How one micro-batch gets run — the seam between the loop and where the work happens. |
 
