@@ -29,6 +29,26 @@ use crate::InterpError;
 /// combine only every `N` morsels.
 const AGG_FOLD_EVERY: usize = 32;
 
+/// Partial rows a morsel may keep, per input row, before pre-aggregating it *alone* stops
+/// paying — the streaming twin of `agg_par::REDUCTION_CEILING`, and the same number.
+///
+/// A morsel is 16,384 rows. A key with 10,000 groups therefore fills a morsel's hash table
+/// almost completely: the partial keeps ~0.5 rows per input row, its group columns are `take`n
+/// out at that width, and `combine` inherits half the relation — all to discover a reduction
+/// the *shard* achieves 12x better. Above this ratio the fold buffers morsels and groups them
+/// together instead, which is `agg_par::chunked_partials`' argument driven by a measurement the
+/// stream can take as it goes rather than from a sample.
+const MORSEL_REDUCTION_CEILING: f64 = 0.20;
+
+/// Rows the chunked fold buffers before it groups them.
+///
+/// The chunk is what bounds this path's extra memory: it holds the buffered morsels and, for
+/// the moment `concat` runs, a copy of them — so a shard's transient footprint is ~2x this
+/// many rows, not the relation. 128 k rows is eight morsels, enough for a 10,000-group key to
+/// reduce ~12x over a single morsel, and small enough that a wide row (blobs, embeddings)
+/// stays inside a few MB per shard.
+const CHUNK_FOLD_ROWS: usize = 128 * 1024;
+
 /// Morsels each worker gets per parallel fold round.
 ///
 /// The round is the unit of buffering, so this is what the "streaming" aggregate holds of its
@@ -403,6 +423,16 @@ pub(crate) fn fold_partial(
     // per-expression cost once per core (~90× on a big box), which measured as a real fraction
     // of a low-cardinality aggregate — this hoists it to exactly one compile per query.
 
+    // Whether a morsel's own partial reduces enough to be worth taking — decided by the first
+    // one, then held. See [`MORSEL_REDUCTION_CEILING`]: below the ceiling this is the ordinary
+    // per-morsel fold; above it, morsels are buffered into [`CHUNK_FOLD_ROWS`]-row chunks and
+    // grouped together, so the hash build runs against the shard's cardinality rather than a
+    // morsel's. Same `partial`s over the same rows in the same order — a bigger unit, nothing
+    // else — so `combine`, `finalize`, the spill path and the distributed reduce are untouched.
+    let mut per_morsel: Option<bool> = None;
+    let mut chunk: Vec<RecordBatch> = Vec::new();
+    let mut chunk_rows = 0usize;
+
     for morsel in input {
         let morsel = morsel?;
         if morsel.num_rows() == 0 {
@@ -410,7 +440,22 @@ pub(crate) fn fold_partial(
         }
         rows_in += morsel.num_rows() as u64;
         let jit = jit.get_or_init(|| ops::compile_agg(group_keys, aggregates, &morsel));
-        partials.push(ops::eval_partial_jit(&morsel, group_keys, aggregates, jit)?);
+        if per_morsel == Some(false) {
+            chunk_rows += morsel.num_rows();
+            chunk.push(morsel);
+            if chunk_rows >= CHUNK_FOLD_ROWS {
+                partials.push(group_chunk(&mut chunk, group_keys, aggregates, jit)?);
+                chunk_rows = 0;
+            }
+        } else {
+            let partial = ops::eval_partial_jit(&morsel, group_keys, aggregates, jit)?;
+            if per_morsel.is_none() {
+                let kept = partial.group_columns.first().map_or(0, |c| c.len());
+                per_morsel =
+                    Some((kept as f64 / morsel.num_rows() as f64) < MORSEL_REDUCTION_CEILING);
+            }
+            partials.push(partial);
+        }
         // Bounded: without this the "streaming" aggregate quietly re-materializes its input as a
         // heap of per-morsel partials. Combining on *every* morsel would instead re-hash the
         // whole running state once per morsel; batching the fold keeps state at O(groups).
@@ -422,6 +467,12 @@ pub(crate) fn fold_partial(
             partials.clear();
         }
     }
+    if !chunk.is_empty() {
+        let jit = jit
+            .get()
+            .expect("a buffered chunk implies a compiled aggregate");
+        partials.push(group_chunk(&mut chunk, group_keys, aggregates, jit)?);
+    }
 
     if let Some(prev) = folded.take() {
         partials.push(prev);
@@ -430,6 +481,27 @@ pub(crate) fn fold_partial(
         return Ok((None, rows_in));
     }
     Ok((Some(agg::combine(&partials, &funcs)?), rows_in))
+}
+
+/// Group a buffered run of morsels as one unit, draining the buffer.
+///
+/// A single morsel needs no concatenation — copying it to group it would be pure loss — which
+/// is also what makes the chunked path safe to enter on a short input.
+fn group_chunk(
+    chunk: &mut Vec<RecordBatch>,
+    group_keys: &[bc_ir::ProjectionItem],
+    aggregates: &[bc_ir::AggregateItem],
+    jit: &ops::AggJit,
+) -> Result<agg::Partial, InterpError> {
+    let partial = match chunk.as_slice() {
+        [only] => ops::eval_partial_jit(only, group_keys, aggregates, jit),
+        many => {
+            let joined = arrow::compute::concat_batches(&many[0].schema(), many)?;
+            ops::eval_partial_jit(&joined, group_keys, aggregates, jit)
+        }
+    };
+    chunk.clear();
+    partial
 }
 
 /// `finalize` one (already combined) partial into the aggregate's output batch.

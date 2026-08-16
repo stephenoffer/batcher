@@ -2773,7 +2773,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/breaker.rs` | 595 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 236 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
-| `stream/folds.rs` | 469 | The mergeable folds a streaming breaker reduces its input with. |
+| `stream/folds.rs` | 541 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 309 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 696 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/parallel.rs` | 1366 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
@@ -2798,7 +2798,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/finalize.rs` | 63 | The finalize dispatch — turning each aggregate's merged partial into its output column. |
 | `agg/fused.rs` | 638 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
-| `agg/group/assign.rs` | 1370 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
+| `agg/group/assign.rs` | 1484 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
 | `agg/group/combine.rs` | 561 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
 | `agg/group/hash.rs` | 296 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 32 | Group-key assignment and the parallel `combine` regroup. |
