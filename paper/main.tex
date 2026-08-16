@@ -96,17 +96,24 @@ everywhere, which is what lets \sys{} plan the next query from what it measured
 rather than from vendor constants.
 
 The result is breadth that costs nothing. On relational work, one 96-core machine
-matches DuckDB on TPC-H~\cite{tpch} sf1, leads Polars and Daft by
-$1.8$--$2.2\times$, sweeps PyArrow's Acero engine, and wins 43 of 43 ClickBench
-queries against DuckDB on identical input. On eight nodes, aggregate shuffle
+leads DuckDB's own compressed store on TPC-H~\cite{tpch} sf1 ($0.76\times$), on all 99
+queries of TPC-DS~\cite{tpcds} ($0.96\times$) and on ClickBench~\cite{clickbench}
+($0.62\times$), leads Polars and Daft by $2.3$--$2.9\times$, sweeps PyArrow's Acero
+engine, and wins every TPC-H and every ClickBench query against DuckDB reading the
+identical Arrow input. On eight nodes, aggregate shuffle
 throughput rises superlinearly, $7.6\times$ for $4\times$ the hardware. On the AI
 pipelines a purpose-built runtime was designed for, it holds $2$--$3.6\times$ against
 Ray Data while treating decode and inference as relational operators. And streaming
 inherits the batch operators unchanged: peak memory on a join-heavy query is 3.4\,MB
 at one million rows and 3.3\,MB at four million, against 198\,MB and 794\,MB for
-\sys{}'s own materializing executor on the same query. One axis is not yet won:
-reading raw Arrow, \sys{} trails DuckDB's compressed native store with zone maps,
-and the evaluation isolates that gap to storage and not to execution.
+\sys{}'s own materializing executor on the same query. Three axes are not yet won, and
+the evaluation attributes each rather than averaging it away. Two are storage: at ten
+times the data DuckDB's compressed store leads again ($1.29\times$ at sf10), and a
+group-by on low-cardinality string keys loses to that store's dictionary encoding while
+beating it $9\times$ on identical input. The third is not. The Join Order
+Benchmark~\cite{leis2015goodjoin} --- the suite built to expose the estimation errors
+this design claims to correct --- remains $1.37\times$ behind, and the losses trace to
+estimates this paper's own cost model gets wrong.
 \end{abstract}
 
 \begin{figure*}[tbp]
@@ -131,16 +138,16 @@ and the evaluation isolates that gap to storage and not to execution.
 % ---- Panel A: relational ---------------------------------------------------
 \begin{axis}[hbar, name=relA,
   width=0.42\textwidth, xmax=4.0, xtick={0,1,2,3,4},
-  symbolic y coords={store,duck,daft,polars},
-  ytick={store,duck,daft,polars},
-  yticklabels={DuckDB {\tiny(native store)},DuckDB {\tiny(same Arrow)},Daft,Polars},
+  symbolic y coords={store,polars,daft,duck},
+  ytick={store,polars,daft,duck},
+  yticklabels={DuckDB {\tiny(native store)},Polars,Daft,DuckDB {\tiny(same Arrow)}},
   xlabel={\sys{} speedup ($\times$) --- higher is better},
-  title={Relational\\{\scriptsize\mdseries TPC-H sf10, one 96-core node}},
+  title={Relational\\{\scriptsize\mdseries TPC-H sf1, one 96-core node}},
 ]
-\fill[okOrange!12] (axis cs:0,store) rectangle (axis cs:1,polars);
-\addplot[draw=okVermillion, fill=okOrange!45] coordinates {(0.67,store)};
-\addplot[draw=okBlue, fill=okSky!60] coordinates {(1.89,duck) (1.92,daft) (2.22,polars)};
-\draw[draw=pfigGray, dashed, line width=0.7pt] (axis cs:1,store) -- (axis cs:1,polars);
+\fill[okOrange!12] (axis cs:0,store) rectangle (axis cs:1,duck);
+\addplot[draw=okBlue, fill=okSky!60]
+  coordinates {(1.33,store) (2.35,polars) (2.86,daft) (3.85,duck)};
+\draw[draw=pfigGray, dashed, line width=0.7pt] (axis cs:1,store) -- (axis cs:1,duck);
 \end{axis}
 % ---- Panel B: AI pipelines -------------------------------------------------
 \begin{axis}[hbar, name=aiB, at={($(relA.east)+(20mm,0)$)}, anchor=west,
@@ -161,9 +168,12 @@ and the evaluation isolates that gap to storage and not to execution.
 AI, nor an AI runtime that tolerates SQL. On the left it beats the fastest native
 engines on a standard SQL benchmark; on the right it beats a runtime purpose-built
 for GPU pipelines, on that runtime's own workloads, while treating decode and
-inference as relational operators under the same optimizer. The amber bar is the
-honest one: against DuckDB's compressed native store with zone maps, \sys{} reading
-raw Arrow loses, and \cref{sec:eval} isolates that to storage and not to kernels.
+inference as relational operators under the same optimizer. The bottom-left bar is the
+one to read carefully: it is DuckDB's compressed native store with zone maps against
+\sys{} reading raw Arrow --- a storage engine \emph{and} an execution engine against an
+execution engine alone --- and \sys{} leads it by $1.33\times$ at this scale but not at
+ten times it, where the same comparison inverts to $0.78\times$. \cref{sec:eval}
+isolates that to storage and to four superlinear query shapes, not to kernels.
 Two axes not shown here move the same way: aggregate shuffle throughput rises
 $7.6\times$ for $4\times$ the nodes, and a join-heavy streaming query holds 3.4\,MB
 where a materializing executor takes 198\,MB.}
@@ -747,7 +757,10 @@ native Rust engines over Arrow~\cite{arrow}, and Daft distributes over Ray.
 
 \cref{tab:differs} places \sys{} against all of them, and the pattern in it is the
 paper's thesis in tabular form. \sys{} does not lead because its kernels are faster
-than everyone else's; on several rows it is at parity, and on storage it is behind.
+than everyone else's; on several rows it is at parity, and on storage --- a compressed,
+dictionary-encoded, zone-mapped format, which \cref{sec:algebra}'s Arrow-only contract
+forecloses --- it is behind, which \cref{sec:eval} shows is where every remaining
+relational loss lives.
 It leads where the previous generation shipped a constant and \sys{} ships a
 measurement, and where the previous generation required a second system.
 
@@ -984,21 +997,23 @@ the smaller sizes become $1.6$--$2.0\times$ wins.
 \cmidrule(lr){2-3}\cmidrule(lr){5-6}
 Baseline & geomean $b/x$ & wins & & geomean $b/x$ & wins & Note \\
 \midrule
-DuckDB (native compressed store) & 1.02$\times$ & 12/22 & & \loss 1.49$\times$ & \loss 3/22 & compressed store \\
-DuckDB (same Arrow input)        & \win \textbf{0.34}$\times$ & \win \textbf{22/22} & & \win \textbf{0.53}$\times$ & \win \textbf{21/22} & like-for-like$^*$ \\
-Polars~\cite{polars}             & \win \textbf{0.55}$\times$ & \win 19/22 & & \win \textbf{0.45}$\times$ & \win 17/22 & \\
-Daft~\cite{daft}                 & \win \textbf{0.48}$\times$ & \win 18/20 & & \win \textbf{0.52}$\times$ & 13/20 & wrong answers on q6, q15$^\dagger$ \\
+DuckDB (native compressed store) & \win \textbf{0.76}$\times$ & \win 17/22 & & \loss 1.29$\times$ & \loss 8/22 & compressed store \\
+DuckDB (same Arrow input)        & \win \textbf{0.26}$\times$ & \win \textbf{22/22} & & --- & --- & like-for-like$^*$ \\
+Polars~\cite{polars}             & \win \textbf{0.43}$\times$ & \win 21/22 & & \win \textbf{0.37}$\times$ & \win 18/22 & \\
+Daft~\cite{daft}                 & \win \textbf{0.35}$\times$ & \win \textbf{20/20} & & \win \textbf{0.42}$\times$ & \win 16/20 & wrong answers on q6, q15$^\dagger$ \\
 Spark~\cite{armbrust2015sparksql}& 0.041$\times$ & 22/22 & & 0.074$\times$ & 22/22 & reads Parquet in timed region$^\ddagger$ \\
 
 \bottomrule
 \end{tabular}
 \caption{TPC-H, all 22 queries, correctness-gated, one 96-core node. $b/x$ is
 $\text{\sys{}}_{ms}/x_{ms}$: \textbf{below 1.00 means \sys{} is faster.} Suite
-totals (ms), sf1 / sf10: \sys{} 618 / 4{,}491; DuckDB 616 / 2{,}353; Polars
-1{,}256 / 10{,}624; Daft 1{,}224 / 9{,}261; Spark 14{,}555 / 57{,}781.
-$^*$Separate run: DuckDB executing the same zero-copy Arrow \sys{} is given, not a
-compressed store it was allowed to build first; sf1 563 vs 1{,}581\,ms, sf10 4{,}453 vs
-8{,}436\,ms. Both arms must be timed on an otherwise idle machine: DuckDB-on-Arrow
+totals (ms), sf1 / sf10: \sys{} 472 / 3{,}707; DuckDB 594 / 2{,}038; Polars
+1{,}173 / 9{,}914; Daft 1{,}152 / 8{,}680; Spark 14{,}555 / 57{,}781.
+$^*$DuckDB executing the same zero-copy Arrow \sys{} is given, not a compressed store it
+was allowed to build first; sf1 472 vs 1{,}632\,ms. It is not reported at sf10: over Arrow
+views DuckDB's planner has no storage statistics to order a many-way join with, and it was
+\emph{SIGKILL}ed on TPC-DS q64 and still growing past 22\,GiB on q72 for the same reason.
+Both arms must be timed on an otherwise idle machine: DuckDB-on-Arrow
 degrades far more than \sys{} under CPU contention, and a run sharing the box with a
 test suite inflated this ratio by roughly ten times (q17 read 1{,}033\,ms against 83\,ms
 idle) --- an error in \sys{}'s favour, which is the direction that gets published.
@@ -1031,66 +1046,188 @@ here are combinations of a non-default flag with a non-default path.
 
 \subsection{TPC-H}
 
-\cref{tab:tpch} is the headline, and it splits cleanly. Against Polars and Daft,
-\sys{} leads by $1.8$--$2.2\times$ in geometric mean at both scales. Against DuckDB
-the result splits along the line \cref{tab:differs} predicted: on identical Arrow
-input \sys{} wins 21 of 22 at sf10 and is $1.89\times$ faster overall, and against
-DuckDB's compressed native store it loses. q1 and q6 are essentially scans and sit at
-$1.47\times$/$1.52\times$, about what reading compressed pages instead of raw Arrow
-buys, but q21 ($3.18\times$), q9 ($3.79\times$), q7 ($3.19\times$) and q5
-($3.95\times$) are several times that, and those are engine work.
+\cref{tab:tpch} is the headline, and the line it splits along has moved. Against
+Polars and Daft, \sys{} leads by $2.3$--$2.9\times$ in geometric mean at both scales,
+and against DuckDB on identical Arrow input it wins \emph{every} query at sf1 by
+$3.9\times$ overall. The result that changed is the third one: \sys{} now also leads
+DuckDB's \emph{compressed native store} at sf1, $0.76\times$ on 17 of 22 queries,
+where an earlier build of this system read $1.02\times$ on 12 of 22. That comparison
+gives DuckDB an untimed ingest into a compressed, dictionary-encoded, zone-mapped
+format and \sys{} nothing but raw Arrow, so it is a storage engine \emph{and} an
+execution engine against an execution engine alone --- and it is the bar this paper
+previously conceded.
+
+It is conceded at sf10, where the same comparison reads $1.29\times$. That boundary is
+worth locating rather than bracketing, because it is not a uniform degradation. Going
+from sf1 to sf10 --- ten times the rows --- nine of thirteen measured shapes cost
+\emph{less} than ten times as much: q15 $1.4\times$, q22 $2.3\times$, q6 $5.2\times$,
+q10 $5.4\times$, q1 and q8 $6.0\times$, q7 $6.5\times$, q3 $7.3\times$, q21
+$7.4\times$. Four are superlinear and carry the loss between them: q5 ($14.9\times$),
+q13 ($12.7\times$), q18 ($12.5\times$) and q9 ($11.2\times$), which are the two
+highest-cardinality group-bys in the benchmark, its largest intermediate, and its
+six-way join. The gap at scale is those four shapes plus a compressed scan, not a
+uniformly slower engine.
 
 Correctness is not free for everyone. Daft gets TPC-H q6 wrong at both scales,
 dropping the \texttt{l\_discount = 0.07} rows because $0.06+0.01$ in IEEE double is
-$0.06999999999999999$, and Polars makes the same mistake; ground truth computed
-independently in PyArrow equals the official answer. Hence the gate on every timing.
-A benchmark that does not check results reports the fastest wrong answer.
+$0.06999999999999999$; it also returns an empty q15 and cannot run q21 or q22, and
+Polars cannot parse eight of the 99 TPC-DS queries. Ground truth computed
+independently in PyArrow equals the official answer. Hence the gate on every timing,
+and the reporting of such a case as incomparable rather than as a win: a benchmark
+that does not check results reports the fastest wrong answer.
 
 \subsection{Operator mix and ClickBench}
 
 \begin{table}[tbp]
-\centering\small
-\setlength{\tabcolsep}{5pt}
-\begin{tabular}{lrrrr}
+\centering\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{lrrrrr}
 \toprule
-Operator case & DuckDB & Polars & PyArrow & Daft \\
+& \multicolumn{2}{c}{DuckDB} & & & \\
+\cmidrule(lr){2-3}
+Operator case & native & Arrow & Polars & PyArrow & Daft \\
 \midrule
-\texttt{groupby-sum}     & \win 0.80 & \win 0.42 & \win 0.60 & \win 0.37 \\
-\texttt{groupby-2key}    & \win 0.62 & \win 0.40 & \win 0.54 & \win 0.22 \\
-\texttt{global-sum}      & \win 0.04 & \win 0.06 & \win 0.04 & \win 0.02 \\
-\texttt{filter-count}    & \win 0.07 & \win 0.03 & \win 0.00 & \win 0.03 \\
-\texttt{join-agg}        & \loss 1.25 & \loss 1.18 & \win 0.32 & \win 0.46 \\
-\texttt{sort-limit}      & \loss 1.09 & \win 0.02 & \win 0.01 & \win 0.10 \\
-\texttt{filter-project}  & \win 0.79 & \loss 1.10 & \win 0.06 & \win 0.49 \\
-\texttt{window-rank}     & \win 0.84 & \win 0.12 & --- & hangs \\
-\texttt{window-runsum}   & \win 0.50 & \win 0.15 & --- & hangs \\
-\texttt{window-lag}      & \win 0.71 & \win 0.04 & --- & hangs \\
-\texttt{window-sum-part} & \win 0.64 & \win 0.85 & --- & hangs \\
+\texttt{global\-sum}$^\S$      & \win 0.11 & \win 0.02 & \win 0.11 & \win 0.02 & \win 0.03 \\
+\texttt{filter\-count}$^\S$    & \win 0.31 & \win 0.02 & \win 0.04 & \win 0.00 & \win 0.06 \\
+\texttt{distinct\-limit}       & \win 0.19 & \win 0.16 & \win 0.13 & \win 0.02 & \win 0.17 \\
+\texttt{window\-runsum}        & \win 0.20 & \win 0.21 & \win 0.06 & --- & --- \\
+\texttt{window\-lag}           & \win 0.36 & \win 0.34 & \win 0.02 & --- & --- \\
+\texttt{window\-rank}          & \win 0.44 & \win 0.38 & \win 0.06 & --- & --- \\
+\texttt{distinct\-lowcard}   & \win 0.54 & \win 0.37 & \win 0.08 & \win 0.86 & \win 0.13 \\
+\texttt{window\-sum\-part}     & \win 0.65 & \win 0.58 & \win 0.65 & --- & \win 0.02 \\
+\texttt{dedup\-unordered}   & \win 0.80 & \win 0.64 & \win 0.10 & \win 0.02 & \win 0.45 \\
+\texttt{join\-agg}             & \win 0.83 & \win 0.35 & \win 0.65 & \win 0.14 & \win 0.19 \\
+\texttt{dedup\-ordered} & \win 0.92 & \win 0.57 & \win 0.03 & \win 0.03 & --- \\
+\texttt{sort\-limit}           & \win 0.94 & \win 0.78 & \win 0.03 & \win 0.00 & \win 0.14 \\
+\texttt{sort\-string}          & \loss 1.10 & \loss 1.12 & \win 0.28 & \win 0.03 & \win 0.03 \\
+\texttt{groupby\-2key}         & \loss 1.13 & \win 0.31 & \win 0.28 & \win 0.83 & \win 0.15 \\
+\texttt{filter\-project}       & \loss 1.21 & \win 0.39 & \win 0.58 & \win 0.04 & \win 0.72 \\
+\texttt{distinct\-highcard}  & \loss 1.24 & \loss 1.06 & \win 0.18 & \win 0.14 & \win 0.56 \\
+\texttt{sort\-str\-lowcard} & \loss 1.55 & \loss 1.13 & \win 0.28 & \win 0.04 & \win 0.09 \\
+\texttt{groupby\-sum}         & \loss 1.58 & \win 0.44 & \win 0.34 & \loss 1.18 & \win 0.14 \\
+\texttt{sort\-str\-limit}   & \loss 1.68 & \loss 1.04 & \win 0.03 & \win 0.00 & \win 0.12 \\
 \midrule
-\textbf{\sys{} wins}     & 8/11 & 9/11 & \textbf{7/7} & \textbf{7/7} \\
+geomean                        & \win \textbf{0.64} & \win \textbf{0.35} & \win \textbf{0.12} & \win \textbf{0.04} & \win \textbf{0.12} \\
+\textbf{\sys{} wins}           & 12/19 & 15/19 & \textbf{19/19} & 14/15 & \textbf{15/15} \\
 \bottomrule
 \end{tabular}
-\caption{Operator mix at sf1, $\text{\sys{}}_{ms}/x_{ms}$; below 1.00 is a \sys{}
-win. All engines take the same in-memory Arrow input, so this carries none of
-\cref{tab:tpch}'s scan asymmetry. PyArrow (Acero) has no window functions.}
+\caption{Operator mix at sf1, all 19 cases, $\text{\sys{}}_{ms}/x_{ms}$; below 1.00 is
+a \sys{} win, and rows are sorted by the first column. Every engine takes the same
+in-memory Arrow input; the two DuckDB columns differ only in whether it was allowed to
+ingest that input into its own compressed store first, which is the single variable
+\cref{tab:tpch} could not isolate. PyArrow (Acero) has no window functions.
+$^\S$Two cases \sys{} answers from a recorded column statistic rather than by
+executing --- an unfiltered \texttt{SUM} or \texttt{COUNT} over an immutable relation,
+served from a figure the first run computed. The answers are exact and gate-checked,
+but the timing is a memo lookup rather than a scan; excluding both, the two DuckDB
+geomeans are $0.76$ and $0.50$ over 17 cases, and those are the figures an execution
+claim should use.}
 \label{tab:opmix}
 \end{table}
 
 \cref{tab:opmix} is the cleanest comparison here: one input representation, one
-machine, no SQL front-end differences, no scan in the timed region for anybody.
-\sys{} sweeps PyArrow's Acero engine on all seven cases it can express and takes 8 of
-11 from DuckDB and 9 of 11 from Polars.
+machine, no SQL front-end differences, no scan in the timed region for anybody, and
+DuckDB present twice differing only in whether it ingested first. \sys{} takes all 19
+cases from Polars, all 15 Daft can express, 11 of 12 from PyArrow's Acero engine, 15
+of 19 from DuckDB-on-Arrow and 12 of 19 from DuckDB's native store.
+
+The four it loses to DuckDB-on-Arrow are informative because they are the only cases
+where the input is genuinely equal and \sys{} is still behind: three string sorts and a
+high-cardinality \texttt{DISTINCT}. Arrow's \texttt{Utf8} keeps a string's bytes in a
+separate buffer behind a 32-bit offset, so ordering one is a gather through an
+indirection where DuckDB compares a 16-byte value with its first bytes inline. That is
+a data-layout gap in the columnar format itself rather than in either engine, and it is
+the same gap \cref{sec:eval}'s group-by results attribute to storage.
 
 On ClickBench~\cite{clickbench} (43 queries, correctness-gated) \sys{} wins 43 of 43
-against DuckDB on identical Arrow input, every query, by $0.00$--$0.42\times$, and 35
-of 40 against Polars (the five losses are sub-3\,ms queries where fixed overhead
-dominates). Against DuckDB's \emph{native} store it wins a minority: 15 clear wins, 9
-within $\pm 10\%$, 19 clear losses. We report the split and not a win count
-because a fifth of the suite sits inside the noise a shared machine adds, and a run
-of ours on a quieter box put it at 26 of 43. The attribution survives that
-uncertainty: the same engine on the same 43 queries wins \emph{all} of them on
-identical Arrow input and a minority against a compressed store with zone maps. One
-variable, isolated, and the residue is storage, not kernels.
+against DuckDB on identical Arrow input --- every query, geomean $0.073\times$ --- and
+36 of 40 against Polars ($0.33\times$) and 41 of 41 against Daft ($0.26\times$).
+Against DuckDB's \emph{native} store it now wins the suite too, $0.62\times$ on 30 of
+43. Five of those 43, however, \sys{} answers from a recorded statistic rather than by
+executing, so the figure an execution claim should use is $0.77\times$ over the other
+38. Both numbers say the same thing about attribution: the same engine on the same
+queries sweeps a compressed store's execution engine on identical input and leads it
+more narrowly when the store is allowed to compress. One variable, isolated, and the
+residue is storage, not kernels.
+
+\subsection{Breadth: TPC-DS, the Join Order Benchmark, and H2O.ai}
+
+Two suites and a wide table are enough to be tuned for. \cref{tab:breadth} adds the
+three that are hardest to tune for and easiest to omit.
+
+\begin{table}[tbp]
+\centering\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{lrrr}
+\toprule
+Suite & Queries & geomean $b/\text{DuckDB}$ & wins \\
+\midrule
+JSON (semi-structured)   & 5   & \win \textbf{0.25}$\times$ & \win 5/5 \\
+ClickBench~\cite{clickbench} & 43 & \win \textbf{0.62}$\times$ & \win 30/43 \\
+Operator mix             & 19  & \win \textbf{0.64}$\times$ & \win 12/19 \\
+TPC-H~\cite{tpch} sf1    & 22  & \win \textbf{0.76}$\times$ & \win 17/22 \\
+H2O.ai \texttt{join}     & 5   & \win \textbf{0.95}$\times$ & 3/5 \\
+TPC-DS~\cite{tpcds} sf1  & 99  & \win \textbf{0.96}$\times$ & 44/99 \\
+\midrule
+H2O.ai \texttt{groupby}  & 10  & \loss 1.28$\times$ & \loss 4/10 \\
+TPC-H sf10               & 22  & \loss 1.29$\times$ & \loss 8/22 \\
+Join Order~\cite{leis2015goodjoin} & 113 & \loss 1.37$\times$ & \loss 31/109 \\
+\bottomrule
+\end{tabular}
+\caption{Every relational suite in the harness against DuckDB's \emph{native
+compressed store} --- the harder of the two bars --- on one 96-core node, ordered by
+result. Six of nine go to \sys{}. On identical Arrow input the margins widen: TPC-H
+22/22 at $0.26\times$, ClickBench 43/43 at $0.07\times$, and H2O \texttt{groupby}, a
+loss above, 10 of 10 at $0.11\times$.}
+\label{tab:breadth}
+\end{table}
+
+\textbf{TPC-DS}~\cite{tpcds} is 99 queries of roll-ups, grouping sets, correlated
+subqueries and snowflake joins, and every one of them is registered rather than a
+curated subset: a suite that registered only the queries the front-end already runs
+would report completeness and measure nothing. \sys{} takes the suite at $0.96\times$
+on 44 wins. What moved it there was not a kernel. A lookup of "what has been measured
+about this source's columns" walked every column of every source the session had ever
+seen, so on a 24-table schema each query paid roughly 264{,}000 key comparisons that
+grew with the session's own history --- the opposite of what a learning loop is for.
+Indexing it by source took the suite from $1.08\times$ to $0.96\times$ and moved no
+other suite at all, which is the signature of a fixed cost rather than a kernel.
+
+\textbf{The Join Order Benchmark}~\cite{leis2015goodjoin} is the one aimed squarely at
+this paper's thesis, and the one \sys{} loses. Its 113 queries run over a real IMDb
+snapshot whose predicates are correlated the way real data is, which is precisely
+where the independence assumptions in a textbook cost model fail; Leis et al. built it
+to show that estimation error, not the join-order search, is where optimizers lose. At
+$1.37\times$ it is the largest remaining relational gap, and the shape of the loss
+confirms their finding rather than ours: on \texttt{q13a}, 21 of the 733 join
+estimates the search makes price a join below one row, and zero times the next join's
+rows is zero, so a single such estimate takes every join above it with it. One
+instance of that we did fix, and it is instructive about how such estimates arise.
+\texttt{q32a} states \texttt{t1.id = mk.movie\_id} and then restates it; propagating
+the equivalence leaves \texttt{t1.id = t1.id} pushed into the scan, where containment
+prices a self-equality at $1/d$ --- \emph{one row} against an actual 2{,}528{,}312.
+The joins above then estimated zero and the build-side rule broadcast the 2.5M-row
+side against a 1-row one. Pricing a column compared with itself at its non-null share
+took that query from $22.4\times$ to $2.2\times$ and \texttt{q19b} from $10.1\times$
+to $1.3\times$. The suite also now completes: two earlier runs were killed by the
+memory a mis-ordered many-way join builds, and \texttt{q7c}, the query that took the
+process down, is now a win at 291\,ms against DuckDB's 504.
+
+\textbf{H2O.ai db-benchmark}~\cite{h2obenchmark} isolates the two things TPC-* buries
+inside larger plans: group-by state management, and join build-side selection. \sys{}
+takes the join task ($0.95\times$) and loses the group-by ($1.28\times$), and that
+split is legible rather than mysterious. The group-by keys are low-cardinality strings.
+DuckDB holds them dictionary-encoded and groups on eight-bit codes; \sys{} reads the
+same column as full Arrow \texttt{Utf8}, because \cref{sec:algebra}'s contract is that
+Arrow is the only columnar representation any operator sees. On identical Arrow input
+the same suite is $0.11\times$ and 10 of 10. The gap is the encoding, and we can
+measure exactly what it is worth: a two-key group-by over 10M rows costs $38.8$\,ms
+when the columns arrive already decoded and $151.5$\,ms when they arrive
+dictionary-encoded, because the boundary decodes them to satisfy that same contract.
+Handing \sys{} DuckDB's own representation therefore makes it \emph{slower}, not
+faster. Preserving the encoding requires separating a plan's
+logical type from a morsel's physical one, which is the one place where the paper's
+central constraint is currently paid for in performance rather than repaid.
 
 \subsection{The small case, which a warm benchmark never measures}
 \label{sec:smallquery}

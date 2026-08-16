@@ -95,16 +95,16 @@ means Batcher is faster**:
 
 | Suite | vs `duckdb` (native store) | vs `duckdb_arrow` (same Arrow) |
 |---|---:|---:|
-| Semi-structured JSON (5) | **0.23x** — 5 of 5 | **0.04x** — 5 of 5 |
+| Semi-structured JSON (5) | **0.25x** — 5 of 5 | **0.04x** — 5 of 5 |
 | ClickBench (43) | **0.62x** — 30 of 43 | **0.07x** — 43 of 43 |
-| Operator mix (19) | **0.66x** — 10 of 19 | **0.36x** — 16 of 19 |
-| TPC-H (22) | **0.77x** — 17 of 22 | **0.27x** — 22 of 22 |
-| H2O.ai `join` (5) | **0.89x** — 3 of 5 | **0.24x** — 5 of 5 |
-| TPC-DS (99) | **~1.00x** — 39 to 42 of 99 | — |
-| H2O.ai `groupby` (10) | 1.23x — 4 of 10 | **0.11x** — 10 of 10 |
-| Join Order Benchmark (113) | 1.49x — 31 of 109 | — |
+| Operator mix (19) | **0.64x** — 12 of 19 | **0.35x** — 15 of 19 |
+| TPC-H (22) | **0.76x** — 17 of 22 | **0.26x** — 22 of 22 |
+| H2O.ai `join` (5) | **0.95x** — 3 of 5 | **0.24x** — 5 of 5 |
+| TPC-DS (99) | **0.96x** — 44 of 99 | — |
+| H2O.ai `groupby` (10) | 1.28x — 4 of 10 | **0.11x** — 10 of 10 |
+| Join Order Benchmark (113) | 1.37x — 31 of 109 | — |
 
-Read the two columns together. On identical input Batcher's execution engine is **3.7x
+Read the two columns together. On identical input Batcher's execution engine is **3.9x
 DuckDB's on TPC-H and 14x on ClickBench**, and it wins every query of both. Against DuckDB's
 native store the margin narrows to 1.3x and 1.6x, and the queries Batcher loses are the ones
 where the storage advantage is largest — which is exactly what a storage advantage should
@@ -118,13 +118,13 @@ Five of the 43 ClickBench queries and two of the 19 operator cases are answered 
 Batcher's recorded column statistics rather than executed — an unfiltered `SUM`, `AVG` or
 `COUNT(DISTINCT)` over an immutable in-memory relation. The answers are exact, but the timing
 is a memo lookup rather than a scan. **Excluding them**, ClickBench is **0.77x over 38
-queries** and the operator mix **0.77x over 17**. Quote those when the claim is about
+queries** and the operator mix **0.76x over 17**. Quote those when the claim is about
 execution speed.
 :::
 
 ### Where it does not hold: scale factor 10
 
-At ten times the data the native-store comparison inverts: TPC-H sf10 is **1.27x**, a loss.
+At ten times the data the native-store comparison inverts: TPC-H sf10 is **1.29x**, a loss.
 Nine of thirteen shapes still scale *sublinearly* for ten times the rows, but four do not —
 q5 (14.9x), q13 (12.7x), q18 (12.5x) and q9 (11.2x), which between them carry the
 highest-cardinality group-bys and the largest intermediates in the benchmark. That is the

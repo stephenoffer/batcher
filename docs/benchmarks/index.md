@@ -5,7 +5,7 @@ This page summarizes Batcher's measured results across analytics, I/O, and AI wo
 Numbers, not adjectives. Every figure here comes from a run that was correctness-gated first. The harness executes the query on every engine, checks they return the identical result as a sorted row multiset within float tolerance, and only then records a time. A fast wrong answer is a bug, not a win. A benchmark that disagrees with the oracle reports `FAILED` and produces no number at all.
 
 :::{important}
-That gate is not decoration. On TPC-H q6 it caught two other engines returning 75,207,768.19 where the official TPC-H answer is 123,141,078.23. They fold the predicate bound `0.06 + 0.01` in IEEE double, getting `0.06999999999999999`, and so drop every `l_discount = 0.07` row. Batcher returns the official answer exactly, and the harness declines to time a wrong result. Read every table on this site knowing that a missing number means a wrong answer, not a slow one.
+That gate is not decoration. On TPC-H q6 it caught Daft returning 75,207,768.19 where the official TPC-H answer is 123,141,078.23. Daft folds the predicate bound `0.06 + 0.01` in IEEE double, getting `0.06999999999999999`, and so drops every `l_discount = 0.07` row. Polars made the same mistake in earlier sweeps and no longer does. Batcher returns the official answer exactly, and the harness declines to time a wrong result. Read every table on this site knowing that a missing number means a wrong answer, not a slow one.
 :::
 
 ::::{grid} 1 3 3 3
@@ -32,7 +32,7 @@ Hardware, correctness gating, and the commands to reproduce every number.
 
 ## The short version
 
-Batcher leads the classical analytics suites against DuckDB reading the same Arrow — 22 of 22 TPC-H at scale factor 1, 43 of 43 ClickBench, 5 of 5 JSON — and, since 2026-08-15, against DuckDB's own native compressed store as well on TPC-H, ClickBench, JSON and the operator mix, with TPC-DS at parity. That second bar is the harder one and the one worth arguing about: it puts DuckDB's storage engine *and* its execution engine against Batcher's execution engine alone. Where Batcher still loses is stated in the table below rather than omitted from it.
+Batcher leads the classical analytics suites against DuckDB reading the same Arrow — 22 of 22 TPC-H at scale factor 1, 43 of 43 ClickBench, 5 of 5 JSON — and, since 2026-08-15, against DuckDB's own native compressed store as well — TPC-H sf1, all 99 queries of TPC-DS, ClickBench, JSON, the operator mix and the H2O.ai join task. That second bar is the harder one and the one worth arguing about: it puts DuckDB's storage engine *and* its execution engine against Batcher's execution engine alone. Where Batcher still loses is stated in the table below rather than omitted from it.
 
 Model and multimodal work is one more workload family on that same engine rather than a separate system, and it is measured the same way: real models on 8xT4, with the GPU held above 80% utilization on every family sampled.
 
@@ -43,17 +43,17 @@ is DuckDB on its native compressed store (the harder bar); `duckdb_arrow` is Duc
 same zero-copy Arrow Batcher runs on (the like-for-like one). Lower is better and **below
 1.0x means Batcher is faster**:
 
-| Suite | vs `duckdb` | vs `duckdb_arrow` | vs Polars |
-|---|---:|---:|---:|
-| **Semi-structured JSON** (5) | **0.23x**, 5 of 5 | **0.04x** | **0.01x** |
-| **ClickBench** (43) | **0.62x**, 30 of 43 | **0.07x**, 43 of 43 | **0.33x** |
-| **Operator mix** (19) | **0.66x**, 10 of 19 | **0.36x** | **0.12x** |
-| **TPC-H sf1** (22) | **0.77x**, 17 of 22 | **0.27x**, 22 of 22 | **0.43x** |
-| **H2O.ai `join`** (5) | **0.89x**, 3 of 5 | **0.24x** | **0.63x** |
-| **TPC-DS sf1** (99) | ~1.00x, 39-42 of 99 | — | — |
-| **H2O.ai `groupby`** (10) | 1.23x, 4 of 10 | **0.11x**, 10 of 10 | **0.49x** |
-| **Join Order Benchmark** (113) | 1.49x, 31 of 109 | — | — |
-| **TPC-H sf10** (22) | 1.27x, 6 of 22 | — | — |
+| Suite | vs `duckdb` | vs `duckdb_arrow` | vs Polars | vs Daft |
+|---|---:|---:|---:|---:|
+| **Semi-structured JSON** (5) | **0.25x**, 5 of 5 | **0.04x**, 5 of 5 | **0.01x** | **0.02x** |
+| **ClickBench** (43) | **0.62x**, 30 of 43 | **0.07x**, 43 of 43 | **0.33x**, 36 of 40 | **0.26x**, 41 of 41 |
+| **Operator mix** (19) | **0.64x**, 12 of 19 | **0.35x**, 15 of 19 | **0.12x**, 19 of 19 | **0.12x**, 15 of 15 |
+| **TPC-H sf1** (22) | **0.76x**, 17 of 22 | **0.26x**, 22 of 22 | **0.43x**, 21 of 22 | **0.35x**, 20 of 20 |
+| **H2O.ai `join`** (5) | **0.95x**, 3 of 5 | **0.24x**, 5 of 5 | **0.63x** | — |
+| **TPC-DS sf1** (99) | **0.96x**, 44 of 99 | — | — | — |
+| **H2O.ai `groupby`** (10) | 1.28x, 4 of 10 | **0.11x**, 10 of 10 | **0.49x** | — |
+| **TPC-H sf10** (22) | 1.29x, 8 of 22 | — | **0.37x**, 18 of 22 | **0.42x**, 16 of 20 |
+| **Join Order Benchmark** (113) | 1.37x, 31 of 109 | — | — | — |
 
 | Other workloads | Measured |
 |---|---|
@@ -73,7 +73,7 @@ recorded column statistics rather than executed**. An unfiltered `SUM`, `AVG` or
 `COUNT(DISTINCT)` over an immutable in-memory relation is served from a statistic the first
 run computed. The answers are exact — they match DuckDB — but the timing is a memo lookup, not
 a scan. Excluding those cases, ClickBench is **0.77x over 38 queries** and the operator mix
-**0.77x over 17**. Use those figures when the claim is about execution speed.
+**0.76x over 17**. Use those figures when the claim is about execution speed.
 :::
 
 :::{note}

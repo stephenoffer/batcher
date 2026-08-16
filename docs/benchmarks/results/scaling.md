@@ -46,7 +46,7 @@ as much for ten times the rows, because at scale factor 1 they do not fill the m
 scale factor 10 they do. Four are superlinear, and they are named rather than averaged away —
 q5, q9, q13 and q18. q13 and q18 each carry a very high-cardinality `GROUP BY` (1.5M and 15M
 groups at sf10), q9 builds the largest intermediate in the benchmark, and q5 is the six-way
-join. Against DuckDB's native store the suite is **0.78x at sf1 and 1.27x at sf10**, so ten
+join. Against DuckDB's native store the suite is **0.76x at sf1 and 1.29x at sf10**, so ten
 times the data is currently where the single-node lead is lost.
 
 DuckDB's column reads 2.4x to 4.7x throughout, and that is not a better scaling law: it is a

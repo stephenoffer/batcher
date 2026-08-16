@@ -75,10 +75,10 @@ faster**:
 
 | Against | Geomean | Queries won |
 |---|---:|---|
-| DuckDB on the same Arrow (`duckdb_arrow`) | **0.27x** — 3.7x faster | **22 of 22** |
-| Polars | **0.43x** — 2.3x faster | 20 of 22 |
-| Daft | **0.36x** — 2.8x faster | 19 of 20 |
-| DuckDB on its **native** compressed store (`duckdb`) | **0.77x** — 1.3x faster | **17 of 22** |
+| DuckDB on the same Arrow (`duckdb_arrow`) | **0.26x** — 3.9x faster | **22 of 22** |
+| Polars | **0.43x** — 2.4x faster | 21 of 22 |
+| Daft | **0.35x** — 2.9x faster | **20 of 20** |
+| DuckDB on its **native** compressed store (`duckdb`) | **0.76x** — 1.3x faster | **17 of 22** |
 
 The last row is the one that changed: leading DuckDB's own storage engine *and* execution
 engine, rather than only its execution engine, is new as of this sweep — it read 0.99x on

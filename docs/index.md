@@ -19,7 +19,7 @@
 
 <div class="bt-stats">
   <div class="bt-stat">
-    <span class="bt-stat-value">3.7&times;</span>
+    <span class="bt-stat-value">3.9&times;</span>
     <span class="bt-stat-label">faster than DuckDB on the same Arrow</span>
     <span class="bt-stat-src">TPC-H sf1, 96 cores, 22 of 22 queries won</span>
   </div>
@@ -82,16 +82,18 @@ Suite geometric means, scale factor 1, 96 cores / 184 GiB, 2026-08-15:
 
 | Suite | vs DuckDB, same Arrow | vs DuckDB, native store |
 |---|---|---|
-| Semi-structured JSON, 5 queries | **26x**, won 5 of 5 | **4.3x**, won 5 of 5 |
+| Semi-structured JSON, 5 queries | **27x**, won 5 of 5 | **4.0x**, won 5 of 5 |
 | ClickBench, 43 queries | **14x**, won 43 of 43 | **1.6x**, won 30 of 43 |
-| Operator mix, 19 kernels | **2.8x**, won 16 of 19 | **1.5x**, won 10 of 19 |
-| TPC-H sf1, 22 queries | **3.7x**, won 22 of 22 | **1.3x**, won 17 of 22 |
-| TPC-DS sf1, all 99 queries | — | **parity**, won 39-42 of 99 |
+| Operator mix, 19 kernels | **2.9x**, won 15 of 19 | **1.6x**, won 12 of 19 |
+| TPC-H sf1, 22 queries | **3.9x**, won 22 of 22 | **1.3x**, won 17 of 22 |
+| TPC-DS sf1, all 99 queries | — | **1.04x**, won 44 of 99 |
 
 And where it does not win, which is the half a benchmark page usually leaves out: H2O.ai
-`groupby` (1.23x), the 113-query Join Order Benchmark (1.49x), and TPC-H at scale factor 10
-(1.27x) all go to DuckDB's native store today. Every one of them is a Batcher win against
-DuckDB on the same Arrow.
+`groupby` (1.28x), the 113-query Join Order Benchmark (1.37x), and TPC-H at scale factor 10
+(1.29x) all go to DuckDB's native store today. Two of the three flip on the same Arrow.
+`groupby` becomes a Batcher win 10 of 10 and sf10 becomes 21 of 22, which places that gap in
+the storage format rather than in the operators. The Join Order Benchmark has not been measured
+that way.
 
 | Other workloads | Result |
 |---|---|

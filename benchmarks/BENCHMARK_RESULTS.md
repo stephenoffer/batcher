@@ -296,8 +296,8 @@ changes is that the geomean is quoted both ways:
 
 | suite | as reported | excluding the metadata-answered cases |
 |---|---:|---:|
-| ClickBench (43) | 0.607x | **0.772x** over 38 |
-| operators (19) | 0.662x | **0.765x** over 17 |
+| ClickBench (43) | 0.627x | **0.767x** over 38 |
+| operators (19) | 0.643x | **0.760x** over 17 |
 
 The five ClickBench cases average **0.097x** between them. Quote the second column when the
 claim is about execution speed. (`cb-q06`, `MIN`/`MAX` over a date, is *not* in that set: DuckDB
