@@ -1440,7 +1440,7 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 |---|---|---|
 | `arithmetic.py` | 242 | Reading a predicate through the arithmetic wrapped around its column. |
 | `combine.py` | 601 | Composing leaf selectivities into a whole-predicate estimate. |
-| `leaves.py` | 731 | Leaf predicate selectivity — one estimate per non-composite predicate. |
+| `leaves.py` | 739 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 341 | What a text pattern says about how many rows it matches. |
 | `scalars.py` | 502 | Scalar and column-statistic primitives shared by every selectivity estimator. |
 

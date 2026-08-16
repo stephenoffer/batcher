@@ -610,3 +610,32 @@ def test_column_pair_complements_across_the_operator():
     lt = _s(bt.col("x") < bt.col("y"))
     ge = _s(bt.col("x") >= bt.col("y"))
     assert lt + ge == pytest.approx(1.0)
+
+
+# --- a column compared with itself is not a filter ---------------------------------
+
+
+def test_a_column_equals_itself_on_every_row_that_has_a_value():
+    """`x = x` keeps every non-null row, not `1 / ndv` of them.
+
+    Nobody writes this; the planner derives it. JOB q32a states `t1.id = mk.movie_id` and
+    then repeats `mk.movie_id = t1.id`, and propagating that equivalence leaves
+    `t1.id = t1.id` pushed into the `title` scan. Under the containment formula for
+    `col_a = col_b` that is `1 / d`, which on a key column estimates **one row** where the
+    answer is the whole relation — a 2.5-million-fold miss that then made every join above
+    it estimate zero and pick its build side backwards.
+    """
+    assert _s(bt.col("x") == bt.col("x")) == pytest.approx(1.0)
+    # And it is not confused with a genuine two-column equality, which stays at `1 / d`.
+    two = sel(bt.col("x") == bt.col("y"), {"x": 10.0, "y": 10.0}, _CFG, None, None, None, None)
+    assert two == pytest.approx(1.0 / 10.0)
+
+
+def test_a_self_equality_still_drops_null_rows():
+    """`x = x` is NULL where `x` is, and SQL keeps only TRUE — so nulls are still excluded.
+
+    This is what distinguishes the predicate from `TRUE`, and it is why the estimate is the
+    non-null share rather than 1.0.
+    """
+    quarter_null = _s(bt.col("x") == bt.col("x"), nulls={"x": 0.25})
+    assert quarter_null == pytest.approx(0.75)
