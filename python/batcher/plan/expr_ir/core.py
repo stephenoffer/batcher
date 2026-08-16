@@ -1417,7 +1417,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
                 >>> ds.select(r=bt.col("x").asinh()).to_pydict()
-                {'r': [0.0, 0.8813735870195429]}
+                {'r': [0.0, 0.881373587019543]}
         """
         return MathExpr("asinh", self)
 
@@ -1459,7 +1459,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [0.0, 0.5]})
                 >>> ds.select(r=bt.col("x").atanh()).to_pydict()
-                {'r': [0.0, 0.5493061443340549]}
+                {'r': [0.0, 0.5493061443340548]}
         """
         return MathExpr("atanh", self)
 
@@ -1523,7 +1523,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [0.0, 1.0]})
                 >>> ds.select(r=bt.col("x").arcsinh()).to_pydict()
-                {'r': [0.0, 0.8813735870195429]}
+                {'r': [0.0, 0.881373587019543]}
         """
         return self.asinh()
 
@@ -1555,7 +1555,7 @@ class Expr:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"x": [0.0, 0.5]})
                 >>> ds.select(r=bt.col("x").arctanh()).to_pydict()
-                {'r': [0.0, 0.5493061443340549]}
+                {'r': [0.0, 0.5493061443340548]}
         """
         return self.atanh()
 

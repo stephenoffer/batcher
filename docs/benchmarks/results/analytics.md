@@ -56,7 +56,7 @@ Against DuckDB reading the same zero-copy Arrow, which is the like-for-like exec
 | ClickBench, 43 queries | **won 43 of 43**, 43 of 43 correct |
 | Semi-structured JSON, 5 queries | **won 5 of 5**: 3.6x to 12.5x DuckDB, 11x to 100x Polars |
 
-Against DuckDB on its own native compressed store, Batcher leads on 13 of 22 queries as of the 2026-07-26 sweep, taking the scan-and-aggregate-dominated ones outright (q15 0.46x, q12 0.74x, q11 0.80x, q1 and q9 0.88x). That comparison is not like-for-like: DuckDB decompresses its own format as it scans and never pays an Arrow ingest, which is exactly what an engine gives up to keep Arrow as its only columnar contract. {doc}`/benchmarks/results/tpch` has the per-query detail.
+Against DuckDB on its own native compressed store, Batcher now leads the **suite**: 0.77x on the geometric mean, winning 17 of 22 queries as of the 2026-08-15 sweep on 96 cores (it was 13 of 22 and a 0.99x geomean on 16 cores in July). That comparison is not like-for-like — DuckDB decompresses its own format as it scans and never pays an Arrow ingest, which is exactly what an engine gives up to keep Arrow as its only columnar contract — which is what makes leading it worth stating. {doc}`/benchmarks/results/tpch` has the per-query detail, and {doc}`/benchmarks/results/scaling` has the scale-factor-10 picture, where the same comparison inverts to 1.27x.
 
 Two notes on the other engines' surfaces:
 

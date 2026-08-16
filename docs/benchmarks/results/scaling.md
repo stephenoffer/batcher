@@ -18,6 +18,63 @@ worker node x 8 CPU cluster, and an 8xT4 GPU cluster. Compare engines *within* a
 {doc}`/benchmarks/methodology` lists the shapes.
 :::
 
+## Scaling with the data: sublinear on nine shapes of thirteen
+
+Distribution is one axis. The other is what happens when the data grows on one machine, and
+it is the one a scheduling change can quietly get wrong. TPC-H at scale factor 1 against
+scale factor 10 on the same 96-core / 184 GiB node, same binary, measured 2026-08-15. Ten
+times the rows, so **ten times the time is the line to beat**:
+
+| Query | Shape | sf1 | sf10 | Batcher | DuckDB |
+|---|---|---:|---:|---:|---:|
+| q15 | scan + aggregate | 2.3 ms | 3.3 ms | **1.4x** | 3.8x |
+| q22 | scan + aggregate | 18.9 | 43.0 | **2.3x** | 3.0x |
+| q6 | scan + filter | 5.8 | 30.3 | **5.2x** | 3.6x |
+| q10 | join | 28.0 | 152.1 | **5.4x** | 3.4x |
+| q1 | scan + aggregate | 15.5 | 93.6 | **6.0x** | 4.7x |
+| q8 | join | 17.7 | 105.8 | **6.0x** | 3.7x |
+| q7 | join | 20.7 | 134.6 | **6.5x** | 2.4x |
+| q3 | join | 19.9 | 145.3 | **7.3x** | 3.8x |
+| q21 | join | 73.1 | 540.1 | **7.4x** | 4.1x |
+| q9 | join | 47.9 | 536.1 | 11.2x | 3.0x |
+| q18 | join + aggregate | 31.4 | 392.9 | 12.5x | 4.2x |
+| q13 | join + aggregate | 40.2 | 510.3 | 12.7x | 2.8x |
+| q5 | join | 25.3 | 376.7 | 14.9x | 4.5x |
+
+Nine of thirteen are **sublinear**: a scan, a filter and most joins cost less than ten times
+as much for ten times the rows, because at scale factor 1 they do not fill the machine and at
+scale factor 10 they do. Four are superlinear, and they are named rather than averaged away —
+q5, q9, q13 and q18. q13 and q18 each carry a very high-cardinality `GROUP BY` (1.5M and 15M
+groups at sf10), q9 builds the largest intermediate in the benchmark, and q5 is the six-way
+join. Against DuckDB's native store the suite is **0.78x at sf1 and 1.27x at sf10**, so ten
+times the data is currently where the single-node lead is lost.
+
+DuckDB's column reads 2.4x to 4.7x throughout, and that is not a better scaling law: it is a
+fixed per-query cost that dominates its scale-factor-1 numbers and disappears by scale factor
+10. Neither column means much alone; the shape of Batcher's is the claim.
+
+## Scaling with cores: a gather-bound join saturates near 10x
+
+More cores is the third axis, and the honest curve is not a straight line. The H2O.ai `join`
+q5 shape (10M x 10M inner join, 9M rows and 13 columns out — a query whose cost is dominated
+by materializing its own output) with the worker count pinned:
+
+| Threads | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Time | 3,790 ms | 1,885 | 1,114 | 658 | 433 | 388 | **375** | 442 |
+| Speedup | 1.0x | 2.0x | 3.4x | 5.8x | 8.8x | 9.8x | **10.1x** | 8.6x |
+| Efficiency | 100% | 101% | 85% | 72% | 55% | 31% | 21% | 13% |
+
+Linear to two cores, 85% efficient at four, and then a ceiling near **10x** — an Amdahl serial
+fraction of roughly 9%, already reached by sixteen cores. Past this box's 48 *physical* cores
+it gets worse, which is why the executor's default width is every physical core plus a third
+of the SMT siblings rather than every hardware thread.
+
+The useful reading is not the ceiling but where it is: a query that moves a gigabyte of output
+is bounded by the part of that work which cannot be split, so the way to make it faster is to
+move less, not to add threads. That is what the gather work in `BENCHMARK_RESULTS.md`
+(2026-08-15) does, and it is why the same page records the curve rather than a speedup figure.
+
 ## Small data should not distribute
 
 At TPC-H scale factor 1 (6M rows), distributing a query is a mistake, and the benchmark

@@ -19,9 +19,14 @@
 
 <div class="bt-stats">
   <div class="bt-stat">
-    <span class="bt-stat-value">2.37&times;</span>
+    <span class="bt-stat-value">3.7&times;</span>
     <span class="bt-stat-label">faster than DuckDB on the same Arrow</span>
-    <span class="bt-stat-src">TPC-H sf1, 16 cores, 22 of 22 queries won</span>
+    <span class="bt-stat-src">TPC-H sf1, 96 cores, 22 of 22 queries won</span>
+  </div>
+  <div class="bt-stat">
+    <span class="bt-stat-value">1.3&times;</span>
+    <span class="bt-stat-label">faster than DuckDB's own compressed store</span>
+    <span class="bt-stat-src">TPC-H sf1 &mdash; storage engine and all, 17 of 22 won</span>
   </div>
   <div class="bt-stat">
     <span class="bt-stat-value">43 / 43</span>
@@ -66,15 +71,30 @@ never leaves the engine.
 
 ## The numbers
 
-Every engine reads the identical zero-copy Arrow input, so these compare execution rather
-than storage formats.
+DuckDB can be measured two ways, and both are here because quoting only one would be
+choosing the flattering one. **Same Arrow** is DuckDB executing over the identical zero-copy
+input Batcher runs on: two execution engines, one input. **Native store** is DuckDB over its
+own compressed, dictionary-encoded, zone-mapped format, ingested before the clock starts —
+DuckDB at its best, and a storage engine *plus* an execution engine against Batcher's
+execution engine alone.
 
-| Suite | Result |
+Suite geometric means, scale factor 1, 96 cores / 184 GiB, 2026-08-15:
+
+| Suite | vs DuckDB, same Arrow | vs DuckDB, native store |
+|---|---|---|
+| Semi-structured JSON, 5 queries | **26x**, won 5 of 5 | **4.3x**, won 5 of 5 |
+| ClickBench, 43 queries | **14x**, won 43 of 43 | **1.6x**, won 30 of 43 |
+| Operator mix, 19 kernels | **2.8x**, won 16 of 19 | **1.5x**, won 10 of 19 |
+| TPC-H sf1, 22 queries | **3.7x**, won 22 of 22 | **1.3x**, won 17 of 22 |
+| TPC-DS sf1, all 99 queries | — | **parity**, won 39-42 of 99 |
+
+And where it does not win, which is the half a benchmark page usually leaves out: H2O.ai
+`groupby` (1.23x), the 113-query Join Order Benchmark (1.49x), and TPC-H at scale factor 10
+(1.27x) all go to DuckDB's native store today. Every one of them is a Batcher win against
+DuckDB on the same Arrow.
+
+| Other workloads | Result |
 |---|---|
-| TPC-H sf1, 22 queries, 16 cores | **2.37x** DuckDB on the same Arrow, won 22 of 22; 1.26x Polars |
-| TPC-H sf10, 22 queries, 96 cores | **1.89x** DuckDB on the same Arrow, won 21 of 22; 2.26x Polars |
-| ClickBench, 43 queries | **won 43 of 43** vs DuckDB on the same Arrow, and 43 of 43 correct |
-| Semi-structured JSON, 5 queries | won 5 of 5, **3.6x to 12.5x** DuckDB, 11x to 100x Polars |
 | Image decode to tensor | **5,693 img/s**, 2.4x Daft |
 | ResNet-50 batch inference, 8xT4 | **2,504 img/s** at 81% GPU utilization |
 | Text embeddings, MiniLM, 8xT4 | **33,611 text/s** |

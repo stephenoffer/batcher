@@ -404,7 +404,9 @@ article img[src*="_images/"]:not([src$=".svg"]) {
 
 .bt-stats {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  /* `auto-fit` rather than a fixed count so the row reflows for however many tiles the
+     hero carries: a fixed `repeat(4, ...)` left a fifth stranded alone on its own line. */
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
   gap: 0.9rem;
   margin: 1.6rem 0 0.4rem;
 }
@@ -438,5 +440,4 @@ article img[src*="_images/"]:not([src$=".svg"]) {
 }
 /* Two-up on tablets, stacked on phones: a four-across strip is unreadable in a
    narrow column, and these tiles carry real text rather than just a figure. */
-@media (max-width: 900px) { .bt-stats { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 520px) { .bt-stats { grid-template-columns: 1fr; } }
